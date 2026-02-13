@@ -54,10 +54,26 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
 
+### Async Runtime: asupersync (MANDATORY — NO TOKIO)
+
+**This project uses [asupersync](/dp/asupersync) exclusively for all async/concurrent operations. Tokio and the entire tokio ecosystem are FORBIDDEN.**
+
+- **Structured concurrency**: `Cx`, `Scope`, `region()` — no orphan tasks
+- **Cancel-correct channels**: Two-phase `reserve()/send()` — no data loss on cancellation
+- **Sync primitives**: `asupersync::sync::Mutex`, `RwLock`, `OnceCell`, `Pool` — cancel-aware
+- **Deterministic testing**: `LabRuntime` with virtual time, DPOR, oracles
+- **Native HTTP**: `asupersync::http::h1` for model downloads (replaces reqwest)
+- **Rayon is allowed**: For CPU-bound data parallelism (vector dot products). Rayon is not an async runtime.
+
+**Forbidden crates**: `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio.
+
+**Pattern**: All async functions take `&Cx` as first parameter. The `Cx` flows down from the consumer's runtime — frankensearch does NOT create its own runtime.
+
 ### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
+| `asupersync` | Structured async runtime (channels, sync, regions, HTTP, testing) |
 | `half` | IEEE 754 f16 float support for quantized vectors |
 | `wide` | Portable SIMD (`f32x8`) across x86 SSE2/AVX2 and ARM NEON |
 | `memmap2` | Memory-mapped file I/O for zero-copy vector index access |
@@ -68,7 +84,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `serde` + `serde_json` | Serialization |
 | `thiserror` | Ergonomic error type derivation |
 | `tracing` | Structured logging and diagnostics |
-| `rayon` | Data parallelism for vector search |
+| `rayon` | Data parallelism for vector search (CPU-bound, not async) |
 | `unicode-normalization` | NFC text canonicalization |
 
 ### Release Profile
@@ -269,7 +285,7 @@ fastembed = ['dep:fastembed']                        # MiniLM-L6-v2 quality embe
 lexical = ['dep:tantivy']                           # Tantivy BM25 full-text search
 rerank = ['dep:ort', 'dep:tokenizers']              # FlashRank cross-encoder
 ann = ['dep:hnsw_rs']                               # HNSW approximate nearest neighbors
-download = ['dep:reqwest']                          # Model auto-download from HuggingFace
+download = ['asupersync/tls']                       # Model download via asupersync HTTP (NO reqwest/tokio)
 semantic = ['hash', 'model2vec', 'fastembed']        # All embedding models
 hybrid = ['semantic', 'lexical']                     # Semantic + lexical + RRF
 full = ['hybrid', 'rerank', 'ann', 'download']       # Everything
@@ -286,12 +302,14 @@ full = ['hybrid', 'rerank', 'ann', 'download']       # Everything
 | `TwoTierSearcher` | Main orchestrator — progressive search via iterator protocol |
 | `TwoTierConfig` | All tuning knobs (blend factor, RRF K, timeouts, fast_only mode) |
 | `TwoTierMetrics` | Diagnostics: latencies, Kendall tau, promoted/demoted/stable counts, SkipReason |
-| `Embedder` | Core trait — `embed()`, `dimension()`, `is_semantic()`, `category()` |
-| `Reranker` | Core trait — cross-encoder scoring interface |
+| `Embedder` | Core async trait — `embed(&Cx, &str)`, `dimension()`, `is_semantic()`, `category()` |
+| `Reranker` | Core async trait — `rerank(&Cx, query, docs)` cross-encoder scoring |
 | `SearchError` | Unified error enum across all crates (thiserror-derived) |
 | `Canonicalizer` | Text preprocessing trait (NFC, markdown strip, code collapse, truncation) |
 | `QueryClass` | Query classification enum (Empty/Identifier/ShortKeyword/NaturalLanguage) |
 | `EmbedderStack` | Auto-detected fast + quality embedder pair |
+| `Cx` | asupersync capability context — passed to all async operations |
+| `Outcome<T, E>` | Four-valued result: Ok, Err, Cancelled, Panicked |
 
 ### Performance Targets
 
@@ -317,6 +335,10 @@ full = ['hybrid', 'rerank', 'ann', 'download']       # Everything
 - **Two-phase allocation** in top-k search: Phase 1 stores only `(index: u32, score: f32)`, Phase 2 resolves doc_id strings for winners only
 - **fsync on vector index save** for durability guarantees
 - **Structured tracing** throughout — every search emits spans with latency, counts, embedder info
+- **asupersync exclusively** — NO tokio/reqwest/hyper. All async via `Cx` + structured concurrency
+- **Rayon for data parallelism** — CPU-bound vector dot products use rayon's work-stealing; this composes with asupersync tasks
+- **Cancel-correct lifecycle** — background workers use asupersync regions, channels use two-phase reserve/commit
+- **LabRuntime for deterministic tests** — virtual time, DPOR schedule exploration, correctness oracles
 
 ---
 
