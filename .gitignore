@@ -1,0 +1,38 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# ONNX models and ML artifacts (large, downloaded at runtime)
+*.onnx
+*.safetensors
+models/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# Benchmarks (generated)
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Environment
+.env
+.env.*
