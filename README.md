@@ -1,6 +1,10 @@
 # frankensearch
 
 <div align="center">
+  <img src="frankensearch_illustration.webp" alt="frankensearch - Two-tier hybrid search for Rust">
+</div>
+
+<div align="center">
 
 [![CI](https://github.com/Dicklesworthstone/frankensearch/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/frankensearch/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/frankensearch.svg)](https://crates.io/crates/frankensearch)
