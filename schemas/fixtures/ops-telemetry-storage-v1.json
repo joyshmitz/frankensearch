@@ -14,12 +14,77 @@
     {
       "name": "projects",
       "purpose": "Project namespace for fleet telemetry",
-      "primary_key": "project_key"
+      "primary_key": "project_key",
+      "columns": [
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "display_name",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ]
     },
     {
       "name": "instances",
       "purpose": "Runtime process identity and lifecycle",
       "primary_key": "instance_id",
+      "columns": [
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "host_name",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "pid",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "version",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "first_seen_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "last_heartbeat_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "check": "state IN ('started','healthy','degraded','stale','stopped')"
+        }
+      ],
       "foreign_keys": [
         "project_key -> projects(project_key)"
       ]
@@ -27,47 +92,473 @@
     {
       "name": "search_events",
       "purpose": "Raw search phase events",
-      "primary_key": "event_id"
+      "primary_key": "event_id",
+      "columns": [
+        {
+          "name": "event_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "correlation_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "query_hash",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "query_class",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "phase",
+          "type": "TEXT",
+          "nullable": false,
+          "check": "phase IN ('initial','refined','failed')"
+        },
+        {
+          "name": "latency_us",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "result_count",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "memory_bytes",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "ts_ms",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)",
+        "instance_id -> instances(instance_id)"
+      ]
     },
     {
       "name": "search_summaries",
       "purpose": "Windowed latency/count aggregates",
-      "primary_key": "(project_key, instance_id, window, window_start_ms)"
+      "primary_key": "(project_key, instance_id, window, window_start_ms)",
+      "columns": [
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "window",
+          "type": "TEXT",
+          "nullable": false,
+          "check": "window IN ('1m','15m','1h','6h','24h','3d','1w')"
+        },
+        {
+          "name": "window_start_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "search_count",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "p50_latency_us",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "p95_latency_us",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "p99_latency_us",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "avg_result_count",
+          "type": "REAL",
+          "nullable": true
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)",
+        "instance_id -> instances(instance_id)"
+      ]
     },
     {
       "name": "embedding_job_snapshots",
       "purpose": "Embedding queue and throughput snapshots",
-      "primary_key": "snapshot_id"
+      "primary_key": "snapshot_id",
+      "columns": [
+        {
+          "name": "snapshot_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "embedder_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "pending_jobs",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "processing_jobs",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "completed_jobs",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "failed_jobs",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "retried_jobs",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "batch_latency_us",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "ts_ms",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)",
+        "instance_id -> instances(instance_id)"
+      ],
+      "constraints": [
+        "UNIQUE (project_key, instance_id, embedder_id, ts_ms)"
+      ]
     },
     {
       "name": "index_inventory_snapshots",
       "purpose": "Index size/hash/staleness snapshots",
-      "primary_key": "snapshot_id"
+      "primary_key": "snapshot_id",
+      "columns": [
+        {
+          "name": "snapshot_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "index_name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "index_type",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "record_count",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "file_size_bytes",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "file_hash",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "is_stale",
+          "type": "INTEGER",
+          "nullable": false,
+          "check": "is_stale IN (0,1)"
+        },
+        {
+          "name": "ts_ms",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)",
+        "instance_id -> instances(instance_id)"
+      ],
+      "constraints": [
+        "UNIQUE (project_key, instance_id, index_name, ts_ms)"
+      ]
     },
     {
       "name": "resource_samples",
       "purpose": "CPU/RSS/IO samples",
-      "primary_key": "sample_id"
+      "primary_key": "sample_id",
+      "columns": [
+        {
+          "name": "sample_id",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "cpu_pct",
+          "type": "REAL",
+          "nullable": true
+        },
+        {
+          "name": "rss_bytes",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "io_read_bytes",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "io_write_bytes",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "queue_depth",
+          "type": "INTEGER",
+          "nullable": true
+        },
+        {
+          "name": "ts_ms",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)",
+        "instance_id -> instances(instance_id)"
+      ],
+      "constraints": [
+        "UNIQUE (project_key, instance_id, ts_ms)"
+      ]
     },
     {
       "name": "alerts_timeline",
       "purpose": "Open/ack/resolved incident timeline",
-      "primary_key": "alert_id"
+      "primary_key": "alert_id",
+      "columns": [
+        {
+          "name": "alert_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "instance_id",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "category",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "nullable": false,
+          "check": "severity IN ('info','warn','error','critical')"
+        },
+        {
+          "name": "reason_code",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "summary",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "state",
+          "type": "TEXT",
+          "nullable": false,
+          "check": "state IN ('open','acknowledged','resolved')"
+        },
+        {
+          "name": "opened_at_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "updated_at_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "resolved_at_ms",
+          "type": "INTEGER",
+          "nullable": true
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)"
+      ]
     },
     {
       "name": "evidence_links",
       "purpose": "Alert-to-artifact evidence mappings",
-      "primary_key": "link_id"
+      "primary_key": "link_id",
+      "columns": [
+        {
+          "name": "link_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "project_key",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "alert_id",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "evidence_type",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "evidence_uri",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "evidence_hash",
+          "type": "TEXT",
+          "nullable": true
+        },
+        {
+          "name": "created_at_ms",
+          "type": "INTEGER",
+          "nullable": false
+        }
+      ],
+      "foreign_keys": [
+        "project_key -> projects(project_key)",
+        "alert_id -> alerts_timeline(alert_id)"
+      ],
+      "constraints": [
+        "UNIQUE (alert_id, evidence_uri)"
+      ]
     },
     {
       "name": "ops_schema_migrations",
       "purpose": "Versioned migration tracking",
-      "primary_key": "version"
+      "primary_key": "version",
+      "columns": [
+        {
+          "name": "version",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "applied_at_ms",
+          "type": "INTEGER",
+          "nullable": false
+        },
+        {
+          "name": "checksum",
+          "type": "TEXT",
+          "nullable": false
+        },
+        {
+          "name": "reversible",
+          "type": "INTEGER",
+          "nullable": false,
+          "check": "reversible IN (0,1)"
+        }
+      ]
     }
   ],
   "indexes": [
     {
-      "name": "idx_instances_project_heartbeat",
+      "name": "ix_inst_pk_hb",
       "table": "instances",
       "columns": [
         "project_key",
@@ -76,7 +567,7 @@
       "query_goal": "List freshest instances per project"
     },
     {
-      "name": "idx_search_events_project_time",
+      "name": "ix_se_pk_ts",
       "table": "search_events",
       "columns": [
         "project_key",
@@ -85,7 +576,7 @@
       "query_goal": "Project-scoped event timeline"
     },
     {
-      "name": "idx_search_events_instance_time",
+      "name": "ix_se_ii_ts",
       "table": "search_events",
       "columns": [
         "instance_id",
@@ -94,7 +585,7 @@
       "query_goal": "Instance timeline drilldown"
     },
     {
-      "name": "idx_search_events_corr",
+      "name": "ix_se_corr",
       "table": "search_events",
       "columns": [
         "project_key",
@@ -103,7 +594,7 @@
       "query_goal": "Correlation lookup"
     },
     {
-      "name": "idx_search_summaries_project_window_start",
+      "name": "ix_ss_pk_w",
       "table": "search_summaries",
       "columns": [
         "project_key",
@@ -113,7 +604,7 @@
       "query_goal": "Windowed latency chart reads"
     },
     {
-      "name": "idx_embedding_snapshots_project_time",
+      "name": "ix_ejs_pk",
       "table": "embedding_job_snapshots",
       "columns": [
         "project_key",
@@ -122,7 +613,7 @@
       "query_goal": "Embedding backlog trend"
     },
     {
-      "name": "idx_index_inventory_project_time",
+      "name": "ix_iis_pk",
       "table": "index_inventory_snapshots",
       "columns": [
         "project_key",
@@ -131,7 +622,7 @@
       "query_goal": "Index inventory trend"
     },
     {
-      "name": "idx_resource_samples_project_time",
+      "name": "ix_rs_pk",
       "table": "resource_samples",
       "columns": [
         "project_key",
@@ -140,7 +631,7 @@
       "query_goal": "Resource usage timeline"
     },
     {
-      "name": "idx_alerts_project_time",
+      "name": "ix_at_pk",
       "table": "alerts_timeline",
       "columns": [
         "project_key",
@@ -149,7 +640,7 @@
       "query_goal": "Incident history list"
     },
     {
-      "name": "idx_alerts_open",
+      "name": "ix_at_open",
       "table": "alerts_timeline",
       "columns": [
         "project_key",
@@ -159,6 +650,15 @@
       ],
       "query_goal": "Open alerts widget",
       "partial_predicate": "state != 'resolved'"
+    },
+    {
+      "name": "ix_el_aid",
+      "table": "evidence_links",
+      "columns": [
+        "alert_id",
+        "created_at_ms DESC"
+      ],
+      "query_goal": "Alert evidence history"
     }
   ],
   "dedup_keys": [
@@ -197,7 +697,14 @@
     "tracking_table": "ops_schema_migrations",
     "forward_only_in_production": true,
     "reversible_in_dev_test": true,
-    "checksum_validation": true
+    "checksum_validation": true,
+    "migration_columns": [
+      "version",
+      "name",
+      "applied_at_ms",
+      "checksum",
+      "reversible"
+    ]
   },
   "retention_policy": {
     "raw_events_days": 7,

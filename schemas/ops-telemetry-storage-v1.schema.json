@@ -3,6 +3,7 @@
   "$id": "https://frankensearch.dev/schemas/ops-telemetry-storage-v1.schema.json",
   "title": "FrankenSearch Ops Telemetry Storage Contract v1",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "version",
     "database",
@@ -33,14 +34,16 @@
     },
     "tables": {
       "type": "array",
-      "minItems": 9,
+      "minItems": 10,
+      "maxItems": 10,
       "items": {
         "$ref": "#/$defs/table"
       }
     },
     "indexes": {
       "type": "array",
-      "minItems": 10,
+      "minItems": 11,
+      "maxItems": 11,
       "items": {
         "$ref": "#/$defs/index"
       }
@@ -69,6 +72,508 @@
       "$ref": "#/$defs/query_api"
     }
   },
+  "allOf": [
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "projects"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "project_key"
+                    }
+                  },
+                  "required": [
+                    "name"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "instances"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "state"
+                    },
+                    "check": {
+                      "const": "state IN ('started','healthy','degraded','stale','stopped')"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "search_events"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "phase"
+                    },
+                    "check": {
+                      "const": "phase IN ('initial','refined','failed')"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "search_summaries"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "window"
+                    },
+                    "check": {
+                      "const": "window IN ('1m','15m','1h','6h','24h','3d','1w')"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "embedding_job_snapshots"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "index_inventory_snapshots"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "is_stale"
+                    },
+                    "check": {
+                      "const": "is_stale IN (0,1)"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "resource_samples"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "alerts_timeline"
+              },
+              "columns": {
+                "allOf": [
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "const": "severity"
+                        },
+                        "check": {
+                          "const": "severity IN ('info','warn','error','critical')"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "check"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "const": "state"
+                        },
+                        "check": {
+                          "const": "state IN ('open','acknowledged','resolved')"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "check"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "evidence_links"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "tables": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ops_schema_migrations"
+              },
+              "columns": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "const": "reversible"
+                    },
+                    "check": {
+                      "const": "reversible IN (0,1)"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "check"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "name",
+              "columns"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_inst_pk_hb"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_se_pk_ts"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_se_ii_ts"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_se_corr"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_ss_pk_w"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_ejs_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_iis_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_rs_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_at_pk"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_at_open"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "indexes": {
+          "contains": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "const": "ix_el_aid"
+              }
+            },
+            "required": [
+              "name"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "window_label": {
       "type": "string",
@@ -82,12 +587,52 @@
         "1w"
       ]
     },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "nullable"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "TEXT",
+            "INTEGER",
+            "REAL"
+          ]
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": [
+            "string",
+            "number",
+            "boolean"
+          ]
+        },
+        "check": {
+          "type": "string"
+        },
+        "unique": {
+          "type": "boolean"
+        }
+      }
+    },
     "table": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "name",
         "purpose",
-        "primary_key"
+        "primary_key",
+        "columns"
       ],
       "properties": {
         "name": {
@@ -111,6 +656,13 @@
         "primary_key": {
           "type": "string"
         },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/column"
+          }
+        },
         "foreign_keys": {
           "type": "array",
           "items": {
@@ -127,6 +679,7 @@
     },
     "index": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "name",
         "table",
@@ -135,10 +688,33 @@
       ],
       "properties": {
         "name": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "ix_inst_pk_hb",
+            "ix_se_pk_ts",
+            "ix_se_ii_ts",
+            "ix_se_corr",
+            "ix_ss_pk_w",
+            "ix_ejs_pk",
+            "ix_iis_pk",
+            "ix_rs_pk",
+            "ix_at_pk",
+            "ix_at_open",
+            "ix_el_aid"
+          ]
         },
         "table": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "instances",
+            "search_events",
+            "search_summaries",
+            "embedding_job_snapshots",
+            "index_inventory_snapshots",
+            "resource_samples",
+            "alerts_timeline",
+            "evidence_links"
+          ]
         },
         "columns": {
           "type": "array",
@@ -157,9 +733,11 @@
     },
     "dedup_key": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "table",
-        "key"
+        "key",
+        "strategy"
       ],
       "properties": {
         "table": {
@@ -179,11 +757,13 @@
     },
     "migration_strategy": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "tracking_table",
         "forward_only_in_production",
         "reversible_in_dev_test",
-        "checksum_validation"
+        "checksum_validation",
+        "migration_columns"
       ],
       "properties": {
         "tracking_table": {
@@ -197,11 +777,28 @@
         },
         "checksum_validation": {
           "const": true
+        },
+        "migration_columns": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "version",
+              "name",
+              "applied_at_ms",
+              "checksum",
+              "reversible"
+            ]
+          }
         }
       }
     },
     "query_pattern": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "name",
         "filters",
@@ -245,6 +842,7 @@
     },
     "retention_policy": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "raw_events_days",
         "summaries_days",
@@ -272,6 +870,7 @@
     },
     "query_api": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "latency_window",
         "live_alerts",

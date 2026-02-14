@@ -265,6 +265,11 @@ These calls align directly with the `DataSource` contract windows (`1m/15m/1h/6h
 - Valid fixture: `schemas/fixtures/ops-telemetry-storage-v1.json`
 - Invalid fixture (missing required root field): `schemas/fixtures-invalid/ops-telemetry-storage-invalid-missing-indexes-v1.json`
 
+The schema contract now validates three acceptance-critical invariants:
+- every required table is present with explicit column metadata (including enum/check constraints on `state`, `phase`, `window`, and `is_stale`);
+- migration strategy explicitly tracks `ops_schema_migrations` column set (`version`, `name`, `applied_at_ms`, `checksum`, `reversible`);
+- all query-plan indexes from the DDL (`ix_*`, including `ix_el_aid`) are present.
+
 Validation commands:
 
 ```bash

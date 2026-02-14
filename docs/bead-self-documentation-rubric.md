@@ -96,3 +96,16 @@ The checker emits JSON findings with deterministic IDs:
 ```bash
 scripts/check_bead_self_documentation.sh --mode all
 ```
+
+## CI and Operations
+1. CI gate workflow: `.github/workflows/selfdoc-lint.yml`
+2. Reporter formats:
+   - `--format human` (terminal summary)
+   - `--format json --report-path <path>` (machine ingest)
+   - `--format ci` (GitHub annotations)
+3. Rollout phases:
+   - `--phase audit` (report-only)
+   - `--phase default` (fail on `error`)
+   - `--phase strict` (fail on `warning` and `error`)
+4. Operational ownership and lifecycle guidance:
+   - `docs/self-documentation-lint-playbook.md`

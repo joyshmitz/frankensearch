@@ -89,3 +89,9 @@ CI recommendation:
 ```bash
 scripts/check_dependency_semantics.sh --mode all
 ```
+
+Workflow:
+- `.github/workflows/dependency-semantics-lint.yml`
+
+Maintenance playbook:
+- `docs/dependency-semantics-lint-playbook.md`

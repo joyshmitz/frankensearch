@@ -1,0 +1,20 @@
+name: Dependency Semantics Lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  dependency-semantics-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run Dependency Semantics Lint
+        run: scripts/check_dependency_semantics.sh --mode all

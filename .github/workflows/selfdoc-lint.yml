@@ -1,0 +1,46 @@
+name: Self-Documentation Lint
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  selfdoc-lint:
+    runs-on: ubuntu-latest
+    env:
+      # Rollout control: audit -> report only, default -> fail on errors, strict -> fail on warnings+
+      SELFDOC_LINT_PHASE: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Audit Preview (non-blocking)
+        continue-on-error: true
+        run: |
+          mkdir -p artifacts
+          scripts/check_bead_self_documentation.sh \
+            --mode all \
+            --phase audit \
+            --format ci \
+            --report-path artifacts/selfdoc-lint-audit.json
+
+      - name: Enforced Self-Doc Gate
+        run: |
+          mkdir -p artifacts
+          scripts/check_bead_self_documentation.sh \
+            --mode all \
+            --phase "${SELFDOC_LINT_PHASE}" \
+            --format ci \
+            --report-path artifacts/selfdoc-lint-gate.json
+
+      - name: Upload Lint Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfdoc-lint-reports
+          path: artifacts/selfdoc-lint-*.json

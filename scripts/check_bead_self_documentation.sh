@@ -5,6 +5,11 @@ MODE="all"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISSUES_FILE="$ROOT_DIR/.beads/issues.jsonl"
 FAILURES=0
+FORMAT="${SELFDOC_LINT_FORMAT:-human}"
+PHASE="${SELFDOC_LINT_PHASE:-default}"
+MIN_FAIL_SEVERITY="${SELFDOC_LINT_MIN_FAIL_SEVERITY:-}"
+REPORT_PATH=""
+declare -a FINDINGS=()
 
 RATIONALE_TAG="[bd-3qwe self-doc] RATIONALE"
 EVIDENCE_TAG="[bd-3qwe self-doc] EVIDENCE"
@@ -51,7 +56,7 @@ EXCEPTION_FIELDS=(
 
 usage() {
   cat <<USAGE
-Usage: scripts/check_bead_self_documentation.sh [--mode unit|integration|e2e|all] [--issues <path>]
+Usage: scripts/check_bead_self_documentation.sh [--mode unit|integration|e2e|all] [--issues <path>] [--format human|json|ci] [--phase audit|default|strict] [--min-fail-severity error|warning|info] [--report-path <path>]
 
 Checks bead self-documentation rationale/evidence/exception policy anchors for bd-3qwe.1.
 USAGE
@@ -96,6 +101,120 @@ severity_for_missing_anchor() {
     exploratory) echo "info" ;;
     *) echo "error" ;;
   esac
+}
+
+severity_rank() {
+  local severity="${1:-error}"
+  case "$severity" in
+    error) echo 3 ;;
+    warning) echo 2 ;;
+    info) echo 1 ;;
+    *) echo 3 ;;
+  esac
+}
+
+phase_default_min_fail_severity() {
+  case "$PHASE" in
+    audit) echo "" ;;
+    default) echo "error" ;;
+    strict) echo "warning" ;;
+    *)
+      echo "ERROR: invalid phase '$PHASE' (expected audit|default|strict)" >&2
+      exit 2
+      ;;
+  esac
+}
+
+record_finding() {
+  local rule_id="$1"
+  local severity="$2"
+  local bead_id="$3"
+  local message="$4"
+  local fix_hint="$5"
+  FINDINGS+=("${rule_id}"$'\t'"${severity}"$'\t'"${bead_id}"$'\t'"${message}"$'\t'"${fix_hint}")
+}
+
+finding_triggers_failure() {
+  local finding_severity="$1"
+  local threshold="$2"
+  if [[ -z "$threshold" ]]; then
+    return 1
+  fi
+  local finding_rank threshold_rank
+  finding_rank="$(severity_rank "$finding_severity")"
+  threshold_rank="$(severity_rank "$threshold")"
+  if (( finding_rank >= threshold_rank )); then
+    return 0
+  fi
+  return 1
+}
+
+emit_findings() {
+  local finding
+  if [[ "$FORMAT" == "human" ]]; then
+    if ((${#FINDINGS[@]} == 0)); then
+      echo "[report][OK] no lint findings"
+      return
+    fi
+    echo "[report] lint findings:"
+    for finding in "${FINDINGS[@]}"; do
+      IFS=$'\t' read -r rule_id severity bead_id message fix_hint <<<"$finding"
+      echo "  - [$rule_id][$severity] $bead_id: $message"
+      echo "    fix_hint: $fix_hint"
+    done
+    return
+  fi
+
+  if [[ "$FORMAT" == "ci" ]]; then
+    local level
+    for finding in "${FINDINGS[@]}"; do
+      IFS=$'\t' read -r rule_id severity bead_id message fix_hint <<<"$finding"
+      level="$severity"
+      if [[ "$level" == "info" ]]; then
+        level="notice"
+      fi
+      echo "::${level} title=${rule_id},bead=${bead_id}::${message} | fix_hint=${fix_hint}"
+    done
+    return
+  fi
+
+  # json (default fallback for non-human/non-ci after validation)
+  for finding in "${FINDINGS[@]}"; do
+    IFS=$'\t' read -r rule_id severity bead_id message fix_hint <<<"$finding"
+    jq -cn \
+      --arg rule_id "$rule_id" \
+      --arg severity "$severity" \
+      --arg bead_id "$bead_id" \
+      --arg message "$message" \
+      --arg fix_hint "$fix_hint" \
+      '{rule_id:$rule_id,severity:$severity,bead_id:$bead_id,message:$message,fix_hint:$fix_hint}'
+  done
+}
+
+write_report_if_requested() {
+  if [[ -z "$REPORT_PATH" ]]; then
+    return
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  if ((${#FINDINGS[@]} == 0)); then
+    echo "[]" > "$tmp"
+  else
+    for finding in "${FINDINGS[@]}"; do
+      IFS=$'\t' read -r rule_id severity bead_id message fix_hint <<<"$finding"
+      jq -cn \
+        --arg rule_id "$rule_id" \
+        --arg severity "$severity" \
+        --arg bead_id "$bead_id" \
+        --arg message "$message" \
+        --arg fix_hint "$fix_hint" \
+        '{rule_id:$rule_id,severity:$severity,bead_id:$bead_id,message:$message,fix_hint:$fix_hint}' >> "$tmp"
+    done
+    jq -s '.' "$tmp" > "${tmp}.json"
+    mv "${tmp}.json" "$tmp"
+  fi
+  mkdir -p "$(dirname "$REPORT_PATH")"
+  mv "$tmp" "$REPORT_PATH"
 }
 
 assert_eq() {
@@ -201,6 +320,22 @@ while [[ $# -gt 0 ]]; do
       ISSUES_FILE="${2:-}"
       shift 2
       ;;
+    --format)
+      FORMAT="${2:-}"
+      shift 2
+      ;;
+    --phase)
+      PHASE="${2:-}"
+      shift 2
+      ;;
+    --min-fail-severity)
+      MIN_FAIL_SEVERITY="${2:-}"
+      shift 2
+      ;;
+    --report-path)
+      REPORT_PATH="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -220,6 +355,28 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+case "$FORMAT" in
+  human|json|ci) ;;
+  *)
+    echo "ERROR: invalid format '$FORMAT' (expected human|json|ci)" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z "$MIN_FAIL_SEVERITY" ]]; then
+  MIN_FAIL_SEVERITY="$(phase_default_min_fail_severity)"
+fi
+
+if [[ -n "$MIN_FAIL_SEVERITY" ]]; then
+  case "$MIN_FAIL_SEVERITY" in
+    error|warning|info) ;;
+    *)
+      echo "ERROR: invalid min fail severity '$MIN_FAIL_SEVERITY' (expected error|warning|info)" >&2
+      exit 2
+      ;;
+  esac
+fi
 
 if [[ ! -f "$ISSUES_FILE" ]]; then
   echo "ERROR: issues file not found: $ISSUES_FILE" >&2
@@ -282,7 +439,7 @@ check_unit() {
 }
 
 check_integration() {
-  echo "[integration] surfacing open beads missing self-doc anchors"
+  echo "[integration] evaluating open/in-progress self-doc lint findings"
 
   local candidates
   candidates="$(jq -r --arg rationale_tag "$RATIONALE_TAG" --arg evidence_tag "$EVIDENCE_TAG" '
@@ -290,8 +447,8 @@ check_integration() {
     | select((.status == "open" or .status == "in_progress"))
     | . as $issue
     | (($issue.comments // []) | map(.text // "") | join("\n")) as $comments
-    | ($comments | contains($rationale_tag)) as $has_rationale
-    | ($comments | contains($evidence_tag)) as $has_evidence
+    | ($comments | test("(^|\\n)\\Q" + $rationale_tag + "\\E(\\n|$)")) as $has_rationale
+    | ($comments | test("(^|\\n)\\Q" + $evidence_tag + "\\E(\\n|$)")) as $has_evidence
     | select(($has_rationale | not) or ($has_evidence | not))
     | [
         ($issue.id // ""),
@@ -303,16 +460,67 @@ check_integration() {
     | @tsv
   ' <<<"$DATA" | sort -u)"
 
+  local finding_count=0
+  local issue_id issue_type labels_csv has_rationale has_evidence bead_class severity comments
+  local missing_field fields_csv message fix_hint
+  local -a missing_fields=()
+
   if [[ -n "$candidates" ]]; then
-    echo "[integration][INFO] candidate backlog items missing anchors:"
     while IFS=$'\t' read -r issue_id issue_type labels_csv has_rationale has_evidence; do
-      local bead_class severity
       bead_class="$(classify_bead_class "$issue_type" "$labels_csv")"
       severity="$(severity_for_missing_anchor "$bead_class")"
-      echo "  - $issue_id (class=$bead_class default_severity=$severity rationale=$has_rationale evidence=$has_evidence)"
+      comments="$(issue_comments "$issue_id")"
+
+      if [[ "$has_rationale" != "yes" ]]; then
+        message="missing rationale anchor $RATIONALE_TAG"
+        fix_hint="add rationale anchor with PROBLEM_CONTEXT/WHY_NOW/SCOPE_BOUNDARY/PRIMARY_SURFACES"
+        record_finding "$RULE_MISSING_RATIONALE_TAG" "$severity" "$issue_id" "$message" "$fix_hint"
+        finding_count=$((finding_count + 1))
+        if finding_triggers_failure "$severity" "$MIN_FAIL_SEVERITY"; then
+          FAILURES=$((FAILURES + 1))
+        fi
+      else
+        mapfile -t missing_fields < <(missing_fields_for_text "$comments" "${RATIONALE_FIELDS[@]}")
+        if ((${#missing_fields[@]} > 0)); then
+          fields_csv="$(IFS=,; echo "${missing_fields[*]}")"
+          message="rationale anchor missing field(s): ${fields_csv}"
+          fix_hint="fill all rationale fields: PROBLEM_CONTEXT, WHY_NOW, SCOPE_BOUNDARY, PRIMARY_SURFACES"
+          record_finding "$RULE_MISSING_RATIONALE_FIELDS" "$severity" "$issue_id" "$message" "$fix_hint"
+          finding_count=$((finding_count + 1))
+          if finding_triggers_failure "$severity" "$MIN_FAIL_SEVERITY"; then
+            FAILURES=$((FAILURES + 1))
+          fi
+        fi
+      fi
+
+      if [[ "$has_evidence" != "yes" ]]; then
+        message="missing evidence anchor $EVIDENCE_TAG"
+        fix_hint="add evidence anchor with UNIT_TESTS/INTEGRATION_TESTS/E2E_TESTS/PERFORMANCE_VALIDATION/LOGGING_ARTIFACTS"
+        record_finding "$RULE_MISSING_EVIDENCE_TAG" "$severity" "$issue_id" "$message" "$fix_hint"
+        finding_count=$((finding_count + 1))
+        if finding_triggers_failure "$severity" "$MIN_FAIL_SEVERITY"; then
+          FAILURES=$((FAILURES + 1))
+        fi
+      else
+        mapfile -t missing_fields < <(missing_fields_for_text "$comments" "${EVIDENCE_FIELDS[@]}")
+        if ((${#missing_fields[@]} > 0)); then
+          fields_csv="$(IFS=,; echo "${missing_fields[*]}")"
+          message="evidence anchor missing field(s): ${fields_csv}"
+          fix_hint="fill all evidence fields: UNIT_TESTS, INTEGRATION_TESTS, E2E_TESTS, PERFORMANCE_VALIDATION, LOGGING_ARTIFACTS"
+          record_finding "$RULE_MISSING_EVIDENCE_FIELDS" "$severity" "$issue_id" "$message" "$fix_hint"
+          finding_count=$((finding_count + 1))
+          if finding_triggers_failure "$severity" "$MIN_FAIL_SEVERITY"; then
+            FAILURES=$((FAILURES + 1))
+          fi
+        fi
+      fi
     done <<<"$candidates"
+  fi
+
+  if ((finding_count == 0)); then
+    echo "[integration][OK]   no self-doc lint findings"
   else
-    echo "[integration][OK]   no missing-anchor candidates detected"
+    echo "[integration][INFO] recorded $finding_count finding(s) (phase=$PHASE min_fail_severity=${MIN_FAIL_SEVERITY:-none})"
   fi
 
   local -a exception_ids=()
@@ -320,7 +528,7 @@ check_integration() {
     .[]
     | . as $issue
     | (($issue.comments // []) | map(.text // "") | join("\n")) as $comments
-    | select($comments | contains($tag))
+    | select($comments | test("(^|\\n)\\Q" + $tag + "\\E(\\n|$)"))
     | .id
   ' <<<"$DATA" | sort -u)
 
@@ -429,6 +637,9 @@ fi
 if [[ "$MODE" == "e2e" || "$MODE" == "all" ]]; then
   check_e2e
 fi
+
+write_report_if_requested
+emit_findings
 
 if ((FAILURES > 0)); then
   echo "Result: FAIL ($FAILURES violation(s))"
