@@ -19,6 +19,8 @@ use tracing::{debug, warn};
 use crate::normalize::{NormalizationMethod, normalize_scores_with_method};
 use crate::searcher::TwoTierSearcher;
 
+const DEFAULT_FEDERATED_RRF_K: f64 = 60.0;
+
 /// Fusion methods supported by [`FederatedSearcher`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FederatedFusion {
@@ -45,7 +47,9 @@ pub enum FederatedFusion {
 
 impl Default for FederatedFusion {
     fn default() -> Self {
-        Self::Rrf { k: 60.0 }
+        Self::Rrf {
+            k: DEFAULT_FEDERATED_RRF_K,
+        }
     }
 }
 
@@ -330,6 +334,7 @@ impl FederatedSearcher {
 }
 
 fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
+    let k = sanitize_rrf_k(k);
     let mut docs: HashMap<String, AggregateDoc> = HashMap::new();
     for shard in shards {
         let weight = shard.weight.max(0.0);
@@ -382,6 +387,15 @@ fn fuse_weighted(
     }
 
     into_ranked_hits(docs, apply_comb_mnz)
+}
+
+#[inline]
+fn sanitize_rrf_k(k: f64) -> f64 {
+    if k.is_finite() && k >= 0.0 {
+        k
+    } else {
+        DEFAULT_FEDERATED_RRF_K
+    }
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
@@ -1006,6 +1020,19 @@ mod tests {
         let c = super::rank_contribution(60.0, usize::MAX);
         assert!(c >= 0.0);
         assert!(c.is_finite());
+    }
+
+    #[test]
+    fn rank_contribution_invalid_k_falls_back_to_default() {
+        let expected = super::rank_contribution(super::DEFAULT_FEDERATED_RRF_K, 0);
+        for invalid_k in [f64::NAN, f64::INFINITY, -1.0, -100.0] {
+            let sanitized = super::sanitize_rrf_k(invalid_k);
+            let contribution = super::rank_contribution(sanitized, 0);
+            assert!(
+                (contribution - expected).abs() < f32::EPSILON,
+                "invalid k={invalid_k} should fall back to default",
+            );
+        }
     }
 
     #[test]

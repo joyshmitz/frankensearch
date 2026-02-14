@@ -21,13 +21,25 @@ use asupersync::Cx;
 use asupersync::test_utils::run_test_with_cx;
 
 use frankensearch_core::config::TwoTierConfig;
+use frankensearch_core::e2e_artifact::reason_codes;
 use frankensearch_core::error::SearchError;
 use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, SearchFuture};
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult, SearchPhase};
+use frankensearch_core::{
+    ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST,
+    E2E_SCHEMA_ORACLE_REPORT, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome,
+    E2eSeverity, EventBody, ExitStatus, LaneReport, ManifestBody, ModelVersion, OracleReportBody,
+    OracleVerdictRecord, Platform, ReplayBody, ReplayEventType, ReportTotals, Suite,
+    build_artifact_entries, normalize_replay_command, render_artifacts_index, sha256_checksum,
+    validate_event_envelope, validate_manifest_envelope,
+};
 use frankensearch_index::TwoTierIndex;
 
 use frankensearch_fusion::interaction_lanes::{
-    ExpectedPhase, InteractionLane, derive_query_seed, lane_by_id, lane_catalog, queries_for_lane,
+    ExpectedPhase, InteractionLane, RiskLevel, derive_query_seed, lane_by_id, lane_catalog,
+    lanes_at_risk, queries_for_lane,
 };
 use frankensearch_fusion::interaction_oracles::{
     InvariantGroup, LaneOracleTemplate, LaneTestReport, OracleOutcome, OracleVerdict,
@@ -449,6 +461,473 @@ async fn run_template_driven_test(cx: &Cx, lane_id: &str) -> (LaneTestReport, La
     (aggregate_report, template)
 }
 
+const INTERACTION_OWNER_LANE: &str = "composition-lane";
+const INTERACTION_REASON_RUN_START: &str = "e2e.run.start";
+const INTERACTION_REASON_LANE_PASS: &str = "e2e.run.lane_pass";
+const INTERACTION_REASON_LANE_FAIL: &str = "e2e.run.lane_fail";
+const INTERACTION_PRIMARY_LANES: [&str; 5] = [
+    "explain_mmr",
+    "explain_negation",
+    "prf_negation",
+    "adaptive_calibration_conformal",
+    "breaker_adaptive_feedback",
+];
+
+#[derive(Debug)]
+struct InteractionE2eArtifacts {
+    manifest: E2eEnvelope<ManifestBody>,
+    oracle_report: E2eEnvelope<OracleReportBody>,
+    events: Vec<E2eEnvelope<EventBody>>,
+    replay: Vec<E2eEnvelope<ReplayBody>>,
+    replay_command: String,
+}
+
+const fn e2e_outcome_for_verdict(verdict: &OracleVerdict) -> E2eOutcome {
+    match verdict.outcome {
+        OracleOutcome::Pass => E2eOutcome::Pass,
+        OracleOutcome::Fail => E2eOutcome::Fail,
+        OracleOutcome::Skip => E2eOutcome::Skip,
+    }
+}
+
+fn reason_code_for_verdict(verdict: &OracleVerdict) -> &'static str {
+    match verdict.outcome {
+        OracleOutcome::Pass => reason_codes::ORACLE_PASS,
+        OracleOutcome::Skip => reason_codes::ORACLE_SKIP_STUB_BACKEND,
+        OracleOutcome::Fail => match verdict.oracle_id.as_str() {
+            "no_duplicates" => reason_codes::ORACLE_DUPLICATES_FOUND,
+            "monotonic_scores" => reason_codes::ORACLE_SCORE_NON_MONOTONIC,
+            "deterministic_ordering" => reason_codes::ORACLE_ORDERING_VIOLATED,
+            oracle if oracle.contains("phase") || oracle == "refinement_subset" => {
+                reason_codes::ORACLE_PHASE_MISMATCH
+            }
+            _ => reason_codes::ORACLE_ORDERING_VIOLATED,
+        },
+    }
+}
+
+const fn severity_for_outcome(outcome: E2eOutcome) -> E2eSeverity {
+    match outcome {
+        E2eOutcome::Pass => E2eSeverity::Info,
+        E2eOutcome::Skip => E2eSeverity::Warn,
+        E2eOutcome::Fail => E2eSeverity::Error,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_event(
+    events: &mut Vec<E2eEnvelope<EventBody>>,
+    run_id: &str,
+    ts: &str,
+    seq: &mut u64,
+    event_type: E2eEventType,
+    severity: E2eSeverity,
+    lane_id: Option<String>,
+    oracle_id: Option<String>,
+    outcome: Option<E2eOutcome>,
+    reason_code: Option<String>,
+    context: Option<String>,
+    metrics: Option<BTreeMap<String, f64>>,
+) {
+    let event_id = format!("interaction-e2e-evt-{seq:04}");
+    let body = EventBody {
+        event_type,
+        correlation: Correlation {
+            event_id,
+            root_request_id: "interaction-e2e-root".to_owned(),
+            parent_event_id: None,
+        },
+        severity,
+        lane_id,
+        oracle_id,
+        outcome,
+        reason_code,
+        context,
+        metrics,
+    };
+    events.push(E2eEnvelope::new(E2E_SCHEMA_EVENT, run_id, ts, body));
+    *seq += 1;
+}
+
+fn interaction_replay_command() -> String {
+    normalize_replay_command(
+        "cargo test -p frankensearch-fusion --test interaction_integration -- --nocapture --exact interaction_high_risk_lanes_emit_replay_ready_artifacts",
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+async fn build_interaction_e2e_artifacts(
+    cx: &Cx,
+    forced_failure_lane: Option<&str>,
+) -> InteractionE2eArtifacts {
+    let mut selected_lanes: BTreeMap<String, InteractionLane> = lanes_at_risk(RiskLevel::High)
+        .into_iter()
+        .map(|lane| (lane.id.to_owned(), lane))
+        .collect();
+    for lane_id in INTERACTION_PRIMARY_LANES {
+        let lane = lane_by_id(lane_id).expect("primary interaction lane must exist");
+        selected_lanes.insert(lane.id.to_owned(), lane);
+    }
+    let selected_lanes: Vec<InteractionLane> = selected_lanes.into_values().collect();
+    assert!(
+        !selected_lanes.is_empty(),
+        "expected at least one interaction lane selected for e2e coverage"
+    );
+
+    let run_id = if forced_failure_lane.is_some() {
+        "01JABCD3EFGHJKMNPQRSTVWXY0"
+    } else {
+        "01JABCD3EFGHJKMNPQRSTVWXYZ"
+    };
+    let ts = "2026-02-14T00:00:00Z";
+
+    let mut event_seq = 1u64;
+    let mut replay_seq = 1u64;
+    let mut events = Vec::new();
+    let mut replay = Vec::new();
+    let mut lane_reports = Vec::new();
+    let mut totals = ReportTotals {
+        lanes_run: 0,
+        lanes_passed: 0,
+        oracles_pass: 0,
+        oracles_fail: 0,
+        oracles_skip: 0,
+        all_passed: true,
+    };
+
+    push_event(
+        &mut events,
+        run_id,
+        ts,
+        &mut event_seq,
+        E2eEventType::E2eStart,
+        E2eSeverity::Info,
+        None,
+        None,
+        None,
+        Some(INTERACTION_REASON_RUN_START.to_owned()),
+        Some("starting high-risk interaction e2e matrix".to_owned()),
+        None,
+    );
+
+    for lane in &selected_lanes {
+        let (mut report, template) = run_template_driven_test(cx, lane.id).await;
+        if forced_failure_lane == Some(lane.id) {
+            report.add(OracleVerdict::fail(
+                "phase2_refined",
+                lane.id,
+                "forced failure for replay-ready artifact assertion".to_owned(),
+            ));
+        }
+
+        let queries = queries_for_lane(lane);
+        let query_count = u32::try_from(queries.len()).expect("query count fits in u32");
+        let replay_query = queries.first().map_or_else(
+            || "rust ownership borrowing".to_owned(),
+            |query| {
+                query
+                    .query_for_lane(lane.query_slice.include_negated)
+                    .to_owned()
+            },
+        );
+
+        let lane_seed = derive_query_seed(lane.seed, 0);
+        replay.push(E2eEnvelope::new(
+            E2E_SCHEMA_REPLAY,
+            run_id,
+            ts,
+            ReplayBody {
+                replay_type: ReplayEventType::Query,
+                offset_ms: replay_seq * 10,
+                seq: replay_seq,
+                payload: serde_json::json!({
+                    "lane_id": lane.id,
+                    "owner_lane": INTERACTION_OWNER_LANE,
+                    "query": replay_query,
+                    "seed": lane_seed,
+                    "bead_refs": lane.bead_refs,
+                }),
+            },
+        ));
+        replay_seq += 1;
+
+        let mut lane_metrics = BTreeMap::new();
+        lane_metrics.insert(
+            "query_count".to_owned(),
+            f64::from(u32::try_from(queries.len()).expect("query count fits in u32")),
+        );
+        lane_metrics.insert(
+            "template_oracles".to_owned(),
+            f64::from(u32::try_from(template.oracle_ids.len()).expect("oracle count fits in u32")),
+        );
+        lane_metrics.insert(
+            "seed".to_owned(),
+            f64::from(
+                u32::try_from(lane.seed & u64::from(u32::MAX))
+                    .expect("masked lane seed fits in u32"),
+            ),
+        );
+
+        push_event(
+            &mut events,
+            run_id,
+            ts,
+            &mut event_seq,
+            E2eEventType::LaneStart,
+            E2eSeverity::Info,
+            Some(lane.id.to_owned()),
+            None,
+            None,
+            Some(INTERACTION_REASON_RUN_START.to_owned()),
+            Some(format!(
+                "owner={INTERACTION_OWNER_LANE};beads={}",
+                lane.bead_refs.join(",")
+            )),
+            Some(lane_metrics),
+        );
+
+        let mut pass_count = 0u32;
+        let mut fail_count = 0u32;
+        let mut skip_count = 0u32;
+        let mut verdict_records = Vec::new();
+
+        for verdict in &report.verdicts {
+            let outcome = e2e_outcome_for_verdict(verdict);
+            match outcome {
+                E2eOutcome::Pass => pass_count += 1,
+                E2eOutcome::Fail => fail_count += 1,
+                E2eOutcome::Skip => skip_count += 1,
+            }
+
+            let reason_code = reason_code_for_verdict(verdict).to_owned();
+            let invariant_context = if verdict.context.is_empty() {
+                format!(
+                    "owner={INTERACTION_OWNER_LANE};invariant={}",
+                    verdict.oracle_id
+                )
+            } else {
+                format!(
+                    "owner={INTERACTION_OWNER_LANE};invariant={};{}",
+                    verdict.oracle_id, verdict.context
+                )
+            };
+
+            push_event(
+                &mut events,
+                run_id,
+                ts,
+                &mut event_seq,
+                E2eEventType::OracleCheck,
+                severity_for_outcome(outcome),
+                Some(lane.id.to_owned()),
+                Some(verdict.oracle_id.clone()),
+                Some(outcome),
+                Some(reason_code),
+                Some(invariant_context),
+                None,
+            );
+
+            verdict_records.push(OracleVerdictRecord {
+                oracle_id: verdict.oracle_id.clone(),
+                outcome,
+                context: (!verdict.context.is_empty()).then(|| verdict.context.clone()),
+            });
+        }
+
+        let lane_passed = fail_count == 0;
+        let lane_outcome = if lane_passed {
+            E2eOutcome::Pass
+        } else {
+            E2eOutcome::Fail
+        };
+
+        push_event(
+            &mut events,
+            run_id,
+            ts,
+            &mut event_seq,
+            E2eEventType::LaneEnd,
+            severity_for_outcome(lane_outcome),
+            Some(lane.id.to_owned()),
+            None,
+            Some(lane_outcome),
+            Some(
+                if lane_passed {
+                    INTERACTION_REASON_LANE_PASS
+                } else {
+                    INTERACTION_REASON_LANE_FAIL
+                }
+                .to_owned(),
+            ),
+            Some(format!(
+                "owner={INTERACTION_OWNER_LANE};beads={}",
+                lane.bead_refs.join(",")
+            )),
+            None,
+        );
+
+        totals.lanes_run += 1;
+        if lane_passed {
+            totals.lanes_passed += 1;
+        }
+        totals.oracles_pass += pass_count;
+        totals.oracles_fail += fail_count;
+        totals.oracles_skip += skip_count;
+
+        lane_reports.push(LaneReport {
+            lane_id: lane.id.to_owned(),
+            seed: lane.seed,
+            query_count,
+            verdicts: verdict_records,
+            pass_count,
+            fail_count,
+            skip_count,
+            all_passed: lane_passed,
+        });
+    }
+
+    totals.all_passed = totals.oracles_fail == 0;
+    let run_outcome = if totals.all_passed {
+        E2eOutcome::Pass
+    } else {
+        E2eOutcome::Fail
+    };
+    push_event(
+        &mut events,
+        run_id,
+        ts,
+        &mut event_seq,
+        E2eEventType::E2eEnd,
+        severity_for_outcome(run_outcome),
+        None,
+        None,
+        Some(run_outcome),
+        Some(
+            if totals.all_passed {
+                reason_codes::ORACLE_PASS
+            } else {
+                reason_codes::ORACLE_PHASE_MISMATCH
+            }
+            .to_owned(),
+        ),
+        Some("interaction matrix run complete".to_owned()),
+        None,
+    );
+
+    let oracle_report = E2eEnvelope::new(
+        E2E_SCHEMA_ORACLE_REPORT,
+        run_id,
+        ts,
+        OracleReportBody {
+            lanes: lane_reports,
+            totals,
+        },
+    );
+
+    let events_jsonl = events
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("serialize event envelopes to json")
+        .join("\n");
+    let replay_jsonl = replay
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("serialize replay envelopes to json")
+        .join("\n");
+    let oracle_report_json = serde_json::to_string_pretty(&oracle_report)
+        .expect("serialize oracle report envelope for artifact manifest");
+    let replay_command = interaction_replay_command();
+
+    let mut emission_inputs = vec![
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            bytes: events_jsonl.as_bytes(),
+            line_count: Some(u64::try_from(events.len()).expect("event line count fits in u64")),
+        },
+        ArtifactEmissionInput {
+            file: "oracle-report.json",
+            bytes: oracle_report_json.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: "replay.jsonl",
+            bytes: replay_jsonl.as_bytes(),
+            line_count: Some(u64::try_from(replay.len()).expect("replay line count fits in u64")),
+        },
+    ];
+
+    let exit_status = if oracle_report.body.totals.all_passed {
+        ExitStatus::Pass
+    } else {
+        ExitStatus::Fail
+    };
+    if matches!(exit_status, ExitStatus::Fail | ExitStatus::Error) {
+        emission_inputs.push(ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+            bytes: replay_command.as_bytes(),
+            line_count: None,
+        });
+    }
+
+    let mut artifacts = build_artifact_entries(emission_inputs).expect("build artifact entries");
+    if matches!(exit_status, ExitStatus::Fail | ExitStatus::Error) {
+        let artifacts_index_payload =
+            render_artifacts_index(&artifacts).expect("render artifacts index");
+        artifacts.push(ArtifactEntry {
+            file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+            checksum: sha256_checksum(artifacts_index_payload.as_bytes()),
+            line_count: None,
+        });
+    }
+    artifacts.sort_by(|left, right| left.file.cmp(&right.file));
+
+    let manifest = E2eEnvelope::new(
+        E2E_SCHEMA_MANIFEST,
+        run_id,
+        ts,
+        ManifestBody {
+            suite: Suite::Interaction,
+            determinism_tier: DeterminismTier::Semantic,
+            seed: 0x_CAFE_5250,
+            config_hash: "sha256:3e7f8a4d4e5c9aa3f57ca90ea2cbff7f3ef749f818acdfca0f06f6e9fb87f020"
+                .to_owned(),
+            index_version: Some("fsvi-test-v1".to_owned()),
+            model_versions: vec![
+                ModelVersion {
+                    name: "stub-fast".to_owned(),
+                    revision: "interaction-e2e-v1".to_owned(),
+                    digest: None,
+                },
+                ModelVersion {
+                    name: "stub-quality".to_owned(),
+                    revision: "interaction-e2e-v1".to_owned(),
+                    digest: None,
+                },
+            ],
+            platform: Platform {
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
+                rustc: "nightly-2026-02-14".to_owned(),
+            },
+            clock_mode: ClockMode::Simulated,
+            tie_break_policy: "doc_id_lexical".to_owned(),
+            artifacts,
+            duration_ms: u64::try_from(events.len()).expect("event count fits in u64"),
+            exit_status,
+        },
+    );
+
+    InteractionE2eArtifacts {
+        manifest,
+        oracle_report,
+        events,
+        replay,
+        replay_command,
+    }
+}
+
 // ─── Template Structure Tests ──────────────────────────────────────────────
 
 #[test]
@@ -775,6 +1254,147 @@ fn all_lanes_run_without_panic() {
         for (lane_id, (pass, fail, _skip)) in &lane_summaries {
             assert!(*pass > 0, "lane {lane_id} had 0 passing oracles");
             assert_eq!(*fail, 0, "lane {lane_id} had {fail} failing oracles");
+        }
+    });
+}
+
+#[test]
+fn interaction_high_risk_lanes_emit_replay_ready_artifacts() {
+    run_test_with_cx(|cx| async move {
+        let artifacts = build_interaction_e2e_artifacts(&cx, None).await;
+        validate_manifest_envelope(&artifacts.manifest)
+            .expect("manifest should satisfy unified interaction artifact contract");
+        for event in &artifacts.events {
+            validate_event_envelope(event)
+                .expect("event must satisfy unified interaction contract");
+        }
+
+        let must_cover = [
+            "explain_mmr",
+            "explain_negation",
+            "prf_negation",
+            "adaptive_calibration_conformal",
+            "breaker_adaptive_feedback",
+        ];
+        let reported_lane_ids: HashSet<&str> = artifacts
+            .oracle_report
+            .body
+            .lanes
+            .iter()
+            .map(|lane| lane.lane_id.as_str())
+            .collect();
+        for lane_id in must_cover {
+            assert!(
+                reported_lane_ids.contains(lane_id),
+                "missing high-risk interaction lane in oracle report: {lane_id}"
+            );
+        }
+
+        let oracle_events: Vec<&E2eEnvelope<EventBody>> = artifacts
+            .events
+            .iter()
+            .filter(|event| event.body.event_type == E2eEventType::OracleCheck)
+            .collect();
+        assert!(!oracle_events.is_empty(), "expected oracle check events");
+        for event in oracle_events {
+            let lane_id = event
+                .body
+                .lane_id
+                .as_deref()
+                .expect("oracle events must include lane_id");
+            assert!(
+                reported_lane_ids.contains(lane_id),
+                "oracle event lane_id should map to reported lane"
+            );
+            let context = event
+                .body
+                .context
+                .as_deref()
+                .expect("oracle events must include invariant context");
+            assert!(
+                context.contains("owner=composition-lane"),
+                "oracle context must include ownership metadata"
+            );
+        }
+
+        for replay in &artifacts.replay {
+            let lane_id = replay
+                .body
+                .payload
+                .get("lane_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("replay payload must include lane_id");
+            let owner = replay
+                .body
+                .payload
+                .get("owner_lane")
+                .and_then(serde_json::Value::as_str)
+                .expect("replay payload must include owner lane");
+            assert_eq!(owner, INTERACTION_OWNER_LANE);
+            assert!(
+                reported_lane_ids.contains(lane_id),
+                "replay lane_id must map to reported lane"
+            );
+        }
+
+        assert_eq!(artifacts.manifest.body.suite, Suite::Interaction);
+        assert_eq!(artifacts.manifest.body.clock_mode, ClockMode::Simulated);
+    });
+}
+
+#[test]
+fn interaction_failure_path_includes_replay_command_and_lane_context() {
+    run_test_with_cx(|cx| async move {
+        let forced_lane = lanes_at_risk(RiskLevel::High)
+            .first()
+            .expect("at least one high-risk lane")
+            .id;
+        let artifacts = build_interaction_e2e_artifacts(&cx, Some(forced_lane)).await;
+
+        assert_eq!(artifacts.manifest.body.exit_status, ExitStatus::Fail);
+        let files: HashSet<&str> = artifacts
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.file.as_str())
+            .collect();
+        assert!(files.contains(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+        assert!(files.contains(E2E_ARTIFACT_REPLAY_COMMAND_TXT));
+        assert!(files.contains(E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
+        assert!(
+            artifacts
+                .replay_command
+                .contains("interaction_high_risk_lanes_emit_replay_ready_artifacts"),
+            "replay command should point to deterministic lane test entrypoint"
+        );
+
+        let failing_oracles: Vec<&E2eEnvelope<EventBody>> = artifacts
+            .events
+            .iter()
+            .filter(|event| {
+                event.body.event_type == E2eEventType::OracleCheck
+                    && event.body.outcome == Some(E2eOutcome::Fail)
+            })
+            .collect();
+        assert!(
+            !failing_oracles.is_empty(),
+            "forced lane failure should emit failing oracle event(s)"
+        );
+        for event in failing_oracles {
+            assert!(
+                event.body.lane_id.is_some(),
+                "failing oracle events must include lane_id"
+            );
+            let context = event
+                .body
+                .context
+                .as_deref()
+                .expect("failing oracle events must include invariant context");
+            assert!(
+                context.contains("invariant="),
+                "failing oracle context should include invariant identifier"
+            );
         }
     });
 }

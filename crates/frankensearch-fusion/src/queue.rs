@@ -122,6 +122,7 @@ pub struct QueueMetrics {
 
 impl QueueMetrics {
     /// Record a job outcome.
+    #[allow(clippy::too_many_lines)]
     pub fn record(&self, outcome: JobOutcome) {
         match outcome {
             JobOutcome::Succeeded => {
@@ -161,8 +162,19 @@ struct QueueState {
     /// Tracks which `doc_ids` are currently in the queue (for dedup).
     pending_ids: HashMap<String, usize>,
     /// Content hashes of recently embedded documents (for skip-unchanged).
-    known_hashes: HashMap<String, String>,
+    known_hashes: HashMap<String, KnownHashEntry>,
+    /// Approximate LRU queue for pruning known content hashes.
+    ///
+    /// The tuple stores `(doc_id, sequence)` to guard against stale queue entries.
+    known_hash_order: VecDeque<(String, usize)>,
     /// Monotonically increasing sequence for dedup ordering.
+    sequence: usize,
+}
+
+/// Cached hash entry with monotonic sequence for LRU pruning.
+#[derive(Debug)]
+struct KnownHashEntry {
+    hash: String,
     sequence: usize,
 }
 
@@ -205,6 +217,7 @@ impl EmbeddingQueue {
                 jobs: VecDeque::with_capacity(config.capacity),
                 pending_ids: HashMap::new(),
                 known_hashes: HashMap::new(),
+                known_hash_order: VecDeque::new(),
                 sequence: 0,
             }),
             config,
@@ -230,6 +243,7 @@ impl EmbeddingQueue {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned.
+    #[allow(clippy::too_many_lines)]
     pub fn submit(&self, request: EmbeddingRequest) -> SearchResult<JobOutcome> {
         self.metrics.total_submitted.fetch_add(1, Ordering::Relaxed);
 
@@ -247,42 +261,96 @@ impl EmbeddingQueue {
 
         // Compute content hash
         let content_hash = sha256_hex(&canonical);
+        let EmbeddingRequest {
+            doc_id,
+            metadata,
+            submitted_at,
+            ..
+        } = request;
 
         let mut state = self.state.lock().expect("queue lock poisoned");
 
-        // Check if content hash matches known (already-embedded) version
-        if state
-            .known_hashes
-            .get(&request.doc_id)
-            .is_some_and(|known_hash| *known_hash == content_hash)
-        {
-            debug!(
-                target: "frankensearch.queue",
-                doc_id = %request.doc_id,
-                "skipping unchanged content (hash match)"
-            );
-            self.metrics.record(JobOutcome::SkippedUnchanged);
-            return Ok(JobOutcome::SkippedUnchanged);
-        }
+        // Handle an existing pending job first so "latest submission wins" is honored.
+        if let Some(&old_seq) = state.pending_ids.get(&doc_id) {
+            if let Some(position) = state.jobs.iter().position(|job| job.doc_id == doc_id) {
+                // Duplicate of the pending payload: keep one job but refresh metadata/timestamp.
+                if state.jobs[position].content_hash == content_hash {
+                    let existing = state
+                        .jobs
+                        .get_mut(position)
+                        .expect("position came from VecDeque::position");
+                    existing.metadata = metadata;
+                    existing.submitted_at = submitted_at;
+                    existing.retry_count = 0;
+                    debug!(
+                        target: "frankensearch.queue",
+                        doc_id = %doc_id,
+                        seq = old_seq,
+                        "deduped duplicate submission for pending job"
+                    );
+                    return Ok(JobOutcome::Succeeded);
+                }
 
-        // Replace existing pending job for the same doc_id
-        if let Some(&old_seq) = state.pending_ids.get(&request.doc_id) {
-            // Remove old job by marking it (we'll skip it during drain)
-            // Actually, find and replace in the VecDeque
-            if let Some(existing) = state.jobs.iter_mut().find(|j| j.doc_id == request.doc_id) {
+                // If latest payload matches the already-embedded hash, drop pending update.
+                if state
+                    .known_hashes
+                    .get(&doc_id)
+                    .is_some_and(|known| known.hash == content_hash)
+                {
+                    let _ = state.jobs.remove(position);
+                    state.pending_ids.remove(&doc_id);
+                    debug!(
+                        target: "frankensearch.queue",
+                        doc_id = %doc_id,
+                        seq = old_seq,
+                        "latest submission matches embedded content; removing pending update"
+                    );
+                    self.metrics.record(JobOutcome::SkippedUnchanged);
+                    return Ok(JobOutcome::SkippedUnchanged);
+                }
+
+                // Replace pending job with newer content.
+                let existing = state
+                    .jobs
+                    .get_mut(position)
+                    .expect("position came from VecDeque::position");
                 existing.canonical_text = canonical;
                 existing.content_hash = content_hash;
-                existing.metadata = request.metadata;
-                existing.submitted_at = request.submitted_at;
+                existing.metadata = metadata;
+                existing.submitted_at = submitted_at;
                 existing.retry_count = 0;
                 debug!(
                     target: "frankensearch.queue",
-                    doc_id = %request.doc_id,
+                    doc_id = %doc_id,
                     seq = old_seq,
                     "replaced pending job with newer text"
                 );
                 return Ok(JobOutcome::Succeeded);
             }
+
+            // Defensive recovery: pending index said present, queue entry missing.
+            state.pending_ids.remove(&doc_id);
+            warn!(
+                target: "frankensearch.queue",
+                doc_id = %doc_id,
+                seq = old_seq,
+                "recovered stale pending_ids entry without matching queue job"
+            );
+        }
+
+        // Skip content that is unchanged from the most recently embedded version.
+        if state
+            .known_hashes
+            .get(&doc_id)
+            .is_some_and(|known_hash| known_hash.hash == content_hash)
+        {
+            debug!(
+                target: "frankensearch.queue",
+                doc_id = %doc_id,
+                "skipping unchanged content (hash match)"
+            );
+            self.metrics.record(JobOutcome::SkippedUnchanged);
+            return Ok(JobOutcome::SkippedUnchanged);
         }
 
         // Check capacity
@@ -294,18 +362,18 @@ impl EmbeddingQueue {
         }
 
         let seq = state.sequence;
-        state.sequence += 1;
+        state.sequence = state.sequence.wrapping_add(1);
 
         let job = EmbeddingJob {
-            doc_id: request.doc_id.clone(),
+            doc_id: doc_id.clone(),
             canonical_text: canonical,
             content_hash,
-            metadata: request.metadata,
-            submitted_at: request.submitted_at,
+            metadata,
+            submitted_at,
             retry_count: 0,
         };
 
-        state.pending_ids.insert(request.doc_id, seq);
+        state.pending_ids.insert(doc_id, seq);
         state.jobs.push_back(job);
 
         debug!(
@@ -404,7 +472,7 @@ impl EmbeddingQueue {
         }
 
         let seq = state.sequence;
-        state.sequence += 1;
+        state.sequence = state.sequence.wrapping_add(1);
         state.pending_ids.insert(job.doc_id.clone(), seq);
         state.jobs.push_back(job);
         drop(state);
@@ -421,11 +489,8 @@ impl EmbeddingQueue {
     ///
     /// Panics if the internal mutex is poisoned.
     pub fn record_embedded(&self, doc_id: &str, content_hash: &str) {
-        self.state
-            .lock()
-            .expect("queue lock poisoned")
-            .known_hashes
-            .insert(doc_id.to_owned(), content_hash.to_owned());
+        let mut state = self.state.lock().expect("queue lock poisoned");
+        self.record_known_hash_locked(&mut state, doc_id, content_hash);
         self.metrics.record(JobOutcome::Succeeded);
     }
 
@@ -471,6 +536,53 @@ impl EmbeddingQueue {
     pub fn clear_known_hashes(&self) {
         let mut state = self.state.lock().expect("queue lock poisoned");
         state.known_hashes.clear();
+        state.known_hash_order.clear();
+    }
+
+    /// Upper bound for remembered content hashes.
+    ///
+    /// We keep a multiple of queue capacity so dedup remains effective while
+    /// preventing unbounded growth from one-off document IDs.
+    const KNOWN_HASH_CAPACITY_FACTOR: usize = 8;
+
+    const fn known_hash_limit(&self) -> usize {
+        self.config
+            .capacity
+            .saturating_mul(Self::KNOWN_HASH_CAPACITY_FACTOR)
+    }
+
+    fn record_known_hash_locked(&self, state: &mut QueueState, doc_id: &str, content_hash: &str) {
+        let seq = state.sequence;
+        state.sequence = state.sequence.wrapping_add(1);
+
+        state.known_hashes.insert(
+            doc_id.to_owned(),
+            KnownHashEntry {
+                hash: content_hash.to_owned(),
+                sequence: seq,
+            },
+        );
+        state.known_hash_order.push_back((doc_id.to_owned(), seq));
+        self.prune_known_hashes_locked(state);
+    }
+
+    fn prune_known_hashes_locked(&self, state: &mut QueueState) {
+        let limit = self.known_hash_limit();
+        while state.known_hashes.len() > limit {
+            let Some((doc_id, seq)) = state.known_hash_order.pop_front() else {
+                // Defensive recovery if ordering metadata is lost.
+                state.known_hashes.clear();
+                break;
+            };
+
+            if state
+                .known_hashes
+                .get(&doc_id)
+                .is_some_and(|entry| entry.sequence == seq)
+            {
+                state.known_hashes.remove(&doc_id);
+            }
+        }
     }
 }
 
@@ -835,6 +947,43 @@ mod tests {
         let outcome = queue.submit(request("doc-1", "Text")).unwrap();
         assert_eq!(outcome, JobOutcome::Succeeded);
         assert_eq!(queue.pending_count(), 1);
+    }
+
+    #[test]
+    fn latest_submission_matching_embedded_hash_cancels_pending_update() {
+        let queue = make_queue(10);
+
+        queue.submit(request("doc-1", "Original text")).unwrap();
+        let batch = queue.drain_batch();
+        queue.record_embedded(&batch[0].doc_id, &batch[0].content_hash);
+
+        // Enqueue a changed version.
+        let outcome = queue.submit(request("doc-1", "Changed text")).unwrap();
+        assert_eq!(outcome, JobOutcome::Succeeded);
+        assert_eq!(queue.pending_count(), 1);
+
+        // Submit latest text matching embedded content; should remove pending update.
+        let outcome = queue.submit(request("doc-1", "Original text")).unwrap();
+        assert_eq!(outcome, JobOutcome::SkippedUnchanged);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn known_hash_cache_is_pruned_and_reembeds_evicted_entries() {
+        // capacity=1 => known hash cache limit is 8 entries.
+        let queue = make_queue(1);
+
+        for i in 0..12 {
+            queue
+                .submit(request(&format!("doc-{i}"), "Stable payload"))
+                .unwrap();
+            let batch = queue.drain_batch();
+            queue.record_embedded(&batch[0].doc_id, &batch[0].content_hash);
+        }
+
+        // doc-0 should have been pruned from known hashes and thus re-enqueued.
+        let outcome = queue.submit(request("doc-0", "Stable payload")).unwrap();
+        assert_eq!(outcome, JobOutcome::Succeeded);
     }
 
     #[test]

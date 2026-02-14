@@ -18,6 +18,7 @@ use frankensearch_core::{FusedHit, ScoredResult, VectorHit};
 use tracing::{debug, instrument};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
+const DEFAULT_RRF_K: f64 = 60.0;
 
 /// RRF fusion parameters.
 ///
@@ -35,7 +36,7 @@ pub struct RrfConfig {
 
 impl Default for RrfConfig {
     fn default() -> Self {
-        Self { k: 60.0 }
+        Self { k: DEFAULT_RRF_K }
     }
 }
 
@@ -60,6 +61,15 @@ pub const fn candidate_count(limit: usize, offset: usize, multiplier: usize) -> 
 fn rank_contribution(k: f64, rank: usize) -> f64 {
     let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
     1.0 / (k + f64::from(rank_u32) + 1.0)
+}
+
+#[inline]
+fn sanitize_rrf_k(k: f64) -> f64 {
+    if k.is_finite() && k >= 0.0 {
+        k
+    } else {
+        DEFAULT_RRF_K
+    }
 }
 
 // ─── RRF Fusion ─────────────────────────────────────────────────────────────
@@ -103,7 +113,7 @@ pub fn rrf_fuse(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
-    let k = config.k;
+    let k = sanitize_rrf_k(config.k);
     let capacity = lexical.len() + semantic.len();
     let mut hits: HashMap<String, FusedHit> = HashMap::with_capacity(capacity);
 
@@ -228,6 +238,33 @@ mod tests {
         // rank 1: 1/(1+1+1) = 0.333...
         assert!((results[0].rrf_score - 0.5).abs() < 1e-12);
         assert!((results[1].rrf_score - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_score_formula_k0_is_valid() {
+        let config = RrfConfig { k: 0.0 };
+        let lexical = vec![lexical_hit("doc-a", 10.0)];
+
+        let results = rrf_fuse(&lexical, &[], 10, 0, &config);
+
+        assert_eq!(results.len(), 1);
+        assert!((results[0].rrf_score - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn invalid_k_falls_back_to_default() {
+        let lexical = vec![lexical_hit("doc-a", 10.0)];
+        let expected = 1.0 / (DEFAULT_RRF_K + 1.0);
+
+        for invalid_k in [f64::NAN, f64::INFINITY, -1.0, -100.0] {
+            let config = RrfConfig { k: invalid_k };
+            let results = rrf_fuse(&lexical, &[], 10, 0, &config);
+            assert_eq!(results.len(), 1);
+            assert!(
+                (results[0].rrf_score - expected).abs() < 1e-12,
+                "invalid k={invalid_k} should fall back to default",
+            );
+        }
     }
 
     // ─── Multi-source fusion ────────────────────────────────────────────

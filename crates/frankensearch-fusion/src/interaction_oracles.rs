@@ -301,7 +301,7 @@ pub const ORACLE_REFINEMENT_SUBSET: OracleDescriptor = OracleDescriptor {
     category: InvariantCategory::Phase,
     requires: OracleRequirements {
         features: &[],
-        expected_phase: Some(ExpectedPhase::InitialThenRefined),
+        expected_phase: None,
     },
 };
 
@@ -1176,6 +1176,8 @@ mod tests {
         assert!(!oracle_applicable(&ORACLE_PHASE2_REFINED, &breaker_lane));
         // But phase2_graceful SHOULD apply
         assert!(oracle_applicable(&ORACLE_PHASE2_GRACEFUL, &breaker_lane));
+        // refinement_subset is valid whenever a refined phase is emitted.
+        assert!(oracle_applicable(&ORACLE_REFINEMENT_SUBSET, &breaker_lane));
     }
 
     #[test]
