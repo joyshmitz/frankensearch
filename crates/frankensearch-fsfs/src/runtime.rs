@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
@@ -20,6 +21,7 @@ use crate::pressure::{
     PressureTransition,
 };
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
+use crate::watcher::{FsWatcher, NoopWatchIngestPipeline};
 
 /// Supported fsfs interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,7 +592,18 @@ impl FsfsRuntime {
         self.run_cli(cx).await?;
 
         if self.config.indexing.watch_mode {
-            let reason = self.await_shutdown(cx, shutdown).await;
+            let watcher = FsWatcher::from_config(&self.config, Arc::new(NoopWatchIngestPipeline));
+            watcher.start(cx).await?;
+            let policy = watcher.execution_policy();
+            info!(
+                watch_roots = watcher.roots().len(),
+                debounce_ms = policy.debounce_ms,
+                batch_size = policy.batch_size,
+                "fsfs watch mode enabled; watcher started"
+            );
+
+            let reason = self.await_shutdown(cx, shutdown, Some(&watcher)).await;
+            watcher.stop().await;
             self.finalize_shutdown(cx, reason).await?;
         }
 
@@ -603,12 +616,46 @@ impl FsfsRuntime {
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
         self.run_tui(cx).await?;
-        let reason = self.await_shutdown(cx, shutdown).await;
+        let reason = self.await_shutdown(cx, shutdown, None).await;
         self.finalize_shutdown(cx, reason).await
     }
 
-    async fn await_shutdown(&self, cx: &Cx, shutdown: &ShutdownCoordinator) -> ShutdownReason {
+    async fn await_shutdown(
+        &self,
+        cx: &Cx,
+        shutdown: &ShutdownCoordinator,
+        watcher: Option<&FsWatcher>,
+    ) -> ShutdownReason {
+        let mut pressure_collector = HostPressureCollector::default();
+        let mut pressure_controller = self.new_pressure_controller();
+        let sample_interval_ms = self.config.pressure.sample_interval_ms.max(1);
+        let mut last_pressure_sample_ms = 0_u64;
+
         loop {
+            if let Some(watcher) = watcher {
+                let now_ms = pressure_timestamp_ms();
+                if now_ms.saturating_sub(last_pressure_sample_ms) >= sample_interval_ms {
+                    match self.collect_pressure_signal(&mut pressure_collector) {
+                        Ok(sample) => {
+                            let transition =
+                                self.observe_pressure(&mut pressure_controller, sample);
+                            watcher.apply_pressure_state(transition.to);
+                            if transition.changed {
+                                info!(
+                                    pressure_state = ?transition.to,
+                                    reason_code = transition.reason_code,
+                                    "fsfs watcher pressure policy updated"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "fsfs watcher pressure update failed");
+                        }
+                    }
+                    last_pressure_sample_ms = now_ms;
+                }
+            }
+
             if shutdown.take_reload_requested() {
                 info!("fsfs runtime observed SIGHUP; config reload scaffold invoked");
             }

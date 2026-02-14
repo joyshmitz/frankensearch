@@ -6,7 +6,9 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
+pub mod agent_ergonomics;
 pub mod catalog;
+pub mod cli_e2e;
 pub mod concurrency;
 pub mod config;
 pub mod evidence;
@@ -32,6 +34,11 @@ pub use adapters::cli::{
     CliCommand, CliInput, CommandSource, ConfigAction, OutputFormat, detect_auto_mode, exit_code,
     parse_cli_args,
 };
+pub use agent_ergonomics::{
+    CompactEnvelope, CompactError, CompactHit, CompactLevel, CompactSearchResponse,
+    QUERY_TEMPLATE_VERSION, QueryTemplate, RESULT_ID_PREFIX, ResultIdEntry, ResultIdRegistry,
+    TemplateParam, TemplateStep, builtin_templates, compactify, parse_result_id, result_id,
+};
 pub use adapters::format_emitter::{
     emit_envelope, emit_envelope_string, emit_stream_frame, emit_stream_frame_string,
     meta_for_format, verify_json_toon_parity,
@@ -44,6 +51,12 @@ pub use catalog::{
     INDEX_CHANGELOG_FILE_REVISION, INDEX_CHANGELOG_PENDING_APPLY, INDEX_CHANGELOG_REPLAY,
     ReplayDecision, bootstrap_catalog_schema, classify_replay_sequence,
     current_catalog_schema_version,
+};
+pub use cli_e2e::{
+    CLI_E2E_REASON_SCENARIO_DEGRADE, CLI_E2E_REASON_SCENARIO_PASS,
+    CLI_E2E_REASON_SCENARIO_START, CLI_E2E_SCHEMA_VERSION, CliE2eArtifactBundle,
+    CliE2eRunConfig, CliE2eScenario, CliE2eScenarioKind, build_default_cli_e2e_bundles,
+    default_cli_e2e_scenarios, replay_command_for_scenario,
 };
 pub use concurrency::{
     AccessMode, ContentionMetrics, ContentionPolicy, ContentionSnapshot, LockLevel, LockOrderGuard,
