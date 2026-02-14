@@ -196,13 +196,13 @@ impl ResultIdRegistry {
 
     /// Number of registered results.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the registry is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -221,7 +221,7 @@ pub const QUERY_TEMPLATE_VERSION: &str = "fsfs.template.v1";
 /// A parameterized query template for common agent workflows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryTemplate {
-    /// Template name (e.g., "search_then_explain").
+    /// Template name (e.g., `search_then_explain`).
     pub name: String,
     /// Human-readable description.
     pub description: String,
@@ -418,7 +418,7 @@ pub fn compactify<T>(
     let raw_hits: Vec<(String, f64, usize, Option<String>)> = envelope
         .data
         .as_ref()
-        .map(|data| hits_extractor(data))
+        .map(hits_extractor)
         .unwrap_or_default();
 
     // Register hits and assign stable IDs
@@ -507,7 +507,10 @@ mod tests {
             assert_eq!(expected.to_string(), *text);
             assert_eq!(text.parse::<CompactLevel>().unwrap(), *expected);
         }
-        assert_eq!("min".parse::<CompactLevel>().unwrap(), CompactLevel::Minimal);
+        assert_eq!(
+            "min".parse::<CompactLevel>().unwrap(),
+            CompactLevel::Minimal
+        );
         assert!("unknown".parse::<CompactLevel>().is_err());
     }
 
@@ -598,7 +601,10 @@ mod tests {
     #[test]
     fn search_then_explain_template_structure() {
         let templates = builtin_templates();
-        let t = templates.iter().find(|t| t.name == "search_then_explain").unwrap();
+        let t = templates
+            .iter()
+            .find(|t| t.name == "search_then_explain")
+            .unwrap();
         assert_eq!(t.steps.len(), 2);
         assert_eq!(t.steps[0].command, "search");
         assert!(!t.steps[0].depends_on_previous);
@@ -648,11 +654,7 @@ mod tests {
     #[test]
     fn compactify_minimal_strips_optional_fields() {
         let meta = OutputMeta::new("search", "json").with_duration_ms(42);
-        let env = OutputEnvelope::success(
-            vec![("doc-a".to_string(), 0.95)],
-            meta,
-            sample_ts(),
-        );
+        let env = OutputEnvelope::success(vec![("doc-a".to_string(), 0.95)], meta, sample_ts());
 
         let mut registry = ResultIdRegistry::new();
         let compact = compactify(&env, CompactLevel::Minimal, &mut registry, |data| {
@@ -706,16 +708,9 @@ mod tests {
     #[test]
     fn compactify_preserves_registry_state() {
         let meta = OutputMeta::new("search", "json");
-        let env1 = OutputEnvelope::success(
-            vec![("doc-a".to_string(), 0.95)],
-            meta.clone(),
-            sample_ts(),
-        );
-        let env2 = OutputEnvelope::success(
-            vec![("doc-b".to_string(), 0.80)],
-            meta,
-            sample_ts(),
-        );
+        let env1 =
+            OutputEnvelope::success(vec![("doc-a".to_string(), 0.95)], meta.clone(), sample_ts());
+        let env2 = OutputEnvelope::success(vec![("doc-b".to_string(), 0.80)], meta, sample_ts());
 
         let mut registry = ResultIdRegistry::new();
         let extractor = |data: &Vec<(String, f64)>| {

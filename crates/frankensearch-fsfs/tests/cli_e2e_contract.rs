@@ -14,17 +14,22 @@ fn scenario_by_kind(kind: CliE2eScenarioKind) -> frankensearch_fsfs::CliE2eScena
 #[test]
 fn scenario_cli_index_baseline() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Index);
-    let bundle = CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    let bundle =
+        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.schema_version, CLI_E2E_SCHEMA_VERSION);
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Index);
-    assert_eq!(bundle.scenario.args.first().map(String::as_str), Some("index"));
+    assert_eq!(
+        bundle.scenario.args.first().map(String::as_str),
+        Some("index")
+    );
 }
 
 #[test]
 fn scenario_cli_search_stream() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Search);
-    let bundle = CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    let bundle =
+        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Search);
     assert!(bundle.scenario.args.contains(&"--stream".to_owned()));
@@ -40,7 +45,8 @@ fn scenario_cli_search_stream() {
 #[test]
 fn scenario_cli_explain_hit() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Explain);
-    let bundle = CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    let bundle =
+        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Explain);
     assert!(bundle.scenario.args.contains(&"toon".to_owned()));
@@ -49,22 +55,29 @@ fn scenario_cli_explain_hit() {
 #[test]
 fn scenario_cli_degrade_path() {
     let scenario = scenario_by_kind(CliE2eScenarioKind::Degrade);
-    let bundle = CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Fail);
+    let bundle =
+        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Fail);
     bundle.validate().expect("bundle must validate");
     assert_eq!(bundle.scenario.kind, CliE2eScenarioKind::Degrade);
-    assert!(bundle
-        .events
-        .iter()
-        .any(|event| event.body.outcome == Some(E2eOutcome::Fail)));
-    assert!(bundle
-        .manifest
-        .body
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.file == "replay_command.txt"));
-    assert!(bundle
-        .replay_command
-        .contains("--exact scenario_cli_degrade_path"));
+    assert!(
+        bundle
+            .events
+            .iter()
+            .any(|event| event.body.outcome == Some(E2eOutcome::Fail))
+    );
+    assert!(
+        bundle
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.file == "replay_command.txt")
+    );
+    assert!(
+        bundle
+            .replay_command
+            .contains("--exact scenario_cli_degrade_path")
+    );
 }
 
 #[test]
