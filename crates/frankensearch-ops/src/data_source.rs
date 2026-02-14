@@ -6,7 +6,8 @@
 //! test data for development and testing.
 
 use crate::state::{
-    ControlPlaneMetrics, FleetSnapshot, InstanceInfo, ResourceMetrics, SearchMetrics,
+    ControlPlaneMetrics, FleetSnapshot, InstanceAttribution, InstanceInfo, InstanceLifecycle,
+    LifecycleSignal, ProjectAttributionResolver, ResourceMetrics, SearchMetrics,
 };
 
 // ─── Time Window ─────────────────────────────────────────────────────────────
@@ -98,6 +99,12 @@ pub trait DataSource: Send {
 
     /// Get control-plane self-monitoring metrics.
     fn control_plane_metrics(&self) -> ControlPlaneMetrics;
+
+    /// Attribution metadata for an instance.
+    fn attribution(&self, instance_id: &str) -> Option<InstanceAttribution>;
+
+    /// Lifecycle snapshot for an instance.
+    fn lifecycle(&self, instance_id: &str) -> Option<InstanceLifecycle>;
 }
 
 // ─── Mock Data Source ────────────────────────────────────────────────────────
@@ -114,8 +121,10 @@ pub struct MockDataSource {
 impl MockDataSource {
     /// Create a mock with sample data.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn sample() -> Self {
         let mut snapshot = FleetSnapshot::default();
+        let resolver = ProjectAttributionResolver;
 
         snapshot.instances.push(InstanceInfo {
             id: "cass-001".to_string(),
@@ -189,6 +198,46 @@ impl MockDataSource {
             },
         );
 
+        snapshot.attribution.insert(
+            "cass-001".to_string(),
+            resolver.resolve(
+                Some("cass"),
+                Some("cass-devbox"),
+                Some("coding-agent-session-search"),
+            ),
+        );
+        snapshot.attribution.insert(
+            "xf-001".to_string(),
+            resolver.resolve(Some("xf"), Some("xf-worker"), Some("xf")),
+        );
+        snapshot.attribution.insert(
+            "amail-001".to_string(),
+            resolver.resolve(
+                Some("agent-mail"),
+                Some("mail-runner-42"),
+                Some("mcp_agent_mail_rust"),
+            ),
+        );
+
+        let mut cass_lifecycle = InstanceLifecycle::new(1_000);
+        cass_lifecycle.apply_signal(LifecycleSignal::Heartbeat, 1_250, None);
+        snapshot
+            .lifecycle
+            .insert("cass-001".to_string(), cass_lifecycle);
+
+        let mut xf_lifecycle = InstanceLifecycle::new(1_000);
+        xf_lifecycle.apply_signal(LifecycleSignal::Heartbeat, 1_300, None);
+        snapshot
+            .lifecycle
+            .insert("xf-001".to_string(), xf_lifecycle);
+
+        let mut amail_lifecycle = InstanceLifecycle::new(1_000);
+        amail_lifecycle.apply_signal(LifecycleSignal::Heartbeat, 1_100, None);
+        amail_lifecycle.mark_stale_if_heartbeat_gap(9_500, 5_000);
+        snapshot
+            .lifecycle
+            .insert("amail-001".to_string(), amail_lifecycle);
+
         let control_plane = ControlPlaneMetrics {
             ingestion_lag_events: 1_549,
             storage_bytes: 384 * 1024 * 1024,
@@ -232,6 +281,14 @@ impl DataSource for MockDataSource {
 
     fn control_plane_metrics(&self) -> ControlPlaneMetrics {
         self.control_plane.clone()
+    }
+
+    fn attribution(&self, instance_id: &str) -> Option<InstanceAttribution> {
+        self.snapshot.attribution.get(instance_id).cloned()
+    }
+
+    fn lifecycle(&self, instance_id: &str) -> Option<InstanceLifecycle> {
+        self.snapshot.lifecycle.get(instance_id).cloned()
     }
 }
 
@@ -277,6 +334,8 @@ mod tests {
                 .is_none()
         );
         assert!(mock.resource_metrics("unknown").is_none());
+        assert!(mock.attribution("unknown").is_none());
+        assert!(mock.lifecycle("unknown").is_none());
     }
 
     #[test]
@@ -285,6 +344,23 @@ mod tests {
         let metrics = mock.control_plane_metrics();
         assert!(metrics.ingestion_lag_events > 0);
         assert!(metrics.storage_limit_bytes > metrics.storage_bytes / 2);
+    }
+
+    #[test]
+    fn mock_attribution_metadata_present() {
+        let mock = MockDataSource::sample();
+        let attribution = mock
+            .attribution("cass-001")
+            .expect("cass attribution exists");
+        assert_eq!(attribution.resolved_project, "coding_agent_session_search");
+        assert!(attribution.confidence_score >= 80);
+    }
+
+    #[test]
+    fn mock_lifecycle_contains_stale_instance() {
+        let mock = MockDataSource::sample();
+        let lifecycle = mock.lifecycle("amail-001").expect("amail lifecycle exists");
+        assert_eq!(lifecycle.state, frankensearch_core::LifecycleState::Stale);
     }
 
     #[test]

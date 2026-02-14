@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
 
+use frankensearch_core::host_adapter::resolve_host_project_attribution;
+use frankensearch_core::{LifecycleSeverity, LifecycleState};
 use serde::{Deserialize, Serialize};
 
 // ─── Instance Info ───────────────────────────────────────────────────────────
@@ -28,6 +30,231 @@ pub struct InstanceInfo {
     pub doc_count: u64,
     /// Number of pending embedding jobs.
     pub pending_jobs: u64,
+}
+
+/// Attribution metadata attached to a discovered instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceAttribution {
+    /// Raw project key hint from telemetry/discovery.
+    pub project_key_hint: Option<String>,
+    /// Raw host name hint from telemetry/discovery.
+    pub host_name_hint: Option<String>,
+    /// Canonical resolved project key, or `unknown`.
+    pub resolved_project: String,
+    /// Confidence score in `[0, 100]`.
+    pub confidence_score: u8,
+    /// Machine-stable reason code.
+    pub reason_code: String,
+    /// Whether competing project candidates were observed.
+    pub collision: bool,
+}
+
+impl InstanceAttribution {
+    #[must_use]
+    pub fn unknown(
+        project_key_hint: Option<&str>,
+        host_name_hint: Option<&str>,
+        reason_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            project_key_hint: project_key_hint.map(str::to_owned),
+            host_name_hint: host_name_hint.map(str::to_owned),
+            resolved_project: "unknown".to_owned(),
+            confidence_score: 20,
+            reason_code: reason_code.into(),
+            collision: false,
+        }
+    }
+}
+
+/// Deterministic project attribution resolver used by dashboards and alerts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProjectAttributionResolver;
+
+impl ProjectAttributionResolver {
+    /// Resolve instance attribution from available project/host hints.
+    #[must_use]
+    pub fn resolve(
+        self,
+        project_key_hint: Option<&str>,
+        host_name_hint: Option<&str>,
+        adapter_identity_hint: Option<&str>,
+    ) -> InstanceAttribution {
+        let attribution = resolve_host_project_attribution(
+            adapter_identity_hint,
+            project_key_hint,
+            host_name_hint,
+        );
+
+        InstanceAttribution {
+            project_key_hint: project_key_hint.map(str::to_owned),
+            host_name_hint: host_name_hint.map(str::to_owned),
+            resolved_project: attribution.resolved_project_key,
+            confidence_score: attribution.confidence_score,
+            reason_code: attribution.reason_code,
+            collision: attribution.collision,
+        }
+    }
+}
+
+/// Discrete lifecycle signals ingested by the tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleSignal {
+    Start,
+    Heartbeat,
+    Degraded,
+    Recovering,
+    Stop,
+}
+
+/// One lifecycle transition decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleTransition {
+    /// Prior lifecycle state.
+    pub from: LifecycleState,
+    /// Resulting lifecycle state.
+    pub to: LifecycleState,
+    /// Stable reason code explaining the transition.
+    pub reason_code: String,
+    /// Whether the transition changed state.
+    pub changed: bool,
+}
+
+/// Current lifecycle snapshot for an instance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceLifecycle {
+    /// Current lifecycle state.
+    pub state: LifecycleState,
+    /// Current lifecycle severity.
+    pub severity: LifecycleSeverity,
+    /// Last transition reason code.
+    pub reason_code: String,
+    /// Last state transition timestamp (unix ms).
+    pub last_transition_ms: u64,
+    /// Last heartbeat timestamp (unix ms).
+    pub last_heartbeat_ms: u64,
+    /// Number of restart classifications observed.
+    pub restart_count: u32,
+}
+
+impl Default for InstanceLifecycle {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl InstanceLifecycle {
+    /// Create a new lifecycle snapshot in `started` state.
+    #[must_use]
+    pub fn new(ts_ms: u64) -> Self {
+        Self {
+            state: LifecycleState::Started,
+            severity: LifecycleSeverity::Info,
+            reason_code: "lifecycle.started".to_owned(),
+            last_transition_ms: ts_ms,
+            last_heartbeat_ms: ts_ms,
+            restart_count: 0,
+        }
+    }
+
+    /// Apply a deterministic lifecycle signal transition.
+    pub fn apply_signal(
+        &mut self,
+        signal: LifecycleSignal,
+        ts_ms: u64,
+        reason_code: Option<String>,
+    ) -> LifecycleTransition {
+        let from = self.state;
+        let to;
+        let mut reason = reason_code.unwrap_or_else(|| match signal {
+            LifecycleSignal::Start => "lifecycle.started".to_owned(),
+            LifecycleSignal::Heartbeat => "lifecycle.heartbeat".to_owned(),
+            LifecycleSignal::Degraded => "lifecycle.degraded".to_owned(),
+            LifecycleSignal::Recovering => "lifecycle.recovering".to_owned(),
+            LifecycleSignal::Stop => "lifecycle.stopped".to_owned(),
+        });
+
+        match signal {
+            LifecycleSignal::Start => {
+                let restarting = matches!(from, LifecycleState::Stopped | LifecycleState::Stale);
+                if restarting {
+                    self.restart_count = self.restart_count.saturating_add(1);
+                    to = LifecycleState::Recovering;
+                    self.severity = LifecycleSeverity::Warn;
+                    reason.clear();
+                    reason.push_str("lifecycle.restart");
+                } else {
+                    to = LifecycleState::Started;
+                    self.severity = LifecycleSeverity::Info;
+                }
+                self.last_heartbeat_ms = ts_ms;
+            }
+            LifecycleSignal::Heartbeat => {
+                self.last_heartbeat_ms = ts_ms;
+                to = LifecycleState::Healthy;
+                self.severity = LifecycleSeverity::Info;
+            }
+            LifecycleSignal::Degraded => {
+                to = LifecycleState::Degraded;
+                self.severity = LifecycleSeverity::Warn;
+            }
+            LifecycleSignal::Recovering => {
+                to = LifecycleState::Recovering;
+                self.severity = LifecycleSeverity::Warn;
+            }
+            LifecycleSignal::Stop => {
+                to = LifecycleState::Stopped;
+                self.severity = LifecycleSeverity::Info;
+            }
+        }
+
+        let changed = to != from;
+        self.state = to;
+        self.reason_code.clone_from(&reason);
+        if changed {
+            self.last_transition_ms = ts_ms;
+        }
+
+        LifecycleTransition {
+            from,
+            to,
+            reason_code: reason,
+            changed,
+        }
+    }
+
+    /// Mark the instance stale if heartbeat gap exceeds the timeout.
+    pub fn mark_stale_if_heartbeat_gap(
+        &mut self,
+        now_ms: u64,
+        heartbeat_timeout_ms: u64,
+    ) -> Option<LifecycleTransition> {
+        if heartbeat_timeout_ms == 0
+            || matches!(self.state, LifecycleState::Stopped | LifecycleState::Stale)
+        {
+            return None;
+        }
+
+        let deadline = self.last_heartbeat_ms.saturating_add(heartbeat_timeout_ms);
+        if now_ms < deadline {
+            return None;
+        }
+
+        let from = self.state;
+        self.state = LifecycleState::Stale;
+        self.severity = LifecycleSeverity::Warn;
+        self.reason_code.clear();
+        self.reason_code.push_str("lifecycle.heartbeat_gap");
+        self.last_transition_ms = now_ms;
+
+        Some(LifecycleTransition {
+            from,
+            to: LifecycleState::Stale,
+            reason_code: self.reason_code.clone(),
+            changed: true,
+        })
+    }
 }
 
 // ─── Metrics Snapshot ────────────────────────────────────────────────────────
@@ -245,6 +472,10 @@ pub struct FleetSnapshot {
     pub resources: HashMap<String, ResourceMetrics>,
     /// Per-instance search metrics (keyed by instance ID).
     pub search_metrics: HashMap<String, SearchMetrics>,
+    /// Per-instance project attribution metadata (keyed by instance ID).
+    pub attribution: HashMap<String, InstanceAttribution>,
+    /// Per-instance lifecycle state snapshots (keyed by instance ID).
+    pub lifecycle: HashMap<String, InstanceLifecycle>,
 }
 
 impl FleetSnapshot {
@@ -270,6 +501,27 @@ impl FleetSnapshot {
     #[must_use]
     pub fn total_pending_jobs(&self) -> u64 {
         self.instances.iter().map(|i| i.pending_jobs).sum()
+    }
+
+    /// Number of instances currently marked stale.
+    #[must_use]
+    pub fn stale_count(&self) -> usize {
+        self.lifecycle
+            .values()
+            .filter(|lifecycle| lifecycle.state == LifecycleState::Stale)
+            .count()
+    }
+
+    /// Attribution metadata for an instance id.
+    #[must_use]
+    pub fn attribution_for(&self, instance_id: &str) -> Option<&InstanceAttribution> {
+        self.attribution.get(instance_id)
+    }
+
+    /// Lifecycle snapshot for an instance id.
+    #[must_use]
+    pub fn lifecycle_for(&self, instance_id: &str) -> Option<&InstanceLifecycle> {
+        self.lifecycle.get(instance_id)
     }
 }
 
@@ -322,7 +574,8 @@ impl AppState {
     fn refresh_connection_status(&mut self) {
         let count = self.fleet.instance_count();
         let healthy = self.fleet.healthy_count();
-        self.connection_status = format!("{count} instances, {healthy} healthy");
+        let stale = self.fleet.stale_count();
+        self.connection_status = format!("{count} instances, {healthy} healthy, {stale} stale");
     }
 
     /// Get the current fleet snapshot.
@@ -379,6 +632,34 @@ mod tests {
     use super::*;
 
     fn sample_snapshot() -> FleetSnapshot {
+        let resolver = ProjectAttributionResolver;
+        let mut attribution = HashMap::new();
+        attribution.insert(
+            "inst-1".to_string(),
+            resolver.resolve(
+                Some("cass"),
+                Some("cass-devbox"),
+                Some("coding_agent_session_search"),
+            ),
+        );
+        attribution.insert(
+            "inst-2".to_string(),
+            resolver.resolve(Some("xf"), Some("xf-node-02"), Some("xf")),
+        );
+
+        let mut lifecycle = HashMap::new();
+        let mut lifecycle_1 = InstanceLifecycle::new(1_000);
+        lifecycle_1.apply_signal(LifecycleSignal::Heartbeat, 1_250, None);
+        lifecycle.insert("inst-1".to_string(), lifecycle_1);
+
+        let mut lifecycle_2 = InstanceLifecycle::new(1_000);
+        lifecycle_2.apply_signal(
+            LifecycleSignal::Degraded,
+            1_400,
+            Some("health.timeout".to_string()),
+        );
+        lifecycle.insert("inst-2".to_string(), lifecycle_2);
+
         FleetSnapshot {
             instances: vec![
                 InstanceInfo {
@@ -400,6 +681,8 @@ mod tests {
             ],
             resources: HashMap::new(),
             search_metrics: HashMap::new(),
+            attribution,
+            lifecycle,
         }
     }
 
@@ -424,6 +707,7 @@ mod tests {
         let snap = sample_snapshot();
         assert_eq!(snap.total_docs(), 8000);
         assert_eq!(snap.total_pending_jobs(), 210);
+        assert_eq!(snap.stale_count(), 0);
     }
 
     #[test]
@@ -496,5 +780,49 @@ mod tests {
         let decoded: InstanceInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.id, info.id);
         assert_eq!(decoded.doc_count, info.doc_count);
+    }
+
+    #[test]
+    fn attribution_resolver_maps_known_and_unknown_projects() {
+        let resolver = ProjectAttributionResolver;
+        let known = resolver.resolve(Some("agent-mail"), Some("mail-host"), None);
+        assert_eq!(known.resolved_project, "mcp_agent_mail_rust");
+        assert!(known.confidence_score >= 80);
+        assert!(!known.collision);
+
+        let unknown = resolver.resolve(Some("custom-app"), Some("mystery-box"), None);
+        assert_eq!(unknown.resolved_project, "unknown");
+        assert_eq!(unknown.confidence_score, 20);
+        assert_eq!(unknown.reason_code, "attribution.unknown");
+    }
+
+    #[test]
+    fn attribution_resolver_marks_conflicting_hints() {
+        let resolver = ProjectAttributionResolver;
+        let result = resolver.resolve(
+            Some("xf"),
+            Some("cass-host"),
+            Some("coding-agent-session-search"),
+        );
+        assert!(result.collision);
+        assert_eq!(result.reason_code, "attribution.collision");
+    }
+
+    #[test]
+    fn lifecycle_transitions_are_deterministic() {
+        let mut lifecycle = InstanceLifecycle::new(10);
+
+        let transition = lifecycle.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        assert_eq!(transition.from, LifecycleState::Started);
+        assert_eq!(transition.to, LifecycleState::Healthy);
+
+        lifecycle.apply_signal(LifecycleSignal::Stop, 30, None);
+        let restart = lifecycle.apply_signal(LifecycleSignal::Start, 40, None);
+        assert_eq!(restart.to, LifecycleState::Recovering);
+        assert_eq!(lifecycle.restart_count, 1);
+
+        let stale = lifecycle.mark_stale_if_heartbeat_gap(10_000, 5_000);
+        assert!(stale.is_some());
+        assert_eq!(lifecycle.state, LifecycleState::Stale);
     }
 }

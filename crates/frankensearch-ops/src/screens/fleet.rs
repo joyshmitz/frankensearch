@@ -301,8 +301,7 @@ mod tests {
                     pending_jobs: 50,
                 },
             ],
-            resources: std::collections::HashMap::new(),
-            search_metrics: std::collections::HashMap::new(),
+            ..FleetSnapshot::default()
         });
         screen.update_state(&state, &ViewState::default());
         let rows = screen.build_rows();
@@ -332,8 +331,7 @@ mod tests {
                     pending_jobs: 0,
                 },
             ],
-            resources: std::collections::HashMap::new(),
-            search_metrics: std::collections::HashMap::new(),
+            ..FleetSnapshot::default()
         });
         screen.update_state(&state, &ViewState::default());
 
@@ -393,8 +391,7 @@ mod tests {
                     pending_jobs: 1,
                 },
             ],
-            resources: std::collections::HashMap::new(),
-            search_metrics: std::collections::HashMap::new(),
+            ..FleetSnapshot::default()
         });
         let view = ViewState {
             hide_healthy: true,
