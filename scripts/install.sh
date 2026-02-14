@@ -966,7 +966,13 @@ configure_claude_code() {
       return 1
     }
   else
-    warn "jq not found; writing minimal Claude settings without merge support."
+    if [[ -f "${settings_path}" ]]; then
+      LAST_CONFIG_RESULT="failed (jq required for merge)"
+      warn "jq not found; refusing to overwrite existing Claude settings at ${settings_path}."
+      warn "Install jq to enable safe merge-based configuration."
+      return 1
+    fi
+    warn "jq not found; writing minimal Claude settings (no existing settings detected)."
     cat > "${settings_path}" <<EOF
 {
   "mcpServers": {
@@ -1473,10 +1479,194 @@ print_plan() {
   printf '  Configure shell  : %s\n' "$([[ "${NO_CONFIGURE}" == true ]] && echo "false" || echo "true")"
 }
 
+check_source_build_prerequisites() {
+  local missing=()
+
+  if ! has_cmd cargo; then
+    missing+=("cargo (Rust toolchain)")
+  fi
+
+  if ! has_cmd rustc; then
+    missing+=("rustc (Rust compiler)")
+  fi
+
+  if ! has_cmd git; then
+    missing+=("git")
+  fi
+
+  # Check for a C compiler (needed for ONNX Runtime native bindings).
+  if ! has_cmd cc && ! has_cmd gcc && ! has_cmd clang; then
+    missing+=("C compiler (cc, gcc, or clang)")
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "Missing build prerequisites:"
+    for dep in "${missing[@]}"; do
+      err "  - ${dep}"
+    done
+    return 1
+  fi
+
+  # Check for nightly toolchain (edition 2024 requires nightly).
+  local rustc_version=""
+  rustc_version="$(rustc --version 2>/dev/null || true)"
+  if [[ -n "${rustc_version}" ]] && [[ "${rustc_version}" != *"nightly"* ]]; then
+    warn "Current Rust toolchain is not nightly: ${rustc_version}"
+    warn "frankensearch requires Rust nightly (edition 2024)."
+    if has_cmd rustup; then
+      info "Attempting to install nightly toolchain via rustup..."
+      if ! rustup toolchain install nightly 2>/dev/null; then
+        err "Failed to install nightly toolchain."
+        return 1
+      fi
+      if ! rustup default nightly 2>/dev/null; then
+        err "Failed to set nightly as default toolchain."
+        return 1
+      fi
+      ok "Nightly toolchain installed and set as default."
+    else
+      err "No rustup found. Install nightly manually: https://rustup.rs"
+      return 1
+    fi
+  fi
+}
+
+estimate_build_resources() {
+  local free_kb
+  free_kb="$(df -Pk "${TEMP_DIR}" | awk 'NR==2 {print $4}')"
+  local free_mb=$((free_kb / 1024))
+
+  if (( free_mb < 2048 )); then
+    warn "Only ${free_mb}MB free disk space. Source builds typically need 2GB+."
+    warn "The build may fail due to insufficient disk space."
+  fi
+}
+
+build_from_source() {
+  local repo_slug="${FRANKENSEARCH_REPO:-${DEFAULT_REPO_SLUG}}"
+  local repo_url="https://github.com/${repo_slug}.git"
+  local source_dir="${TEMP_DIR}/frankensearch-src"
+
+  info "Building from source (this may take 5-10 minutes)..."
+  estimate_build_resources
+
+  # Clone the repository.
+  local git_args=(clone --depth=1)
+  if [[ "${RESOLVED_VERSION}" != "latest" ]]; then
+    git_args+=(--branch "${RESOLVED_VERSION}")
+  fi
+
+  info "Cloning ${repo_url}..."
+  if ! git "${git_args[@]}" "${repo_url}" "${source_dir}" 2>/dev/null; then
+    err "Failed to clone repository."
+    if [[ "${RESOLVED_VERSION}" != "latest" ]]; then
+      err "Tag '${RESOLVED_VERSION}' may not exist. Try --version latest"
+    fi
+    return 1
+  fi
+  ok "Repository cloned."
+
+  # Build the fsfs binary.
+  info "Building frankensearch-fsfs (release mode)..."
+  local cargo_args=(build --release -p frankensearch-fsfs)
+
+  if ! (cd "${source_dir}" && cargo "${cargo_args[@]}" 2>&1); then
+    err "Build failed. Common causes:"
+    err "  - Missing system dependencies (openssl-dev, pkg-config)"
+    err "  - Insufficient memory (need ~4GB RAM)"
+    err "  - Insufficient disk space (need ~2GB)"
+    return 1
+  fi
+  ok "Build completed."
+
+  # Locate the built binary.
+  local built_binary="${source_dir}/target/release/${DEFAULT_BINARY_NAME}"
+  if [[ ! -f "${built_binary}" ]]; then
+    err "Expected binary not found at ${built_binary}"
+    return 1
+  fi
+
+  # Stage the binary for installation (same as download path).
+  cp "${built_binary}" "${TEMP_DIR}/${DEFAULT_BINARY_NAME}" || {
+    err "Failed to stage built binary."
+    return 1
+  }
+  ok "Built binary staged for installation."
+}
+
+install_rust_toolchain() {
+  if has_cmd cargo && has_cmd rustc; then
+    return 0
+  fi
+
+  info "Rust toolchain not found. Attempting to install via rustup..."
+
+  if [[ "${OFFLINE}" == true ]]; then
+    die "Cannot install Rust toolchain in offline mode. Install Rust manually: https://rustup.rs"
+  fi
+
+  if ! has_cmd curl && ! has_cmd wget; then
+    die "Need curl or wget to install Rust toolchain"
+  fi
+
+  if has_cmd curl; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
+  elif has_cmd wget; then
+    wget -qO- https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
+  fi
+
+  # Source the cargo env to make cargo/rustc available in this session.
+  if [[ -f "${HOME}/.cargo/env" ]]; then
+    # shellcheck disable=SC1091
+    . "${HOME}/.cargo/env"
+  fi
+
+  if ! has_cmd cargo || ! has_cmd rustc; then
+    die "Rust installation completed but cargo/rustc not found in PATH."
+  fi
+
+  ok "Rust nightly toolchain installed."
+}
+
 run_install() {
   if [[ "${FROM_SOURCE}" == true ]]; then
-    info "FROM_SOURCE=true: building from source (see bd-2w7x.19)."
-    die "Build-from-source is not yet implemented. Remove --from-source to download a prebuilt binary."
+    info "FROM_SOURCE=true: building from source."
+
+    # Install Rust if not present.
+    install_rust_toolchain
+
+    # Check all prerequisites.
+    if ! check_source_build_prerequisites; then
+      die "Source build prerequisites not met. Install the missing dependencies and retry."
+    fi
+
+    # Build from source.
+    if ! build_from_source; then
+      die "Build from source failed."
+    fi
+
+    # Install the built binary (reuses the same install path as download).
+    install_binary
+
+    # Verify installation.
+    if ! verify_installation; then
+      warn "Binary verification failed but installation completed."
+      warn "You may need to install runtime dependencies (e.g., ONNX Runtime)."
+    fi
+
+    # Post-install configuration.
+    maybe_configure_shell_path
+    maybe_install_shell_completion
+
+    detect_agent_integrations
+    configure_detected_agents
+    print_agent_report_table
+    maybe_run_initial_model_download
+    maybe_run_post_install_doctor
+
+    ok "Source build installation completed successfully."
+    info "Run '${DEFAULT_BINARY_NAME} --help' to get started."
+    return
   fi
 
   # Stage 1: Download the binary archive.

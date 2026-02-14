@@ -501,6 +501,77 @@ jq '.success_retention_days, .failure_retention_days' ci_artifacts/e2e_retention
 
 Failure retention is intentionally longer to preserve triage evidence and replay handles.
 
+## Interaction Matrix CI Gate (bd-3un.52.6)
+
+The interaction matrix now has a dedicated CI workflow:
+
+- Workflow file: `.github/workflows/interaction-matrix-gate.yml`
+- Gate scope: `frankensearch-fusion` interaction unit + targeted e2e diagnostics lanes
+- Pass threshold: all required interaction-gate tests pass
+
+Required gate commands:
+
+```bash
+cargo test -p frankensearch-fusion --test interaction_unit -- --nocapture
+cargo test -p frankensearch-fusion --test interaction_integration interaction_high_risk_lanes_emit_replay_ready_artifacts -- --nocapture
+cargo test -p frankensearch-fusion --test interaction_integration interaction_failure_path_includes_replay_command_and_lane_context -- --nocapture
+```
+
+The workflow emits machine-readable artifacts:
+
+- `interaction_gate_policy.json`
+- `interaction_lane_ownership.json`
+- `interaction_failure_summary.json` (failure only)
+- interaction logs: `interaction_unit.log`, `interaction_e2e_high_risk.log`, `interaction_e2e_failure_path.log`
+
+### Lane Ownership Mapping
+
+The canonical lane ownership artifact (`interaction_lane_ownership.json`) must include:
+
+| lane_id | owner_lane | bead_refs | escalation |
+|---|---|---|---|
+| `explain_mmr` | `fusion-explainability` | `bd-11n`, `bd-z3j` | `core-ranking-explainability` |
+| `explain_negation` | `fusion-negation-explainability` | `bd-11n`, `bd-2n6` | `core-query-parsing` |
+| `prf_negation` | `fusion-prf-negation` | `bd-3st`, `bd-2n6` | `core-prf-query-parsing` |
+| `adaptive_calibration_conformal` | `fusion-adaptive-calibration` | `bd-21g`, `bd-22k`, `bd-2yj` | `core-calibration-conformal` |
+| `breaker_adaptive_feedback` | `fusion-breaker-feedback` | `bd-1do`, `bd-21g`, `bd-2tv` | `core-relevance-feedback` |
+| `mmr_feedback` | `fusion-diversity-feedback` | `bd-z3j`, `bd-2tv` | `core-relevance-feedback` |
+| `prf_adaptive` | `fusion-prf-adaptive` | `bd-3st`, `bd-21g` | `core-adaptive-fusion` |
+| `calibration_conformal` | `fusion-calibration-conformal` | `bd-22k`, `bd-2yj` | `core-calibration-conformal` |
+| `explain_calibration` | `fusion-explain-calibration` | `bd-11n`, `bd-22k` | `core-ranking-explainability` |
+| `breaker_explain` | `fusion-breaker-explainability` | `bd-1do`, `bd-11n` | `core-circuit-breaker` |
+| `kitchen_sink` | `fusion-composition-owner` | `bd-11n`, `bd-z3j`, `bd-2n6`, `bd-3st`, `bd-21g`, `bd-22k`, `bd-2yj`, `bd-1do`, `bd-2tv` | `composition-owner` |
+| `baseline` | `fusion-composition-owner` | `bd-3un.52` | `composition-owner` |
+
+### Standardized Failure Summary Contract
+
+When the interaction gate fails, `interaction_failure_summary.json` must include:
+
+- `schema`: `interaction-failure-summary-v1`
+- `bead`: `bd-3un.52.6`
+- `workflow`: `interaction-matrix-gate`
+- `run_url`
+- `replay_command`
+- `required_artifacts` (must include logs and `interaction_lane_ownership.json`)
+- `escalation_playbook` (this section)
+- `escalation_metadata.thread_id` (`bd-3un.52.6`)
+
+Failure reporting must always be lane-attributable:
+- include `lane_id`
+- map lane to `owner_lane` + `bead_refs`
+- provide a replay command and escalation route
+
+### Deterministic Lane Extension Rules
+
+When adding/modifying interaction lanes, update all of:
+
+1. `crates/frankensearch-fusion/src/interaction_lanes.rs` with deterministic `seed`, `risk`, and `bead_refs`.
+2. `interaction_lane_ownership.json` emission in `.github/workflows/interaction-matrix-gate.yml`.
+3. Interaction e2e assertions in `crates/frankensearch-fusion/tests/interaction_integration.rs`.
+4. This section's ownership/escalation mapping table.
+
+Do not add lanes without deterministic seeds and explicit owner/bead attribution.
+
 ## Validation Artifacts
 
 - Schema: `schemas/e2e-artifact-v1.schema.json`

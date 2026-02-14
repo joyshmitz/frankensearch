@@ -260,13 +260,188 @@ run_installer_fn() {
 }
 
 # ---------------------------------------------------------------------------
-# --from-source triggers clear error message
+# --from-source: prerequisite checks
 # ---------------------------------------------------------------------------
 
-@test "scripts/install.sh --from-source fails with not-implemented message" {
-  run bash "${INSTALLER}" --from-source --offline --version v0.1.0 --dest "${INSTALL_DEST}" --force
+@test "check_source_build_prerequisites fails when cargo is missing" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    has_cmd() {
+      case "$1" in
+        cargo) return 1 ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    check_source_build_prerequisites
+  '
   [ "$status" -ne 0 ]
-  [[ "$output" == *"not yet implemented"* ]]
+  [[ "$output" == *"cargo"* ]]
+}
+
+@test "check_source_build_prerequisites fails when git is missing" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    has_cmd() {
+      case "$1" in
+        git) return 1 ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    check_source_build_prerequisites
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"git"* ]]
+}
+
+@test "check_source_build_prerequisites reports all missing deps at once" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    has_cmd() { return 1; }
+    check_source_build_prerequisites
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"cargo"* ]]
+  [[ "$output" == *"git"* ]]
+  [[ "$output" == *"C compiler"* ]]
+}
+
+@test "check_source_build_prerequisites succeeds when all deps present" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    has_cmd() { return 0; }
+    rustc() { echo "rustc 1.84.0-nightly (abc123 2025-01-01)"; }
+    check_source_build_prerequisites
+  '
+  [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# --from-source: nightly toolchain detection
+# ---------------------------------------------------------------------------
+
+@test "check_source_build_prerequisites warns on stable rustc" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    has_cmd() { return 0; }
+    rustc() { echo "rustc 1.82.0 (f6e511eec 2024-10-15)"; }
+    rustup() { return 0; }
+    check_source_build_prerequisites
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"not nightly"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# --from-source: estimate_build_resources warns on low disk
+# ---------------------------------------------------------------------------
+
+@test "estimate_build_resources warns when disk space is low" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    TEMP_DIR="$(mktemp -d)"
+    df() {
+      printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+      printf "mockfs 2000000 1900000 100000 95%% /tmp\n"
+    }
+    estimate_build_resources
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"free disk space"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# --from-source: install_rust_toolchain offline mode
+# ---------------------------------------------------------------------------
+
+@test "install_rust_toolchain fails in offline mode when cargo missing" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    OFFLINE=true
+    has_cmd() { return 1; }
+    install_rust_toolchain
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"offline mode"* ]]
+}
+
+@test "install_rust_toolchain is no-op when cargo and rustc exist" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    OFFLINE=false
+    has_cmd() { return 0; }
+    install_rust_toolchain
+  '
+  [ "$status" -eq 0 ]
+  # Should produce no output (early return)
+  [[ -z "$output" ]]
+}
+
+# ---------------------------------------------------------------------------
+# --from-source: build_from_source clone failure
+# ---------------------------------------------------------------------------
+
+@test "build_from_source fails gracefully when git clone fails" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    TEMP_DIR="$(mktemp -d)"
+    RESOLVED_VERSION="v99.99.99"
+    DEFAULT_BINARY_NAME="fsfs"
+    DEFAULT_REPO_SLUG="Dicklesworthstone/frankensearch"
+    df() {
+      printf "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+      printf "mockfs 20000000 1000000 19000000 5%% /tmp\n"
+    }
+    git() { return 1; }
+    build_from_source
+  '
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Failed to clone"* ]]
+  [[ "$output" == *"may not exist"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# --from-source: run_install FROM_SOURCE path entry
+# ---------------------------------------------------------------------------
+
+@test "run_install with FROM_SOURCE=true calls source build pipeline" {
+  run bash -c '
+    eval "$(sed '"'"'/^main "\$@"/d; /^if \[\[.*BASH_SOURCE/d'"'"' "'"${INSTALLER}"'")"
+    FROM_SOURCE=true
+    OFFLINE=false
+    QUIET=false
+    USE_COLOR=false
+    HAVE_GUM=false
+    DEST_DIR="'"${INSTALL_DEST}"'"
+    TEMP_DIR="$(mktemp -d)"
+    DEFAULT_BINARY_NAME="fsfs"
+
+    # Mock: Rust already installed.
+    has_cmd() { return 0; }
+    rustc() { echo "rustc 1.84.0-nightly (abc 2025-01-01)"; }
+
+    # Mock: build_from_source produces a binary.
+    build_from_source() {
+      printf "#!/bin/bash\necho fsfs version 0.1.0-test" > "${TEMP_DIR}/fsfs"
+      chmod +x "${TEMP_DIR}/fsfs"
+      return 0
+    }
+    estimate_build_resources() { :; }
+
+    # Skip post-install steps that require real environment.
+    maybe_configure_shell_path() { :; }
+    maybe_install_shell_completion() { :; }
+    detect_agent_integrations() { :; }
+    configure_detected_agents() { :; }
+    print_agent_report_table() { :; }
+    maybe_run_initial_model_download() { :; }
+    maybe_run_post_install_doctor() { :; }
+
+    run_install
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"FROM_SOURCE=true"* ]]
+  [[ "$output" == *"Source build installation completed"* ]]
+  [ -x "${INSTALL_DEST}/fsfs" ]
 }
 
 # ---------------------------------------------------------------------------

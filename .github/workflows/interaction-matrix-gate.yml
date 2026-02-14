@@ -1,0 +1,184 @@
+name: Interaction Matrix Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: interaction-matrix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  interaction-matrix:
+    name: Interaction Matrix (fusion)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Prepare path dependencies under /dp
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /dp
+          sudo chown -R "$USER":"$(id -gn)" /dp
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin main
+              git -C "${dest_path}" checkout main
+              git -C "${dest_path}" pull --ff-only origin main
+            else
+              git clone --depth 1 "${repo_url}" "${dest_path}"
+            fi
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: interaction-matrix-nightly
+          cache-targets: true
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run interaction unit matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+          cargo test -p frankensearch-fusion --test interaction_unit -- --nocapture \
+            2>&1 | tee ci_artifacts/interaction_unit.log
+
+      - name: Run high-risk interaction e2e lane gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-fusion --test interaction_integration \
+            interaction_high_risk_lanes_emit_replay_ready_artifacts -- --nocapture \
+            2>&1 | tee ci_artifacts/interaction_e2e_high_risk.log
+
+      - name: Run failure-path interaction e2e lane gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-fusion --test interaction_integration \
+            interaction_failure_path_includes_replay_command_and_lane_context -- --nocapture \
+            2>&1 | tee ci_artifacts/interaction_e2e_failure_path.log
+
+      - name: Emit interaction gate policy and lane ownership artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n --arg ts "${now}" '
+            {
+              schema: "interaction-matrix-gate-policy-v1",
+              generated_at: $ts,
+              bead: "bd-3un.52.6",
+              pass_threshold: "all_required_tests_pass",
+              required_tests: [
+                "cargo test -p frankensearch-fusion --test interaction_unit -- --nocapture",
+                "cargo test -p frankensearch-fusion --test interaction_integration interaction_high_risk_lanes_emit_replay_ready_artifacts -- --nocapture",
+                "cargo test -p frankensearch-fusion --test interaction_integration interaction_failure_path_includes_replay_command_and_lane_context -- --nocapture"
+              ],
+              required_failure_artifacts: [
+                "interaction_lane_ownership.json",
+                "interaction_failure_summary.json"
+              ]
+            }
+          ' > ci_artifacts/interaction_gate_policy.json
+
+          jq -n --arg ts "${now}" '
+            {
+              schema: "interaction-lane-ownership-v1",
+              generated_at: $ts,
+              bead: "bd-3un.52.6",
+              lanes: [
+                { lane_id: "explain_mmr", owner_lane: "fusion-explainability", bead_refs: ["bd-11n","bd-z3j"], escalation: "core-ranking-explainability" },
+                { lane_id: "explain_negation", owner_lane: "fusion-negation-explainability", bead_refs: ["bd-11n","bd-2n6"], escalation: "core-query-parsing" },
+                { lane_id: "prf_negation", owner_lane: "fusion-prf-negation", bead_refs: ["bd-3st","bd-2n6"], escalation: "core-prf-query-parsing" },
+                { lane_id: "adaptive_calibration_conformal", owner_lane: "fusion-adaptive-calibration", bead_refs: ["bd-21g","bd-22k","bd-2yj"], escalation: "core-calibration-conformal" },
+                { lane_id: "breaker_adaptive_feedback", owner_lane: "fusion-breaker-feedback", bead_refs: ["bd-1do","bd-21g","bd-2tv"], escalation: "core-relevance-feedback" },
+                { lane_id: "mmr_feedback", owner_lane: "fusion-diversity-feedback", bead_refs: ["bd-z3j","bd-2tv"], escalation: "core-relevance-feedback" },
+                { lane_id: "prf_adaptive", owner_lane: "fusion-prf-adaptive", bead_refs: ["bd-3st","bd-21g"], escalation: "core-adaptive-fusion" },
+                { lane_id: "calibration_conformal", owner_lane: "fusion-calibration-conformal", bead_refs: ["bd-22k","bd-2yj"], escalation: "core-calibration-conformal" },
+                { lane_id: "explain_calibration", owner_lane: "fusion-explain-calibration", bead_refs: ["bd-11n","bd-22k"], escalation: "core-ranking-explainability" },
+                { lane_id: "breaker_explain", owner_lane: "fusion-breaker-explainability", bead_refs: ["bd-1do","bd-11n"], escalation: "core-circuit-breaker" },
+                { lane_id: "kitchen_sink", owner_lane: "fusion-composition-owner", bead_refs: ["bd-11n","bd-z3j","bd-2n6","bd-3st","bd-21g","bd-22k","bd-2yj","bd-1do","bd-2tv"], escalation: "composition-owner" },
+                { lane_id: "baseline", owner_lane: "fusion-composition-owner", bead_refs: ["bd-3un.52"], escalation: "composition-owner" }
+              ]
+            }
+          ' > ci_artifacts/interaction_lane_ownership.json
+
+      - name: Emit standardized failure summary payload
+        if: failure()
+        shell: bash
+        env:
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PLAYBOOK_URL: https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/e2e-artifact-contract.md#interaction-matrix-ci-gate-bd-3un526
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --arg ts "${now}" \
+            --arg run_url "${RUN_URL}" \
+            --arg playbook "${PLAYBOOK_URL}" \
+            '{
+              schema: "interaction-failure-summary-v1",
+              generated_at: $ts,
+              bead: "bd-3un.52.6",
+              workflow: "interaction-matrix-gate",
+              run_url: $run_url,
+              replay_command: "cargo test -p frankensearch-fusion --test interaction_integration -- --nocapture",
+              required_artifacts: [
+                "interaction_unit.log",
+                "interaction_e2e_high_risk.log",
+                "interaction_e2e_failure_path.log",
+                "interaction_lane_ownership.json"
+              ],
+              escalation_playbook: $playbook,
+              escalation_metadata: {
+                thread_id: "bd-3un.52.6",
+                ownership_artifact: "interaction_lane_ownership.json",
+                summary_contract: "lane_id + owner_lane + bead_refs + replay_command"
+              }
+            }' > ci_artifacts/interaction_failure_summary.json
+
+          echo "::error title=Interaction Matrix Gate Failed::See interaction_failure_summary.json and interaction_lane_ownership.json artifacts for escalation metadata."
+          {
+            echo "### Interaction matrix gate failure"
+            echo ""
+            echo "- Run URL: ${RUN_URL}"
+            echo "- Replay command: \`cargo test -p frankensearch-fusion --test interaction_integration -- --nocapture\`"
+            echo "- Escalation playbook: [Interaction Matrix CI Gate](${PLAYBOOK_URL})"
+            echo "- Required metadata artifact: \`interaction_lane_ownership.json\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload interaction matrix artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interaction-matrix-gate-${{ github.run_id }}
+          path: ci_artifacts/*
+          retention-days: 30

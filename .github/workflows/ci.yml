@@ -80,6 +80,13 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
 
+      - name: Install JSON schema validator
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --upgrade jsonschema
+
       - name: Validate unified e2e artifact schema fixtures
         if: matrix.os == 'ubuntu-latest'
         shell: bash
