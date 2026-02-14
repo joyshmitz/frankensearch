@@ -13,7 +13,7 @@ use frankensearch_durability::metrics::DurabilityMetrics;
 use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
 use xxhash_rust::xxh3::xxh3_64;
 
-/// Mock codec that mimics RaptorQ behavior for benchmarking the pipeline
+/// Mock codec that mimics `RaptorQ` behavior for benchmarking the pipeline
 /// overhead (serialization, CRC, file I/O) without the actual erasure coding.
 #[derive(Debug)]
 struct BenchCodec;
@@ -102,12 +102,13 @@ fn make_protector() -> FileProtector {
 
 // --- Encode throughput ---
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_encode_throughput(c: &mut Criterion) {
     let protector = make_protector();
     let mut group = c.benchmark_group("encode_throughput");
     group.measurement_time(Duration::from_secs(5));
 
-    for &size_mb in &[1, 10] {
+    for &size_mb in &[1u32, 10] {
         let data_size = size_mb * 1024 * 1024;
         let dir = tempfile_dir("bench-encode");
         let file = dir.join(format!("source-{size_mb}mb.bin"));
@@ -115,7 +116,7 @@ fn bench_encode_throughput(c: &mut Criterion) {
         let payload: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
         std::fs::write(&file, &payload).expect("write source");
 
-        group.throughput(criterion::Throughput::Bytes(data_size as u64));
+        group.throughput(criterion::Throughput::Bytes(u64::from(data_size)));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{size_mb}MB")),
             &file,
@@ -134,15 +135,16 @@ fn bench_encode_throughput(c: &mut Criterion) {
 
 // --- Verify fast path (xxh3) ---
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_verify_fast_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("verify_xxh3_fast_path");
 
-    for &size_mb in &[1, 10, 50, 100] {
+    for &size_mb in &[1u32, 10, 50, 100] {
         let data_size = size_mb * 1024 * 1024;
         let data: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
         let expected = xxh3_64(&data);
 
-        group.throughput(criterion::Throughput::Bytes(data_size as u64));
+        group.throughput(criterion::Throughput::Bytes(u64::from(data_size)));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{size_mb}MB")),
             &data,
@@ -160,12 +162,13 @@ fn bench_verify_fast_path(c: &mut Criterion) {
 
 // --- File protect + verify roundtrip ---
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_protect_verify_roundtrip(c: &mut Criterion) {
     let protector = make_protector();
     let mut group = c.benchmark_group("protect_verify_roundtrip");
     group.measurement_time(Duration::from_secs(5));
 
-    for &size_mb in &[1, 5] {
+    for &size_mb in &[1u32, 5] {
         let data_size = size_mb * 1024 * 1024;
         let dir = tempfile_dir("bench-roundtrip");
         let file = dir.join(format!("source-{size_mb}mb.bin"));
@@ -173,7 +176,7 @@ fn bench_protect_verify_roundtrip(c: &mut Criterion) {
         std::fs::write(&file, &payload).expect("write source");
         let result = protector.protect_file(&file).expect("protect");
 
-        group.throughput(criterion::Throughput::Bytes(data_size as u64));
+        group.throughput(criterion::Throughput::Bytes(u64::from(data_size)));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{size_mb}MB")),
             &(file.clone(), result.sidecar_path.clone()),
@@ -193,6 +196,7 @@ fn bench_protect_verify_roundtrip(c: &mut Criterion) {
 
 // --- Repair latency ---
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_repair_latency(c: &mut Criterion) {
     let config = DurabilityConfig {
         symbol_size: 4096,
@@ -206,7 +210,7 @@ fn bench_repair_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("repair_latency");
     group.measurement_time(Duration::from_secs(5));
 
-    let data_size = 1024 * 1024; // 1MB
+    let data_size = 1024u32 * 1024; // 1MB
     let dir = tempfile_dir("bench-repair");
     let file = dir.join("repair-target.bin");
     let payload: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
@@ -234,11 +238,12 @@ fn bench_repair_latency(c: &mut Criterion) {
 
 // --- Overhead measurement ---
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_overhead_ratio(c: &mut Criterion) {
     let mut group = c.benchmark_group("overhead_ratio");
     group.measurement_time(Duration::from_secs(3));
 
-    let data_size = 1024 * 1024; // 1MB
+    let data_size = 1024u32 * 1024; // 1MB
     let payload: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
 
     for &overhead in &[1.05, 1.10, 1.20, 1.30, 1.50] {
@@ -252,9 +257,12 @@ fn bench_overhead_ratio(c: &mut Criterion) {
             .expect("protector");
 
         let dir = tempfile_dir("bench-overhead");
-        let file = dir.join(format!("overhead-{}.bin", (overhead * 100.0) as u32));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let overhead_label = (overhead * 100.0) as u32;
+        let file = dir.join(format!("overhead-{overhead_label}.bin"));
         std::fs::write(&file, &payload).expect("write");
 
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pct = ((overhead - 1.0) * 100.0) as u32;
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{pct}%")),
@@ -264,9 +272,7 @@ fn bench_overhead_ratio(c: &mut Criterion) {
                     let sidecar = FileProtector::sidecar_path(file);
                     let _ = std::fs::remove_file(&sidecar);
                     let result = protector.protect_file(black_box(file)).expect("protect");
-                    let fec_size = std::fs::metadata(&result.sidecar_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let fec_size = std::fs::metadata(&result.sidecar_path).map_or(0, |m| m.len());
                     black_box(fec_size);
                 });
             },

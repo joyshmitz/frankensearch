@@ -208,6 +208,13 @@ impl CodecFacade {
                 reason: "must be greater than zero".to_owned(),
             });
         }
+        if symbol_size == 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "symbol_size".to_owned(),
+                value: "0".to_owned(),
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
 
         let symbol_size_usize =
             usize::try_from(symbol_size).map_err(|_| SearchError::InvalidConfig {
@@ -306,7 +313,7 @@ impl CodecFacade {
         source_data: &[u8],
         repair_data: &RepairData,
     ) -> SearchResult<VerifyResult> {
-        self.validate_repair_data(repair_data)?;
+        Self::validate_repair_data(repair_data)?;
 
         if xxh3_64(source_data).to_le_bytes() == repair_data.source_hash {
             return Ok(VerifyResult::Intact);
@@ -341,7 +348,7 @@ impl CodecFacade {
 
     /// Attempt to reconstruct original payload bytes from corrupted data + repair symbols.
     pub fn repair(&self, corrupted_data: &[u8], repair_data: &RepairData) -> SearchResult<Vec<u8>> {
-        self.validate_repair_data(repair_data)?;
+        Self::validate_repair_data(repair_data)?;
 
         let mut symbols = source_symbols_from_bytes(
             corrupted_data,
@@ -414,7 +421,7 @@ impl CodecFacade {
         }
     }
 
-    fn validate_repair_data(&self, repair_data: &RepairData) -> SearchResult<()> {
+    fn validate_repair_data(repair_data: &RepairData) -> SearchResult<()> {
         if repair_data.symbol_size == 0 {
             return Err(SearchError::InvalidConfig {
                 field: "repair_data.symbol_size".to_owned(),
@@ -460,6 +467,14 @@ fn source_symbols_from_bytes(
     symbol_size: u32,
     k_source: u32,
 ) -> SearchResult<Vec<(u32, Vec<u8>)>> {
+    if symbol_size == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "symbol_size".to_owned(),
+            value: "0".to_owned(),
+            reason: "must be greater than zero".to_owned(),
+        });
+    }
+
     let symbol_size_usize =
         usize::try_from(symbol_size).map_err(|_| SearchError::InvalidConfig {
             field: "symbol_size".to_owned(),
@@ -468,7 +483,9 @@ fn source_symbols_from_bytes(
         })?;
 
     let mut out = Vec::new();
-    for esi in 0..k_source {
+    let max_symbols = bytes.len().div_ceil(symbol_size_usize);
+    let max_symbols_u32 = u32::try_from(max_symbols).unwrap_or(u32::MAX);
+    for esi in 0..k_source.min(max_symbols_u32) {
         let esi_usize = usize::try_from(esi).map_err(|_| SearchError::InvalidConfig {
             field: "esi".to_owned(),
             value: esi.to_string(),
@@ -807,6 +824,26 @@ mod tests {
         assert!(matches!(
             err,
             frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "k_source"
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_zero_symbol_size() {
+        let facade = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig::default(),
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("facade");
+
+        let err = facade
+            .decode_for_symbol_size(&[], 1, 0)
+            .expect_err("must fail");
+        assert!(matches!(
+            err,
+            frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "symbol_size"
         ));
     }
 

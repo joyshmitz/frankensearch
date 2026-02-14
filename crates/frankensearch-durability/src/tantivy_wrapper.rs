@@ -1,7 +1,7 @@
-//! Self-healing Tantivy segment wrapper with RaptorQ durability.
+//! Self-healing Tantivy segment wrapper with `RaptorQ` durability.
 //!
 //! Wraps a Tantivy [`Index`] to add per-segment `.seg.fec` sidecar files
-//! containing RaptorQ repair symbols. The approach is entirely external
+//! containing `RaptorQ` repair symbols. The approach is entirely external
 //! to Tantivy: we enumerate segments via [`Index::searchable_segment_metas`],
 //! protect their component files through the generic [`FileProtector`],
 //! and verify/repair on open.
@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::DurabilityConfig;
 use crate::file_protector::{
-    FileProtectionResult, FileProtector, FileRepairOutcome, FileVerifyResult,
+    FileHealth, FileProtectionResult, FileProtector, FileRepairOutcome, FileVerifyResult,
 };
 use crate::metrics::{DurabilityMetrics, DurabilityMetricsSnapshot};
 
@@ -109,7 +109,7 @@ impl TantivySegmentProtector {
     }
 }
 
-/// Tantivy index wrapped with per-segment RaptorQ durability.
+/// Tantivy index wrapped with per-segment `RaptorQ` durability.
 ///
 /// Provides segment-level protect/verify/repair operations that integrate
 /// with Tantivy's segment lifecycle. Component files within each segment
@@ -217,9 +217,7 @@ impl DurableTantivyIndex {
                 match self.protector.protect_file(&abs_path) {
                     Ok(result) => {
                         total_source += result.source_len;
-                        let repair_size = fs::metadata(&result.sidecar_path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let repair_size = fs::metadata(&result.sidecar_path).map_or(0, |m| m.len());
                         total_repair += repair_size;
                         protected += 1;
 
@@ -299,87 +297,60 @@ impl DurableTantivyIndex {
                 }
 
                 files_checked += 1;
-                let sidecar = FileProtector::sidecar_path(&abs_path);
-
-                if !sidecar.exists() {
-                    files_unprotected += 1;
-                    debug!(
-                        segment_id = %meta.id().short_uuid_string(),
-                        file = %relative_path.display(),
-                        "no sidecar, skipping verification"
-                    );
-                    continue;
-                }
-
-                match self.protector.verify_file(&abs_path, &sidecar) {
-                    Ok(verify) if verify.healthy => {
-                        files_intact += 1;
-                    }
-                    Ok(_verify) => {
-                        // Corruption detected — attempt repair.
-                        warn!(
-                            segment_id = %meta.id().short_uuid_string(),
-                            file = %relative_path.display(),
-                            "corruption detected, attempting repair"
-                        );
-
-                        let repair_start = Instant::now();
-                        match self.protector.repair_file(&abs_path, &sidecar) {
-                            Ok(FileRepairOutcome::Repaired {
-                                bytes_written,
-                                symbols_used,
-                            }) => {
-                                repair_time += repair_start.elapsed();
-                                files_repaired += 1;
-                                info!(
-                                    segment_id = %meta.id().short_uuid_string(),
-                                    file = %relative_path.display(),
-                                    bytes_written,
-                                    symbols_used,
-                                    "segment component repaired"
-                                );
-                            }
-                            Ok(FileRepairOutcome::NotNeeded) => {
-                                // Verify said corrupted but repair says not needed
-                                // — possible race condition, treat as intact.
-                                repair_time += repair_start.elapsed();
-                                files_intact += 1;
-                            }
-                            Ok(FileRepairOutcome::Unrecoverable { reason, .. }) => {
-                                repair_time += repair_start.elapsed();
-                                files_unrecoverable += 1;
-                                warn!(
-                                    segment_id = %meta.id().short_uuid_string(),
-                                    file = %relative_path.display(),
-                                    ?reason,
-                                    "segment component unrecoverable"
-                                );
-                            }
-                            Err(e) => {
-                                repair_time += repair_start.elapsed();
-                                files_unrecoverable += 1;
-                                warn!(
-                                    segment_id = %meta.id().short_uuid_string(),
-                                    file = %relative_path.display(),
-                                    error = %e,
-                                    "repair attempt failed"
-                                );
-                            }
+                let check_start = Instant::now();
+                match self.protector.verify_and_repair_file(&abs_path) {
+                    Ok(health) => match health.status {
+                        FileHealth::Intact => {
+                            files_intact += 1;
                         }
-                    }
+                        FileHealth::Repaired {
+                            bytes_written,
+                            repair_time: file_repair_time,
+                        } => {
+                            files_repaired += 1;
+                            repair_time += file_repair_time;
+                            info!(
+                                segment_id = %meta.id().short_uuid_string(),
+                                file = %relative_path.display(),
+                                bytes_written,
+                                repair_time_ms = file_repair_time.as_millis(),
+                                "segment component repaired"
+                            );
+                        }
+                        FileHealth::Unrecoverable { reason } => {
+                            files_unrecoverable += 1;
+                            repair_time += check_start.elapsed();
+                            warn!(
+                                segment_id = %meta.id().short_uuid_string(),
+                                file = %relative_path.display(),
+                                reason,
+                                "segment component unrecoverable"
+                            );
+                        }
+                        FileHealth::Unprotected => {
+                            files_unprotected += 1;
+                            debug!(
+                                segment_id = %meta.id().short_uuid_string(),
+                                file = %relative_path.display(),
+                                "no sidecar, skipping verification"
+                            );
+                        }
+                    },
                     Err(e) => {
+                        files_unrecoverable += 1;
+                        repair_time += check_start.elapsed();
                         warn!(
                             segment_id = %meta.id().short_uuid_string(),
                             file = %relative_path.display(),
                             error = %e,
-                            "verification failed, skipping"
+                            "verify-and-repair failed"
                         );
                     }
                 }
             }
         }
 
-        let verify_time = verify_start.elapsed() - repair_time;
+        let verify_time = verify_start.elapsed().saturating_sub(repair_time);
 
         info!(
             files_checked,
@@ -422,19 +393,13 @@ impl DurableTantivyIndex {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_owned(),
-                None => continue,
-            };
-
             // Only look at .fec files.
-            if !name.ends_with(".fec") {
+            if !Self::has_fec_extension(&path) {
                 continue;
             }
 
-            // Derive the source file path by stripping .fec.
-            let source_name = &name[..name.len() - 4];
-            let source_path = self.data_dir.join(source_name);
+            // Derive the source file path by stripping the extension.
+            let source_path = path.with_extension("");
 
             if !known_files.contains(&source_path) && !source_path.exists() {
                 match fs::remove_file(&path) {
@@ -457,6 +422,11 @@ impl DurableTantivyIndex {
         }
 
         cleaned
+    }
+
+    fn has_fec_extension(path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("fec"))
     }
 }
 
@@ -606,16 +576,15 @@ mod tests {
         let mut writer = index.writer(15_000_000).expect("writer");
         for i in 0..5 {
             let mut doc = tantivy::TantivyDocument::new();
-            doc.add_text(id_field, &format!("doc-{i}"));
-            doc.add_text(content_field, &format!("test content number {i}"));
+            doc.add_text(id_field, format!("doc-{i}"));
+            doc.add_text(content_field, format!("test content number {i}"));
             writer.add_document(doc).expect("add doc");
         }
         writer.commit().expect("commit");
 
         // Create durable wrapper and protect.
-        let durable =
-            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
-                .expect("durable index");
+        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
+            .expect("durable index");
 
         let protection = durable.protect_segments().expect("protect");
         assert!(protection.segments_protected > 0);
@@ -686,6 +655,47 @@ mod tests {
         assert!(
             health.files_repaired > 0 || health.files_unrecoverable > 0,
             "corruption should be detected"
+        );
+    }
+
+    #[test]
+    fn durable_index_sidecar_decode_failures_are_reported_as_unrecoverable() {
+        let dir = temp_dir("durable-sidecar-corrupt");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema.clone()).expect("create index");
+
+        let id_field = schema.get_field("id").expect("id field");
+        let content_field = schema.get_field("content").expect("content field");
+
+        let mut writer = index.writer(15_000_000).expect("writer");
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(id_field, "doc-1");
+        doc.add_text(content_field, "content for sidecar corruption test");
+        writer.add_document(doc).expect("add doc");
+        writer.commit().expect("commit");
+
+        let durable =
+            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
+        durable.protect_segments().expect("protect");
+
+        let segment_metas = durable.index().searchable_segment_metas().expect("metas");
+        let target = segment_metas[0]
+            .list_files()
+            .into_iter()
+            .find(|relative| {
+                let abs = dir.join(relative);
+                abs.exists() && FileProtector::sidecar_path(&abs).exists()
+            })
+            .expect("find protected file");
+        let abs_target = dir.join(target);
+        let sidecar = FileProtector::sidecar_path(&abs_target);
+        std::fs::write(&sidecar, b"invalid sidecar payload").expect("corrupt sidecar");
+
+        let health = durable.verify_and_repair().expect("verify");
+        assert!(
+            health.files_unrecoverable > 0,
+            "verify errors should increment files_unrecoverable"
         );
     }
 

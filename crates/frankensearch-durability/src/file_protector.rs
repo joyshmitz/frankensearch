@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -275,11 +276,16 @@ impl FileProtector {
         config: DurabilityConfig,
         metrics: Arc<DurabilityMetrics>,
     ) -> SearchResult<Self> {
+        let verify_on_open = config.verify_on_open;
         let codec = CodecFacade::new(codec, config, Arc::clone(&metrics))?;
+        let pipeline_config = RepairPipelineConfig {
+            verify_on_open,
+            ..RepairPipelineConfig::default()
+        };
         Ok(Self {
             codec,
             metrics,
-            pipeline_config: RepairPipelineConfig::default(),
+            pipeline_config,
         })
     }
 
@@ -288,8 +294,9 @@ impl FileProtector {
         codec: Arc<dyn SymbolCodec>,
         config: DurabilityConfig,
         metrics: Arc<DurabilityMetrics>,
-        pipeline_config: RepairPipelineConfig,
+        mut pipeline_config: RepairPipelineConfig,
     ) -> SearchResult<Self> {
+        pipeline_config.verify_on_open = config.verify_on_open;
         let codec = CodecFacade::new(codec, config, Arc::clone(&metrics))?;
         Ok(Self {
             codec,
@@ -308,7 +315,53 @@ impl FileProtector {
     }
 
     pub fn sidecar_path(path: &Path) -> PathBuf {
-        PathBuf::from(format!("{}.fec", path.display()))
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(".fec");
+        PathBuf::from(sidecar)
+    }
+
+    fn backup_path(path: &Path, timestamp: u64) -> PathBuf {
+        let mut backup: OsString = path.as_os_str().to_os_string();
+        backup.push(".corrupt.");
+        backup.push(timestamp.to_string());
+        PathBuf::from(backup)
+    }
+
+    fn restore_backup(backup_path: &Path, destination: &Path) -> SearchResult<()> {
+        if destination.exists()
+            && let Err(error) = fs::remove_file(destination)
+        {
+            warn!(
+                destination = %destination.display(),
+                error = %error,
+                "failed to remove repaired destination before backup restore"
+            );
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(backup_path, destination) {
+            warn!(
+                backup = %backup_path.display(),
+                destination = %destination.display(),
+                error = %error,
+                "failed to restore backup"
+            );
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn has_fec_extension(path: &Path) -> bool {
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("fec"))
+    }
+
+    fn should_skip_directory_entry(path: &Path) -> bool {
+        if Self::has_fec_extension(path) {
+            return true;
+        }
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.') || name.contains(".corrupt."))
     }
 
     pub fn protect_file(&self, path: &Path) -> SearchResult<FileProtectionResult> {
@@ -394,6 +447,28 @@ impl FileProtector {
 
         let trailer_bytes = fs::read(sidecar_path)?;
         let (header, trailer_symbols) = deserialize_repair_trailer(&trailer_bytes)?;
+
+        if header.source_len == 0 {
+            let empty_crc32 = crc32fast::hash(&[]);
+            if header.source_crc32 != empty_crc32 {
+                self.metrics.record_repair_failure();
+                return Err(SearchError::IndexCorrupted {
+                    path: sidecar_path.to_path_buf(),
+                    detail: "sidecar metadata is inconsistent for empty source payload".to_owned(),
+                });
+            }
+
+            fs::write(path, [])?;
+            self.metrics.record_repair_success();
+            info!(
+                path = %path.display(),
+                "durability repair completed (empty payload sidecar)"
+            );
+            return Ok(FileRepairOutcome::Repaired {
+                bytes_written: 0,
+                symbols_used: 0,
+            });
+        }
 
         let repair_symbols: Vec<(u32, Vec<u8>)> = trailer_symbols
             .into_iter()
@@ -587,7 +662,7 @@ impl FileProtector {
 
         // Backup-before-repair: rename corrupted file to .corrupt.{timestamp}
         let timestamp = unix_timestamp_secs();
-        let backup_path = PathBuf::from(format!("{}.corrupt.{timestamp}", path.display()));
+        let backup_path = Self::backup_path(path, timestamp);
         let had_source = path.exists();
         if had_source {
             fs::rename(path, &backup_path).map_err(|e| {
@@ -605,15 +680,40 @@ impl FileProtector {
         let outcome = self.repair_file(path, &sidecar);
         let repair_time = repair_start.elapsed();
 
+        self.finalize_repair(
+            path,
+            &backup_path,
+            &sidecar,
+            had_source,
+            outcome,
+            repair_time,
+        )
+    }
+
+    /// Process the repair outcome, verify the result, restore backups on
+    /// failure, and log the event.
+    fn finalize_repair(
+        &self,
+        path: &Path,
+        backup_path: &Path,
+        sidecar: &Path,
+        had_source: bool,
+        outcome: SearchResult<FileRepairOutcome>,
+        repair_time: Duration,
+    ) -> SearchResult<HealthCheckResult> {
         match outcome {
             Ok(FileRepairOutcome::Repaired { bytes_written, .. }) => {
                 // Verify the repaired file passes integrity check.
-                let post_verify = self.verify_file(path, &sidecar);
+                let post_verify = self.verify_file(path, sidecar);
                 match post_verify {
                     Ok(v) if v.healthy => {
                         // Success — clean up backup.
-                        if had_source {
-                            let _ = fs::remove_file(&backup_path);
+                        if had_source && let Err(error) = fs::remove_file(backup_path) {
+                            warn!(
+                                backup = %backup_path.display(),
+                                error = %error,
+                                "failed to remove backup after successful repair"
+                            );
                         }
                         self.log_repair_event(
                             path,
@@ -638,8 +738,7 @@ impl FileProtector {
                             "repaired file failed post-repair verification, restoring backup"
                         );
                         if had_source {
-                            let _ = fs::remove_file(path);
-                            let _ = fs::rename(&backup_path, path);
+                            Self::restore_backup(backup_path, path)?;
                         }
                         self.log_repair_event(path, false, 0, 0, 0, repair_time);
                         Ok(HealthCheckResult {
@@ -654,7 +753,7 @@ impl FileProtector {
             Ok(FileRepairOutcome::NotNeeded) => {
                 // Race condition: file was fine when repair ran.
                 if had_source {
-                    let _ = fs::rename(&backup_path, path);
+                    Self::restore_backup(backup_path, path)?;
                 }
                 Ok(HealthCheckResult {
                     path: path.to_path_buf(),
@@ -664,7 +763,7 @@ impl FileProtector {
             Ok(FileRepairOutcome::Unrecoverable { reason, .. }) => {
                 // Restore backup — repair failed.
                 if had_source {
-                    let _ = fs::rename(&backup_path, path);
+                    Self::restore_backup(backup_path, path)?;
                 }
                 self.log_repair_event(path, false, 0, 0, 0, repair_time);
                 Ok(HealthCheckResult {
@@ -677,7 +776,7 @@ impl FileProtector {
             Err(e) => {
                 // Restore backup on error.
                 if had_source {
-                    let _ = fs::rename(&backup_path, path);
+                    Self::restore_backup(backup_path, path)?;
                 }
                 Err(e)
             }
@@ -697,16 +796,22 @@ impl FileProtector {
 
         let entries = fs::read_dir(dir)?;
         for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %error,
+                        "failed to read directory entry type during protection pass"
+                    );
+                    continue;
+                }
+            };
+            if !file_type.is_file() {
                 continue;
             }
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_owned(),
-                None => continue,
-            };
-            // Skip sidecar files and hidden files.
-            if name.ends_with(".fec") || name.starts_with('.') || name.contains(".corrupt.") {
+            let path = entry.path();
+            if Self::should_skip_directory_entry(&path) {
                 continue;
             }
 
@@ -719,9 +824,7 @@ impl FileProtector {
             match self.protect_file(&path) {
                 Ok(result) => {
                     total_source_bytes += result.source_len;
-                    let repair_size = fs::metadata(&result.sidecar_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let repair_size = fs::metadata(&result.sidecar_path).map_or(0, |m| m.len());
                     total_repair_bytes += repair_size;
                     files_protected += 1;
                 }
@@ -766,16 +869,22 @@ impl FileProtector {
 
         let entries = fs::read_dir(dir)?;
         for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %error,
+                        "failed to read directory entry type during verification pass"
+                    );
+                    continue;
+                }
+            };
+            if !file_type.is_file() {
                 continue;
             }
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_owned(),
-                None => continue,
-            };
-            // Skip sidecar files, hidden files, and backup files.
-            if name.ends_with(".fec") || name.starts_with('.') || name.contains(".corrupt.") {
+            let path = entry.path();
+            if Self::should_skip_directory_entry(&path) {
                 continue;
             }
 
@@ -829,10 +938,17 @@ impl FileProtector {
         actual_crc32: u32,
         repair_time: Duration,
     ) {
-        let log_dir = match &self.pipeline_config.repair_log_dir {
-            Some(dir) => dir,
-            None => return,
+        let Some(log_dir) = &self.pipeline_config.repair_log_dir else {
+            return;
         };
+        if let Err(e) = fs::create_dir_all(log_dir) {
+            warn!(
+                log_dir = %log_dir.display(),
+                error = %e,
+                "failed to create repair log directory"
+            );
+            return;
+        }
 
         let event = RepairEvent {
             timestamp: iso8601_now(),
@@ -842,15 +958,17 @@ impl FileProtector {
             bytes_written,
             source_crc32_expected: expected_crc32,
             source_crc32_after: actual_crc32,
-            repair_time_ms: repair_time.as_millis() as u64,
+            repair_time_ms: u64::try_from(repair_time.as_millis()).unwrap_or(u64::MAX),
         };
 
         let log_path = log_dir.join("repair-events.jsonl");
 
         if let Ok(json) = serde_json::to_string(&event) {
             // Rotate if needed.
-            if let Ok(true) = should_rotate(&log_path, self.pipeline_config.max_repair_log_entries)
-            {
+            if matches!(
+                should_rotate(&log_path, self.pipeline_config.max_repair_log_entries),
+                Ok(true)
+            ) {
                 let rotated = log_dir.join("repair-events.1.jsonl");
                 let _ = fs::rename(&log_path, &rotated);
             }
@@ -887,11 +1005,11 @@ impl DurabilityProvider for FileProtector {
     }
 
     fn protect_directory(&self, dir: &Path) -> SearchResult<DirectoryProtectionReport> {
-        FileProtector::protect_directory(self, dir)
+        Self::protect_directory(self, dir)
     }
 
     fn verify_directory(&self, dir: &Path) -> SearchResult<DirectoryHealthReport> {
-        FileProtector::verify_directory(self, dir)
+        Self::verify_directory(self, dir)
     }
 
     fn metrics_snapshot(&self) -> DurabilityMetricsSnapshot {
@@ -920,6 +1038,14 @@ fn source_symbols_from_bytes(
     symbol_size: u32,
     k_source: u32,
 ) -> SearchResult<Vec<(u32, Vec<u8>)>> {
+    if symbol_size == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "symbol_size".to_owned(),
+            value: "0".to_owned(),
+            reason: "must be greater than zero".to_owned(),
+        });
+    }
+
     let symbol_size_usize =
         usize::try_from(symbol_size).map_err(|_| SearchError::InvalidConfig {
             field: "symbol_size".to_owned(),
@@ -928,7 +1054,9 @@ fn source_symbols_from_bytes(
         })?;
 
     let mut out = Vec::new();
-    for esi in 0..k_source {
+    let max_symbols = bytes.len().div_ceil(symbol_size_usize);
+    let max_symbols_u32 = u32::try_from(max_symbols).unwrap_or(u32::MAX);
+    for esi in 0..k_source.min(max_symbols_u32) {
         let esi_usize = usize::try_from(esi).map_err(|_| SearchError::InvalidConfig {
             field: "esi".to_owned(),
             value: esi.to_string(),
@@ -969,9 +1097,32 @@ fn unix_timestamp_secs() -> u64 {
 }
 
 fn iso8601_now() -> String {
-    let secs = unix_timestamp_secs();
-    // Simple ISO 8601 format without external chrono dependency.
-    format!("{secs}")
+    format_iso8601_from_unix(unix_timestamp_secs())
+}
+
+fn format_iso8601_from_unix(secs: u64) -> String {
+    let days = secs / 86_400;
+    let remaining = secs % 86_400;
+    let hours = remaining / 3_600;
+    let minutes = (remaining % 3_600) / 60;
+    let seconds = remaining % 60;
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let era_days = days + 719_468;
+    let era = era_days / 146_097;
+    let day_of_era = era_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let mp = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let normalized_year = if month <= 2 { year + 1 } else { year };
+    (normalized_year, month, day)
 }
 
 fn should_rotate(log_path: &Path, max_entries: usize) -> std::io::Result<bool> {
@@ -1245,12 +1396,10 @@ mod tests {
         let backup_exists = std::fs::read_dir(dir).unwrap().flatten().any(|e| {
             e.file_name()
                 .to_str()
-                .map(|n| n.contains(".corrupt."))
-                .unwrap_or(false)
+                .is_some_and(|n| n.contains(".corrupt."))
                 && e.path()
                     .to_str()
-                    .map(|p| p.contains("health-corrupt"))
-                    .unwrap_or(false)
+                    .is_some_and(|p| p.contains("health-corrupt"))
         });
         assert!(
             !backup_exists,
@@ -1288,6 +1437,37 @@ mod tests {
             matches!(result.status, FileHealth::Unrecoverable { .. }),
             "expected Unrecoverable when auto_repair disabled, got {:?}",
             result.status
+        );
+    }
+
+    #[test]
+    fn verify_on_open_is_propagated_from_durability_config() {
+        let metrics = Arc::new(crate::metrics::DurabilityMetrics::default());
+        let config = DurabilityConfig {
+            verify_on_open: false,
+            ..test_config()
+        };
+        let protector = FileProtector::new_with_metrics(Arc::new(MockRepairCodec), config, metrics)
+            .expect("protector");
+        assert!(!protector.pipeline_config().verify_on_open);
+    }
+
+    #[test]
+    fn restore_backup_replaces_existing_destination_file() {
+        let path = temp_path("restore-backup-destination");
+        let backup_path = FileProtector::backup_path(&path, super::unix_timestamp_secs());
+        let original = vec![1_u8, 2, 3, 4];
+        let replacement = vec![9_u8, 9, 9, 9];
+
+        std::fs::write(&backup_path, &original).expect("write backup");
+        std::fs::write(&path, &replacement).expect("write destination");
+        FileProtector::restore_backup(&backup_path, &path).expect("restore backup");
+
+        let restored = std::fs::read(&path).expect("read restored");
+        assert_eq!(restored, original);
+        assert!(
+            !backup_path.exists(),
+            "backup should be moved back into place"
         );
     }
 
@@ -1383,6 +1563,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repair_event_logging_creates_missing_directory() {
+        let parent = temp_dir("repair-log-create");
+        let log_dir = parent.join("nested").join("logs");
+        assert!(
+            !log_dir.exists(),
+            "test precondition requires missing log directory"
+        );
+        let metrics = Arc::new(crate::metrics::DurabilityMetrics::default());
+        let pipeline_config = RepairPipelineConfig {
+            repair_log_dir: Some(log_dir.clone()),
+            ..RepairPipelineConfig::default()
+        };
+        let protector = FileProtector::new_with_pipeline_config(
+            Arc::new(MockRepairCodec),
+            test_config(),
+            metrics,
+            pipeline_config,
+        )
+        .expect("protector");
+
+        let path = temp_path("repair-log-create-file");
+        let payload = vec![42_u8; 500];
+        std::fs::write(&path, &payload).expect("write");
+        protector.protect_file(&path).expect("protect");
+        let mut corrupted = payload;
+        corrupted[0] ^= 0xFF;
+        std::fs::write(&path, &corrupted).expect("corrupt");
+        let result = protector.verify_and_repair_file(&path).expect("repair");
+        assert!(matches!(result.status, FileHealth::Repaired { .. }));
+
+        let log_path = log_dir.join("repair-events.jsonl");
+        assert!(log_path.exists(), "repair event log should be created");
+    }
+
+    #[test]
+    fn iso8601_now_uses_utc_timestamp_shape() {
+        let ts = super::iso8601_now();
+        assert_eq!(ts.len(), 20);
+        assert!(ts.ends_with('Z'));
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[7..8], "-");
+        assert_eq!(&ts[10..11], "T");
+        assert_eq!(&ts[13..14], ":");
+        assert_eq!(&ts[16..17], ":");
+    }
+
     // --- DurabilityProvider trait impl tests ---
 
     #[test]
@@ -1435,7 +1662,7 @@ mod tests {
         let result = protector.protect_file(&path).expect("protect");
 
         // Flip a single bit.
-        let mut corrupted = payload.clone();
+        let mut corrupted = payload;
         corrupted[100] ^= 0x01;
         std::fs::write(&path, &corrupted).expect("corrupt");
 
@@ -1471,18 +1698,19 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn detect_zeroed_block() {
         let protector =
             FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
 
         let path = temp_path("zeroed-block");
         // Use data with non-zero content so zeroing is detectable.
-        let payload: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let payload: Vec<u8> = (0u32..1024).map(|i| (i % 256) as u8).collect();
         std::fs::write(&path, &payload).expect("write");
         let result = protector.protect_file(&path).expect("protect");
 
         // Zero out a 256-byte block (one symbol).
-        let mut corrupted = payload.clone();
+        let mut corrupted = payload;
         corrupted[256..512].fill(0);
         std::fs::write(&path, &corrupted).expect("corrupt");
 
@@ -1493,12 +1721,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn repair_zeroed_block() {
         let protector =
             FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
 
         let path = temp_path("repair-zeroed");
-        let payload: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
+        let payload: Vec<u8> = (0u32..1024).map(|i| (i % 256) as u8).collect();
         std::fs::write(&path, &payload).expect("write");
         protector.protect_file(&path).expect("protect");
 
@@ -1540,12 +1769,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn repair_multiple_non_adjacent_corruptions() {
         let protector =
             FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
 
         let path = temp_path("multi-corrupt");
-        let payload: Vec<u8> = (0..2048).map(|i| ((i * 7) % 256) as u8).collect();
+        let payload: Vec<u8> = (0u32..2048).map(|i| ((i * 7) % 256) as u8).collect();
         std::fs::write(&path, &payload).expect("write");
         protector.protect_file(&path).expect("protect");
 
@@ -1611,13 +1841,48 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_scans_skip_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("skip-symlink");
+        let external_target = temp_path("symlink-target");
+        std::fs::write(&external_target, vec![9_u8; 256]).expect("write symlink target");
+        let link_path = dir.join("external-link.dat");
+        symlink(&external_target, &link_path).expect("create symlink");
+
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let protect_report = protector
+            .protect_directory(&dir)
+            .expect("protect directory");
+        assert_eq!(
+            protect_report.files_protected, 0,
+            "symlinks must be skipped during protection scans"
+        );
+        assert!(
+            !FileProtector::sidecar_path(&link_path).exists(),
+            "sidecar should not be created for symlink entries"
+        );
+
+        let verify_report = protector.verify_directory(&dir).expect("verify directory");
+        assert!(
+            verify_report.results.is_empty(),
+            "symlinks must be skipped during verification scans"
+        );
+
+        let _ = std::fs::remove_file(link_path);
+        let _ = std::fs::remove_file(external_target);
+    }
+
     #[test]
     fn empty_file_protect_and_verify() {
         let protector =
             FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
 
         let path = temp_path("empty-file");
-        std::fs::write(&path, &[]).expect("write empty");
+        std::fs::write(&path, []).expect("write empty");
 
         // Empty file should still be protectable (0 source symbols).
         let result = protector.protect_file(&path).expect("protect");
@@ -1627,5 +1892,598 @@ mod tests {
             .verify_file(&path, &result.sidecar_path)
             .expect("verify");
         assert!(verify.healthy);
+    }
+
+    #[test]
+    fn empty_file_restore_from_sidecar() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+
+        let path = temp_path("empty-file-restore");
+        std::fs::write(&path, []).expect("write empty");
+        protector.protect_file(&path).expect("protect");
+
+        std::fs::remove_file(&path).expect("delete");
+        let result = protector.verify_and_repair_file(&path).expect("repair");
+        assert!(
+            matches!(result.status, FileHealth::Repaired { .. }),
+            "empty file should be repairable from sidecar, got {:?}",
+            result.status
+        );
+
+        let restored = std::fs::read(&path).expect("read");
+        assert!(restored.is_empty());
+    }
+}
+
+// ─── E2E corruption-and-recovery integration tests (bd-3w1.18) ──────────────
+//
+// These tests verify end-to-end corruption detection, repair, and recovery
+// scenarios that exercise the full durability pipeline across components.
+#[cfg(test)]
+mod e2e_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
+
+    use super::{FileHealth, FileProtector, RepairPipelineConfig};
+    use frankensearch_core::SearchError;
+    use crate::config::DurabilityConfig;
+    use crate::fsvi_protector::{FsviProtector, FsviVerifyResult};
+    use crate::metrics::DurabilityMetrics;
+
+    /// Mock codec that creates 1:1 repair symbols (each source symbol has a
+    /// matching repair symbol at ESI + `1_000_000`). This allows repair of any
+    /// individual corrupted symbol.
+    #[derive(Debug)]
+    struct MockRepairCodec;
+
+    impl SymbolCodec for MockRepairCodec {
+        fn encode(
+            &self,
+            source_data: &[u8],
+            symbol_size: u32,
+            _repair_overhead: f64,
+        ) -> fsqlite_error::Result<CodecEncodeResult> {
+            let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
+            let mut source_symbols = Vec::new();
+            let mut repair_symbols = Vec::new();
+
+            let mut esi: u32 = 0;
+            for chunk in source_data.chunks(symbol_size_usize) {
+                let mut data = chunk.to_vec();
+                if data.len() < symbol_size_usize {
+                    data.resize(symbol_size_usize, 0);
+                }
+                source_symbols.push((esi, data.clone()));
+                repair_symbols.push((esi + 1_000_000, data));
+                esi = esi.saturating_add(1);
+            }
+
+            Ok(CodecEncodeResult {
+                source_symbols,
+                repair_symbols,
+                k_source: esi,
+            })
+        }
+
+        fn decode(
+            &self,
+            symbols: &[(u32, Vec<u8>)],
+            k_source: u32,
+            _symbol_size: u32,
+        ) -> fsqlite_error::Result<CodecDecodeResult> {
+            let mut reconstructed = Vec::new();
+            for source_esi in 0..k_source {
+                let primary = symbols
+                    .iter()
+                    .find(|(esi, _)| *esi == source_esi)
+                    .map(|(_, data)| data.clone());
+                let fallback = symbols
+                    .iter()
+                    .find(|(esi, _)| *esi == source_esi + 1_000_000)
+                    .map(|(_, data)| data.clone());
+
+                match primary.or(fallback) {
+                    Some(data) => reconstructed.extend_from_slice(&data),
+                    None => {
+                        return Ok(CodecDecodeResult::Failure {
+                            reason: fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                            symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                            k_required: k_source,
+                        });
+                    }
+                }
+            }
+
+            Ok(CodecDecodeResult::Success {
+                data: reconstructed,
+                symbols_used: k_source,
+                peeled_count: k_source,
+                inactivated_count: 0,
+            })
+        }
+    }
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "frankensearch-e2e-{prefix}-{}-{nanos}.bin",
+            std::process::id()
+        ))
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "frankensearch-e2e-dir-{prefix}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn test_config() -> DurabilityConfig {
+        DurabilityConfig {
+            symbol_size: 256,
+            repair_overhead: 2.0,
+            ..DurabilityConfig::default()
+        }
+    }
+
+    fn make_protector() -> FileProtector {
+        FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector")
+    }
+
+    fn make_fsvi_protector() -> FsviProtector {
+        FsviProtector::new(Arc::new(MockRepairCodec), test_config()).expect("fsvi protector")
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn synthetic_data(size: usize) -> Vec<u8> {
+        (0..size).map(|i| ((i * 7 + 13) % 256) as u8).collect()
+    }
+
+    // ── Scenario 1: Power loss during index write (truncated file) ──
+
+    #[test]
+    fn power_loss_truncated_file_repaired_from_sidecar() {
+        let protector = make_protector();
+        let path = temp_path("power-loss");
+        let payload = synthetic_data(2048);
+
+        // Write and protect original file.
+        std::fs::write(&path, &payload).expect("write");
+        let protected = protector.protect_file(&path).expect("protect");
+
+        // Simulate power loss: truncate file at random offset mid-write.
+        let truncated = &payload[..payload.len() / 3];
+        std::fs::write(&path, truncated).expect("truncate");
+
+        // Verify detects corruption (length mismatch + CRC mismatch).
+        let verify = protector
+            .verify_file(&path, &protected.sidecar_path)
+            .expect("verify");
+        assert!(!verify.healthy);
+        assert_ne!(verify.expected_len, verify.actual_len);
+
+        // Repair restores the original.
+        let result = protector.verify_and_repair_file(&path).expect("repair");
+        assert!(
+            matches!(result.status, FileHealth::Repaired { .. }),
+            "truncated file should be repaired, got {:?}",
+            result.status
+        );
+        let restored = std::fs::read(&path).expect("read");
+        assert_eq!(restored, payload);
+    }
+
+    // ── Scenario 2: Gradual bit rot (cumulative bit flips) ──────────
+
+    #[test]
+    fn gradual_bit_rot_survives_repeated_single_bit_flips() {
+        let protector = make_protector();
+        let path = temp_path("bit-rot");
+        let payload = synthetic_data(4096);
+
+        std::fs::write(&path, &payload).expect("write");
+        protector.protect_file(&path).expect("protect");
+
+        // Simulate 10 "days" of single-bit rot: each day, flip one bit,
+        // detect corruption, repair, and re-protect.
+        let mut surviving_days = 0;
+        for day in 0..10_usize {
+            let mut data = std::fs::read(&path).expect("read current");
+            let byte_idx = (day * 137 + 41) % data.len();
+            let bit_idx = (day * 3 + 1) % 8;
+            data[byte_idx] ^= 1 << bit_idx;
+            std::fs::write(&path, &data).expect("inject bit rot");
+
+            let result = protector.verify_and_repair_file(&path).expect("repair");
+            match result.status {
+                FileHealth::Repaired { .. } => {
+                    surviving_days += 1;
+                    // Re-protect with fresh sidecar after repair.
+                    protector.protect_file(&path).expect("re-protect");
+                }
+                FileHealth::Intact => {
+                    // If somehow the bit flip didn't change CRC (unlikely).
+                    surviving_days += 1;
+                }
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            surviving_days, 10,
+            "index should survive 10 days of gradual bit rot"
+        );
+
+        // Final data should match original.
+        let final_data = std::fs::read(&path).expect("read final");
+        assert_eq!(final_data, payload);
+    }
+
+    // ── Scenario 3: Storage medium failure (zeroed blocks) ──────────
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn zeroed_block_bad_sector_is_repaired() {
+        let protector = make_protector();
+        let path = temp_path("bad-sector");
+        let payload = synthetic_data(4096);
+
+        std::fs::write(&path, &payload).expect("write");
+        protector.protect_file(&path).expect("protect");
+
+        // Simulate a bad sector: zero out a 256-byte block.
+        let mut corrupted = payload.clone();
+        corrupted[512..768].fill(0);
+        std::fs::write(&path, &corrupted).expect("corrupt");
+
+        let result = protector.verify_and_repair_file(&path).expect("repair");
+        assert!(
+            matches!(result.status, FileHealth::Repaired { .. }),
+            "bad sector should be repaired, got {:?}",
+            result.status
+        );
+        let restored = std::fs::read(&path).expect("read");
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn multiple_zeroed_blocks_repaired() {
+        let protector = make_protector();
+        let path = temp_path("multi-bad-sector");
+        let payload = synthetic_data(4096);
+
+        std::fs::write(&path, &payload).expect("write");
+        protector.protect_file(&path).expect("protect");
+
+        // Zero out 3 non-adjacent 256-byte blocks (simulating 3 bad sectors).
+        let mut corrupted = payload.clone();
+        corrupted[0..256].fill(0);
+        corrupted[1024..1280].fill(0);
+        corrupted[2560..2816].fill(0);
+        std::fs::write(&path, &corrupted).expect("corrupt");
+
+        let result = protector.verify_and_repair_file(&path).expect("repair");
+        assert!(
+            matches!(result.status, FileHealth::Repaired { .. }),
+            "multiple bad sectors should be repaired, got {:?}",
+            result.status
+        );
+        let restored = std::fs::read(&path).expect("read");
+        assert_eq!(restored, payload);
+    }
+
+    // ── Scenario 4: Cascading corruption (index + sidecar) ──────────
+
+    #[test]
+    fn corrupted_sidecar_makes_repair_impossible() {
+        let protector = make_protector();
+        let path = temp_path("cascade");
+        let payload = synthetic_data(1024);
+
+        std::fs::write(&path, &payload).expect("write");
+        let protected = protector.protect_file(&path).expect("protect");
+
+        // Corrupt both the index and the sidecar.
+        let mut corrupted_data = payload;
+        corrupted_data[0] ^= 0xFF;
+        std::fs::write(&path, &corrupted_data).expect("corrupt index");
+
+        // Corrupt sidecar trailer (overwrite magic bytes).
+        let mut sidecar = std::fs::read(&protected.sidecar_path).expect("read sidecar");
+        if sidecar.len() >= 4 {
+            sidecar[0..4].fill(0x00);
+        }
+        std::fs::write(&protected.sidecar_path, &sidecar).expect("corrupt sidecar");
+
+        // Repair should fail gracefully (Unrecoverable, not panic).
+        let result = protector.verify_and_repair_file(&path);
+        if let Ok(check) = result {
+            assert!(
+                matches!(
+                    check.status,
+                    FileHealth::Unrecoverable { .. } | FileHealth::Unprotected
+                ),
+                "cascading corruption should be unrecoverable, got {:?}",
+                check.status
+            );
+        }
+        // An Err is also acceptable (corrupted sidecar can't be parsed).
+    }
+
+    // ── Scenario 5: Full index deletion and detection ───────────────
+
+    #[test]
+    fn deleted_index_detected_and_rebuilt_from_sidecar() {
+        let protector = make_protector();
+        let path = temp_path("full-delete");
+        let payload = synthetic_data(2048);
+
+        std::fs::write(&path, &payload).expect("write");
+        protector.protect_file(&path).expect("protect");
+
+        // Delete the index file entirely (simulating catastrophic loss).
+        std::fs::remove_file(&path).expect("delete");
+        assert!(!path.exists());
+
+        // Repair restores from sidecar.
+        let result = protector.verify_and_repair_file(&path).expect("repair");
+        assert!(
+            matches!(result.status, FileHealth::Repaired { .. }),
+            "deleted file should be rebuilt from sidecar, got {:?}",
+            result.status
+        );
+        let restored = std::fs::read(&path).expect("read");
+        assert_eq!(restored, payload);
+    }
+
+    // ── Scenario 6: FEC sidecar corruption detection ────────────────
+
+    #[test]
+    fn corrupted_fec_sidecar_detected_by_verification() {
+        let protector = make_protector();
+        let path = temp_path("fec-corrupt-detect");
+        let payload = synthetic_data(1024);
+
+        std::fs::write(&path, &payload).expect("write");
+        let protected = protector.protect_file(&path).expect("protect");
+
+        // Corrupt the FEC sidecar (flip bytes in trailer).
+        let mut sidecar = std::fs::read(&protected.sidecar_path).expect("read sidecar");
+        if sidecar.len() >= 10 {
+            // Corrupt data in the middle of the sidecar.
+            let mid = sidecar.len() / 2;
+            sidecar[mid] ^= 0xFF;
+            sidecar[mid + 1] ^= 0xFF;
+        }
+        std::fs::write(&protected.sidecar_path, &sidecar).expect("corrupt sidecar");
+
+        // Corrupted sidecar means the repair trailer CRC won't match,
+        // so verify_file returns an IndexCorrupted error during deserialization.
+        let verify_err = protector
+            .verify_file(&path, &protected.sidecar_path)
+            .expect_err("corrupted sidecar should fail verification");
+        assert!(
+            matches!(verify_err, SearchError::IndexCorrupted { .. }),
+            "expected IndexCorrupted, got: {verify_err:?}"
+        );
+
+        // Regenerate sidecar from intact source → verification succeeds again.
+        let re_protected = protector.protect_file(&path).expect("re-protect");
+        let new_verify = protector
+            .verify_file(&path, &re_protected.sidecar_path)
+            .expect("verify new");
+        assert!(new_verify.healthy, "regenerated sidecar should verify");
+    }
+
+    // ── Scenario 7: FSVI-specific protect-corrupt-repair cycle ──────
+
+    #[test]
+    fn fsvi_protect_corrupt_repair_preserves_data() {
+        let protector = make_fsvi_protector();
+        let path = temp_path("fsvi-e2e");
+        // Fake FSVI file content.
+        let payload = synthetic_data(3000);
+
+        std::fs::write(&path, &payload).expect("write");
+        let protected = protector.protect_atomic(&path).expect("protect");
+        assert!(protected.sidecar_path.exists());
+
+        // Verify original is intact.
+        let verify = protector.verify(&path).expect("verify");
+        assert!(
+            matches!(verify, FsviVerifyResult::Intact),
+            "expected Intact, got {:?}",
+            verify
+        );
+
+        // Corrupt the FSVI file (byte flips in data region).
+        let mut corrupted = payload.clone();
+        for i in (0..corrupted.len()).step_by(300) {
+            corrupted[i] ^= 0xFF;
+        }
+        std::fs::write(&path, &corrupted).expect("corrupt");
+
+        // Verify detects corruption.
+        let verify = protector.verify(&path).expect("verify corrupted");
+        assert!(
+            matches!(verify, FsviVerifyResult::Corrupted { repairable: true }),
+            "expected Corrupted+repairable, got {:?}",
+            verify
+        );
+
+        // Repair restores original data.
+        let repaired = protector.repair(&path).expect("repair");
+        assert!(repaired.bytes_written > 0);
+
+        let restored = std::fs::read(&path).expect("read");
+        assert_eq!(restored, payload);
+    }
+
+    // ── Scenario 8: Directory-level corruption and recovery ─────────
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn directory_level_mixed_corruption_recovery() {
+        let dir = temp_dir("dir-e2e");
+        let protector = make_protector();
+
+        // Create 5 data files with unique content.
+        let mut original_data = Vec::new();
+        for i in 0..5 {
+            let data = synthetic_data(512 + i * 100);
+            let name = format!("index-{i}.dat");
+            std::fs::write(dir.join(&name), &data).expect("write");
+            original_data.push((name, data));
+        }
+
+        // Protect all files.
+        let protect_report = protector.protect_directory(&dir).expect("protect");
+        assert_eq!(protect_report.files_protected, 5);
+
+        // Corrupt files 0 and 2 (byte flip), delete file 4.
+        let mut corrupted = original_data[0].1.clone();
+        corrupted[0] ^= 0xFF;
+        std::fs::write(dir.join(&original_data[0].0), &corrupted).expect("corrupt 0");
+
+        let mut corrupted2 = original_data[2].1.clone();
+        corrupted2[100] ^= 0xFF;
+        std::fs::write(dir.join(&original_data[2].0), &corrupted2).expect("corrupt 2");
+
+        std::fs::remove_file(dir.join(&original_data[4].0)).expect("delete 4");
+
+        // Verify directory: should detect 3 issues (2 corrupted + 1 missing).
+        let health = protector.verify_directory(&dir).expect("verify");
+        assert_eq!(health.intact_count, 2, "files 1 and 3 should be intact");
+        assert!(
+            health.repaired_count >= 2,
+            "at least files 0 and 2 should be repaired"
+        );
+
+        // Verify all files are restored.
+        for (name, data) in &original_data {
+            let path = dir.join(name);
+            if path.exists() {
+                let restored = std::fs::read(&path).expect("read restored");
+                assert_eq!(
+                    &restored, data,
+                    "{name} should be restored to original content"
+                );
+            }
+        }
+    }
+
+    // ── Scenario 9: Metrics accumulation across repair pipeline ─────
+
+    #[test]
+    fn metrics_track_all_repair_operations() {
+        let metrics = Arc::new(DurabilityMetrics::default());
+        let protector = FileProtector::new_with_metrics(
+            Arc::new(MockRepairCodec),
+            test_config(),
+            Arc::clone(&metrics),
+        )
+        .expect("protector");
+
+        // Protect 3 files.
+        let paths: Vec<_> = (0..3)
+            .map(|i| {
+                let path = temp_path(&format!("metrics-{i}"));
+                let data = synthetic_data(512 + i * 100);
+                std::fs::write(&path, &data).expect("write");
+                (path, data)
+            })
+            .collect();
+
+        for (path, _) in &paths {
+            protector.protect_file(path).expect("protect");
+        }
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.encode_ops, 3, "3 encode operations expected");
+        assert!(snap.encoded_bytes_total > 0);
+        assert!(snap.source_symbols_total > 0);
+        assert!(snap.repair_symbols_total > 0);
+
+        // Corrupt and repair 2 files.
+        for (path, _) in &paths[0..2] {
+            let mut data = std::fs::read(path).expect("read");
+            data[0] ^= 0xFF;
+            std::fs::write(path, &data).expect("corrupt");
+            protector.verify_and_repair_file(path).expect("repair");
+        }
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.repair_attempts, 2);
+        assert_eq!(snap.repair_successes, 2);
+        assert_eq!(snap.repair_failures, 0);
+        assert!(snap.decode_ops >= 2);
+    }
+
+    // ── Scenario 10: Repair logging with event trail ────────────────
+
+    #[test]
+    fn repair_events_logged_to_jsonl_across_multiple_repairs() {
+        let log_dir = temp_dir("e2e-repair-log");
+        let metrics = Arc::new(DurabilityMetrics::default());
+        let pipeline_config = RepairPipelineConfig {
+            repair_log_dir: Some(log_dir.clone()),
+            ..RepairPipelineConfig::default()
+        };
+        let protector = FileProtector::new_with_pipeline_config(
+            Arc::new(MockRepairCodec),
+            test_config(),
+            metrics,
+            pipeline_config,
+        )
+        .expect("protector");
+
+        // Create, protect, corrupt, and repair 3 different files.
+        for i in 0..3 {
+            let path = temp_path(&format!("repair-log-{i}"));
+            let payload = synthetic_data(512);
+            std::fs::write(&path, &payload).expect("write");
+            protector.protect_file(&path).expect("protect");
+
+            let mut corrupted = payload;
+            corrupted[i * 50] ^= 0xFF;
+            std::fs::write(&path, &corrupted).expect("corrupt");
+            let result = protector.verify_and_repair_file(&path).expect("repair");
+            assert!(
+                matches!(result.status, FileHealth::Repaired { .. }),
+                "file {i} should be repaired"
+            );
+        }
+
+        // Verify log file contains all 3 repair events.
+        let log_path = log_dir.join("repair-events.jsonl");
+        assert!(log_path.exists(), "repair event log should exist");
+        let contents = std::fs::read_to_string(&log_path).expect("read log");
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected 3 repair event lines, got {}",
+            lines.len()
+        );
+        for line in &lines {
+            assert!(
+                line.contains("repair_succeeded"),
+                "each line should contain repair_succeeded"
+            );
+        }
     }
 }

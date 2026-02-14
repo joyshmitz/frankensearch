@@ -110,6 +110,11 @@ pub fn deserialize_repair_trailer(
         source_crc32: read_u32_le(payload, 22)?,
         repair_symbol_count: read_u32_le(payload, 26)?,
     };
+    if header.symbol_size == 0 {
+        return Err(trailer_corruption(
+            "repair trailer symbol_size must be greater than zero",
+        ));
+    }
 
     let mut cursor = FIXED_HEADER_BYTES;
     let mut symbols = Vec::new();
@@ -345,6 +350,27 @@ mod tests {
         assert!(
             err.to_string().contains("repair_symbol_count"),
             "error: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_symbol_size_is_rejected() {
+        let header = RepairTrailerHeader {
+            symbol_size: 0,
+            k_source: 1,
+            source_len: 16,
+            source_crc32: 7,
+            repair_symbol_count: 1,
+        };
+        let symbols = vec![RepairSymbol {
+            esi: 1,
+            data: vec![9, 9, 9],
+        }];
+        let encoded = serialize_repair_trailer(&header, &symbols).expect("serialize");
+        let err = deserialize_repair_trailer(&encoded).expect_err("must fail");
+        assert!(
+            err.to_string().contains("symbol_size"),
+            "error should mention symbol_size: {err}"
         );
     }
 

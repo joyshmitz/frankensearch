@@ -6,6 +6,7 @@
 //! - File naming convention: `index.fsvi` → `index.fsvi.fec`
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -123,7 +124,7 @@ impl FsviProtector {
             temp_file.sync_all().map_err(SearchError::Io)?;
 
             // Atomic rename
-            fs::rename(&temp_path, &sidecar_path).map_err(SearchError::Io)?;
+            atomic_replace_file(&temp_path, &sidecar_path)?;
 
             // fsync the parent directory
             if let Some(parent) = sidecar_path.parent() {
@@ -334,6 +335,30 @@ impl FsviProtector {
     /// Get the current durability metrics.
     pub fn metrics_snapshot(&self) -> crate::metrics::DurabilityMetricsSnapshot {
         self.metrics.snapshot()
+    }
+}
+
+fn atomic_replace_file(temp_path: &Path, target_path: &Path) -> SearchResult<()> {
+    match fs::rename(temp_path, target_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let backup_path = PathBuf::from(format!("{}.bak", target_path.display()));
+            let _ = fs::remove_file(&backup_path);
+            fs::rename(target_path, &backup_path).map_err(SearchError::Io)?;
+
+            match fs::rename(temp_path, target_path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&backup_path);
+                    Ok(())
+                }
+                Err(rename_error) => {
+                    let _ = fs::rename(&backup_path, target_path);
+                    let _ = fs::remove_file(temp_path);
+                    Err(SearchError::Io(rename_error))
+                }
+            }
+        }
+        Err(error) => Err(SearchError::Io(error)),
     }
 }
 
@@ -564,5 +589,31 @@ mod tests {
         let sidecar = FsviProtector::sidecar_path(&path);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn protect_atomic_can_replace_existing_sidecar_repeatedly() {
+        let protector = make_protector();
+        let path = temp_path("protect-replace-existing");
+        let sidecar = FsviProtector::sidecar_path(&path);
+
+        std::fs::write(&path, vec![7_u8; 512]).expect("write initial payload");
+        protector.protect_atomic(&path).expect("first protect");
+        assert!(sidecar.exists());
+
+        std::fs::write(&path, vec![9_u8; 640]).expect("write updated payload");
+        protector.protect_atomic(&path).expect("second protect");
+        assert!(sidecar.exists());
+        assert!(
+            !PathBuf::from(format!("{}.tmp", sidecar.display())).exists(),
+            "temp sidecar should be cleaned up"
+        );
+
+        let verify = protector.verify(&path).expect("verify after replace");
+        assert_eq!(verify, FsviVerifyResult::Intact);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
     }
 }
