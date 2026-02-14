@@ -1401,6 +1401,148 @@ mod tests {
         assert!(out.field.is_none());
     }
 
+    // ─── Helpful Error Messages (bd-2w7x.31) ──────────────────────────
+
+    #[test]
+    fn suggestion_for_model_not_found() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::ModelNotFound {
+            name: "potion-128m".into(),
+        };
+        let out = output_error_from(&err);
+        let suggestion = out.suggestion.unwrap();
+        assert!(
+            suggestion.contains("fsfs download-models"),
+            "suggestion should tell user to download: {suggestion}"
+        );
+        assert!(
+            suggestion.contains("potion-128m"),
+            "suggestion should mention the missing model: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn suggestion_for_embedder_unavailable() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::EmbedderUnavailable {
+            model: "MiniLM-L6-v2".into(),
+            reason: "feature not enabled".into(),
+        };
+        let out = output_error_from(&err);
+        let suggestion = out.suggestion.unwrap();
+        assert!(suggestion.contains("FRANKENSEARCH_MODEL_DIR"));
+        assert!(suggestion.contains("MiniLM-L6-v2"));
+    }
+
+    #[test]
+    fn suggestion_for_index_not_found() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::IndexNotFound {
+            path: PathBuf::from("/home/user/.frankensearch"),
+        };
+        let out = output_error_from(&err);
+        let suggestion = out.suggestion.unwrap();
+        assert!(
+            suggestion.contains("fsfs index"),
+            "should tell user to create index: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn suggestion_for_index_corrupted() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::IndexCorrupted {
+            path: PathBuf::from("/data/index.fsvi"),
+            detail: "CRC mismatch".into(),
+        };
+        let out = output_error_from(&err);
+        let suggestion = out.suggestion.unwrap();
+        assert!(suggestion.contains("--force"));
+    }
+
+    #[test]
+    fn context_for_model_errors() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::ModelNotFound {
+            name: "potion".into(),
+        };
+        let out = output_error_from(&err);
+        let context = out.context.unwrap();
+        assert!(
+            context.contains("200MB"),
+            "context should mention download size: {context}"
+        );
+    }
+
+    #[test]
+    fn context_for_index_not_found() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::IndexNotFound {
+            path: PathBuf::from("/tmp"),
+        };
+        let out = output_error_from(&err);
+        let context = out.context.unwrap();
+        assert!(context.contains("index"));
+    }
+
+    #[test]
+    fn output_error_suggestion_omitted_in_json_when_none() {
+        let err = OutputError::new("cancelled", "user cancelled", 130);
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(
+            !json.contains("suggestion"),
+            "suggestion should be omitted from JSON when None"
+        );
+        assert!(
+            !json.contains("context"),
+            "context should be omitted from JSON when None"
+        );
+    }
+
+    #[test]
+    fn output_error_suggestion_present_in_json_when_set() {
+        let err = OutputError::new("model_not_found", "not found", 78)
+            .with_suggestion("fsfs download-models")
+            .with_context("Models needed for semantic search");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("suggestion"));
+        assert!(json.contains("fsfs download-models"));
+        assert!(json.contains("context"));
+        assert!(json.contains("Models needed"));
+    }
+
+    #[test]
+    fn output_error_serde_roundtrip_with_hints() {
+        let err = OutputError::new("io_error", "disk full", 1)
+            .with_suggestion("free disk space")
+            .with_context("not enough room");
+        let json = serde_json::to_string(&err).unwrap();
+        let restored: OutputError = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.suggestion.as_deref(), Some("free disk space"));
+        assert_eq!(restored.context.as_deref(), Some("not enough room"));
+    }
+
+    #[test]
+    fn no_suggestion_for_cancelled() {
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::Cancelled {
+            phase: "search".into(),
+            reason: "user interrupt".into(),
+        };
+        let out = output_error_from(&err);
+        assert!(
+            out.suggestion.is_none(),
+            "cancelled errors should not have suggestions"
+        );
+    }
+
     // ─── Validation ────────────────────────────────────────────────────
 
     #[test]

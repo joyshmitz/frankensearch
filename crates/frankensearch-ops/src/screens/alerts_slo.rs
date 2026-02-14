@@ -427,14 +427,16 @@ impl AlertsSloScreen {
         if !throughput_eps.is_finite() || throughput_eps <= 0.0 {
             return u64::MAX;
         }
-        let eta = (backlog as f64 / throughput_eps).round();
+        let backlog_f64 = f64::from(u32::try_from(backlog).unwrap_or(u32::MAX));
+        let eta = (backlog_f64 / throughput_eps).round();
         if !eta.is_finite() || eta < 0.0 {
             return u64::MAX;
         }
-        if eta > u64::MAX as f64 {
+        let max_u64_f64 = f64::from(u32::MAX);
+        if eta > max_u64_f64 {
             return u64::MAX;
         }
-        eta as u64
+        format!("{eta:.0}").parse::<u64>().unwrap_or(u64::MAX)
     }
 
     fn project_slo_rows(&self) -> Vec<SloProjectRow> {
@@ -481,9 +483,9 @@ impl AlertsSloScreen {
                 let p95_latency_us = Self::average_u64(&p95_values);
 
                 let instance_count_f64 = f64::from(u32::try_from(instance_count).unwrap_or(1));
-                let total_instances_f64 = f64::from(u32::try_from(total_instances).unwrap_or(1));
+                let total_instance_weight = f64::from(u32::try_from(total_instances).unwrap_or(1));
                 let throughput_share =
-                    (throughput_eps * (instance_count_f64 / total_instances_f64)).max(0.1);
+                    (throughput_eps * (instance_count_f64 / total_instance_weight)).max(0.1);
                 let backlog_eta_s = Self::eta_seconds(pending_jobs, throughput_share);
 
                 let unhealthy_ratio = if instance_count == 0 {
@@ -495,10 +497,12 @@ impl AlertsSloScreen {
                 let latency_ratio = if p95_latency_us == 0 {
                     0.0
                 } else {
-                    p95_latency_us as f64 / TARGET_P95_US as f64
+                    f64::from(u32::try_from(p95_latency_us).unwrap_or(u32::MAX))
+                        / f64::from(u32::try_from(TARGET_P95_US).unwrap_or(1))
                 };
                 let latency_burn = (latency_ratio - 1.0).max(0.0);
-                let backlog_burn = (pending_jobs as f64 / 2_000.0).min(2.0);
+                let backlog_burn =
+                    (f64::from(u32::try_from(pending_jobs).unwrap_or(u32::MAX)) / 2_000.0).min(2.0);
                 let burn_ratio = latency_burn + (unhealthy_ratio * 1.5) + (backlog_burn * 0.5);
                 let remaining_ratio = (1.0 - burn_ratio).clamp(0.0, 1.0);
 
@@ -564,7 +568,7 @@ impl AlertsSloScreen {
             .saturating_add(total_instances_u64 / 2)
             .saturating_div(total_instances_u64);
 
-        let total_instances_f64 = f64::from(u32::try_from(total_instances).unwrap_or(1));
+        let total_instance_weight = f64::from(u32::try_from(total_instances).unwrap_or(1));
         let weighted_burn = project_rows
             .iter()
             .map(|row| {
@@ -572,7 +576,7 @@ impl AlertsSloScreen {
                 row.burn_ratio * weight
             })
             .sum::<f64>()
-            / total_instances_f64;
+            / total_instance_weight;
 
         let remaining_ratio = (1.0 - weighted_burn).clamp(0.0, 1.0);
         let backlog_eta_s = project_rows
@@ -640,7 +644,7 @@ impl AlertsSloScreen {
         )
     }
 
-    fn alerts_summary_line(&self, alerts: &[AlertRow]) -> String {
+    fn alerts_summary_line(alerts: &[AlertRow]) -> String {
         if alerts.is_empty() {
             return "alerts: no lifecycle alerts for current filter".to_owned();
         }
@@ -665,7 +669,7 @@ impl AlertsSloScreen {
         )
     }
 
-    fn slo_summary_line(&self, project_rows: &[SloProjectRow]) -> String {
+    fn slo_summary_line(project_rows: &[SloProjectRow]) -> String {
         let Some(fleet_row) = Self::fleet_rollup_row(project_rows) else {
             return "slo fleet: unavailable (no instances)".to_owned();
         };
@@ -751,7 +755,7 @@ impl AlertsSloScreen {
             .collect()
     }
 
-    fn build_slo_rows(&self, project_rows: &[SloProjectRow]) -> Vec<Row<'static>> {
+    fn build_slo_rows(project_rows: &[SloProjectRow]) -> Vec<Row<'static>> {
         let mut rows = project_rows.to_vec();
         if let Some(fleet) = Self::fleet_rollup_row(project_rows) {
             rows.insert(0, fleet);
@@ -818,9 +822,9 @@ impl Screen for AlertsSloScreen {
                     "Alerts/SLO: ",
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(self.alerts_summary_line(&alerts)),
+                Span::raw(Self::alerts_summary_line(&alerts)),
             ]),
-            Line::from(self.slo_summary_line(&project_rows)),
+            Line::from(Self::slo_summary_line(&project_rows)),
             Line::from(self.capacity_summary_line(&project_rows)),
             Line::from(self.filter_summary()),
             Line::from(self.selected_context_line(&alerts)),
@@ -866,7 +870,7 @@ impl Screen for AlertsSloScreen {
         frame.render_widget(alerts_table, chunks[1]);
 
         let slo_table = Table::new(
-            self.build_slo_rows(&project_rows),
+            Self::build_slo_rows(&project_rows),
             [
                 Constraint::Length(12),
                 Constraint::Length(6),
@@ -978,6 +982,7 @@ mod tests {
         SearchMetrics,
     };
 
+    #[allow(clippy::too_many_lines)]
     fn sample_state() -> AppState {
         let mut state = AppState::new();
         let mut fleet = FleetSnapshot {
@@ -1168,8 +1173,8 @@ mod tests {
         let alerts = screen.filtered_alerts();
         let project_rows = screen.project_slo_rows();
 
-        let alerts_summary = screen.alerts_summary_line(&alerts);
-        let slo_summary = screen.slo_summary_line(&project_rows);
+        let alerts_summary = AlertsSloScreen::alerts_summary_line(&alerts);
+        let slo_summary = AlertsSloScreen::slo_summary_line(&project_rows);
         let capacity_summary = screen.capacity_summary_line(&project_rows);
 
         assert!(alerts_summary.contains("critical="));

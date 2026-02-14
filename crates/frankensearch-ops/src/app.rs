@@ -176,6 +176,7 @@ impl OpsApp {
     }
 
     /// Dispatch a confirmed palette action by ID.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_palette_action(&mut self, action_id: &str) {
         match action_id {
             "nav.fleet" => {
@@ -536,8 +537,10 @@ impl OpsApp {
         if moved_alerts_to_project
             && matches!(
                 event,
-                frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Enter, _)
-                    | frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Char('g'), _)
+                frankensearch_tui::InputEvent::Key(
+                    crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
+                    _
+                )
             )
         {
             self.view.apply_preset(ViewPreset::ProjectDeepDive);
@@ -679,6 +682,7 @@ mod tests {
         ControlPlaneMetrics, FleetSnapshot, InstanceAttribution, InstanceLifecycle,
         ResourceMetrics, SearchMetrics,
     };
+    use crate::{DiscoveredInstance, DiscoverySignalKind, DiscoveryStatus};
 
     struct SequencedControlPlaneSource {
         metrics: Vec<ControlPlaneMetrics>,
@@ -947,7 +951,19 @@ mod tests {
 
     #[test]
     fn g_from_alerts_opens_project_detail_with_project_context() {
-        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        let discovered = vec![DiscoveredInstance {
+            instance_id: "host-a:cass-001".to_string(),
+            project_key_hint: Some("cass".to_string()),
+            host_name: Some("cass-host".to_string()),
+            pid: Some(4242),
+            version: Some("0.1.0".to_string()),
+            first_seen_ms: 1_000,
+            last_seen_ms: 2_000,
+            status: DiscoveryStatus::Active,
+            sources: vec![DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["instance:host-a:cass-001".to_string()],
+        }];
+        let mut app = OpsApp::new(Box::new(MockDataSource::from_discovery(&discovered)));
         app.refresh_data();
         app.dispatch_palette_action("nav.alerts");
         assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.alerts")));

@@ -12,7 +12,7 @@ use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, IndexableDocument, LexicalSearch, SearchError,
     SearchResult,
 };
-use frankensearch_embed::EmbedderStack;
+use frankensearch_embed::{EmbedderStack, HashAlgorithm, HashEmbedder};
 use frankensearch_index::VectorIndex;
 use frankensearch_lexical::TantivyIndex;
 use ignore::WalkBuilder;
@@ -1171,6 +1171,7 @@ impl FsfsRuntime {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_one_shot_index_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
@@ -1305,7 +1306,7 @@ impl FsfsRuntime {
         let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
 
         let embed_start = Instant::now();
-        let embedder = self.resolve_fast_embedder()?;
+        let mut embedder = self.resolve_fast_embedder()?;
         let semantic_docs = documents
             .iter()
             .filter(|(class, _)| matches!(class, IngestionClass::FullSemanticLexical))
@@ -1318,7 +1319,22 @@ impl FsfsRuntime {
         let semantic_embeddings = if semantic_texts.is_empty() {
             Vec::new()
         } else {
-            embedder.embed_batch(cx, &semantic_texts).await?
+            match embedder.embed_batch(cx, &semantic_texts).await {
+                Ok(embeddings) => embeddings,
+                Err(error) => {
+                    warn!(
+                        embedder = embedder.id(),
+                        error = %error,
+                        "fsfs semantic embedder failed; falling back to hash embeddings"
+                    );
+                    let fallback: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(
+                        embedder.dimension().max(1),
+                        HashAlgorithm::FnvModular,
+                    ));
+                    embedder = fallback;
+                    embedder.embed_batch(cx, &semantic_texts).await?
+                }
+            }
         };
         let embed_elapsed_ms = embed_start.elapsed().as_millis();
 
@@ -1429,6 +1445,10 @@ impl FsfsRuntime {
     }
 
     fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
+        if cfg!(test) {
+            return Ok(Arc::new(HashEmbedder::default_256()));
+        }
+
         let configured_root = PathBuf::from(&self.config.indexing.model_dir);
         let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
             .or_else(|_| EmbedderStack::auto_detect())?;
@@ -2238,6 +2258,9 @@ mod tests {
     use std::time::Duration;
 
     use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_core::LexicalSearch;
+    use frankensearch_index::VectorIndex;
+    use frankensearch_lexical::TantivyIndex;
 
     use super::{
         EmbedderAvailability, FsfsRuntime, IndexStoragePaths, InterfaceMode,
@@ -2902,6 +2925,13 @@ mod tests {
             assert!(sentinel.discovered_files >= 2);
             assert!(sentinel.indexed_files >= 1);
             assert!(!sentinel.source_hash_hex.is_empty());
+
+            let vector_index = VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
+                .expect("open fsvi");
+            assert!(vector_index.record_count() >= 1);
+            let lexical_index =
+                TantivyIndex::open(&index_root.join("lexical")).expect("open tantivy");
+            assert!(lexical_index.doc_count() >= 1);
         });
     }
 

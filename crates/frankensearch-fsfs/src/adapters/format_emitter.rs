@@ -511,6 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn emit_table_error_shows_suggestion() {
+        let err = OutputError::new("model_not_found", "model X not found", 78)
+            .with_suggestion("fsfs download-models --model X")
+            .with_context("Models are required for semantic search");
+        let env: OutputEnvelope<()> = OutputEnvelope::error(err, sample_meta("table"), sample_ts());
+        let output = emit_envelope_string(&env, OutputFormat::Table).unwrap();
+        assert!(
+            output.contains("Fix: fsfs download-models"),
+            "table output should include suggestion: {output}"
+        );
+        assert!(
+            output.contains("Models are required"),
+            "table output should include context: {output}"
+        );
+    }
+
+    #[test]
+    fn emit_table_error_without_suggestion_unchanged() {
+        let err = OutputError::new("cancelled", "cancelled", 130);
+        let env: OutputEnvelope<()> = OutputEnvelope::error(err, sample_meta("table"), sample_ts());
+        let output = emit_envelope_string(&env, OutputFormat::Table).unwrap();
+        assert!(output.contains("error: [cancelled] cancelled"));
+        assert!(
+            !output.contains("Fix:"),
+            "should not show Fix section when no suggestion"
+        );
+    }
+
+    #[test]
     fn emit_table_shows_duration() {
         let meta = OutputMeta::new("search", "table").with_duration_ms(42);
         let env = OutputEnvelope::success("ok", meta, sample_ts());
