@@ -19,6 +19,9 @@ It covers:
 Schema artifact: `schemas/telemetry-event-v1.schema.json`  
 Representative fixtures: `schemas/fixtures/telemetry-*.json`
 
+Cross-epic compatibility and rollout policy:
+`docs/cross-epic-telemetry-adapter-lockstep-contract.md`
+
 ## Canonical Envelope
 
 Every event uses the same envelope:

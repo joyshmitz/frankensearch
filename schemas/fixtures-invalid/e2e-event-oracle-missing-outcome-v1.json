@@ -1,0 +1,16 @@
+{
+  "v": 1,
+  "schema": "e2e-event-v1",
+  "run_id": "01HQXG5M7P3KZFV9N2RSTW6YAB",
+  "ts": "2026-02-14T12:00:01Z",
+  "body": {
+    "type": "oracle_check",
+    "correlation": {
+      "event_id": "01HQXG5M7QABCDEF12345678AB",
+      "root_request_id": "01HQXG5M7P3KZFV9N2RSTW6YAB"
+    },
+    "severity": "info",
+    "lane_id": "baseline",
+    "oracle_id": "ORACLE_NO_DUPLICATES"
+  }
+}

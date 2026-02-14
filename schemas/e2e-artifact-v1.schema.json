@@ -1,0 +1,598 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/e2e-artifact-v1.schema.json",
+  "title": "frankensearch Unified E2E Artifact Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "schema",
+    "run_id",
+    "ts",
+    "body"
+  ],
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 1
+    },
+    "schema": {
+      "type": "string",
+      "enum": [
+        "e2e-manifest-v1",
+        "e2e-event-v1",
+        "e2e-oracle-report-v1",
+        "e2e-replay-v1",
+        "e2e-snapshot-diff-v1"
+      ]
+    },
+    "run_id": {
+      "$ref": "#/$defs/ulid"
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "body": {
+      "oneOf": [
+        { "$ref": "#/$defs/manifestBody" },
+        { "$ref": "#/$defs/eventBody" },
+        { "$ref": "#/$defs/oracleReportBody" },
+        { "$ref": "#/$defs/replayBody" },
+        { "$ref": "#/$defs/snapshotDiffBody" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "schema": { "const": "e2e-manifest-v1" } }
+      },
+      "then": {
+        "properties": { "body": { "$ref": "#/$defs/manifestBody" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema": { "const": "e2e-event-v1" } }
+      },
+      "then": {
+        "properties": { "body": { "$ref": "#/$defs/eventBody" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema": { "const": "e2e-oracle-report-v1" } }
+      },
+      "then": {
+        "properties": { "body": { "$ref": "#/$defs/oracleReportBody" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema": { "const": "e2e-replay-v1" } }
+      },
+      "then": {
+        "properties": { "body": { "$ref": "#/$defs/replayBody" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "schema": { "const": "e2e-snapshot-diff-v1" } }
+      },
+      "then": {
+        "properties": { "body": { "$ref": "#/$defs/snapshotDiffBody" } }
+      }
+    }
+  ],
+  "$defs": {
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+\\.[a-z0-9_]+\\.[a-z0-9_]+$"
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "root_request_id"
+      ],
+      "properties": {
+        "event_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "root_request_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "parent_event_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+        }
+      }
+    },
+    "modelVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "revision"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifactEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file",
+        "checksum"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*\\.(json|jsonl|txt)$"
+        },
+        "checksum": {
+          "$ref": "#/$defs/sha256"
+        },
+        "line_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "manifestBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "suite",
+        "determinism_tier",
+        "seed",
+        "config_hash",
+        "model_versions",
+        "platform",
+        "clock_mode",
+        "tie_break_policy",
+        "artifacts",
+        "duration_ms",
+        "exit_status"
+      ],
+      "properties": {
+        "suite": {
+          "type": "string",
+          "enum": [
+            "core",
+            "fsfs",
+            "ops",
+            "interaction"
+          ]
+        },
+        "determinism_tier": {
+          "type": "string",
+          "enum": [
+            "bit_exact",
+            "semantic",
+            "statistical"
+          ]
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "config_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "index_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/modelVersion"
+          }
+        },
+        "platform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "os",
+            "arch",
+            "rustc"
+          ],
+          "properties": {
+            "os": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arch": {
+              "type": "string",
+              "minLength": 1
+            },
+            "rustc": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "clock_mode": {
+          "type": "string",
+          "enum": [
+            "simulated",
+            "frozen",
+            "realtime"
+          ]
+        },
+        "tie_break_policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/artifactEntry"
+          }
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exit_status": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "error"
+          ]
+        }
+      }
+    },
+    "eventBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "correlation",
+        "severity"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "e2e_start",
+            "e2e_end",
+            "lane_start",
+            "lane_end",
+            "oracle_check",
+            "phase_transition",
+            "assertion"
+          ]
+        },
+        "correlation": {
+          "$ref": "#/$defs/correlation"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "lane_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "oracle_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "skip"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "context": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "oracle_check" } }
+          },
+          "then": {
+            "required": [
+              "oracle_id",
+              "outcome"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "lane_start" } }
+          },
+          "then": {
+            "required": [
+              "lane_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "lane_end" } }
+          },
+          "then": {
+            "required": [
+              "lane_id"
+            ]
+          }
+        }
+      ]
+    },
+    "oracleVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "oracle_id",
+        "outcome"
+      ],
+      "properties": {
+        "oracle_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "skip"
+          ]
+        },
+        "context": {
+          "type": "string",
+          "maxLength": 1000
+        }
+      }
+    },
+    "laneReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lane_id",
+        "seed",
+        "query_count",
+        "verdicts",
+        "pass_count",
+        "fail_count",
+        "skip_count",
+        "all_passed"
+      ],
+      "properties": {
+        "lane_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "query_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verdicts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/oracleVerdict"
+          }
+        },
+        "pass_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fail_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skip_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "all_passed": {
+          "type": "boolean"
+        }
+      }
+    },
+    "oracleReportBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lanes",
+        "totals"
+      ],
+      "properties": {
+        "lanes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/laneReport"
+          }
+        },
+        "totals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "lanes_run",
+            "lanes_passed",
+            "oracles_pass",
+            "oracles_fail",
+            "oracles_skip",
+            "all_passed"
+          ],
+          "properties": {
+            "lanes_run": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lanes_passed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "oracles_pass": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "oracles_fail": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "oracles_skip": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "all_passed": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "replayBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "offset_ms",
+        "seq",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "query",
+            "config_change",
+            "clock_advance",
+            "signal"
+          ]
+        },
+        "offset_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payload": {
+          "type": "object"
+        }
+      }
+    },
+    "diffEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field_path",
+        "baseline",
+        "current",
+        "within_tolerance"
+      ],
+      "properties": {
+        "field_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "baseline": {
+          "type": "string"
+        },
+        "current": {
+          "type": "string"
+        },
+        "delta": {
+          "type": "string"
+        },
+        "within_tolerance": {
+          "type": "boolean"
+        },
+        "tolerance": {
+          "type": "string"
+        }
+      }
+    },
+    "snapshotDiffBody": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "comparison_mode",
+        "baseline_run_id",
+        "diffs",
+        "pass",
+        "mismatch_count"
+      ],
+      "properties": {
+        "comparison_mode": {
+          "type": "string",
+          "enum": [
+            "bit_exact",
+            "semantic",
+            "statistical"
+          ]
+        },
+        "baseline_run_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "diffs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diffEntry"
+          }
+        },
+        "pass": {
+          "type": "boolean"
+        },
+        "mismatch_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
