@@ -13,6 +13,7 @@ members = [
     "crates/frankensearch-tui",
     "crates/frankensearch-ops",
     "frankensearch",
+    "tools/optimize_params",
 ]
 
 [workspace.package]

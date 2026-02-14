@@ -177,12 +177,34 @@ pub use frankensearch_lexical as lexical;
 pub use frankensearch_rerank as rerank;
 
 #[cfg(feature = "storage")]
-/// FrankenSQLite storage backend.
+/// `FrankenSQLite` storage backend.
 pub use frankensearch_storage as storage;
 
 #[cfg(feature = "durability")]
-/// RaptorQ self-healing durability layer.
+/// `RaptorQ` self-healing durability layer.
 pub use frankensearch_durability as durability;
+
+// ─── Feature-gated facade exports (flat import surface) ────────────────────
+
+#[cfg(feature = "storage")]
+pub use frankensearch_storage::{
+    BatchResult, ContentHasher, DeduplicationDecision, DocumentRecord, IndexMetadata, IngestAction,
+    IngestResult, JobQueueConfig, JobQueueMetrics, PersistentJobQueue, StalenessCheck,
+    StalenessReason, Storage, StorageBackedJobRunner, StorageConfig,
+};
+
+#[cfg(feature = "fts5")]
+pub use frankensearch_storage::{
+    Fts5AdapterConfig as Fts5Config, Fts5ContentMode, Fts5LexicalSearch,
+    Fts5TokenizerChoice as Fts5Tokenizer,
+};
+
+#[cfg(feature = "durability")]
+pub use frankensearch_durability::{
+    DurabilityConfig, DurabilityMetrics, FileHealth, FileProtectionResult as ProtectionResult,
+    FileProtector, FileRepairOutcome as RepairResult, FsviProtector, RepairCodec,
+    RepairCodecConfig, VerifyResult as RepairCodecVerifyResult,
+};
 
 // ─── Async runtime re-exports ───────────────────────────────────────────────
 
@@ -246,7 +268,8 @@ pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex};
 // ─── Fusion and search orchestration (always available) ─────────────────────
 
 pub use frankensearch_fusion::{
-    RrfConfig, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
+    FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher, RrfConfig, TwoTierSearcher,
+    blend_two_tier, candidate_count, rrf_fuse,
 };
 
 // ─── Feature-gated embedder re-exports ──────────────────────────────────────
@@ -286,9 +309,16 @@ pub mod prelude {
     pub use asupersync::Cx;
 
     pub use crate::{
-        DocumentFingerprint, Embedder, LexicalSearch, Reranker, ScoreSource, ScoredResult,
-        SearchError, SearchPhase, SearchResult, TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
+        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalSearch, Reranker,
+        ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, TwoTierConfig,
+        TwoTierMetrics, TwoTierSearcher,
     };
+
+    #[cfg(feature = "storage")]
+    pub use crate::{IngestAction, IngestResult, Storage, StorageBackedJobRunner};
+
+    #[cfg(feature = "durability")]
+    pub use crate::{FileProtector, FsviProtector, RepairCodec};
 }
 
 #[cfg(test)]
@@ -387,6 +417,11 @@ mod tests {
     fn storage_reexports_accessible() {
         let schema_version = storage::SCHEMA_VERSION;
         assert!(schema_version >= 1);
+
+        let _cfg = StorageConfig::default();
+        let _queue = JobQueueConfig::default();
+        assert!(matches!(IngestAction::New, IngestAction::New));
+        let _ = std::mem::size_of::<StorageBackedJobRunner>();
     }
 
     #[cfg(feature = "durability")]
@@ -394,5 +429,10 @@ mod tests {
     fn durability_reexports_accessible() {
         let trailer_version = durability::REPAIR_TRAILER_VERSION;
         assert!(trailer_version >= 1);
+
+        let _ = std::mem::size_of::<DurabilityConfig>();
+        let _ = std::mem::size_of::<ProtectionResult>();
+        let _ = std::mem::size_of::<RepairResult>();
+        let _ = std::mem::size_of::<RepairCodecVerifyResult>();
     }
 }
