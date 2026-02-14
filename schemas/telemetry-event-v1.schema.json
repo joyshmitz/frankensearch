@@ -1,0 +1,523 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/telemetry-event-v1.schema.json",
+  "title": "frankensearch Telemetry Event Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "ts",
+    "event"
+  ],
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 1
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/searchEvent"
+        },
+        {
+          "$ref": "#/$defs/embeddingEvent"
+        },
+        {
+          "$ref": "#/$defs/indexEvent"
+        },
+        {
+          "$ref": "#/$defs/resourceEvent"
+        },
+        {
+          "$ref": "#/$defs/lifecycleEvent"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "instance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instance_id",
+        "project_key",
+        "host_name"
+      ],
+      "properties": {
+        "instance_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "project_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "host_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "root_request_id"
+      ],
+      "properties": {
+        "event_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "root_request_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "parent_event_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+        }
+      }
+    },
+    "searchEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "instance",
+        "correlation",
+        "query",
+        "results",
+        "metrics"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "search"
+        },
+        "instance": {
+          "$ref": "#/$defs/instance"
+        },
+        "correlation": {
+          "$ref": "#/$defs/correlation"
+        },
+        "query": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "text",
+            "class",
+            "phase"
+          ],
+          "properties": {
+            "text": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            },
+            "class": {
+              "type": "string",
+              "enum": [
+                "empty",
+                "identifier",
+                "short_keyword",
+                "natural_language"
+              ]
+            },
+            "phase": {
+              "type": "string",
+              "enum": [
+                "initial",
+                "refined",
+                "refinement_failed"
+              ]
+            }
+          }
+        },
+        "results": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result_count",
+            "lexical_count",
+            "semantic_count"
+          ],
+          "properties": {
+            "result_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lexical_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "semantic_count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "latency_us",
+            "memory_bytes"
+          ],
+          "properties": {
+            "latency_us": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "memory_bytes": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "embeddingEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "instance",
+        "correlation",
+        "job",
+        "embedder",
+        "status",
+        "duration_ms"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "embedding"
+        },
+        "instance": {
+          "$ref": "#/$defs/instance"
+        },
+        "correlation": {
+          "$ref": "#/$defs/correlation"
+        },
+        "job": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "job_id",
+            "queue_depth",
+            "doc_count",
+            "stage"
+          ],
+          "properties": {
+            "job_id": {
+              "$ref": "#/$defs/ulid"
+            },
+            "queue_depth": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "doc_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stage": {
+              "type": "string",
+              "enum": [
+                "fast",
+                "quality",
+                "background"
+              ]
+            }
+          }
+        },
+        "embedder": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "id",
+            "tier",
+            "dimension"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tier": {
+              "type": "string",
+              "enum": [
+                "hash",
+                "fast",
+                "quality"
+              ]
+            },
+            "dimension": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "indexEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "instance",
+        "correlation",
+        "operation",
+        "inventory",
+        "dimension",
+        "quantization",
+        "status",
+        "duration_ms"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "index"
+        },
+        "instance": {
+          "$ref": "#/$defs/instance"
+        },
+        "correlation": {
+          "$ref": "#/$defs/correlation"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "build",
+            "rebuild",
+            "append",
+            "compact",
+            "repair",
+            "snapshot"
+          ]
+        },
+        "inventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "words",
+            "tokens",
+            "lines",
+            "bytes",
+            "docs"
+          ],
+          "properties": {
+            "words": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tokens": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lines": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "docs": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "dimension": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "quantization": {
+          "type": "string",
+          "enum": [
+            "f32",
+            "f16",
+            "int8",
+            "pq"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "started",
+            "completed",
+            "failed"
+          ]
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "resourceEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "instance",
+        "correlation",
+        "sample"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "resource"
+        },
+        "instance": {
+          "$ref": "#/$defs/instance"
+        },
+        "correlation": {
+          "$ref": "#/$defs/correlation"
+        },
+        "sample": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpu_pct",
+            "rss_bytes",
+            "io_read_bytes",
+            "io_write_bytes",
+            "interval_ms"
+          ],
+          "properties": {
+            "cpu_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "rss_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "io_read_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "io_write_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "interval_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "load_avg_1m": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "pressure_profile": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "strict",
+                "performance",
+                "degraded",
+                null
+              ]
+            }
+          }
+        }
+      }
+    },
+    "lifecycleEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "instance",
+        "correlation",
+        "state",
+        "severity"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "lifecycle"
+        },
+        "instance": {
+          "$ref": "#/$defs/instance"
+        },
+        "correlation": {
+          "$ref": "#/$defs/correlation"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "started",
+            "stopped",
+            "healthy",
+            "degraded",
+            "stale",
+            "recovering"
+          ]
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uptime_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

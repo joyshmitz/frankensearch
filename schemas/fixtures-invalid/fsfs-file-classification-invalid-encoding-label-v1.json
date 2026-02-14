@@ -1,0 +1,25 @@
+{
+  "kind": "fsfs_file_classification_decision",
+  "v": 1,
+  "path": "/workspace/docs/readme.txt",
+  "size_bytes": 200,
+  "probe_bytes": 200,
+  "sniff_features": {
+    "null_bytes": 0,
+    "non_printable_ratio": 0.01,
+    "high_bit_ratio": 0.12,
+    "bom": "none"
+  },
+  "detected_type": "text",
+  "detected_encoding": "UTF 8",
+  "normalization_applied": "utf8_nfc",
+  "ingest_action": "index",
+  "classification_confidence": 0.9,
+  "encoding_confidence": 0.7,
+  "reason_code": "FSFS_TEXT_ENCODING_HEURISTIC",
+  "downstream_signals": {
+    "utility_penalty": 0.05,
+    "skip_candidate": false,
+    "requires_manual_review": true
+  }
+}

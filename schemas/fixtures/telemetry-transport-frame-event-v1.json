@@ -1,0 +1,19 @@
+{
+  "kind": "telemetry_transport_stream_frame",
+  "v": 1,
+  "frame_type": "event",
+  "transport": "unix_domain_socket",
+  "connection_id": "01K2Q6H7Q7T3N6M4R9C5V2X8YA",
+  "sequence": 42,
+  "producer_ts": "2026-02-14T01:20:00Z",
+  "dispatch_ts": "2026-02-14T01:20:00.045Z",
+  "lag_ms": 45,
+  "dropped_since_last": 0,
+  "payload": {
+    "cursor": "cursor:01K2Q6J4M2Q9C7R5T3W8Y1Z6AB",
+    "event_id": "01K2Q6J4M2Q9C7R5T3W8Y1Z6AB",
+    "topic": "search",
+    "bytes": 640,
+    "encoding": "msgpack"
+  }
+}

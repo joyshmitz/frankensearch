@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/ops-config-v1.schema.json",
+  "title": "frankensearch OpsConfig Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/opsConfigDefinition"
+    },
+    {
+      "$ref": "#/$defs/opsConfigEffective"
+    }
+  ],
+  "$defs": {
+    "opsValues": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "telemetry_collection_interval_ms",
+        "ingestion_batch_size",
+        "retention_raw_days",
+        "retention_summary_days",
+        "slo_search_p99_ms",
+        "slo_embedding_throughput_min_docs_per_s",
+        "discovery_scan_interval_ms",
+        "ui_refresh_interval_ms",
+        "backpressure_queue_depth_limit"
+      ],
+      "properties": {
+        "telemetry_collection_interval_ms": {
+          "type": "integer",
+          "minimum": 100
+        },
+        "ingestion_batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "retention_raw_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650
+        },
+        "retention_summary_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3650
+        },
+        "slo_search_p99_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "slo_embedding_throughput_min_docs_per_s": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "discovery_scan_interval_ms": {
+          "type": "integer",
+          "minimum": 1000
+        },
+        "ui_refresh_interval_ms": {
+          "type": "integer",
+          "minimum": 50
+        },
+        "backpressure_queue_depth_limit": {
+          "type": "integer",
+          "minimum": 100
+        }
+      }
+    },
+    "opsConfigDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "source_precedence",
+        "file_path_policy",
+        "defaults",
+        "reloadable_fields",
+        "restart_required_fields"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "ops_config_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "source_precedence": {
+          "type": "array",
+          "const": [
+            "env",
+            "file",
+            "defaults"
+          ]
+        },
+        "file_path_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primary",
+            "fallback"
+          ],
+          "properties": {
+            "primary": {
+              "type": "string",
+              "minLength": 1
+            },
+            "fallback": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "defaults": {
+          "$ref": "#/$defs/opsValues"
+        },
+        "reloadable_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "slo_search_p99_ms",
+              "slo_embedding_throughput_min_docs_per_s",
+              "discovery_scan_interval_ms",
+              "ui_refresh_interval_ms",
+              "backpressure_queue_depth_limit"
+            ]
+          }
+        },
+        "restart_required_fields": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "telemetry_collection_interval_ms",
+              "ingestion_batch_size",
+              "retention_raw_days",
+              "retention_summary_days"
+            ]
+          }
+        }
+      }
+    },
+    "opsConfigEffective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "resolved_at_ts",
+        "source_precedence_applied",
+        "sources",
+        "values"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "ops_config_effective"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "resolved_at_ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_precedence_applied": {
+          "type": "array",
+          "const": [
+            "env",
+            "file",
+            "defaults"
+          ]
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "env_keys_used",
+            "config_file_used"
+          ],
+          "properties": {
+            "env_keys_used": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^FRANKENSEARCH_OPS_[A-Z0-9_]+$"
+              }
+            },
+            "config_file_used": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "values": {
+          "$ref": "#/$defs/opsValues"
+        }
+      }
+    }
+  }
+}

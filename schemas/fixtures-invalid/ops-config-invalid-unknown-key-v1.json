@@ -1,0 +1,26 @@
+{
+  "kind": "ops_config_effective",
+  "v": 1,
+  "resolved_at_ts": "2026-02-14T01:10:07Z",
+  "source_precedence_applied": [
+    "env",
+    "file",
+    "defaults"
+  ],
+  "sources": {
+    "env_keys_used": [],
+    "config_file_used": "/home/ubuntu/.config/frankensearch/ops.toml"
+  },
+  "values": {
+    "telemetry_collection_interval_ms": 1000,
+    "ingestion_batch_size": 100,
+    "retention_raw_days": 7,
+    "retention_summary_days": 90,
+    "slo_search_p99_ms": 500,
+    "slo_embedding_throughput_min_docs_per_s": 10.0,
+    "discovery_scan_interval_ms": 30000,
+    "ui_refresh_interval_ms": 250,
+    "backpressure_queue_depth_limit": 10000,
+    "mystery_config_key": true
+  }
+}

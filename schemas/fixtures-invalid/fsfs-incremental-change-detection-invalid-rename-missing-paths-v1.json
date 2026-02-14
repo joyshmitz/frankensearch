@@ -1,0 +1,10 @@
+{
+  "kind": "fsfs_incremental_change_decision",
+  "v": 1,
+  "path": "/workspace/src/new_name.rs",
+  "event_type": "rename",
+  "detection_mode": "mtime_size_fastpath",
+  "queue_action": "skip_no_change",
+  "reason_code": "FSFS_RENAME_IDENTITY_PRESERVED",
+  "confidence": 0.9
+}

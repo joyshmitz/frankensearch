@@ -1,0 +1,27 @@
+{
+  "kind": "fsfs_incremental_change_detection_contract_definition",
+  "v": 1,
+  "fastpath_policy": {
+    "mtime_granularity_ns": 1000000000,
+    "require_size_change": false,
+    "hash_on_mtime_only": true,
+    "max_fastpath_skips": 3
+  },
+  "rename_move_policy": {
+    "identity_keys": [
+      "inode"
+    ],
+    "same_device_rename_preserves_identity": true,
+    "cross_device_move": "treat_as_delete_create"
+  },
+  "recovery_policy": {
+    "journal_required": true,
+    "replay_order": "sequence_asc",
+    "pending_ttl_seconds": 3600
+  },
+  "reconciliation_policy": {
+    "full_scan_interval_seconds": 21600,
+    "stale_after_seconds": 86400,
+    "orphan_entry_action": "delete"
+  }
+}

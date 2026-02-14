@@ -1,0 +1,808 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-determinism-v1.schema.json",
+  "title": "fsfs Determinism and Reproducibility Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/reproManifest"
+    },
+    {
+      "$ref": "#/$defs/determinismCheckResult"
+    }
+  ],
+  "$defs": {
+    "tier": {
+      "type": "string",
+      "enum": [
+        "tier1",
+        "tier2",
+        "tier3"
+      ]
+    },
+    "nondeterminismSource": {
+      "type": "string",
+      "enum": [
+        "float_arithmetic",
+        "thread_scheduling",
+        "filesystem_ordering",
+        "clock_source",
+        "random_sampling"
+      ]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "tier_matrix",
+        "nondeterminism_mitigations",
+        "repro_manifest_required_fields",
+        "test_contract",
+        "logging_requirements"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_determinism_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "tier_matrix": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "tier",
+              "comparison_mode",
+              "required_surfaces",
+              "guarantee"
+            ],
+            "properties": {
+              "tier": {
+                "$ref": "#/$defs/tier"
+              },
+              "comparison_mode": {
+                "type": "string",
+                "enum": [
+                  "bit_exact",
+                  "semantic_equivalence",
+                  "statistical_tolerance"
+                ]
+              },
+              "required_surfaces": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "guarantee": {
+                "type": "string",
+                "minLength": 8
+              }
+            }
+          },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "tier": {
+                    "const": "tier1"
+                  },
+                  "comparison_mode": {
+                    "const": "bit_exact"
+                  }
+                },
+                "required": [
+                  "tier",
+                  "comparison_mode"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "tier": {
+                    "const": "tier2"
+                  },
+                  "comparison_mode": {
+                    "const": "semantic_equivalence"
+                  }
+                },
+                "required": [
+                  "tier",
+                  "comparison_mode"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "tier": {
+                    "const": "tier3"
+                  },
+                  "comparison_mode": {
+                    "const": "statistical_tolerance"
+                  }
+                },
+                "required": [
+                  "tier",
+                  "comparison_mode"
+                ]
+              }
+            }
+          ]
+        },
+        "nondeterminism_mitigations": {
+          "type": "array",
+          "minItems": 5,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "mitigation",
+              "requirement_id"
+            ],
+            "properties": {
+              "source": {
+                "$ref": "#/$defs/nondeterminismSource"
+              },
+              "mitigation": {
+                "type": "string",
+                "minLength": 8
+              },
+              "requirement_id": {
+                "type": "string",
+                "pattern": "^DET-[A-Z0-9_]+$"
+              }
+            }
+          },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "const": "float_arithmetic"
+                  }
+                },
+                "required": [
+                  "source"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "const": "thread_scheduling"
+                  }
+                },
+                "required": [
+                  "source"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "const": "filesystem_ordering"
+                  }
+                },
+                "required": [
+                  "source"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "const": "clock_source"
+                  }
+                },
+                "required": [
+                  "source"
+                ]
+              }
+            },
+            {
+              "contains": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "const": "random_sampling"
+                  }
+                },
+                "required": [
+                  "source"
+                ]
+              }
+            }
+          ]
+        },
+        "repro_manifest_required_fields": {
+          "type": "array",
+          "minItems": 9,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "seed",
+              "config_hash",
+              "determinism_tier",
+              "index_version",
+              "model_versions",
+              "platform",
+              "clock_mode",
+              "tie_break_policy",
+              "float_policy",
+              "query_fingerprint",
+              "evidence_bundle"
+            ]
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "seed"
+              }
+            },
+            {
+              "contains": {
+                "const": "config_hash"
+              }
+            },
+            {
+              "contains": {
+                "const": "determinism_tier"
+              }
+            },
+            {
+              "contains": {
+                "const": "index_version"
+              }
+            },
+            {
+              "contains": {
+                "const": "model_versions"
+              }
+            },
+            {
+              "contains": {
+                "const": "platform"
+              }
+            },
+            {
+              "contains": {
+                "const": "clock_mode"
+              }
+            },
+            {
+              "contains": {
+                "const": "tie_break_policy"
+              }
+            },
+            {
+              "contains": {
+                "const": "float_policy"
+              }
+            }
+          ]
+        },
+        "test_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "unit_replay_count_min",
+            "integration_replay_count_min",
+            "e2e_replay_count_min",
+            "required_checks"
+          ],
+          "properties": {
+            "unit_replay_count_min": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "integration_replay_count_min": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "e2e_replay_count_min": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "required_checks": {
+              "type": "array",
+              "minItems": 3,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "ranking_output_stability",
+                  "degradation_state_stability",
+                  "serialization_normalization_stability",
+                  "repeated_scenario_replay",
+                  "artifact_bundle_replay"
+                ]
+              },
+              "allOf": [
+                {
+                  "contains": {
+                    "const": "ranking_output_stability"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "degradation_state_stability"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "repeated_scenario_replay"
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "logging_requirements": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seed_in_every_log",
+            "config_hash_in_every_log",
+            "tier_in_every_log",
+            "mismatch_reason_codes_required"
+          ],
+          "properties": {
+            "seed_in_every_log": {
+              "type": "boolean",
+              "const": true
+            },
+            "config_hash_in_every_log": {
+              "type": "boolean",
+              "const": true
+            },
+            "tier_in_every_log": {
+              "type": "boolean",
+              "const": true
+            },
+            "mismatch_reason_codes_required": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        }
+      }
+    },
+    "reproManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "run_id",
+        "determinism_tier",
+        "seed",
+        "config_hash",
+        "index_version",
+        "model_versions",
+        "platform",
+        "clock_mode",
+        "tie_break_policy",
+        "float_policy",
+        "query_fingerprint",
+        "evidence_bundle"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_reproducibility_manifest"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^run-[a-z0-9-]{6,}$"
+        },
+        "determinism_tier": {
+          "$ref": "#/$defs/tier"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "config_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "index_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_versions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "version",
+              "digest"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string",
+                "minLength": 1
+              },
+              "digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        },
+        "platform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "os",
+            "arch",
+            "rustc"
+          ],
+          "properties": {
+            "os": {
+              "type": "string",
+              "minLength": 1
+            },
+            "arch": {
+              "type": "string",
+              "minLength": 1
+            },
+            "rustc": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "clock_mode": {
+          "type": "string",
+          "enum": [
+            "frozen",
+            "simulated",
+            "realtime"
+          ]
+        },
+        "tie_break_policy": {
+          "type": "string",
+          "enum": [
+            "doc_id_lexicographic",
+            "stable_input_order"
+          ]
+        },
+        "float_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "max_delta"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "canonical_rounding",
+                "epsilon_window",
+                "ulp_budget"
+              ]
+            },
+            "max_delta": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "query_fingerprint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "query_hash",
+            "canonicalizer_version",
+            "corpus_snapshot_id"
+          ],
+          "properties": {
+            "query_hash": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "canonicalizer_version": {
+              "type": "string",
+              "pattern": "^v[0-9]+$"
+            },
+            "corpus_snapshot_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "evidence_bundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "manifest_hash",
+            "artifact_paths",
+            "config_signature"
+          ],
+          "properties": {
+            "manifest_hash": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "artifact_paths": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "string",
+                "pattern": "^artifacts/.+"
+              }
+            },
+            "config_signature": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "schema_version",
+                "config_hash"
+              ],
+              "properties": {
+                "schema_version": {
+                  "type": "string",
+                  "pattern": "^v[0-9]+$"
+                },
+                "config_hash": {
+                  "type": "string",
+                  "pattern": "^sha256:[0-9a-f]{64}$"
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "determinism_tier": {
+                "const": "tier1"
+              }
+            },
+            "required": [
+              "determinism_tier"
+            ]
+          },
+          "then": {
+            "properties": {
+              "clock_mode": {
+                "enum": [
+                  "frozen",
+                  "simulated"
+                ]
+              },
+              "tie_break_policy": {
+                "const": "doc_id_lexicographic"
+              }
+            },
+            "required": [
+              "clock_mode",
+              "tie_break_policy"
+            ]
+          }
+        }
+      ]
+    },
+    "determinismCheckResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "scenario_id",
+        "determinism_tier",
+        "comparison_mode",
+        "run_count",
+        "pass",
+        "manifest_ref",
+        "mismatch_diagnostics"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_determinism_check_result"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "scenario_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "determinism_tier": {
+          "$ref": "#/$defs/tier"
+        },
+        "comparison_mode": {
+          "type": "string",
+          "enum": [
+            "bit_exact",
+            "semantic_equivalence",
+            "statistical_tolerance"
+          ]
+        },
+        "run_count": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "pass": {
+          "type": "boolean"
+        },
+        "manifest_ref": {
+          "type": "string",
+          "pattern": "^run-[a-z0-9-]{6,}$"
+        },
+        "tolerance_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "metric",
+            "max_delta"
+          ],
+          "properties": {
+            "metric": {
+              "type": "string",
+              "minLength": 1
+            },
+            "max_delta": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "mismatch_diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reason_code",
+              "field_path",
+              "lhs",
+              "rhs"
+            ],
+            "properties": {
+              "reason_code": {
+                "type": "string",
+                "pattern": "^DET_MISMATCH_[A-Z0-9_]+$"
+              },
+              "field_path": {
+                "type": "string",
+                "minLength": 1
+              },
+              "lhs": {
+                "type": "string",
+                "minLength": 1
+              },
+              "rhs": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "pass": {
+                "const": false
+              }
+            },
+            "required": [
+              "pass"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mismatch_diagnostics": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "determinism_tier": {
+                "const": "tier1"
+              }
+            },
+            "required": [
+              "determinism_tier"
+            ]
+          },
+          "then": {
+            "properties": {
+              "comparison_mode": {
+                "const": "bit_exact"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "determinism_tier": {
+                "const": "tier2"
+              }
+            },
+            "required": [
+              "determinism_tier"
+            ]
+          },
+          "then": {
+            "properties": {
+              "comparison_mode": {
+                "const": "semantic_equivalence"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "determinism_tier": {
+                "const": "tier3"
+              }
+            },
+            "required": [
+              "determinism_tier"
+            ]
+          },
+          "then": {
+            "properties": {
+              "comparison_mode": {
+                "const": "statistical_tolerance"
+              }
+            },
+            "required": [
+              "tolerance_policy"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

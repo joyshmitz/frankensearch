@@ -1,0 +1,598 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/control-plane-interface-v1.schema.json",
+  "title": "frankensearch Control Plane Interface v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/snapshotResponse"
+    },
+    {
+      "$ref": "#/$defs/streamSubscribe"
+    },
+    {
+      "$ref": "#/$defs/streamFrame"
+    }
+  ],
+  "$defs": {
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "topic": {
+      "type": "string",
+      "enum": [
+        "search",
+        "embedding",
+        "index",
+        "resource",
+        "anomaly",
+        "lifecycle"
+      ]
+    },
+    "snapshotResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "snapshot_id",
+        "generated_ts",
+        "fleet_summary",
+        "instances"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "snapshot_response"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "snapshot_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "generated_ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "fleet_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "detected_instances",
+            "healthy_instances",
+            "degraded_instances",
+            "stale_instances"
+          ],
+          "properties": {
+            "detected_instances": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "healthy_instances": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "degraded_instances": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stale_instances": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "instances": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "instance_id",
+              "project_key",
+              "host_name",
+              "attribution_confidence",
+              "health",
+              "latest_metrics",
+              "anomaly_summary",
+              "lag"
+            ],
+            "properties": {
+              "instance_id": {
+                "$ref": "#/$defs/ulid"
+              },
+              "project_key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "host_name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "attribution_confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "health": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "lifecycle_state",
+                  "slo_status",
+                  "error_budget_consumed_pct"
+                ],
+                "properties": {
+                  "lifecycle_state": {
+                    "type": "string",
+                    "enum": [
+                      "started",
+                      "healthy",
+                      "degraded",
+                      "stale",
+                      "stopped",
+                      "recovering"
+                    ]
+                  },
+                  "slo_status": {
+                    "type": "string",
+                    "enum": [
+                      "green",
+                      "yellow",
+                      "red"
+                    ]
+                  },
+                  "error_budget_consumed_pct": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 100
+                  }
+                }
+              },
+              "latest_metrics": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "search",
+                  "embedding",
+                  "index",
+                  "resource"
+                ],
+                "properties": {
+                  "search": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "p50_ms",
+                      "p95_ms",
+                      "qps"
+                    ],
+                    "properties": {
+                      "p50_ms": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "p95_ms": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "qps": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    }
+                  },
+                  "embedding": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "queue_depth",
+                      "throughput_eps",
+                      "fail_rate_pct"
+                    ],
+                    "properties": {
+                      "queue_depth": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "throughput_eps": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "fail_rate_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100
+                      }
+                    }
+                  },
+                  "index": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "docs",
+                      "index_bytes",
+                      "stale_ratio_pct"
+                    ],
+                    "properties": {
+                      "docs": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "index_bytes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "stale_ratio_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100
+                      }
+                    }
+                  },
+                  "resource": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "cpu_pct",
+                      "rss_bytes",
+                      "io_read_bps",
+                      "io_write_bps"
+                    ],
+                    "properties": {
+                      "cpu_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 100
+                      },
+                      "rss_bytes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "io_read_bps": {
+                        "type": "number",
+                        "minimum": 0
+                      },
+                      "io_write_bps": {
+                        "type": "number",
+                        "minimum": 0
+                      }
+                    }
+                  }
+                }
+              },
+              "anomaly_summary": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "active_count",
+                  "max_severity",
+                  "last_anomaly_ts"
+                ],
+                "properties": {
+                  "active_count": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "max_severity": {
+                    "type": "string",
+                    "enum": [
+                      "none",
+                      "info",
+                      "warn",
+                      "error"
+                    ]
+                  },
+                  "last_anomaly_ts": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "format": "date-time"
+                  }
+                }
+              },
+              "lag": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "ingest_lag_ms_p50",
+                  "ingest_lag_ms_p95",
+                  "stream_queue_depth"
+                ],
+                "properties": {
+                  "ingest_lag_ms_p50": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "ingest_lag_ms_p95": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "stream_queue_depth": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "streamSubscribe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "client_id",
+        "topics",
+        "max_inflight",
+        "heartbeat_ms"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "stream_subscribe"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "client_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "topics": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/topic"
+          }
+        },
+        "project_filter": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "resume_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_inflight": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "heartbeat_ms": {
+          "type": "integer",
+          "minimum": 100
+        }
+      }
+    },
+    "streamFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "frame_type",
+        "dispatch_ts",
+        "lag_ms",
+        "payload"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "stream_frame"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "frame_type": {
+          "type": "string",
+          "enum": [
+            "event",
+            "control",
+            "heartbeat",
+            "error"
+          ]
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "producer_ts": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "dispatch_ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lag_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payload": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/eventPayload"
+            },
+            {
+              "$ref": "#/$defs/controlPayload"
+            },
+            {
+              "$ref": "#/$defs/heartbeatPayload"
+            },
+            {
+              "$ref": "#/$defs/errorPayload"
+            }
+          ]
+        }
+      }
+    },
+    "eventPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "topic",
+        "instance_id",
+        "project_key",
+        "root_request_id"
+      ],
+      "properties": {
+        "event_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "topic": {
+          "$ref": "#/$defs/topic"
+        },
+        "instance_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "project_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "root_request_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "body": {
+          "type": "object"
+        }
+      }
+    },
+    "controlPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control_type"
+      ],
+      "properties": {
+        "control_type": {
+          "type": "string",
+          "enum": [
+            "backpressure",
+            "reconnect_advisory",
+            "sampling",
+            "topology_change"
+          ]
+        },
+        "backpressure_state": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "normal",
+            "constrained",
+            "dropping",
+            null
+          ]
+        },
+        "dropped_count_window": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "sampling_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "resume_cursor_hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "heartbeatPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "queue_depth",
+        "max_inflight",
+        "unacked"
+      ],
+      "properties": {
+        "queue_depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_inflight": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "unacked": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "errorPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "recoverable",
+        "retry_after_ms"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recoverable": {
+          "type": "boolean"
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

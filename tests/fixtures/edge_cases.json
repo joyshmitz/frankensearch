@@ -1,0 +1,110 @@
+{
+  "version": "v1",
+  "cases": [
+    {
+      "id": "empty",
+      "text": "",
+      "expected_behavior": "Classified as empty query; returns no lexical terms and no semantic embedding work."
+    },
+    {
+      "id": "whitespace_only",
+      "text": "   \n\t   ",
+      "expected_behavior": "Canonicalization trims to empty and follows empty-query behavior."
+    },
+    {
+      "id": "single_word",
+      "text": "ownership",
+      "expected_behavior": "Short-keyword path with small lexical + semantic candidate budgets."
+    },
+    {
+      "id": "unicode_nfc",
+      "text": "naïve café résumé coöperate",
+      "expected_behavior": "Remains semantically intact after NFC normalization."
+    },
+    {
+      "id": "unicode_nfd",
+      "text": "naïve café résumé coöperate",
+      "expected_behavior": "Canonicalized to NFC-equivalent form matching unicode_nfc behavior."
+    },
+    {
+      "id": "symbol_heavy",
+      "text": "error::E0425 && foo::bar::<T>() ??? ### !!!",
+      "expected_behavior": "Tokenizer captures meaningful identifiers and drops noise-heavy punctuation."
+    },
+    {
+      "id": "path_like",
+      "text": "/var/log/nginx/error.log and C:\\Users\\alice\\project\\Cargo.toml",
+      "expected_behavior": "Treats path tokens as searchable terms without panics or escaping issues."
+    },
+    {
+      "id": "code_block",
+      "text": "fn search(cx: &Cx, query: &str) -> Outcome<Vec<FusedHit>, SearchError> { ... }",
+      "expected_behavior": "Code-like tokens are preserved enough for identifier-style matching."
+    },
+    {
+      "id": "long_input",
+      "text": "This long synthetic paragraph repeats realistic operations language about indexing, batching, observability, and error budgets across many clauses to test truncation boundaries without using lorem ipsum filler. This long synthetic paragraph repeats realistic operations language about indexing, batching, observability, and error budgets across many clauses to test truncation boundaries without using lorem ipsum filler. This long synthetic paragraph repeats realistic operations language about indexing, batching, observability, and error budgets across many clauses to test truncation boundaries without using lorem ipsum filler.",
+      "expected_behavior": "Canonicalizer truncates deterministically at configured limits and remains stable."
+    },
+    {
+      "id": "multilingual",
+      "text": "Implementación de búsqueda híbrida, recherche lexicale, 本地语义搜索, بحث دلالي",
+      "expected_behavior": "Non-English tokens remain valid UTF-8 and do not corrupt indexing."
+    },
+    {
+      "id": "json_like",
+      "text": "{\"event\":\"search\",\"phase\":\"refined\",\"latency_ms\":147}",
+      "expected_behavior": "JSON-like text can be indexed and matched by key/value fragments."
+    },
+    {
+      "id": "repeated_token",
+      "text": "error error error error error error error error error error error error",
+      "expected_behavior": "Term repetition should not trigger instability or pathological scoring behavior."
+    },
+    {
+      "id": "single_char",
+      "text": "x",
+      "expected_behavior": "Single character produces a valid embedding without error."
+    },
+    {
+      "id": "html_injection",
+      "text": "<script>alert('xss')</script><img src=x onerror=alert(1)>",
+      "expected_behavior": "HTML tags are processed as text, not executed."
+    },
+    {
+      "id": "sql_like",
+      "text": "DROP TABLE documents; SELECT * FROM users WHERE 1=1--",
+      "expected_behavior": "SQL-like content is processed as text without injection."
+    },
+    {
+      "id": "null_bytes",
+      "text": "word1\u0000word2\u0000word3",
+      "expected_behavior": "Null bytes are handled gracefully without truncation or panic."
+    },
+    {
+      "id": "emoji_only",
+      "text": "\ud83d\ude80\ud83c\udf1f\ud83d\udd25\ud83c\udf0d\ud83d\udcbb\ud83d\udd0d",
+      "expected_behavior": "Emoji-only input produces a valid embedding."
+    },
+    {
+      "id": "arabic_rtl",
+      "text": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645",
+      "expected_behavior": "Arabic RTL text is processed without error."
+    },
+    {
+      "id": "cjk_chars",
+      "text": "\u4f60\u597d\u4e16\u754c \u691c\u7d22\u30a8\u30f3\u30b8\u30f3 \uac80\uc0c9 \uc5d4\uc9c4",
+      "expected_behavior": "CJK characters from Chinese, Japanese, and Korean are handled."
+    },
+    {
+      "id": "unmatched_brackets",
+      "text": "a]b)c}d>e[f(g{h<i",
+      "expected_behavior": "Unmatched brackets do not cause parsing errors."
+    },
+    {
+      "id": "stopwords_only",
+      "text": "the a an is are was were be been being have has had do does did",
+      "expected_behavior": "Stopwords-only input produces a valid but low-signal result."
+    }
+  ]
+}

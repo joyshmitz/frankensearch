@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/asupersync-cx-contract-v1.schema.json",
+  "title": "frankensearch asupersync + Cx Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/apiSignatureCase"
+    },
+    {
+      "$ref": "#/$defs/labRuntimeResult"
+    }
+  ],
+  "$defs": {
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "cx_rules",
+        "execution_boundaries",
+        "patterns",
+        "test_matrix"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "asupersync_cx_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "cx_rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "async_requires_cx_first",
+            "sync_forbids_cx"
+          ],
+          "properties": {
+            "async_requires_cx_first": {
+              "type": "boolean",
+              "const": true
+            },
+            "sync_forbids_cx": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "execution_boundaries": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "asupersync_domain",
+            "rayon_domain",
+            "sync_domain"
+          ],
+          "properties": {
+            "asupersync_domain": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "io_bound",
+                  "structured_concurrency",
+                  "timeout_orchestration",
+                  "cancellation_control"
+                ]
+              }
+            },
+            "rayon_domain": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "cpu_parallel"
+                ]
+              }
+            },
+            "sync_domain": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "pure_transform",
+                  "deterministic_math"
+                ]
+              }
+            }
+          }
+        },
+        "patterns": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "string",
+            "enum": [
+              "timeout_bounded",
+              "structured_worker_pool",
+              "two_phase_channel"
+            ]
+          }
+        },
+        "test_matrix": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "unit",
+            "integration",
+            "e2e"
+          ],
+          "properties": {
+            "unit": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "async_signatures_have_cx_first",
+                  "sync_signatures_forbid_cx"
+                ]
+              }
+            },
+            "integration": {
+              "type": "array",
+              "minItems": 3,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "labruntime_determinism",
+                  "timeout_cancellation_path",
+                  "region_cleanup_no_leaks"
+                ]
+              }
+            },
+            "e2e": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "apiSignatureCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "function_name",
+        "function_kind",
+        "cx_position",
+        "valid"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "asupersync_cx_api_signature_case"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "function_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "function_kind": {
+          "type": "string",
+          "enum": [
+            "async_public",
+            "sync_public"
+          ]
+        },
+        "cx_position": {
+          "type": "string",
+          "enum": [
+            "first",
+            "not_first",
+            "absent"
+          ]
+        },
+        "valid": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "function_kind": {
+                "const": "async_public"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "cx_position": {
+                "const": "first"
+              },
+              "valid": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "function_kind": {
+                "const": "sync_public"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "cx_position": {
+                "const": "absent"
+              },
+              "valid": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "labRuntimeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "seed",
+        "scenario",
+        "deterministic_match",
+        "quiescence_ok",
+        "obligation_leak_ok",
+        "timeout_outcome"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "asupersync_cx_labruntime_result"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "scenario": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deterministic_match": {
+          "type": "boolean",
+          "const": true
+        },
+        "quiescence_ok": {
+          "type": "boolean",
+          "const": true
+        },
+        "obligation_leak_ok": {
+          "type": "boolean",
+          "const": true
+        },
+        "timeout_outcome": {
+          "type": "string",
+          "enum": [
+            "ok",
+            "err",
+            "cancelled",
+            "panicked"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/evidence-jsonl-v1.schema.json",
+  "title": "frankensearch Evidence JSONL Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "ts",
+    "event"
+  ],
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 1
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event": {
+      "$ref": "#/$defs/evidenceEvent"
+    }
+  },
+  "$defs": {
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+\\.[a-z0-9_]+\\.[a-z0-9_]+$"
+    },
+    "evidenceEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "type",
+        "project_key",
+        "instance_id",
+        "trace",
+        "reason",
+        "replay",
+        "redaction",
+        "payload"
+      ],
+      "properties": {
+        "event_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "decision",
+            "alert",
+            "degradation",
+            "transition",
+            "replay_marker"
+          ]
+        },
+        "project_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "instance_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "trace": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "root_request_id",
+            "parent_event_id"
+          ],
+          "properties": {
+            "root_request_id": {
+              "$ref": "#/$defs/ulid"
+            },
+            "parent_event_id": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        },
+        "reason": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "human",
+            "severity"
+          ],
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/reasonCode"
+            },
+            "human": {
+              "type": "string",
+              "minLength": 1
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "info",
+                "warn",
+                "error"
+              ]
+            }
+          }
+        },
+        "replay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "live",
+                "deterministic"
+              ]
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "tick_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "frame_seq": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "mode": {
+                    "const": "deterministic"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "seed",
+                  "tick_ms",
+                  "frame_seq"
+                ]
+              }
+            }
+          ]
+        },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "policy_version",
+            "contains_sensitive_source",
+            "transforms_applied"
+          ],
+          "properties": {
+            "policy_version": {
+              "type": "string",
+              "pattern": "^v[0-9]+$"
+            },
+            "contains_sensitive_source": {
+              "type": "boolean"
+            },
+            "transforms_applied": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "hash_sha256",
+                  "truncate_preview",
+                  "drop",
+                  "path_tokenize",
+                  "mask_partial"
+                ]
+              }
+            }
+          }
+        },
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "query_hash": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "query_preview": {
+              "type": "string",
+              "maxLength": 120
+            },
+            "resource_profile": {
+              "type": "string",
+              "enum": [
+                "strict",
+                "performance",
+                "degraded"
+              ]
+            },
+            "lag_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "dropped_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "notes": {
+              "type": "string",
+              "maxLength": 500
+            }
+          }
+        }
+      }
+    }
+  }
+}

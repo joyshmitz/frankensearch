@@ -1,0 +1,42 @@
+{
+  "kind": "fsfs_reproducibility_manifest",
+  "v": 1,
+  "run_id": "run-fsfs-tier1-0002",
+  "determinism_tier": "tier1",
+  "config_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "index_version": "fsvi-v1.3.0",
+  "model_versions": [
+    {
+      "name": "potion-128m",
+      "version": "1.0.0",
+      "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64",
+    "rustc": "1.86.0-nightly"
+  },
+  "clock_mode": "frozen",
+  "tie_break_policy": "doc_id_lexicographic",
+  "float_policy": {
+    "mode": "canonical_rounding",
+    "max_delta": 0.0
+  },
+  "query_fingerprint": {
+    "query_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "canonicalizer_version": "v1",
+    "corpus_snapshot_id": "snapshot-2026-02-14-b"
+  },
+  "evidence_bundle": {
+    "manifest_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "artifact_paths": [
+      "artifacts/replay/run-fsfs-tier1-0002/manifest.json",
+      "artifacts/replay/run-fsfs-tier1-0002/check-result.json"
+    ],
+    "config_signature": {
+      "schema_version": "v1",
+      "config_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  }
+}

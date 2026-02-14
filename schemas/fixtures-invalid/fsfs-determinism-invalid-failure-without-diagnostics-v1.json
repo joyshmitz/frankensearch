@@ -1,0 +1,11 @@
+{
+  "kind": "fsfs_determinism_check_result",
+  "v": 1,
+  "scenario_id": "tier2-evidence-replay",
+  "determinism_tier": "tier2",
+  "comparison_mode": "semantic_equivalence",
+  "run_count": 3,
+  "pass": false,
+  "manifest_ref": "run-fsfs-tier2-0007",
+  "mismatch_diagnostics": []
+}

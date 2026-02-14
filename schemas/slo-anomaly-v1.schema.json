@@ -1,0 +1,443 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/slo-anomaly-v1.schema.json",
+  "title": "frankensearch SLO + Anomaly Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/sloContractDefinition"
+    },
+    {
+      "$ref": "#/$defs/sloAnomalyEvent"
+    }
+  ],
+  "$defs": {
+    "ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "window": {
+      "type": "string",
+      "enum": [
+        "1m",
+        "15m",
+        "1h",
+        "6h",
+        "24h",
+        "3d",
+        "1w"
+      ]
+    },
+    "metricId": {
+      "type": "string",
+      "enum": [
+        "search_latency_p95",
+        "query_failure_rate",
+        "stale_index_lag",
+        "embedding_backlog_age"
+      ]
+    },
+    "windowBudgetObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "budget_fraction"
+      ],
+      "properties": {
+        "budget_fraction": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "windowBudgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "1m",
+        "15m",
+        "1h",
+        "6h",
+        "24h",
+        "3d",
+        "1w"
+      ],
+      "properties": {
+        "1m": {
+          "$ref": "#/$defs/windowBudgetObject"
+        },
+        "15m": {
+          "$ref": "#/$defs/windowBudgetObject"
+        },
+        "1h": {
+          "$ref": "#/$defs/windowBudgetObject"
+        },
+        "6h": {
+          "$ref": "#/$defs/windowBudgetObject"
+        },
+        "24h": {
+          "$ref": "#/$defs/windowBudgetObject"
+        },
+        "3d": {
+          "$ref": "#/$defs/windowBudgetObject"
+        },
+        "1w": {
+          "$ref": "#/$defs/windowBudgetObject"
+        }
+      }
+    },
+    "sloContractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "generated_ts",
+        "formula_version",
+        "windows",
+        "metrics",
+        "test_vectors"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "slo_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "generated_ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "formula_version": {
+          "type": "string",
+          "const": "v1"
+        },
+        "windows": {
+          "$ref": "#/$defs/windowBudgets"
+        },
+        "metrics": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "metric_id",
+              "unit",
+              "objective_threshold",
+              "objective_bad_ratio",
+              "reason_code_prefix"
+            ],
+            "properties": {
+              "metric_id": {
+                "$ref": "#/$defs/metricId"
+              },
+              "unit": {
+                "type": "string",
+                "minLength": 1
+              },
+              "objective_threshold": {
+                "type": "number",
+                "minimum": 0
+              },
+              "objective_bad_ratio": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 1
+              },
+              "reason_code_prefix": {
+                "type": "string",
+                "pattern": "^(slo|anomaly)\\.[a-z0-9_]+$"
+              }
+            }
+          }
+        },
+        "test_vectors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "metric_id",
+              "inputs"
+            ],
+            "properties": {
+              "metric_id": {
+                "$ref": "#/$defs/metricId"
+              },
+              "inputs": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "1m",
+                  "15m",
+                  "1h",
+                  "6h",
+                  "24h",
+                  "3d",
+                  "1w"
+                ],
+                "properties": {
+                  "1m": {
+                    "$ref": "#/$defs/formulaCase"
+                  },
+                  "15m": {
+                    "$ref": "#/$defs/formulaCase"
+                  },
+                  "1h": {
+                    "$ref": "#/$defs/formulaCase"
+                  },
+                  "6h": {
+                    "$ref": "#/$defs/formulaCase"
+                  },
+                  "24h": {
+                    "$ref": "#/$defs/formulaCase"
+                  },
+                  "3d": {
+                    "$ref": "#/$defs/formulaCase"
+                  },
+                  "1w": {
+                    "$ref": "#/$defs/formulaCase"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "formulaCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bad_events",
+        "total_events",
+        "expected_bad_ratio",
+        "expected_consumed",
+        "expected_remaining",
+        "expected_burn_rate"
+      ],
+      "properties": {
+        "bad_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_events": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_bad_ratio": {
+          "type": "number",
+          "minimum": 0
+        },
+        "expected_consumed": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "expected_remaining": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "expected_burn_rate": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "sloAnomalyEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "ts",
+        "event_id",
+        "project_key",
+        "instance_id",
+        "metric_id",
+        "window",
+        "reason_code",
+        "severity",
+        "baseline",
+        "observed_value",
+        "deviation",
+        "suppression",
+        "confidence"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "slo_anomaly_event"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "project_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "instance_id": {
+          "$ref": "#/$defs/ulid"
+        },
+        "metric_id": {
+          "$ref": "#/$defs/metricId"
+        },
+        "window": {
+          "$ref": "#/$defs/window"
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^(slo|anomaly)\\.[a-z0-9_]+\\.[a-z0-9_]+$"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "critical"
+          ]
+        },
+        "baseline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "method",
+            "baseline_value",
+            "lookback_points"
+          ],
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": [
+                "rolling_mean",
+                "ewma",
+                "seasonal_median"
+              ]
+            },
+            "baseline_value": {
+              "type": "number"
+            },
+            "lookback_points": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "observed_value": {
+          "type": "number"
+        },
+        "deviation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "absolute",
+            "relative_pct",
+            "z_score"
+          ],
+          "properties": {
+            "absolute": {
+              "type": "number"
+            },
+            "relative_pct": {
+              "type": "number"
+            },
+            "z_score": {
+              "type": "number"
+            }
+          }
+        },
+        "suppression": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "is_suppressed"
+          ],
+          "properties": {
+            "is_suppressed": {
+              "type": "boolean"
+            },
+            "policy_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "until_ts": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "date-time"
+            },
+            "suppress_reason_code": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^(slo|anomaly)\\.[a-z0-9_]+\\.[a-z0-9_]+$"
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "is_suppressed": {
+                    "const": true
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "policy_id",
+                  "suppress_reason_code"
+                ]
+              }
+            }
+          ]
+        },
+        "confidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "score",
+            "band",
+            "evidence_points"
+          ],
+          "properties": {
+            "score": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "band": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            },
+            "evidence_points": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

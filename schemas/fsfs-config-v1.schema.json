@@ -1,0 +1,887 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-config-v1.schema.json",
+  "title": "fsfs Configuration Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/configContractDefinition"
+    },
+    {
+      "$ref": "#/$defs/configEffective"
+    },
+    {
+      "$ref": "#/$defs/configLoadEvent"
+    }
+  ],
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "severity",
+        "reason_code",
+        "field",
+        "message"
+      ],
+      "properties": {
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^config\\.[a-z0-9_.]+$"
+        },
+        "field": {
+          "type": "string",
+          "pattern": "^(discovery|indexing|search|pressure|tui|storage|privacy)\\.[a-z0-9_]+$"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "env",
+            "file",
+            "defaults",
+            "runtime"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "configValues": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "discovery",
+        "indexing",
+        "search",
+        "pressure",
+        "tui",
+        "storage",
+        "privacy"
+      ],
+      "properties": {
+        "discovery": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "roots",
+            "exclude_patterns",
+            "text_selection_mode",
+            "binary_blocklist_extensions",
+            "max_file_size_mb",
+            "follow_symlinks"
+          ],
+          "properties": {
+            "roots": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "exclude_patterns": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "text_selection_mode": {
+              "type": "string",
+              "enum": [
+                "blocklist",
+                "allowlist"
+              ]
+            },
+            "binary_blocklist_extensions": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^\\.[a-z0-9]+$"
+              }
+            },
+            "max_file_size_mb": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1024
+            },
+            "follow_symlinks": {
+              "type": "boolean"
+            }
+          }
+        },
+        "indexing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fast_model",
+            "quality_model",
+            "model_dir",
+            "embedding_batch_size",
+            "reindex_on_change",
+            "watch_mode"
+          ],
+          "properties": {
+            "fast_model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "quality_model": {
+              "type": "string",
+              "minLength": 1
+            },
+            "model_dir": {
+              "type": "string",
+              "minLength": 1
+            },
+            "embedding_batch_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4096
+            },
+            "reindex_on_change": {
+              "type": "boolean"
+            },
+            "watch_mode": {
+              "type": "boolean"
+            }
+          }
+        },
+        "search": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "default_limit",
+            "quality_weight",
+            "rrf_k",
+            "quality_timeout_ms",
+            "fast_only",
+            "explain"
+          ],
+          "properties": {
+            "default_limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200
+            },
+            "quality_weight": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "rrf_k": {
+              "type": "number",
+              "minimum": 1
+            },
+            "quality_timeout_ms": {
+              "type": "integer",
+              "minimum": 50
+            },
+            "fast_only": {
+              "type": "boolean"
+            },
+            "explain": {
+              "type": "boolean"
+            }
+          }
+        },
+        "pressure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "profile",
+            "cpu_ceiling_pct",
+            "memory_ceiling_mb"
+          ],
+          "properties": {
+            "profile": {
+              "type": "string",
+              "enum": [
+                "strict",
+                "performance",
+                "degraded"
+              ]
+            },
+            "cpu_ceiling_pct": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "memory_ceiling_mb": {
+              "type": "integer",
+              "minimum": 128
+            }
+          }
+        },
+        "tui": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "theme",
+            "frame_budget_ms",
+            "show_explanations",
+            "density"
+          ],
+          "properties": {
+            "theme": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "light",
+                "dark"
+              ]
+            },
+            "frame_budget_ms": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 200
+            },
+            "show_explanations": {
+              "type": "boolean"
+            },
+            "density": {
+              "type": "string",
+              "enum": [
+                "compact",
+                "normal",
+                "expanded"
+              ]
+            }
+          }
+        },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "db_path",
+            "evidence_retention_days",
+            "summary_retention_days"
+          ],
+          "properties": {
+            "db_path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "evidence_retention_days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3650
+            },
+            "summary_retention_days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3650
+            }
+          }
+        },
+        "privacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "redact_file_contents_in_logs",
+            "redact_paths_in_telemetry"
+          ],
+          "properties": {
+            "redact_file_contents_in_logs": {
+              "type": "boolean"
+            },
+            "redact_paths_in_telemetry": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "defaultConfigValues": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/configValues"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "discovery": {
+              "type": "object",
+              "properties": {
+                "text_selection_mode": {
+                  "const": "blocklist"
+                }
+              }
+            },
+            "privacy": {
+              "type": "object",
+              "properties": {
+                "redact_file_contents_in_logs": {
+                  "const": true
+                },
+                "redact_paths_in_telemetry": {
+                  "const": true
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "envVarMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "discovery_roots",
+        "discovery_exclude_patterns",
+        "search_default_limit",
+        "search_fast_only",
+        "search_explain",
+        "pressure_profile",
+        "tui_theme",
+        "privacy_redact_paths_in_telemetry"
+      ],
+      "properties": {
+        "discovery_roots": {
+          "type": "string",
+          "const": "FSFS_DISCOVERY_ROOTS"
+        },
+        "discovery_exclude_patterns": {
+          "type": "string",
+          "const": "FSFS_DISCOVERY_EXCLUDE_PATTERNS"
+        },
+        "search_default_limit": {
+          "type": "string",
+          "const": "FSFS_SEARCH_DEFAULT_LIMIT"
+        },
+        "search_fast_only": {
+          "type": "string",
+          "const": "FSFS_SEARCH_FAST_ONLY"
+        },
+        "search_explain": {
+          "type": "string",
+          "const": "FSFS_SEARCH_EXPLAIN"
+        },
+        "pressure_profile": {
+          "type": "string",
+          "const": "FSFS_PRESSURE_PROFILE"
+        },
+        "tui_theme": {
+          "type": "string",
+          "const": "FSFS_TUI_THEME"
+        },
+        "privacy_redact_paths_in_telemetry": {
+          "type": "string",
+          "const": "FSFS_PRIVACY_REDACT_PATHS_IN_TELEMETRY"
+        }
+      }
+    },
+    "cliFlagMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "roots",
+        "exclude",
+        "limit",
+        "fast_only",
+        "explain",
+        "profile",
+        "theme"
+      ],
+      "properties": {
+        "roots": {
+          "type": "string",
+          "const": "--roots"
+        },
+        "exclude": {
+          "type": "string",
+          "const": "--exclude"
+        },
+        "limit": {
+          "type": "string",
+          "const": "--limit"
+        },
+        "fast_only": {
+          "type": "string",
+          "const": "--fast-only"
+        },
+        "explain": {
+          "type": "string",
+          "const": "--explain"
+        },
+        "profile": {
+          "type": "string",
+          "const": "--profile"
+        },
+        "theme": {
+          "type": "string",
+          "const": "--theme"
+        }
+      }
+    },
+    "configContractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "source_precedence",
+        "config_file_policy",
+        "defaults",
+        "env_var_map",
+        "cli_flag_map",
+        "validation",
+        "logging"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_config_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "source_precedence": {
+          "type": "array",
+          "const": [
+            "cli",
+            "env",
+            "file",
+            "defaults"
+          ]
+        },
+        "config_file_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primary",
+            "fallback",
+            "expand_tilde"
+          ],
+          "properties": {
+            "primary": {
+              "type": "string",
+              "pattern": "XDG_CONFIG_HOME"
+            },
+            "fallback": {
+              "type": "string",
+              "pattern": "^~/.+"
+            },
+            "expand_tilde": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "defaults": {
+          "$ref": "#/$defs/defaultConfigValues"
+        },
+        "env_var_map": {
+          "$ref": "#/$defs/envVarMap"
+        },
+        "cli_flag_map": {
+          "$ref": "#/$defs/cliFlagMap"
+        },
+        "validation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "unknown_key_policy",
+            "path_expansion",
+            "conflict_rules",
+            "invariants"
+          ],
+          "properties": {
+            "unknown_key_policy": {
+              "type": "string",
+              "const": "warn"
+            },
+            "path_expansion": {
+              "type": "string",
+              "const": "tilde_to_home"
+            },
+            "conflict_rules": {
+              "type": "array",
+              "contains": {
+                "const": "config.search.fast_only_with_quality_model"
+              },
+              "items": {
+                "type": "string",
+                "pattern": "^config\\.[a-z0-9_.]+$"
+              }
+            },
+            "invariants": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "string",
+                "pattern": "^config\\.[a-z0-9_.]+$"
+              }
+            }
+          }
+        },
+        "logging": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event_name",
+            "required_fields",
+            "reason_code_prefix"
+          ],
+          "properties": {
+            "event_name": {
+              "type": "string",
+              "const": "config_loaded"
+            },
+            "required_fields": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "allOf": [
+                {
+                  "contains": {
+                    "const": "source_precedence_applied"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "resolved_values"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "warnings"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "reason_codes"
+                  }
+                }
+              ]
+            },
+            "reason_code_prefix": {
+              "type": "string",
+              "const": "config."
+            }
+          }
+        }
+      }
+    },
+    "configEffective": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "resolved_at_ts",
+        "source_precedence_applied",
+        "sources",
+        "values",
+        "path_expansions",
+        "diagnostics",
+        "conflict_warnings"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_config_effective"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "resolved_at_ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_precedence_applied": {
+          "type": "array",
+          "const": [
+            "cli",
+            "env",
+            "file",
+            "defaults"
+          ]
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cli_flags_used",
+            "env_keys_used",
+            "config_file_used"
+          ],
+          "properties": {
+            "cli_flags_used": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^--[a-z0-9-]+$"
+              }
+            },
+            "env_keys_used": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^FSFS_[A-Z0-9_]+$"
+              }
+            },
+            "config_file_used": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        "values": {
+          "$ref": "#/$defs/configValues"
+        },
+        "path_expansions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "field",
+              "raw",
+              "expanded",
+              "source"
+            ],
+            "properties": {
+              "field": {
+                "type": "string",
+                "pattern": "^(discovery|indexing|storage)\\.[a-z0-9_]+$"
+              },
+              "raw": {
+                "type": "string",
+                "minLength": 1
+              },
+              "expanded": {
+                "type": "string",
+                "pattern": "^/.+"
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "cli",
+                  "env",
+                  "file",
+                  "defaults"
+                ]
+              }
+            }
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        },
+        "conflict_warnings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "config.search.fast_only_with_quality_model"
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "values": {
+                "properties": {
+                  "search": {
+                    "properties": {
+                      "fast_only": {
+                        "const": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "conflict_warnings": {
+                "contains": {
+                  "const": "config.search.fast_only_with_quality_model"
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "values": {
+                "properties": {
+                  "storage": {
+                    "properties": {
+                      "summary_retention_days": {
+                        "type": "integer"
+                      },
+                      "evidence_retention_days": {
+                        "type": "integer"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "diagnostics": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "configLoadEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "event",
+        "event_ts",
+        "source_precedence_applied",
+        "resolved_values",
+        "cli_flags_used",
+        "env_keys_used",
+        "config_file_used",
+        "warnings",
+        "reason_codes",
+        "redaction_applied",
+        "emit_fields"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_config_loaded_event"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "event": {
+          "type": "string",
+          "const": "config_loaded"
+        },
+        "event_ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source_precedence_applied": {
+          "type": "array",
+          "const": [
+            "cli",
+            "env",
+            "file",
+            "defaults"
+          ]
+        },
+        "resolved_values": {
+          "$ref": "#/$defs/configValues"
+        },
+        "cli_flags_used": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^--[a-z0-9-]+$"
+          }
+        },
+        "env_keys_used": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^FSFS_[A-Z0-9_]+$"
+          }
+        },
+        "config_file_used": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnostic"
+          }
+        },
+        "reason_codes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^config\\.[a-z0-9_.]+$"
+          }
+        },
+        "redaction_applied": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "redact_file_contents_in_logs",
+            "redact_paths_in_telemetry"
+          ],
+          "properties": {
+            "redact_file_contents_in_logs": {
+              "type": "boolean",
+              "const": true
+            },
+            "redact_paths_in_telemetry": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "emit_fields": {
+          "type": "array",
+          "allOf": [
+            {
+              "contains": {
+                "const": "source_precedence_applied"
+              }
+            },
+            {
+              "contains": {
+                "const": "resolved_values"
+              }
+            },
+            {
+              "contains": {
+                "const": "warnings"
+              }
+            },
+            {
+              "contains": {
+                "const": "reason_codes"
+              }
+            }
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

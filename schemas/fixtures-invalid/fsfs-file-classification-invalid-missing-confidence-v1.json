@@ -1,0 +1,24 @@
+{
+  "kind": "fsfs_file_classification_decision",
+  "v": 1,
+  "path": "/workspace/src/main.py",
+  "size_bytes": 1800,
+  "probe_bytes": 1800,
+  "sniff_features": {
+    "null_bytes": 0,
+    "non_printable_ratio": 0.02,
+    "high_bit_ratio": 0.01,
+    "bom": "none"
+  },
+  "detected_type": "text",
+  "detected_encoding": "utf-8",
+  "normalization_applied": "utf8_nfc",
+  "ingest_action": "index",
+  "encoding_confidence": 0.95,
+  "reason_code": "FSFS_TEXT_UTF8_HIGH_CONFIDENCE",
+  "downstream_signals": {
+    "utility_penalty": 0.03,
+    "skip_candidate": false,
+    "requires_manual_review": false
+  }
+}

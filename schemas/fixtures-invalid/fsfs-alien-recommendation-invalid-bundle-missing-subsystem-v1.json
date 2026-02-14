@@ -1,0 +1,100 @@
+{
+  "kind": "fsfs_alien_recommendation_bundle",
+  "v": 1,
+  "cards": [
+    {
+      "kind": "fsfs_alien_recommendation_card",
+      "v": 1,
+      "subsystem": "ingestion_policy",
+      "ev_score": 3.8,
+      "priority_tier": "A",
+      "adoption_wedge": "Start on code/docs roots.",
+      "budgeted_mode": {
+        "latency_budget_ms": 35,
+        "memory_budget_mb": 96,
+        "retry_budget": 1,
+        "on_exhaustion": "Defer low utility ingest."
+      },
+      "fallback_trigger": {
+        "condition": "queue_p95_ms > 250",
+        "fallback_action": "index_later",
+        "reason_code": "FSFS_INGEST_QUEUE_PRESSURE_TRIP"
+      },
+      "baseline_comparator": "Naive immediate indexing.",
+      "isomorphism_proof_plan": {
+        "invariants": [
+          "Stable include/exclude decisions for identical snapshots."
+        ],
+        "baseline_harness": "tests/e2e_ingest_replay.sh",
+        "replay_checks": [
+          "decision_trace_equivalence"
+        ]
+      },
+      "repro_artifacts": {
+        "manifest_fields": [
+          "seed",
+          "config_hash",
+          "subsystem"
+        ],
+        "artifact_outputs": [
+          "ingest_trace.jsonl",
+          "ingest_summary.json"
+        ],
+        "replay_command": "cargo test -p frankensearch --test ingest_replay"
+      },
+      "rollback_plan": {
+        "rollback_command": "fsfsctl policy set ingest.naive=true",
+        "abort_conditions": [
+          "recall_drop_gt_5pct"
+        ]
+      }
+    },
+    {
+      "kind": "fsfs_alien_recommendation_card",
+      "v": 1,
+      "subsystem": "degradation_scheduler",
+      "ev_score": 3.5,
+      "priority_tier": "A",
+      "adoption_wedge": "Start where pressure telemetry is stable.",
+      "budgeted_mode": {
+        "latency_budget_ms": 20,
+        "memory_budget_mb": 64,
+        "retry_budget": 0,
+        "on_exhaustion": "Hold degraded mode under sustained pressure."
+      },
+      "fallback_trigger": {
+        "condition": "cpu_p95_ms > 220",
+        "fallback_action": "degrade_hold",
+        "reason_code": "FSFS_DEGRADE_PRESSURE_GUARD"
+      },
+      "baseline_comparator": "Threshold-only degradation policy.",
+      "isomorphism_proof_plan": {
+        "invariants": [
+          "Deterministic transition order for identical telemetry."
+        ],
+        "baseline_harness": "tests/e2e_degrade_replay.sh",
+        "replay_checks": [
+          "transition_trace_equivalence"
+        ]
+      },
+      "repro_artifacts": {
+        "manifest_fields": [
+          "seed",
+          "config_hash",
+          "subsystem"
+        ],
+        "artifact_outputs": [
+          "degrade_trace.jsonl",
+          "degrade_summary.json"
+        ],
+        "replay_command": "cargo test -p frankensearch --test degrade_replay"
+      },
+      "rollback_plan": {
+        "rollback_command": "fsfsctl policy set degrade.static=true",
+        "abort_conditions": [
+          "state_oscillation_gt_3_per_hour"
+        ]
+      }
+    }
+  ]
+}

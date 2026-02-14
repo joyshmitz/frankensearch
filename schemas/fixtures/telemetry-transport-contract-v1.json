@@ -1,0 +1,42 @@
+{
+  "kind": "telemetry_transport_contract_definition",
+  "v": 1,
+  "primary_transport": {
+    "type": "unix_domain_socket",
+    "socket_path_template": "${XDG_RUNTIME_DIR}/frankensearch/{instance_id}.sock",
+    "framing": "length_prefixed",
+    "supported_codecs": [
+      "msgpack",
+      "cbor"
+    ],
+    "auth_mode": "uid_match"
+  },
+  "fallback_transport": {
+    "type": "jsonl_file",
+    "path_template": "{data_dir}/telemetry/{instance_id}.jsonl"
+  },
+  "backpressure": {
+    "strategy": "drop_not_block",
+    "drop_counter_required": true,
+    "max_inflight_min": 128,
+    "block_instance_search": false
+  },
+  "lifecycle": {
+    "handshake_required": true,
+    "heartbeat_required": true,
+    "resume_required": true,
+    "disconnect_behavior": "graceful_or_retry"
+  },
+  "multi_consumer": {
+    "mode": "fan_out",
+    "max_consumers": 8
+  },
+  "security": {
+    "local_only": true,
+    "network_transport_allowed": false
+  },
+  "slo_targets": {
+    "p95_delivery_lag_ms_target": 100,
+    "throughput_eps_target": 10000
+  }
+}

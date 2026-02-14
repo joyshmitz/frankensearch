@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-high-cost-artifact-detectors-v1.schema.json",
+  "title": "fsfs High-Cost Artifact Detectors Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/detectorDecision"
+    },
+    {
+      "$ref": "#/$defs/overrideEvent"
+    }
+  ],
+  "$defs": {
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^FSFS_[A-Z0-9_]+$"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "index_full",
+        "index_metadata_only",
+        "skip",
+        "quarantine"
+      ]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "giant_log_detector",
+        "vendor_generated_detector",
+        "archive_transient_detector",
+        "override_policy",
+        "default_actions"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_high_cost_artifact_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "giant_log_detector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_size_mb",
+            "churn_window_minutes",
+            "redundancy_ratio_threshold"
+          ],
+          "properties": {
+            "max_size_mb": {
+              "type": "number",
+              "minimum": 1
+            },
+            "churn_window_minutes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "redundancy_ratio_threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "vendor_generated_detector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "vendor_path_patterns",
+            "generated_markers",
+            "library_tree_depth_threshold"
+          ],
+          "properties": {
+            "vendor_path_patterns": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "generated_markers": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "library_tree_depth_threshold": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "archive_transient_detector": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "archive_extensions",
+            "transient_directories",
+            "build_artifact_patterns"
+          ],
+          "properties": {
+            "archive_extensions": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^\\.[a-z0-9]+$"
+              },
+              "minItems": 1
+            },
+            "transient_directories": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "build_artifact_patterns": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            }
+          }
+        },
+        "override_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "allow_user_force_include",
+            "requires_reason",
+            "max_override_ttl_seconds"
+          ],
+          "properties": {
+            "allow_user_force_include": {
+              "type": "boolean",
+              "const": true
+            },
+            "requires_reason": {
+              "type": "boolean",
+              "const": true
+            },
+            "max_override_ttl_seconds": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "default_actions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "giant_log",
+            "vendor_tree",
+            "generated_file",
+            "archive_container",
+            "transient_build_artifact"
+          ],
+          "properties": {
+            "giant_log": {
+              "$ref": "#/$defs/action"
+            },
+            "vendor_tree": {
+              "$ref": "#/$defs/action"
+            },
+            "generated_file": {
+              "$ref": "#/$defs/action"
+            },
+            "archive_container": {
+              "$ref": "#/$defs/action"
+            },
+            "transient_build_artifact": {
+              "$ref": "#/$defs/action"
+            }
+          }
+        }
+      }
+    },
+    "detectorDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "detectors_fired",
+        "evidence",
+        "final_action",
+        "reason_code",
+        "cost_score",
+        "override_applied",
+        "needs_manual_review"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_high_cost_artifact_decision"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "detectors_fired": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "giant_log",
+              "vendor_tree",
+              "generated_file",
+              "archive_container",
+              "transient_build_artifact"
+            ]
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "size_mb",
+            "churn_rate_per_hour",
+            "redundancy_ratio",
+            "path_depth",
+            "extension"
+          ],
+          "properties": {
+            "size_mb": {
+              "type": "number",
+              "minimum": 0
+            },
+            "churn_rate_per_hour": {
+              "type": "number",
+              "minimum": 0
+            },
+            "redundancy_ratio": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "path_depth": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "extension": {
+              "type": "string"
+            }
+          }
+        },
+        "user_override": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "requested_action",
+            "reason"
+          ],
+          "properties": {
+            "requested_action": {
+              "$ref": "#/$defs/action"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 3
+            },
+            "expires_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        },
+        "final_action": {
+          "$ref": "#/$defs/action"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "cost_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "override_applied": {
+          "type": "boolean"
+        },
+        "needs_manual_review": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "override_applied": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "user_override"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "final_action": {
+                "const": "index_full"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "override_applied": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "overrideEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "requested_action",
+        "approved",
+        "reason",
+        "reason_code"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_high_cost_override_event"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "requested_action": {
+          "$ref": "#/$defs/action"
+        },
+        "approved": {
+          "type": "boolean"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 3
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      }
+    }
+  }
+}

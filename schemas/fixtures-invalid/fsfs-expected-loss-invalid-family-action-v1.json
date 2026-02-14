@@ -1,0 +1,41 @@
+{
+  "kind": "fsfs_expected_loss_matrix",
+  "v": 1,
+  "family": "degrade",
+  "state_space": [
+    "cpu_pressure"
+  ],
+  "action_space": [
+    "degrade_enter",
+    "index_now"
+  ],
+  "loss_rows": [
+    {
+      "state_id": "cpu_pressure",
+      "action_losses": [
+        {
+          "action": "degrade_enter",
+          "expected_loss": 0.2,
+          "false_include_cost": 0.1,
+          "false_exclude_cost": 0.3,
+          "latency_cost": 0.2,
+          "quality_cost": 0.1,
+          "compute_cost": 0.1,
+          "risk_level": "high",
+          "reason_code": "FSFS_PRESSURE_DEGRADE_ENTER"
+        }
+      ]
+    }
+  ],
+  "fallback_triggers": [
+    {
+      "condition": "cpu_p95_ms > 200",
+      "fallback_action": "degrade_hold",
+      "reason_code": "FSFS_FALLBACK_CPU_TRIP",
+      "trip_threshold": "2_windows",
+      "applies_to_actions": [
+        "degrade_enter"
+      ]
+    }
+  ]
+}

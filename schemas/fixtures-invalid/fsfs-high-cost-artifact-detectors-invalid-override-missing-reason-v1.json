@@ -1,0 +1,8 @@
+{
+  "kind": "fsfs_high_cost_override_event",
+  "v": 1,
+  "path": "/workspace/dist/build.tar.gz",
+  "requested_action": "index_metadata_only",
+  "approved": true,
+  "reason_code": "FSFS_OVERRIDE_APPROVED"
+}

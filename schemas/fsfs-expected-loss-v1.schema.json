@@ -1,0 +1,594 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-expected-loss-v1.schema.json",
+  "title": "fsfs Expected-Loss Decision Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/decisionMatrix"
+    },
+    {
+      "$ref": "#/$defs/decisionEvent"
+    }
+  ],
+  "$defs": {
+    "family": {
+      "type": "string",
+      "enum": [
+        "ingest",
+        "embed",
+        "degrade"
+      ]
+    },
+    "riskLevel": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^FSFS_[A-Z0-9_]+$"
+    },
+    "actionLoss": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "expected_loss",
+        "false_include_cost",
+        "false_exclude_cost",
+        "latency_cost",
+        "quality_cost",
+        "compute_cost",
+        "risk_level",
+        "reason_code"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_loss": {
+          "type": "number",
+          "minimum": 0
+        },
+        "false_include_cost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "false_exclude_cost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "latency_cost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "quality_cost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "compute_cost": {
+          "type": "number",
+          "minimum": 0
+        },
+        "risk_level": {
+          "$ref": "#/$defs/riskLevel"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      }
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "action_families",
+        "cost_asymmetry_definitions",
+        "required_decision_fields",
+        "fallback_policy"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_expected_loss_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "action_families": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ingest",
+            "embed",
+            "degrade"
+          ],
+          "properties": {
+            "ingest": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "index_now"
+                },
+                {
+                  "const": "index_later"
+                },
+                {
+                  "const": "skip"
+                }
+              ],
+              "items": false
+            },
+            "embed": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "embed_now"
+                },
+                {
+                  "const": "embed_defer"
+                },
+                {
+                  "const": "embed_disable"
+                }
+              ],
+              "items": false
+            },
+            "degrade": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "degrade_enter"
+                },
+                {
+                  "const": "degrade_hold"
+                },
+                {
+                  "const": "degrade_exit"
+                }
+              ],
+              "items": false
+            }
+          }
+        },
+        "cost_asymmetry_definitions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "false_include_vs_false_exclude",
+            "latency_vs_quality",
+            "compute_vs_recall"
+          ],
+          "properties": {
+            "false_include_vs_false_exclude": {
+              "type": "string",
+              "minLength": 8
+            },
+            "latency_vs_quality": {
+              "type": "string",
+              "minLength": 8
+            },
+            "compute_vs_recall": {
+              "type": "string",
+              "minLength": 8
+            }
+          }
+        },
+        "required_decision_fields": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "family",
+              "state_id",
+              "action",
+              "expected_loss",
+              "false_include_cost",
+              "false_exclude_cost",
+              "latency_cost",
+              "quality_cost",
+              "compute_cost",
+              "risk_level",
+              "reason_code"
+            ]
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "family"
+              }
+            },
+            {
+              "contains": {
+                "const": "action"
+              }
+            },
+            {
+              "contains": {
+                "const": "expected_loss"
+              }
+            },
+            {
+              "contains": {
+                "const": "reason_code"
+              }
+            }
+          ]
+        },
+        "fallback_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required_for_high_risk",
+            "required_fields"
+          ],
+          "properties": {
+            "required_for_high_risk": {
+              "type": "boolean",
+              "const": true
+            },
+            "required_fields": {
+              "type": "array",
+              "minItems": 4,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "condition",
+                  "fallback_action",
+                  "reason_code",
+                  "trip_threshold",
+                  "applies_to_actions"
+                ]
+              },
+              "allOf": [
+                {
+                  "contains": {
+                    "const": "condition"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "fallback_action"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "reason_code"
+                  }
+                },
+                {
+                  "contains": {
+                    "const": "trip_threshold"
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "decisionMatrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "family",
+        "state_space",
+        "action_space",
+        "loss_rows",
+        "fallback_triggers"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_expected_loss_matrix"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "family": {
+          "$ref": "#/$defs/family"
+        },
+        "state_space": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "action_space": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "loss_rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "state_id",
+              "action_losses"
+            ],
+            "properties": {
+              "state_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "action_losses": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/actionLoss"
+                }
+              }
+            }
+          }
+        },
+        "fallback_triggers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "condition",
+              "fallback_action",
+              "reason_code",
+              "trip_threshold",
+              "applies_to_actions"
+            ],
+            "properties": {
+              "condition": {
+                "type": "string",
+                "minLength": 1
+              },
+              "fallback_action": {
+                "type": "string",
+                "minLength": 1
+              },
+              "reason_code": {
+                "$ref": "#/$defs/reasonCode"
+              },
+              "trip_threshold": {
+                "type": "string",
+                "minLength": 1
+              },
+              "applies_to_actions": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": "ingest"
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action_space": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "index_now",
+                    "index_later",
+                    "skip"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": "embed"
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action_space": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "embed_now",
+                    "embed_defer",
+                    "embed_disable"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "family": {
+                "const": "degrade"
+              }
+            },
+            "required": [
+              "family"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action_space": {
+                "type": "array",
+                "items": {
+                  "enum": [
+                    "degrade_enter",
+                    "degrade_hold",
+                    "degrade_exit"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "loss_rows": {
+                "contains": {
+                  "type": "object",
+                  "properties": {
+                    "action_losses": {
+                      "contains": {
+                        "type": "object",
+                        "properties": {
+                          "risk_level": {
+                            "const": "high"
+                          }
+                        },
+                        "required": [
+                          "risk_level"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "action_losses"
+                  ]
+                }
+              }
+            },
+            "required": [
+              "loss_rows"
+            ]
+          },
+          "then": {
+            "properties": {
+              "fallback_triggers": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "decisionEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "decision_id",
+        "seed",
+        "config_hash",
+        "family",
+        "state_id",
+        "chosen_action",
+        "evaluated_actions",
+        "selected_reason_code",
+        "fallback_invoked"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_expected_loss_decision_event"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "decision_id": {
+          "type": "string",
+          "pattern": "^dec-[a-z0-9-]{6,}$"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "config_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "family": {
+          "$ref": "#/$defs/family"
+        },
+        "state_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "chosen_action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evaluated_actions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/actionLoss"
+          }
+        },
+        "selected_reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "fallback_invoked": {
+          "type": "boolean"
+        },
+        "fallback_reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "fallback_invoked": {
+                "const": true
+              }
+            },
+            "required": [
+              "fallback_invoked"
+            ]
+          },
+          "then": {
+            "required": [
+              "fallback_reason_code"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

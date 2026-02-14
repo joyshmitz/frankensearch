@@ -1,0 +1,36 @@
+{
+  "kind": "fsfs_high_cost_artifact_contract_definition",
+  "v": 1,
+  "giant_log_detector": {
+    "max_size_mb": 25,
+    "churn_window_minutes": 60,
+    "redundancy_ratio_threshold": 0.8
+  },
+  "vendor_generated_detector": {
+    "vendor_path_patterns": [
+      "vendor/"
+    ],
+    "generated_markers": [
+      "@generated"
+    ],
+    "library_tree_depth_threshold": 4
+  },
+  "archive_transient_detector": {
+    "archive_extensions": [
+      ".zip"
+    ],
+    "transient_directories": [
+      "target/"
+    ],
+    "build_artifact_patterns": [
+      "*.pyc"
+    ]
+  },
+  "default_actions": {
+    "giant_log": "skip",
+    "vendor_tree": "skip",
+    "generated_file": "index_metadata_only",
+    "archive_container": "skip",
+    "transient_build_artifact": "skip"
+  }
+}

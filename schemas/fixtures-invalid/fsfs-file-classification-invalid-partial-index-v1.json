@@ -1,0 +1,25 @@
+{
+  "kind": "fsfs_file_classification_decision",
+  "v": 1,
+  "path": "/workspace/tmp/incomplete.md",
+  "size_bytes": 20000,
+  "probe_bytes": 4096,
+  "sniff_features": {
+    "null_bytes": 0,
+    "non_printable_ratio": 0.15,
+    "high_bit_ratio": 0.0,
+    "bom": "none"
+  },
+  "detected_type": "partial",
+  "detected_encoding": "utf-8",
+  "normalization_applied": "utf8_nfc",
+  "ingest_action": "index",
+  "classification_confidence": 0.6,
+  "encoding_confidence": 0.75,
+  "reason_code": "FSFS_PARTIAL_TRUNCATED_PREFIX_ONLY",
+  "downstream_signals": {
+    "utility_penalty": 0.35,
+    "skip_candidate": true,
+    "requires_manual_review": true
+  }
+}

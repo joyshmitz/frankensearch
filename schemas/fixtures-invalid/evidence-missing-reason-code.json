@@ -1,0 +1,32 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:56:08Z",
+  "event": {
+    "event_id": "01JAH9B1GK2M3N4P5Q6R7S8T95",
+    "type": "degradation",
+    "project_key": "/data/projects/frankensearch",
+    "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+    "trace": {
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "reason": {
+      "human": "Reason code omitted.",
+      "severity": "error"
+    },
+    "replay": {
+      "mode": "live"
+    },
+    "redaction": {
+      "policy_version": "v1",
+      "contains_sensitive_source": false,
+      "transforms_applied": [
+        "drop"
+      ]
+    },
+    "payload": {
+      "resource_profile": "degraded",
+      "dropped_count": 23
+    }
+  }
+}

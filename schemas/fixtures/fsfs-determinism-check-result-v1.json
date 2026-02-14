@@ -1,0 +1,11 @@
+{
+  "kind": "fsfs_determinism_check_result",
+  "v": 1,
+  "scenario_id": "tier1-ranked-output-replay",
+  "determinism_tier": "tier1",
+  "comparison_mode": "bit_exact",
+  "run_count": 2,
+  "pass": true,
+  "manifest_ref": "run-fsfs-tier1-0001",
+  "mismatch_diagnostics": []
+}

@@ -1,0 +1,21 @@
+{
+  "kind": "fsfs_high_cost_artifact_decision",
+  "v": 1,
+  "path": "/workspace/node_modules/pkg/bundle.js",
+  "detectors_fired": [
+    "vendor_tree",
+    "transient_build_artifact"
+  ],
+  "evidence": {
+    "size_mb": 12,
+    "churn_rate_per_hour": 1,
+    "redundancy_ratio": 0.4,
+    "path_depth": 4,
+    "extension": ".js"
+  },
+  "final_action": "index_full",
+  "reason_code": "FSFS_VENDOR_FORCE_INDEX",
+  "cost_score": 0.81,
+  "override_applied": false,
+  "needs_manual_review": true
+}

@@ -1,0 +1,33 @@
+{
+  "v": 1,
+  "ts": "2026-02-14T00:56:04Z",
+  "event": {
+    "event_id": "01JAH9B1DK2M3N4P5Q6R7S8T94",
+    "type": "alert",
+    "project_key": "/data/projects/frankensearch",
+    "instance_id": "01JAH9A2W8F8Q6GQ4C7M3N2P1R",
+    "trace": {
+      "root_request_id": "01JAH9A2WZZZZZZZZZZZZZZZZZ",
+      "parent_event_id": null
+    },
+    "reason": {
+      "code": "slo.latency.p95_exceeded",
+      "human": "Unsafe raw query included.",
+      "severity": "warn"
+    },
+    "replay": {
+      "mode": "live"
+    },
+    "redaction": {
+      "policy_version": "v1",
+      "contains_sensitive_source": true,
+      "transforms_applied": [
+        "truncate_preview"
+      ]
+    },
+    "payload": {
+      "raw_query": "user@example.com financial records",
+      "lag_ms": 90
+    }
+  }
+}

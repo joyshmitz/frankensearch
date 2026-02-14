@@ -1,0 +1,433 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-file-classification-v1.schema.json",
+  "title": "fsfs File Classification Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/classificationDecision"
+    },
+    {
+      "$ref": "#/$defs/corruptEvent"
+    }
+  ],
+  "$defs": {
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^FSFS_[A-Z0-9_]+$"
+    },
+    "encodingLabel": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "sniff_heuristics",
+        "encoding_policy",
+        "corrupt_partial_policy",
+        "confidence_signals"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_file_classification_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "sniff_heuristics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_probe_bytes",
+            "binary_byte_threshold_pct",
+            "high_bit_ratio_threshold_pct",
+            "null_byte_hard_binary"
+          ],
+          "properties": {
+            "max_probe_bytes": {
+              "type": "integer",
+              "minimum": 256
+            },
+            "binary_byte_threshold_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "high_bit_ratio_threshold_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "null_byte_hard_binary": {
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "encoding_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primary_detectors",
+            "normalization",
+            "unknown_encoding_action"
+          ],
+          "properties": {
+            "primary_detectors": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "bom"
+                },
+                {
+                  "const": "utf8_validation"
+                }
+              ],
+              "items": {
+                "type": "string",
+                "enum": [
+                  "bom",
+                  "utf8_validation",
+                  "icu_heuristic"
+                ]
+              },
+              "minItems": 2
+            },
+            "normalization": {
+              "type": "string",
+              "enum": [
+                "utf8_nfc",
+                "utf8_nfc_lossy",
+                "reject_non_text"
+              ]
+            },
+            "unknown_encoding_action": {
+              "type": "string",
+              "enum": [
+                "skip",
+                "lossy_decode",
+                "quarantine"
+              ]
+            }
+          }
+        },
+        "corrupt_partial_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "truncated_action",
+            "checksum_mismatch_action",
+            "max_recovery_prefix_bytes"
+          ],
+          "properties": {
+            "truncated_action": {
+              "type": "string",
+              "enum": [
+                "quarantine",
+                "skip",
+                "index_partial_with_flag"
+              ]
+            },
+            "checksum_mismatch_action": {
+              "type": "string",
+              "enum": [
+                "quarantine",
+                "skip"
+              ]
+            },
+            "max_recovery_prefix_bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "confidence_signals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "min_confidence_for_text",
+            "min_confidence_for_lossy_decode",
+            "emit_required_fields"
+          ],
+          "properties": {
+            "min_confidence_for_text": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "min_confidence_for_lossy_decode": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "emit_required_fields": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "classification_confidence",
+                  "encoding_confidence",
+                  "reason_code",
+                  "utility_penalty",
+                  "skip_candidate",
+                  "requires_manual_review"
+                ]
+              },
+              "minItems": 4,
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "classificationDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "size_bytes",
+        "probe_bytes",
+        "sniff_features",
+        "detected_type",
+        "detected_encoding",
+        "normalization_applied",
+        "ingest_action",
+        "classification_confidence",
+        "encoding_confidence",
+        "reason_code",
+        "downstream_signals"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_file_classification_decision"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "probe_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sniff_features": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "null_bytes",
+            "non_printable_ratio",
+            "high_bit_ratio",
+            "bom"
+          ],
+          "properties": {
+            "null_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "non_printable_ratio": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "high_bit_ratio": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "bom": {
+              "type": "string",
+              "enum": [
+                "none",
+                "utf8",
+                "utf16le",
+                "utf16be"
+              ]
+            }
+          }
+        },
+        "detected_type": {
+          "type": "string",
+          "enum": [
+            "text",
+            "binary",
+            "archive",
+            "partial",
+            "corrupt"
+          ]
+        },
+        "detected_encoding": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/encodingLabel"
+            },
+            {
+              "const": "none"
+            }
+          ]
+        },
+        "normalization_applied": {
+          "type": "string",
+          "enum": [
+            "utf8_nfc",
+            "utf8_nfc_lossy",
+            "none"
+          ]
+        },
+        "ingest_action": {
+          "type": "string",
+          "enum": [
+            "index",
+            "skip",
+            "quarantine",
+            "index_partial_with_flag"
+          ]
+        },
+        "classification_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "encoding_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "downstream_signals": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "utility_penalty",
+            "skip_candidate",
+            "requires_manual_review"
+          ],
+          "properties": {
+            "utility_penalty": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "skip_candidate": {
+              "type": "boolean"
+            },
+            "requires_manual_review": {
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "detected_type": {
+                "const": "binary"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "detected_encoding": {
+                "const": "none"
+              },
+              "normalization_applied": {
+                "const": "none"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "detected_type": {
+                "const": "partial"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ingest_action": {
+                "enum": [
+                  "index_partial_with_flag",
+                  "skip",
+                  "quarantine"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "corruptEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "error_class",
+        "bytes_recovered",
+        "ingest_action",
+        "reason_code"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_file_classification_corrupt_event"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "error_class": {
+          "type": "string",
+          "enum": [
+            "truncated",
+            "checksum_mismatch",
+            "decode_error",
+            "io_short_read"
+          ]
+        },
+        "bytes_recovered": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ingest_action": {
+          "type": "string",
+          "enum": [
+            "skip",
+            "quarantine",
+            "index_partial_with_flag"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      }
+    }
+  }
+}

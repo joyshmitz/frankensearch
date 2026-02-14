@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-root-discovery-v1.schema.json",
+  "title": "fsfs Root Discovery Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/discoveryDecision"
+    },
+    {
+      "$ref": "#/$defs/guardEvent"
+    }
+  ],
+  "$defs": {
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^FSFS_[A-Z0-9_]+$"
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "default_roots",
+        "override_modes",
+        "precedence_order",
+        "traversal_safety"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_root_discovery_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "default_roots": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "override_modes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "strict",
+            "permissive"
+          ],
+          "properties": {
+            "strict": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "deny_on_ambiguity",
+                "cross_mount_default",
+                "follow_symlink_default"
+              ],
+              "properties": {
+                "deny_on_ambiguity": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "cross_mount_default": {
+                  "type": "boolean",
+                  "const": false
+                },
+                "follow_symlink_default": {
+                  "type": "boolean",
+                  "const": false
+                }
+              }
+            },
+            "permissive": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "allow_explicit_include_override",
+                "audit_reason_codes_required"
+              ],
+              "properties": {
+                "allow_explicit_include_override": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "audit_reason_codes_required": {
+                  "type": "boolean",
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        "precedence_order": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "hard_deny"
+            },
+            {
+              "const": "explicit_exclude"
+            },
+            {
+              "const": "explicit_include"
+            },
+            {
+              "const": "fsfs_config_exclude"
+            },
+            {
+              "const": "fsfs_config_include"
+            },
+            {
+              "const": "gitignore"
+            },
+            {
+              "const": "dot_ignore"
+            },
+            {
+              "const": "system_exclude"
+            },
+            {
+              "const": "default_root"
+            }
+          ],
+          "items": false
+        },
+        "traversal_safety": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "symlink_policy",
+            "max_symlink_depth",
+            "detect_loops",
+            "mount_boundary_policy",
+            "max_mount_hops"
+          ],
+          "properties": {
+            "symlink_policy": {
+              "type": "string",
+              "enum": [
+                "no_follow",
+                "follow_bounded"
+              ]
+            },
+            "max_symlink_depth": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "detect_loops": {
+              "type": "boolean",
+              "const": true
+            },
+            "mount_boundary_policy": {
+              "type": "string",
+              "enum": [
+                "stay_on_device",
+                "allow_cross_mount_bounded"
+              ]
+            },
+            "max_mount_hops": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "discoveryDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "override_mode",
+        "rules_evaluated",
+        "final_decision",
+        "reason_code",
+        "symlink_detected",
+        "mount_crossing",
+        "loop_detected"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_root_discovery_decision"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "override_mode": {
+          "type": "string",
+          "enum": [
+            "strict",
+            "permissive"
+          ]
+        },
+        "rules_evaluated": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "source",
+              "matched",
+              "effect"
+            ],
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "hard_deny",
+                  "explicit_exclude",
+                  "explicit_include",
+                  "fsfs_config_exclude",
+                  "fsfs_config_include",
+                  "gitignore",
+                  "dot_ignore",
+                  "system_exclude",
+                  "default_root"
+                ]
+              },
+              "matched": {
+                "type": "boolean"
+              },
+              "effect": {
+                "type": "string",
+                "enum": [
+                  "include",
+                  "exclude",
+                  "noop"
+                ]
+              }
+            }
+          }
+        },
+        "final_decision": {
+          "type": "string",
+          "enum": [
+            "include",
+            "exclude",
+            "require_opt_in"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "symlink_detected": {
+          "type": "boolean"
+        },
+        "mount_crossing": {
+          "type": "boolean"
+        },
+        "loop_detected": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "loop_detected": {
+                "const": true
+              }
+            },
+            "required": [
+              "loop_detected"
+            ]
+          },
+          "then": {
+            "properties": {
+              "final_decision": {
+                "const": "exclude"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "guardEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "guard_type",
+        "action_taken",
+        "reason_code"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_root_traversal_guard_event"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "guard_type": {
+          "type": "string",
+          "enum": [
+            "symlink_loop",
+            "mount_boundary",
+            "system_root_block"
+          ]
+        },
+        "action_taken": {
+          "type": "string",
+          "enum": [
+            "excluded",
+            "require_opt_in",
+            "stopped_traversal"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      }
+    }
+  }
+}

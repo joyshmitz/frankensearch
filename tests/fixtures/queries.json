@@ -1,0 +1,362 @@
+[
+  {
+    "query": "rust ownership borrowing",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [
+      "test-rust-001",
+      "test-rust-009",
+      "test-rust-012",
+      "test-rust-015",
+      "test-rust-018",
+      "test-mixed-001",
+      "test-mixed-009",
+      "test-rust-003",
+      "test-rust-004",
+      "test-rust-014"
+    ]
+  },
+  {
+    "query": "how do transformers work for text embeddings",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-ml-002",
+      "test-ml-001",
+      "test-ml-011",
+      "test-ml-010",
+      "test-ml-003",
+      "test-ml-019",
+      "test-ml-013",
+      "test-mixed-009",
+      "test-mixed-001",
+      "test-ml-007"
+    ]
+  },
+  {
+    "query": "how to deploy containers with kubernetes",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-sysadmin-002",
+      "test-sysadmin-005",
+      "test-sysadmin-001",
+      "test-mixed-002",
+      "test-mixed-007",
+      "test-sysadmin-020",
+      "test-mixed-017",
+      "test-sysadmin-010",
+      "test-sysadmin-011",
+      "test-mixed-003"
+    ]
+  },
+  {
+    "query": "chocolate chip cookies recipe",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-cooking-001",
+      "test-cooking-012",
+      "test-cooking-009",
+      "test-cooking-011",
+      "test-cooking-013",
+      "test-mixed-020",
+      "test-cooking-004",
+      "test-cooking-010",
+      "test-cooking-003",
+      "test-cooking-008"
+    ]
+  },
+  {
+    "query": "cosine similarity vector search",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [
+      "test-ml-006",
+      "test-ml-001",
+      "test-ml-009",
+      "test-ml-020",
+      "test-ml-018",
+      "test-mixed-005",
+      "test-mixed-011",
+      "test-mixed-001",
+      "test-ml-007",
+      "test-ml-014"
+    ]
+  },
+  {
+    "query": "ONNX Runtime inference",
+    "query_class": "Identifier",
+    "relevant_ids": [
+      "test-ml-004",
+      "test-ml-008",
+      "test-mixed-008",
+      "test-mixed-002",
+      "test-mixed-009",
+      "test-ml-016",
+      "test-ml-005",
+      "test-code-002",
+      "test-ml-010",
+      "test-ml-007"
+    ]
+  },
+  {
+    "query": "f16 quantization memory savings",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [
+      "test-ml-008",
+      "test-ml-018",
+      "test-mixed-011",
+      "test-ml-020",
+      "test-ml-006",
+      "test-mixed-005",
+      "test-ml-013",
+      "test-ml-001",
+      "test-mixed-001",
+      "test-ml-009"
+    ]
+  },
+  {
+    "query": "sourdough bread starter fermentation",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-cooking-004",
+      "test-cooking-012",
+      "test-cooking-007",
+      "test-cooking-011",
+      "test-cooking-010",
+      "test-cooking-013",
+      "test-cooking-006",
+      "test-mixed-020",
+      "test-cooking-015",
+      "test-cooking-016"
+    ]
+  },
+  {
+    "query": "docker compose health check",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [
+      "test-sysadmin-005",
+      "test-sysadmin-001",
+      "test-config-002",
+      "test-mixed-007",
+      "test-sysadmin-002",
+      "test-mixed-002",
+      "test-sysadmin-020",
+      "test-sysadmin-004",
+      "test-sysadmin-011",
+      "test-mixed-003"
+    ]
+  },
+  {
+    "query": "BM25 scoring algorithm",
+    "query_class": "Identifier",
+    "relevant_ids": [
+      "test-ml-015",
+      "test-ml-017",
+      "test-ml-014",
+      "test-mixed-014",
+      "test-mixed-001",
+      "test-mixed-006",
+      "test-mixed-007",
+      "test-mixed-012",
+      "test-ml-001",
+      "test-ml-006"
+    ]
+  },
+  {
+    "query": "error handling Result type in Rust",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-rust-004",
+      "test-mixed-013",
+      "test-rust-010",
+      "test-rust-003",
+      "test-mixed-009",
+      "test-mixed-001",
+      "test-rust-001",
+      "test-rust-016",
+      "test-rust-017",
+      "test-rust-008"
+    ]
+  },
+  {
+    "query": "monitoring prometheus grafana dashboards",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-sysadmin-004",
+      "test-mixed-006",
+      "test-sysadmin-009",
+      "test-mixed-018",
+      "test-mixed-005",
+      "test-sysadmin-006",
+      "test-sysadmin-010",
+      "test-sysadmin-002",
+      "test-mixed-002",
+      "test-mixed-012"
+    ]
+  },
+  {
+    "query": "async await future executor",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [
+      "test-rust-002",
+      "test-rust-019",
+      "test-rust-011",
+      "test-rust-018",
+      "test-rust-001",
+      "test-mixed-001",
+      "test-mixed-009",
+      "test-rust-003",
+      "test-rust-013",
+      "test-rust-014"
+    ]
+  },
+  {
+    "query": "HNSW approximate nearest neighbor",
+    "query_class": "Identifier",
+    "relevant_ids": [
+      "test-ml-009",
+      "test-ml-006",
+      "test-ml-001",
+      "test-ml-018",
+      "test-mixed-005",
+      "test-mixed-011",
+      "test-mixed-001",
+      "test-ml-020",
+      "test-ml-014",
+      "test-ml-007"
+    ]
+  },
+  {
+    "query": "how to sear a steak properly",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-cooking-005",
+      "test-cooking-011",
+      "test-cooking-018",
+      "test-cooking-014",
+      "test-cooking-020",
+      "test-cooking-013",
+      "test-cooking-003",
+      "test-cooking-016",
+      "test-cooking-015",
+      "test-cooking-006"
+    ]
+  },
+  {
+    "query": "memory mapped file mmap",
+    "query_class": "ShortKeyword",
+    "relevant_ids": [
+      "test-rust-006",
+      "test-ml-018",
+      "test-mixed-011",
+      "test-mixed-005",
+      "test-mixed-001",
+      "test-sysadmin-018",
+      "test-rust-007",
+      "test-mixed-010",
+      "test-ml-009",
+      "test-ml-020"
+    ]
+  },
+  {
+    "query": "SSH key authentication configuration",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-sysadmin-008",
+      "test-sysadmin-007",
+      "test-sysadmin-017",
+      "test-sysadmin-014",
+      "test-sysadmin-003",
+      "test-sysadmin-015",
+      "test-sysadmin-006",
+      "test-sysadmin-019",
+      "test-sysadmin-020",
+      "test-sysadmin-010"
+    ]
+  },
+  {
+    "query": "reciprocal rank fusion hybrid search",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-ml-014",
+      "test-mixed-014",
+      "test-mixed-001",
+      "test-mixed-006",
+      "test-ml-015",
+      "test-ml-007",
+      "test-ml-017",
+      "test-ml-001",
+      "test-ml-006",
+      "test-mixed-012"
+    ]
+  },
+  {
+    "query": "sentence transformers MiniLM",
+    "query_class": "Identifier",
+    "relevant_ids": [
+      "test-ml-010",
+      "test-ml-012",
+      "test-ml-001",
+      "test-ml-007",
+      "test-ml-016",
+      "test-code-002",
+      "test-ml-005",
+      "test-ml-019",
+      "test-mixed-009",
+      "test-mixed-008"
+    ]
+  },
+  {
+    "query": "Maillard reaction browning temperature",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-cooking-011",
+      "test-cooking-005",
+      "test-cooking-018",
+      "test-cooking-015",
+      "test-cooking-020",
+      "test-cooking-009",
+      "test-cooking-012",
+      "test-cooking-014",
+      "test-cooking-016",
+      "test-cooking-006"
+    ]
+  },
+  {
+    "query": "",
+    "query_class": "Empty",
+    "relevant_ids": [],
+    "note": "Empty query should return no results"
+  },
+  {
+    "query": "x",
+    "query_class": "Identifier",
+    "relevant_ids": [],
+    "note": "Single character query, unlikely to match meaningfully"
+  },
+  {
+    "query": "this query intentionally matches absolutely nothing in any document in the entire corpus because it contains made up words like flurbnozzle and zyphraxic",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [],
+    "note": "No-match query should return empty results without error"
+  },
+  {
+    "query": "SearchIndex::new",
+    "query_class": "Identifier",
+    "relevant_ids": [
+      "test-code-001",
+      "test-adversarial-010",
+      "test-mixed-010",
+      "test-mixed-001"
+    ],
+    "note": "Identifier-mode query for Rust function name"
+  },
+  {
+    "query": "Vektorsuche Einbettungen semantische",
+    "query_class": "NaturalLanguage",
+    "relevant_ids": [
+      "test-adversarial-012",
+      "test-adversarial-013",
+      "test-ml-001",
+      "test-ml-006"
+    ],
+    "note": "German cross-lingual query - should find German doc and semantically similar English docs"
+  }
+]

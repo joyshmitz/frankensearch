@@ -1,0 +1,363 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-scope-privacy-v1.schema.json",
+  "title": "fsfs Scope/Privacy/Redaction Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/scanDecision"
+    },
+    {
+      "$ref": "#/$defs/redactedArtifact"
+    }
+  ],
+  "$defs": {
+    "sensitiveClass": {
+      "type": "string",
+      "enum": [
+        "credentials",
+        "tokens",
+        "private_keys",
+        "ssh_material",
+        "browser_secrets",
+        "personal_data",
+        "financial_data",
+        "health_data"
+      ]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "scope_defaults",
+        "sensitive_classes",
+        "path_policies",
+        "redaction",
+        "threat_model",
+        "telemetry_emission_rules"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_scope_privacy_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "scope_defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "default_roots",
+            "requires_explicit_opt_in_outside_defaults",
+            "opt_out_globs_supported",
+            "precedence"
+          ],
+          "properties": {
+            "default_roots": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^/"
+              }
+            },
+            "requires_explicit_opt_in_outside_defaults": {
+              "type": "boolean",
+              "const": true
+            },
+            "opt_out_globs_supported": {
+              "type": "boolean",
+              "const": true
+            },
+            "precedence": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "hard_deny"
+                },
+                {
+                  "const": "opt_out"
+                },
+                {
+                  "const": "opt_in"
+                },
+                {
+                  "const": "default"
+                }
+              ],
+              "items": false
+            }
+          }
+        },
+        "sensitive_classes": {
+          "type": "array",
+          "minItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sensitiveClass"
+          }
+        },
+        "path_policies": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "deny_always_globs",
+            "allow_with_opt_in_globs"
+          ],
+          "properties": {
+            "deny_always_globs": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "allow_with_opt_in_globs": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "logs_default_action",
+            "explain_default_action",
+            "replay_default_action",
+            "deterministic_profile_id"
+          ],
+          "properties": {
+            "logs_default_action": {
+              "type": "string",
+              "enum": [
+                "mask",
+                "hash",
+                "drop"
+              ]
+            },
+            "explain_default_action": {
+              "type": "string",
+              "enum": [
+                "mask",
+                "hash",
+                "drop"
+              ]
+            },
+            "replay_default_action": {
+              "type": "string",
+              "enum": [
+                "mask",
+                "hash",
+                "drop"
+              ]
+            },
+            "deterministic_profile_id": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "threat_model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "local_multi_user_assumed",
+            "same_host_read_risk",
+            "mitigations"
+          ],
+          "properties": {
+            "local_multi_user_assumed": {
+              "type": "boolean",
+              "const": true
+            },
+            "same_host_read_risk": {
+              "type": "boolean",
+              "const": true
+            },
+            "mitigations": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "telemetry_emission_rules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "raw_content_allowed",
+            "reason_code_required",
+            "redaction_version"
+          ],
+          "properties": {
+            "raw_content_allowed": {
+              "type": "boolean",
+              "const": false
+            },
+            "reason_code_required": {
+              "type": "boolean",
+              "const": true
+            },
+            "redaction_version": {
+              "type": "string",
+              "pattern": "^v[0-9]+$"
+            }
+          }
+        }
+      }
+    },
+    "scanDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "decision",
+        "reason_code",
+        "sensitive_classes",
+        "persist_allowed",
+        "emit_allowed",
+        "display_allowed",
+        "redaction_profile"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_scope_scan_decision"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "include",
+            "exclude",
+            "require_opt_in"
+          ]
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$",
+          "minLength": 3
+        },
+        "sensitive_classes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sensitiveClass"
+          }
+        },
+        "persist_allowed": {
+          "type": "boolean"
+        },
+        "emit_allowed": {
+          "type": "boolean"
+        },
+        "display_allowed": {
+          "type": "boolean"
+        },
+        "redaction_profile": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "sensitive_classes": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "persist_allowed": {
+                "const": false
+              },
+              "emit_allowed": {
+                "const": false
+              }
+            }
+          }
+        }
+      ]
+    },
+    "redactedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "artifact_type",
+        "path",
+        "reason_code",
+        "redaction_applied",
+        "raw_content_present",
+        "redaction_profile"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_scope_redacted_artifact"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "artifact_type": {
+          "type": "string",
+          "enum": [
+            "log",
+            "explain",
+            "replay"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "reason_code": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$",
+          "minLength": 3
+        },
+        "redaction_applied": {
+          "type": "boolean",
+          "const": true
+        },
+        "raw_content_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "redaction_profile": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

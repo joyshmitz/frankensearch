@@ -1,0 +1,11 @@
+{
+  "kind": "fsfs_incremental_recovery_checkpoint",
+  "v": 1,
+  "checkpoint_id": "fsfs-ckpt-invalid",
+  "last_applied_seq": 500,
+  "pending_changes": 9,
+  "journal_clean": true,
+  "stale_entries": 0,
+  "action_on_restart": "resume_tail",
+  "reason_code": "FSFS_RECOVERY_STATE_INCONSISTENT"
+}

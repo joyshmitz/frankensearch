@@ -1,0 +1,36 @@
+{
+  "kind": "fsfs_expected_loss_decision_event",
+  "v": 1,
+  "decision_id": "dec-embed-0003",
+  "seed": 9,
+  "config_hash": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "family": "embed",
+  "state_id": "memory_pressure",
+  "chosen_action": "embed_defer",
+  "evaluated_actions": [
+    {
+      "action": "embed_now",
+      "expected_loss": 0.73,
+      "false_include_cost": 0.2,
+      "false_exclude_cost": 0.4,
+      "latency_cost": 0.6,
+      "quality_cost": 0.2,
+      "compute_cost": 0.7,
+      "risk_level": "high",
+      "reason_code": "FSFS_EMBED_NOW_HIGH_PRESSURE"
+    },
+    {
+      "action": "embed_defer",
+      "expected_loss": 0.19,
+      "false_include_cost": 0.05,
+      "false_exclude_cost": 0.26,
+      "latency_cost": 0.1,
+      "quality_cost": 0.18,
+      "compute_cost": 0.06,
+      "risk_level": "medium",
+      "reason_code": "FSFS_EMBED_DEFER_PRESSURE"
+    }
+  ],
+  "selected_reason_code": "FSFS_DECISION_MIN_EXPECTED_LOSS",
+  "fallback_invoked": true
+}

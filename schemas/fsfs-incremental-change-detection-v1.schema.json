@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-incremental-change-detection-v1.schema.json",
+  "title": "fsfs Incremental Change Detection Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/changeDecision"
+    },
+    {
+      "$ref": "#/$defs/recoveryCheckpoint"
+    }
+  ],
+  "$defs": {
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^FSFS_[A-Z0-9_]+$"
+    },
+    "fileState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_id",
+        "size_bytes",
+        "mtime_ns",
+        "content_hash"
+      ],
+      "properties": {
+        "file_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mtime_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "fastpath_policy",
+        "hash_policy",
+        "rename_move_policy",
+        "recovery_policy",
+        "reconciliation_policy"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_incremental_change_detection_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "fastpath_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mtime_granularity_ns",
+            "require_size_change",
+            "hash_on_mtime_only",
+            "max_fastpath_skips"
+          ],
+          "properties": {
+            "mtime_granularity_ns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "require_size_change": {
+              "type": "boolean"
+            },
+            "hash_on_mtime_only": {
+              "type": "boolean",
+              "const": true
+            },
+            "max_fastpath_skips": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "hash_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "sample_prefix_bytes",
+            "full_hash_threshold_bytes"
+          ],
+          "properties": {
+            "algorithm": {
+              "type": "string",
+              "enum": [
+                "sha256",
+                "blake3"
+              ]
+            },
+            "sample_prefix_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "full_hash_threshold_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "rename_move_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "identity_keys",
+            "same_device_rename_preserves_identity",
+            "cross_device_move"
+          ],
+          "properties": {
+            "identity_keys": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "device",
+                  "inode",
+                  "content_hash"
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            },
+            "same_device_rename_preserves_identity": {
+              "type": "boolean",
+              "const": true
+            },
+            "cross_device_move": {
+              "type": "string",
+              "enum": [
+                "treat_as_delete_create",
+                "hash_confirm"
+              ]
+            }
+          }
+        },
+        "recovery_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "journal_required",
+            "replay_order",
+            "pending_ttl_seconds"
+          ],
+          "properties": {
+            "journal_required": {
+              "type": "boolean",
+              "const": true
+            },
+            "replay_order": {
+              "type": "string",
+              "const": "sequence_asc"
+            },
+            "pending_ttl_seconds": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "reconciliation_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "full_scan_interval_seconds",
+            "stale_after_seconds",
+            "orphan_entry_action"
+          ],
+          "properties": {
+            "full_scan_interval_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "stale_after_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "orphan_entry_action": {
+              "type": "string",
+              "enum": [
+                "delete",
+                "quarantine",
+                "mark_stale"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "changeDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "path",
+        "event_type",
+        "detection_mode",
+        "queue_action",
+        "reason_code",
+        "confidence"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_incremental_change_decision"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_type": {
+          "type": "string",
+          "enum": [
+            "create",
+            "modify",
+            "delete",
+            "rename",
+            "move",
+            "reconcile"
+          ]
+        },
+        "detection_mode": {
+          "type": "string",
+          "enum": [
+            "mtime_size_fastpath",
+            "hash_confirm",
+            "full_reconcile",
+            "journal_replay"
+          ]
+        },
+        "previous_state": {
+          "$ref": "#/$defs/fileState"
+        },
+        "current_state": {
+          "$ref": "#/$defs/fileState"
+        },
+        "rename_from": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rename_to": {
+          "type": "string",
+          "minLength": 1
+        },
+        "queue_action": {
+          "type": "string",
+          "enum": [
+            "enqueue_embed",
+            "skip_no_change",
+            "drop_missing",
+            "mark_stale",
+            "reconcile_full"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "event_type": {
+                "const": "rename"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "rename_from",
+              "rename_to"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_type": {
+                "const": "move"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "rename_from",
+              "rename_to"
+            ]
+          }
+        }
+      ]
+    },
+    "recoveryCheckpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "checkpoint_id",
+        "last_applied_seq",
+        "pending_changes",
+        "journal_clean",
+        "stale_entries",
+        "action_on_restart",
+        "reason_code"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_incremental_recovery_checkpoint"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "checkpoint_id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9._:-]+$"
+        },
+        "last_applied_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pending_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "journal_clean": {
+          "type": "boolean"
+        },
+        "stale_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action_on_restart": {
+          "type": "string",
+          "enum": [
+            "replay_pending",
+            "force_reconcile",
+            "resume_tail"
+          ]
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "journal_clean": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "pending_changes": {
+                "const": 0
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

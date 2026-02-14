@@ -1,0 +1,18 @@
+{
+  "kind": "fsfs_root_discovery_decision",
+  "v": 1,
+  "path": "/home/ubuntu/loop-symlink",
+  "override_mode": "permissive",
+  "rules_evaluated": [
+    {
+      "source": "explicit_include",
+      "matched": true,
+      "effect": "include"
+    }
+  ],
+  "final_decision": "include",
+  "reason_code": "FSFS_EXPLICIT_INCLUDE_OVERRIDE",
+  "symlink_detected": true,
+  "mount_crossing": false,
+  "loop_detected": true
+}

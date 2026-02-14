@@ -1,0 +1,183 @@
+{
+  "kind": "slo_contract_definition",
+  "v": 1,
+  "generated_ts": "2026-02-14T01:00:00Z",
+  "formula_version": "v1",
+  "windows": {
+    "1m": {
+      "budget_fraction": 0.005
+    },
+    "15m": {
+      "budget_fraction": 0.01
+    },
+    "1h": {
+      "budget_fraction": 0.02
+    },
+    "6h": {
+      "budget_fraction": 0.08
+    },
+    "24h": {
+      "budget_fraction": 0.2
+    },
+    "3d": {
+      "budget_fraction": 0.35
+    },
+    "1w": {
+      "budget_fraction": 1.0
+    }
+  },
+  "metrics": [
+    {
+      "metric_id": "search_latency_p95",
+      "unit": "ms",
+      "objective_threshold": 150,
+      "objective_bad_ratio": 0.01,
+      "reason_code_prefix": "slo.search_latency_p95"
+    },
+    {
+      "metric_id": "query_failure_rate",
+      "unit": "ratio",
+      "objective_threshold": 0.01,
+      "objective_bad_ratio": 0.01,
+      "reason_code_prefix": "slo.query_failure_rate"
+    },
+    {
+      "metric_id": "stale_index_lag",
+      "unit": "seconds",
+      "objective_threshold": 300,
+      "objective_bad_ratio": 0.02,
+      "reason_code_prefix": "slo.stale_index_lag"
+    },
+    {
+      "metric_id": "embedding_backlog_age",
+      "unit": "seconds",
+      "objective_threshold": 120,
+      "objective_bad_ratio": 0.03,
+      "reason_code_prefix": "slo.embedding_backlog_age"
+    }
+  ],
+  "test_vectors": [
+    {
+      "metric_id": "search_latency_p95",
+      "inputs": {
+        "1m": {
+          "bad_events": 3,
+          "total_events": 120,
+          "expected_bad_ratio": 0.025,
+          "expected_consumed": 1.0,
+          "expected_remaining": 0.0,
+          "expected_burn_rate": 200.0
+        },
+        "15m": {
+          "bad_events": 5,
+          "total_events": 500,
+          "expected_bad_ratio": 0.01,
+          "expected_consumed": 1.0,
+          "expected_remaining": 0.0,
+          "expected_burn_rate": 100.0
+        },
+        "1h": {
+          "bad_events": 20,
+          "total_events": 4000,
+          "expected_bad_ratio": 0.005,
+          "expected_consumed": 0.5,
+          "expected_remaining": 0.5,
+          "expected_burn_rate": 25.0
+        },
+        "6h": {
+          "bad_events": 40,
+          "total_events": 30000,
+          "expected_bad_ratio": 0.0013333333,
+          "expected_consumed": 0.13333333,
+          "expected_remaining": 0.86666667,
+          "expected_burn_rate": 1.6666666
+        },
+        "24h": {
+          "bad_events": 120,
+          "total_events": 120000,
+          "expected_bad_ratio": 0.001,
+          "expected_consumed": 0.1,
+          "expected_remaining": 0.9,
+          "expected_burn_rate": 0.5
+        },
+        "3d": {
+          "bad_events": 280,
+          "total_events": 420000,
+          "expected_bad_ratio": 0.0006666667,
+          "expected_consumed": 0.06666667,
+          "expected_remaining": 0.93333333,
+          "expected_burn_rate": 0.19047619
+        },
+        "1w": {
+          "bad_events": 500,
+          "total_events": 1000000,
+          "expected_bad_ratio": 0.0005,
+          "expected_consumed": 0.05,
+          "expected_remaining": 0.95,
+          "expected_burn_rate": 0.05
+        }
+      }
+    },
+    {
+      "metric_id": "query_failure_rate",
+      "inputs": {
+        "1m": {
+          "bad_events": 1,
+          "total_events": 400,
+          "expected_bad_ratio": 0.0025,
+          "expected_consumed": 0.25,
+          "expected_remaining": 0.75,
+          "expected_burn_rate": 50.0
+        },
+        "15m": {
+          "bad_events": 4,
+          "total_events": 4000,
+          "expected_bad_ratio": 0.001,
+          "expected_consumed": 0.1,
+          "expected_remaining": 0.9,
+          "expected_burn_rate": 10.0
+        },
+        "1h": {
+          "bad_events": 6,
+          "total_events": 12000,
+          "expected_bad_ratio": 0.0005,
+          "expected_consumed": 0.05,
+          "expected_remaining": 0.95,
+          "expected_burn_rate": 2.5
+        },
+        "6h": {
+          "bad_events": 20,
+          "total_events": 90000,
+          "expected_bad_ratio": 0.0002222222,
+          "expected_consumed": 0.02222222,
+          "expected_remaining": 0.97777778,
+          "expected_burn_rate": 0.27777775
+        },
+        "24h": {
+          "bad_events": 60,
+          "total_events": 360000,
+          "expected_bad_ratio": 0.0001666667,
+          "expected_consumed": 0.01666667,
+          "expected_remaining": 0.98333333,
+          "expected_burn_rate": 0.08333335
+        },
+        "3d": {
+          "bad_events": 90,
+          "total_events": 900000,
+          "expected_bad_ratio": 0.0001,
+          "expected_consumed": 0.01,
+          "expected_remaining": 0.99,
+          "expected_burn_rate": 0.02857143
+        },
+        "1w": {
+          "bad_events": 140,
+          "total_events": 1800000,
+          "expected_bad_ratio": 0.0000777778,
+          "expected_consumed": 0.00777778,
+          "expected_remaining": 0.99222222,
+          "expected_burn_rate": 0.00777778
+        }
+      }
+    }
+  ]
+}

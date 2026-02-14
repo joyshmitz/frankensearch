@@ -1,0 +1,10 @@
+{
+  "kind": "fsfs_scope_redacted_artifact",
+  "v": 1,
+  "artifact_type": "replay",
+  "path": "/home/ubuntu/project/.env",
+  "reason_code": "raw_content_leak",
+  "redaction_applied": true,
+  "raw_content_present": true,
+  "redaction_profile": "privacy-v1-default"
+}
