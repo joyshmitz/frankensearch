@@ -1,0 +1,429 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-explanation-payload-v1.schema.json",
+  "title": "fsfs Explanation Payload Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/explanationDecision"
+    }
+  ],
+  "$defs": {
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+\\.[a-z0-9_]+\\.[a-z0-9_.-]+$"
+    },
+    "confidencePerMille": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000
+    },
+    "scoreComponentSource": {
+      "type": "string",
+      "enum": [
+        "lexical_bm25",
+        "semantic_fast",
+        "semantic_quality",
+        "rerank"
+      ]
+    },
+    "policyDomain": {
+      "type": "string",
+      "enum": [
+        "query_intent",
+        "retrieval_budget",
+        "query_execution",
+        "degradation",
+        "discovery"
+      ]
+    },
+    "rankingPhase": {
+      "type": "string",
+      "enum": [
+        "Initial",
+        "Refined"
+      ]
+    },
+    "traceLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trace_id",
+        "event_id"
+      ],
+      "properties": {
+        "trace_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_event_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "claim_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "rankMovementSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "initial_rank",
+        "refined_rank",
+        "delta",
+        "reason"
+      ],
+      "properties": {
+        "initial_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "refined_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "delta": {
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fusionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fused_score",
+        "in_both_sources"
+      ],
+      "properties": {
+        "fused_score": {
+          "type": "number"
+        },
+        "lexical_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "semantic_rank": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lexical_score": {
+          "type": "number"
+        },
+        "semantic_score": {
+          "type": "number"
+        },
+        "in_both_sources": {
+          "type": "boolean"
+        }
+      }
+    },
+    "scoreComponentBreakdown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "summary",
+        "raw_score",
+        "normalized_score",
+        "rrf_contribution",
+        "weight",
+        "confidence_per_mille"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/scoreComponentSource"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_score": {
+          "type": "number"
+        },
+        "normalized_score": {
+          "type": "number"
+        },
+        "rrf_contribution": {
+          "type": "number"
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "confidence_per_mille": {
+          "$ref": "#/$defs/confidencePerMille"
+        }
+      }
+    },
+    "rankingExplanation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "doc_id",
+        "final_score",
+        "phase",
+        "reason_code",
+        "confidence_per_mille",
+        "components"
+      ],
+      "properties": {
+        "doc_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "final_score": {
+          "type": "number"
+        },
+        "phase": {
+          "$ref": "#/$defs/rankingPhase"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "confidence_per_mille": {
+          "$ref": "#/$defs/confidencePerMille"
+        },
+        "rank_movement": {
+          "$ref": "#/$defs/rankMovementSnapshot"
+        },
+        "fusion": {
+          "$ref": "#/$defs/fusionContext"
+        },
+        "components": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/scoreComponentBreakdown"
+          }
+        }
+      }
+    },
+    "policyDecisionExplanation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "decision",
+        "reason_code",
+        "confidence_per_mille",
+        "summary",
+        "metadata"
+      ],
+      "properties": {
+        "domain": {
+          "$ref": "#/$defs/policyDomain"
+        },
+        "decision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "confidence_per_mille": {
+          "$ref": "#/$defs/confidencePerMille"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "ranking_policy",
+        "policy_decision_policy",
+        "transport_parity_policy",
+        "diagnostics_policy"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_explanation_payload_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "ranking_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required_fields",
+            "require_component_breakdown",
+            "phase_enum"
+          ],
+          "properties": {
+            "required_fields": {
+              "type": "array",
+              "minItems": 6,
+              "items": {
+                "type": "string"
+              }
+            },
+            "require_component_breakdown": {
+              "type": "boolean"
+            },
+            "phase_enum": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "Initial",
+                  "Refined"
+                ]
+              }
+            }
+          }
+        },
+        "policy_decision_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required_fields",
+            "domain_enum"
+          ],
+          "properties": {
+            "required_fields": {
+              "type": "array",
+              "minItems": 6,
+              "items": {
+                "type": "string"
+              }
+            },
+            "domain_enum": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "items": {
+                "$ref": "#/$defs/policyDomain"
+              }
+            }
+          }
+        },
+        "transport_parity_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "json_lossless",
+            "toon_requires_stable_labels",
+            "tui_preserves_reason_codes"
+          ],
+          "properties": {
+            "json_lossless": {
+              "type": "boolean"
+            },
+            "toon_requires_stable_labels": {
+              "type": "boolean"
+            },
+            "tui_preserves_reason_codes": {
+              "type": "boolean"
+            }
+          }
+        },
+        "diagnostics_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reason_code_prefixes",
+            "confidence_bounds"
+          ],
+          "properties": {
+            "reason_code_prefixes": {
+              "type": "array",
+              "minItems": 2,
+              "items": {
+                "type": "string"
+              }
+            },
+            "confidence_bounds": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer",
+                  "const": 0
+                },
+                {
+                  "type": "integer",
+                  "const": 1000
+                }
+              ],
+              "minItems": 2,
+              "maxItems": 2
+            }
+          }
+        }
+      }
+    },
+    "explanationDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "schema_version",
+        "query",
+        "ranking",
+        "policy_decisions"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_explanation_payload_decision"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "schema_version": {
+          "type": "string",
+          "const": "fsfs.explanation.payload.v1"
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "trace": {
+          "$ref": "#/$defs/traceLink"
+        },
+        "ranking": {
+          "$ref": "#/$defs/rankingExplanation"
+        },
+        "policy_decisions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/policyDecisionExplanation"
+          }
+        }
+      }
+    }
+  }
+}

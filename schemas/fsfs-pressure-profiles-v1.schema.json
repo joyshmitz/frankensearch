@@ -1,0 +1,374 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-pressure-profiles-v1.schema.json",
+  "title": "fsfs Pressure Profiles Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/profileResolution"
+    }
+  ],
+  "$defs": {
+    "profileId": {
+      "type": "string",
+      "enum": [
+        "strict",
+        "performance",
+        "degraded"
+      ]
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^(profile|override|safety)\\.[a-z0-9_.-]+$"
+    },
+    "schedulerMode": {
+      "type": "string",
+      "enum": [
+        "fair_share",
+        "latency_sensitive"
+      ]
+    },
+    "fieldName": {
+      "type": "string",
+      "enum": [
+        "scheduler_mode",
+        "max_embed_concurrency",
+        "max_index_concurrency",
+        "quality_enabled",
+        "allow_background_indexing"
+      ]
+    },
+    "profileConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scheduler_mode",
+        "max_embed_concurrency",
+        "max_index_concurrency",
+        "quality_enabled",
+        "allow_background_indexing",
+        "pressure_enter_threshold",
+        "pressure_exit_threshold",
+        "override_policy"
+      ],
+      "properties": {
+        "scheduler_mode": {
+          "$ref": "#/$defs/schedulerMode"
+        },
+        "max_embed_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "max_index_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "quality_enabled": {
+          "type": "boolean"
+        },
+        "allow_background_indexing": {
+          "type": "boolean"
+        },
+        "pressure_enter_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "pressure_exit_threshold": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "override_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "overridable_fields",
+            "locked_fields"
+          ],
+          "properties": {
+            "overridable_fields": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/fieldName"
+              },
+              "uniqueItems": true
+            },
+            "locked_fields": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/fieldName"
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "profiles",
+        "precedence_order",
+        "migration_policy"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_pressure_profiles_contract_definition"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "strict",
+            "performance",
+            "degraded"
+          ],
+          "properties": {
+            "strict": {
+              "$ref": "#/$defs/profileConfig"
+            },
+            "performance": {
+              "$ref": "#/$defs/profileConfig"
+            },
+            "degraded": {
+              "$ref": "#/$defs/profileConfig"
+            }
+          }
+        },
+        "precedence_order": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "const": "hard_safety_guards"
+            },
+            {
+              "const": "cli_override"
+            },
+            {
+              "const": "env_override"
+            },
+            {
+              "const": "config_override"
+            },
+            {
+              "const": "profile_default"
+            }
+          ],
+          "items": {
+            "type": "string"
+          },
+          "minItems": 5
+        },
+        "migration_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "profile_version",
+            "requires_revision_bump_on_semantic_change",
+            "drift_protection"
+          ],
+          "properties": {
+            "profile_version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "requires_revision_bump_on_semantic_change": {
+              "type": "boolean",
+              "const": true
+            },
+            "drift_protection": {
+              "type": "string",
+              "enum": [
+                "explicit_migration_required",
+                "compat_layer_with_reason_code"
+              ]
+            },
+            "deprecated_fields": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "uniqueItems": true
+            }
+          }
+        }
+      }
+    },
+    "overrideDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "field",
+        "source",
+        "requested_value",
+        "applied",
+        "reason_code"
+      ],
+      "properties": {
+        "field": {
+          "$ref": "#/$defs/fieldName"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "cli",
+            "env",
+            "config"
+          ]
+        },
+        "requested_value": {},
+        "applied": {
+          "type": "boolean"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        }
+      }
+    },
+    "profileResolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "trace_id",
+        "selected_profile",
+        "overrides",
+        "effective",
+        "safety_clamps",
+        "conflict_detected",
+        "diagnostics"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_pressure_profile_resolution"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "trace_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "selected_profile": {
+          "$ref": "#/$defs/profileId"
+        },
+        "overrides": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/overrideDecision"
+          }
+        },
+        "effective": {
+          "$ref": "#/$defs/profileConfig"
+        },
+        "safety_clamps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "field",
+              "clamped_to",
+              "reason_code"
+            ],
+            "properties": {
+              "field": {
+                "$ref": "#/$defs/fieldName"
+              },
+              "clamped_to": {},
+              "reason_code": {
+                "$ref": "#/$defs/reasonCode"
+              }
+            }
+          }
+        },
+        "conflict_detected": {
+          "type": "boolean"
+        },
+        "conflict_reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "diagnostics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "reason_code",
+            "precedence_chain",
+            "effective_profile_version"
+          ],
+          "properties": {
+            "event": {
+              "type": "string",
+              "minLength": 1
+            },
+            "reason_code": {
+              "$ref": "#/$defs/reasonCode"
+            },
+            "precedence_chain": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "const": "hard_safety_guards"
+                },
+                {
+                  "const": "cli_override"
+                },
+                {
+                  "const": "env_override"
+                },
+                {
+                  "const": "config_override"
+                },
+                {
+                  "const": "profile_default"
+                }
+              ],
+              "items": {
+                "type": "string"
+              },
+              "minItems": 5
+            },
+            "effective_profile_version": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "conflict_detected": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "conflict_reason_code"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "kind": "fsfs_snippet_highlight_provenance_decision",
+  "v": 1,
+  "trace_id": "trace-fail-02",
+  "doc_id": "doc://src/lib.rs",
+  "path": "/home/ubuntu/project/src/lib.rs",
+  "render_mode": "json",
+  "snippet_status": "rendered",
+  "snippet_segments": [
+    {
+      "segment_id": "seg_0021",
+      "text": "fn main() { println!(\"hello\"); }",
+      "line_range": [
+        1,
+        1
+      ],
+      "byte_range": [
+        0,
+        32
+      ],
+      "truncated": false,
+      "highlights": [
+        {
+          "start_byte": 3,
+          "end_byte": 7,
+          "highlight_type": "lexical",
+          "query_term": "main"
+        }
+      ]
+    }
+  ],
+  "provenance": {
+    "path": "/home/ubuntu/project/src/lib.rs",
+    "segment_id": "seg_0021",
+    "index_revision": 9,
+    "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "score_contributors": [
+      {
+        "name": "lexical_bm25",
+        "weight": 1.0,
+        "raw_score": 1.0
+      }
+    ]
+  },
+  "diagnostics": {
+    "event": "snippet_rendered",
+    "reason_code": "config.invalid_prefix",
+    "unicode_safe": true,
+    "offsets_verified": true,
+    "emitted_fields": [
+      "event",
+      "reason_code"
+    ]
+  },
+  "degraded": {
+    "applied": false,
+    "mode": "none",
+    "fallback_action": "none"
+  }
+}

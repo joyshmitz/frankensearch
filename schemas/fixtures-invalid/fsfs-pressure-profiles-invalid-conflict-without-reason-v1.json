@@ -1,0 +1,41 @@
+{
+  "kind": "fsfs_pressure_profile_resolution",
+  "v": 1,
+  "trace_id": "trace-prof-invalid-1",
+  "selected_profile": "strict",
+  "overrides": [],
+  "effective": {
+    "scheduler_mode": "fair_share",
+    "max_embed_concurrency": 2,
+    "max_index_concurrency": 2,
+    "quality_enabled": false,
+    "allow_background_indexing": false,
+    "pressure_enter_threshold": 0.35,
+    "pressure_exit_threshold": 0.20,
+    "override_policy": {
+      "overridable_fields": [
+        "scheduler_mode",
+        "max_index_concurrency"
+      ],
+      "locked_fields": [
+        "quality_enabled",
+        "allow_background_indexing",
+        "max_embed_concurrency"
+      ]
+    }
+  },
+  "safety_clamps": [],
+  "conflict_detected": true,
+  "diagnostics": {
+    "event": "profile_resolution_failed",
+    "reason_code": "profile.conflict.detected",
+    "precedence_chain": [
+      "hard_safety_guards",
+      "cli_override",
+      "env_override",
+      "config_override",
+      "profile_default"
+    ],
+    "effective_profile_version": 1
+  }
+}

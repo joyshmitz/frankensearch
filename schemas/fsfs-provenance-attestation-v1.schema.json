@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-provenance-attestation-v1.schema.json",
+  "title": "fsfs Provenance Attestation and Startup Verification Contract v1",
+  "description": "Schema for fsfs provenance attestation definitions, manifests, and startup verification outputs.",
+  "oneOf": [
+    { "$ref": "#/$defs/contractDefinition" },
+    { "$ref": "#/$defs/attestationManifest" },
+    { "$ref": "#/$defs/startupCheck" }
+  ],
+  "$defs": {
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(?:\\.[a-z0-9_]+){2,}$"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "continue",
+        "continue_with_alert",
+        "enter_read_only",
+        "enter_safe_mode",
+        "abort_startup"
+      ]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["info", "warn", "error"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["verified", "degraded", "failed"]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "required_attestation_fields",
+        "startup_policy",
+        "reason_codes"
+      ],
+      "properties": {
+        "kind": { "const": "fsfs_provenance_contract" },
+        "schema_version": { "const": 1 },
+        "required_attestation_fields": {
+          "type": "array",
+          "minItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "attestation_id",
+              "generated_at",
+              "build.source_commit",
+              "build.build_profile",
+              "build.rustc_version",
+              "build.target_triple",
+              "runtime.binary_hash_sha256",
+              "runtime.config_hash_sha256",
+              "runtime.index_manifest_hash_sha256",
+              "artifact_hashes[].path",
+              "artifact_hashes[].sha256",
+              "signature.algorithm",
+              "signature.key_id",
+              "signature.signature_b64"
+            ]
+          }
+        },
+        "startup_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "require_attestation",
+            "require_signature",
+            "on_attestation_missing",
+            "on_signature_missing",
+            "on_signature_invalid",
+            "on_hash_mismatch"
+          ],
+          "properties": {
+            "require_attestation": { "type": "boolean" },
+            "require_signature": { "type": "boolean" },
+            "on_attestation_missing": { "$ref": "#/$defs/action" },
+            "on_signature_missing": { "$ref": "#/$defs/action" },
+            "on_signature_invalid": { "$ref": "#/$defs/action" },
+            "on_hash_mismatch": { "$ref": "#/$defs/action" }
+          }
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/reasonCode" }
+        }
+      }
+    },
+    "attestationManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "attestation_id",
+        "generated_at",
+        "build",
+        "runtime",
+        "artifact_hashes"
+      ],
+      "properties": {
+        "kind": { "const": "fsfs_provenance_attestation" },
+        "schema_version": { "const": 1 },
+        "attestation_id": {
+          "type": "string",
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "build": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_commit",
+            "build_profile",
+            "rustc_version",
+            "target_triple"
+          ],
+          "properties": {
+            "source_commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "build_profile": {
+              "type": "string",
+              "enum": ["debug", "release"]
+            },
+            "rustc_version": { "type": "string", "minLength": 3 },
+            "target_triple": { "type": "string", "minLength": 3 }
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "binary_hash_sha256",
+            "config_hash_sha256",
+            "index_manifest_hash_sha256"
+          ],
+          "properties": {
+            "binary_hash_sha256": { "$ref": "#/$defs/sha256Digest" },
+            "config_hash_sha256": { "$ref": "#/$defs/sha256Digest" },
+            "index_manifest_hash_sha256": { "$ref": "#/$defs/sha256Digest" }
+          }
+        },
+        "artifact_hashes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "sha256": { "$ref": "#/$defs/sha256Digest" }
+            }
+          }
+        },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "key_id", "signature_b64"],
+          "properties": {
+            "algorithm": { "type": "string", "minLength": 1 },
+            "key_id": { "type": "string", "minLength": 1 },
+            "signature_b64": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "startupCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "trace_id",
+        "attestation_id",
+        "status",
+        "action",
+        "checks",
+        "alerts"
+      ],
+      "properties": {
+        "kind": { "const": "fsfs_provenance_startup_check" },
+        "schema_version": { "const": 1 },
+        "trace_id": { "type": "string", "minLength": 1 },
+        "attestation_id": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "action": { "$ref": "#/$defs/action" },
+        "checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "attestation_present",
+            "attestation_parsed",
+            "signature_present",
+            "signature_valid",
+            "binary_hash_match",
+            "config_hash_match",
+            "index_manifest_hash_match"
+          ],
+          "properties": {
+            "attestation_present": { "type": "boolean" },
+            "attestation_parsed": { "type": "boolean" },
+            "signature_present": { "type": "boolean" },
+            "signature_valid": { "type": "boolean" },
+            "binary_hash_match": { "type": "boolean" },
+            "config_hash_match": { "type": "boolean" },
+            "index_manifest_hash_match": { "type": "boolean" }
+          }
+        },
+        "alerts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["reason_code", "severity", "message"],
+            "properties": {
+              "reason_code": { "$ref": "#/$defs/reasonCode" },
+              "severity": { "$ref": "#/$defs/severity" },
+              "message": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "verified" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "action": { "const": "continue" },
+              "alerts": { "maxItems": 0 }
+            }
+          },
+          "else": {
+            "properties": { "alerts": { "minItems": 1 } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "action": { "const": "abort_startup" } },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": { "status": { "const": "failed" } }
+          }
+        }
+      ]
+    }
+  }
+}

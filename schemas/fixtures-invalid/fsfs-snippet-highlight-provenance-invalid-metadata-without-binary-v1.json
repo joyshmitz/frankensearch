@@ -1,0 +1,39 @@
+{
+  "kind": "fsfs_snippet_highlight_provenance_decision",
+  "v": 1,
+  "trace_id": "trace-fail-01",
+  "doc_id": "doc://binary/blob.bin",
+  "path": "/home/ubuntu/project/blob.bin",
+  "render_mode": "cli",
+  "snippet_status": "metadata_only",
+  "snippet_segments": [],
+  "provenance": {
+    "path": "/home/ubuntu/project/blob.bin",
+    "segment_id": "seg_meta",
+    "index_revision": 5,
+    "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "score_contributors": [
+      {
+        "name": "policy_binary",
+        "weight": 1.0,
+        "raw_score": 0.0
+      }
+    ]
+  },
+  "diagnostics": {
+    "event": "snippet_metadata_only",
+    "reason_code": "snippet.metadata.binary",
+    "unicode_safe": true,
+    "offsets_verified": true,
+    "emitted_fields": [
+      "event",
+      "trace_id",
+      "reason_code"
+    ]
+  },
+  "degraded": {
+    "applied": true,
+    "mode": "metadata_only",
+    "fallback_action": "metadata_only"
+  }
+}
