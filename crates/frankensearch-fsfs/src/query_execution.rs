@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use crate::config::PressureProfile;
 use crate::orchestration::BackpressureMode;
+use crate::output_schema::{SearchHitPayload, SearchOutputPhase, SearchPayload};
 use crate::pressure::PressureState;
 use crate::query_planning::{QueryFallbackPath, QueryIntentDecision, RetrievalBudget};
 
@@ -840,6 +841,35 @@ impl QueryExecutionOrchestrator {
 
         fused.into_iter().skip(offset).take(limit).collect()
     }
+
+    /// Build search output payload rows from fused candidate rankings.
+    #[must_use]
+    pub fn build_search_payload(
+        &self,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+        snippets_by_doc: &HashMap<String, String>,
+    ) -> SearchPayload {
+        let hits = fused
+            .iter()
+            .enumerate()
+            .map(|(idx, candidate)| SearchHitPayload {
+                rank: idx.saturating_add(1),
+                path: candidate.doc_id.clone(),
+                score: sanitize_fused_score(candidate.fused_score),
+                snippet: snippets_by_doc
+                    .get(&candidate.doc_id)
+                    .cloned()
+                    .filter(|snippet| !snippet.trim().is_empty()),
+                lexical_rank: candidate.lexical_rank,
+                semantic_rank: candidate.semantic_rank,
+                in_both_sources: candidate.in_both_sources,
+            })
+            .collect();
+
+        SearchPayload::new(query, phase, fused.len(), hits)
+    }
 }
 
 #[must_use]
@@ -1005,6 +1035,11 @@ const fn sanitize_score(score: f32) -> f32 {
 }
 
 #[must_use]
+const fn sanitize_fused_score(score: f64) -> f64 {
+    if score.is_finite() { score } else { 0.0 }
+}
+
+#[must_use]
 fn option_score(score: Option<f32>) -> f32 {
     score.map_or(f32::NEG_INFINITY, sanitize_score)
 }
@@ -1057,6 +1092,7 @@ mod tests {
     };
     use crate::config::{FsfsConfig, PressureProfile};
     use crate::orchestration::BackpressureMode;
+    use crate::output_schema::SearchOutputPhase;
     use crate::pressure::PressureState;
     use crate::query_planning::QueryPlanner;
     use std::collections::HashMap;
@@ -1256,6 +1292,61 @@ mod tests {
         let ids: Vec<&str> = fused.iter().map(|hit| hit.doc_id.as_str()).collect();
 
         assert_eq!(ids, vec!["doc-b", "doc-a"]);
+    }
+
+    #[test]
+    fn build_search_payload_maps_ranks_scores_and_snippets() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let fused = vec![
+            super::FusedCandidate {
+                doc_id: "src/auth.rs".to_owned(),
+                fused_score: 0.923,
+                prior_boost: 0.0,
+                lexical_rank: Some(0),
+                semantic_rank: Some(1),
+                lexical_score: Some(1.0),
+                semantic_score: Some(0.9),
+                in_both_sources: true,
+            },
+            super::FusedCandidate {
+                doc_id: "docs/auth.md".to_owned(),
+                fused_score: f64::NAN,
+                prior_boost: 0.0,
+                lexical_rank: Some(3),
+                semantic_rank: None,
+                lexical_score: Some(0.4),
+                semantic_score: None,
+                in_both_sources: false,
+            },
+        ];
+        let snippets = HashMap::from([
+            (
+                "src/auth.rs".to_owned(),
+                "fn authenticate(token: &str) -> bool".to_owned(),
+            ),
+            ("docs/auth.md".to_owned(), "   ".to_owned()),
+        ]);
+
+        let payload = orchestrator.build_search_payload(
+            "how auth works",
+            SearchOutputPhase::Initial,
+            &fused,
+            &snippets,
+        );
+        assert_eq!(payload.query, "how auth works");
+        assert_eq!(payload.phase, SearchOutputPhase::Initial);
+        assert_eq!(payload.total_candidates, 2);
+        assert_eq!(payload.returned_hits, 2);
+        assert_eq!(payload.hits[0].rank, 1);
+        assert_eq!(payload.hits[0].path, "src/auth.rs");
+        assert!((payload.hits[0].score - 0.923).abs() < f64::EPSILON);
+        assert_eq!(
+            payload.hits[0].snippet.as_deref(),
+            Some("fn authenticate(token: &str) -> bool")
+        );
+        assert_eq!(payload.hits[1].rank, 2);
+        assert!(payload.hits[1].score.abs() < f64::EPSILON);
+        assert!(payload.hits[1].snippet.is_none());
     }
 
     #[test]

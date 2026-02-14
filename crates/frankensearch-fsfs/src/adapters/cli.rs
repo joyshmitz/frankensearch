@@ -148,7 +148,7 @@ impl CliCommand {
         "status",
         "explain",
         "config",
-        "download",
+        "download-models",
         "doctor",
         "update",
         "completions",
@@ -199,12 +199,28 @@ pub struct CliInput {
     pub full_reindex: bool,
     /// Target model name (for download command).
     pub model_name: Option<String>,
+    /// Whether `--list` was requested (for download command).
+    pub download_list: bool,
+    /// Whether `--verify` was requested (for download command).
+    pub download_verify: bool,
+    /// Optional output/cache root override (for download command).
+    pub download_output_dir: Option<PathBuf>,
     /// Config subcommand (get/set/list/reset).
     pub config_action: Option<ConfigAction>,
     /// Shell target for completions command.
     pub completion_shell: Option<CompletionShell>,
     /// Whether update should only check for availability.
     pub update_check_only: bool,
+    /// Whether update should rollback to a previous version.
+    pub update_rollback: bool,
+    /// Specific version to rollback to (e.g. "v0.1.0").
+    pub update_rollback_version: Option<String>,
+    /// Whether uninstall should purge cache/config artifacts.
+    pub uninstall_purge: bool,
+    /// Whether uninstall execution is explicitly confirmed.
+    pub uninstall_yes: bool,
+    /// Whether uninstall should only print planned removals.
+    pub uninstall_dry_run: bool,
     /// Verbose diagnostics requested.
     pub verbose: bool,
     /// Quiet output requested.
@@ -216,12 +232,16 @@ pub struct CliInput {
 /// Config subcommand actions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigAction {
+    /// Show merged config values with source annotations.
+    Show,
     /// Get a config value.
     Get { key: String },
     /// Set a config value.
     Set { key: String, value: String },
-    /// List all config values with sources.
-    List,
+    /// Initialize a starter config file.
+    Init,
+    /// Validate configuration resolution and report warnings.
+    Validate,
     /// Reset config to defaults.
     Reset,
 }
@@ -394,6 +414,52 @@ where
                 input.watch = true;
                 idx += 1;
             }
+            "--model" => {
+                if command != CliCommand::Download {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--model".into(),
+                        reason: "--model is only valid for the download command".into(),
+                    });
+                }
+                let value = expect_value(&tokens, idx, "--model")?;
+                input.model_name = Some(value.to_owned());
+                idx += 2;
+            }
+            "--list" => {
+                if command != CliCommand::Download {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--list".into(),
+                        reason: "--list is only valid for the download command".into(),
+                    });
+                }
+                input.download_list = true;
+                idx += 1;
+            }
+            "--verify" => {
+                if command != CliCommand::Download {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--verify".into(),
+                        reason: "--verify is only valid for the download command".into(),
+                    });
+                }
+                input.download_verify = true;
+                idx += 1;
+            }
+            "--output" => {
+                if command != CliCommand::Download {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--output".into(),
+                        reason: "--output is only valid for the download command".into(),
+                    });
+                }
+                let value = expect_value(&tokens, idx, "--output")?;
+                input.download_output_dir = Some(PathBuf::from(value));
+                idx += 2;
+            }
             "--force" | "--full" => {
                 input.full_reindex = true;
                 idx += 1;
@@ -407,6 +473,57 @@ where
                     });
                 }
                 input.update_check_only = true;
+                idx += 1;
+            }
+            "--rollback" => {
+                if command != CliCommand::Update {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--rollback".into(),
+                        reason: "--rollback is only valid for the update command".into(),
+                    });
+                }
+                input.update_rollback = true;
+                // Optional version argument (e.g. --rollback v0.1.0).
+                if let Some(next) = tokens.get(idx + 1) {
+                    if !next.starts_with('-') {
+                        input.update_rollback_version = Some(next.clone());
+                        idx += 1;
+                    }
+                }
+                idx += 1;
+            }
+            "--purge" => {
+                if command != CliCommand::Uninstall {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--purge".into(),
+                        reason: "--purge is only valid for the uninstall command".into(),
+                    });
+                }
+                input.uninstall_purge = true;
+                idx += 1;
+            }
+            "--yes" => {
+                if command != CliCommand::Uninstall {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--yes".into(),
+                        reason: "--yes is only valid for the uninstall command".into(),
+                    });
+                }
+                input.uninstall_yes = true;
+                idx += 1;
+            }
+            "--dry-run" => {
+                if command != CliCommand::Uninstall {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--dry-run".into(),
+                        reason: "--dry-run is only valid for the uninstall command".into(),
+                    });
+                }
+                input.uninstall_dry_run = true;
                 idx += 1;
             }
             "--verbose" | "-v" => {
@@ -460,6 +577,28 @@ where
                 idx += 2;
             }
             _ => {
+                if command == CliCommand::Search && input.query.is_none() {
+                    if flag == "--" {
+                        let query =
+                            tokens
+                                .get(idx + 1)
+                                .ok_or_else(|| SearchError::InvalidConfig {
+                                    field: "cli.search_query".into(),
+                                    value: "--".into(),
+                                    reason: "missing query after '--'".into(),
+                                })?;
+                        input.query = Some(query.clone());
+                        idx += 2;
+                        continue;
+                    }
+
+                    if !flag.starts_with('-') {
+                        input.query = Some(tokens[idx].clone());
+                        idx += 1;
+                        continue;
+                    }
+                }
+
                 return Err(SearchError::InvalidConfig {
                     field: "cli.flag".into(),
                     value: flag.into(),
@@ -498,6 +637,13 @@ fn validate_required_args(input: &CliInput) -> SearchResult<()> {
             field: "cli.completions.shell".into(),
             value: String::new(),
             reason: "missing shell argument (bash|zsh|fish|powershell)".into(),
+        });
+    }
+    if input.command == CliCommand::Download && input.download_list && input.download_verify {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.download.mode".into(),
+            value: "--list --verify".into(),
+            reason: "use either --list or --verify, not both".into(),
         });
     }
     Ok(())
@@ -552,7 +698,7 @@ fn parse_command(token: &str) -> SearchResult<CliCommand> {
         "status" | "st" => Ok(CliCommand::Status),
         "explain" | "ex" => Ok(CliCommand::Explain),
         "config" | "cfg" => Ok(CliCommand::Config),
-        "download" | "dl" => Ok(CliCommand::Download),
+        "download-models" | "download" | "dl" => Ok(CliCommand::Download),
         "doctor" | "doc" => Ok(CliCommand::Doctor),
         "update" | "up" => Ok(CliCommand::Update),
         "completions" | "comp" => Ok(CliCommand::Completions),
@@ -575,7 +721,9 @@ fn parse_config_action(tokens: &[String], idx: &mut usize) -> SearchResult<Confi
     let action = tokens[*idx].as_str();
     *idx += 1;
     match action {
-        "list" | "ls" => Ok(ConfigAction::List),
+        "show" | "list" | "ls" => Ok(ConfigAction::Show),
+        "init" => Ok(ConfigAction::Init),
+        "validate" | "check" => Ok(ConfigAction::Validate),
         "reset" => Ok(ConfigAction::Reset),
         "get" => {
             let key = tokens.get(*idx).ok_or_else(|| SearchError::InvalidConfig {
@@ -607,7 +755,7 @@ fn parse_config_action(tokens: &[String], idx: &mut usize) -> SearchResult<Confi
         _ => Err(SearchError::InvalidConfig {
             field: "config.action".into(),
             value: action.into(),
-            reason: "expected get|set|list|reset".into(),
+            reason: "expected show|get|set|init|validate|reset".into(),
         }),
     }
 }
@@ -675,9 +823,16 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-e"
             | "--stream"
             | "--watch"
+            | "--model"
+            | "--list"
+            | "--verify"
+            | "--output"
             | "--force"
             | "--full"
             | "--check"
+            | "--purge"
+            | "--yes"
+            | "--dry-run"
             | "--verbose"
             | "-v"
             | "--quiet"
@@ -928,6 +1083,44 @@ mod tests {
     }
 
     #[test]
+    fn parse_download_models_alias() {
+        let input = parse_cli_args(["download-models"]).unwrap();
+        assert_eq!(input.command, CliCommand::Download);
+    }
+
+    #[test]
+    fn parse_download_flags() {
+        let input = parse_cli_args([
+            "download-models",
+            "--model",
+            "all-MiniLM-L6-v2",
+            "--list",
+            "--output",
+            "/tmp/models",
+            "--force",
+        ])
+        .unwrap();
+        assert_eq!(input.command, CliCommand::Download);
+        assert_eq!(input.model_name.as_deref(), Some("all-MiniLM-L6-v2"));
+        assert!(input.download_list);
+        assert!(!input.download_verify);
+        assert_eq!(
+            input.download_output_dir,
+            Some(PathBuf::from("/tmp/models"))
+        );
+        assert!(input.full_reindex);
+    }
+
+    #[test]
+    fn parse_download_rejects_list_and_verify_together() {
+        let err = parse_cli_args(["download-models", "--list", "--verify"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("use either --list or --verify, not both")
+        );
+    }
+
+    #[test]
     fn parse_filter_flag() {
         let input = parse_cli_args(["search", "query", "--filter", "type:rs"]).unwrap();
         assert_eq!(input.filter.as_deref(), Some("type:rs"));
@@ -951,6 +1144,22 @@ mod tests {
         let input = parse_cli_args(["search", "--", "--limit"]).unwrap();
         assert_eq!(input.command, CliCommand::Search);
         assert_eq!(input.query.as_deref(), Some("--limit"));
+    }
+
+    #[test]
+    fn parse_search_query_after_flags() {
+        let input = parse_cli_args(["search", "--format", "json", "latency"]).unwrap();
+        assert_eq!(input.command, CliCommand::Search);
+        assert_eq!(input.format, OutputFormat::Json);
+        assert_eq!(input.query.as_deref(), Some("latency"));
+    }
+
+    #[test]
+    fn parse_search_query_after_flags_with_double_dash() {
+        let input = parse_cli_args(["search", "--format", "json", "--", "-secret-token"]).unwrap();
+        assert_eq!(input.command, CliCommand::Search);
+        assert_eq!(input.format, OutputFormat::Json);
+        assert_eq!(input.query.as_deref(), Some("-secret-token"));
     }
 
     #[test]
@@ -979,7 +1188,7 @@ mod tests {
     fn parse_config_list() {
         let input = parse_cli_args(["config", "list"]).unwrap();
         assert_eq!(input.command, CliCommand::Config);
-        assert_eq!(input.config_action, Some(ConfigAction::List));
+        assert_eq!(input.config_action, Some(ConfigAction::Show));
     }
 
     #[test]
@@ -1015,7 +1224,19 @@ mod tests {
     fn parse_config_alias() {
         let input = parse_cli_args(["cfg", "ls"]).unwrap();
         assert_eq!(input.command, CliCommand::Config);
-        assert_eq!(input.config_action, Some(ConfigAction::List));
+        assert_eq!(input.config_action, Some(ConfigAction::Show));
+    }
+
+    #[test]
+    fn parse_config_show_init_validate() {
+        let show = parse_cli_args(["config", "show"]).unwrap();
+        assert_eq!(show.config_action, Some(ConfigAction::Show));
+
+        let init = parse_cli_args(["config", "init"]).unwrap();
+        assert_eq!(init.config_action, Some(ConfigAction::Init));
+
+        let validate = parse_cli_args(["config", "validate"]).unwrap();
+        assert_eq!(validate.config_action, Some(ConfigAction::Validate));
     }
 
     #[test]
@@ -1039,12 +1260,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_rollback_flag() {
+        let input = parse_cli_args(["update", "--rollback"]).unwrap();
+        assert_eq!(input.command, CliCommand::Update);
+        assert!(input.update_rollback);
+        assert!(input.update_rollback_version.is_none());
+    }
+
+    #[test]
+    fn parse_update_rollback_with_version() {
+        let input = parse_cli_args(["update", "--rollback", "v0.1.0"]).unwrap();
+        assert!(input.update_rollback);
+        assert_eq!(input.update_rollback_version.as_deref(), Some("v0.1.0"));
+    }
+
+    #[test]
+    fn parse_rollback_rejects_non_update_commands() {
+        let err = parse_cli_args(["status", "--rollback"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("only valid for the update command"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn parse_check_rejects_non_update_commands() {
         let err = parse_cli_args(["status", "--check"]).expect_err("must fail");
         assert!(
             err.to_string()
                 .contains("only valid for the update command")
         );
+    }
+
+    #[test]
+    fn parse_uninstall_flags() {
+        let input = parse_cli_args(["uninstall", "--purge", "--yes", "--dry-run"]).unwrap();
+        assert_eq!(input.command, CliCommand::Uninstall);
+        assert!(input.uninstall_purge);
+        assert!(input.uninstall_yes);
+        assert!(input.uninstall_dry_run);
+    }
+
+    #[test]
+    fn parse_uninstall_flags_reject_non_uninstall_commands() {
+        for flag in ["--purge", "--yes", "--dry-run"] {
+            let err = parse_cli_args(["status", flag]).expect_err("must fail");
+            assert!(
+                err.to_string()
+                    .contains("only valid for the uninstall command"),
+                "unexpected error for {flag}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1066,7 +1333,7 @@ mod tests {
     fn invalid_config_action_returns_error() {
         let err = parse_cli_args(["config", "drop"]).expect_err("must fail");
         let msg = err.to_string();
-        assert!(msg.contains("expected get|set|list|reset"));
+        assert!(msg.contains("expected show|get|set|init|validate|reset"));
     }
 
     #[test]

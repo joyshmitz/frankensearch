@@ -177,7 +177,11 @@ pub use repro::{
     ReplayMode, ReproInstance, ReproManifest, RetentionPolicy, RetentionTier, files_for_tier,
     should_capture_env, should_redact_env,
 };
-pub use runtime::{FsfsRuntime, InterfaceMode};
+pub use runtime::{
+    FsfsRuntime, InterfaceMode, VersionCheckCache, is_cache_valid, maybe_print_update_notice,
+    read_version_cache, refresh_version_cache, spawn_version_cache_refresh, version_cache_path,
+    write_version_cache,
+};
 pub use shutdown::{FORCE_EXIT_WINDOW, ShutdownCoordinator, ShutdownReason, ShutdownState};
 pub use stream_protocol::{
     STREAM_PROTOCOL_VERSION, STREAM_SCHEMA_VERSION, StreamEvent, StreamEventKind,

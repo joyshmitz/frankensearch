@@ -10,13 +10,14 @@
 //! envelope as TOON and decoding it back yields the same `serde_json::Value`
 //! as direct JSON serialization. This is verified by [`verify_json_toon_parity`].
 
+use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use frankensearch_core::{SearchError, SearchResult};
 use serde::Serialize;
 
 use super::cli::OutputFormat;
-use crate::output_schema::{OutputEnvelope, OutputMeta, encode_envelope_toon};
+use crate::output_schema::{OutputEnvelope, OutputMeta, SearchPayload, encode_envelope_toon};
 use crate::stream_protocol::{
     StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_ndjson,
     encode_stream_frame_toon,
@@ -212,7 +213,20 @@ fn emit_table<T: Serialize, W: Write>(
     // the data since we don't have type-specific table renderers yet.
     if envelope.ok {
         if let Some(data) = &envelope.data {
-            let json = serde_json::to_string_pretty(data).map_err(|source| {
+            let value =
+                serde_json::to_value(data).map_err(|source| SearchError::SubsystemError {
+                    subsystem: SUBSYSTEM,
+                    source: Box::new(io::Error::other(format!(
+                        "failed to project data for table display: {source}"
+                    ))),
+                })?;
+
+            if let Ok(search_payload) = serde_json::from_value::<SearchPayload>(value.clone()) {
+                write!(writer, "{}", render_search_table(&search_payload)).map_err(write_err)?;
+                return Ok(());
+            }
+
+            let json = serde_json::to_string_pretty(&value).map_err(|source| {
                 SearchError::SubsystemError {
                     subsystem: SUBSYSTEM,
                     source: Box::new(io::Error::other(format!(
@@ -244,6 +258,34 @@ fn emit_table<T: Serialize, W: Write>(
     }
 
     Ok(())
+}
+
+fn render_search_table(payload: &SearchPayload) -> String {
+    let mut out = String::new();
+    let phase = payload.phase.to_string().to_ascii_uppercase();
+    let _ = writeln!(
+        out,
+        "PHASE {phase}: {} hit(s) for \"{}\"",
+        payload.returned_hits, payload.query
+    );
+
+    if payload.is_empty() {
+        let _ = writeln!(out, "No results found.");
+        return out;
+    }
+
+    for hit in &payload.hits {
+        let _ = write!(out, "{:>3}. {}  score={:.3}", hit.rank, hit.path, hit.score);
+        if let (Some(lexical_rank), Some(semantic_rank)) = (hit.lexical_rank, hit.semantic_rank) {
+            let _ = write!(out, " [L{} S{}]", lexical_rank + 1, semantic_rank + 1);
+        }
+        let _ = writeln!(out);
+        if let Some(snippet) = hit.snippet.as_deref() {
+            let _ = writeln!(out, "     {snippet}");
+        }
+    }
+
+    out
 }
 
 fn write_err(source: io::Error) -> SearchError {
@@ -343,7 +385,7 @@ mod tests {
     use super::*;
     use crate::output_schema::{
         OutputEnvelope, OutputError, OutputErrorCode, OutputMeta, OutputWarning, OutputWarningCode,
-        decode_envelope_toon,
+        SearchHitPayload, SearchOutputPhase, SearchPayload, decode_envelope_toon,
     };
     use crate::stream_protocol::{
         StreamEvent, StreamFrame, StreamResultEvent, TOON_STREAM_RECORD_SEPARATOR_BYTE,
@@ -492,6 +534,42 @@ mod tests {
         let output = emit_envelope_string(&env, OutputFormat::Table).unwrap();
         assert!(output.contains("hello world"));
         assert!(output.contains("warning: [degraded_mode]"));
+    }
+
+    #[test]
+    fn emit_table_search_payload_renders_ranked_hits() {
+        let payload = SearchPayload::new(
+            "how auth works",
+            SearchOutputPhase::Initial,
+            2,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/auth.rs".to_owned(),
+                    score: 0.923,
+                    snippet: Some("fn authenticate(token: &str) -> bool".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(1),
+                    in_both_sources: true,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "docs/auth.md".to_owned(),
+                    score: 0.811,
+                    snippet: None,
+                    lexical_rank: Some(2),
+                    semantic_rank: None,
+                    in_both_sources: false,
+                },
+            ],
+        );
+        let env = OutputEnvelope::success(payload, sample_meta("table"), sample_ts());
+
+        let output = emit_envelope_string(&env, OutputFormat::Table).expect("render table");
+        assert!(output.contains("PHASE INITIAL"));
+        assert!(output.contains("1. src/auth.rs"));
+        assert!(output.contains("score=0.923"));
+        assert!(output.contains("fn authenticate(token: &str) -> bool"));
     }
 
     #[test]

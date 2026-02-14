@@ -1,0 +1,305 @@
+{
+  "files": [
+    {
+      "path": "rust/ownership/borrow_checker.md",
+      "contents": "Rust ownership is enforced by the borrow checker. Borrow checker diagnostics explain aliasing and mutable borrow rules with lifetime constraints."
+    },
+    {
+      "path": "rust/ownership/lifetimes.md",
+      "contents": "Lifetimes encode ownership relationships. Rust lifetimes and borrow checker checks prevent dangling references and clarify ownership transfer."
+    },
+    {
+      "path": "rust/ownership/move_semantics.md",
+      "contents": "Move semantics transfer ownership in Rust. Ownership, borrowing, and lifetime annotations guide safe move operations."
+    },
+    {
+      "path": "rust/ownership/ownership_rules.txt",
+      "contents": "Ownership rules: one owner at a time, multiple immutable borrows, single mutable borrow. Borrow checker + lifetimes enforce this model."
+    },
+    {
+      "path": "rust/ownership/reference_patterns.rs",
+      "contents": "fn borrow_patterns<'a>(x: &'a str) -> &'a str { x } // ownership, borrow checker, lifetimes, references"
+    },
+
+    {
+      "path": "rust/async/structured_concurrency.md",
+      "contents": "Structured concurrency scopes async tasks and cancellation boundaries. Async cancellation is explicit and deterministic with scoped lifetimes."
+    },
+    {
+      "path": "rust/async/cancellation_tokens.md",
+      "contents": "Cancellation tokens coordinate async shutdown. Structured concurrency plus cancellation tokens avoids orphaned tasks."
+    },
+    {
+      "path": "rust/async/task_scopes.txt",
+      "contents": "Task scopes and structured concurrency propagate cancellation. Async scopes guarantee children complete or cancel before exit."
+    },
+    {
+      "path": "rust/async/select_cancellation.rs",
+      "contents": "async fn race() { /* select! with cancellation token and structured concurrency */ }"
+    },
+    {
+      "path": "rust/async/backpressure_notes.md",
+      "contents": "Backpressure and bounded queues reduce async overload. Cancellation-aware scheduling keeps latency stable under burst pressure."
+    },
+
+    {
+      "path": "distributed/consensus/raft_overview.md",
+      "contents": "Distributed consensus with Raft uses leader election, quorum commits, and replicated logs for fault tolerance."
+    },
+    {
+      "path": "distributed/consensus/leader_election.md",
+      "contents": "Raft leader election uses randomized timeouts and quorum votes. Consensus safety depends on election term monotonicity."
+    },
+    {
+      "path": "distributed/consensus/quorum_math.txt",
+      "contents": "Quorum math in distributed consensus: majority quorum prevents split-brain and ensures linearizable commit decisions."
+    },
+    {
+      "path": "distributed/consensus/log_replication.rs",
+      "contents": "struct AppendEntries; // raft log replication, quorum acknowledgement, distributed consensus"
+    },
+    {
+      "path": "distributed/consensus/split_brain_mitigation.md",
+      "contents": "Split-brain mitigation in consensus systems relies on quorum fencing and strict leader election rules."
+    },
+
+    {
+      "path": "web/api/idempotency_keys.md",
+      "contents": "Idempotency keys make web API retries safe. API handlers should reject duplicate side effects under retry storms."
+    },
+    {
+      "path": "web/api/rate_limiting.md",
+      "contents": "Rate limiting protects web APIs from abuse. Token buckets and sliding windows enforce fair request throughput."
+    },
+    {
+      "path": "web/api/retry_backoff.txt",
+      "contents": "Retry backoff for API clients: exponential delays, jitter, and idempotency safeguards reduce cascading failures."
+    },
+    {
+      "path": "web/api/http_status_contracts.md",
+      "contents": "HTTP status contracts define API semantics for retries, idempotency conflicts, and rate-limited responses."
+    },
+    {
+      "path": "web/api/pagination_cursor.rs",
+      "contents": "fn cursor_page() {} // api pagination, retry safety, idempotency key and rate limit awareness"
+    },
+
+    {
+      "path": "db/indexing/btree_query_planner.md",
+      "contents": "Database indexing with B-tree structures improves query planner selectivity and predicate pushdown performance."
+    },
+    {
+      "path": "db/indexing/covering_indexes.md",
+      "contents": "Covering indexes reduce heap lookups. Query planner chooses covering index when projections match indexed columns."
+    },
+    {
+      "path": "db/indexing/composite_keys.txt",
+      "contents": "Composite key indexing supports multi-column filters. B-tree prefix order affects query planner cost models."
+    },
+    {
+      "path": "db/indexing/vacuum_stats.md",
+      "contents": "Planner statistics and vacuum maintenance influence index selectivity estimates and join strategies."
+    },
+    {
+      "path": "db/indexing/transaction_costs.rs",
+      "contents": "// query planner chooses btree index for transactional workload with composite key predicates"
+    },
+
+    {
+      "path": "security/oauth/pkce_flow.md",
+      "contents": "OAuth2 PKCE flow secures public clients. Authorization code exchange requires verifier/challenge and scoped access tokens."
+    },
+    {
+      "path": "security/oauth/refresh_token_rotation.md",
+      "contents": "Refresh token rotation limits replay. OAuth2 refresh tokens should rotate on every exchange and revoke prior token."
+    },
+    {
+      "path": "security/oauth/access_token_scopes.txt",
+      "contents": "OAuth scopes constrain access token privilege. Scope minimization and refresh rotation reduce breach blast radius."
+    },
+    {
+      "path": "security/oauth/device_code_flow.md",
+      "contents": "Device code flow in OAuth2 still benefits from refresh token rotation and strict scope policies."
+    },
+    {
+      "path": "security/oauth/session_revocation.rs",
+      "contents": "// oauth2 session revocation endpoint invalidates refresh token family and scopes"
+    },
+
+    {
+      "path": "security/passwords/argon2_pepper.md",
+      "contents": "Password hashing should use Argon2 with per-user salt and application pepper. Argon2 tuning controls work factor."
+    },
+    {
+      "path": "security/passwords/salt_and_work_factor.md",
+      "contents": "Salting and work factor selection are critical for password hashing. Argon2 memory and iterations must be calibrated."
+    },
+    {
+      "path": "security/passwords/credential_stuffing_controls.txt",
+      "contents": "Credential stuffing defenses include Argon2 hashing, breached-password checks, and lockout controls."
+    },
+    {
+      "path": "security/passwords/password_reset_policy.md",
+      "contents": "Reset policy should preserve strong hashing guarantees and avoid reducing Argon2 work factor or pepper hygiene."
+    },
+    {
+      "path": "security/passwords/hmac_secret_rotation.rs",
+      "contents": "// rotate pepper and hmac secrets without weakening password hashing migration safety"
+    },
+
+    {
+      "path": "observability/tracing/span_correlation.md",
+      "contents": "Observability tracing links spans using correlation IDs. Structured spans enable root-cause analysis across services."
+    },
+    {
+      "path": "observability/tracing/request_ids.md",
+      "contents": "Request IDs and trace IDs provide correlation for distributed tracing, logs, and metrics."
+    },
+    {
+      "path": "observability/tracing/open_telemetry_notes.txt",
+      "contents": "OpenTelemetry spans, traceparent propagation, and correlation identifiers unify observability pipelines."
+    },
+    {
+      "path": "observability/tracing/error_budget_burn.md",
+      "contents": "Error budget burn analysis depends on tracing spans and request correlation to isolate latency regressions."
+    },
+    {
+      "path": "observability/tracing/log_sampling.rs",
+      "contents": "// tracing spans with correlation id and request id drive sampled logging decisions"
+    },
+
+    {
+      "path": "performance/cache/write_through_vs_write_back.md",
+      "contents": "Cache invalidation strategy compares write-through and write-back. Write-through improves consistency during invalidation."
+    },
+    {
+      "path": "performance/cache/ttl_invalidation.md",
+      "contents": "TTL invalidation expires stale entries. Cache TTL values must balance freshness and recomputation cost."
+    },
+    {
+      "path": "performance/cache/cache_stampede_controls.txt",
+      "contents": "Cache stampede controls: request coalescing, jittered TTL, and stale-while-revalidate invalidation."
+    },
+    {
+      "path": "performance/cache/read_through_patterns.md",
+      "contents": "Read-through caching plus invalidation hooks avoid stale data after write transactions."
+    },
+    {
+      "path": "performance/cache/invalidation_hooks.rs",
+      "contents": "// cache invalidation hooks trigger ttl refresh and write-through consistency updates"
+    },
+
+    {
+      "path": "db/transactions/isolation_levels.md",
+      "contents": "SQL transaction isolation levels include read committed, repeatable read, and serializable for consistency guarantees."
+    },
+    {
+      "path": "db/transactions/serializable_vs_snapshot.md",
+      "contents": "Serializable vs snapshot isolation: serializable prevents write skew; snapshot may require retry logic."
+    },
+    {
+      "path": "db/transactions/deadlock_detection.txt",
+      "contents": "Deadlock detection identifies cyclic lock waits. Transaction retry policies handle deadlock aborts safely."
+    },
+    {
+      "path": "db/transactions/two_phase_commit.md",
+      "contents": "Two-phase commit coordinates distributed SQL transactions with explicit prepare/commit semantics and failure handling."
+    },
+    {
+      "path": "db/transactions/retryable_errors.rs",
+      "contents": "// transaction retry loop for serializable isolation conflicts and deadlock errors"
+    }
+  ],
+  "queries": [
+    {
+      "query": "rust ownership borrow checker lifetimes",
+      "expected_docs": [
+        "rust/ownership/borrow_checker.md",
+        "rust/ownership/lifetimes.md",
+        "rust/ownership/ownership_rules.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "structured concurrency async cancellation tokens",
+      "expected_docs": [
+        "rust/async/structured_concurrency.md",
+        "rust/async/cancellation_tokens.md",
+        "rust/async/task_scopes.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "distributed consensus raft leader election quorum",
+      "expected_docs": [
+        "distributed/consensus/raft_overview.md",
+        "distributed/consensus/leader_election.md",
+        "distributed/consensus/quorum_math.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "web api idempotency rate limiting retries",
+      "expected_docs": [
+        "web/api/idempotency_keys.md",
+        "web/api/rate_limiting.md",
+        "web/api/retry_backoff.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "database indexing btree query planner composite key",
+      "expected_docs": [
+        "db/indexing/btree_query_planner.md",
+        "db/indexing/composite_keys.txt",
+        "db/indexing/covering_indexes.md"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "oauth2 refresh token rotation pkce scopes",
+      "expected_docs": [
+        "security/oauth/refresh_token_rotation.md",
+        "security/oauth/pkce_flow.md",
+        "security/oauth/access_token_scopes.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "password hashing argon2 pepper salting work factor",
+      "expected_docs": [
+        "security/passwords/argon2_pepper.md",
+        "security/passwords/salt_and_work_factor.md",
+        "security/passwords/credential_stuffing_controls.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "observability tracing spans correlation request ids",
+      "expected_docs": [
+        "observability/tracing/span_correlation.md",
+        "observability/tracing/request_ids.md",
+        "observability/tracing/open_telemetry_notes.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "cache invalidation write through ttl stampede",
+      "expected_docs": [
+        "performance/cache/write_through_vs_write_back.md",
+        "performance/cache/ttl_invalidation.md",
+        "performance/cache/cache_stampede_controls.txt"
+      ],
+      "min_recall_at_5": 0.6
+    },
+    {
+      "query": "sql transaction isolation serializable snapshot deadlock",
+      "expected_docs": [
+        "db/transactions/isolation_levels.md",
+        "db/transactions/serializable_vs_snapshot.md",
+        "db/transactions/deadlock_detection.txt"
+      ],
+      "min_recall_at_5": 0.6
+    }
+  ]
+}

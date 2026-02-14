@@ -376,6 +376,76 @@ impl OutputMeta {
     }
 }
 
+// ─── Search Payload ────────────────────────────────────────────────────────
+
+/// Progressive search phase for CLI output payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchOutputPhase {
+    Initial,
+    Refined,
+    RefinementFailed,
+}
+
+impl fmt::Display for SearchOutputPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initial => write!(f, "initial"),
+            Self::Refined => write!(f, "refined"),
+            Self::RefinementFailed => write!(f, "refinement_failed"),
+        }
+    }
+}
+
+/// One ranked search hit inside a [`SearchPayload`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchHitPayload {
+    pub rank: usize,
+    pub path: String,
+    pub score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_rank: Option<usize>,
+    pub in_both_sources: bool,
+}
+
+/// Search payload embedded in `OutputEnvelope::data` for `fsfs search`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchPayload {
+    pub query: String,
+    pub phase: SearchOutputPhase,
+    pub total_candidates: usize,
+    pub returned_hits: usize,
+    pub hits: Vec<SearchHitPayload>,
+}
+
+impl SearchPayload {
+    #[must_use]
+    pub fn new(
+        query: impl Into<String>,
+        phase: SearchOutputPhase,
+        total_candidates: usize,
+        hits: Vec<SearchHitPayload>,
+    ) -> Self {
+        let returned_hits = hits.len();
+        Self {
+            query: query.into(),
+            phase,
+            total_candidates,
+            returned_hits,
+            hits,
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+}
+
 // ─── Stable Error Codes ─────────────────────────────────────────────────────
 
 /// Machine-stable error code constants for JSON output.
@@ -960,6 +1030,51 @@ mod tests {
 
     fn sample_ts() -> &'static str {
         "2026-02-14T12:00:00Z"
+    }
+
+    #[test]
+    fn search_output_phase_display_matches_wire_values() {
+        assert_eq!(SearchOutputPhase::Initial.to_string(), "initial");
+        assert_eq!(SearchOutputPhase::Refined.to_string(), "refined");
+        assert_eq!(
+            SearchOutputPhase::RefinementFailed.to_string(),
+            "refinement_failed"
+        );
+    }
+
+    #[test]
+    fn search_payload_serde_roundtrip() {
+        let payload = SearchPayload::new(
+            "how does auth work",
+            SearchOutputPhase::Initial,
+            3,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/auth.rs".to_owned(),
+                    score: 0.923,
+                    snippet: Some("fn authenticate(token: &str) -> bool".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(1),
+                    in_both_sources: true,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "docs/auth.md".to_owned(),
+                    score: 0.811,
+                    snippet: None,
+                    lexical_rank: Some(2),
+                    semantic_rank: None,
+                    in_both_sources: false,
+                },
+            ],
+        );
+        assert!(!payload.is_empty());
+
+        let json = serde_json::to_string(&payload).expect("serialize payload");
+        let decoded: SearchPayload = serde_json::from_str(&json).expect("deserialize payload");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.returned_hits, 2);
     }
 
     // ─── OutputEnvelope construction ────────────────────────────────────

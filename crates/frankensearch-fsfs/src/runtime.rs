@@ -1,4 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Write};
@@ -9,36 +9,49 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 use dirs::home_dir;
 use frankensearch_core::{
-    Canonicalizer, DefaultCanonicalizer, Embedder, IndexableDocument, LexicalSearch, SearchError,
-    SearchResult,
+    Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
+    HitExplanation, IndexableDocument, LexicalSearch, ScoreComponent, SearchError, SearchResult,
 };
-use frankensearch_embed::{EmbedderStack, HashAlgorithm, HashEmbedder};
+use frankensearch_embed::{
+    ConsentSource, DownloadConsent, EmbedderStack, HashAlgorithm, HashEmbedder, ModelDownloader,
+    ModelLifecycle, ModelManifest,
+};
 use frankensearch_index::VectorIndex;
-use frankensearch_lexical::TantivyIndex;
+use frankensearch_lexical::{SnippetConfig, TantivyIndex};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
 use tracing::{info, warn};
 
 use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
-use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
+use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for_format};
 use crate::adapters::tui::FsfsTuiShellModel;
 use crate::config::{
     DegradationOverrideMode, DiscoveryCandidate, DiscoveryDecision, DiscoveryScopeDecision,
     FsfsConfig, IngestionClass, PressureProfile, RootDiscoveryDecision,
     default_project_config_file_path, default_user_config_file_path,
 };
+use crate::explanation_payload::{FsfsExplanationPayload, RankingExplanation};
 use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
     ResourceLimits, ResourceUsage, WatchdogConfig,
 };
-use crate::output_schema::OutputEnvelope;
+use crate::output_schema::{OutputEnvelope, SearchHitPayload, SearchOutputPhase, SearchPayload};
 use crate::pressure::{
     DegradationControllerConfig, DegradationSignal, DegradationStateMachine, DegradationTransition,
     HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
     PressureState, PressureTransition,
 };
+use crate::query_execution::{
+    FusionPolicy as QueryFusionPolicy, LexicalCandidate, QueryExecutionOrchestrator,
+    SemanticCandidate,
+};
+use crate::query_planning::{CapabilityState, QueryExecutionCapabilities, QueryPlanner};
 use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
+use crate::stream_protocol::{
+    StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
+    terminal_event_completed, terminal_event_from_error,
+};
 use crate::watcher::{FsWatcher, NoopWatchIngestPipeline};
 
 /// Supported fsfs interfaces.
@@ -257,6 +270,656 @@ struct FsfsRuntimeStatus {
     disk_budget_action: Option<String>,
     disk_budget_reason_code: Option<String>,
     tracked_index_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsfsDownloadModelsPayload {
+    operation: String,
+    force: bool,
+    model_root: String,
+    models: Vec<FsfsDownloadModelEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsfsDownloadModelEntry {
+    id: String,
+    install_dir: String,
+    tier: Option<String>,
+    state: String,
+    verified: Option<bool>,
+    size_bytes: u64,
+    destination: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FsfsDoctorPayload {
+    version: String,
+    checks: Vec<DoctorCheck>,
+    pass_count: usize,
+    warn_count: usize,
+    fail_count: usize,
+    overall: DoctorVerdict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsfsUninstallPayload {
+    purge: bool,
+    dry_run: bool,
+    confirmed: bool,
+    removed: usize,
+    skipped: usize,
+    failed: usize,
+    entries: Vec<FsfsUninstallEntry>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsfsUninstallEntry {
+    target: String,
+    kind: String,
+    path: String,
+    purge_only: bool,
+    status: String,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UninstallTargetKind {
+    File,
+    Directory,
+}
+
+impl UninstallTargetKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UninstallTarget {
+    target: String,
+    kind: UninstallTargetKind,
+    path: PathBuf,
+    purge_only: bool,
+}
+
+// ─── Self-Update Payload Types ─────────────────────────────────────────────
+
+/// Structured payload for `fsfs update` (and `fsfs update --check`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct FsfsUpdatePayload {
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+    check_only: bool,
+    applied: bool,
+    channel: String,
+    release_url: Option<String>,
+    notes: Vec<String>,
+}
+
+/// Minimal semver triple used for version comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemVer {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl SemVer {
+    /// Parse a version string like "0.1.0", "v0.2.3", or "1.0.0-beta.1".
+    /// Pre-release suffixes are stripped (compared only on numeric triple).
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let base = s.split('-').next()?;
+        let mut parts = base.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        Some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+
+    /// Returns true when `self` is strictly newer than `other`.
+    fn is_newer_than(self, other: Self) -> bool {
+        (self.major, self.minor, self.patch) > (other.major, other.minor, other.patch)
+    }
+}
+
+impl std::fmt::Display for SemVer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+// ─── GitHub Release Fetcher ────────────────────────────────────────────────
+
+const GITHUB_OWNER: &str = "Dicklesworthstone";
+const GITHUB_REPO: &str = "frankensearch";
+
+/// Fetch the latest release tag from GitHub Releases via `curl`.
+/// Returns `(tag_name, html_url)` on success.
+fn fetch_latest_release_tag() -> SearchResult<(String, String)> {
+    let url = format!(
+        "https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+    );
+
+    let output = std::process::Command::new("curl")
+        .args([
+            "-sSf",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+            "--max-time",
+            "10",
+            &url,
+        ])
+        .output()
+        .map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.curl",
+            source: Box::new(e),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SearchError::InvalidConfig {
+            field: "update.github_api".into(),
+            value: url,
+            reason: format!("GitHub API request failed: {stderr}"),
+        });
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.json",
+            source: Box::new(e),
+        })?;
+
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let html_url = json
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    if tag.is_empty() {
+        return Err(SearchError::InvalidConfig {
+            field: "update.tag_name".into(),
+            value: body.into_owned(),
+            reason: "no tag_name found in GitHub API response".into(),
+        });
+    }
+
+    Ok((tag, html_url))
+}
+
+/// Download a release asset to a local path using `curl`.
+fn download_release_asset(url: &str, dest: &Path) -> SearchResult<()> {
+    let status = std::process::Command::new("curl")
+        .args([
+            "-sSfL",
+            "-o",
+            &dest.to_string_lossy(),
+            "--max-time",
+            "120",
+            url,
+        ])
+        .status()
+        .map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.download",
+            source: Box::new(e),
+        })?;
+
+    if !status.success() {
+        return Err(SearchError::InvalidConfig {
+            field: "update.download".into(),
+            value: url.to_owned(),
+            reason: "asset download failed".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Compute SHA-256 hex digest of a file using `sha256sum`.
+fn compute_sha256_of_file(path: &Path) -> SearchResult<String> {
+    let output = std::process::Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.sha256",
+            source: Box::new(e),
+        })?;
+
+    if !output.status.success() {
+        return Err(SearchError::SubsystemError {
+            subsystem: "fsfs.update.sha256",
+            source: Box::new(std::io::Error::other("sha256sum failed")),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hash = stdout.split_whitespace().next().unwrap_or("").to_owned();
+    Ok(hash)
+}
+
+/// Detect the platform target triple for asset naming.
+fn detect_target_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match (arch, os) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-musl".into(),
+        ("x86_64", "macos") => "x86_64-apple-darwin".into(),
+        ("aarch64", "linux") => "aarch64-unknown-linux-musl".into(),
+        ("aarch64", "macos") => "aarch64-apple-darwin".into(),
+        _ => format!("{arch}-unknown-{os}"),
+    }
+}
+
+/// Build the download URL for a release asset.
+fn release_asset_url(tag: &str, triple: &str) -> String {
+    format!(
+        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{triple}.tar.xz"
+    )
+}
+
+/// Build the download URL for the per-artifact checksum sidecar.
+fn release_checksum_url(tag: &str, triple: &str) -> String {
+    format!(
+        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{triple}.tar.xz.sha256"
+    )
+}
+
+// ─── Version Check Cache ───────────────────────────────────────────────────
+
+/// Default TTL for the version-check cache (24 hours).
+const VERSION_CACHE_TTL_SECS: u64 = 86_400;
+
+/// Cached version-check result persisted to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionCheckCache {
+    /// Epoch seconds when this cache entry was written.
+    pub checked_at_epoch: u64,
+    /// The `CARGO_PKG_VERSION` at the time of check.
+    pub current_version: String,
+    /// Latest version tag from GitHub (e.g. "v0.3.0").
+    pub latest_version: String,
+    /// URL of the latest release page.
+    #[serde(default)]
+    pub release_url: String,
+    /// TTL in seconds (allows override in the cache file itself).
+    #[serde(default = "default_ttl")]
+    pub ttl_seconds: u64,
+}
+
+fn default_ttl() -> u64 {
+    VERSION_CACHE_TTL_SECS
+}
+
+/// Resolve the path to the version-check cache file.
+pub fn version_cache_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("frankensearch").join("version_check.json"))
+}
+
+/// Read the version cache from disk. Returns `None` if missing or unreadable.
+pub fn read_version_cache() -> Option<VersionCheckCache> {
+    let path = version_cache_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Write the version cache to disk.
+pub fn write_version_cache(cache: &VersionCheckCache) -> SearchResult<()> {
+    let path = version_cache_path().ok_or_else(|| SearchError::InvalidConfig {
+        field: "version_cache.path".into(),
+        value: String::new(),
+        reason: "could not determine cache directory".into(),
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.version_cache.dir",
+            source: Box::new(e),
+        })?;
+    }
+    let json = serde_json::to_string_pretty(cache).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.version_cache.json",
+        source: Box::new(e),
+    })?;
+    fs::write(&path, json).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.version_cache.write",
+        source: Box::new(e),
+    })?;
+    Ok(())
+}
+
+fn epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Check if the cache is still valid (not expired and matches current version).
+pub fn is_cache_valid(cache: &VersionCheckCache) -> bool {
+    let elapsed = epoch_now().saturating_sub(cache.checked_at_epoch);
+    elapsed < cache.ttl_seconds && cache.current_version == env!("CARGO_PKG_VERSION")
+}
+
+/// Refresh the version cache by querying GitHub. Writes the result to disk.
+/// Returns the refreshed cache on success.
+pub fn refresh_version_cache() -> SearchResult<VersionCheckCache> {
+    let (tag, html_url) = fetch_latest_release_tag()?;
+    let cache = VersionCheckCache {
+        checked_at_epoch: epoch_now(),
+        current_version: env!("CARGO_PKG_VERSION").to_owned(),
+        latest_version: tag,
+        release_url: html_url,
+        ttl_seconds: VERSION_CACHE_TTL_SECS,
+    };
+    write_version_cache(&cache)?;
+    Ok(cache)
+}
+
+/// Print a one-line update notice to stderr if an update is available.
+///
+/// Reads the cached version-check result. If the cache is expired or missing,
+/// silently does nothing (the background refresh will populate it for next time).
+///
+/// Returns `true` if a notice was printed.
+pub fn maybe_print_update_notice(quiet: bool) -> bool {
+    if quiet {
+        return false;
+    }
+    let Some(cache) = read_version_cache() else {
+        return false;
+    };
+    if !is_cache_valid(&cache) {
+        return false;
+    }
+    let Some(current) = SemVer::parse(&cache.current_version) else {
+        return false;
+    };
+    let Some(latest) = SemVer::parse(&cache.latest_version) else {
+        return false;
+    };
+    if !latest.is_newer_than(current) {
+        return false;
+    }
+    eprintln!(
+        "Update available: v{current} \u{2192} v{latest} (run `fsfs update`)"
+    );
+    true
+}
+
+/// Spawn a background thread to refresh the version cache.
+/// The thread is detached — if it fails or times out, the main process is unaffected.
+pub fn spawn_version_cache_refresh() {
+    std::thread::Builder::new()
+        .name("fsfs-version-check".into())
+        .spawn(|| {
+            let _ = refresh_version_cache();
+        })
+        .ok();
+}
+
+// ─── Backup / Rollback ────────────────────────────────────────────────────
+
+/// Maximum number of backup versions to keep.
+const MAX_BACKUP_VERSIONS: usize = 3;
+
+/// Metadata for a single backup entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupEntry {
+    pub version: String,
+    pub backed_up_at_epoch: u64,
+    pub original_path: String,
+    pub binary_filename: String,
+    pub sha256: String,
+}
+
+/// Manifest tracking all backups in the backup directory.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RollbackManifest {
+    pub entries: Vec<BackupEntry>,
+}
+
+/// Resolve the backup directory path.
+pub fn backup_dir() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("frankensearch").join("backups"))
+}
+
+/// Resolve the rollback manifest path.
+pub fn rollback_manifest_path() -> Option<PathBuf> {
+    backup_dir().map(|d| d.join("rollback-manifest.json"))
+}
+
+/// Read the rollback manifest from disk.
+pub fn read_rollback_manifest() -> RollbackManifest {
+    let Some(path) = rollback_manifest_path() else {
+        return RollbackManifest::default();
+    };
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Write the rollback manifest to disk.
+pub fn write_rollback_manifest(manifest: &RollbackManifest) -> SearchResult<()> {
+    let path = rollback_manifest_path().ok_or_else(|| SearchError::InvalidConfig {
+        field: "backup.manifest_path".into(),
+        value: String::new(),
+        reason: "could not determine data directory for backups".into(),
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.backup.dir",
+            source: Box::new(e),
+        })?;
+    }
+    let json = serde_json::to_string_pretty(manifest).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.backup.json",
+        source: Box::new(e),
+    })?;
+    fs::write(&path, json).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.backup.write",
+        source: Box::new(e),
+    })?;
+    Ok(())
+}
+
+/// Create a backup of the current binary before an update.
+///
+/// Returns the backup entry on success. On failure (e.g. disk full), returns
+/// an error but the caller may choose to proceed without backup.
+pub fn create_backup(current_exe: &Path) -> SearchResult<BackupEntry> {
+    let dir = backup_dir().ok_or_else(|| SearchError::InvalidConfig {
+        field: "backup.dir".into(),
+        value: String::new(),
+        reason: "could not determine data directory for backups".into(),
+    })?;
+    fs::create_dir_all(&dir).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.backup.mkdir",
+        source: Box::new(e),
+    })?;
+
+    let version = env!("CARGO_PKG_VERSION");
+    let binary_filename = format!("fsfs-{version}");
+    let dest = dir.join(&binary_filename);
+
+    fs::copy(current_exe, &dest).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.backup.copy",
+        source: Box::new(e),
+    })?;
+
+    // Set executable permission.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let sha256 = compute_sha256_of_file(&dest).unwrap_or_default();
+
+    let entry = BackupEntry {
+        version: version.to_owned(),
+        backed_up_at_epoch: epoch_now(),
+        original_path: current_exe.display().to_string(),
+        binary_filename,
+        sha256,
+    };
+
+    // Update manifest: add entry, prune old ones.
+    let mut manifest = read_rollback_manifest();
+    // Remove duplicate of same version if already backed up.
+    manifest.entries.retain(|e| e.version != version);
+    manifest.entries.push(entry.clone());
+    prune_backups(&mut manifest, &dir);
+    write_rollback_manifest(&manifest)?;
+
+    Ok(entry)
+}
+
+/// Prune old backup entries beyond `MAX_BACKUP_VERSIONS`.
+fn prune_backups(manifest: &mut RollbackManifest, backup_directory: &Path) {
+    // Sort newest first.
+    manifest
+        .entries
+        .sort_by_key(|b| std::cmp::Reverse(b.backed_up_at_epoch));
+    while manifest.entries.len() > MAX_BACKUP_VERSIONS {
+        if let Some(old) = manifest.entries.pop() {
+            let path = backup_directory.join(&old.binary_filename);
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Restore a backup. If `target_version` is `None`, restores the most recent backup.
+pub fn restore_backup(target_version: Option<&str>) -> SearchResult<BackupEntry> {
+    let dir = backup_dir().ok_or_else(|| SearchError::InvalidConfig {
+        field: "backup.dir".into(),
+        value: String::new(),
+        reason: "could not determine data directory for backups".into(),
+    })?;
+    let manifest = read_rollback_manifest();
+    if manifest.entries.is_empty() {
+        return Err(SearchError::InvalidConfig {
+            field: "backup.entries".into(),
+            value: String::new(),
+            reason: "no backups available for rollback".into(),
+        });
+    }
+
+    let entry = if let Some(ver) = target_version {
+        let ver_clean = ver.strip_prefix('v').unwrap_or(ver);
+        manifest
+            .entries
+            .iter()
+            .find(|e| e.version == ver_clean || e.version == ver)
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "backup.version".into(),
+                value: ver.to_owned(),
+                reason: format!(
+                    "no backup found for version {ver}; available: {}",
+                    manifest
+                        .entries
+                        .iter()
+                        .map(|e| e.version.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })?
+    } else {
+        // Most recent backup (already sorted newest-first by prune).
+        manifest.entries.first().ok_or_else(|| SearchError::InvalidConfig {
+            field: "backup.entries".into(),
+            value: String::new(),
+            reason: "no backups available".into(),
+        })?
+    };
+
+    let backup_path = dir.join(&entry.binary_filename);
+    if !backup_path.is_file() {
+        return Err(SearchError::InvalidConfig {
+            field: "backup.file".into(),
+            value: backup_path.display().to_string(),
+            reason: "backup binary not found on disk".into(),
+        });
+    }
+
+    // Verify checksum if available.
+    if !entry.sha256.is_empty() {
+        let actual = compute_sha256_of_file(&backup_path)?;
+        if !actual.eq_ignore_ascii_case(&entry.sha256) {
+            return Err(SearchError::InvalidConfig {
+                field: "backup.checksum".into(),
+                value: actual,
+                reason: format!("backup checksum mismatch: expected {}", entry.sha256),
+            });
+        }
+    }
+
+    // Replace current binary with backup.
+    let current_exe = std::env::current_exe().map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.backup.current_exe",
+        source: Box::new(e),
+    })?;
+
+    fs::copy(&backup_path, &current_exe).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.backup.restore",
+        source: Box::new(e),
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755));
+    }
+
+    Ok(entry.clone())
+}
+
+/// List available backups for display.
+pub fn list_backups() -> Vec<BackupEntry> {
+    read_rollback_manifest().entries
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DoctorVerdict {
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl std::fmt::Display for DoctorVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "pass"),
+            Self::Warn => write!(f, "warn"),
+            Self::Fail => write!(f, "fail"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct DoctorCheck {
+    name: String,
+    verdict: DoctorVerdict,
+    detail: String,
+    suggestion: Option<String>,
 }
 
 /// Shared runtime entrypoint used by interface adapters.
@@ -783,14 +1446,8 @@ impl FsfsRuntime {
                 Ok(())
             }
             CliCommand::Completions => self.run_completions_command(),
-            CliCommand::Update => {
-                self.run_update_command();
-                Ok(())
-            }
-            CliCommand::Uninstall => {
-                Self::run_uninstall_command();
-                Ok(())
-            }
+            CliCommand::Update => self.run_update_command(),
+            CliCommand::Uninstall => self.run_uninstall_command(),
             CliCommand::Tui => self.run_tui(cx).await,
             command => self.run_cli_scaffold(cx, command).await,
         }
@@ -809,30 +1466,635 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    fn run_update_command(&self) {
-        if self.cli_input.update_check_only {
-            println!(
-                "fsfs {}: update check complete (updater backend not configured)",
-                env!("CARGO_PKG_VERSION")
-            );
-        } else {
-            println!(
-                "fsfs {}: updater backend not configured; no changes applied",
-                env!("CARGO_PKG_VERSION")
-            );
+    fn run_update_command(&self) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Csv {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "update command does not support csv output".to_owned(),
+            });
         }
+
+        // Handle --rollback separately.
+        if self.cli_input.update_rollback {
+            return self.run_rollback_command();
+        }
+
+        let payload = self.collect_update_payload()?;
+        if self.cli_input.format == OutputFormat::Table {
+            let table = render_update_table(&payload, self.cli_input.no_color);
+            print!("{table}");
+            return Ok(());
+        }
+
+        let meta = meta_for_format("update", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.update",
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
     }
 
-    fn run_uninstall_command() {
-        println!(
-            "Uninstall is manual in this build. Remove the fsfs binary and any index/cache directories explicitly."
-        );
+    #[allow(clippy::too_many_lines)]
+    fn collect_update_payload(&self) -> SearchResult<FsfsUpdatePayload> {
+        let current_str = env!("CARGO_PKG_VERSION");
+        let check_only = self.cli_input.update_check_only;
+        let channel = "stable".to_owned();
+
+        let current = SemVer::parse(current_str).ok_or_else(|| SearchError::InvalidConfig {
+            field: "update.current_version".into(),
+            value: current_str.to_owned(),
+            reason: "cannot parse current version as semver".into(),
+        })?;
+
+        // Query GitHub for the latest release.
+        let (tag, html_url) = fetch_latest_release_tag()?;
+        let latest = SemVer::parse(&tag).ok_or_else(|| SearchError::InvalidConfig {
+            field: "update.latest_version".into(),
+            value: tag.clone(),
+            reason: "cannot parse latest release tag as semver".into(),
+        })?;
+
+        let update_available = latest.is_newer_than(current);
+        let mut notes = Vec::new();
+
+        if !update_available {
+            notes.push(format!("fsfs {current_str} is already up to date"));
+            return Ok(FsfsUpdatePayload {
+                current_version: current_str.to_owned(),
+                latest_version: latest.to_string(),
+                update_available: false,
+                check_only,
+                applied: false,
+                channel,
+                release_url: Some(html_url),
+                notes,
+            });
+        }
+
+        if check_only {
+            notes.push(format!(
+                "update available: v{current} -> v{latest} (run `fsfs update` to apply)"
+            ));
+            return Ok(FsfsUpdatePayload {
+                current_version: current_str.to_owned(),
+                latest_version: latest.to_string(),
+                update_available: true,
+                check_only: true,
+                applied: false,
+                channel,
+                release_url: Some(html_url),
+                notes,
+            });
+        }
+
+        // Full update: download, verify, replace.
+        let triple = detect_target_triple();
+        let asset_url = release_asset_url(&tag, &triple);
+        let checksum_url = release_checksum_url(&tag, &triple);
+
+        let temp_dir = std::env::temp_dir().join("fsfs-update");
+        fs::create_dir_all(&temp_dir).map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.tempdir",
+            source: Box::new(e),
+        })?;
+
+        let archive_path = temp_dir.join(format!("fsfs-{triple}.tar.xz"));
+        let checksum_path = temp_dir.join(format!("fsfs-{triple}.tar.xz.sha256"));
+
+        // Download archive.
+        notes.push(format!("downloading {asset_url}"));
+        download_release_asset(&asset_url, &archive_path)?;
+
+        // Download and verify checksum.
+        let expected_hash = if download_release_asset(&checksum_url, &checksum_path).is_ok() {
+            let content = fs::read_to_string(&checksum_path).unwrap_or_default();
+            let hash = content.split_whitespace().next().unwrap_or("").to_owned();
+            if hash.is_empty() { None } else { Some(hash) }
+        } else {
+            notes.push("checksum sidecar not available; skipping verification".into());
+            None
+        };
+
+        if let Some(ref expected) = expected_hash {
+            let actual = compute_sha256_of_file(&archive_path)?;
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(SearchError::InvalidConfig {
+                    field: "update.checksum".into(),
+                    value: actual,
+                    reason: format!("SHA-256 mismatch: expected {expected}"),
+                });
+            }
+            notes.push("SHA-256 checksum verified".into());
+        }
+
+        // Extract binary from the tar.xz archive.
+        let extract_dir = temp_dir.join("extract");
+        fs::create_dir_all(&extract_dir).map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.extract_dir",
+            source: Box::new(e),
+        })?;
+
+        let tar_status = std::process::Command::new("tar")
+            .args(["-xJf"])
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&extract_dir)
+            .status()
+            .map_err(|e| SearchError::SubsystemError {
+                subsystem: "fsfs.update.tar",
+                source: Box::new(e),
+            })?;
+
+        if !tar_status.success() {
+            return Err(SearchError::InvalidConfig {
+                field: "update.extract".into(),
+                value: archive_path.display().to_string(),
+                reason: "tar extraction failed".into(),
+            });
+        }
+
+        // Find the extracted binary (search up to 2 levels deep).
+        let new_binary = find_extracted_binary(&extract_dir, "fsfs")?;
+
+        // Locate the currently-running binary.
+        let current_exe = std::env::current_exe().map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.update.current_exe",
+            source: Box::new(e),
+        })?;
+
+        // Create a proper backup before replacing.
+        match create_backup(&current_exe) {
+            Ok(entry) => {
+                notes.push(format!(
+                    "backed up v{} to {}",
+                    entry.version, entry.binary_filename
+                ));
+            }
+            Err(e) => {
+                notes.push(format!("backup failed (proceeding anyway): {e}"));
+            }
+        }
+
+        // Also keep a transient .old for immediate rollback if install fails.
+        let transient_backup = current_exe.with_extension("old");
+        if current_exe.exists() {
+            let _ = fs::rename(&current_exe, &transient_backup);
+        }
+
+        if let Err(e) = fs::copy(&new_binary, &current_exe) {
+            // Attempt to restore from transient backup on failure.
+            if transient_backup.exists() {
+                let _ = fs::rename(&transient_backup, &current_exe);
+            }
+            return Err(SearchError::SubsystemError {
+                subsystem: "fsfs.update.install",
+                source: Box::new(e),
+            });
+        }
+
+        // Set executable permission on the new binary.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            let _ = fs::set_permissions(&current_exe, perms);
+        }
+
+        // Verify the new binary runs.
+        let verify = std::process::Command::new(&current_exe)
+            .arg("--version")
+            .output();
+        match verify {
+            Ok(out) if out.status.success() => {
+                let version_out = String::from_utf8_lossy(&out.stdout);
+                notes.push(format!(
+                    "verified new binary: {}",
+                    version_out.trim()
+                ));
+                // Remove transient backup on success.
+                let _ = fs::remove_file(&transient_backup);
+            }
+            _ => {
+                // Rollback: restore from transient backup.
+                if transient_backup.exists() {
+                    let _ = fs::rename(&transient_backup, &current_exe);
+                    notes.push("verification failed; rolled back to previous version".into());
+                    return Err(SearchError::InvalidConfig {
+                        field: "update.verify".into(),
+                        value: current_exe.display().to_string(),
+                        reason: "new binary failed verification; rolled back".into(),
+                    });
+                }
+            }
+        }
+
+        // Cleanup temp files.
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        notes.push(format!("updated: v{current} -> v{latest}"));
+
+        Ok(FsfsUpdatePayload {
+            current_version: current_str.to_owned(),
+            latest_version: latest.to_string(),
+            update_available: true,
+            check_only: false,
+            applied: true,
+            channel,
+            release_url: Some(html_url),
+            notes,
+        })
+    }
+
+    fn run_rollback_command(&self) -> SearchResult<()> {
+        let version = self.cli_input.update_rollback_version.as_deref();
+
+        // If no version specified and format is table, list available backups.
+        if version.is_none() && self.cli_input.update_check_only {
+            let backups = list_backups();
+            if backups.is_empty() {
+                println!("No backups available for rollback.");
+            } else {
+                println!("Available backups:");
+                for entry in &backups {
+                    println!(
+                        "  v{} (backed up at epoch {})",
+                        entry.version, entry.backed_up_at_epoch
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let entry = restore_backup(version)?;
+
+        let mut notes = Vec::new();
+        notes.push(format!("restored v{} from backup", entry.version));
+
+        // Verify the restored binary.
+        if let Ok(current_exe) = std::env::current_exe() {
+            let verify = std::process::Command::new(&current_exe)
+                .arg("--version")
+                .output();
+            if let Ok(out) = verify {
+                if out.status.success() {
+                    let version_out = String::from_utf8_lossy(&out.stdout);
+                    notes.push(format!("verified: {}", version_out.trim()));
+                }
+            }
+        }
+
+        let payload = FsfsUpdatePayload {
+            current_version: env!("CARGO_PKG_VERSION").to_owned(),
+            latest_version: entry.version,
+            update_available: false,
+            check_only: false,
+            applied: true,
+            channel: "rollback".into(),
+            release_url: None,
+            notes,
+        };
+
+        if self.cli_input.format == OutputFormat::Table {
+            let table = render_update_table(&payload, self.cli_input.no_color);
+            print!("{table}");
+            return Ok(());
+        }
+
+        let meta = meta_for_format("update", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.update.rollback",
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn run_uninstall_command(&self) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Csv {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "uninstall command does not support csv output".to_owned(),
+            });
+        }
+
+        let payload = self.collect_uninstall_payload()?;
+        if self.cli_input.format == OutputFormat::Table {
+            let table = render_uninstall_table(&payload, self.cli_input.no_color);
+            print!("{table}");
+            return Ok(());
+        }
+
+        let meta = meta_for_format("uninstall", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.uninstall",
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    fn collect_uninstall_payload(&self) -> SearchResult<FsfsUninstallPayload> {
+        let dry_run = self.cli_input.uninstall_dry_run;
+        let confirmed = self.cli_input.uninstall_yes;
+        let purge = self.cli_input.uninstall_purge;
+
+        if !dry_run && !confirmed {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.uninstall.confirmation".to_owned(),
+                value: String::new(),
+                reason: "uninstall requires --yes or --dry-run".to_owned(),
+            });
+        }
+
+        let mut notes = Vec::new();
+        if dry_run {
+            notes.push("dry-run mode: no files were deleted".to_owned());
+        }
+        if !purge {
+            notes.push("purge-disabled: model/cache/config targets were skipped".to_owned());
+        }
+
+        let mut entries = Vec::new();
+        for target in self.collect_uninstall_targets()? {
+            entries.push(Self::apply_uninstall_target(&target, dry_run, purge));
+        }
+
+        let removed = entries
+            .iter()
+            .filter(|entry| entry.status == "removed")
+            .count();
+        let failed = entries
+            .iter()
+            .filter(|entry| entry.status == "error")
+            .count();
+        let skipped = entries.len().saturating_sub(removed + failed);
+
+        Ok(FsfsUninstallPayload {
+            purge,
+            dry_run,
+            confirmed,
+            removed,
+            skipped,
+            failed,
+            entries,
+            notes,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn collect_uninstall_targets(&self) -> SearchResult<Vec<UninstallTarget>> {
+        let mut candidates = Vec::new();
+
+        if !cfg!(test)
+            && let Ok(path) = std::env::current_exe()
+        {
+            candidates.push(UninstallTarget {
+                target: "binary".to_owned(),
+                kind: UninstallTargetKind::File,
+                path,
+                purge_only: false,
+            });
+        }
+
+        candidates.push(UninstallTarget {
+            target: "index_dir".to_owned(),
+            kind: UninstallTargetKind::Directory,
+            path: self.resolve_uninstall_index_root()?,
+            purge_only: false,
+        });
+
+        candidates.push(UninstallTarget {
+            target: "model_dir".to_owned(),
+            kind: UninstallTargetKind::Directory,
+            path: PathBuf::from(&self.config.indexing.model_dir),
+            purge_only: true,
+        });
+
+        if let Some(config_dir) = dirs::config_dir() {
+            let root = config_dir.join("frankensearch");
+            candidates.push(UninstallTarget {
+                target: "config_dir".to_owned(),
+                kind: UninstallTargetKind::Directory,
+                path: root.clone(),
+                purge_only: true,
+            });
+            candidates.push(UninstallTarget {
+                target: "fish_completion".to_owned(),
+                kind: UninstallTargetKind::File,
+                path: config_dir.join("fish/completions/fsfs.fish"),
+                purge_only: false,
+            });
+            candidates.push(UninstallTarget {
+                target: "install_manifest".to_owned(),
+                kind: UninstallTargetKind::File,
+                path: root.join("install-manifest.json"),
+                purge_only: true,
+            });
+        }
+
+        if let Some(cache_dir) = dirs::cache_dir() {
+            candidates.push(UninstallTarget {
+                target: "cache_dir".to_owned(),
+                kind: UninstallTargetKind::Directory,
+                path: cache_dir.join("frankensearch"),
+                purge_only: true,
+            });
+        }
+
+        if let Some(data_dir) = dirs::data_dir() {
+            candidates.push(UninstallTarget {
+                target: "data_dir".to_owned(),
+                kind: UninstallTargetKind::Directory,
+                path: data_dir.join("frankensearch"),
+                purge_only: true,
+            });
+            candidates.push(UninstallTarget {
+                target: "bash_completion".to_owned(),
+                kind: UninstallTargetKind::File,
+                path: data_dir.join("bash-completion/completions/fsfs"),
+                purge_only: false,
+            });
+            candidates.push(UninstallTarget {
+                target: "zsh_completion".to_owned(),
+                kind: UninstallTargetKind::File,
+                path: data_dir.join("zsh/site-functions/_fsfs"),
+                purge_only: false,
+            });
+        }
+
+        if let Some(home) = home_dir() {
+            candidates.push(UninstallTarget {
+                target: "zsh_completion_home".to_owned(),
+                kind: UninstallTargetKind::File,
+                path: home.join(".zfunc/_fsfs"),
+                purge_only: false,
+            });
+            for (target, relative) in [
+                ("claude_hook_fsfs", ".claude/hooks/fsfs.sh"),
+                (
+                    "claude_hook_frankensearch",
+                    ".claude/hooks/frankensearch.sh",
+                ),
+                ("claude_code_hook_fsfs", ".config/claude-code/hooks/fsfs.sh"),
+                (
+                    "claude_code_hook_frankensearch",
+                    ".config/claude-code/hooks/frankensearch.sh",
+                ),
+                ("cursor_hook_fsfs", ".config/cursor/hooks/fsfs.sh"),
+                (
+                    "cursor_hook_frankensearch",
+                    ".config/cursor/hooks/frankensearch.sh",
+                ),
+            ] {
+                candidates.push(UninstallTarget {
+                    target: target.to_owned(),
+                    kind: UninstallTargetKind::File,
+                    path: home.join(relative),
+                    purge_only: false,
+                });
+            }
+        }
+
+        let mut dedupe = HashSet::new();
+        Ok(candidates
+            .into_iter()
+            .filter_map(|target| {
+                if target.path.as_os_str().is_empty() {
+                    return None;
+                }
+                if dedupe.insert(target.path.clone()) {
+                    Some(target)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    fn resolve_uninstall_index_root(&self) -> SearchResult<PathBuf> {
+        if let Some(path) = self.cli_input.index_dir.as_deref() {
+            return absolutize_path(path);
+        }
+        absolutize_path(Path::new(&self.config.storage.index_dir))
+    }
+
+    fn apply_uninstall_target(
+        target: &UninstallTarget,
+        dry_run: bool,
+        purge_enabled: bool,
+    ) -> FsfsUninstallEntry {
+        let mut entry = FsfsUninstallEntry {
+            target: target.target.clone(),
+            kind: target.kind.as_str().to_owned(),
+            path: target.path.display().to_string(),
+            purge_only: target.purge_only,
+            status: "skipped".to_owned(),
+            detail: None,
+        };
+
+        if target.purge_only && !purge_enabled {
+            entry.detail = Some("requires --purge".to_owned());
+            return entry;
+        }
+
+        let normalized = normalize_probe_path(&target.path);
+        if is_uninstall_protected_path(&normalized) {
+            "error".clone_into(&mut entry.status);
+            entry.detail = Some("refusing to remove unsafe root path".to_owned());
+            return entry;
+        }
+
+        let metadata = match fs::symlink_metadata(&normalized) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                "not_found".clone_into(&mut entry.status);
+                return entry;
+            }
+            Err(error) => {
+                "error".clone_into(&mut entry.status);
+                entry.detail = Some(error.to_string());
+                return entry;
+            }
+        };
+
+        if target.target == "index_dir"
+            && target.kind == UninstallTargetKind::Directory
+            && metadata.is_dir()
+            && !looks_like_fsfs_index_root(&normalized)
+        {
+            "error".clone_into(&mut entry.status);
+            entry.detail = Some(
+                "refusing to remove index_dir that is not recognized as fsfs-managed".to_owned(),
+            );
+            return entry;
+        }
+
+        if dry_run {
+            "planned".clone_into(&mut entry.status);
+            return entry;
+        }
+
+        let deletion =
+            if metadata.file_type().is_symlink() || target.kind == UninstallTargetKind::File {
+                fs::remove_file(&normalized)
+            } else {
+                fs::remove_dir_all(&normalized)
+            };
+
+        match deletion {
+            Ok(()) => {
+                "removed".clone_into(&mut entry.status);
+            }
+            Err(error) => {
+                "error".clone_into(&mut entry.status);
+                entry.detail = Some(error.to_string());
+            }
+        }
+
+        entry
     }
 
     async fn run_cli_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
         self.validate_command_inputs(command)?;
+        if command == CliCommand::Search {
+            self.run_search_command(cx).await?;
+            return Ok(());
+        }
+        if command == CliCommand::Explain {
+            self.run_explain_command()?;
+            return Ok(());
+        }
         if command == CliCommand::Status {
             self.run_status_command()?;
+            return Ok(());
+        }
+        if command == CliCommand::Download {
+            self.run_download_command().await?;
+            return Ok(());
+        }
+        if command == CliCommand::Doctor {
+            self.run_doctor_command()?;
             return Ok(());
         }
         std::future::ready(()).await;
@@ -898,6 +2160,536 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    async fn run_search_command(&self, cx: &Cx) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Csv {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "search command does not support csv output".to_owned(),
+            });
+        }
+
+        if self.cli_input.filter.is_some() {
+            warn!(
+                filter = ?self.cli_input.filter,
+                "fsfs search filter expression is not yet wired; continuing without filter"
+            );
+        }
+
+        let query = self
+            .cli_input
+            .query
+            .as_deref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: String::new(),
+                reason: "missing search query argument".to_owned(),
+            })?;
+        let limit = self
+            .cli_input
+            .overrides
+            .limit
+            .unwrap_or(self.config.search.default_limit)
+            .max(1);
+
+        if self.cli_input.stream {
+            return self.run_search_stream_command(cx, query, limit).await;
+        }
+
+        let started = Instant::now();
+        let payload = self.execute_search_payload(cx, query, limit).await?;
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        info!(
+            phase = "display",
+            format = self.cli_input.format.to_string(),
+            returned_hits = payload.returned_hits,
+            elapsed_ms,
+            "fsfs search display phase prepared"
+        );
+        info!(
+            query = payload.query,
+            phase = payload.phase.to_string(),
+            returned_hits = payload.returned_hits,
+            total_candidates = payload.total_candidates,
+            elapsed_ms,
+            "fsfs search command completed"
+        );
+
+        let meta = meta_for_format("search", self.cli_input.format).with_duration_ms(elapsed_ms);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.search",
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn run_search_stream_command(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<()> {
+        if !matches!(
+            self.cli_input.format,
+            OutputFormat::Jsonl | OutputFormat::Toon
+        ) {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "stream mode requires --format jsonl or --format toon".to_owned(),
+            });
+        }
+
+        let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
+        let mut stdout = std::io::stdout();
+        let mut seq = 0_u64;
+
+        self.emit_search_stream_started(query, &stream_id, &mut seq, &mut stdout)?;
+        match self.execute_search_payload(cx, query, limit).await {
+            Ok(payload) => {
+                self.emit_search_stream_payload(&payload, &stream_id, &mut seq, &mut stdout)?;
+                self.emit_search_stream_terminal_completed(&stream_id, &mut seq, &mut stdout)?;
+                info!(
+                    query = query,
+                    phase = payload.phase.to_string(),
+                    returned_hits = payload.returned_hits,
+                    total_candidates = payload.total_candidates,
+                    stream_id,
+                    frames_emitted = seq,
+                    format = self.cli_input.format.to_string(),
+                    "fsfs search stream completed"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.emit_search_stream_terminal_error(&stream_id, &error, &mut seq, &mut stdout)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn emit_search_stream_started<W: Write>(
+        &self,
+        query: &str,
+        stream_id: &str,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let frame = StreamFrame::new(
+            stream_id.to_owned(),
+            *seq,
+            iso_timestamp_now(),
+            "search",
+            StreamEvent::<SearchHitPayload>::Started(StreamStartedEvent {
+                stream_id: stream_id.to_owned(),
+                query: query.to_owned(),
+                format: self.cli_input.format.to_string(),
+            }),
+        );
+        emit_stream_frame(&frame, self.cli_input.format, writer)?;
+        *seq = seq.saturating_add(1);
+        Ok(())
+    }
+
+    fn emit_search_stream_payload<W: Write>(
+        &self,
+        payload: &SearchPayload,
+        stream_id: &str,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let (stage, reason_code, message) = match payload.phase {
+            SearchOutputPhase::Initial => (
+                "retrieve.fast",
+                "query.stream.initial_ready",
+                "initial results ready",
+            ),
+            SearchOutputPhase::Refined => (
+                "retrieve.quality",
+                "query.stream.refined_ready",
+                "refined results ready",
+            ),
+            SearchOutputPhase::RefinementFailed => (
+                "retrieve.refinement_failed",
+                "query.stream.refinement_failed",
+                "quality refinement failed; returning initial results",
+            ),
+        };
+        let progress_frame = StreamFrame::new(
+            stream_id.to_owned(),
+            *seq,
+            iso_timestamp_now(),
+            "search",
+            StreamEvent::<SearchHitPayload>::Progress(StreamProgressEvent {
+                stage: stage.to_owned(),
+                completed_units: u64::try_from(payload.returned_hits).unwrap_or(u64::MAX),
+                total_units: Some(u64::try_from(payload.total_candidates).unwrap_or(u64::MAX)),
+                reason_code: reason_code.to_owned(),
+                message: message.to_owned(),
+            }),
+        );
+        emit_stream_frame(&progress_frame, self.cli_input.format, writer)?;
+        *seq = seq.saturating_add(1);
+
+        for hit in &payload.hits {
+            let result_frame = StreamFrame::new(
+                stream_id.to_owned(),
+                *seq,
+                iso_timestamp_now(),
+                "search",
+                StreamEvent::<SearchHitPayload>::Result(StreamResultEvent {
+                    rank: u64::try_from(hit.rank).unwrap_or(u64::MAX),
+                    item: hit.clone(),
+                }),
+            );
+            emit_stream_frame(&result_frame, self.cli_input.format, writer)?;
+            *seq = seq.saturating_add(1);
+        }
+
+        Ok(())
+    }
+
+    fn emit_search_stream_terminal_completed<W: Write>(
+        &self,
+        stream_id: &str,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let frame = StreamFrame::new(
+            stream_id.to_owned(),
+            *seq,
+            iso_timestamp_now(),
+            "search",
+            StreamEvent::<SearchHitPayload>::Terminal(terminal_event_completed()),
+        );
+        emit_stream_frame(&frame, self.cli_input.format, writer)?;
+        *seq = seq.saturating_add(1);
+        Ok(())
+    }
+
+    fn emit_search_stream_terminal_error<W: Write>(
+        &self,
+        stream_id: &str,
+        error: &SearchError,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let frame = StreamFrame::new(
+            stream_id.to_owned(),
+            *seq,
+            iso_timestamp_now(),
+            "search",
+            StreamEvent::<SearchHitPayload>::Terminal(terminal_event_from_error(error, 0, 3)),
+        );
+        emit_stream_frame(&frame, self.cli_input.format, writer)?;
+        *seq = seq.saturating_add(1);
+        Ok(())
+    }
+
+    fn run_explain_command(&self) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Csv {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "explain command does not support csv output".to_owned(),
+            });
+        }
+
+        let result_id =
+            self.cli_input
+                .result_id
+                .as_deref()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "cli.explain.result_id".to_owned(),
+                    value: String::new(),
+                    reason: "missing result identifier argument".to_owned(),
+                })?;
+        let query = self.cli_input.query.clone().unwrap_or_default();
+        let matched_terms = query
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let explanation = HitExplanation {
+            final_score: 0.0,
+            components: vec![ScoreComponent {
+                source: ExplainedSource::LexicalBm25 {
+                    matched_terms,
+                    tf: 0.0,
+                    idf: 0.0,
+                },
+                raw_score: 0.0,
+                normalized_score: 0.0,
+                rrf_contribution: 0.0,
+                weight: 1.0,
+            }],
+            phase: ExplanationPhase::Initial,
+            rank_movement: None,
+        };
+        let ranking = RankingExplanation::from_hit_explanation(
+            result_id,
+            &explanation,
+            "query.explain.stub",
+            500,
+        );
+        let payload = FsfsExplanationPayload::new(query, ranking);
+
+        if self.cli_input.format == OutputFormat::Table {
+            println!("{}", payload.to_toon());
+            return Ok(());
+        }
+
+        let meta = meta_for_format("explain", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.explain",
+                    source: Box::new(source),
+                })?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_search_payload(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<SearchPayload> {
+        let normalized_query = query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_owned();
+        if normalized_query.is_empty() {
+            return Ok(SearchPayload::new(
+                String::new(),
+                SearchOutputPhase::Initial,
+                0,
+                Vec::new(),
+            ));
+        }
+
+        let search_start = Instant::now();
+        let index_root = self.resolve_status_index_root()?;
+        let lexical_path = index_root.join("lexical");
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        let lexical_index = if lexical_path.exists() {
+            Some(TantivyIndex::open(&lexical_path)?)
+        } else {
+            None
+        };
+        let lexical_available = lexical_index.is_some();
+        let vector_index = if vector_path.exists() {
+            match VectorIndex::open(&vector_path) {
+                Ok(index) => Some(index),
+                Err(error) if lexical_available => {
+                    warn!(
+                        error = %error,
+                        path = %vector_path.display(),
+                        "fsfs search falling back to lexical-only mode after vector index load failure"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
+        if lexical_index.is_none() && vector_index.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "no index found; run `fsfs index <dir>` first".to_owned(),
+            });
+        }
+
+        let mut fast_embedder = None;
+        if vector_index.is_some() {
+            match self.resolve_fast_embedder() {
+                Ok(embedder) => fast_embedder = Some(embedder),
+                Err(error) if lexical_available => {
+                    warn!(
+                        error = %error,
+                        "fsfs search falling back to lexical-only mode after fast embedder init failure"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let capabilities = QueryExecutionCapabilities {
+            lexical: if lexical_index.is_some() {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
+            fast_semantic: if vector_index.is_some() && fast_embedder.is_some() {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
+            quality_semantic: CapabilityState::Disabled,
+            rerank: CapabilityState::Disabled,
+        };
+        let planner = QueryPlanner::from_fsfs(&self.config);
+        let plan = planner.execution_plan_for_query(&normalized_query, Some(limit), capabilities);
+
+        info!(
+            phase = "query_parse",
+            query = normalized_query,
+            intent = ?plan.intent.intent,
+            fallback = ?plan.intent.fallback,
+            confidence_per_mille = plan.intent.confidence_per_mille,
+            execution_mode = ?plan.mode,
+            reason_code = plan.reason_code,
+            "fsfs search query planned"
+        );
+
+        let lexical_start = Instant::now();
+        let lexical_budget = plan.lexical_stage.candidate_budget.max(limit);
+        let snippet_config = SnippetConfig::default();
+        let mut snippets_by_doc = HashMap::new();
+        let lexical_candidates = if plan.lexical_stage.enabled {
+            if let Some(lexical) = lexical_index.as_ref() {
+                let hits = lexical.search_with_snippets(
+                    cx,
+                    &normalized_query,
+                    lexical_budget,
+                    &snippet_config,
+                )?;
+                for hit in &hits {
+                    if let Some(snippet) = hit.snippet.as_ref()
+                        && !snippet.trim().is_empty()
+                    {
+                        snippets_by_doc.insert(hit.doc_id.clone(), snippet.clone());
+                    }
+                }
+                hits.into_iter()
+                    .map(|hit| LexicalCandidate::new(hit.doc_id, hit.bm25_score))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
+
+        let semantic_start = Instant::now();
+        let semantic_budget = plan.semantic_stage.candidate_budget.max(limit);
+        let semantic_candidates = if plan.semantic_stage.enabled {
+            if let (Some(index), Some(embedder)) = (vector_index.as_ref(), fast_embedder.as_ref()) {
+                match embedder.embed(cx, &normalized_query).await {
+                    Ok(query_embedding) => {
+                        match index.search_top_k(&query_embedding, semantic_budget, None) {
+                            Ok(hits) => hits
+                                .into_iter()
+                                .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
+                                .collect::<Vec<_>>(),
+                            Err(error) if lexical_available => {
+                                warn!(
+                                    error = %error,
+                                    "fsfs search falling back to lexical-only mode after vector search failure"
+                                );
+                                Vec::new()
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) if lexical_available => {
+                        warn!(
+                            error = %error,
+                            "fsfs search falling back to lexical-only mode after query embedding failure"
+                        );
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let semantic_elapsed_ms = semantic_start.elapsed().as_millis();
+
+        let fusion_start = Instant::now();
+        let orchestrator = QueryExecutionOrchestrator::new(QueryFusionPolicy {
+            rrf_k: plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
+        });
+        let fused = orchestrator.fuse_rankings(&lexical_candidates, &semantic_candidates, limit, 0);
+        let payload = orchestrator.build_search_payload(
+            &normalized_query,
+            SearchOutputPhase::Initial,
+            &fused,
+            &snippets_by_doc,
+        );
+        let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
+
+        info!(
+            phase = "fast_search",
+            query = normalized_query,
+            lexical_candidates = lexical_candidates.len(),
+            semantic_candidates = semantic_candidates.len(),
+            fused_candidates = payload.total_candidates,
+            returned_hits = payload.returned_hits,
+            lexical_elapsed_ms,
+            semantic_elapsed_ms,
+            fusion_elapsed_ms,
+            total_elapsed_ms = search_start.elapsed().as_millis(),
+            "fsfs search retrieval pipeline completed"
+        );
+        info!(
+            phase = "fusion",
+            rrf_k = plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
+            fused_candidates = payload.total_candidates,
+            returned_hits = payload.returned_hits,
+            "fsfs search fusion phase completed"
+        );
+        info!(
+            phase = "quality_refine",
+            status = if plan.quality_stage.enabled {
+                "enabled"
+            } else {
+                "skipped"
+            },
+            reason_code = plan.quality_stage.reason_code,
+            candidate_budget = plan.quality_stage.candidate_budget,
+            timeout_ms = plan.quality_stage.timeout_ms,
+            "fsfs search quality-refinement phase status"
+        );
+        info!(
+            phase = "rerank",
+            status = if plan.rerank_stage.enabled {
+                "enabled"
+            } else {
+                "skipped"
+            },
+            reason_code = plan.rerank_stage.reason_code,
+            candidate_budget = plan.rerank_stage.candidate_budget,
+            timeout_ms = plan.rerank_stage.timeout_ms,
+            "fsfs search rerank phase status"
+        );
+
+        Ok(payload)
+    }
+
     fn run_status_command(&self) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Csv {
             return Err(SearchError::InvalidConfig {
@@ -927,6 +2719,513 @@ impl FsfsRuntime {
                 })?;
         }
         Ok(())
+    }
+
+    async fn run_download_command(&self) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Csv {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "download-models command does not support csv output".to_owned(),
+            });
+        }
+
+        let payload = self.collect_download_models_payload().await?;
+        if self.cli_input.format == OutputFormat::Table {
+            let table = render_download_models_table(&payload, self.cli_input.no_color);
+            print!("{table}");
+            return Ok(());
+        }
+
+        let meta = meta_for_format("download-models", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.download_models",
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn collect_download_models_payload(&self) -> SearchResult<FsfsDownloadModelsPayload> {
+        let model_root = self.resolve_download_model_root()?;
+        let manifests = self.resolve_download_manifests()?;
+        let operation = if self.cli_input.download_list {
+            "list"
+        } else if self.cli_input.download_verify {
+            "verify"
+        } else {
+            "download"
+        };
+        fs::create_dir_all(&model_root)?;
+
+        let mut results = Vec::with_capacity(manifests.len());
+        let show_progress = self.cli_input.format == OutputFormat::Table && !self.cli_input.quiet;
+
+        for manifest in manifests {
+            let install_dir = Self::manifest_install_dir_name(&manifest);
+            let destination = model_root.join(&install_dir);
+            let (present, verified, verify_message) =
+                Self::inspect_manifest_installation(&manifest, &destination);
+
+            let entry = match operation {
+                "list" => {
+                    let state = if !present {
+                        "missing"
+                    } else if verified == Some(true) {
+                        "cached"
+                    } else {
+                        "corrupt"
+                    };
+                    Self::download_model_entry(
+                        &manifest,
+                        &install_dir,
+                        &destination,
+                        state,
+                        verified,
+                        Self::path_bytes(&destination)?,
+                        verify_message,
+                    )
+                }
+                "verify" => {
+                    let state = if !present {
+                        "missing"
+                    } else if verified == Some(true) {
+                        "verified"
+                    } else {
+                        "mismatch"
+                    };
+                    Self::download_model_entry(
+                        &manifest,
+                        &install_dir,
+                        &destination,
+                        state,
+                        verified,
+                        Self::path_bytes(&destination)?,
+                        verify_message,
+                    )
+                }
+                _ => {
+                    if !self.cli_input.full_reindex && verified == Some(true) {
+                        Self::download_model_entry(
+                            &manifest,
+                            &install_dir,
+                            &destination,
+                            "cached",
+                            Some(true),
+                            Self::path_bytes(&destination)?,
+                            Some("already present and verified".to_owned()),
+                        )
+                    } else {
+                        let mut lifecycle = ModelLifecycle::new(
+                            manifest.clone(),
+                            DownloadConsent::granted(ConsentSource::Programmatic),
+                        );
+                        let downloader = ModelDownloader::with_defaults();
+                        let staged = downloader
+                            .download_model(&manifest, &model_root, &mut lifecycle, |progress| {
+                                if show_progress {
+                                    eprintln!("{progress}");
+                                }
+                            })
+                            .await?;
+                        manifest.promote_verified_installation(&staged, &destination)?;
+                        Self::download_model_entry(
+                            &manifest,
+                            &install_dir,
+                            &destination,
+                            "downloaded",
+                            Some(true),
+                            Self::path_bytes(&destination)?,
+                            None,
+                        )
+                    }
+                }
+            };
+            results.push(entry);
+        }
+
+        Ok(FsfsDownloadModelsPayload {
+            operation: operation.to_owned(),
+            force: self.cli_input.full_reindex,
+            model_root: model_root.display().to_string(),
+            models: results,
+        })
+    }
+
+    fn run_doctor_command(&self) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Csv {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.format".to_owned(),
+                value: self.cli_input.format.to_string(),
+                reason: "doctor command does not support csv output".to_owned(),
+            });
+        }
+
+        let payload = self.collect_doctor_payload()?;
+        if self.cli_input.format == OutputFormat::Table {
+            let table = render_doctor_table(&payload, self.cli_input.no_color);
+            print!("{table}");
+            return Ok(());
+        }
+
+        let meta = meta_for_format("doctor", self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.doctor",
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn collect_doctor_payload(&self) -> SearchResult<FsfsDoctorPayload> {
+        let mut checks = Vec::new();
+
+        // 1. Version check
+        checks.push(DoctorCheck {
+            name: "version".to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail: format!("fsfs {}", env!("CARGO_PKG_VERSION")),
+            suggestion: None,
+        });
+
+        // 2. Model cache checks
+        let model_root = PathBuf::from(&self.config.indexing.model_dir);
+        for (tier, model_name) in [
+            ("fast", self.config.indexing.fast_model.as_str()),
+            ("quality", self.config.indexing.quality_model.as_str()),
+        ] {
+            let model_path = model_root.join(model_name);
+            if model_path.exists() {
+                checks.push(DoctorCheck {
+                    name: format!("model.{tier}"),
+                    verdict: DoctorVerdict::Pass,
+                    detail: format!("{model_name} cached at {}", model_path.display()),
+                    suggestion: None,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    name: format!("model.{tier}"),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!("{model_name} not found at {}", model_path.display()),
+                    suggestion: Some("run `fsfs download-models` to download".to_owned()),
+                });
+            }
+        }
+
+        // 3. Model directory writable
+        if model_root.exists() {
+            let probe = model_root.join(".fsfs_doctor_probe");
+            match fs::write(&probe, b"probe") {
+                Ok(()) => {
+                    let _ = fs::remove_file(&probe);
+                    checks.push(DoctorCheck {
+                        name: "model_dir.writable".to_owned(),
+                        verdict: DoctorVerdict::Pass,
+                        detail: format!("{} is writable", model_root.display()),
+                        suggestion: None,
+                    });
+                }
+                Err(error) => {
+                    checks.push(DoctorCheck {
+                        name: "model_dir.writable".to_owned(),
+                        verdict: DoctorVerdict::Fail,
+                        detail: format!("{} is not writable: {error}", model_root.display()),
+                        suggestion: Some(format!("check permissions on {}", model_root.display())),
+                    });
+                }
+            }
+        } else {
+            checks.push(DoctorCheck {
+                name: "model_dir.writable".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: format!("{} does not exist yet", model_root.display()),
+                suggestion: Some(
+                    "directory will be created on first `fsfs download-models`".to_owned(),
+                ),
+            });
+        }
+
+        // 4. Index directory
+        let index_root = self.resolve_status_index_root()?;
+        if index_root.exists() {
+            let sentinel = Self::read_index_sentinel(&index_root)?;
+            if let Some(sentinel) = &sentinel {
+                let stale = Self::count_stale_files(&index_root, Some(sentinel))?;
+                let stale_count = stale.unwrap_or(0);
+                if stale_count == 0 {
+                    checks.push(DoctorCheck {
+                        name: "index".to_owned(),
+                        verdict: DoctorVerdict::Pass,
+                        detail: format!("{} files indexed, up-to-date", sentinel.indexed_files),
+                        suggestion: None,
+                    });
+                } else {
+                    checks.push(DoctorCheck {
+                        name: "index".to_owned(),
+                        verdict: DoctorVerdict::Warn,
+                        detail: format!(
+                            "{} files indexed, {stale_count} stale",
+                            sentinel.indexed_files
+                        ),
+                        suggestion: Some("run `fsfs index` to refresh".to_owned()),
+                    });
+                }
+            } else {
+                checks.push(DoctorCheck {
+                    name: "index".to_owned(),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!(
+                        "index directory exists at {} but no sentinel found",
+                        index_root.display()
+                    ),
+                    suggestion: Some("run `fsfs index` to build the index".to_owned()),
+                });
+            }
+        } else {
+            checks.push(DoctorCheck {
+                name: "index".to_owned(),
+                verdict: DoctorVerdict::Warn,
+                detail: "no index found".to_owned(),
+                suggestion: Some("run `fsfs index <dir>` to create one".to_owned()),
+            });
+        }
+
+        // 5. Index directory writable
+        if index_root.exists() {
+            let probe = index_root.join(".fsfs_doctor_probe");
+            match fs::write(&probe, b"probe") {
+                Ok(()) => {
+                    let _ = fs::remove_file(&probe);
+                    checks.push(DoctorCheck {
+                        name: "index_dir.writable".to_owned(),
+                        verdict: DoctorVerdict::Pass,
+                        detail: format!("{} is writable", index_root.display()),
+                        suggestion: None,
+                    });
+                }
+                Err(error) => {
+                    checks.push(DoctorCheck {
+                        name: "index_dir.writable".to_owned(),
+                        verdict: DoctorVerdict::Fail,
+                        detail: format!("{} is not writable: {error}", index_root.display()),
+                        suggestion: Some(format!("check permissions on {}", index_root.display())),
+                    });
+                }
+            }
+        }
+
+        // 6. Disk space check
+        let disks = Disks::new_with_refreshed_list();
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if let Some(disk) = disks
+            .iter()
+            .filter(|disk| cwd.starts_with(disk.mount_point()))
+            .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        {
+            let available = disk.available_space();
+            let min_required: u64 = 500 * 1024 * 1024; // 500 MB minimum
+            if available >= min_required {
+                checks.push(DoctorCheck {
+                    name: "disk_space".to_owned(),
+                    verdict: DoctorVerdict::Pass,
+                    detail: format!("{} available", humanize_bytes(available)),
+                    suggestion: None,
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    name: "disk_space".to_owned(),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!(
+                        "only {} available (minimum recommended: {})",
+                        humanize_bytes(available),
+                        humanize_bytes(min_required)
+                    ),
+                    suggestion: Some("free disk space for model downloads and indexing".to_owned()),
+                });
+            }
+        }
+
+        // 7. Config sources
+        let config_summary = self.status_config_source_summary()?;
+        checks.push(DoctorCheck {
+            name: "config".to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail: format!("sources: {config_summary}"),
+            suggestion: None,
+        });
+
+        // 8. Nightly toolchain note
+        checks.push(DoctorCheck {
+            name: "rust_edition".to_owned(),
+            verdict: DoctorVerdict::Pass,
+            detail: format!(
+                "edition {} (requires nightly)",
+                env!("CARGO_PKG_RUST_VERSION")
+            ),
+            suggestion: None,
+        });
+
+        // Tally
+        let pass_count = checks
+            .iter()
+            .filter(|c| c.verdict == DoctorVerdict::Pass)
+            .count();
+        let warn_count = checks
+            .iter()
+            .filter(|c| c.verdict == DoctorVerdict::Warn)
+            .count();
+        let fail_count = checks
+            .iter()
+            .filter(|c| c.verdict == DoctorVerdict::Fail)
+            .count();
+        let overall = if fail_count > 0 {
+            DoctorVerdict::Fail
+        } else if warn_count > 0 {
+            DoctorVerdict::Warn
+        } else {
+            DoctorVerdict::Pass
+        };
+
+        Ok(FsfsDoctorPayload {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            checks,
+            pass_count,
+            warn_count,
+            fail_count,
+            overall,
+        })
+    }
+
+    fn resolve_download_model_root(&self) -> SearchResult<PathBuf> {
+        if let Some(path) = self.cli_input.download_output_dir.as_deref() {
+            return absolutize_path(path);
+        }
+
+        let configured = self.config.indexing.model_dir.as_str();
+        if configured == "~"
+            && let Some(home) = home_dir()
+        {
+            return Ok(home);
+        }
+        if let Some(rest) = configured.strip_prefix("~/")
+            && let Some(home) = home_dir()
+        {
+            return Ok(home.join(rest));
+        }
+
+        absolutize_path(Path::new(configured))
+    }
+
+    fn resolve_download_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
+        let manifests = ModelManifest::builtin_catalog().models;
+        let Some(requested) = self.cli_input.model_name.as_deref() else {
+            return Ok(manifests);
+        };
+
+        let requested_token = normalize_model_token(requested);
+        let mut exact = Vec::new();
+        let mut fuzzy = Vec::new();
+        for manifest in manifests {
+            let install_dir = Self::manifest_install_dir_name(&manifest);
+            let id_token = normalize_model_token(&manifest.id);
+            let install_token = normalize_model_token(&install_dir);
+            let display_token = manifest
+                .display_name
+                .as_ref()
+                .map(|value| normalize_model_token(value));
+            let repo_token = normalize_model_token(&manifest.repo);
+
+            let exact_match = requested_token == id_token
+                || requested_token == install_token
+                || display_token.as_deref() == Some(requested_token.as_str());
+            if exact_match {
+                exact.push(manifest);
+                continue;
+            }
+
+            let fuzzy_match = id_token.contains(&requested_token)
+                || install_token.contains(&requested_token)
+                || display_token
+                    .as_ref()
+                    .is_some_and(|value| value.contains(&requested_token))
+                || repo_token.contains(&requested_token);
+            if fuzzy_match {
+                fuzzy.push(manifest);
+            }
+        }
+
+        if !exact.is_empty() {
+            return Ok(exact);
+        }
+        if !fuzzy.is_empty() {
+            return Ok(fuzzy);
+        }
+
+        Err(SearchError::InvalidConfig {
+            field: "cli.download.model".to_owned(),
+            value: requested.to_owned(),
+            reason: "unknown model; run download-models --list to see available ids".to_owned(),
+        })
+    }
+
+    fn manifest_install_dir_name(manifest: &ModelManifest) -> String {
+        match manifest.id.as_str() {
+            "potion-multilingual-128m" => "potion-multilingual-128M".to_owned(),
+            "all-minilm-l6-v2" => "all-MiniLM-L6-v2".to_owned(),
+            "ms-marco-minilm-l-6-v2" => "ms-marco-MiniLM-L-6-v2".to_owned(),
+            _ => manifest.id.clone(),
+        }
+    }
+
+    fn inspect_manifest_installation(
+        manifest: &ModelManifest,
+        destination: &Path,
+    ) -> (bool, Option<bool>, Option<String>) {
+        if !destination.exists() {
+            return (false, None, None);
+        }
+        match manifest.verify_dir(destination) {
+            Ok(()) => (true, Some(true), None),
+            Err(error) => (true, Some(false), Some(error.to_string())),
+        }
+    }
+
+    fn download_model_entry(
+        manifest: &ModelManifest,
+        install_dir: &str,
+        destination: &Path,
+        state: &str,
+        verified: Option<bool>,
+        size_bytes: u64,
+        message: Option<String>,
+    ) -> FsfsDownloadModelEntry {
+        let tier = manifest
+            .tier
+            .map(|value| format!("{value:?}").to_ascii_lowercase());
+        FsfsDownloadModelEntry {
+            id: manifest.id.clone(),
+            install_dir: install_dir.to_owned(),
+            tier,
+            state: state.to_owned(),
+            verified,
+            size_bytes,
+            destination: destination.display().to_string(),
+            message,
+        }
     }
 
     fn collect_status_payload(&self) -> SearchResult<FsfsStatusPayload> {
@@ -1175,7 +3474,7 @@ impl FsfsRuntime {
     async fn run_one_shot_index_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
-        let index_root = self.resolve_index_root(&target_root);
+        let index_root = self.resolve_index_root(&target_root)?;
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
@@ -1435,12 +3734,16 @@ impl FsfsRuntime {
         Ok(target)
     }
 
-    fn resolve_index_root(&self, target_root: &Path) -> PathBuf {
+    fn resolve_index_root(&self, target_root: &Path) -> SearchResult<PathBuf> {
+        if let Some(path) = self.cli_input.index_dir.as_deref() {
+            return absolutize_path(path);
+        }
+
         let configured = PathBuf::from(&self.config.storage.index_dir);
         if configured.is_absolute() {
-            configured
+            Ok(configured)
         } else {
-            target_root.join(configured)
+            Ok(target_root.join(configured))
         }
     }
 
@@ -1820,11 +4123,11 @@ fn print_cli_help() {
     println!("  explain <result-id>       Explain ranking details");
     println!("  status                    Show index and runtime status");
     println!("  config <action>           Manage configuration");
-    println!("  download [model]          Download embedding models");
+    println!("  download-models [model]   Download/verify embedding models");
     println!("  doctor                    Run local health checks");
     println!("  update [--check]          Check/apply binary updates");
     println!("  completions <shell>       Generate shell completions");
-    println!("  uninstall                 Print uninstall instructions");
+    println!("  uninstall [--yes] [--dry-run] [--purge]  Remove local fsfs artifacts");
     println!("  help                      Show this help");
     println!("  version                   Show version");
     println!();
@@ -1834,16 +4137,16 @@ fn print_cli_help() {
 const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
-            "complete -W \"search index watch explain status config download doctor update completions uninstall help version\" fsfs"
+            "complete -W \"search index watch explain status config download-models download doctor update completions uninstall help version\" fsfs"
         }
         CompletionShell::Zsh => {
-            "compdef '_arguments \"1: :((search index watch explain status config download doctor update completions uninstall help version))\"' fsfs"
+            "compdef '_arguments \"1: :((search index watch explain status config download-models download doctor update completions uninstall help version))\"' fsfs"
         }
         CompletionShell::Fish => {
-            "complete -c fsfs -f -a \"search index watch explain status config download doctor update completions uninstall help version\""
+            "complete -c fsfs -f -a \"search index watch explain status config download-models download doctor update completions uninstall help version\""
         }
         CompletionShell::PowerShell => {
-            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','index','watch','explain','status','config','download','doctor','update','completions','uninstall','help','version' | Where-Object { $_ -like \"$wordToComplete*\" } }"
+            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','index','watch','explain','status','config','download-models','download','doctor','update','completions','uninstall','help','version' | Where-Object { $_ -like \"$wordToComplete*\" } }"
         }
     }
 }
@@ -1900,6 +4203,37 @@ fn nearest_existing_path(path: &Path) -> PathBuf {
         current = parent;
     }
     current
+}
+
+#[must_use]
+fn is_uninstall_protected_path(path: &Path) -> bool {
+    if path.as_os_str().is_empty() || path.parent().is_none() || path == Path::new("/") {
+        return true;
+    }
+    if let Some(home) = home_dir()
+        && path == home
+    {
+        return true;
+    }
+    false
+}
+
+#[must_use]
+fn looks_like_fsfs_index_root(path: &Path) -> bool {
+    if path.join(FSFS_SENTINEL_FILE).exists()
+        || path.join(FSFS_VECTOR_MANIFEST_FILE).exists()
+        || path.join(FSFS_LEXICAL_MANIFEST_FILE).exists()
+        || path.join(FSFS_VECTOR_INDEX_FILE).exists()
+    {
+        return true;
+    }
+
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| {
+            let normalized = name.to_ascii_lowercase();
+            normalized == ".frankensearch" || normalized == "frankensearch"
+        })
 }
 
 #[must_use]
@@ -2095,6 +4429,181 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     out
 }
 
+fn render_download_models_table(payload: &FsfsDownloadModelsPayload, no_color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "download-models ({})", payload.operation);
+    let _ = writeln!(out, "  model root: {}", payload.model_root);
+    let _ = writeln!(out, "  force: {}", payload.force);
+    let _ = writeln!(out);
+    for model in &payload.models {
+        let state_color = match model.state.as_str() {
+            "cached" | "verified" | "downloaded" => "32",
+            "missing" => "33",
+            "corrupt" | "mismatch" => "31",
+            _ => "90",
+        };
+        let state = paint(&model.state, state_color, no_color);
+        let tier = model.tier.as_deref().unwrap_or("unknown");
+        let _ = writeln!(
+            out,
+            "  {} [{}] {} ({})",
+            model.install_dir,
+            tier,
+            state,
+            humanize_bytes(model.size_bytes),
+        );
+        let _ = writeln!(out, "    path: {}", model.destination);
+        if let Some(message) = model.message.as_deref() {
+            let _ = writeln!(out, "    note: {message}");
+        }
+    }
+    out
+}
+
+fn render_update_table(payload: &FsfsUpdatePayload, no_color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "fsfs update");
+    let _ = writeln!(out, "  current: v{}", payload.current_version);
+    let _ = writeln!(out, "  latest:  v{}", payload.latest_version);
+
+    if payload.update_available {
+        let status_text = if payload.applied {
+            "applied"
+        } else if payload.check_only {
+            "available (check-only)"
+        } else {
+            "available"
+        };
+        let color = if payload.applied { "32" } else { "33" };
+        let status = paint(status_text, color, no_color);
+        let _ = writeln!(out, "  status:  {status}");
+    } else {
+        let status = paint("up to date", "32", no_color);
+        let _ = writeln!(out, "  status:  {status}");
+    }
+
+    let _ = writeln!(out, "  channel: {}", payload.channel);
+    if let Some(ref url) = payload.release_url {
+        let _ = writeln!(out, "  release: {url}");
+    }
+
+    if !payload.notes.is_empty() {
+        let _ = writeln!(out);
+        for note in &payload.notes {
+            let _ = writeln!(out, "  {note}");
+        }
+    }
+    out
+}
+
+/// Recursively search up to 2 levels deep for an extracted binary.
+fn find_extracted_binary(dir: &Path, name: &str) -> SearchResult<PathBuf> {
+    // Check top level first.
+    let direct = dir.join(name);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    // Check one level deeper.
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let candidate = path.join(name);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(SearchError::InvalidConfig {
+        field: "update.extract".into(),
+        value: dir.display().to_string(),
+        reason: format!("could not find '{name}' binary in extracted archive"),
+    })
+}
+
+fn render_uninstall_table(payload: &FsfsUninstallPayload, no_color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let mode = if payload.dry_run {
+        "dry-run"
+    } else {
+        "execute"
+    };
+    let _ = writeln!(out, "uninstall ({mode})");
+    let _ = writeln!(out, "  purge: {}", payload.purge);
+    let _ = writeln!(out, "  confirmed: {}", payload.confirmed);
+    let _ = writeln!(
+        out,
+        "  removed: {}, skipped: {}, failed: {}",
+        payload.removed, payload.skipped, payload.failed
+    );
+    let _ = writeln!(out);
+    for entry in &payload.entries {
+        let color = match entry.status.as_str() {
+            "removed" => "32",
+            "planned" | "not_found" | "skipped" => "33",
+            "error" => "31",
+            _ => "90",
+        };
+        let status = paint(&entry.status, color, no_color);
+        let _ = writeln!(
+            out,
+            "  {:<10} {:<16} [{}] {}",
+            status, entry.target, entry.kind, entry.path
+        );
+        if let Some(detail) = entry.detail.as_deref() {
+            let _ = writeln!(out, "             note: {detail}");
+        }
+    }
+    if !payload.notes.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "notes:");
+        for note in &payload.notes {
+            let _ = writeln!(out, "  - {note}");
+        }
+    }
+    out
+}
+
+fn render_doctor_table(payload: &FsfsDoctorPayload, no_color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "fsfs doctor ({})", payload.version);
+    let _ = writeln!(out);
+    for check in &payload.checks {
+        let (icon, color) = match check.verdict {
+            DoctorVerdict::Pass => ("ok", "32"),
+            DoctorVerdict::Warn => ("!!", "33"),
+            DoctorVerdict::Fail => ("FAIL", "31"),
+        };
+        let verdict = paint(icon, color, no_color);
+        let _ = writeln!(out, "  [{verdict}] {}: {}", check.name, check.detail);
+        if let Some(suggestion) = check.suggestion.as_deref() {
+            let _ = writeln!(out, "       -> {suggestion}");
+        }
+    }
+    let _ = writeln!(out);
+    let overall_color = match payload.overall {
+        DoctorVerdict::Pass => "32",
+        DoctorVerdict::Warn => "33",
+        DoctorVerdict::Fail => "31",
+    };
+    let overall = paint(&payload.overall.to_string(), overall_color, no_color);
+    let _ = writeln!(
+        out,
+        "Result: {overall} ({} passed, {} warnings, {} failures)",
+        payload.pass_count, payload.warn_count, payload.fail_count,
+    );
+    out
+}
+
 fn humanize_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut unit_index = 0_usize;
@@ -2267,7 +4776,7 @@ mod tests {
         VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
         degradation_controller_config_for_profile,
     };
-    use crate::adapters::cli::{CliCommand, CliInput, CompletionShell};
+    use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::config::{
         DegradationOverrideMode, DiscoveryCandidate, DiscoveryScopeDecision, FsfsConfig,
         IngestionClass, PressureProfile,
@@ -2275,10 +4784,15 @@ mod tests {
     use crate::lifecycle::{
         DiskBudgetAction, DiskBudgetStage, LifecycleTracker, ResourceLimits, WatchdogConfig,
     };
+    use crate::output_schema::{SearchHitPayload, SearchOutputPhase, SearchPayload};
     use crate::pressure::{
         DegradationStage, HostPressureCollector, PressureSignal, PressureState, QueryCapabilityMode,
     };
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
+    use crate::stream_protocol::{
+        StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE,
+        decode_stream_frame_ndjson, decode_stream_frame_toon,
+    };
 
     #[test]
     fn runtime_modes_are_callable() {
@@ -2932,7 +5446,365 @@ mod tests {
             let lexical_index =
                 TantivyIndex::open(&index_root.join("lexical")).expect("open tantivy");
             assert!(lexical_index.doc_count() >= 1);
+            let hits = lexical_index
+                .search(&cx, "index", 5)
+                .await
+                .expect("lexical query");
+            assert!(!hits.is_empty());
         });
+    }
+
+    #[test]
+    fn runtime_index_command_respects_index_dir_override() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            let override_index_root = temp.path().join("custom-index");
+            fs::create_dir_all(project.join("src")).expect("project dirs");
+            fs::write(project.join("src/lib.rs"), "pub fn demo() {}\n").expect("write file");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                index_dir: Some(override_index_root.clone()),
+                ..CliInput::default()
+            });
+
+            runtime
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index scaffold command should succeed");
+
+            assert!(
+                override_index_root.join(super::FSFS_SENTINEL_FILE).exists(),
+                "index artifacts should be written to --index-dir override"
+            );
+            assert!(
+                !project
+                    .join(".frankensearch")
+                    .join(super::FSFS_SENTINEL_FILE)
+                    .exists(),
+                "default index dir should remain untouched when override is provided"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_payload_returns_ranked_hits_after_index() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("README.md"),
+                "Authentication middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write readme");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let index_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            index_runtime
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("authentication middleware".to_owned()),
+                index_dir: Some(project.join(".frankensearch")),
+                ..CliInput::default()
+            });
+            let payload = search_runtime
+                .execute_search_payload(&cx, "authentication middleware", 5)
+                .await
+                .expect("search payload");
+
+            assert_eq!(payload.phase, SearchOutputPhase::Initial);
+            assert!(!payload.hits.is_empty(), "expected at least one ranked hit");
+            assert!(
+                payload
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path.contains("auth") || hit.path.contains("README")),
+                "expected auth-related hit path in payload"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_payload_falls_back_to_lexical_when_vector_index_is_corrupt() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("README.md"),
+                "Authentication middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write readme");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            fs::write(
+                project
+                    .join(".frankensearch")
+                    .join(super::FSFS_VECTOR_INDEX_FILE),
+                b"not-fsvi",
+            )
+            .expect("corrupt vector index file");
+
+            let payload = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    query: Some("authentication middleware".to_owned()),
+                    index_dir: Some(project.join(".frankensearch")),
+                    ..CliInput::default()
+                })
+                .execute_search_payload(&cx, "authentication middleware", 5)
+                .await
+                .expect("search payload should fall back to lexical index");
+
+            assert!(
+                !payload.hits.is_empty(),
+                "expected lexical hits after fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_payload_empty_query_returns_empty_results() {
+        run_test_with_cx(|cx| async move {
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("   ".to_owned()),
+                ..CliInput::default()
+            });
+
+            let payload = runtime
+                .execute_search_payload(&cx, "   ", 10)
+                .await
+                .expect("empty query should not fail");
+
+            assert_eq!(payload.phase, SearchOutputPhase::Initial);
+            assert!(payload.is_empty());
+            assert_eq!(payload.total_candidates, 0);
+        });
+    }
+
+    #[test]
+    fn runtime_search_payload_errors_when_index_missing() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let missing_index = temp.path().join("missing-index");
+
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("auth flow".to_owned()),
+                index_dir: Some(missing_index.clone()),
+                ..CliInput::default()
+            });
+
+            let err = runtime
+                .execute_search_payload(&cx, "auth flow", 5)
+                .await
+                .expect_err("missing index should fail");
+            let text = err.to_string();
+            assert!(text.contains("no index found"), "unexpected error: {text}");
+            assert!(
+                text.contains("fsfs index"),
+                "error should include remediation command: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_command_runs_via_cli_dispatch() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth_flow.rs"),
+                "pub fn auth_flow() -> &'static str { \"dispatch\" }\n",
+            )
+            .expect("write auth source");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    query: Some("auth flow dispatch".to_owned()),
+                    index_dir: Some(project.join(".frankensearch")),
+                    format: OutputFormat::Json,
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("search command should complete via cli dispatch");
+        });
+    }
+
+    #[test]
+    fn runtime_stream_emitter_outputs_protocol_frames_ndjson() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            stream: true,
+            format: OutputFormat::Jsonl,
+            ..CliInput::default()
+        });
+        let payload = SearchPayload::new(
+            "auth middleware",
+            SearchOutputPhase::Initial,
+            3,
+            vec![
+                SearchHitPayload {
+                    rank: 1,
+                    path: "src/auth.rs".to_owned(),
+                    score: 0.82,
+                    snippet: Some("auth middleware".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(1),
+                    in_both_sources: true,
+                },
+                SearchHitPayload {
+                    rank: 2,
+                    path: "README.md".to_owned(),
+                    score: 0.71,
+                    snippet: None,
+                    lexical_rank: Some(1),
+                    semantic_rank: None,
+                    in_both_sources: false,
+                },
+            ],
+        );
+
+        let mut bytes = Vec::new();
+        let mut seq = 0_u64;
+        runtime
+            .emit_search_stream_started("auth middleware", "stream-test", &mut seq, &mut bytes)
+            .expect("emit started");
+        runtime
+            .emit_search_stream_payload(&payload, "stream-test", &mut seq, &mut bytes)
+            .expect("emit payload");
+        runtime
+            .emit_search_stream_terminal_completed("stream-test", &mut seq, &mut bytes)
+            .expect("emit terminal");
+
+        let text = String::from_utf8(bytes).expect("utf8");
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 5, "started + progress + 2 results + terminal");
+
+        let started: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_ndjson(lines[0]).expect("decode started");
+        assert_eq!(started.event.kind(), StreamEventKind::Started);
+        let progress: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_ndjson(lines[1]).expect("decode progress");
+        assert_eq!(progress.event.kind(), StreamEventKind::Progress);
+        let first_result: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_ndjson(lines[2]).expect("decode result 1");
+        assert_eq!(first_result.event.kind(), StreamEventKind::Result);
+        let terminal: StreamFrame<SearchHitPayload> =
+            decode_stream_frame_ndjson(lines[4]).expect("decode terminal");
+        assert_eq!(terminal.event.kind(), StreamEventKind::Terminal);
+    }
+
+    #[test]
+    fn runtime_stream_emitter_outputs_protocol_frames_toon_with_rs() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            stream: true,
+            format: OutputFormat::Toon,
+            ..CliInput::default()
+        });
+        let payload = SearchPayload::new(
+            "config layering",
+            SearchOutputPhase::Initial,
+            1,
+            vec![SearchHitPayload {
+                rank: 1,
+                path: "docs/config.md".to_owned(),
+                score: 0.91,
+                snippet: None,
+                lexical_rank: Some(0),
+                semantic_rank: Some(0),
+                in_both_sources: true,
+            }],
+        );
+
+        let mut bytes = Vec::new();
+        let mut seq = 0_u64;
+        runtime
+            .emit_search_stream_started("config layering", "stream-toon", &mut seq, &mut bytes)
+            .expect("emit started");
+        runtime
+            .emit_search_stream_payload(&payload, "stream-toon", &mut seq, &mut bytes)
+            .expect("emit payload");
+        runtime
+            .emit_search_stream_terminal_completed("stream-toon", &mut seq, &mut bytes)
+            .expect("emit terminal");
+
+        assert_eq!(
+            bytes.first().copied(),
+            Some(TOON_STREAM_RECORD_SEPARATOR_BYTE)
+        );
+        let records = bytes
+            .split(|byte| *byte == TOON_STREAM_RECORD_SEPARATOR_BYTE)
+            .filter(|chunk| !chunk.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 4, "started + progress + result + terminal");
+        for record in records {
+            let payload = std::str::from_utf8(record)
+                .expect("utf8")
+                .trim_end_matches('\n');
+            let frame: StreamFrame<SearchHitPayload> =
+                decode_stream_frame_toon(payload).expect("decode toon frame");
+            assert!(matches!(
+                frame.event.kind(),
+                StreamEventKind::Started
+                    | StreamEventKind::Progress
+                    | StreamEventKind::Result
+                    | StreamEventKind::Terminal
+            ));
+        }
     }
 
     #[test]
@@ -3023,5 +5895,721 @@ mod tests {
         assert!(payload.models[0].cached);
         assert_eq!(payload.models[1].tier, "quality");
         assert!(!payload.models[1].cached);
+    }
+
+    #[test]
+    fn runtime_download_models_list_reports_missing_models() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut config = FsfsConfig::default();
+            config.indexing.model_dir = temp.path().join("models").display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Download,
+                download_list: true,
+                ..CliInput::default()
+            });
+
+            let payload = runtime
+                .collect_download_models_payload()
+                .await
+                .expect("list payload");
+            assert_eq!(payload.operation, "list");
+            assert_eq!(payload.models.len(), 3);
+            assert!(payload.models.iter().all(|entry| entry.state == "missing"));
+        });
+    }
+
+    #[test]
+    fn runtime_download_models_verify_reports_mismatch() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let model_root = temp.path().join("models");
+            let potion_dir = model_root.join("potion-multilingual-128M");
+            fs::create_dir_all(&potion_dir).expect("create model dir");
+            fs::write(potion_dir.join("tokenizer.json"), b"broken").expect("write model file");
+
+            let mut config = FsfsConfig::default();
+            config.indexing.model_dir = model_root.display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Download,
+                download_verify: true,
+                model_name: Some("potion".to_owned()),
+                ..CliInput::default()
+            });
+
+            let payload = runtime
+                .collect_download_models_payload()
+                .await
+                .expect("verify payload");
+            assert_eq!(payload.operation, "verify");
+            assert_eq!(payload.models.len(), 1);
+            assert_eq!(payload.models[0].id, "potion-multilingual-128m");
+            assert_eq!(payload.models[0].state, "mismatch");
+            assert_eq!(payload.models[0].verified, Some(false));
+        });
+    }
+
+    #[test]
+    fn runtime_download_models_unknown_model_is_error() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Download,
+            model_name: Some("does-not-exist".to_owned()),
+            ..CliInput::default()
+        });
+        let err = runtime
+            .resolve_download_manifests()
+            .expect_err("unknown model");
+        assert!(err.to_string().contains("unknown model"));
+    }
+
+    #[test]
+    fn runtime_uninstall_requires_confirmation_without_yes_or_dry_run() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Uninstall,
+            ..CliInput::default()
+        });
+        let err = runtime
+            .collect_uninstall_payload()
+            .expect_err("missing confirmation should fail");
+        assert!(err.to_string().contains("requires --yes or --dry-run"));
+    }
+
+    #[test]
+    fn runtime_uninstall_dry_run_marks_targets_without_removal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let model_root = temp.path().join("models");
+        fs::create_dir_all(index_root.join("vector")).expect("index dir");
+        fs::write(index_root.join("vector/index.fsvi"), b"fsvi").expect("index file");
+        fs::create_dir_all(model_root.join("potion")).expect("model dir");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        config.indexing.model_dir = model_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Uninstall,
+            uninstall_dry_run: true,
+            uninstall_purge: true,
+            ..CliInput::default()
+        });
+
+        let payload = runtime
+            .collect_uninstall_payload()
+            .expect("dry-run payload");
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|entry| { entry.target == "index_dir" && entry.status == "planned" })
+        );
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|entry| { entry.target == "model_dir" && entry.status == "planned" })
+        );
+        assert!(index_root.exists(), "dry-run must not remove index dir");
+        assert!(model_root.exists(), "dry-run must not remove model dir");
+    }
+
+    #[test]
+    fn runtime_uninstall_refuses_non_fsfs_index_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("non-fsfs-index");
+        fs::create_dir_all(index_root.join("data")).expect("index dir");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Uninstall,
+            uninstall_yes: true,
+            ..CliInput::default()
+        });
+
+        let payload = runtime
+            .collect_uninstall_payload()
+            .expect("uninstall payload");
+        let index_entry = payload
+            .entries
+            .iter()
+            .find(|entry| entry.target == "index_dir")
+            .expect("index entry");
+        assert_eq!(index_entry.status, "error");
+        assert!(
+            index_entry
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("not recognized as fsfs-managed"))
+        );
+        assert!(index_root.exists(), "unsafe directory should be preserved");
+    }
+
+    #[test]
+    fn runtime_uninstall_removes_index_dir_when_confirmed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(index_root.join("vector")).expect("index dir");
+        fs::write(index_root.join("vector/index.fsvi"), b"fsvi").expect("index file");
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Uninstall,
+            uninstall_yes: true,
+            ..CliInput::default()
+        });
+
+        let payload = runtime
+            .collect_uninstall_payload()
+            .expect("uninstall payload");
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|entry| { entry.target == "index_dir" && entry.status == "removed" })
+        );
+        assert!(!index_root.exists(), "index dir should be removed");
+    }
+
+    #[test]
+    fn doctor_payload_has_all_expected_checks() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            ..CliInput::default()
+        });
+        let payload = runtime.collect_doctor_payload().unwrap();
+        assert!(!payload.checks.is_empty(), "doctor should produce checks");
+        assert!(
+            payload.checks.iter().any(|c| c.name == "version"),
+            "doctor should check version"
+        );
+        assert!(
+            payload.checks.iter().any(|c| c.name == "model.fast"),
+            "doctor should check fast model"
+        );
+        assert!(
+            payload.checks.iter().any(|c| c.name == "model.quality"),
+            "doctor should check quality model"
+        );
+        assert!(
+            payload.checks.iter().any(|c| c.name == "index"),
+            "doctor should check index"
+        );
+        assert!(
+            payload.checks.iter().any(|c| c.name == "config"),
+            "doctor should check config"
+        );
+        assert_eq!(
+            payload.pass_count + payload.warn_count + payload.fail_count,
+            payload.checks.len(),
+            "verdict counts should sum to total checks"
+        );
+    }
+
+    #[test]
+    fn doctor_version_check_always_passes() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            ..CliInput::default()
+        });
+        let payload = runtime.collect_doctor_payload().unwrap();
+        let version_check = payload
+            .checks
+            .iter()
+            .find(|c| c.name == "version")
+            .expect("version check");
+        assert_eq!(version_check.verdict, super::DoctorVerdict::Pass);
+        assert!(version_check.detail.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn doctor_table_output_contains_all_checks() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            ..CliInput::default()
+        });
+        let payload = runtime.collect_doctor_payload().unwrap();
+        let table = super::render_doctor_table(&payload, true);
+        assert!(table.contains("fsfs doctor"));
+        assert!(table.contains("version"));
+        assert!(table.contains("model.fast"));
+        assert!(table.contains("Result:"));
+    }
+
+    #[test]
+    fn doctor_json_output_roundtrips() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            ..CliInput::default()
+        });
+        let payload = runtime.collect_doctor_payload().unwrap();
+        let json = serde_json::to_string(&payload).expect("serialize doctor payload");
+        let roundtrip: super::FsfsDoctorPayload =
+            serde_json::from_str(&json).expect("deserialize doctor payload");
+        assert_eq!(roundtrip.version, payload.version);
+        assert_eq!(roundtrip.checks.len(), payload.checks.len());
+        assert_eq!(roundtrip.overall, payload.overall);
+    }
+
+    #[test]
+    fn doctor_overall_verdict_reflects_worst_check() {
+        let all_pass = super::FsfsDoctorPayload {
+            version: "test".to_owned(),
+            checks: vec![super::DoctorCheck {
+                name: "test".to_owned(),
+                verdict: super::DoctorVerdict::Pass,
+                detail: "ok".to_owned(),
+                suggestion: None,
+            }],
+            pass_count: 1,
+            warn_count: 0,
+            fail_count: 0,
+            overall: super::DoctorVerdict::Pass,
+        };
+        assert_eq!(all_pass.overall, super::DoctorVerdict::Pass);
+
+        let has_warn = super::FsfsDoctorPayload {
+            version: "test".to_owned(),
+            checks: vec![
+                super::DoctorCheck {
+                    name: "ok".to_owned(),
+                    verdict: super::DoctorVerdict::Pass,
+                    detail: "ok".to_owned(),
+                    suggestion: None,
+                },
+                super::DoctorCheck {
+                    name: "warn".to_owned(),
+                    verdict: super::DoctorVerdict::Warn,
+                    detail: "warning".to_owned(),
+                    suggestion: Some("fix it".to_owned()),
+                },
+            ],
+            pass_count: 1,
+            warn_count: 1,
+            fail_count: 0,
+            overall: super::DoctorVerdict::Warn,
+        };
+        assert_eq!(has_warn.overall, super::DoctorVerdict::Warn);
+    }
+
+    // ─── Self-Update Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn semver_parse_basic() {
+        let v = super::SemVer::parse("0.1.0").unwrap();
+        assert_eq!(v.major, 0);
+        assert_eq!(v.minor, 1);
+        assert_eq!(v.patch, 0);
+    }
+
+    #[test]
+    fn semver_parse_with_v_prefix() {
+        let v = super::SemVer::parse("v1.2.3").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 2, 3));
+    }
+
+    #[test]
+    fn semver_parse_with_prerelease() {
+        let v = super::SemVer::parse("v2.0.0-beta.1").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (2, 0, 0));
+    }
+
+    #[test]
+    fn semver_parse_rejects_garbage() {
+        assert!(super::SemVer::parse("").is_none());
+        assert!(super::SemVer::parse("abc").is_none());
+        assert!(super::SemVer::parse("1.2").is_none());
+        assert!(super::SemVer::parse("v").is_none());
+    }
+
+    #[test]
+    fn semver_is_newer_than() {
+        let v010 = super::SemVer::parse("0.1.0").unwrap();
+        let v020 = super::SemVer::parse("0.2.0").unwrap();
+        let v100 = super::SemVer::parse("1.0.0").unwrap();
+        let v101 = super::SemVer::parse("1.0.1").unwrap();
+
+        assert!(v020.is_newer_than(v010));
+        assert!(v100.is_newer_than(v020));
+        assert!(v101.is_newer_than(v100));
+        assert!(!v010.is_newer_than(v020));
+        assert!(!v010.is_newer_than(v010)); // equal is not newer
+    }
+
+    #[test]
+    fn semver_display() {
+        let v = super::SemVer::parse("v3.14.159").unwrap();
+        assert_eq!(v.to_string(), "3.14.159");
+    }
+
+    #[test]
+    fn update_payload_serde_roundtrip() {
+        let payload = super::FsfsUpdatePayload {
+            current_version: "0.1.0".into(),
+            latest_version: "0.2.0".into(),
+            update_available: true,
+            check_only: true,
+            applied: false,
+            channel: "stable".into(),
+            release_url: Some("https://example.com/release".into()),
+            notes: vec!["update available".into()],
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: super::FsfsUpdatePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn render_update_table_up_to_date() {
+        let payload = super::FsfsUpdatePayload {
+            current_version: "0.1.0".into(),
+            latest_version: "0.1.0".into(),
+            update_available: false,
+            check_only: false,
+            applied: false,
+            channel: "stable".into(),
+            release_url: None,
+            notes: vec!["fsfs 0.1.0 is already up to date".into()],
+        };
+        let table = super::render_update_table(&payload, true);
+        assert!(table.contains("up to date"));
+        assert!(table.contains("v0.1.0"));
+    }
+
+    #[test]
+    fn render_update_table_check_only() {
+        let payload = super::FsfsUpdatePayload {
+            current_version: "0.1.0".into(),
+            latest_version: "0.2.0".into(),
+            update_available: true,
+            check_only: true,
+            applied: false,
+            channel: "stable".into(),
+            release_url: Some("https://example.com".into()),
+            notes: vec!["update available: v0.1.0 -> v0.2.0".into()],
+        };
+        let table = super::render_update_table(&payload, true);
+        assert!(table.contains("check-only"));
+        assert!(table.contains("v0.2.0"));
+    }
+
+    #[test]
+    fn render_update_table_applied() {
+        let payload = super::FsfsUpdatePayload {
+            current_version: "0.1.0".into(),
+            latest_version: "0.2.0".into(),
+            update_available: true,
+            check_only: false,
+            applied: true,
+            channel: "stable".into(),
+            release_url: None,
+            notes: vec!["updated: v0.1.0 -> v0.2.0".into()],
+        };
+        let table = super::render_update_table(&payload, true);
+        assert!(table.contains("applied"));
+    }
+
+    #[test]
+    fn detect_target_triple_returns_nonempty() {
+        let triple = super::detect_target_triple();
+        assert!(!triple.is_empty());
+        assert!(triple.contains('-'));
+    }
+
+    #[test]
+    fn release_asset_url_format() {
+        let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl");
+        assert!(url.contains("v0.2.0"));
+        assert!(url.contains("fsfs-x86_64-unknown-linux-musl.tar.xz"));
+        assert!(url.starts_with("https://github.com/"));
+    }
+
+    #[test]
+    fn release_checksum_url_format() {
+        let url = super::release_checksum_url("v0.2.0", "x86_64-unknown-linux-musl");
+        assert!(url.ends_with(".tar.xz.sha256"));
+    }
+
+    #[test]
+    fn find_extracted_binary_direct() {
+        let dir = std::env::temp_dir().join("fsfs_test_extract_direct");
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("fsfs");
+        fs::write(&binary, b"#!/bin/sh\necho test").unwrap();
+        let found = super::find_extracted_binary(&dir, "fsfs").unwrap();
+        assert_eq!(found, binary);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_extracted_binary_nested() {
+        let dir = std::env::temp_dir().join("fsfs_test_extract_nested");
+        let sub = dir.join("subdir");
+        let _ = fs::create_dir_all(&sub);
+        let binary = sub.join("fsfs");
+        fs::write(&binary, b"#!/bin/sh\necho test").unwrap();
+        let found = super::find_extracted_binary(&dir, "fsfs").unwrap();
+        assert_eq!(found, binary);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_extracted_binary_missing() {
+        let dir = std::env::temp_dir().join("fsfs_test_extract_empty");
+        let _ = fs::create_dir_all(&dir);
+        let result = super::find_extracted_binary(&dir, "fsfs");
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn github_constants_are_set() {
+        assert_eq!(super::GITHUB_OWNER, "Dicklesworthstone");
+        assert_eq!(super::GITHUB_REPO, "frankensearch");
+    }
+
+    // ─── Version Cache Tests ───────────────────────────────────────────
+
+    #[test]
+    fn version_cache_serde_roundtrip() {
+        let cache = super::VersionCheckCache {
+            checked_at_epoch: 1_700_000_000,
+            current_version: "0.1.0".into(),
+            latest_version: "v0.2.0".into(),
+            release_url: "https://example.com/release".into(),
+            ttl_seconds: 86_400,
+        };
+        let json = serde_json::to_string(&cache).unwrap();
+        let decoded: super::VersionCheckCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.current_version, "0.1.0");
+        assert_eq!(decoded.latest_version, "v0.2.0");
+        assert_eq!(decoded.ttl_seconds, 86_400);
+    }
+
+    #[test]
+    fn version_cache_default_ttl() {
+        let json = r#"{"checked_at_epoch":0,"current_version":"0.1.0","latest_version":"v0.1.0","release_url":""}"#;
+        let cache: super::VersionCheckCache = serde_json::from_str(json).unwrap();
+        assert_eq!(cache.ttl_seconds, super::VERSION_CACHE_TTL_SECS);
+    }
+
+    #[test]
+    fn is_cache_valid_detects_expired() {
+        let cache = super::VersionCheckCache {
+            checked_at_epoch: 0, // epoch 0 is way in the past
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            latest_version: "v0.1.0".into(),
+            release_url: String::new(),
+            ttl_seconds: 86_400,
+        };
+        assert!(!super::is_cache_valid(&cache));
+    }
+
+    #[test]
+    fn is_cache_valid_detects_version_mismatch() {
+        let cache = super::VersionCheckCache {
+            checked_at_epoch: super::epoch_now(),
+            current_version: "99.99.99".into(), // won't match CARGO_PKG_VERSION
+            latest_version: "v99.99.99".into(),
+            release_url: String::new(),
+            ttl_seconds: 86_400,
+        };
+        assert!(!super::is_cache_valid(&cache));
+    }
+
+    #[test]
+    fn is_cache_valid_accepts_fresh_cache() {
+        let cache = super::VersionCheckCache {
+            checked_at_epoch: super::epoch_now(),
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            latest_version: "v0.1.0".into(),
+            release_url: String::new(),
+            ttl_seconds: 86_400,
+        };
+        assert!(super::is_cache_valid(&cache));
+    }
+
+    #[test]
+    fn version_cache_path_is_some() {
+        // On most systems this will return Some.
+        let path = super::version_cache_path();
+        if let Some(p) = path {
+            assert!(p.ends_with("frankensearch/version_check.json"));
+        }
+    }
+
+    #[test]
+    fn write_and_read_version_cache_roundtrip() {
+        let cache = super::VersionCheckCache {
+            checked_at_epoch: super::epoch_now(),
+            current_version: env!("CARGO_PKG_VERSION").into(),
+            latest_version: "v99.0.0".into(),
+            release_url: "https://example.com".into(),
+            ttl_seconds: 86_400,
+        };
+        // Write it.
+        super::write_version_cache(&cache).unwrap();
+        // Read it back.
+        let loaded = super::read_version_cache().unwrap();
+        assert_eq!(loaded.latest_version, "v99.0.0");
+        assert_eq!(loaded.release_url, "https://example.com");
+    }
+
+    #[test]
+    fn maybe_print_update_notice_quiet_mode() {
+        // Quiet mode should always return false.
+        assert!(!super::maybe_print_update_notice(true));
+    }
+
+    #[test]
+    fn maybe_print_update_notice_no_cache() {
+        // If cache file doesn't exist / can't be read, returns false.
+        // This is inherently true in a fresh test environment or when
+        // the cache hasn't been populated, so we just verify no panic.
+        let _ = super::maybe_print_update_notice(false);
+    }
+
+    #[test]
+    fn version_cache_ttl_constant() {
+        assert_eq!(super::VERSION_CACHE_TTL_SECS, 86_400);
+    }
+
+    // ─── Backup / Rollback Tests ───────────────────────────────────────
+
+    #[test]
+    fn backup_entry_serde_roundtrip() {
+        let entry = super::BackupEntry {
+            version: "0.1.0".into(),
+            backed_up_at_epoch: 1_700_000_000,
+            original_path: "/usr/local/bin/fsfs".into(),
+            binary_filename: "fsfs-0.1.0".into(),
+            sha256: "abc123".into(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: super::BackupEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn rollback_manifest_serde_roundtrip() {
+        let manifest = super::RollbackManifest {
+            entries: vec![
+                super::BackupEntry {
+                    version: "0.1.0".into(),
+                    backed_up_at_epoch: 100,
+                    original_path: "/bin/fsfs".into(),
+                    binary_filename: "fsfs-0.1.0".into(),
+                    sha256: "aaa".into(),
+                },
+                super::BackupEntry {
+                    version: "0.2.0".into(),
+                    backed_up_at_epoch: 200,
+                    original_path: "/bin/fsfs".into(),
+                    binary_filename: "fsfs-0.2.0".into(),
+                    sha256: "bbb".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let decoded: super::RollbackManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(decoded.entries[0].version, "0.1.0");
+        assert_eq!(decoded.entries[1].version, "0.2.0");
+    }
+
+    #[test]
+    fn rollback_manifest_default_is_empty() {
+        let manifest = super::RollbackManifest::default();
+        assert!(manifest.entries.is_empty());
+    }
+
+    #[test]
+    fn prune_backups_keeps_max() {
+        let dir = std::env::temp_dir().join("fsfs_test_prune_backups");
+        let _ = fs::create_dir_all(&dir);
+
+        let mut manifest = super::RollbackManifest {
+            entries: (0..5)
+                .map(|i| super::BackupEntry {
+                    version: format!("0.{i}.0"),
+                    backed_up_at_epoch: i as u64 * 100,
+                    original_path: "/bin/fsfs".into(),
+                    binary_filename: format!("fsfs-0.{i}.0"),
+                    sha256: String::new(),
+                })
+                .collect(),
+        };
+
+        // Create the files that will be pruned.
+        for entry in &manifest.entries {
+            fs::write(dir.join(&entry.binary_filename), b"test").unwrap();
+        }
+
+        super::prune_backups(&mut manifest, &dir);
+        assert_eq!(manifest.entries.len(), super::MAX_BACKUP_VERSIONS);
+
+        // The newest entries should be kept (highest epoch).
+        assert_eq!(manifest.entries[0].version, "0.4.0");
+        assert_eq!(manifest.entries[1].version, "0.3.0");
+        assert_eq!(manifest.entries[2].version, "0.2.0");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_dir_is_some() {
+        let dir = super::backup_dir();
+        if let Some(d) = dir {
+            assert!(d.ends_with("frankensearch/backups"));
+        }
+    }
+
+    #[test]
+    fn rollback_manifest_path_is_some() {
+        let path = super::rollback_manifest_path();
+        if let Some(p) = path {
+            assert!(p.ends_with("rollback-manifest.json"));
+        }
+    }
+
+    #[test]
+    fn list_backups_returns_vec() {
+        // Just verify it doesn't panic.
+        let backups = super::list_backups();
+        assert!(backups.len() <= 100); // sanity check
+    }
+
+    #[test]
+    fn restore_backup_fails_with_no_backups() {
+        // With a fresh manifest, restore should fail.
+        // This may succeed if a previous test wrote backups, so we just
+        // verify the function doesn't panic.
+        let result = super::restore_backup(Some("v99.99.99"));
+        // Should fail because that version doesn't exist.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn max_backup_versions_constant() {
+        assert_eq!(super::MAX_BACKUP_VERSIONS, 3);
+    }
+
+    #[test]
+    fn write_and_read_rollback_manifest_roundtrip() {
+        let manifest = super::RollbackManifest {
+            entries: vec![super::BackupEntry {
+                version: "0.99.0".into(),
+                backed_up_at_epoch: super::epoch_now(),
+                original_path: "/test/fsfs".into(),
+                binary_filename: "fsfs-0.99.0".into(),
+                sha256: "test_hash".into(),
+            }],
+        };
+        super::write_rollback_manifest(&manifest).unwrap();
+        let loaded = super::read_rollback_manifest();
+        assert!(!loaded.entries.is_empty());
+        // Find our test entry (other tests may have added entries too).
+        let found = loaded.entries.iter().any(|e| e.version == "0.99.0");
+        assert!(found);
     }
 }

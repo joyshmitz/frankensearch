@@ -1204,7 +1204,9 @@ pub fn default_user_config_file_path(home_dir: &Path) -> PathBuf {
 
 #[must_use]
 pub fn default_project_config_file_path(cwd: &Path) -> PathBuf {
-    cwd.join(".frankensearch").join("config.toml")
+    project_root_from_cwd(cwd)
+        .join(".frankensearch")
+        .join("config.toml")
 }
 
 #[must_use]
@@ -1232,6 +1234,13 @@ fn expand_home_prefix(path: &Path, home_dir: &Path) -> PathBuf {
     }
 
     expanded
+}
+
+#[must_use]
+fn project_root_from_cwd(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|candidate| candidate.join(".git").exists())
+        .map_or_else(|| cwd.to_path_buf(), Path::to_path_buf)
 }
 
 /// Load config from file/env/CLI overlays using the fsfs precedence contract.
@@ -1872,12 +1881,33 @@ fn apply_env_overrides(
 
     if let Some((key, value)) = env_override(
         env,
+        "FRANKENSEARCH_FAST_ONLY",
         "FRANKENSEARCH_SEARCH_FAST_ONLY",
-        "FSFS_SEARCH_FAST_ONLY",
-    ) {
+    )
+    .or_else(|| env_override(env, "FSFS_FAST_ONLY", "FSFS_SEARCH_FAST_ONLY"))
+    {
         let fast_only = parse_bool(value, "search.fast_only")?;
         config.search.fast_only = fast_only;
         profile_overrides.quality_enabled = Some(!fast_only);
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_QUALITY_WEIGHT",
+        "FRANKENSEARCH_SEARCH_QUALITY_WEIGHT",
+    )
+    .or_else(|| env_override(env, "FSFS_QUALITY_WEIGHT", "FSFS_SEARCH_QUALITY_WEIGHT"))
+    {
+        config.search.quality_weight = parse_f64(value, "search.quality_weight")?;
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) =
+        env_override(env, "FRANKENSEARCH_RRF_K", "FRANKENSEARCH_SEARCH_RRF_K")
+            .or_else(|| env_override(env, "FSFS_RRF_K", "FSFS_SEARCH_RRF_K"))
+    {
+        config.search.rrf_k = parse_f64(value, "search.rrf_k")?;
         keys_used.push(key.into());
     }
 
@@ -2012,11 +2042,15 @@ fn apply_env_overrides(
         keys_used.push(key.into());
     }
 
-    if let Some((key, value)) = env_override(
-        env,
-        "FRANKENSEARCH_STORAGE_INDEX_DIR",
-        "FSFS_STORAGE_INDEX_DIR",
-    ) {
+    if let Some((key, value)) = env_override(env, "FRANKENSEARCH_INDEX_DIR", "FSFS_INDEX_DIR")
+        .or_else(|| {
+            env_override(
+                env,
+                "FRANKENSEARCH_STORAGE_INDEX_DIR",
+                "FSFS_STORAGE_INDEX_DIR",
+            )
+        })
+    {
         config.storage.index_dir.clone_from(value);
         keys_used.push(key.into());
     }
@@ -2025,6 +2059,11 @@ fn apply_env_overrides(
         env_override(env, "FRANKENSEARCH_STORAGE_DB_PATH", "FSFS_STORAGE_DB_PATH")
     {
         config.storage.db_path.clone_from(value);
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) = env_override(env, "FRANKENSEARCH_MODEL_DIR", "FSFS_MODEL_DIR") {
+        config.indexing.model_dir.clone_from(value);
         keys_used.push(key.into());
     }
 
@@ -2495,6 +2534,16 @@ fn parse_u8(value: &str, field: &str) -> SearchResult<u8> {
         value: value.into(),
         reason: "expected unsigned integer".into(),
     })
+}
+
+fn parse_f64(value: &str, field: &str) -> SearchResult<f64> {
+    value
+        .parse::<f64>()
+        .map_err(|_| SearchError::InvalidConfig {
+            field: field.into(),
+            value: value.into(),
+            reason: "expected floating-point number".into(),
+        })
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -3254,6 +3303,26 @@ mod tests {
     }
 
     #[test]
+    fn frankensearch_index_dir_alias_takes_precedence() {
+        let env = HashMap::from([
+            ("FRANKENSEARCH_INDEX_DIR".into(), "/tmp/from-alias".into()),
+            (
+                "FRANKENSEARCH_STORAGE_INDEX_DIR".into(),
+                "/tmp/from-storage-key".into(),
+            ),
+        ]);
+
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load config");
+        assert_eq!(result.config.storage.index_dir, "/tmp/from-alias");
+        assert!(
+            result
+                .env_keys_used
+                .contains(&"FRANKENSEARCH_INDEX_DIR".to_string())
+        );
+    }
+
+    #[test]
     fn default_paths_and_zero_config_storage_defaults_are_project_friendly() {
         let user = default_user_config_file_path(home());
         assert!(
@@ -3276,7 +3345,59 @@ mod tests {
         )
         .expect("load defaults");
         assert_eq!(result.config.discovery.roots, vec![".".to_string()]);
+        assert!(!result.config.discovery.follow_symlinks);
         assert_eq!(result.config.storage.index_dir, ".frankensearch");
         assert_eq!(result.config.search.default_limit, 10);
+    }
+
+    #[test]
+    fn project_config_path_walks_up_to_git_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fsfs-git-root-{unique}"));
+        let nested = root.join("deep").join("inside").join("repo");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        fs::create_dir_all(root.join(".git")).expect("mkdir .git");
+
+        let path = default_project_config_file_path(&nested);
+        assert_eq!(path, root.join(".frankensearch").join("config.toml"));
+    }
+
+    #[test]
+    fn project_config_path_accepts_worktree_git_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fsfs-worktree-root-{unique}"));
+        let nested = root.join("subdir");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        fs::write(root.join(".git"), "gitdir: /tmp/virtual/gitdir\n").expect("write .git file");
+
+        let path = default_project_config_file_path(&nested);
+        assert_eq!(path, root.join(".frankensearch").join("config.toml"));
+    }
+
+    #[test]
+    fn frankensearch_model_and_search_env_aliases_apply() {
+        let env = HashMap::from([
+            ("FRANKENSEARCH_MODEL_DIR".into(), "/tmp/env-models".into()),
+            ("FRANKENSEARCH_QUALITY_WEIGHT".into(), "0.42".into()),
+            ("FRANKENSEARCH_RRF_K".into(), "77.0".into()),
+            ("FRANKENSEARCH_FAST_ONLY".into(), "true".into()),
+        ]);
+
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load config");
+        assert_eq!(result.config.indexing.model_dir, "/tmp/env-models");
+        assert!((result.config.search.quality_weight - 0.42).abs() < f64::EPSILON);
+        assert!((result.config.search.rrf_k - 77.0).abs() < f64::EPSILON);
+        assert!(
+            result
+                .env_keys_used
+                .contains(&"FRANKENSEARCH_FAST_ONLY".to_string())
+        );
     }
 }
