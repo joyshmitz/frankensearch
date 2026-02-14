@@ -180,12 +180,23 @@ fn matches_not_keyword(chars: &[char], i: usize) -> bool {
 
 impl std::fmt::Display for ParsedQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.positive)?;
+        let mut wrote_any = !self.positive.is_empty();
+        if wrote_any {
+            write!(f, "{}", self.positive)?;
+        }
         for term in &self.negative_terms {
-            write!(f, " -{term}")?;
+            if wrote_any {
+                write!(f, " ")?;
+            }
+            write!(f, "-{term}")?;
+            wrote_any = true;
         }
         for phrase in &self.negative_phrases {
-            write!(f, " NOT \"{phrase}\"")?;
+            if wrote_any {
+                write!(f, " ")?;
+            }
+            write!(f, "NOT \"{phrase}\"")?;
+            wrote_any = true;
         }
         Ok(())
     }
@@ -466,7 +477,14 @@ mod tests {
     fn display_only_negations() {
         let q = ParsedQuery::parse(r#"-a NOT "b c""#);
         let displayed = q.to_string();
-        assert_eq!(displayed, r#" -a NOT "b c""#);
+        assert_eq!(displayed, r#"-a NOT "b c""#);
+    }
+
+    #[test]
+    fn display_only_phrase_negation_has_no_leading_space() {
+        let q = ParsedQuery::parse(r#"NOT "b c""#);
+        let displayed = q.to_string();
+        assert_eq!(displayed, r#"NOT "b c""#);
     }
 
     #[test]

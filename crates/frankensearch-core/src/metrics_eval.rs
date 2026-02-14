@@ -6,6 +6,8 @@
 //! - **MRR**: Mean Reciprocal Rank
 //! - **Recall@K**: Fraction of relevant documents retrieved in top-K
 
+use std::collections::HashSet;
+
 #[inline]
 #[allow(clippy::cast_precision_loss)]
 const fn usize_to_f64(value: usize) -> f64 {
@@ -21,22 +23,32 @@ const fn usize_to_f64(value: usize) -> f64 {
 /// Returns 0.0 when `relevant` is empty or `k` is 0.
 #[must_use]
 pub fn ndcg_at_k(retrieved: &[&str], relevant: &[&str], k: usize) -> f64 {
-    if relevant.is_empty() || k == 0 {
+    let relevant_set: HashSet<&str> = relevant.iter().copied().collect();
+    if relevant_set.is_empty() || k == 0 {
         return 0.0;
     }
 
     let limit = k.min(retrieved.len());
+    let mut seen = HashSet::with_capacity(limit);
 
     // DCG: sum of 1/log2(rank+1) for relevant docs in retrieved
     let dcg: f64 = retrieved[..limit]
         .iter()
         .enumerate()
-        .filter(|(_, doc)| relevant.contains(doc))
-        .map(|(i, _)| 1.0 / (usize_to_f64(i) + 2.0).log2())
+        .filter_map(|(i, doc)| {
+            if !seen.insert(*doc) {
+                return None;
+            }
+            if relevant_set.contains(doc) {
+                Some(1.0 / (usize_to_f64(i) + 2.0).log2())
+            } else {
+                None
+            }
+        })
         .sum();
 
     // Ideal DCG: all relevant docs at top positions
-    let ideal_count = k.min(relevant.len());
+    let ideal_count = k.min(relevant_set.len());
     let idcg: f64 = (0..ideal_count)
         .map(|i| 1.0 / (usize_to_f64(i) + 2.0).log2())
         .sum();
@@ -56,22 +68,27 @@ pub fn ndcg_at_k(retrieved: &[&str], relevant: &[&str], k: usize) -> f64 {
 /// Returns 0.0 when `relevant` is empty or `k` is 0.
 #[must_use]
 pub fn map_at_k(retrieved: &[&str], relevant: &[&str], k: usize) -> f64 {
-    if relevant.is_empty() || k == 0 {
+    let relevant_set: HashSet<&str> = relevant.iter().copied().collect();
+    if relevant_set.is_empty() || k == 0 {
         return 0.0;
     }
 
     let limit = k.min(retrieved.len());
     let mut hits = 0_u32;
     let mut sum_precision = 0.0;
+    let mut seen = HashSet::with_capacity(limit);
 
     for (i, doc) in retrieved[..limit].iter().enumerate() {
-        if relevant.contains(doc) {
+        if !seen.insert(*doc) {
+            continue;
+        }
+        if relevant_set.contains(doc) {
             hits += 1;
             sum_precision += f64::from(hits) / (usize_to_f64(i) + 1.0);
         }
     }
 
-    let denominator = usize_to_f64(k.min(relevant.len()));
+    let denominator = usize_to_f64(k.min(relevant_set.len()));
     sum_precision / denominator
 }
 
@@ -81,8 +98,17 @@ pub fn map_at_k(retrieved: &[&str], relevant: &[&str], k: usize) -> f64 {
 /// document appears in the retrieved list.
 #[must_use]
 pub fn mrr(retrieved: &[&str], relevant: &[&str]) -> f64 {
+    let relevant_set: HashSet<&str> = relevant.iter().copied().collect();
+    if relevant_set.is_empty() {
+        return 0.0;
+    }
+
+    let mut seen = HashSet::new();
     for (i, doc) in retrieved.iter().enumerate() {
-        if relevant.contains(doc) {
+        if !seen.insert(*doc) {
+            continue;
+        }
+        if relevant_set.contains(doc) {
             return 1.0 / (usize_to_f64(i) + 1.0);
         }
     }
@@ -95,17 +121,25 @@ pub fn mrr(retrieved: &[&str], relevant: &[&str]) -> f64 {
 /// Returns 0.0 when `relevant` is empty or `k` is 0.
 #[must_use]
 pub fn recall_at_k(retrieved: &[&str], relevant: &[&str], k: usize) -> f64 {
-    if relevant.is_empty() || k == 0 {
+    let relevant_set: HashSet<&str> = relevant.iter().copied().collect();
+    if relevant_set.is_empty() || k == 0 {
         return 0.0;
     }
 
     let limit = k.min(retrieved.len());
-    let found = retrieved[..limit]
-        .iter()
-        .filter(|doc| relevant.contains(doc))
-        .count();
+    let mut seen = HashSet::with_capacity(limit);
+    let mut found = 0_usize;
 
-    usize_to_f64(found) / usize_to_f64(relevant.len())
+    for doc in &retrieved[..limit] {
+        if !seen.insert(*doc) {
+            continue;
+        }
+        if relevant_set.contains(doc) {
+            found += 1;
+        }
+    }
+
+    usize_to_f64(found) / usize_to_f64(relevant_set.len())
 }
 
 #[cfg(test)]
@@ -169,6 +203,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ndcg_duplicate_retrievals_count_once() {
+        let score = ndcg_at_k(&["a", "a", "b"], &["a", "b"], 3);
+        let expected = 1.5 / (1.0 + 1.0 / 3f64.log2());
+        assert!(
+            (score - expected).abs() < 1e-12,
+            "duplicates in the ranking should not push nDCG above the ideal"
+        );
+    }
+
     // ─── MAP@K ──────────────────────────────────────────────────────────
 
     #[test]
@@ -214,6 +258,16 @@ mod tests {
         assert!(
             score.abs() < f64::EPSILON,
             "no overlap should be 0.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn map_ignores_duplicate_docs() {
+        let score = map_at_k(&["a", "a", "b"], &["a", "b"], 3);
+        let expected = f64::midpoint(1.0, 2.0 / 3.0);
+        assert!(
+            (score - expected).abs() < 1e-12,
+            "duplicate doc hit should only contribute once to average precision"
         );
     }
 
@@ -277,5 +331,14 @@ mod tests {
         // Only look at top-2, so "b" at position 3 doesn't count
         let score = recall_at_k(&["a", "x", "b"], &["a", "b"], 2);
         assert!((score - 0.5).abs() < 1e-10, "got {score}");
+    }
+
+    #[test]
+    fn recall_duplicate_documents_count_once() {
+        let score = recall_at_k(&["a", "a", "b"], &["a", "b"], 3);
+        assert!(
+            (score - 1.0).abs() < 1e-10,
+            "duplicate hits should not inflate recall beyond 1.0"
+        );
     }
 }
