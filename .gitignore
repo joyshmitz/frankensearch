@@ -36,3 +36,25 @@ perf.data.old
 # Environment
 .env
 .env.*
+
+# Local scratch DBs
+storage.sqlite3
+storage.sqlite3-*
+
+# Compiled binaries
+a.out
+
+# FastEmbed model caches (downloaded at runtime)
+.fastembed_cache/
+
+# Codex build artifacts
+target_codex/
+
+# Agent coordination config
+.agent-mail.yaml
+
+# Beads history snapshots
+.beads/.br_history/
+
+# bv graph output
+--graph-format.svg
