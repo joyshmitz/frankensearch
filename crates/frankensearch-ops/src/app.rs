@@ -4,13 +4,17 @@
 //! data source, and drives the event loop. Product binaries create an
 //! `OpsApp` and call `run()`.
 
+use frankensearch_tui::Screen;
+use frankensearch_tui::overlay::{OverlayKind, OverlayRequest};
 use frankensearch_tui::palette::{Action, ActionCategory};
+use frankensearch_tui::screen::ScreenId;
 use frankensearch_tui::shell::{AppShell, ShellConfig};
 use frankensearch_tui::theme::Theme;
-use frankensearch_tui::Screen;
+use ratatui::Frame;
 
 use crate::data_source::DataSource;
 use crate::preferences::DisplayPreferences;
+use crate::presets::{ViewPreset, ViewState};
 use crate::screens::FleetOverviewScreen;
 use crate::state::AppState;
 
@@ -26,10 +30,12 @@ pub struct OpsApp {
     pub state: AppState,
     /// Data source for populating state.
     data_source: Box<dyn DataSource>,
-    /// Fleet screen (kept outside registry for direct state updates).
-    fleet_screen: FleetOverviewScreen,
+    /// Registered fleet screen id.
+    fleet_screen_id: ScreenId,
     /// Accessibility and display preferences.
     pub preferences: DisplayPreferences,
+    /// Current view state (preset + density + filters).
+    pub view: ViewState,
 }
 
 impl OpsApp {
@@ -53,7 +59,7 @@ impl OpsApp {
         // Create and register the fleet screen.
         let fleet_screen = FleetOverviewScreen::new();
         let fleet_id = fleet_screen.id().clone();
-        shell.registry.register(Box::new(FleetOverviewScreen::new()));
+        shell.registry.register(Box::new(fleet_screen));
 
         // Set initial active screen.
         shell.navigate_to(&fleet_id);
@@ -62,25 +68,28 @@ impl OpsApp {
             shell,
             state: AppState::new(),
             data_source,
-            fleet_screen,
+            fleet_screen_id: fleet_id,
             preferences: DisplayPreferences::new(),
+            view: ViewState::default(),
         }
     }
 
     /// Refresh state from the data source.
     pub fn refresh_data(&mut self) {
         let snapshot = self.data_source.fleet_snapshot();
+        let control_plane = self.data_source.control_plane_metrics();
         self.state.update_fleet(snapshot);
+        self.state.update_control_plane(control_plane);
 
         // Update status line with connection info.
         self.shell.status_line = self
             .shell
             .status_line
             .clone()
-            .with_center(self.state.connection_status().to_string());
+            .with_center(self.state.connection_status().to_string())
+            .with_right(self.state.control_plane_health().badge());
 
-        // Update the fleet screen's state.
-        self.fleet_screen.update_state(&self.state);
+        self.sync_fleet_screen_state();
     }
 
     /// Process an input event. Returns `true` if the app should quit.
@@ -88,11 +97,25 @@ impl OpsApp {
         let quit = self.shell.handle_input(event);
 
         // Handle palette action confirmations.
-        if let Some(action_id) = self.shell.last_palette_action() {
-            self.dispatch_palette_action(action_id);
+        if let Some(action_id) = self.shell.last_palette_action().map(str::to_string) {
+            self.dispatch_palette_action(&action_id);
         }
 
         quit
+    }
+
+    /// Render the shell plus ops-specific overlays.
+    ///
+    /// Consumers should render via this method (instead of calling
+    /// `self.shell.render(...)` directly) so palette/help/alert overlays
+    /// are painted on top of the active screen.
+    pub fn render(&self, frame: &mut Frame<'_>) {
+        self.shell.render(frame);
+        let area = frame.area();
+        if let Some(request) = self.shell.overlays.top() {
+            crate::overlays::render_overlay(frame, area, request);
+        }
+        crate::overlays::render_palette_overlay(frame, area, &self.shell.palette);
     }
 
     /// Dispatch a confirmed palette action by ID.
@@ -102,8 +125,30 @@ impl OpsApp {
                 let id = frankensearch_tui::screen::ScreenId::new("ops.fleet");
                 self.shell.navigate_to(&id);
             }
+            "nav.search" | "nav.index" => {
+                tracing::warn!(
+                    target: "frankensearch.ops",
+                    action_id,
+                    "palette navigation action is not implemented yet"
+                );
+            }
             "debug.refresh" => {
                 self.refresh_data();
+            }
+            "debug.self_check" => {
+                let metrics = self.state.control_plane_metrics();
+                tracing::info!(
+                    target: "frankensearch.ops",
+                    health = %self.state.control_plane_health(),
+                    ingestion_lag_events = metrics.ingestion_lag_events,
+                    dead_letter_events = metrics.dead_letter_events,
+                    discovery_latency_ms = metrics.discovery_latency_ms,
+                    "control-plane self-check requested"
+                );
+                self.shell.overlays.push(
+                    OverlayRequest::new(OverlayKind::Alert, "Control Plane Self-Check")
+                        .with_body(self.state.self_check_report()),
+                );
             }
             "settings.theme" => {
                 self.shell.config.theme = if self.shell.config.theme == Theme::dark() {
@@ -124,7 +169,44 @@ impl OpsApp {
             "settings.hints" => {
                 self.preferences.toggle_shortcut_hints();
             }
-            _ => {}
+            "view.density" => {
+                self.view.cycle_density();
+                self.sync_fleet_screen_state();
+            }
+            "view.fleet_triage" => {
+                self.view.apply_preset(ViewPreset::FleetTriage);
+                self.sync_fleet_screen_state();
+            }
+            "view.project_deep_dive" => {
+                self.view.apply_preset(ViewPreset::ProjectDeepDive);
+                self.sync_fleet_screen_state();
+            }
+            "view.incident_mode" => {
+                self.view.apply_preset(ViewPreset::IncidentMode);
+                if self.view.preset.prefer_high_contrast() {
+                    self.preferences.contrast = crate::preferences::ContrastMode::High;
+                }
+                self.sync_fleet_screen_state();
+            }
+            "view.low_noise" => {
+                self.view.apply_preset(ViewPreset::LowNoise);
+                self.sync_fleet_screen_state();
+            }
+            "view.hide_healthy" => {
+                self.view.toggle_hide_healthy();
+                self.sync_fleet_screen_state();
+            }
+            "view.unhealthy_first" => {
+                self.view.toggle_unhealthy_first();
+                self.sync_fleet_screen_state();
+            }
+            _ => {
+                tracing::warn!(
+                    target: "frankensearch.ops",
+                    action_id,
+                    "unhandled palette action"
+                );
+            }
         }
     }
 
@@ -136,33 +218,46 @@ impl OpsApp {
 
     /// Get a reference to the fleet screen (for testing/inspection).
     #[must_use]
-    pub const fn fleet_screen(&self) -> &FleetOverviewScreen {
-        &self.fleet_screen
+    pub fn fleet_screen(&self) -> Option<&FleetOverviewScreen> {
+        self.shell
+            .registry
+            .get(&self.fleet_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<FleetOverviewScreen>())
     }
 
     /// Get a list of all registered palette actions (for help screen).
     #[must_use]
     pub fn palette_actions() -> Vec<Action> {
         vec![
-            Action::new("nav.fleet", "Go to Fleet Overview", ActionCategory::Navigation)
-                .with_shortcut("1"),
-            Action::new("nav.search", "Go to Search Stream", ActionCategory::Navigation)
-                .with_shortcut("2"),
-            Action::new("nav.index", "Go to Index Status", ActionCategory::Navigation)
-                .with_shortcut("3"),
             Action::new(
-                "debug.refresh",
-                "Force Refresh Data",
+                "nav.fleet",
+                "Go to Fleet Overview",
+                ActionCategory::Navigation,
+            )
+            .with_shortcut("1"),
+            Action::new(
+                "nav.search",
+                "Go to Search Stream",
+                ActionCategory::Navigation,
+            )
+            .with_shortcut("2"),
+            Action::new(
+                "nav.index",
+                "Go to Index Status",
+                ActionCategory::Navigation,
+            )
+            .with_shortcut("3"),
+            Action::new("debug.refresh", "Force Refresh Data", ActionCategory::Debug)
+                .with_shortcut("F5"),
+            Action::new(
+                "debug.self_check",
+                "Run Control-Plane Self-Check",
                 ActionCategory::Debug,
             )
-            .with_shortcut("F5"),
-            Action::new(
-                "settings.theme",
-                "Toggle Theme",
-                ActionCategory::Settings,
-            )
-            .with_shortcut("T")
-            .with_description("Switch between dark and light theme"),
+            .with_description("Show internal health metrics and degradation status"),
+            Action::new("settings.theme", "Toggle Theme", ActionCategory::Settings)
+                .with_shortcut("T")
+                .with_description("Switch between dark and light theme"),
             Action::new(
                 "settings.contrast",
                 "Toggle High Contrast",
@@ -187,6 +282,50 @@ impl OpsApp {
                 ActionCategory::Settings,
             )
             .with_description("Show or hide inline keyboard shortcut hints"),
+            // ── View Presets ────────────────────────────────────────
+            Action::new(
+                "view.density",
+                "Cycle Density Mode",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_shortcut("D")
+            .with_description("Cycle between compact, normal, and expanded"),
+            Action::new(
+                "view.fleet_triage",
+                "Fleet Triage View",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_description("Compact fleet overview, health-first sorting"),
+            Action::new(
+                "view.project_deep_dive",
+                "Project Deep Dive View",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_description("Expanded single-project view with full metrics"),
+            Action::new(
+                "view.incident_mode",
+                "Incident Mode View",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_description("High-contrast, alerts prominent, unhealthy first"),
+            Action::new(
+                "view.low_noise",
+                "Low Noise View",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_description("Hide healthy instances, show only actionable items"),
+            Action::new(
+                "view.hide_healthy",
+                "Toggle Hide Healthy",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_description("Show or hide healthy instances"),
+            Action::new(
+                "view.unhealthy_first",
+                "Toggle Unhealthy First",
+                ActionCategory::Custom("View".to_string()),
+            )
+            .with_description("Sort unhealthy instances to the top"),
         ]
     }
 
@@ -194,6 +333,33 @@ impl OpsApp {
     #[must_use]
     pub const fn preferences(&self) -> &DisplayPreferences {
         &self.preferences
+    }
+
+    /// Get the current view state.
+    #[must_use]
+    pub const fn view(&self) -> &ViewState {
+        &self.view
+    }
+
+    fn fleet_screen_mut(&mut self) -> Option<&mut FleetOverviewScreen> {
+        self.shell
+            .registry
+            .get_mut(&self.fleet_screen_id)
+            .and_then(|screen| screen.as_any_mut().downcast_mut::<FleetOverviewScreen>())
+    }
+
+    fn sync_fleet_screen_state(&mut self) {
+        let state_snapshot = self.state.clone();
+        let view_snapshot = self.view.clone();
+        if let Some(screen) = self.fleet_screen_mut() {
+            screen.update_state(&state_snapshot, &view_snapshot);
+        } else {
+            tracing::warn!(
+                target: "frankensearch.ops",
+                screen_id = %self.fleet_screen_id,
+                "fleet screen missing or wrong type; skipping screen state refresh"
+            );
+        }
     }
 }
 
@@ -255,12 +421,22 @@ mod tests {
         assert!(actions.iter().any(|a| a.id == "settings.motion"));
         assert!(actions.iter().any(|a| a.id == "settings.focus"));
         assert!(actions.iter().any(|a| a.id == "settings.hints"));
+        assert!(actions.iter().any(|a| a.id == "debug.self_check"));
     }
 
     #[test]
     fn fleet_screen_accessible() {
         let app = OpsApp::new(Box::new(MockDataSource::sample()));
-        assert_eq!(app.fleet_screen().id(), &ScreenId::new("ops.fleet"));
+        let fleet = app.fleet_screen().expect("fleet screen should exist");
+        assert_eq!(fleet.id(), &ScreenId::new("ops.fleet"));
+    }
+
+    #[test]
+    fn refresh_updates_registered_fleet_screen_state() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        let fleet = app.fleet_screen().expect("fleet screen should exist");
+        assert_eq!(fleet.instance_count(), 3);
     }
 
     #[test]
@@ -332,6 +508,26 @@ mod tests {
         assert!(!app.state.has_data());
         app.dispatch_palette_action("debug.refresh");
         assert!(app.state.has_data());
+        assert_eq!(
+            app.shell.status_line.right,
+            app.state.control_plane_health().badge()
+        );
+    }
+
+    #[test]
+    fn dispatch_self_check_opens_overlay() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        app.refresh_data();
+        app.dispatch_palette_action("debug.self_check");
+        let overlay = app.shell.overlays.top().expect("overlay should be visible");
+        assert_eq!(overlay.kind, OverlayKind::Alert);
+        assert_eq!(overlay.title, "Control Plane Self-Check");
+        assert!(
+            overlay
+                .body
+                .as_deref()
+                .is_some_and(|body| body.contains("ingestion_lag_events"))
+        );
     }
 
     #[test]
@@ -340,5 +536,58 @@ mod tests {
         let prefs = app.preferences();
         assert_eq!(prefs.contrast, ContrastMode::Normal);
         assert!(prefs.show_shortcut_hints);
+    }
+
+    #[test]
+    fn view_state_default() {
+        let app = OpsApp::new(Box::new(MockDataSource::sample()));
+        assert_eq!(app.view().preset, crate::presets::ViewPreset::FleetTriage);
+        assert_eq!(app.view().density, crate::presets::Density::Compact);
+    }
+
+    #[test]
+    fn dispatch_cycle_density() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        assert_eq!(app.view.density, crate::presets::Density::Compact);
+        app.dispatch_palette_action("view.density");
+        assert_eq!(app.view.density, crate::presets::Density::Normal);
+        app.dispatch_palette_action("view.density");
+        assert_eq!(app.view.density, crate::presets::Density::Expanded);
+    }
+
+    #[test]
+    fn dispatch_incident_mode_sets_high_contrast() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        assert_eq!(app.preferences.contrast, ContrastMode::Normal);
+        app.dispatch_palette_action("view.incident_mode");
+        assert_eq!(app.view.preset, crate::presets::ViewPreset::IncidentMode);
+        assert_eq!(app.preferences.contrast, ContrastMode::High);
+    }
+
+    #[test]
+    fn dispatch_low_noise_hides_healthy() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        assert!(!app.view.hide_healthy);
+        app.dispatch_palette_action("view.low_noise");
+        assert!(app.view.hide_healthy);
+    }
+
+    #[test]
+    fn dispatch_toggle_hide_healthy() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
+        assert!(!app.view.hide_healthy);
+        app.dispatch_palette_action("view.hide_healthy");
+        assert!(app.view.hide_healthy);
+        app.dispatch_palette_action("view.hide_healthy");
+        assert!(!app.view.hide_healthy);
+    }
+
+    #[test]
+    fn palette_actions_include_view_presets() {
+        let actions = OpsApp::palette_actions();
+        assert!(actions.iter().any(|a| a.id == "view.density"));
+        assert!(actions.iter().any(|a| a.id == "view.fleet_triage"));
+        assert!(actions.iter().any(|a| a.id == "view.incident_mode"));
+        assert!(actions.iter().any(|a| a.id == "view.low_noise"));
     }
 }

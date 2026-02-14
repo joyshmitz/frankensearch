@@ -4,11 +4,11 @@
 //! The shell manages the overlay stack; this module provides the visual
 //! presentation for each overlay kind.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
-use ratatui::Frame;
 
 use frankensearch_tui::overlay::{OverlayKind, OverlayRequest};
 use frankensearch_tui::palette::{CommandPalette, PaletteState};
@@ -51,19 +51,58 @@ pub struct HelpEntry {
 #[must_use]
 pub fn default_help_entries() -> Vec<HelpEntry> {
     vec![
-        HelpEntry { key: "?  / F1", description: "Toggle help" },
-        HelpEntry { key: "q  / Ctrl+C", description: "Quit" },
-        HelpEntry { key: "Ctrl+P / :", description: "Command palette" },
-        HelpEntry { key: "Tab", description: "Next screen" },
-        HelpEntry { key: "Shift+Tab", description: "Previous screen" },
-        HelpEntry { key: "j / Down", description: "Move down" },
-        HelpEntry { key: "k / Up", description: "Move up" },
-        HelpEntry { key: "h / Left", description: "Move left" },
-        HelpEntry { key: "l / Right", description: "Move right" },
-        HelpEntry { key: "Enter", description: "Confirm / select" },
-        HelpEntry { key: "Esc", description: "Dismiss overlay" },
-        HelpEntry { key: "PgUp / PgDn", description: "Page navigation" },
-        HelpEntry { key: "Ctrl+Y", description: "Copy to clipboard" },
+        HelpEntry {
+            key: "?  / F1",
+            description: "Toggle help",
+        },
+        HelpEntry {
+            key: "q  / Ctrl+C",
+            description: "Quit",
+        },
+        HelpEntry {
+            key: "Ctrl+P / :",
+            description: "Command palette",
+        },
+        HelpEntry {
+            key: "Tab",
+            description: "Next screen",
+        },
+        HelpEntry {
+            key: "Shift+Tab",
+            description: "Previous screen",
+        },
+        HelpEntry {
+            key: "j / Down",
+            description: "Move down",
+        },
+        HelpEntry {
+            key: "k / Up",
+            description: "Move up",
+        },
+        HelpEntry {
+            key: "h / Left",
+            description: "Move left",
+        },
+        HelpEntry {
+            key: "l / Right",
+            description: "Move right",
+        },
+        HelpEntry {
+            key: "Enter",
+            description: "Confirm / select",
+        },
+        HelpEntry {
+            key: "Esc",
+            description: "Dismiss overlay",
+        },
+        HelpEntry {
+            key: "PgUp / PgDn",
+            description: "Page navigation",
+        },
+        HelpEntry {
+            key: "Ctrl+Y",
+            description: "Copy to clipboard",
+        },
     ]
 }
 
@@ -103,19 +142,14 @@ pub fn render_alert_overlay(frame: &mut Frame<'_>, area: Rect, request: &Overlay
     let popup = centered_rect(50, 30, area);
     frame.render_widget(Clear, popup);
 
-    let body_text = request
-        .body
-        .as_deref()
-        .unwrap_or("(no details)");
+    let body_text = request.body.as_deref().unwrap_or("(no details)");
 
-    let content = Paragraph::new(body_text)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", request.title))
-                .title_style(Style::default().add_modifier(Modifier::BOLD)),
-        );
+    let content = Paragraph::new(body_text).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", request.title))
+            .title_style(Style::default().add_modifier(Modifier::BOLD)),
+    );
 
     frame.render_widget(content, popup);
 }
@@ -152,14 +186,12 @@ pub fn render_confirm_overlay(frame: &mut Frame<'_>, area: Rect, request: &Overl
         )));
     }
 
-    let content = Paragraph::new(lines)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" {} ", request.title))
-                .title_style(Style::default().add_modifier(Modifier::BOLD)),
-        );
+    let content = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", request.title))
+            .title_style(Style::default().add_modifier(Modifier::BOLD)),
+    );
 
     frame.render_widget(content, popup);
 }
@@ -245,9 +277,8 @@ pub fn render_palette_overlay(frame: &mut Frame<'_>, area: Rect, palette: &Comma
 pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, request: &OverlayRequest) {
     match &request.kind {
         OverlayKind::Help => render_help_overlay(frame, area),
-        OverlayKind::Alert => render_alert_overlay(frame, area, request),
         OverlayKind::Confirm => render_confirm_overlay(frame, area, request),
-        OverlayKind::Custom(_) => render_alert_overlay(frame, area, request),
+        OverlayKind::Alert | OverlayKind::Custom(_) => render_alert_overlay(frame, area, request),
     }
 }
 
@@ -259,10 +290,16 @@ mod tests {
     fn centered_rect_within_bounds() {
         let area = Rect::new(0, 0, 100, 50);
         let popup = centered_rect(60, 40, area);
-        assert!(popup.x >= 0);
-        assert!(popup.y >= 0);
-        assert!(popup.x + popup.width <= area.width);
-        assert!(popup.y + popup.height <= area.height);
+        assert!(popup.x >= area.x);
+        assert!(popup.y >= area.y);
+        assert!(
+            u32::from(popup.x) + u32::from(popup.width)
+                <= u32::from(area.x) + u32::from(area.width)
+        );
+        assert!(
+            u32::from(popup.y) + u32::from(popup.height)
+                <= u32::from(area.y) + u32::from(area.height)
+        );
     }
 
     #[test]
@@ -291,8 +328,8 @@ mod tests {
 
     #[test]
     fn alert_overlay_request() {
-        let request = OverlayRequest::new(OverlayKind::Alert, "Test Alert")
-            .with_body("Something happened");
+        let request =
+            OverlayRequest::new(OverlayKind::Alert, "Test Alert").with_body("Something happened");
         assert_eq!(request.title, "Test Alert");
         assert_eq!(request.body.as_deref(), Some("Something happened"));
     }

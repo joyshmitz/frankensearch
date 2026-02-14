@@ -29,6 +29,7 @@ pub mod category;
 pub mod data_source;
 pub mod overlays;
 pub mod preferences;
+pub mod presets;
 pub mod screens;
 pub mod state;
 
@@ -39,4 +40,5 @@ pub use category::ScreenCategory;
 pub use data_source::{DataSource, MockDataSource};
 pub use overlays::{render_overlay, render_palette_overlay};
 pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
-pub use state::AppState;
+pub use presets::{Density, ViewPreset, ViewState};
+pub use state::{AppState, ControlPlaneHealth, ControlPlaneMetrics};

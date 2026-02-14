@@ -3,22 +3,26 @@
 //! Displays instance list with health status, document counts, pending jobs,
 //! and resource utilization at a glance.
 
+use std::any::Any;
+
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table};
-use ratatui::Frame;
 
+use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
 use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
-use frankensearch_tui::Screen;
 
+use crate::presets::ViewState;
 use crate::state::AppState;
 
 /// Fleet overview screen showing all discovered instances.
 pub struct FleetOverviewScreen {
     id: ScreenId,
     state: AppState,
+    view: ViewState,
     selected_row: usize,
 }
 
@@ -29,21 +33,55 @@ impl FleetOverviewScreen {
         Self {
             id: ScreenId::new("ops.fleet"),
             state: AppState::new(),
+            view: ViewState::default(),
             selected_row: 0,
         }
     }
 
     /// Update the screen's data from shared state.
-    pub fn update_state(&mut self, state: &AppState) {
+    pub fn update_state(&mut self, state: &AppState, view: &ViewState) {
         self.state = state.clone();
+        self.view = view.clone();
+        let visible = self.visible_instances().len();
+        if visible == 0 {
+            self.selected_row = 0;
+        } else if self.selected_row >= visible {
+            self.selected_row = visible - 1;
+        }
+    }
+
+    fn visible_instances(&self) -> Vec<&crate::state::InstanceInfo> {
+        let fleet = self.state.fleet();
+        let mut visible: Vec<_> = fleet
+            .instances
+            .iter()
+            .filter(|inst| !self.view.hide_healthy || !inst.healthy)
+            .filter(|inst| {
+                self.view
+                    .project_filter
+                    .as_deref()
+                    .is_none_or(|project| inst.project.eq_ignore_ascii_case(project))
+            })
+            .collect();
+
+        if self.view.unhealthy_first {
+            visible.sort_by(|left, right| {
+                (left.healthy, left.project.as_str(), left.id.as_str()).cmp(&(
+                    right.healthy,
+                    right.project.as_str(),
+                    right.id.as_str(),
+                ))
+            });
+        }
+
+        visible
     }
 
     /// Build the instance table rows.
     fn build_rows(&self) -> Vec<Row<'_>> {
         let fleet = self.state.fleet();
-        fleet
-            .instances
-            .iter()
+        self.visible_instances()
+            .into_iter()
             .enumerate()
             .map(|(i, inst)| {
                 let health = if inst.healthy { "OK" } else { "WARN" };
@@ -60,17 +98,36 @@ impl FleetOverviewScreen {
                     Style::default()
                 };
 
-                Row::new(vec![
-                    health.to_string(),
-                    inst.project.clone(),
-                    inst.id.clone(),
-                    format!("{}", inst.doc_count),
-                    format!("{}", inst.pending_jobs),
-                    resources,
-                ])
-                .style(style)
+                let cells = if self.view.density.show_inline_metrics() {
+                    vec![
+                        health.to_string(),
+                        inst.project.clone(),
+                        inst.id.clone(),
+                        format!("{}", inst.doc_count),
+                        format!("{}", inst.pending_jobs),
+                        resources,
+                    ]
+                } else {
+                    vec![
+                        health.to_string(),
+                        inst.project.clone(),
+                        inst.id.clone(),
+                        format!("{}", inst.doc_count),
+                        format!("{}", inst.pending_jobs),
+                    ]
+                };
+
+                Row::new(cells)
+                    .style(style)
+                    .height(self.view.density.row_height())
             })
             .collect()
+    }
+
+    /// Number of instances currently visible to this screen.
+    #[must_use]
+    pub fn instance_count(&self) -> usize {
+        self.visible_instances().len()
     }
 }
 
@@ -99,12 +156,15 @@ impl Screen for FleetOverviewScreen {
 
         // Header with summary stats.
         let fleet = self.state.fleet();
+        let visible = self.visible_instances();
+        let visible_count = visible.len();
+        let visible_healthy = visible.iter().filter(|inst| inst.healthy).count();
+        let visible_docs: u64 = visible.iter().map(|inst| inst.doc_count).sum();
+        let visible_pending: u64 = visible.iter().map(|inst| inst.pending_jobs).sum();
         let summary = format!(
-            " {} instances | {} healthy | {} docs | {} pending",
+            " {visible_count}/{} instances | {visible_healthy} healthy | {visible_docs} docs | {visible_pending} pending | {} density",
             fleet.instance_count(),
-            fleet.healthy_count(),
-            fleet.total_docs(),
-            fleet.total_pending_jobs(),
+            self.view.density,
         );
         let header = Paragraph::new(Line::from(vec![
             Span::styled("Fleet: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -118,29 +178,46 @@ impl Screen for FleetOverviewScreen {
         frame.render_widget(header, chunks[0]);
 
         // Instance table.
-        let header_row = Row::new(vec![
-            "Health", "Project", "Instance", "Docs", "Pending", "CPU",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+        let show_metrics = self.view.density.show_inline_metrics();
+        let header_row = if show_metrics {
+            Row::new(vec![
+                "Health", "Project", "Instance", "Docs", "Pending", "CPU",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            Row::new(vec!["Health", "Project", "Instance", "Docs", "Pending"])
+                .style(Style::default().add_modifier(Modifier::BOLD))
+        };
 
         let rows = self.build_rows();
-        let table = Table::new(
-            rows,
-            [
-                Constraint::Length(6),
-                Constraint::Length(12),
-                Constraint::Length(15),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(8),
-            ],
-        )
-        .header(header_row)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Instances "),
-        );
+        let table = if show_metrics {
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(6),
+                    Constraint::Length(12),
+                    Constraint::Length(15),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Length(8),
+                ],
+            )
+            .header(header_row)
+            .block(Block::default().borders(Borders::ALL).title(" Instances "))
+        } else {
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(6),
+                    Constraint::Length(14),
+                    Constraint::Length(16),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                ],
+            )
+            .header(header_row)
+            .block(Block::default().borders(Borders::ALL).title(" Instances "))
+        };
 
         frame.render_widget(table, chunks[1]);
     }
@@ -155,7 +232,7 @@ impl Screen for FleetOverviewScreen {
                     return ScreenAction::Consumed;
                 }
                 crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                    let count = self.state.fleet().instance_count();
+                    let count = self.instance_count();
                     if count > 0 && self.selected_row < count - 1 {
                         self.selected_row += 1;
                     }
@@ -170,11 +247,20 @@ impl Screen for FleetOverviewScreen {
     fn semantic_role(&self) -> &'static str {
         "grid"
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::presets::ViewState;
     use crate::state::FleetSnapshot;
 
     #[test]
@@ -218,7 +304,7 @@ mod tests {
             resources: std::collections::HashMap::new(),
             search_metrics: std::collections::HashMap::new(),
         });
-        screen.update_state(&state);
+        screen.update_state(&state, &ViewState::default());
         let rows = screen.build_rows();
         assert_eq!(rows.len(), 2);
     }
@@ -249,7 +335,7 @@ mod tests {
             resources: std::collections::HashMap::new(),
             search_metrics: std::collections::HashMap::new(),
         });
-        screen.update_state(&state);
+        screen.update_state(&state, &ViewState::default());
 
         assert_eq!(screen.selected_row, 0);
 
@@ -282,5 +368,41 @@ mod tests {
         let result = screen.handle_input(&event, &ctx);
         assert_eq!(result, ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn hide_healthy_filter_applies_to_rows() {
+        let mut screen = FleetOverviewScreen::new();
+        let mut state = AppState::new();
+        state.update_fleet(FleetSnapshot {
+            instances: vec![
+                crate::state::InstanceInfo {
+                    id: "healthy".to_string(),
+                    project: "p".to_string(),
+                    pid: None,
+                    healthy: true,
+                    doc_count: 1,
+                    pending_jobs: 0,
+                },
+                crate::state::InstanceInfo {
+                    id: "warn".to_string(),
+                    project: "p".to_string(),
+                    pid: None,
+                    healthy: false,
+                    doc_count: 2,
+                    pending_jobs: 1,
+                },
+            ],
+            resources: std::collections::HashMap::new(),
+            search_metrics: std::collections::HashMap::new(),
+        });
+        let view = ViewState {
+            hide_healthy: true,
+            ..ViewState::default()
+        };
+        screen.update_state(&state, &view);
+
+        let rows = screen.build_rows();
+        assert_eq!(rows.len(), 1);
     }
 }

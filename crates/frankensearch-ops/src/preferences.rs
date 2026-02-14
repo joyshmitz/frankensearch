@@ -147,22 +147,22 @@ impl DisplayPreferences {
     }
 
     /// Toggle contrast mode.
-    pub fn toggle_contrast(&mut self) {
+    pub const fn toggle_contrast(&mut self) {
         self.contrast = self.contrast.toggle();
     }
 
     /// Toggle motion preference.
-    pub fn toggle_motion(&mut self) {
+    pub const fn toggle_motion(&mut self) {
         self.motion = self.motion.toggle();
     }
 
     /// Toggle focus visibility.
-    pub fn toggle_focus_visibility(&mut self) {
+    pub const fn toggle_focus_visibility(&mut self) {
         self.focus_visibility = self.focus_visibility.toggle();
     }
 
     /// Toggle shortcut hints.
-    pub fn toggle_shortcut_hints(&mut self) {
+    pub const fn toggle_shortcut_hints(&mut self) {
         self.show_shortcut_hints = !self.show_shortcut_hints;
     }
 }

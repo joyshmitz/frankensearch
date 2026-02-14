@@ -5,7 +5,9 @@
 //! `FrankenSQLite` (wired in via bd-2yu.4.3), while [`MockDataSource`] provides
 //! test data for development and testing.
 
-use crate::state::{FleetSnapshot, InstanceInfo, ResourceMetrics, SearchMetrics};
+use crate::state::{
+    ControlPlaneMetrics, FleetSnapshot, InstanceInfo, ResourceMetrics, SearchMetrics,
+};
 
 // ─── Time Window ─────────────────────────────────────────────────────────────
 
@@ -93,6 +95,9 @@ pub trait DataSource: Send {
 
     /// Get resource metrics for a given instance.
     fn resource_metrics(&self, instance_id: &str) -> Option<ResourceMetrics>;
+
+    /// Get control-plane self-monitoring metrics.
+    fn control_plane_metrics(&self) -> ControlPlaneMetrics;
 }
 
 // ─── Mock Data Source ────────────────────────────────────────────────────────
@@ -103,6 +108,7 @@ pub trait DataSource: Send {
 /// independently of the real `FrankenSQLite` backend.
 pub struct MockDataSource {
     snapshot: FleetSnapshot,
+    control_plane: ControlPlaneMetrics,
 }
 
 impl MockDataSource {
@@ -183,7 +189,22 @@ impl MockDataSource {
             },
         );
 
-        Self { snapshot }
+        let control_plane = ControlPlaneMetrics {
+            ingestion_lag_events: 1_549,
+            storage_bytes: 384 * 1024 * 1024,
+            storage_limit_bytes: 512 * 1024 * 1024,
+            frame_time_ms: 19.8,
+            discovery_latency_ms: 320,
+            event_throughput_eps: 145.2,
+            rss_bytes: 620 * 1024 * 1024,
+            rss_limit_bytes: 1024 * 1024 * 1024,
+            dead_letter_events: 2,
+        };
+
+        Self {
+            snapshot,
+            control_plane,
+        }
     }
 
     /// Create an empty mock (no instances).
@@ -191,6 +212,7 @@ impl MockDataSource {
     pub fn empty() -> Self {
         Self {
             snapshot: FleetSnapshot::default(),
+            control_plane: ControlPlaneMetrics::default(),
         }
     }
 }
@@ -206,6 +228,10 @@ impl DataSource for MockDataSource {
 
     fn resource_metrics(&self, instance_id: &str) -> Option<ResourceMetrics> {
         self.snapshot.resources.get(instance_id).cloned()
+    }
+
+    fn control_plane_metrics(&self) -> ControlPlaneMetrics {
+        self.control_plane.clone()
     }
 }
 
@@ -246,8 +272,19 @@ mod tests {
     #[test]
     fn mock_unknown_instance() {
         let mock = MockDataSource::sample();
-        assert!(mock.search_metrics("unknown", TimeWindow::OneMinute).is_none());
+        assert!(
+            mock.search_metrics("unknown", TimeWindow::OneMinute)
+                .is_none()
+        );
         assert!(mock.resource_metrics("unknown").is_none());
+    }
+
+    #[test]
+    fn mock_control_plane_metrics_present() {
+        let mock = MockDataSource::sample();
+        let metrics = mock.control_plane_metrics();
+        assert!(metrics.ingestion_lag_events > 0);
+        assert!(metrics.storage_limit_bytes > metrics.storage_bytes / 2);
     }
 
     #[test]
