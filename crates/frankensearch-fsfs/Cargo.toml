@@ -1,0 +1,30 @@
+[package]
+name = "frankensearch-fsfs"
+version = "0.1.0"
+description = "Scaffold crate for frankensearch-fast-search (fsfs) binary surfaces"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fsfs"
+path = "src/main.rs"
+
+[dependencies]
+frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+asupersync = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

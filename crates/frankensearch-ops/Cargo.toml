@@ -1,0 +1,29 @@
+[package]
+name = "frankensearch-ops"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Operations control-plane TUI for frankensearch fleet monitoring"
+
+[dependencies]
+frankensearch-core = { workspace = true }
+frankensearch-tui = { workspace = true }
+
+# Terminal UI rendering
+ratatui = "0.30"
+crossterm = "0.29"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Structured logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

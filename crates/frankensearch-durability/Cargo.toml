@@ -1,0 +1,29 @@
+[package]
+name = "frankensearch-durability"
+version = "0.1.0"
+description = "RaptorQ durability primitives for frankensearch indices"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+frankensearch-core = { workspace = true }
+fsqlite-core = { path = "/dp/frankensqlite/crates/fsqlite-core" }
+fsqlite-error = { path = "/dp/frankensqlite/crates/fsqlite-error" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tantivy = { workspace = true }
+tracing = { workspace = true }
+crc32fast = { workspace = true }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "durability_bench"
+harness = false
+
+[lints]
+workspace = true
