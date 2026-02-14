@@ -1,0 +1,27 @@
+{
+  "schema_version": "fsfs-benchmark-golden-v1",
+  "dataset_version": "2026-02-14",
+  "profile": "medium",
+  "corpus": {
+    "files": 50000,
+    "tokens": 17500000,
+    "lines": 3100000,
+    "bytes": 220000000
+  },
+  "workload": {
+    "crawl_events": 55000,
+    "index_documents": 50000,
+    "query_cases": 1200,
+    "tui_interactions": 1400
+  },
+  "baseline_p95_ms": {
+    "crawl": 410,
+    "index": 980,
+    "query": 58,
+    "tui_frame": 17
+  },
+  "notes": [
+    "Large machine-wide corpus profile",
+    "Nightly benchmark comparator"
+  ]
+}

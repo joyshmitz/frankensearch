@@ -1,0 +1,27 @@
+{
+  "schema_version": "fsfs-benchmark-golden-v1",
+  "dataset_version": "2026-02-14",
+  "profile": "small",
+  "corpus": {
+    "files": 5000,
+    "tokens": 1450000,
+    "lines": 230000,
+    "bytes": 18000000
+  },
+  "workload": {
+    "crawl_events": 5200,
+    "index_documents": 5000,
+    "query_cases": 420,
+    "tui_interactions": 640
+  },
+  "baseline_p95_ms": {
+    "crawl": 75,
+    "index": 135,
+    "query": 26,
+    "tui_frame": 14
+  },
+  "notes": [
+    "Mid-size mono-repo profile",
+    "Primary CI comparator for perf drift"
+  ]
+}
