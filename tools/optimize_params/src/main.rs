@@ -9,9 +9,10 @@
 //! This tests fusion parameter sensitivity rather than embedding quality.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use fastcma::{CmaesState, CovarianceModeKind};
@@ -19,6 +20,17 @@ use frankensearch_core::metrics_eval::ndcg_at_k;
 use frankensearch_core::{ScoreSource, ScoredResult, TwoTierConfig, VectorHit};
 use frankensearch_fusion::{RrfConfig, rrf_fuse};
 use serde::{Deserialize, Serialize};
+
+// ─── Type Aliases ────────────────────────────────────────────────────────────
+
+/// Per-generation optimization history entry: `(evaluations, params, best_ndcg)`.
+type GenerationHistory = Vec<(usize, Vec<f64>, f64)>;
+
+/// Result of a single fold optimization: `(best_params, best_ndcg, history, total_evaluations)`.
+type FoldResult = (Vec<f64>, f64, GenerationHistory, usize);
+
+/// Result of cross-validation: `(fold_params, train_ndcgs, val_ndcgs, histories, evaluation_counts)`.
+type CrossValidationResult = (Vec<Vec<f64>>, Vec<f64>, Vec<f64>, Vec<GenerationHistory>, Vec<usize>);
 
 // ─── Fixture Types ──────────────────────────────────────────────────────────
 
@@ -150,6 +162,32 @@ fn tfidf_cosine(
 const LOWER_BOUNDS: [f64; 6] = [0.1, 10.0, 1.5, 200.0, 30.0, 10.0];
 const UPPER_BOUNDS: [f64; 6] = [0.95, 150.0, 6.0, 1500.0, 300.0, 100.0];
 
+const DEFAULT_MAX_GENERATIONS: usize = 200;
+const DEFAULT_MAX_EVALUATIONS: usize = 2000;
+const DEFAULT_SEED: u64 = 42;
+const DEFAULT_FOLDS: usize = 5;
+
+#[derive(Debug, Clone)]
+struct RunConfig {
+    max_generations: usize,
+    max_evaluations: usize,
+    seed: u64,
+    folds: usize,
+    output_dir: Option<PathBuf>,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            max_generations: DEFAULT_MAX_GENERATIONS,
+            max_evaluations: DEFAULT_MAX_EVALUATIONS,
+            seed: DEFAULT_SEED,
+            folds: DEFAULT_FOLDS,
+            output_dir: None,
+        }
+    }
+}
+
 /// Clamp parameter vector to bounds.
 fn clamp_params(x: &[f64]) -> [f64; 6] {
     let mut out = [0.0; 6];
@@ -253,6 +291,16 @@ impl EvalContext {
         clippy::cast_sign_loss
     )]
     fn evaluate(&self, x: &[f64], query_indices: &[usize]) -> f64 {
+        // Degenerate parameter vectors should map to a zero-quality score so
+        // tests and smoke validations can assert fail-safe objective behavior.
+        if x.len() >= 2 {
+            let blend = x[0];
+            let rrf_k = x[1];
+            if !blend.is_finite() || !rrf_k.is_finite() || blend <= 0.0 || rrf_k <= 0.0 {
+                return 0.0;
+            }
+        }
+
         let config = params_to_config(x);
         let rrf_config = RrfConfig { k: config.rrf_k };
         let candidate_count = 10_usize
@@ -343,7 +391,7 @@ impl EvalContext {
 
 // ─── Optimization Log ───────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct LogEntry {
     generation: usize,
     evaluations: usize,
@@ -399,11 +447,18 @@ fn k_fold_split(n: usize, k: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
 
 /// Run CMA-ES optimization on a given set of train queries.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn optimize_fold(ctx: &EvalContext, train_indices: &[usize], fold_id: usize) -> (Vec<f64>, f64) {
+fn optimize_fold(
+    ctx: &EvalContext,
+    train_indices: &[usize],
+    fold_id: usize,
+    run_config: &RunConfig,
+) -> FoldResult {
     let best_params: Mutex<(Vec<f64>, f64)> =
         Mutex::new((vec![0.7, 60.0, 3.0, 500.0, 100.0, 30.0], f64::INFINITY));
 
     let train_indices_owned: Vec<usize> = train_indices.to_vec();
+    let mut history: GenerationHistory = Vec::new();
+    let mut evaluations = 0_usize;
 
     // Use ask/tell API directly for full control
     let x0 = vec![0.7, 60.0, 3.0, 500.0, 100.0, 30.0];
@@ -412,13 +467,13 @@ fn optimize_fold(ctx: &EvalContext, train_indices: &[usize], fold_id: usize) -> 
         0.3,
         None,        // auto popsize
         Some(-0.95), // target: nDCG >= 0.95
-        Some(2000),  // max evaluations
+        Some(run_config.max_evaluations),
         CovarianceModeKind::Full,
-        42 + fold_id as u64,
+        run_config.seed + fold_id as u64,
     );
 
     let mut generation = 0;
-    while !es.has_terminated() {
+    while !es.has_terminated() && generation < run_config.max_generations {
         let candidates = es.ask();
         let fitvals: Vec<f64> = candidates
             .iter()
@@ -436,21 +491,24 @@ fn optimize_fold(ctx: &EvalContext, train_indices: &[usize], fold_id: usize) -> 
                 fitness
             })
             .collect();
+        evaluations = evaluations.saturating_add(fitvals.len());
         es.tell(candidates, fitvals);
         generation += 1;
 
+        let best = best_params.lock().unwrap();
+        history.push((evaluations, best.0.clone(), -best.1));
+
         if generation % 20 == 0 {
-            let best = best_params.lock().unwrap();
             eprintln!(
                 "  fold {fold_id}: gen {generation}, best nDCG = {:.4}",
                 -best.1
             );
-            drop(best);
         }
+        drop(best);
     }
 
     let best = best_params.lock().unwrap();
-    (best.0.clone(), -best.1)
+    (best.0.clone(), -best.1, history, evaluations)
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -483,11 +541,17 @@ fn load_fixtures(workspace_root: &std::path::Path) -> (Corpus, Vec<QueryEntry>) 
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn run_cross_validation(ctx: &EvalContext, n_folds: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
+fn run_cross_validation(
+    ctx: &EvalContext,
+    run_config: &RunConfig,
+) -> CrossValidationResult {
+    let n_folds = run_config.folds.min(ctx.queries.len()).max(1);
     let folds = k_fold_split(ctx.queries.len(), n_folds);
     let mut fold_params: Vec<Vec<f64>> = Vec::with_capacity(n_folds);
     let mut fold_train_ndcg: Vec<f64> = Vec::with_capacity(n_folds);
     let mut fold_val_ndcg: Vec<f64> = Vec::with_capacity(n_folds);
+    let mut fold_histories: Vec<GenerationHistory> = Vec::with_capacity(n_folds);
+    let mut fold_evaluations: Vec<usize> = Vec::with_capacity(n_folds);
 
     eprintln!("\nRunning {n_folds}-fold cross-validation...");
     for (fold_idx, (train_indices, val_indices)) in folds.iter().enumerate() {
@@ -498,7 +562,8 @@ fn run_cross_validation(ctx: &EvalContext, n_folds: usize) -> (Vec<Vec<f64>>, Ve
             val_indices.len()
         );
 
-        let (best_x, train_ndcg) = optimize_fold(ctx, train_indices, fold_idx);
+        let (best_x, train_ndcg, history, evaluations) =
+            optimize_fold(ctx, train_indices, fold_idx, run_config);
 
         // Evaluate on validation set
         let val_ndcg = ctx.evaluate(&best_x, val_indices);
@@ -521,9 +586,17 @@ fn run_cross_validation(ctx: &EvalContext, n_folds: usize) -> (Vec<Vec<f64>>, Ve
         fold_params.push(best_x);
         fold_train_ndcg.push(train_ndcg);
         fold_val_ndcg.push(val_ndcg);
+        fold_histories.push(history);
+        fold_evaluations.push(evaluations);
     }
 
-    (fold_params, fold_train_ndcg, fold_val_ndcg)
+    (
+        fold_params,
+        fold_train_ndcg,
+        fold_val_ndcg,
+        fold_histories,
+        fold_evaluations,
+    )
 }
 
 fn print_results(
@@ -574,27 +647,29 @@ fn print_results(
 
 #[allow(clippy::too_many_arguments)]
 fn write_outputs(
-    workspace_root: &std::path::Path,
+    output_dir: &Path,
     baseline_ndcg: f64,
     final_ndcg: f64,
     cv_variance: f64,
     final_snapshot: &ParamSnapshot,
     default_params: &[f64],
-    fold_params: &[Vec<f64>],
-    fold_train_ndcg: &[f64],
+    fold_histories: &[Vec<(usize, Vec<f64>, f64)>],
+    fold_evaluations: &[usize],
     n_folds: usize,
+    run_config: &RunConfig,
 ) {
     // Write optimized_params.toml
-    let data_dir = workspace_root.join("data");
-    fs::create_dir_all(&data_dir).expect("failed to create data directory");
+    fs::create_dir_all(output_dir).expect("failed to create output directory");
 
-    let toml_path = data_dir.join("optimized_params.toml");
+    let toml_path = output_dir.join("optimized_params.toml");
     let toml_content = format!(
         r"# Optimized TwoTierConfig parameters
-# Generated by optimize-params via CMA-ES with 5-fold CV
+# Generated by optimize-params via CMA-ES with {n_folds}-fold CV
 # Baseline nDCG@10: {baseline_ndcg:.4}
 # Optimized nDCG@10: {final_ndcg:.4}
 # CV variance: {cv_variance:.6}
+# Seed: {seed}
+# Max generations/fold: {max_generations}
 
 quality_weight = {quality_weight}
 rrf_k = {rrf_k}
@@ -615,58 +690,131 @@ mrl_rescore_top_k = {mrl_rescore_top_k}
         quality_timeout_ms = final_snapshot.quality_timeout_ms,
         hnsw_ef_search = final_snapshot.hnsw_ef_search,
         mrl_rescore_top_k = final_snapshot.mrl_rescore_top_k,
+        seed = run_config.seed,
+        max_generations = run_config.max_generations,
     );
     fs::write(&toml_path, &toml_content)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", toml_path.display()));
     eprintln!("\nWrote: {}", toml_path.display());
 
     // Write optimization_log.jsonl
-    let log_path = data_dir.join("optimization_log.jsonl");
+    let log_path = output_dir.join("optimization_log.jsonl");
     let mut log_file = fs::File::create(&log_path)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", log_path.display()));
+    let mut running_best_fitness = -baseline_ndcg;
+    let mut running_best_params = ParamSnapshot::from_raw(default_params);
+    let mut generation = 0_usize;
+    let mut evaluation_offset = 0_usize;
 
-    // Write baseline entry
-    let baseline_entry = LogEntry {
-        generation: 0,
-        evaluations: 0,
-        best_fitness: -baseline_ndcg,
-        best_ndcg: baseline_ndcg,
-        params: ParamSnapshot::from_raw(default_params),
-    };
-    writeln!(
-        log_file,
-        "{}",
-        serde_json::to_string(&baseline_entry).unwrap()
-    )
-    .unwrap();
-
-    // Write per-fold entries
-    for (fold_idx, params) in fold_params.iter().enumerate() {
-        let entry = LogEntry {
-            generation: fold_idx + 1,
-            evaluations: 2000, // approximate per fold
-            best_fitness: -fold_train_ndcg[fold_idx],
-            best_ndcg: fold_train_ndcg[fold_idx],
-            params: ParamSnapshot::from_raw(params),
-        };
-        writeln!(log_file, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+    for (fold_idx, history) in fold_histories.iter().enumerate() {
+        for (fold_evaluations_so_far, best_params, best_ndcg) in history {
+            generation = generation.saturating_add(1);
+            let fitness = -*best_ndcg;
+            if fitness < running_best_fitness {
+                running_best_fitness = fitness;
+                running_best_params = ParamSnapshot::from_raw(best_params);
+            }
+            let entry = LogEntry {
+                generation,
+                evaluations: evaluation_offset.saturating_add(*fold_evaluations_so_far),
+                best_fitness: running_best_fitness,
+                best_ndcg: -running_best_fitness,
+                params: running_best_params.clone(),
+            };
+            writeln!(log_file, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
+        }
+        evaluation_offset = evaluation_offset
+            .saturating_add(fold_evaluations.get(fold_idx).copied().unwrap_or_default());
     }
-
-    // Write final entry
-    let final_entry = LogEntry {
-        generation: n_folds + 1,
-        evaluations: n_folds * 2000,
-        best_fitness: -final_ndcg,
-        best_ndcg: final_ndcg,
-        params: final_snapshot.clone(),
-    };
-    writeln!(log_file, "{}", serde_json::to_string(&final_entry).unwrap()).unwrap();
 
     eprintln!("Wrote: {}", log_path.display());
 }
 
+fn print_usage() {
+    eprintln!(
+        "Usage: cargo run -p optimize-params -- [--max-generations N] [--max-evaluations N] [--seed N] [--folds N] [--output-dir PATH]"
+    );
+}
+
+fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
+    let mut config = RunConfig::default();
+    let mut index = 0usize;
+
+    while index < args.len() {
+        let raw = &args[index];
+        let (flag, inline_value) = raw
+            .split_once('=')
+            .map_or((raw.as_str(), None), |(f, v)| (f, Some(v.to_owned())));
+        let mut next_value = |name: &str| -> Result<String, String> {
+            if let Some(value) = inline_value.clone() {
+                return Ok(value);
+            }
+            index = index.saturating_add(1);
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| format!("missing value for {name}"))
+        };
+
+        match flag {
+            "--max-generations" => {
+                let value = next_value("--max-generations")?;
+                config.max_generations = value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid --max-generations value".to_owned())?;
+                if config.max_generations == 0 {
+                    return Err("--max-generations must be >= 1".to_owned());
+                }
+            }
+            "--max-evaluations" => {
+                let value = next_value("--max-evaluations")?;
+                config.max_evaluations = value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid --max-evaluations value".to_owned())?;
+                if config.max_evaluations == 0 {
+                    return Err("--max-evaluations must be >= 1".to_owned());
+                }
+            }
+            "--seed" => {
+                let value = next_value("--seed")?;
+                config.seed = value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid --seed value".to_owned())?;
+            }
+            "--folds" => {
+                let value = next_value("--folds")?;
+                config.folds = value
+                    .parse::<usize>()
+                    .map_err(|_| "invalid --folds value".to_owned())?;
+                if config.folds == 0 {
+                    return Err("--folds must be >= 1".to_owned());
+                }
+            }
+            "--output-dir" => {
+                let value = next_value("--output-dir")?;
+                config.output_dir = Some(PathBuf::from(value));
+            }
+            _ => return Err(format!("unknown option: {flag}")),
+        }
+
+        index = index.saturating_add(1);
+    }
+
+    Ok(config)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print_usage();
+        return;
+    }
+    let run_config = parse_run_config(&args).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        print_usage();
+        std::process::exit(2);
+    });
+
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -686,8 +834,9 @@ fn main() {
     eprintln!("Baseline nDCG@10 (default params): {baseline_ndcg:.4}");
 
     // 5-fold cross-validation
-    let n_folds = 5;
-    let (fold_params, fold_train_ndcg, fold_val_ndcg) = run_cross_validation(&ctx, n_folds);
+    let n_folds = run_config.folds.min(ctx.queries.len()).max(1);
+    let (fold_params, _fold_train_ndcg, fold_val_ndcg, fold_histories, fold_evaluations) =
+        run_cross_validation(&ctx, &run_config);
 
     // Compute parameter-wise median across folds
     let final_params = parameter_wise_median(&fold_params);
@@ -710,16 +859,23 @@ fn main() {
         &final_snapshot,
     );
 
+    let default_output_dir = workspace_root.join("data");
+    let output_dir = run_config
+        .output_dir
+        .as_deref()
+        .unwrap_or(default_output_dir.as_path());
+
     write_outputs(
-        &workspace_root,
+        output_dir,
         baseline_ndcg,
         final_ndcg,
         cv_variance,
         &final_snapshot,
         &default_params,
-        &fold_params,
-        &fold_train_ndcg,
+        &fold_histories,
+        &fold_evaluations,
         n_folds,
+        &run_config,
     );
 
     // Regression check
@@ -749,4 +905,183 @@ fn parameter_wise_median(fold_params: &[Vec<f64>]) -> Vec<f64> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_eval_context() -> EvalContext {
+        let docs = vec![
+            Document {
+                doc_id: "doc-a".to_owned(),
+                title: "Rust ownership".to_owned(),
+                content: "Ownership and borrowing in rust".to_owned(),
+            },
+            Document {
+                doc_id: "doc-b".to_owned(),
+                title: "Python threading".to_owned(),
+                content: "GIL and threading model".to_owned(),
+            },
+            Document {
+                doc_id: "doc-c".to_owned(),
+                title: "Distributed systems".to_owned(),
+                content: "Consensus and replication".to_owned(),
+            },
+        ];
+        let queries = vec![
+            QueryEntry {
+                query: "rust ownership".to_owned(),
+                relevant_ids: vec!["doc-a".to_owned()],
+                expected_top_10: Vec::new(),
+            },
+            QueryEntry {
+                query: "distributed consensus".to_owned(),
+                relevant_ids: vec!["doc-c".to_owned()],
+                expected_top_10: Vec::new(),
+            },
+        ];
+        EvalContext::from_fixtures(&docs, &queries)
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn objective_score_is_bounded_between_zero_and_one() {
+        let ctx = sample_eval_context();
+        let query_indices: Vec<usize> = (0..ctx.queries.len()).collect();
+        let score = ctx.evaluate(&[0.7, 60.0, 3.0, 500.0, 100.0, 30.0], &query_indices);
+        assert!((0.0..=1.0).contains(&score), "score out of bounds: {score}");
+    }
+
+    #[test]
+    fn objective_score_returns_zero_for_degenerate_params() {
+        let ctx = sample_eval_context();
+        let query_indices: Vec<usize> = (0..ctx.queries.len()).collect();
+        let score = ctx.evaluate(&[0.0, 0.0, 3.0, 500.0, 100.0, 30.0], &query_indices);
+        assert!(score.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parameter_bounds_are_enforced() {
+        let clamped = clamp_params(&[-1.0, 500.0, 0.1, 9_999.0, -5.0, 1_000.0]);
+        for index in 0..clamped.len() {
+            assert!(
+                (LOWER_BOUNDS[index]..=UPPER_BOUNDS[index]).contains(&clamped[index]),
+                "parameter {index} out of bounds after clamp: {}",
+                clamped[index]
+            );
+        }
+    }
+
+    #[test]
+    fn k_fold_split_assigns_each_query_once_to_validation() {
+        let folds = k_fold_split(25, 5);
+        let mut val_all = Vec::new();
+        for (train, val) in &folds {
+            for idx in val {
+                assert!(!train.contains(idx), "train/val overlap on index {idx}");
+                val_all.push(*idx);
+            }
+        }
+        val_all.sort_unstable();
+        assert_eq!(val_all, (0..25).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn optimized_toml_roundtrip_is_lossless() {
+        let config = TwoTierConfig {
+            quality_weight: 0.82,
+            rrf_k: 73.5,
+            candidate_multiplier: 4,
+            quality_timeout_ms: 777,
+            fast_only: false,
+            explain: false,
+            hnsw_ef_search: 123,
+            hnsw_ef_construction: 222,
+            hnsw_m: 16,
+            hnsw_threshold: 50_000,
+            mrl_search_dims: 64,
+            mrl_rescore_top_k: 45,
+            ..TwoTierConfig::default()
+        };
+        let toml = toml::to_string(&config).expect("serialize config");
+        let decoded: TwoTierConfig = toml::from_str(&toml).expect("deserialize config");
+        assert!((decoded.quality_weight - config.quality_weight).abs() < 1e-12);
+        assert!((decoded.rrf_k - config.rrf_k).abs() < 1e-12);
+        assert_eq!(decoded.candidate_multiplier, config.candidate_multiplier);
+        assert_eq!(decoded.quality_timeout_ms, config.quality_timeout_ms);
+        assert_eq!(decoded.hnsw_ef_search, config.hnsw_ef_search);
+        assert_eq!(decoded.mrl_rescore_top_k, config.mrl_rescore_top_k);
+    }
+
+    #[test]
+    fn optimization_log_jsonl_is_valid_and_monotonic() {
+        let output_dir = unique_temp_dir("optimize-params-jsonl");
+        let run_config = RunConfig {
+            max_generations: 3,
+            max_evaluations: 30,
+            seed: 42,
+            folds: 1,
+            output_dir: Some(output_dir.clone()),
+        };
+        let fold_histories = vec![vec![
+            (3, vec![0.7, 60.0, 3.0, 500.0, 100.0, 30.0], 0.20),
+            (6, vec![0.8, 65.0, 3.0, 500.0, 100.0, 30.0], 0.30),
+            (9, vec![0.9, 70.0, 3.0, 500.0, 100.0, 30.0], 0.40),
+        ]];
+        let fold_evaluations = vec![9];
+        write_outputs(
+            &output_dir,
+            0.10,
+            0.40,
+            0.0,
+            &ParamSnapshot::from_raw(&[0.9, 70.0, 3.0, 500.0, 100.0, 30.0]),
+            &[0.7, 60.0, 3.0, 500.0, 100.0, 30.0],
+            &fold_histories,
+            &fold_evaluations,
+            1,
+            &run_config,
+        );
+
+        let log_path = output_dir.join("optimization_log.jsonl");
+        let raw = std::fs::read_to_string(&log_path).expect("read optimization log");
+        let mut previous_best = f64::INFINITY;
+        for line in raw.lines() {
+            let entry: LogEntry =
+                serde_json::from_str(line).expect("each optimization log line must be JSON");
+            assert!(entry.best_fitness <= previous_best + f64::EPSILON);
+            previous_best = entry.best_fitness;
+        }
+    }
+
+    #[test]
+    fn parse_run_config_supports_equals_and_space_forms() {
+        let parsed = parse_run_config(&[
+            "--max-generations=5".to_owned(),
+            "--max-evaluations".to_owned(),
+            "100".to_owned(),
+            "--seed".to_owned(),
+            "7".to_owned(),
+            "--folds".to_owned(),
+            "2".to_owned(),
+            "--output-dir".to_owned(),
+            "/tmp/opt".to_owned(),
+        ])
+        .expect("parse run config");
+
+        assert_eq!(parsed.max_generations, 5);
+        assert_eq!(parsed.max_evaluations, 100);
+        assert_eq!(parsed.seed, 7);
+        assert_eq!(parsed.folds, 2);
+        assert_eq!(parsed.output_dir, Some(PathBuf::from("/tmp/opt")));
+    }
 }

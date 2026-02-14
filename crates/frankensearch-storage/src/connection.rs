@@ -341,6 +341,34 @@ mod tests {
     }
 
     const CONCURRENT_OPEN_THREADS: usize = 4;
+    const CONCURRENT_OPEN_STRESS_ROUNDS: usize = 24;
+
+    fn run_concurrent_open_round(config: &StorageConfig) -> Vec<SearchResult<i64>> {
+        let barrier = Arc::new(Barrier::new(CONCURRENT_OPEN_THREADS));
+        let (tx, rx) = mpsc::channel::<SearchResult<i64>>();
+        let mut handles = Vec::with_capacity(CONCURRENT_OPEN_THREADS);
+
+        for _ in 0..CONCURRENT_OPEN_THREADS {
+            let cfg = config.clone();
+            let gate = Arc::clone(&barrier);
+            let sender = tx.clone();
+            handles.push(thread::spawn(move || {
+                gate.wait();
+                let open_result = Storage::open(cfg)
+                    .and_then(|storage| schema::current_version(storage.connection()));
+                sender
+                    .send(open_result)
+                    .expect("result send should succeed");
+            }));
+        }
+        drop(tx);
+
+        let results: Vec<SearchResult<i64>> = rx.into_iter().collect();
+        for handle in handles {
+            handle.join().expect("concurrent opener thread should join");
+        }
+        results
+    }
 
     fn insert_document_minimal(conn: &fsqlite::Connection, id: &str) -> SearchResult<()> {
         let params = [
@@ -469,34 +497,44 @@ mod tests {
     #[test]
     fn concurrent_open_initializes_schema_consistently() {
         let tmp = TempDbPath::new("concurrent-bootstrap");
-        let barrier = Arc::new(Barrier::new(CONCURRENT_OPEN_THREADS));
-        let (tx, rx) = mpsc::channel::<i64>();
-        let mut handles = Vec::new();
-
-        for _ in 0..CONCURRENT_OPEN_THREADS {
-            let cfg = tmp.config();
-            let gate = Arc::clone(&barrier);
-            let sender = tx.clone();
-            handles.push(thread::spawn(move || {
-                gate.wait();
-                let storage = Storage::open(cfg).expect("concurrent open should succeed");
-                let version = schema::current_version(storage.connection())
-                    .expect("schema version available");
-                sender.send(version).expect("version send should succeed");
-            }));
+        let config = tmp.config();
+        let results = run_concurrent_open_round(&config);
+        assert_eq!(results.len(), CONCURRENT_OPEN_THREADS);
+        for (thread_idx, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(version) => assert_eq!(
+                    version, SCHEMA_VERSION,
+                    "thread {thread_idx} should observe latest schema version"
+                ),
+                Err(error) => panic!("thread {thread_idx} failed concurrent open: {error}"),
+            }
         }
-        drop(tx);
+    }
 
-        let versions: Vec<i64> = rx.iter().collect();
-        for handle in handles {
-            handle.join().expect("concurrent opener thread should join");
+    #[test]
+    fn concurrent_open_stays_stable_across_repeated_rounds() {
+        let tmp = TempDbPath::new("concurrent-bootstrap-rounds");
+        let config = tmp.config();
+
+        for round in 0..CONCURRENT_OPEN_STRESS_ROUNDS {
+            let results = run_concurrent_open_round(&config);
+            assert_eq!(
+                results.len(),
+                CONCURRENT_OPEN_THREADS,
+                "round {round} should return one result per thread"
+            );
+            for (thread_idx, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(version) => assert_eq!(
+                        version, SCHEMA_VERSION,
+                        "round {round}, thread {thread_idx} should observe latest schema version"
+                    ),
+                    Err(error) => {
+                        panic!("round {round}, thread {thread_idx} failed concurrent open: {error}")
+                    }
+                }
+            }
         }
-
-        assert_eq!(versions.len(), CONCURRENT_OPEN_THREADS);
-        assert!(
-            versions.iter().all(|version| *version == SCHEMA_VERSION),
-            "all concurrent opens should observe latest schema"
-        );
     }
 
     #[test]

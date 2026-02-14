@@ -3,6 +3,7 @@
 ## Purpose
 Define a stable lint rule catalog and severity policy for backlog self-documentation quality.
 This policy is consumed by `scripts/check_bead_test_matrix.sh` and future lint stages in `bd-3qwe.7.*`.
+For the broader rationale/evidence/exception rubric, see `docs/bead-self-documentation-rubric.md`.
 
 ## Bead Classes
 Beads are classified before rule evaluation:

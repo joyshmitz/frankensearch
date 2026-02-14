@@ -28,6 +28,7 @@
 pub mod app;
 pub mod category;
 pub mod data_source;
+pub mod discovery;
 pub mod overlays;
 pub mod preferences;
 pub mod presets;
@@ -40,6 +41,10 @@ pub mod storage;
 pub use app::OpsApp;
 pub use category::ScreenCategory;
 pub use data_source::{DataSource, MockDataSource};
+pub use discovery::{
+    DiscoveredInstance, DiscoveryConfig, DiscoveryEngine, DiscoverySignalKind, DiscoverySource,
+    DiscoveryStats, DiscoveryStatus, InstanceSighting, StaticDiscoverySource,
+};
 pub use overlays::{render_overlay, render_palette_overlay};
 pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
 pub use presets::{Density, ViewPreset, ViewState};

@@ -9,6 +9,7 @@ use crate::state::{
     ControlPlaneMetrics, FleetSnapshot, InstanceAttribution, InstanceInfo, InstanceLifecycle,
     LifecycleSignal, ProjectAttributionResolver, ResourceMetrics, SearchMetrics,
 };
+use crate::{DiscoveredInstance, DiscoveryStatus};
 
 // ─── Time Window ─────────────────────────────────────────────────────────────
 
@@ -264,6 +265,33 @@ impl MockDataSource {
             control_plane: ControlPlaneMetrics::default(),
         }
     }
+
+    /// Build a mock snapshot from reconciled discovery output.
+    ///
+    /// This keeps view-level tests deterministic while exercising the same
+    /// instance identity model used by the discovery engine.
+    #[must_use]
+    pub fn from_discovery(instances: &[DiscoveredInstance]) -> Self {
+        let mut snapshot = FleetSnapshot::default();
+        for instance in instances {
+            snapshot.instances.push(InstanceInfo {
+                id: instance.instance_id.clone(),
+                project: instance
+                    .project_key_hint
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                pid: instance.pid,
+                healthy: instance.status == DiscoveryStatus::Active,
+                doc_count: 0,
+                pending_jobs: 0,
+            });
+        }
+        snapshot.instances.sort_by(|left, right| left.id.cmp(&right.id));
+        Self {
+            snapshot,
+            control_plane: ControlPlaneMetrics::default(),
+        }
+    }
 }
 
 impl DataSource for MockDataSource {
@@ -361,6 +389,43 @@ mod tests {
         let mock = MockDataSource::sample();
         let lifecycle = mock.lifecycle("amail-001").expect("amail lifecycle exists");
         assert_eq!(lifecycle.state, frankensearch_core::LifecycleState::Stale);
+    }
+
+    #[test]
+    fn mock_from_discovery_maps_instance_health() {
+        let instances = vec![
+            DiscoveredInstance {
+                instance_id: "inst-a".to_owned(),
+                project_key_hint: Some("cass".to_owned()),
+                host_name: Some("host-a".to_owned()),
+                pid: Some(11),
+                version: Some("0.1.0".to_owned()),
+                first_seen_ms: 10,
+                last_seen_ms: 20,
+                status: DiscoveryStatus::Active,
+                sources: vec![crate::DiscoverySignalKind::Process],
+                identity_keys: vec!["hostpid:host-a:11".to_owned()],
+            },
+            DiscoveredInstance {
+                instance_id: "inst-b".to_owned(),
+                project_key_hint: None,
+                host_name: Some("host-b".to_owned()),
+                pid: Some(22),
+                version: Some("0.1.0".to_owned()),
+                first_seen_ms: 10,
+                last_seen_ms: 20,
+                status: DiscoveryStatus::Stale,
+                sources: vec![crate::DiscoverySignalKind::Heartbeat],
+                identity_keys: vec!["heartbeat:/tmp/inst-b".to_owned()],
+            },
+        ];
+
+        let mock = MockDataSource::from_discovery(&instances);
+        let fleet = mock.fleet_snapshot();
+        assert_eq!(fleet.instance_count(), 2);
+        assert_eq!(fleet.healthy_count(), 1);
+        assert_eq!(fleet.instances[0].project, "cass");
+        assert_eq!(fleet.instances[1].project, "unknown");
     }
 
     #[test]
