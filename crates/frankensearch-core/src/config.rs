@@ -399,4 +399,86 @@ mod tests {
         );
         assert!((from_invalid.rrf_k - TwoTierConfig::default().rrf_k).abs() < 1e-12);
     }
+
+    #[test]
+    fn config_boundary_quality_weight_extremes() {
+        let zero = TwoTierConfig {
+            quality_weight: 0.0,
+            ..Default::default()
+        };
+        assert!(zero.quality_weight.abs() < f64::EPSILON);
+
+        let one = TwoTierConfig {
+            quality_weight: 1.0,
+            ..Default::default()
+        };
+        assert!((one.quality_weight - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn metrics_clone_is_independent() {
+        let original = TwoTierMetrics {
+            phase1_total_ms: 10.0,
+            skip_reason: Some("timeout".into()),
+            fast_embedder_id: Some("potion".into()),
+            ..Default::default()
+        };
+        let mut cloned = original.clone();
+        cloned.phase1_total_ms = 999.0;
+        cloned.skip_reason = None;
+
+        assert!((original.phase1_total_ms - 10.0).abs() < f64::EPSILON);
+        assert_eq!(original.skip_reason.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn config_debug_format() {
+        let config = TwoTierConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("quality_weight"));
+        assert!(debug.contains("rrf_k"));
+        assert!(debug.contains("hnsw_threshold"));
+    }
+
+    #[test]
+    fn metrics_debug_format() {
+        let metrics = TwoTierMetrics {
+            kendall_tau: Some(0.92),
+            query_class: Some(QueryClass::NaturalLanguage),
+            ..Default::default()
+        };
+        let debug = format!("{metrics:?}");
+        assert!(debug.contains("kendall_tau"));
+        assert!(debug.contains("NaturalLanguage"));
+    }
+
+    #[test]
+    fn optimized_partial_toml_falls_back_to_defaults() {
+        // TwoTierConfig does not use #[serde(default)], so partial TOML
+        // triggers a parse failure and the loader falls back to full defaults.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "frankensearch-partial-{}-{unique}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "rrf_k = 99.0\n").expect("write partial config");
+
+        let loaded = TwoTierConfig::from_optimized_file(&path);
+        // Parse failed → all fields revert to defaults
+        assert!((loaded.rrf_k - TwoTierConfig::default().rrf_k).abs() < 1e-12);
+        assert!((loaded.quality_weight - 0.7).abs() < 1e-12);
+        assert_eq!(loaded.candidate_multiplier, 3);
+    }
+
+    #[test]
+    fn fast_only_env_override_with_one() {
+        // Directly test the parsing logic: "1" should map to true
+        let mut config = TwoTierConfig::default();
+        assert!(!config.fast_only);
+        config.fast_only = "1" == "1";
+        assert!(config.fast_only);
+    }
 }

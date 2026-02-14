@@ -224,6 +224,7 @@ pub type SearchResult<T> = Result<T, SearchError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
 
     #[test]
     fn error_is_send_sync() {
@@ -307,5 +308,165 @@ mod tests {
         };
         assert!(err.to_string().contains("quality_embed"));
         assert!(err.to_string().contains("parent scope dropped"));
+    }
+
+    #[test]
+    fn embedder_unavailable_display() {
+        let err = SearchError::EmbedderUnavailable {
+            model: "MiniLM".into(),
+            reason: "feature not enabled".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("MiniLM"));
+        assert!(msg.contains("feature not enabled"));
+    }
+
+    #[test]
+    fn model_not_found_display() {
+        let err = SearchError::ModelNotFound {
+            name: "all-MiniLM-L6-v2".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("all-MiniLM-L6-v2"));
+        assert!(msg.contains("FRANKENSEARCH_MODEL_DIR"));
+    }
+
+    #[test]
+    fn model_load_failed_preserves_source() {
+        let inner = std::io::Error::other("mmap failed");
+        let err = SearchError::ModelLoadFailed {
+            path: PathBuf::from("/models/broken.onnx"),
+            source: Box::new(inner),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/models/broken.onnx"));
+        assert!(msg.contains("mmap failed"));
+        // Verify source chain via std::error::Error trait
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn index_corrupted_display() {
+        let err = SearchError::IndexCorrupted {
+            path: PathBuf::from("/data/index.fsvi"),
+            detail: "CRC mismatch in header".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/data/index.fsvi"));
+        assert!(msg.contains("CRC mismatch"));
+        assert!(msg.contains("rebuild"));
+    }
+
+    #[test]
+    fn index_version_mismatch_display() {
+        let err = SearchError::IndexVersionMismatch {
+            expected: 3,
+            found: 1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("v3"));
+        assert!(msg.contains("v1"));
+        assert!(msg.contains("Rebuild"));
+    }
+
+    #[test]
+    fn query_parse_error_display() {
+        let err = SearchError::QueryParseError {
+            query: "foo AND OR bar".into(),
+            detail: "unexpected OR after AND".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("foo AND OR bar"));
+        assert!(msg.contains("unexpected OR after AND"));
+    }
+
+    #[test]
+    fn search_timeout_display() {
+        let err = SearchError::SearchTimeout {
+            elapsed_ms: 750,
+            budget_ms: 500,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("750"));
+        assert!(msg.contains("500"));
+    }
+
+    #[test]
+    fn reranker_unavailable_display() {
+        let err = SearchError::RerankerUnavailable {
+            model: "cross-encoder".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cross-encoder"));
+        assert!(msg.contains("rerank"));
+    }
+
+    #[test]
+    fn rerank_failed_preserves_source() {
+        let inner = std::io::Error::other("inference oom");
+        let err = SearchError::RerankFailed {
+            model: "cross-encoder".into(),
+            source: Box::new(inner),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cross-encoder"));
+        assert!(msg.contains("inference oom"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn invalid_config_display() {
+        let err = SearchError::InvalidConfig {
+            field: "quality_weight".into(),
+            value: "-1.0".into(),
+            reason: "must be between 0.0 and 1.0".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("quality_weight"));
+        assert!(msg.contains("-1.0"));
+        assert!(msg.contains("must be between"));
+    }
+
+    #[test]
+    fn hash_mismatch_display() {
+        let err = SearchError::HashMismatch {
+            path: PathBuf::from("/tmp/model.bin"),
+            expected: "abc123".into(),
+            actual: "def456".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/model.bin"));
+        assert!(msg.contains("abc123"));
+        assert!(msg.contains("def456"));
+    }
+
+    #[test]
+    fn queue_full_display() {
+        let err = SearchError::QueueFull {
+            pending: 100,
+            capacity: 100,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("100"));
+        assert!(msg.contains("backpressure"));
+    }
+
+    #[test]
+    fn durability_disabled_display() {
+        let err = SearchError::DurabilityDisabled;
+        let msg = err.to_string();
+        assert!(msg.contains("durability"));
+    }
+
+    #[test]
+    fn error_debug_format() {
+        let err = SearchError::DimensionMismatch {
+            expected: 128,
+            found: 256,
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("DimensionMismatch"));
+        assert!(debug.contains("128"));
+        assert!(debug.contains("256"));
     }
 }

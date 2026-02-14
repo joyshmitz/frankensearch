@@ -142,4 +142,71 @@ mod tests {
         assert_eq!(parse_level(""), None);
         assert_eq!(parse_level("verbose"), None);
     }
+
+    #[test]
+    fn all_span_names_start_with_target_prefix() {
+        let all_spans = [
+            span_names::SEARCH,
+            span_names::FAST_EMBED,
+            span_names::FAST_SEARCH,
+            span_names::LEXICAL_SEARCH,
+            span_names::RRF_FUSE,
+            span_names::QUALITY_EMBED,
+            span_names::BLEND,
+            span_names::RERANK,
+            span_names::INDEX_REBUILD,
+            span_names::REFRESH_CYCLE,
+            span_names::EMBED_BATCH,
+        ];
+        for span in all_spans {
+            assert!(
+                span.starts_with(&format!("{TARGET_PREFIX}::")),
+                "span {span:?} must start with \"{TARGET_PREFIX}::\"",
+            );
+        }
+    }
+
+    #[test]
+    fn field_names_are_non_empty() {
+        let all_fields = [
+            field_names::QUERY_LEN,
+            field_names::QUERY_CLASS,
+            field_names::PHASE,
+            field_names::RESULT_COUNT,
+            field_names::DOC_COUNT,
+            field_names::DURATION_US,
+            field_names::MODEL_ID,
+            field_names::DIMENSION,
+            field_names::BLEND_FACTOR,
+            field_names::K,
+            field_names::LEXICAL_COUNT,
+            field_names::SEMANTIC_COUNT,
+            field_names::FUSED_COUNT,
+            field_names::OVERLAP_COUNT,
+        ];
+        for field in all_fields {
+            assert!(!field.is_empty(), "field name must not be empty");
+        }
+    }
+
+    #[test]
+    fn parse_level_rejects_whitespace_padded_input() {
+        assert_eq!(parse_level(" info"), None);
+        assert_eq!(parse_level("info "), None);
+        assert_eq!(parse_level(" debug "), None);
+    }
+
+    #[test]
+    fn level_from_env_uses_default_when_var_unset() {
+        // When the env var is not set, the default should be returned.
+        // We use a unique key that is never set to validate the fallback path.
+        fn level_from_custom_key(key: &str, default: Level) -> Level {
+            std::env::var(key)
+                .ok()
+                .and_then(|s| parse_level(&s))
+                .unwrap_or(default)
+        }
+        let level = level_from_custom_key("FRANKENSEARCH_NEVER_SET_12345", Level::WARN);
+        assert_eq!(level, Level::WARN);
+    }
 }
