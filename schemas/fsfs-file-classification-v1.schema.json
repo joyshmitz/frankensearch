@@ -341,7 +341,11 @@
           "if": {
             "properties": {
               "detected_type": {
-                "const": "binary"
+                "enum": [
+                  "binary",
+                  "archive",
+                  "corrupt"
+                ]
               }
             }
           },
@@ -369,6 +373,44 @@
               "ingest_action": {
                 "enum": [
                   "index_partial_with_flag",
+                  "skip",
+                  "quarantine"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "detected_type": {
+                "const": "archive"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ingest_action": {
+                "enum": [
+                  "skip",
+                  "quarantine"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "detected_type": {
+                "const": "corrupt"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "ingest_action": {
+                "enum": [
                   "skip",
                   "quarantine"
                 ]

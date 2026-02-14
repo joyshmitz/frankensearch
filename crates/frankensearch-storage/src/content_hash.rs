@@ -133,8 +133,13 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
         let items = [(doc_id.to_owned(), *new_hash)];
-        let mut decisions = self.check_dedup_batch(&items, embedder_id)?;
-        Ok(decisions.remove(0))
+        self.check_dedup_batch(&items, embedder_id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| SearchError::SubsystemError {
+                subsystem: "storage",
+                source: Box::new(io::Error::other("check_dedup expected one decision result")),
+            })
     }
 
     pub fn check_dedup_batch(
@@ -265,15 +270,22 @@ fn build_dedup_decision(
         };
     }
 
-    if matches!(existing.status, Some(EmbeddingStatus::Embedded)) {
-        DeduplicationDecision::Skip {
+    match existing.status {
+        Some(EmbeddingStatus::Embedded) => DeduplicationDecision::Skip {
             doc_id: doc_id.to_owned(),
             reason: "unchanged_content_already_embedded",
-        }
-    } else {
-        DeduplicationDecision::New {
+        },
+        Some(EmbeddingStatus::Pending) => DeduplicationDecision::Skip {
             doc_id: doc_id.to_owned(),
-        }
+            reason: "unchanged_content_already_pending",
+        },
+        Some(EmbeddingStatus::Skipped) => DeduplicationDecision::Skip {
+            doc_id: doc_id.to_owned(),
+            reason: "unchanged_content_previously_skipped",
+        },
+        Some(EmbeddingStatus::Failed) | None => DeduplicationDecision::New {
+            doc_id: doc_id.to_owned(),
+        },
     }
 }
 
@@ -385,6 +397,8 @@ mod tests {
     use super::{ContentHasher, DeduplicationDecision, sha256_hex};
     use crate::Storage;
     use crate::document::DocumentRecord;
+    use crate::document::EmbeddingStatus;
+    use fsqlite_types::value::SqliteValue;
 
     fn hash_with(byte: u8) -> [u8; 32] {
         [byte; 32]
@@ -399,6 +413,29 @@ mod tests {
             1_739_499_200,
             1_739_499_200,
         )
+    }
+
+    fn upsert_status_row(
+        storage: &Storage,
+        doc_id: &str,
+        embedder_id: &str,
+        status: EmbeddingStatus,
+    ) {
+        let params = [
+            SqliteValue::Text(doc_id.to_owned()),
+            SqliteValue::Text(embedder_id.to_owned()),
+            SqliteValue::Text(status.as_str().to_owned()),
+        ];
+        storage
+            .connection()
+            .execute_with_params(
+                "INSERT INTO embedding_status \
+                 (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+                 VALUES (?1, ?2, NULL, ?3, NULL, NULL, 0) \
+                 ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status;",
+                &params,
+            )
+            .expect("embedding_status upsert should succeed");
     }
 
     #[test]
@@ -475,6 +512,83 @@ mod tests {
             decision,
             DeduplicationDecision::New {
                 doc_id: "doc-2".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn check_dedup_skip_when_unchanged_and_pending() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let doc = sample_document("doc-pending", 7);
+        storage
+            .upsert_document(&doc)
+            .expect("document insert should succeed");
+        upsert_status_row(
+            &storage,
+            "doc-pending",
+            "fast-tier",
+            EmbeddingStatus::Pending,
+        );
+
+        let decision = storage
+            .check_dedup("doc-pending", &doc.content_hash, "fast-tier")
+            .expect("check_dedup should succeed");
+
+        assert_eq!(
+            decision,
+            DeduplicationDecision::Skip {
+                doc_id: "doc-pending".to_owned(),
+                reason: "unchanged_content_already_pending",
+            }
+        );
+    }
+
+    #[test]
+    fn check_dedup_skip_when_unchanged_and_previously_skipped() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let doc = sample_document("doc-skipped", 8);
+        storage
+            .upsert_document(&doc)
+            .expect("document insert should succeed");
+        upsert_status_row(
+            &storage,
+            "doc-skipped",
+            "fast-tier",
+            EmbeddingStatus::Skipped,
+        );
+
+        let decision = storage
+            .check_dedup("doc-skipped", &doc.content_hash, "fast-tier")
+            .expect("check_dedup should succeed");
+
+        assert_eq!(
+            decision,
+            DeduplicationDecision::Skip {
+                doc_id: "doc-skipped".to_owned(),
+                reason: "unchanged_content_previously_skipped",
+            }
+        );
+    }
+
+    #[test]
+    fn check_dedup_new_when_unchanged_and_failed() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let doc = sample_document("doc-failed", 9);
+        storage
+            .upsert_document(&doc)
+            .expect("document insert should succeed");
+        storage
+            .mark_failed("doc-failed", "fast-tier", "transient failure")
+            .expect("mark_failed should succeed");
+
+        let decision = storage
+            .check_dedup("doc-failed", &doc.content_hash, "fast-tier")
+            .expect("check_dedup should succeed");
+
+        assert_eq!(
+            decision,
+            DeduplicationDecision::New {
+                doc_id: "doc-failed".to_owned()
             }
         );
     }

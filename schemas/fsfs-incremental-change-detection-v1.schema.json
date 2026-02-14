@@ -316,6 +316,26 @@
               "rename_to"
             ]
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "event_type": {
+                "const": "delete"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "queue_action": {
+                "enum": [
+                  "drop_missing",
+                  "mark_stale",
+                  "reconcile_full"
+                ]
+              }
+            }
+          }
         }
       ]
     },

@@ -64,6 +64,13 @@ Normalization policy MUST specify whether NFC normalization is strict (`utf8_nfc
 
 Corrupt files MUST NOT be indexed as normal text. Partial files MAY be indexed only via `index_partial_with_flag` and MUST carry reason-coded degradation metadata.
 
+For `binary`, `archive`, and `corrupt` classifications:
+
+- `detected_encoding` MUST be `none`
+- `normalization_applied` MUST be `none`
+
+For `archive` and `corrupt` classifications, `ingest_action` MUST be `skip` or `quarantine`.
+
 ## Required Confidence Signals
 
 Every classification decision MUST include:

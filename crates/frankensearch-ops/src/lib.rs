@@ -27,6 +27,8 @@
 pub mod app;
 pub mod category;
 pub mod data_source;
+pub mod overlays;
+pub mod preferences;
 pub mod screens;
 pub mod state;
 
@@ -35,4 +37,6 @@ pub mod state;
 pub use app::OpsApp;
 pub use category::ScreenCategory;
 pub use data_source::{DataSource, MockDataSource};
+pub use overlays::{render_overlay, render_palette_overlay};
+pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
 pub use state::AppState;

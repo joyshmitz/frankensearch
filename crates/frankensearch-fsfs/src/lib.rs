@@ -12,7 +12,9 @@ pub mod redaction;
 pub mod repro;
 pub mod runtime;
 
-pub use adapters::cli::{CliCommand, CliInput, parse_cli_args};
+pub use adapters::cli::{
+    CliCommand, CliInput, ConfigAction, OutputFormat, detect_auto_mode, exit_code, parse_cli_args,
+};
 pub use adapters::tui::TuiAdapterSettings;
 pub use config::{
     CliOverrides, ConfigLoadResult, ConfigLoadedEvent, ConfigSource, ConfigWarning, Density,

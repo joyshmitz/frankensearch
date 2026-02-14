@@ -1980,6 +1980,90 @@ mod tests {
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
+    #[test]
+    fn vacuum_noop_when_no_tombstones() {
+        let path = temp_index_path("soft-delete-vacuum-noop");
+        let mut writer = VectorIndex::create(&path, "fnv1a-384", 4).expect("writer");
+        writer
+            .write_record("doc-a", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write a");
+        writer
+            .write_record("doc-b", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write b");
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        assert_eq!(index.tombstone_count(), 0);
+
+        let stats = index.vacuum().expect("vacuum with no tombstones");
+        assert_eq!(stats.records_before, 2);
+        assert_eq!(stats.records_after, 2);
+        assert_eq!(stats.tombstones_removed, 0);
+        assert_eq!(index.record_count(), 2);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn soft_delete_all_records_yields_empty_search() {
+        let path = temp_index_path("soft-delete-all");
+        let mut writer = VectorIndex::create(&path, "fnv1a-384", 4).expect("writer");
+        for i in 0..5 {
+            writer
+                .write_record(&format!("doc-{i}"), &sample_vector(0.1, 4))
+                .expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        for i in 0..5 {
+            assert!(index.soft_delete(&format!("doc-{i}")).expect("delete"));
+        }
+        assert_eq!(index.tombstone_count(), 5);
+        assert!((index.tombstone_ratio() - 1.0).abs() < f64::EPSILON);
+        assert!(index.needs_vacuum());
+
+        let hits = index
+            .search_top_k(&sample_vector(0.1, 4), 10, None)
+            .expect("search");
+        assert!(hits.is_empty(), "search with all deleted should return nothing");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vacuum_after_deleting_all_records_yields_empty_index() {
+        let path = temp_index_path("soft-delete-vacuum-all");
+        let mut writer = VectorIndex::create(&path, "fnv1a-384", 4).expect("writer");
+        for i in 0..3 {
+            writer
+                .write_record(&format!("doc-{i}"), &[1.0, 0.0, 0.0, 0.0])
+                .expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        for i in 0..3 {
+            index.soft_delete(&format!("doc-{i}")).expect("delete");
+        }
+
+        let stats = index.vacuum().expect("vacuum all deleted");
+        assert_eq!(stats.records_before, 3);
+        assert_eq!(stats.records_after, 0);
+        assert_eq!(stats.tombstones_removed, 3);
+        assert_eq!(index.record_count(), 0);
+        assert_eq!(index.tombstone_count(), 0);
+        assert!(index.tombstone_ratio().abs() < f64::EPSILON);
+        assert!(!index.needs_vacuum());
+
+        let hits = index
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+            .expect("search");
+        assert!(hits.is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
     // ─── WAL integration tests ─────────────────────────────────────────
 
     #[test]

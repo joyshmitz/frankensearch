@@ -11,6 +11,7 @@ members = [
     "crates/frankensearch-durability",
     "crates/frankensearch-fsfs",
     "crates/frankensearch-tui",
+    "crates/frankensearch-ops",
     "frankensearch",
 ]
 
@@ -32,6 +33,7 @@ frankensearch-storage = { path = "crates/frankensearch-storage" }
 frankensearch-durability = { path = "crates/frankensearch-durability" }
 frankensearch-fsfs = { path = "crates/frankensearch-fsfs" }
 frankensearch-tui = { path = "crates/frankensearch-tui" }
+frankensearch-ops = { path = "crates/frankensearch-ops" }
 
 # Async runtime (structured concurrency, NO tokio)
 # test-internals enables LabRuntime for deterministic testing

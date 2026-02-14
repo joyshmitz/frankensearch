@@ -27,6 +27,14 @@
         "quarantine"
       ]
     },
+    "defaultAction": {
+      "type": "string",
+      "enum": [
+        "index_metadata_only",
+        "skip",
+        "quarantine"
+      ]
+    },
     "contractDefinition": {
       "type": "object",
       "additionalProperties": false,
@@ -173,19 +181,19 @@
           ],
           "properties": {
             "giant_log": {
-              "$ref": "#/$defs/action"
+              "$ref": "#/$defs/defaultAction"
             },
             "vendor_tree": {
-              "$ref": "#/$defs/action"
+              "$ref": "#/$defs/defaultAction"
             },
             "generated_file": {
-              "$ref": "#/$defs/action"
+              "$ref": "#/$defs/defaultAction"
             },
             "archive_container": {
-              "$ref": "#/$defs/action"
+              "$ref": "#/$defs/defaultAction"
             },
             "transient_build_artifact": {
-              "$ref": "#/$defs/action"
+              "$ref": "#/$defs/defaultAction"
             }
           }
         }

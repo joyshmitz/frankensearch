@@ -30,6 +30,8 @@ This contract specifies:
 4. queue decision (`enqueue_embed`, `skip_no_change`, `mark_stale`, `reconcile_full`)
 5. durable journal checkpoint update
 
+Delete events MUST NOT enqueue embedding work. Allowed actions for `delete` are `drop_missing`, `mark_stale`, or `reconcile_full`.
+
 ## mtime / Size / Hash Tradeoff Policy
 
 The policy MUST explicitly define:

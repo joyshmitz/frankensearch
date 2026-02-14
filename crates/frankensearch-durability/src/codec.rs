@@ -191,6 +191,15 @@ impl CodecFacade {
         symbols: &[(u32, Vec<u8>)],
         k_source: u32,
     ) -> SearchResult<DecodedPayload> {
+        self.decode_for_symbol_size(symbols, k_source, self.config.symbol_size)
+    }
+
+    pub(crate) fn decode_for_symbol_size(
+        &self,
+        symbols: &[(u32, Vec<u8>)],
+        k_source: u32,
+        symbol_size: u32,
+    ) -> SearchResult<DecodedPayload> {
         let t0 = Instant::now();
         if k_source == 0 {
             return Err(SearchError::InvalidConfig {
@@ -201,9 +210,9 @@ impl CodecFacade {
         }
 
         let symbol_size_usize =
-            usize::try_from(self.config.symbol_size).map_err(|_| SearchError::InvalidConfig {
+            usize::try_from(symbol_size).map_err(|_| SearchError::InvalidConfig {
                 field: "symbol_size".to_owned(),
-                value: self.config.symbol_size.to_string(),
+                value: symbol_size.to_string(),
                 reason: "cannot convert symbol_size to usize".to_owned(),
             })?;
 
@@ -233,7 +242,7 @@ impl CodecFacade {
 
         let outcome = self
             .codec
-            .decode(symbols, k_source, self.config.symbol_size)
+            .decode(symbols, k_source, symbol_size)
             .map_err(map_codec_error)?;
 
         let payload = match outcome {
@@ -312,7 +321,7 @@ impl CodecFacade {
         symbols.extend(repair_data.repair_symbols.clone());
 
         let repairable = matches!(
-            self.decode(&symbols, repair_data.k_source)?,
+            self.decode_for_symbol_size(&symbols, repair_data.k_source, repair_data.symbol_size)?,
             DecodedPayload::Success { .. }
         );
 
@@ -341,7 +350,11 @@ impl CodecFacade {
         )?;
         symbols.extend(repair_data.repair_symbols.clone());
 
-        match self.decode(&symbols, repair_data.k_source)? {
+        match self.decode_for_symbol_size(
+            &symbols,
+            repair_data.k_source,
+            repair_data.symbol_size,
+        )? {
             DecodedPayload::Success { data, .. } => Ok(data),
             DecodedPayload::Failure {
                 class,
@@ -402,27 +415,11 @@ impl CodecFacade {
     }
 
     fn validate_repair_data(&self, repair_data: &RepairData) -> SearchResult<()> {
-        if repair_data.symbol_size != self.config.symbol_size {
+        if repair_data.symbol_size == 0 {
             return Err(SearchError::InvalidConfig {
                 field: "repair_data.symbol_size".to_owned(),
-                value: repair_data.symbol_size.to_string(),
-                reason: format!(
-                    "must match configured symbol_size ({})",
-                    self.config.symbol_size
-                ),
-            });
-        }
-
-        let max_repair_symbols_usize =
-            usize::try_from(self.config.max_repair_symbols).unwrap_or(usize::MAX);
-        if repair_data.repair_symbols.len() > max_repair_symbols_usize {
-            return Err(SearchError::InvalidConfig {
-                field: "repair_data.repair_symbols".to_owned(),
-                value: repair_data.repair_symbols.len().to_string(),
-                reason: format!(
-                    "exceeds max_repair_symbols ({})",
-                    self.config.max_repair_symbols
-                ),
+                value: "0".to_owned(),
+                reason: "must be greater than zero".to_owned(),
             });
         }
 
@@ -625,11 +622,24 @@ mod tests {
             &self,
             symbols: &[(u32, Vec<u8>)],
             k_source: u32,
-            _symbol_size: u32,
+            symbol_size: u32,
         ) -> fsqlite_error::Result<CodecDecodeResult> {
             if let Some(reason) = self.fail_decode_reason {
                 return Ok(CodecDecodeResult::Failure {
                     reason,
+                    symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                    k_required: k_source,
+                });
+            }
+
+            let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(usize::MAX);
+            if symbols
+                .iter()
+                .any(|(_, data)| data.len() != symbol_size_usize)
+            {
+                return Ok(CodecDecodeResult::Failure {
+                    reason:
+                        fsqlite_core::raptorq_integration::DecodeFailureReason::SymbolSizeMismatch,
                     symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
                     k_required: k_source,
                 });
@@ -918,6 +928,83 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn repair_uses_repair_data_symbol_size_not_runtime_config() {
+        let source = b"cross-config-symbol-size";
+
+        let producer = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig {
+                symbol_size: 256,
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("producer facade");
+        let repair_data = producer
+            .compute_repair_symbols(source)
+            .expect("compute repair data");
+
+        let consumer = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig {
+                symbol_size: 4096,
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("consumer facade");
+
+        let mut corrupted = source.to_vec();
+        corrupted[0] ^= 0xFF;
+        let repaired = consumer
+            .repair(&corrupted, &repair_data)
+            .expect("repair across differing runtime symbol_size");
+        assert!(!repaired.is_empty());
+    }
+
+    #[test]
+    fn repair_accepts_repair_data_above_runtime_generation_cap() {
+        let source = b"repair-cap-agnostic";
+
+        let producer = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig::default(),
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("producer facade");
+        let mut repair_data = producer
+            .compute_repair_symbols(source)
+            .expect("compute repair data");
+        repair_data
+            .repair_symbols
+            .push((2_000_000, vec![1_u8; 4096]));
+
+        let consumer = CodecFacade::new(
+            Arc::new(MockCodec {
+                fail_decode_reason: None,
+            }),
+            DurabilityConfig {
+                max_repair_symbols: 1,
+                slack_decode: 1,
+                ..DurabilityConfig::default()
+            },
+            Arc::new(DurabilityMetrics::default()),
+        )
+        .expect("consumer facade");
+
+        let repaired = consumer
+            .repair(source, &repair_data)
+            .expect("decode should not reject repair symbol count above runtime generation cap");
+        assert!(!repaired.is_empty());
     }
 
     #[test]

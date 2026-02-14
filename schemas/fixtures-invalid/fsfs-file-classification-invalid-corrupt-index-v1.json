@@ -1,0 +1,25 @@
+{
+  "kind": "fsfs_file_classification_decision",
+  "v": 1,
+  "path": "/workspace/bad/corrupt.txt",
+  "size_bytes": 512,
+  "probe_bytes": 512,
+  "sniff_features": {
+    "null_bytes": 12,
+    "non_printable_ratio": 0.82,
+    "high_bit_ratio": 0.6,
+    "bom": "none"
+  },
+  "detected_type": "corrupt",
+  "detected_encoding": "none",
+  "normalization_applied": "none",
+  "ingest_action": "index",
+  "classification_confidence": 0.95,
+  "encoding_confidence": 0.0,
+  "reason_code": "FSFS_CORRUPT_DECODE_ERROR",
+  "downstream_signals": {
+    "utility_penalty": 1.0,
+    "skip_candidate": true,
+    "requires_manual_review": true
+  }
+}

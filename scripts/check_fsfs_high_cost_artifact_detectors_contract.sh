@@ -76,6 +76,7 @@ check_unit() {
   echo "[unit] validating detector contract defaults and override policy requirements"
   check_valid "unit" "$ROOT_DIR/schemas/fixtures/fsfs-high-cost-artifact-detectors-contract-v1.json"
   check_invalid "unit" "$ROOT_DIR/schemas/fixtures-invalid/fsfs-high-cost-artifact-detectors-invalid-missing-override-policy-v1.json"
+  check_invalid "unit" "$ROOT_DIR/schemas/fixtures-invalid/fsfs-high-cost-artifact-detectors-invalid-default-index-full-v1.json"
 }
 
 check_integration() {

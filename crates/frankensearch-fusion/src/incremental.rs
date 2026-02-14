@@ -604,8 +604,18 @@ mod tests {
         let mut s = default_searcher();
 
         // Simulate rapid typing of "hello world".
-        let sequence = ["he", "hel", "hell", "hello", "hello ", "hello w", "hello wo",
-            "hello wor", "hello worl", "hello world"];
+        let sequence = [
+            "he",
+            "hel",
+            "hell",
+            "hello",
+            "hello ",
+            "hello w",
+            "hello wo",
+            "hello wor",
+            "hello worl",
+            "hello world",
+        ];
 
         for (i, query) in sequence.iter().enumerate() {
             let plan = s.plan(query);

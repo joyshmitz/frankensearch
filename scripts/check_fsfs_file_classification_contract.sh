@@ -88,6 +88,7 @@ check_e2e() {
   echo "[e2e] validating corrupt/partial behavior and guarded ingest action"
   check_valid "e2e" "$ROOT_DIR/schemas/fixtures/fsfs-file-classification-corrupt-event-v1.json"
   check_invalid "e2e" "$ROOT_DIR/schemas/fixtures-invalid/fsfs-file-classification-invalid-partial-index-v1.json"
+  check_invalid "e2e" "$ROOT_DIR/schemas/fixtures-invalid/fsfs-file-classification-invalid-corrupt-index-v1.json"
 }
 
 if [[ "$MODE" == "unit" || "$MODE" == "all" ]]; then

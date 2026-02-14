@@ -1,0 +1,10 @@
+{
+  "kind": "fsfs_incremental_change_decision",
+  "v": 1,
+  "path": "/workspace/src/old.rs",
+  "event_type": "delete",
+  "detection_mode": "journal_replay",
+  "queue_action": "enqueue_embed",
+  "reason_code": "FSFS_DELETE_OBSERVED",
+  "confidence": 0.99
+}

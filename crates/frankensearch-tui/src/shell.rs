@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::input::{InputEvent, KeyAction, Keymap};
 use crate::overlay::OverlayManager;
+use crate::palette::{CommandPalette, PaletteState};
 use crate::screen::{ScreenAction, ScreenContext, ScreenId, ScreenRegistry};
 use crate::theme::Theme;
 
@@ -98,10 +99,14 @@ pub struct AppShell {
     pub keymap: Keymap,
     /// Overlay manager.
     pub overlays: OverlayManager,
+    /// Command palette.
+    pub palette: CommandPalette,
     /// Status line content.
     pub status_line: StatusLine,
     /// Whether the app should quit.
     pub should_quit: bool,
+    /// Last confirmed palette action ID (reset each `handle_input` call).
+    last_palette_action: Option<String>,
 }
 
 impl AppShell {
@@ -114,8 +119,10 @@ impl AppShell {
             active_screen: None,
             keymap: Keymap::default_bindings(),
             overlays: OverlayManager::new(),
+            palette: CommandPalette::new(),
             status_line: StatusLine::new(),
             should_quit: false,
+            last_palette_action: None,
         }
     }
 
@@ -170,7 +177,55 @@ impl AppShell {
     }
 
     /// Handle an input event. Returns `true` if the app should quit.
+    ///
+    /// Returns the confirmed palette action ID if the user selected a command.
+    /// Callers should check `last_palette_action()` after calling this.
     pub fn handle_input(&mut self, event: &InputEvent) -> bool {
+        self.last_palette_action = None;
+
+        // If the command palette is open, route input there first.
+        if self.palette.state() == &PaletteState::Open {
+            if let InputEvent::Key(key, mods) = event {
+                if let Some(action) = self.keymap.resolve(*key, *mods) {
+                    match action {
+                        KeyAction::Dismiss => {
+                            self.palette.close();
+                            return false;
+                        }
+                        KeyAction::Up => {
+                            self.palette.select_prev();
+                            return false;
+                        }
+                        KeyAction::Down => {
+                            self.palette.select_next();
+                            return false;
+                        }
+                        KeyAction::Confirm => {
+                            if let Some(action_id) = self.palette.confirm() {
+                                self.last_palette_action = Some(action_id);
+                            }
+                            self.palette.close();
+                            return false;
+                        }
+                        _ => {}
+                    }
+                }
+                // Handle text input for palette search.
+                match key {
+                    crossterm::event::KeyCode::Char(ch) if *mods == crossterm::event::KeyModifiers::NONE => {
+                        self.palette.push_char(*ch);
+                        return false;
+                    }
+                    crossterm::event::KeyCode::Backspace => {
+                        self.palette.pop_char();
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+
         // If an overlay is active, let it handle first.
         if self.overlays.has_active() {
             if let InputEvent::Key(key, mods) = event {
@@ -201,11 +256,19 @@ impl AppShell {
                         return false;
                     }
                     KeyAction::ToggleHelp => {
-                        self.overlays
-                            .push(crate::overlay::OverlayRequest::new(
-                                crate::overlay::OverlayKind::Help,
-                                "Help".to_string(),
-                            ));
+                        if self.overlays.top().is_some_and(|o| o.kind == crate::overlay::OverlayKind::Help) {
+                            self.overlays.dismiss();
+                        } else {
+                            self.overlays
+                                .push(crate::overlay::OverlayRequest::new(
+                                    crate::overlay::OverlayKind::Help,
+                                    "Keyboard Shortcuts",
+                                ));
+                        }
+                        return false;
+                    }
+                    KeyAction::TogglePalette => {
+                        self.palette.toggle();
                         return false;
                     }
                     _ => {}
@@ -240,6 +303,15 @@ impl AppShell {
         }
 
         false
+    }
+
+    /// Get the last palette action confirmed by the user.
+    ///
+    /// Returns `Some(action_id)` if the user selected an action from the
+    /// command palette during the last `handle_input()` call.
+    #[must_use]
+    pub fn last_palette_action(&self) -> Option<&str> {
+        self.last_palette_action.as_deref()
     }
 
     /// Render the shell chrome and active screen.

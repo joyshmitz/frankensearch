@@ -134,7 +134,7 @@ impl AppState {
 
     /// Get the current fleet snapshot.
     #[must_use]
-    pub fn fleet(&self) -> &FleetSnapshot {
+    pub const fn fleet(&self) -> &FleetSnapshot {
         &self.fleet
     }
 
@@ -146,13 +146,13 @@ impl AppState {
 
     /// When the fleet was last updated.
     #[must_use]
-    pub fn last_update(&self) -> Option<Instant> {
+    pub const fn last_update(&self) -> Option<Instant> {
         self.last_update
     }
 
     /// Whether we have received at least one fleet update.
     #[must_use]
-    pub fn has_data(&self) -> bool {
+    pub const fn has_data(&self) -> bool {
         self.last_update.is_some()
     }
 }

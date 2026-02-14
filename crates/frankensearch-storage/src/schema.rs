@@ -161,7 +161,7 @@ const MIGRATIONS: &[Migration] = &[
             );",
             "CREATE TABLE IF NOT EXISTS index_build_history (\
                 build_id INTEGER PRIMARY KEY AUTOINCREMENT,\
-                index_name TEXT NOT NULL REFERENCES index_metadata(index_name) ON DELETE CASCADE,\
+                index_name TEXT NOT NULL,\
                 built_at INTEGER NOT NULL,\
                 build_duration_ms INTEGER NOT NULL,\
                 record_count INTEGER NOT NULL,\

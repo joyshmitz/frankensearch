@@ -153,11 +153,10 @@ impl ConformalSearchCalibration {
             ));
         }
 
-        let exceed = self
+        let first_geq = self
             .nonconformity_scores
-            .iter()
-            .filter(|&&r| r >= observed_rank)
-            .count();
+            .partition_point(|&rank| rank < observed_rank);
+        let exceed = self.n_calibration - first_geq;
         #[allow(clippy::cast_precision_loss)]
         let numerator = (exceed + 1) as f32;
         #[allow(clippy::cast_precision_loss)]

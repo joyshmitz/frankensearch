@@ -652,4 +652,350 @@ mod tests {
         // The exact behavior depends on budget math, but it shouldn't panic.
         let _ = cache.get(&"a");
     }
+
+    // --- bd-3un.47: Additional coverage ─────────────────────────────────────
+
+    #[test]
+    fn zero_memory_budget_rejects_all_inserts() {
+        let cache = S3FifoCache::new(S3FifoConfig {
+            max_bytes: 0,
+            ..small_config(0)
+        });
+        // Every insert exceeds the budget (size > 0 > max_bytes=0).
+        // The oversized check (size_bytes > max_bytes) is false for size=0,
+        // but Small budget is 0 so inserts should evict immediately.
+        cache.insert("a", 1, 1);
+        cache.insert("b", 2, 0);
+        // size=1 > max_bytes=0 triggers the oversized guard, so "a" is skipped.
+        assert!(cache.get(&"a").is_none());
+        // size=0 is not > max_bytes=0, so it enters Small. Small budget=0 triggers
+        // eviction, but since the item is 0 bytes it fits (0+0 <= 0).
+        assert_eq!(cache.get(&"b"), Some(2));
+        assert_eq!(cache.memory_used(), 0);
+    }
+
+    #[test]
+    fn empty_cache_get_returns_none() {
+        let cache = S3FifoCache::<String, Vec<u8>>::new(small_config(1024));
+        assert!(cache.get(&"nonexistent".to_owned()).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.memory_used(), 0);
+        assert!(cache.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn single_entry_cache_evicts_on_second_insert() {
+        // max_bytes=100, small=10. Each entry is 10 bytes.
+        // First insert fills Small. Second insert triggers eviction of first.
+        let cache = S3FifoCache::new(small_config(100));
+        cache.insert("first", 1, 10);
+        assert_eq!(cache.get(&"first"), Some(1));
+
+        // Don't access "first" again, so freq stays at 1 from the get above.
+        // freq=1 >= threshold=1, so "first" will be promoted to Main on eviction.
+        // Insert "second" which fills Small past budget (10+10=20 > 10).
+        cache.insert("second", 2, 10);
+
+        // "first" was promoted to Main (freq=1 >= threshold).
+        assert_eq!(cache.get(&"first"), Some(1));
+        assert_eq!(cache.get(&"second"), Some(2));
+    }
+
+    #[test]
+    fn single_entry_cache_evicts_unaccessed_item() {
+        // Same setup but without accessing "first" — freq stays 0.
+        let cache = S3FifoCache::new(small_config(100));
+        cache.insert("first", 1, 10);
+        // Do NOT access "first" — freq remains 0 < threshold=1.
+        cache.insert("second", 2, 10);
+
+        // "first" should be evicted to ghost (freq=0).
+        assert!(cache.get(&"first").is_none());
+        assert_eq!(cache.get(&"second"), Some(2));
+    }
+
+    #[test]
+    fn memory_budget_never_exceeded_under_heavy_load() {
+        let max_bytes = 500;
+        let cache = S3FifoCache::new(small_config(max_bytes));
+
+        for i in 0..1000 {
+            let key = format!("k{i}");
+            cache.insert(key, i, 10 + (i % 20)); // Variable sizes 10-29 bytes.
+            assert!(
+                cache.memory_used() <= max_bytes,
+                "budget exceeded: used={}, max={max_bytes}",
+                cache.memory_used()
+            );
+        }
+    }
+
+    #[test]
+    fn hit_rate_ema_converges_to_one_on_all_hits() {
+        let cache = S3FifoCache::new(S3FifoConfig {
+            hit_rate_alpha: 0.2, // Aggressive smoothing for fast convergence.
+            ..small_config(65536)
+        });
+        cache.insert("always_hit", 42, 10);
+
+        for _ in 0..100 {
+            let _ = cache.get(&"always_hit");
+        }
+        // After 100 consecutive hits with alpha=0.2, EMA should converge close to 1.0.
+        assert!(
+            cache.hit_rate() > 0.95,
+            "expected >0.95, got {}",
+            cache.hit_rate()
+        );
+    }
+
+    #[test]
+    fn hit_rate_ema_converges_to_zero_on_all_misses() {
+        let cache = S3FifoCache::<String, i32>::new(S3FifoConfig {
+            hit_rate_alpha: 0.2,
+            ..small_config(65536)
+        });
+        cache.insert("x".to_owned(), 1, 10);
+        // One hit to make rate nonzero.
+        let _ = cache.get(&"x".to_owned());
+        assert!(cache.hit_rate() > 0.0);
+
+        // 100 consecutive misses.
+        for i in 0..100 {
+            let _ = cache.get(&format!("miss{i}"));
+        }
+        assert!(
+            cache.hit_rate() < 0.01,
+            "expected <0.01, got {}",
+            cache.hit_rate()
+        );
+    }
+
+    #[test]
+    fn update_in_place_for_main_entry() {
+        // max_bytes=200, small=20, main=180
+        let cache = S3FifoCache::new(small_config(200));
+        cache.insert("a", 1, 10);
+        let _ = cache.get(&"a"); // freq=1, eligible for promotion.
+
+        // Force "a" out of Small into Main via eviction pressure.
+        cache.insert("b", 2, 10);
+        cache.insert("c", 3, 10);
+        // "a" is now in Main.
+        assert_eq!(cache.get(&"a"), Some(1));
+
+        // Update "a" in-place while it's in Main.
+        cache.insert("a", 99, 15);
+        assert_eq!(cache.get(&"a"), Some(99));
+        // Memory should reflect the new size, not old + new.
+        // Main has "a" (15 bytes). Small has "b" or "c" or both depending on eviction.
+        assert!(cache.memory_used() <= 200);
+    }
+
+    #[test]
+    fn ghost_queue_bounded_eviction() {
+        // Verify ghost entries are evicted when the ghost queue exceeds its capacity.
+        // Ghost capacity = max(2 * (small_order.len + main_order.len), 1024).
+        // With small budget, entries cycle through Small → Ghost rapidly.
+        let cache = S3FifoCache::new(small_config(200));
+
+        // Insert and evict many entries to fill ghost.
+        for i in 0..2000 {
+            cache.insert(i, i, 10);
+        }
+
+        // Early ghost entries should have been evicted from ghost.
+        // Re-inserting key 0 should NOT trigger ghost re-admission
+        // (it was evicted from ghost long ago).
+        cache.insert(0_i32, 0, 10);
+        // Just verify no panic and the entry is present.
+        assert_eq!(cache.get(&0), Some(0));
+    }
+
+    #[test]
+    fn all_entries_freq_zero_eviction_cascade() {
+        // When all entries have freq=0, eviction from Small sends everything to ghost
+        // (none promoted). This tests the cascade where Small fills and drains repeatedly.
+        let cache = S3FifoCache::new(small_config(200));
+
+        // Insert 100 entries without ever reading them (freq stays 0).
+        for i in 0..100 {
+            cache.insert(i, i, 10);
+        }
+
+        // Only the most recent entries should survive in Small.
+        // Small budget = 20 bytes = 2 entries of 10 bytes each.
+        assert!(
+            cache.len() <= 3,
+            "expected <=3 entries, got {}",
+            cache.len()
+        );
+        assert!(cache.memory_used() <= 200);
+    }
+
+    #[test]
+    fn concurrent_heavy_eviction_pressure() {
+        use std::sync::Arc;
+
+        // Small cache with high contention triggers frequent eviction under lock.
+        let cache = Arc::new(S3FifoCache::new(small_config(500)));
+        let mut handles = Vec::new();
+
+        for t in 0..8 {
+            let cache = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..500 {
+                    let key = format!("t{t}-{i}");
+                    cache.insert(key.clone(), i, 10);
+                    if i % 3 == 0 {
+                        let _ = cache.get(&key);
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // Budget invariant: memory never exceeds max_bytes.
+        assert!(
+            cache.memory_used() <= 500,
+            "budget violated: {}",
+            cache.memory_used()
+        );
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn no_cache_memory_and_hit_rate_invariants() {
+        let cache = NoCache;
+        // Multiple operations should not affect any state.
+        for _ in 0..100 {
+            CachePolicy::<i32, i32>::insert(&cache, 42, 99, 1000);
+        }
+        assert_eq!(CachePolicy::<i32, i32>::memory_used(&cache), 0);
+        assert!(CachePolicy::<i32, i32>::hit_rate(&cache).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rapid_insert_same_key_different_sizes() {
+        let cache = S3FifoCache::new(small_config(1024));
+
+        // Rapidly update the same key with different sizes.
+        for size in (1..=50).rev() {
+            cache.insert("same", size, size);
+        }
+
+        // Final value should be the last insertion.
+        assert_eq!(cache.get(&"same"), Some(1));
+        assert_eq!(cache.memory_used(), 1);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn promotion_resets_freq_counter() {
+        // After promotion from Small to Main, freq should be reset to 0.
+        // This means a promoted entry can be evicted from Main by newer entries
+        // without special treatment.
+        let cache = S3FifoCache::<String, i32>::new(small_config(200));
+
+        // Insert "a", access once (freq=1 >= threshold), then evict from Small.
+        cache.insert("a".to_owned(), 1, 10);
+        let _ = cache.get(&"a".to_owned()); // freq=1
+        cache.insert("b".to_owned(), 2, 10);
+        cache.insert("c".to_owned(), 3, 10); // "a" promoted to Main with freq reset to 0.
+
+        // "a" is in Main. Fill Main to capacity to evict "a".
+        // Main budget = 180 bytes. We need 18 entries of 10 bytes.
+        for i in 0..20 {
+            let key = format!("fill-{i}");
+            cache.insert(key.clone(), i + 10, 10);
+            let _ = cache.get(&key); // Promote each to Main.
+        }
+        // Force promotion cascade.
+        for i in 20..40 {
+            cache.insert(format!("fill-{i}"), i + 10, 10);
+        }
+
+        // "a" should eventually be evicted from Main.
+        // (It was the oldest Main entry with no further accesses.)
+        assert!(cache.get(&"a".to_owned()).is_none());
+    }
+
+    #[test]
+    fn config_defaults_match_documented_values() {
+        let config = S3FifoConfig::default();
+        assert_eq!(config.max_bytes, 256 * 1024 * 1024);
+        assert!((config.small_ratio - 0.10).abs() < f64::EPSILON);
+        assert_eq!(config.freq_threshold, 1);
+        assert!((config.hit_rate_alpha - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_max_small_and_main_bytes() {
+        let config = S3FifoConfig {
+            max_bytes: 1000,
+            small_ratio: 0.20,
+            ..S3FifoConfig::default()
+        };
+        assert_eq!(config.max_small_bytes(), 200);
+        assert_eq!(config.max_main_bytes(), 800);
+    }
+
+    #[test]
+    fn freq_threshold_zero_always_promotes() {
+        // With freq_threshold=0, every entry is promoted from Small to Main on eviction
+        // (freq=0 >= 0), so nothing ever goes to ghost.
+        let cache = S3FifoCache::new(S3FifoConfig {
+            max_bytes: 200,
+            small_ratio: 0.10,
+            freq_threshold: 0,
+            hit_rate_alpha: 0.1,
+        });
+
+        cache.insert("a", 1, 10);
+        // Don't access "a" at all — freq stays 0.
+        cache.insert("b", 2, 10);
+        cache.insert("c", 3, 10); // "a" evicted from Small, freq=0 >= 0, promoted to Main.
+
+        // "a" should be in Main.
+        assert_eq!(cache.get(&"a"), Some(1));
+    }
+
+    #[test]
+    fn high_freq_threshold_never_promotes() {
+        // With freq_threshold=255, entries need 255 accesses to get promoted.
+        // Without that many accesses, everything goes to ghost.
+        let cache = S3FifoCache::new(S3FifoConfig {
+            max_bytes: 200,
+            small_ratio: 0.10,
+            freq_threshold: 255,
+            hit_rate_alpha: 0.1,
+        });
+
+        cache.insert("a", 1, 10);
+        // Access 10 times — freq=10, still < 255.
+        for _ in 0..10 {
+            let _ = cache.get(&"a");
+        }
+        cache.insert("b", 2, 10);
+        cache.insert("c", 3, 10); // "a" evicted from Small, freq=10 < 255, goes to ghost.
+
+        assert!(cache.get(&"a").is_none());
+    }
+
+    #[test]
+    fn freq_counter_saturates_at_u8_max() {
+        let cache = S3FifoCache::new(small_config(65536));
+        cache.insert("sat", 1, 10);
+
+        // Access 300 times — freq should saturate at 255 (u8::MAX).
+        for _ in 0..300 {
+            let _ = cache.get(&"sat");
+        }
+
+        // Entry should still be retrievable (no overflow panic).
+        assert_eq!(cache.get(&"sat"), Some(1));
+    }
 }

@@ -404,7 +404,10 @@ impl FileProtector {
             source_symbols_from_bytes(&source_bytes, header.symbol_size, header.k_source)?;
         symbols.extend(repair_symbols.iter().cloned());
 
-        match self.codec.decode(&symbols, header.k_source)? {
+        match self
+            .codec
+            .decode_for_symbol_size(&symbols, header.k_source, header.symbol_size)?
+        {
             DecodedPayload::Success {
                 data, symbols_used, ..
             } => {
@@ -418,7 +421,11 @@ impl FileProtector {
                         "decoded payload failed crc verification; retrying with repair symbols only"
                     );
 
-                    match self.codec.decode(&repair_symbols, header.k_source)? {
+                    match self.codec.decode_for_symbol_size(
+                        &repair_symbols,
+                        header.k_source,
+                        header.symbol_size,
+                    )? {
                         DecodedPayload::Success {
                             data, symbols_used, ..
                         } => {

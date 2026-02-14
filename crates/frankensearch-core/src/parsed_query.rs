@@ -356,4 +356,148 @@ mod tests {
         let decoded: ParsedQuery = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, q);
     }
+
+    // ── bd-3un.49: Additional coverage ───────────────────────────────
+
+    #[test]
+    fn parse_negation_in_middle_of_query() {
+        let q = ParsedQuery::parse("foo -bar baz");
+        assert_eq!(q.positive, "foo baz");
+        assert_eq!(q.negative_terms, vec!["bar"]);
+    }
+
+    #[test]
+    fn parse_double_dash_is_treated_as_negation() {
+        // Current behavior: `--flag` is parsed as negation of `-flag`.
+        // The first `-` triggers negation, the second `-` is part of the term.
+        let q = ParsedQuery::parse("query --flag");
+        assert_eq!(q.positive, "query");
+        assert_eq!(q.negative_terms, vec!["-flag"]);
+    }
+
+    #[test]
+    fn parse_special_chars_in_negated_term() {
+        let q = ParsedQuery::parse("query -foo.bar");
+        assert_eq!(q.positive, "query");
+        assert_eq!(q.negative_terms, vec!["foo.bar"]);
+    }
+
+    #[test]
+    fn parse_negated_path() {
+        let q = ParsedQuery::parse("search -src/main.rs");
+        assert_eq!(q.positive, "search");
+        assert_eq!(q.negative_terms, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    fn parse_negated_term_preserves_case() {
+        let q = ParsedQuery::parse("search -Rust -ASYNC");
+        assert_eq!(q.positive, "search");
+        assert_eq!(q.negative_terms, vec!["Rust", "ASYNC"]);
+    }
+
+    #[test]
+    fn parse_multiple_not_phrases() {
+        let q = ParsedQuery::parse(r#"language NOT "deep learning" NOT "neural network""#);
+        assert_eq!(q.positive, "language");
+        assert_eq!(q.negative_phrases, vec!["deep learning", "neural network"]);
+    }
+
+    #[test]
+    fn parse_unicode_in_negated_term() {
+        let q = ParsedQuery::parse("search -café");
+        assert_eq!(q.positive, "search");
+        assert_eq!(q.negative_terms, vec!["café"]);
+    }
+
+    #[test]
+    fn parse_unicode_in_not_phrase() {
+        let q = ParsedQuery::parse(r#"query NOT "über cool""#);
+        assert_eq!(q.positive, "query");
+        assert_eq!(q.negative_phrases, vec!["über cool"]);
+    }
+
+    #[test]
+    fn has_negations_false_for_plain_query() {
+        let q = ParsedQuery::parse("just a plain query");
+        assert!(!q.has_negations());
+        assert_eq!(q.negation_count(), 0);
+    }
+
+    #[test]
+    fn has_negations_true_for_term_only() {
+        let q = ParsedQuery::parse("-excluded");
+        assert!(q.has_negations());
+        assert_eq!(q.negation_count(), 1);
+        assert!(q.is_positive_empty());
+    }
+
+    #[test]
+    fn has_negations_true_for_phrase_only() {
+        let q = ParsedQuery::parse(r#"NOT "excluded phrase""#);
+        assert!(q.has_negations());
+        assert_eq!(q.negation_count(), 1);
+        assert!(q.is_positive_empty());
+    }
+
+    #[test]
+    fn display_all_components() {
+        let q = ParsedQuery::parse(r#"find stuff -bad NOT "worse thing""#);
+        let displayed = q.to_string();
+        assert_eq!(displayed, r#"find stuff -bad NOT "worse thing""#);
+    }
+
+    #[test]
+    fn display_only_negations() {
+        let q = ParsedQuery::parse(r#"-a NOT "b c""#);
+        let displayed = q.to_string();
+        assert_eq!(displayed, r#" -a NOT "b c""#);
+    }
+
+    #[test]
+    fn serde_roundtrip_complex() {
+        let q = ParsedQuery::parse(r#"complex -query NOT "phrase one" -again NOT "phrase two""#);
+        let json = serde_json::to_string(&q).unwrap();
+        let decoded: ParsedQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, q);
+        assert_eq!(decoded.negative_terms, vec!["query", "again"]);
+        assert_eq!(decoded.negative_phrases, vec!["phrase one", "phrase two"]);
+    }
+
+    #[test]
+    fn parse_tab_and_newline_as_whitespace() {
+        let q = ParsedQuery::parse("hello\t-bad\nworld");
+        assert_eq!(q.positive, "hello world");
+        assert_eq!(q.negative_terms, vec!["bad"]);
+    }
+
+    #[test]
+    fn parse_many_negations() {
+        let q = ParsedQuery::parse("query -a -b -c -d -e -f -g -h -i -j");
+        assert_eq!(q.positive, "query");
+        assert_eq!(q.negative_terms.len(), 10);
+        assert_eq!(q.negation_count(), 10);
+    }
+
+    #[test]
+    fn parse_not_at_end_without_content() {
+        // "NOT" at end of string without a quote.
+        let q = ParsedQuery::parse("query NOT");
+        assert_eq!(q.positive, "query NOT");
+        assert!(!q.has_negations());
+    }
+
+    #[test]
+    fn parse_numeric_negated_term() {
+        let q = ParsedQuery::parse("error -404 -500");
+        assert_eq!(q.positive, "error");
+        assert_eq!(q.negative_terms, vec!["404", "500"]);
+    }
+
+    #[test]
+    fn equality_and_clone() {
+        let q1 = ParsedQuery::parse("query -bad");
+        let q2 = q1.clone();
+        assert_eq!(q1, q2);
+    }
 }

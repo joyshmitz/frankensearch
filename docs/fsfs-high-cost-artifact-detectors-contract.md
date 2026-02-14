@@ -61,6 +61,7 @@ The policy MUST support user-forced inclusion with guardrails:
 - audit event with reason code and final action
 
 `index_full` for a high-cost artifact MUST require an explicit override.
+Contract defaults for detector families MUST NOT set `index_full`.
 
 ## Required Decision Fields
 

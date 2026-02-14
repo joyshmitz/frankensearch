@@ -2,7 +2,7 @@
 //!
 //! The [`DataSource`] trait decouples the TUI from the concrete data backend.
 //! Product screens read from a `DataSource`; the real implementation queries
-//! FrankenSQLite (wired in via bd-2yu.4.3), while [`MockDataSource`] provides
+//! `FrankenSQLite` (wired in via bd-2yu.4.3), while [`MockDataSource`] provides
 //! test data for development and testing.
 
 use crate::state::{FleetSnapshot, InstanceInfo, ResourceMetrics, SearchMetrics};
@@ -82,7 +82,7 @@ impl std::fmt::Display for TimeWindow {
 /// Synchronous interface for the render loop. Background async tasks
 /// populate the backing store; the `DataSource` provides read access.
 ///
-/// The real implementation queries FrankenSQLite (bd-2yu.4.3).
+/// The real implementation queries `FrankenSQLite` (bd-2yu.4.3).
 /// [`MockDataSource`] provides synthetic data for development.
 pub trait DataSource: Send {
     /// Get the current fleet snapshot.
@@ -100,7 +100,7 @@ pub trait DataSource: Send {
 /// Mock data source for development and testing.
 ///
 /// Provides synthetic fleet data so the TUI can be developed and tested
-/// independently of the real FrankenSQLite backend.
+/// independently of the real `FrankenSQLite` backend.
 pub struct MockDataSource {
     snapshot: FleetSnapshot,
 }

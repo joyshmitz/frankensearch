@@ -82,6 +82,7 @@ check_integration() {
   echo "[integration] validating rename/move decision requirements"
   check_valid "integration" "$ROOT_DIR/schemas/fixtures/fsfs-incremental-change-detection-decision-v1.json"
   check_invalid "integration" "$ROOT_DIR/schemas/fixtures-invalid/fsfs-incremental-change-detection-invalid-rename-missing-paths-v1.json"
+  check_invalid "integration" "$ROOT_DIR/schemas/fixtures-invalid/fsfs-incremental-change-detection-invalid-delete-enqueue-embed-v1.json"
 }
 
 check_e2e() {

@@ -192,9 +192,10 @@ fn bench_vector_vacuum_time(c: &mut Criterion) {
     group.sample_size(10);
 
     let dim = 384;
-    let n = 10_000usize;
+    let n = 2_000usize;
 
-    for (label, delete_count) in [("10pct", 1_000usize), ("50pct", 5_000usize), ("90pct", 9_000usize)] {
+    for (label, delete_count) in [("10pct", n / 10), ("50pct", n / 2), ("90pct", (n * 9) / 10)]
+    {
         group.bench_function(BenchmarkId::new("vacuum", label), |b| {
             b.iter_batched(
                 || {

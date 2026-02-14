@@ -155,7 +155,7 @@ impl KPosterior {
 
     /// Posterior mean (expected K).
     #[must_use]
-    pub fn mean(&self) -> f64 {
+    pub const fn mean(&self) -> f64 {
         self.mu
     }
 
@@ -179,7 +179,7 @@ pub struct EvidenceEvent {
     pub k_used: f64,
     /// Blend posterior after update (alpha, beta).
     pub blend_posterior: (f64, f64),
-    /// K posterior after update (mu, sigma_sq).
+    /// K posterior after update (mu, `sigma_sq`).
     pub k_posterior: (f64, f64),
     /// Source of the relevance signal.
     pub signal_source: SignalSource,
@@ -251,10 +251,15 @@ impl AdaptiveFusion {
     ///
     /// Returns the posterior mean, clamped to `[blend_min, blend_max]`.
     /// Falls back to the global posterior when per-class data is insufficient.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn blend_factor(&self, query_class: QueryClass) -> f64 {
         let state = self.state.lock().expect("adaptive lock poisoned");
         let blend = self.resolve_blend(&state, query_class);
+        drop(state);
         blend.clamp(self.config.blend_min, self.config.blend_max)
     }
 
@@ -262,16 +267,25 @@ impl AdaptiveFusion {
     ///
     /// Returns the posterior mean, clamped to `[k_min, k_max]`.
     /// Falls back to the global posterior when per-class data is insufficient.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn rrf_k(&self, query_class: QueryClass) -> f64 {
         let state = self.state.lock().expect("adaptive lock poisoned");
         let k = self.resolve_k(&state, query_class);
+        drop(state);
         k.clamp(self.config.k_min, self.config.k_max)
     }
 
     /// Update the blend posterior with a Bernoulli observation.
     ///
     /// `success = true` means quality-tier reranking improved the ranking.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn update_blend(
         &self,
         query_class: QueryClass,
@@ -284,31 +298,40 @@ impl AdaptiveFusion {
         let class_state = state.per_class.entry(query_class).or_default();
         class_state.blend.update(success);
 
-        // Update global posterior.
-        state.global.blend.update(success);
+        // Snapshot values before releasing the per-class borrow.
+        let blend_used = class_state.blend.mean();
+        let k_used = class_state.k.mean();
+        let blend_posterior = (class_state.blend.alpha, class_state.blend.beta);
+        let k_posterior = (class_state.k.mu, class_state.k.sigma_sq);
 
-        let event = EvidenceEvent {
-            query_class,
-            blend_used: class_state.blend.mean(),
-            k_used: class_state.k.mean(),
-            blend_posterior: (class_state.blend.alpha, class_state.blend.beta),
-            k_posterior: (class_state.k.mu, class_state.k.sigma_sq),
-            signal_source: signal,
-        };
+        // Update global posterior (separate borrow).
+        state.global.blend.update(success);
+        drop(state);
 
         debug!(
             query_class = ?query_class,
-            blend_alpha = class_state.blend.alpha,
-            blend_beta = class_state.blend.beta,
-            blend_mean = class_state.blend.mean(),
+            blend_alpha = blend_posterior.0,
+            blend_beta = blend_posterior.1,
+            blend_mean = blend_used,
             signal = ?signal,
             "blend posterior updated"
         );
 
-        event
+        EvidenceEvent {
+            query_class,
+            blend_used,
+            k_used,
+            blend_posterior,
+            k_posterior,
+            signal_source: signal,
+        }
     }
 
     /// Update the RRF K posterior with an observed optimal K value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn update_k(
         &self,
         query_class: QueryClass,
@@ -321,42 +344,57 @@ impl AdaptiveFusion {
         let class_state = state.per_class.entry(query_class).or_default();
         class_state.k.update(observed_k);
 
-        // Update global posterior.
-        state.global.k.update(observed_k);
+        // Snapshot values before releasing the per-class borrow.
+        let blend_used = class_state.blend.mean();
+        let k_used = class_state.k.mean();
+        let blend_posterior = (class_state.blend.alpha, class_state.blend.beta);
+        let k_posterior = (class_state.k.mu, class_state.k.sigma_sq);
+        let k_sigma = class_state.k.std_dev();
 
-        let event = EvidenceEvent {
-            query_class,
-            blend_used: class_state.blend.mean(),
-            k_used: class_state.k.mean(),
-            blend_posterior: (class_state.blend.alpha, class_state.blend.beta),
-            k_posterior: (class_state.k.mu, class_state.k.sigma_sq),
-            signal_source: signal,
-        };
+        // Update global posterior (separate borrow).
+        state.global.k.update(observed_k);
+        drop(state);
 
         debug!(
             query_class = ?query_class,
-            k_mu = class_state.k.mu,
-            k_sigma = class_state.k.std_dev(),
+            k_mu = k_posterior.0,
+            k_sigma,
             observed_k,
             signal = ?signal,
             "K posterior updated"
         );
 
-        event
+        EvidenceEvent {
+            query_class,
+            blend_used,
+            k_used,
+            blend_posterior,
+            k_posterior,
+            signal_source: signal,
+        }
     }
 
     /// Reset all learned parameters to their priors.
     ///
     /// Clears all per-class and global observations, returning the fusion
     /// state to its initial configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn reset(&self) {
         let mut state = self.state.lock().expect("adaptive lock poisoned");
         state.per_class.clear();
         state.global = ClassState::default();
+        drop(state);
         debug!("adaptive fusion state reset to prior");
     }
 
     /// Snapshot the current state for serialization or inspection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> AdaptiveSnapshot {
         let state = self.state.lock().expect("adaptive lock poisoned");
@@ -372,10 +410,10 @@ impl AdaptiveFusion {
     }
 
     fn resolve_blend(&self, state: &AdaptiveState, query_class: QueryClass) -> f64 {
-        if let Some(cs) = state.per_class.get(&query_class) {
-            if cs.blend.n >= self.config.min_samples {
-                return cs.blend.mean();
-            }
+        if let Some(cs) = state.per_class.get(&query_class)
+            && cs.blend.n >= self.config.min_samples
+        {
+            return cs.blend.mean();
         }
         // Fallback to global if per-class has insufficient data.
         if state.global.blend.n >= self.config.min_samples {
@@ -386,10 +424,10 @@ impl AdaptiveFusion {
     }
 
     fn resolve_k(&self, state: &AdaptiveState, query_class: QueryClass) -> f64 {
-        if let Some(cs) = state.per_class.get(&query_class) {
-            if cs.k.n >= self.config.min_samples {
-                return cs.k.mean();
-            }
+        if let Some(cs) = state.per_class.get(&query_class)
+            && cs.k.n >= self.config.min_samples
+        {
+            return cs.k.mean();
         }
         if state.global.k.n >= self.config.min_samples {
             return state.global.k.mean();
@@ -553,18 +591,48 @@ mod tests {
 
     #[test]
     fn per_class_independence() {
-        let af = AdaptiveFusion::new(test_config());
+        // Use high min_samples so global fallback stays at prior.
+        let af = AdaptiveFusion::new(AdaptiveConfig {
+            min_samples: 100,
+            ..AdaptiveConfig::default()
+        });
 
-        // Update Identifier class.
+        // Update Identifier class (10 observations, below min_samples=100).
         for _ in 0..10 {
             af.update_blend(QueryClass::Identifier, false, SignalSource::Skip);
         }
 
-        // NaturalLanguage class should still be at prior default.
+        // NaturalLanguage has no per-class data. Global has 10 obs (below min_samples=100).
+        // Both fall back to prior default since neither crosses threshold.
         assert!((af.blend_factor(QueryClass::NaturalLanguage) - 0.7).abs() < 1e-10);
 
-        // Identifier should have adapted downward.
+        // Now give Identifier enough data to cross threshold.
+        for _ in 0..100 {
+            af.update_blend(QueryClass::Identifier, false, SignalSource::Skip);
+        }
+
+        // Identifier should have adapted downward (110 obs >= 100).
         assert!(af.blend_factor(QueryClass::Identifier) < 0.7);
+
+        // NaturalLanguage still has no per-class data.
+        // Global has 110 obs (>= 100), so global fallback is used (shifted by failures).
+        // But this tests per-class POSTERIORS are independent — Identifier's per-class
+        // posterior and NaturalLanguage's per-class posterior don't leak into each other.
+        let snap = af.snapshot();
+        let id_blend = snap
+            .per_class
+            .iter()
+            .find(|(qc, _, _)| *qc == QueryClass::Identifier)
+            .map(|(_, b, _)| b.clone())
+            .expect("Identifier should have per-class state");
+        let nl_blend = snap
+            .per_class
+            .iter()
+            .find(|(qc, _, _)| *qc == QueryClass::NaturalLanguage);
+        // NaturalLanguage should have NO per-class state (never observed).
+        assert!(nl_blend.is_none());
+        // Identifier per-class blend should be heavily shifted toward 0.
+        assert!(id_blend.mean() < 0.3);
     }
 
     #[test]
@@ -806,7 +874,10 @@ mod tests {
         assert!(snap.global_blend.beta.is_finite());
         assert!(snap.global_k.mu.is_finite());
         assert!(snap.global_k.sigma_sq.is_finite());
-        assert!(snap.global_k.sigma_sq > 0.0, "K variance must stay positive");
+        assert!(
+            snap.global_k.sigma_sq > 0.0,
+            "K variance must stay positive"
+        );
     }
 
     // --- Conflicting observations edge case ---
@@ -836,7 +907,10 @@ mod tests {
         let var = snap.global_blend.alpha * snap.global_blend.beta
             / ((snap.global_blend.alpha + snap.global_blend.beta).powi(2)
                 * (snap.global_blend.alpha + snap.global_blend.beta + 1.0));
-        assert!(var > 0.0, "variance should remain positive with conflicting data");
+        assert!(
+            var > 0.0,
+            "variance should remain positive with conflicting data"
+        );
     }
 
     // --- Identical observations edge case ---
@@ -973,5 +1047,172 @@ mod tests {
         assert!(classes.contains(&QueryClass::ShortKeyword));
         assert!(classes.contains(&QueryClass::Identifier));
         assert!(classes.contains(&QueryClass::Empty));
+    }
+
+    // --- Adaptation disabled (high min_samples) ---
+
+    #[test]
+    fn adaptation_disabled_with_max_min_samples() {
+        let af = AdaptiveFusion::new(AdaptiveConfig {
+            min_samples: u64::MAX,
+            ..AdaptiveConfig::default()
+        });
+
+        // Feed many observations — none should cross the threshold.
+        for _ in 0..500 {
+            af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+            af.update_k(QueryClass::NaturalLanguage, 100.0, SignalSource::NdcgEval);
+        }
+
+        // Blend and K should still return prior defaults.
+        assert!(
+            (af.blend_factor(QueryClass::NaturalLanguage) - 0.7).abs() < 1e-10,
+            "adaptation disabled: blend should remain at prior 0.7"
+        );
+        assert!(
+            (af.rrf_k(QueryClass::NaturalLanguage) - 60.0).abs() < 1e-10,
+            "adaptation disabled: K should remain at prior 60.0"
+        );
+    }
+
+    // --- Single observation shifts posterior ---
+
+    #[test]
+    fn single_blend_observation_shifts_posterior_correctly() {
+        let mut bp = BlendPosterior::default();
+        // Prior: alpha=7, beta=3 → mean = 0.7
+        bp.update(true);
+        // After success: alpha=8, beta=3 → mean = 8/11 ≈ 0.7273
+        assert_eq!(bp.n, 1);
+        assert!((bp.alpha - 8.0).abs() < f64::EPSILON);
+        assert!((bp.beta - 3.0).abs() < f64::EPSILON);
+        assert!((bp.mean() - 8.0 / 11.0).abs() < 1e-10);
+
+        let mut bp2 = BlendPosterior::default();
+        bp2.update(false);
+        // After failure: alpha=7, beta=4 → mean = 7/11 ≈ 0.6364
+        assert!((bp2.alpha - 7.0).abs() < f64::EPSILON);
+        assert!((bp2.beta - 4.0).abs() < f64::EPSILON);
+        assert!((bp2.mean() - 7.0 / 11.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn single_k_observation_shifts_posterior_correctly() {
+        let mut kp = KPosterior::default();
+        // Prior: mu=60, sigma_sq=100, sigma_obs_sq=225
+        let precision_prior: f64 = 1.0 / 100.0;
+        let precision_obs: f64 = 1.0 / 225.0;
+        let precision_post = precision_prior + precision_obs;
+        let expected_mu =
+            precision_prior.mul_add(60.0, precision_obs * 80.0) / precision_post;
+        let expected_sigma_sq = 1.0 / precision_post;
+
+        kp.update(80.0);
+        assert_eq!(kp.n, 1);
+        assert!(
+            (kp.mu - expected_mu).abs() < 1e-10,
+            "K posterior mu mismatch: got {}, expected {expected_mu}",
+            kp.mu
+        );
+        assert!(
+            (kp.sigma_sq - expected_sigma_sq).abs() < 1e-10,
+            "K posterior sigma_sq mismatch: got {}, expected {expected_sigma_sq}",
+            kp.sigma_sq
+        );
+    }
+
+    // --- Evidence event fields are correctly populated ---
+
+    #[test]
+    fn evidence_event_tracks_observation_count() {
+        let af = AdaptiveFusion::new(test_config());
+
+        let ev1 = af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+        assert!(ev1.blend_posterior.0 > 7.0, "alpha should increase after success");
+        assert!(
+            (ev1.blend_posterior.1 - 3.0).abs() < f64::EPSILON,
+            "beta should stay at prior for success"
+        );
+
+        let ev2 = af.update_k(QueryClass::NaturalLanguage, 80.0, SignalSource::NdcgEval);
+        assert!(ev2.k_posterior.0 > 60.0, "K mu should shift toward observed 80");
+        assert!(
+            ev2.k_posterior.1 < 100.0,
+            "K sigma_sq should decrease after observation"
+        );
+    }
+
+    // --- Snapshot persistence roundtrip preserves learned state ---
+
+    #[test]
+    fn snapshot_persistence_preserves_per_class_state() {
+        let af = AdaptiveFusion::new(test_config());
+
+        // Train different classes with different patterns.
+        for _ in 0..20 {
+            af.update_blend(QueryClass::NaturalLanguage, true, SignalSource::Click);
+            af.update_blend(QueryClass::Identifier, false, SignalSource::Skip);
+            af.update_k(QueryClass::NaturalLanguage, 45.0, SignalSource::NdcgEval);
+            af.update_k(QueryClass::Identifier, 90.0, SignalSource::NdcgEval);
+        }
+
+        let snap = af.snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        let restored: AdaptiveSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
+
+        // Verify per-class data survived the roundtrip.
+        assert_eq!(restored.per_class.len(), snap.per_class.len());
+        assert_eq!(restored.global_blend.n, snap.global_blend.n);
+        assert_eq!(restored.global_k.n, snap.global_k.n);
+
+        for (orig, rest) in snap.per_class.iter().zip(restored.per_class.iter()) {
+            assert_eq!(orig.0, rest.0, "query class mismatch");
+            assert!((orig.1.alpha - rest.1.alpha).abs() < f64::EPSILON);
+            assert!((orig.2.mu - rest.2.mu).abs() < f64::EPSILON);
+        }
+    }
+
+    // --- Stress test: rapid alternating updates ---
+
+    #[test]
+    fn rapid_alternating_updates_stay_stable() {
+        let af = AdaptiveFusion::new(AdaptiveConfig {
+            min_samples: 0,
+            ..AdaptiveConfig::default()
+        });
+
+        // Alternate between query classes rapidly.
+        for i in 0..500 {
+            let qc = match i % 4 {
+                0 => QueryClass::NaturalLanguage,
+                1 => QueryClass::ShortKeyword,
+                2 => QueryClass::Identifier,
+                _ => QueryClass::Empty,
+            };
+            af.update_blend(qc, i % 2 == 0, SignalSource::Click);
+            af.update_k(qc, 30.0 + f64::from(i % 60), SignalSource::NdcgEval);
+        }
+
+        // All per-class blend factors should be finite and within safety bounds.
+        for qc in [
+            QueryClass::NaturalLanguage,
+            QueryClass::ShortKeyword,
+            QueryClass::Identifier,
+            QueryClass::Empty,
+        ] {
+            let blend = af.blend_factor(qc);
+            let k = af.rrf_k(qc);
+            assert!(blend.is_finite(), "blend for {qc:?} must be finite");
+            assert!(k.is_finite(), "K for {qc:?} must be finite");
+            assert!(
+                blend >= 0.1 && blend <= 0.95,
+                "blend for {qc:?} out of safety bounds: {blend}"
+            );
+            assert!(
+                k >= 1.0 && k <= 200.0,
+                "K for {qc:?} out of safety bounds: {k}"
+            );
+        }
     }
 }
