@@ -19,6 +19,7 @@ use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 struct MonitorRow {
     project: String,
     instance_id: String,
@@ -34,12 +35,44 @@ struct MonitorRow {
     cpu_percentile: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonWindow {
+    CurrentVsPreviousHourEstimate,
+    CurrentVsSameHourYesterdayEstimate,
+}
+
+impl ComparisonWindow {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CurrentVsPreviousHourEstimate => "current_hour vs previous_hour_estimate",
+            Self::CurrentVsSameHourYesterdayEstimate => {
+                "current_hour vs same_hour_yesterday_estimate"
+            }
+        }
+    }
+
+    const fn baseline_scale(self) -> (u16, u16) {
+        match self {
+            Self::CurrentVsPreviousHourEstimate => (92, 100),
+            Self::CurrentVsSameHourYesterdayEstimate => (85, 100),
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::CurrentVsPreviousHourEstimate => Self::CurrentVsSameHourYesterdayEstimate,
+            Self::CurrentVsSameHourYesterdayEstimate => Self::CurrentVsPreviousHourEstimate,
+        }
+    }
+}
+
 /// Index/resource monitoring screen.
 pub struct IndexResourceScreen {
     id: ScreenId,
     state: AppState,
     selected_row: usize,
     project_filter_index: usize,
+    comparison_window: ComparisonWindow,
 }
 
 impl IndexResourceScreen {
@@ -51,6 +84,7 @@ impl IndexResourceScreen {
             state: AppState::new(),
             selected_row: 0,
             project_filter_index: 0,
+            comparison_window: ComparisonWindow::CurrentVsPreviousHourEstimate,
         }
     }
 
@@ -122,6 +156,10 @@ impl IndexResourceScreen {
     fn reset_filters(&mut self) {
         self.project_filter_index = 0;
         self.clamp_selected_row();
+    }
+
+    const fn cycle_comparison_window(&mut self) {
+        self.comparison_window = self.comparison_window.next();
     }
 
     fn percentile_rank_u64(values: &[u64], value: u64) -> u8 {
@@ -231,6 +269,7 @@ impl IndexResourceScreen {
         rows
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn summary_lines(&self, rows: &[MonitorRow]) -> Vec<Line<'static>> {
         if rows.is_empty() {
             return vec![
@@ -251,6 +290,20 @@ impl IndexResourceScreen {
         let cpu_avg = cpu_total / f64::from(count_u32);
         let memory_avg = memory_total.saturating_add(count_u64 / 2) / count_u64;
         let p95_avg = p95_total.saturating_add(count_u64 / 2) / count_u64;
+        let (baseline_numerator, baseline_denominator) = self.comparison_window.baseline_scale();
+        let baseline_numerator_u64 = u64::from(baseline_numerator);
+        let baseline_denominator_u64 = u64::from(baseline_denominator);
+        let baseline_cpu_avg =
+            cpu_avg * f64::from(baseline_numerator) / f64::from(baseline_denominator);
+        let baseline_p95_avg = p95_avg
+            .saturating_mul(baseline_numerator_u64)
+            .saturating_div(baseline_denominator_u64);
+        let baseline_pending_total = pending_total
+            .saturating_mul(baseline_numerator_u64)
+            .saturating_div(baseline_denominator_u64);
+        let delta_cpu_avg = cpu_avg - baseline_cpu_avg;
+        let delta_p95_avg = i128::from(p95_avg) - i128::from(baseline_p95_avg);
+        let delta_pending_total = i128::from(pending_total) - i128::from(baseline_pending_total);
 
         let fleet = self.state.fleet();
         let filtered_ids: BTreeSet<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
@@ -287,7 +340,11 @@ impl IndexResourceScreen {
                 "Resources cpu_avg={cpu_avg:.1}% | mem_avg={memory_avg}MiB | io_total={io_total}KiB"
             )),
             Line::from(format!(
-                "Search p95_avg={p95_avg}us | keys: p cycle project, x reset filters"
+                "comparison[{}]: p95 Δ{delta_p95_avg:+}us | cpu Δ{delta_cpu_avg:+.1}% | pending Δ{delta_pending_total:+}",
+                self.comparison_window.label(),
+            )),
+            Line::from(format!(
+                "Search p95_avg={p95_avg}us | keys: p cycle project, o cycle comparison, x reset filters"
             )),
         ]
     }
@@ -415,6 +472,10 @@ impl Screen for IndexResourceScreen {
                 }
                 crossterm::event::KeyCode::Char('x') => {
                     self.reset_filters();
+                    return ScreenAction::Consumed;
+                }
+                crossterm::event::KeyCode::Char('o') => {
+                    self.cycle_comparison_window();
                     return ScreenAction::Consumed;
                 }
                 _ => {}
@@ -630,5 +691,43 @@ mod tests {
         assert!(text.contains("Embedding pending="));
         assert!(text.contains("Resources cpu_avg="));
         assert!(text.contains("refined_share="));
+        assert!(text.contains("comparison["));
+    }
+
+    #[test]
+    fn comparison_window_cycles_via_keyboard() {
+        let mut screen = IndexResourceScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+
+        let initial = screen
+            .summary_lines(&screen.row_models())
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(initial.contains("current_hour vs previous_hour_estimate"));
+
+        let cycle = InputEvent::Key(
+            crossterm::event::KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&cycle, &ctx), ScreenAction::Consumed);
+        let after_first = screen
+            .summary_lines(&screen.row_models())
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(after_first.contains("current_hour vs same_hour_yesterday_estimate"));
+
+        assert_eq!(screen.handle_input(&cycle, &ctx), ScreenAction::Consumed);
+        let after_second = screen
+            .summary_lines(&screen.row_models())
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(after_second.contains("current_hour vs previous_hour_estimate"));
     }
 }

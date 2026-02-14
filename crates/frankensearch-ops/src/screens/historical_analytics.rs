@@ -65,6 +65,37 @@ struct EvidenceRow {
     replay_handle: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotExportMode {
+    Compact,
+    Full,
+}
+
+impl SnapshotExportMode {
+    const fn from_compact(compact: bool) -> Self {
+        if compact { Self::Compact } else { Self::Full }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotExportPayload {
+    mode: SnapshotExportMode,
+    project: String,
+    host: String,
+    instance_id: String,
+    ts_ms: u64,
+    reason_code: String,
+    confidence: u8,
+    replay_handle: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplayTarget {
+    project: String,
+    instance_id: String,
+    replay_handle: String,
+}
+
 #[derive(Clone, Debug)]
 struct CorrelationRow {
     reason_code: String,
@@ -146,9 +177,23 @@ impl HistoricalAnalyticsScreen {
     /// Selected project from the evidence table.
     #[must_use]
     pub fn selected_project(&self) -> Option<String> {
-        self.filtered_evidence_rows()
-            .get(self.selected_row)
-            .map(|row| row.project.clone())
+        self.selected_snapshot_payload()
+            .map(|payload| payload.project)
+    }
+
+    #[must_use]
+    fn selected_replay_target(&self) -> Option<ReplayTarget> {
+        self.selected_snapshot_payload().map(|payload| ReplayTarget {
+            project: payload.project,
+            instance_id: payload.instance_id,
+            replay_handle: payload.replay_handle,
+        })
+    }
+
+    #[must_use]
+    fn selected_snapshot_payload(&self) -> Option<SnapshotExportPayload> {
+        let rows = self.filtered_evidence_rows();
+        self.selected_snapshot_payload_for_rows(&rows)
     }
 
     fn rebuild_derived_rows(&mut self) {
@@ -513,20 +558,38 @@ impl HistoricalAnalyticsScreen {
     }
 
     fn export_snapshot_line_for_rows(&self, rows: &[EvidenceRow]) -> String {
-        if let Some(row) = rows.get(self.selected_row) {
-            if self.compact_export {
+        if let Some(payload) = self.selected_snapshot_payload_for_rows(rows) {
+            if matches!(payload.mode, SnapshotExportMode::Compact) {
                 return format!(
                     "snapshot(compact): incident={}::{}::{} replay={} (toggle: e)",
-                    row.project, row.instance_id, row.ts_ms, row.replay_handle
+                    payload.project, payload.instance_id, payload.ts_ms, payload.replay_handle
                 );
             }
 
             return format!(
-                "snapshot(full): scope=project:{} reason={} confidence={} replay={} (toggle: e)",
-                row.project, row.reason_code, row.confidence, row.replay_handle
+                "snapshot(full): scope=project:{} host:{} reason={} confidence={} replay={} (toggle: e)",
+                payload.project,
+                payload.host,
+                payload.reason_code,
+                payload.confidence,
+                payload.replay_handle
             );
         }
         "snapshot: no evidence row selected".to_owned()
+    }
+
+    fn selected_snapshot_payload_for_rows(&self, rows: &[EvidenceRow]) -> Option<SnapshotExportPayload> {
+        let row = rows.get(self.selected_row)?;
+        Some(SnapshotExportPayload {
+            mode: SnapshotExportMode::from_compact(self.compact_export),
+            project: row.project.clone(),
+            host: row.host.clone(),
+            instance_id: row.instance_id.clone(),
+            ts_ms: row.ts_ms,
+            reason_code: row.reason_code.clone(),
+            confidence: row.confidence,
+            replay_handle: row.replay_handle.clone(),
+        })
     }
 
     fn filter_summary(&self) -> String {
@@ -647,6 +710,15 @@ impl Screen for HistoricalAnalyticsScreen {
     fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
         let evidence = self.filtered_evidence_rows();
         let correlation = self.correlation_rows_for_rows(&evidence);
+        let replay_summary = self.selected_replay_target().map_or_else(
+            || "selected_replay: none".to_owned(),
+            |target| {
+                format!(
+                    "selected_replay: {}::{} ({})",
+                    target.project, target.instance_id, target.replay_handle
+                )
+            },
+        );
 
         let area = frame.area();
         let chunks = Layout::default()
@@ -681,6 +753,7 @@ impl Screen for HistoricalAnalyticsScreen {
             Line::from(Self::correlation_summary_line(&correlation)),
             Line::from(self.filter_summary()),
             Line::from(self.export_snapshot_line_for_rows(&evidence)),
+            Line::from(replay_summary),
         ])
         .block(
             Block::default()
@@ -1045,5 +1118,65 @@ mod tests {
             screen.handle_input(&timeline, &ctx),
             ScreenAction::Navigate(ScreenId::new("ops.timeline.custom"))
         );
+    }
+
+    #[test]
+    fn export_toggle_switches_snapshot_mode_line() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+
+        let compact_line = screen.export_snapshot_line();
+        assert!(compact_line.contains("snapshot(compact)"));
+
+        let toggle = InputEvent::Key(
+            crossterm::event::KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&toggle, &ctx), ScreenAction::Consumed);
+
+        let full_line = screen.export_snapshot_line();
+        assert!(full_line.contains("snapshot(full)"));
+        assert!(full_line.contains("replay://"));
+    }
+
+    #[test]
+    fn selected_snapshot_payload_and_replay_target_follow_selection() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = context();
+
+        let first_payload = screen
+            .selected_snapshot_payload()
+            .expect("payload should exist for initial selection");
+        let first_target = screen
+            .selected_replay_target()
+            .expect("replay target should exist for initial selection");
+        assert_eq!(first_payload.project, first_target.project);
+        assert_eq!(first_payload.instance_id, first_target.instance_id);
+        assert_eq!(first_payload.replay_handle, first_target.replay_handle);
+
+        let down = InputEvent::Key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
+
+        let second_payload = screen
+            .selected_snapshot_payload()
+            .expect("payload should still exist after moving selection");
+        assert_ne!(
+            (first_payload.ts_ms, first_payload.reason_code),
+            (second_payload.ts_ms, second_payload.reason_code)
+        );
+    }
+
+    #[test]
+    fn selected_snapshot_payload_handles_empty_rows() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        screen.update_state(&AppState::new());
+        assert!(screen.selected_snapshot_payload().is_none());
+        assert!(screen.selected_replay_target().is_none());
+        assert_eq!(screen.export_snapshot_line(), "snapshot: no evidence row selected");
     }
 }

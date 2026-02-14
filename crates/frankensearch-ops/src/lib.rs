@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accessibility;
 pub mod app;
 pub mod category;
 pub mod data_source;
@@ -36,9 +37,16 @@ pub mod screens;
 pub mod simulator;
 pub mod state;
 pub mod storage;
+pub mod theme;
 
 // ─── Re-exports ─────────────────────────────────────────────────────────────
 
+pub use accessibility::{
+    ACCESSIBILITY_SCHEMA_VERSION, AnimationTiming, FRAME_BUDGET_MS, FRAME_BUDGETS,
+    FRAME_DROP_THRESHOLD_MS, FramePhase, FrameQualityTracker, FrameQualityVerdict, FrameTimeBudget,
+    INPUT_FEEDBACK_BUDGET_MS, KeyboardBinding, KeyboardParityAudit, MAX_CONSECUTIVE_DROPS,
+    MIN_EFFECTIVE_FPS, QualityConstraints, TARGET_FPS,
+};
 pub use app::OpsApp;
 pub use category::ScreenCategory;
 pub use data_source::{DataSource, MockDataSource};
@@ -63,3 +71,4 @@ pub use storage::{
     SloMaterializationConfig, SloMaterializationResult, SloRollupSnapshot, SloScope,
     bootstrap as bootstrap_ops_storage, current_version as current_ops_schema_version,
 };
+pub use theme::{FocusIndicatorSpec, PALETTE_SCHEMA_VERSION, SemanticPalette, ThemeVariant};
