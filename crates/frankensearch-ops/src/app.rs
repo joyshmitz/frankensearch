@@ -4,12 +4,12 @@
 //! data source, and drives the event loop. Product binaries create an
 //! `OpsApp` and call `run()`.
 
-use frankensearch_tui::Screen;
 use frankensearch_tui::overlay::{OverlayKind, OverlayRequest};
 use frankensearch_tui::palette::{Action, ActionCategory};
 use frankensearch_tui::screen::ScreenId;
 use frankensearch_tui::shell::{AppShell, ShellConfig};
 use frankensearch_tui::theme::Theme;
+use frankensearch_tui::Screen;
 use ratatui::Frame;
 
 use crate::data_source::DataSource;
@@ -643,12 +643,10 @@ mod tests {
         let overlay = app.shell.overlays.top().expect("overlay should be visible");
         assert_eq!(overlay.kind, OverlayKind::Alert);
         assert_eq!(overlay.title, "Control Plane Self-Check");
-        assert!(
-            overlay
-                .body
-                .as_deref()
-                .is_some_and(|body| body.contains("ingestion_lag_events"))
-        );
+        assert!(overlay
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("ingestion_lag_events")));
     }
 
     #[test]
@@ -672,12 +670,10 @@ mod tests {
             .expect("degradation alert should exist");
         assert_eq!(overlay.kind, OverlayKind::Alert);
         assert_eq!(overlay.title, "Control Plane Degraded");
-        assert!(
-            overlay
-                .body
-                .as_deref()
-                .is_some_and(|body| body.contains("health transition: healthy -> degraded"))
-        );
+        assert!(overlay
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("health transition: healthy -> degraded")));
     }
 
     #[test]
@@ -726,12 +722,10 @@ mod tests {
             .top()
             .expect("critical alert should exist");
         assert_eq!(overlay.title, "Control Plane Critical");
-        assert!(
-            overlay
-                .body
-                .as_deref()
-                .is_some_and(|body| body.contains("health transition: degraded -> critical"))
-        );
+        assert!(overlay
+            .body
+            .as_deref()
+            .is_some_and(|body| body.contains("health transition: degraded -> critical")));
     }
 
     #[test]

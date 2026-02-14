@@ -3204,25 +3204,36 @@ mod tests {
         (result, logs)
     }
 
-    fn seed_project_and_instance(conn: &Connection) {
-        conn.execute(
+    fn seed_project_and_instance_named(conn: &Connection, project_key: &str, instance_id: &str) {
+        let project_insert = format!(
             "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
-             VALUES ('project-a', 'Project A', 1, 1);",
-        )
-        .expect("project row should insert");
-        conn.execute(
+             VALUES ('{project_key}', '{project_key}', 1, 1);"
+        );
+        conn.execute(&project_insert)
+            .expect("project row should insert");
+
+        let instance_insert = format!(
             "INSERT INTO instances(\
                 instance_id, project_key, host_name, pid, version, first_seen_ms, \
                 last_heartbeat_ms, state\
              ) VALUES (\
-                'instance-a', 'project-a', 'host-a', 123, '0.1.0', 1, 1, 'healthy'\
-             );",
-        )
-        .expect("instance row should insert");
+                '{instance_id}', '{project_key}', 'host-a', 123, '0.1.0', 1, 1, 'healthy'\
+             );"
+        );
+        conn.execute(&instance_insert)
+            .expect("instance row should insert");
+    }
+
+    fn seed_project_and_instance(conn: &Connection) {
+        seed_project_and_instance_named(conn, "project-a", "instance-a");
+    }
+
+    fn seed_second_project_and_instance(conn: &Connection) {
+        seed_project_and_instance_named(conn, "project-b", "instance-b");
     }
 
     #[test]
-    fn bootstrap_creates_v1_schema_tables_and_indexes() {
+    fn bootstrap_creates_schema_tables_and_indexes() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
 
         bootstrap(&conn).expect("bootstrap should succeed");
@@ -3241,6 +3252,8 @@ mod tests {
             "resource_samples",
             "alerts_timeline",
             "evidence_links",
+            "slo_rollups",
+            "anomaly_materializations",
             "ops_schema_migrations",
         ] {
             assert!(
@@ -3261,6 +3274,10 @@ mod tests {
             "ix_at_pk",
             "ix_at_open",
             "ix_el_aid",
+            "ix_slo_scope_window",
+            "ix_slo_project_window",
+            "ix_am_scope_state",
+            "ix_am_project_timeline",
         ] {
             assert!(
                 index_exists(&conn, index),
@@ -3282,8 +3299,8 @@ mod tests {
         );
         assert_eq!(
             migration_row_count(&conn),
-            1,
-            "schema should record a single applied migration"
+            OPS_SCHEMA_VERSION,
+            "schema should record one row per applied migration version"
         );
     }
 
