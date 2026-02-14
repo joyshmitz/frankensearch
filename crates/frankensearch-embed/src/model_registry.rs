@@ -20,6 +20,7 @@ const CONFIG_JSON: &str = "config.json";
 const SPECIAL_TOKENS_JSON: &str = "special_tokens_map.json";
 const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
 const FRANKENSEARCH_MODEL_DIR_ENV: &str = "FRANKENSEARCH_MODEL_DIR";
+const FRANKENSEARCH_DATA_DIR_ENV: &str = "FRANKENSEARCH_DATA_DIR";
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 const KNOWN_MODEL_LAYOUT_DIRS: [&str; 4] = [
     "potion-base-128M",
@@ -298,6 +299,9 @@ fn default_registry_data_dir() -> PathBuf {
 pub(crate) fn model_storage_root() -> PathBuf {
     if let Some(path) = std::env::var_os(FRANKENSEARCH_MODEL_DIR_ENV) {
         return PathBuf::from(path);
+    }
+    if let Some(path) = std::env::var_os(FRANKENSEARCH_DATA_DIR_ENV) {
+        return PathBuf::from(path).join("models");
     }
     if let Some(path) = std::env::var_os(XDG_DATA_HOME_ENV) {
         return PathBuf::from(path).join("frankensearch").join("models");

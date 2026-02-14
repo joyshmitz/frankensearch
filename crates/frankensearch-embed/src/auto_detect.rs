@@ -79,7 +79,7 @@ use crate::model2vec_embedder::{
 const POTION_MODEL_NAME: &str = "potion-multilingual-128M";
 #[cfg(feature = "model2vec")]
 const POTION_HF_ID: &str = "minishlab/potion-multilingual-128M";
-#[cfg(feature = "model2vec")]
+#[cfg(all(feature = "download", feature = "model2vec"))]
 const POTION_DIMENSION: usize = 256;
 #[cfg(all(
     feature = "download",
@@ -1556,6 +1556,12 @@ mod tests {
         let model_dir = temp.path().join(POTION_MODEL_NAME);
         fs::create_dir_all(&model_dir).unwrap();
         create_test_model2vec_layout(&model_dir, 16, 8);
+        // Plant a verification marker so auto-detect skips SHA-256 checks
+        // against the real manifest (test files have dummy content).
+        crate::model_manifest::write_verification_marker(
+            &crate::model_manifest::ModelManifest::potion_128m(),
+            &model_dir,
+        );
 
         #[cfg(all(
             feature = "download",
