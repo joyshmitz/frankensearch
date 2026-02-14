@@ -29,7 +29,7 @@
     "tie_break_policy": "doc_id_lexical",
     "artifacts": [
       {
-        "file": "events.jsonl",
+        "file": "structured_events.jsonl",
         "checksum": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
         "line_count": 147
       },

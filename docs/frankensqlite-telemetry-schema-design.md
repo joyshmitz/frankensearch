@@ -22,7 +22,7 @@ This is intentionally separated from `{data_dir}/frankensearch.db` (document/sea
 
 ### Search and Embedding Telemetry
 - `search_events`: raw search-phase events.
-- `search_summaries`: windowed aggregates (`1m`, `15m`, `1h`, `6h`, `24h`).
+- `search_summaries`: windowed aggregates (`1m`, `15m`, `1h`, `6h`, `24h`, `3d`, `1w`).
 - `embedding_job_snapshots`: queue depth/progress and throughput snapshots.
 
 ### Index and Resource Telemetry
@@ -70,7 +70,7 @@ CREATE TABLE search_events (
 CREATE TABLE search_summaries (
     project_key TEXT NOT NULL REFERENCES projects(project_key) ON DELETE CASCADE,
     instance_id TEXT NOT NULL REFERENCES instances(instance_id) ON DELETE CASCADE,
-    window TEXT NOT NULL CHECK (window IN ('1m','15m','1h','6h','24h')),
+    window TEXT NOT NULL CHECK (window IN ('1m','15m','1h','6h','24h','3d','1w')),
     window_start_ms INTEGER NOT NULL,
     search_count INTEGER NOT NULL,
     p50_latency_us INTEGER,
@@ -150,35 +150,38 @@ CREATE TABLE evidence_links (
 
 ## Query Index Plan
 ```sql
-CREATE INDEX idx_instances_project_heartbeat
+CREATE INDEX ix_inst_pk_hb
     ON instances(project_key, last_heartbeat_ms DESC);
 
-CREATE INDEX idx_search_events_project_time
+CREATE INDEX ix_se_pk_ts
     ON search_events(project_key, ts_ms DESC);
 
-CREATE INDEX idx_search_events_instance_time
+CREATE INDEX ix_se_ii_ts
     ON search_events(instance_id, ts_ms DESC);
 
-CREATE INDEX idx_search_events_corr
+CREATE INDEX ix_se_corr
     ON search_events(project_key, correlation_id);
 
-CREATE INDEX idx_embedding_snapshots_project_time
+CREATE INDEX ix_ss_pk_w
+    ON search_summaries(project_key, window, window_start_ms DESC);
+
+CREATE INDEX ix_ejs_pk
     ON embedding_job_snapshots(project_key, ts_ms DESC);
 
-CREATE INDEX idx_index_inventory_project_time
+CREATE INDEX ix_iis_pk
     ON index_inventory_snapshots(project_key, ts_ms DESC);
 
-CREATE INDEX idx_resource_samples_project_time
+CREATE INDEX ix_rs_pk
     ON resource_samples(project_key, ts_ms DESC);
 
-CREATE INDEX idx_alerts_project_time
+CREATE INDEX ix_at_pk
     ON alerts_timeline(project_key, opened_at_ms DESC);
 
-CREATE INDEX idx_alerts_open
+CREATE INDEX ix_at_open
     ON alerts_timeline(project_key, state, severity, updated_at_ms DESC)
     WHERE state != 'resolved';
 
-CREATE INDEX idx_evidence_alert
+CREATE INDEX ix_el_aid
     ON evidence_links(alert_id, created_at_ms DESC);
 ```
 
@@ -244,3 +247,34 @@ ORDER BY ts_ms ASC;
 - This schema is for ops/control-plane data only.
 - Search/document metadata remains in the primary storage database.
 - Future ingestion writer bead (`bd-2yu.4.2`) should write through this contract using idempotent upserts.
+
+## Query API Surface (Read Path Contract)
+The dashboard/query layer should expose a stable read API over this schema:
+
+- `search_latency_window(project_key, instance_id, window, start_ms, end_ms)`  
+  returns `window_start_ms`, `search_count`, and percentile latency fields.
+- `open_alerts(project_key, limit)`  
+  returns unresolved alert rows sorted by recency.
+- `resource_timeline(project_key, instance_id, start_ms, end_ms)`  
+  returns ordered CPU/RSS/IO/queue samples.
+
+These calls align directly with the `DataSource` contract windows (`1m/15m/1h/6h/24h/3d/1w`) and must remain deterministic across backend adapters.
+
+## Validation Artifacts
+- Contract schema: `schemas/ops-telemetry-storage-v1.schema.json`
+- Valid fixture: `schemas/fixtures/ops-telemetry-storage-v1.json`
+- Invalid fixture (missing required root field): `schemas/fixtures-invalid/ops-telemetry-storage-invalid-missing-indexes-v1.json`
+
+Validation commands:
+
+```bash
+jsonschema -i schemas/fixtures/ops-telemetry-storage-v1.json \
+  schemas/ops-telemetry-storage-v1.schema.json
+
+jsonschema -i schemas/fixtures-invalid/ops-telemetry-storage-invalid-missing-indexes-v1.json \
+  schemas/ops-telemetry-storage-v1.schema.json
+```
+
+Expected behavior:
+- valid fixture: passes
+- invalid fixture: fails because `indexes` is required

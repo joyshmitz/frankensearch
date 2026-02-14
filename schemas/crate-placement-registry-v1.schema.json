@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/crate-placement-registry-v1.schema.json",
+  "title": "Crate Placement Registry v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "generated_from",
+    "last_updated",
+    "rules",
+    "change_management"
+  ],
+  "properties": {
+    "version": {
+      "const": "1.0.0"
+    },
+    "generated_from": {
+      "type": "string",
+      "minLength": 1
+    },
+    "last_updated": {
+      "type": "string",
+      "format": "date"
+    },
+    "owners": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    },
+    "change_management": {
+      "$ref": "#/$defs/change_management"
+    }
+  },
+  "$defs": {
+    "path_pattern": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "id_pattern",
+        "placement_status",
+        "target_paths",
+        "owner",
+        "rationale"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "pattern": "^[A-Z0-9-]+$"
+        },
+        "id_pattern": {
+          "type": "string",
+          "pattern": "^\\^bd-"
+        },
+        "placement_status": {
+          "type": "string",
+          "enum": [
+            "resolved",
+            "conflict",
+            "unknown"
+          ]
+        },
+        "target_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/path_pattern"
+          }
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1
+        },
+        "integration_boundaries": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "resolution_owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "resolution_deadline": {
+          "type": "string",
+          "format": "date"
+        },
+        "blocking_impact": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "placement_status": {
+                "enum": [
+                  "conflict",
+                  "unknown"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "resolution_owner",
+              "resolution_deadline",
+              "blocking_impact"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "placement_status": {
+                "const": "resolved"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "resolution_owner"
+                  ]
+                },
+                {
+                  "required": [
+                    "resolution_deadline"
+                  ]
+                },
+                {
+                  "required": [
+                    "blocking_impact"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "change_management": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "update_workflow",
+        "lint_commands"
+      ],
+      "properties": {
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "update_workflow": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "lint_commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "diagnostic_output": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

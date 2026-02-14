@@ -1,19 +1,108 @@
-# Per-Bead Test Matrix Policy (bd-264r)
+# Self-Documentation Lint Policy v1 (`bd-3qwe.7.1`)
 
-## Goal
-Make test scope explicit at bead level so implementation work is auditable before coding starts.
+## Purpose
+Define a stable lint rule catalog and severity policy for backlog self-documentation quality.
+This policy is consumed by `scripts/check_bead_test_matrix.sh` and future lint stages in `bd-3qwe.7.*`.
 
-## Required Test Matrix Sections
-Each implementation bead must include these sections (either in description or explicit policy comment):
-1. `Unit tests`
-2. `Integration tests`
-3. `E2E tests` (or explicit `N/A` + rationale)
-4. `Performance/bench` (or explicit `N/A` + rationale)
-5. `Logs/artifacts assertions`
+## Bead Classes
+Beads are classified before rule evaluation:
 
-## Standard Template
+1. `implementation`
+   Applies to `task`, `feature`, `bug` by default.
+2. `program`
+   Applies to `epic` and other coordination/aggregation workstreams.
+3. `gate`
+   Any bead with `gate` or `release-gate` label (overrides issue type).
+4. `exploratory`
+   Applies to `question` and `docs`.
+
+## Rule Catalog
+Stable rule IDs and default severities:
+
+1. `SDOC-MATRIX-001` (default: `error`)
+   Missing explicit `[bd-264r test-matrix] TEST_MATRIX` annotation on implementation beads that require matrix coverage.
+2. `SDOC-MATRIX-002` (default: `error`)
+   Missing required matrix sections:
+   `Unit tests`, `Integration tests`, `E2E tests`, `Performance/bench`, `Logs/artifacts`.
+3. `SDOC-MATRIX-003` (default: `error`)
+   Missing explicit `[bd-264r test-matrix] EXCEPTION` annotation for approved workstream exceptions.
+4. `SDOC-POLICY-000` (default: `error`)
+   Internal policy self-test failure (classification/severity mapping drift in the checker).
+
+Severity remapping by bead class for missing-matrix findings:
+
+1. `implementation` -> `error`
+2. `gate` -> `error`
+3. `program` -> `warning`
+4. `exploratory` -> `info`
+
+## CI Fail Thresholds And Rollout
+Phased rollout knobs:
+
+1. Phase 0 (`audit`): report only, no fail.
+2. Phase 1 (`default`): fail on `error`.
+3. Phase 2 (`strict`): fail on `warning` and above for selected tracks.
+
+Recommended environment knobs:
+
+1. `SELFDOC_LINT_PHASE=audit|default|strict`
+2. `SELFDOC_LINT_MIN_FAIL_SEVERITY=error|warning|info`
+3. `SELFDOC_LINT_SCOPE=<label|prefix|all>`
+
+## Exception Contract
+Any waiver must be explicit and machine-readable in bead comments:
+
+1. Marker: `[bd-264r test-matrix] EXCEPTION`
+2. Required metadata:
+   `rule_id`, `owner`, `justification`, `expires_on`, `follow_up_bead`
+3. Waivers without `expires_on` are invalid for strict CI.
+
+## Reporter Payload Contract
+Each rule outcome must include these structured fields:
+
+1. `rule_id`
+2. `severity`
+3. `bead_id`
+4. `message`
+5. `fix_hint`
+
+`scripts/check_bead_test_matrix.sh` emits this payload as JSON lines for findings.
+
+## Normalized Scanner Model v1 (`bd-3qwe.7.2`)
+The lint scanner normalizes `.beads/issues.jsonl` into a deterministic in-memory model before rule evaluation.
+
+Normalized per-bead fields:
+
+1. `id`
+2. `issue_type`
+3. `status`
+4. `priority`
+5. `labels` (sorted, unique)
+6. `title`
+7. `description`
+8. `acceptance_criteria` (scalarized string)
+9. `notes` (scalarized string)
+10. `comments` (array of `{author,text,created_at}`)
+11. `comment_text` (joined comment text)
+12. `dependencies` (array of `{depends_on_id,dep_type}`)
+13. `source_line`
+
+Determinism contract:
+
+1. Output is sorted by `(id, source_line)`.
+2. Mixed scalar/array/object shapes are normalized to stable string/object forms.
+3. Scanner emits deterministic diagnostics for parse and normalization errors:
+   `SDOC-SCAN-001` (parse) and `SDOC-SCAN-002` (normalization).
+
+Scanner validation coverage:
+
+1. Unit checks for mixed-type comments, acceptance criteria, and dependencies.
+2. Unit checks for malformed-record normalization behavior (missing IDs/dependency targets).
+3. Integration run confirms normalized model is consumable by matrix rule checks.
+
+## Matrix Template
 ```text
-TEST_MATRIX
+[bd-264r test-matrix] TEST_MATRIX
 Unit tests:
 - ...
 Integration tests:
@@ -26,33 +115,7 @@ Logs/artifacts:
 - ...
 ```
 
-## Wave-1 Retrofit (completed)
-Updated with explicit test-matrix annotations:
-- `bd-3un.31`
-- `bd-3un.32`
-- `bd-3un.40`
-- `bd-3un.52`
-
-## Wave-2 Retrofit (completed with justified exceptions)
-Workstream aggregators marked with explicit exception rationale (matrix inherited by child implementation beads):
-- `bd-2hz.10`
-- `bd-2yu.8`
-
-## Lint/CI Checker
-Checker script:
-- `scripts/check_bead_test_matrix.sh`
-
-Modes:
-- `--mode unit`: validates wave-1 explicit matrix annotations and wave-2 exception annotations.
-- `--mode integration`: surfaces additional open implementation beads likely missing explicit matrix sections.
-- `--mode all`: runs both.
-
-Replay command:
+## Validation Command
 ```bash
 scripts/check_bead_test_matrix.sh --mode all
 ```
-
-## Change Log (bd-264r pass)
-- Added explicit matrix annotations to 4 wave-1 high-priority beads.
-- Added explicit exception markers/rationales to 2 wave-2 workstream beads.
-- Added CI-checkable script to prevent silent regressions.

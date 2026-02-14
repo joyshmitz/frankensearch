@@ -161,7 +161,45 @@
           "type": "integer",
           "minimum": 0
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "file": {
+                "pattern": "\\.jsonl$"
+              }
+            },
+            "required": [
+              "file"
+            ]
+          },
+          "then": {
+            "required": [
+              "line_count"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "file": {
+                "pattern": "\\.(json|txt)$"
+              }
+            },
+            "required": [
+              "file"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "line_count"
+              ]
+            }
+          }
+        }
+      ]
     },
     "manifestBody": {
       "type": "object",
@@ -268,7 +306,111 @@
             "error"
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "properties": {
+            "artifacts": {
+              "contains": {
+                "type": "object",
+                "required": [
+                  "file"
+                ],
+                "properties": {
+                  "file": {
+                    "const": "structured_events.jsonl"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "exit_status": {
+                "enum": [
+                  "fail",
+                  "error"
+                ]
+              }
+            },
+            "required": [
+              "exit_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "allOf": [
+                  {
+                    "contains": {
+                      "type": "object",
+                      "required": [
+                        "file"
+                      ],
+                      "properties": {
+                        "file": {
+                          "const": "artifacts_index.json"
+                        }
+                      }
+                    }
+                  },
+                  {
+                    "contains": {
+                      "type": "object",
+                      "required": [
+                        "file"
+                      ],
+                      "properties": {
+                        "file": {
+                          "const": "replay_command.txt"
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "suite": {
+                "const": "ops"
+              },
+              "exit_status": {
+                "enum": [
+                  "fail",
+                  "error"
+                ]
+              }
+            },
+            "required": [
+              "suite",
+              "exit_status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "artifacts": {
+                "contains": {
+                  "type": "object",
+                  "required": [
+                    "file"
+                  ],
+                  "properties": {
+                    "file": {
+                      "const": "terminal_transcript.txt"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "eventBody": {
       "type": "object",
@@ -361,6 +503,26 @@
           "then": {
             "required": [
               "lane_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "fail",
+                  "skip"
+                ]
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason_code"
             ]
           }
         }

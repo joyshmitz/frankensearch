@@ -1,0 +1,278 @@
+{
+  "version": "v1",
+  "database": "frankensearch-ops.db",
+  "supported_windows": [
+    "1m",
+    "15m",
+    "1h",
+    "6h",
+    "24h",
+    "3d",
+    "1w"
+  ],
+  "tables": [
+    {
+      "name": "projects",
+      "purpose": "Project namespace for fleet telemetry",
+      "primary_key": "project_key"
+    },
+    {
+      "name": "instances",
+      "purpose": "Runtime process identity and lifecycle",
+      "primary_key": "instance_id",
+      "foreign_keys": [
+        "project_key -> projects(project_key)"
+      ]
+    },
+    {
+      "name": "search_events",
+      "purpose": "Raw search phase events",
+      "primary_key": "event_id"
+    },
+    {
+      "name": "search_summaries",
+      "purpose": "Windowed latency/count aggregates",
+      "primary_key": "(project_key, instance_id, window, window_start_ms)"
+    },
+    {
+      "name": "embedding_job_snapshots",
+      "purpose": "Embedding queue and throughput snapshots",
+      "primary_key": "snapshot_id"
+    },
+    {
+      "name": "index_inventory_snapshots",
+      "purpose": "Index size/hash/staleness snapshots",
+      "primary_key": "snapshot_id"
+    },
+    {
+      "name": "resource_samples",
+      "purpose": "CPU/RSS/IO samples",
+      "primary_key": "sample_id"
+    },
+    {
+      "name": "alerts_timeline",
+      "purpose": "Open/ack/resolved incident timeline",
+      "primary_key": "alert_id"
+    },
+    {
+      "name": "evidence_links",
+      "purpose": "Alert-to-artifact evidence mappings",
+      "primary_key": "link_id"
+    },
+    {
+      "name": "ops_schema_migrations",
+      "purpose": "Versioned migration tracking",
+      "primary_key": "version"
+    }
+  ],
+  "indexes": [
+    {
+      "name": "idx_instances_project_heartbeat",
+      "table": "instances",
+      "columns": [
+        "project_key",
+        "last_heartbeat_ms DESC"
+      ],
+      "query_goal": "List freshest instances per project"
+    },
+    {
+      "name": "idx_search_events_project_time",
+      "table": "search_events",
+      "columns": [
+        "project_key",
+        "ts_ms DESC"
+      ],
+      "query_goal": "Project-scoped event timeline"
+    },
+    {
+      "name": "idx_search_events_instance_time",
+      "table": "search_events",
+      "columns": [
+        "instance_id",
+        "ts_ms DESC"
+      ],
+      "query_goal": "Instance timeline drilldown"
+    },
+    {
+      "name": "idx_search_events_corr",
+      "table": "search_events",
+      "columns": [
+        "project_key",
+        "correlation_id"
+      ],
+      "query_goal": "Correlation lookup"
+    },
+    {
+      "name": "idx_search_summaries_project_window_start",
+      "table": "search_summaries",
+      "columns": [
+        "project_key",
+        "window",
+        "window_start_ms DESC"
+      ],
+      "query_goal": "Windowed latency chart reads"
+    },
+    {
+      "name": "idx_embedding_snapshots_project_time",
+      "table": "embedding_job_snapshots",
+      "columns": [
+        "project_key",
+        "ts_ms DESC"
+      ],
+      "query_goal": "Embedding backlog trend"
+    },
+    {
+      "name": "idx_index_inventory_project_time",
+      "table": "index_inventory_snapshots",
+      "columns": [
+        "project_key",
+        "ts_ms DESC"
+      ],
+      "query_goal": "Index inventory trend"
+    },
+    {
+      "name": "idx_resource_samples_project_time",
+      "table": "resource_samples",
+      "columns": [
+        "project_key",
+        "ts_ms DESC"
+      ],
+      "query_goal": "Resource usage timeline"
+    },
+    {
+      "name": "idx_alerts_project_time",
+      "table": "alerts_timeline",
+      "columns": [
+        "project_key",
+        "opened_at_ms DESC"
+      ],
+      "query_goal": "Incident history list"
+    },
+    {
+      "name": "idx_alerts_open",
+      "table": "alerts_timeline",
+      "columns": [
+        "project_key",
+        "state",
+        "severity",
+        "updated_at_ms DESC"
+      ],
+      "query_goal": "Open alerts widget",
+      "partial_predicate": "state != 'resolved'"
+    }
+  ],
+  "dedup_keys": [
+    {
+      "table": "search_events",
+      "key": "event_id",
+      "strategy": "insert_or_ignore"
+    },
+    {
+      "table": "embedding_job_snapshots",
+      "key": "(project_key, instance_id, embedder_id, ts_ms)",
+      "strategy": "upsert"
+    },
+    {
+      "table": "index_inventory_snapshots",
+      "key": "(project_key, instance_id, index_name, ts_ms)",
+      "strategy": "upsert"
+    },
+    {
+      "table": "resource_samples",
+      "key": "(project_key, instance_id, ts_ms)",
+      "strategy": "upsert"
+    },
+    {
+      "table": "alerts_timeline",
+      "key": "alert_id",
+      "strategy": "upsert"
+    },
+    {
+      "table": "evidence_links",
+      "key": "(alert_id, evidence_uri)",
+      "strategy": "insert_or_ignore"
+    }
+  ],
+  "migration_strategy": {
+    "tracking_table": "ops_schema_migrations",
+    "forward_only_in_production": true,
+    "reversible_in_dev_test": true,
+    "checksum_validation": true
+  },
+  "retention_policy": {
+    "raw_events_days": 7,
+    "summaries_days": 90,
+    "cleanup_interval_minutes": 60,
+    "cleanup_batch_rows": 2000
+  },
+  "query_patterns": [
+    {
+      "name": "project_search_latency_window",
+      "filters": [
+        "project_key",
+        "instance_id",
+        "window",
+        "window_start_ms BETWEEN start AND end"
+      ],
+      "sort": "window_start_ms ASC",
+      "outputs": [
+        "search_count",
+        "p50_latency_us",
+        "p95_latency_us",
+        "p99_latency_us"
+      ],
+      "window": "1h"
+    },
+    {
+      "name": "live_open_alerts",
+      "filters": [
+        "project_key",
+        "state != resolved"
+      ],
+      "sort": "updated_at_ms DESC",
+      "limit": 50,
+      "outputs": [
+        "alert_id",
+        "severity",
+        "category",
+        "reason_code",
+        "summary"
+      ]
+    },
+    {
+      "name": "project_resource_timeline",
+      "filters": [
+        "project_key",
+        "instance_id",
+        "ts_ms BETWEEN start AND end"
+      ],
+      "sort": "ts_ms ASC",
+      "outputs": [
+        "cpu_pct",
+        "rss_bytes",
+        "io_read_bytes",
+        "io_write_bytes",
+        "queue_depth"
+      ],
+      "window": "24h"
+    },
+    {
+      "name": "instance_heartbeat_health",
+      "filters": [
+        "project_key"
+      ],
+      "sort": "last_heartbeat_ms DESC",
+      "outputs": [
+        "instance_id",
+        "state",
+        "last_heartbeat_ms"
+      ],
+      "window": "15m"
+    }
+  ],
+  "query_api": {
+    "latency_window": "search_latency_window(project_key, instance_id, window, start_ms, end_ms)",
+    "live_alerts": "open_alerts(project_key, limit)",
+    "resource_timeline": "resource_timeline(project_key, instance_id, start_ms, end_ms)"
+  }
+}

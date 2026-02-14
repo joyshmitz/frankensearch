@@ -1,0 +1,146 @@
+{
+  "version": "v1",
+  "database": "frankensearch-ops.db",
+  "supported_windows": [
+    "1m",
+    "15m",
+    "1h",
+    "6h",
+    "24h",
+    "3d",
+    "1w"
+  ],
+  "tables": [
+    {
+      "name": "projects",
+      "purpose": "Project namespace",
+      "primary_key": "project_key"
+    },
+    {
+      "name": "instances",
+      "purpose": "Instance lifecycle",
+      "primary_key": "instance_id"
+    },
+    {
+      "name": "search_events",
+      "purpose": "Raw events",
+      "primary_key": "event_id"
+    },
+    {
+      "name": "search_summaries",
+      "purpose": "Windowed aggregates",
+      "primary_key": "(project_key, instance_id, window, window_start_ms)"
+    },
+    {
+      "name": "embedding_job_snapshots",
+      "purpose": "Embedding snapshots",
+      "primary_key": "snapshot_id"
+    },
+    {
+      "name": "index_inventory_snapshots",
+      "purpose": "Index snapshots",
+      "primary_key": "snapshot_id"
+    },
+    {
+      "name": "resource_samples",
+      "purpose": "Resource samples",
+      "primary_key": "sample_id"
+    },
+    {
+      "name": "alerts_timeline",
+      "purpose": "Alerts timeline",
+      "primary_key": "alert_id"
+    },
+    {
+      "name": "evidence_links",
+      "purpose": "Evidence links",
+      "primary_key": "link_id"
+    }
+  ],
+  "dedup_keys": [
+    {
+      "table": "search_events",
+      "key": "event_id",
+      "strategy": "insert_or_ignore"
+    },
+    {
+      "table": "embedding_job_snapshots",
+      "key": "(project_key, instance_id, embedder_id, ts_ms)",
+      "strategy": "upsert"
+    },
+    {
+      "table": "index_inventory_snapshots",
+      "key": "(project_key, instance_id, index_name, ts_ms)",
+      "strategy": "upsert"
+    },
+    {
+      "table": "resource_samples",
+      "key": "(project_key, instance_id, ts_ms)",
+      "strategy": "upsert"
+    },
+    {
+      "table": "alerts_timeline",
+      "key": "alert_id",
+      "strategy": "upsert"
+    },
+    {
+      "table": "evidence_links",
+      "key": "(alert_id, evidence_uri)",
+      "strategy": "insert_or_ignore"
+    }
+  ],
+  "migration_strategy": {
+    "tracking_table": "ops_schema_migrations",
+    "forward_only_in_production": true,
+    "reversible_in_dev_test": true,
+    "checksum_validation": true
+  },
+  "retention_policy": {
+    "raw_events_days": 7,
+    "summaries_days": 90,
+    "cleanup_interval_minutes": 60,
+    "cleanup_batch_rows": 2000
+  },
+  "query_patterns": [
+    {
+      "name": "project_search_latency_window",
+      "filters": [
+        "project_key",
+        "instance_id",
+        "window"
+      ],
+      "sort": "window_start_ms ASC",
+      "outputs": [
+        "p95_latency_us"
+      ],
+      "window": "1h"
+    },
+    {
+      "name": "live_open_alerts",
+      "filters": [
+        "project_key"
+      ],
+      "sort": "updated_at_ms DESC",
+      "outputs": [
+        "alert_id"
+      ]
+    },
+    {
+      "name": "project_resource_timeline",
+      "filters": [
+        "project_key",
+        "instance_id"
+      ],
+      "sort": "ts_ms ASC",
+      "outputs": [
+        "cpu_pct"
+      ],
+      "window": "24h"
+    }
+  ],
+  "query_api": {
+    "latency_window": "search_latency_window(project_key, instance_id, window, start_ms, end_ms)",
+    "live_alerts": "open_alerts(project_key, limit)",
+    "resource_timeline": "resource_timeline(project_key, instance_id, start_ms, end_ms)"
+  }
+}

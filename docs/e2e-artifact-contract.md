@@ -27,11 +27,13 @@ All artifact files live in a single directory per run:
 ```
 <output_dir>/<run_id>/
   manifest.json
-  events.jsonl
+  structured_events.jsonl
   oracle-report.json
   replay.jsonl
   snapshot-diff.json
-  transcript.txt
+  artifacts_index.json
+  replay_command.txt
+  terminal_transcript.txt
 ```
 
 Rules:
@@ -41,6 +43,8 @@ Rules:
 - File extensions: `.json` for single objects, `.jsonl` for line-delimited, `.txt` for plain text.
 - No nested subdirectories within a run directory.
 - Absent optional artifacts simply omit the file.
+- Failed runs must include `artifacts_index.json` and `replay_command.txt`.
+- Failed ops/UI runs must include `terminal_transcript.txt`.
 
 ## Envelope Structure
 
@@ -66,7 +70,7 @@ Required envelope fields:
 | `ts` | RFC 3339 | Timestamp of artifact creation |
 | `body` | object | Type-specific payload |
 
-JSONL files (`events.jsonl`, `replay.jsonl`) use one envelope per line.
+JSONL files (`structured_events.jsonl`, `replay.jsonl`) use one envelope per line.
 
 ## Manifest Schema (`manifest.json`)
 
@@ -91,7 +95,7 @@ The manifest is the entry point for any artifact pack. Required body fields:
     "clock_mode": "simulated|frozen|realtime",
     "tie_break_policy": "doc_id_lexical",
     "artifacts": [
-      { "file": "events.jsonl", "checksum": "sha256:...", "line_count": 147 },
+      { "file": "structured_events.jsonl", "checksum": "sha256:...", "line_count": 147 },
       { "file": "oracle-report.json", "checksum": "sha256:..." }
     ],
     "duration_ms": 1234,
@@ -117,9 +121,20 @@ Required manifest body fields:
 | `exit_status` | Yes | Overall pass/fail/error |
 | `index_version` | No | Index format version string |
 
-## Events Schema (`events.jsonl`)
+Additional manifest contract rules enforced by schema/validator:
 
-Each line in `events.jsonl` is an envelope wrapping either:
+- `artifacts` must include a `structured_events.jsonl` entry.
+- If `exit_status` is `fail` or `error`, `artifacts` must include:
+  - `artifacts_index.json`
+  - `replay_command.txt`
+- If `suite` is `ops` and `exit_status` is `fail` or `error`, `artifacts` must include:
+  - `terminal_transcript.txt`
+- `line_count` is required for `.jsonl` artifact entries.
+- `line_count` must be omitted for `.json` and `.txt` artifact entries.
+
+## Events Schema (`structured_events.jsonl`)
+
+Each line in `structured_events.jsonl` is an envelope wrapping either:
 - An evidence event (from `evidence-jsonl-v1` schema)
 - A telemetry event (from `telemetry-event-v1` schema)
 - An e2e-specific lifecycle event
@@ -156,7 +171,7 @@ Required event body fields:
 | `lane_id` | If lane test | Interaction lane identifier |
 | `oracle_id` | If oracle check | Oracle assertion identifier |
 | `outcome` | If oracle check | Pass/fail/skip |
-| `reason_code` | If fail/skip | Machine-stable reason code |
+| `reason_code` | If fail/skip (required) | Machine-stable reason code |
 | `context` | No | Human-readable diagnostic text |
 | `metrics` | No | Arbitrary numeric metrics |
 
@@ -249,7 +264,7 @@ Before/after comparison for regression detection:
 }
 ```
 
-## Transcript Format (`transcript.txt`)
+## Transcript Format (`terminal_transcript.txt`)
 
 Plain text execution log with fixed section markers:
 
