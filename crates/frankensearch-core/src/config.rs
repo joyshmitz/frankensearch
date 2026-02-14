@@ -105,6 +105,23 @@ impl Default for TwoTierConfig {
 }
 
 impl TwoTierConfig {
+    fn from_optimized_file(path: &std::path::Path) -> Self {
+        std::fs::read_to_string(path).map_or_else(
+            |_| Self::default(),
+            |contents| match toml::from_str::<Self>(&contents) {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to parse optimized params, using defaults"
+                    );
+                    Self::default()
+                }
+            },
+        )
+    }
+
     /// Load overrides from environment variables.
     ///
     /// Only overrides fields for which environment variables are set.
@@ -152,20 +169,7 @@ impl TwoTierConfig {
             .unwrap_or_else(|| std::path::Path::new(manifest_dir));
         let path = workspace_root.join("data").join("optimized_params.toml");
 
-        std::fs::read_to_string(&path).map_or_else(
-            |_| Self::default(),
-            |contents| match toml::from_str::<Self>(&contents) {
-                Ok(config) => config,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to parse optimized params, using defaults"
-                    );
-                    Self::default()
-                }
-            },
-        )
+        Self::from_optimized_file(&path)
     }
 
     /// Attach a telemetry exporter.
@@ -334,5 +338,65 @@ mod tests {
 
         let config = config.without_metrics_exporter();
         assert!(config.metrics_exporter().is_none());
+    }
+
+    #[test]
+    fn optimized_loader_reads_toml_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "frankensearch-optimized-config-{}-{unique}.toml",
+            std::process::id()
+        ));
+        let expected = TwoTierConfig {
+            quality_weight: 0.82,
+            rrf_k: 73.5,
+            candidate_multiplier: 4,
+            quality_timeout_ms: 777,
+            hnsw_ef_search: 123,
+            mrl_rescore_top_k: 45,
+            ..TwoTierConfig::default()
+        };
+        std::fs::write(&path, toml::to_string(&expected).expect("serialize config"))
+            .expect("write optimized config fixture");
+
+        let loaded = TwoTierConfig::from_optimized_file(&path);
+        assert!((loaded.quality_weight - expected.quality_weight).abs() < 1e-12);
+        assert!((loaded.rrf_k - expected.rrf_k).abs() < 1e-12);
+        assert_eq!(loaded.candidate_multiplier, expected.candidate_multiplier);
+        assert_eq!(loaded.quality_timeout_ms, expected.quality_timeout_ms);
+        assert_eq!(loaded.hnsw_ef_search, expected.hnsw_ef_search);
+        assert_eq!(loaded.mrl_rescore_top_k, expected.mrl_rescore_top_k);
+    }
+
+    #[test]
+    fn optimized_loader_falls_back_to_default_for_missing_or_invalid_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let missing = std::env::temp_dir().join(format!(
+            "frankensearch-optimized-missing-{}-{unique}.toml",
+            std::process::id()
+        ));
+        let from_missing = TwoTierConfig::from_optimized_file(&missing);
+        assert!(
+            (from_missing.quality_weight - TwoTierConfig::default().quality_weight).abs() < 1e-12
+        );
+        assert!((from_missing.rrf_k - TwoTierConfig::default().rrf_k).abs() < 1e-12);
+
+        let invalid = std::env::temp_dir().join(format!(
+            "frankensearch-optimized-invalid-{}-{unique}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&invalid, "quality_weight = \"not-a-number\"")
+            .expect("write invalid optimized config");
+        let from_invalid = TwoTierConfig::from_optimized_file(&invalid);
+        assert!(
+            (from_invalid.quality_weight - TwoTierConfig::default().quality_weight).abs() < 1e-12
+        );
+        assert!((from_invalid.rrf_k - TwoTierConfig::default().rrf_k).abs() < 1e-12);
     }
 }

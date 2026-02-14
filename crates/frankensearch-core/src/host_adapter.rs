@@ -35,8 +35,12 @@ pub struct AdapterIdentity {
     pub adapter_id: String,
     /// Adapter implementation version.
     pub adapter_version: String,
-    /// Host project identifier.
+    /// Host project identifier (required).
     pub host_project: String,
+    /// Optional runtime role label (e.g. `indexer`, `query`, `control-plane`).
+    pub runtime_role: Option<String>,
+    /// Optional stable instance UUID advertised by the host integration.
+    pub instance_uuid: Option<String>,
     /// Telemetry schema version emitted by this adapter.
     pub telemetry_schema_version: u8,
     /// Redaction policy version enforced by this adapter.
@@ -311,6 +315,28 @@ impl ConformanceHarness {
                 "adapter.identity.missing_host_project",
                 "identity.host_project",
                 "host_project must be non-empty",
+            ));
+        }
+        if identity
+            .runtime_role
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            violations.push(violation(
+                "adapter.identity.empty_runtime_role",
+                "identity.runtime_role",
+                "runtime_role must be non-empty when provided",
+            ));
+        }
+        if identity
+            .instance_uuid
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            violations.push(violation(
+                "adapter.identity.empty_instance_uuid",
+                "identity.instance_uuid",
+                "instance_uuid must be non-empty when provided",
             ));
         }
 
@@ -815,6 +841,8 @@ mod tests {
             adapter_id: "sample-host-adapter".to_owned(),
             adapter_version: "0.1.0".to_owned(),
             host_project: "sample-host".to_owned(),
+            runtime_role: Some("query".to_owned()),
+            instance_uuid: Some("sample-instance-uuid".to_owned()),
             telemetry_schema_version: TELEMETRY_SCHEMA_VERSION,
             redaction_policy_version: "v1".to_owned(),
         }
@@ -858,6 +886,24 @@ mod tests {
         assert!(violations.iter().any(|violation| {
             violation.code == "adapter.identity.schema_version_mismatch"
                 && violation.field == "identity.telemetry_schema_version"
+        }));
+    }
+
+    #[test]
+    fn identity_optional_handshake_fields_require_nonempty_values_when_present() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.runtime_role = Some("   ".to_owned());
+        identity.instance_uuid = Some(String::new());
+
+        let violations = harness.validate_identity(&identity);
+        assert!(violations.iter().any(|violation| {
+            violation.code == "adapter.identity.empty_runtime_role"
+                && violation.field == "identity.runtime_role"
+        }));
+        assert!(violations.iter().any(|violation| {
+            violation.code == "adapter.identity.empty_instance_uuid"
+                && violation.field == "identity.instance_uuid"
         }));
     }
 

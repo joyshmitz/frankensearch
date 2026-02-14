@@ -220,8 +220,14 @@ where
         if size_bytes > self.config.max_bytes {
             return; // Single entry exceeds entire budget — skip.
         }
+        if size_bytes > self.config.max_main_bytes() {
+            // Entries that exceed the Main partition can violate total-budget
+            // invariants under churn; skip them.
+            return;
+        }
 
         let mut state = self.state.lock().expect("cache lock poisoned");
+        let max_small = self.config.max_small_bytes();
 
         // Update existing entry in-place.
         if let Some(entry) = state.entries.get_mut(&key) {
@@ -230,17 +236,25 @@ where
             entry.size_bytes = size_bytes;
             match entry.location {
                 EntryLocation::Small => {
-                    state.small_bytes = state.small_bytes.wrapping_sub(old_size) + size_bytes;
+                    state.small_bytes = state
+                        .small_bytes
+                        .saturating_sub(old_size)
+                        .saturating_add(size_bytes);
                 }
                 EntryLocation::Main => {
-                    state.main_bytes = state.main_bytes.wrapping_sub(old_size) + size_bytes;
+                    state.main_bytes = state
+                        .main_bytes
+                        .saturating_sub(old_size)
+                        .saturating_add(size_bytes);
                 }
             }
             return;
         }
 
         // Check ghost: re-accessed evicted key goes directly to Main.
-        if state.ghost_set.remove(&key) {
+        // Also route entries larger than the Small partition to Main so they
+        // can't overflow Small and violate budget partitions.
+        if state.ghost_set.remove(&key) || size_bytes > max_small {
             // Evict from Main if needed to make room.
             evict_main(&mut state, size_bytes, &self.config);
             state.main_order.push_back(key.clone());
@@ -424,6 +438,23 @@ mod tests {
         cache.insert("key", "new", 60);
         assert_eq!(cache.get(&"key"), Some("new"));
         assert_eq!(cache.memory_used(), 60); // Updated, not doubled.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn update_existing_key_uses_saturating_accounting() {
+        let cache = S3FifoCache::new(small_config(1024));
+        cache.insert("key", "old", 50);
+
+        {
+            let mut state = cache.state.lock().expect("cache lock poisoned");
+            // Simulate corrupted accounting counters. Update path must not wrap.
+            state.small_bytes = 0;
+        }
+
+        cache.insert("key", "new", 20);
+        assert_eq!(cache.get(&"key"), Some("new"));
+        assert_eq!(cache.memory_used(), 20);
         assert_eq!(cache.len(), 1);
     }
 
@@ -891,6 +922,33 @@ mod tests {
         assert_eq!(cache.get(&"same"), Some(1));
         assert_eq!(cache.memory_used(), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn large_entry_routes_to_main_when_exceeding_small_budget() {
+        // max_bytes=200, small=20, main=180
+        let cache = S3FifoCache::new(small_config(200));
+        cache.insert("large", 7, 25); // > small partition, < main partition
+
+        let (location, small_bytes, main_bytes) = {
+            let state = cache.state.lock().expect("cache lock poisoned");
+            let entry = state.entries.get("large").expect("entry should be cached");
+            (entry.location, state.small_bytes, state.main_bytes)
+        };
+        assert_eq!(location, EntryLocation::Main);
+        assert_eq!(small_bytes, 0);
+        assert_eq!(main_bytes, 25);
+    }
+
+    #[test]
+    fn entry_larger_than_main_partition_is_skipped() {
+        // max_bytes=100, small=10, main=90
+        let cache = S3FifoCache::new(small_config(100));
+        cache.insert("too-large", 42, 95); // > main partition
+
+        assert!(cache.get(&"too-large").is_none());
+        assert_eq!(cache.memory_used(), 0);
+        assert!(cache.is_empty());
     }
 
     #[test]
