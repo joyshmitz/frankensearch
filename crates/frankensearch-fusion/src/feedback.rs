@@ -1,0 +1,755 @@
+//! Implicit relevance feedback loop with document boost map.
+//!
+//! Learns from consumer usage patterns (clicks, dwell time, selections, skips)
+//! to boost or demote documents in future searches. The boost map applies
+//! multiplicative adjustments to RRF scores **after** fusion but **before**
+//! limit/offset.
+//!
+//! # Decay
+//!
+//! Boosts decay exponentially toward 1.0: at query time, the effective boost
+//! is `1.0 + (stored_boost - 1.0) * 2^(-elapsed_hours / halflife)`. This is
+//! computed lazily (no background timer).
+//!
+//! # Thread Safety
+//!
+//! `FeedbackCollector` is thread-safe via `std::sync::RwLock`. Reads (applying
+//! boosts at query time) take a shared lock. Writes (recording signals) take
+//! an exclusive lock.
+
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+/// Signal weight configuration for different user interaction types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignalWeights {
+    /// Weight for click signals. Default: 1.0.
+    pub click: f64,
+    /// Weight for long dwell signals (>30s). Default: 2.0.
+    pub dwell_long: f64,
+    /// Weight for explicit selection/use signals. Default: 3.0.
+    pub select: f64,
+    /// Weight for skip signals (presented but not clicked). Default: -0.5.
+    pub skip: f64,
+}
+
+impl Default for SignalWeights {
+    fn default() -> Self {
+        Self {
+            click: 1.0,
+            dwell_long: 2.0,
+            select: 3.0,
+            skip: -0.5,
+        }
+    }
+}
+
+/// Configuration for the feedback collector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FeedbackConfig {
+    /// Enable feedback-based boosting. Default: false (opt-in).
+    pub enabled: bool,
+    /// Boost decay half-life in hours. Default: 168 (1 week).
+    pub decay_halflife_hours: f64,
+    /// Maximum multiplicative boost. Default: 2.0.
+    pub max_boost: f64,
+    /// Minimum multiplicative boost. Default: 0.5.
+    pub min_boost: f64,
+    /// Signal weights for different interaction types.
+    pub signal_weights: SignalWeights,
+    /// Maximum entries in the boost map. Default: `100_000`.
+    pub max_entries: usize,
+    /// Boost values within `1.0 +/- cleanup_threshold` are removed during cleanup.
+    /// Default: 0.01.
+    pub cleanup_threshold: f64,
+}
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            decay_halflife_hours: 168.0,
+            max_boost: 2.0,
+            min_boost: 0.5,
+            signal_weights: SignalWeights::default(),
+            max_entries: 100_000,
+            cleanup_threshold: 0.01,
+        }
+    }
+}
+
+// ─── Signals ──────────────────────────────────────────────────────────────────
+
+/// User interaction signal fed into the feedback loop.
+#[derive(Debug, Clone)]
+pub enum FeedbackSignal {
+    /// User clicked on a search result.
+    Click {
+        /// Document identifier.
+        doc_id: String,
+        /// Rank at which the result was presented.
+        rank: usize,
+    },
+    /// User dwelt on a search result for a significant duration.
+    Dwell {
+        /// Document identifier.
+        doc_id: String,
+        /// Dwell duration in seconds.
+        duration_secs: f64,
+    },
+    /// User explicitly selected/used a search result.
+    Select {
+        /// Document identifier.
+        doc_id: String,
+    },
+    /// Result was presented but the user did not interact.
+    Skip {
+        /// Document identifier.
+        doc_id: String,
+        /// Rank at which the result was presented.
+        rank: usize,
+    },
+}
+
+impl FeedbackSignal {
+    /// Extract the document ID from any signal variant.
+    #[must_use]
+    pub fn doc_id(&self) -> &str {
+        match self {
+            Self::Click { doc_id, .. }
+            | Self::Dwell { doc_id, .. }
+            | Self::Select { doc_id, .. }
+            | Self::Skip { doc_id, .. } => doc_id,
+        }
+    }
+}
+
+// ─── Document Boost ──────────────────────────────────────────────────────────
+
+/// Per-document boost state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentBoost {
+    /// Raw stored boost (before decay).
+    pub raw_boost: f64,
+    /// Total positive interactions.
+    pub positive_signals: u32,
+    /// Total negative interactions.
+    pub negative_signals: u32,
+    /// Timestamp of the last signal (seconds since collector creation).
+    last_signal_secs: f64,
+}
+
+// ─── Feedback Collector ──────────────────────────────────────────────────────
+
+/// Thread-safe feedback collector with lazy-decaying document boosts.
+pub struct FeedbackCollector {
+    boost_map: RwLock<HashMap<String, DocumentBoost>>,
+    config: FeedbackConfig,
+    /// Reference instant for computing elapsed time.
+    epoch: Instant,
+}
+
+impl FeedbackCollector {
+    /// Create a new feedback collector with the given configuration.
+    #[must_use]
+    pub fn new(config: FeedbackConfig) -> Self {
+        Self {
+            boost_map: RwLock::new(HashMap::new()),
+            config,
+            epoch: Instant::now(),
+        }
+    }
+
+    /// Create a new collector with default (disabled) configuration.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(FeedbackConfig::default())
+    }
+
+    /// Record a user interaction signal.
+    ///
+    /// Updates the boost map for the affected document. If the collector
+    /// is disabled, this is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn record_signal(&self, signal: &FeedbackSignal) {
+        if !self.config.enabled {
+            return;
+        }
+
+        let weight = self.signal_weight(signal);
+        if !weight.is_finite() {
+            return;
+        }
+
+        let doc_id = signal.doc_id().to_owned();
+        let now_secs = self.elapsed_secs();
+        let is_positive = weight > 0.0;
+
+        let mut map = self.boost_map.write().expect("feedback boost map poisoned");
+
+        // Enforce max entries.
+        if !map.contains_key(&doc_id) && map.len() >= self.config.max_entries {
+            return;
+        }
+
+        let entry = map.entry(doc_id).or_insert_with(|| DocumentBoost {
+            raw_boost: 1.0,
+            positive_signals: 0,
+            negative_signals: 0,
+            last_signal_secs: now_secs,
+        });
+
+        // Apply decay before updating.
+        let elapsed_hours = (now_secs - entry.last_signal_secs) / 3600.0;
+        entry.raw_boost = self.apply_decay(entry.raw_boost, elapsed_hours);
+        entry.last_signal_secs = now_secs;
+
+        // Update boost.
+        entry.raw_boost += weight * 0.1; // Scale factor to keep boosts reasonable.
+        entry.raw_boost = entry
+            .raw_boost
+            .clamp(self.config.min_boost, self.config.max_boost);
+
+        if is_positive {
+            entry.positive_signals = entry.positive_signals.saturating_add(1);
+        } else {
+            entry.negative_signals = entry.negative_signals.saturating_add(1);
+        }
+    }
+
+    /// Get the effective boost for a document at the current time.
+    ///
+    /// Returns `1.0` (neutral) for unknown documents or when disabled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn get_boost(&self, doc_id: &str) -> f64 {
+        if !self.config.enabled {
+            return 1.0;
+        }
+
+        let map = self.boost_map.read().expect("feedback boost map poisoned");
+        map.get(doc_id).map_or(1.0, |entry| {
+            let elapsed_hours = (self.elapsed_secs() - entry.last_signal_secs) / 3600.0;
+            let effective = self.apply_decay(entry.raw_boost, elapsed_hours);
+            effective.clamp(self.config.min_boost, self.config.max_boost)
+        })
+    }
+
+    /// Apply boosts to a scored result set (in-place multiplication).
+    ///
+    /// `results` is a slice of `(doc_id, score)` pairs. Scores are multiplied
+    /// by the effective boost for each document.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn apply_boosts(&self, results: &mut [(String, f64)]) {
+        if !self.config.enabled {
+            return;
+        }
+
+        let map = self.boost_map.read().expect("feedback boost map poisoned");
+        let now_secs = self.elapsed_secs();
+
+        for (doc_id, score) in results.iter_mut() {
+            if let Some(entry) = map.get(doc_id.as_str()) {
+                let elapsed_hours = (now_secs - entry.last_signal_secs) / 3600.0;
+                let effective = self.apply_decay(entry.raw_boost, elapsed_hours);
+                let clamped = effective.clamp(self.config.min_boost, self.config.max_boost);
+                *score *= clamped;
+            }
+        }
+    }
+
+    /// Remove boost entries that have decayed to near-neutral.
+    ///
+    /// Returns the number of entries removed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn cleanup(&self) -> usize {
+        let mut map = self.boost_map.write().expect("feedback boost map poisoned");
+        let now_secs = self.elapsed_secs();
+        let threshold = self.config.cleanup_threshold;
+
+        let before = map.len();
+        map.retain(|_, entry| {
+            let elapsed_hours = (now_secs - entry.last_signal_secs) / 3600.0;
+            let effective = self.apply_decay(entry.raw_boost, elapsed_hours);
+            (effective - 1.0).abs() > threshold
+        });
+        before - map.len()
+    }
+
+    /// Number of documents in the boost map.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.boost_map
+            .read()
+            .expect("feedback boost map poisoned")
+            .len()
+    }
+
+    /// Whether the boost map is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Current configuration.
+    #[must_use]
+    pub const fn config(&self) -> &FeedbackConfig {
+        &self.config
+    }
+
+    /// Serialize the boost map to JSON for persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn export_boost_map(&self) -> Result<String, serde_json::Error> {
+        let map = self.boost_map.read().expect("feedback boost map poisoned");
+        serde_json::to_string(&*map)
+    }
+
+    /// Restore the boost map from a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON deserialization fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn import_boost_map(&self, json: &str) -> Result<(), serde_json::Error> {
+        let imported: HashMap<String, DocumentBoost> = serde_json::from_str(json)?;
+        let mut map = self.boost_map.write().expect("feedback boost map poisoned");
+        *map = imported;
+        Ok(())
+    }
+
+    // ─── Internal ─────────────────────────────────────────────────────
+
+    fn signal_weight(&self, signal: &FeedbackSignal) -> f64 {
+        match signal {
+            FeedbackSignal::Click { .. } => self.config.signal_weights.click,
+            FeedbackSignal::Dwell { duration_secs, .. } => {
+                if *duration_secs > 30.0 {
+                    self.config.signal_weights.dwell_long
+                } else {
+                    // Short dwell: partial credit.
+                    self.config.signal_weights.click * 0.5
+                }
+            }
+            FeedbackSignal::Select { .. } => self.config.signal_weights.select,
+            FeedbackSignal::Skip { .. } => self.config.signal_weights.skip,
+        }
+    }
+
+    fn apply_decay(&self, raw_boost: f64, elapsed_hours: f64) -> f64 {
+        if elapsed_hours <= 0.0 || self.config.decay_halflife_hours <= 0.0 {
+            return raw_boost;
+        }
+        let decay_factor = (-elapsed_hours / self.config.decay_halflife_hours).exp2();
+        (raw_boost - 1.0).mul_add(decay_factor, 1.0)
+    }
+
+    fn elapsed_secs(&self) -> f64 {
+        self.epoch.elapsed().as_secs_f64()
+    }
+}
+
+impl std::fmt::Debug for FeedbackCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.boost_map.read().map_or(0, |m| m.len());
+        f.debug_struct("FeedbackCollector")
+            .field("enabled", &self.config.enabled)
+            .field("entries", &len)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::significant_drop_tightening)]
+mod tests {
+    use super::*;
+
+    fn enabled_config() -> FeedbackConfig {
+        FeedbackConfig {
+            enabled: true,
+            decay_halflife_hours: 168.0,
+            max_boost: 2.0,
+            min_boost: 0.5,
+            signal_weights: SignalWeights::default(),
+            max_entries: 1000,
+            cleanup_threshold: 0.01,
+        }
+    }
+
+    // ─── Initial State ──────────────────────────────────────────────
+
+    #[test]
+    fn initial_state_empty() {
+        let fc = FeedbackCollector::new(enabled_config());
+        assert!(fc.is_empty());
+        assert_eq!(fc.len(), 0);
+    }
+
+    #[test]
+    fn unknown_doc_returns_neutral_boost() {
+        let fc = FeedbackCollector::new(enabled_config());
+        assert!((fc.get_boost("unknown") - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ─── Signal Recording ───────────────────────────────────────────
+
+    #[test]
+    fn click_increases_boost() {
+        let fc = FeedbackCollector::new(enabled_config());
+        let signal = FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        };
+
+        fc.record_signal(&signal);
+        assert!(fc.get_boost("doc1") > 1.0);
+        assert_eq!(fc.len(), 1);
+    }
+
+    #[test]
+    fn select_increases_boost_more_than_click() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        let click = FeedbackSignal::Click {
+            doc_id: "doc_click".into(),
+            rank: 1,
+        };
+        let select = FeedbackSignal::Select {
+            doc_id: "doc_select".into(),
+        };
+
+        fc.record_signal(&click);
+        fc.record_signal(&select);
+
+        assert!(fc.get_boost("doc_select") > fc.get_boost("doc_click"));
+    }
+
+    #[test]
+    fn skip_decreases_boost() {
+        let fc = FeedbackCollector::new(enabled_config());
+        let signal = FeedbackSignal::Skip {
+            doc_id: "doc1".into(),
+            rank: 3,
+        };
+
+        fc.record_signal(&signal);
+        assert!(fc.get_boost("doc1") < 1.0);
+    }
+
+    #[test]
+    fn long_dwell_increases_boost() {
+        let fc = FeedbackCollector::new(enabled_config());
+        let signal = FeedbackSignal::Dwell {
+            doc_id: "doc1".into(),
+            duration_secs: 60.0,
+        };
+
+        fc.record_signal(&signal);
+        assert!(fc.get_boost("doc1") > 1.0);
+    }
+
+    #[test]
+    fn short_dwell_gives_partial_credit() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        let short = FeedbackSignal::Dwell {
+            doc_id: "doc_short".into(),
+            duration_secs: 10.0,
+        };
+        let long = FeedbackSignal::Dwell {
+            doc_id: "doc_long".into(),
+            duration_secs: 60.0,
+        };
+
+        fc.record_signal(&short);
+        fc.record_signal(&long);
+
+        assert!(fc.get_boost("doc_long") > fc.get_boost("doc_short"));
+    }
+
+    // ─── Max/Min Boost Clamping ─────────────────────────────────────
+
+    #[test]
+    fn boost_clamped_at_max() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        // Many positive signals.
+        for _ in 0..100 {
+            fc.record_signal(&FeedbackSignal::Select {
+                doc_id: "doc1".into(),
+            });
+        }
+
+        assert!(fc.get_boost("doc1") <= 2.0);
+    }
+
+    #[test]
+    fn boost_clamped_at_min() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        // Many negative signals.
+        for _ in 0..100 {
+            fc.record_signal(&FeedbackSignal::Skip {
+                doc_id: "doc1".into(),
+                rank: 5,
+            });
+        }
+
+        assert!(fc.get_boost("doc1") >= 0.5);
+    }
+
+    // ─── Apply Boosts ───────────────────────────────────────────────
+
+    #[test]
+    fn apply_boosts_modifies_scores() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        fc.record_signal(&FeedbackSignal::Select {
+            doc_id: "doc1".into(),
+        });
+
+        let mut results = vec![("doc1".to_string(), 0.8), ("doc2".to_string(), 0.7)];
+
+        fc.apply_boosts(&mut results);
+
+        // doc1 should be boosted.
+        assert!(results[0].1 > 0.8);
+        // doc2 (no signals) should be unchanged.
+        assert!((results[1].1 - 0.7).abs() < f64::EPSILON);
+    }
+
+    // ─── Disabled Collector ─────────────────────────────────────────
+
+    #[test]
+    fn disabled_collector_is_noop() {
+        let fc = FeedbackCollector::with_defaults(); // disabled by default
+
+        fc.record_signal(&FeedbackSignal::Select {
+            doc_id: "doc1".into(),
+        });
+
+        assert!(fc.is_empty());
+        assert!((fc.get_boost("doc1") - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ─── Cleanup ────────────────────────────────────────────────────
+
+    #[test]
+    fn cleanup_removes_near_neutral_entries() {
+        let config = FeedbackConfig {
+            cleanup_threshold: 0.2,
+            ..enabled_config()
+        };
+        let fc = FeedbackCollector::new(config);
+
+        // Very small boost change.
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+
+        // boost = 1.0 + 1.0 * 0.1 = 1.1. With threshold 0.2, this should be cleaned up.
+        let removed = fc.cleanup();
+        assert_eq!(removed, 1);
+        assert!(fc.is_empty());
+    }
+
+    // ─── Signal Count Tracking ──────────────────────────────────────
+
+    #[test]
+    fn signal_counts_track_positive_and_negative() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 2,
+        });
+        fc.record_signal(&FeedbackSignal::Skip {
+            doc_id: "doc1".into(),
+            rank: 3,
+        });
+
+        let map = fc.boost_map.read().unwrap();
+        let entry = map.get("doc1").unwrap();
+        assert_eq!(entry.positive_signals, 2);
+        assert_eq!(entry.negative_signals, 1);
+    }
+
+    // ─── Max Entries ────────────────────────────────────────────────
+
+    #[test]
+    fn max_entries_enforced() {
+        let config = FeedbackConfig {
+            max_entries: 3,
+            ..enabled_config()
+        };
+        let fc = FeedbackCollector::new(config);
+
+        for i in 0..5 {
+            fc.record_signal(&FeedbackSignal::Click {
+                doc_id: format!("doc{i}"),
+                rank: 1,
+            });
+        }
+
+        assert_eq!(fc.len(), 3);
+    }
+
+    // ─── NaN/Infinity Guard ─────────────────────────────────────────
+
+    #[test]
+    fn nan_duration_does_not_corrupt() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        let signal = FeedbackSignal::Dwell {
+            doc_id: "doc1".into(),
+            duration_secs: f64::NAN,
+        };
+
+        fc.record_signal(&signal);
+        // Should either reject or produce a finite boost.
+        let boost = fc.get_boost("doc1");
+        assert!(boost.is_finite());
+    }
+
+    // ─── Persistence Round-Trip ─────────────────────────────────────
+
+    #[test]
+    fn export_import_roundtrip() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+        fc.record_signal(&FeedbackSignal::Select {
+            doc_id: "doc2".into(),
+        });
+
+        let json = fc.export_boost_map().unwrap();
+
+        let fc2 = FeedbackCollector::new(enabled_config());
+        fc2.import_boost_map(&json).unwrap();
+
+        assert_eq!(fc2.len(), 2);
+        // Boosts may differ slightly due to time between export and import,
+        // but they should be close.
+        let diff = (fc.get_boost("doc1") - fc2.get_boost("doc1")).abs();
+        assert!(diff < 0.01);
+    }
+
+    // ─── Config Serde ───────────────────────────────────────────────
+
+    #[test]
+    fn config_serde_roundtrip() {
+        let config = enabled_config();
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: FeedbackConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn signal_weights_serde_roundtrip() {
+        let w = SignalWeights::default();
+        let json = serde_json::to_string(&w).unwrap();
+        let decoded: SignalWeights = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, w);
+    }
+
+    // ─── All-Zero Weights ───────────────────────────────────────────
+
+    #[test]
+    fn zero_weights_produce_no_boost_change() {
+        let config = FeedbackConfig {
+            signal_weights: SignalWeights {
+                click: 0.0,
+                dwell_long: 0.0,
+                select: 0.0,
+                skip: 0.0,
+            },
+            ..enabled_config()
+        };
+        let fc = FeedbackCollector::new(config);
+
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+
+        // Boost should be exactly 1.0 (no change).
+        assert!((fc.get_boost("doc1") - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ─── Debug Format ───────────────────────────────────────────────
+
+    #[test]
+    fn debug_format() {
+        let fc = FeedbackCollector::new(enabled_config());
+        let debug = format!("{fc:?}");
+        assert!(debug.contains("FeedbackCollector"));
+        assert!(debug.contains("enabled"));
+    }
+
+    // ─── Doc ID Extraction ──────────────────────────────────────────
+
+    #[test]
+    fn signal_doc_id_extraction() {
+        let click = FeedbackSignal::Click {
+            doc_id: "a".into(),
+            rank: 1,
+        };
+        let dwell = FeedbackSignal::Dwell {
+            doc_id: "b".into(),
+            duration_secs: 5.0,
+        };
+        let select = FeedbackSignal::Select { doc_id: "c".into() };
+        let skip = FeedbackSignal::Skip {
+            doc_id: "d".into(),
+            rank: 2,
+        };
+
+        assert_eq!(click.doc_id(), "a");
+        assert_eq!(dwell.doc_id(), "b");
+        assert_eq!(select.doc_id(), "c");
+        assert_eq!(skip.doc_id(), "d");
+    }
+}

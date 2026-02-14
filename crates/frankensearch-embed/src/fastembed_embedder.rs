@@ -1,0 +1,507 @@
+//! FastEmbed-based quality-tier embedder (`all-MiniLM-L6-v2`).
+//!
+//! This embedder loads ONNX + tokenizer assets from a local model directory and
+//! performs semantic embedding inference through `fastembed`.
+//!
+//! Required files:
+//! - `onnx/model.onnx` (preferred, current layout) OR `model.onnx` (legacy layout)
+//! - `tokenizer.json`
+//! - `config.json`
+//! - `special_tokens_map.json`
+//! - `tokenizer_config.json`
+
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use asupersync::Cx;
+use asupersync::sync::{LockError, Mutex};
+use fastembed::{
+    InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
+};
+use tracing::instrument;
+
+use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize};
+
+/// Default quality-tier model directory name.
+pub const DEFAULT_MODEL_NAME: &str = "all-MiniLM-L6-v2";
+
+/// `HuggingFace` model ID for MiniLM-L6-v2.
+pub const DEFAULT_HF_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+/// Expected `MiniLM` output dimension.
+pub const DEFAULT_DIMENSION: usize = 384;
+
+const MODEL_ONNX_SUBDIR: &str = "onnx/model.onnx";
+const MODEL_ONNX_LEGACY: &str = "model.onnx";
+
+const TOKENIZER_JSON: &str = "tokenizer.json";
+const CONFIG_JSON: &str = "config.json";
+const SPECIAL_TOKENS_JSON: &str = "special_tokens_map.json";
+const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
+
+const REQUIRED_NON_MODEL_FILES: [&str; 4] = [
+    TOKENIZER_JSON,
+    CONFIG_JSON,
+    SPECIAL_TOKENS_JSON,
+    TOKENIZER_CONFIG_JSON,
+];
+
+/// FastEmbed-backed `MiniLM` embedder.
+///
+/// `TextEmbedding` is wrapped in a cancel-aware `asupersync::sync::Mutex`
+/// because ONNX sessions are not safe for concurrent mutable access.
+pub struct FastEmbedEmbedder {
+    model: Mutex<TextEmbedding>,
+    name: String,
+    model_dir: PathBuf,
+}
+
+impl fmt::Debug for FastEmbedEmbedder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FastEmbedEmbedder")
+            .field("name", &self.name)
+            .field("dimension", &DEFAULT_DIMENSION)
+            .field("model_dir", &self.model_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FastEmbedEmbedder {
+    /// Load `all-MiniLM-L6-v2` from a local directory.
+    ///
+    /// `model_dir` may be either:
+    /// - the model directory itself (contains tokenizer/config + `onnx/model.onnx`)
+    /// - a parent directory containing `<model_name>/`
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::ModelNotFound` when required files are missing.
+    /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
+    #[instrument(skip_all, fields(model_dir = %model_dir.as_ref().display()))]
+    pub fn load(model_dir: impl AsRef<Path>) -> SearchResult<Self> {
+        Self::load_with_name(model_dir, DEFAULT_MODEL_NAME)
+    }
+
+    /// Load a `FastEmbed` model with a custom model directory name.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::ModelNotFound` when required files are missing.
+    /// Returns `SearchError::ModelLoadFailed` when ONNX/session initialization fails.
+    pub fn load_with_name(model_dir: impl AsRef<Path>, name: &str) -> SearchResult<Self> {
+        let model_dir = resolve_model_dir(model_dir.as_ref(), name)?;
+        let model_file =
+            select_model_file(&model_dir).ok_or_else(|| SearchError::ModelNotFound {
+                name: format!("{name} (missing {MODEL_ONNX_SUBDIR} or {MODEL_ONNX_LEGACY})"),
+            })?;
+
+        for filename in &REQUIRED_NON_MODEL_FILES {
+            let path = model_dir.join(filename);
+            if !path.is_file() {
+                return Err(SearchError::ModelNotFound {
+                    name: format!("{name} (missing {filename} in {})", model_dir.display()),
+                });
+            }
+        }
+
+        let model_bytes = read_required(&model_file)?;
+        let tokenizer_file = read_required(&model_dir.join(TOKENIZER_JSON))?;
+        let config_file = read_required(&model_dir.join(CONFIG_JSON))?;
+        let special_tokens_map_file = read_required(&model_dir.join(SPECIAL_TOKENS_JSON))?;
+        let tokenizer_config_file = read_required(&model_dir.join(TOKENIZER_CONFIG_JSON))?;
+
+        let tokenizer_files = TokenizerFiles {
+            tokenizer_file,
+            config_file,
+            special_tokens_map_file,
+            tokenizer_config_file,
+        };
+
+        let mut user_model = UserDefinedEmbeddingModel::new(model_bytes, tokenizer_files);
+        user_model.pooling = Some(Pooling::Mean);
+
+        let init_options = InitOptionsUserDefined::new();
+        let text_embedding = TextEmbedding::try_new_from_user_defined(user_model, init_options)
+            .map_err(|e| SearchError::ModelLoadFailed {
+                path: model_dir.clone(),
+                source: format!("failed to initialize FastEmbed model: {e}").into(),
+            })?;
+
+        // Fail fast on model/schema mismatch rather than deferring to first query.
+        let probe = text_embedding
+            .embed(vec!["dimension probe"], None)
+            .map_err(|e| SearchError::ModelLoadFailed {
+                path: model_dir.clone(),
+                source: format!("failed to run embedding probe: {e}").into(),
+            })?;
+        let probe_dim = probe.first().map_or(0, Vec::len);
+        if probe_dim != DEFAULT_DIMENSION {
+            return Err(SearchError::ModelLoadFailed {
+                path: model_dir,
+                source: format!(
+                    "dimension mismatch for {name}: expected {DEFAULT_DIMENSION}, got {probe_dim}"
+                )
+                .into(),
+            });
+        }
+
+        tracing::info!(
+            model = %name,
+            dimension = DEFAULT_DIMENSION,
+            model_dir = %model_dir.display(),
+            "FastEmbed quality model loaded"
+        );
+
+        Ok(Self {
+            model: Mutex::new(text_embedding),
+            name: name.to_owned(),
+            model_dir,
+        })
+    }
+
+    /// Embed a single non-empty string.
+    async fn embed_non_empty(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
+        let model = self
+            .model
+            .lock(cx)
+            .await
+            .map_err(|err| map_lock_error(&self.name, "fastembed.embed", err))?;
+
+        let mut embeddings =
+            model
+                .embed(vec![text], None)
+                .map_err(|e| SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: format!("fastembed inference failed: {e}").into(),
+                })?;
+
+        let embedding = embeddings
+            .pop()
+            .ok_or_else(|| SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: "fastembed returned no embedding".into(),
+            })?;
+
+        if embedding.len() != DEFAULT_DIMENSION {
+            return Err(SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: format!(
+                    "dimension mismatch: expected {DEFAULT_DIMENSION}, got {}",
+                    embedding.len()
+                )
+                .into(),
+            });
+        }
+
+        Ok(l2_normalize(&embedding))
+    }
+
+    /// Embed a batch of non-empty strings.
+    async fn embed_batch_non_empty(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+        let model = self
+            .model
+            .lock(cx)
+            .await
+            .map_err(|err| map_lock_error(&self.name, "fastembed.embed_batch", err))?;
+
+        let embeddings =
+            model
+                .embed(texts.to_vec(), None)
+                .map_err(|e| SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: format!("fastembed batch inference failed: {e}").into(),
+                })?;
+
+        if embeddings.len() != texts.len() {
+            return Err(SearchError::EmbeddingFailed {
+                model: self.name.clone(),
+                source: format!(
+                    "batch size mismatch: requested {}, got {}",
+                    texts.len(),
+                    embeddings.len()
+                )
+                .into(),
+            });
+        }
+
+        let mut normalized = Vec::with_capacity(embeddings.len());
+        for embedding in embeddings {
+            if embedding.len() != DEFAULT_DIMENSION {
+                return Err(SearchError::EmbeddingFailed {
+                    model: self.name.clone(),
+                    source: format!(
+                        "dimension mismatch: expected {DEFAULT_DIMENSION}, got {}",
+                        embedding.len()
+                    )
+                    .into(),
+                });
+            }
+            normalized.push(l2_normalize(&embedding));
+        }
+        Ok(normalized)
+    }
+
+    /// Directory containing model assets.
+    #[must_use]
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
+    }
+}
+
+impl Embedder for FastEmbedEmbedder {
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            if text.is_empty() {
+                return Ok(vec![0.0; DEFAULT_DIMENSION]);
+            }
+            self.embed_non_empty(cx, text).await
+        })
+    }
+
+    fn embed_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut output = vec![vec![0.0; DEFAULT_DIMENSION]; texts.len()];
+            let mut non_empty_indices = Vec::new();
+            let mut non_empty_texts = Vec::new();
+
+            for (idx, text) in texts.iter().enumerate() {
+                if !text.is_empty() {
+                    non_empty_indices.push(idx);
+                    non_empty_texts.push(*text);
+                }
+            }
+
+            if non_empty_texts.is_empty() {
+                return Ok(output);
+            }
+
+            let normalized = self.embed_batch_non_empty(cx, &non_empty_texts).await?;
+            for (slot_idx, embedding) in non_empty_indices.into_iter().zip(normalized.into_iter()) {
+                output[slot_idx] = embedding;
+            }
+            Ok(output)
+        })
+    }
+
+    fn dimension(&self) -> usize {
+        DEFAULT_DIMENSION
+    }
+
+    fn id(&self) -> &str {
+        &self.name
+    }
+
+    fn model_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_semantic(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::TransformerEmbedder
+    }
+}
+
+/// Search for a `FastEmbed` model directory in standard locations.
+///
+/// Checks these paths in order:
+/// 1. `$FRANKENSEARCH_MODEL_DIR/<model_name>/` then `$FRANKENSEARCH_MODEL_DIR`
+/// 2. `~/.cache/frankensearch/models/<model_name>/`
+/// 3. `~/.local/share/frankensearch/models/<model_name>/`
+/// 4. `~/.cache/fastembed/<model_name>/`
+/// 5. `~/.cache/huggingface/hub/models--<hf_id>/snapshots/*/`
+///
+/// Returns `None` if no directory with required files is found.
+#[must_use]
+pub fn find_model_dir(model_name: &str) -> Option<PathBuf> {
+    find_model_dir_with_hf_id(model_name, DEFAULT_HF_ID)
+}
+
+/// Search for a `FastEmbed` model directory with a specific `HuggingFace` ID.
+#[must_use]
+pub fn find_model_dir_with_hf_id(model_name: &str, hf_id: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(dir) = std::env::var("FRANKENSEARCH_MODEL_DIR") {
+        let base = PathBuf::from(dir);
+        candidates.push(base.join(model_name));
+        candidates.push(base);
+    }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        candidates.push(cache_dir.join("frankensearch/models").join(model_name));
+        candidates.push(cache_dir.join("fastembed").join(model_name));
+    }
+    if let Some(data_dir) = dirs::data_local_dir() {
+        candidates.push(data_dir.join("frankensearch/models").join(model_name));
+    }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let hf_dir = cache_dir
+            .join("huggingface/hub")
+            .join(format!("models--{}", hf_id.replace('/', "--")))
+            .join("snapshots");
+        if let Ok(entries) = fs::read_dir(hf_dir) {
+            for entry in entries.flatten() {
+                candidates.push(entry.path());
+            }
+        }
+    }
+
+    candidates.into_iter().find(|dir| has_required_files(dir))
+}
+
+fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
+    match error {
+        LockError::Cancelled => SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: "mutex lock cancelled".to_owned(),
+        },
+        LockError::Poisoned => SearchError::EmbeddingFailed {
+            model: model.to_owned(),
+            source: "fastembed mutex poisoned".into(),
+        },
+    }
+}
+
+fn read_required(path: &Path) -> SearchResult<Vec<u8>> {
+    fs::read(path).map_err(|e| SearchError::ModelLoadFailed {
+        path: path.to_path_buf(),
+        source: Box::new(e),
+    })
+}
+
+fn resolve_model_dir(base_dir: &Path, model_name: &str) -> SearchResult<PathBuf> {
+    if has_required_files(base_dir) {
+        return Ok(base_dir.to_path_buf());
+    }
+
+    let nested = base_dir.join(model_name);
+    if has_required_files(&nested) {
+        return Ok(nested);
+    }
+
+    Err(SearchError::ModelNotFound {
+        name: format!(
+            "{model_name} (missing required files in {} or {})",
+            base_dir.display(),
+            nested.display()
+        ),
+    })
+}
+
+fn select_model_file(model_dir: &Path) -> Option<PathBuf> {
+    let modern = model_dir.join(MODEL_ONNX_SUBDIR);
+    if modern.is_file() {
+        return Some(modern);
+    }
+
+    let legacy = model_dir.join(MODEL_ONNX_LEGACY);
+    if legacy.is_file() {
+        return Some(legacy);
+    }
+
+    None
+}
+
+fn has_required_files(dir: &Path) -> bool {
+    select_model_file(dir).is_some()
+        && REQUIRED_NON_MODEL_FILES
+            .iter()
+            .all(|filename| dir.join(filename).is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_stub_model_layout(dir: &Path, use_onnx_subdir: bool) {
+        if use_onnx_subdir {
+            std::fs::create_dir_all(dir.join("onnx")).unwrap();
+            std::fs::write(dir.join("onnx/model.onnx"), b"stub-onnx").unwrap();
+        } else {
+            std::fs::write(dir.join("model.onnx"), b"stub-onnx").unwrap();
+        }
+
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        std::fs::write(dir.join("special_tokens_map.json"), "{}").unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn has_required_files_accepts_modern_onnx_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        create_stub_model_layout(temp.path(), true);
+        assert!(has_required_files(temp.path()));
+    }
+
+    #[test]
+    fn has_required_files_accepts_legacy_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        create_stub_model_layout(temp.path(), false);
+        assert!(has_required_files(temp.path()));
+    }
+
+    #[test]
+    fn resolve_model_dir_accepts_direct_model_path() {
+        let temp = tempfile::tempdir().unwrap();
+        create_stub_model_layout(temp.path(), true);
+
+        let resolved = resolve_model_dir(temp.path(), DEFAULT_MODEL_NAME).unwrap();
+        assert_eq!(resolved, temp.path());
+    }
+
+    #[test]
+    fn resolve_model_dir_accepts_parent_with_named_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join(DEFAULT_MODEL_NAME);
+        std::fs::create_dir_all(&child).unwrap();
+        create_stub_model_layout(&child, true);
+
+        let resolved = resolve_model_dir(temp.path(), DEFAULT_MODEL_NAME).unwrap();
+        assert_eq!(resolved, child);
+    }
+
+    #[test]
+    fn resolve_model_dir_errors_when_missing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = resolve_model_dir(temp.path(), DEFAULT_MODEL_NAME).unwrap_err();
+
+        assert!(matches!(err, SearchError::ModelNotFound { .. }));
+    }
+
+    #[test]
+    fn map_lock_error_cancelled_to_search_cancelled() {
+        let err = map_lock_error("all-MiniLM-L6-v2", "fastembed.embed", LockError::Cancelled);
+        assert!(matches!(err, SearchError::Cancelled { .. }));
+    }
+
+    #[test]
+    fn map_lock_error_poisoned_to_embedding_failed() {
+        let err = map_lock_error("all-MiniLM-L6-v2", "fastembed.embed", LockError::Poisoned);
+        assert!(matches!(err, SearchError::EmbeddingFailed { .. }));
+    }
+
+    #[test]
+    fn select_model_file_prefers_modern_path() {
+        let temp = tempfile::tempdir().unwrap();
+        create_stub_model_layout(temp.path(), true);
+        std::fs::write(temp.path().join("model.onnx"), b"legacy").unwrap();
+
+        let selected = select_model_file(temp.path()).unwrap();
+        assert!(selected.ends_with(MODEL_ONNX_SUBDIR));
+    }
+}

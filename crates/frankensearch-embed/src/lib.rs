@@ -7,3 +7,45 @@
 //!
 //! The `EmbedderStack` auto-detection probes for available models and configures
 //! the best fast+quality pair automatically.
+
+pub mod auto_detect;
+pub mod batch_coalescer;
+pub mod model_manifest;
+pub mod model_registry;
+pub use auto_detect::{DimReduceEmbedder, EmbedderStack, TwoTierAvailability};
+pub use batch_coalescer::{
+    BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
+};
+pub use model_manifest::{
+    ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, ModelFile, ModelLifecycle, ModelManifest,
+    ModelManifestCatalog, ModelState, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, resolve_download_consent,
+    verify_file_sha256,
+};
+pub use model_registry::{
+    BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,
+    registered_embedders, registered_rerankers,
+};
+
+#[cfg(feature = "hash")]
+pub mod hash_embedder;
+
+#[cfg(feature = "hash")]
+pub use hash_embedder::{HashAlgorithm, HashEmbedder};
+
+#[cfg(feature = "model2vec")]
+pub mod model2vec_embedder;
+
+#[cfg(feature = "model2vec")]
+pub use model2vec_embedder::{Model2VecEmbedder, find_model_dir};
+
+#[cfg(feature = "fastembed")]
+pub mod fastembed_embedder;
+
+#[cfg(feature = "fastembed")]
+pub use fastembed_embedder::FastEmbedEmbedder;
+
+#[cfg(feature = "download")]
+pub mod model_download;
+
+#[cfg(feature = "download")]
+pub use model_download::{DownloadConfig, DownloadProgress, ModelDownloader};

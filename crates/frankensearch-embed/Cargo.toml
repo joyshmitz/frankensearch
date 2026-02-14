@@ -11,12 +11,16 @@ default = ["hash"]
 hash = []
 model2vec = ["dep:safetensors", "dep:tokenizers"]
 fastembed = ["dep:fastembed"]
+download = ["asupersync/tls", "asupersync/tls-webpki-roots"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
+sha2 = { workspace = true }
 
 # Feature-gated embedder dependencies
 safetensors = { workspace = true, optional = true }
@@ -25,6 +29,9 @@ fastembed = { workspace = true, optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true }
+tempfile = "3"
+safetensors = { workspace = true }
+tokenizers = { workspace = true }
 
 [lints]
 workspace = true

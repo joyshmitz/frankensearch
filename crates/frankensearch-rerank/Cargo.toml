@@ -8,13 +8,15 @@ repository.workspace = true
 
 [dependencies]
 frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
 ort = { workspace = true }
 tokenizers = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+dirs = { workspace = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -1,0 +1,537 @@
+//! Conformal prediction wrappers for distribution-free search coverage.
+//!
+//! This module implements lightweight conformal utilities around empirical
+//! nonconformity scores (here: relevant-document ranks) so consumers can ask:
+//! - "How many results do I need for coverage `1 - alpha`?" (`required_k`)
+//! - "What rank interval is plausible at confidence `1 - alpha`?"
+//! - "How surprising is an observed rank?" (`p_value`)
+//!
+//! The design keeps calibration storage and query-time operations simple:
+//! - Calibration is `O(n log n)` once (sort scores).
+//! - Query operations are `O(1)` plus integer indexing.
+
+use std::collections::HashMap;
+
+use frankensearch_core::query_class::QueryClass;
+use frankensearch_core::{SearchError, SearchResult};
+use serde::{Deserialize, Serialize};
+
+/// Empirical conformal calibration based on observed nonconformity ranks.
+///
+/// Ranks are 1-indexed (`1` = best/top hit). Higher ranks are worse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConformalSearchCalibration {
+    nonconformity_scores: Vec<usize>,
+    n_calibration: usize,
+}
+
+impl ConformalSearchCalibration {
+    /// Build a calibration object from observed relevant-document ranks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when:
+    /// - `nonconformity_scores` is empty
+    /// - any rank is `0` (ranks must be 1-indexed)
+    pub fn calibrate(nonconformity_scores: &[usize]) -> SearchResult<Self> {
+        if nonconformity_scores.is_empty() {
+            return Err(invalid_config(
+                "conformal.nonconformity_scores",
+                "[]",
+                "calibration set must contain at least one rank",
+            ));
+        }
+        if let Some(invalid) = nonconformity_scores.iter().copied().find(|&r| r == 0) {
+            return Err(invalid_config(
+                "conformal.nonconformity_scores",
+                &invalid.to_string(),
+                "ranks must be 1-indexed (minimum value is 1)",
+            ));
+        }
+
+        let mut scores = nonconformity_scores.to_vec();
+        scores.sort_unstable();
+        let n_calibration = scores.len();
+        Ok(Self {
+            nonconformity_scores: scores,
+            n_calibration,
+        })
+    }
+
+    /// Number of calibration observations.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.n_calibration
+    }
+
+    /// Always false once constructed (calibration requires non-empty input).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.n_calibration == 0
+    }
+
+    /// Sorted nonconformity ranks used for calibration.
+    #[must_use]
+    pub fn nonconformity_scores(&self) -> &[usize] {
+        &self.nonconformity_scores
+    }
+
+    /// Required `k` to achieve target coverage `1 - alpha`.
+    ///
+    /// Invalid alphas return the most conservative fallback (`max(rank)`).
+    #[must_use]
+    pub fn required_k(&self, alpha: f32) -> usize {
+        self.required_k_checked(alpha)
+            .unwrap_or_else(|_| self.nonconformity_scores[self.n_calibration - 1])
+    }
+
+    /// Checked variant of [`required_k`](Self::required_k).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] if `alpha` is not finite or outside `[0, 1)`.
+    pub fn required_k_checked(&self, alpha: f32) -> SearchResult<usize> {
+        let alpha = validate_alpha(alpha)?;
+        let coverage = 1.0 - f64::from(alpha);
+        let idx = quantile_index(self.n_calibration, coverage);
+        Ok(self.nonconformity_scores[idx])
+    }
+
+    /// Two-sided rank prediction interval at confidence `1 - alpha`.
+    ///
+    /// Invalid alphas fall back to the full empirical support.
+    #[must_use]
+    pub fn rank_prediction_interval(&self, alpha: f32) -> (usize, usize) {
+        self.rank_prediction_interval_checked(alpha)
+            .unwrap_or_else(|_| {
+                (
+                    self.nonconformity_scores[0],
+                    self.nonconformity_scores[self.n_calibration - 1],
+                )
+            })
+    }
+
+    /// Checked variant of [`rank_prediction_interval`](Self::rank_prediction_interval).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] if `alpha` is not finite or outside `[0, 1)`.
+    pub fn rank_prediction_interval_checked(&self, alpha: f32) -> SearchResult<(usize, usize)> {
+        let alpha = validate_alpha(alpha)?;
+        let tail = f64::from(alpha) / 2.0;
+        let lower_idx = quantile_index(self.n_calibration, tail);
+        let upper_idx = quantile_index(self.n_calibration, 1.0 - tail);
+        Ok((
+            self.nonconformity_scores[lower_idx],
+            self.nonconformity_scores[upper_idx],
+        ))
+    }
+
+    /// Conformal p-value for an observed rank.
+    ///
+    /// Invalid ranks (`0`) return `0.0`.
+    #[must_use]
+    pub fn p_value(&self, observed_rank: usize) -> f32 {
+        self.p_value_checked(observed_rank).unwrap_or(0.0)
+    }
+
+    /// Checked variant of [`p_value`](Self::p_value).
+    ///
+    /// Uses the standard conformal finite-sample correction:
+    /// `p = (#{score >= observed_rank} + 1) / (n + 1)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] if `observed_rank == 0`.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn p_value_checked(&self, observed_rank: usize) -> SearchResult<f32> {
+        if observed_rank == 0 {
+            return Err(invalid_config(
+                "conformal.observed_rank",
+                "0",
+                "rank must be 1-indexed (minimum value is 1)",
+            ));
+        }
+
+        let exceed = self
+            .nonconformity_scores
+            .iter()
+            .filter(|&&r| r >= observed_rank)
+            .count();
+        #[allow(clippy::cast_precision_loss)]
+        let numerator = (exceed + 1) as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let denominator = (self.n_calibration + 1) as f32;
+        Ok(numerator / denominator)
+    }
+}
+
+/// Query-class-conditional (Mondrian) conformal calibration.
+///
+/// When a query class has enough calibration examples, it gets an independent
+/// conformal model; otherwise the global model is used as deterministic fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MondrianConformalCalibration {
+    global: ConformalSearchCalibration,
+    by_class: HashMap<QueryClass, ConformalSearchCalibration>,
+    min_examples_per_class: usize,
+}
+
+impl MondrianConformalCalibration {
+    /// Calibrate global + per-query-class conformal models from `(query, rank)` examples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when:
+    /// - `examples` is empty
+    /// - `min_examples_per_class == 0`
+    /// - any rank is `0`
+    pub fn calibrate(
+        examples: &[(String, usize)],
+        min_examples_per_class: usize,
+    ) -> SearchResult<Self> {
+        if examples.is_empty() {
+            return Err(invalid_config(
+                "mondrian.examples",
+                "[]",
+                "calibration set must contain at least one query/rank pair",
+            ));
+        }
+        if min_examples_per_class == 0 {
+            return Err(invalid_config(
+                "mondrian.min_examples_per_class",
+                "0",
+                "minimum per-class sample count must be >= 1",
+            ));
+        }
+
+        let mut global_ranks = Vec::with_capacity(examples.len());
+        let mut class_ranks: HashMap<QueryClass, Vec<usize>> = HashMap::new();
+
+        for (query, rank) in examples {
+            if *rank == 0 {
+                return Err(invalid_config(
+                    "mondrian.rank",
+                    "0",
+                    "ranks must be 1-indexed (minimum value is 1)",
+                ));
+            }
+
+            let class = QueryClass::classify(query);
+            class_ranks.entry(class).or_default().push(*rank);
+            global_ranks.push(*rank);
+        }
+
+        let global = ConformalSearchCalibration::calibrate(&global_ranks)?;
+        let mut by_class = HashMap::new();
+        for (class, ranks) in class_ranks {
+            if ranks.len() >= min_examples_per_class {
+                by_class.insert(class, ConformalSearchCalibration::calibrate(&ranks)?);
+            }
+        }
+
+        Ok(Self {
+            global,
+            by_class,
+            min_examples_per_class,
+        })
+    }
+
+    /// Required `k` for a query at target coverage `1 - alpha`.
+    ///
+    /// Uses class-specific calibration when available, otherwise global fallback.
+    #[must_use]
+    pub fn required_k(&self, query: &str, alpha: f32) -> usize {
+        self.calibration_for_query(query).required_k(alpha)
+    }
+
+    /// Checked variant of [`required_k`](Self::required_k).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] if `alpha` is invalid.
+    pub fn required_k_checked(&self, query: &str, alpha: f32) -> SearchResult<usize> {
+        self.calibration_for_query(query).required_k_checked(alpha)
+    }
+
+    /// Returns true when this query class has its own calibration model.
+    #[must_use]
+    pub fn has_class_calibration(&self, class: QueryClass) -> bool {
+        self.by_class.contains_key(&class)
+    }
+
+    /// Global fallback calibration.
+    #[must_use]
+    pub const fn global(&self) -> &ConformalSearchCalibration {
+        &self.global
+    }
+
+    /// Optional class-specific calibration.
+    #[must_use]
+    pub fn class_calibration(&self, class: QueryClass) -> Option<&ConformalSearchCalibration> {
+        self.by_class.get(&class)
+    }
+
+    /// Minimum number of class examples required before enabling class-specific calibration.
+    #[must_use]
+    pub const fn min_examples_per_class(&self) -> usize {
+        self.min_examples_per_class
+    }
+
+    fn calibration_for_query(&self, query: &str) -> &ConformalSearchCalibration {
+        let class = QueryClass::classify(query);
+        self.by_class.get(&class).unwrap_or(&self.global)
+    }
+}
+
+/// Online adaptive alpha state for non-stationary distributions.
+///
+/// Update rule:
+/// `alpha_t = clamp(alpha_{t-1} + gamma * (err_t - alpha_{t-1}), ε, 1-ε)`
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct AdaptiveConformalState {
+    /// Current target miscoverage (`alpha`).
+    pub alpha: f32,
+    /// Adaptation rate in `(0, 1]`.
+    pub gamma: f32,
+}
+
+/// Structured telemetry for one adaptive-alpha update.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct AdaptiveConformalUpdate {
+    /// Alpha before update.
+    pub alpha_before: f32,
+    /// Alpha after update.
+    pub alpha_after: f32,
+    /// Observed error rate driving the update.
+    pub observed_error_rate: f32,
+    /// Updated `required_k` under `alpha_after`.
+    pub required_k: usize,
+}
+
+impl AdaptiveConformalState {
+    /// Create adaptive state with validated parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when `alpha` or `gamma` are invalid.
+    pub fn new(alpha: f32, gamma: f32) -> SearchResult<Self> {
+        let alpha = validate_alpha(alpha)?;
+        if !gamma.is_finite() || !(0.0..=1.0).contains(&gamma) || gamma == 0.0 {
+            return Err(invalid_config(
+                "conformal.gamma",
+                &gamma.to_string(),
+                "gamma must be finite and in (0, 1]",
+            ));
+        }
+        Ok(Self { alpha, gamma })
+    }
+
+    /// Update alpha from observed error and return structured telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] for non-finite/out-of-range error rates.
+    pub fn update(
+        &mut self,
+        observed_error_rate: f32,
+        calibration: &ConformalSearchCalibration,
+    ) -> SearchResult<AdaptiveConformalUpdate> {
+        if !observed_error_rate.is_finite() || !(0.0..=1.0).contains(&observed_error_rate) {
+            return Err(invalid_config(
+                "conformal.observed_error_rate",
+                &observed_error_rate.to_string(),
+                "observed error rate must be finite and in [0, 1]",
+            ));
+        }
+
+        let alpha_before = self.alpha;
+        let drift = observed_error_rate - self.alpha;
+        self.alpha = self
+            .gamma
+            .mul_add(drift, self.alpha)
+            .clamp(1e-6, 1.0 - 1e-6);
+        let required_k = calibration.required_k_checked(self.alpha)?;
+
+        Ok(AdaptiveConformalUpdate {
+            alpha_before,
+            alpha_after: self.alpha,
+            observed_error_rate,
+            required_k,
+        })
+    }
+}
+
+fn invalid_config(field: &str, value: &str, reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: field.to_owned(),
+        value: value.to_owned(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn validate_alpha(alpha: f32) -> SearchResult<f32> {
+    if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+        return Err(invalid_config(
+            "conformal.alpha",
+            &alpha.to_string(),
+            "alpha must be finite and in [0, 1)",
+        ));
+    }
+    Ok(alpha)
+}
+
+/// Quantile index using conformal finite-sample correction.
+///
+/// `quantile` is clamped to `[0, 1]`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn quantile_index(n: usize, quantile: f64) -> usize {
+    let q = quantile.clamp(0.0, 1.0);
+    #[allow(clippy::cast_precision_loss)]
+    let adjusted = ((n as f64 + 1.0) * q).ceil();
+    #[allow(clippy::cast_precision_loss)]
+    let bounded = adjusted.max(1.0).min(n as f64);
+    bounded as usize - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibrate_rejects_empty_input() {
+        let err = ConformalSearchCalibration::calibrate(&[]).expect_err("must reject empty");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn calibrate_rejects_zero_rank() {
+        let err = ConformalSearchCalibration::calibrate(&[1, 0, 2]).expect_err("must reject zero");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn required_k_decreases_as_alpha_increases() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3, 5, 8, 13]).expect("calibrate");
+        let k_tight = cal.required_k(0.01);
+        let k_looser = cal.required_k(0.20);
+        assert!(k_tight >= k_looser);
+    }
+
+    #[test]
+    fn rank_prediction_interval_is_ordered() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3, 4, 7, 9]).expect("calibrate");
+        let (lower, upper) = cal.rank_prediction_interval(0.1);
+        assert!(lower <= upper);
+        assert!(lower >= 1);
+    }
+
+    #[test]
+    fn p_value_is_bounded_and_monotone() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3, 4, 6, 9]).expect("calibrate");
+        let p_rank_2 = cal.p_value(2);
+        let p_rank_8 = cal.p_value(8);
+        assert!((0.0..=1.0).contains(&p_rank_2));
+        assert!((0.0..=1.0).contains(&p_rank_8));
+        assert!(p_rank_8 <= p_rank_2);
+    }
+
+    #[test]
+    fn checked_methods_validate_inputs() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 3]).expect("calibrate");
+        assert!(cal.required_k_checked(1.0).is_err());
+        assert!(cal.rank_prediction_interval_checked(f32::NAN).is_err());
+        assert!(cal.p_value_checked(0).is_err());
+    }
+
+    #[test]
+    fn adaptive_update_adjusts_alpha_and_returns_required_k() {
+        let cal = ConformalSearchCalibration::calibrate(&[1, 2, 2, 3, 5, 8]).expect("calibrate");
+        let mut state = AdaptiveConformalState::new(0.1, 0.2).expect("state");
+        let update = state.update(0.3, &cal).expect("update");
+        assert!(update.alpha_after > update.alpha_before);
+        assert!(update.required_k >= 1);
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_scores() {
+        let cal = ConformalSearchCalibration::calibrate(&[3, 1, 2, 5]).expect("calibrate");
+        let encoded = serde_json::to_string(&cal).expect("serialize");
+        let decoded: ConformalSearchCalibration =
+            serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, cal);
+    }
+
+    #[test]
+    fn empirical_coverage_hits_target_within_sampling_tolerance() {
+        let mut calibration = Vec::with_capacity(200);
+        for _ in 0..10 {
+            calibration.extend(1..=20);
+        }
+        let cal = ConformalSearchCalibration::calibrate(&calibration).expect("calibrate");
+        let alpha = 0.10;
+        let required_k = cal.required_k(alpha);
+
+        let heldout: Vec<usize> = (0..120).map(|i| (i % 20) + 1).collect();
+        let covered = heldout.iter().filter(|&&rank| rank <= required_k).count();
+        #[allow(clippy::cast_precision_loss)]
+        let empirical_coverage = covered as f32 / heldout.len() as f32;
+
+        assert!(empirical_coverage >= (1.0 - alpha - 0.03));
+    }
+
+    #[test]
+    fn mondrian_uses_class_specific_calibration_when_sufficient() {
+        let examples = vec![
+            ("vector search".to_owned(), 1),
+            ("error handling".to_owned(), 2),
+            ("index format".to_owned(), 2),
+            ("ranking logic".to_owned(), 3),
+            ("why does ranking drift under pressure".to_owned(), 9),
+            (
+                "how does calibration improve coverage guarantees".to_owned(),
+                10,
+            ),
+            (
+                "what causes retrieval quality degradation over time".to_owned(),
+                11,
+            ),
+            (
+                "when should quality phase be skipped by controller".to_owned(),
+                12,
+            ),
+        ];
+        let mondrian = MondrianConformalCalibration::calibrate(&examples, 3).expect("calibrate");
+        assert!(mondrian.has_class_calibration(QueryClass::ShortKeyword));
+        assert!(mondrian.has_class_calibration(QueryClass::NaturalLanguage));
+
+        let short_k = mondrian.required_k("vector search", 0.10);
+        let nl_k = mondrian.required_k("how does conformal coverage work in search", 0.10);
+        assert!(nl_k > short_k);
+    }
+
+    #[test]
+    fn mondrian_falls_back_to_global_for_sparse_classes() {
+        let examples = vec![
+            ("src/main.rs".to_owned(), 1),
+            ("bd-123".to_owned(), 2),
+            ("vector search".to_owned(), 4),
+            ("error handling".to_owned(), 5),
+            ("hybrid ranking".to_owned(), 6),
+            ("fusion behavior".to_owned(), 7),
+        ];
+        let mondrian = MondrianConformalCalibration::calibrate(&examples, 3).expect("calibrate");
+
+        assert!(!mondrian.has_class_calibration(QueryClass::Identifier));
+        let global_k = mondrian.global().required_k(0.20);
+        let identifier_k = mondrian.required_k("src/lib.rs", 0.20);
+        assert_eq!(identifier_k, global_k);
+    }
+
+    #[test]
+    fn mondrian_rejects_zero_min_examples() {
+        let err = MondrianConformalCalibration::calibrate(&[("q".to_owned(), 1)], 0)
+            .expect_err("must reject min_examples=0");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+}

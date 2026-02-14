@@ -1,0 +1,726 @@
+//! Optional HNSW approximate nearest-neighbor index (`ann` feature).
+//!
+//! This module wraps `hnsw_rs` behind a frankensearch-native API and a
+//! deterministic on-disk `CHSW` format.
+
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::path::Path;
+use std::time::Instant;
+
+use frankensearch_core::{SearchError, SearchResult, VectorHit};
+use hnsw_rs::prelude::{DistDot, Hnsw};
+
+use crate::VectorIndex;
+
+/// Magic bytes for serialized ANN indices.
+pub const HNSW_MAGIC: [u8; 4] = *b"CHSW";
+/// Supported ANN file version.
+pub const HNSW_VERSION: u16 = 1;
+
+/// Default HNSW `M` (max connections per node).
+pub const HNSW_DEFAULT_M: usize = 16;
+/// Default HNSW `ef_construction` (build-time beam width).
+pub const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
+/// Default HNSW `ef_search` (query-time beam width).
+pub const HNSW_DEFAULT_EF_SEARCH: usize = 100;
+/// Default HNSW max layer depth.
+pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
+const DIST_DOT_SHRINK: f32 = 0.999_999;
+
+/// ANN construction/runtime parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswConfig {
+    /// HNSW `M` (max connections per node).
+    pub m: usize,
+    /// HNSW `ef_construction` (build-time beam width).
+    pub ef_construction: usize,
+    /// Default HNSW `ef_search` (query-time beam width).
+    pub ef_search: usize,
+    /// Maximum HNSW layer depth.
+    pub max_layer: usize,
+}
+
+impl Default for HnswConfig {
+    fn default() -> Self {
+        Self {
+            m: HNSW_DEFAULT_M,
+            ef_construction: HNSW_DEFAULT_EF_CONSTRUCTION,
+            ef_search: HNSW_DEFAULT_EF_SEARCH,
+            max_layer: HNSW_DEFAULT_MAX_LAYER,
+        }
+    }
+}
+
+/// Diagnostics for one ANN query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnnSearchStats {
+    /// Number of vectors indexed.
+    pub index_size: usize,
+    /// Vector dimensionality.
+    pub dimension: usize,
+    /// Effective ef used for this query.
+    pub ef_search: usize,
+    /// Requested `k`.
+    pub k_requested: usize,
+    /// Returned result count.
+    pub k_returned: usize,
+    /// Query latency in microseconds.
+    pub search_time_us: u64,
+    /// Whether this path is approximate ANN.
+    pub is_approximate: bool,
+    /// Estimated recall@k from ef/k ratio.
+    pub estimated_recall: f64,
+}
+
+/// HNSW ANN index over vectors aligned to `VectorIndex` row order.
+pub struct HnswIndex {
+    hnsw: Hnsw<'static, f32, DistDot>,
+    doc_ids: Vec<String>,
+    vectors: Vec<Vec<f32>>,
+    dimension: usize,
+    config: HnswConfig,
+}
+
+impl std::fmt::Debug for HnswIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HnswIndex")
+            .field("points", &self.hnsw.get_nb_point())
+            .field("doc_ids", &self.doc_ids.len())
+            .field("vectors", &self.vectors.len())
+            .field("dimension", &self.dimension)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HnswIndex {
+    /// Build a new HNSW index from an opened `VectorIndex`.
+    ///
+    /// # Errors
+    ///
+    /// Returns:
+    /// - `SearchError::InvalidConfig` for invalid HNSW params
+    /// - `SearchError::IndexCorrupted` if `vectors/doc_ids` cannot be decoded
+    pub fn build_from_vector_index(index: &VectorIndex, config: HnswConfig) -> SearchResult<Self> {
+        let dimension = index.dimension();
+        let mut doc_ids = Vec::with_capacity(index.record_count());
+        let mut vectors = Vec::with_capacity(index.record_count());
+        for i in 0..index.record_count() {
+            doc_ids.push(index.doc_id_at(i)?.to_owned());
+            vectors.push(index.vector_at_f32(i)?);
+        }
+        Self::build_from_parts(doc_ids, vectors, dimension, config)
+    }
+
+    /// Load an ANN index from disk and rebuild the in-memory HNSW graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::IndexCorrupted` for malformed data.
+    pub fn load(path: &Path) -> SearchResult<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        let mut magic = [0_u8; 4];
+        read_exact_or_corrupted(&mut reader, &mut magic, path, "magic")?;
+        if magic != HNSW_MAGIC {
+            return Err(ann_corrupted(
+                path,
+                format!("invalid magic bytes: expected {HNSW_MAGIC:?}, found {magic:?}"),
+            ));
+        }
+
+        let version = read_u16(&mut reader, path, "version")?;
+        if version != HNSW_VERSION {
+            return Err(ann_corrupted(
+                path,
+                format!("unsupported CHSW version: {version}"),
+            ));
+        }
+
+        let dimension = usize::try_from(read_u32(&mut reader, path, "dimension")?)
+            .map_err(|_| ann_corrupted(path, "dimension field does not fit in usize"))?;
+        let record_count = usize::try_from(read_u32(&mut reader, path, "record_count")?)
+            .map_err(|_| ann_corrupted(path, "record_count field does not fit in usize"))?;
+
+        let config = HnswConfig {
+            m: usize::try_from(read_u32(&mut reader, path, "m")?)
+                .map_err(|_| ann_corrupted(path, "m field does not fit in usize"))?,
+            ef_construction: usize::try_from(read_u32(&mut reader, path, "ef_construction")?)
+                .map_err(|_| ann_corrupted(path, "ef_construction field does not fit in usize"))?,
+            ef_search: usize::try_from(read_u32(&mut reader, path, "ef_search")?)
+                .map_err(|_| ann_corrupted(path, "ef_search field does not fit in usize"))?,
+            max_layer: usize::try_from(read_u32(&mut reader, path, "max_layer")?)
+                .map_err(|_| ann_corrupted(path, "max_layer field does not fit in usize"))?,
+        };
+
+        let mut doc_ids = Vec::with_capacity(record_count);
+        let mut vectors = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            let doc_id_len = usize::try_from(read_u32(&mut reader, path, "doc_id_len")?)
+                .map_err(|_| ann_corrupted(path, "doc_id_len does not fit in usize"))?;
+            let mut doc_id_bytes = vec![0_u8; doc_id_len];
+            read_exact_or_corrupted(&mut reader, &mut doc_id_bytes, path, "doc_id")?;
+            let doc_id = String::from_utf8(doc_id_bytes)
+                .map_err(|error| ann_corrupted(path, format!("invalid UTF-8 doc_id: {error}")))?;
+            doc_ids.push(doc_id);
+
+            let mut vector = Vec::with_capacity(dimension);
+            for _ in 0..dimension {
+                let value = read_f32(&mut reader, path, "vector_value")?;
+                vector.push(value);
+            }
+            vectors.push(vector);
+        }
+
+        Self::build_from_parts(doc_ids, vectors, dimension, config)
+    }
+
+    /// Persist ANN index data as deterministic `CHSW` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::Io` on write/flush/sync failures.
+    pub fn save(&self, path: &Path) -> SearchResult<()> {
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
+        let tmp_path = path.with_extension("tmp");
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+
+        writer.write_all(&HNSW_MAGIC)?;
+        writer.write_all(&HNSW_VERSION.to_le_bytes())?;
+        write_u32(&mut writer, self.dimension, "dimension")?;
+        write_u32(&mut writer, self.doc_ids.len(), "record_count")?;
+        write_u32(&mut writer, self.config.m, "m")?;
+        write_u32(&mut writer, self.config.ef_construction, "ef_construction")?;
+        write_u32(&mut writer, self.config.ef_search, "ef_search")?;
+        write_u32(&mut writer, self.config.max_layer, "max_layer")?;
+
+        for (doc_id, vector) in self.doc_ids.iter().zip(&self.vectors) {
+            write_u32(&mut writer, doc_id.len(), "doc_id_len")?;
+            writer.write_all(doc_id.as_bytes())?;
+            for value in vector {
+                writer.write_all(&value.to_le_bytes())?;
+            }
+        }
+
+        writer.flush()?;
+        let file = writer
+            .into_inner()
+            .map_err(|error| SearchError::Io(error.into_error()))?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(tmp_path, path)?;
+        Ok(())
+    }
+
+    /// Run ANN query and return hits plus query diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` if query dimension differs.
+    pub fn knn_search_with_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        if query.len() != self.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: query.len(),
+            });
+        }
+
+        if k == 0 || self.doc_ids.is_empty() {
+            let stats = AnnSearchStats {
+                index_size: self.len(),
+                dimension: self.dimension,
+                ef_search,
+                k_requested: k,
+                k_returned: 0,
+                search_time_us: 0,
+                is_approximate: true,
+                estimated_recall: 1.0,
+            };
+            return Ok((Vec::new(), stats));
+        }
+
+        let effective_k = k.min(self.doc_ids.len());
+        let effective_ef = ef_search.max(effective_k).max(1);
+        let normalized_query = normalize_for_dist_dot(query.to_vec());
+
+        let start = Instant::now();
+        let neighbors = self
+            .hnsw
+            .search(&normalized_query, effective_k, effective_ef);
+        let elapsed = start.elapsed();
+        let search_time_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+
+        let mut hits = Vec::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            let doc_id =
+                self.doc_ids
+                    .get(neighbor.d_id)
+                    .ok_or_else(|| SearchError::InvalidConfig {
+                        field: "neighbor_id".to_owned(),
+                        value: neighbor.d_id.to_string(),
+                        reason: "neighbor id exceeds doc_id table".to_owned(),
+                    })?;
+            let index = u32::try_from(neighbor.d_id).map_err(|_| SearchError::InvalidConfig {
+                field: "neighbor_id".to_owned(),
+                value: neighbor.d_id.to_string(),
+                reason: "neighbor id exceeds u32 range for VectorHit".to_owned(),
+            })?;
+            hits.push(VectorHit {
+                index,
+                score: 1.0 - neighbor.distance,
+                doc_id: doc_id.clone(),
+            });
+        }
+        hits.sort_by(|left, right| {
+            left.cmp_by_score(right)
+                .then_with(|| left.index.cmp(&right.index))
+        });
+
+        let stats = AnnSearchStats {
+            index_size: self.len(),
+            dimension: self.dimension,
+            ef_search: effective_ef,
+            k_requested: k,
+            k_returned: hits.len(),
+            search_time_us,
+            is_approximate: true,
+            estimated_recall: estimate_recall(effective_ef, effective_k),
+        };
+        Ok((hits, stats))
+    }
+
+    /// Run ANN query and return only the hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` if query dimension differs.
+    pub fn knn_search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.knn_search_with_stats(query, k, ef_search)
+            .map(|(hits, _)| hits)
+    }
+
+    /// Returns true when this ANN index matches row order and shape of a `VectorIndex`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates decoding errors from `VectorIndex::doc_id_at`.
+    pub fn matches_vector_index(&self, index: &VectorIndex) -> SearchResult<bool> {
+        if self.dimension != index.dimension() || self.len() != index.record_count() {
+            return Ok(false);
+        }
+        for i in 0..self.doc_ids.len() {
+            if self.doc_ids[i] != index.doc_id_at(i)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Number of indexed vectors.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    /// Whether ANN index has zero vectors.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.doc_ids.is_empty()
+    }
+
+    /// Vector dimensionality.
+    #[must_use]
+    pub const fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// ANN configuration used to build this index.
+    #[must_use]
+    pub const fn config(&self) -> HnswConfig {
+        self.config
+    }
+
+    fn build_from_parts(
+        doc_ids: Vec<String>,
+        vectors: Vec<Vec<f32>>,
+        dimension: usize,
+        config: HnswConfig,
+    ) -> SearchResult<Self> {
+        validate_config(config)?;
+        if dimension == 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "dimension".to_owned(),
+                value: "0".to_owned(),
+                reason: "dimension must be greater than zero".to_owned(),
+            });
+        }
+        if doc_ids.len() != vectors.len() {
+            return Err(SearchError::InvalidConfig {
+                field: "vectors".to_owned(),
+                value: vectors.len().to_string(),
+                reason: format!("doc_id count {} must match vector count", doc_ids.len()),
+            });
+        }
+        let mut normalized_vectors = Vec::with_capacity(vectors.len());
+        for (idx, vector) in vectors.into_iter().enumerate() {
+            if vector.len() != dimension {
+                return Err(SearchError::DimensionMismatch {
+                    expected: dimension,
+                    found: vector.len(),
+                });
+            }
+            if vector.iter().any(|value| !value.is_finite()) {
+                return Err(SearchError::InvalidConfig {
+                    field: "vector".to_owned(),
+                    value: idx.to_string(),
+                    reason: "all vector values must be finite".to_owned(),
+                });
+            }
+            normalized_vectors.push(normalize_for_dist_dot(vector));
+        }
+
+        let hnsw = Hnsw::new(
+            config.m,
+            doc_ids.len().max(1),
+            config.max_layer,
+            config.ef_construction,
+            DistDot,
+        );
+        if !normalized_vectors.is_empty() {
+            let vectors_with_ids: Vec<(&Vec<f32>, usize)> = normalized_vectors
+                .iter()
+                .enumerate()
+                .map(|(index, vector)| (vector, index))
+                .collect();
+            hnsw.parallel_insert(&vectors_with_ids);
+        }
+
+        Ok(Self {
+            hnsw,
+            doc_ids,
+            vectors: normalized_vectors,
+            dimension,
+            config,
+        })
+    }
+}
+
+fn validate_config(config: HnswConfig) -> SearchResult<()> {
+    if config.m == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "hnsw_m".to_owned(),
+            value: "0".to_owned(),
+            reason: "hnsw_m must be greater than zero".to_owned(),
+        });
+    }
+    if config.m > 256 {
+        return Err(SearchError::InvalidConfig {
+            field: "hnsw_m".to_owned(),
+            value: config.m.to_string(),
+            reason: "hnsw_m must be <= 256".to_owned(),
+        });
+    }
+    if config.ef_construction == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "hnsw_ef_construction".to_owned(),
+            value: "0".to_owned(),
+            reason: "hnsw_ef_construction must be greater than zero".to_owned(),
+        });
+    }
+    if config.ef_search == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "hnsw_ef_search".to_owned(),
+            value: "0".to_owned(),
+            reason: "hnsw_ef_search must be greater than zero".to_owned(),
+        });
+    }
+    if config.max_layer == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "hnsw_max_layer".to_owned(),
+            value: "0".to_owned(),
+            reason: "hnsw_max_layer must be greater than zero".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn read_exact_or_corrupted<R: Read>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    path: &Path,
+    field: &str,
+) -> SearchResult<()> {
+    reader.read_exact(buffer).map_err(|error| {
+        if error.kind() == ErrorKind::UnexpectedEof {
+            ann_corrupted(path, format!("unexpected EOF while reading {field}"))
+        } else {
+            SearchError::Io(error)
+        }
+    })
+}
+
+fn read_u16<R: Read>(reader: &mut R, path: &Path, field: &str) -> SearchResult<u16> {
+    let mut bytes = [0_u8; 2];
+    read_exact_or_corrupted(reader, &mut bytes, path, field)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32<R: Read>(reader: &mut R, path: &Path, field: &str) -> SearchResult<u32> {
+    let mut bytes = [0_u8; 4];
+    read_exact_or_corrupted(reader, &mut bytes, path, field)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_f32<R: Read>(reader: &mut R, path: &Path, field: &str) -> SearchResult<f32> {
+    let mut bytes = [0_u8; 4];
+    read_exact_or_corrupted(reader, &mut bytes, path, field)?;
+    Ok(f32::from_le_bytes(bytes))
+}
+
+fn write_u32<W: Write>(writer: &mut W, value: usize, field: &str) -> SearchResult<()> {
+    let value_u32 = u32::try_from(value).map_err(|_| SearchError::InvalidConfig {
+        field: field.to_owned(),
+        value: value.to_string(),
+        reason: "value does not fit in u32".to_owned(),
+    })?;
+    writer.write_all(&value_u32.to_le_bytes())?;
+    Ok(())
+}
+
+fn ann_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
+    SearchError::IndexCorrupted {
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    }
+}
+
+fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        let inv_norm = DIST_DOT_SHRINK / norm;
+        for value in &mut vector {
+            *value *= inv_norm;
+        }
+    }
+    vector
+}
+
+fn estimate_recall(ef_search: usize, k: usize) -> f64 {
+    if k == 0 {
+        return 1.0;
+    }
+    let numerator = f64::from(u32::try_from(ef_search.max(1)).unwrap_or(u32::MAX));
+    let denominator = f64::from(u32::try_from(k).unwrap_or(u32::MAX));
+    let ratio = numerator / denominator;
+    0.1_f64.mul_add(ratio.log2(), 0.9_f64).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::Quantization;
+
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "frankensearch-hnsw-{label}-{}-{now}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    fn lcg_next(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        u32::try_from((*state >> 32) & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+    }
+
+    fn normalized_vector(seed: usize, dimension: usize) -> Vec<f32> {
+        let mut state = u64::try_from(seed).unwrap_or(0).wrapping_add(1);
+        let mut out = Vec::with_capacity(dimension);
+        for _ in 0..dimension {
+            let random = lcg_next(&mut state);
+            let upper = u16::try_from((random >> 16) & u32::from(u16::MAX)).unwrap_or(u16::MAX);
+            let raw = f32::from(upper) / f32::from(u16::MAX);
+            out.push((raw * 2.0_f32) - 1.0_f32);
+        }
+        let norm = out.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut out {
+                *value /= norm;
+            }
+        }
+        out
+    }
+
+    fn write_index(path: &Path, vectors: &[Vec<f32>]) -> SearchResult<VectorIndex> {
+        let dimension = vectors.first().map_or(8, Vec::len);
+        let mut writer =
+            VectorIndex::create_with_revision(path, "hash", "test", dimension, Quantization::F32)?;
+        for (idx, vector) in vectors.iter().enumerate() {
+            writer.write_record(&format!("doc-{idx:04}"), vector)?;
+        }
+        writer.finish()?;
+        VectorIndex::open(path)
+    }
+
+    fn recall_at_k(approx: &[VectorHit], exact: &[VectorHit]) -> f64 {
+        if exact.is_empty() {
+            return 1.0;
+        }
+        let exact_ids: HashSet<&str> = exact.iter().map(|hit| hit.doc_id.as_str()).collect();
+        let overlap = approx
+            .iter()
+            .filter(|hit| exact_ids.contains(hit.doc_id.as_str()))
+            .count();
+        f64::from(u32::try_from(overlap).unwrap_or(u32::MAX))
+            / f64::from(u32::try_from(exact.len()).unwrap_or(u32::MAX))
+    }
+
+    #[test]
+    fn empty_index_returns_no_hits() {
+        let path = temp_path("empty", "fsvi");
+        let writer = VectorIndex::create_with_revision(&path, "hash", "test", 8, Quantization::F16)
+            .expect("create writer");
+        writer.finish().expect("finish");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let hits = ann
+            .knn_search(&normalized_vector(7, 8), 10, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn single_vector_round_trip() {
+        let path = temp_path("single", "fsvi");
+        let index = write_index(&path, &[normalized_vector(1, 32)]).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let hits = ann
+            .knn_search(&normalized_vector(1, 32), 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-0000");
+    }
+
+    #[test]
+    fn serialization_round_trip_restores_searchability() {
+        let fsvi_path = temp_path("serialize", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..64).map(|i| normalized_vector(i, 48)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let query = normalized_vector(999, 48);
+        let original = ann
+            .knn_search(&query, 10, HNSW_DEFAULT_EF_SEARCH)
+            .expect("original search");
+        let exact = index.search_top_k(&query, 10, None).expect("exact");
+
+        let chsw_path = temp_path("serialize", "chsw");
+        ann.save(&chsw_path).expect("save");
+        let loaded = HnswIndex::load(&chsw_path).expect("load");
+        let reloaded = loaded.knn_search(&query, 10, 256).expect("reloaded search");
+
+        assert_eq!(original.len(), reloaded.len());
+        assert!(
+            loaded
+                .matches_vector_index(&index)
+                .expect("index alignment")
+        );
+        assert!(recall_at_k(&original, &exact) >= 0.8);
+        assert!(recall_at_k(&reloaded, &exact) >= 0.8);
+    }
+
+    #[test]
+    fn higher_ef_improves_or_matches_recall() {
+        let fsvi_path = temp_path("ef", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..256).map(|i| normalized_vector(i, 96)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let mut low_total = 0.0_f64;
+        let mut high_total = 0.0_f64;
+        let mut count = 0_u32;
+        for query_seed in (0..128).step_by(16) {
+            let query = normalized_vector(query_seed, 96);
+            let exact = index.search_top_k(&query, 10, None).expect("exact");
+            let low = ann.knn_search(&query, 10, 10).expect("low ef");
+            let high = ann.knn_search(&query, 10, 100).expect("high ef");
+            low_total += recall_at_k(&low, &exact);
+            high_total += recall_at_k(&high, &exact);
+            count += 1;
+        }
+
+        let count_f = f64::from(count);
+        assert!((high_total / count_f) >= (low_total / count_f));
+    }
+
+    #[test]
+    fn recall_against_bruteforce_is_high() {
+        let fsvi_path = temp_path("recall", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..1_000).map(|i| normalized_vector(i, 384)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let mut total_recall = 0.0_f64;
+        let mut query_count = 0_u32;
+        for query_seed in (0..1_000).step_by(40) {
+            let query = normalized_vector(query_seed, 384);
+            let exact = index.search_top_k(&query, 10, None).expect("exact");
+            let approx = ann
+                .knn_search(&query, 10, HNSW_DEFAULT_EF_SEARCH)
+                .expect("approx");
+            total_recall += recall_at_k(&approx, &exact);
+            query_count += 1;
+        }
+
+        let avg_recall = total_recall / f64::from(query_count);
+        assert!(
+            avg_recall >= 0.95,
+            "expected avg recall >= 0.95, got {avg_recall:.4}"
+        );
+    }
+
+    #[test]
+    fn scores_are_consistent_with_exact_top_hit() {
+        let fsvi_path = temp_path("score", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..128).map(|i| normalized_vector(i, 64)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let query = normalized_vector(7, 64);
+        let exact = index.search_top_k(&query, 1, None).expect("exact");
+        let approx = ann
+            .knn_search(&query, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("approx");
+
+        assert_eq!(exact[0].doc_id, approx[0].doc_id);
+        assert!((exact[0].score - approx[0].score).abs() < 1e-3);
+    }
+}
