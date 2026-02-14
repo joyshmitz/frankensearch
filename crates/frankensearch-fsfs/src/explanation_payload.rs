@@ -451,6 +451,18 @@ impl From<&DegradationTransition> for PolicyDecisionExplanation {
             "override_mode".to_owned(),
             format!("{:?}", value.override_mode),
         );
+        metadata.insert(
+            "manual_intervention".to_owned(),
+            value.manual_intervention().to_string(),
+        );
+        metadata.insert(
+            "transition_context".to_owned(),
+            value.transition_context().to_owned(),
+        );
+        metadata.insert(
+            "override_guardrail".to_owned(),
+            value.override_guardrail().to_owned(),
+        );
 
         Self {
             domain: PolicyDomain::Degradation,
@@ -736,6 +748,45 @@ mod tests {
         assert_eq!(
             policy.metadata.get("banner"),
             Some(&"Constrained mode".to_owned())
+        );
+        assert_eq!(
+            policy.metadata.get("manual_intervention"),
+            Some(&"false".to_owned())
+        );
+        assert_eq!(
+            policy.metadata.get("transition_context"),
+            Some(&"pressure_escalation".to_owned())
+        );
+    }
+
+    #[test]
+    fn degradation_policy_conversion_marks_manual_override_audit_context() {
+        let transition = DegradationTransition {
+            from: DegradedRetrievalMode::MetadataOnly,
+            to: DegradedRetrievalMode::Paused,
+            changed: true,
+            reason_code: "degrade.override.applied",
+            status: DegradationStatus {
+                banner: "Paused mode",
+                controls_hint: "override:auto|normal",
+            },
+            override_mode: DegradationOverride::ForcePause,
+        };
+
+        let policy = PolicyDecisionExplanation::from(&transition);
+        assert_eq!(
+            policy.metadata.get("manual_intervention"),
+            Some(&"true".to_owned())
+        );
+        assert_eq!(
+            policy.metadata.get("transition_context"),
+            Some(&"manual_override_transition".to_owned())
+        );
+        assert!(
+            policy
+                .metadata
+                .get("override_guardrail")
+                .is_some_and(|text| text.contains("writes remain paused"))
         );
     }
 

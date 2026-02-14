@@ -3801,6 +3801,41 @@ mod tests {
     }
 
     #[test]
+    fn materialize_slo_rollups_uses_no_data_reason_when_min_requests_not_met() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let now_ms = 700_000;
+        let event = sample_search_event("event-min-requests", now_ms - 100);
+        storage
+            .ingest_search_events_batch(&[event], 64)
+            .expect("event ingest should succeed");
+
+        let result = storage
+            .materialize_slo_rollups_and_anomalies(
+                now_ms,
+                SloMaterializationConfig {
+                    min_requests: 5,
+                    ..SloMaterializationConfig::default()
+                },
+            )
+            .expect("materialization should succeed");
+        assert_eq!(result.anomalies_opened, 0);
+
+        let rollup = storage
+            .latest_slo_rollup(SloScope::Project, "project-a", SummaryWindow::OneMinute)
+            .expect("latest rollup query should succeed")
+            .expect("project rollup should exist");
+        assert_eq!(rollup.reason_code, "slo.no_data.min_requests");
+        assert_eq!(rollup.health, SloHealth::NoData);
+
+        let open_anomalies = storage
+            .query_open_anomalies_for_scope(SloScope::Project, "project-a", 10)
+            .expect("open anomaly query should succeed");
+        assert!(open_anomalies.is_empty());
+    }
+
+    #[test]
     fn query_resource_trend_returns_ordered_points_in_window() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
         seed_project_and_instance(storage.connection());
@@ -4194,6 +4229,38 @@ mod tests {
         let metrics = storage.ingestion_metrics();
         assert_eq!(metrics.total_batches, 1);
         assert_eq!(metrics.total_failed_records, 2);
+        assert_eq!(metrics.total_inserted, 0);
+        assert_eq!(metrics.total_deduplicated, 0);
+    }
+
+    #[test]
+    fn ingest_search_events_batch_rejects_empty_correlation_id() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let invalid = SearchEventRecord {
+            correlation_id: String::new(),
+            ..sample_search_event("event-invalid-correlation", 95)
+        };
+
+        let error = storage
+            .ingest_search_events_batch(&[invalid], 64)
+            .expect_err("empty correlation_id should fail validation");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig {
+                    ref field,
+                    ..
+                } if field == "correlation_id"
+            ),
+            "unexpected validation error: {error}"
+        );
+        assert_eq!(search_event_count(storage.connection()), 0);
+
+        let metrics = storage.ingestion_metrics();
+        assert_eq!(metrics.total_batches, 1);
+        assert_eq!(metrics.total_failed_records, 1);
         assert_eq!(metrics.total_inserted, 0);
         assert_eq!(metrics.total_deduplicated, 0);
     }

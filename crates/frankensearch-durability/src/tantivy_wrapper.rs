@@ -13,7 +13,7 @@
 //! 2. **On open** — call [`DurableTantivyIndex::verify_and_repair`] to
 //!    check all segments and auto-repair any corruption.
 //! 3. **On merge/GC** — orphaned `.seg.fec` files whose segments no longer
-//!    exist are lazily cleaned up during [`protect_segments`].
+//!    exist are lazily cleaned up during [`DurableTantivyIndex::protect_segments`].
 
 use std::collections::HashSet;
 use std::fs;

@@ -186,6 +186,23 @@ pub struct DegradationTransition {
     pub override_mode: DegradationOverride,
 }
 
+impl DegradationTransition {
+    #[must_use]
+    pub const fn transition_context(self) -> &'static str {
+        transition_context_for_transition(self)
+    }
+
+    #[must_use]
+    pub const fn manual_intervention(self) -> bool {
+        !matches!(self.override_mode, DegradationOverride::Auto)
+    }
+
+    #[must_use]
+    pub const fn override_guardrail(self) -> &'static str {
+        override_guardrail_for_mode(self.to)
+    }
+}
+
 /// Ladder-based graceful degradation controller for query execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DegradationStateMachine {
@@ -889,6 +906,44 @@ const fn transition_reason_code(mode: DegradedRetrievalMode) -> &'static str {
 }
 
 #[must_use]
+const fn transition_context_for_transition(transition: DegradationTransition) -> &'static str {
+    if !transition.changed {
+        if matches!(transition.override_mode, DegradationOverride::Auto) {
+            "state_stable"
+        } else {
+            "manual_override_hold"
+        }
+    } else if !matches!(transition.override_mode, DegradationOverride::Auto) {
+        "manual_override_transition"
+    } else if transition.to.severity() > transition.from.severity() {
+        "pressure_escalation"
+    } else {
+        "pressure_recovery"
+    }
+}
+
+#[must_use]
+const fn override_guardrail_for_mode(mode: DegradedRetrievalMode) -> &'static str {
+    match mode {
+        DegradedRetrievalMode::Normal => {
+            "manual overrides are optional; controller can still escalate under pressure"
+        }
+        DegradedRetrievalMode::EmbedDeferred => {
+            "resume to normal only when pressure recovers or operator forces normal"
+        }
+        DegradedRetrievalMode::LexicalOnly => {
+            "metadata-only and pause remain available as emergency guardrails"
+        }
+        DegradedRetrievalMode::MetadataOnly => {
+            "only pause or normal-recovery overrides are allowed at this severity"
+        }
+        DegradedRetrievalMode::Paused => {
+            "writes remain paused until operator clears override or forces recovery"
+        }
+    }
+}
+
+#[must_use]
 const fn status_for_mode(mode: DegradedRetrievalMode) -> DegradationStatus {
     match mode {
         DegradedRetrievalMode::Normal => DegradationStatus {
@@ -996,9 +1051,9 @@ fn fused_cmp(left: &FusedCandidate, right: &FusedCandidate) -> Ordering {
 mod tests {
     use super::{
         CancellationAction, CancellationPoint, DegradationOverride, DegradationPolicy,
-        DegradationSignals, DegradationStateMachine, DegradedRetrievalMode, LexicalCandidate,
-        QueryExecutionOrchestrator, RankingPriorSignals, RankingPriorTuning, RetrievalStage,
-        SemanticCandidate,
+        DegradationSignals, DegradationStateMachine, DegradationTransition, DegradedRetrievalMode,
+        LexicalCandidate, QueryExecutionOrchestrator, RankingPriorSignals, RankingPriorTuning,
+        RetrievalStage, SemanticCandidate, status_for_mode,
     };
     use crate::config::{FsfsConfig, PressureProfile};
     use crate::orchestration::BackpressureMode;
@@ -1273,5 +1328,72 @@ mod tests {
 
         assert!(strict.escalate_after <= performance.escalate_after);
         assert!(degraded.recover_after > performance.recover_after);
+    }
+
+    #[test]
+    fn transition_context_distinguishes_escalation_recovery_and_override() {
+        let escalation = DegradationTransition {
+            from: DegradedRetrievalMode::Normal,
+            to: DegradedRetrievalMode::EmbedDeferred,
+            changed: true,
+            reason_code: "degrade.transition.embed_deferred",
+            status: status_for_mode(DegradedRetrievalMode::EmbedDeferred),
+            override_mode: DegradationOverride::Auto,
+        };
+        assert_eq!(escalation.transition_context(), "pressure_escalation");
+        assert!(!escalation.manual_intervention());
+
+        let recovery = DegradationTransition {
+            from: DegradedRetrievalMode::LexicalOnly,
+            to: DegradedRetrievalMode::EmbedDeferred,
+            changed: true,
+            reason_code: "degrade.transition.recovered",
+            status: status_for_mode(DegradedRetrievalMode::EmbedDeferred),
+            override_mode: DegradationOverride::Auto,
+        };
+        assert_eq!(recovery.transition_context(), "pressure_recovery");
+        assert!(!recovery.manual_intervention());
+
+        let manual = DegradationTransition {
+            from: DegradedRetrievalMode::LexicalOnly,
+            to: DegradedRetrievalMode::Paused,
+            changed: true,
+            reason_code: "degrade.override.applied",
+            status: status_for_mode(DegradedRetrievalMode::Paused),
+            override_mode: DegradationOverride::ForcePause,
+        };
+        assert_eq!(manual.transition_context(), "manual_override_transition");
+        assert!(manual.manual_intervention());
+    }
+
+    #[test]
+    fn override_guardrail_hint_tracks_target_mode() {
+        let paused = DegradationTransition {
+            from: DegradedRetrievalMode::MetadataOnly,
+            to: DegradedRetrievalMode::Paused,
+            changed: true,
+            reason_code: "degrade.transition.pause",
+            status: status_for_mode(DegradedRetrievalMode::Paused),
+            override_mode: DegradationOverride::Auto,
+        };
+        assert!(
+            paused.override_guardrail().contains("writes remain paused"),
+            "guardrail should explain paused safety behavior"
+        );
+
+        let normal = DegradationTransition {
+            from: DegradedRetrievalMode::EmbedDeferred,
+            to: DegradedRetrievalMode::Normal,
+            changed: true,
+            reason_code: "degrade.transition.recovered",
+            status: status_for_mode(DegradedRetrievalMode::Normal),
+            override_mode: DegradationOverride::Auto,
+        };
+        assert!(
+            normal
+                .override_guardrail()
+                .contains("controller can still escalate"),
+            "normal mode guardrail should preserve safety semantics"
+        );
     }
 }

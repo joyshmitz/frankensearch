@@ -2,7 +2,7 @@
 //!
 //! Implements the evidence-jsonl-v1 contract (see `docs/evidence-jsonl-contract.md`
 //! and `schemas/evidence-jsonl-v1.schema.json`). Evidence events are emitted as
-//! JSONL lines to an [`EvidenceWriter`] sink.
+//! JSONL lines to an `EvidenceWriter` sink.
 //!
 //! All evidence payloads go through mandatory redaction — raw sensitive fields
 //! are never emitted.

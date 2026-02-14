@@ -183,7 +183,7 @@ impl ModelDownloader {
         let mut cumulative_bytes: u64 = 0;
 
         for (idx, file) in manifest.files.iter().enumerate() {
-            let url = huggingface_url(&manifest.repo, &manifest.revision, &file.name);
+            let url = file.download_url(&manifest.repo, &manifest.revision);
             let file_dest = staging_dir.join(&file.name);
 
             // Create parent directories for nested paths (e.g., "onnx/model.onnx").
@@ -445,6 +445,7 @@ impl ModelDownloader {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Build a `HuggingFace` CDN URL for a model file.
+#[cfg(test)]
 fn huggingface_url(repo: &str, revision: &str, file_name: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/{revision}/{file_name}")
 }
@@ -509,10 +510,10 @@ impl TempFileGuard {
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Err(e) = std::fs::remove_file(&self.path) {
-                tracing::warn!(path = %self.path.display(), error = %e, "failed to clean up temp file");
-            }
+        if self.armed
+            && let Err(e) = std::fs::remove_file(&self.path)
+        {
+            tracing::warn!(path = %self.path.display(), error = %e, "failed to clean up temp file");
         }
     }
 }
@@ -548,6 +549,7 @@ fn client_error_to_search(error: ClientError, url: &str) -> SearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_manifest::{PLACEHOLDER_PINNED_REVISION, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD};
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
@@ -727,6 +729,7 @@ mod tests {
             name: "model.onnx".to_owned(),
             sha256: sha256_hex(&body),
             size: u64::try_from(body.len()).unwrap(),
+            url: None,
         };
 
         let (base_url, served, handle) = spawn_test_http_server(vec![TestHttpResponse {
@@ -778,6 +781,7 @@ mod tests {
             name: "model.onnx".to_owned(),
             sha256: sha256_hex(&body),
             size: u64::try_from(body.len()).unwrap(),
+            url: None,
         };
 
         let (base_url, served, handle) = spawn_test_http_server(vec![
@@ -821,6 +825,7 @@ mod tests {
             name: "model.onnx".to_owned(),
             sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             size: 4,
+            url: None,
         };
 
         let (base_url, served, handle) = spawn_test_http_server(vec![
@@ -867,6 +872,7 @@ mod tests {
             name: "model.onnx".to_owned(),
             sha256: sha256_hex(&expected),
             size: u64::try_from(expected.len()).unwrap(),
+            url: None,
         };
 
         let (base_url, served, handle) = spawn_test_http_server(vec![TestHttpResponse {
@@ -903,6 +909,9 @@ mod tests {
     fn download_model_failure_transitions_lifecycle_to_verification_failed() {
         let manifest = ModelManifest {
             id: "test-model".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
             repo: "owner/repo".to_owned(),
             revision: "deadbeef".to_owned(),
             files: vec![ModelFile {
@@ -910,8 +919,12 @@ mod tests {
                 name: "bad file.bin".to_owned(),
                 sha256: "0".repeat(64),
                 size: 1,
+                url: None,
             }],
             license: "Apache-2.0".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 0,
         };
         let consent = crate::model_manifest::DownloadConsent::granted(
             crate::model_manifest::ConsentSource::Environment,
@@ -952,7 +965,11 @@ mod tests {
 
     #[test]
     fn download_model_rejects_non_production_ready_manifest() {
-        let manifest = ModelManifest::minilm_v2();
+        let mut manifest = ModelManifest::minilm_v2();
+        manifest.revision = PLACEHOLDER_PINNED_REVISION.to_owned();
+        manifest.files[0].sha256 = PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned();
+        manifest.files[0].size = 0;
+        manifest.files[0].url = None;
         let consent = crate::model_manifest::DownloadConsent::granted(
             crate::model_manifest::ConsentSource::Environment,
         );

@@ -14,6 +14,10 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::adapters::tui::FsfsScreen;
+use crate::orchestration::{BackpressureMode, WatcherThrottle};
+use crate::pressure::{
+    DegradationOverride as PressureDegradationOverride, DegradationStage, PressureState,
+};
 use crate::query_execution::DegradedRetrievalMode;
 
 // ─── Schema Version ──────────────────────────────────────────────────────────
@@ -169,6 +173,7 @@ impl ScreenLayout {
 /// Downstream beads (bd-2hz.7.2 through bd-2hz.7.6) implement actual rendering
 /// against these descriptors.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn canonical_layout(screen: FsfsScreen) -> ScreenLayout {
     match screen {
         FsfsScreen::Search => ScreenLayout {
@@ -373,6 +378,10 @@ pub enum ScreenAction {
     ExpandSelected,
     /// Collapse the selected item's details.
     CollapseSelected,
+    /// Open the currently selected search result.
+    OpenSelectedResult,
+    /// Jump to the selected result's source location.
+    JumpToSelectedSource,
 
     // -- Timeline-specific --
     /// Toggle auto-follow mode (scroll to newest events).
@@ -383,6 +392,22 @@ pub enum ScreenAction {
     PauseIndexing,
     /// Resume background indexing.
     ResumeIndexing,
+    /// Apply constrained throttle to indexing/watcher cadence.
+    ThrottleIndexing,
+    /// Request recovery toward normal indexing/query operation.
+    RecoverIndexing,
+    /// Clear any manual degradation override and return to automatic policy.
+    SetOverrideAuto,
+    /// Force fully-enabled degradation stage.
+    ForceOverrideFull,
+    /// Force embed-deferred degradation stage.
+    ForceOverrideEmbedDeferred,
+    /// Force lexical-only degradation stage.
+    ForceOverrideLexicalOnly,
+    /// Force metadata-only degradation stage.
+    ForceOverrideMetadataOnly,
+    /// Force paused degradation stage.
+    ForceOverridePaused,
 
     // -- Configuration --
     /// Reload configuration from disk.
@@ -408,10 +433,30 @@ impl ScreenAction {
     pub fn from_palette_action_id(action_id: &str) -> Option<Self> {
         match action_id {
             "search.focus_query" => Some(Self::FocusQuery),
+            "search.submit_query" => Some(Self::SubmitQuery),
+            "search.clear_query" => Some(Self::ClearQuery),
             "search.repeat_last" => Some(Self::RepeatLastQuery),
+            "search.select_up" => Some(Self::SelectUp),
+            "search.select_down" => Some(Self::SelectDown),
+            "search.select_first" => Some(Self::SelectFirst),
+            "search.select_last" => Some(Self::SelectLast),
+            "search.page_up" => Some(Self::PageUp),
+            "search.page_down" => Some(Self::PageDown),
+            "search.toggle_explain" | "explain.toggle_panel" => Some(Self::ToggleDetailPanel),
+            "search.expand_selected" => Some(Self::ExpandSelected),
+            "search.collapse_selected" => Some(Self::CollapseSelected),
+            "search.open_selected" => Some(Self::OpenSelectedResult),
+            "search.jump_to_source" => Some(Self::JumpToSelectedSource),
             "index.pause" => Some(Self::PauseIndexing),
             "index.resume" => Some(Self::ResumeIndexing),
-            "explain.toggle_panel" => Some(Self::ToggleDetailPanel),
+            "index.throttle" => Some(Self::ThrottleIndexing),
+            "index.recover" => Some(Self::RecoverIndexing),
+            "index.override.auto" => Some(Self::SetOverrideAuto),
+            "index.override.full" => Some(Self::ForceOverrideFull),
+            "index.override.embed_deferred" => Some(Self::ForceOverrideEmbedDeferred),
+            "index.override.lexical_only" => Some(Self::ForceOverrideLexicalOnly),
+            "index.override.metadata_only" => Some(Self::ForceOverrideMetadataOnly),
+            "index.override.paused" => Some(Self::ForceOverridePaused),
             "config.reload" => Some(Self::ReloadConfig),
             "ops.open_timeline" => Some(Self::NavigateTo(FsfsScreen::OpsTimeline)),
             "diag.replay_trace" => Some(Self::ReplayTrace),
@@ -464,11 +509,13 @@ impl PanelFocusState {
     }
 
     /// Advance focus to the next panel in tab order (wraps).
+    #[allow(clippy::missing_const_for_fn)]
     pub fn focus_next(&mut self) {
         self.current = (self.current + 1) % self.cycle.len();
     }
 
     /// Move focus to the previous panel in tab order (wraps).
+    #[allow(clippy::missing_const_for_fn)]
     pub fn focus_prev(&mut self) {
         self.current = if self.current == 0 {
             self.cycle.len() - 1
@@ -486,12 +533,14 @@ impl PanelFocusState {
 
     /// Number of focusable panels.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn len(&self) -> usize {
         self.cycle.len()
     }
 
     /// Whether there are no focusable panels.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn is_empty(&self) -> bool {
         self.cycle.is_empty()
     }
@@ -553,9 +602,9 @@ pub struct InteractionSnapshot {
 impl InteractionSnapshot {
     /// Compute and set the checksum from current field values.
     ///
-    /// The checksum covers: screen ID, tick, focused_panel, selected_index,
-    /// scroll_offset, visible_count, query_text, filters, follow_mode,
-    /// and degradation_mode. It does NOT include seq or checksum itself.
+    /// The checksum covers: screen ID, tick, `focused_panel`, `selected_index`,
+    /// `scroll_offset`, `visible_count`, `query_text`, filters, `follow_mode`,
+    /// and `degradation_mode`. It does NOT include `seq` or `checksum` itself.
     #[must_use]
     pub fn with_checksum(mut self) -> Self {
         self.checksum = self.compute_checksum();
@@ -688,6 +737,7 @@ impl InteractionBudget {
 
     /// Total cycle budget across all phases.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub const fn total(&self) -> Duration {
         Duration::from_nanos(
             self.input_budget.as_nanos() as u64
@@ -729,8 +779,8 @@ impl InteractionBudget {
 
 /// Collected timing for a complete interaction cycle.
 ///
-/// Consumers build this by measuring each phase and then call
-/// [`InteractionCycleTiming::evaluate`] to check budget compliance.
+/// Consumers build this by measuring each phase and then check
+/// budget compliance against an [`InteractionBudget`].
 #[derive(Debug, Clone)]
 pub struct InteractionCycleTiming {
     pub input: PhaseTiming,
@@ -748,10 +798,9 @@ impl InteractionCycleTiming {
 
     /// Whether any phase exceeded its individual budget.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn has_phase_overrun(&self) -> bool {
-        self.input.is_over_budget()
-            || self.update.is_over_budget()
-            || self.render.is_over_budget()
+        self.input.is_over_budget() || self.update.is_over_budget() || self.render.is_over_budget()
     }
 
     /// List of phases that exceeded their budgets.
@@ -769,6 +818,67 @@ impl InteractionCycleTiming {
         }
         overruns
     }
+
+    /// Coarse latency bucket for artifact-friendly telemetry output.
+    #[must_use]
+    pub fn latency_bucket(&self, budget: &InteractionBudget) -> LatencyBucket {
+        LatencyBucket::from_totals(self.total_duration(), budget.total())
+    }
+}
+
+/// Coarse interaction latency category used by replay/diagnostic artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyBucket {
+    /// Uses <= 80% of frame budget.
+    UnderBudget,
+    /// Uses > 80% and <= 100% of frame budget.
+    NearBudget,
+    /// Exceeds frame budget.
+    OverBudget,
+}
+
+impl LatencyBucket {
+    /// Derive a bucket from observed total duration and frame budget.
+    #[must_use]
+    pub const fn from_totals(total: Duration, budget: Duration) -> Self {
+        let total_ns = total.as_nanos();
+        let budget_ns = budget.as_nanos();
+        if budget_ns == 0 {
+            return Self::OverBudget;
+        }
+        if total_ns <= (budget_ns * 4) / 5 {
+            Self::UnderBudget
+        } else if total_ns <= budget_ns {
+            Self::NearBudget
+        } else {
+            Self::OverBudget
+        }
+    }
+}
+
+impl fmt::Display for LatencyBucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnderBudget => "under_budget",
+            Self::NearBudget => "near_budget",
+            Self::OverBudget => "over_budget",
+        })
+    }
+}
+
+/// Deterministic search interaction telemetry payload for logs/replay artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchInteractionTelemetry {
+    pub interaction_id: u64,
+    pub frame_seq: u64,
+    pub frame_budget_ms: u16,
+    pub total_latency_ms: u16,
+    pub latency_bucket: LatencyBucket,
+    pub visible_window: (usize, usize),
+    pub visible_count: usize,
+    pub selected_index: usize,
+    pub detail_panel_visible: bool,
+    pub query_len: usize,
 }
 
 // ─── Degradation Tier (presentation layer) ──────────────────────────────────
@@ -858,7 +968,8 @@ impl VirtualizedListState {
         }
     }
 
-    /// Ensure the selected item is visible by adjusting scroll_offset.
+    /// Ensure the selected item is visible by adjusting `scroll_offset`.
+    #[allow(clippy::missing_const_for_fn)]
     pub fn ensure_visible(&mut self) {
         if self.viewport_height == 0 {
             return;
@@ -936,6 +1047,231 @@ impl VirtualizedListState {
     }
 }
 
+/// Minimal result payload tracked by the interactive search state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchResultEntry {
+    pub doc_id: String,
+    pub source_path: String,
+    pub snippet: String,
+}
+
+impl SearchResultEntry {
+    #[must_use]
+    pub fn new(
+        doc_id: impl Into<String>,
+        source_path: impl Into<String>,
+        snippet: impl Into<String>,
+    ) -> Self {
+        Self {
+            doc_id: doc_id.into(),
+            source_path: source_path.into(),
+            snippet: snippet.into(),
+        }
+    }
+}
+
+/// Event emitted when search interaction state triggers an external operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchInteractionEvent {
+    QuerySubmitted(String),
+    OpenSelected { doc_id: String, source_path: String },
+    JumpToSource { doc_id: String, source_path: String },
+}
+
+/// Stateful contract for the fsfs interactive search screen.
+///
+/// This model handles incremental query updates, virtualized result navigation,
+/// inline explainability toggles, and explicit open/jump actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchInteractionState {
+    pub focus: PanelFocusState,
+    pub list: VirtualizedListState,
+    pub query_input: String,
+    pub pending_incremental_query: Option<String>,
+    pub last_submitted_query: Option<String>,
+    pub detail_panel_visible: bool,
+    pub results: Vec<SearchResultEntry>,
+}
+
+impl SearchInteractionState {
+    /// Build the default search interaction state with fixed viewport height.
+    #[must_use]
+    pub fn new(viewport_height: usize) -> Self {
+        let layout = canonical_layout(FsfsScreen::Search);
+        let focus = PanelFocusState::from_layout(&layout).unwrap_or_else(|| PanelFocusState {
+            cycle: vec![PanelRole::QueryInput],
+            current: 0,
+        });
+        let mut list = VirtualizedListState::empty();
+        list.set_viewport_height(viewport_height);
+        Self {
+            focus,
+            list,
+            query_input: String::new(),
+            pending_incremental_query: None,
+            last_submitted_query: None,
+            detail_panel_visible: false,
+            results: Vec::new(),
+        }
+    }
+
+    /// Apply an incremental query edit and queue it for submit.
+    pub fn apply_incremental_query(&mut self, query: impl Into<String>) {
+        let query = query.into();
+        self.query_input.clone_from(&query);
+        let trimmed = query.trim();
+        self.pending_incremental_query = (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+
+    /// Replace result rows and synchronize virtualization bounds.
+    pub fn set_results(&mut self, results: Vec<SearchResultEntry>) {
+        self.results = results;
+        self.list.set_total_items(self.results.len());
+    }
+
+    /// Current visible window as `[start, end)` over `results`.
+    #[must_use]
+    pub fn visible_window(&self) -> (usize, usize) {
+        let start = self.list.scroll_offset.min(self.results.len());
+        let end = (start + self.list.viewport_height.max(1)).min(self.results.len());
+        (start, end)
+    }
+
+    /// Borrow the currently visible result rows.
+    #[must_use]
+    pub fn visible_results(&self) -> &[SearchResultEntry] {
+        let (start, end) = self.visible_window();
+        &self.results[start..end]
+    }
+
+    /// Selected result, if any.
+    #[must_use]
+    pub fn selected_result(&self) -> Option<&SearchResultEntry> {
+        self.results.get(self.list.selected)
+    }
+
+    /// Build deterministic telemetry artifact fields for one interaction cycle.
+    ///
+    /// Includes required evidence fields: `interaction_id`, `visible_window`,
+    /// `frame_budget_ms`, and `latency_bucket`.
+    #[must_use]
+    pub fn telemetry_sample(
+        &self,
+        cycle: &InteractionCycleTiming,
+        budget: &InteractionBudget,
+    ) -> SearchInteractionTelemetry {
+        let visible_window = self.visible_window();
+        let total_latency = cycle.total_duration();
+        SearchInteractionTelemetry {
+            interaction_id: self.compute_interaction_id(cycle.frame_seq, visible_window),
+            frame_seq: cycle.frame_seq,
+            frame_budget_ms: saturating_duration_ms_u16(budget.total()),
+            total_latency_ms: saturating_duration_ms_u16(total_latency),
+            latency_bucket: cycle.latency_bucket(budget),
+            visible_window,
+            visible_count: visible_window.1.saturating_sub(visible_window.0),
+            selected_index: self.list.selected,
+            detail_panel_visible: self.detail_panel_visible,
+            query_len: self.query_input.trim().chars().count(),
+        }
+    }
+
+    /// Apply one semantic action and return any external side-effect event.
+    pub fn apply_action(&mut self, action: &ScreenAction) -> Option<SearchInteractionEvent> {
+        match action {
+            ScreenAction::FocusNextPanel => self.focus.focus_next(),
+            ScreenAction::FocusPrevPanel => self.focus.focus_prev(),
+            ScreenAction::FocusPanel(role) => self.focus.focus_role(*role),
+            ScreenAction::SelectUp => self.list.select_prev(),
+            ScreenAction::SelectDown => self.list.select_next(),
+            ScreenAction::SelectFirst => self.list.select_first(),
+            ScreenAction::SelectLast => self.list.select_last(),
+            ScreenAction::PageUp => self.list.page_up(),
+            ScreenAction::PageDown => self.list.page_down(),
+            ScreenAction::FocusQuery => self.focus.focus_role(PanelRole::QueryInput),
+            ScreenAction::SubmitQuery => return self.submit_current_query(),
+            ScreenAction::ClearQuery => {
+                self.query_input.clear();
+                self.pending_incremental_query = None;
+            }
+            ScreenAction::RepeatLastQuery => return self.repeat_last_query(),
+            ScreenAction::ToggleDetailPanel => {
+                self.detail_panel_visible = !self.detail_panel_visible;
+            }
+            ScreenAction::ExpandSelected => {
+                self.detail_panel_visible = true;
+            }
+            ScreenAction::CollapseSelected => {
+                self.detail_panel_visible = false;
+            }
+            ScreenAction::OpenSelectedResult => {
+                return self
+                    .selected_result()
+                    .map(|entry| SearchInteractionEvent::OpenSelected {
+                        doc_id: entry.doc_id.clone(),
+                        source_path: entry.source_path.clone(),
+                    });
+            }
+            ScreenAction::JumpToSelectedSource => {
+                return self
+                    .selected_result()
+                    .map(|entry| SearchInteractionEvent::JumpToSource {
+                        doc_id: entry.doc_id.clone(),
+                        source_path: entry.source_path.clone(),
+                    });
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn submit_current_query(&mut self) -> Option<SearchInteractionEvent> {
+        if let Some(query) = self.pending_incremental_query.take() {
+            self.last_submitted_query = Some(query.clone());
+            return Some(SearchInteractionEvent::QuerySubmitted(query));
+        }
+
+        let trimmed = self.query_input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let query = trimmed.to_owned();
+        self.last_submitted_query = Some(query.clone());
+        Some(SearchInteractionEvent::QuerySubmitted(query))
+    }
+
+    fn repeat_last_query(&mut self) -> Option<SearchInteractionEvent> {
+        let last = self.last_submitted_query.clone()?;
+        self.query_input.clone_from(&last);
+        self.pending_incremental_query = Some(last);
+        self.submit_current_query()
+    }
+
+    fn compute_interaction_id(&self, frame_seq: u64, visible_window: (usize, usize)) -> u64 {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_seq.to_le_bytes());
+        append_usize_as_u64_le(&mut buf, visible_window.0);
+        append_usize_as_u64_le(&mut buf, visible_window.1);
+        append_usize_as_u64_le(&mut buf, self.list.selected);
+        buf.push(u8::from(self.detail_panel_visible));
+        buf.extend_from_slice(self.query_input.trim().as_bytes());
+        if let Some(last) = &self.last_submitted_query {
+            buf.extend_from_slice(last.as_bytes());
+        }
+        fnv1a_64(&buf)
+    }
+}
+
+fn saturating_duration_ms_u16(duration: Duration) -> u16 {
+    u16::try_from(duration.as_millis()).unwrap_or(u16::MAX)
+}
+
+fn append_usize_as_u64_le(buf: &mut Vec<u8>, value: usize) {
+    let as_u64 = u64::try_from(value).unwrap_or(u64::MAX);
+    buf.extend_from_slice(&as_u64.to_le_bytes());
+}
+
 // ─── Filter Cycling ─────────────────────────────────────────────────────────
 
 /// A cycleable filter axis with a finite set of values.
@@ -964,22 +1300,27 @@ impl CyclicFilter {
     }
 
     /// Advance to the next value in the cycle (wraps through None).
+    #[allow(clippy::missing_const_for_fn)]
     pub fn cycle_next(&mut self) {
         self.selected = match self.selected {
             None if self.values.is_empty() => None,
             None => Some(0),
-            Some(idx) if idx + 1 >= self.values.len() => None,
-            Some(idx) => Some(idx + 1),
+            Some(idx) => match idx.checked_add(1) {
+                Some(next) if next < self.values.len() => Some(next),
+                _ => None,
+            },
         };
     }
 
     /// Active filter value, or `None` for "show all".
     #[must_use]
     pub fn active_value(&self) -> Option<&str> {
-        self.selected.map(|idx| self.values[idx].as_str())
+        self.selected
+            .and_then(|idx| self.values.get(idx).map(String::as_str))
     }
 
     /// Clear the filter (back to "show all").
+    #[allow(clippy::missing_const_for_fn)]
     pub fn clear(&mut self) {
         self.selected = None;
     }
@@ -987,10 +1328,410 @@ impl CyclicFilter {
     /// Display string for the current state.
     #[must_use]
     pub fn display(&self) -> String {
-        match self.active_value() {
-            Some(val) => format!("{}: {val}", self.label),
-            None => format!("{}: all", self.label),
+        self.active_value().map_or_else(
+            || format!("{}: all", self.label),
+            |value| format!("{}: {value}", self.label),
+        )
+    }
+}
+
+// ─── Indexing Cockpit Contracts ────────────────────────────────────────────
+
+/// Directional trend used by backlog/throughput visualizations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendDirection {
+    Rising,
+    Stable,
+    Falling,
+}
+
+impl TrendDirection {
+    #[must_use]
+    pub fn from_delta(delta_per_min: f64) -> Self {
+        const EPSILON: f64 = 0.05;
+        if delta_per_min > EPSILON {
+            Self::Rising
+        } else if delta_per_min < -EPSILON {
+            Self::Falling
+        } else {
+            Self::Stable
         }
+    }
+}
+
+/// One throughput datapoint for cockpit charting.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThroughputSample {
+    pub timestamp_ms: u64,
+    pub docs_per_min: f64,
+    pub embeds_per_min: f64,
+}
+
+impl ThroughputSample {
+    #[must_use]
+    pub const fn new(timestamp_ms: u64, docs_per_min: f64, embeds_per_min: f64) -> Self {
+        Self {
+            timestamp_ms,
+            docs_per_min,
+            embeds_per_min,
+        }
+    }
+}
+
+/// Backlog visualization state for indexing/job cockpit screens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BacklogVisualization {
+    pub current_depth: usize,
+    pub high_watermark: usize,
+    pub hard_limit: usize,
+    pub pending_replay_items: usize,
+    pub trend: TrendDirection,
+}
+
+impl BacklogVisualization {
+    /// Construct normalized backlog visualization state.
+    #[must_use]
+    pub fn new(
+        current_depth: usize,
+        high_watermark: usize,
+        hard_limit: usize,
+        pending_replay_items: usize,
+        delta_per_min: f64,
+    ) -> Self {
+        let normalized_high = high_watermark.max(1);
+        let normalized_hard = hard_limit.max(normalized_high);
+        Self {
+            current_depth,
+            high_watermark: normalized_high,
+            hard_limit: normalized_hard,
+            pending_replay_items,
+            trend: TrendDirection::from_delta(delta_per_min),
+        }
+    }
+
+    /// Queue utilization against hard limit in the range `0.0..=1.0`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn utilization_ratio(&self) -> f64 {
+        if self.hard_limit == 0 {
+            return 0.0;
+        }
+        let depth = self.current_depth.min(self.hard_limit) as f64;
+        let hard = self.hard_limit as f64;
+        (depth / hard).clamp(0.0, 1.0)
+    }
+
+    /// Whether queue pressure warrants operator attention.
+    #[must_use]
+    pub const fn is_hot(&self) -> bool {
+        self.current_depth >= self.high_watermark
+    }
+}
+
+/// Throughput visualization contract for indexing cockpit screens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThroughputVisualization {
+    pub recent_samples: Vec<ThroughputSample>,
+    pub rolling_docs_per_min: f64,
+    pub rolling_embeds_per_min: f64,
+}
+
+impl ThroughputVisualization {
+    /// Build a rolling throughput view from recent samples.
+    #[must_use]
+    pub fn from_samples(samples: Vec<ThroughputSample>) -> Self {
+        let mut docs_avg = 0.0_f64;
+        let mut embeds_avg = 0.0_f64;
+        let mut seen = 0.0_f64;
+
+        for sample in &samples {
+            seen += 1.0;
+            docs_avg += (sample.docs_per_min - docs_avg) / seen;
+            embeds_avg += (sample.embeds_per_min - embeds_avg) / seen;
+        }
+
+        Self {
+            recent_samples: samples,
+            rolling_docs_per_min: docs_avg.max(0.0),
+            rolling_embeds_per_min: embeds_avg.max(0.0),
+        }
+    }
+
+    /// True when both document and embedding throughput are effectively stalled.
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        self.rolling_docs_per_min < 1.0 && self.rolling_embeds_per_min < 1.0
+    }
+}
+
+/// Pressure/degradation indicator payload rendered in cockpit screens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourcePressureIndicator {
+    pub pressure_state: PressureState,
+    pub degradation_stage: DegradationStage,
+    pub backpressure_mode: BackpressureMode,
+    pub throttle: WatcherThrottle,
+    pub user_banner: &'static str,
+    pub transition_reason_code: &'static str,
+    pub override_mode: PressureDegradationOverride,
+    pub override_allowed: bool,
+    pub reason_code: &'static str,
+}
+
+impl ResourcePressureIndicator {
+    /// Whether pressure/degradation state currently needs operator attention.
+    #[must_use]
+    pub const fn requires_attention(&self) -> bool {
+        !matches!(self.pressure_state, PressureState::Normal)
+            || !matches!(self.degradation_stage, DegradationStage::Full)
+            || !matches!(self.backpressure_mode, BackpressureMode::Normal)
+    }
+
+    /// Whether indexing is effectively paused/suspended.
+    #[must_use]
+    pub const fn indexing_paused(&self) -> bool {
+        matches!(self.degradation_stage, DegradationStage::Paused) || self.throttle.suspended
+    }
+
+    /// Whether manual override is currently active.
+    #[must_use]
+    pub const fn manual_override_active(&self) -> bool {
+        !matches!(self.override_mode, PressureDegradationOverride::Auto)
+    }
+
+    /// Build a user-facing banner projection for deterministic UI rendering.
+    #[must_use]
+    pub const fn banner(&self) -> DegradationBanner {
+        DegradationBanner {
+            stage: self.degradation_stage,
+            text: self.user_banner,
+            transition_reason_code: self.transition_reason_code,
+            override_mode: self.override_mode,
+            override_allowed: self.override_allowed,
+        }
+    }
+}
+
+/// User-facing degradation banner with transition context and override state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DegradationBanner {
+    pub stage: DegradationStage,
+    pub text: &'static str,
+    pub transition_reason_code: &'static str,
+    pub override_mode: PressureDegradationOverride,
+    pub override_allowed: bool,
+}
+
+/// Operator control taxonomy for indexing/resource cockpit screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CockpitControlKind {
+    PauseIndexing,
+    ResumeIndexing,
+    ThrottleIndexing,
+    RecoverIndexing,
+    SetOverrideAuto,
+    ForceOverrideFull,
+    ForceOverrideEmbedDeferred,
+    ForceOverrideLexicalOnly,
+    ForceOverrideMetadataOnly,
+    ForceOverridePaused,
+}
+
+/// One actionable cockpit control with deterministic enablement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CockpitControl {
+    pub kind: CockpitControlKind,
+    pub action: ScreenAction,
+    pub label: &'static str,
+    pub enabled: bool,
+    pub reason_code: &'static str,
+}
+
+impl CockpitControl {
+    #[must_use]
+    pub const fn new(
+        kind: CockpitControlKind,
+        action: ScreenAction,
+        label: &'static str,
+        enabled: bool,
+        reason_code: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            action,
+            label,
+            enabled,
+            reason_code,
+        }
+    }
+}
+
+/// Real-time indexing/jobs/resource cockpit snapshot contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexingCockpitSnapshot {
+    pub timestamp_ms: u64,
+    pub backlog: BacklogVisualization,
+    pub throughput: ThroughputVisualization,
+    pub pressure: ResourcePressureIndicator,
+    pub controls: Vec<CockpitControl>,
+}
+
+impl IndexingCockpitSnapshot {
+    /// Construct snapshot and derive default operator controls.
+    #[must_use]
+    pub fn new(
+        timestamp_ms: u64,
+        backlog: BacklogVisualization,
+        throughput: ThroughputVisualization,
+        pressure: ResourcePressureIndicator,
+    ) -> Self {
+        let controls = Self::derive_controls(&pressure);
+        Self {
+            timestamp_ms,
+            backlog,
+            throughput,
+            pressure,
+            controls,
+        }
+    }
+
+    fn derive_controls(pressure: &ResourcePressureIndicator) -> Vec<CockpitControl> {
+        let mut controls = Self::derive_indexing_controls(pressure);
+        controls.extend(Self::derive_override_controls(pressure));
+        controls
+    }
+
+    fn derive_indexing_controls(pressure: &ResourcePressureIndicator) -> Vec<CockpitControl> {
+        let pause_enabled = !pressure.indexing_paused();
+        let resume_enabled = pressure.indexing_paused();
+        let throttle_enabled = pressure.requires_attention()
+            && !matches!(pressure.backpressure_mode, BackpressureMode::Saturated);
+        let recovery_needed = !matches!(pressure.degradation_stage, DegradationStage::Full)
+            || pressure.throttle.suspended;
+        let recover_enabled = matches!(pressure.pressure_state, PressureState::Normal)
+            && matches!(pressure.backpressure_mode, BackpressureMode::Normal)
+            && recovery_needed;
+
+        vec![
+            CockpitControl::new(
+                CockpitControlKind::PauseIndexing,
+                ScreenAction::PauseIndexing,
+                "Pause indexing",
+                pause_enabled,
+                "cockpit.control.pause",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ResumeIndexing,
+                ScreenAction::ResumeIndexing,
+                "Resume indexing",
+                resume_enabled,
+                "cockpit.control.resume",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ThrottleIndexing,
+                ScreenAction::ThrottleIndexing,
+                "Throttle indexing",
+                throttle_enabled,
+                "cockpit.control.throttle",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::RecoverIndexing,
+                ScreenAction::RecoverIndexing,
+                "Recover normal mode",
+                recover_enabled,
+                "cockpit.control.recover",
+            ),
+        ]
+    }
+
+    fn derive_override_controls(pressure: &ResourcePressureIndicator) -> Vec<CockpitControl> {
+        let override_auto_enabled = pressure.override_allowed && pressure.manual_override_active();
+        let force_full_enabled = pressure.override_allowed
+            && matches!(pressure.pressure_state, PressureState::Normal)
+            && matches!(pressure.backpressure_mode, BackpressureMode::Normal)
+            && !matches!(
+                pressure.override_mode,
+                PressureDegradationOverride::ForceFull
+            );
+        let force_embed_deferred_enabled = pressure.override_allowed
+            && !matches!(pressure.degradation_stage, DegradationStage::Paused)
+            && !matches!(
+                pressure.override_mode,
+                PressureDegradationOverride::ForceEmbedDeferred
+            );
+        let force_lexical_only_enabled = pressure.override_allowed
+            && pressure.requires_attention()
+            && !matches!(
+                pressure.override_mode,
+                PressureDegradationOverride::ForceLexicalOnly
+            );
+        let force_metadata_only_enabled = pressure.override_allowed
+            && pressure.requires_attention()
+            && !matches!(
+                pressure.override_mode,
+                PressureDegradationOverride::ForceMetadataOnly
+            );
+        let force_paused_enabled = pressure.override_allowed
+            && pressure.requires_attention()
+            && !matches!(
+                pressure.override_mode,
+                PressureDegradationOverride::ForcePaused
+            );
+
+        vec![
+            CockpitControl::new(
+                CockpitControlKind::SetOverrideAuto,
+                ScreenAction::SetOverrideAuto,
+                "Override: auto policy",
+                override_auto_enabled,
+                "cockpit.control.override.auto",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ForceOverrideFull,
+                ScreenAction::ForceOverrideFull,
+                "Override: force full",
+                force_full_enabled,
+                "cockpit.control.override.force_full",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ForceOverrideEmbedDeferred,
+                ScreenAction::ForceOverrideEmbedDeferred,
+                "Override: force embed-deferred",
+                force_embed_deferred_enabled,
+                "cockpit.control.override.force_embed_deferred",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ForceOverrideLexicalOnly,
+                ScreenAction::ForceOverrideLexicalOnly,
+                "Override: force lexical-only",
+                force_lexical_only_enabled,
+                "cockpit.control.override.force_lexical_only",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ForceOverrideMetadataOnly,
+                ScreenAction::ForceOverrideMetadataOnly,
+                "Override: force metadata-only",
+                force_metadata_only_enabled,
+                "cockpit.control.override.force_metadata_only",
+            ),
+            CockpitControl::new(
+                CockpitControlKind::ForceOverridePaused,
+                ScreenAction::ForceOverridePaused,
+                "Override: force pause",
+                force_paused_enabled,
+                "cockpit.control.override.force_paused",
+            ),
+        ]
+    }
+
+    /// Enabled actions that should be surfaced as quick controls.
+    #[must_use]
+    pub fn enabled_actions(&self) -> Vec<ScreenAction> {
+        self.controls
+            .iter()
+            .filter(|control| control.enabled)
+            .map(|control| control.action.clone())
+            .collect()
     }
 }
 
@@ -1117,6 +1858,26 @@ mod tests {
             Some(ScreenAction::FocusQuery)
         );
         assert_eq!(
+            ScreenAction::from_palette_action_id("search.submit_query"),
+            Some(ScreenAction::SubmitQuery)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("search.clear_query"),
+            Some(ScreenAction::ClearQuery)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("search.toggle_explain"),
+            Some(ScreenAction::ToggleDetailPanel)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("search.open_selected"),
+            Some(ScreenAction::OpenSelectedResult)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("search.jump_to_source"),
+            Some(ScreenAction::JumpToSelectedSource)
+        );
+        assert_eq!(
             ScreenAction::from_palette_action_id("index.pause"),
             Some(ScreenAction::PauseIndexing)
         );
@@ -1129,9 +1890,26 @@ mod tests {
             Some(ScreenAction::NavigateTo(FsfsScreen::OpsTimeline))
         );
         assert_eq!(
-            ScreenAction::from_palette_action_id("unknown.action"),
-            None
+            ScreenAction::from_palette_action_id("index.throttle"),
+            Some(ScreenAction::ThrottleIndexing)
         );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("index.recover"),
+            Some(ScreenAction::RecoverIndexing)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("index.override.auto"),
+            Some(ScreenAction::SetOverrideAuto)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("index.override.lexical_only"),
+            Some(ScreenAction::ForceOverrideLexicalOnly)
+        );
+        assert_eq!(
+            ScreenAction::from_palette_action_id("index.override.paused"),
+            Some(ScreenAction::ForceOverridePaused)
+        );
+        assert_eq!(ScreenAction::from_palette_action_id("unknown.action"), None);
     }
 
     // -- PanelFocusState --
@@ -1262,9 +2040,18 @@ mod tests {
     #[test]
     fn budget_for_phase() {
         let budget = InteractionBudget::at_60fps();
-        assert_eq!(budget.for_phase(LatencyPhase::Input), Duration::from_millis(1));
-        assert_eq!(budget.for_phase(LatencyPhase::Update), Duration::from_millis(5));
-        assert_eq!(budget.for_phase(LatencyPhase::Render), Duration::from_millis(10));
+        assert_eq!(
+            budget.for_phase(LatencyPhase::Input),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            budget.for_phase(LatencyPhase::Update),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            budget.for_phase(LatencyPhase::Render),
+            Duration::from_millis(10)
+        );
     }
 
     #[test]
@@ -1332,6 +2119,70 @@ mod tests {
         );
         assert!(cycle.has_phase_overrun());
         assert_eq!(cycle.overrun_phases(), vec![LatencyPhase::Update]);
+    }
+
+    #[test]
+    fn cycle_timing_latency_bucket_classification() {
+        let budget = InteractionBudget::at_60fps();
+        let under = InteractionCycleTiming {
+            input: PhaseTiming {
+                phase: LatencyPhase::Input,
+                duration: Duration::from_millis(1),
+                budget: budget.input_budget,
+            },
+            update: PhaseTiming {
+                phase: LatencyPhase::Update,
+                duration: Duration::from_millis(3),
+                budget: budget.update_budget,
+            },
+            render: PhaseTiming {
+                phase: LatencyPhase::Render,
+                duration: Duration::from_millis(4),
+                budget: budget.render_budget,
+            },
+            frame_seq: 1,
+        };
+        assert_eq!(under.latency_bucket(&budget), LatencyBucket::UnderBudget);
+
+        let near = InteractionCycleTiming {
+            input: PhaseTiming {
+                phase: LatencyPhase::Input,
+                duration: Duration::from_millis(1),
+                budget: budget.input_budget,
+            },
+            update: PhaseTiming {
+                phase: LatencyPhase::Update,
+                duration: Duration::from_millis(5),
+                budget: budget.update_budget,
+            },
+            render: PhaseTiming {
+                phase: LatencyPhase::Render,
+                duration: Duration::from_millis(10),
+                budget: budget.render_budget,
+            },
+            frame_seq: 2,
+        };
+        assert_eq!(near.latency_bucket(&budget), LatencyBucket::NearBudget);
+
+        let over = InteractionCycleTiming {
+            input: PhaseTiming {
+                phase: LatencyPhase::Input,
+                duration: Duration::from_millis(2),
+                budget: budget.input_budget,
+            },
+            update: PhaseTiming {
+                phase: LatencyPhase::Update,
+                duration: Duration::from_millis(8),
+                budget: budget.update_budget,
+            },
+            render: PhaseTiming {
+                phase: LatencyPhase::Render,
+                duration: Duration::from_millis(12),
+                budget: budget.render_budget,
+            },
+            frame_seq: 3,
+        };
+        assert_eq!(over.latency_bucket(&budget), LatencyBucket::OverBudget);
     }
 
     // -- RenderTier --
@@ -1458,6 +2309,182 @@ mod tests {
         assert_eq!(list.selected, 0);
     }
 
+    // -- SearchInteractionState --
+
+    #[test]
+    fn search_interaction_submit_and_repeat_last_query() {
+        let mut state = SearchInteractionState::new(4);
+        state.apply_incremental_query("  fn parse_query  ");
+
+        let first = state.apply_action(&ScreenAction::SubmitQuery);
+        assert_eq!(
+            first,
+            Some(SearchInteractionEvent::QuerySubmitted(
+                "fn parse_query".to_owned(),
+            ))
+        );
+        assert_eq!(
+            state.last_submitted_query.as_deref(),
+            Some("fn parse_query")
+        );
+
+        state.query_input.clear();
+        let second = state.apply_action(&ScreenAction::RepeatLastQuery);
+        assert_eq!(
+            second,
+            Some(SearchInteractionEvent::QuerySubmitted(
+                "fn parse_query".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn search_interaction_open_and_jump_use_selected_row() {
+        let mut state = SearchInteractionState::new(3);
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/a.rs", "alpha"),
+            SearchResultEntry::new("doc-2", "src/b.rs", "beta"),
+        ]);
+        state.apply_action(&ScreenAction::SelectDown);
+
+        let open = state.apply_action(&ScreenAction::OpenSelectedResult);
+        assert_eq!(
+            open,
+            Some(SearchInteractionEvent::OpenSelected {
+                doc_id: "doc-2".to_owned(),
+                source_path: "src/b.rs".to_owned(),
+            })
+        );
+
+        let jump = state.apply_action(&ScreenAction::JumpToSelectedSource);
+        assert_eq!(
+            jump,
+            Some(SearchInteractionEvent::JumpToSource {
+                doc_id: "doc-2".to_owned(),
+                source_path: "src/b.rs".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn search_interaction_detail_toggle_and_clear_query_are_deterministic() {
+        let mut state = SearchInteractionState::new(2);
+        state.apply_incremental_query("query");
+        assert!(state.pending_incremental_query.is_some());
+        assert!(!state.detail_panel_visible);
+
+        state.apply_action(&ScreenAction::ToggleDetailPanel);
+        assert!(state.detail_panel_visible);
+        state.apply_action(&ScreenAction::CollapseSelected);
+        assert!(!state.detail_panel_visible);
+        state.apply_action(&ScreenAction::ExpandSelected);
+        assert!(state.detail_panel_visible);
+
+        state.apply_action(&ScreenAction::ClearQuery);
+        assert!(state.query_input.is_empty());
+        assert!(state.pending_incremental_query.is_none());
+    }
+
+    #[test]
+    fn search_interaction_visible_window_tracks_virtualized_selection() {
+        let mut state = SearchInteractionState::new(2);
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/one.rs", "one"),
+            SearchResultEntry::new("doc-2", "src/two.rs", "two"),
+            SearchResultEntry::new("doc-3", "src/three.rs", "three"),
+            SearchResultEntry::new("doc-4", "src/four.rs", "four"),
+        ]);
+
+        state.apply_action(&ScreenAction::PageDown);
+        assert_eq!(state.list.selected, 2);
+        assert_eq!(state.visible_window(), (1, 3));
+        assert_eq!(state.visible_results()[0].doc_id, "doc-2");
+        assert_eq!(
+            state.selected_result().map(|row| row.doc_id.as_str()),
+            Some("doc-3")
+        );
+    }
+
+    #[test]
+    fn search_interaction_telemetry_contains_required_fields() {
+        let mut state = SearchInteractionState::new(2);
+        state.apply_incremental_query("auth middleware");
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/a.rs", "a"),
+            SearchResultEntry::new("doc-2", "src/b.rs", "b"),
+            SearchResultEntry::new("doc-3", "src/c.rs", "c"),
+        ]);
+        state.apply_action(&ScreenAction::SelectDown);
+
+        let budget = InteractionBudget::at_60fps();
+        let cycle = InteractionCycleTiming {
+            input: PhaseTiming {
+                phase: LatencyPhase::Input,
+                duration: Duration::from_millis(1),
+                budget: budget.input_budget,
+            },
+            update: PhaseTiming {
+                phase: LatencyPhase::Update,
+                duration: Duration::from_millis(4),
+                budget: budget.update_budget,
+            },
+            render: PhaseTiming {
+                phase: LatencyPhase::Render,
+                duration: Duration::from_millis(7),
+                budget: budget.render_budget,
+            },
+            frame_seq: 77,
+        };
+
+        let telemetry = state.telemetry_sample(&cycle, &budget);
+        assert_eq!(telemetry.frame_seq, 77);
+        assert_eq!(telemetry.frame_budget_ms, 16);
+        assert_eq!(telemetry.total_latency_ms, 12);
+        assert_eq!(telemetry.latency_bucket, LatencyBucket::UnderBudget);
+        assert_eq!(telemetry.visible_window, (0, 2));
+        assert_eq!(telemetry.visible_count, 2);
+        assert_eq!(telemetry.selected_index, 1);
+        assert_eq!(telemetry.query_len, "auth middleware".len());
+    }
+
+    #[test]
+    fn search_interaction_telemetry_interaction_id_is_deterministic() {
+        let mut state = SearchInteractionState::new(2);
+        state.apply_incremental_query("query");
+        state.set_results(vec![
+            SearchResultEntry::new("doc-1", "src/a.rs", "a"),
+            SearchResultEntry::new("doc-2", "src/b.rs", "b"),
+        ]);
+
+        let budget = InteractionBudget::at_60fps();
+        let cycle = InteractionCycleTiming {
+            input: PhaseTiming {
+                phase: LatencyPhase::Input,
+                duration: Duration::from_millis(1),
+                budget: budget.input_budget,
+            },
+            update: PhaseTiming {
+                phase: LatencyPhase::Update,
+                duration: Duration::from_millis(2),
+                budget: budget.update_budget,
+            },
+            render: PhaseTiming {
+                phase: LatencyPhase::Render,
+                duration: Duration::from_millis(3),
+                budget: budget.render_budget,
+            },
+            frame_seq: 11,
+        };
+
+        let first = state.telemetry_sample(&cycle, &budget).interaction_id;
+        let second = state.telemetry_sample(&cycle, &budget).interaction_id;
+        assert_eq!(first, second);
+
+        state.apply_action(&ScreenAction::SelectDown);
+        let third = state.telemetry_sample(&cycle, &budget).interaction_id;
+        assert_ne!(first, third);
+    }
+
     // -- CyclicFilter --
 
     #[test]
@@ -1505,6 +2532,222 @@ mod tests {
         let mut filter = CyclicFilter::new("Empty", vec![]);
         filter.cycle_next();
         assert!(filter.active_value().is_none()); // Stays None.
+    }
+
+    #[test]
+    fn cyclic_filter_out_of_range_selection_is_safe() {
+        let mut filter = CyclicFilter::new("Kind", vec!["A".to_string(), "B".to_string()]);
+        filter.selected = Some(usize::MAX);
+        assert!(filter.active_value().is_none());
+        assert_eq!(filter.display(), "Kind: all");
+
+        filter.cycle_next();
+        assert!(filter.active_value().is_none());
+    }
+
+    // -- IndexingCockpitSnapshot --
+
+    #[test]
+    fn backlog_visualization_computes_trend_and_utilization() {
+        let backlog = BacklogVisualization::new(80, 50, 100, 12, 8.0);
+        assert_eq!(backlog.trend, TrendDirection::Rising);
+        assert!(backlog.is_hot());
+        assert!((backlog.utilization_ratio() - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn throughput_visualization_detects_stall() {
+        let throughput = ThroughputVisualization::from_samples(vec![
+            ThroughputSample::new(1, 0.2, 0.3),
+            ThroughputSample::new(2, 0.1, 0.0),
+        ]);
+        assert!(throughput.is_stalled());
+    }
+
+    #[test]
+    fn cockpit_controls_enable_throttle_under_pressure() {
+        let backlog = BacklogVisualization::new(120, 64, 256, 0, 5.0);
+        let throughput =
+            ThroughputVisualization::from_samples(vec![ThroughputSample::new(1, 22.0, 18.0)]);
+        let pressure = ResourcePressureIndicator {
+            pressure_state: PressureState::Constrained,
+            degradation_stage: DegradationStage::EmbedDeferred,
+            backpressure_mode: BackpressureMode::HighWatermark,
+            throttle: WatcherThrottle {
+                debounce_ms: 2_000,
+                batch_size: 25,
+                suspended: false,
+                reason_code: "watcher.throttle.constrained",
+            },
+            user_banner: "Constrained mode active",
+            transition_reason_code: "degrade.transition.embed_deferred",
+            override_mode: PressureDegradationOverride::Auto,
+            override_allowed: true,
+            reason_code: "pressure.transition.constrained",
+        };
+
+        let snapshot = IndexingCockpitSnapshot::new(42, backlog, throughput, pressure);
+        let enabled = snapshot.enabled_actions();
+        assert!(enabled.contains(&ScreenAction::PauseIndexing));
+        assert!(enabled.contains(&ScreenAction::ThrottleIndexing));
+        assert!(!enabled.contains(&ScreenAction::RecoverIndexing));
+    }
+
+    #[test]
+    fn cockpit_controls_enable_recover_when_pressure_is_healthy() {
+        let backlog = BacklogVisualization::new(20, 64, 256, 0, -5.0);
+        let throughput =
+            ThroughputVisualization::from_samples(vec![ThroughputSample::new(1, 120.0, 95.0)]);
+        let pressure = ResourcePressureIndicator {
+            pressure_state: PressureState::Normal,
+            degradation_stage: DegradationStage::LexicalOnly,
+            backpressure_mode: BackpressureMode::Normal,
+            throttle: WatcherThrottle {
+                debounce_ms: 500,
+                batch_size: 64,
+                suspended: false,
+                reason_code: "watcher.throttle.normal",
+            },
+            user_banner: "Recovered from degradation",
+            transition_reason_code: "degrade.transition.recovered",
+            override_mode: PressureDegradationOverride::Auto,
+            override_allowed: true,
+            reason_code: "degrade.transition.recovered",
+        };
+
+        let snapshot = IndexingCockpitSnapshot::new(99, backlog, throughput, pressure);
+        let enabled = snapshot.enabled_actions();
+        assert!(enabled.contains(&ScreenAction::RecoverIndexing));
+        assert!(enabled.contains(&ScreenAction::PauseIndexing));
+    }
+
+    #[test]
+    fn cockpit_controls_enable_recover_when_watcher_is_suspended() {
+        let backlog = BacklogVisualization::new(12, 64, 256, 0, -1.0);
+        let throughput =
+            ThroughputVisualization::from_samples(vec![ThroughputSample::new(1, 90.0, 72.0)]);
+        let pressure = ResourcePressureIndicator {
+            pressure_state: PressureState::Normal,
+            degradation_stage: DegradationStage::Full,
+            backpressure_mode: BackpressureMode::Normal,
+            throttle: WatcherThrottle {
+                debounce_ms: 2_000,
+                batch_size: 16,
+                suspended: true,
+                reason_code: "watcher.suspended",
+            },
+            user_banner: "Normal operation",
+            transition_reason_code: "pressure.transition.normalized",
+            override_mode: PressureDegradationOverride::Auto,
+            override_allowed: true,
+            reason_code: "pressure.transition.normalized",
+        };
+
+        let snapshot = IndexingCockpitSnapshot::new(100, backlog, throughput, pressure);
+        let enabled = snapshot.enabled_actions();
+        assert!(enabled.contains(&ScreenAction::RecoverIndexing));
+    }
+
+    #[test]
+    fn cockpit_controls_disable_recover_when_backpressure_not_normal() {
+        let backlog = BacklogVisualization::new(22, 64, 256, 0, -2.0);
+        let throughput =
+            ThroughputVisualization::from_samples(vec![ThroughputSample::new(1, 110.0, 90.0)]);
+        let pressure = ResourcePressureIndicator {
+            pressure_state: PressureState::Normal,
+            degradation_stage: DegradationStage::LexicalOnly,
+            backpressure_mode: BackpressureMode::HighWatermark,
+            throttle: WatcherThrottle {
+                debounce_ms: 500,
+                batch_size: 64,
+                suspended: false,
+                reason_code: "watcher.throttle.high-watermark",
+            },
+            user_banner: "Recovering from high watermark",
+            transition_reason_code: "pressure.transition.normalizing",
+            override_mode: PressureDegradationOverride::Auto,
+            override_allowed: true,
+            reason_code: "pressure.transition.normalizing",
+        };
+
+        let snapshot = IndexingCockpitSnapshot::new(101, backlog, throughput, pressure);
+        let enabled = snapshot.enabled_actions();
+        assert!(!enabled.contains(&ScreenAction::RecoverIndexing));
+    }
+
+    #[test]
+    fn cockpit_override_controls_are_guarded_and_auditable() {
+        let backlog = BacklogVisualization::new(80, 64, 256, 0, 4.0);
+        let throughput =
+            ThroughputVisualization::from_samples(vec![ThroughputSample::new(1, 20.0, 14.0)]);
+        let pressure = ResourcePressureIndicator {
+            pressure_state: PressureState::Degraded,
+            degradation_stage: DegradationStage::LexicalOnly,
+            backpressure_mode: BackpressureMode::HighWatermark,
+            throttle: WatcherThrottle {
+                debounce_ms: 1_500,
+                batch_size: 24,
+                suspended: false,
+                reason_code: "watcher.throttle.degraded",
+            },
+            user_banner: "Degraded mode active",
+            transition_reason_code: "degrade.transition.override",
+            override_mode: PressureDegradationOverride::ForceLexicalOnly,
+            override_allowed: true,
+            reason_code: "pressure.transition.degraded",
+        };
+
+        let snapshot = IndexingCockpitSnapshot::new(102, backlog, throughput, pressure.clone());
+        let enabled = snapshot.enabled_actions();
+        assert!(enabled.contains(&ScreenAction::SetOverrideAuto));
+        assert!(enabled.contains(&ScreenAction::ForceOverrideMetadataOnly));
+        assert!(enabled.contains(&ScreenAction::ForceOverridePaused));
+        assert!(!enabled.contains(&ScreenAction::ForceOverrideLexicalOnly));
+        assert!(snapshot
+            .controls
+            .iter()
+            .any(|control| control.reason_code == "cockpit.control.override.force_paused"));
+
+        let banner = pressure.banner();
+        assert_eq!(banner.text, "Degraded mode active");
+        assert_eq!(banner.transition_reason_code, "degrade.transition.override");
+        assert_eq!(
+            banner.override_mode,
+            PressureDegradationOverride::ForceLexicalOnly
+        );
+        assert!(banner.override_allowed);
+    }
+
+    #[test]
+    fn cockpit_override_controls_stay_disabled_without_override_permission() {
+        let backlog = BacklogVisualization::new(40, 64, 256, 0, 1.0);
+        let throughput =
+            ThroughputVisualization::from_samples(vec![ThroughputSample::new(1, 60.0, 48.0)]);
+        let pressure = ResourcePressureIndicator {
+            pressure_state: PressureState::Constrained,
+            degradation_stage: DegradationStage::EmbedDeferred,
+            backpressure_mode: BackpressureMode::Normal,
+            throttle: WatcherThrottle {
+                debounce_ms: 800,
+                batch_size: 32,
+                suspended: false,
+                reason_code: "watcher.throttle.constrained",
+            },
+            user_banner: "Constrained mode active",
+            transition_reason_code: "degrade.transition.embed_deferred",
+            override_mode: PressureDegradationOverride::Auto,
+            override_allowed: false,
+            reason_code: "pressure.transition.constrained",
+        };
+
+        let snapshot = IndexingCockpitSnapshot::new(103, backlog, throughput, pressure);
+        let enabled = snapshot.enabled_actions();
+        assert!(!enabled.contains(&ScreenAction::SetOverrideAuto));
+        assert!(!enabled.contains(&ScreenAction::ForceOverrideFull));
+        assert!(!enabled.contains(&ScreenAction::ForceOverrideEmbedDeferred));
+        assert!(!enabled.contains(&ScreenAction::ForceOverrideLexicalOnly));
+        assert!(!enabled.contains(&ScreenAction::ForceOverrideMetadataOnly));
+        assert!(!enabled.contains(&ScreenAction::ForceOverridePaused));
     }
 
     // -- LatencyPhase --

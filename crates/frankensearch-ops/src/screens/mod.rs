@@ -3,12 +3,14 @@
 //! Each screen implements the [`frankensearch_tui::Screen`] trait and
 //! is registered in the [`frankensearch_tui::ScreenRegistry`].
 
+pub mod alerts_slo;
 pub mod fleet;
 pub mod index_resources;
 pub mod live_stream;
 pub mod project_detail;
 pub mod timeline;
 
+pub use alerts_slo::AlertsSloScreen;
 pub use fleet::FleetOverviewScreen;
 pub use index_resources::IndexResourceScreen;
 pub use live_stream::LiveSearchStreamScreen;

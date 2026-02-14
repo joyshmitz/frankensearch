@@ -770,12 +770,17 @@ impl DiscoveryConfig {
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
-            roots: vec!["$HOME".into()],
+            roots: vec![".".into()],
             exclude_patterns: vec![
                 ".git".into(),
                 "node_modules".into(),
                 "target".into(),
                 "__pycache__".into(),
+                ".venv".into(),
+                "vendor".into(),
+                "dist".into(),
+                "build".into(),
+                ".next".into(),
             ],
             text_selection_mode: TextSelectionMode::Blocklist,
             binary_blocklist_extensions: vec![
@@ -820,7 +825,7 @@ impl Default for IndexingConfig {
         Self {
             fast_model: "potion-multilingual-128M".into(),
             quality_model: "all-MiniLM-L6-v2".into(),
-            model_dir: "~/.cache/frankensearch/models".into(),
+            model_dir: "~/.local/share/frankensearch/models".into(),
             embedding_batch_size: 64,
             reindex_on_change: true,
             watch_mode: false,
@@ -841,7 +846,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_limit: 20,
+            default_limit: 10,
             quality_weight: 0.7,
             rrf_k: 60.0,
             quality_timeout_ms: 500,
@@ -905,6 +910,7 @@ impl Default for TuiConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageConfig {
+    pub index_dir: String,
     pub db_path: String,
     pub evidence_retention_days: u16,
     pub summary_retention_days: u16,
@@ -913,6 +919,7 @@ pub struct StorageConfig {
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
+            index_dir: ".frankensearch".into(),
             db_path: "~/.local/share/fsfs/fsfs.db".into(),
             evidence_retention_days: 7,
             summary_retention_days: 90,
@@ -1003,6 +1010,7 @@ struct TuiConfigPatch {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 struct StorageConfigPatch {
+    index_dir: Option<String>,
     db_path: Option<String>,
     evidence_retention_days: Option<u16>,
     summary_retention_days: Option<u16>,
@@ -1181,14 +1189,27 @@ impl CliOverrides {
 }
 
 #[must_use]
-pub fn default_config_file_path(home_dir: &Path) -> PathBuf {
+pub fn default_user_config_file_path(home_dir: &Path) -> PathBuf {
     if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(xdg_config_home)
-            .join("fsfs")
+            .join("frankensearch")
             .join("config.toml");
     }
 
-    home_dir.join(".config").join("fsfs").join("config.toml")
+    home_dir
+        .join(".config")
+        .join("frankensearch")
+        .join("config.toml")
+}
+
+#[must_use]
+pub fn default_project_config_file_path(cwd: &Path) -> PathBuf {
+    cwd.join(".frankensearch").join("config.toml")
+}
+
+#[must_use]
+pub fn default_config_file_path(home_dir: &Path) -> PathBuf {
+    default_user_config_file_path(home_dir)
 }
 
 #[must_use]
@@ -1243,6 +1264,47 @@ where
     )
 }
 
+/// Load config with layered file precedence (`project > user`), then env and
+/// CLI overlays.
+///
+/// # Errors
+///
+/// Returns `SearchError::InvalidConfig` for parse/validation failures and
+/// `SearchError::Io` if reading a present file fails.
+pub fn load_from_layered_sources<S>(
+    project_config_file: Option<&Path>,
+    user_config_file: Option<&Path>,
+    env: &HashMap<String, String, S>,
+    cli: &CliOverrides,
+    home_dir: &Path,
+) -> SearchResult<ConfigLoadResult>
+where
+    S: BuildHasher,
+{
+    let expanded_user_config = user_config_file.map(|path| expand_home_prefix(path, home_dir));
+    let expanded_project_config =
+        project_config_file.map(|path| expand_home_prefix(path, home_dir));
+
+    let (user_toml, user_config_used) = match expanded_user_config {
+        Some(path) if path.exists() => (Some(fs::read_to_string(&path)?), Some(path)),
+        Some(_) | None => (None, None),
+    };
+    let (project_toml, project_config_used) = match expanded_project_config {
+        Some(path) if path.exists() => (Some(fs::read_to_string(&path)?), Some(path)),
+        Some(_) | None => (None, None),
+    };
+
+    load_from_str_layers(
+        user_toml.as_deref(),
+        user_config_used.as_deref(),
+        project_toml.as_deref(),
+        project_config_used.as_deref(),
+        env,
+        cli,
+        home_dir,
+    )
+}
+
 /// Load config from raw TOML/env/CLI overlays using the fsfs precedence
 /// contract (`CLI > env > file > defaults`).
 ///
@@ -1259,20 +1321,82 @@ pub fn load_from_str<S>(
 where
     S: BuildHasher,
 {
+    load_from_str_layers(
+        config_toml,
+        config_file_path,
+        None,
+        None,
+        env,
+        cli,
+        home_dir,
+    )
+}
+
+const fn merge_profile_overrides(
+    base: &mut ProfileSourceOverrides,
+    overlay: ProfileSourceOverrides,
+) {
+    if overlay.quality_enabled.is_some() {
+        base.quality_enabled = overlay.quality_enabled;
+    }
+    if overlay.allow_background_indexing.is_some() {
+        base.allow_background_indexing = overlay.allow_background_indexing;
+    }
+}
+
+fn apply_file_patch(
+    config: &mut FsfsConfig,
+    warnings: &mut Vec<ConfigWarning>,
+    file_profile_overrides: &mut ProfileSourceOverrides,
+    config_toml: &str,
+) -> SearchResult<()> {
+    warnings.extend(collect_unknown_key_warnings(config_toml)?);
+    let patch: FsfsConfigPatch =
+        toml::from_str(config_toml).map_err(|error| SearchError::InvalidConfig {
+            field: "config_file".into(),
+            value: "<toml>".into(),
+            reason: error.to_string(),
+        })?;
+    merge_profile_overrides(
+        file_profile_overrides,
+        profile_overrides_from_file_patch(&patch),
+    );
+    apply_patch(config, patch);
+    Ok(())
+}
+
+fn load_from_str_layers<S>(
+    user_config_toml: Option<&str>,
+    user_config_path: Option<&Path>,
+    project_config_toml: Option<&str>,
+    project_config_path: Option<&Path>,
+    env: &HashMap<String, String, S>,
+    cli: &CliOverrides,
+    home_dir: &Path,
+) -> SearchResult<ConfigLoadResult>
+where
+    S: BuildHasher,
+{
     let mut config = FsfsConfig::default();
     let mut warnings = Vec::new();
     let mut file_profile_overrides = ProfileSourceOverrides::default();
 
-    if let Some(config_toml) = config_toml {
-        warnings.extend(collect_unknown_key_warnings(config_toml)?);
-        let patch: FsfsConfigPatch =
-            toml::from_str(config_toml).map_err(|error| SearchError::InvalidConfig {
-                field: "config_file".into(),
-                value: "<toml>".into(),
-                reason: error.to_string(),
-            })?;
-        file_profile_overrides = profile_overrides_from_file_patch(&patch);
-        apply_patch(&mut config, patch);
+    if let Some(config_toml) = user_config_toml {
+        apply_file_patch(
+            &mut config,
+            &mut warnings,
+            &mut file_profile_overrides,
+            config_toml,
+        )?;
+    }
+
+    if let Some(config_toml) = project_config_toml {
+        apply_file_patch(
+            &mut config,
+            &mut warnings,
+            &mut file_profile_overrides,
+            config_toml,
+        )?;
     }
 
     let env_report = apply_env_overrides(&mut config, env)?;
@@ -1291,7 +1415,9 @@ where
     Ok(ConfigLoadResult {
         config,
         source_precedence: PRECEDENCE,
-        config_file_used: config_file_path.map(Path::to_path_buf),
+        config_file_used: project_config_path
+            .or(user_config_path)
+            .map(Path::to_path_buf),
         cli_flags_used: cli.used_flags(),
         env_keys_used: env_report.keys_used,
         pressure_profile_resolution,
@@ -1677,6 +1803,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
     }
 
     if let Some(storage) = patch.storage {
+        if let Some(index_dir) = storage.index_dir {
+            config.storage.index_dir = index_dir;
+        }
         if let Some(db_path) = storage.db_path {
             config.storage.db_path = db_path;
         }
@@ -1698,85 +1827,144 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_env_overrides(
     config: &mut FsfsConfig,
     env: &HashMap<String, String, impl BuildHasher>,
 ) -> SearchResult<EnvOverrideReport> {
+    fn env_override<'a>(
+        env: &'a HashMap<String, String, impl BuildHasher>,
+        canonical: &'static str,
+        legacy: &'static str,
+    ) -> Option<(&'static str, &'a String)> {
+        env.get(canonical)
+            .map(|value| (canonical, value))
+            .or_else(|| env.get(legacy).map(|value| (legacy, value)))
+    }
+
     let mut keys_used = Vec::new();
     let mut profile_overrides = ProfileSourceOverrides::default();
 
-    if let Some(value) = env.get("FSFS_DISCOVERY_ROOTS") {
+    if let Some((key, value)) =
+        env_override(env, "FRANKENSEARCH_DISCOVERY_ROOTS", "FSFS_DISCOVERY_ROOTS")
+    {
         config.discovery.roots = parse_csv(value, "discovery.roots")?;
-        keys_used.push("FSFS_DISCOVERY_ROOTS".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_DISCOVERY_EXCLUDE_PATTERNS") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_DISCOVERY_EXCLUDE_PATTERNS",
+        "FSFS_DISCOVERY_EXCLUDE_PATTERNS",
+    ) {
         config.discovery.exclude_patterns = parse_csv(value, "discovery.exclude_patterns")?;
-        keys_used.push("FSFS_DISCOVERY_EXCLUDE_PATTERNS".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_SEARCH_DEFAULT_LIMIT") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_SEARCH_DEFAULT_LIMIT",
+        "FSFS_SEARCH_DEFAULT_LIMIT",
+    ) {
         config.search.default_limit = parse_usize(value, "search.default_limit")?;
-        keys_used.push("FSFS_SEARCH_DEFAULT_LIMIT".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_SEARCH_FAST_ONLY") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_SEARCH_FAST_ONLY",
+        "FSFS_SEARCH_FAST_ONLY",
+    ) {
         let fast_only = parse_bool(value, "search.fast_only")?;
         config.search.fast_only = fast_only;
         profile_overrides.quality_enabled = Some(!fast_only);
-        keys_used.push("FSFS_SEARCH_FAST_ONLY".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_INDEXING_WATCH_MODE") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_INDEXING_WATCH_MODE",
+        "FSFS_INDEXING_WATCH_MODE",
+    ) {
         let watch_mode = parse_bool(value, "indexing.watch_mode")?;
         config.indexing.watch_mode = watch_mode;
         profile_overrides.allow_background_indexing = Some(watch_mode);
-        keys_used.push("FSFS_INDEXING_WATCH_MODE".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_SEARCH_EXPLAIN") {
+    if let Some((key, value)) =
+        env_override(env, "FRANKENSEARCH_SEARCH_EXPLAIN", "FSFS_SEARCH_EXPLAIN")
+    {
         config.search.explain = parse_bool(value, "search.explain")?;
-        keys_used.push("FSFS_SEARCH_EXPLAIN".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_PROFILE") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_PROFILE",
+        "FSFS_PRESSURE_PROFILE",
+    ) {
         config.pressure.profile =
             PressureProfile::from_str(value).map_err(|()| SearchError::InvalidConfig {
                 field: "pressure.profile".into(),
                 value: value.clone(),
                 reason: "expected strict|performance|degraded".into(),
             })?;
-        keys_used.push("FSFS_PRESSURE_PROFILE".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_SAMPLE_INTERVAL_MS") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_SAMPLE_INTERVAL_MS",
+        "FSFS_PRESSURE_SAMPLE_INTERVAL_MS",
+    ) {
         config.pressure.sample_interval_ms = parse_u64(value, "pressure.sample_interval_ms")?;
-        keys_used.push("FSFS_PRESSURE_SAMPLE_INTERVAL_MS".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_EWMA_ALPHA_PER_MILLE") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_EWMA_ALPHA_PER_MILLE",
+        "FSFS_PRESSURE_EWMA_ALPHA_PER_MILLE",
+    ) {
         config.pressure.ewma_alpha_per_mille = parse_u16(value, "pressure.ewma_alpha_per_mille")?;
-        keys_used.push("FSFS_PRESSURE_EWMA_ALPHA_PER_MILLE".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_ANTI_FLAP_READINGS") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_ANTI_FLAP_READINGS",
+        "FSFS_PRESSURE_ANTI_FLAP_READINGS",
+    ) {
         config.pressure.anti_flap_readings = parse_u8(value, "pressure.anti_flap_readings")?;
-        keys_used.push("FSFS_PRESSURE_ANTI_FLAP_READINGS".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_IO_CEILING_BYTES_PER_SEC") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_IO_CEILING_BYTES_PER_SEC",
+        "FSFS_PRESSURE_IO_CEILING_BYTES_PER_SEC",
+    ) {
         config.pressure.io_ceiling_bytes_per_sec =
             parse_u64(value, "pressure.io_ceiling_bytes_per_sec")?;
-        keys_used.push("FSFS_PRESSURE_IO_CEILING_BYTES_PER_SEC".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_LOAD_CEILING_PER_MILLE") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_LOAD_CEILING_PER_MILLE",
+        "FSFS_PRESSURE_LOAD_CEILING_PER_MILLE",
+    ) {
         config.pressure.load_ceiling_per_mille =
             parse_u16(value, "pressure.load_ceiling_per_mille")?;
-        keys_used.push("FSFS_PRESSURE_LOAD_CEILING_PER_MILLE".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_DEGRADATION_OVERRIDE") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE",
+        "FSFS_PRESSURE_DEGRADATION_OVERRIDE",
+    ) {
         config.pressure.degradation_override =
             DegradationOverrideMode::from_str(value).map_err(|()| SearchError::InvalidConfig {
                 field: "pressure.degradation_override".into(),
@@ -1784,37 +1972,60 @@ fn apply_env_overrides(
                 reason: "expected auto|full|embed_deferred|lexical_only|metadata_only|paused"
                     .into(),
             })?;
-        keys_used.push("FSFS_PRESSURE_DEGRADATION_OVERRIDE".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_HARD_PAUSE_REQUESTED") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_HARD_PAUSE_REQUESTED",
+        "FSFS_PRESSURE_HARD_PAUSE_REQUESTED",
+    ) {
         config.pressure.hard_pause_requested = parse_bool(value, "pressure.hard_pause_requested")?;
-        keys_used.push("FSFS_PRESSURE_HARD_PAUSE_REQUESTED".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRESSURE_QUALITY_CIRCUIT_OPEN") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRESSURE_QUALITY_CIRCUIT_OPEN",
+        "FSFS_PRESSURE_QUALITY_CIRCUIT_OPEN",
+    ) {
         config.pressure.quality_circuit_open = parse_bool(value, "pressure.quality_circuit_open")?;
-        keys_used.push("FSFS_PRESSURE_QUALITY_CIRCUIT_OPEN".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_TUI_THEME") {
+    if let Some((key, value)) = env_override(env, "FRANKENSEARCH_TUI_THEME", "FSFS_TUI_THEME") {
         config.tui.theme = TuiTheme::from_str(value).map_err(|()| SearchError::InvalidConfig {
             field: "tui.theme".into(),
             value: value.clone(),
             reason: "expected auto|light|dark".into(),
         })?;
-        keys_used.push("FSFS_TUI_THEME".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_PRIVACY_REDACT_PATHS_IN_TELEMETRY") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_PRIVACY_REDACT_PATHS_IN_TELEMETRY",
+        "FSFS_PRIVACY_REDACT_PATHS_IN_TELEMETRY",
+    ) {
         config.privacy.redact_paths_in_telemetry =
             parse_bool(value, "privacy.redact_paths_in_telemetry")?;
-        keys_used.push("FSFS_PRIVACY_REDACT_PATHS_IN_TELEMETRY".into());
+        keys_used.push(key.into());
     }
 
-    if let Some(value) = env.get("FSFS_STORAGE_DB_PATH") {
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_STORAGE_INDEX_DIR",
+        "FSFS_STORAGE_INDEX_DIR",
+    ) {
+        config.storage.index_dir.clone_from(value);
+        keys_used.push(key.into());
+    }
+
+    if let Some((key, value)) =
+        env_override(env, "FRANKENSEARCH_STORAGE_DB_PATH", "FSFS_STORAGE_DB_PATH")
+    {
         config.storage.db_path.clone_from(value);
-        keys_used.push("FSFS_STORAGE_DB_PATH".into());
+        keys_used.push(key.into());
     }
 
     Ok(EnvOverrideReport {
@@ -1973,6 +2184,7 @@ fn collect_unknown_key_warnings(config_toml: &str) -> SearchResult<Vec<ConfigWar
                 .into_iter()
                 .collect(),
             "storage" => [
+                "index_dir",
                 "db_path",
                 "evidence_retention_days",
                 "summary_retention_days",
@@ -2033,6 +2245,16 @@ fn expand_tilde_paths(config: &mut FsfsConfig, home_dir: &Path) -> Vec<PathExpan
             source: ConfigSource::Runtime,
         });
         config.storage.db_path = expanded;
+    }
+
+    if let Some(expanded) = expand_tilde(&config.storage.index_dir, home_dir) {
+        expansions.push(PathExpansion {
+            field: "storage.index_dir".into(),
+            raw: config.storage.index_dir.clone(),
+            expanded: expanded.clone(),
+            source: ConfigSource::Runtime,
+        });
+        config.storage.index_dir = expanded;
     }
 
     expansions
@@ -2183,6 +2405,14 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
             field: "storage.summary_retention_days".into(),
             value: config.storage.summary_retention_days.to_string(),
             reason: "must be between 1 and 3650".into(),
+        });
+    }
+
+    if config.storage.index_dir.trim().is_empty() {
+        return Err(SearchError::InvalidConfig {
+            field: "storage.index_dir".into(),
+            value: config.storage.index_dir.clone(),
+            reason: "must not be empty".into(),
         });
     }
 
@@ -2385,7 +2615,8 @@ mod tests {
     use super::{
         CliOverrides, DiscoveryCandidate, DiscoveryScopeDecision, IngestionClass,
         PRESSURE_PROFILE_VERSION, PressureProfileField, ProfileOverrideSource,
-        default_config_file_path, load_from_sources, load_from_str, parse_bool, parse_csv,
+        default_config_file_path, default_project_config_file_path, default_user_config_file_path,
+        load_from_layered_sources, load_from_sources, load_from_str, parse_bool, parse_csv,
     };
 
     fn home() -> &'static Path {
@@ -2736,12 +2967,15 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let home_dir = std::env::temp_dir().join(format!("fsfs-config-home-{unique}"));
-        let config_file = home_dir.join(".config").join("fsfs").join("config.toml");
+        let config_file = home_dir
+            .join(".config")
+            .join("frankensearch")
+            .join("config.toml");
         fs::create_dir_all(config_file.parent().expect("parent")).expect("mkdir");
         fs::write(&config_file, "[search]\ndefault_limit = 42\n").expect("write");
 
         let result = load_from_sources(
-            Some(Path::new("~/.config/fsfs/config.toml")),
+            Some(Path::new("~/.config/frankensearch/config.toml")),
             &HashMap::new(),
             &CliOverrides::default(),
             &home_dir,
@@ -2966,6 +3200,83 @@ mod tests {
         // Verify helper shape without mutating process environment in tests.
         let path = default_config_file_path(home());
         let rendered = path.to_string_lossy();
-        assert!(rendered.contains("/fsfs/config.toml"));
+        assert!(rendered.contains("/frankensearch/config.toml"));
+    }
+
+    #[test]
+    fn layered_sources_apply_project_over_user() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("fsfs-config-layer-{unique}"));
+        let project = root.join("repo");
+        let project_config = project.join(".frankensearch").join("config.toml");
+        let user_config = root
+            .join(".config")
+            .join("frankensearch")
+            .join("config.toml");
+
+        fs::create_dir_all(project_config.parent().expect("project parent")).expect("mkdir");
+        fs::create_dir_all(user_config.parent().expect("user parent")).expect("mkdir");
+
+        fs::write(&user_config, "[search]\ndefault_limit = 15\n").expect("write user");
+        fs::write(&project_config, "[search]\ndefault_limit = 7\n").expect("write project");
+
+        let result = load_from_layered_sources(
+            Some(project_config.as_path()),
+            Some(user_config.as_path()),
+            &HashMap::new(),
+            &CliOverrides::default(),
+            &root,
+        )
+        .expect("layered load");
+
+        assert_eq!(result.config.search.default_limit, 7);
+        assert_eq!(result.config_file_used, Some(project_config));
+    }
+
+    #[test]
+    fn frankensearch_env_prefix_takes_precedence_over_legacy_fsfs_prefix() {
+        let env = HashMap::from([
+            ("FRANKENSEARCH_SEARCH_DEFAULT_LIMIT".into(), "13".into()),
+            ("FSFS_SEARCH_DEFAULT_LIMIT".into(), "29".into()),
+        ]);
+
+        let result =
+            load_from_str(None, None, &env, &CliOverrides::default(), home()).expect("load config");
+        assert_eq!(result.config.search.default_limit, 13);
+        assert!(
+            result
+                .env_keys_used
+                .contains(&"FRANKENSEARCH_SEARCH_DEFAULT_LIMIT".to_string())
+        );
+    }
+
+    #[test]
+    fn default_paths_and_zero_config_storage_defaults_are_project_friendly() {
+        let user = default_user_config_file_path(home());
+        assert!(
+            user.to_string_lossy()
+                .contains("/frankensearch/config.toml")
+        );
+
+        let project = default_project_config_file_path(Path::new("/tmp/workspace"));
+        assert_eq!(
+            project,
+            Path::new("/tmp/workspace/.frankensearch/config.toml")
+        );
+
+        let result = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load defaults");
+        assert_eq!(result.config.discovery.roots, vec![".".to_string()]);
+        assert_eq!(result.config.storage.index_dir, ".frankensearch");
+        assert_eq!(result.config.search.default_limit, 10);
     }
 }

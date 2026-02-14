@@ -7,12 +7,14 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::{
-    CliCommand, FsfsRuntime, InterfaceMode, ShutdownCoordinator, ShutdownReason,
-    default_config_file_path, detect_auto_mode, emit_config_loaded, exit_code, load_from_sources,
+    CliCommand, FsfsRuntime, InterfaceMode, ShutdownCoordinator, ShutdownReason, Verbosity,
+    default_project_config_file_path, default_user_config_file_path, detect_auto_mode,
+    emit_config_loaded, exit_code, init_subscriber, load_from_layered_sources, load_from_sources,
     parse_cli_args,
 };
 use tracing::info;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> SearchResult<()> {
     let cli_input = parse_cli_args(std::env::args().skip(1))?;
 
@@ -26,28 +28,41 @@ fn main() -> SearchResult<()> {
         std::process::exit(exit_code::OK);
     }
 
+    // Initialize tracing subscriber before anything else that emits events.
+    // CLI flags are already parsed, so we can derive verbosity.
+    let verbosity = Verbosity::from_flags(cli_input.verbose, cli_input.quiet);
+    init_subscriber(verbosity, cli_input.no_color);
+
     let env_map: HashMap<String, String> = std::env::vars().collect();
 
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-    let config_path = cli_input.overrides.config_path.as_deref().map_or_else(
-        || default_config_file_path(&home_dir),
-        |path| expand_cli_config_path(path, &home_dir),
-    );
-
-    if cli_input.overrides.config_path.is_some() && !config_path.exists() {
-        return Err(SearchError::InvalidConfig {
-            field: "config_file".to_owned(),
-            value: config_path.display().to_string(),
-            reason: "explicitly provided --config path does not exist".to_owned(),
-        });
-    }
-
-    let loaded = load_from_sources(
-        Some(config_path.as_path()),
-        &env_map,
-        &cli_input.overrides,
-        &home_dir,
-    )?;
+    let loaded = if let Some(path) = cli_input.overrides.config_path.as_deref() {
+        let config_path = expand_cli_config_path(path, &home_dir);
+        if !config_path.exists() {
+            return Err(SearchError::InvalidConfig {
+                field: "config_file".to_owned(),
+                value: config_path.display().to_string(),
+                reason: "explicitly provided --config path does not exist".to_owned(),
+            });
+        }
+        load_from_sources(
+            Some(config_path.as_path()),
+            &env_map,
+            &cli_input.overrides,
+            &home_dir,
+        )?
+    } else {
+        let cwd = std::env::current_dir().map_err(SearchError::Io)?;
+        let project_config_path = default_project_config_file_path(&cwd);
+        let user_config_path = default_user_config_file_path(&home_dir);
+        load_from_layered_sources(
+            Some(project_config_path.as_path()),
+            Some(user_config_path.as_path()),
+            &env_map,
+            &cli_input.overrides,
+            &home_dir,
+        )?
+    };
 
     let event = loaded.to_loaded_event();
     emit_config_loaded(&event);
@@ -65,16 +80,23 @@ fn main() -> SearchResult<()> {
         resolved_config.indexing.watch_mode = true;
     }
 
-    let app_runtime = FsfsRuntime::new(resolved_config);
+    let mut runtime_cli_input = cli_input;
+    runtime_cli_input.command = command;
+    let app_runtime = FsfsRuntime::new(resolved_config).with_cli_input(runtime_cli_input);
     let interface_mode = match command {
         CliCommand::Tui => InterfaceMode::Tui,
         CliCommand::Search
         | CliCommand::Index
+        | CliCommand::Watch
         | CliCommand::Status
         | CliCommand::Explain
         | CliCommand::Config
         | CliCommand::Download
         | CliCommand::Doctor
+        | CliCommand::Update
+        | CliCommand::Completions
+        | CliCommand::Uninstall
+        | CliCommand::Help
         | CliCommand::Version => InterfaceMode::Cli,
     };
 

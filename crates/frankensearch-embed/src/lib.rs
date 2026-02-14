@@ -10,16 +10,24 @@
 
 pub mod auto_detect;
 pub mod batch_coalescer;
+pub mod model_cache;
 pub mod model_manifest;
 pub mod model_registry;
-pub use auto_detect::{DimReduceEmbedder, EmbedderStack, TwoTierAvailability};
+pub use auto_detect::{
+    DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus, TwoTierAvailability,
+};
 pub use batch_coalescer::{
     BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
 };
+pub use model_cache::{
+    ENV_DATA_DIR, ENV_MODEL_DIR, KnownModel, MODEL_CACHE_LAYOUT_VERSION, ModelCacheLayout,
+    ModelDirEntry, ensure_cache_layout, ensure_default_cache, is_model_installed, known_models,
+    model_file_path, resolve_cache_root,
+};
 pub use model_manifest::{
-    ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, ModelFile, ModelLifecycle, ModelManifest,
-    ModelManifestCatalog, ModelState, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, resolve_download_consent,
-    verify_file_sha256,
+    ConsentSource, DOWNLOAD_CONSENT_ENV, DownloadConsent, MANIFEST_SCHEMA_VERSION, ModelFile,
+    ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelState, ModelTier,
+    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, resolve_download_consent, verify_file_sha256,
 };
 pub use model_registry::{
     BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,

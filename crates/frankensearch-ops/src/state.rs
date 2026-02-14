@@ -1242,6 +1242,19 @@ mod tests {
         assert_eq!(healthy.state, LifecycleState::Healthy);
     }
 
+    #[test]
+    fn lifecycle_tracker_config_normalization_enforces_bounds() {
+        let normalized = LifecycleTrackerConfig {
+            stale_after_ms: 50,
+            stop_after_ms: 10,
+            max_retained_events: 0,
+        }
+        .normalized();
+        assert_eq!(normalized.stale_after_ms, 50);
+        assert_eq!(normalized.stop_after_ms, 50);
+        assert_eq!(normalized.max_retained_events, 1);
+    }
+
     fn discovery_instance(
         id: &str,
         project_key_hint: Option<&str>,
@@ -1403,5 +1416,33 @@ mod tests {
         let _ = tracker.ingest_discovery(12, &[]);
 
         assert_eq!(tracker.event_log().len(), 2);
+    }
+
+    #[test]
+    fn lifecycle_tracker_uses_unknown_attribution_when_cache_missing() {
+        let mut tracker = ProjectLifecycleTracker::new(LifecycleTrackerConfig {
+            stale_after_ms: 5,
+            stop_after_ms: 10,
+            max_retained_events: 16,
+        });
+        let first = vec![discovery_instance(
+            "inst-missing-attr",
+            Some("cass"),
+            Some("cass-host"),
+            10,
+            DiscoveryStatus::Active,
+        )];
+        let _ = tracker.ingest_discovery(10, &first);
+
+        tracker.attributions.clear();
+        let events = tracker.ingest_discovery(25, &[]);
+        let stop = events
+            .iter()
+            .find(|event| event.to == LifecycleState::Stopped)
+            .expect("stop transition should be emitted");
+
+        assert_eq!(stop.reason_code, "lifecycle.discovery.stop");
+        assert_eq!(stop.attribution_confidence_score, 20);
+        assert!(!stop.attribution_collision);
     }
 }

@@ -20,6 +20,7 @@ use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tracing::instrument;
 
+use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize};
 
@@ -370,8 +371,9 @@ fn parse_f32_matrix(
 ///
 /// Checks these paths in order:
 /// 1. `$FRANKENSEARCH_MODEL_DIR/<model_name>/`
-/// 2. `~/.cache/frankensearch/models/<model_name>/`
-/// 3. `~/.local/share/frankensearch/models/<model_name>/`
+/// 2. `$XDG_DATA_HOME/frankensearch/models/<model_name>/`
+/// 3. `~/.local/share/frankensearch/models/<model_name>/` (or macOS
+///    `~/Library/Application Support/frankensearch/models/<model_name>/`)
 /// 4. `~/.cache/huggingface/hub/models--<hf_id>/snapshots/*/`
 ///
 /// Returns `None` if no directory with the required files is found.
@@ -387,15 +389,17 @@ pub fn find_model_dir_with_hf_id(model_name: &str, hf_id: &str) -> Option<PathBu
 
     // 1. Explicit env var override
     if let Ok(dir) = std::env::var("FRANKENSEARCH_MODEL_DIR") {
-        candidates.push(PathBuf::from(dir).join(model_name));
+        let base = PathBuf::from(dir);
+        for variant in model_directory_variants(model_name) {
+            candidates.push(base.join(variant));
+        }
+        candidates.push(base);
     }
 
-    // 2-3. Standard paths
-    if let Some(cache_dir) = dirs::cache_dir() {
-        candidates.push(cache_dir.join("frankensearch/models").join(model_name));
-    }
-    if let Some(data_dir) = dirs::data_local_dir() {
-        candidates.push(data_dir.join("frankensearch/models").join(model_name));
+    // 2-3. Standard frankensearch model layout (created on first access)
+    let model_root = ensure_model_storage_layout();
+    for variant in model_directory_variants(model_name) {
+        candidates.push(model_root.join(variant));
     }
 
     // 4. HuggingFace cache
@@ -430,7 +434,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Create a minimal Model2Vec model in a temp directory for testing.
+    /// Create a minimal `Model2Vec` model in a temp directory for testing.
     ///
     /// Creates a tiny tokenizer and a small safetensors file with known values.
     fn create_test_model(dir: &Path, vocab_size: usize, dimensions: usize) {
@@ -503,7 +507,7 @@ mod tests {
         for row in 0..vocab_size {
             for col in 0..dimensions {
                 #[allow(clippy::cast_precision_loss)]
-                let val = (row as f32) * 0.1 + (col as f32) * 0.01;
+                let val = (row as f32).mul_add(0.1, (col as f32) * 0.01);
                 data.extend_from_slice(&val.to_le_bytes());
             }
         }

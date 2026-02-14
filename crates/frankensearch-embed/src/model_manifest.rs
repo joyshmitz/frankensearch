@@ -26,6 +26,25 @@ pub const PLACEHOLDER_VERIFY_AFTER_DOWNLOAD: &str = "PLACEHOLDER_VERIFY_AFTER_DO
 /// Placeholder revision used by built-in manifests until pinned revisions are filled in.
 pub const PLACEHOLDER_PINNED_REVISION: &str = "UNPINNED_VERIFY_AFTER_DOWNLOAD";
 
+/// Schema version for the manifest catalog format.
+///
+/// Bump this when the manifest structure changes in a backwards-incompatible way.
+/// Consumers compare the embedded schema version against the cached manifest to
+/// detect model upgrades that require re-download.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+
+/// Which search tier a model serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    /// Fast tier (~0.57ms per query), lower dimension.
+    Fast,
+    /// Quality tier (~128ms per query), higher dimension.
+    Quality,
+    /// Cross-encoder reranker, applied to top-K results.
+    Reranker,
+}
+
 const HASH_BUFFER_SIZE: usize = 8 * 1024;
 
 /// One file required by a model manifest.
@@ -37,6 +56,10 @@ pub struct ModelFile {
     pub sha256: String,
     /// Expected size in bytes.
     pub size: u64,
+    /// Explicit download URL. When `None`, the URL is derived from the parent
+    /// manifest's `repo` + `revision` using the `HuggingFace` `/resolve/` path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl ModelFile {
@@ -51,6 +74,21 @@ impl ModelFile {
     pub fn has_verified_checksum(&self) -> bool {
         self.size > 0 && is_valid_sha256_hex(&self.sha256) && !self.uses_placeholder_checksum()
     }
+
+    /// Return the download URL for this file, preferring the explicit `url`
+    /// field and falling back to the standard `HuggingFace` `/resolve/` path.
+    #[must_use]
+    pub fn download_url(&self, repo: &str, revision: &str) -> String {
+        self.url.as_ref().map_or_else(
+            || {
+                format!(
+                    "https://huggingface.co/{repo}/resolve/{revision}/{}",
+                    self.name
+                )
+            },
+            Clone::clone,
+        )
+    }
 }
 
 /// Manifest for one downloadable model bundle.
@@ -58,6 +96,15 @@ impl ModelFile {
 pub struct ModelManifest {
     /// Stable model identifier.
     pub id: String,
+    /// Human-readable version tag for manifest-managed model assets.
+    #[serde(default)]
+    pub version: String,
+    /// Human-readable display name (e.g., "Potion Base 128M (fast tier)").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional longer description for CLI/help output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// `HuggingFace` repository slug.
     pub repo: String,
     /// Pinned revision (commit SHA).
@@ -66,67 +113,231 @@ pub struct ModelManifest {
     pub files: Vec<ModelFile>,
     /// SPDX-style license identifier.
     pub license: String,
+    /// Output embedding dimension (e.g., 256 for potion, 384 for `MiniLM`).
+    /// `None` for models that don't produce fixed-dim embeddings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    /// Which search tier this model serves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ModelTier>,
+    /// Optional precomputed aggregate download size in bytes.
+    #[serde(
+        default,
+        rename = "total_size_bytes",
+        skip_serializing_if = "is_zero_u64"
+    )]
+    pub download_size_bytes: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires &T signature
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl ModelManifest {
     /// Built-in manifest for MiniLM-L6-v2 (quality tier).
     #[must_use]
     pub fn minilm_v2() -> Self {
+        const REVISION: &str = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf";
+        const REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
         Self {
             id: "all-minilm-l6-v2".to_owned(),
-            repo: "sentence-transformers/all-MiniLM-L6-v2".to_owned(),
-            revision: PLACEHOLDER_PINNED_REVISION.to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("All MiniLM L6 v2 (quality tier)".to_owned()),
+            description: Some(
+                "MiniLM-L6-v2 ONNX sentence embedding model for quality-tier semantic search"
+                    .to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
             files: vec![
                 ModelFile {
                     name: "onnx/model.onnx".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452"
+                        .to_owned(),
+                    size: 90_405_214,
+                    url: Some(
+                        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/onnx/model.onnx"
+                            .to_owned(),
+                    ),
                 },
                 ModelFile {
                     name: "tokenizer.json".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"
+                        .to_owned(),
+                    size: 466_247,
+                    url: Some(
+                        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/tokenizer.json"
+                            .to_owned(),
+                    ),
                 },
                 ModelFile {
                     name: "config.json".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41"
+                        .to_owned(),
+                    size: 612,
+                    url: Some(
+                        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/config.json"
+                            .to_owned(),
+                    ),
                 },
                 ModelFile {
                     name: "special_tokens_map.json".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3"
+                        .to_owned(),
+                    size: 112,
+                    url: Some(
+                        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/special_tokens_map.json"
+                            .to_owned(),
+                    ),
                 },
                 ModelFile {
                     name: "tokenizer_config.json".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "acb92769e8195aabd29b7b2137a9e6d6e25c476a4f15aa4355c233426c61576b"
+                        .to_owned(),
+                    size: 350,
+                    url: Some(
+                        "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/c9745ed1d9f207416be6d2e6f8de32d1f16199bf/tokenizer_config.json"
+                            .to_owned(),
+                    ),
                 },
             ],
             license: "Apache-2.0".to_owned(),
+            dimension: Some(384),
+            tier: Some(ModelTier::Quality),
+            download_size_bytes: 90_872_535,
         }
     }
 
     /// Built-in manifest for potion-128M style `Model2Vec` assets (fast tier).
     #[must_use]
     pub fn potion_128m() -> Self {
+        const REVISION: &str = "a28f4eebecd4dc585034f605e52d414878a0417c";
+        const REPO: &str = "minishlab/potion-multilingual-128M";
         Self {
             id: "potion-multilingual-128m".to_owned(),
-            repo: "minishlab/potion-multilingual-128M".to_owned(),
-            revision: PLACEHOLDER_PINNED_REVISION.to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Potion Multilingual 128M (fast tier)".to_owned()),
+            description: Some(
+                "Model2Vec static embedding model for fast-tier multilingual retrieval".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
             files: vec![
                 ModelFile {
                     name: "tokenizer.json".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "19f1909063da3cfe3bd83a782381f040dccea475f4816de11116444a73e1b6a1"
+                        .to_owned(),
+                    size: 18_616_131,
+                    url: Some(
+                        "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/a28f4eebecd4dc585034f605e52d414878a0417c/tokenizer.json"
+                            .to_owned(),
+                    ),
                 },
                 ModelFile {
                     name: "model.safetensors".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
+                    sha256: "14b5eb39cb4ce5666da8ad1f3dc6be4346e9b2d601c073302fa0a31bf7943397"
+                        .to_owned(),
+                    size: 512_361_560,
+                    url: Some(
+                        "https://huggingface.co/minishlab/potion-multilingual-128M/resolve/a28f4eebecd4dc585034f605e52d414878a0417c/model.safetensors"
+                            .to_owned(),
+                    ),
                 },
             ],
             license: "Apache-2.0".to_owned(),
+            dimension: Some(256),
+            tier: Some(ModelTier::Fast),
+            download_size_bytes: 530_977_691,
+        }
+    }
+
+    /// Built-in manifest for MS MARCO `MiniLM` reranker (cross-encoder).
+    #[must_use]
+    pub fn ms_marco_reranker() -> Self {
+        const REVISION: &str = "c5ee24cb16019beea0893ab7796b1df96625c6b8";
+        const REPO: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
+        Self {
+            id: "ms-marco-minilm-l-6-v2".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("MS MARCO MiniLM L-6 v2 (reranker)".to_owned()),
+            description: Some(
+                "MS MARCO cross-encoder reranker model for final relevance scoring".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".to_owned(),
+                    sha256: "5d3e70fd0c9ff14b9b5169a51e957b7a9c74897afd0a35ce4bd318150c1d4d4a"
+                        .to_owned(),
+                    size: 91_011_230,
+                    url: Some(
+                        "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/c5ee24cb16019beea0893ab7796b1df96625c6b8/onnx/model.onnx"
+                            .to_owned(),
+                    ),
+                },
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+                        .to_owned(),
+                    size: 711_396,
+                    url: Some(
+                        "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/c5ee24cb16019beea0893ab7796b1df96625c6b8/tokenizer.json"
+                            .to_owned(),
+                    ),
+                },
+                ModelFile {
+                    name: "config.json".to_owned(),
+                    sha256: "380e02c93f431831be65d99a4e7e5f67c133985bf2e77d9d4eba46847190bacc"
+                        .to_owned(),
+                    size: 794,
+                    url: Some(
+                        "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/c5ee24cb16019beea0893ab7796b1df96625c6b8/config.json"
+                            .to_owned(),
+                    ),
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".to_owned(),
+                    sha256: "3c3507f36dff57bce437223db3b3081d1e2b52ec3e56ee55438193ecb2c94dd6"
+                        .to_owned(),
+                    size: 132,
+                    url: Some(
+                        "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/c5ee24cb16019beea0893ab7796b1df96625c6b8/special_tokens_map.json"
+                            .to_owned(),
+                    ),
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".to_owned(),
+                    sha256: "a5c2e5a7b1a29a0702cd28c08a399b5ecc110c263009d17f7e3b415f25905fd8"
+                        .to_owned(),
+                    size: 1_330,
+                    url: Some(
+                        "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/c5ee24cb16019beea0893ab7796b1df96625c6b8/tokenizer_config.json"
+                            .to_owned(),
+                    ),
+                },
+            ],
+            license: "Apache-2.0".to_owned(),
+            dimension: None, // Cross-encoder produces scores, not embeddings
+            tier: Some(ModelTier::Reranker),
+            download_size_bytes: 91_724_882,
+        }
+    }
+
+    /// Return the compiled-in catalog of all built-in model manifests.
+    ///
+    /// This is the single source of truth for what models frankensearch needs.
+    /// The binary always knows what models it requires without network access.
+    #[must_use]
+    pub fn builtin_catalog() -> ModelManifestCatalog {
+        ModelManifestCatalog {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            models: vec![
+                Self::potion_128m(),
+                Self::minilm_v2(),
+                Self::ms_marco_reranker(),
+            ],
         }
     }
 
@@ -186,6 +397,9 @@ impl ModelManifest {
     /// Sum of expected bytes for all files.
     #[must_use]
     pub fn total_size_bytes(&self) -> u64 {
+        if self.download_size_bytes > 0 {
+            return self.download_size_bytes;
+        }
         self.files.iter().map(|file| file.size).sum()
     }
 
@@ -243,6 +457,17 @@ impl ModelManifest {
                     "files[].size",
                     "0",
                     "must be > 0 when checksum is non-placeholder",
+                ));
+            }
+        }
+
+        if self.download_size_bytes > 0 {
+            let computed_size: u64 = self.files.iter().map(|file| file.size).sum();
+            if computed_size != self.download_size_bytes {
+                return Err(invalid_manifest_field(
+                    "total_size_bytes",
+                    &self.download_size_bytes.to_string(),
+                    "must match the sum of files[].size",
                 ));
             }
         }
@@ -356,11 +581,27 @@ impl ModelManifest {
 }
 
 /// Model manifest catalog for bulk load/validation.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelManifestCatalog {
+    /// Schema version for forward compatibility.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     /// Manifests contained in this catalog.
     #[serde(default)]
     pub models: Vec<ModelManifest>,
+}
+
+const fn default_schema_version() -> u32 {
+    MANIFEST_SCHEMA_VERSION
+}
+
+impl Default for ModelManifestCatalog {
+    fn default() -> Self {
+        Self {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            models: Vec::new(),
+        }
+    }
 }
 
 impl ModelManifestCatalog {
@@ -820,11 +1061,11 @@ fn promote_atomically(staged_dir: &Path, destination_dir: &Path) -> SearchResult
 fn manifest_registry() -> &'static RwLock<BTreeMap<String, ModelManifest>> {
     static REGISTRY: OnceLock<RwLock<BTreeMap<String, ModelManifest>>> = OnceLock::new();
     REGISTRY.get_or_init(|| {
+        let catalog = ModelManifest::builtin_catalog();
         let mut data = BTreeMap::new();
-        let minilm = ModelManifest::minilm_v2();
-        data.insert(minilm.id.clone(), minilm);
-        let potion = ModelManifest::potion_128m();
-        data.insert(potion.id.clone(), potion);
+        for manifest in catalog.models {
+            data.insert(manifest.id.clone(), manifest);
+        }
         RwLock::new(data)
     })
 }
@@ -1072,7 +1313,10 @@ mod tests {
 
     #[test]
     fn placeholder_checksums_are_rejected_in_release_policy_mode() {
-        let manifest = ModelManifest::minilm_v2();
+        let mut manifest = ModelManifest::minilm_v2();
+        manifest.files[0].sha256 = PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned();
+        manifest.files[0].size = 0;
+        manifest.files[0].url = None;
         let err = manifest.validate_checksum_policy_for(true).unwrap_err();
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
     }
@@ -1106,6 +1350,9 @@ mod tests {
 
         let manifest = ModelManifest {
             id: "test".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
             repo: "owner/repo".to_owned(),
             revision: "abcdef1".to_owned(),
             files: vec![ModelFile {
@@ -1113,8 +1360,12 @@ mod tests {
                 sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
                 size: 1,
+                url: None,
             }],
             license: "MIT".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 0,
         };
 
         let err = manifest.verify_dir(model_root).unwrap_err();
@@ -1134,6 +1385,9 @@ mod tests {
         );
         let manifest = ModelManifest {
             id: unique_id.clone(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
             repo: "acme/custom".to_owned(),
             revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             files: vec![ModelFile {
@@ -1141,8 +1395,12 @@ mod tests {
                 sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_owned(),
                 size: 42,
+                url: None,
             }],
             license: "MIT".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 0,
         };
 
         manifest.clone().register().unwrap();
@@ -1294,9 +1552,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_manifests_not_production_ready() {
-        assert!(!ModelManifest::minilm_v2().is_production_ready());
-        assert!(!ModelManifest::potion_128m().is_production_ready());
+    fn builtin_manifests_are_production_ready() {
+        assert!(ModelManifest::minilm_v2().is_production_ready());
+        assert!(ModelManifest::potion_128m().is_production_ready());
+        assert!(ModelManifest::ms_marco_reranker().is_production_ready());
     }
 
     #[test]
@@ -1336,13 +1595,16 @@ mod tests {
                     name: "a".to_owned(),
                     sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
                     size: 100,
+                    url: None,
                 },
                 ModelFile {
                     name: "b".to_owned(),
                     sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
                     size: 200,
+                    url: None,
                 },
             ],
+            download_size_bytes: 0,
             ..ModelManifest::potion_128m()
         };
         assert_eq!(m.total_size_bytes(), 300);
@@ -1501,7 +1763,10 @@ mod tests {
 
     #[test]
     fn detect_update_state_unpinned_returns_none() {
-        let manifest = ModelManifest::potion_128m();
+        let manifest = ModelManifest {
+            revision: PLACEHOLDER_PINNED_REVISION.to_owned(),
+            ..ModelManifest::potion_128m()
+        };
         assert!(manifest.detect_update_state("anything").is_none());
     }
 
@@ -1549,6 +1814,7 @@ mod tests {
             name: "f.bin".to_owned(),
             sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
             size: 0,
+            url: None,
         };
         assert!(file.uses_placeholder_checksum());
         assert!(!file.has_verified_checksum());
@@ -1560,6 +1826,7 @@ mod tests {
             name: "f.bin".to_owned(),
             sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             size: 42,
+            url: None,
         };
         assert!(!file.uses_placeholder_checksum());
         assert!(file.has_verified_checksum());
@@ -1579,14 +1846,21 @@ mod tests {
 
         let manifest = ModelManifest {
             id: "test".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
             repo: "owner/repo".to_owned(),
             revision: "abc".to_owned(),
             files: vec![ModelFile {
                 name: "model.bin".to_owned(),
                 sha256: hash,
                 size,
+                url: None,
             }],
             license: "MIT".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 0,
         };
 
         let backup = manifest
@@ -1612,14 +1886,21 @@ mod tests {
 
         let manifest = ModelManifest {
             id: "test".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: None,
+            description: None,
             repo: "owner/repo".to_owned(),
             revision: "abc".to_owned(),
             files: vec![ModelFile {
                 name: "model.bin".to_owned(),
                 sha256: hash,
                 size,
+                url: None,
             }],
             license: "MIT".to_owned(),
+            dimension: None,
+            tier: None,
+            download_size_bytes: 0,
         };
 
         let backup = manifest
@@ -1728,5 +2009,233 @@ mod tests {
         let result = truncate_for_error(&long);
         assert!(result.ends_with("..."));
         assert!(result.len() < 200);
+    }
+
+    // ── bd-2w7x.5: Model manifest enrichment tests ─────────────────────
+
+    #[test]
+    fn manifest_schema_version_is_two() {
+        assert_eq!(MANIFEST_SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn model_tier_serde_roundtrip() {
+        for tier in &[ModelTier::Fast, ModelTier::Quality, ModelTier::Reranker] {
+            let json = serde_json::to_string(tier).unwrap();
+            let decoded: ModelTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(&decoded, tier);
+        }
+    }
+
+    #[test]
+    fn model_tier_serde_uses_snake_case() {
+        assert_eq!(serde_json::to_string(&ModelTier::Fast).unwrap(), "\"fast\"");
+        assert_eq!(
+            serde_json::to_string(&ModelTier::Quality).unwrap(),
+            "\"quality\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelTier::Reranker).unwrap(),
+            "\"reranker\""
+        );
+    }
+
+    #[test]
+    fn builtin_potion_has_correct_metadata() {
+        let m = ModelManifest::potion_128m();
+        assert_eq!(m.dimension, Some(256));
+        assert_eq!(m.tier, Some(ModelTier::Fast));
+        assert!(m.display_name.is_some());
+        assert!(m.display_name.as_deref().unwrap().contains("fast"));
+    }
+
+    #[test]
+    fn builtin_minilm_has_correct_metadata() {
+        let m = ModelManifest::minilm_v2();
+        assert_eq!(m.dimension, Some(384));
+        assert_eq!(m.tier, Some(ModelTier::Quality));
+        assert!(m.display_name.is_some());
+        assert!(m.display_name.as_deref().unwrap().contains("quality"));
+    }
+
+    #[test]
+    fn builtin_reranker_has_correct_metadata() {
+        let m = ModelManifest::ms_marco_reranker();
+        assert_eq!(m.id, "ms-marco-minilm-l-6-v2");
+        assert_eq!(m.dimension, None); // Cross-encoder, no embedding dim
+        assert_eq!(m.tier, Some(ModelTier::Reranker));
+        assert!(m.display_name.is_some());
+        assert!(m.display_name.as_deref().unwrap().contains("reranker"));
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn builtin_catalog_contains_all_three_models() {
+        let catalog = ModelManifest::builtin_catalog();
+        assert_eq!(catalog.schema_version, MANIFEST_SCHEMA_VERSION);
+        assert_eq!(catalog.models.len(), 3);
+
+        let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"potion-multilingual-128m"));
+        assert!(ids.contains(&"all-minilm-l6-v2"));
+        assert!(ids.contains(&"ms-marco-minilm-l-6-v2"));
+
+        catalog.validate().unwrap();
+    }
+
+    #[test]
+    fn builtin_catalog_covers_all_tiers() {
+        let catalog = ModelManifest::builtin_catalog();
+        let tiers: Vec<Option<ModelTier>> = catalog.models.iter().map(|m| m.tier).collect();
+        assert!(tiers.contains(&Some(ModelTier::Fast)));
+        assert!(tiers.contains(&Some(ModelTier::Quality)));
+        assert!(tiers.contains(&Some(ModelTier::Reranker)));
+    }
+
+    #[test]
+    fn builtin_manifests_include_version_description_and_size_metadata() {
+        let manifests = [
+            ModelManifest::potion_128m(),
+            ModelManifest::minilm_v2(),
+            ModelManifest::ms_marco_reranker(),
+        ];
+
+        for manifest in manifests {
+            assert!(!manifest.version.is_empty());
+            assert!(manifest.description.is_some());
+            assert!(manifest.download_size_bytes > 0);
+            let summed_size: u64 = manifest.files.iter().map(|file| file.size).sum();
+            assert_eq!(manifest.download_size_bytes, summed_size);
+        }
+    }
+
+    #[test]
+    fn model_file_download_url_uses_explicit_when_present() {
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+            size: 0,
+            url: Some("https://mirror.example.com/model.onnx".to_owned()),
+        };
+        let url = file.download_url("owner/repo", "abc123");
+        assert_eq!(url, "https://mirror.example.com/model.onnx");
+    }
+
+    #[test]
+    fn model_file_download_url_derives_from_repo_when_none() {
+        let file = ModelFile {
+            name: "onnx/model.onnx".to_owned(),
+            sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+            size: 0,
+            url: None,
+        };
+        let url = file.download_url("sentence-transformers/all-MiniLM-L6-v2", "abc123");
+        assert_eq!(
+            url,
+            "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/abc123/onnx/model.onnx"
+        );
+    }
+
+    #[test]
+    fn model_file_url_field_is_optional_in_json() {
+        // URL absent: should deserialize with url=None
+        let json = r#"{"name":"f.bin","sha256":"PLACEHOLDER_VERIFY_AFTER_DOWNLOAD","size":0}"#;
+        let file: ModelFile = serde_json::from_str(json).unwrap();
+        assert!(file.url.is_none());
+
+        // URL present: should deserialize
+        let json = r#"{"name":"f.bin","sha256":"PLACEHOLDER_VERIFY_AFTER_DOWNLOAD","size":0,"url":"https://example.com/f.bin"}"#;
+        let file: ModelFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.url.as_deref(), Some("https://example.com/f.bin"));
+    }
+
+    #[test]
+    fn model_file_url_skipped_in_serialization_when_none() {
+        let file = ModelFile {
+            name: "f.bin".to_owned(),
+            sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+            size: 0,
+            url: None,
+        };
+        let json = serde_json::to_string(&file).unwrap();
+        assert!(!json.contains("url"));
+    }
+
+    #[test]
+    fn manifest_display_name_optional_in_json() {
+        let json = r#"{
+            "id": "test", "repo": "r", "revision": "v",
+            "files": [], "license": "MIT"
+        }"#;
+        let m: ModelManifest = serde_json::from_str(json).unwrap();
+        assert!(m.display_name.is_none());
+        assert!(m.dimension.is_none());
+        assert!(m.tier.is_none());
+    }
+
+    #[test]
+    fn manifest_with_all_new_fields_roundtrips() {
+        let m = ModelManifest {
+            id: "test".to_owned(),
+            version: "test-v1".to_owned(),
+            display_name: Some("Test Model".to_owned()),
+            description: Some("test manifest".to_owned()),
+            repo: "owner/repo".to_owned(),
+            revision: "abc123".to_owned(),
+            files: vec![ModelFile {
+                name: "model.onnx".to_owned(),
+                sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                size: 0,
+                url: Some("https://example.com/model.onnx".to_owned()),
+            }],
+            license: "MIT".to_owned(),
+            dimension: Some(384),
+            tier: Some(ModelTier::Quality),
+            download_size_bytes: 0,
+        };
+        let json = m.to_pretty_json().unwrap();
+        let restored = ModelManifest::from_json_str(&json).unwrap();
+        assert_eq!(restored.display_name, m.display_name);
+        assert_eq!(restored.dimension, m.dimension);
+        assert_eq!(restored.tier, m.tier);
+        assert_eq!(restored.files[0].url, m.files[0].url);
+    }
+
+    #[test]
+    fn catalog_schema_version_defaults_on_missing() {
+        let json = r#"{"models":[]}"#;
+        let catalog = ModelManifestCatalog::from_json_str(json).unwrap();
+        assert_eq!(catalog.schema_version, MANIFEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn catalog_schema_version_preserved_from_json() {
+        let json = r#"{"schema_version": 42, "models":[]}"#;
+        let catalog = ModelManifestCatalog::from_json_str(json).unwrap();
+        assert_eq!(catalog.schema_version, 42);
+    }
+
+    #[test]
+    fn builtin_catalog_json_roundtrip() {
+        let catalog = ModelManifest::builtin_catalog();
+        let json = serde_json::to_string_pretty(&catalog).unwrap();
+        let restored = ModelManifestCatalog::from_json_str(&json).unwrap();
+        assert_eq!(restored.schema_version, catalog.schema_version);
+        assert_eq!(restored.models.len(), catalog.models.len());
+        for (orig, rest) in catalog.models.iter().zip(restored.models.iter()) {
+            assert_eq!(orig.id, rest.id);
+            assert_eq!(orig.dimension, rest.dimension);
+            assert_eq!(orig.tier, rest.tier);
+        }
+    }
+
+    #[test]
+    fn registry_includes_reranker() {
+        let all = ModelManifest::registered();
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&"ms-marco-minilm-l-6-v2"),
+            "registry should contain ms-marco reranker, got: {ids:?}"
+        );
     }
 }

@@ -472,6 +472,41 @@ mod tests {
     }
 
     #[test]
+    fn mock_from_discovery_handles_missing_identity_hints() {
+        let instances = vec![DiscoveredInstance {
+            instance_id: "inst-unknown".to_owned(),
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            version: Some("0.1.0".to_owned()),
+            first_seen_ms: 10,
+            last_seen_ms: 20,
+            status: DiscoveryStatus::Active,
+            sources: vec![crate::DiscoverySignalKind::Heartbeat],
+            identity_keys: vec!["fallback:heartbeat:20".to_owned()],
+        }];
+
+        let mock = MockDataSource::from_discovery(&instances);
+        let attribution = mock
+            .attribution("inst-unknown")
+            .expect("unknown attribution should exist");
+        assert_eq!(attribution.resolved_project, "unknown");
+        assert_eq!(attribution.reason_code, "attribution.unknown");
+        assert_eq!(attribution.confidence_score, 20);
+        assert!(
+            attribution
+                .evidence_trace
+                .iter()
+                .any(|entry| entry == "resolved_project=unknown")
+        );
+
+        let lifecycle = mock
+            .lifecycle("inst-unknown")
+            .expect("unknown lifecycle should exist");
+        assert_eq!(lifecycle.state, frankensearch_core::LifecycleState::Healthy);
+    }
+
+    #[test]
     fn mock_from_discovery_surfaces_attribution_collisions() {
         let instances = vec![DiscoveredInstance {
             instance_id: "inst-collision".to_owned(),

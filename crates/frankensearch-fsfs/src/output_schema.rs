@@ -7,7 +7,7 @@
 //! - **Schema version**: integer `v` field for version negotiation.
 //! - **Success/error bifurcation**: `ok` boolean, with `data` or `error` present.
 //! - **Stable error codes**: [`OutputErrorCode`] constants that map 1:1 from
-//!   [`SearchError`](frankensearch_core::SearchError) variants.
+//!   [`SearchError`] variants.
 //! - **Field optionality**: explicit [`FieldPresence`] descriptors for every
 //!   envelope field.
 //! - **Compatibility mode**: [`CompatibilityMode`] controls whether unknown
@@ -250,7 +250,7 @@ fn toon_unquoted_token_roundtrips_as_same_string(token: &str) -> bool {
 /// Structured error object with a machine-stable code.
 ///
 /// Error codes are drawn from [`OutputErrorCode`] constants and map 1:1
-/// from [`SearchError`](frankensearch_core::SearchError) variants.
+/// from [`SearchError`] variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputError {
     /// Machine-stable error code (`snake_case`, never changes within a major version).
@@ -354,7 +354,7 @@ impl OutputMeta {
 
 /// Machine-stable error code constants for JSON output.
 ///
-/// These map 1:1 from [`SearchError`](frankensearch_core::SearchError) variants
+/// These map 1:1 from [`SearchError`] variants
 /// and are guaranteed to remain stable within a major schema version. Consumers
 /// should match on these codes, never on the `message` field.
 pub struct OutputErrorCode;
@@ -588,7 +588,7 @@ pub const ENVELOPE_FIELDS: &[FieldDescriptor] = &[
 
 // ─── SearchError → OutputError ──────────────────────────────────────────────
 
-/// Map a [`SearchError`](frankensearch_core::SearchError) to its stable output
+/// Map a [`SearchError`] to its stable output
 /// error code string.
 #[must_use]
 pub const fn error_code_for(err: &frankensearch_core::SearchError) -> &'static str {
@@ -619,7 +619,7 @@ pub const fn error_code_for(err: &frankensearch_core::SearchError) -> &'static s
     }
 }
 
-/// Map a [`SearchError`](frankensearch_core::SearchError) to its suggested
+/// Map a [`SearchError`] to its suggested
 /// exit code.
 #[must_use]
 pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
@@ -629,12 +629,15 @@ pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
         SearchError::InvalidConfig { .. } | SearchError::QueryParseError { .. } => {
             exit_code::USAGE_ERROR
         }
+        SearchError::EmbedderUnavailable { .. }
+        | SearchError::ModelNotFound { .. }
+        | SearchError::ModelLoadFailed { .. } => exit_code::MODEL_UNAVAILABLE,
         SearchError::Cancelled { .. } => exit_code::INTERRUPTED,
         _ => exit_code::RUNTIME_ERROR,
     }
 }
 
-/// Convert a [`SearchError`](frankensearch_core::SearchError) into a structured
+/// Convert a [`SearchError`] into a structured
 /// [`OutputError`].
 #[must_use]
 pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
@@ -1181,6 +1184,29 @@ mod tests {
             reason: "r".into(),
         };
         assert_eq!(exit_code_for(&err), exit_code::INTERRUPTED);
+    }
+
+    #[test]
+    fn exit_code_for_model_unavailable() {
+        use crate::adapters::cli::exit_code;
+        use frankensearch_core::SearchError;
+
+        let err = SearchError::EmbedderUnavailable {
+            model: "MiniLM".into(),
+            reason: "feature not enabled".into(),
+        };
+        assert_eq!(exit_code_for(&err), exit_code::MODEL_UNAVAILABLE);
+
+        let err = SearchError::ModelNotFound {
+            name: "potion-128M".into(),
+        };
+        assert_eq!(exit_code_for(&err), exit_code::MODEL_UNAVAILABLE);
+
+        let err = SearchError::ModelLoadFailed {
+            path: PathBuf::from("/models/broken.onnx"),
+            source: Box::new(std::io::Error::other("corrupted")),
+        };
+        assert_eq!(exit_code_for(&err), exit_code::MODEL_UNAVAILABLE);
     }
 
     #[test]

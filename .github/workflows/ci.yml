@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Prepare path dependencies under /dp
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /dp
+          sudo chown -R "$USER":"$(id -gn)" /dp
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin main
+              git -C "${dest_path}" checkout main
+              git -C "${dest_path}" pull --ff-only origin main
+            else
+              git clone --depth 1 "${repo_url}" "${dest_path}"
+            fi
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-${{ matrix.os }}-nightly
+          cache-targets: true
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: E2E contract smoke (fsfs)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+
+  release-build:
+    name: Release build (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: quality
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Prepare path dependencies under /dp
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /dp
+          sudo chown -R "$USER":"$(id -gn)" /dp
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin main
+              git -C "${dest_path}" checkout main
+              git -C "${dest_path}" pull --ff-only origin main
+            else
+              git clone --depth 1 "${repo_url}" "${dest_path}"
+            fi
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "/dp/asupersync"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "/dp/frankensqlite"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "/dp/fast_cmaes"
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.os }}-nightly
+          cache-targets: true
+
+      - name: Build fsfs release binary
+        run: cargo build -p frankensearch-fsfs --release
+
+      - name: Package archive + checksum
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          os_name="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+          arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+          archive_base="fsfs-${TAG_NAME}-${os_name}-${arch_name}"
+          mkdir -p dist
+          cp target/release/fsfs dist/fsfs
+          tar -C dist -cJf "dist/${archive_base}.tar.xz" fsfs
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${archive_base}.tar.xz" > "dist/${archive_base}.tar.xz.sha256"
+          else
+            shasum -a 256 "dist/${archive_base}.tar.xz" > "dist/${archive_base}.tar.xz.sha256"
+          fi
+          rm -f dist/fsfs
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: dist/*
+
+  release-publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.tar.xz*

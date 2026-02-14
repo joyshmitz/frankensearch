@@ -8,8 +8,8 @@
 //! Backpressure: when the queue reaches capacity, [`EmbeddingQueue::submit`]
 //! returns [`SearchError::QueueFull`].
 //!
-//! The [`EmbeddingJobRunner`] drains batches from the queue, embeds them via
-//! an [`Embedder`], and writes vectors to a [`VectorIndexWriter`].
+//! The `EmbeddingJobRunner` drains batches from the queue, embeds them via
+//! an `Embedder`, and writes vectors to a `VectorIndexWriter`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};

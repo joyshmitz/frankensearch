@@ -6,7 +6,7 @@
 //! ensuring no mixed-generation reads within a single request.
 //!
 //! The [`GenerationManifest`] captures everything needed to replicate, verify, and
-//! activate a generation on any node. The [`ManifestValidator`] enforces structural
+//! activate a generation on any node. The `ManifestValidator` enforces structural
 //! and semantic invariants before activation is permitted.
 
 use serde::{Deserialize, Serialize};

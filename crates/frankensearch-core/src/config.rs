@@ -210,6 +210,8 @@ pub struct TwoTierMetrics {
     pub rrf_fusion_ms: f64,
     /// Total time for Phase 1 (Initial results).
     pub phase1_total_ms: f64,
+    /// How many vectors were evaluated during Phase 1.
+    pub phase1_vectors_searched: usize,
 
     // ── Phase 2 (Refined) ───────────────────────────────────────────
     /// Time spent on quality-tier embedding.
@@ -222,6 +224,8 @@ pub struct TwoTierMetrics {
     pub rerank_ms: f64,
     /// Total time for Phase 2 (Refined results).
     pub phase2_total_ms: f64,
+    /// How many vectors were evaluated during Phase 2.
+    pub phase2_vectors_searched: usize,
 
     // ── Ranking quality ─────────────────────────────────────────────
     /// Kendall tau rank correlation between Phase 1 and Phase 2 rankings.
@@ -297,6 +301,8 @@ mod tests {
         assert!(metrics.query_class.is_none());
         assert_eq!(metrics.lexical_candidates, 0);
         assert_eq!(metrics.semantic_candidates, 0);
+        assert_eq!(metrics.phase1_vectors_searched, 0);
+        assert_eq!(metrics.phase2_vectors_searched, 0);
     }
 
     #[test]

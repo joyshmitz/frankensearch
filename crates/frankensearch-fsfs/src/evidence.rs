@@ -2,8 +2,8 @@
 //!
 //! This module defines the canonical evidence events and linkage IDs emitted by
 //! fsfs during discovery, indexing, search, pressure management, and privacy
-//! enforcement. It extends the core [`EvidenceRecord`](frankensearch_core::EvidenceRecord)
-//! and [`ReasonCode`](frankensearch_core::ReasonCode) types with fsfs-specific
+//! enforcement. It extends the core [`EvidenceRecord`]
+//! and [`ReasonCode`] types with fsfs-specific
 //! event families.
 //!
 //! # Trace-Link Model

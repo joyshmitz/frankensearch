@@ -8,7 +8,7 @@
 //! # Contract Rules
 //!
 //! 1. **Schema version lockstep**: Every adapter's `telemetry_schema_version`
-//!    must match [`TELEMETRY_SCHEMA_VERSION`](crate::collectors::TELEMETRY_SCHEMA_VERSION).
+//!    must match [`TELEMETRY_SCHEMA_VERSION`].
 //! 2. **Redaction policy alignment**: Every adapter must declare the same
 //!    `redaction_policy_version` as the harness expects.
 //! 3. **Compatibility window**: Adapters may lag by at most

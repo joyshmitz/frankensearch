@@ -1,10 +1,13 @@
 [package]
 name = "frankensearch-fsfs"
 version = "0.1.0"
-description = "Scaffold crate for frankensearch-fast-search (fsfs) binary surfaces"
+description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["search", "cli", "semantic", "bm25", "hybrid"]
+categories = ["command-line-utilities", "text-processing", "development-tools"]
 
 [lib]
 path = "src/lib.rs"
@@ -15,6 +18,9 @@ path = "src/main.rs"
 
 [dependencies]
 frankensearch-core = { workspace = true }
+frankensearch-embed = { workspace = true, features = ["hash", "model2vec", "download"] }
+frankensearch-index = { workspace = true }
+frankensearch-lexical = { workspace = true }
 frankensearch-tui = { workspace = true }
 asupersync = { workspace = true }
 fsqlite = { path = "/dp/frankensqlite/crates/fsqlite" }
@@ -23,11 +29,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toon-rust = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 dirs = { workspace = true }
 toml = { workspace = true }
 signal-hook = "0.3"
 sysinfo = { workspace = true }
 notify = "7.0"
+ignore = "0.4"
 
 [dev-dependencies]
 asupersync = { workspace = true }

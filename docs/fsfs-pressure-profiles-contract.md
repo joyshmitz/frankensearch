@@ -91,6 +91,33 @@ Profile-resolution diagnostics MUST include:
 - `reason_code`
 - `effective_profile_version`
 
+## Degraded-Mode UX and Override Control Contract
+
+When runtime enters any non-`normal` query mode, the UI layer MUST provide:
+
+- a deterministic banner string describing the active mode impact
+- a transition context classification (`pressure_escalation|pressure_recovery|manual_override_transition|manual_override_hold|state_stable`)
+- a controls hint string listing currently valid override actions
+
+Transition context MUST remain stable for equivalent `(from, to, changed, override_mode)` inputs so operator replay logs remain auditable.
+
+## Override Guardrails and Manual Intervention Visibility
+
+Manual overrides (`override_mode != auto`) MUST be:
+
+- explicitly marked as manual intervention in policy/explanation metadata
+- accompanied by guardrail text for the resulting target mode
+- emitted with reason-coded events that distinguish automatic transitions from operator-driven transitions
+
+At minimum, degradation policy artifacts MUST expose:
+
+- `manual_intervention` (`true|false`)
+- `transition_context`
+- `override_guardrail`
+- `override_mode`
+
+This metadata is mandatory for operator timeline/audit surfaces and post-incident replay.
+
 ## Migration-Safe Evolution Strategy
 
 1. Profile schema version is explicit and required.

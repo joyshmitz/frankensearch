@@ -283,7 +283,7 @@ impl TwoTierSearcher {
             latency: initial_latency,
             metrics: PhaseMetrics {
                 embedder_id: self.fast_embedder.id().to_owned(),
-                vectors_searched: self.index.doc_count(),
+                vectors_searched: metrics.phase1_vectors_searched,
                 lexical_candidates: metrics.lexical_candidates,
                 fused_count: initial_hits.len(),
             },
@@ -369,7 +369,7 @@ impl TwoTierSearcher {
                                     .as_ref()
                                     .map_or("none", |e| e.id())
                                     .to_owned(),
-                                vectors_searched: self.index.doc_count(),
+                                vectors_searched: metrics.phase2_vectors_searched,
                                 lexical_candidates: metrics.lexical_candidates,
                                 fused_count: refined_count,
                             },
@@ -554,6 +554,7 @@ impl TwoTierSearcher {
                 };
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.semantic_candidates = fast_hits.len();
+                metrics.phase1_vectors_searched = self.index.doc_count();
 
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();
@@ -687,6 +688,7 @@ impl TwoTierSearcher {
             .iter()
             .filter_map(|h| self.index.fast_index_for_doc_id(&h.doc_id))
             .collect();
+        metrics.phase2_vectors_searched = fast_indices.len();
 
         let quality_scores = self
             .index
@@ -758,9 +760,9 @@ impl TwoTierSearcher {
 
         // Optional cross-encoder reranking.
         if let Some(ref reranker) = self.reranker {
-            let rerank_start = Instant::now();
             #[cfg(feature = "rerank")]
             {
+                let rerank_start = Instant::now();
                 if let Err(err) = frankensearch_rerank::pipeline::rerank_step(
                     cx,
                     reranker.as_ref(),
@@ -775,13 +777,13 @@ impl TwoTierSearcher {
                     self.export_error(&err);
                     return Err(err);
                 }
+                metrics.rerank_ms = rerank_start.elapsed().as_secs_f64() * 1000.0;
             }
             #[cfg(not(feature = "rerank"))]
             {
                 let _ = (reranker, text_fn);
                 tracing::debug!("reranker configured but `rerank` feature not enabled");
             }
-            metrics.rerank_ms = rerank_start.elapsed().as_secs_f64() * 1000.0;
         }
 
         Ok(results)
@@ -1688,6 +1690,44 @@ mod tests {
             assert_eq!(
                 refined_fused_count, refined_result_len,
                 "refined phase should report fused_count equal to emitted result length"
+            );
+        });
+    }
+
+    #[test]
+    fn initial_phase_metrics_report_fast_index_scope() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4); // 10 docs in fixture index
+            let expected_doc_count = index.doc_count();
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+
+            let mut phase1_vectors = None;
+            let mut phase1_semantic_candidates = None;
+            searcher
+                .search(
+                    &cx,
+                    "test query",
+                    3, // keep k below index size to ensure hit count != scan scope
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { metrics, .. } = phase {
+                            phase1_vectors = Some(metrics.vectors_searched);
+                            phase1_semantic_candidates = Some(metrics.fused_count);
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert_eq!(
+                phase1_vectors,
+                Some(expected_doc_count),
+                "phase-1 vectors_searched should describe fast-tier search scope"
+            );
+            assert!(
+                phase1_semantic_candidates.is_some_and(|count| count <= expected_doc_count),
+                "fused candidates should not exceed index size"
             );
         });
     }

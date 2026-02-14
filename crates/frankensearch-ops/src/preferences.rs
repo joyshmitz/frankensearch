@@ -124,7 +124,7 @@ pub struct DisplayPreferences {
     pub motion: MotionPreference,
     /// Focus indicator visibility.
     pub focus_visibility: FocusVisibility,
-    /// Whether to show shortcut hints inline (e.g., "[j] down [k] up").
+    /// Whether to show shortcut hints inline (e.g., "\[j\] down \[k\] up").
     pub show_shortcut_hints: bool,
 }
 

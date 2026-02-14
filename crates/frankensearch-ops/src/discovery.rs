@@ -70,23 +70,23 @@ impl InstanceSighting {
     pub fn identity_keys(&self) -> Vec<String> {
         let mut keys = Vec::new();
 
-        if let Some(instance_key) = normalized(self.instance_key_hint.as_deref()) {
+        if let Some(instance_key) = normalized_folded(self.instance_key_hint.as_deref()) {
             keys.push(format!("instance:{instance_key}"));
         }
 
-        if let (Some(host), Some(pid)) = (normalized(self.host_name.as_deref()), self.pid) {
+        if let (Some(host), Some(pid)) = (normalized_folded(self.host_name.as_deref()), self.pid) {
             keys.push(format!("hostpid:{host}:{pid}"));
         }
 
-        if let Some(endpoint) = normalized(self.control_endpoint.as_deref()) {
+        if let Some(endpoint) = normalized_endpoint(self.control_endpoint.as_deref()) {
             keys.push(format!("endpoint:{endpoint}"));
         }
 
-        if let Some(socket_path) = normalized(self.socket_path.as_deref()) {
+        if let Some(socket_path) = normalized_exact(self.socket_path.as_deref()) {
             keys.push(format!("socket:{socket_path}"));
         }
 
-        if let Some(heartbeat_path) = normalized(self.heartbeat_path.as_deref()) {
+        if let Some(heartbeat_path) = normalized_exact(self.heartbeat_path.as_deref()) {
             keys.push(format!("heartbeat:{heartbeat_path}"));
         }
 
@@ -303,11 +303,16 @@ impl DiscoveryEngine {
                     instance.sources.sort_unstable();
                 }
 
-                merge_hint(
+                refresh_lowercase_hint(
                     &mut instance.project_key_hint,
                     sighting.project_key_hint.as_deref(),
+                    sighting.observed_at_ms >= previous_last_seen,
                 );
-                merge_hint(&mut instance.host_name, sighting.host_name.as_deref());
+                refresh_lowercase_hint(
+                    &mut instance.host_name,
+                    sighting.host_name.as_deref(),
+                    sighting.observed_at_ms >= previous_last_seen,
+                );
                 refresh_pid_hint(
                     &mut instance.pid,
                     sighting.pid,
@@ -386,8 +391,16 @@ impl DiscoveryEngine {
         into.last_seen_ms = into.last_seen_ms.max(from.last_seen_ms);
         into.status = DiscoveryStatus::Active;
 
-        merge_hint(&mut into.project_key_hint, from.project_key_hint.as_deref());
-        merge_hint(&mut into.host_name, from.host_name.as_deref());
+        refresh_lowercase_hint(
+            &mut into.project_key_hint,
+            from.project_key_hint.as_deref(),
+            from_is_newer_or_equal,
+        );
+        refresh_lowercase_hint(
+            &mut into.host_name,
+            from.host_name.as_deref(),
+            from_is_newer_or_equal,
+        );
         if from_is_newer_or_equal {
             if from.pid.is_some() {
                 into.pid = from.pid;
@@ -422,11 +435,11 @@ impl DiscoveryEngine {
     }
 }
 
-fn merge_hint(current: &mut Option<String>, candidate: Option<&str>) {
-    if current.is_some() {
+fn refresh_lowercase_hint(current: &mut Option<String>, candidate: Option<&str>, prefer: bool) {
+    let Some(candidate) = normalized_folded(candidate) else {
         return;
-    }
-    if let Some(candidate) = normalized(candidate) {
+    };
+    if current.is_none() || prefer {
         *current = Some(candidate);
     }
 }
@@ -451,7 +464,7 @@ fn refresh_version_hint(
     observed_at_ms: u64,
     previous_last_seen: u64,
 ) {
-    let Some(version) = normalized(candidate) else {
+    let Some(version) = normalized_folded(candidate) else {
         return;
     };
     if current.is_none() || observed_at_ms >= previous_last_seen {
@@ -459,7 +472,7 @@ fn refresh_version_hint(
     }
 }
 
-fn normalized(raw: Option<&str>) -> Option<String> {
+fn normalized_folded(raw: Option<&str>) -> Option<String> {
     raw.and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -468,6 +481,71 @@ fn normalized(raw: Option<&str>) -> Option<String> {
             Some(trimmed.to_ascii_lowercase())
         }
     })
+}
+
+fn normalized_exact(raw: Option<&str>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn normalized_endpoint(raw: Option<&str>) -> Option<String> {
+    let raw = normalized_exact(raw)?;
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return Some(raw);
+    };
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    if authority.is_empty() {
+        return Some(format!("{}://{suffix}", scheme.to_ascii_lowercase()));
+    }
+
+    let normalized_authority = normalize_endpoint_authority(authority);
+    Some(format!(
+        "{}://{}{}",
+        scheme.to_ascii_lowercase(),
+        normalized_authority,
+        suffix
+    ))
+}
+
+fn normalize_endpoint_authority(authority: &str) -> String {
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .map_or(("", authority), |(userinfo, host_port)| {
+            (userinfo, host_port)
+        });
+    let normalized_host_port = normalize_host_port(host_port);
+    if userinfo.is_empty() {
+        normalized_host_port
+    } else {
+        format!("{userinfo}@{normalized_host_port}")
+    }
+}
+
+fn normalize_host_port(host_port: &str) -> String {
+    if let Some(rest) = host_port.strip_prefix('[')
+        && let Some(closing) = rest.find(']')
+    {
+        let host = rest[..closing].to_ascii_lowercase();
+        let suffix = &rest[closing + 1..];
+        return format!("[{host}]{suffix}");
+    }
+
+    if let Some((host, port)) = host_port.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return format!("{}:{port}", host.to_ascii_lowercase());
+    }
+
+    host_port.to_ascii_lowercase()
 }
 
 fn stable_instance_id(seed: &str) -> String {
@@ -759,5 +837,146 @@ mod tests {
         assert_eq!(keys_a, keys_b);
         assert_eq!(keys_a.len(), 1);
         assert!(keys_a[0].starts_with("fallback:"));
+    }
+
+    #[test]
+    fn identity_keys_preserve_case_for_path_hints() {
+        let upper = InstanceSighting {
+            source: DiscoverySignalKind::Socket,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            instance_key_hint: None,
+            control_endpoint: None,
+            socket_path: Some("/tmp/Agent.sock".to_owned()),
+            heartbeat_path: Some("/tmp/Heartbeat.pid".to_owned()),
+            version: None,
+        };
+        let lower = InstanceSighting {
+            socket_path: Some("/tmp/agent.sock".to_owned()),
+            heartbeat_path: Some("/tmp/heartbeat.pid".to_owned()),
+            ..upper.clone()
+        };
+
+        let upper_keys = upper.identity_keys();
+        let lower_keys = lower.identity_keys();
+
+        assert!(upper_keys.contains(&"socket:/tmp/Agent.sock".to_owned()));
+        assert!(upper_keys.contains(&"heartbeat:/tmp/Heartbeat.pid".to_owned()));
+        assert!(lower_keys.contains(&"socket:/tmp/agent.sock".to_owned()));
+        assert!(lower_keys.contains(&"heartbeat:/tmp/heartbeat.pid".to_owned()));
+    }
+
+    #[test]
+    fn identity_keys_fold_control_endpoint_scheme_and_host_case() {
+        let upper = InstanceSighting {
+            source: DiscoverySignalKind::ControlEndpoint,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            instance_key_hint: None,
+            control_endpoint: Some("HTTP://LOCALHOST:9000/control".to_owned()),
+            socket_path: None,
+            heartbeat_path: None,
+            version: None,
+        };
+        let lower = InstanceSighting {
+            control_endpoint: Some("http://localhost:9000/control".to_owned()),
+            ..upper.clone()
+        };
+
+        assert_eq!(upper.identity_keys(), lower.identity_keys());
+    }
+
+    #[test]
+    fn identity_keys_preserve_control_endpoint_path_case() {
+        let upper = InstanceSighting {
+            source: DiscoverySignalKind::ControlEndpoint,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            instance_key_hint: None,
+            control_endpoint: Some("http://localhost:9000/Control".to_owned()),
+            socket_path: None,
+            heartbeat_path: None,
+            version: None,
+        };
+        let lower = InstanceSighting {
+            control_endpoint: Some("http://localhost:9000/control".to_owned()),
+            ..upper.clone()
+        };
+
+        let upper_keys = upper.identity_keys();
+        let lower_keys = lower.identity_keys();
+        assert!(upper_keys.contains(&"endpoint:http://localhost:9000/Control".to_owned()));
+        assert!(lower_keys.contains(&"endpoint:http://localhost:9000/control".to_owned()));
+        assert_ne!(upper_keys, lower_keys);
+    }
+
+    #[test]
+    fn newer_sighting_refreshes_project_and_host_hints() {
+        let mut source = StaticDiscoverySource::new(vec![
+            InstanceSighting {
+                source: DiscoverySignalKind::Process,
+                observed_at_ms: 10,
+                project_key_hint: Some("Legacy-Project".to_owned()),
+                host_name: Some("Legacy-Host".to_owned()),
+                pid: None,
+                instance_key_hint: Some("shared-instance".to_owned()),
+                control_endpoint: None,
+                socket_path: None,
+                heartbeat_path: None,
+                version: None,
+            },
+            InstanceSighting {
+                source: DiscoverySignalKind::ControlEndpoint,
+                observed_at_ms: 20,
+                project_key_hint: Some("Fresh-Project".to_owned()),
+                host_name: Some("Fresh-Host".to_owned()),
+                pid: None,
+                instance_key_hint: Some("shared-instance".to_owned()),
+                control_endpoint: Some("http://localhost:9000/control".to_owned()),
+                socket_path: None,
+                heartbeat_path: None,
+                version: None,
+            },
+        ]);
+
+        let mut engine = DiscoveryEngine::new(DiscoveryConfig::default());
+        let _ = engine.poll(25, &mut [&mut source]);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].project_key_hint.as_deref(),
+            Some("fresh-project")
+        );
+        assert_eq!(snapshot[0].host_name.as_deref(), Some("fresh-host"));
+    }
+
+    #[test]
+    fn zero_observed_timestamp_uses_poll_time_and_prunes_at_normalized_threshold() {
+        let config = DiscoveryConfig {
+            stale_after_ms: 50,
+            prune_after_ms: 10,
+        };
+        let mut engine = DiscoveryEngine::new(config);
+        let mut source = StaticDiscoverySource::new(vec![process_sighting(0, "cass", "host-a", 7)]);
+
+        let first = engine.poll(100, &mut [&mut source]);
+        assert_eq!(first.pruned_instances, 0);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].first_seen_ms, 100);
+        assert_eq!(snapshot[0].last_seen_ms, 100);
+        assert_eq!(snapshot[0].status, DiscoveryStatus::Active);
+
+        let mut empty = StaticDiscoverySource::new(Vec::new());
+        let prune = engine.poll(150, &mut [&mut empty]);
+        assert_eq!(prune.pruned_instances, 1);
+        assert_eq!(prune.stale_instances, 0);
+        assert!(engine.snapshot().is_empty());
     }
 }

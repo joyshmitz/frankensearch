@@ -2,7 +2,7 @@
 //!
 //! When multiple concurrent callers request embeddings (e.g., during index
 //! building or concurrent searches), [`BatchCoalescer`] groups their requests
-//! into optimal batches for [`Embedder::embed_batch()`]. This amortises the
+//! into optimal batches for `Embedder::embed_batch()`. This amortises the
 //! high fixed overhead of ONNX model inference across many inputs.
 //!
 //! # Scheduling algorithm

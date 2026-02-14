@@ -21,6 +21,7 @@ use fastembed::{
 };
 use tracing::instrument;
 
+use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize};
 
@@ -318,10 +319,10 @@ impl Embedder for FastEmbedEmbedder {
 ///
 /// Checks these paths in order:
 /// 1. `$FRANKENSEARCH_MODEL_DIR/<model_name>/` then `$FRANKENSEARCH_MODEL_DIR`
-/// 2. `~/.cache/frankensearch/models/<model_name>/`
-/// 3. `~/.local/share/frankensearch/models/<model_name>/`
-/// 4. `~/.cache/fastembed/<model_name>/`
-/// 5. `~/.cache/huggingface/hub/models--<hf_id>/snapshots/*/`
+/// 2. `$XDG_DATA_HOME/frankensearch/models/<model_name>/`
+/// 3. `~/.local/share/frankensearch/models/<model_name>/` (or macOS
+///    `~/Library/Application Support/frankensearch/models/<model_name>/`)
+/// 4. `~/.cache/huggingface/hub/models--<hf_id>/snapshots/*/`
 ///
 /// Returns `None` if no directory with required files is found.
 #[must_use]
@@ -336,16 +337,15 @@ pub fn find_model_dir_with_hf_id(model_name: &str, hf_id: &str) -> Option<PathBu
 
     if let Ok(dir) = std::env::var("FRANKENSEARCH_MODEL_DIR") {
         let base = PathBuf::from(dir);
-        candidates.push(base.join(model_name));
+        for variant in model_directory_variants(model_name) {
+            candidates.push(base.join(variant));
+        }
         candidates.push(base);
     }
 
-    if let Some(cache_dir) = dirs::cache_dir() {
-        candidates.push(cache_dir.join("frankensearch/models").join(model_name));
-        candidates.push(cache_dir.join("fastembed").join(model_name));
-    }
-    if let Some(data_dir) = dirs::data_local_dir() {
-        candidates.push(data_dir.join("frankensearch/models").join(model_name));
+    let model_root = ensure_model_storage_layout();
+    for variant in model_directory_variants(model_name) {
+        candidates.push(model_root.join(variant));
     }
 
     if let Some(cache_dir) = dirs::cache_dir() {

@@ -33,6 +33,7 @@ pub mod overlays;
 pub mod preferences;
 pub mod presets;
 pub mod screens;
+pub mod simulator;
 pub mod state;
 pub mod storage;
 
@@ -48,6 +49,10 @@ pub use discovery::{
 pub use overlays::{render_overlay, render_palette_overlay};
 pub use preferences::{ContrastMode, DisplayPreferences, FocusVisibility, MotionPreference};
 pub use presets::{Density, ViewPreset, ViewState};
+pub use simulator::{
+    E2eSimulationReport, PerfSimulationReport, SimulatedProject, SimulatedSearchEvent,
+    SimulationBatch, SimulationRun, TelemetrySimulator, TelemetrySimulatorConfig, WorkloadProfile,
+};
 pub use state::{
     AppState, ControlPlaneHealth, ControlPlaneMetrics, InstanceAttribution, InstanceLifecycle,
     LifecycleEvent, LifecycleSignal, LifecycleTrackerConfig, LifecycleTransition,

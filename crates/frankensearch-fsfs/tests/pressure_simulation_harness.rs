@@ -35,24 +35,24 @@ struct PressureEvent {
 /// Raw pressure signal values for scenario definition.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct PressureSignalInput {
-    cpu_pct: f64,
-    memory_pct: f64,
-    io_pct: f64,
-    load_pct: f64,
+    cpu: f64,
+    memory: f64,
+    io: f64,
+    load: f64,
 }
 
 impl PressureSignalInput {
-    const fn new(cpu_pct: f64, memory_pct: f64, io_pct: f64, load_pct: f64) -> Self {
+    const fn new(cpu: f64, memory: f64, io: f64, load: f64) -> Self {
         Self {
-            cpu_pct,
-            memory_pct,
-            io_pct,
-            load_pct,
+            cpu,
+            memory,
+            io,
+            load,
         }
     }
 
     fn to_signal(self) -> PressureSignal {
-        PressureSignal::new(self.cpu_pct, self.memory_pct, self.io_pct, self.load_pct)
+        PressureSignal::new(self.cpu, self.memory, self.io, self.load)
     }
 }
 
@@ -150,12 +150,13 @@ struct OracleResult {
 fn scenario_gradual_ramp_up() -> SimulationScenario {
     let mut events = Vec::new();
     // Start normal, gradually increase CPU pressure over 30 ticks
+    let mut cpu = 40.0;
     for i in 0_u64..30 {
-        let cpu = 40.0 + (i as f64) * 2.0; // 40 → 98
         events.push(PressureEvent {
             timestamp_ms: i * 1000,
             signal: PressureSignalInput::new(cpu, 30.0, 20.0, 35.0),
         });
+        cpu += 2.0; // 40 → 98
     }
     // Hold at 98% for 10 more ticks so EWMA (alpha=0.3) catches up past
     // the Emergency threshold (95% on Performance profile).
@@ -423,12 +424,13 @@ fn scenario_quality_circuit_breaker() -> SimulationScenario {
 fn scenario_multi_profile_comparison() -> SimulationScenario {
     let mut events = Vec::new();
     // Slowly ramp from 50 to 99 to test all profile thresholds
+    let mut cpu = 50.0;
     for i in 0_u64..50 {
-        let cpu = 50.0 + (i as f64);
         events.push(PressureEvent {
             timestamp_ms: i * 1000,
             signal: PressureSignalInput::new(cpu, 30.0, 20.0, 30.0),
         });
+        cpu += 1.0;
     }
     SimulationScenario {
         name: "multi_profile_ramp".to_owned(),
@@ -907,7 +909,7 @@ fn oracle_stable_has_no_state_change(records: &[DegradationRecord]) -> OracleRes
     }
 }
 
-fn stage_severity(stage: DegradationStage) -> u8 {
+const fn stage_severity(stage: DegradationStage) -> u8 {
     match stage {
         DegradationStage::Full => 0,
         DegradationStage::EmbedDeferred => 1,
@@ -922,21 +924,21 @@ fn stage_severity(stage: DegradationStage) -> u8 {
 /// Core simulation runner: produces traces WITHOUT oracle checks.
 /// Used by `oracle_determinism` to avoid infinite recursion.
 fn run_simulation_core(scenario: &SimulationScenario) -> SimulationTrace {
-    let pressure_trace = if !scenario.pressure_events.is_empty() {
-        run_pressure_simulation(scenario.pressure_config, &scenario.pressure_events)
-    } else {
+    let pressure_trace = if scenario.pressure_events.is_empty() {
         Vec::new()
+    } else {
+        run_pressure_simulation(scenario.pressure_config, &scenario.pressure_events)
     };
 
-    let (calibration_trace, cal_deg_trace) = if !scenario.calibration_events.is_empty() {
+    let (calibration_trace, cal_deg_trace) = if scenario.calibration_events.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
         run_calibration_simulation(
             scenario.calibration_config,
             scenario.degradation_config,
             &scenario.calibration_events,
             &scenario.degradation_events,
         )
-    } else {
-        (Vec::new(), Vec::new())
     };
 
     let degradation_trace =
@@ -1174,7 +1176,7 @@ fn scenario_hard_pause_blocks_recovery_until_cleared() {
     );
 
     // Verify stepwise: Paused → MetadataOnly → LexicalOnly → EmbedDeferred → Full
-    let expected_recovery = vec![
+    let expected_recovery = [
         (DegradationStage::Paused, DegradationStage::MetadataOnly),
         (
             DegradationStage::MetadataOnly,
@@ -1222,21 +1224,19 @@ fn scenario_calibration_triggers_and_recovers() {
     assert_eq!(healthy_count, 5, "First 5 evaluations should be Healthy");
 
     // Phase 2: Should have breach(es) and eventually a fallback
-    let breaches: Vec<_> = trace
+    let has_breach = trace
         .calibration_trace
         .iter()
-        .filter(|r| r.status == CalibrationGuardStatus::Breach)
-        .collect();
-    assert!(!breaches.is_empty(), "Coverage drop should trigger breach");
+        .any(|record| record.status == CalibrationGuardStatus::Breach);
+    assert!(has_breach, "Coverage drop should trigger breach");
 
     // The fallback should force a degradation transition
-    let cal_fallbacks: Vec<_> = trace
+    let has_cal_fallback = trace
         .degradation_trace
         .iter()
-        .filter(|r| r.trigger == DegradationTrigger::CalibrationBreach)
-        .collect();
+        .any(|record| record.trigger == DegradationTrigger::CalibrationBreach);
     assert!(
-        !cal_fallbacks.is_empty(),
+        has_cal_fallback,
         "Calibration breach should trigger degradation fallback"
     );
 
@@ -1291,7 +1291,7 @@ fn scenario_strict_profile_triggers_earlier_than_performance() {
     let strict_trace = run_full_simulation(&strict_scenario);
 
     // Build a Performance profile scenario with the same events
-    let mut perf_scenario = strict_scenario.clone();
+    let mut perf_scenario = strict_scenario;
     perf_scenario.pressure_config.profile = PressureProfile::Performance;
     perf_scenario.name = "multi_profile_ramp_performance".to_owned();
     let perf_trace = run_full_simulation(&perf_scenario);
@@ -1350,14 +1350,13 @@ fn scenario_watch_state_protects_against_premature_breach() {
     }
 
     // After sample threshold is crossed, breaches should appear
-    let post_threshold_breaches: Vec<_> = trace
+    let has_post_threshold_breach = trace
         .calibration_trace
         .iter()
         .skip(5)
-        .filter(|r| r.status == CalibrationGuardStatus::Breach)
-        .collect();
+        .any(|record| record.status == CalibrationGuardStatus::Breach);
     assert!(
-        !post_threshold_breaches.is_empty(),
+        has_post_threshold_breach,
         "Bad metrics above sample threshold should produce breaches"
     );
 

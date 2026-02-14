@@ -19,6 +19,14 @@ const MODEL_SAFETENSORS: &str = "model.safetensors";
 const CONFIG_JSON: &str = "config.json";
 const SPECIAL_TOKENS_JSON: &str = "special_tokens_map.json";
 const TOKENIZER_CONFIG_JSON: &str = "tokenizer_config.json";
+const FRANKENSEARCH_MODEL_DIR_ENV: &str = "FRANKENSEARCH_MODEL_DIR";
+const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
+const KNOWN_MODEL_LAYOUT_DIRS: [&str; 4] = [
+    "potion-base-128M",
+    "potion-multilingual-128M",
+    "all-MiniLM-L6-v2",
+    "ms-marco-MiniLM-L-6-v2",
+];
 
 /// Static embedder metadata entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,16 +292,58 @@ impl EmbedderRegistry {
 }
 
 fn default_registry_data_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("FRANKENSEARCH_MODEL_DIR") {
+    ensure_model_storage_layout()
+}
+
+pub(crate) fn model_storage_root() -> PathBuf {
+    if let Some(path) = std::env::var_os(FRANKENSEARCH_MODEL_DIR_ENV) {
         return PathBuf::from(path);
     }
-    if let Some(path) = dirs::cache_dir() {
-        return path.join("frankensearch/models");
+    if let Some(path) = std::env::var_os(XDG_DATA_HOME_ENV) {
+        return PathBuf::from(path).join("frankensearch").join("models");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(path) = dirs::data_local_dir() {
+            return path.join("frankensearch").join("models");
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home
+            .join(".local")
+            .join("share")
+            .join("frankensearch")
+            .join("models");
     }
     if let Some(path) = dirs::data_local_dir() {
-        return path.join("frankensearch/models");
+        return path.join("frankensearch").join("models");
     }
     PathBuf::from("models")
+}
+
+pub(crate) fn ensure_model_storage_layout() -> PathBuf {
+    let root = model_storage_root();
+    let _ = ensure_model_layout_dirs(&root);
+    root
+}
+
+fn ensure_model_layout_dirs(root: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(root)?;
+    for model_dir in KNOWN_MODEL_LAYOUT_DIRS {
+        fs::create_dir_all(root.join(model_dir))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn model_directory_variants(model_name: &str) -> Vec<String> {
+    let mut variants = vec![model_name.to_owned()];
+    if matches!(model_name, "potion-base-128M" | "potion-multilingual-128M") {
+        variants.push("potion-base-128M".to_owned());
+        variants.push("potion-multilingual-128M".to_owned());
+    }
+    variants.sort();
+    variants.dedup();
+    variants
 }
 
 fn embedder_preference_rank(id: &str) -> u8 {
@@ -391,13 +441,9 @@ fn model_candidates(data_dir: &Path, model_dir: &str, huggingface_id: &str) -> V
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     push_candidate(&mut out, &mut seen, data_dir.to_path_buf());
-    push_candidate(&mut out, &mut seen, data_dir.join(model_dir));
-    push_candidate(&mut out, &mut seen, data_dir.join("models").join(model_dir));
-    push_candidate(
-        &mut out,
-        &mut seen,
-        data_dir.join("frankensearch/models").join(model_dir),
-    );
+    for variant in model_directory_variants(model_dir) {
+        push_candidate(&mut out, &mut seen, data_dir.join(&variant));
+    }
 
     if huggingface_id != NO_HUGGINGFACE_ID {
         let hub_root = data_dir
@@ -491,19 +537,26 @@ mod tests {
             "sentence-transformers/all-MiniLM-L6-v2",
         );
 
-        assert!(candidates.len() >= 4);
+        assert!(candidates.len() >= 2);
         assert_eq!(candidates[0], temp.path().to_path_buf());
         assert_eq!(candidates[1], temp.path().join("all-MiniLM-L6-v2"));
-        assert_eq!(
-            candidates[2],
-            temp.path().join("models").join("all-MiniLM-L6-v2")
-        );
-        assert_eq!(
-            candidates[3],
-            temp.path()
-                .join("frankensearch/models")
-                .join("all-MiniLM-L6-v2")
-        );
+    }
+
+    #[test]
+    fn model_directory_variants_include_potion_aliases() {
+        let variants = model_directory_variants("potion-multilingual-128M");
+        assert!(variants.contains(&"potion-base-128M".to_owned()));
+        assert!(variants.contains(&"potion-multilingual-128M".to_owned()));
+    }
+
+    #[test]
+    fn ensure_model_layout_dirs_creates_known_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        ensure_model_layout_dirs(temp.path()).expect("create layout");
+
+        for expected in KNOWN_MODEL_LAYOUT_DIRS {
+            assert!(temp.path().join(expected).is_dir(), "missing {expected}");
+        }
     }
 
     #[test]

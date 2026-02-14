@@ -109,9 +109,10 @@ impl ActionTimelineScreen {
 
     /// Update timeline data from shared app state.
     pub fn update_state(&mut self, state: &AppState) {
+        let focused = self.selected_event_key();
         self.state = state.clone();
         self.clamp_filter_indices();
-        self.clamp_selected_row();
+        self.restore_selected_event(focused);
     }
 
     fn all_events(&self) -> Vec<LifecycleEvent> {
@@ -251,50 +252,79 @@ impl ActionTimelineScreen {
         }
     }
 
-    fn clamp_selected_row(&mut self) {
-        let count = self.filtered_events().len();
-        if count == 0 {
+    fn selected_event_key(&self) -> Option<(u64, String, String)> {
+        self.filtered_events().get(self.selected_row).map(|event| {
+            (
+                event.at_ms,
+                event.instance_id.clone(),
+                event.reason_code.clone(),
+            )
+        })
+    }
+
+    fn restore_selected_event(&mut self, key: Option<(u64, String, String)>) {
+        let events = self.filtered_events();
+        if events.is_empty() {
             self.selected_row = 0;
-        } else if self.selected_row >= count {
-            self.selected_row = count.saturating_sub(1);
+            return;
+        }
+
+        if let Some((at_ms, instance_id, reason_code)) = key
+            && let Some(index) = events.iter().position(|event| {
+                event.at_ms == at_ms
+                    && event.instance_id == instance_id
+                    && event.reason_code == reason_code
+            })
+        {
+            self.selected_row = index;
+            return;
+        }
+
+        if self.selected_row >= events.len() {
+            self.selected_row = events.len().saturating_sub(1);
         }
     }
 
     fn cycle_project_filter(&mut self) {
+        let focused = self.selected_event_key();
         let len = self.project_filters().len();
         if len > 0 {
             self.project_filter_index = (self.project_filter_index + 1) % len;
         }
-        self.clamp_selected_row();
+        self.restore_selected_event(focused);
     }
 
     fn cycle_reason_filter(&mut self) {
+        let focused = self.selected_event_key();
         let len = self.reason_filters().len();
         if len > 0 {
             self.reason_filter_index = (self.reason_filter_index + 1) % len;
         }
-        self.clamp_selected_row();
+        self.restore_selected_event(focused);
     }
 
     fn cycle_host_filter(&mut self) {
+        let focused = self.selected_event_key();
         let len = self.host_filters().len();
         if len > 0 {
             self.host_filter_index = (self.host_filter_index + 1) % len;
         }
-        self.clamp_selected_row();
+        self.restore_selected_event(focused);
     }
 
     fn cycle_severity_filter(&mut self) {
+        let focused = self.selected_event_key();
         self.severity_filter = self.severity_filter.next();
-        self.clamp_selected_row();
+        self.restore_selected_event(focused);
     }
 
     fn reset_filters(&mut self) {
+        let focused = self.selected_event_key();
         self.project_filter_index = 0;
         self.reason_filter_index = 0;
         self.host_filter_index = 0;
         self.severity_filter = SeverityFilter::All;
-        self.clamp_selected_row();
+        self.restore_selected_event(focused);
     }
 
     fn build_rows(&self) -> Vec<Row<'static>> {
@@ -391,6 +421,49 @@ impl ActionTimelineScreen {
     fn event_count(&self) -> usize {
         self.filtered_events().len()
     }
+
+    fn stream_health_summary(&self) -> String {
+        let metrics = self.state.control_plane_metrics();
+        let health = self.state.control_plane_health();
+        let reconnect_state = match (self.state.has_data(), health) {
+            (false, _) => "reconnecting",
+            (true, crate::state::ControlPlaneHealth::Critical) => "backoff",
+            (true, crate::state::ControlPlaneHealth::Degraded) => "degraded",
+            (true, crate::state::ControlPlaneHealth::Healthy) => "steady",
+        };
+        format!(
+            "stream: health={health} reconnect={reconnect_state} lag={} drops={} throughput={:.2} eps",
+            metrics.ingestion_lag_events, metrics.dead_letter_events, metrics.event_throughput_eps
+        )
+    }
+
+    fn selected_context_summary(&self) -> String {
+        if let Some(event) = self.filtered_events().get(self.selected_row) {
+            let severity = Self::event_severity(event);
+            let project = self
+                .project_for_instance(&event.instance_id)
+                .unwrap_or("unknown")
+                .to_owned();
+            let host = Self::host_bucket(&event.instance_id);
+            return format!(
+                "focus: ts={} project={} host={} instance={} severity={} reason={}",
+                event.at_ms,
+                project,
+                host,
+                event.instance_id,
+                severity.label(),
+                event.reason_code
+            );
+        }
+        "focus: none".to_owned()
+    }
+
+    #[cfg(test)]
+    fn selected_instance_id(&self) -> Option<String> {
+        self.filtered_events()
+            .get(self.selected_row)
+            .map(|event| event.instance_id.clone())
+    }
 }
 
 impl Default for ActionTimelineScreen {
@@ -413,7 +486,7 @@ impl Screen for ActionTimelineScreen {
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(5)])
+            .constraints([Constraint::Length(7), Constraint::Min(5)])
             .split(area);
 
         let header = Paragraph::new(vec![
@@ -422,7 +495,9 @@ impl Screen for ActionTimelineScreen {
                 Span::raw(Self::timeline_summary(&events)),
             ]),
             Line::from(Self::rolling_counter_summary(&events)),
+            Line::from(self.stream_health_summary()),
             Line::from(self.filter_summary()),
+            Line::from(self.selected_context_summary()),
         ])
         .block(
             Block::default()
@@ -696,5 +771,35 @@ mod tests {
         assert!(summary.contains("1m=2"));
         assert!(summary.contains("15m=3"));
         assert!(summary.contains("1w=3"));
+    }
+
+    #[test]
+    fn timeline_filter_cycles_preserve_selected_context_when_possible() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        screen.selected_row = 2;
+        assert_eq!(
+            screen.selected_instance_id().as_deref(),
+            Some("host-a:inst-c")
+        );
+
+        screen.cycle_project_filter(); // all -> proj-a (selected event still visible)
+        assert_eq!(
+            screen.selected_instance_id().as_deref(),
+            Some("host-a:inst-c")
+        );
+    }
+
+    #[test]
+    fn timeline_context_summary_reports_selected_event_and_stream_health() {
+        let mut screen = ActionTimelineScreen::new();
+        screen.update_state(&sample_state());
+        let focus = screen.selected_context_summary();
+        let stream = screen.stream_health_summary();
+
+        assert!(focus.contains("focus: ts="));
+        assert!(focus.contains("reason="));
+        assert!(stream.contains("stream: health="));
+        assert!(stream.contains("lag="));
     }
 }

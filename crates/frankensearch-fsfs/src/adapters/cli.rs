@@ -15,6 +15,11 @@ pub mod exit_code {
     pub const RUNTIME_ERROR: i32 = 1;
     /// Usage error (invalid args, unknown command).
     pub const USAGE_ERROR: i32 = 2;
+    /// Required model unavailable (no models cached and download blocked/failed).
+    ///
+    /// Uses sysexits.h `EX_CONFIG` (78) to indicate a configuration/resource issue
+    /// that the user can resolve by downloading models or setting `FRANKENSEARCH_MODEL_DIR`.
+    pub const MODEL_UNAVAILABLE: i32 = 78;
     /// Interrupted by signal (SIGINT).
     pub const INTERRUPTED: i32 = 130;
 }
@@ -64,6 +69,40 @@ impl std::fmt::Display for OutputFormat {
     }
 }
 
+/// Supported shell targets for completion script generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    PowerShell,
+}
+
+impl FromStr for CompletionShell {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "bash" => Ok(Self::Bash),
+            "zsh" => Ok(Self::Zsh),
+            "fish" => Ok(Self::Fish),
+            "powershell" | "pwsh" => Ok(Self::PowerShell),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for CompletionShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bash => write!(f, "bash"),
+            Self::Zsh => write!(f, "zsh"),
+            Self::Fish => write!(f, "fish"),
+            Self::PowerShell => write!(f, "powershell"),
+        }
+    }
+}
+
 // ─── CLI Command ─────────────────────────────────────────────────────────────
 
 /// Top-level fsfs command entrypoints.
@@ -73,6 +112,8 @@ pub enum CliCommand {
     Search,
     /// Index/re-index corpus.
     Index,
+    /// Watch mode alias (`index --watch`).
+    Watch,
     /// Show index health and status.
     #[default]
     Status,
@@ -84,6 +125,14 @@ pub enum CliCommand {
     Download,
     /// Run self-diagnostics.
     Doctor,
+    /// Self-update the fsfs binary.
+    Update,
+    /// Generate shell completion scripts.
+    Completions,
+    /// Remove local fsfs installation artifacts.
+    Uninstall,
+    /// Show command usage and examples.
+    Help,
     /// Launch the deluxe TUI interface.
     Tui,
     /// Show version and build info.
@@ -93,7 +142,20 @@ pub enum CliCommand {
 impl CliCommand {
     /// All valid command names for help text.
     pub const ALL_NAMES: &'static [&'static str] = &[
-        "search", "index", "status", "explain", "config", "download", "doctor", "tui", "version",
+        "search",
+        "index",
+        "watch",
+        "status",
+        "explain",
+        "config",
+        "download",
+        "doctor",
+        "update",
+        "completions",
+        "uninstall",
+        "help",
+        "tui",
+        "version",
     ];
 }
 
@@ -108,6 +170,7 @@ pub enum CommandSource {
 }
 
 /// Parsed CLI input including command and high-priority overrides.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliInput {
     /// The selected command.
@@ -120,6 +183,12 @@ pub struct CliInput {
     pub format: OutputFormat,
     /// Search query text (for search command).
     pub query: Option<String>,
+    /// Optional target path for index/watch.
+    pub target_path: Option<PathBuf>,
+    /// Optional explicit index directory override for index/status commands.
+    pub index_dir: Option<PathBuf>,
+    /// Explain result identifier.
+    pub result_id: Option<String>,
     /// Filter expression (for search command).
     pub filter: Option<String>,
     /// Whether `--stream` was requested.
@@ -132,6 +201,16 @@ pub struct CliInput {
     pub model_name: Option<String>,
     /// Config subcommand (get/set/list/reset).
     pub config_action: Option<ConfigAction>,
+    /// Shell target for completions command.
+    pub completion_shell: Option<CompletionShell>,
+    /// Whether update should only check for availability.
+    pub update_check_only: bool,
+    /// Verbose diagnostics requested.
+    pub verbose: bool,
+    /// Quiet output requested.
+    pub quiet: bool,
+    /// Disable ANSI colors in terminal output.
+    pub no_color: bool,
 }
 
 /// Config subcommand actions.
@@ -190,6 +269,10 @@ where
         ..CliInput::default()
     };
 
+    if command == CliCommand::Help {
+        return Ok(input);
+    }
+
     // For search command, capture an explicit query token before flags.
     if command == CliCommand::Search && idx < tokens.len() {
         if tokens[idx] == "--" {
@@ -208,9 +291,34 @@ where
         }
     }
 
+    if matches!(command, CliCommand::Index | CliCommand::Watch)
+        && idx < tokens.len()
+        && !tokens[idx].starts_with('-')
+    {
+        input.target_path = Some(PathBuf::from(tokens[idx].clone()));
+        idx += 1;
+    }
+
+    if command == CliCommand::Explain && idx < tokens.len() && !tokens[idx].starts_with('-') {
+        input.result_id = Some(tokens[idx].clone());
+        idx += 1;
+    }
+
     // For download command, the next non-flag token is the model name.
     if command == CliCommand::Download && idx < tokens.len() && !tokens[idx].starts_with('-') {
         input.model_name = Some(tokens[idx].clone());
+        idx += 1;
+    }
+
+    if command == CliCommand::Completions && idx < tokens.len() && !tokens[idx].starts_with('-') {
+        let shell = CompletionShell::from_str(tokens[idx].as_str()).map_err(|()| {
+            SearchError::InvalidConfig {
+                field: "cli.completions.shell".into(),
+                value: tokens[idx].clone(),
+                reason: "expected bash|zsh|fish|powershell".into(),
+            }
+        })?;
+        input.completion_shell = Some(shell);
         idx += 1;
     }
 
@@ -220,9 +328,19 @@ where
         input.config_action = Some(action);
     }
 
+    if command == CliCommand::Watch {
+        input.watch = true;
+        input.overrides.allow_background_indexing = Some(true);
+    }
+
     while idx < tokens.len() {
         let flag = tokens[idx].as_str();
         match flag {
+            "--help" | "-h" => {
+                input.command = CliCommand::Help;
+                input.command_source = CommandSource::Explicit;
+                return Ok(input);
+            }
             "--roots" => {
                 let value = expect_value(&tokens, idx, "--roots")?;
                 input.overrides.roots = Some(split_csv(value)?);
@@ -276,8 +394,31 @@ where
                 input.watch = true;
                 idx += 1;
             }
-            "--full" => {
+            "--force" | "--full" => {
                 input.full_reindex = true;
+                idx += 1;
+            }
+            "--check" => {
+                if command != CliCommand::Update {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--check".into(),
+                        reason: "--check is only valid for the update command".into(),
+                    });
+                }
+                input.update_check_only = true;
+                idx += 1;
+            }
+            "--verbose" | "-v" => {
+                input.verbose = true;
+                idx += 1;
+            }
+            "--quiet" | "-q" => {
+                input.quiet = true;
+                idx += 1;
+            }
+            "--no-color" => {
+                input.no_color = true;
                 idx += 1;
             }
             "--filter" => {
@@ -313,6 +454,11 @@ where
                 input.overrides.config_path = Some(PathBuf::from(value));
                 idx += 2;
             }
+            "--index-dir" => {
+                let value = expect_value(&tokens, idx, "--index-dir")?;
+                input.index_dir = Some(PathBuf::from(value));
+                idx += 2;
+            }
             _ => {
                 return Err(SearchError::InvalidConfig {
                     field: "cli.flag".into(),
@@ -327,8 +473,34 @@ where
     }
 
     normalize_stream_settings(&mut input)?;
+    validate_required_args(&input)?;
 
     Ok(input)
+}
+
+fn validate_required_args(input: &CliInput) -> SearchResult<()> {
+    if input.command == CliCommand::Search && input.query.is_none() {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.search_query".into(),
+            value: String::new(),
+            reason: "missing search query argument".into(),
+        });
+    }
+    if input.command == CliCommand::Explain && input.result_id.is_none() {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.explain.result_id".into(),
+            value: String::new(),
+            reason: "missing result identifier argument".into(),
+        });
+    }
+    if input.command == CliCommand::Completions && input.completion_shell.is_none() {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.completions.shell".into(),
+            value: String::new(),
+            reason: "missing shell argument (bash|zsh|fish|powershell)".into(),
+        });
+    }
+    Ok(())
 }
 
 fn normalize_stream_settings(input: &mut CliInput) -> SearchResult<()> {
@@ -361,10 +533,13 @@ fn normalize_stream_settings(input: &mut CliInput) -> SearchResult<()> {
 }
 
 fn extract_command(tokens: &[String]) -> SearchResult<(CliCommand, usize, CommandSource)> {
-    if let Some(token) = tokens.first()
-        && !token.starts_with('-')
-    {
-        return Ok((parse_command(token)?, 1, CommandSource::Explicit));
+    if let Some(token) = tokens.first() {
+        if is_help_flag(token) {
+            return Ok((CliCommand::Help, 1, CommandSource::Explicit));
+        }
+        if !token.starts_with('-') {
+            return Ok((parse_command(token)?, 1, CommandSource::Explicit));
+        }
     }
     Ok((CliCommand::default(), 0, CommandSource::ImplicitDefault))
 }
@@ -373,11 +548,16 @@ fn parse_command(token: &str) -> SearchResult<CliCommand> {
     match token {
         "search" | "s" => Ok(CliCommand::Search),
         "index" | "idx" => Ok(CliCommand::Index),
+        "watch" | "w" => Ok(CliCommand::Watch),
         "status" | "st" => Ok(CliCommand::Status),
         "explain" | "ex" => Ok(CliCommand::Explain),
         "config" | "cfg" => Ok(CliCommand::Config),
         "download" | "dl" => Ok(CliCommand::Download),
         "doctor" | "doc" => Ok(CliCommand::Doctor),
+        "update" | "up" => Ok(CliCommand::Update),
+        "completions" | "comp" => Ok(CliCommand::Completions),
+        "uninstall" | "rm" => Ok(CliCommand::Uninstall),
+        "help" | "h" => Ok(CliCommand::Help),
         "tui" => Ok(CliCommand::Tui),
         "version" | "ver" => Ok(CliCommand::Version),
         _ => Err(SearchError::InvalidConfig {
@@ -473,6 +653,11 @@ fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
 }
 
 #[must_use]
+fn is_help_flag(token: &str) -> bool {
+    matches!(token, "--help" | "-h")
+}
+
+#[must_use]
 fn is_known_cli_flag(token: &str) -> bool {
     matches!(
         token,
@@ -490,11 +675,19 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-e"
             | "--stream"
             | "--watch"
+            | "--force"
             | "--full"
+            | "--check"
+            | "--verbose"
+            | "-v"
+            | "--quiet"
+            | "-q"
+            | "--no-color"
             | "--filter"
             | "--profile"
             | "--theme"
             | "--config"
+            | "--index-dir"
     )
 }
 
@@ -559,6 +752,23 @@ mod tests {
             parse_cli_args(["doctor"]).unwrap().command,
             CliCommand::Doctor
         );
+        assert_eq!(
+            parse_cli_args(["watch"]).unwrap().command,
+            CliCommand::Watch
+        );
+        assert_eq!(
+            parse_cli_args(["update"]).unwrap().command,
+            CliCommand::Update
+        );
+        assert_eq!(
+            parse_cli_args(["completions", "bash"]).unwrap().command,
+            CliCommand::Completions
+        );
+        assert_eq!(
+            parse_cli_args(["uninstall"]).unwrap().command,
+            CliCommand::Uninstall
+        );
+        assert_eq!(parse_cli_args(["help"]).unwrap().command, CliCommand::Help);
         assert_eq!(parse_cli_args(["tui"]).unwrap().command, CliCommand::Tui);
         assert_eq!(
             parse_cli_args(["version"]).unwrap().command,
@@ -568,20 +778,51 @@ mod tests {
 
     #[test]
     fn parse_command_aliases() {
-        assert_eq!(parse_cli_args(["s"]).unwrap().command, CliCommand::Search);
+        assert_eq!(
+            parse_cli_args(["s", "q"]).unwrap().command,
+            CliCommand::Search
+        );
         assert_eq!(parse_cli_args(["idx"]).unwrap().command, CliCommand::Index);
+        assert_eq!(parse_cli_args(["w"]).unwrap().command, CliCommand::Watch);
         assert_eq!(parse_cli_args(["st"]).unwrap().command, CliCommand::Status);
-        assert_eq!(parse_cli_args(["ex"]).unwrap().command, CliCommand::Explain);
+        assert_eq!(
+            parse_cli_args(["ex", "r0"]).unwrap().command,
+            CliCommand::Explain
+        );
         assert_eq!(parse_cli_args(["cfg"]).unwrap().command, CliCommand::Config);
         assert_eq!(
             parse_cli_args(["dl"]).unwrap().command,
             CliCommand::Download
         );
         assert_eq!(parse_cli_args(["doc"]).unwrap().command, CliCommand::Doctor);
+        assert_eq!(parse_cli_args(["up"]).unwrap().command, CliCommand::Update);
+        assert_eq!(
+            parse_cli_args(["comp", "zsh"]).unwrap().command,
+            CliCommand::Completions
+        );
+        assert_eq!(
+            parse_cli_args(["rm"]).unwrap().command,
+            CliCommand::Uninstall
+        );
+        assert_eq!(parse_cli_args(["h"]).unwrap().command, CliCommand::Help);
         assert_eq!(
             parse_cli_args(["ver"]).unwrap().command,
             CliCommand::Version
         );
+    }
+
+    #[test]
+    fn parse_help_flag() {
+        let input = parse_cli_args(["--help"]).expect("parse");
+        assert_eq!(input.command, CliCommand::Help);
+        assert_eq!(input.command_source, CommandSource::Explicit);
+    }
+
+    #[test]
+    fn parse_help_flag_after_command() {
+        let input = parse_cli_args(["status", "--help"]).expect("parse");
+        assert_eq!(input.command, CliCommand::Help);
+        assert_eq!(input.command_source, CommandSource::Explicit);
     }
 
     #[test]
@@ -641,11 +882,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_index_dir_override() {
+        let input = parse_cli_args(["status", "--index-dir", "/tmp/fsfs-index"]).unwrap();
+        assert_eq!(input.index_dir, Some(PathBuf::from("/tmp/fsfs-index")));
+    }
+
+    #[test]
     fn parse_index_flags() {
         let input = parse_cli_args(["index", "--full", "--watch"]).unwrap();
         assert_eq!(input.command, CliCommand::Index);
         assert!(input.full_reindex);
         assert!(input.watch);
+    }
+
+    #[test]
+    fn parse_watch_command_sets_watch_mode_and_path() {
+        let input = parse_cli_args(["watch", "/tmp/corpus"]).unwrap();
+        assert_eq!(input.command, CliCommand::Watch);
+        assert!(input.watch);
+        assert_eq!(input.target_path, Some(PathBuf::from("/tmp/corpus")));
+        assert_eq!(input.overrides.allow_background_indexing, Some(true));
+    }
+
+    #[test]
+    fn parse_force_alias_for_full_reindex() {
+        let input = parse_cli_args(["index", "--force"]).unwrap();
+        assert!(input.full_reindex);
     }
 
     #[test]
@@ -672,6 +934,12 @@ mod tests {
     }
 
     #[test]
+    fn parse_search_requires_query() {
+        let err = parse_cli_args(["search"]).expect_err("must fail");
+        assert!(err.to_string().contains("missing search query argument"));
+    }
+
+    #[test]
     fn parse_search_query_starting_with_dash() {
         let input = parse_cli_args(["search", "-secret-token"]).unwrap();
         assert_eq!(input.command, CliCommand::Search);
@@ -689,6 +957,22 @@ mod tests {
     fn parse_search_double_dash_requires_query() {
         let err = parse_cli_args(["search", "--"]).expect_err("must fail");
         assert!(err.to_string().contains("missing query after '--'"));
+    }
+
+    #[test]
+    fn parse_explain_requires_result_id() {
+        let err = parse_cli_args(["explain"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("missing result identifier argument")
+        );
+    }
+
+    #[test]
+    fn parse_explain_result_id() {
+        let input = parse_cli_args(["explain", "hit_123"]).unwrap();
+        assert_eq!(input.command, CliCommand::Explain);
+        assert_eq!(input.result_id.as_deref(), Some("hit_123"));
     }
 
     #[test]
@@ -732,6 +1016,43 @@ mod tests {
         let input = parse_cli_args(["cfg", "ls"]).unwrap();
         assert_eq!(input.command, CliCommand::Config);
         assert_eq!(input.config_action, Some(ConfigAction::List));
+    }
+
+    #[test]
+    fn parse_completions_requires_shell() {
+        let err = parse_cli_args(["completions"]).expect_err("must fail");
+        assert!(err.to_string().contains("missing shell argument"));
+    }
+
+    #[test]
+    fn parse_completions_shell() {
+        let input = parse_cli_args(["completions", "fish"]).unwrap();
+        assert_eq!(input.command, CliCommand::Completions);
+        assert_eq!(input.completion_shell, Some(CompletionShell::Fish));
+    }
+
+    #[test]
+    fn parse_update_check_flag() {
+        let input = parse_cli_args(["update", "--check"]).unwrap();
+        assert_eq!(input.command, CliCommand::Update);
+        assert!(input.update_check_only);
+    }
+
+    #[test]
+    fn parse_check_rejects_non_update_commands() {
+        let err = parse_cli_args(["status", "--check"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("only valid for the update command")
+        );
+    }
+
+    #[test]
+    fn parse_global_output_flags() {
+        let input = parse_cli_args(["status", "--verbose", "--quiet", "--no-color"]).unwrap();
+        assert!(input.verbose);
+        assert!(input.quiet);
+        assert!(input.no_color);
     }
 
     #[test]
@@ -804,7 +1125,13 @@ mod tests {
     #[test]
     fn all_command_names_parseable() {
         for name in CliCommand::ALL_NAMES {
-            let _input = parse_cli_args([*name]).expect(name);
+            let parsed = match *name {
+                "search" => parse_cli_args(["search", "q"]),
+                "explain" => parse_cli_args(["explain", "result-id"]),
+                "completions" => parse_cli_args(["completions", "bash"]),
+                _ => parse_cli_args([*name]),
+            };
+            let _input = parsed.expect(name);
         }
     }
 

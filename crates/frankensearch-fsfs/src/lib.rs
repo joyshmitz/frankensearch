@@ -12,6 +12,7 @@ pub mod cli_e2e;
 pub mod concurrency;
 pub mod config;
 pub mod evidence;
+pub mod explainability_screen;
 pub mod explanation_payload;
 pub mod interaction_primitives;
 pub mod lexical_pipeline;
@@ -30,11 +31,12 @@ pub mod repro;
 pub mod runtime;
 pub mod shutdown;
 pub mod stream_protocol;
+pub mod tracing_setup;
 pub mod watcher;
 
 pub use adapters::cli::{
-    CliCommand, CliInput, CommandSource, ConfigAction, OutputFormat, detect_auto_mode, exit_code,
-    parse_cli_args,
+    CliCommand, CliInput, CommandSource, CompletionShell, ConfigAction, OutputFormat,
+    detect_auto_mode, exit_code, parse_cli_args,
 };
 pub use adapters::format_emitter::{
     emit_envelope, emit_envelope_string, emit_stream_frame, emit_stream_frame_string,
@@ -77,13 +79,19 @@ pub use config::{
     PressureProfileEffectiveSettings, PressureProfileField, PressureProfileOverrideDecision,
     PressureProfileOverridePolicy, PressureProfileResolution, PressureProfileResolutionDiagnostics,
     PrivacyConfig, ProfileOverrideSource, ProfileSchedulerMode, SearchConfig, StorageConfig,
-    TextSelectionMode, TuiConfig, TuiTheme, default_config_file_path, emit_config_loaded,
-    load_from_sources, load_from_str,
+    TextSelectionMode, TuiConfig, TuiTheme, default_config_file_path,
+    default_project_config_file_path, default_user_config_file_path, emit_config_loaded,
+    load_from_layered_sources, load_from_sources, load_from_str,
 };
 pub use evidence::{
     ALL_FSFS_REASON_CODES, FsfsEventFamily, FsfsEvidenceEvent, FsfsReasonCode, ScopeDecision,
     ScopeDecisionKind, TraceLink, ValidationResult, ValidationViolation, is_valid_fsfs_reason_code,
     validate_event,
+};
+pub use explainability_screen::{
+    ComponentRow, ConfidenceBadge, EXPLAINABILITY_SCREEN_SCHEMA_VERSION, ExplainabilityLevel,
+    ExplainabilityScreenState, FusionRow, PolicyDecisionCard, RankMovementRow, RankingDecisionCard,
+    TraceNode, build_policy_card, build_ranking_card,
 };
 pub use explanation_payload::{
     EXPLANATION_PAYLOAD_SCHEMA_VERSION, FsfsExplanationPayload, FusionContext,
@@ -92,7 +100,7 @@ pub use explanation_payload::{
 };
 pub use interaction_primitives::{
     CyclicFilter, INTERACTION_PRIMITIVES_SCHEMA_VERSION, InteractionBudget, InteractionCycleTiming,
-    InteractionSnapshot, LayoutConstraint, LayoutDirection, LatencyPhase, PanelDescriptor,
+    InteractionSnapshot, LatencyPhase, LayoutConstraint, LayoutDirection, PanelDescriptor,
     PanelFocusState, PanelRole, PhaseTiming, RenderTier, ScreenAction, ScreenLayout,
     VirtualizedListState, canonical_layout, fnv1a_64,
 };
@@ -180,6 +188,7 @@ pub use stream_protocol::{
     encode_stream_frame_toon, failure_category_for_error, is_retryable_error, retry_backoff_ms,
     terminal_event_completed, terminal_event_from_error, validate_stream_frame,
 };
+pub use tracing_setup::{Verbosity, init_subscriber};
 pub use watcher::{
     DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
     WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestOp, WatchIngestPipeline,

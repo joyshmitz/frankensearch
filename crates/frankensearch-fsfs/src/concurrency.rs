@@ -26,7 +26,7 @@
 //! - **`FrankenSQLite`**: Page-level MVCC via `BEGIN CONCURRENT`. Readers never block
 //!   writers; writers serialize at commit time only if pages conflict.
 //! - **FSVI**: Append-only segments. Readers see consistent snapshots via `Arc` cloning
-//!   from [`IndexCache`]. The [`RefreshWorker`] is the single writer.
+//!   from `IndexCache`. The `RefreshWorker` is the single writer.
 //! - **Tantivy**: Built-in single-writer model. fsfs ensures exactly one `IndexWriter`
 //!   per index directory via [`ResourceToken`].
 
@@ -246,7 +246,8 @@ impl ContentionPolicy {
     /// Compute the backoff delay for the given retry attempt (0-indexed).
     #[must_use]
     pub fn backoff_delay(&self, attempt: u32) -> Duration {
-        let multiplier = self.backoff_multiplier.powi(attempt.cast_signed());
+        #[allow(clippy::cast_possible_wrap)]
+        let multiplier = self.backoff_multiplier.powi(attempt as i32);
         let delay = self.initial_backoff.as_secs_f64() * multiplier;
         let capped = delay.min(self.max_backoff.as_secs_f64());
         Duration::from_secs_f64(capped)

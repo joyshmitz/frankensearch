@@ -98,7 +98,7 @@ pub struct SearchPlan {
 
     /// Whether the candidate pool from the last search can be reused.
     ///
-    /// When `true`, the consumer may re-rank [`candidate_doc_ids`] instead
+    /// When `true`, the consumer may re-rank `candidate_doc_ids` instead
     /// of scanning the full index. This gives `O(k)` per keystroke instead
     /// of `O(n)`.
     pub reuse_candidates: bool,

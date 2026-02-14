@@ -148,7 +148,7 @@ impl Storage {
 
     /// Run a closure inside a `BEGIN IMMEDIATE` transaction.
     ///
-    /// Unlike [`transaction`], this acquires a write lock immediately,
+    /// Unlike [`Storage::transaction`], this acquires a write lock immediately,
     /// preventing concurrent writers from interleaving reads and writes.
     /// Use this when correctness depends on serialized read-then-write
     /// (e.g. `claim_batch`).

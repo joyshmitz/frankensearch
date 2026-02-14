@@ -1,13 +1,13 @@
 //! Index refresh worker (asupersync background task).
 //!
-//! [`RefreshWorker`] periodically drains the [`EmbeddingQueue`](crate::EmbeddingQueue),
+//! [`RefreshWorker`] periodically drains the [`EmbeddingQueue`],
 //! embeds documents in batches, and rebuilds the vector index. It runs as an
 //! asupersync task within a structured concurrency region.
 //!
 //! # Single-writer guarantee
 //!
 //! The worker is the **only** component that writes to vector indices. All
-//! reads go through the [`IndexCache`](crate::IndexCache) which provides
+//! reads go through the [`IndexCache`] which provides
 //! atomic snapshot replacement.
 //!
 //! # Lifecycle

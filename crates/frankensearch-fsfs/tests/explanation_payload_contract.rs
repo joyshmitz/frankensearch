@@ -77,6 +77,19 @@ fn explanation_payload_validates_inside_output_envelope() {
         decoded["data"]["policy_decisions"][0]["reason_code"].as_str(),
         Some("degrade.transition.lexical_only")
     );
+    assert_eq!(
+        decoded["data"]["policy_decisions"][0]["metadata"]["manual_intervention"].as_str(),
+        Some("false")
+    );
+    assert_eq!(
+        decoded["data"]["policy_decisions"][0]["metadata"]["transition_context"].as_str(),
+        Some("pressure_escalation")
+    );
+    assert!(
+        decoded["data"]["policy_decisions"][0]["metadata"]["override_guardrail"]
+            .as_str()
+            .is_some_and(|text| text.contains("metadata-only and pause"))
+    );
 }
 
 #[test]

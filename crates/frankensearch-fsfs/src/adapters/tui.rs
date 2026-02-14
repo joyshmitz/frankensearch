@@ -300,6 +300,11 @@ impl Default for TuiKeymapModel {
                 TuiKeyBindingSpec::new("?", "shell.help.toggle", TuiKeyBindingScope::Global),
                 TuiKeyBindingSpec::new("Esc", "shell.dismiss", TuiKeyBindingScope::Global),
                 TuiKeyBindingSpec::new("Ctrl+L", "search.focus_query", TuiKeyBindingScope::Global),
+                TuiKeyBindingSpec::new(
+                    "Ctrl+Enter",
+                    "search.submit_query",
+                    TuiKeyBindingScope::Global,
+                ),
                 TuiKeyBindingSpec::new("Enter", "palette.confirm", TuiKeyBindingScope::Palette),
                 TuiKeyBindingSpec::new("Up", "palette.up", TuiKeyBindingScope::Palette),
                 TuiKeyBindingSpec::new("Down", "palette.down", TuiKeyBindingScope::Palette),
@@ -430,7 +435,15 @@ impl TuiPaletteModel {
             .map(TuiPaletteActionSpec::navigation)
             .collect::<Vec<_>>();
 
-        actions.extend([
+        actions.extend(Self::search_actions());
+        actions.extend(Self::indexing_actions());
+        actions.extend(Self::operations_actions());
+
+        Self { actions }
+    }
+
+    fn search_actions() -> Vec<TuiPaletteActionSpec> {
+        vec![
             TuiPaletteActionSpec::named(
                 "search.focus_query",
                 "Focus Query Input",
@@ -439,12 +452,52 @@ impl TuiPaletteModel {
                 Some("Ctrl+L"),
             ),
             TuiPaletteActionSpec::named(
+                "search.submit_query",
+                "Submit Query",
+                "Submit the current query text for staged retrieval",
+                TuiPaletteCategory::Search,
+                Some("Ctrl+Enter"),
+            ),
+            TuiPaletteActionSpec::named(
+                "search.clear_query",
+                "Clear Query",
+                "Clear query input and pending incremental submission",
+                TuiPaletteCategory::Search,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
                 "search.repeat_last",
                 "Repeat Last Search",
                 "Re-run the most recent search with current mode settings",
                 TuiPaletteCategory::Search,
                 None,
             ),
+            TuiPaletteActionSpec::named(
+                "search.toggle_explain",
+                "Toggle Inline Explainability",
+                "Show or hide inline score/provenance details for selected result",
+                TuiPaletteCategory::Search,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "search.open_selected",
+                "Open Selected Result",
+                "Open the currently selected result in the local editor/viewer",
+                TuiPaletteCategory::Search,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "search.jump_to_source",
+                "Jump To Source",
+                "Jump directly to the selected result's file/source location",
+                TuiPaletteCategory::Search,
+                None,
+            ),
+        ]
+    }
+
+    fn indexing_actions() -> Vec<TuiPaletteActionSpec> {
+        vec![
             TuiPaletteActionSpec::named(
                 "index.pause",
                 "Pause Indexing",
@@ -459,6 +512,67 @@ impl TuiPaletteModel {
                 TuiPaletteCategory::Indexing,
                 None,
             ),
+            TuiPaletteActionSpec::named(
+                "index.throttle",
+                "Throttle Indexing",
+                "Apply constrained watcher/indexing throttle under resource pressure",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.recover",
+                "Recover Indexing Mode",
+                "Request staged recovery toward normal indexing/query operation",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.override.auto",
+                "Override: Auto Policy",
+                "Clear manual override and return to automatic degradation policy",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.override.full",
+                "Override: Force Full",
+                "Force full retrieval/indexing mode when guardrails permit",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.override.embed_deferred",
+                "Override: Force Embed Deferred",
+                "Force embed-deferred mode to protect interactive latency",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.override.lexical_only",
+                "Override: Force Lexical Only",
+                "Force lexical-only retrieval while preserving correctness",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.override.metadata_only",
+                "Override: Force Metadata Only",
+                "Force metadata-only fallback for emergency operation",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+            TuiPaletteActionSpec::named(
+                "index.override.paused",
+                "Override: Force Pause",
+                "Force paused state until operator clears override",
+                TuiPaletteCategory::Indexing,
+                None,
+            ),
+        ]
+    }
+
+    fn operations_actions() -> [TuiPaletteActionSpec; 4] {
+        [
             TuiPaletteActionSpec::named(
                 "explain.toggle_panel",
                 "Toggle Explainability Panel",
@@ -487,9 +601,7 @@ impl TuiPaletteModel {
                 TuiPaletteCategory::Diagnostics,
                 None,
             ),
-        ]);
-
-        Self { actions }
+        ]
     }
 
     /// Build shared `CommandPalette` from fsfs action specs.
@@ -550,7 +662,12 @@ pub enum FsfsCardPrimitive {
     ResultListVirtualized,
     ResultDetailPanel,
     IndexingQueuePanel,
+    IndexingBacklogChart,
+    IndexingThroughputChart,
+    DegradationBannerStrip,
+    IndexingControlPanel,
     PressureBudgetPanel,
+    PressureIndicatorStrip,
     ExplainabilityEvidencePanel,
     OpsTimelineStream,
     ConfigInspectorPanel,
@@ -583,6 +700,10 @@ impl TuiScreenLayoutContract {
                 screen: FsfsScreen::Indexing,
                 cards: vec![
                     FsfsCardPrimitive::IndexingQueuePanel,
+                    FsfsCardPrimitive::IndexingBacklogChart,
+                    FsfsCardPrimitive::IndexingThroughputChart,
+                    FsfsCardPrimitive::DegradationBannerStrip,
+                    FsfsCardPrimitive::IndexingControlPanel,
                     FsfsCardPrimitive::StatusFooter,
                 ],
                 primary_focus_card: FsfsCardPrimitive::IndexingQueuePanel,
@@ -590,10 +711,13 @@ impl TuiScreenLayoutContract {
             Self {
                 screen: FsfsScreen::Pressure,
                 cards: vec![
+                    FsfsCardPrimitive::PressureIndicatorStrip,
                     FsfsCardPrimitive::PressureBudgetPanel,
+                    FsfsCardPrimitive::DegradationBannerStrip,
+                    FsfsCardPrimitive::IndexingControlPanel,
                     FsfsCardPrimitive::StatusFooter,
                 ],
-                primary_focus_card: FsfsCardPrimitive::PressureBudgetPanel,
+                primary_focus_card: FsfsCardPrimitive::PressureIndicatorStrip,
             },
             Self {
                 screen: FsfsScreen::Explainability,
@@ -629,9 +753,22 @@ impl TuiScreenLayoutContract {
 pub enum TuiPaletteIntent {
     NavigateScreen,
     FocusQueryInput,
+    SubmitSearchQuery,
+    ClearSearchQuery,
     RepeatLastSearch,
+    ToggleInlineExplainability,
+    OpenSelectedSearchResult,
+    JumpToSelectedSource,
     PauseIndexing,
     ResumeIndexing,
+    ThrottleIndexing,
+    RecoverIndexing,
+    SetOverrideAuto,
+    ForceOverrideFull,
+    ForceOverrideEmbedDeferred,
+    ForceOverrideLexicalOnly,
+    ForceOverrideMetadataOnly,
+    ForceOverridePaused,
     ToggleExplainabilityPanel,
     ReloadConfiguration,
     OpenOpsTimeline,
@@ -676,9 +813,22 @@ impl TuiPaletteIntentModel {
         }
         match action.id.as_str() {
             "search.focus_query" => TuiPaletteIntent::FocusQueryInput,
+            "search.submit_query" => TuiPaletteIntent::SubmitSearchQuery,
+            "search.clear_query" => TuiPaletteIntent::ClearSearchQuery,
             "search.repeat_last" => TuiPaletteIntent::RepeatLastSearch,
+            "search.toggle_explain" => TuiPaletteIntent::ToggleInlineExplainability,
+            "search.open_selected" => TuiPaletteIntent::OpenSelectedSearchResult,
+            "search.jump_to_source" => TuiPaletteIntent::JumpToSelectedSource,
             "index.pause" => TuiPaletteIntent::PauseIndexing,
             "index.resume" => TuiPaletteIntent::ResumeIndexing,
+            "index.throttle" => TuiPaletteIntent::ThrottleIndexing,
+            "index.recover" => TuiPaletteIntent::RecoverIndexing,
+            "index.override.auto" => TuiPaletteIntent::SetOverrideAuto,
+            "index.override.full" => TuiPaletteIntent::ForceOverrideFull,
+            "index.override.embed_deferred" => TuiPaletteIntent::ForceOverrideEmbedDeferred,
+            "index.override.lexical_only" => TuiPaletteIntent::ForceOverrideLexicalOnly,
+            "index.override.metadata_only" => TuiPaletteIntent::ForceOverrideMetadataOnly,
+            "index.override.paused" => TuiPaletteIntent::ForceOverridePaused,
             "explain.toggle_panel" => TuiPaletteIntent::ToggleExplainabilityPanel,
             "config.reload" => TuiPaletteIntent::ReloadConfiguration,
             "ops.open_timeline" => TuiPaletteIntent::OpenOpsTimeline,
@@ -767,13 +917,24 @@ impl TuiStateSerializationPoint {
                     "filters".to_owned(),
                     "cursor".to_owned(),
                     "phase".to_owned(),
+                    "interaction_id".to_owned(),
+                    "visible_window".to_owned(),
+                    "frame_budget_ms".to_owned(),
+                    "latency_bucket".to_owned(),
                 ],
             },
             Self {
                 id: "indexing.degradation.transition".to_owned(),
                 screen: FsfsScreen::Indexing,
                 trigger: TuiSerializationTrigger::DegradationTransition,
-                state_keys: vec!["queue_state".to_owned(), "degradation_stage".to_owned()],
+                state_keys: vec![
+                    "queue_state".to_owned(),
+                    "degradation_stage".to_owned(),
+                    "degradation_banner".to_owned(),
+                    "transition_reason_code".to_owned(),
+                    "override_mode".to_owned(),
+                    "override_allowed".to_owned(),
+                ],
             },
             Self {
                 id: "pressure.palette.action".to_owned(),
@@ -948,7 +1109,7 @@ pub struct FsfsShowcaseSurfaceMapping {
 
 impl FsfsShowcaseSurfaceMapping {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         surface: InteractionSurfaceKind,
         screen: FsfsScreen,
         palette_routes: Vec<PaletteIntentRoute>,
@@ -987,6 +1148,12 @@ impl FsfsShowcasePortingSpec {
                         PaletteIntentRoute::new(
                             PaletteIntent::RepeatQuery,
                             "search.repeat_last",
+                            Some(InteractionSurfaceKind::Search),
+                            false,
+                        ),
+                        PaletteIntentRoute::new(
+                            PaletteIntent::ToggleExplainability,
+                            "search.toggle_explain",
                             Some(InteractionSurfaceKind::Search),
                             false,
                         ),
@@ -1316,8 +1483,9 @@ mod tests {
 
     use super::{
         ContextRetentionPolicy, FsfsCardPrimitive, FsfsScreen, FsfsTuiShellModel,
-        TuiAdapterSettings, TuiLatencyBudgetHook, TuiModelValidationError, TuiNavigationModel,
-        TuiPaletteActionSpec, TuiPaletteCategory, TuiPaletteIntent, TuiStateSerializationPoint,
+        TuiAdapterSettings, TuiKeyBindingScope, TuiLatencyBudgetHook, TuiModelValidationError,
+        TuiNavigationModel, TuiPaletteActionSpec, TuiPaletteCategory, TuiPaletteIntent,
+        TuiStateSerializationPoint,
     };
     use crate::config::{Density, FsfsConfig, TuiTheme};
 
@@ -1432,19 +1600,85 @@ mod tests {
     }
 
     #[test]
+    fn indexing_layout_includes_backlog_throughput_and_controls_cards() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let indexing_contract = shell
+            .layout_contracts
+            .iter()
+            .find(|contract| contract.screen == FsfsScreen::Indexing)
+            .expect("indexing contract should exist");
+
+        assert!(indexing_contract
+            .cards
+            .contains(&FsfsCardPrimitive::IndexingBacklogChart));
+        assert!(indexing_contract
+            .cards
+            .contains(&FsfsCardPrimitive::IndexingThroughputChart));
+        assert!(indexing_contract
+            .cards
+            .contains(&FsfsCardPrimitive::IndexingControlPanel));
+        assert!(indexing_contract
+            .cards
+            .contains(&FsfsCardPrimitive::DegradationBannerStrip));
+    }
+
+    #[test]
+    fn palette_includes_throttle_and_recover_controls() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let action_ids = shell
+            .palette
+            .actions
+            .iter()
+            .map(|action| action.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(action_ids.contains("index.throttle"));
+        assert!(action_ids.contains("index.recover"));
+        assert!(action_ids.contains("index.override.auto"));
+        assert!(action_ids.contains("index.override.lexical_only"));
+        assert!(action_ids.contains("index.override.metadata_only"));
+        assert!(action_ids.contains("index.override.paused"));
+    }
+
+    #[test]
+    fn palette_includes_search_virtualization_and_explainability_actions() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let action_ids = shell
+            .palette
+            .actions
+            .iter()
+            .map(|action| action.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(action_ids.contains("search.submit_query"));
+        assert!(action_ids.contains("search.clear_query"));
+        assert!(action_ids.contains("search.toggle_explain"));
+        assert!(action_ids.contains("search.open_selected"));
+        assert!(action_ids.contains("search.jump_to_source"));
+    }
+
+    #[test]
+    fn keymap_includes_explicit_search_submit_chord() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        assert!(shell.keymap.bindings.iter().any(|binding| {
+            binding.scope == TuiKeyBindingScope::Global
+                && binding.chord == "Ctrl+Enter"
+                && binding.action_id == "search.submit_query"
+        }));
+    }
+
+    #[test]
     fn palette_intents_cover_all_palette_actions() {
         let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
         assert_eq!(
             shell.palette_intents.intents.len(),
             shell.palette.actions.len()
         );
-        assert!(
-            shell
-                .palette_intents
-                .intents
-                .iter()
-                .all(|intent| intent.intent != TuiPaletteIntent::Unknown)
-        );
+        assert!(shell
+            .palette_intents
+            .intents
+            .iter()
+            .all(|intent| intent.intent != TuiPaletteIntent::Unknown));
     }
 
     #[test]
@@ -1454,6 +1688,46 @@ mod tests {
             .expect("default serialization points should be valid");
         TuiLatencyBudgetHook::validate(&shell.latency_budget_hooks)
             .expect("default latency hooks should be valid");
+    }
+
+    #[test]
+    fn degradation_serialization_point_includes_override_audit_keys() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let point = shell
+            .serialization_points
+            .iter()
+            .find(|point| point.id == "indexing.degradation.transition")
+            .expect("indexing degradation serialization point must exist");
+
+        let keys = point
+            .state_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(keys.contains("degradation_banner"));
+        assert!(keys.contains("transition_reason_code"));
+        assert!(keys.contains("override_mode"));
+        assert!(keys.contains("override_allowed"));
+    }
+
+    #[test]
+    fn search_serialization_point_includes_interaction_telemetry_keys() {
+        let shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let point = shell
+            .serialization_points
+            .iter()
+            .find(|point| point.id == "search.frame.commit")
+            .expect("search frame serialization point must exist");
+
+        let keys = point
+            .state_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(keys.contains("interaction_id"));
+        assert!(keys.contains("visible_window"));
+        assert!(keys.contains("frame_budget_ms"));
+        assert!(keys.contains("latency_bucket"));
     }
 
     #[test]

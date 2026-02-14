@@ -22,13 +22,86 @@ use crate::state::{AppState, ControlPlaneHealth};
 #[derive(Clone)]
 struct StreamRowData {
     instance_id: String,
+    correlation_id: String,
     project: String,
+    host: String,
     searches: u64,
     avg_latency_us: u64,
     p95_latency_us: u64,
     refined_count: u64,
     memory_bytes: u64,
-    degraded: bool,
+    severity: StreamSeverity,
+    degradation_marker: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamSeverity {
+    Info,
+    Warn,
+    Critical,
+}
+
+impl StreamSeverity {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    const fn color(self) -> Color {
+        match self {
+            Self::Info => Color::Gray,
+            Self::Warn => Color::Yellow,
+            Self::Critical => Color::Red,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamSeverityFilter {
+    All,
+    Info,
+    Warn,
+    Critical,
+}
+
+impl StreamSeverityFilter {
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Info,
+            Self::Info => Self::Warn,
+            Self::Warn => Self::Critical,
+            Self::Critical => Self::All,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Critical => "critical",
+        }
+    }
+
+    const fn allows(self, severity: StreamSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Info => matches!(severity, StreamSeverity::Info),
+            Self::Warn => matches!(severity, StreamSeverity::Warn),
+            Self::Critical => matches!(severity, StreamSeverity::Critical),
+        }
+    }
+}
+
+const fn severity_rank(severity: StreamSeverity) -> u8 {
+    match severity {
+        StreamSeverity::Info => 0,
+        StreamSeverity::Warn => 1,
+        StreamSeverity::Critical => 2,
+    }
 }
 
 /// Live stream screen with recent activity and stream-health status.
@@ -37,6 +110,8 @@ pub struct LiveSearchStreamScreen {
     state: AppState,
     selected_row: usize,
     project_filter_index: usize,
+    host_filter_index: usize,
+    severity_filter: StreamSeverityFilter,
     degraded_only: bool,
 }
 
@@ -49,6 +124,8 @@ impl LiveSearchStreamScreen {
             state: AppState::new(),
             selected_row: 0,
             project_filter_index: 0,
+            host_filter_index: 0,
+            severity_filter: StreamSeverityFilter::All,
             degraded_only: false,
         }
     }
@@ -63,10 +140,15 @@ impl LiveSearchStreamScreen {
     fn row_data(&self) -> Vec<StreamRowData> {
         let fleet = self.state.fleet();
         let project_filters = self.project_filters();
+        let host_filters = self.host_filters();
         let project_filter = project_filters
             .get(self.project_filter_index)
             .map(String::as_str);
         let project_filter = project_filter.filter(|value| *value != "all");
+        let host_filter = host_filters
+            .get(self.host_filter_index)
+            .map(String::as_str)
+            .filter(|value| *value != "all");
 
         let mut rows: Vec<_> = fleet
             .instances
@@ -77,29 +159,66 @@ impl LiveSearchStreamScreen {
             .map(|instance| {
                 let metrics = fleet.search_metrics.get(&instance.id);
                 let resources = fleet.resources.get(&instance.id);
-                let degraded = !instance.healthy
-                    || metrics.is_none_or(|value| {
-                        value.p95_latency_us >= 5_000 || value.avg_latency_us >= 2_000
-                    })
-                    || resources.is_some_and(|value| value.memory_bytes >= 512 * 1024 * 1024);
+                let searches = metrics.map_or(0, |value| value.total_searches);
+                let avg_latency_us = metrics.map_or(0, |value| value.avg_latency_us);
+                let p95_latency_us = metrics.map_or(0, |value| value.p95_latency_us);
+                let refined_count = metrics.map_or(0, |value| value.refined_count);
+                let memory_bytes = resources.map_or(0, |value| value.memory_bytes);
+                let host = Self::host_bucket(&instance.id);
+                let mut markers: Vec<&'static str> = Vec::new();
+                if !instance.healthy {
+                    markers.push("health");
+                }
+                if p95_latency_us >= 5_000 {
+                    markers.push("latency_p95");
+                }
+                if avg_latency_us >= 2_000 {
+                    markers.push("latency_avg");
+                }
+                if memory_bytes >= 512 * 1024 * 1024 {
+                    markers.push("memory");
+                }
+                let severity = if !instance.healthy
+                    || p95_latency_us >= 10_000
+                    || memory_bytes >= 1024 * 1024 * 1024
+                {
+                    StreamSeverity::Critical
+                } else if !markers.is_empty() {
+                    StreamSeverity::Warn
+                } else {
+                    StreamSeverity::Info
+                };
+                if markers.is_empty() {
+                    markers.push("nominal");
+                }
                 StreamRowData {
                     instance_id: instance.id.clone(),
+                    correlation_id: Self::correlation_id(
+                        &instance.id,
+                        searches,
+                        avg_latency_us,
+                        p95_latency_us,
+                        memory_bytes,
+                    ),
                     project: instance.project.clone(),
-                    searches: metrics.map_or(0, |value| value.total_searches),
-                    avg_latency_us: metrics.map_or(0, |value| value.avg_latency_us),
-                    p95_latency_us: metrics.map_or(0, |value| value.p95_latency_us),
-                    refined_count: metrics.map_or(0, |value| value.refined_count),
-                    memory_bytes: resources.map_or(0, |value| value.memory_bytes),
-                    degraded,
+                    host,
+                    searches,
+                    avg_latency_us,
+                    p95_latency_us,
+                    refined_count,
+                    memory_bytes,
+                    severity,
+                    degradation_marker: markers.join("+"),
                 }
             })
-            .filter(|row| !self.degraded_only || row.degraded)
+            .filter(|row| host_filter.is_none_or(|host| row.host.eq_ignore_ascii_case(host)))
+            .filter(|row| self.severity_filter.allows(row.severity))
+            .filter(|row| !self.degraded_only || !matches!(row.severity, StreamSeverity::Info))
             .collect();
 
         rows.sort_by(|left, right| {
-            right
-                .degraded
-                .cmp(&left.degraded)
+            severity_rank(right.severity)
+                .cmp(&severity_rank(left.severity))
                 .then_with(|| right.searches.cmp(&left.searches))
                 .then_with(|| right.p95_latency_us.cmp(&left.p95_latency_us))
                 .then_with(|| right.memory_bytes.cmp(&left.memory_bytes))
@@ -122,10 +241,27 @@ impl LiveSearchStreamScreen {
         values
     }
 
+    fn host_filters(&self) -> Vec<String> {
+        let mut values = vec!["all".to_owned()];
+        let hosts: BTreeSet<_> = self
+            .state
+            .fleet()
+            .instances
+            .iter()
+            .map(|instance| Self::host_bucket(&instance.id))
+            .collect();
+        values.extend(hosts);
+        values
+    }
+
     fn clamp_filter_index(&mut self) {
-        let max_index = self.project_filters().len().saturating_sub(1);
-        if self.project_filter_index > max_index {
-            self.project_filter_index = max_index;
+        let project_max = self.project_filters().len().saturating_sub(1);
+        let host_max = self.host_filters().len().saturating_sub(1);
+        if self.project_filter_index > project_max {
+            self.project_filter_index = project_max;
+        }
+        if self.host_filter_index > host_max {
+            self.host_filter_index = host_max;
         }
     }
 
@@ -145,6 +281,21 @@ impl LiveSearchStreamScreen {
             return;
         }
         self.project_filter_index = (self.project_filter_index + 1) % len;
+        self.clamp_selected_row();
+    }
+
+    fn cycle_host_filter(&mut self) {
+        let len = self.host_filters().len();
+        if len == 0 {
+            self.host_filter_index = 0;
+            return;
+        }
+        self.host_filter_index = (self.host_filter_index + 1) % len;
+        self.clamp_selected_row();
+    }
+
+    fn cycle_severity_filter(&mut self) {
+        self.severity_filter = self.severity_filter.next();
         self.clamp_selected_row();
     }
 
@@ -170,19 +321,21 @@ impl LiveSearchStreamScreen {
                 } else {
                     Style::default()
                 };
-                if row.degraded && index != self.selected_row {
-                    style = style.fg(Color::Yellow);
+                if index != self.selected_row {
+                    style = style.fg(row.severity.color());
                 }
-                let state = if row.degraded { "WARN" } else { "OK" };
                 Row::new(vec![
                     row.instance_id,
+                    row.correlation_id,
                     row.project,
+                    row.host,
                     row.searches.to_string(),
                     row.avg_latency_us.to_string(),
                     row.p95_latency_us.to_string(),
                     mem_mib.to_string(),
                     refined_rate,
-                    state.to_owned(),
+                    row.severity.label().to_owned(),
+                    row.degradation_marker,
                 ])
                 .style(style)
             })
@@ -192,6 +345,20 @@ impl LiveSearchStreamScreen {
     fn stream_health_summary(&self) -> String {
         let metrics = self.state.control_plane_metrics();
         let health = self.state.control_plane_health();
+        let lag_state = if metrics.ingestion_lag_events >= 10_000 {
+            "crit"
+        } else if metrics.ingestion_lag_events >= 1_000 {
+            "warn"
+        } else {
+            "ok"
+        };
+        let drop_state = if metrics.dead_letter_events >= 20 {
+            "crit"
+        } else if metrics.dead_letter_events > 0 {
+            "warn"
+        } else {
+            "ok"
+        };
         let reconnect_state = match (self.state.has_data(), health) {
             (false, _) => "reconnecting",
             (true, ControlPlaneHealth::Critical) => "backoff",
@@ -199,7 +366,7 @@ impl LiveSearchStreamScreen {
             (true, ControlPlaneHealth::Healthy) => "steady",
         };
         format!(
-            "health={health} | reconnect={reconnect_state} | lag={} | drops={} | throughput={:.2} eps",
+            "health={health} | reconnect={reconnect_state} | lag={}({lag_state}) | drops={}({drop_state}) | throughput={:.2} eps",
             metrics.ingestion_lag_events, metrics.dead_letter_events, metrics.event_throughput_eps
         )
     }
@@ -228,8 +395,14 @@ impl LiveSearchStreamScreen {
             .get(self.project_filter_index)
             .cloned()
             .unwrap_or_else(|| "all".to_owned());
+        let host = self
+            .host_filters()
+            .get(self.host_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned());
         format!(
-            "filters: project={project}, degraded_only={} | keys: p=project d=degraded x=clear",
+            "filters: project={project}, host={host}, severity={}, degraded_only={} | keys: p/h/s/d/x",
+            self.severity_filter.label(),
             self.degraded_only
         )
     }
@@ -238,10 +411,68 @@ impl LiveSearchStreamScreen {
         self.row_data().len()
     }
 
+    fn selected_context_summary(&self) -> String {
+        if let Some(selected) = self.row_data().get(self.selected_row) {
+            let mem_mib = selected.memory_bytes / (1024 * 1024);
+            return format!(
+                "focus: {} corr={} host={} sev={} marker={} p95={}us mem={}MiB",
+                selected.instance_id,
+                selected.correlation_id,
+                selected.host,
+                selected.severity.label(),
+                selected.degradation_marker,
+                selected.p95_latency_us,
+                mem_mib
+            );
+        }
+        "focus: none".to_owned()
+    }
+
+    fn host_bucket(instance_id: &str) -> String {
+        if let Some((host, _)) = instance_id.split_once(':') {
+            return host.to_owned();
+        }
+        if let Some((host, _)) = instance_id.split_once('-') {
+            return host.to_owned();
+        }
+        instance_id.to_owned()
+    }
+
+    fn correlation_id(
+        instance_id: &str,
+        searches: u64,
+        avg_latency_us: u64,
+        p95_latency_us: u64,
+        memory_bytes: u64,
+    ) -> String {
+        const FNV_PRIME: u64 = 1_099_511_628_211;
+        let mut digest: u64 = 1_469_598_103_934_665_603;
+        for byte in instance_id.bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(FNV_PRIME);
+        }
+        digest ^= searches;
+        digest = digest.wrapping_mul(FNV_PRIME);
+        digest ^= avg_latency_us;
+        digest = digest.wrapping_mul(FNV_PRIME);
+        digest ^= p95_latency_us;
+        digest = digest.wrapping_mul(FNV_PRIME);
+        digest ^= memory_bytes;
+        format!("{digest:016x}")
+    }
+
     #[cfg(test)]
     fn selected_project_filter(&self) -> String {
         self.project_filters()
             .get(self.project_filter_index)
+            .cloned()
+            .unwrap_or_else(|| "all".to_owned())
+    }
+
+    #[cfg(test)]
+    fn selected_host_filter(&self) -> String {
+        self.host_filters()
+            .get(self.host_filter_index)
             .cloned()
             .unwrap_or_else(|| "all".to_owned())
     }
@@ -266,7 +497,7 @@ impl Screen for LiveSearchStreamScreen {
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(5)])
+            .constraints([Constraint::Length(6), Constraint::Min(5)])
             .split(area);
 
         let header = Paragraph::new(vec![
@@ -276,6 +507,7 @@ impl Screen for LiveSearchStreamScreen {
             ]),
             Line::from(self.rolling_counter_summary()),
             Line::from(self.filter_summary()),
+            Line::from(self.selected_context_summary()),
         ])
         .block(
             Block::default()
@@ -287,20 +519,23 @@ impl Screen for LiveSearchStreamScreen {
         let table = Table::new(
             self.build_rows(),
             [
+                Constraint::Length(14),
                 Constraint::Length(16),
-                Constraint::Length(18),
-                Constraint::Length(9),
-                Constraint::Length(11),
-                Constraint::Length(11),
+                Constraint::Length(14),
                 Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
                 Constraint::Length(12),
-                Constraint::Length(7),
+                Constraint::Length(9),
+                Constraint::Min(10),
             ],
         )
         .header(
             Row::new(vec![
-                "Instance", "Project", "Searches", "Avg(us)", "P95(us)", "Mem(MiB)", "Refined",
-                "State",
+                "Instance", "Corr ID", "Project", "Host", "Searches", "Avg(us)", "P95(us)",
+                "Mem(MiB)", "Refined", "Severity", "Marker",
             ])
             .style(Style::default().add_modifier(Modifier::BOLD)),
         )
@@ -328,6 +563,14 @@ impl Screen for LiveSearchStreamScreen {
                     self.cycle_project_filter();
                     return ScreenAction::Consumed;
                 }
+                crossterm::event::KeyCode::Char('h') => {
+                    self.cycle_host_filter();
+                    return ScreenAction::Consumed;
+                }
+                crossterm::event::KeyCode::Char('s') => {
+                    self.cycle_severity_filter();
+                    return ScreenAction::Consumed;
+                }
                 crossterm::event::KeyCode::Char('d') => {
                     self.degraded_only = !self.degraded_only;
                     self.clamp_selected_row();
@@ -335,6 +578,8 @@ impl Screen for LiveSearchStreamScreen {
                 }
                 crossterm::event::KeyCode::Char('x') => {
                     self.project_filter_index = 0;
+                    self.host_filter_index = 0;
+                    self.severity_filter = StreamSeverityFilter::All;
                     self.degraded_only = false;
                     self.clamp_selected_row();
                     return ScreenAction::Consumed;
@@ -490,6 +735,7 @@ mod tests {
 
         assert_eq!(screen.row_data().len(), 2);
         assert_eq!(screen.selected_project_filter(), "all");
+        assert_eq!(screen.selected_host_filter(), "all");
 
         let project = InputEvent::Key(
             crossterm::event::KeyCode::Char('p'),
@@ -505,6 +751,7 @@ mod tests {
         );
         assert_eq!(screen.handle_input(&reset, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_project_filter(), "all");
+        assert_eq!(screen.selected_host_filter(), "all");
         assert_eq!(screen.row_data().len(), 2);
     }
 
@@ -522,7 +769,7 @@ mod tests {
         let rows = screen.row_data();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].instance_id, "inst-b");
-        assert!(rows[0].degraded);
+        assert!(!matches!(rows[0].severity, StreamSeverity::Info));
     }
 
     #[test]
@@ -537,5 +784,40 @@ mod tests {
         assert!(summary.contains("24h="));
         assert!(summary.contains("3d="));
         assert!(summary.contains("1w="));
+    }
+
+    #[test]
+    fn live_stream_host_and_severity_filters_apply() {
+        let mut screen = LiveSearchStreamScreen::new();
+        screen.update_state(&sample_state());
+        let ctx = screen_context();
+
+        let host = InputEvent::Key(
+            crossterm::event::KeyCode::Char('h'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&host, &ctx), ScreenAction::Consumed);
+        assert_eq!(screen.selected_host_filter(), "inst");
+        assert_eq!(screen.row_data().len(), 2);
+
+        let severity = InputEvent::Key(
+            crossterm::event::KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&severity, &ctx), ScreenAction::Consumed);
+        let info_rows = screen.row_data();
+        assert_eq!(info_rows.len(), 1);
+        assert_eq!(info_rows[0].instance_id, "inst-a");
+        assert_eq!(info_rows[0].severity.label(), "info");
+    }
+
+    #[test]
+    fn live_stream_context_summary_contains_correlation_marker() {
+        let mut screen = LiveSearchStreamScreen::new();
+        screen.update_state(&sample_state());
+        let summary = screen.selected_context_summary();
+        assert!(summary.contains("focus: "));
+        assert!(summary.contains("corr="));
+        assert!(summary.contains("marker="));
     }
 }

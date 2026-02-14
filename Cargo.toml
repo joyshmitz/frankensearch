@@ -50,6 +50,7 @@ thiserror = "2"
 
 # Structured logging
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # Data parallelism (CPU-bound vector ops, NOT an async runtime)
 rayon = "1.10"
