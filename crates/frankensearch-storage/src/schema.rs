@@ -11,6 +11,98 @@ struct Migration {
     statements: &'static [&'static str],
 }
 
+/// Canonical latest schema for brand-new databases.
+///
+/// We intentionally bootstrap directly to latest instead of replaying historical
+/// migrations (which include create/drop churn from early prototypes).
+const LATEST_SCHEMA: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS documents (\
+        doc_id TEXT PRIMARY KEY,\
+        source_path TEXT,\
+        content_preview TEXT NOT NULL,\
+        content_hash BLOB NOT NULL,\
+        content_length INTEGER NOT NULL,\
+        created_at INTEGER NOT NULL,\
+        updated_at INTEGER NOT NULL,\
+        metadata_json TEXT\
+    );",
+    "CREATE TABLE IF NOT EXISTS embedding_jobs (\
+        job_id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,\
+        embedder_id TEXT NOT NULL,\
+        priority INTEGER NOT NULL DEFAULT 0,\
+        submitted_at INTEGER NOT NULL,\
+        started_at INTEGER,\
+        completed_at INTEGER,\
+        status TEXT NOT NULL DEFAULT 'pending',\
+        retry_count INTEGER NOT NULL DEFAULT 0,\
+        max_retries INTEGER NOT NULL DEFAULT 3,\
+        error_message TEXT,\
+        content_hash BLOB,\
+        worker_id TEXT,\
+        UNIQUE(doc_id, embedder_id, status)\
+    );",
+    "CREATE TABLE IF NOT EXISTS embedding_status (\
+        doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,\
+        embedder_id TEXT NOT NULL,\
+        embedder_revision TEXT,\
+        status TEXT NOT NULL DEFAULT 'pending',\
+        embedded_at INTEGER,\
+        error_message TEXT,\
+        retry_count INTEGER NOT NULL DEFAULT 0,\
+        PRIMARY KEY(doc_id, embedder_id)\
+    );",
+    "CREATE TABLE IF NOT EXISTS content_hashes (\
+        content_hash TEXT PRIMARY KEY,\
+        first_doc_id TEXT NOT NULL,\
+        seen_count INTEGER NOT NULL DEFAULT 1,\
+        first_seen_at INTEGER NOT NULL,\
+        last_seen_at INTEGER NOT NULL\
+    );",
+    "CREATE TABLE IF NOT EXISTS index_metadata (\
+        index_name TEXT PRIMARY KEY,\
+        index_type TEXT NOT NULL,\
+        embedder_id TEXT NOT NULL,\
+        embedder_revision TEXT,\
+        dimension INTEGER NOT NULL,\
+        record_count INTEGER NOT NULL DEFAULT 0,\
+        file_path TEXT,\
+        file_size_bytes INTEGER,\
+        file_hash TEXT,\
+        schema_version INTEGER,\
+        built_at INTEGER,\
+        build_duration_ms INTEGER,\
+        source_doc_count INTEGER NOT NULL DEFAULT 0,\
+        config_json TEXT,\
+        fec_path TEXT,\
+        fec_size_bytes INTEGER,\
+        last_verified_at INTEGER,\
+        last_repair_at INTEGER,\
+        repair_count INTEGER NOT NULL DEFAULT 0,\
+        mean_norm REAL,\
+        variance REAL\
+    );",
+    "CREATE TABLE IF NOT EXISTS index_build_history (\
+        build_id INTEGER PRIMARY KEY AUTOINCREMENT,\
+        index_name TEXT NOT NULL,\
+        built_at INTEGER NOT NULL,\
+        build_duration_ms INTEGER NOT NULL,\
+        record_count INTEGER NOT NULL,\
+        source_doc_count INTEGER NOT NULL,\
+        \"trigger\" TEXT NOT NULL,\
+        config_json TEXT,\
+        notes TEXT,\
+        mean_norm REAL,\
+        variance REAL\
+    );",
+    "CREATE INDEX IF NOT EXISTS idx_documents_content_hash ON documents(content_hash);",
+    "CREATE INDEX IF NOT EXISTS idx_documents_updated_at ON documents(updated_at DESC);",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_status_pending ON embedding_status(status, doc_id) WHERE status = 'pending';",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON embedding_jobs(status, priority DESC, submitted_at ASC) WHERE status = 'pending';",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_processing ON embedding_jobs(status, started_at) WHERE status = 'processing';",
+    "CREATE INDEX IF NOT EXISTS idx_build_history_index ON index_build_history(index_name, built_at DESC);",
+];
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -166,7 +258,7 @@ const MIGRATIONS: &[Migration] = &[
                 build_duration_ms INTEGER NOT NULL,\
                 record_count INTEGER NOT NULL,\
                 source_doc_count INTEGER NOT NULL,\
-                trigger TEXT NOT NULL,\
+                \"trigger\" TEXT NOT NULL,\
                 config_json TEXT,\
                 notes TEXT,\
                 mean_norm REAL,\
@@ -182,11 +274,36 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
         .map_err(storage_error)?;
 
     let mut version = current_version_optional(conn)?.unwrap_or(0);
+    if version == 0 {
+        tracing::debug!(
+            target: "frankensearch.storage",
+            to_version = SCHEMA_VERSION,
+            "bootstrapping fresh storage database directly to latest schema"
+        );
+
+        for statement in LATEST_SCHEMA {
+            conn.execute(statement).map_err(storage_error)?;
+        }
+
+        let params = [SqliteValue::Integer(SCHEMA_VERSION)];
+        conn.execute_with_params("INSERT INTO schema_version(version) VALUES (?1);", &params)
+            .map_err(storage_error)?;
+        version = SCHEMA_VERSION;
+    }
+
     if version > SCHEMA_VERSION {
         return Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
                 "schema version {version} is newer than supported {SCHEMA_VERSION}"
+            ))),
+        });
+    }
+    if version < SCHEMA_VERSION {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other(format!(
+                "legacy schema version {version} is unsupported; rebuild storage to schema version {SCHEMA_VERSION}"
             ))),
         });
     }
@@ -272,8 +389,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        MIGRATIONS, SCHEMA_VERSION, bootstrap, current_version, current_version_optional,
-        storage_error,
+        SCHEMA_VERSION, bootstrap, current_version, current_version_optional, storage_error,
     };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
@@ -314,15 +430,11 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_upgrades_v1_database_to_latest() {
+    fn bootstrap_rejects_legacy_schema_versions() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
 
         conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
             .expect("schema_version should be creatable");
-        for statement in MIGRATIONS[0].statements {
-            conn.execute(statement)
-                .expect("v1 schema statement should execute");
-        }
         conn.execute("INSERT INTO schema_version(version) VALUES (1);")
             .expect("v1 marker row should insert");
 
@@ -330,27 +442,11 @@ mod tests {
             current_version_optional(&conn).expect("version should read"),
             Some(1)
         );
+        let error = bootstrap(&conn).expect_err("legacy schemas should be rejected");
+        let message = error.to_string();
         assert!(
-            !index_exists(&conn, "idx_embedding_status_pending"),
-            "v3 index should not exist before bootstrap upgrade"
-        );
-
-        bootstrap(&conn).expect("bootstrap should upgrade schema");
-        assert_eq!(
-            current_version(&conn).expect("schema version should exist"),
-            SCHEMA_VERSION
-        );
-        assert!(
-            index_exists(&conn, "idx_embedding_status_pending"),
-            "v3 migration should create pending-status index"
-        );
-        assert!(
-            index_exists(&conn, "idx_jobs_pending"),
-            "v4 migration should create queue pending index"
-        );
-        assert!(
-            index_exists(&conn, "idx_jobs_processing"),
-            "v4 migration should create queue processing index"
+            message.contains("legacy schema version 1 is unsupported"),
+            "unexpected error message: {message}"
         );
     }
 

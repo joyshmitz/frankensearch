@@ -70,6 +70,10 @@ pub enum StalenessReason {
     NeverBuilt,
     /// Embedder revision changed since last build.
     EmbedderChanged,
+    /// Index age exceeded the configured maximum.
+    AgeExceeded,
+    /// Storage schema version differs from the index build schema version.
+    SchemaChanged,
 }
 
 /// Result of a staleness check for a given index.
@@ -258,7 +262,14 @@ impl Storage {
         let built_at = meta.built_at.unwrap_or(0);
 
         // Check for modified documents since last build.
-        let docs_modified = count_modified_since(self.connection(), built_at)?;
+        let current_docs = count_total_documents(self.connection())?;
+        let docs_removed = if current_docs < meta.source_doc_count {
+            meta.source_doc_count - current_docs
+        } else {
+            0
+        };
+        let docs_modified =
+            count_modified_since(self.connection(), built_at)?.saturating_add(docs_removed);
         if docs_modified > 0 {
             reasons.push(StalenessReason::ContentChanged);
         }
@@ -364,25 +375,23 @@ impl Storage {
             return Ok(Vec::new());
         }
 
+        let escaped_index = sql_escape_single_quoted(index_name);
         let sql = format!(
             "SELECT build_id, index_name, built_at, build_duration_ms, \
-                record_count, source_doc_count, trigger, config_json, notes, \
+                record_count, source_doc_count, \"trigger\", config_json, notes, \
                 mean_norm, variance \
              FROM index_build_history \
-             WHERE index_name = ?1 \
-             ORDER BY built_at DESC \
-             LIMIT {limit};"
+             WHERE index_name = '{escaped_index}' \
+             ORDER BY built_at DESC, build_id DESC;"
         );
-
-        let params = [SqliteValue::Text(index_name.to_owned())];
-        let rows = self
-            .connection()
-            .query_with_params(&sql, &params)
-            .map_err(map_storage_error)?;
+        let rows = self.connection().query(&sql).map_err(map_storage_error)?;
 
         let mut history = Vec::with_capacity(rows.len());
         for row in &rows {
             history.push(parse_build_record(row)?);
+        }
+        if history.len() > limit {
+            history.truncate(limit);
         }
 
         tracing::debug!(
@@ -401,21 +410,32 @@ impl Storage {
     pub fn delete_index_metadata(&self, index_name: &str) -> SearchResult<bool> {
         ensure_non_empty(index_name, "index_name")?;
 
-        let params = [SqliteValue::Text(index_name.to_owned())];
-        let affected = self
-            .connection()
-            .execute_with_params("DELETE FROM index_metadata WHERE index_name = ?1;", &params)
-            .map_err(map_storage_error)?;
+        let (history_deleted, metadata_deleted) = self.transaction(|conn| {
+            let params = [SqliteValue::Text(index_name.to_owned())];
+            let history_deleted = conn
+                .execute_with_params(
+                    "DELETE FROM index_build_history WHERE index_name = ?1;",
+                    &params,
+                )
+                .map_err(map_storage_error)?;
+            let metadata_deleted = conn
+                .execute_with_params("DELETE FROM index_metadata WHERE index_name = ?1;", &params)
+                .map_err(map_storage_error)?;
+            Ok((history_deleted, metadata_deleted))
+        })?;
+        let deleted_any = history_deleted > 0 || metadata_deleted > 0;
 
         tracing::debug!(
             target: "frankensearch.storage",
             op = "delete_index_metadata",
             index_name,
-            deleted = affected > 0,
+            history_deleted,
+            metadata_deleted,
+            deleted = deleted_any,
             "index metadata deleted"
         );
 
-        Ok(affected > 0)
+        Ok(deleted_any)
     }
 }
 
@@ -426,8 +446,7 @@ fn upsert_index_metadata(
     params: &RecordBuildParams,
     built_at: i64,
 ) -> SearchResult<()> {
-    let sql_params = [
-        SqliteValue::Text(params.index_name.clone()),
+    let update_params = [
         SqliteValue::Text(params.index_type.clone()),
         SqliteValue::Text(params.embedder_id.clone()),
         sqlite_text_opt(params.embedder_revision.as_deref()),
@@ -445,6 +464,59 @@ fn upsert_index_metadata(
         sqlite_i64_opt(params.fec_size_bytes),
         sqlite_f64_opt(params.mean_norm),
         sqlite_f64_opt(params.variance),
+        SqliteValue::Text(params.index_name.clone()),
+    ];
+
+    let updated = conn
+        .execute_with_params(
+            "UPDATE index_metadata SET \
+                index_type = ?1, \
+                embedder_id = ?2, \
+                embedder_revision = ?3, \
+                dimension = ?4, \
+                record_count = ?5, \
+                file_path = ?6, \
+                file_size_bytes = ?7, \
+                file_hash = ?8, \
+                schema_version = ?9, \
+                built_at = ?10, \
+                build_duration_ms = ?11, \
+                source_doc_count = ?12, \
+                config_json = ?13, \
+                fec_path = ?14, \
+                fec_size_bytes = ?15, \
+                mean_norm = ?16, \
+                variance = ?17 \
+             WHERE index_name = ?18;",
+            &update_params,
+        )
+        .map_err(map_storage_error)?;
+    if updated > 0 {
+        return Ok(());
+    }
+
+    let insert_params = [
+        SqliteValue::Text(params.index_name.clone()),
+        SqliteValue::Text(params.index_type.clone()),
+        SqliteValue::Text(params.embedder_id.clone()),
+        sqlite_text_opt(params.embedder_revision.as_deref()),
+        SqliteValue::Integer(params.dimension),
+        SqliteValue::Integer(params.record_count),
+        sqlite_text_opt(params.file_path.as_deref()),
+        sqlite_i64_opt(params.file_size_bytes),
+        sqlite_text_opt(params.file_hash.as_deref()),
+        sqlite_i64_opt(params.schema_version),
+        SqliteValue::Integer(built_at),
+        SqliteValue::Integer(params.build_duration_ms),
+        SqliteValue::Integer(params.source_doc_count),
+        sqlite_text_opt(params.config_json.as_deref()),
+        sqlite_text_opt(params.fec_path.as_deref()),
+        sqlite_i64_opt(params.fec_size_bytes),
+        SqliteValue::Null,
+        SqliteValue::Null,
+        SqliteValue::Integer(0),
+        sqlite_f64_opt(params.mean_norm),
+        sqlite_f64_opt(params.variance),
     ];
 
     conn.execute_with_params(
@@ -452,28 +524,13 @@ fn upsert_index_metadata(
             index_name, index_type, embedder_id, embedder_revision, \
             dimension, record_count, file_path, file_size_bytes, file_hash, \
             schema_version, built_at, build_duration_ms, source_doc_count, \
-            config_json, fec_path, fec_size_bytes, mean_norm, variance\
+            config_json, fec_path, fec_size_bytes, last_verified_at, \
+            last_repair_at, repair_count, mean_norm, variance\
          ) VALUES (\
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18\
-         ) ON CONFLICT(index_name) DO UPDATE SET \
-            index_type = excluded.index_type, \
-            embedder_id = excluded.embedder_id, \
-            embedder_revision = excluded.embedder_revision, \
-            dimension = excluded.dimension, \
-            record_count = excluded.record_count, \
-            file_path = excluded.file_path, \
-            file_size_bytes = excluded.file_size_bytes, \
-            file_hash = excluded.file_hash, \
-            schema_version = excluded.schema_version, \
-            built_at = excluded.built_at, \
-            build_duration_ms = excluded.build_duration_ms, \
-            source_doc_count = excluded.source_doc_count, \
-            config_json = excluded.config_json, \
-            fec_path = excluded.fec_path, \
-            fec_size_bytes = excluded.fec_size_bytes, \
-            mean_norm = excluded.mean_norm, \
-            variance = excluded.variance;",
-        &sql_params,
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21\
+         );",
+        &insert_params,
     )
     .map_err(map_storage_error)?;
 
@@ -501,7 +558,7 @@ fn insert_build_history(
     conn.execute_with_params(
         "INSERT INTO index_build_history (\
             index_name, built_at, build_duration_ms, record_count, \
-            source_doc_count, trigger, config_json, notes, mean_norm, variance\
+            source_doc_count, \"trigger\", config_json, notes, mean_norm, variance\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
         &sql_params,
     )
@@ -511,21 +568,41 @@ fn insert_build_history(
 }
 
 fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> SearchResult<()> {
-    let params = [
-        SqliteValue::Text(index_name.to_owned()),
-        SqliteValue::Integer(keep),
-    ];
-    conn.execute_with_params(
+    let escaped_index = sql_escape_single_quoted(index_name);
+
+    if keep <= 0 {
+        conn.execute(&format!(
+            "DELETE FROM index_build_history WHERE index_name = '{escaped_index}';"
+        ))
+        .map_err(map_storage_error)?;
+        return Ok(());
+    }
+    let keep = usize::try_from(keep).map_err(|error| SearchError::SubsystemError {
+        subsystem: "storage",
+        source: Box::new(io::Error::other(format!(
+            "invalid keep value for prune_build_history: {error}"
+        ))),
+    })?;
+
+    let rows = conn
+        .query(&format!(
+            "SELECT build_id FROM index_build_history \
+             WHERE index_name = '{escaped_index}' \
+             ORDER BY build_id DESC;"
+        ))
+        .map_err(map_storage_error)?;
+    if rows.len() <= keep {
+        return Ok(());
+    }
+
+    let cutoff_row = &rows[keep - 1];
+    let cutoff = row_i64(cutoff_row, 0, "index_build_history.build_id")?;
+
+    conn.execute(&format!(
         "DELETE FROM index_build_history \
-         WHERE index_name = ?1 \
-           AND build_id NOT IN (\
-               SELECT build_id FROM index_build_history \
-               WHERE index_name = ?1 \
-               ORDER BY built_at DESC \
-               LIMIT ?2\
-           );",
-        &params,
-    )
+         WHERE index_name = '{escaped_index}' \
+           AND build_id < {cutoff};"
+    ))
     .map_err(map_storage_error)?;
     Ok(())
 }
@@ -556,6 +633,13 @@ fn count_added_since(conn: &Connection, since: i64) -> SearchResult<i64> {
         return Ok(0);
     };
     row_i64(row, 0, "count_added")
+}
+
+fn count_total_documents(conn: &Connection) -> SearchResult<i64> {
+    let row = conn
+        .query_row("SELECT COUNT(*) FROM documents;")
+        .map_err(map_storage_error)?;
+    row_i64(&row, 0, "documents.count")
 }
 
 fn parse_index_metadata(row: &Row) -> SearchResult<IndexMetadata> {
@@ -697,6 +781,10 @@ fn sqlite_f64_opt(value: Option<f64>) -> SqliteValue {
     value.map_or(SqliteValue::Null, SqliteValue::Float)
 }
 
+fn sql_escape_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 fn ensure_non_empty(value: &str, field: &'static str) -> SearchResult<()> {
     if value.trim().is_empty() {
         return Err(SearchError::SubsystemError {
@@ -736,7 +824,7 @@ mod tests {
             embedder_revision: Some("v1.0".to_owned()),
             dimension: 256,
             record_count: 100,
-            source_doc_count: 100,
+            source_doc_count: 0,
             build_duration_ms: 500,
             trigger: BuildTrigger::Initial,
             file_path: Some("/tmp/index.fsvi".to_owned()),
@@ -782,7 +870,7 @@ mod tests {
         assert_eq!(meta.embedder_revision.as_deref(), Some("v1.0"));
         assert_eq!(meta.dimension, 256);
         assert_eq!(meta.record_count, 100);
-        assert_eq!(meta.source_doc_count, 100);
+        assert_eq!(meta.source_doc_count, 0);
         assert_eq!(meta.file_path.as_deref(), Some("/tmp/index.fsvi"));
         assert_eq!(meta.file_size_bytes, Some(102_400));
         assert_eq!(meta.mean_norm, Some(1.0));
@@ -1024,6 +1112,25 @@ mod tests {
 
         assert!(check.is_stale);
         assert!(check.reasons.contains(&StalenessReason::EmbedderChanged));
+    }
+
+    #[test]
+    fn staleness_detects_missing_documents_from_build_snapshot() {
+        let storage = Storage::open_in_memory().expect("storage");
+
+        insert_test_document(&storage, "doc-1", 1_000_000, 1_000_000);
+
+        let mut params = sample_build_params("idx");
+        params.source_doc_count = 2;
+        storage.record_index_build(&params).expect("build");
+
+        let check = storage
+            .check_index_staleness("idx", Some("v1.0"))
+            .expect("staleness check");
+
+        assert!(check.is_stale);
+        assert!(check.reasons.contains(&StalenessReason::ContentChanged));
+        assert!(check.docs_modified >= 1);
     }
 
     #[test]

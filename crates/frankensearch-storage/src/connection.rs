@@ -42,7 +42,9 @@ impl Default for StorageConfig {
             db_path: PathBuf::from("storage.sqlite3"),
             wal_mode: true,
             busy_timeout_ms: 5_000,
-            raptorq_repair_symbols: 2,
+            // Disabled by default until upstream frankensqlite reserve-byte
+            // balancing issues are resolved.
+            raptorq_repair_symbols: 0,
             cache_size_pages: 2_000,
             concurrent_transactions: true,
         }
@@ -125,15 +127,33 @@ impl Storage {
     where
         F: FnOnce(&Connection) -> SearchResult<T>,
     {
+        self.transaction_with_mode(self.config.begin_sql(), f)
+    }
+
+    /// Run a closure inside a `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Unlike [`transaction`], this acquires a write lock immediately,
+    /// preventing concurrent writers from interleaving reads and writes.
+    /// Use this when correctness depends on serialized read-then-write
+    /// (e.g. `claim_batch`).
+    pub fn immediate_transaction<F, T>(&self, f: F) -> SearchResult<T>
+    where
+        F: FnOnce(&Connection) -> SearchResult<T>,
+    {
+        self.transaction_with_mode("BEGIN IMMEDIATE;", f)
+    }
+
+    fn transaction_with_mode<F, T>(&self, begin_sql: &str, f: F) -> SearchResult<T>
+    where
+        F: FnOnce(&Connection) -> SearchResult<T>,
+    {
         tracing::trace!(
             target: "frankensearch.storage",
-            begin_sql = self.config.begin_sql(),
+            begin_sql,
             "starting storage transaction"
         );
 
-        self.conn
-            .execute(self.config.begin_sql())
-            .map_err(map_storage_error)?;
+        self.conn.execute(begin_sql).map_err(map_storage_error)?;
 
         let outcome = catch_unwind(AssertUnwindSafe(|| f(&self.conn)));
 
@@ -212,15 +232,11 @@ impl Storage {
             ))
             .map_err(map_storage_error)?;
 
-        if let Err(error) = self.conn.execute(&format!(
-            "PRAGMA raptorq_repair_symbols={};",
-            self.config.raptorq_repair_symbols
-        )) {
+        if self.config.raptorq_repair_symbols > 0 {
             tracing::warn!(
                 target: "frankensearch.storage",
-                ?error,
                 symbols = self.config.raptorq_repair_symbols,
-                "raptorq pragma was not accepted by backend"
+                "raptorq pragma is temporarily disabled due backend btree instability"
             );
         }
 
@@ -243,6 +259,8 @@ mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::path::PathBuf;
     use std::process;
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::{SearchError, SearchResult};
@@ -305,6 +323,8 @@ mod tests {
         doc.metadata = Some(json!({"fixture": true}));
         doc
     }
+
+    const CONCURRENT_OPEN_THREADS: usize = 4;
 
     fn insert_document_minimal(conn: &fsqlite::Connection, id: &str) -> SearchResult<()> {
         let params = [
@@ -431,6 +451,39 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_open_initializes_schema_consistently() {
+        let tmp = TempDbPath::new("concurrent-bootstrap");
+        let barrier = Arc::new(Barrier::new(CONCURRENT_OPEN_THREADS));
+        let (tx, rx) = mpsc::channel::<i64>();
+        let mut handles = Vec::new();
+
+        for _ in 0..CONCURRENT_OPEN_THREADS {
+            let cfg = tmp.config();
+            let gate = Arc::clone(&barrier);
+            let sender = tx.clone();
+            handles.push(thread::spawn(move || {
+                gate.wait();
+                let storage = Storage::open(cfg).expect("concurrent open should succeed");
+                let version = schema::current_version(storage.connection())
+                    .expect("schema version available");
+                sender.send(version).expect("version send should succeed");
+            }));
+        }
+        drop(tx);
+
+        let versions: Vec<i64> = rx.iter().collect();
+        for handle in handles {
+            handle.join().expect("concurrent opener thread should join");
+        }
+
+        assert_eq!(versions.len(), CONCURRENT_OPEN_THREADS);
+        assert!(
+            versions.iter().all(|version| *version == SCHEMA_VERSION),
+            "all concurrent opens should observe latest schema"
+        );
+    }
+
+    #[test]
     fn transaction_rolls_back_on_error() {
         let storage = Storage::open_in_memory().expect("in-memory storage should open");
         let doc = sample_document("doc-error");
@@ -554,6 +607,131 @@ mod tests {
         assert_eq!(
             count_documents(storage_b.connection()).expect("count after write"),
             1
+        );
+    }
+
+    #[test]
+    fn nested_transaction_error_rolls_back_outer_transaction() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+
+        let result: SearchResult<()> = storage.transaction(|conn| {
+            insert_document_minimal(conn, "doc-nested")?;
+            storage.transaction(|_nested_conn| Ok(()))
+        });
+
+        assert!(
+            result.is_err(),
+            "nested transaction should fail and propagate error"
+        );
+        assert_eq!(
+            count_documents(storage.connection()).expect("count after nested failure"),
+            0,
+            "outer transaction should rollback when nested begin fails"
+        );
+    }
+
+    #[test]
+    fn uncommitted_writes_are_invisible_to_concurrent_reader() {
+        let tmp = TempDbPath::new("snapshot");
+        let config = tmp.config();
+        let reader = Storage::open(config.clone()).expect("reader storage should open");
+        let writer_config = config;
+
+        let (inserted_tx, inserted_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let writer_thread = thread::spawn(move || {
+            let writer = Storage::open(writer_config).expect("writer storage should open");
+            writer
+                .transaction(|conn| {
+                    insert_document_minimal(conn, "doc-uncommitted")?;
+                    inserted_tx
+                        .send(())
+                        .expect("writer should signal insert before commit");
+                    release_rx
+                        .recv()
+                        .expect("writer should wait for reader inspection");
+                    Ok(())
+                })
+                .expect("writer transaction should commit");
+        });
+
+        inserted_rx
+            .recv()
+            .expect("reader should observe insert signal");
+
+        assert_eq!(
+            count_documents(reader.connection()).expect("reader count during writer transaction"),
+            0,
+            "reader should not see uncommitted write from concurrent transaction"
+        );
+
+        release_tx
+            .send(())
+            .expect("reader should release writer to commit");
+        writer_thread.join().expect("writer thread should join");
+
+        assert_eq!(
+            count_documents(reader.connection()).expect("reader count after writer commit"),
+            0,
+            "existing reader connection should preserve its snapshot until reopened"
+        );
+
+        let refreshed_reader =
+            Storage::open(tmp.config()).expect("refreshed reader storage should open");
+        assert_eq!(
+            count_documents(refreshed_reader.connection()).expect("count after reopening reader"),
+            1,
+            "reopened reader should observe committed write from writer transaction"
+        );
+    }
+
+    #[test]
+    fn multi_threaded_serial_writers_commit_disjoint_documents() {
+        let tmp = TempDbPath::new("concurrent-writers");
+        let config = tmp.config();
+        let (first_done_tx, first_done_rx) = mpsc::channel::<()>();
+
+        let cfg_a = config.clone();
+        let first_writer = thread::spawn(move || {
+            let storage = Storage::open(cfg_a).expect("first writer storage should open");
+            storage
+                .transaction(|conn| {
+                    insert_document_minimal(conn, "doc-a")?;
+                    Ok(())
+                })
+                .expect("first writer transaction should commit");
+            first_done_tx
+                .send(())
+                .expect("first writer should signal completion");
+        });
+
+        let cfg_b = config.clone();
+        let second_writer = thread::spawn(move || {
+            first_done_rx
+                .recv()
+                .expect("second writer should wait for first writer");
+            let storage = Storage::open(cfg_b).expect("second writer storage should open");
+            storage
+                .transaction(|conn| {
+                    insert_document_minimal(conn, "doc-b")?;
+                    Ok(())
+                })
+                .expect("second writer transaction should commit");
+        });
+
+        first_writer
+            .join()
+            .expect("first writer thread should not panic");
+        second_writer
+            .join()
+            .expect("second writer thread should not panic");
+
+        let verifier = Storage::open(config).expect("verifier storage should open");
+        assert_eq!(
+            count_documents(verifier.connection()).expect("count after concurrent writes"),
+            2,
+            "both writer transactions should persist exactly one row"
         );
     }
 }

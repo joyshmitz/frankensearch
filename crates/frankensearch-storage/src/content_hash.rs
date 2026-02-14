@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::io;
 
@@ -79,10 +79,11 @@ pub fn record_content_hash(
     doc_id: &str,
     seen_at: i64,
 ) -> SearchResult<usize> {
-    let sql = "INSERT INTO content_hashes (content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at)\
-        VALUES (?1, ?2, 1, ?3, ?4)\
-        ON CONFLICT(content_hash) DO UPDATE SET\
-            seen_count = content_hashes.seen_count + 1,\
+    let sql = "INSERT INTO content_hashes \
+        (content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at) \
+        VALUES (?1, ?2, 1, ?3, ?4) \
+        ON CONFLICT(content_hash) DO UPDATE SET \
+            seen_count = content_hashes.seen_count + 1, \
             last_seen_at = excluded.last_seen_at;";
 
     let params = [
@@ -150,6 +151,17 @@ impl Storage {
         ensure_non_empty(embedder_id, "embedder_id")?;
         if items.is_empty() {
             return Ok(Vec::new());
+        }
+
+        let mut seen_doc_ids = HashSet::with_capacity(items.len());
+        for (doc_id, _) in items {
+            ensure_non_empty(doc_id, "doc_id")?;
+            if !seen_doc_ids.insert(doc_id.as_str()) {
+                return Err(validation_error(
+                    "doc_id",
+                    format!("duplicate doc_id in dedup payload: {doc_id}"),
+                ));
+            }
         }
 
         self.transaction(|conn| {
@@ -291,23 +303,33 @@ fn build_dedup_decision(
 
 fn ensure_non_empty(value: &str, field: &'static str) -> SearchResult<()> {
     if value.trim().is_empty() {
-        return Err(SearchError::SubsystemError {
-            subsystem: "storage",
-            source: Box::new(io::Error::other(format!("{field} must not be empty"))),
-        });
+        return Err(validation_error(field, "must not be empty"));
     }
     Ok(())
+}
+
+fn validation_error(field: &'static str, reason: impl AsRef<str>) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "storage",
+        source: Box::new(io::Error::other(format!("{field}: {}", reason.as_ref()))),
+    }
 }
 
 fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
     match row.get(index) {
         Some(SqliteValue::Text(value)) => Ok(Some(value.clone())),
-        Some(SqliteValue::Null) | None => Ok(None),
+        Some(SqliteValue::Null) => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
                 "unexpected optional text type: {:?}",
                 other
+            ))),
+        }),
+        None => Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other(format!(
+                "missing optional text column at index {index}"
             ))),
         }),
     }
@@ -664,5 +686,25 @@ mod tests {
                 new_hash: hash_with(7),
             }
         );
+    }
+
+    #[test]
+    fn check_dedup_batch_rejects_duplicate_doc_ids() {
+        let storage = Storage::open_in_memory().expect("storage should open");
+        let duplicate = hash_with(3);
+
+        let err = storage
+            .check_dedup_batch(
+                &[
+                    ("doc-dup".to_owned(), duplicate),
+                    ("doc-dup".to_owned(), duplicate),
+                ],
+                "fast-tier",
+            )
+            .expect_err("duplicate doc_id should be rejected");
+
+        let msg = err.to_string();
+        assert!(msg.contains("doc_id"));
+        assert!(msg.contains("duplicate"));
     }
 }

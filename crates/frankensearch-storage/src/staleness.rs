@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::connection::Storage;
 use crate::document::count_documents;
 use crate::index_metadata::StalenessReason;
+use crate::schema::SCHEMA_VERSION;
 
 /// Configuration for the storage-backed staleness detector.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,12 +221,21 @@ impl StorageBackedStaleness {
         // Collect reasons, starting from the base staleness check.
         let mut reasons = staleness.reasons;
 
+        if self.config.check_schema_version
+            && meta
+                .as_ref()
+                .is_some_and(|m| m.schema_version != Some(SCHEMA_VERSION))
+            && !reasons.contains(&StalenessReason::SchemaChanged)
+        {
+            reasons.push(StalenessReason::SchemaChanged);
+        }
+
         // Check index age if configured.
         if let Some(max_age_secs) = self.config.max_index_age_secs {
-            if index_age.as_secs() > max_age_secs
-                && !reasons.contains(&StalenessReason::ContentChanged)
+            if index_age > Duration::from_secs(max_age_secs)
+                && !reasons.contains(&StalenessReason::AgeExceeded)
             {
-                reasons.push(StalenessReason::ContentChanged);
+                reasons.push(StalenessReason::AgeExceeded);
             }
         }
 
@@ -233,8 +243,13 @@ impl StorageBackedStaleness {
         let level = compute_level(&reasons, docs_changed, total_documents, &self.config);
 
         // Determine recommended action.
-        let recommended_action =
-            compute_action(&reasons, docs_changed, total_documents, &self.config);
+        let recommended_action = compute_action(
+            &reasons,
+            docs_changed,
+            indexed_documents,
+            total_documents,
+            &self.config,
+        );
 
         let is_stale = level > StalenessLevel::None;
 
@@ -289,9 +304,11 @@ fn compute_level(
         return StalenessLevel::None;
     }
 
-    // Critical: never built, embedder changed.
+    // Critical: never built, embedder changed, schema changed.
     if reasons.contains(&StalenessReason::NeverBuilt)
         || reasons.contains(&StalenessReason::EmbedderChanged)
+        || reasons.contains(&StalenessReason::AgeExceeded)
+        || reasons.contains(&StalenessReason::SchemaChanged)
     {
         return StalenessLevel::Critical;
     }
@@ -311,6 +328,7 @@ fn compute_level(
 fn compute_action(
     reasons: &[StalenessReason],
     docs_changed: usize,
+    indexed_docs: usize,
     total_docs: usize,
     config: &StalenessConfig,
 ) -> RecommendedAction {
@@ -329,15 +347,32 @@ fn compute_action(
             reason: "embedder model revision changed".to_owned(),
         };
     }
+    if reasons.contains(&StalenessReason::AgeExceeded) {
+        return RecommendedAction::FullRebuild {
+            reason: "index age exceeded configured maximum".to_owned(),
+        };
+    }
+    if reasons.contains(&StalenessReason::SchemaChanged) {
+        return RecommendedAction::FullRebuild {
+            reason: "storage schema version changed".to_owned(),
+        };
+    }
 
-    // Incremental vs full rebuild based on change fraction.
-    if total_docs > 0 {
+    // Incremental vs full rebuild based on change fraction against the
+    // corpus the current index was built from. If that baseline is missing,
+    // infer it from unchanged documents.
+    let baseline_docs = if indexed_docs > 0 {
+        indexed_docs
+    } else {
+        total_docs.saturating_sub(docs_changed)
+    };
+    if baseline_docs > 0 {
         #[allow(clippy::cast_precision_loss)]
-        let fraction = docs_changed as f64 / total_docs as f64;
+        let fraction = docs_changed as f64 / baseline_docs as f64;
         if fraction >= config.full_rebuild_fraction {
             return RecommendedAction::FullRebuild {
                 reason: format!(
-                    "{docs_changed}/{total_docs} documents changed ({:.0}%)",
+                    "{docs_changed}/{baseline_docs} baseline documents changed ({:.0}%)",
                     fraction * 100.0
                 ),
             };
@@ -368,9 +403,12 @@ fn now_ms() -> SearchResult<i64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::arc_with_non_send_sync)]
+
     use super::*;
     use crate::document::DocumentRecord;
     use crate::index_metadata::{BuildTrigger, RecordBuildParams};
+    use crate::schema::SCHEMA_VERSION;
 
     fn test_storage() -> Arc<Storage> {
         Arc::new(Storage::open_in_memory().expect("in-memory storage"))
@@ -384,13 +422,13 @@ mod tests {
             embedder_revision: Some("v1.0".to_owned()),
             dimension: 256,
             record_count: 100,
-            source_doc_count: 100,
+            source_doc_count: 0,
             build_duration_ms: 500,
             trigger: BuildTrigger::Initial,
             file_path: None,
             file_size_bytes: None,
             file_hash: None,
-            schema_version: Some(1),
+            schema_version: Some(SCHEMA_VERSION),
             config_json: None,
             fec_path: None,
             fec_size_bytes: None,
@@ -612,6 +650,95 @@ mod tests {
 
         assert!(!report.is_stale);
         assert!(!report.reasons.contains(&StalenessReason::EmbedderChanged));
+    }
+
+    #[test]
+    fn schema_mismatch_is_critical_when_enabled() {
+        let storage = test_storage();
+        let mut params = sample_build_params("idx");
+        params.schema_version = Some(SCHEMA_VERSION.saturating_sub(1));
+        storage.record_index_build(&params).expect("build");
+
+        let detector = StorageBackedStaleness::with_defaults(storage);
+        let report = detector.check("idx", Some("v1.0")).expect("check");
+
+        assert!(report.is_stale);
+        assert_eq!(report.level, StalenessLevel::Critical);
+        assert!(report.reasons.contains(&StalenessReason::SchemaChanged));
+        assert!(matches!(
+            report.recommended_action,
+            RecommendedAction::FullRebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn schema_mismatch_is_ignored_when_disabled() {
+        let storage = test_storage();
+        let mut params = sample_build_params("idx");
+        params.schema_version = Some(SCHEMA_VERSION.saturating_sub(1));
+        storage.record_index_build(&params).expect("build");
+
+        let detector = StorageBackedStaleness::new(
+            storage,
+            StalenessConfig {
+                check_schema_version: false,
+                ..StalenessConfig::default()
+            },
+        );
+        let report = detector.check("idx", Some("v1.0")).expect("check");
+
+        assert!(!report.is_stale);
+        assert!(!report.reasons.contains(&StalenessReason::SchemaChanged));
+    }
+
+    #[test]
+    fn index_age_limit_forces_full_rebuild() {
+        let storage = test_storage();
+        let params = sample_build_params("idx");
+        storage.record_index_build(&params).expect("build");
+
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let detector = StorageBackedStaleness::new(
+            storage,
+            StalenessConfig {
+                max_index_age_secs: Some(0),
+                ..StalenessConfig::default()
+            },
+        );
+        let report = detector.check("idx", Some("v1.0")).expect("check");
+
+        assert!(report.is_stale);
+        assert_eq!(report.level, StalenessLevel::Critical);
+        assert!(report.reasons.contains(&StalenessReason::AgeExceeded));
+        assert!(matches!(
+            report.recommended_action,
+            RecommendedAction::FullRebuild { .. }
+        ));
+    }
+
+    #[test]
+    fn index_age_limit_uses_subsecond_precision() {
+        let storage = test_storage();
+        let params = sample_build_params("idx");
+        storage.record_index_build(&params).expect("build");
+
+        // Sleep slightly above one second so truncating to whole seconds would miss it.
+        std::thread::sleep(Duration::from_millis(1_100));
+
+        let detector = StorageBackedStaleness::new(
+            storage,
+            StalenessConfig {
+                max_index_age_secs: Some(1),
+                ..StalenessConfig::default()
+            },
+        );
+        let report = detector.check("idx", Some("v1.0")).expect("check");
+
+        assert!(
+            report.reasons.contains(&StalenessReason::AgeExceeded),
+            "age threshold should be evaluated with subsecond precision"
+        );
     }
 
     #[test]

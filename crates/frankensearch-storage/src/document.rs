@@ -937,6 +937,68 @@ mod tests {
     }
 
     #[test]
+    fn upsert_batch_reports_insert_update_and_unchanged_counts() {
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+
+        let doc_a = sample_document("doc-a", 1);
+        let doc_b = sample_document("doc-b", 2);
+        let first = storage
+            .upsert_batch(&[doc_a.clone(), doc_b.clone()])
+            .expect("initial batch insert should succeed");
+        assert_eq!(first.inserted, 2);
+        assert_eq!(first.updated, 0);
+        assert_eq!(first.unchanged, 0);
+
+        let mut doc_b_updated = doc_b;
+        doc_b_updated.content_hash = hash_with(3);
+        doc_b_updated.updated_at += 1;
+        let doc_c = sample_document("doc-c", 4);
+
+        let second = storage
+            .upsert_batch(&[doc_a, doc_b_updated, doc_c])
+            .expect("mixed-outcome batch should succeed");
+        assert_eq!(second.inserted, 1);
+        assert_eq!(second.updated, 1);
+        assert_eq!(second.unchanged, 1);
+        assert_eq!(
+            count_documents(storage.connection()).expect("count should succeed"),
+            3
+        );
+    }
+
+    #[test]
+    fn upsert_batch_large_payload_is_atomic_and_complete() {
+        const DOC_COUNT: usize = 500;
+
+        let storage = Storage::open_in_memory().expect("in-memory storage should open");
+        let docs: Vec<DocumentRecord> = (0..DOC_COUNT)
+            .map(|idx| {
+                let hash_seed = u8::try_from(idx % 251).expect("hash seed should fit into u8");
+                sample_document(&format!("doc-large-{idx}"), hash_seed)
+            })
+            .collect();
+
+        let first = storage
+            .upsert_batch(&docs)
+            .expect("large initial batch should succeed");
+        let expected = u64::try_from(DOC_COUNT).expect("doc count should fit u64");
+        assert_eq!(first.inserted, expected);
+        assert_eq!(first.updated, 0);
+        assert_eq!(first.unchanged, 0);
+        assert_eq!(
+            count_documents(storage.connection()).expect("count should succeed"),
+            i64::try_from(DOC_COUNT).expect("doc count should fit i64")
+        );
+
+        let second = storage
+            .upsert_batch(&docs)
+            .expect("repeated large batch should succeed");
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.updated, 0);
+        assert_eq!(second.unchanged, expected);
+    }
+
+    #[test]
     fn delete_document_cascades_embedding_status() {
         let storage = Storage::open_in_memory().expect("in-memory storage should open");
         let doc = sample_document("doc-1", 3);

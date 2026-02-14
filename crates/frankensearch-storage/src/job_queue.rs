@@ -332,7 +332,17 @@ impl PersistentJobQueue {
         let batch_limit = batch_size.min(self.config.batch_size);
         let now_ms = unix_timestamp_ms()?;
         let limit = usize_to_i64(batch_limit)?;
-        let claimed = self.storage.transaction(|conn| {
+
+        // Use BEGIN IMMEDIATE for defense-in-depth (acquires a write lock
+        // eagerly on backends that support cross-connection locking).
+        //
+        // IMPORTANT: FrankenSQLite connections maintain isolated in-memory
+        // snapshots. Multiple connections to the same database file will NOT
+        // see each other's committed writes within the same process.
+        // Callers MUST route all claim_batch calls through a single
+        // PersistentJobQueue instance backed by one Storage connection to
+        // prevent duplicate assignments.
+        let claimed = self.storage.immediate_transaction(|conn| {
             let claim_params = [SqliteValue::Integer(now_ms), SqliteValue::Integer(limit)];
             let candidates = conn
                 .query_with_params(
@@ -576,7 +586,7 @@ impl PersistentJobQueue {
                 .execute_with_params(
                     "UPDATE embedding_jobs \
                      SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = ?3 \
-                     WHERE job_id = ?4;",
+                     WHERE job_id = ?4 AND status IN ('pending', 'processing');",
                     &params,
                 )
                 .map_err(map_storage_error)?;
@@ -603,33 +613,92 @@ impl PersistentJobQueue {
         let reclaim_after_ms = self
             .config
             .visibility_timeout_ms
-            .max(self.config.stale_job_threshold_ms);
+            .min(self.config.stale_job_threshold_ms);
         let cutoff = now_ms.saturating_sub(i64::try_from(reclaim_after_ms).unwrap_or(i64::MAX));
-        let params = [
-            SqliteValue::Text(JobStatus::Pending.as_str().to_owned()),
-            SqliteValue::Integer(now_ms),
-            SqliteValue::Text("reclaimed stale lease".to_owned()),
-            SqliteValue::Integer(cutoff),
-        ];
-        let reclaimed = self
-            .storage
-            .connection()
-            .execute_with_params(
-                "UPDATE embedding_jobs \
-                 SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3 \
-                 WHERE status = 'processing' AND (started_at IS NULL OR started_at <= ?4);",
-                &params,
-            )
-            .map_err(map_storage_error)?;
+        let (reclaimed_pending, superseded) = self.storage.transaction(|conn| {
+            let stale_params = [SqliteValue::Integer(cutoff)];
+            let stale_rows = conn
+                .query_with_params(
+                    "SELECT job_id, doc_id, embedder_id \
+                     FROM embedding_jobs \
+                     WHERE status = 'processing' \
+                       AND (started_at IS NULL OR started_at <= ?1);",
+                    &stale_params,
+                )
+                .map_err(map_storage_error)?;
 
-        if reclaimed > 0 {
+            let mut reclaimed_pending = 0_usize;
+            let mut superseded = 0_usize;
+            for row in &stale_rows {
+                let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
+                let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?.to_owned();
+                let embedder_id = row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned();
+
+                let pending_params = [
+                    SqliteValue::Text(doc_id.clone()),
+                    SqliteValue::Text(embedder_id.clone()),
+                ];
+                let pending_exists = !conn
+                    .query_with_params(
+                        "SELECT job_id \
+                         FROM embedding_jobs \
+                         WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
+                         LIMIT 1;",
+                        &pending_params,
+                    )
+                    .map_err(map_storage_error)?
+                    .is_empty();
+
+                if pending_exists {
+                    let delete_params = [SqliteValue::Integer(job_id)];
+                    let deleted = conn
+                        .execute_with_params(
+                            "DELETE FROM embedding_jobs \
+                             WHERE job_id = ?1 AND status = 'processing';",
+                            &delete_params,
+                        )
+                        .map_err(map_storage_error)?;
+                    if deleted == 1 {
+                        superseded += 1;
+                    }
+                } else {
+                    let update_params = [
+                        SqliteValue::Text(JobStatus::Pending.as_str().to_owned()),
+                        SqliteValue::Integer(now_ms),
+                        SqliteValue::Text("reclaimed stale lease".to_owned()),
+                        SqliteValue::Integer(job_id),
+                    ];
+                    let updated = conn
+                        .execute_with_params(
+                            "UPDATE embedding_jobs \
+                             SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3 \
+                             WHERE job_id = ?4 AND status = 'processing';",
+                            &update_params,
+                        )
+                        .map_err(map_storage_error)?;
+                    if updated == 1 {
+                        reclaimed_pending += 1;
+                    }
+                }
+            }
+
+            Ok((reclaimed_pending, superseded))
+        })?;
+        let reclaimed = reclaimed_pending.saturating_add(superseded);
+
+        if reclaimed_pending > 0 {
             self.metrics
                 .total_retried
-                .fetch_add(usize_to_u64(reclaimed), Ordering::Relaxed);
+                .fetch_add(usize_to_u64(reclaimed_pending), Ordering::Relaxed);
+        }
+
+        if reclaimed > 0 {
             tracing::warn!(
                 target: "frankensearch.storage",
                 op = "queue.reclaim_stale_jobs",
                 reclaimed,
+                reclaimed_pending,
+                superseded,
                 cutoff_ms = cutoff,
                 "reclaimed stale embedding jobs"
             );
@@ -718,7 +787,7 @@ impl BatchEnqueueResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnqueueOutcome {
+pub(crate) enum EnqueueOutcome {
     Inserted,
     Replaced,
     Deduplicated,
@@ -733,7 +802,7 @@ struct JobState {
     started_at: Option<i64>,
 }
 
-fn enqueue_inner(
+pub(crate) fn enqueue_inner(
     conn: &Connection,
     request: &EnqueueRequest,
     submitted_at: i64,
@@ -775,7 +844,7 @@ fn enqueue_inner(
     if has_active_job {
         conn.execute_with_params(
             "DELETE FROM embedding_jobs \
-             WHERE doc_id = ?1 AND embedder_id = ?2 AND status IN ('pending', 'processing');",
+             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending';",
             &active_params,
         )
         .map_err(map_storage_error)?;
@@ -1021,7 +1090,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::process;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use fsqlite_types::value::SqliteValue;
@@ -1278,6 +1347,52 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_replacement_keeps_inflight_processing_job() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(storage.as_ref(), "doc-inflight", 7);
+
+        let old_hash = [7_u8; 32];
+        let new_hash = [8_u8; 32];
+
+        queue
+            .enqueue("doc-inflight", "all-MiniLM-L6-v2", &old_hash, 0)
+            .expect("initial enqueue should succeed");
+        let inflight = claim_single(&queue, "worker-inflight");
+        assert_eq!(
+            inflight.content_hash,
+            Some(old_hash),
+            "claimed processing job should keep original hash"
+        );
+
+        assert!(
+            queue
+                .enqueue("doc-inflight", "all-MiniLM-L6-v2", &new_hash, 5)
+                .expect("replacement enqueue should succeed")
+        );
+
+        let depth = queue.queue_depth().expect("queue depth should load");
+        assert_eq!(
+            depth.processing, 1,
+            "in-flight job should remain processing"
+        );
+        assert_eq!(depth.pending, 1, "replacement should be queued as pending");
+
+        queue
+            .complete(inflight.job_id)
+            .expect("completing inflight job should still succeed");
+        let replacement = claim_single(&queue, "worker-replacement");
+        assert_ne!(
+            replacement.job_id, inflight.job_id,
+            "replacement must be a distinct job row"
+        );
+        assert_eq!(
+            replacement.content_hash,
+            Some(new_hash),
+            "replacement job should carry new hash"
+        );
+    }
+
+    #[test]
     fn fail_transitions_retry_then_terminal_failure() {
         let (queue, storage) = queue_fixture(JobQueueConfig {
             max_retries: 1,
@@ -1365,6 +1480,42 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_stale_jobs_uses_visibility_timeout_when_stale_threshold_is_larger() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            visibility_timeout_ms: 25,
+            stale_job_threshold_ms: 60_000,
+            ..JobQueueConfig::default()
+        });
+        insert_document(storage.as_ref(), "doc-vis-timeout", 22);
+
+        let hash = [22_u8; 32];
+        queue
+            .enqueue("doc-vis-timeout", "all-MiniLM-L6-v2", &hash, 0)
+            .expect("enqueue should succeed");
+        let claim = claim_single(&queue, "worker-visibility");
+
+        let stale_started_at = unix_timestamp_ms()
+            .expect("timestamp should resolve")
+            .saturating_sub(1_000);
+        let params = [
+            SqliteValue::Integer(stale_started_at),
+            SqliteValue::Integer(claim.job_id),
+        ];
+        storage
+            .connection()
+            .execute_with_params(
+                "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
+                &params,
+            )
+            .expect("stale timestamp update should succeed");
+
+        let reclaimed = queue
+            .reclaim_stale_jobs()
+            .expect("stale reclaim should succeed");
+        assert_eq!(reclaimed, 1, "job should reclaim after visibility timeout");
+    }
+
+    #[test]
     fn restart_recovery_preserves_and_reclaims_jobs() {
         let tmp = TempDbPath::new("restart");
         let queue_config = JobQueueConfig {
@@ -1415,6 +1566,57 @@ mod tests {
 
         let recovered = claim_single(&queue_b, "worker-after-restart");
         assert_eq!(recovered.job_id, claim.job_id);
+    }
+
+    #[test]
+    fn reclaim_stale_jobs_removes_processing_job_when_replacement_pending_exists() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            visibility_timeout_ms: 10,
+            stale_job_threshold_ms: 10,
+            ..JobQueueConfig::default()
+        });
+        insert_document(storage.as_ref(), "doc-superseded", 44);
+
+        let old_hash = [44_u8; 32];
+        let new_hash = [45_u8; 32];
+        queue
+            .enqueue("doc-superseded", "all-MiniLM-L6-v2", &old_hash, 0)
+            .expect("initial enqueue should succeed");
+        let claim = claim_single(&queue, "worker-superseded");
+        queue
+            .enqueue("doc-superseded", "all-MiniLM-L6-v2", &new_hash, 0)
+            .expect("replacement enqueue should succeed");
+
+        let stale_started_at = unix_timestamp_ms()
+            .expect("timestamp should resolve")
+            .saturating_sub(5_000);
+        let params = [
+            SqliteValue::Integer(stale_started_at),
+            SqliteValue::Integer(claim.job_id),
+        ];
+        storage
+            .connection()
+            .execute_with_params(
+                "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
+                &params,
+            )
+            .expect("stale timestamp update should succeed");
+
+        let reclaimed = queue
+            .reclaim_stale_jobs()
+            .expect("stale reclaim should succeed with replacement pending");
+        assert_eq!(
+            reclaimed, 1,
+            "stale superseded processing row should be removed"
+        );
+
+        let depth = queue.queue_depth().expect("queue depth should load");
+        assert_eq!(depth.processing, 0);
+        assert_eq!(depth.pending, 1);
+
+        let replacement = claim_single(&queue, "worker-replacement");
+        assert_ne!(replacement.job_id, claim.job_id);
+        assert_eq!(replacement.content_hash, Some(new_hash));
     }
 
     #[test]
@@ -1470,5 +1672,239 @@ mod tests {
         let metrics = queue.metrics().snapshot();
         assert_eq!(metrics.total_enqueued, 2);
         assert_eq!(metrics.total_deduplicated, 2);
+    }
+
+    #[test]
+    fn claim_batch_orders_by_priority_then_fifo_submission() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            batch_size: 8,
+            ..JobQueueConfig::default()
+        });
+        insert_document(storage.as_ref(), "doc-priority-a", 61);
+        insert_document(storage.as_ref(), "doc-priority-b", 62);
+        insert_document(storage.as_ref(), "doc-priority-c", 63);
+
+        let jobs = vec![
+            EnqueueRequest::new("doc-priority-a", "all-MiniLM-L6-v2", [61_u8; 32], 10),
+            EnqueueRequest::new("doc-priority-b", "all-MiniLM-L6-v2", [62_u8; 32], 10),
+            EnqueueRequest::new("doc-priority-c", "all-MiniLM-L6-v2", [63_u8; 32], 5),
+        ];
+        queue
+            .enqueue_batch(&jobs)
+            .expect("batch enqueue should succeed");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let claimed = queue
+            .claim_batch("worker-priority", 8)
+            .expect("claim should succeed");
+        let claimed_doc_ids: Vec<&str> = claimed.iter().map(|job| job.doc_id.as_str()).collect();
+        assert_eq!(
+            claimed_doc_ids,
+            vec!["doc-priority-a", "doc-priority-b", "doc-priority-c"]
+        );
+    }
+
+    #[test]
+    fn queue_depth_tracks_ready_pending_for_delayed_retries() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            max_retries: 3,
+            retry_base_delay_ms: 1_000,
+            ..JobQueueConfig::default()
+        });
+        insert_document(storage.as_ref(), "doc-delay", 71);
+
+        let hash = [71_u8; 32];
+        queue
+            .enqueue("doc-delay", "all-MiniLM-L6-v2", &hash, 0)
+            .expect("enqueue should succeed");
+        let claim = claim_single(&queue, "worker-delay");
+        let retry = queue
+            .fail(claim.job_id, "transient")
+            .expect("fail should schedule retry");
+        assert!(
+            matches!(retry, FailResult::Retried { delay_ms, .. } if delay_ms >= 1_000),
+            "retry should include a future delay"
+        );
+
+        let depth = queue.queue_depth().expect("queue depth should load");
+        assert_eq!(depth.pending, 1);
+        assert_eq!(
+            depth.ready_pending, 0,
+            "delayed retry should not appear as ready pending yet"
+        );
+    }
+
+    #[test]
+    fn backpressure_trips_only_when_pending_exceeds_threshold() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            backpressure_threshold: 2,
+            ..JobQueueConfig::default()
+        });
+
+        for (doc_id, seed) in [("doc-bp-1", 81_u8), ("doc-bp-2", 82), ("doc-bp-3", 83)] {
+            insert_document(storage.as_ref(), doc_id, seed);
+            queue
+                .enqueue(doc_id, "all-MiniLM-L6-v2", &[seed; 32], 0)
+                .expect("enqueue should succeed");
+        }
+
+        assert!(
+            queue
+                .is_backpressured()
+                .expect("backpressure check should work"),
+            "3 pending jobs should exceed threshold 2"
+        );
+
+        let _ = queue
+            .claim_batch("worker-bp", 1)
+            .expect("claim should reduce pending depth");
+        assert!(
+            !queue
+                .is_backpressured()
+                .expect("backpressure check should work"),
+            "2 pending jobs should not exceed threshold 2"
+        );
+    }
+
+    #[test]
+    fn round_robin_multi_worker_claims_never_double_assign_jobs() {
+        const JOB_COUNT: usize = 50;
+
+        let queue_config = JobQueueConfig {
+            batch_size: 5,
+            ..JobQueueConfig::default()
+        };
+        let storage = Arc::new(Storage::open_in_memory().expect("seed storage should open"));
+        let queue = PersistentJobQueue::new(Arc::clone(&storage), queue_config);
+        for index in 0..JOB_COUNT {
+            let doc_id = format!("doc-concurrent-{index}");
+            let seed = u8::try_from(index % 200).expect("seed should fit into u8");
+            insert_document(storage.as_ref(), &doc_id, seed);
+            queue
+                .enqueue(&doc_id, "all-MiniLM-L6-v2", &[seed; 32], 0)
+                .expect("seed enqueue should succeed");
+        }
+
+        let mut unique_ids = HashSet::new();
+        let mut total_claimed = 0_usize;
+        for worker_idx in 0..4 {
+            let worker_id = format!("worker-{worker_idx}");
+            loop {
+                let batch = queue
+                    .claim_batch(&worker_id, 3)
+                    .expect("claim should succeed");
+                if batch.is_empty() {
+                    break;
+                }
+                for job in batch {
+                    assert!(
+                        unique_ids.insert(job.job_id),
+                        "job {} was claimed more than once",
+                        job.job_id
+                    );
+                    total_claimed = total_claimed.saturating_add(1);
+                }
+            }
+        }
+
+        assert_eq!(
+            total_claimed, JOB_COUNT,
+            "all seeded jobs must be claimed exactly once"
+        );
+    }
+
+    /// Verifies that concurrent workers claiming through a single queue
+    /// (the production pattern) never double-assign jobs.
+    ///
+    /// Previously tracked as bd-2cnc: the race occurred when separate
+    /// connections each read stale snapshots. The fix documents and enforces
+    /// that all `claim_batch` calls MUST flow through a single
+    /// `PersistentJobQueue` instance backed by one `Storage` connection.
+    ///
+    /// Since `Storage` is `!Send` (`FrankenSQLite` `Connection` uses `Rc`),
+    /// the test uses a channel pattern: worker threads send claim requests
+    /// to a dispatcher thread that owns the queue, matching the production
+    /// pattern where an asupersync event loop owns the storage.
+    #[test]
+    fn concurrent_claim_once_through_shared_queue_has_no_double_assignment() {
+        const JOB_COUNT: usize = 50;
+        const WORKER_COUNT: usize = 8;
+        const BATCH_SIZE: usize = 10;
+        type ClaimRequest = (String, mpsc::Sender<Vec<ClaimedJob>>);
+
+        let queue_config = JobQueueConfig {
+            batch_size: BATCH_SIZE,
+            ..JobQueueConfig::default()
+        };
+
+        // All queue operations happen on this single thread (the test main
+        // thread), which owns Storage. Workers communicate via channels.
+        let storage = Arc::new(Storage::open_in_memory().expect("in-memory storage should open"));
+        let queue = PersistentJobQueue::new(Arc::clone(&storage), queue_config);
+
+        for index in 0..JOB_COUNT {
+            let doc_id = format!("doc-cc-{index}");
+            let seed = u8::try_from(index % 200).expect("seed should fit into u8");
+            insert_document(storage.as_ref(), &doc_id, seed);
+            queue
+                .enqueue(&doc_id, "all-MiniLM-L6-v2", &[seed; 32], 0)
+                .expect("seed enqueue should succeed");
+        }
+
+        // Each worker thread sends (worker_id, response_sender) to the
+        // dispatcher. The dispatcher calls claim_batch and sends back results.
+        let (request_tx, request_rx) = mpsc::channel::<ClaimRequest>();
+
+        // Shared gate so workers start racing at the same time.
+        let barrier = Arc::new(Barrier::new(WORKER_COUNT));
+        let mut handles = Vec::with_capacity(WORKER_COUNT);
+        for worker in 0..WORKER_COUNT {
+            let tx = request_tx.clone();
+            let start = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                let mut all_claimed = Vec::new();
+                loop {
+                    let (resp_tx, resp_rx) = mpsc::channel();
+                    tx.send((format!("worker-cc-{worker}"), resp_tx))
+                        .expect("request send should succeed");
+                    let batch = resp_rx.recv().expect("response recv should succeed");
+                    if batch.is_empty() {
+                        break;
+                    }
+                    all_claimed.extend(batch.into_iter().map(|job| job.job_id));
+                }
+                all_claimed
+            }));
+        }
+        drop(request_tx);
+
+        // Dispatch loop: process claim requests sequentially on the queue-
+        // owning thread. This serializes claim_batch calls through a single
+        // Storage connection, preventing the TOCTOU duplicate-claim race.
+        for (worker_id, resp_tx) in request_rx {
+            let batch = queue
+                .claim_batch(&worker_id, BATCH_SIZE)
+                .expect("claim should succeed");
+            let _ = resp_tx.send(batch);
+        }
+
+        let mut claimed_ids = Vec::new();
+        for handle in handles {
+            let claimed = handle.join().expect("worker claim thread should join");
+            claimed_ids.extend(claimed);
+        }
+
+        assert_eq!(
+            claimed_ids.len(),
+            JOB_COUNT,
+            "all pending jobs should be claimed exactly once across workers"
+        );
+        let unique: HashSet<i64> = claimed_ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            JOB_COUNT,
+            "no job id should appear in more than one claimed batch"
+        );
     }
 }

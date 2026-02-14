@@ -16,6 +16,7 @@ pub mod fts5_adapter;
 pub mod index_metadata;
 pub mod job_queue;
 pub mod metrics;
+pub mod pipeline;
 pub mod schema;
 pub mod staleness;
 
@@ -41,6 +42,11 @@ pub use job_queue::{
     JobQueueMetricsSnapshot, JobStatus, PersistentJobQueue, QueueDepth, QueueErrorKind,
 };
 pub use metrics::{StorageMetrics, StorageMetricsSnapshot};
+pub use pipeline::{
+    BatchIngestResult, BatchProcessResult, EmbeddingVectorSink, InMemoryVectorSink, IngestAction,
+    IngestRequest, IngestResult, PersistedEmbedding, PipelineConfig, PipelineMetrics,
+    PipelineMetricsSnapshot, StorageBackedJobRunner, WorkerReport,
+};
 pub use schema::{SCHEMA_VERSION, bootstrap, current_version};
 pub use staleness::{
     QuickStalenessCheck, RecommendedAction, StalenessConfig, StalenessLevel, StalenessReport,
