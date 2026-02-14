@@ -510,7 +510,9 @@ impl TempFileGuard {
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = std::fs::remove_file(&self.path);
+            if let Err(e) = std::fs::remove_file(&self.path) {
+                tracing::warn!(path = %self.path.display(), error = %e, "failed to clean up temp file");
+            }
         }
     }
 }

@@ -572,6 +572,94 @@ mod tests {
         serde_json::Value::Object(vocab)
     }
 
+    #[cfg(feature = "hash")]
+    #[test]
+    fn from_parts_hash_only_availability() {
+        let hash = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let stack = EmbedderStack::from_parts(hash, None);
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert!(stack.quality().is_none());
+        assert!(stack.quality_arc().is_none());
+        assert_eq!(stack.fast().category(), ModelCategory::HashEmbedder);
+        assert_eq!(stack.fast_embedder().id(), stack.fast().id());
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn from_parts_with_quality_is_full() {
+        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let quality: Arc<dyn Embedder> =
+            Arc::new(crate::hash_embedder::HashEmbedder::default_384());
+        let stack = EmbedderStack::from_parts(fast, Some(quality));
+        assert_eq!(stack.availability(), TwoTierAvailability::Full);
+        assert!(stack.quality().is_some());
+        assert!(stack.quality_arc().is_some());
+        assert_eq!(
+            stack.quality_embedder().unwrap().id(),
+            stack.quality().unwrap().id()
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn dim_reduce_rejects_zero_target_dim() {
+        let inner: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let err = DimReduceEmbedder::new(inner, 0).expect_err("should reject target_dim=0");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn dim_reduce_rejects_target_exceeding_inner_dim() {
+        let inner: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let err =
+            DimReduceEmbedder::new(inner, 512).expect_err("should reject target_dim > inner dim");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn dim_reduce_rejects_non_mrl_embedder() {
+        let inner: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        assert!(!inner.supports_mrl());
+        let err = DimReduceEmbedder::new(inner, 64).expect_err("should reject non-MRL embedder");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn with_mrl_target_dim_zero_is_rejected() {
+        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let stack = EmbedderStack::from_parts(fast, None);
+        let err = stack
+            .with_mrl_target_dim(0)
+            .expect_err("should reject target_dim=0");
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn with_mrl_passthrough_when_non_mrl() {
+        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let stack = EmbedderStack::from_parts(fast, None);
+        // hash embedder doesn't support MRL, so with_mrl_target_dim should
+        // pass through without wrapping (target_dim < dimension but !supports_mrl)
+        let stack = stack.with_mrl_target_dim(64).unwrap();
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        // dimension should be unchanged since wrapping was skipped
+        assert_eq!(stack.fast().dimension(), 256);
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn embedder_stack_debug_format() {
+        let fast: Arc<dyn Embedder> = Arc::new(crate::hash_embedder::HashEmbedder::default_256());
+        let stack = EmbedderStack::from_parts(fast, None);
+        let debug = format!("{stack:?}");
+        assert!(debug.contains("EmbedderStack"));
+        assert!(debug.contains("HashOnly"));
+    }
+
     #[cfg(all(feature = "model2vec", feature = "hash"))]
     fn create_test_safetensors(dir: &Path, vocab_size: usize, dimensions: usize) {
         use std::collections::HashMap;
