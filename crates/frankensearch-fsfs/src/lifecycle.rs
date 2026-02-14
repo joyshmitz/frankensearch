@@ -235,13 +235,17 @@ impl PidFileContents {
 /// Manage a PID file at the given path.
 pub struct PidFile {
     path: PathBuf,
+    acquired: bool,
 }
 
 impl PidFile {
     /// Create a PID file manager for the given path.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            acquired: false,
+        }
     }
 
     /// Default PID file path.
@@ -259,7 +263,7 @@ impl PidFile {
     /// # Errors
     ///
     /// Returns error if PID file is held by a live process or I/O fails.
-    pub fn acquire(&self, version: &str) -> std::io::Result<()> {
+    pub fn acquire(&mut self, version: &str) -> std::io::Result<()> {
         // Check for existing PID file.
         if let Ok(contents) = read_pid_file(&self.path) {
             if contents.is_alive() {
@@ -291,6 +295,7 @@ impl PidFile {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&self.path, json.as_bytes())?;
 
+        self.acquired = true;
         info!(
             target: "frankensearch.fsfs.lifecycle",
             pid = contents.pid,
@@ -300,8 +305,12 @@ impl PidFile {
         Ok(())
     }
 
-    /// Release the PID file (remove it).
-    pub fn release(&self) {
+    /// Release the PID file (remove it). No-op if not acquired.
+    pub fn release(&mut self) {
+        if !self.acquired {
+            return;
+        }
+        self.acquired = false;
         match std::fs::remove_file(&self.path) {
             Ok(()) => {
                 debug!(
@@ -661,11 +670,11 @@ impl LifecycleTracker {
         let subsystem_vec: Vec<SubsystemHealth> = subs.values().cloned().collect();
         drop(subs);
 
-        let started_at_ms = SystemTime::now()
+        let started_at_ms = (SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64
-            - (self.started_at.elapsed().as_millis() as u64);
+            .as_millis() as u64)
+            .saturating_sub(self.started_at.elapsed().as_millis() as u64);
 
         // Compute aggregate phase.
         let phase = *lock_or_recover(&self.phase);
@@ -824,7 +833,7 @@ mod tests {
     fn pid_file_acquire_and_release() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("test.pid");
-        let pid_file = PidFile::new(&path);
+        let mut pid_file = PidFile::new(&path);
 
         pid_file.acquire("0.1.0").expect("acquire");
         assert!(path.exists());
@@ -835,7 +844,7 @@ mod tests {
         assert_eq!(contents.version, "0.1.0");
 
         // Second acquire should fail (same PID is alive).
-        let pid_file2 = PidFile::new(&path);
+        let mut pid_file2 = PidFile::new(&path);
         assert!(pid_file2.acquire("0.1.0").is_err());
 
         // Release.
@@ -855,7 +864,7 @@ mod tests {
         std::fs::write(&path, json.as_bytes()).unwrap();
 
         // Should recover and acquire.
-        let pid_file = PidFile::new(&path);
+        let mut pid_file = PidFile::new(&path);
         pid_file.acquire("0.2.0").expect("recover stale");
 
         let new_contents = pid_file.read().expect("read");
@@ -869,7 +878,7 @@ mod tests {
         let path = dir.path().join("test.pid");
 
         {
-            let pid_file = PidFile::new(&path);
+            let mut pid_file = PidFile::new(&path);
             pid_file.acquire("0.1.0").expect("acquire");
             assert!(path.exists());
         } // Drop releases.

@@ -90,7 +90,14 @@ impl TickClock {
 
     /// Advance time by `n` ticks.
     pub fn tick_n(&mut self, n: u64) {
-        self.elapsed += self.tick_size * u32::try_from(n).unwrap_or(u32::MAX);
+        let mut remaining = n;
+        while remaining > 0 {
+            let batch = remaining.min(u64::from(u32::MAX));
+            #[allow(clippy::cast_possible_truncation)]
+            let batch_u32 = batch as u32;
+            self.elapsed += self.tick_size * batch_u32;
+            remaining -= batch;
+        }
         self.tick_count += n;
     }
 
