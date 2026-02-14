@@ -549,12 +549,8 @@ impl LifecycleTracker {
     }
 
     /// Transition to a new lifecycle phase.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the phase mutex is poisoned.
     pub fn transition_to(&self, phase: DaemonPhase) {
-        let mut current = self.phase.lock().expect("phase lock");
+        let mut current = lock_or_recover(&self.phase);
         info!(
             target: "frankensearch.fsfs.lifecycle",
             from = %*current,
@@ -565,23 +561,15 @@ impl LifecycleTracker {
     }
 
     /// Current lifecycle phase.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the phase mutex is poisoned.
     #[must_use]
     pub fn current_phase(&self) -> DaemonPhase {
-        *self.phase.lock().expect("phase lock")
+        *lock_or_recover(&self.phase)
     }
 
     /// Register a subsystem with initial Pending status.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the subsystems mutex is poisoned.
     pub fn register_subsystem(&self, id: SubsystemId) {
         let now = iso_now();
-        let mut subs = self.subsystems.lock().expect("subsystems lock");
+        let mut subs = lock_or_recover(&self.subsystems);
         subs.insert(
             id,
             SubsystemHealth {
@@ -596,13 +584,9 @@ impl LifecycleTracker {
     }
 
     /// Update a subsystem's health status.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the subsystems mutex is poisoned.
     pub fn update_subsystem(&self, id: SubsystemId, status: HealthStatus, error: Option<String>) {
         let now = iso_now();
-        let mut subs = self.subsystems.lock().expect("subsystems lock");
+        let mut subs = lock_or_recover(&self.subsystems);
         if let Some(health) = subs.get_mut(&id) {
             if status == HealthStatus::Healthy {
                 health.last_healthy_at = Some(now.clone());
@@ -617,14 +601,10 @@ impl LifecycleTracker {
     }
 
     /// Record a recovered panic for a subsystem.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the subsystems mutex is poisoned.
     pub fn record_panic_recovery(&self, id: SubsystemId, error_msg: &str) {
         self.total_panics.fetch_add(1, Ordering::Relaxed);
         let now = iso_now();
-        let mut subs = self.subsystems.lock().expect("subsystems lock");
+        let mut subs = lock_or_recover(&self.subsystems);
         if let Some(health) = subs.get_mut(&id) {
             health.restart_count += 1;
             health.last_error = Some(error_msg.to_owned());
@@ -642,13 +622,9 @@ impl LifecycleTracker {
     }
 
     /// Whether the watchdog should restart a given subsystem.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the subsystems mutex is poisoned.
     #[must_use]
     pub fn should_restart(&self, id: SubsystemId) -> Option<Duration> {
-        let subs = self.subsystems.lock().expect("subsystems lock");
+        let subs = lock_or_recover(&self.subsystems);
         let health = subs.get(&id)?;
 
         if health.status != HealthStatus::Failed {
@@ -678,14 +654,10 @@ impl LifecycleTracker {
     }
 
     /// Build a complete status snapshot.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the subsystems or phase mutex is poisoned.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn status(&self) -> DaemonStatus {
-        let subs = self.subsystems.lock().expect("subsystems lock");
+        let subs = lock_or_recover(&self.subsystems);
         let subsystem_vec: Vec<SubsystemHealth> = subs.values().cloned().collect();
         drop(subs);
 
@@ -696,7 +668,7 @@ impl LifecycleTracker {
             - (self.started_at.elapsed().as_millis() as u64);
 
         // Compute aggregate phase.
-        let phase = *self.phase.lock().expect("phase lock");
+        let phase = *lock_or_recover(&self.phase);
 
         DaemonStatus {
             phase,
@@ -729,6 +701,19 @@ fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
         .unwrap_or_else(|_| "unknown".into())
+}
+
+fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                target: "frankensearch.fsfs.lifecycle",
+                "poisoned mutex encountered; recovering inner state"
+            );
+            poisoned.into_inner()
+        }
+    }
 }
 
 fn iso_now() -> String {
