@@ -160,6 +160,12 @@ pub use query_execution::{
     LexicalCandidate, QueryExecutionOrchestrator, QueryExecutionPlan, RetrievalStage,
     SemanticCandidate, StagePlan,
 };
+pub use query_latency_optimization::{
+    CorrectnessAssertion, CorrectnessProofKind, LatencyDecomposition, OptimizationMechanism,
+    PhaseObservation, QUERY_LATENCY_OPT_SCHEMA_VERSION, QueryOptimizationLever, QueryPhase,
+    VerificationProtocol, VerificationResult, query_path_lever_catalog,
+    query_path_opportunity_matrix,
+};
 pub use query_planning::{
     DEFAULT_LOW_CONFIDENCE_THRESHOLD_PER_MILLE, QueryBudgetProfile, QueryFallbackPath,
     QueryIntentClass, QueryIntentDecision, QueryPlanner, QueryPlannerConfig, RetrievalBudget,

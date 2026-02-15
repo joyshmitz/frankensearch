@@ -1519,10 +1519,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        ContextRetentionPolicy, FsfsCardPrimitive, FsfsScreen, FsfsTuiShellModel, PaletteIntent,
-        REPLAY_TRACE_ACTION_ID, TuiAdapterSettings, TuiKeyBindingScope, TuiLatencyBoundary,
+        ContextRetentionPolicy, ContextRetentionRule, FsfsCardPrimitive, FsfsScreen,
+        FsfsTuiShellModel, PaletteIntent, REPLAY_TRACE_ACTION_ID, TuiAdapterSettings,
+        TuiKeyBindingScope, TuiKeyBindingSpec, TuiKeymapModel, TuiLatencyBoundary,
         TuiLatencyBudgetHook, TuiModelValidationError, TuiNavigationModel, TuiPaletteActionSpec,
-        TuiPaletteCategory, TuiPaletteIntent, TuiStateSerializationPoint,
+        TuiPaletteCategory, TuiPaletteIntent, TuiPaletteIntentModel, TuiPaletteIntentSpec,
+        TuiPaletteModel, TuiScreenLayoutContract, TuiSerializationTrigger,
+        TuiStateSerializationPoint,
     };
     use crate::config::{Density, FsfsConfig, TuiTheme};
     use crate::repro::{ReplayClientSurface, ReplayEntrypoint};
@@ -1989,4 +1992,717 @@ mod tests {
                 if id == REPLAY_TRACE_ACTION_ID
         ));
     }
+
+    // ─── bd-3jpu tests begin ───
+
+    #[test]
+    fn fsfs_screen_all_returns_six_screens() {
+        let all = FsfsScreen::all();
+        assert_eq!(all.len(), 6);
+        assert_eq!(all[0], FsfsScreen::Search);
+        assert_eq!(all[5], FsfsScreen::OpsTimeline);
+    }
+
+    #[test]
+    fn fsfs_screen_id_returns_stable_identifiers() {
+        assert_eq!(FsfsScreen::Search.id(), "fsfs.search");
+        assert_eq!(FsfsScreen::Indexing.id(), "fsfs.indexing");
+        assert_eq!(FsfsScreen::Pressure.id(), "fsfs.pressure");
+        assert_eq!(FsfsScreen::Explainability.id(), "fsfs.explain");
+        assert_eq!(FsfsScreen::Configuration.id(), "fsfs.config");
+        assert_eq!(FsfsScreen::OpsTimeline.id(), "fsfs.timeline");
+    }
+
+    #[test]
+    fn fsfs_screen_label_returns_human_labels() {
+        assert_eq!(FsfsScreen::Search.label(), "Search");
+        assert_eq!(FsfsScreen::Indexing.label(), "Indexing");
+        assert_eq!(FsfsScreen::Pressure.label(), "Pressure");
+        assert_eq!(FsfsScreen::Explainability.label(), "Explainability");
+        assert_eq!(FsfsScreen::Configuration.label(), "Configuration");
+        assert_eq!(FsfsScreen::OpsTimeline.label(), "Timeline");
+    }
+
+    #[test]
+    fn fsfs_screen_screen_id_wraps_id_string() {
+        let screen_id = FsfsScreen::Search.screen_id();
+        assert_eq!(screen_id.0, "fsfs.search");
+    }
+
+    #[test]
+    fn navigation_next_screen_mid_order() {
+        let navigation = TuiNavigationModel::default();
+        assert_eq!(
+            navigation.next_screen(FsfsScreen::Indexing),
+            FsfsScreen::Pressure
+        );
+        assert_eq!(
+            navigation.next_screen(FsfsScreen::Pressure),
+            FsfsScreen::Explainability
+        );
+    }
+
+    #[test]
+    fn navigation_previous_screen_mid_order() {
+        let navigation = TuiNavigationModel::default();
+        assert_eq!(
+            navigation.previous_screen(FsfsScreen::Pressure),
+            FsfsScreen::Indexing
+        );
+        assert_eq!(
+            navigation.previous_screen(FsfsScreen::Explainability),
+            FsfsScreen::Pressure
+        );
+    }
+
+    #[test]
+    fn navigation_next_screen_unknown_returns_default() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Indexing,
+            screen_order: vec![FsfsScreen::Indexing, FsfsScreen::Pressure],
+            history_limit: 10,
+            context_rules: vec![],
+        };
+        assert_eq!(
+            navigation.next_screen(FsfsScreen::Search),
+            FsfsScreen::Indexing
+        );
+    }
+
+    #[test]
+    fn navigation_previous_screen_unknown_returns_default() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Pressure,
+            screen_order: vec![FsfsScreen::Indexing, FsfsScreen::Pressure],
+            history_limit: 10,
+            context_rules: vec![],
+        };
+        assert_eq!(
+            navigation.previous_screen(FsfsScreen::Search),
+            FsfsScreen::Pressure
+        );
+    }
+
+    #[test]
+    fn navigation_screen_ids_matches_order() {
+        let navigation = TuiNavigationModel::default();
+        let ids = navigation.screen_ids();
+        assert_eq!(ids.len(), navigation.screen_order.len());
+        assert_eq!(ids[0].0, "fsfs.search");
+        assert_eq!(ids[1].0, "fsfs.indexing");
+    }
+
+    #[test]
+    fn navigation_validate_rejects_empty_screen_order() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Search,
+            screen_order: vec![],
+            history_limit: 10,
+            context_rules: vec![],
+        };
+        let err = navigation
+            .validate()
+            .expect_err("empty screen order must fail");
+        assert!(matches!(err, TuiModelValidationError::EmptyScreenOrder));
+    }
+
+    #[test]
+    fn navigation_validate_rejects_zero_history_limit() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Search,
+            screen_order: vec![FsfsScreen::Search],
+            history_limit: 0,
+            context_rules: vec![],
+        };
+        let err = navigation
+            .validate()
+            .expect_err("zero history limit must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::InvalidHistoryLimit(0)
+        ));
+    }
+
+    #[test]
+    fn navigation_validate_rejects_duplicate_screen() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Search,
+            screen_order: vec![FsfsScreen::Search, FsfsScreen::Search],
+            history_limit: 10,
+            context_rules: vec![],
+        };
+        let err = navigation
+            .validate()
+            .expect_err("duplicate screen must fail");
+        assert!(matches!(err, TuiModelValidationError::DuplicateScreenId(_)));
+    }
+
+    #[test]
+    fn navigation_validate_rejects_missing_default_screen() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Search,
+            screen_order: vec![FsfsScreen::Indexing],
+            history_limit: 10,
+            context_rules: vec![],
+        };
+        let err = navigation
+            .validate()
+            .expect_err("missing default screen must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::MissingDefaultScreen(_)
+        ));
+    }
+
+    #[test]
+    fn navigation_default_policy_for_targets() {
+        let navigation = TuiNavigationModel::default();
+        assert_eq!(
+            navigation.context_policy(FsfsScreen::Indexing, FsfsScreen::Configuration),
+            ContextRetentionPolicy::ResetTransient
+        );
+        assert_eq!(
+            navigation.context_policy(FsfsScreen::Indexing, FsfsScreen::OpsTimeline),
+            ContextRetentionPolicy::PreserveQueryAndFilters
+        );
+        assert_eq!(
+            navigation.context_policy(FsfsScreen::Indexing, FsfsScreen::Search),
+            ContextRetentionPolicy::PreserveAll
+        );
+    }
+
+    #[test]
+    fn key_binding_scope_as_str() {
+        assert_eq!(TuiKeyBindingScope::Global.as_str(), "global");
+        assert_eq!(TuiKeyBindingScope::Palette.as_str(), "palette");
+    }
+
+    #[test]
+    fn key_binding_spec_new_constructs_correctly() {
+        let spec = TuiKeyBindingSpec::new("Ctrl+X", "test.action", TuiKeyBindingScope::Global);
+        assert_eq!(spec.chord, "Ctrl+X");
+        assert_eq!(spec.action_id, "test.action");
+        assert_eq!(spec.scope, TuiKeyBindingScope::Global);
+    }
+
+    #[test]
+    fn keymap_default_has_18_bindings() {
+        let keymap = TuiKeymapModel::default();
+        assert_eq!(keymap.bindings.len(), 18);
+    }
+
+    #[test]
+    fn keymap_validate_passes_for_defaults() {
+        let keymap = TuiKeymapModel::default();
+        keymap.validate().expect("default keymap should validate");
+    }
+
+    #[test]
+    fn keymap_validate_rejects_duplicate_binding() {
+        let mut keymap = TuiKeymapModel::default();
+        keymap.bindings.push(TuiKeyBindingSpec::new(
+            "Ctrl+P",
+            "duplicate.action",
+            TuiKeyBindingScope::Global,
+        ));
+        let err = keymap.validate().expect_err("duplicate binding must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::DuplicateKeyBinding(ref key) if key == "global::Ctrl+P"
+        ));
+    }
+
+    #[test]
+    fn palette_category_to_action_category_all_variants() {
+        use frankensearch_tui::ActionCategory;
+        assert!(matches!(
+            TuiPaletteCategory::Navigation.to_action_category(),
+            ActionCategory::Navigation
+        ));
+        assert!(matches!(
+            TuiPaletteCategory::Search.to_action_category(),
+            ActionCategory::Search
+        ));
+        assert!(matches!(
+            TuiPaletteCategory::Indexing.to_action_category(),
+            ActionCategory::Custom(ref s) if s == "Indexing"
+        ));
+        assert!(matches!(
+            TuiPaletteCategory::Explainability.to_action_category(),
+            ActionCategory::Custom(ref s) if s == "Explainability"
+        ));
+        assert!(matches!(
+            TuiPaletteCategory::Configuration.to_action_category(),
+            ActionCategory::Settings
+        ));
+        assert!(matches!(
+            TuiPaletteCategory::Operations.to_action_category(),
+            ActionCategory::Custom(ref s) if s == "Operations"
+        ));
+        assert!(matches!(
+            TuiPaletteCategory::Diagnostics.to_action_category(),
+            ActionCategory::Debug
+        ));
+    }
+
+    #[test]
+    fn palette_action_navigation_fields_correct() {
+        let action = TuiPaletteActionSpec::navigation(FsfsScreen::Pressure);
+        assert_eq!(action.id, "nav.fsfs.pressure");
+        assert_eq!(action.label, "Go to Pressure");
+        assert!(action.description.contains("Pressure"));
+        assert_eq!(action.category, TuiPaletteCategory::Navigation);
+        assert!(action.shortcut_hint.is_none());
+        assert_eq!(action.target_screen, Some(FsfsScreen::Pressure));
+    }
+
+    #[test]
+    fn palette_action_named_with_shortcut() {
+        let action = TuiPaletteActionSpec::named(
+            "test.id",
+            "Test Label",
+            "Test description",
+            TuiPaletteCategory::Diagnostics,
+            Some("Ctrl+T"),
+        );
+        assert_eq!(action.id, "test.id");
+        assert_eq!(action.shortcut_hint.as_deref(), Some("Ctrl+T"));
+        assert!(action.target_screen.is_none());
+    }
+
+    #[test]
+    fn palette_action_named_without_shortcut() {
+        let action = TuiPaletteActionSpec::named(
+            "test.id2",
+            "Label",
+            "Desc",
+            TuiPaletteCategory::Search,
+            None,
+        );
+        assert!(action.shortcut_hint.is_none());
+    }
+
+    #[test]
+    fn palette_action_to_palette_action_conversion() {
+        let action = TuiPaletteActionSpec::named(
+            "test.conv",
+            "Convert Test",
+            "Test action for conversion",
+            TuiPaletteCategory::Search,
+            Some("Ctrl+Z"),
+        );
+        let palette_action = action.to_palette_action();
+        assert_eq!(palette_action.id, "test.conv");
+        assert_eq!(palette_action.label, "Convert Test");
+    }
+
+    #[test]
+    fn palette_model_from_navigation_includes_all_screens() {
+        let navigation = TuiNavigationModel::default();
+        let palette = TuiPaletteModel::from_navigation(&navigation);
+        assert_eq!(palette.actions.len(), 27);
+        for (i, screen) in navigation.screen_order.iter().enumerate() {
+            assert_eq!(palette.actions[i].target_screen, Some(*screen));
+        }
+    }
+
+    #[test]
+    fn palette_validate_rejects_nav_action_missing_target() {
+        let navigation = TuiNavigationModel::default();
+        let mut palette = TuiPaletteModel::from_navigation(&navigation);
+        palette.actions.push(TuiPaletteActionSpec {
+            id: "nav.broken".to_owned(),
+            label: "Broken Nav".to_owned(),
+            description: "Navigation action without target".to_owned(),
+            category: TuiPaletteCategory::Navigation,
+            shortcut_hint: None,
+            target_screen: None,
+        });
+        let err = palette
+            .validate(&navigation)
+            .expect_err("missing target should fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::NavigationActionMissingTarget(ref id) if id == "nav.broken"
+        ));
+    }
+
+    #[test]
+    fn palette_validate_rejects_nav_action_unknown_target() {
+        let navigation = TuiNavigationModel {
+            default_screen: FsfsScreen::Search,
+            screen_order: vec![FsfsScreen::Search, FsfsScreen::Indexing],
+            history_limit: 10,
+            context_rules: vec![],
+        };
+        let mut palette = TuiPaletteModel::from_navigation(&navigation);
+        palette
+            .actions
+            .push(TuiPaletteActionSpec::navigation(FsfsScreen::Pressure));
+        let err = palette
+            .validate(&navigation)
+            .expect_err("unknown target should fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::NavigationActionUnknownTarget(_)
+        ));
+    }
+
+    #[test]
+    fn palette_intent_model_maps_all_known_actions() {
+        let navigation = TuiNavigationModel::default();
+        let palette = TuiPaletteModel::from_navigation(&navigation);
+        let intent_model = TuiPaletteIntentModel::from_palette(&palette);
+        assert_eq!(intent_model.intents.len(), palette.actions.len());
+        for intent in &intent_model.intents {
+            assert_ne!(intent.intent, TuiPaletteIntent::Unknown);
+        }
+    }
+
+    #[test]
+    fn palette_intent_validate_rejects_duplicate_intent() {
+        let navigation = TuiNavigationModel::default();
+        let palette = TuiPaletteModel::from_navigation(&navigation);
+        let mut intent_model = TuiPaletteIntentModel::from_palette(&palette);
+        let dup = intent_model.intents[0].clone();
+        intent_model.intents.push(dup);
+        let err = intent_model
+            .validate(&palette)
+            .expect_err("duplicate intent must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::DuplicatePaletteIntent(_)
+        ));
+    }
+
+    #[test]
+    fn palette_intent_validate_rejects_unknown_action_reference() {
+        let navigation = TuiNavigationModel::default();
+        let palette = TuiPaletteModel::from_navigation(&navigation);
+        let mut intent_model = TuiPaletteIntentModel::from_palette(&palette);
+        intent_model.intents.push(TuiPaletteIntentSpec {
+            action_id: "nonexistent.action".to_owned(),
+            intent: TuiPaletteIntent::FocusQueryInput,
+            target_screen: None,
+            preserves_context: true,
+        });
+        let err = intent_model
+            .validate(&palette)
+            .expect_err("unknown action reference must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::PaletteIntentUnknownAction(ref id)
+                if id == "nonexistent.action"
+        ));
+    }
+
+    #[test]
+    fn serialization_point_defaults_cover_all_screens() {
+        let defaults = TuiStateSerializationPoint::defaults();
+        assert_eq!(defaults.len(), 6);
+        let screens: BTreeSet<_> = defaults.iter().map(|p| p.screen).collect();
+        for screen in FsfsScreen::all() {
+            assert!(screens.contains(&screen));
+        }
+    }
+
+    #[test]
+    fn serialization_validate_rejects_duplicate_id() {
+        let mut points = TuiStateSerializationPoint::defaults();
+        let dup = points[0].clone();
+        points.push(dup);
+        let navigation = TuiNavigationModel::default();
+        let err = TuiStateSerializationPoint::validate(&points, &navigation)
+            .expect_err("duplicate ID must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::DuplicateSerializationPoint(_)
+        ));
+    }
+
+    #[test]
+    fn serialization_validate_rejects_empty_state_keys() {
+        let mut points = TuiStateSerializationPoint::defaults();
+        points[0].state_keys.clear();
+        let navigation = TuiNavigationModel::default();
+        let err = TuiStateSerializationPoint::validate(&points, &navigation)
+            .expect_err("empty state keys must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::SerializationPointMissingStateKeys(_)
+        ));
+    }
+
+    #[test]
+    fn serialization_validate_rejects_missing_screen_coverage() {
+        let mut points = TuiStateSerializationPoint::defaults();
+        points.retain(|p| p.screen != FsfsScreen::Pressure);
+        let navigation = TuiNavigationModel::default();
+        let err = TuiStateSerializationPoint::validate(&points, &navigation)
+            .expect_err("missing screen must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::MissingSerializationPoint(ref id) if id == "fsfs.pressure"
+        ));
+    }
+
+    #[test]
+    fn latency_hook_defaults_count() {
+        let hooks = TuiLatencyBudgetHook::defaults();
+        assert_eq!(hooks.len(), 7);
+    }
+
+    #[test]
+    fn latency_hook_validate_rejects_duplicate_id() {
+        let mut hooks = TuiLatencyBudgetHook::defaults();
+        let dup = hooks[0].clone();
+        hooks.push(dup);
+        let err = TuiLatencyBudgetHook::validate(&hooks).expect_err("duplicate hook ID must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::DuplicateLatencyBudgetHook(_)
+        ));
+    }
+
+    #[test]
+    fn latency_hook_validate_rejects_zero_budget() {
+        let mut hooks = TuiLatencyBudgetHook::defaults();
+        hooks[0].budget_ms = 0;
+        let err = TuiLatencyBudgetHook::validate(&hooks).expect_err("zero budget must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::InvalidLatencyBudget(_)
+        ));
+    }
+
+    #[test]
+    fn latency_hook_validate_rejects_empty_metric_key() {
+        let mut hooks = TuiLatencyBudgetHook::defaults();
+        hooks[0].metric_key = "   ".to_owned();
+        let err = TuiLatencyBudgetHook::validate(&hooks).expect_err("empty metric key must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::MissingLatencyMetricKey(_)
+        ));
+    }
+
+    #[test]
+    fn layout_contract_defaults_count_and_coverage() {
+        let defaults = TuiScreenLayoutContract::defaults();
+        assert_eq!(defaults.len(), 6);
+        let screens: BTreeSet<_> = defaults.iter().map(|c| c.screen).collect();
+        for screen in FsfsScreen::all() {
+            assert!(screens.contains(&screen));
+        }
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_layout_contract() {
+        let mut shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        let dup = shell.layout_contracts[0].clone();
+        shell.layout_contracts.push(dup);
+        let err = shell
+            .validate()
+            .expect_err("duplicate layout contract must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::DuplicateLayoutContract(_)
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_layout_with_missing_focus_card() {
+        let mut shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
+        shell.layout_contracts[0].primary_focus_card = FsfsCardPrimitive::OpsTimelineStream;
+        let err = shell.validate().expect_err("missing focus card must fail");
+        assert!(matches!(
+            err,
+            TuiModelValidationError::MissingLayoutFocusCard(_)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn validation_error_display_all_variants() {
+        let cases: Vec<(TuiModelValidationError, &str)> = vec![
+            (TuiModelValidationError::EmptyScreenOrder, "empty"),
+            (
+                TuiModelValidationError::InvalidHistoryLimit(0),
+                "history_limit",
+            ),
+            (
+                TuiModelValidationError::DuplicateScreenId("x".into()),
+                "duplicate screen",
+            ),
+            (
+                TuiModelValidationError::MissingDefaultScreen("x".into()),
+                "default screen",
+            ),
+            (
+                TuiModelValidationError::DuplicateKeyBinding("x".into()),
+                "duplicate key",
+            ),
+            (
+                TuiModelValidationError::DuplicatePaletteActionId("x".into()),
+                "duplicate command palette",
+            ),
+            (
+                TuiModelValidationError::NavigationActionMissingTarget("x".into()),
+                "missing target",
+            ),
+            (
+                TuiModelValidationError::NavigationActionUnknownTarget("x".into()),
+                "unknown screen",
+            ),
+            (
+                TuiModelValidationError::DuplicateLayoutContract("x".into()),
+                "duplicate layout",
+            ),
+            (
+                TuiModelValidationError::MissingLayoutContract("x".into()),
+                "missing layout",
+            ),
+            (
+                TuiModelValidationError::MissingLayoutFocusCard("x".into()),
+                "focus card",
+            ),
+            (
+                TuiModelValidationError::DuplicatePaletteIntent("x".into()),
+                "duplicate palette intent",
+            ),
+            (
+                TuiModelValidationError::PaletteIntentUnknownAction("x".into()),
+                "unknown action",
+            ),
+            (
+                TuiModelValidationError::MissingPaletteIntent("x".into()),
+                "no explicit intent",
+            ),
+            (
+                TuiModelValidationError::DuplicateSerializationPoint("x".into()),
+                "duplicate serialization",
+            ),
+            (
+                TuiModelValidationError::MissingSerializationPoint("x".into()),
+                "missing serialization",
+            ),
+            (
+                TuiModelValidationError::SerializationPointMissingStateKeys("x".into()),
+                "missing state keys",
+            ),
+            (
+                TuiModelValidationError::DuplicateLatencyBudgetHook("x".into()),
+                "duplicate latency",
+            ),
+            (
+                TuiModelValidationError::InvalidLatencyBudget("x".into()),
+                "invalid budget",
+            ),
+            (
+                TuiModelValidationError::MissingLatencyMetricKey("x".into()),
+                "missing metric key",
+            ),
+            (
+                TuiModelValidationError::InvalidShowcaseInteractionSpec("x".into()),
+                "invalid showcase",
+            ),
+            (
+                TuiModelValidationError::MissingShowcaseSurfaceMapping("x".into()),
+                "missing fsfs showcase",
+            ),
+            (
+                TuiModelValidationError::ShowcaseMappingUnknownScreen("x".into()),
+                "unknown screen",
+            ),
+            (
+                TuiModelValidationError::ShowcaseMappingMissingAction("x".into()),
+                "missing palette action",
+            ),
+        ];
+        for (err, expected_substr) in &cases {
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(expected_substr),
+                "Display for {err:?} should contain '{expected_substr}', got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_error_implements_std_error() {
+        let err = TuiModelValidationError::EmptyScreenOrder;
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn context_retention_rule_debug_clone() {
+        let rule = ContextRetentionRule {
+            from: FsfsScreen::Search,
+            to: FsfsScreen::Pressure,
+            policy: ContextRetentionPolicy::PreserveQueryAndFilters,
+        };
+        #[allow(clippy::clone_on_copy)]
+        let cloned = rule.clone();
+        assert_eq!(rule, cloned);
+        let debug = format!("{rule:?}");
+        assert!(debug.contains("ContextRetentionRule"));
+    }
+
+    #[test]
+    fn serialization_trigger_debug_clone_eq() {
+        let a = TuiSerializationTrigger::FrameCommitted;
+        let b = a;
+        assert_eq!(a, b);
+        let debug = format!("{a:?}");
+        assert!(debug.contains("FrameCommitted"));
+    }
+
+    #[test]
+    fn latency_boundary_debug_clone_eq() {
+        let a = TuiLatencyBoundary::InputToIntent;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(a, TuiLatencyBoundary::IntentToState);
+    }
+
+    #[test]
+    fn card_primitive_ord_is_deterministic() {
+        assert!(FsfsCardPrimitive::QueryToolbar < FsfsCardPrimitive::StatusFooter);
+        let a = FsfsCardPrimitive::ResultListVirtualized;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn palette_intent_config_reload_does_not_preserve_context() {
+        let navigation = TuiNavigationModel::default();
+        let palette = TuiPaletteModel::from_navigation(&navigation);
+        let intent_model = TuiPaletteIntentModel::from_palette(&palette);
+        let reload_intent = intent_model
+            .intents
+            .iter()
+            .find(|i| i.action_id == "config.reload")
+            .expect("config.reload intent should exist");
+        assert!(!reload_intent.preserves_context);
+        assert_eq!(reload_intent.intent, TuiPaletteIntent::ReloadConfiguration);
+    }
+
+    #[test]
+    fn palette_intent_navigate_screen_preserves_context() {
+        let navigation = TuiNavigationModel::default();
+        let palette = TuiPaletteModel::from_navigation(&navigation);
+        let intent_model = TuiPaletteIntentModel::from_palette(&palette);
+        let nav_intents: Vec<_> = intent_model
+            .intents
+            .iter()
+            .filter(|i| i.intent == TuiPaletteIntent::NavigateScreen)
+            .collect();
+        assert_eq!(nav_intents.len(), 6);
+        for intent in &nav_intents {
+            assert!(intent.preserves_context);
+            assert!(intent.target_screen.is_some());
+        }
+    }
+
+    // ─── bd-3jpu tests end ───
 }

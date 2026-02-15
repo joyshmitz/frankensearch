@@ -57,7 +57,12 @@ impl TestContext {
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(&self.fsfs_bin)
+        self.run_with_env(cwd, args, &[])
+    }
+
+    fn run_with_env(&self, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(&self.fsfs_bin);
+        command
             .args(args)
             .current_dir(cwd)
             .env("HOME", &self.home_dir)
@@ -67,9 +72,12 @@ impl TestContext {
             .env("FRANKENSEARCH_MODEL_DIR", &self.model_dir)
             .env("FRANKENSEARCH_OFFLINE", "1")
             .env("FRANKENSEARCH_ALLOW_DOWNLOAD", "0")
-            .env("NO_COLOR", "1")
-            .output()
-            .expect("spawn fsfs process")
+            .env("NO_COLOR", "1");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+
+        command.output().expect("spawn fsfs process")
     }
 }
 
@@ -104,6 +112,21 @@ fn parse_json(label: &str, output: &Output) -> Value {
             stdout_str(output)
         )
     })
+}
+
+fn assert_generic_csv_envelope(label: &str, output: &Output) {
+    assert_success(label, output);
+    let text = stdout_str(output);
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        "data_json",
+        "{label} should emit generic csv envelope header"
+    );
+    assert!(
+        lines.next().is_some_and(|line| !line.trim().is_empty()),
+        "{label} should emit one payload row"
+    );
 }
 
 /// Create a small corpus with known files and build an index.
@@ -278,6 +301,73 @@ fn search_json_returns_ok_envelope_with_hits() {
 }
 
 #[test]
+fn search_logs_include_output_format_field_when_info_logging_enabled() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run_with_env(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff strategy",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "5",
+            "--format",
+            "json",
+        ],
+        &[("FRANKENSEARCH_LOG", "info")],
+    );
+    assert_success("search logging format field", &output);
+
+    let stderr = stderr_str(&output);
+    assert!(
+        stderr.contains("fsfs search command completed"),
+        "expected info search completion log line in stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("output_format=json") || stderr.contains("output_format=\"json\""),
+        "expected output_format field in search logs: {stderr}"
+    );
+}
+
+#[test]
+fn search_default_format_is_jsonl_for_non_tty_stdout() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "retry backoff strategy",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "5",
+        ],
+    );
+    assert_success("search default format", &output);
+
+    let text = stdout_str(&output);
+    let mut line_count = 0_usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        serde_json::from_str::<Value>(trimmed).unwrap_or_else(|error| {
+            panic!("default format must emit JSONL in non-tty tests: {error}\nline: {trimmed}")
+        });
+        line_count += 1;
+    }
+
+    assert!(
+        line_count >= 1,
+        "default non-tty output should emit at least one JSONL line"
+    );
+}
+
+#[test]
 fn search_csv_output_has_header_row() {
     let (temp, ctx, index_arg) = indexed_fixture();
     let output = ctx.run(
@@ -307,6 +397,40 @@ fn search_csv_output_has_header_row() {
 }
 
 #[test]
+fn search_toon_output_decodes_as_valid_envelope() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "authenticate token",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "5",
+            "--format",
+            "toon",
+        ],
+    );
+    assert_success("search toon", &output);
+
+    let text = stdout_str(&output);
+    assert!(
+        text.contains("ok: true"),
+        "TOON output should include success marker: {text}"
+    );
+    assert!(
+        text.contains("command: search"),
+        "TOON output should include command metadata: {text}"
+    );
+    assert!(
+        text.contains("format: toon"),
+        "TOON output should include toon format metadata: {text}"
+    );
+}
+
+#[test]
 fn search_table_output_is_human_readable() {
     let (temp, ctx, index_arg) = indexed_fixture();
     let output = ctx.run(
@@ -329,6 +453,41 @@ fn search_table_output_is_human_readable() {
     assert!(
         text.chars().any(char::is_alphanumeric),
         "table output should contain readable text"
+    );
+}
+
+#[test]
+fn search_explicit_table_overrides_non_tty_default() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "authenticate token",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--limit",
+            "5",
+            "--format",
+            "table",
+        ],
+    );
+    assert_success("search table explicit", &output);
+
+    let text = stdout_str(&output);
+    assert!(
+        !text
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_start()
+            .starts_with('{'),
+        "explicit table format should not emit JSONL default output"
+    );
+    assert!(
+        text.contains("PHASE") || text.contains("results in"),
+        "table output should contain human-readable result sections"
     );
 }
 
@@ -534,6 +693,93 @@ fn search_missing_index_dir_reports_error() {
 }
 
 #[test]
+fn status_csv_output_uses_generic_csv_envelope() {
+    let (temp, ctx, index_arg) = indexed_fixture();
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "status",
+            "--index-dir",
+            &index_arg,
+            "--no-watch-mode",
+            "--format",
+            "csv",
+        ],
+    );
+    assert_generic_csv_envelope("status csv", &output);
+}
+
+#[test]
+fn config_validate_csv_output_uses_generic_csv_envelope() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let output = ctx.run(temp.path(), &["config", "validate", "--format", "csv"]);
+    assert_generic_csv_envelope("config validate csv", &output);
+}
+
+#[test]
+fn doctor_csv_output_uses_generic_csv_envelope() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let output = ctx.run(temp.path(), &["doctor", "--format", "csv"]);
+    assert_generic_csv_envelope("doctor csv", &output);
+}
+
+#[test]
+fn download_list_csv_output_uses_generic_csv_envelope() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let output = ctx.run(
+        temp.path(),
+        &["download-models", "--list", "--format", "csv"],
+    );
+    assert_generic_csv_envelope("download list csv", &output);
+}
+
+#[test]
+fn explain_csv_output_uses_generic_csv_envelope() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let output = ctx.run(temp.path(), &["explain", "R1", "--format", "csv"]);
+    assert_generic_csv_envelope("explain csv", &output);
+}
+
+#[test]
+fn uninstall_dry_run_csv_output_uses_generic_csv_envelope() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let output = ctx.run(temp.path(), &["uninstall", "--dry-run", "--format", "csv"]);
+    assert_generic_csv_envelope("uninstall dry-run csv", &output);
+}
+
+#[test]
+fn search_missing_index_dir_csv_reports_error() {
+    let temp = tempfile::tempdir().expect("create temp dir");
+    let ctx = TestContext::new(temp.path());
+    let output = ctx.run(
+        temp.path(),
+        &[
+            "search",
+            "test query",
+            "--index-dir",
+            "/nonexistent/path/to/index",
+            "--no-watch-mode",
+            "--format",
+            "csv",
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "search against missing index should fail for csv output"
+    );
+    let combined = format!("{}\n{}", stdout_str(&output), stderr_str(&output));
+    assert!(
+        !combined.trim().is_empty(),
+        "csv error path should emit diagnostics"
+    );
+}
+
+#[test]
 fn index_nonexistent_corpus_reports_error() {
     let temp = tempfile::tempdir().expect("create temp dir");
     let ctx = TestContext::new(temp.path());
@@ -562,7 +808,7 @@ fn all_search_formats_succeed_on_same_query() {
     let (temp, ctx, index_arg) = indexed_fixture();
     let query = "search library indexing";
 
-    for format in &["json", "csv", "table", "jsonl"] {
+    for format in &["json", "csv", "table", "jsonl", "toon"] {
         let output = ctx.run(
             temp.path(),
             &[

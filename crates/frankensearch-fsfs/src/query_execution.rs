@@ -1804,9 +1804,7 @@ mod tests {
         assert!(
             override_guardrail_for_mode(DegradedRetrievalMode::LexicalOnly).contains("emergency")
         );
-        assert!(
-            override_guardrail_for_mode(DegradedRetrievalMode::MetadataOnly).contains("pause")
-        );
+        assert!(override_guardrail_for_mode(DegradedRetrievalMode::MetadataOnly).contains("pause"));
         assert!(
             override_guardrail_for_mode(DegradedRetrievalMode::Paused).contains("writes remain")
         );
@@ -1861,29 +1859,29 @@ mod tests {
 
     #[test]
     fn sanitize_score_nan_becomes_neg_infinity() {
-        assert_eq!(super::sanitize_score(f32::NAN), f32::NEG_INFINITY);
+        assert!(super::sanitize_score(f32::NAN) == f32::NEG_INFINITY);
     }
 
     #[test]
     fn sanitize_score_normal_value_unchanged() {
-        assert_eq!(super::sanitize_score(1.5), 1.5);
+        assert!((super::sanitize_score(1.5) - 1.5).abs() < f32::EPSILON);
     }
 
     #[test]
     fn sanitize_score_infinity_unchanged() {
-        assert_eq!(super::sanitize_score(f32::INFINITY), f32::INFINITY);
+        assert!(super::sanitize_score(f32::INFINITY) == f32::INFINITY);
     }
 
     // --- sanitize_fused_score ---
 
     #[test]
     fn sanitize_fused_score_nan_becomes_zero() {
-        assert_eq!(super::sanitize_fused_score(f64::NAN), 0.0);
+        assert!(super::sanitize_fused_score(f64::NAN).abs() < f64::EPSILON);
     }
 
     #[test]
     fn sanitize_fused_score_infinity_becomes_zero() {
-        assert_eq!(super::sanitize_fused_score(f64::INFINITY), 0.0);
+        assert!(super::sanitize_fused_score(f64::INFINITY).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1895,12 +1893,12 @@ mod tests {
 
     #[test]
     fn sanitize_non_negative_negative_becomes_zero() {
-        assert_eq!(super::sanitize_non_negative(-1.0), 0.0);
+        assert!(super::sanitize_non_negative(-1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn sanitize_non_negative_nan_becomes_zero() {
-        assert_eq!(super::sanitize_non_negative(f64::NAN), 0.0);
+        assert!(super::sanitize_non_negative(f64::NAN).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1912,12 +1910,12 @@ mod tests {
 
     #[test]
     fn sanitize_signal_none_becomes_zero() {
-        assert_eq!(super::sanitize_signal(None), 0.0);
+        assert!(super::sanitize_signal(None).abs() < f64::EPSILON);
     }
 
     #[test]
     fn sanitize_signal_nan_becomes_zero() {
-        assert_eq!(super::sanitize_signal(Some(f64::NAN)), 0.0);
+        assert!(super::sanitize_signal(Some(f64::NAN)).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1927,7 +1925,7 @@ mod tests {
 
     #[test]
     fn sanitize_signal_clamped_below_0() {
-        assert_eq!(super::sanitize_signal(Some(-0.5)), 0.0);
+        assert!(super::sanitize_signal(Some(-0.5)).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1961,17 +1959,17 @@ mod tests {
 
     #[test]
     fn option_score_none_is_neg_infinity() {
-        assert_eq!(super::option_score(None), f32::NEG_INFINITY);
+        assert!(super::option_score(None) == f32::NEG_INFINITY);
     }
 
     #[test]
     fn option_score_some_nan_is_neg_infinity() {
-        assert_eq!(super::option_score(Some(f32::NAN)), f32::NEG_INFINITY);
+        assert!(super::option_score(Some(f32::NAN)) == f32::NEG_INFINITY);
     }
 
     #[test]
     fn option_score_some_value() {
-        assert_eq!(super::option_score(Some(1.5)), 1.5);
+        assert!((super::option_score(Some(1.5)) - 1.5).abs() < f32::EPSILON);
     }
 
     // --- FusionPolicy ---

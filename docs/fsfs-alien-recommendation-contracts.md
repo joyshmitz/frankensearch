@@ -82,6 +82,61 @@ Rollback guardrails (per optimization class):
 - abort triggers include class-specific reason codes (scope regressions, idempotency violations, queue starvation/unbounded growth, embed/degrade policy regressions)
 - required recovery reason code: `opt.rollback.completed`
 
+## Query Latency Optimization Track (`bd-2hz.9.4`)
+
+Prioritized retrieval/fusion/explanation levers (ICE rank, highest first):
+
+1. `vector_search.scratch_buffer_reuse` (phase: `fast_vector_search`)
+   - mechanism: `buffer_reuse`
+   - target: lower allocation churn in tight scan loops; expected p95 latency reduction in fast path
+2. `fuse.hashmap_capacity` (phase: `fuse`)
+   - mechanism: `allocation_reduction`
+   - target: fewer HashMap rehashes for typical lexical/semantic overlap ratios
+3. `fuse.string_clone_reduction` (phase: `fuse`)
+   - mechanism: `data_movement`
+   - target: avoid repeated `doc_id` clone work in RRF merge loops
+4. `blend.string_clone_reduction` (phase: `blend`)
+   - mechanism: `data_movement`
+   - target: reduce blend-loop string allocation pressure
+5. `blend.rank_map_cache` (phase: `blend`)
+   - mechanism: `precomputation`
+   - target: reuse phase-1 rank metadata in phase-2 blending
+6. `serialize.preallocate_json_buffer` (phase: `serialize`)
+   - mechanism: `allocation_reduction`
+   - target: reduce serialization reallocations for large result payloads
+7. `vector_search.parallel_threshold_tuning` (phase: `fast_vector_search`)
+   - mechanism: `parallelism`
+   - target: improve p95 crossover by tuning scan parallelization threshold
+8. `blend.kendall_tau_approximation` (phase: `blend`)
+   - mechanism: `algorithm_replacement`
+   - target: replace O(n^2) Kendall tau with O(n log n) equivalent
+
+Latency decomposition and budget contract:
+
+- canonical phase model: `canonicalize`, `classify`, `fast_embed`, `lexical_retrieve`, `fast_vector_search`, `fuse`, `quality_embed`, `quality_vector_search`, `blend`, `rerank`, `explain`, `serialize`
+- each phase records `actual_us`, `budget_us`, and `skipped` flag
+- decomposition verdict reason codes:
+  - `query.latency.on_budget`
+  - `query.latency.single_phase_over_budget`
+  - `query.latency.multiple_phases_over_budget`
+
+Correctness-preserving verification protocol requirements:
+
+- schema/version contract: `fsfs-query-latency-opt-v1`
+- required corpora:
+  - `golden_100`
+  - `adversarial_unicode`
+  - `empty_query`
+  - `identifier_query`
+  - `natural_language_query`
+- proof kinds by lever:
+  - `bit_identical` for refactors and allocation/data-movement levers
+  - `numerically_equivalent` for floating-point sensitive improvements
+  - `rank_preserving` for parallel threshold and ordering-risk levers
+- merge gate reason codes:
+  - pass: `opt.verify.passed`
+  - fail: `opt.verify.failed`
+
 ## Contract Semantics
 
 - `ev_score` is numeric expected value (impact-confidence-reuse-effort normalization)

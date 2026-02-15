@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 
 use frankensearch_fsfs::{
-    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, ITERATION_REASON_ACCEPTED,
-    ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE, LeverSnapshot,
-    OPPORTUNITY_MATRIX_SCHEMA_VERSION, OneLeverIterationProtocol, OpportunityCandidate,
-    OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind, ProfileWorkflow,
-    crawl_ingest_optimization_track,
+    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorrectnessAssertion, CorrectnessProofKind,
+    ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE,
+    LatencyDecomposition, LeverSnapshot, OPPORTUNITY_MATRIX_SCHEMA_VERSION,
+    OneLeverIterationProtocol, OpportunityCandidate, OpportunityMatrix,
+    PROFILING_WORKFLOW_SCHEMA_VERSION, PhaseObservation, ProfileKind, ProfileWorkflow,
+    QUERY_LATENCY_OPT_SCHEMA_VERSION, QueryPhase, VerificationProtocol, VerificationResult,
+    crawl_ingest_optimization_track, query_path_lever_catalog, query_path_opportunity_matrix,
 };
 
 #[test]
@@ -103,6 +105,129 @@ fn crawl_ingest_track_is_ranked_and_guarded() {
         );
         assert!(!guardrail.abort_reason_codes.is_empty());
     }
+}
+
+#[test]
+fn query_latency_track_matrix_and_catalog_stay_in_sync() {
+    let matrix = query_path_opportunity_matrix();
+    assert_eq!(matrix.schema_version, OPPORTUNITY_MATRIX_SCHEMA_VERSION);
+    assert!(
+        !matrix.candidates.is_empty(),
+        "query matrix must not be empty"
+    );
+
+    let ranked = matrix.ranked();
+    assert_eq!(
+        ranked[0].candidate.id, "vector_search.scratch_buffer_reuse",
+        "top-ranked query lever drifted; revisit expected optimization order"
+    );
+
+    let matrix_ids: BTreeSet<&str> = matrix.candidates.iter().map(|c| c.id.as_str()).collect();
+    let catalog = query_path_lever_catalog();
+    let catalog_ids: BTreeSet<&str> = catalog.iter().map(|lever| lever.id.as_str()).collect();
+
+    assert_eq!(matrix_ids, catalog_ids, "matrix and catalog should match");
+    assert_eq!(catalog_ids.len(), 8, "unexpected query lever count");
+}
+
+#[test]
+fn query_latency_decomposition_reports_over_budget_phase() {
+    let decomposition = LatencyDecomposition::new(
+        vec![
+            PhaseObservation {
+                phase: QueryPhase::Canonicalize,
+                actual_us: 120,
+                budget_us: QueryPhase::Canonicalize.default_budget_us(),
+                skipped: false,
+            },
+            PhaseObservation {
+                phase: QueryPhase::FastEmbed,
+                actual_us: 700,
+                budget_us: QueryPhase::FastEmbed.default_budget_us(),
+                skipped: false,
+            },
+            PhaseObservation {
+                phase: QueryPhase::FastVectorSearch,
+                actual_us: 7_600,
+                budget_us: QueryPhase::FastVectorSearch.default_budget_us(),
+                skipped: false,
+            },
+            PhaseObservation {
+                phase: QueryPhase::Fuse,
+                actual_us: 480,
+                budget_us: QueryPhase::Fuse.default_budget_us(),
+                skipped: false,
+            },
+            PhaseObservation {
+                phase: QueryPhase::QualityEmbed,
+                actual_us: 0,
+                budget_us: QueryPhase::QualityEmbed.default_budget_us(),
+                skipped: true,
+            },
+        ],
+        12,
+        4_096,
+    );
+
+    assert_eq!(
+        decomposition.schema_version,
+        QUERY_LATENCY_OPT_SCHEMA_VERSION
+    );
+    assert_eq!(decomposition.initial_path_us(), 8_900);
+    assert_eq!(decomposition.refinement_path_us(), 0);
+    assert_eq!(
+        decomposition.verdict_reason_code(),
+        "query.latency.single_phase_over_budget"
+    );
+
+    let over_budget = decomposition.over_budget_phases();
+    assert_eq!(over_budget.len(), 1);
+    assert_eq!(over_budget[0].phase, QueryPhase::FastVectorSearch);
+    assert_eq!(over_budget[0].overshoot_us(), 2_600);
+}
+
+#[test]
+fn query_latency_verification_protocol_covers_catalog_and_rejects_failure() {
+    let protocol = VerificationProtocol::default_protocol();
+    assert_eq!(protocol.schema_version, QUERY_LATENCY_OPT_SCHEMA_VERSION);
+    let epsilon: f64 = protocol
+        .score_epsilon_str
+        .parse()
+        .expect("epsilon should parse");
+    assert!(epsilon > 0.0);
+
+    let catalog_ids: BTreeSet<String> = query_path_lever_catalog()
+        .into_iter()
+        .map(|lever| lever.id)
+        .collect();
+    let protocol_ids: BTreeSet<String> = protocol.required_lever_ids.iter().cloned().collect();
+    assert_eq!(catalog_ids, protocol_ids);
+
+    let verification = VerificationResult::from_assertions(
+        "vector_search.parallel_threshold_tuning",
+        vec![
+            CorrectnessAssertion {
+                lever_id: "vector_search.parallel_threshold_tuning".to_owned(),
+                proof_kind: CorrectnessProofKind::RankPreserving,
+                test_corpus_ids: vec!["golden_100".to_owned()],
+                assertion: "ranking order preserved".to_owned(),
+                passed: true,
+                reason_code: "opt.assert.rank_preserving.passed".to_owned(),
+            },
+            CorrectnessAssertion {
+                lever_id: "vector_search.parallel_threshold_tuning".to_owned(),
+                proof_kind: CorrectnessProofKind::RankPreserving,
+                test_corpus_ids: vec!["adversarial_unicode".to_owned()],
+                assertion: "ranking order preserved".to_owned(),
+                passed: false,
+                reason_code: "opt.assert.rank_preserving.rank_swap_at_position_3".to_owned(),
+            },
+        ],
+    );
+
+    assert!(!verification.passed);
+    assert_eq!(verification.failure_count(), 1);
+    assert_eq!(verification.reason_code, "opt.verify.failed");
 }
 
 #[test]

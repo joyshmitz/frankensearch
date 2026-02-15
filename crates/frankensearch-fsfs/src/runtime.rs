@@ -1693,14 +1693,6 @@ impl FsfsRuntime {
     }
 
     fn run_update_command(&self) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "update command does not support csv output".to_owned(),
-            });
-        }
-
         // Handle --rollback separately.
         if self.cli_input.update_rollback {
             return self.run_rollback_command();
@@ -2007,14 +1999,6 @@ impl FsfsRuntime {
     }
 
     fn run_uninstall_command(&self) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "uninstall command does not support csv output".to_owned(),
-            });
-        }
-
         let payload = self.collect_uninstall_payload()?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_uninstall_table(&payload, self.cli_input.no_color);
@@ -2417,6 +2401,7 @@ impl FsfsRuntime {
         info!(
             phase = "display",
             format = self.cli_input.format.to_string(),
+            output_format = self.cli_input.format.to_string(),
             returned_hits = payload.returned_hits,
             elapsed_ms,
             "fsfs search display phase prepared"
@@ -2424,6 +2409,7 @@ impl FsfsRuntime {
         info!(
             query = payload.query,
             phase = payload.phase.to_string(),
+            output_format = self.cli_input.format.to_string(),
             returned_hits = payload.returned_hits,
             total_candidates = payload.total_candidates,
             elapsed_ms,
@@ -2492,6 +2478,7 @@ impl FsfsRuntime {
                     stream_id,
                     frames_emitted = seq,
                     format = self.cli_input.format.to_string(),
+                    output_format = self.cli_input.format.to_string(),
                     "fsfs search stream completed"
                 );
                 Ok(())
@@ -2622,14 +2609,6 @@ impl FsfsRuntime {
     }
 
     fn run_explain_command(&self) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "explain command does not support csv output".to_owned(),
-            });
-        }
-
         let result_id =
             self.cli_input
                 .result_id
@@ -2919,14 +2898,6 @@ impl FsfsRuntime {
     }
 
     fn run_status_command(&self) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "status command does not support csv output".to_owned(),
-            });
-        }
-
         let payload = self.collect_status_payload()?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_status_table(&payload, self.cli_input.no_color);
@@ -2950,14 +2921,6 @@ impl FsfsRuntime {
     }
 
     async fn run_download_command(&self) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "download-models command does not support csv output".to_owned(),
-            });
-        }
-
         let payload = self.collect_download_models_payload().await?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_download_models_table(&payload, self.cli_input.no_color);
@@ -3088,14 +3051,6 @@ impl FsfsRuntime {
     }
 
     fn run_doctor_command(&self) -> SearchResult<()> {
-        if self.cli_input.format == OutputFormat::Csv {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.format".to_owned(),
-                value: self.cli_input.format.to_string(),
-                reason: "doctor command does not support csv output".to_owned(),
-            });
-        }
-
         let payload = self.collect_doctor_payload()?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_doctor_table(&payload, self.cli_input.no_color);

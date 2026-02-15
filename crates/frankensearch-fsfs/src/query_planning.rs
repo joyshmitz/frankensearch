@@ -1328,11 +1328,8 @@ mod tests {
 
     #[test]
     fn identifier_signal_double_colon_with_space_no_signal() {
-        // "foo :: bar" has a space, so :: check doesn't fire
-        assert_eq!(
-            super::identifier_signal_count("foo :: bar") & 0, // just check it doesn't panic
-            0
-        );
+        // "foo :: bar" has a space, so :: check doesn't fire — just verify it doesn't panic
+        let _ = super::identifier_signal_count("foo :: bar");
     }
 
     // --- natural_language_signal_count ---

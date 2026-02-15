@@ -274,14 +274,6 @@ fn run_config_command(
     project_config_path: Option<&Path>,
     user_config_path: Option<&Path>,
 ) -> SearchResult<()> {
-    if cli_input.format == OutputFormat::Csv {
-        return Err(SearchError::InvalidConfig {
-            field: "cli.format".to_owned(),
-            value: cli_input.format.to_string(),
-            reason: "config command does not support csv output".to_owned(),
-        });
-    }
-
     let action = cli_input
         .config_action
         .clone()

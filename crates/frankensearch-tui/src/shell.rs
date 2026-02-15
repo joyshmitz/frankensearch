@@ -683,4 +683,439 @@ mod tests {
             .expect("context captured");
         assert_eq!(seen, (111, 37));
     }
+
+    // ─── bd-n6x8 tests begin ───
+
+    /// Minimal stub screen for navigation/lifecycle tests.
+    struct StubScreen {
+        id: ScreenId,
+        title: &'static str,
+        focused: Arc<Mutex<bool>>,
+    }
+
+    impl StubScreen {
+        fn new(id: &str, title: &'static str) -> Self {
+            Self {
+                id: ScreenId::new(id),
+                title,
+                focused: Arc::new(Mutex::new(false)),
+            }
+        }
+
+        #[expect(dead_code)]
+        fn is_focused(&self) -> bool {
+            *self.focused.lock().unwrap()
+        }
+    }
+
+    impl Screen for StubScreen {
+        fn id(&self) -> &ScreenId {
+            &self.id
+        }
+
+        fn title(&self) -> &'static str {
+            self.title
+        }
+
+        fn render(&self, _frame: &mut Frame<'_>, _ctx: &ScreenContext) {}
+
+        fn handle_input(&mut self, _event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
+            ScreenAction::Ignored
+        }
+
+        fn on_focus(&mut self) {
+            *self.focused.lock().unwrap() = true;
+        }
+
+        fn on_blur(&mut self) {
+            *self.focused.lock().unwrap() = false;
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn status_line_default_is_empty() {
+        let sl = StatusLine::default();
+        assert!(sl.left.is_empty());
+        assert!(sl.center.is_empty());
+        assert!(sl.right.is_empty());
+    }
+
+    #[test]
+    fn status_line_new_matches_default() {
+        let n = StatusLine::new();
+        let d = StatusLine::default();
+        assert_eq!(n.left, d.left);
+        assert_eq!(n.center, d.center);
+        assert_eq!(n.right, d.right);
+    }
+
+    #[test]
+    fn status_line_partial_builder_only_left() {
+        let sl = StatusLine::new().with_left("L");
+        assert_eq!(sl.left, "L");
+        assert!(sl.center.is_empty());
+        assert!(sl.right.is_empty());
+    }
+
+    #[test]
+    fn status_line_partial_builder_only_right() {
+        let sl = StatusLine::new().with_right("R");
+        assert!(sl.left.is_empty());
+        assert!(sl.center.is_empty());
+        assert_eq!(sl.right, "R");
+    }
+
+    #[test]
+    fn status_line_debug() {
+        let sl = StatusLine::new().with_center("mid");
+        let debug = format!("{sl:?}");
+        assert!(debug.contains("StatusLine"));
+    }
+
+    #[test]
+    fn status_line_clone() {
+        let sl = StatusLine::new().with_left("L").with_center("C");
+        #[allow(clippy::redundant_clone)]
+        let cloned = sl.clone();
+        assert_eq!(cloned.left, "L");
+        assert_eq!(cloned.center, "C");
+    }
+
+    #[test]
+    fn shell_config_debug() {
+        let config = ShellConfig::default();
+        let debug = format!("{config:?}");
+        assert!(debug.contains("ShellConfig"));
+        assert!(debug.contains("frankensearch"));
+    }
+
+    #[test]
+    fn shell_config_clone() {
+        let config = ShellConfig::default();
+        #[allow(clippy::redundant_clone)]
+        let cloned = config.clone();
+        assert_eq!(cloned.title, "frankensearch");
+        assert!(cloned.show_status_bar);
+    }
+
+    #[test]
+    fn navigate_to_nonexistent_screen_is_noop() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let bad_id = ScreenId::new("nonexistent");
+        shell.navigate_to(&bad_id);
+        assert!(shell.active_screen.is_none());
+    }
+
+    #[test]
+    fn navigate_to_valid_screen() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let id_a = ScreenId::new("a");
+        shell
+            .registry
+            .register(Box::new(StubScreen::new("a", "Screen A")));
+        shell.navigate_to(&id_a);
+        assert_eq!(shell.active_screen.as_ref(), Some(&id_a));
+    }
+
+    #[test]
+    fn navigate_blurs_old_focuses_new() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let focused_a = Arc::new(Mutex::new(false));
+        let focused_b = Arc::new(Mutex::new(false));
+        let screen_a = StubScreen {
+            id: ScreenId::new("a"),
+            title: "A",
+            focused: Arc::clone(&focused_a),
+        };
+        let screen_b = StubScreen {
+            id: ScreenId::new("b"),
+            title: "B",
+            focused: Arc::clone(&focused_b),
+        };
+        shell.registry.register(Box::new(screen_a));
+        shell.registry.register(Box::new(screen_b));
+
+        let id_a = ScreenId::new("a");
+        let id_b = ScreenId::new("b");
+
+        shell.navigate_to(&id_a);
+        assert!(*focused_a.lock().unwrap());
+
+        shell.navigate_to(&id_b);
+        assert!(!*focused_a.lock().unwrap(), "old screen should be blurred");
+        assert!(*focused_b.lock().unwrap(), "new screen should be focused");
+    }
+
+    #[test]
+    fn next_screen_with_no_active_is_noop() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.registry.register(Box::new(StubScreen::new("a", "A")));
+        shell.next_screen();
+        assert!(shell.active_screen.is_none());
+    }
+
+    #[test]
+    fn prev_screen_with_no_active_is_noop() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.registry.register(Box::new(StubScreen::new("a", "A")));
+        shell.prev_screen();
+        assert!(shell.active_screen.is_none());
+    }
+
+    #[test]
+    fn screen_context_with_no_active_uses_empty_id() {
+        let shell = AppShell::new(ShellConfig::default());
+        let ctx = shell.screen_context(Rect::new(0, 0, 100, 50));
+        assert_eq!(ctx.active_screen, ScreenId::new(""));
+        assert_eq!(ctx.terminal_width, 100);
+        assert_eq!(ctx.terminal_height, 50);
+        assert!(ctx.focused);
+    }
+
+    #[test]
+    fn screen_context_with_active_screen() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell
+            .registry
+            .register(Box::new(StubScreen::new("s1", "S1")));
+        shell.navigate_to(&ScreenId::new("s1"));
+        let ctx = shell.screen_context(Rect::new(0, 0, 80, 24));
+        assert_eq!(ctx.active_screen, ScreenId::new("s1"));
+    }
+
+    #[test]
+    fn last_palette_action_initially_none() {
+        let shell = AppShell::new(ShellConfig::default());
+        assert!(shell.last_palette_action().is_none());
+    }
+
+    #[test]
+    fn palette_backspace_removes_char() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        // Open palette
+        let open = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&open);
+
+        // Type "ab"
+        let a = InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let b = InputEvent::Key(
+            crossterm::event::KeyCode::Char('b'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&a);
+        let _ = shell.handle_input(&b);
+        assert_eq!(shell.palette.query(), "ab");
+
+        // Backspace
+        let bs = InputEvent::Key(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&bs);
+        assert_eq!(shell.palette.query(), "a");
+    }
+
+    #[test]
+    fn palette_esc_closes() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let open = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&open);
+        assert_eq!(shell.palette.state(), &PaletteState::Open);
+
+        let esc = InputEvent::Key(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&esc);
+        assert_eq!(shell.palette.state(), &PaletteState::Closed);
+    }
+
+    #[test]
+    fn palette_enter_closes_and_clears() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let open = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&open);
+        assert_eq!(shell.palette.state(), &PaletteState::Open);
+
+        let enter = InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = shell.handle_input(&enter);
+        assert!(!quit);
+        assert_eq!(shell.palette.state(), &PaletteState::Closed);
+    }
+
+    #[test]
+    fn overlay_esc_dismisses() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.last_render_area.set(Rect::new(0, 0, 80, 24));
+
+        // Open help overlay with '?'
+        let help = InputEvent::Key(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&help);
+        assert!(shell.overlays.has_active());
+
+        // Dismiss with Esc
+        let esc = InputEvent::Key(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&esc);
+        assert!(!shell.overlays.has_active());
+    }
+
+    #[test]
+    fn help_opens_with_question_mark() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.last_render_area.set(Rect::new(0, 0, 80, 24));
+
+        let help = InputEvent::Key(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+
+        let _ = shell.handle_input(&help);
+        assert!(shell.overlays.has_active());
+
+        // When overlay is active, non-Dismiss keys are swallowed
+        let _ = shell.handle_input(&help);
+        assert!(
+            shell.overlays.has_active(),
+            "overlay stays open on repeat ?"
+        );
+    }
+
+    #[test]
+    fn tab_key_triggers_next_screen() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.last_render_area.set(Rect::new(0, 0, 80, 24));
+        shell.registry.register(Box::new(StubScreen::new("a", "A")));
+        shell.registry.register(Box::new(StubScreen::new("b", "B")));
+        shell.navigate_to(&ScreenId::new("a"));
+
+        let tab = InputEvent::Key(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&tab);
+        assert_eq!(shell.active_screen.as_ref(), Some(&ScreenId::new("b")));
+    }
+
+    #[test]
+    fn shift_tab_triggers_prev_screen() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.last_render_area.set(Rect::new(0, 0, 80, 24));
+        shell.registry.register(Box::new(StubScreen::new("a", "A")));
+        shell.registry.register(Box::new(StubScreen::new("b", "B")));
+        shell.navigate_to(&ScreenId::new("b"));
+
+        let shift_tab = InputEvent::Key(
+            crossterm::event::KeyCode::BackTab,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        let _ = shell.handle_input(&shift_tab);
+        assert_eq!(shell.active_screen.as_ref(), Some(&ScreenId::new("a")));
+    }
+
+    #[test]
+    fn overlay_active_blocks_screen_input() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.last_render_area.set(Rect::new(0, 0, 80, 24));
+        let captured = Arc::new(Mutex::new(None));
+        shell
+            .registry
+            .register(Box::new(CaptureContextScreen::new("cap", captured.clone())));
+        shell.navigate_to(&ScreenId::new("cap"));
+
+        // Open overlay
+        let help = InputEvent::Key(
+            crossterm::event::KeyCode::Char('?'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&help);
+        assert!(shell.overlays.has_active());
+
+        // Send a key that would normally reach the screen
+        let x = InputEvent::Key(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = shell.handle_input(&x);
+        // Screen should NOT have received the event
+        assert!(captured.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn palette_ctrl_char_not_inserted() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let open = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&open);
+
+        // Ctrl+A should NOT be inserted as text
+        let ctrl_a = InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&ctrl_a);
+        assert_eq!(shell.palette.query(), "");
+    }
+
+    #[test]
+    fn palette_alt_char_not_inserted() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        let open = InputEvent::Key(
+            crossterm::event::KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let _ = shell.handle_input(&open);
+
+        let alt_x = InputEvent::Key(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::ALT,
+        );
+        let _ = shell.handle_input(&alt_x);
+        assert_eq!(shell.palette.query(), "");
+    }
+
+    #[test]
+    fn handle_input_does_not_quit_on_non_quit_key() {
+        let mut shell = AppShell::new(ShellConfig::default());
+        shell.last_render_area.set(Rect::new(0, 0, 80, 24));
+        let event = InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = shell.handle_input(&event);
+        assert!(!quit);
+        assert!(!shell.should_quit);
+    }
+
+    // ─── bd-n6x8 tests end ───
 }
