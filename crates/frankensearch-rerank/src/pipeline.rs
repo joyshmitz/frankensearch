@@ -906,9 +906,17 @@ mod tests {
             let reranker = StubReranker;
             let mut candidates = make_candidates(2);
 
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 0)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                0,
+            )
+            .await
+            .unwrap();
 
             // min_candidates=0 means always rerank
             assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
@@ -966,9 +974,17 @@ mod tests {
                 c.metadata = Some(serde_json::Value::String(c.doc_id.clone()));
             }
 
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
 
             // All candidates should still have metadata (even though order may change)
             assert!(candidates.iter().all(|c| c.metadata.is_some()));
@@ -992,9 +1008,17 @@ mod tests {
             let mut candidates = make_candidates(6);
             let original_scores: Vec<f32> = candidates.iter().map(|c| c.score).collect();
 
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
 
             // Original score field should be unchanged per doc_id
             for c in &candidates {
@@ -1020,14 +1044,24 @@ mod tests {
                 c.source = ScoreSource::Reranked;
             }
 
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
 
             // All rerank scores should be overwritten (none should be 999.0)
-            assert!(candidates
-                .iter()
-                .all(|c| c.rerank_score.is_some() && c.rerank_score != Some(999.0)));
+            assert!(
+                candidates
+                    .iter()
+                    .all(|c| c.rerank_score.is_some() && c.rerank_score != Some(999.0))
+            );
         });
     }
 
@@ -1046,7 +1080,7 @@ mod tests {
         });
     }
 
-    /// Reranker that returns correct count but with swapped doc_ids.
+    /// Reranker that returns correct count but with swapped `doc_ids`.
     struct SwappedDocIdReranker;
 
     impl Reranker for SwappedDocIdReranker {
@@ -1086,9 +1120,17 @@ mod tests {
             let mut candidates = make_candidates(6);
 
             // Mismatched doc_ids trigger warnings but scores are still applied
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
 
             // Scores should still be applied despite doc_id mismatch (just warns)
             assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
@@ -1105,9 +1147,17 @@ mod tests {
             candidates[1].source = ScoreSource::SemanticQuality;
             candidates[2].source = ScoreSource::Lexical;
 
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
 
             // All should now be Reranked regardless of prior source
             assert!(candidates.iter().all(|c| c.source == ScoreSource::Reranked));
@@ -1128,9 +1178,17 @@ mod tests {
                 }
             }
 
-            rerank_step(&cx, &reranker, "test", &mut candidates, text_for_doc, 100, 5)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc,
+                100,
+                5,
+            )
+            .await
+            .unwrap();
 
             // fast_score, quality_score, lexical_score should be preserved per doc_id
             for c in &candidates {

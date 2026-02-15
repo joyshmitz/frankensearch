@@ -693,8 +693,6 @@ fn explain_table_renders_human_readable_breakdown() {
         &[
             "explain",
             hit_path,
-            "--query",
-            "retry backoff",
             "--index-dir",
             &index_arg,
             "--no-watch-mode",
