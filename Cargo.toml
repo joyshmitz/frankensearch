@@ -96,6 +96,9 @@ sha2 = "0.10"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.6"
 
+# Date/time formatting/parsing for telemetry RFC3339 timestamps
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
 # System information (CPU, memory, etc.)
 sysinfo = "0.33"
 

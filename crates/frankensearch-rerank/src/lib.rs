@@ -412,23 +412,23 @@ fn extract_logits(
 /// - Shape `[batch, 2]`: binary classification (positive class logit at index 1)
 /// - Shape `[batch]`: flat logits
 /// - Shape `[1, batch]`: transposed single-row output
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn extract_scores_from_raw(
     (shape, data): (&[i64], &[f32]),
     batch_size: usize,
     model_name: &str,
 ) -> SearchResult<Vec<f32>> {
+    // Safe i64→usize helper: negative or out-of-range dimensions never match.
+    let dim_eq = |n: &i64| usize::try_from(*n).is_ok_and(|v| v == batch_size);
+
     match shape {
         // [batch, 1] — single logit per sample
-        [n, 1] if (*n as usize) == batch_size => Ok(data.to_vec()),
+        [n, 1] if dim_eq(n) => Ok(data.to_vec()),
         // [batch, 2] — binary classification, take positive class (index 1)
-        [n, 2] if (*n as usize) == batch_size => {
-            Ok(data.chunks_exact(2).map(|pair| pair[1]).collect())
-        }
+        [n, 2] if dim_eq(n) => Ok(data.chunks_exact(2).map(|pair| pair[1]).collect()),
         // [batch] — flat logits
-        [n] if (*n as usize) == batch_size => Ok(data.to_vec()),
+        [n] if dim_eq(n) => Ok(data.to_vec()),
         // [1, batch] — transposed single-row output
-        [1, n] if (*n as usize) == batch_size => Ok(data.to_vec()),
+        [1, n] if dim_eq(n) => Ok(data.to_vec()),
         _ => {
             // Best-effort: take first `batch_size` elements if enough data
             if data.len() >= batch_size {
@@ -469,6 +469,13 @@ fn rerank_ort_error(model: &str, context: &str, error: &ort::Error) -> SearchErr
 fn resolve_model_dir(base_dir: &Path, model_name: &str) -> SearchResult<PathBuf> {
     if has_required_files(base_dir) {
         return Ok(base_dir.to_path_buf());
+    }
+
+    // Reject model names containing path traversal sequences.
+    if model_name.contains("..") || model_name.starts_with('/') || model_name.starts_with('\\') {
+        return Err(SearchError::ModelNotFound {
+            name: format!("{model_name} (unsafe model name)"),
+        });
     }
 
     let nested = base_dir.join(model_name);

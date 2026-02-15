@@ -78,11 +78,21 @@ impl Default for MrlConfig {
 
 impl MrlConfig {
     /// Resolve `rescore_dims` to the effective value given the index dimension.
+    ///
+    /// Always returns at least `self.search_dims` so the rescore phase never
+    /// uses fewer dimensions than the initial truncated scan.
     const fn effective_rescore_dims(&self, index_dim: usize) -> usize {
-        if self.rescore_dims == 0 || self.rescore_dims > index_dim {
+        let dims = if self.rescore_dims == 0 || self.rescore_dims > index_dim {
             index_dim
         } else {
             self.rescore_dims
+        };
+        // Rescore must use at least as many dims as the initial scan,
+        // otherwise Phase 2 is strictly worse than Phase 1.
+        if dims < self.search_dims {
+            self.search_dims
+        } else {
+            dims
         }
     }
 

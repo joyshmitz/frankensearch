@@ -43,10 +43,16 @@ impl DurabilityConfig {
     ///
     /// `1.25` becomes `25`, `2.0` becomes `100`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn repair_overhead_percent(&self) -> u32 {
         let overhead = (self.repair_overhead - 1.0).max(0.0);
-        (overhead * 100.0).ceil() as u32
+        let pct = (overhead * 100.0).ceil();
+        // Guard against values exceeding u32::MAX (e.g. absurd repair_overhead).
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if pct.is_finite() && pct >= 0.0 && pct <= f64::from(u32::MAX) {
+            pct as u32
+        } else {
+            u32::MAX
+        }
     }
 
     /// Compute the expected repair symbol budget for a source symbol count.
@@ -54,14 +60,16 @@ impl DurabilityConfig {
     /// Formula:
     /// `R = min(max_repair_symbols, max(slack_decode, ceil(K * overhead_percent/100)))`
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn expected_repair_symbols(&self, k_source: u32) -> u32 {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_precision_loss,
-            clippy::cast_sign_loss
-        )]
-        let formula = ((f64::from(k_source) * f64::from(self.repair_overhead_percent())) / 100.0)
-            .ceil() as u32;
+        let raw =
+            ((f64::from(k_source) * f64::from(self.repair_overhead_percent())) / 100.0).ceil();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let formula = if raw.is_finite() && raw >= 0.0 && raw <= f64::from(u32::MAX) {
+            raw as u32
+        } else {
+            u32::MAX
+        };
         formula.max(self.slack_decode).min(self.max_repair_symbols)
     }
 

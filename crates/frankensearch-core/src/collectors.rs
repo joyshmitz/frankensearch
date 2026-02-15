@@ -246,6 +246,16 @@ impl LiveSearchStreamEmitter {
         &self,
         event: TelemetryEnvelope,
     ) -> SearchResult<SearchStreamPublishOutcome> {
+        if event.v != TELEMETRY_SCHEMA_VERSION {
+            return Err(SearchError::InvalidConfig {
+                field: "search_stream.event.schema_version".to_owned(),
+                value: event.v.to_string(),
+                reason: format!(
+                    "live search stream expects schema_version {TELEMETRY_SCHEMA_VERSION}"
+                ),
+            });
+        }
+
         if !matches!(event.event, TelemetryEvent::Search { .. }) {
             return Err(SearchError::InvalidConfig {
                 field: "search_stream.event.type".to_owned(),
@@ -1147,6 +1157,39 @@ mod tests {
             .publish_search(non_search)
             .expect_err("non-search event should be rejected");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn search_stream_rejects_mismatched_schema_version() {
+        let emitter = LiveSearchStreamEmitter::default();
+        let mut event = search_event("schema mismatch query", 777);
+        event.v = TELEMETRY_SCHEMA_VERSION.saturating_add(1);
+
+        let err = emitter
+            .publish_search(event)
+            .expect_err("schema version mismatch should be rejected");
+
+        assert!(
+            matches!(err, SearchError::InvalidConfig { .. }),
+            "expected invalid config error for schema mismatch"
+        );
+
+        if let SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        } = err
+        {
+            assert_eq!(field, "search_stream.event.schema_version");
+            assert_eq!(
+                value,
+                TELEMETRY_SCHEMA_VERSION.saturating_add(1).to_string()
+            );
+            assert!(
+                reason.contains(&TELEMETRY_SCHEMA_VERSION.to_string()),
+                "reason should mention expected schema version"
+            );
+        }
     }
 
     #[test]

@@ -19,8 +19,9 @@ This contract binds:
 3. Compatibility window is explicit and bounded by `MAX_SCHEMA_VERSION_LAG` in `crates/frankensearch-core/src/contract_sanity.rs`.
 4. Versions older than `(core - lag_window)` are deprecated and fail rollout gates.
 5. Versions newer than core are rejected (`TooNew`) until core is upgraded.
-6. Redaction policy mismatches are always hard failures.
-7. Every failure path must emit deterministic diagnostics containing reason code and replay command.
+6. Canonical host/adapters must preserve identity pairing (`host_project` <-> `adapter_id`) for known first-class hosts.
+7. Redaction policy mismatches are always hard failures.
+8. Every failure path must emit deterministic diagnostics containing reason code and replay command.
 
 ## Version Lifecycle and Rollback Rules
 
@@ -72,12 +73,15 @@ Primary reason codes:
 - `contract.schema.deprecated` (error)
 - `contract.schema.too_new` (error)
 - `adapter.identity.schema_version_mismatch` (warning only when in compatibility window; otherwise error)
+- `adapter.identity.canonical_pair_mismatch` (error)
 - `adapter.identity.redaction_policy_mismatch` (error)
 - `adapter.hook.error` (error)
 
 Replay command mapping:
 
 - Schema/compatibility drift violations:
+  - `FRANKENSEARCH_HOST_ADAPTER=<adapter_id> cargo test -p frankensearch-core contract_sanity::tests -- --nocapture`
+- Canonical identity-pair violations (`adapter.identity.canonical_pair_mismatch`):
   - `FRANKENSEARCH_HOST_ADAPTER=<adapter_id> cargo test -p frankensearch-core contract_sanity::tests -- --nocapture`
 - Adapter identity/envelope/redaction/hook violations:
   - `FRANKENSEARCH_HOST_ADAPTER=<adapter_id> cargo test -p frankensearch-core host_adapter::tests -- --nocapture`

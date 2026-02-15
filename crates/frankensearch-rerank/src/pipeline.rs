@@ -4,6 +4,8 @@
 //! [`Reranker`] implementation. It looks up document text via a caller-provided closure,
 //! gracefully skips reranking on any failure, and supports cancellation via `&Cx`.
 
+use std::cmp::Ordering;
+
 use asupersync::Cx;
 use tracing::instrument;
 
@@ -123,6 +125,8 @@ pub async fn rerank_step(
         return Ok(());
     }
 
+    clear_rerank_scores(candidates, rerank_count);
+
     // Apply rerank scores to the original candidates using `original_rank`.
     // This keeps scores aligned with the correct doc_id even after the reranker sorts its output.
     for score in scores {
@@ -131,9 +135,11 @@ pub async fn rerank_step(
                 tracing::warn!(
                     expected = %candidates[candidate_idx].doc_id,
                     got = %score.doc_id,
-                    "reranker returned mismatched doc_id for original_rank {}",
+                    "reranker returned mismatched doc_id for original_rank {}; \
+                     skipping score to prevent cross-document contamination",
                     score.original_rank
                 );
+                continue;
             }
             // Guard against NaN/Inf rerank scores — downstream consumers may use
             // ordinary float comparisons that silently fail on non-finite values.
@@ -156,13 +162,7 @@ pub async fn rerank_step(
 
     // Re-sort the reranked portion by rerank_score descending (NaN-safe).
     // Non-reranked candidates (beyond top_k_rerank) keep their original order.
-    candidates[..rerank_count].sort_by(|a, b| {
-        let score_a = a.rerank_score.unwrap_or(f32::NEG_INFINITY);
-        let score_b = b.rerank_score.unwrap_or(f32::NEG_INFINITY);
-        score_b
-            .total_cmp(&score_a)
-            .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
+    candidates[..rerank_count].sort_by(compare_by_rerank_score);
 
     tracing::debug!(
         reranked = included_indices.len(),
@@ -171,6 +171,28 @@ pub async fn rerank_step(
     );
 
     Ok(())
+}
+
+fn clear_rerank_scores(candidates: &mut [ScoredResult], rerank_count: usize) {
+    // Drop any stale rerank scores so this run only reflects fresh model output.
+    for candidate in candidates.iter_mut().take(rerank_count) {
+        candidate.rerank_score = None;
+    }
+}
+
+fn finite_rerank_sort_score(candidate: &ScoredResult) -> f32 {
+    candidate
+        .rerank_score
+        .filter(|score| score.is_finite())
+        .unwrap_or(f32::NEG_INFINITY)
+}
+
+fn compare_by_rerank_score(a: &ScoredResult, b: &ScoredResult) -> Ordering {
+    let score_a = finite_rerank_sort_score(a);
+    let score_b = finite_rerank_sort_score(b);
+    score_b
+        .total_cmp(&score_a)
+        .then_with(|| a.doc_id.cmp(&b.doc_id))
 }
 
 #[cfg(test)]
@@ -454,6 +476,48 @@ mod tests {
                     assert!(
                         c.rerank_score.is_some(),
                         "{} should have rerank score",
+                        c.doc_id
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_missing_text_clears_stale_scores_for_non_reranked_candidates() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let reranker = StubReranker;
+            let mut candidates = make_candidates(6);
+            for c in &mut candidates {
+                c.rerank_score = Some(999.0);
+                c.source = ScoreSource::Reranked;
+            }
+
+            // With partial text, only even docs are reranked (0,2,4).
+            rerank_step(
+                &cx,
+                &reranker,
+                "test",
+                &mut candidates,
+                text_for_doc_partial,
+                6,
+                3,
+            )
+            .await
+            .unwrap();
+
+            for c in &candidates {
+                let num: usize = c.doc_id.strip_prefix("doc-").unwrap().parse().unwrap();
+                if num.is_multiple_of(2) {
+                    assert!(
+                        c.rerank_score.is_some() && c.rerank_score != Some(999.0),
+                        "reranked doc should have fresh score: {}",
+                        c.doc_id
+                    );
+                } else {
+                    assert_eq!(
+                        c.rerank_score, None,
+                        "non-reranked doc should not keep stale score: {}",
                         c.doc_id
                     );
                 }
@@ -1123,12 +1187,13 @@ mod tests {
     }
 
     #[test]
-    fn rerank_doc_id_mismatch_still_applies_scores() {
+    fn rerank_doc_id_mismatch_skips_score_application() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let reranker = SwappedDocIdReranker;
             let mut candidates = make_candidates(6);
 
-            // Mismatched doc_ids trigger warnings but scores are still applied
+            // Mismatched doc_ids should be skipped to prevent cross-document
+            // score contamination.
             rerank_step(
                 &cx,
                 &reranker,
@@ -1141,8 +1206,8 @@ mod tests {
             .await
             .unwrap();
 
-            // Scores should still be applied despite doc_id mismatch (just warns)
-            assert!(candidates.iter().all(|c| c.rerank_score.is_some()));
+            // No scores should be applied when doc_ids don't match
+            assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
         });
     }
 

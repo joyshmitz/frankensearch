@@ -890,12 +890,18 @@ fn looks_like_ticket_id(query: &str) -> bool {
 
 #[must_use]
 const fn scale_usize(value: usize, numer: usize, denom: usize) -> usize {
+    if denom == 0 {
+        return 0;
+    }
     let scaled = value.saturating_mul(numer);
     scaled.saturating_add(denom.saturating_sub(1)) / denom
 }
 
 #[must_use]
 const fn scale_u64(value: u64, numer: u64, denom: u64) -> u64 {
+    if denom == 0 {
+        return 0;
+    }
     let scaled = value.saturating_mul(numer);
     scaled.saturating_add(denom.saturating_sub(1)) / denom
 }

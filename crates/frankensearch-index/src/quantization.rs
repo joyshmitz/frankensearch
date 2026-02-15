@@ -75,6 +75,12 @@ impl ScalarQuantizer {
         for vec in vectors {
             assert_eq!(vec.len(), dims, "all vectors must have the same dimension");
             for (i, &v) in vec.iter().enumerate() {
+                // NaN comparisons always return false, which would leave
+                // mins[i] = INFINITY and maxs[i] = NEG_INFINITY, producing
+                // a negative scale that corrupts all quantized values.
+                if !v.is_finite() {
+                    continue;
+                }
                 if v < mins[i] {
                     mins[i] = v;
                 }
@@ -252,13 +258,14 @@ impl ScalarQuantizer {
     /// Compute the theoretical upper bound on cosine similarity error
     /// for unit-normalized vectors.
     ///
-    /// `epsilon <= max_scale / 255 * sqrt(dims)`
+    /// `epsilon <= max_scale * sqrt(dims)` where `max_scale = max(range_i / 255)`.
     #[must_use]
     pub fn cosine_error_bound(&self) -> f32 {
         let max_scale = self.scales.iter().copied().fold(0.0_f32, f32::max);
         #[allow(clippy::cast_precision_loss)]
         let sqrt_d = (self.dims as f32).sqrt();
-        max_scale / 255.0 * sqrt_d
+        // scales already stores range/255; do NOT divide by 255 again.
+        max_scale * sqrt_d
     }
 }
 

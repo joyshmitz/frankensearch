@@ -203,6 +203,37 @@ This section defines the required migration playbooks for first-party host adopt
   - monitor interactive response-time SLO and pressure-driven degradation transitions,
   - monitor operator incident count linked to search migration.
 
+### Host migration validation command matrix (required)
+
+All cargo-heavy migration checks MUST run through `rch exec -- ...`.
+
+| Host project | Bead/thread | Toolchain requirement | Required validation lanes (minimum) |
+|---|---|---|---|
+| `/data/projects/xf` | `bd-3un.35` / `br-3un.35` | Nightly required for migration feature paths that pull `asupersync` nightly surfaces | `cargo +nightly check --features frankensearch-migration`, targeted migration tests, host-specific hybrid regression checks |
+| `/data/projects/coding_agent_session_search` | `bd-3un.36` / `br-3un.36` | Nightly required for migration feature paths; validate local-path dependency availability on worker before long lanes | `cargo +nightly check --features frankensearch-migration`, targeted search module tests, bakeoff parity lane |
+| `/data/projects/mcp_agent_mail_rust` | `bd-3un.37` / `br-3un.37` | Nightly recommended for consistency with shared dependency graph | `cargo check -p mcp-agent-mail-search-core --features hybrid`, targeted bridge/tests, db-planner compatibility checks |
+
+Reference commands:
+
+```bash
+# xf (bd-3un.35)
+rch exec -- cargo +nightly check --features frankensearch-migration
+rch exec -- cargo +nightly test --features frankensearch-migration hybrid::tests -- --nocapture
+
+# cass (bd-3un.36)
+rch exec -- cargo +nightly check --features frankensearch-migration
+rch exec -- cargo +nightly test --features frankensearch-migration search::tests -- --nocapture
+
+# mcp_agent_mail_rust (bd-3un.37)
+rch exec -- cargo check -p mcp-agent-mail-search-core --all-targets --features hybrid
+rch exec -- cargo test -p mcp-agent-mail-search-core --features hybrid fs_bridge::tests -- --nocapture
+rch exec -- cargo check -p mcp-agent-mail-db --all-targets --features hybrid
+```
+
+If remote workers cannot resolve required local-path dependencies, run the same
+command through `rch` local-circuit mode and record that mode explicitly in
+the migration report.
+
 ### Migration artifact and evidence requirements
 
 Each host migration run MUST publish:
@@ -211,6 +242,14 @@ Each host migration run MUST publish:
 - `migration_events.jsonl` (structured events with reason codes and timestamps)
 - `migration_replay_command.txt` (deterministic reproduction command)
 - `migration_validation_report.md` (pass/fail summary with explicit rollback decision)
+
+When multiple host migrations run in parallel, artifacts MUST be emitted under
+host-scoped directories to avoid collisions:
+
+- `artifacts/xf/`
+- `artifacts/coding_agent_session_search/`
+- `artifacts/mcp_agent_mail_rust/`
+- `artifacts/frankenterm/`
 
 ## Staged Rollout and Deterministic Fallback Protocol
 

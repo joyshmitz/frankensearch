@@ -369,7 +369,14 @@ fn compute_action(
     if baseline_docs > 0 {
         #[allow(clippy::cast_precision_loss)]
         let fraction = docs_changed as f64 / baseline_docs as f64;
-        if fraction >= config.full_rebuild_fraction {
+        // NaN full_rebuild_fraction makes >= always false, silently
+        // disabling full-rebuild detection. Fall back to the default.
+        let threshold = if config.full_rebuild_fraction.is_finite() {
+            config.full_rebuild_fraction
+        } else {
+            0.30
+        };
+        if fraction >= threshold {
             return RecommendedAction::FullRebuild {
                 reason: format!(
                     "{docs_changed}/{baseline_docs} baseline documents changed ({:.0}%)",

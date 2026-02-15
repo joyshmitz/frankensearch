@@ -11,7 +11,7 @@
 //! handles the actual index mutations.
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -240,6 +240,11 @@ pub struct CommitReplayEngine {
     watermark: RwLock<ReplayWatermark>,
     /// Replay configuration.
     policy: ReplayPolicy,
+    /// Serialises `apply()` calls to prevent TOCTOU races between
+    /// `check_skip()` (which reads the watermark) and `advance_watermark()`
+    /// (which writes it).  Without this, two threads can both pass the
+    /// duplicate-check for the same `commit_seq` and apply it twice.
+    apply_lock: Mutex<()>,
 }
 
 impl CommitReplayEngine {
@@ -249,6 +254,7 @@ impl CommitReplayEngine {
         Self {
             watermark: RwLock::new(ReplayWatermark::empty()),
             policy,
+            apply_lock: Mutex::new(()),
         }
     }
 
@@ -258,6 +264,7 @@ impl CommitReplayEngine {
         Self {
             watermark: RwLock::new(watermark),
             policy,
+            apply_lock: Mutex::new(()),
         }
     }
 
@@ -270,6 +277,13 @@ impl CommitReplayEngine {
         consumer: &dyn ReplayConsumer,
         now_millis: u64,
     ) -> CommitOutcome {
+        // Serialise apply calls so that check_skip and advance_watermark
+        // are atomic with respect to each other (prevents TOCTOU races).
+        let _guard = self
+            .apply_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // Check skip conditions.
         if let Some(skip) = self.check_skip(entry) {
             return skip;

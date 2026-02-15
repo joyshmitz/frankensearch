@@ -15,12 +15,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::time::{timeout, wall_now};
 use tracing::instrument;
 use unicode_normalization::UnicodeNormalization;
+
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
@@ -1051,12 +1053,12 @@ fn next_telemetry_identifier(prefix: &str) -> String {
     format!("{prefix}-{sequence:020}")
 }
 
+const TELEMETRY_TIMESTAMP_FALLBACK_RFC3339: &str = "1970-01-01T00:00:00Z";
+
 fn telemetry_timestamp_now() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    millis.to_string()
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| TELEMETRY_TIMESTAMP_FALLBACK_RFC3339.to_owned())
 }
 
 fn telemetry_instance_for_adapter(host_adapter: &dyn HostAdapter) -> TelemetryInstance {
@@ -3197,10 +3199,21 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_timestamp_now_is_nonempty_numeric() {
+    fn telemetry_timestamp_now_is_valid_rfc3339() {
         let ts = telemetry_timestamp_now();
         assert!(!ts.is_empty());
-        assert!(ts.parse::<u128>().is_ok(), "should be a numeric string");
+        assert!(
+            OffsetDateTime::parse(&ts, &Rfc3339).is_ok(),
+            "should be RFC3339"
+        );
+    }
+
+    #[test]
+    fn telemetry_timestamp_fallback_constant_is_valid_rfc3339() {
+        assert!(
+            OffsetDateTime::parse(TELEMETRY_TIMESTAMP_FALLBACK_RFC3339, &Rfc3339).is_ok(),
+            "fallback timestamp must remain RFC3339"
+        );
     }
 
     #[test]

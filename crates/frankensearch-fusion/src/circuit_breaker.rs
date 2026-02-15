@@ -409,16 +409,53 @@ impl CircuitBreaker {
 
     /// Manually trip the circuit breaker (for testing or operator override).
     ///
+    /// Unconditionally transitions to Open regardless of current state.
     /// Returns evidence records for the state transition.
     pub fn force_open(&self) -> Vec<EvidenceRecord> {
-        self.trip()
+        self.state
+            .store(CircuitState::Open as u32, Ordering::Release);
+        self.last_trip_time_ms
+            .store(self.elapsed_ms(), Ordering::Release);
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.trip_count.fetch_add(1, Ordering::Relaxed);
+
+        let evidence = EvidenceRecord::new(
+            EvidenceEventType::Transition,
+            ReasonCode::CIRCUIT_OPEN_FAILURES,
+            "Circuit breaker force-opened by operator",
+            Severity::Warn,
+            PipelineState::CircuitOpen,
+            "circuit_breaker",
+        )
+        .with_action(PipelineAction::OpenCircuit);
+
+        tracing::warn!("circuit breaker force-opened");
+        vec![evidence]
     }
 
     /// Manually reset the circuit breaker (for testing or operator override).
     ///
+    /// Unconditionally transitions to Closed regardless of current state.
     /// Returns evidence records for the state transition.
     pub fn force_close(&self) -> Vec<EvidenceRecord> {
-        self.reset()
+        self.state
+            .store(CircuitState::Closed as u32, Ordering::Release);
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.consecutive_successes.store(0, Ordering::Release);
+        self.reset_count.fetch_add(1, Ordering::Relaxed);
+
+        let evidence = EvidenceRecord::new(
+            EvidenceEventType::Transition,
+            ReasonCode::CIRCUIT_CLOSE_RECOVERY,
+            "Circuit breaker force-closed by operator",
+            Severity::Info,
+            PipelineState::Nominal,
+            "circuit_breaker",
+        )
+        .with_action(PipelineAction::CloseCircuit);
+
+        tracing::info!("circuit breaker force-closed");
+        vec![evidence]
     }
 
     // ─── Internal ───────────────────────────────────────────────────

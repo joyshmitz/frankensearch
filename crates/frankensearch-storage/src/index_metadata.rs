@@ -375,6 +375,9 @@ impl Storage {
             return Ok(Vec::new());
         }
 
+        // NOTE: Uses format!() with sql_escape_single_quoted instead of
+        // query_with_params because FrankenSQLite's query_with_params
+        // currently returns at most one row for multi-row result sets.
         let escaped_index = sql_escape_single_quoted(index_name);
         let sql = format!(
             "SELECT build_id, index_name, built_at, build_duration_ms, \
@@ -584,6 +587,8 @@ fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> Search
         ))),
     })?;
 
+    // NOTE: Uses format!() because query_with_params returns at most one
+    // row for multi-row result sets (FrankenSQLite limitation).
     let rows = conn
         .query(&format!(
             "SELECT build_id FROM index_build_history \
@@ -781,6 +786,12 @@ fn sqlite_f64_opt(value: Option<f64>) -> SqliteValue {
     value.map_or(SqliteValue::Null, SqliteValue::Float)
 }
 
+/// Escape single quotes for SQL string literals.
+///
+/// Used as a workaround for multi-row SELECT queries where
+/// `query_with_params` currently returns at most one row (FrankenSQLite
+/// limitation).  Single-row queries and DML (INSERT/UPDATE/DELETE) use
+/// parameterized queries instead.
 fn sql_escape_single_quoted(value: &str) -> String {
     value.replace('\'', "''")
 }

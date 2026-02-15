@@ -350,7 +350,16 @@ impl TwoTierIndexBuilder {
                 found: dimension,
             });
         }
-        self.fast_records.push((doc_id.into(), embedding.to_vec()));
+        let doc_id = doc_id.into();
+        if self.fast_records.iter().any(|(id, _)| id == &doc_id) {
+            return Err(SearchError::InvalidConfig {
+                field: "doc_id".to_owned(),
+                value: doc_id,
+                reason: "duplicate doc_id in fast tier; each document must have a unique id"
+                    .to_owned(),
+            });
+        }
+        self.fast_records.push((doc_id, embedding.to_vec()));
         Ok(())
     }
 
@@ -373,8 +382,17 @@ impl TwoTierIndexBuilder {
                 found: dimension,
             });
         }
+        let doc_id = doc_id.into();
+        if self.quality_records.iter().any(|(id, _)| id == &doc_id) {
+            return Err(SearchError::InvalidConfig {
+                field: "doc_id".to_owned(),
+                value: doc_id,
+                reason: "duplicate doc_id in quality tier; each document must have a unique id"
+                    .to_owned(),
+            });
+        }
         self.quality_records
-            .push((doc_id.into(), embedding.to_vec()));
+            .push((doc_id, embedding.to_vec()));
         Ok(())
     }
 

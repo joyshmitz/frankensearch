@@ -1120,6 +1120,12 @@ impl WatchdogConfig {
         let multiplier = self.backoff_multiplier.powi(attempt as i32);
         let delay_ms = (self.initial_backoff_ms as f64) * multiplier;
         let capped_ms = delay_ms.min(self.max_backoff_ms as f64);
+        // NaN/negative/infinite multiplier can produce NaN or negative
+        // delay_ms. NaN propagates through .min(), and `NaN as u64` yields 0
+        // in Rust — causing a zero-backoff tight retry loop.
+        if !capped_ms.is_finite() || capped_ms < 0.0 {
+            return Duration::from_millis(self.initial_backoff_ms);
+        }
         Duration::from_millis(capped_ms as u64)
     }
 

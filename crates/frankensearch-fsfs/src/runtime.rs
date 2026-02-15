@@ -349,14 +349,30 @@ impl LiveIngestPipeline {
         }
     }
 
-    fn resolve_paths(&self, file_key: &str) -> (PathBuf, String) {
+    fn resolve_paths(
+        &self,
+        file_key: &str,
+    ) -> frankensearch_core::SearchResult<(PathBuf, String)> {
         let abs_path = if Path::new(file_key).is_absolute() {
             PathBuf::from(file_key)
         } else {
             self.target_root.join(file_key)
         };
-        let rel_key = normalize_file_key_for_index(&abs_path, &self.target_root);
-        (abs_path, rel_key)
+        // Resolve symlinks / ".." components, then verify the result stays
+        // inside target_root.  Without this check, a file_key containing
+        // "../" can escape the project boundary (path traversal).
+        let canonical = abs_path
+            .canonicalize()
+            .unwrap_or_else(|_| abs_path.clone());
+        if !canonical.starts_with(&self.target_root) {
+            return Err(frankensearch_core::SearchError::InvalidConfig {
+                field: "file_key".into(),
+                value: file_key.into(),
+                reason: "path escapes target root (directory traversal)".into(),
+            });
+        }
+        let rel_key = normalize_file_key_for_index(&canonical, &self.target_root);
+        Ok((canonical, rel_key))
     }
 
     fn soft_delete_vector(&self, rel_key: &str) {
@@ -385,7 +401,7 @@ impl LiveIngestPipeline {
         file_key: &str,
         ingestion_class: IngestionClass,
     ) -> frankensearch_core::SearchResult<bool> {
-        let (abs_path, rel_key) = self.resolve_paths(file_key);
+        let (abs_path, rel_key) = self.resolve_paths(file_key)?;
 
         if matches!(
             ingestion_class,
@@ -457,7 +473,7 @@ impl LiveIngestPipeline {
     }
 
     fn apply_delete_op(&self, file_key: &str) -> frankensearch_core::SearchResult<()> {
-        let (_abs_path, rel_key) = self.resolve_paths(file_key);
+        let (_abs_path, rel_key) = self.resolve_paths(file_key)?;
         self.prune_indexes(&rel_key)
     }
 
@@ -4117,6 +4133,21 @@ impl FsfsRuntime {
             }
         };
         let embed_elapsed_ms = embed_start.elapsed().as_millis();
+
+        // Validate embed_batch returned exactly as many vectors as inputs.
+        // zip() silently drops trailing documents if the embedder returns
+        // fewer vectors, which corrupts the index by losing documents.
+        if semantic_embeddings.len() != semantic_docs.len() {
+            return Err(frankensearch_core::SearchError::EmbeddingFailed {
+                model: embedder.id().to_string(),
+                source: format!(
+                    "embed_batch returned {} vectors for {} documents",
+                    semantic_embeddings.len(),
+                    semantic_docs.len(),
+                )
+                .into(),
+            });
+        }
 
         let vector_start = Instant::now();
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);

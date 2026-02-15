@@ -149,3 +149,36 @@ Representative v1 fixtures exist for each family:
 - `schemas/fixtures/telemetry-lifecycle-v1.json`
 
 These fixtures are the baseline contract tests for downstream schema validation in collectors/storage/adapters.
+
+## Adapter Instrumentation + Conformance
+
+Host integrations should emit this taxonomy through the adapter SDK in
+`crates/frankensearch-core/src/host_adapter.rs`:
+
+- `HostAdapter` defines the required identity handshake, telemetry emission, and lifecycle hooks.
+- `ForwardingHostAdapter` provides canonical identity defaults for
+  `coding_agent_session_search`, `xf`, `mcp_agent_mail_rust`, and `frankenterm`.
+- `AdapterIdentity` must report:
+  `adapter_id`, `adapter_version`, `host_project`,
+  `telemetry_schema_version`, and `redaction_policy_version`.
+
+Conformance checks are executed with `ConformanceHarness`:
+
+- identity checks: required fields + schema version + redaction policy alignment + canonical `host_project`/`adapter_id` pairing for known hosts
+- envelope checks: schema version, timestamp, per-event required fields
+- correlation checks: ULID validity for `event_id`/`root_request_id`/optional `parent_event_id`
+- redaction checks: forbidden secret patterns must not appear in serialized payloads
+- lifecycle checks: adapters must handle start/tick/stop hooks deterministically
+
+Recommended validation commands:
+
+```bash
+# Adapter harness and fixture conformance
+cargo test -p frankensearch-core host_adapter::tests -- --nocapture
+
+# Cross-epic lockstep contract (schema/version drift diagnostics)
+cargo test -p frankensearch-core contract_sanity::tests -- --nocapture
+```
+
+For rollout policy and compatibility window behavior, see:
+`docs/cross-epic-telemetry-adapter-lockstep-contract.md`.

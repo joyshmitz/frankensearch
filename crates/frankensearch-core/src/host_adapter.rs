@@ -573,6 +573,12 @@ impl ConformanceHarness {
             });
         }
 
+        if let Some(violation) =
+            canonical_identity_pair_violation(&identity.adapter_id, &identity.host_project)
+        {
+            violations.push(violation);
+        }
+
         violations
     }
 
@@ -921,6 +927,57 @@ fn adapter_error_violation(context: &str, error: &SearchError) -> ConformanceVio
     }
 }
 
+fn canonical_identity_pair_violation(
+    adapter_id: &str,
+    host_project: &str,
+) -> Option<ConformanceViolation> {
+    let adapter_id = adapter_id.trim();
+    let host_project = host_project.trim();
+    if adapter_id.is_empty() || host_project.is_empty() {
+        return None;
+    }
+
+    let canonical_for_host = CanonicalHostProject::ALL
+        .iter()
+        .copied()
+        .find(|host| host.host_project_key() == host_project);
+    if let Some(host) = canonical_for_host
+        && host.adapter_id() != adapter_id
+    {
+        return Some(ConformanceViolation {
+            code: "adapter.identity.canonical_pair_mismatch".to_owned(),
+            field: "identity.adapter_id".to_owned(),
+            message: format!(
+                "host_project '{}' expects adapter_id '{}', got '{}'",
+                host_project,
+                host.adapter_id(),
+                adapter_id
+            ),
+        });
+    }
+
+    let canonical_for_adapter = CanonicalHostProject::ALL
+        .iter()
+        .copied()
+        .find(|host| host.adapter_id() == adapter_id);
+    if let Some(host) = canonical_for_adapter
+        && host.host_project_key() != host_project
+    {
+        return Some(ConformanceViolation {
+            code: "adapter.identity.canonical_pair_mismatch".to_owned(),
+            field: "identity.host_project".to_owned(),
+            message: format!(
+                "adapter_id '{}' expects host_project '{}', got '{}'",
+                adapter_id,
+                host.host_project_key(),
+                host_project
+            ),
+        });
+    }
+
+    None
+}
+
 fn canonical_projects_from_hint(hint: &str) -> Vec<&'static str> {
     const CANONICAL_ALIASES: &[(&str, &[&str])] = &[
         (
@@ -950,16 +1007,17 @@ fn canonical_projects_from_hint(hint: &str) -> Vec<&'static str> {
     if normalized.is_empty() {
         return Vec::new();
     }
-    let tokens: BTreeSet<&str> = normalized
+    let ordered_tokens: Vec<&str> = normalized
         .split('_')
         .filter(|token| !token.is_empty())
         .collect();
+    let tokens: BTreeSet<&str> = ordered_tokens.iter().copied().collect();
 
     let mut matches = Vec::new();
     for (canonical, aliases) in CANONICAL_ALIASES {
         if aliases
             .iter()
-            .any(|alias| normalized == *alias || tokens.contains(alias))
+            .any(|alias| alias_matches_hint(&normalized, &ordered_tokens, &tokens, alias))
         {
             matches.push(*canonical);
         }
@@ -968,6 +1026,24 @@ fn canonical_projects_from_hint(hint: &str) -> Vec<&'static str> {
     matches.sort_unstable();
     matches.dedup();
     matches
+}
+
+fn alias_matches_hint(
+    normalized_hint: &str,
+    ordered_hint_tokens: &[&str],
+    hint_tokens: &BTreeSet<&str>,
+    alias: &str,
+) -> bool {
+    if normalized_hint == alias || hint_tokens.contains(alias) {
+        return true;
+    }
+
+    let alias_tokens: Vec<&str> = alias.split('_').filter(|token| !token.is_empty()).collect();
+    alias_tokens.len() > 1
+        && alias_tokens.len() <= ordered_hint_tokens.len()
+        && ordered_hint_tokens
+            .windows(alias_tokens.len())
+            .any(|window| window == alias_tokens.as_slice())
 }
 
 fn normalize_project_hint(hint: &str) -> String {
@@ -1239,10 +1315,13 @@ mod tests {
         let harness = ConformanceHarness::default();
         let mut envelope = load_fixture("telemetry-search-v1.json");
 
+        assert!(
+            matches!(envelope.event, TelemetryEvent::Search { .. }),
+            "fixture shape changed"
+        );
+
         if let TelemetryEvent::Search { query, .. } = &mut envelope.event {
             query.text = "BEGIN PRIVATE KEY".to_owned();
-        } else {
-            panic!("fixture shape changed");
         }
 
         let violations = harness.validate_envelope(&envelope);
@@ -1313,6 +1392,15 @@ mod tests {
         let attribution =
             resolve_host_project_attribution(None, None, Some("frankenterm-prod-runner"));
         assert_eq!(attribution.resolved_project_key, "frankenterm");
+        assert_eq!(attribution.reason_code, "attribution.host_name");
+        assert!(!attribution.collision);
+    }
+
+    #[test]
+    fn host_project_attribution_matches_mcp_adapter_style_host_hint() {
+        let attribution =
+            resolve_host_project_attribution(None, None, Some("mcp-agent-mail-host-adapter"));
+        assert_eq!(attribution.resolved_project_key, "mcp_agent_mail_rust");
         assert_eq!(attribution.reason_code, "attribution.host_name");
         assert!(!attribution.collision);
     }
@@ -1405,9 +1493,34 @@ mod tests {
     }
 
     #[test]
+    fn hint_resolves_cass_adapter_style_names() {
+        for hint in [
+            "cass-host-adapter",
+            "coding-agent-session-search-host-adapter",
+        ] {
+            let matches = canonical_projects_from_hint(hint);
+            assert!(
+                matches.contains(&"coding_agent_session_search"),
+                "hint '{hint}' should resolve to coding_agent_session_search"
+            );
+        }
+    }
+
+    #[test]
     fn hint_resolves_xf() {
         let matches = canonical_projects_from_hint("xf");
         assert!(matches.contains(&"xf"));
+    }
+
+    #[test]
+    fn hint_resolves_xf_adapter_style_names() {
+        for hint in ["xf-host-adapter", "collector-xf-host-adapter-prod"] {
+            let matches = canonical_projects_from_hint(hint);
+            assert!(
+                matches.contains(&"xf"),
+                "hint '{hint}' should resolve to xf"
+            );
+        }
     }
 
     #[test]
@@ -1429,9 +1542,57 @@ mod tests {
     }
 
     #[test]
+    fn hint_resolves_mcp_agent_mail_adapter_style_names() {
+        for hint in ["mcp-agent-mail-host-adapter", "mcp_agent_mail_host_adapter"] {
+            let matches = canonical_projects_from_hint(hint);
+            assert!(
+                matches.contains(&"mcp_agent_mail_rust"),
+                "hint '{hint}' should resolve to mcp_agent_mail_rust"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_resolves_mcp_agent_mail_when_phrase_is_embedded() {
+        for hint in [
+            "collector-mcp-agent-mail-host-adapter-prod",
+            "telemetry_mcp_agent_mail_rust_host_adapter_v2",
+        ] {
+            let matches = canonical_projects_from_hint(hint);
+            assert!(
+                matches.contains(&"mcp_agent_mail_rust"),
+                "embedded hint '{hint}' should resolve to mcp_agent_mail_rust"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_does_not_resolve_mcp_agent_mail_when_alias_tokens_are_noncontiguous() {
+        let matches = canonical_projects_from_hint("agent_queue_mail_bridge");
+        assert!(
+            !matches.contains(&"mcp_agent_mail_rust"),
+            "noncontiguous tokens should not match mcp_agent_mail_rust"
+        );
+    }
+
+    #[test]
     fn hint_resolves_frankenterm() {
         let matches = canonical_projects_from_hint("frankenterm");
         assert!(matches.contains(&"frankenterm"));
+    }
+
+    #[test]
+    fn hint_resolves_frankenterm_adapter_style_names() {
+        for hint in [
+            "frankenterm-host-adapter",
+            "telemetry-frankenterm-host-adapter-v2",
+        ] {
+            let matches = canonical_projects_from_hint(hint);
+            assert!(
+                matches.contains(&"frankenterm"),
+                "hint '{hint}' should resolve to frankenterm"
+            );
+        }
     }
 
     #[test]
@@ -1614,6 +1775,45 @@ mod tests {
             violations
                 .iter()
                 .any(|v| v.code == "adapter.identity.redaction_policy_mismatch")
+        );
+    }
+
+    #[test]
+    fn validate_identity_canonical_pair_mismatch_for_known_host() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.host_project = "xf".to_owned();
+        identity.adapter_id = "cass-host-adapter".to_owned();
+        let violations = harness.validate_identity(&identity);
+        assert!(violations.iter().any(|v| {
+            v.code == "adapter.identity.canonical_pair_mismatch" && v.field == "identity.adapter_id"
+        }));
+    }
+
+    #[test]
+    fn validate_identity_canonical_pair_mismatch_for_known_adapter() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.adapter_id = "mcp-agent-mail-host-adapter".to_owned();
+        identity.host_project = "custom_mail".to_owned();
+        let violations = harness.validate_identity(&identity);
+        assert!(violations.iter().any(|v| {
+            v.code == "adapter.identity.canonical_pair_mismatch"
+                && v.field == "identity.host_project"
+        }));
+    }
+
+    #[test]
+    fn validate_identity_allows_unknown_pair_for_future_hosts() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.adapter_id = "future-host-adapter".to_owned();
+        identity.host_project = "future_host".to_owned();
+        let violations = harness.validate_identity(&identity);
+        assert!(
+            !violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.canonical_pair_mismatch")
         );
     }
 

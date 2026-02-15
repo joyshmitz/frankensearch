@@ -197,6 +197,15 @@ impl DurableTantivyIndex {
         for meta in &segment_metas {
             let files = meta.list_files();
             for relative_path in &files {
+                // Validate that the relative path doesn't escape data_dir
+                // (corrupted metadata could contain "../" or absolute paths).
+                if !is_safe_relative_path(relative_path) {
+                    warn!(
+                        path = %relative_path.display(),
+                        "segment file path contains unsafe components, skipping"
+                    );
+                    continue;
+                }
                 let abs_path = self.data_dir.join(relative_path);
                 known_files.insert(abs_path.clone());
 
@@ -271,6 +280,7 @@ impl DurableTantivyIndex {
     /// Iterates over all searchable segments in creation order (oldest first
     /// for detection, newest first for repair priority per the bead spec).
     /// Returns a health report summarizing the results.
+    #[allow(clippy::too_many_lines)]
     pub fn verify_and_repair(&self) -> SearchResult<SegmentHealthReport> {
         let verify_start = Instant::now();
         let mut files_checked = 0_usize;
@@ -291,6 +301,13 @@ impl DurableTantivyIndex {
         for meta in &segment_metas {
             let files = meta.list_files();
             for relative_path in &files {
+                if !is_safe_relative_path(relative_path) {
+                    warn!(
+                        path = %relative_path.display(),
+                        "segment file path contains unsafe components, skipping"
+                    );
+                    continue;
+                }
                 let abs_path = self.data_dir.join(relative_path);
                 if !abs_path.exists() {
                     continue;
@@ -428,6 +445,24 @@ impl DurableTantivyIndex {
         path.extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("fec"))
     }
+}
+
+/// Validate that a relative path from Tantivy metadata is safe to join.
+///
+/// Rejects absolute paths and paths containing `..` components, which could
+/// escape `data_dir` if Tantivy metadata is corrupted or maliciously crafted.
+fn is_safe_relative_path(path: &Path) -> bool {
+    use std::path::Component;
+    if path.is_absolute() {
+        return false;
+    }
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            Component::Normal(_) | Component::CurDir => {}
+        }
+    }
+    true
 }
 
 #[cfg(test)]

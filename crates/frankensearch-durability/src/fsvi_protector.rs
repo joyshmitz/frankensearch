@@ -141,9 +141,10 @@ impl FsviProtector {
         }
 
         let repair_size = fs::metadata(&sidecar_path).map_or(0, |metadata| metadata.len());
-        #[allow(clippy::cast_precision_loss)]
+        // Compute in f64 first to avoid double precision loss from u64→f32.
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         let overhead_ratio = if source_size > 0 {
-            repair_size as f32 / source_size as f32
+            (repair_size as f64 / source_size as f64) as f32
         } else {
             0.0
         };

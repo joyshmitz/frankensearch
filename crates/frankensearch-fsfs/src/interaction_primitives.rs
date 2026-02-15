@@ -739,11 +739,16 @@ impl InteractionBudget {
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub const fn total(&self) -> Duration {
-        Duration::from_nanos(
-            self.input_budget.as_nanos() as u64
-                + self.update_budget.as_nanos() as u64
-                + self.render_budget.as_nanos() as u64,
-        )
+        // Sum in u128 space to avoid per-field truncation, then clamp.
+        let nanos = self.input_budget.as_nanos()
+            + self.update_budget.as_nanos()
+            + self.render_budget.as_nanos();
+        let clamped = if nanos > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            nanos as u64
+        };
+        Duration::from_nanos(clamped)
     }
 
     /// Budget for a specific phase.
