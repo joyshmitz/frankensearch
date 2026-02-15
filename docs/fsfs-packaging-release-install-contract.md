@@ -206,23 +206,25 @@ This section defines the required migration playbooks for first-party host adopt
 ### Host migration validation command matrix (required)
 
 All cargo-heavy migration checks MUST run through `rch exec -- ...`.
+For nightly lanes, prefer `RUSTUP_TOOLCHAIN=nightly rch exec -- cargo ...`
+instead of `cargo +nightly` inside `rch` commands.
 
 | Host project | Bead/thread | Toolchain requirement | Required validation lanes (minimum) |
 |---|---|---|---|
-| `/data/projects/xf` | `bd-3un.35` / `br-3un.35` | Nightly required for migration feature paths that pull `asupersync` nightly surfaces | `cargo +nightly check --features frankensearch-migration`, targeted migration tests, host-specific hybrid regression checks |
-| `/data/projects/coding_agent_session_search` | `bd-3un.36` / `br-3un.36` | Nightly required for migration feature paths; validate local-path dependency availability on worker before long lanes | `cargo +nightly check --features frankensearch-migration`, targeted search module tests, bakeoff parity lane |
+| `/data/projects/xf` | `bd-3un.35` / `br-3un.35` | Nightly required for migration feature paths that pull `asupersync` nightly surfaces | `RUSTUP_TOOLCHAIN=nightly cargo check --features frankensearch-migration`, targeted migration tests, host-specific hybrid regression checks |
+| `/data/projects/coding_agent_session_search` | `bd-3un.36` / `br-3un.36` | Nightly required for migration feature paths; validate local-path dependency availability on worker before long lanes | `RUSTUP_TOOLCHAIN=nightly cargo check --features frankensearch-migration`, targeted search module tests, bakeoff parity lane |
 | `/data/projects/mcp_agent_mail_rust` | `bd-3un.37` / `br-3un.37` | Nightly recommended for consistency with shared dependency graph | `cargo check -p mcp-agent-mail-search-core --features hybrid`, targeted bridge/tests, db-planner compatibility checks |
 
 Reference commands:
 
 ```bash
 # xf (bd-3un.35)
-rch exec -- cargo +nightly check --features frankensearch-migration
-rch exec -- cargo +nightly test --features frankensearch-migration hybrid::tests -- --nocapture
+RUSTUP_TOOLCHAIN=nightly rch exec -- cargo check --features frankensearch-migration
+RUSTUP_TOOLCHAIN=nightly rch exec -- cargo test --features frankensearch-migration hybrid::tests -- --nocapture
 
 # cass (bd-3un.36)
-rch exec -- cargo +nightly check --features frankensearch-migration
-rch exec -- cargo +nightly test --features frankensearch-migration search::tests -- --nocapture
+RUSTUP_TOOLCHAIN=nightly rch exec -- cargo check --features frankensearch-migration
+RUSTUP_TOOLCHAIN=nightly rch exec -- cargo test --features frankensearch-migration search::tests -- --nocapture
 
 # mcp_agent_mail_rust (bd-3un.37)
 rch exec -- cargo check -p mcp-agent-mail-search-core --all-targets --features hybrid
@@ -230,9 +232,34 @@ rch exec -- cargo test -p mcp-agent-mail-search-core --features hybrid fs_bridge
 rch exec -- cargo check -p mcp-agent-mail-db --all-targets --features hybrid
 ```
 
+Remote worker bootstrap and parity preflight (mandatory):
+
+```bash
+# 1) Fleet health
+rch doctor
+rch workers probe --all
+rch status
+rch queue
+
+# 2) Worker nightly capability sanity (all configured hosts)
+awk -F'"' '/host = / {print $2}' ~/.config/rch/workers.toml | while read -r host; do
+  ssh -i ~/.ssh/contabo_vps_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes "ubuntu@$host" \
+    'cargo +nightly --version >/dev/null && rustup run nightly cargo --version >/dev/null'
+done
+```
+
+Remote failure signatures and required handling:
+
+- `no such command: +nightly` in remote logs:
+  rerun with `RUSTUP_TOOLCHAIN=nightly rch exec -- cargo ...` and record worker id.
+- `failed to select a version for the requirement asupersync`:
+  classify as worker dependency-source skew; run local-circuit fallback and record full error text.
+- `Project sync failed: rsync failed` (code `255`):
+  retry once after `rch queue`; if repeated, run local-circuit fallback and mark migration run as infra-degraded.
+
 If remote workers cannot resolve required local-path dependencies, run the same
 command through `rch` local-circuit mode and record that mode explicitly in
-the migration report.
+the migration report (`execution_mode=local-circuit`, `remote_failure_signature=<text>`).
 
 ### Migration artifact and evidence requirements
 
