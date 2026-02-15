@@ -764,11 +764,12 @@ fn validate_search_event(
             "query text must be non-empty",
         ));
     }
-    if query_text.len() > 500 {
+    let char_count = query_text.chars().count();
+    if char_count > 500 {
         violations.push(ConformanceViolation {
             code: "adapter.event.search.query_too_long".to_owned(),
             field: "search.query.text".to_owned(),
-            message: format!("query length {} exceeds 500", query_text.len()),
+            message: format!("query length {char_count} exceeds 500"),
         });
     }
 }
