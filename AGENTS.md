@@ -422,6 +422,7 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
 **Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
+**SQLite lock caveat:** In multi-agent sessions, run `br` commands sequentially (one at a time) from this checkout. Avoid parallel `br` invocations; they can fail with `database is locked`. Parallelize only non-`br` read commands.
 
 ### Conventions
 
@@ -708,6 +709,7 @@ Returns structured results with file paths, line ranges, and extracted code snip
 This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 **Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
+**SQLite lock caveat:** Run `br` commands sequentially in this repo. Parallel `br` calls can contend on `.beads/beads.db` and fail with lock errors; reserve parallelization for non-`br` read-only shell work.
 
 ### Essential Commands
 
