@@ -2513,4 +2513,49 @@ mod e2e_tests {
             );
         }
     }
+
+    #[test]
+    fn write_durable_creates_file_with_expected_content() {
+        let dir = temp_dir("write-durable");
+        let path = dir.join("durable.bin");
+        let payload = b"durable content here";
+
+        super::write_durable(&path, payload).expect("write_durable");
+
+        let read_back = std::fs::read(&path).expect("read back");
+        assert_eq!(read_back, payload);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_durable_overwrites_existing_file() {
+        let dir = temp_dir("write-durable-overwrite");
+        let path = dir.join("overwrite.bin");
+
+        super::write_durable(&path, b"first").expect("write first");
+        super::write_durable(&path, b"second").expect("write second");
+
+        let read_back = std::fs::read(&path).expect("read back");
+        assert_eq!(read_back, b"second");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_durable_empty_data_creates_zero_length_file() {
+        let dir = temp_dir("write-durable-empty");
+        let path = dir.join("empty.bin");
+
+        super::write_durable(&path, &[]).expect("write empty");
+
+        let meta = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(meta.len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_durable_fails_on_nonexistent_parent() {
+        let path = std::path::Path::new("/nonexistent/dir/file.bin");
+        let result = super::write_durable(path, b"data");
+        assert!(result.is_err());
+    }
 }
