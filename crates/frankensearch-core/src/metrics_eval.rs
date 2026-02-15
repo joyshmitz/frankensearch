@@ -504,6 +504,178 @@ pub fn quality_comparison(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Run-stability detection and outlier trimming (bd-2hz.9.9)
+// ---------------------------------------------------------------------------
+
+/// Verdict from a run-stability check.
+///
+/// Used as a pre-gate before statistical comparison: if a benchmark run has
+/// too much variance or too few samples, the comparison is unreliable and
+/// should be flagged rather than trusted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunStabilityVerdict {
+    /// Whether the run is stable enough for meaningful comparison.
+    pub stable: bool,
+    /// Coefficient of variation (std_dev / mean). `None` if mean is zero.
+    pub cv: Option<f64>,
+    /// Number of samples after outlier removal (if trimming was applied).
+    pub effective_sample_count: usize,
+    /// Number of outliers detected (before removal).
+    pub outlier_count: usize,
+    /// Human-readable reason if `stable` is false.
+    pub reason: String,
+}
+
+/// Coefficient of variation: `std_dev / |mean|`.
+///
+/// Returns `None` if the sample is empty or the mean is zero (CV is undefined
+/// when the mean is zero because it would require division by zero).
+#[must_use]
+pub fn coefficient_of_variation(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mean = slice_mean(samples);
+    if mean.abs() < f64::EPSILON {
+        return None;
+    }
+    let n = usize_to_f64(samples.len());
+    let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    Some(variance.sqrt() / mean.abs())
+}
+
+/// Detect outlier indices using the IQR fence method.
+///
+/// An observation is an outlier if it falls outside `[Q1 - k*IQR, Q3 + k*IQR]`.
+/// The standard choice is `k = 1.5` (mild outliers) or `k = 3.0` (extreme).
+///
+/// Returns sorted indices of outliers in the original `samples` slice.
+/// Returns an empty vec if `samples` has fewer than 4 elements (IQR is
+/// unreliable with very small samples).
+#[must_use]
+pub fn detect_outliers_iqr(samples: &[f64], iqr_factor: f64) -> Vec<usize> {
+    if samples.len() < 4 || !iqr_factor.is_finite() || iqr_factor < 0.0 {
+        return Vec::new();
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable_by(f64::total_cmp);
+
+    let q1 = percentile_sorted(&sorted, 0.25);
+    let q3 = percentile_sorted(&sorted, 0.75);
+    let iqr = q3 - q1;
+
+    let lower_fence = q1 - iqr_factor * iqr;
+    let upper_fence = q3 + iqr_factor * iqr;
+
+    let mut outliers: Vec<usize> = samples
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v < lower_fence || **v > upper_fence)
+        .map(|(i, _)| i)
+        .collect();
+    outliers.sort_unstable();
+    outliers
+}
+
+/// Remove IQR outliers from samples and return the trimmed set.
+///
+/// Uses [`detect_outliers_iqr`] with the given `iqr_factor` to identify
+/// outliers, then returns only the non-outlier values (preserving order).
+///
+/// Returns all samples unchanged if fewer than 4 elements (IQR unreliable).
+#[must_use]
+pub fn trim_outliers(samples: &[f64], iqr_factor: f64) -> Vec<f64> {
+    let outlier_indices = detect_outliers_iqr(samples, iqr_factor);
+    if outlier_indices.is_empty() {
+        return samples.to_vec();
+    }
+    let outlier_set: HashSet<usize> = outlier_indices.into_iter().collect();
+    samples
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !outlier_set.contains(i))
+        .map(|(_, &v)| v)
+        .collect()
+}
+
+/// Verify that a benchmark run is stable enough for meaningful comparison.
+///
+/// Checks two conditions:
+/// 1. **Minimum sample count**: at least `min_samples` observations after
+///    outlier removal (with IQR factor 1.5).
+/// 2. **Maximum CV**: coefficient of variation on trimmed samples must not
+///    exceed `max_cv` (e.g. 0.15 for 15% relative spread).
+///
+/// If either check fails, the verdict explains why and `stable` is `false`.
+#[must_use]
+pub fn verify_run_stability(
+    samples: &[f64],
+    max_cv: f64,
+    min_samples: usize,
+) -> RunStabilityVerdict {
+    if samples.is_empty() {
+        return RunStabilityVerdict {
+            stable: false,
+            cv: None,
+            effective_sample_count: 0,
+            outlier_count: 0,
+            reason: "no samples provided".to_owned(),
+        };
+    }
+
+    let outlier_indices = detect_outliers_iqr(samples, 1.5);
+    let outlier_count = outlier_indices.len();
+    let trimmed = if outlier_indices.is_empty() {
+        samples.to_vec()
+    } else {
+        let outlier_set: HashSet<usize> = outlier_indices.into_iter().collect();
+        samples
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !outlier_set.contains(i))
+            .map(|(_, &v)| v)
+            .collect()
+    };
+    let effective_count = trimmed.len();
+
+    if effective_count < min_samples {
+        return RunStabilityVerdict {
+            stable: false,
+            cv: coefficient_of_variation(&trimmed),
+            effective_sample_count: effective_count,
+            outlier_count,
+            reason: format!(
+                "insufficient samples after outlier removal: {effective_count} < {min_samples} \
+                 ({outlier_count} outliers removed from {} total)",
+                samples.len()
+            ),
+        };
+    }
+
+    let cv = coefficient_of_variation(&trimmed);
+    match cv {
+        Some(cv_val) if cv_val > max_cv => RunStabilityVerdict {
+            stable: false,
+            cv: Some(cv_val),
+            effective_sample_count: effective_count,
+            outlier_count,
+            reason: format!(
+                "coefficient of variation {cv_val:.4} exceeds threshold {max_cv:.4} \
+                 ({effective_count} samples, {outlier_count} outliers removed)"
+            ),
+        },
+        _ => RunStabilityVerdict {
+            stable: true,
+            cv,
+            effective_sample_count: effective_count,
+            outlier_count,
+            reason: String::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

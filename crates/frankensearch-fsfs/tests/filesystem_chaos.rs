@@ -13,8 +13,8 @@ use frankensearch_fsfs::{
     CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED, CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
     CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY, CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
     CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP, CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenario,
-    MountTable, build_cli_e2e_filesystem_chaos_bundles,
-    default_cli_e2e_filesystem_chaos_scenarios, read_system_mounts, replay_command_for_scenario,
+    MountTable, build_cli_e2e_filesystem_chaos_bundles, default_cli_e2e_filesystem_chaos_scenarios,
+    read_system_mounts, replay_command_for_scenario,
 };
 use serde::Deserialize;
 
@@ -118,12 +118,15 @@ fn load_manifest(index_root: &Path) -> Vec<IndexManifestEntry> {
 
 fn resolve_mount_point(path: &Path) -> Option<PathBuf> {
     let table = MountTable::new(read_system_mounts(), &HashMap::new());
-    table.lookup(path).map(|(entry, _policy)| entry.mount_point.clone())
+    table
+        .lookup(path)
+        .map(|(entry, _policy)| entry.mount_point.clone())
 }
 
 fn write_mount_boundary_config(root: &Path, mount_point: &Path) -> PathBuf {
     let config_path = root.join("chaos_mount_boundary.toml");
-    let effective_mount_point = resolve_mount_point(mount_point).unwrap_or_else(|| PathBuf::from("/"));
+    let effective_mount_point =
+        resolve_mount_point(mount_point).unwrap_or_else(|| PathBuf::from("/"));
     let config = format!(
         "[discovery]
 skip_network_mounts = true

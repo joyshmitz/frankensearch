@@ -65,3 +65,53 @@ Replay:
 ```bash
 scripts/check_bead_baseline_budget.sh --mode all
 ```
+
+## Statistical Regression Gate Policy (bd-2hz.9.6)
+
+This section defines the canonical CI-facing statistical gate for performance-sensitive lanes.
+
+### Required Metrics and Budgets
+
+Every performance gate evaluation MUST include:
+
+- latency: `p50`, `p95`, `p99` (milliseconds)
+- memory: peak resident memory (`MB`)
+
+Default fail thresholds (unless bead-specific tighter budgets are declared):
+
+- `p50` regression > `5%`
+- `p95` regression > `8%`
+- `p99` regression > `12%`
+- peak memory regression > `10%`
+
+### Confidence Policy
+
+- Minimum independent run count: `5`.
+- Preferred confidence target: `95%` for regression decision.
+- If confidence cannot be established (insufficient samples or unstable variance), gate result MUST be `inconclusive` with deterministic reason code.
+
+### Flake Mitigation Policy
+
+- Detect flake candidate when metric spread exceeds configured variance envelope.
+- Allow up to `2` bounded re-runs before final gate decision.
+- Emit triage metadata identifying:
+  - rerun count,
+  - variance signal,
+  - final decision basis.
+
+### CI Artifact Requirements
+
+Performance gate lanes MUST publish:
+
+- `perf_regression_gate_policy.json`
+- `perf_regression_gate_result.json`
+- baseline and current metric manifests (when available)
+- replay command for reproduction
+
+### Deterministic Reason Codes
+
+- `perf.gate.pass`
+- `perf.gate.missing_inputs`
+- `perf.gate.inconclusive_confidence`
+- `perf.gate.flake_suspected`
+- `perf.gate.regression_detected`

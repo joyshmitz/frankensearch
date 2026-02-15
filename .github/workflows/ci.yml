@@ -203,6 +203,59 @@ jobs:
           }
           EOF
 
+      - name: Emit statistical perf gate policy + provisional result artifacts
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+
+          cat > ci_artifacts/perf_regression_gate_policy.json <<'EOF'
+          {
+            "schema": "perf-regression-gate-policy-v1",
+            "thresholds_pct": {
+              "p50": 5,
+              "p95": 8,
+              "p99": 12,
+              "memory_peak_mb": 10
+            },
+            "confidence_target_pct": 95,
+            "min_run_count": 5,
+            "max_flake_reruns": 2,
+            "reason_codes": [
+              "perf.gate.pass",
+              "perf.gate.missing_inputs",
+              "perf.gate.inconclusive_confidence",
+              "perf.gate.flake_suspected",
+              "perf.gate.regression_detected"
+            ]
+          }
+          EOF
+
+          baseline_file="ci_artifacts/perf_metrics_baseline.json"
+          current_file="ci_artifacts/perf_metrics_current.json"
+          if [[ -f "${baseline_file}" && -f "${current_file}" ]]; then
+            cat > ci_artifacts/perf_regression_gate_result.json <<'EOF'
+          {
+            "schema": "perf-regression-gate-result-v1",
+            "status": "pending_evaluation_logic",
+            "reason_code": "perf.gate.inconclusive_confidence",
+            "details": "baseline/current artifacts present but evaluation lane not yet fully wired in this workflow",
+            "replay_command": "cargo test --workspace --all-features -- --nocapture"
+          }
+          EOF
+          else
+            cat > ci_artifacts/perf_regression_gate_result.json <<'EOF'
+          {
+            "schema": "perf-regression-gate-result-v1",
+            "status": "pending_inputs",
+            "reason_code": "perf.gate.missing_inputs",
+            "details": "benchmark metric artifacts not yet present in ci_artifacts/",
+            "replay_command": "cargo test --workspace --all-features -- --nocapture"
+          }
+          EOF
+          fi
+
       - name: Validate CI artifact payloads
         if: always() && matrix.os == 'ubuntu-latest'
         shell: bash
@@ -237,6 +290,21 @@ jobs:
             (.rollback_triggers | length >= 4)
           ' ci_artifacts/rollout_host_checklist.json >/dev/null
 
+          jq -e '
+            .schema == "perf-regression-gate-policy-v1" and
+            (.thresholds_pct.p50 >= 1) and
+            (.thresholds_pct.p99 >= .thresholds_pct.p95) and
+            (.confidence_target_pct >= 50) and
+            (.min_run_count >= 3) and
+            (.reason_codes | length >= 5)
+          ' ci_artifacts/perf_regression_gate_policy.json >/dev/null
+
+          jq -e '
+            .schema == "perf-regression-gate-result-v1" and
+            (.reason_code | startswith("perf.gate.")) and
+            (.replay_command | length > 0)
+          ' ci_artifacts/perf_regression_gate_result.json >/dev/null
+
       - name: Upload e2e artifact index (success retention)
         if: matrix.os == 'ubuntu-latest' && success()
         uses: actions/upload-artifact@v4
@@ -270,6 +338,7 @@ jobs:
             echo "- Replay source of truth: \`replay_command.txt\` from the failing artifact bundle."
             echo "- Machine index artifact: \`e2e-contract-index-failure-${{ github.run_id }}\` (retention: 30 days)."
             echo "- Quality gate metadata artifacts: \`quality_gate_matrix.json\`, \`rollout_host_checklist.json\`."
+            echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
   release-build:

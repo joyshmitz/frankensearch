@@ -36,6 +36,11 @@ const PRIVACY_REASON_PASS: &str = "e2e.privacy.redaction_pass";
 const PRIVACY_REASON_LEAK: &str = "e2e.privacy.redaction_leak";
 const PRIVACY_REPLAY_COMMAND: &str = "cargo test -p frankensearch-fsfs --test privacy_redaction_suite -- --nocapture --exact redaction_assertions_cover_logs_evidence_explain_and_streamed_outputs";
 
+#[inline]
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).expect("privacy fixture counters must fit in u32"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LeakFinding {
     artifact: String,
@@ -130,6 +135,7 @@ fn sample_ranking() -> RankingExplanation {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_privacy_unified_bundle(
     report: &LeakReport,
     policy: &RedactionPolicy,
@@ -158,9 +164,9 @@ fn build_privacy_unified_bundle(
     };
 
     let mut metrics = BTreeMap::new();
-    metrics.insert("finding_count".to_owned(), lane_meta.finding_count as f64);
+    metrics.insert("finding_count".to_owned(), usize_to_f64(lane_meta.finding_count));
 
-    let event_bodies = vec![
+    let event_bodies = [
         EventBody {
             event_type: E2eEventType::E2eStart,
             correlation: Correlation {

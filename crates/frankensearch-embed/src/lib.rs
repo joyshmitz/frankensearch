@@ -10,6 +10,7 @@
 
 pub mod auto_detect;
 pub mod batch_coalescer;
+pub mod cached_embedder;
 pub mod model_cache;
 pub mod model_manifest;
 pub mod model_registry;
@@ -19,6 +20,7 @@ pub use auto_detect::{
 pub use batch_coalescer::{
     BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
 };
+pub use cached_embedder::{CacheStats, CachedEmbedder};
 pub use model_cache::{
     ENV_DATA_DIR, ENV_MODEL_DIR, KnownModel, MODEL_CACHE_LAYOUT_VERSION, ModelCacheLayout,
     ModelDirEntry, ensure_cache_layout, ensure_default_cache, is_model_installed, known_models,
