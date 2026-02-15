@@ -589,6 +589,22 @@ impl OpsApp {
             .and_then(ActionTimelineScreen::selected_project)
     }
 
+    fn selected_reason_from_timeline(&self) -> Option<String> {
+        self.shell
+            .registry
+            .get(&self.timeline_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<ActionTimelineScreen>())
+            .and_then(ActionTimelineScreen::selected_reason_code)
+    }
+
+    fn selected_host_from_timeline(&self) -> Option<String> {
+        self.shell
+            .registry
+            .get(&self.timeline_screen_id)
+            .and_then(|screen| screen.as_any().downcast_ref::<ActionTimelineScreen>())
+            .and_then(ActionTimelineScreen::selected_host)
+    }
+
     fn open_project_detail_for_selected_project(&mut self) {
         self.view.apply_preset(ViewPreset::ProjectDeepDive);
         if let Some(project) = self.selected_project_from_fleet() {
@@ -658,8 +674,12 @@ impl OpsApp {
 
     fn sync_timeline_to_analytics_transition(&mut self) {
         let project = self.selected_project_from_timeline();
+        let reason = self.selected_reason_from_timeline();
+        let host = self.selected_host_from_timeline();
         if let Some(screen) = self.analytics_screen_mut() {
             screen.set_project_filter(project.as_deref().unwrap_or("all"));
+            screen.set_reason_filter(reason.as_deref().unwrap_or("all"));
+            screen.set_host_filter(host.as_deref().unwrap_or("all"));
         }
         self.sync_screen_states();
     }
@@ -1296,6 +1316,105 @@ mod tests {
                 .and_then(HistoricalAnalyticsScreen::active_project_filter)
                 .as_deref(),
             expected_project.as_deref()
+        );
+    }
+
+    #[test]
+    fn a_from_timeline_overrides_stale_analytics_reason_and_host_filters() {
+        let mut app = OpsApp::new(Box::new(MockDataSource::empty()));
+        app.state.update_fleet(FleetSnapshot {
+            instances: vec![
+                crate::state::InstanceInfo {
+                    id: "host-a:cass-ctx-1".to_owned(),
+                    project: "cass".to_owned(),
+                    pid: Some(1),
+                    healthy: true,
+                    doc_count: 10,
+                    pending_jobs: 0,
+                },
+                crate::state::InstanceInfo {
+                    id: "host-b:xf-ctx-1".to_owned(),
+                    project: "xf".to_owned(),
+                    pid: Some(2),
+                    healthy: true,
+                    doc_count: 10,
+                    pending_jobs: 0,
+                },
+            ],
+            lifecycle_events: vec![
+                crate::state::LifecycleEvent {
+                    instance_id: "host-a:cass-ctx-1".to_owned(),
+                    from: crate::state::LifecycleState::Started,
+                    to: crate::state::LifecycleState::Healthy,
+                    reason_code: "lifecycle.discovery.ready".to_owned(),
+                    at_ms: 2_000,
+                    attribution_confidence_score: 95,
+                    attribution_collision: false,
+                },
+                crate::state::LifecycleEvent {
+                    instance_id: "host-b:xf-ctx-1".to_owned(),
+                    from: crate::state::LifecycleState::Healthy,
+                    to: crate::state::LifecycleState::Stale,
+                    reason_code: "lifecycle.heartbeat_gap".to_owned(),
+                    at_ms: 1_000,
+                    attribution_confidence_score: 65,
+                    attribution_collision: false,
+                },
+            ],
+            ..FleetSnapshot::default()
+        });
+        app.sync_screen_states();
+
+        if let Some(screen) = app.analytics_screen_mut() {
+            screen.set_reason_filter("lifecycle.heartbeat_gap");
+            screen.set_host_filter("host-b");
+        }
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_reason_filter)
+                .as_deref(),
+            Some("lifecycle.heartbeat_gap")
+        );
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_host_filter)
+                .as_deref(),
+            Some("host-b")
+        );
+
+        app.shell.navigate_to(&ScreenId::new("ops.timeline"));
+        assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
+        let expected_project = app.selected_project_from_timeline();
+        let expected_reason = app.selected_reason_from_timeline();
+        let expected_host = app.selected_host_from_timeline();
+
+        let goto_analytics = frankensearch_tui::InputEvent::Key(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let quit = app.handle_input(&goto_analytics);
+        assert!(!quit);
+        assert_eq!(
+            app.shell.active_screen,
+            Some(ScreenId::new("ops.analytics"))
+        );
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_project_filter)
+                .as_deref(),
+            expected_project.as_deref()
+        );
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_reason_filter)
+                .as_deref(),
+            expected_reason.as_deref()
+        );
+        assert_eq!(
+            app.analytics_screen()
+                .and_then(HistoricalAnalyticsScreen::active_host_filter)
+                .as_deref(),
+            expected_host.as_deref()
         );
     }
 

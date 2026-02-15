@@ -1295,4 +1295,462 @@ mod tests {
         assert!(summary.contains("l stream"));
         assert!(summary.contains("t timeline"));
     }
+
+    // ── AlertSeverity tests ──────────────────────────────────────────
+
+    #[test]
+    fn severity_labels_are_lowercase() {
+        assert_eq!(AlertSeverity::Info.label(), "info");
+        assert_eq!(AlertSeverity::Warn.label(), "warn");
+        assert_eq!(AlertSeverity::Critical.label(), "critical");
+    }
+
+    #[test]
+    fn severity_colors_are_distinct() {
+        let colors = [
+            AlertSeverity::Info.color(),
+            AlertSeverity::Warn.color(),
+            AlertSeverity::Critical.color(),
+        ];
+        for (i, c) in colors.iter().enumerate() {
+            for (j, other) in colors.iter().enumerate() {
+                if i != j {
+                    assert_ne!(c, other, "severity colors must be distinct");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn severity_rank_orders_info_warn_critical() {
+        assert!(AlertSeverity::Info.rank() < AlertSeverity::Warn.rank());
+        assert!(AlertSeverity::Warn.rank() < AlertSeverity::Critical.rank());
+    }
+
+    // ── SeverityFilter tests ─────────────────────────────────────────
+
+    #[test]
+    fn severity_filter_cycles_through_all_variants() {
+        let start = SeverityFilter::All;
+        let second = start.next();
+        let third = second.next();
+        let fourth = third.next();
+        assert_eq!(second, SeverityFilter::Warn);
+        assert_eq!(third, SeverityFilter::Critical);
+        assert_eq!(fourth, SeverityFilter::All);
+    }
+
+    #[test]
+    fn severity_filter_labels_are_nonempty() {
+        for filter in [
+            SeverityFilter::All,
+            SeverityFilter::Warn,
+            SeverityFilter::Critical,
+        ] {
+            assert!(!filter.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn severity_filter_all_allows_everything() {
+        assert!(SeverityFilter::All.allows(AlertSeverity::Info));
+        assert!(SeverityFilter::All.allows(AlertSeverity::Warn));
+        assert!(SeverityFilter::All.allows(AlertSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_warn_blocks_info() {
+        assert!(!SeverityFilter::Warn.allows(AlertSeverity::Info));
+        assert!(SeverityFilter::Warn.allows(AlertSeverity::Warn));
+        assert!(SeverityFilter::Warn.allows(AlertSeverity::Critical));
+    }
+
+    #[test]
+    fn severity_filter_critical_blocks_info_and_warn() {
+        assert!(!SeverityFilter::Critical.allows(AlertSeverity::Info));
+        assert!(!SeverityFilter::Critical.allows(AlertSeverity::Warn));
+        assert!(SeverityFilter::Critical.allows(AlertSeverity::Critical));
+    }
+
+    // ── host_bucket tests ────────────────────────────────────────────
+
+    #[test]
+    fn host_bucket_extracts_colon_prefix() {
+        assert_eq!(AlertsSloScreen::host_bucket("host-a:instance-1"), "host-a");
+    }
+
+    #[test]
+    fn host_bucket_extracts_dash_prefix_when_no_colon() {
+        assert_eq!(AlertsSloScreen::host_bucket("host-1"), "host");
+    }
+
+    #[test]
+    fn host_bucket_returns_whole_string_when_no_separator() {
+        assert_eq!(AlertsSloScreen::host_bucket("singletoken"), "singletoken");
+    }
+
+    #[test]
+    fn host_bucket_prefers_colon_over_dash() {
+        assert_eq!(AlertsSloScreen::host_bucket("a-b:c-d"), "a-b");
+    }
+
+    // ── event_severity tests ─────────────────────────────────────────
+
+    #[test]
+    fn event_severity_stopped_is_critical() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Stopped,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 90,
+            attribution_collision: false,
+        };
+        assert_eq!(
+            AlertsSloScreen::event_severity(&event),
+            AlertSeverity::Critical
+        );
+    }
+
+    #[test]
+    fn event_severity_degraded_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Degraded,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 90,
+            attribution_collision: false,
+        };
+        assert_eq!(AlertsSloScreen::event_severity(&event), AlertSeverity::Warn);
+    }
+
+    #[test]
+    fn event_severity_collision_is_warn() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Healthy,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 90,
+            attribution_collision: true,
+        };
+        assert_eq!(AlertsSloScreen::event_severity(&event), AlertSeverity::Warn);
+    }
+
+    #[test]
+    fn event_severity_healthy_no_collision_is_info() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 90,
+            attribution_collision: false,
+        };
+        assert_eq!(AlertsSloScreen::event_severity(&event), AlertSeverity::Info);
+    }
+
+    // ── suppression_state tests ──────────────────────────────────────
+
+    #[test]
+    fn suppression_state_healthy_is_suppressed() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Recovering,
+            to: LifecycleState::Healthy,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 90,
+            attribution_collision: false,
+        };
+        assert_eq!(AlertsSloScreen::suppression_state(&event), "suppressed");
+    }
+
+    #[test]
+    fn suppression_state_collision_is_investigating() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Degraded,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 50,
+            attribution_collision: true,
+        };
+        assert_eq!(AlertsSloScreen::suppression_state(&event), "investigating");
+    }
+
+    #[test]
+    fn suppression_state_active_for_non_healthy_non_collision() {
+        let event = LifecycleEvent {
+            instance_id: "x".to_owned(),
+            from: LifecycleState::Healthy,
+            to: LifecycleState::Stopped,
+            reason_code: "test".to_owned(),
+            at_ms: 0,
+            attribution_confidence_score: 90,
+            attribution_collision: false,
+        };
+        assert_eq!(AlertsSloScreen::suppression_state(&event), "active");
+    }
+
+    // ── average_u64 tests ────────────────────────────────────────────
+
+    #[test]
+    fn average_u64_empty_returns_zero() {
+        assert_eq!(AlertsSloScreen::average_u64(&[]), 0);
+    }
+
+    #[test]
+    fn average_u64_single_value() {
+        assert_eq!(AlertsSloScreen::average_u64(&[42]), 42);
+    }
+
+    #[test]
+    fn average_u64_rounds_half_up() {
+        // [1, 2] => sum=3, count=2, (3+1)/2 = 2
+        assert_eq!(AlertsSloScreen::average_u64(&[1, 2]), 2);
+    }
+
+    #[test]
+    fn average_u64_exact_division() {
+        assert_eq!(AlertsSloScreen::average_u64(&[10, 20, 30]), 20);
+    }
+
+    // ── eta_seconds tests ────────────────────────────────────────────
+
+    #[test]
+    fn eta_seconds_zero_throughput_returns_max() {
+        assert_eq!(AlertsSloScreen::eta_seconds(100, 0.0), u64::MAX);
+    }
+
+    #[test]
+    fn eta_seconds_negative_throughput_returns_max() {
+        assert_eq!(AlertsSloScreen::eta_seconds(100, -1.0), u64::MAX);
+    }
+
+    #[test]
+    fn eta_seconds_nan_throughput_returns_max() {
+        assert_eq!(AlertsSloScreen::eta_seconds(100, f64::NAN), u64::MAX);
+    }
+
+    #[test]
+    fn eta_seconds_inf_throughput_returns_max() {
+        assert_eq!(AlertsSloScreen::eta_seconds(100, f64::INFINITY), u64::MAX);
+    }
+
+    #[test]
+    fn eta_seconds_zero_backlog_returns_zero() {
+        assert_eq!(AlertsSloScreen::eta_seconds(0, 10.0), 0);
+    }
+
+    #[test]
+    fn eta_seconds_normal_calculation() {
+        // 100 items / 10 eps = 10 seconds
+        assert_eq!(AlertsSloScreen::eta_seconds(100, 10.0), 10);
+    }
+
+    // ── fleet_rollup_row tests ───────────────────────────────────────
+
+    #[test]
+    fn fleet_rollup_empty_returns_none() {
+        assert!(AlertsSloScreen::fleet_rollup_row(&[]).is_none());
+    }
+
+    #[test]
+    fn fleet_rollup_single_project_mirrors_values() {
+        let rows = vec![SloProjectRow {
+            project: "alpha".to_owned(),
+            instance_count: 3,
+            unhealthy_count: 1,
+            pending_jobs: 50,
+            p95_latency_us: 2_000,
+            burn_ratio: 0.5,
+            remaining_ratio: 0.5,
+            backlog_eta_s: 120,
+            saturation_risk: "low",
+            status: ControlPlaneHealth::Healthy,
+        }];
+        let rollup = AlertsSloScreen::fleet_rollup_row(&rows).unwrap();
+        assert_eq!(rollup.project, "fleet");
+        assert_eq!(rollup.instance_count, 3);
+        assert_eq!(rollup.unhealthy_count, 1);
+        assert_eq!(rollup.pending_jobs, 50);
+        assert_eq!(rollup.p95_latency_us, 2_000);
+    }
+
+    #[test]
+    fn fleet_rollup_propagates_highest_saturation_risk() {
+        let rows = vec![
+            SloProjectRow {
+                project: "a".to_owned(),
+                instance_count: 1,
+                unhealthy_count: 0,
+                pending_jobs: 0,
+                p95_latency_us: 100,
+                burn_ratio: 0.1,
+                remaining_ratio: 0.9,
+                backlog_eta_s: 10,
+                saturation_risk: "low",
+                status: ControlPlaneHealth::Healthy,
+            },
+            SloProjectRow {
+                project: "b".to_owned(),
+                instance_count: 1,
+                unhealthy_count: 1,
+                pending_jobs: 5000,
+                p95_latency_us: 10_000,
+                burn_ratio: 2.0,
+                remaining_ratio: 0.0,
+                backlog_eta_s: 7_200,
+                saturation_risk: "high",
+                status: ControlPlaneHealth::Critical,
+            },
+        ];
+        let rollup = AlertsSloScreen::fleet_rollup_row(&rows).unwrap();
+        assert_eq!(rollup.saturation_risk, "high");
+    }
+
+    // ── alerts_summary_line tests ────────────────────────────────────
+
+    #[test]
+    fn alerts_summary_empty_alerts() {
+        let line = AlertsSloScreen::alerts_summary_line(&[]);
+        assert!(line.contains("no lifecycle alerts"));
+    }
+
+    #[test]
+    fn alerts_summary_counts_severities() {
+        let alerts = vec![
+            AlertRow {
+                ts_ms: 1,
+                project: "a".to_owned(),
+                host: "h".to_owned(),
+                instance_id: "i1".to_owned(),
+                severity: AlertSeverity::Critical,
+                confidence: 90,
+                suppression_state: "active",
+                reason_code: "r".to_owned(),
+            },
+            AlertRow {
+                ts_ms: 2,
+                project: "a".to_owned(),
+                host: "h".to_owned(),
+                instance_id: "i2".to_owned(),
+                severity: AlertSeverity::Warn,
+                confidence: 80,
+                suppression_state: "suppressed",
+                reason_code: "r".to_owned(),
+            },
+        ];
+        let line = AlertsSloScreen::alerts_summary_line(&alerts);
+        assert!(line.contains("total=2"));
+        assert!(line.contains("critical=1"));
+        assert!(line.contains("warn=1"));
+        assert!(line.contains("suppressed=1"));
+        assert!(line.contains("active=1"));
+    }
+
+    // ── slo_summary_line tests ───────────────────────────────────────
+
+    #[test]
+    fn slo_summary_no_instances() {
+        let line = AlertsSloScreen::slo_summary_line(&[]);
+        assert!(line.contains("unavailable"));
+    }
+
+    // ── Default impl ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_matches_new() {
+        let new_screen = AlertsSloScreen::new();
+        let default_screen = AlertsSloScreen::default();
+        assert_eq!(new_screen.id(), default_screen.id());
+        assert_eq!(new_screen.selected_row, default_screen.selected_row);
+    }
+
+    // ── Navigation bounds ────────────────────────────────────────────
+
+    #[test]
+    fn up_navigation_stops_at_zero() {
+        let mut screen = AlertsSloScreen::new();
+        screen.update_state(&sample_state());
+        screen.selected_row = 0;
+
+        let ctx = screen_context();
+        let up = InputEvent::Key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        screen.handle_input(&up, &ctx);
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn down_navigation_stops_at_last() {
+        let mut screen = AlertsSloScreen::new();
+        screen.update_state(&sample_state());
+        let count = screen.alert_count();
+        screen.selected_row = count.saturating_sub(1);
+
+        let ctx = screen_context();
+        let down = InputEvent::Key(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        screen.handle_input(&down, &ctx);
+        assert_eq!(screen.selected_row, count.saturating_sub(1));
+    }
+
+    // ── Unhandled key returns Ignored ────────────────────────────────
+
+    #[test]
+    fn unhandled_key_returns_ignored() {
+        let mut screen = AlertsSloScreen::new();
+        let ctx = screen_context();
+        let event = InputEvent::Key(
+            crossterm::event::KeyCode::Char('z'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&event, &ctx), ScreenAction::Ignored);
+    }
+
+    // ── selected_context_line tests ──────────────────────────────────
+
+    #[test]
+    fn selected_context_line_empty_alerts() {
+        let screen = AlertsSloScreen::new();
+        let line = screen.selected_context_line(&[]);
+        assert_eq!(line, "focus: none");
+    }
+
+    // ── all_alerts sorting ───────────────────────────────────────────
+
+    #[test]
+    fn all_alerts_sorted_critical_first() {
+        let mut screen = AlertsSloScreen::new();
+        screen.update_state(&sample_state());
+        let alerts = screen.all_alerts();
+        assert!(!alerts.is_empty());
+        // First alert should be Critical (Stopped)
+        assert_eq!(alerts[0].severity, AlertSeverity::Critical);
+    }
+
+    // ── Enter with no selected project ───────────────────────────────
+
+    #[test]
+    fn enter_without_selection_returns_consumed() {
+        let mut screen = AlertsSloScreen::new();
+        let ctx = screen_context();
+        let event = InputEvent::Key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&event, &ctx), ScreenAction::Consumed);
+    }
 }

@@ -783,4 +783,285 @@ mod tests {
             )
         );
     }
+
+    // ── InteractionSurfaceKind tests ─────────────────────────────────
+
+    #[test]
+    fn surface_kind_ids_are_unique() {
+        let all = InteractionSurfaceKind::all();
+        let ids: Vec<&str> = all.iter().map(|kind| kind.id()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            for (j, other) in ids.iter().enumerate() {
+                if i != j {
+                    assert_ne!(id, other, "duplicate surface id: {id}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn surface_kind_all_returns_four_variants() {
+        assert_eq!(InteractionSurfaceKind::all().len(), 4);
+    }
+
+    #[test]
+    fn surface_kind_ids_are_nonempty() {
+        for kind in InteractionSurfaceKind::all() {
+            assert!(!kind.id().is_empty());
+        }
+    }
+
+    // ── InteractionLatencyHooks tests ────────────────────────────────
+
+    #[test]
+    fn component_budget_sums_phases() {
+        let hooks = super::InteractionLatencyHooks::new(1, 2, 3, 10);
+        assert_eq!(hooks.component_budget_ms(), 6);
+    }
+
+    #[test]
+    fn validate_rejects_zero_latency_fields() {
+        let hooks = super::InteractionLatencyHooks::new(0, 2, 3, 10);
+        let err = hooks
+            .validate(InteractionSurfaceKind::Search)
+            .expect_err("zero field must fail");
+        match err {
+            ShowcaseInteractionSpecError::InvalidLatencyBudget(surface, _) => {
+                assert_eq!(surface, InteractionSurfaceKind::Search);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_component_exceeding_frame() {
+        let hooks = super::InteractionLatencyHooks::new(5, 5, 5, 10);
+        let err = hooks
+            .validate(InteractionSurfaceKind::Results)
+            .expect_err("component > frame must fail");
+        match err {
+            ShowcaseInteractionSpecError::InvalidLatencyBudget(_, detail) => {
+                assert!(detail.contains("exceeds"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_component_equal_to_frame() {
+        let hooks = super::InteractionLatencyHooks::new(3, 3, 4, 10);
+        assert!(hooks.validate(InteractionSurfaceKind::Search).is_ok());
+    }
+
+    // ── Contract validation tests ────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_empty_card_grammar() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        let surface = spec
+            .surfaces
+            .iter_mut()
+            .find(|s| s.surface == InteractionSurfaceKind::Search)
+            .unwrap();
+        surface.cards.clear();
+        let err = spec.validate().expect_err("empty cards must fail");
+        assert_eq!(
+            err,
+            ShowcaseInteractionSpecError::EmptyCardGrammar(InteractionSurfaceKind::Search)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_palette_routes() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        let surface = spec
+            .surfaces
+            .iter_mut()
+            .find(|s| s.surface == InteractionSurfaceKind::Search)
+            .unwrap();
+        surface.palette_routes.clear();
+        let err = spec.validate().expect_err("empty routes must fail");
+        assert_eq!(
+            err,
+            ShowcaseInteractionSpecError::EmptyPaletteRoutes(InteractionSurfaceKind::Search)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_card_ids() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        let surface = spec
+            .surfaces
+            .iter_mut()
+            .find(|s| s.surface == InteractionSurfaceKind::Search)
+            .unwrap();
+        let dup = surface.cards[0].clone();
+        surface.cards.push(dup.clone());
+        let err = spec.validate().expect_err("duplicate card ids must fail");
+        assert_eq!(
+            err,
+            ShowcaseInteractionSpecError::DuplicateCardId(
+                InteractionSurfaceKind::Search,
+                dup.card_id
+            )
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_serialization_boundaries() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        let surface = spec
+            .surfaces
+            .iter_mut()
+            .find(|s| s.surface == InteractionSurfaceKind::Search)
+            .unwrap();
+        surface
+            .deterministic_boundaries
+            .retain(|b| b.checkpoint != DeterministicCheckpoint::BeforeStateSerialize);
+        let err = spec
+            .validate()
+            .expect_err("missing serialization boundary must fail");
+        assert_eq!(
+            err,
+            ShowcaseInteractionSpecError::MissingSerializationBoundary(
+                InteractionSurfaceKind::Search
+            )
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_state_keys_at_serialization_checkpoint() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        let surface = spec
+            .surfaces
+            .iter_mut()
+            .find(|s| s.surface == InteractionSurfaceKind::Search)
+            .unwrap();
+        let boundary = surface
+            .deterministic_boundaries
+            .iter_mut()
+            .find(|b| b.checkpoint == DeterministicCheckpoint::BeforeStateSerialize)
+            .unwrap();
+        boundary.state_keys.clear();
+        let err = spec.validate().expect_err("empty state keys must fail");
+        assert_eq!(
+            err,
+            ShowcaseInteractionSpecError::EmptySerializationStateKeys(
+                InteractionSurfaceKind::Search
+            )
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_spec_version() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        spec.spec_version = 999;
+        let err = spec.validate().expect_err("wrong version must fail");
+        assert_eq!(
+            err,
+            ShowcaseInteractionSpecError::UnsupportedSpecVersion(999)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_surfaces() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        let dup = spec.surfaces[0].clone();
+        spec.surfaces.push(dup);
+        let err = spec.validate().expect_err("duplicate surface must fail");
+        assert!(matches!(
+            err,
+            ShowcaseInteractionSpecError::DuplicateSurface(_)
+        ));
+    }
+
+    // ── surface() lookup ─────────────────────────────────────────────
+
+    #[test]
+    fn surface_lookup_returns_none_for_missing() {
+        let mut spec = ShowcaseInteractionSpec::canonical();
+        spec.surfaces
+            .retain(|s| s.surface != InteractionSurfaceKind::Explainability);
+        assert!(
+            spec.surface(InteractionSurfaceKind::Explainability)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn surface_lookup_returns_matching() {
+        let spec = ShowcaseInteractionSpec::canonical();
+        let search = spec.surface(InteractionSurfaceKind::Search);
+        assert!(search.is_some());
+        assert_eq!(search.unwrap().surface, InteractionSurfaceKind::Search);
+    }
+
+    // ── Error Display formatting ─────────────────────────────────────
+
+    #[test]
+    fn error_display_contains_surface_id() {
+        let err = ShowcaseInteractionSpecError::EmptyCardGrammar(InteractionSurfaceKind::Search);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("search"),
+            "error should mention surface: {msg}"
+        );
+    }
+
+    #[test]
+    fn error_display_version() {
+        let err = ShowcaseInteractionSpecError::UnsupportedSpecVersion(42);
+        let msg = format!("{err}");
+        assert!(msg.contains("42"));
+    }
+
+    // ── Serde roundtrip ──────────────────────────────────────────────
+
+    #[test]
+    fn canonical_spec_serde_roundtrip() {
+        let spec = ShowcaseInteractionSpec::canonical();
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let deser: ShowcaseInteractionSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(spec, deser);
+    }
+
+    // ── Construction helpers ─────────────────────────────────────────
+
+    #[test]
+    fn card_layout_rule_construction() {
+        let rule = super::CardLayoutRule::new(
+            "test.card",
+            super::CardRole::QueryInput,
+            super::LayoutAxis::Horizontal,
+            40,
+            3,
+            true,
+            false,
+        );
+        assert_eq!(rule.card_id, "test.card");
+        assert!(rule.virtualized);
+        assert!(!rule.sticky_header);
+    }
+
+    #[test]
+    fn palette_intent_route_construction() {
+        let route = super::PaletteIntentRoute::new(
+            super::PaletteIntent::FocusQuery,
+            "test.action",
+            None,
+            true,
+        );
+        assert_eq!(route.action_id, "test.action");
+        assert!(route.cross_screen_semantics);
+        assert!(route.target_surface.is_none());
+    }
+
+    #[test]
+    fn deterministic_state_boundary_converts_keys() {
+        let boundary = super::DeterministicStateBoundary::new(
+            DeterministicCheckpoint::BeforeFrameCommit,
+            vec!["key1", "key2"],
+        );
+        assert_eq!(boundary.state_keys, vec!["key1", "key2"]);
+    }
 }

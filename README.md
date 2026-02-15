@@ -612,6 +612,63 @@ mrl_rescore_top_k = 30
 Use this when you want deterministic, checked-in tuning presets instead of
 host-specific env var drift.
 
+## Reference Appendix
+
+### Key Source Files
+
+| Area | Source File | Purpose |
+|---|---|---|
+| Facade crate | [`frankensearch/src/lib.rs`](frankensearch/src/lib.rs) | Top-level public API surface and re-exports |
+| Index build workflow | [`frankensearch/src/index_builder.rs`](frankensearch/src/index_builder.rs) | High-level corpus-to-index pipeline |
+| Progressive orchestration | [`crates/frankensearch-fusion/src/searcher.rs`](crates/frankensearch-fusion/src/searcher.rs) | Phase 1/2 flow, fallback paths, telemetry |
+| Rank fusion | [`crates/frankensearch-fusion/src/rrf.rs`](crates/frankensearch-fusion/src/rrf.rs) | Reciprocal Rank Fusion implementation |
+| Two-tier blending | [`crates/frankensearch-fusion/src/blend.rs`](crates/frankensearch-fusion/src/blend.rs) | Fast/quality score normalization and blending |
+| Two-tier index wrapper | [`crates/frankensearch-index/src/two_tier.rs`](crates/frankensearch-index/src/two_tier.rs) | Fast/quality index alignment and lookup |
+| Top-k vector search | [`crates/frankensearch-index/src/search.rs`](crates/frankensearch-index/src/search.rs) | Heap-based top-k selection and scoring paths |
+| On-disk vector format | [`crates/frankensearch-index/src/fsvi.rs`](crates/frankensearch-index/src/fsvi.rs) | FSVI format, quantization, mmap reads |
+| Core config knobs | [`crates/frankensearch-core/src/config.rs`](crates/frankensearch-core/src/config.rs) | `TwoTierConfig`, defaults, env overrides |
+| Core result types | [`crates/frankensearch-core/src/types.rs`](crates/frankensearch-core/src/types.rs) | `SearchPhase`, `ScoredResult`, hit structs |
+| Query classification | [`crates/frankensearch-core/src/query_class.rs`](crates/frankensearch-core/src/query_class.rs) | Query-type detection and adaptive budgets |
+| Eval/statistics | [`crates/frankensearch-core/src/metrics_eval.rs`](crates/frankensearch-core/src/metrics_eval.rs) | nDCG/MRR/Recall/MAP + bootstrap helpers |
+| Embedder auto-detect | [`crates/frankensearch-embed/src/auto_detect.rs`](crates/frankensearch-embed/src/auto_detect.rs) | Fast/quality model discovery and stack setup |
+| FSFS CLI entry | [`crates/frankensearch-fsfs/src/lib.rs`](crates/frankensearch-fsfs/src/lib.rs) | Standalone CLI product wiring |
+
+### Glossary
+
+| Term | Meaning |
+|---|---|
+| Two-tier search | Progressive retrieval: fast initial pass, quality refinement pass |
+| Phase 1 / `Initial` | First emitted result set, optimized for low latency |
+| Phase 2 / `Refined` | Optional improved ranking after quality embedding |
+| `RefinementFailed` | Graceful degradation event when Phase 2 errors/times out |
+| RRF | Reciprocal Rank Fusion combining lexical + semantic rank lists |
+| BM25 | Lexical ranking function used by Tantivy backend |
+| FSVI | On-disk vector index format used by frankensearch-index |
+| `f16` quantization | Half-precision storage mode reducing memory footprint |
+| `TwoTierIndex` | Wrapper over fast and optional quality vector indexes |
+| `TwoTierSearcher` | Main orchestrator that runs retrieval/fusion/refinement |
+| `TwoTierConfig` | Primary tuning config for latency/quality behavior |
+| `TwoTierMetrics` | Per-search diagnostics (phase timings, candidate counts, skip reason) |
+| `EmbedderStack` | Paired fast + optional quality embedder selection object |
+| `Cx` | asupersync capability context passed into async operations |
+
+### Knob Impact Matrix
+
+| Knob | Where Set | Primary Impact | Increase Tends To | Decrease Tends To |
+|---|---|---|---|---|
+| `quality_weight` | `TwoTierConfig`, `FRANKENSEARCH_QUALITY_WEIGHT` | Blend balance | Favor quality-tier ranking signal | Favor fast-tier ranking signal |
+| `rrf_k` | `TwoTierConfig`, `FRANKENSEARCH_RRF_K` | RRF rank sensitivity | Flatten rank differences across sources | Emphasize top ranks more strongly |
+| `candidate_multiplier` | `TwoTierConfig` | Candidate pool size | Improve recall headroom, increase latency/work | Reduce latency/work, may reduce recall |
+| `quality_timeout_ms` | `TwoTierConfig`, `FRANKENSEARCH_QUALITY_TIMEOUT` | Phase 2 budget | More chances to finish refinement | More `RefinementFailed` timeouts |
+| `fast_only` | `TwoTierConfig`, `FRANKENSEARCH_FAST_ONLY` | Phase behavior | Skip Phase 2 entirely (`true`) | Enable Phase 2 when quality embedder exists (`false`) |
+| `hnsw_threshold` | `TwoTierConfig`, `FRANKENSEARCH_HNSW_THRESHOLD` | ANN activation point | Use brute-force for more corpus sizes | Use ANN earlier for large corpora |
+| `hnsw_ef_search` | `TwoTierConfig` | ANN query beam width | Better ANN recall, more latency | Lower latency, potentially lower recall |
+| `mrl_search_dims` | `TwoTierConfig` | MRL scan dimensionality | Better first-pass quality, more compute | Faster first-pass, potentially less quality |
+| `mrl_rescore_top_k` | `TwoTierConfig` | Full-dim rescore scope | Better refined ordering, more compute | Less compute, potentially weaker refinement |
+| `lexical` feature | Cargo feature | Hybrid retrieval capability | Better exact-match precision and fallback paths | Semantic-only behavior |
+| `rerank` feature | Cargo feature | Cross-encoder rerank | Better top-result precision, higher latency | Lower latency, less fine-grained top ordering |
+| `ann` feature | Cargo feature | Approximate nearest-neighbor path | Better scale behavior at large corpus sizes | Simpler exact brute-force behavior |
+
 ## Why Not Just grep/ripgrep/ctags?
 
 `grep`/`ripgrep`/`ctags` are excellent for exact text and symbol lookup. `frankensearch` solves a different problem: semantic intent search over mixed corpora.

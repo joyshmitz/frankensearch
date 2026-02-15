@@ -217,11 +217,53 @@ impl HistoricalAnalyticsScreen {
         self.restore_selected_row(focused);
     }
 
+    /// Apply a reason filter by value, defaulting to `all` when absent.
+    pub fn set_reason_filter(&mut self, reason: &str) {
+        let focused = self.selected_evidence_key();
+        self.reason_filter_index = self
+            .reason_filters()
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(reason))
+            .unwrap_or(0);
+        self.clamp_filter_indices();
+        self.restore_selected_row(focused);
+    }
+
+    /// Apply a host filter by value, defaulting to `all` when absent.
+    pub fn set_host_filter(&mut self, host: &str) {
+        let focused = self.selected_evidence_key();
+        self.host_filter_index = self
+            .host_filters()
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(host))
+            .unwrap_or(0);
+        self.clamp_filter_indices();
+        self.restore_selected_row(focused);
+    }
+
     /// Active project filter label, if not `all`.
     #[must_use]
     pub fn active_project_filter(&self) -> Option<String> {
         self.project_filters()
             .get(self.project_filter_index)
+            .filter(|value| value.as_str() != "all")
+            .cloned()
+    }
+
+    /// Active reason filter label, if not `all`.
+    #[must_use]
+    pub fn active_reason_filter(&self) -> Option<String> {
+        self.reason_filters()
+            .get(self.reason_filter_index)
+            .filter(|value| value.as_str() != "all")
+            .cloned()
+    }
+
+    /// Active host filter label, if not `all`.
+    #[must_use]
+    pub fn active_host_filter(&self) -> Option<String> {
+        self.host_filters()
+            .get(self.host_filter_index)
             .filter(|value| value.as_str() != "all")
             .cloned()
     }

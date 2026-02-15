@@ -552,6 +552,22 @@ impl ActionTimelineScreen {
             .map(std::borrow::ToOwned::to_owned)
     }
 
+    /// Selected reason code from the focused timeline row.
+    #[must_use]
+    pub fn selected_reason_code(&self) -> Option<String> {
+        self.filtered_events()
+            .get(self.selected_row)
+            .map(|event| event.reason_code.clone())
+    }
+
+    /// Selected host bucket from the focused timeline row.
+    #[must_use]
+    pub fn selected_host(&self) -> Option<String> {
+        self.filtered_events()
+            .get(self.selected_row)
+            .map(|event| Self::host_bucket(&event.instance_id))
+    }
+
     #[cfg(test)]
     fn selected_instance_id(&self) -> Option<String> {
         self.filtered_events()

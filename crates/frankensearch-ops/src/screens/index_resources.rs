@@ -730,4 +730,180 @@ mod tests {
             .join("\n");
         assert!(after_second.contains("current_hour vs previous_hour_estimate"));
     }
+
+    // ── ComparisonWindow tests ───────────────────────────────────────
+
+    #[test]
+    fn comparison_window_labels_are_nonempty() {
+        assert!(
+            !ComparisonWindow::CurrentVsPreviousHourEstimate
+                .label()
+                .is_empty()
+        );
+        assert!(
+            !ComparisonWindow::CurrentVsSameHourYesterdayEstimate
+                .label()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn comparison_window_baseline_scales_are_valid_fractions() {
+        for window in [
+            ComparisonWindow::CurrentVsPreviousHourEstimate,
+            ComparisonWindow::CurrentVsSameHourYesterdayEstimate,
+        ] {
+            let (numer, denom) = window.baseline_scale();
+            assert!(denom > 0, "denominator must be positive");
+            assert!(numer <= denom, "scale must be <= 1.0");
+        }
+    }
+
+    #[test]
+    fn comparison_window_cycles_back_to_start() {
+        let start = ComparisonWindow::CurrentVsPreviousHourEstimate;
+        let second = start.next();
+        assert_eq!(second, ComparisonWindow::CurrentVsSameHourYesterdayEstimate);
+        let third = second.next();
+        assert_eq!(third, start);
+    }
+
+    // ── percentile_rank_u64 tests ────────────────────────────────────
+
+    #[test]
+    fn percentile_rank_u64_empty_returns_zero() {
+        assert_eq!(IndexResourceScreen::percentile_rank_u64(&[], 42), 0);
+    }
+
+    #[test]
+    fn percentile_rank_u64_single_at_target() {
+        assert_eq!(IndexResourceScreen::percentile_rank_u64(&[10], 10), 100);
+    }
+
+    #[test]
+    fn percentile_rank_u64_below_all() {
+        assert_eq!(
+            IndexResourceScreen::percentile_rank_u64(&[10, 20, 30], 5),
+            0
+        );
+    }
+
+    #[test]
+    fn percentile_rank_u64_above_all() {
+        assert_eq!(
+            IndexResourceScreen::percentile_rank_u64(&[10, 20, 30], 30),
+            100
+        );
+    }
+
+    // ── percentile_rank_f64 tests ────────────────────────────────────
+
+    #[test]
+    fn percentile_rank_f64_empty_returns_zero() {
+        assert_eq!(IndexResourceScreen::percentile_rank_f64(&[], 1.0), 0);
+    }
+
+    #[test]
+    fn percentile_rank_f64_single_at_target() {
+        assert_eq!(IndexResourceScreen::percentile_rank_f64(&[5.0], 5.0), 100);
+    }
+
+    // ── summary_lines tests ──────────────────────────────────────────
+
+    #[test]
+    fn summary_lines_empty_rows() {
+        let screen = IndexResourceScreen::new();
+        let lines = screen.summary_lines(&[]);
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("No rows"));
+        assert!(text.contains("cycle project filter"));
+    }
+
+    // ── Default impl ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_matches_new() {
+        let new_screen = IndexResourceScreen::new();
+        let default_screen = IndexResourceScreen::default();
+        assert_eq!(new_screen.id(), default_screen.id());
+        assert_eq!(new_screen.selected_row, default_screen.selected_row);
+    }
+
+    // ── Navigation bounds ────────────────────────────────────────────
+
+    #[test]
+    fn up_at_zero_stays_at_zero() {
+        let mut screen = IndexResourceScreen::new();
+        screen.update_state(&sample_state());
+        screen.selected_row = 0;
+        let ctx = context();
+        let up = InputEvent::Key(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        screen.handle_input(&up, &ctx);
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    // ── Unhandled key ────────────────────────────────────────────────
+
+    #[test]
+    fn unhandled_key_returns_ignored() {
+        let mut screen = IndexResourceScreen::new();
+        let ctx = context();
+        let event = InputEvent::Key(
+            crossterm::event::KeyCode::Char('z'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(screen.handle_input(&event, &ctx), ScreenAction::Ignored);
+    }
+
+    // ── clamp_selected_row ───────────────────────────────────────────
+
+    #[test]
+    fn clamp_selected_row_resets_on_empty() {
+        let mut screen = IndexResourceScreen::new();
+        screen.selected_row = 5;
+        screen.clamp_selected_row();
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn clamp_selected_row_clamps_to_last() {
+        let mut screen = IndexResourceScreen::new();
+        screen.update_state(&sample_state());
+        screen.selected_row = 100;
+        screen.clamp_selected_row();
+        assert_eq!(screen.selected_row, 2); // 3 instances, max index = 2
+    }
+
+    // ── row_models with missing metrics ──────────────────────────────
+
+    #[test]
+    fn row_models_handle_missing_metrics() {
+        let mut screen = IndexResourceScreen::new();
+        let mut state = AppState::new();
+        state.update_fleet(FleetSnapshot {
+            instances: vec![InstanceInfo {
+                id: "bare".to_owned(),
+                project: "test".to_owned(),
+                pid: None,
+                healthy: true,
+                doc_count: 10,
+                pending_jobs: 0,
+            }],
+            ..FleetSnapshot::default()
+        });
+        screen.update_state(&state);
+        let rows = screen.row_models();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].cpu_percent - 0.0).abs() < f64::EPSILON);
+        assert_eq!(rows[0].memory_mib, 0);
+        assert_eq!(rows[0].io_kib, 0);
+        assert_eq!(rows[0].p95_latency_us, 0);
+    }
 }

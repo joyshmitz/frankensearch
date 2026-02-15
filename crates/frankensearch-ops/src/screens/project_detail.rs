@@ -40,7 +40,7 @@ impl ProjectDetailScreen {
             fleet_screen_id: ScreenId::new("ops.fleet"),
             live_stream_screen_id: ScreenId::new("ops.live_stream"),
             timeline_screen_id: ScreenId::new("ops.timeline"),
-            analytics_screen_id: ScreenId::new("ops.timeline"),
+            analytics_screen_id: ScreenId::new("ops.analytics"),
             state: AppState::new(),
             view: ViewState::default(),
             selected_row: 0,
@@ -765,7 +765,7 @@ mod tests {
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
-            ScreenAction::Navigate(ScreenId::new("ops.timeline"))
+            ScreenAction::Navigate(ScreenId::new("ops.analytics"))
         );
     }
 

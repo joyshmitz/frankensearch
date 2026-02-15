@@ -39,7 +39,7 @@ impl FleetOverviewScreen {
             project_screen_id: ScreenId::new("ops.project"),
             live_stream_screen_id: ScreenId::new("ops.live_stream"),
             timeline_screen_id: ScreenId::new("ops.timeline"),
-            analytics_screen_id: ScreenId::new("ops.timeline"),
+            analytics_screen_id: ScreenId::new("ops.analytics"),
             state: AppState::new(),
             view: ViewState::default(),
             selected_row: 0,
@@ -1138,7 +1138,7 @@ mod tests {
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
-            ScreenAction::Navigate(ScreenId::new("ops.timeline"))
+            ScreenAction::Navigate(ScreenId::new("ops.analytics"))
         );
     }
 
@@ -1650,5 +1650,286 @@ mod tests {
         assert!(text.contains("R=50%"));
         assert!(text.contains("D=95%"));
         assert!(text.contains("X=70%"));
+    }
+
+    // ── percentile_rank_u64 tests ────────────────────────────────────
+
+    #[test]
+    fn percentile_rank_u64_empty_returns_zero() {
+        assert_eq!(FleetOverviewScreen::percentile_rank_u64(&[], 42), 0);
+    }
+
+    #[test]
+    fn percentile_rank_u64_single_value_at_target() {
+        assert_eq!(FleetOverviewScreen::percentile_rank_u64(&[10], 10), 100);
+    }
+
+    #[test]
+    fn percentile_rank_u64_single_value_below_target() {
+        assert_eq!(FleetOverviewScreen::percentile_rank_u64(&[10], 5), 0);
+    }
+
+    #[test]
+    fn percentile_rank_u64_all_equal() {
+        assert_eq!(
+            FleetOverviewScreen::percentile_rank_u64(&[5, 5, 5, 5], 5),
+            100
+        );
+    }
+
+    #[test]
+    fn percentile_rank_u64_min_of_set() {
+        // target is the minimum of [1,2,3,4,5]
+        let values = [1, 2, 3, 4, 5];
+        let rank = FleetOverviewScreen::percentile_rank_u64(&values, 1);
+        assert!(rank <= 25, "min should have low percentile: got {rank}");
+    }
+
+    #[test]
+    fn percentile_rank_u64_max_of_set() {
+        let values = [1, 2, 3, 4, 5];
+        let rank = FleetOverviewScreen::percentile_rank_u64(&values, 5);
+        assert_eq!(rank, 100);
+    }
+
+    // ── percentile_rank_f64 tests ────────────────────────────────────
+
+    #[test]
+    fn percentile_rank_f64_empty_returns_zero() {
+        assert_eq!(FleetOverviewScreen::percentile_rank_f64(&[], 42.0), 0);
+    }
+
+    #[test]
+    fn percentile_rank_f64_single_value_at_target() {
+        assert_eq!(FleetOverviewScreen::percentile_rank_f64(&[10.0], 10.0), 100);
+    }
+
+    #[test]
+    fn percentile_rank_f64_nan_target_ranks_high() {
+        // In total_cmp, NaN sorts after all finite values, so all values are <= NaN
+        let rank = FleetOverviewScreen::percentile_rank_f64(&[1.0, 2.0, 3.0], f64::NAN);
+        assert_eq!(rank, 100);
+    }
+
+    // ── ratio_percent_u64 tests ──────────────────────────────────────
+
+    #[test]
+    fn ratio_percent_zero_denom_returns_zero() {
+        assert_eq!(FleetOverviewScreen::ratio_percent_u64(42, 0), 0);
+    }
+
+    #[test]
+    fn ratio_percent_equal_values_returns_100() {
+        assert_eq!(FleetOverviewScreen::ratio_percent_u64(100, 100), 100);
+    }
+
+    #[test]
+    fn ratio_percent_half() {
+        assert_eq!(FleetOverviewScreen::ratio_percent_u64(50, 100), 50);
+    }
+
+    #[test]
+    fn ratio_percent_zero_numer_returns_zero() {
+        assert_eq!(FleetOverviewScreen::ratio_percent_u64(0, 100), 0);
+    }
+
+    #[test]
+    fn ratio_percent_usize_delegates_correctly() {
+        assert_eq!(FleetOverviewScreen::ratio_percent_usize(1, 4), 25);
+        assert_eq!(FleetOverviewScreen::ratio_percent_usize(0, 0), 0);
+    }
+
+    // ── clamp_percent tests ──────────────────────────────────────────
+
+    #[test]
+    fn clamp_percent_nan_returns_zero() {
+        assert_eq!(FleetOverviewScreen::clamp_percent(f64::NAN), 0);
+    }
+
+    #[test]
+    fn clamp_percent_neg_inf_returns_zero() {
+        assert_eq!(FleetOverviewScreen::clamp_percent(f64::NEG_INFINITY), 0);
+    }
+
+    #[test]
+    fn clamp_percent_pos_inf_returns_zero() {
+        assert_eq!(FleetOverviewScreen::clamp_percent(f64::INFINITY), 0);
+    }
+
+    #[test]
+    fn clamp_percent_negative_clamps_to_zero() {
+        assert_eq!(FleetOverviewScreen::clamp_percent(-50.0), 0);
+    }
+
+    #[test]
+    fn clamp_percent_over_100_clamps() {
+        assert_eq!(FleetOverviewScreen::clamp_percent(250.0), 100);
+    }
+
+    #[test]
+    fn clamp_percent_normal_value() {
+        assert_eq!(FleetOverviewScreen::clamp_percent(42.0), 42);
+    }
+
+    // ── spark_char tests ─────────────────────────────────────────────
+
+    #[test]
+    fn spark_char_zero_is_lowest_bar() {
+        assert_eq!(FleetOverviewScreen::spark_char(0), '\u{2581}'); // ▁
+    }
+
+    #[test]
+    fn spark_char_100_is_full_block() {
+        assert_eq!(FleetOverviewScreen::spark_char(100), '\u{2588}'); // █
+    }
+
+    #[test]
+    fn spark_char_50_is_middle() {
+        let ch = FleetOverviewScreen::spark_char(50);
+        // 50% should map to index ~3-4 out of 0-7
+        assert!("▁▂▃▄▅▆▇█".contains(ch));
+    }
+
+    // ── sparkline tests ──────────────────────────────────────────────
+
+    #[test]
+    fn sparkline_empty_returns_empty_string() {
+        assert_eq!(FleetOverviewScreen::sparkline(&[]), "");
+    }
+
+    #[test]
+    fn sparkline_length_matches_input() {
+        let result = FleetOverviewScreen::sparkline(&[0, 25, 50, 75, 100]);
+        assert_eq!(result.chars().count(), 5);
+    }
+
+    // ── empty_state_message tests ────────────────────────────────────
+
+    #[test]
+    fn empty_state_message_no_data() {
+        let screen = FleetOverviewScreen::new();
+        assert!(screen.empty_state_message().contains("Scanning"));
+    }
+
+    #[test]
+    fn empty_state_message_with_data_but_no_instances() {
+        let mut screen = FleetOverviewScreen::new();
+        let mut state = AppState::new();
+        state.update_fleet(FleetSnapshot::default());
+        // Mark as having data by updating control plane
+        state.update_control_plane(crate::state::ControlPlaneMetrics {
+            ingestion_lag_events: 0,
+            storage_bytes: 0,
+            storage_limit_bytes: 1000,
+            frame_time_ms: 16.0,
+            discovery_latency_ms: 0,
+            event_throughput_eps: 0.0,
+            rss_bytes: 0,
+            rss_limit_bytes: 1000,
+            dead_letter_events: 0,
+        });
+        screen.update_state(&state, &ViewState::default());
+        let msg = screen.empty_state_message();
+        assert!(
+            msg.contains("No frankensearch instances") || msg.contains("Scanning"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    // ── project_summary_lines tests ──────────────────────────────────
+
+    #[test]
+    fn project_summary_no_instances() {
+        let screen = FleetOverviewScreen::new();
+        let lines = screen.project_summary_lines();
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("No projects"));
+    }
+
+    // ── pipeline_health_lines tests ──────────────────────────────────
+
+    #[test]
+    fn pipeline_health_healthy() {
+        let screen = FleetOverviewScreen::new();
+        let lines = screen.pipeline_health_lines();
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("GREEN"));
+        assert!(text.contains("Refined"));
+    }
+
+    #[test]
+    fn pipeline_health_critical_with_dead_letters() {
+        let mut screen = FleetOverviewScreen::new();
+        let mut state = AppState::new();
+        state.update_control_plane(crate::state::ControlPlaneMetrics {
+            ingestion_lag_events: 50_000,
+            storage_bytes: 990,
+            storage_limit_bytes: 1000,
+            frame_time_ms: 200.0,
+            discovery_latency_ms: 10_000,
+            event_throughput_eps: 0.01,
+            rss_bytes: 999,
+            rss_limit_bytes: 1000,
+            dead_letter_events: 50,
+        });
+        screen.update_state(&state, &ViewState::default());
+        let lines = screen.pipeline_health_lines();
+        let text = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("RED"));
+        assert!(text.contains("IndexCorrupted"));
+    }
+
+    // ── Default impl ─────────────────────────────────────────────────
+
+    #[test]
+    fn default_matches_new() {
+        let new_screen = FleetOverviewScreen::new();
+        let default_screen = FleetOverviewScreen::default();
+        assert_eq!(new_screen.id(), default_screen.id());
+        assert_eq!(new_screen.selected_row, default_screen.selected_row);
+    }
+
+    // ── update_state clamps selected_row ─────────────────────────────
+
+    #[test]
+    fn update_state_clamps_cursor_beyond_visible() {
+        let mut screen = FleetOverviewScreen::new();
+        screen.selected_row = 10;
+
+        let mut state = AppState::new();
+        state.update_fleet(FleetSnapshot {
+            instances: vec![crate::state::InstanceInfo {
+                id: "a".to_string(),
+                project: "p".to_string(),
+                pid: None,
+                healthy: true,
+                doc_count: 1,
+                pending_jobs: 0,
+            }],
+            ..FleetSnapshot::default()
+        });
+        screen.update_state(&state, &ViewState::default());
+        assert_eq!(screen.selected_row, 0);
+    }
+
+    #[test]
+    fn update_state_resets_to_zero_on_empty() {
+        let mut screen = FleetOverviewScreen::new();
+        screen.selected_row = 5;
+        let state = AppState::new();
+        screen.update_state(&state, &ViewState::default());
+        assert_eq!(screen.selected_row, 0);
     }
 }
