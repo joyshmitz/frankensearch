@@ -26,6 +26,10 @@ pub const E2E_SCHEMA_SNAPSHOT_DIFF: &str = "e2e-snapshot-diff-v1";
 pub const E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL: &str = "structured_events.jsonl";
 /// Canonical manifest file name inside an e2e artifact bundle.
 pub const E2E_ARTIFACT_MANIFEST_JSON: &str = "manifest.json";
+/// Mandatory environment capture for replay-first reproducibility.
+pub const E2E_ARTIFACT_ENV_JSON: &str = "env.json";
+/// Mandatory deterministic replay lockfile for reproducibility packs.
+pub const E2E_ARTIFACT_REPRO_LOCK: &str = "repro.lock";
 /// Mandatory artifact index for failed runs.
 pub const E2E_ARTIFACT_ARTIFACTS_INDEX_JSON: &str = "artifacts_index.json";
 /// Mandatory replay command pointer for failed runs.
@@ -174,6 +178,12 @@ pub fn validate_manifest_body(body: &ManifestBody) -> Result<(), E2eArtifactVali
         return Err(E2eArtifactValidationError::MissingRequiredArtifact {
             required_file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
         });
+    }
+
+    for required_file in [E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPRO_LOCK] {
+        if !seen_files.contains(required_file) {
+            return Err(E2eArtifactValidationError::MissingRequiredArtifact { required_file });
+        }
     }
 
     if matches!(body.exit_status, ExitStatus::Fail | ExitStatus::Error) {
@@ -370,9 +380,10 @@ pub fn render_artifacts_index(entries: &[ArtifactEntry]) -> Result<String, serde
 
 /// Build canonical manifest artifact entries for core e2e lanes.
 ///
-/// For failed/error runs this emits a normalized `replay_command.txt` entry
-/// and materializes `artifacts_index.json` content. For passing runs, only the
-/// structured events stream entry is required.
+/// For all runs this emits the reproducibility core:
+/// `structured_events.jsonl`, `env.json`, and `repro.lock`.
+/// Failed/error runs additionally emit a normalized `replay_command.txt` entry
+/// and materialize `artifacts_index.json` content.
 ///
 /// Returns `(manifest_entries, artifacts_index_json)` where the second item is
 /// `Some(...)` only for failed/error runs.
@@ -387,11 +398,31 @@ pub fn build_core_manifest_artifacts(
     exit_status: ExitStatus,
     replay_command: Option<&str>,
 ) -> Result<(Vec<ArtifactEntry>, Option<String>), E2eArtifactEmitterError> {
+    let env_json_payload = r#"{"schema":"frankensearch.e2e.env.v1","captured_env":[]}"#;
+    let repro_lock_payload = format!(
+        "schema=frankensearch.e2e.repro-lock.v1\nstructured_events_line_count={structured_event_line_count}\nexit_status={}\n",
+        match exit_status {
+            ExitStatus::Pass => "pass",
+            ExitStatus::Fail => "fail",
+            ExitStatus::Error => "error",
+        }
+    );
+
     let mut emission_inputs = vec![ArtifactEmissionInput {
         file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
         bytes: structured_events_jsonl,
         line_count: Some(structured_event_line_count),
     }];
+    emission_inputs.push(ArtifactEmissionInput {
+        file: E2E_ARTIFACT_ENV_JSON,
+        bytes: env_json_payload.as_bytes(),
+        line_count: None,
+    });
+    emission_inputs.push(ArtifactEmissionInput {
+        file: E2E_ARTIFACT_REPRO_LOCK,
+        bytes: repro_lock_payload.as_bytes(),
+        line_count: None,
+    });
 
     let normalized_replay_command = if matches!(exit_status, ExitStatus::Fail | ExitStatus::Error) {
         let raw_replay_command =
@@ -761,12 +792,29 @@ mod tests {
             },
             clock_mode: ClockMode::Simulated,
             tie_break_policy: "doc_id_lexical".to_owned(),
-            artifacts: vec![ArtifactEntry {
-                file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL.to_owned(),
-                checksum: "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
-                    .to_owned(),
-                line_count: Some(147),
-            }],
+            artifacts: vec![
+                ArtifactEntry {
+                    file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL.to_owned(),
+                    checksum:
+                        "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                            .to_owned(),
+                    line_count: Some(147),
+                },
+                ArtifactEntry {
+                    file: E2E_ARTIFACT_ENV_JSON.to_owned(),
+                    checksum:
+                        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_owned(),
+                    line_count: None,
+                },
+                ArtifactEntry {
+                    file: E2E_ARTIFACT_REPRO_LOCK.to_owned(),
+                    checksum:
+                        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                            .to_owned(),
+                    line_count: None,
+                },
+            ],
             duration_ms: 1234,
             exit_status: ExitStatus::Pass,
         }
@@ -1039,6 +1087,38 @@ mod tests {
             err,
             E2eArtifactValidationError::MissingRequiredArtifact {
                 required_file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_validator_requires_env_json_artifact() {
+        let mut manifest = make_valid_manifest();
+        manifest
+            .artifacts
+            .retain(|artifact| artifact.file != E2E_ARTIFACT_ENV_JSON);
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_ENV_JSON,
+            }
+        );
+    }
+
+    #[test]
+    fn manifest_validator_requires_repro_lock_artifact() {
+        let mut manifest = make_valid_manifest();
+        manifest
+            .artifacts
+            .retain(|artifact| artifact.file != E2E_ARTIFACT_REPRO_LOCK);
+
+        let err = validate_manifest_body(&manifest).unwrap_err();
+        assert_eq!(
+            err,
+            E2eArtifactValidationError::MissingRequiredArtifact {
+                required_file: E2E_ARTIFACT_REPRO_LOCK,
             }
         );
     }
@@ -1413,6 +1493,8 @@ mod tests {
         .expect("core failed-run artifacts should build");
 
         let artifact_files: Vec<&str> = artifacts.iter().map(|entry| entry.file.as_str()).collect();
+        assert!(artifact_files.contains(&E2E_ARTIFACT_ENV_JSON));
+        assert!(artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK));
         assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
         assert!(artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT));
         assert!(artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
@@ -1444,7 +1526,14 @@ mod tests {
 
         assert!(artifacts_index_json.is_none());
         let artifact_files: Vec<&str> = artifacts.iter().map(|entry| entry.file.as_str()).collect();
-        assert_eq!(artifact_files, vec![E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL]);
+        assert_eq!(
+            artifact_files,
+            vec![
+                E2E_ARTIFACT_ENV_JSON,
+                E2E_ARTIFACT_REPRO_LOCK,
+                E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            ]
+        );
     }
 
     #[test]

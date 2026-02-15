@@ -41,7 +41,10 @@ use frankensearch_core::{
 use frankensearch_embed::CachedEmbedder;
 use frankensearch_index::TwoTierIndex;
 
-use crate::blend::{blend_two_tier, compute_rank_changes, kendall_tau};
+use crate::blend::{
+    blend_two_tier, build_borrowed_rank_map, compute_rank_changes_with_maps,
+    kendall_tau_with_refined_rank,
+};
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -749,8 +752,11 @@ impl TwoTierSearcher {
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
         // Compute rank changes (initial vs refined).
-        let rank_changes = compute_rank_changes(&fast_hits, &blended);
-        let tau = kendall_tau(&fast_hits, &blended);
+        // Precompute rank maps once, then pass to both functions.
+        let initial_rank = build_borrowed_rank_map(&fast_hits);
+        let refined_rank = build_borrowed_rank_map(&blended);
+        let rank_changes = compute_rank_changes_with_maps(&initial_rank, &refined_rank);
+        let tau = kendall_tau_with_refined_rank(&fast_hits, &refined_rank);
         metrics.kendall_tau = tau;
         metrics.rank_changes = rank_changes;
 
@@ -1183,7 +1189,8 @@ fn find_negative_match(text: &str, parsed_query: &ParsedQuery) -> Option<String>
     let normalized_text = normalize_for_negation_match(text);
     for term in &parsed_query.negative_terms {
         let normalized_term = normalize_for_negation_match(term);
-        if !normalized_term.is_empty() && normalized_text.contains(&normalized_term) {
+        if !normalized_term.is_empty() && contains_negative_term(&normalized_text, &normalized_term)
+        {
             return Some(term.clone());
         }
     }
@@ -1198,6 +1205,39 @@ fn find_negative_match(text: &str, parsed_query: &ParsedQuery) -> Option<String>
 
 fn normalize_for_negation_match(value: &str) -> String {
     value.nfc().collect::<String>().to_lowercase()
+}
+
+fn contains_negative_term(normalized_text: &str, normalized_term: &str) -> bool {
+    if term_is_word_like(normalized_term) {
+        contains_term_with_word_boundaries(normalized_text, normalized_term)
+    } else {
+        normalized_text.contains(normalized_term)
+    }
+}
+
+fn term_is_word_like(term: &str) -> bool {
+    term.chars().all(is_word_char)
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn contains_term_with_word_boundaries(text: &str, term: &str) -> bool {
+    let mut search_from = 0_usize;
+    while let Some(relative_index) = text[search_from..].find(term) {
+        let start = search_from + relative_index;
+        let end = start + term.len();
+        let prev = text[..start].chars().next_back();
+        let next = text[end..].chars().next();
+        let start_boundary = prev.is_none_or(|ch| !is_word_char(ch));
+        let end_boundary = next.is_none_or(|ch| !is_word_char(ch));
+        if start_boundary && end_boundary {
+            return true;
+        }
+        search_from = end;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -2276,6 +2316,30 @@ mod tests {
         let decomposed_text = "safe docs with caf\u{0065}\u{0301} references";
         let matched = find_negative_match(decomposed_text, &parsed);
         assert_eq!(matched, Some("café".to_owned()));
+    }
+
+    #[test]
+    fn exclusion_term_matching_requires_word_boundaries_for_word_terms() {
+        let parsed = ParsedQuery::parse("query -he");
+        let text = "the theorem should stay included";
+        let matched = find_negative_match(text, &parsed);
+        assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn exclusion_term_matching_excludes_whole_word_occurrences() {
+        let parsed = ParsedQuery::parse("query -he");
+        let text = "we saw he walk home";
+        let matched = find_negative_match(text, &parsed);
+        assert_eq!(matched, Some("he".to_owned()));
+    }
+
+    #[test]
+    fn exclusion_term_matching_keeps_substring_behavior_for_path_like_terms() {
+        let parsed = ParsedQuery::parse("query -src/main.rs");
+        let text = "candidate path=/workspace/src/main.rs.bak";
+        let matched = find_negative_match(text, &parsed);
+        assert_eq!(matched, Some("src/main.rs".to_owned()));
     }
 
     #[test]

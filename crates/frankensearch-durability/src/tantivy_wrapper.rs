@@ -432,9 +432,9 @@ impl DurableTantivyIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
     use tantivy::Index;
@@ -761,5 +761,268 @@ mod tests {
 
         let health = durable.verify_and_repair().expect("verify empty");
         assert_eq!(health.files_checked, 0);
+    }
+
+    // ── has_fec_extension edge cases ────────────────────────────────────
+
+    #[test]
+    fn has_fec_extension_lowercase() {
+        assert!(DurableTantivyIndex::has_fec_extension(Path::new(
+            "/tmp/file.fec"
+        )));
+    }
+
+    #[test]
+    fn has_fec_extension_uppercase() {
+        assert!(DurableTantivyIndex::has_fec_extension(Path::new(
+            "/tmp/file.FEC"
+        )));
+    }
+
+    #[test]
+    fn has_fec_extension_mixed_case() {
+        assert!(DurableTantivyIndex::has_fec_extension(Path::new(
+            "/tmp/file.Fec"
+        )));
+    }
+
+    #[test]
+    fn has_fec_extension_no_extension() {
+        assert!(!DurableTantivyIndex::has_fec_extension(Path::new(
+            "/tmp/noext"
+        )));
+    }
+
+    #[test]
+    fn has_fec_extension_wrong_extension() {
+        assert!(!DurableTantivyIndex::has_fec_extension(Path::new(
+            "/tmp/file.idx"
+        )));
+    }
+
+    #[test]
+    fn has_fec_extension_empty_path() {
+        assert!(!DurableTantivyIndex::has_fec_extension(Path::new("")));
+    }
+
+    #[test]
+    fn has_fec_extension_dot_only() {
+        assert!(!DurableTantivyIndex::has_fec_extension(Path::new(
+            "/tmp/file."
+        )));
+    }
+
+    // ── Report struct clone ─────────────────────────────────────────────
+
+    #[test]
+    fn segment_protection_report_clone() {
+        let report = super::SegmentProtectionReport {
+            segments_protected: 3,
+            segments_already_protected: 2,
+            orphans_cleaned: 1,
+            total_source_bytes: 1024,
+            total_repair_bytes: 256,
+            encode_time: Duration::from_millis(50),
+        };
+        #[allow(clippy::redundant_clone)]
+        let cloned = report.clone();
+        assert_eq!(cloned.segments_protected, 3);
+        assert_eq!(cloned.segments_already_protected, 2);
+        assert_eq!(cloned.orphans_cleaned, 1);
+        assert_eq!(cloned.total_source_bytes, 1024);
+        assert_eq!(cloned.total_repair_bytes, 256);
+    }
+
+    #[test]
+    fn segment_health_report_clone() {
+        let report = super::SegmentHealthReport {
+            files_checked: 10,
+            files_intact: 8,
+            files_repaired: 1,
+            files_unrecoverable: 0,
+            files_unprotected: 1,
+            verify_time: Duration::from_millis(100),
+            repair_time: Duration::from_millis(20),
+        };
+        #[allow(clippy::redundant_clone)]
+        let cloned = report.clone();
+        assert_eq!(cloned.files_checked, 10);
+        assert_eq!(cloned.files_intact, 8);
+        assert_eq!(cloned.files_repaired, 1);
+        assert_eq!(cloned.files_unrecoverable, 0);
+        assert_eq!(cloned.files_unprotected, 1);
+    }
+
+    // ── DurableTantivyIndex accessors ───────────────────────────────────
+
+    #[test]
+    fn durable_index_data_dir_accessor() {
+        let dir = temp_dir("durable-accessor");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema).expect("create index");
+
+        let durable =
+            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
+
+        assert_eq!(durable.data_dir(), dir.as_path());
+    }
+
+    #[test]
+    fn durable_index_index_accessor_returns_valid_index() {
+        let dir = temp_dir("durable-index-acc");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema).expect("create index");
+
+        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
+            .expect("durable index");
+
+        // Verify the accessor returns an index that can list segments (even if empty).
+        let metas = durable.index().searchable_segment_metas().expect("metas");
+        assert!(metas.is_empty());
+    }
+
+    // ── TantivySegmentProtector batch protect ───────────────────────────
+
+    #[test]
+    fn segment_protector_batch_protect() {
+        let protector =
+            TantivySegmentProtector::new(Arc::new(MockCodec), test_config()).expect("protector");
+
+        let dir = temp_dir("seg-batch");
+        let files: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let file = dir.join(format!("segment-{i}.idx"));
+                std::fs::write(&file, vec![42_u8; 200 + i * 100]).expect("write");
+                file
+            })
+            .collect();
+
+        let paths: Vec<&Path> = files.iter().map(std::path::PathBuf::as_path).collect();
+        let results = protector.protect_segments(paths).expect("batch protect");
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert!(result.sidecar_path.exists());
+        }
+    }
+
+    // ── TantivySegmentProtector repair ──────────────────────────────────
+
+    #[test]
+    fn segment_protector_repair_after_corruption() {
+        let protector =
+            TantivySegmentProtector::new(Arc::new(MockCodec), test_config()).expect("protector");
+
+        let dir = temp_dir("seg-repair");
+        let file = dir.join("repair-test.idx");
+        let original = vec![42_u8; 500];
+        std::fs::write(&file, &original).expect("write");
+        protector.protect_segment(&file).expect("protect");
+
+        // Corrupt the file
+        let mut corrupted = original;
+        corrupted[0] ^= 0xFF;
+        std::fs::write(&file, &corrupted).expect("write corrupted");
+
+        let outcome = protector.repair_segment(&file).expect("repair");
+        // Either repaired or error reported, but should not panic
+        let _ = outcome;
+    }
+
+    // ── Verify with no sidecars ─────────────────────────────────────────
+
+    #[test]
+    fn verify_without_sidecars_reports_unprotected() {
+        let dir = temp_dir("durable-nosidecar");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema.clone()).expect("create index");
+
+        let id_field = schema.get_field("id").unwrap();
+        let content_field = schema.get_field("content").unwrap();
+
+        let mut writer = index.writer(15_000_000).expect("writer");
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(id_field, "doc-1");
+        doc.add_text(content_field, "unprotected content");
+        writer.add_document(doc).expect("add doc");
+        writer.commit().expect("commit");
+
+        // Do NOT call protect_segments — go straight to verify
+        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
+            .expect("durable index");
+
+        let health = durable.verify_and_repair().expect("verify");
+        assert!(health.files_checked > 0);
+        assert_eq!(health.files_repaired, 0);
+        // All files should be unprotected since we never ran protect
+        assert!(health.files_unprotected > 0);
+    }
+
+    // ── Double verify is idempotent ─────────────────────────────────────
+
+    #[test]
+    fn double_verify_is_idempotent() {
+        let dir = temp_dir("durable-double-verify");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema.clone()).expect("create index");
+
+        let id_field = schema.get_field("id").unwrap();
+        let content_field = schema.get_field("content").unwrap();
+
+        let mut writer = index.writer(15_000_000).expect("writer");
+        let mut doc = tantivy::TantivyDocument::new();
+        doc.add_text(id_field, "doc-1");
+        doc.add_text(content_field, "double verify content");
+        writer.add_document(doc).expect("add doc");
+        writer.commit().expect("commit");
+
+        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
+            .expect("durable index");
+
+        durable.protect_segments().expect("protect");
+
+        let health1 = durable.verify_and_repair().expect("first verify");
+        let health2 = durable.verify_and_repair().expect("second verify");
+
+        assert_eq!(health1.files_checked, health2.files_checked);
+        assert_eq!(health1.files_intact, health2.files_intact);
+        assert_eq!(health1.files_repaired, health2.files_repaired);
+    }
+
+    // ── Metrics snapshot initial state ───────────────────────────────────
+
+    #[test]
+    fn metrics_snapshot_initial_is_zero() {
+        let dir = temp_dir("durable-metrics-init");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema).expect("create index");
+
+        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
+            .expect("durable index");
+
+        let snap = durable.metrics_snapshot();
+        assert_eq!(snap.encode_ops, 0);
+        assert_eq!(snap.decode_ops, 0);
+    }
+
+    // ── Non-.fec files ignored during orphan cleanup ─────────────────────
+
+    #[test]
+    fn orphan_cleanup_ignores_non_fec_files() {
+        let dir = temp_dir("durable-orphan-nonfec");
+        let schema = test_schema();
+        let index = Index::create_in_dir(&dir, schema).expect("create index");
+
+        let durable =
+            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
+
+        // Create a non-.fec file that should NOT be cleaned up
+        let non_fec = dir.join("some-random-file.txt");
+        std::fs::write(&non_fec, b"keep me").expect("write");
+
+        let report = durable.protect_segments().expect("protect");
+        assert_eq!(report.orphans_cleaned, 0);
+        assert!(non_fec.exists(), "non-.fec file should not be removed");
     }
 }

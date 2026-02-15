@@ -3,12 +3,14 @@
 //! The registry catalogs known embedders and rerankers, then filters by
 //! on-disk model availability under a configured data directory.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use frankensearch_core::error::{SearchError, SearchResult};
 use tracing::warn;
+
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 /// Bakeoff eligibility cutoff (strictly later than this date).
 pub const BAKEOFF_CUTOFF_DATE: &str = "2025-11-01";
@@ -433,20 +435,18 @@ fn reranker_dir_name(entry: &RegisteredReranker) -> &'static str {
 fn has_embedder_files(id: &str, dir: &Path) -> bool {
     match id {
         "minilm-384" => {
-            has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
-                && has_all_files(
-                    dir,
-                    &[
-                        TOKENIZER_JSON,
-                        CONFIG_JSON,
-                        SPECIAL_TOKENS_JSON,
-                        TOKENIZER_CONFIG_JSON,
-                    ],
-                )
+            has_all_files(
+                dir,
+                &[
+                    TOKENIZER_JSON,
+                    CONFIG_JSON,
+                    SPECIAL_TOKENS_JSON,
+                    TOKENIZER_CONFIG_JSON,
+                ],
+            ) && has_onnx_file(dir)
         }
         "snowflake-arctic-s-384" | "nomic-embed-768" => {
-            has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
-                && has_all_files(dir, &[TOKENIZER_JSON])
+            has_all_files(dir, &[TOKENIZER_JSON]) && has_onnx_file(dir)
         }
         "potion-multilingual-128m-256" | "potion-retrieval-32m-512" => {
             has_all_files(dir, &[TOKENIZER_JSON, MODEL_SAFETENSORS])
@@ -456,10 +456,17 @@ fn has_embedder_files(id: &str, dir: &Path) -> bool {
 }
 
 fn has_reranker_files(dir: &Path) -> bool {
-    has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
-        && has_all_files(dir, &[TOKENIZER_JSON])
+    has_all_files(dir, &[TOKENIZER_JSON]) && has_onnx_file(dir)
 }
 
+fn has_onnx_file(dir: &Path) -> bool {
+    if dir.join(MODEL_ONNX_SUBDIR).is_file() {
+        return true;
+    }
+    dir.join(MODEL_ONNX_LEGACY).is_file()
+}
+
+#[cfg(test)]
 fn has_any_file(dir: &Path, files: &[&str]) -> bool {
     files.iter().any(|file| dir.join(file).is_file())
 }
@@ -468,6 +475,7 @@ fn has_all_files(dir: &Path, files: &[&str]) -> bool {
     files.iter().all(|file| dir.join(file).is_file())
 }
 
+#[cfg(test)]
 fn model_candidates(data_dir: &Path, model_dir: &str, huggingface_id: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -524,6 +532,7 @@ fn any_model_candidate_matches(
     false
 }
 
+#[cfg(test)]
 fn push_candidate(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>, path: PathBuf) {
     if seen.insert(path.clone()) {
         paths.push(path);
@@ -995,8 +1004,13 @@ mod tests {
         // Even if hash is "available", it is not semantic so never bakeoff-eligible.
         let temp = tempfile::tempdir().unwrap();
         let registry = EmbedderRegistry::new(temp.path());
-        let eligible_ids: Vec<_> = registry.bakeoff_eligible().iter().map(|e| e.id).collect();
-        assert!(!eligible_ids.contains(&"fnv1a-384"));
+        assert!(
+            !registry
+                .bakeoff_eligible()
+                .iter()
+                .map(|entry| entry.id)
+                .any(|id| id == "fnv1a-384")
+        );
     }
 
     // --- Potion retrieval availability ---
@@ -1078,6 +1092,83 @@ mod tests {
             assert!(
                 !c.to_string_lossy().contains("huggingface"),
                 "builtin should not probe huggingface: {c:?}"
+            );
+        }
+    }
+
+    fn has_embedder_files_reference(id: &str, dir: &Path) -> bool {
+        match id {
+            "minilm-384" => {
+                has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
+                    && has_all_files(
+                        dir,
+                        &[
+                            TOKENIZER_JSON,
+                            CONFIG_JSON,
+                            SPECIAL_TOKENS_JSON,
+                            TOKENIZER_CONFIG_JSON,
+                        ],
+                    )
+            }
+            "snowflake-arctic-s-384" | "nomic-embed-768" => {
+                has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
+                    && has_all_files(dir, &[TOKENIZER_JSON])
+            }
+            "potion-multilingual-128m-256" | "potion-retrieval-32m-512" => {
+                has_all_files(dir, &[TOKENIZER_JSON, MODEL_SAFETENSORS])
+            }
+            _ => false,
+        }
+    }
+
+    fn has_reranker_files_reference(dir: &Path) -> bool {
+        has_any_file(dir, &[MODEL_ONNX_SUBDIR, MODEL_ONNX_LEGACY])
+            && has_all_files(dir, &[TOKENIZER_JSON])
+    }
+
+    #[test]
+    fn file_presence_checks_match_reference_logic() {
+        let files = [
+            MODEL_ONNX_SUBDIR,
+            MODEL_ONNX_LEGACY,
+            TOKENIZER_JSON,
+            CONFIG_JSON,
+            SPECIAL_TOKENS_JSON,
+            TOKENIZER_CONFIG_JSON,
+            MODEL_SAFETENSORS,
+        ];
+        let embedder_ids = [
+            "minilm-384",
+            "snowflake-arctic-s-384",
+            "nomic-embed-768",
+            "potion-multilingual-128m-256",
+            "potion-retrieval-32m-512",
+        ];
+
+        for mask in 0_u16..(1_u16 << files.len()) {
+            let temp = tempfile::tempdir().expect("tempdir");
+            for (index, file) in files.iter().enumerate() {
+                if (mask & (1_u16 << index)) == 0 {
+                    continue;
+                }
+                let path = temp.path().join(file);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("create parent");
+                }
+                std::fs::write(path, b"stub").expect("write file");
+            }
+
+            for &id in &embedder_ids {
+                assert_eq!(
+                    has_embedder_files(id, temp.path()),
+                    has_embedder_files_reference(id, temp.path()),
+                    "embedder file predicate mismatch for id={id}, mask={mask:07b}"
+                );
+            }
+            assert_eq!(
+                has_reranker_files(temp.path()),
+                has_reranker_files_reference(temp.path()),
+                "reranker file predicate mismatch for mask={mask:07b}"
             );
         }
     }
@@ -1173,9 +1264,9 @@ mod tests {
             .unwrap_or(120);
 
         let temp = tempfile::tempdir().expect("tempdir");
-        let hf_snapshots_root = temp.path().join(
-            "huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots",
-        );
+        let hf_snapshots_root = temp
+            .path()
+            .join("huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/snapshots");
         std::fs::create_dir_all(&hf_snapshots_root).expect("create hf root");
         for i in 0..snapshot_count {
             let dir = hf_snapshots_root.join(format!("snap-{i:04}"));

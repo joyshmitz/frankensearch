@@ -126,7 +126,7 @@ impl DefaultCanonicalizer {
         let max_keep = self.code_head_lines + self.code_tail_lines;
         let mut result = String::with_capacity(text.len());
         let mut in_code_block = false;
-        let mut code_lines: Vec<&str> = Vec::new();
+        let mut code_lines: Vec<&str> = Vec::with_capacity(max_keep);
 
         for line in text.lines() {
             if line.trim_start().starts_with("```") {

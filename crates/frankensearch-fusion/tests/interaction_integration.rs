@@ -27,13 +27,13 @@ use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, SearchF
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult, SearchPhase};
 use frankensearch_core::{
     ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
-    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
-    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST,
-    E2E_SCHEMA_ORACLE_REPORT, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome,
-    E2eSeverity, EventBody, ExitStatus, LaneReport, ManifestBody, ModelVersion, OracleReportBody,
-    OracleVerdictRecord, Platform, ReplayBody, ReplayEventType, ReportTotals, Suite,
-    build_artifact_entries, normalize_replay_command, render_artifacts_index, sha256_checksum,
-    validate_event_envelope, validate_manifest_envelope,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT,
+    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_ORACLE_REPORT, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType,
+    E2eOutcome, E2eSeverity, EventBody, ExitStatus, LaneReport, ManifestBody, ModelVersion,
+    OracleReportBody, OracleVerdictRecord, Platform, ReplayBody, ReplayEventType, ReportTotals,
+    Suite, build_artifact_entries, normalize_replay_command, render_artifacts_index,
+    sha256_checksum, validate_event_envelope, validate_manifest_envelope,
 };
 use frankensearch_index::TwoTierIndex;
 
@@ -555,6 +555,26 @@ fn interaction_replay_command() -> String {
     )
 }
 
+fn interaction_env_json_payload() -> String {
+    serde_json::json!({
+        "schema": "frankensearch.e2e.env.v1",
+        "captured_env": [],
+        "suite": "interaction",
+    })
+    .to_string()
+}
+
+fn interaction_repro_lock_payload(exit_status: ExitStatus) -> String {
+    let status = match exit_status {
+        ExitStatus::Pass => "pass",
+        ExitStatus::Fail => "fail",
+        ExitStatus::Error => "error",
+    };
+    format!(
+        "schema=frankensearch.e2e.repro-lock.v1\nsuite=interaction\nexit_status={status}\nowner_lane={INTERACTION_OWNER_LANE}\n"
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 async fn build_interaction_e2e_artifacts(
     cx: &Cx,
@@ -839,6 +859,13 @@ async fn build_interaction_e2e_artifacts(
     let oracle_report_json = serde_json::to_string_pretty(&oracle_report)
         .expect("serialize oracle report envelope for artifact manifest");
     let replay_command = interaction_replay_command();
+    let exit_status = if oracle_report.body.totals.all_passed {
+        ExitStatus::Pass
+    } else {
+        ExitStatus::Fail
+    };
+    let env_json = interaction_env_json_payload();
+    let repro_lock = interaction_repro_lock_payload(exit_status);
 
     let mut emission_inputs = vec![
         ArtifactEmissionInput {
@@ -856,13 +883,17 @@ async fn build_interaction_e2e_artifacts(
             bytes: replay_jsonl.as_bytes(),
             line_count: Some(u64::try_from(replay.len()).expect("replay line count fits in u64")),
         },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_ENV_JSON,
+            bytes: env_json.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPRO_LOCK,
+            bytes: repro_lock.as_bytes(),
+            line_count: None,
+        },
     ];
-
-    let exit_status = if oracle_report.body.totals.all_passed {
-        ExitStatus::Pass
-    } else {
-        ExitStatus::Fail
-    };
     if matches!(exit_status, ExitStatus::Fail | ExitStatus::Error) {
         emission_inputs.push(ArtifactEmissionInput {
             file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
@@ -1337,6 +1368,15 @@ fn interaction_high_risk_lanes_emit_replay_ready_artifacts() {
             );
         }
 
+        let artifact_files: HashSet<&str> = artifacts
+            .manifest
+            .body
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.file.as_str())
+            .collect();
+        assert!(artifact_files.contains(E2E_ARTIFACT_ENV_JSON));
+        assert!(artifact_files.contains(E2E_ARTIFACT_REPRO_LOCK));
         assert_eq!(artifacts.manifest.body.suite, Suite::Interaction);
         assert_eq!(artifacts.manifest.body.clock_mode, ClockMode::Simulated);
     });
@@ -1359,6 +1399,8 @@ fn interaction_failure_path_includes_replay_command_and_lane_context() {
             .iter()
             .map(|artifact| artifact.file.as_str())
             .collect();
+        assert!(files.contains(E2E_ARTIFACT_ENV_JSON));
+        assert!(files.contains(E2E_ARTIFACT_REPRO_LOCK));
         assert!(files.contains(E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
         assert!(files.contains(E2E_ARTIFACT_REPLAY_COMMAND_TXT));
         assert!(files.contains(E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));

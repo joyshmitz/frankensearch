@@ -1315,4 +1315,472 @@ mod tests {
         assert_eq!(attribution.reason_code, "attribution.host_name");
         assert!(!attribution.collision);
     }
+
+    // ── is_valid_ulid edge cases ────────────────────────────────────────
+
+    #[test]
+    fn ulid_valid_26_char_crockford() {
+        assert!(is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2P1R"));
+    }
+
+    #[test]
+    fn ulid_empty_string() {
+        assert!(!is_valid_ulid(""));
+    }
+
+    #[test]
+    fn ulid_too_short() {
+        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2P1"));
+    }
+
+    #[test]
+    fn ulid_too_long() {
+        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2P1RX"));
+    }
+
+    #[test]
+    fn ulid_invalid_chars_i_l_o_u() {
+        // Crockford base32 excludes I, L, O, U
+        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2PIR")); // I at pos 24
+        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2PLR")); // L at pos 24
+        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2POR")); // O at pos 24
+        assert!(!is_valid_ulid("01JAH9A2W8F8Q6GQ4C7M3N2PUR")); // U at pos 24
+    }
+
+    #[test]
+    fn ulid_lowercase_valid() {
+        assert!(is_valid_ulid("01jah9a2w8f8q6gq4c7m3n2p1r"));
+    }
+
+    // ── normalize_project_hint edge cases ───────────────────────────────
+
+    #[test]
+    fn normalize_hint_strips_special_chars() {
+        assert_eq!(normalize_project_hint("Hello-World!"), "hello_world");
+    }
+
+    #[test]
+    fn normalize_hint_empty_input() {
+        assert_eq!(normalize_project_hint(""), "");
+    }
+
+    #[test]
+    fn normalize_hint_only_special_chars() {
+        assert_eq!(normalize_project_hint("---"), "");
+    }
+
+    #[test]
+    fn normalize_hint_preserves_alphanumeric() {
+        assert_eq!(normalize_project_hint("abc123"), "abc123");
+    }
+
+    #[test]
+    fn normalize_hint_collapses_consecutive_separators() {
+        assert_eq!(normalize_project_hint("a--b__c"), "a_b_c");
+    }
+
+    #[test]
+    fn normalize_hint_no_trailing_separator() {
+        let result = normalize_project_hint("hello-");
+        assert!(!result.ends_with('_'), "no trailing separator: {result}");
+    }
+
+    // ── canonical_projects_from_hint coverage ───────────────────────────
+
+    #[test]
+    fn hint_resolves_cass_aliases() {
+        for alias in [
+            "coding_agent_session_search",
+            "codingagentsessionsearch",
+            "cass",
+            "CASS",
+        ] {
+            let matches = canonical_projects_from_hint(alias);
+            assert!(
+                matches.contains(&"coding_agent_session_search"),
+                "alias '{alias}' should resolve to cass"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_resolves_xf() {
+        let matches = canonical_projects_from_hint("xf");
+        assert!(matches.contains(&"xf"));
+    }
+
+    #[test]
+    fn hint_resolves_mcp_agent_mail_aliases() {
+        for alias in [
+            "mcp_agent_mail_rust",
+            "mcpagentmailrust",
+            "mcpagentmail",
+            "agent_mail",
+            "agentmail",
+            "amail",
+        ] {
+            let matches = canonical_projects_from_hint(alias);
+            assert!(
+                matches.contains(&"mcp_agent_mail_rust"),
+                "alias '{alias}' should resolve to mcp_agent_mail_rust"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_resolves_frankenterm() {
+        let matches = canonical_projects_from_hint("frankenterm");
+        assert!(matches.contains(&"frankenterm"));
+    }
+
+    #[test]
+    fn hint_unknown_returns_empty() {
+        let matches = canonical_projects_from_hint("totally_unknown_project");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn hint_empty_returns_empty() {
+        let matches = canonical_projects_from_hint("");
+        assert!(matches.is_empty());
+    }
+
+    // ── HostProjectAttribution::unknown defaults ────────────────────────
+
+    #[test]
+    fn attribution_unknown_has_expected_defaults() {
+        let attr = HostProjectAttribution::unknown("test.reason");
+        assert_eq!(attr.resolved_project_key, "unknown");
+        assert_eq!(attr.confidence_score, 20);
+        assert_eq!(attr.reason_code, "test.reason");
+        assert!(!attr.collision);
+    }
+
+    // ── attribution with all hints None ─────────────────────────────────
+
+    #[test]
+    fn attribution_all_none_returns_unknown() {
+        let attr = resolve_host_project_attribution(None, None, None);
+        assert_eq!(attr.resolved_project_key, "unknown");
+        assert_eq!(attr.reason_code, "attribution.unknown");
+    }
+
+    // ── AdapterIdentity serde roundtrip ─────────────────────────────────
+
+    #[test]
+    fn adapter_identity_serde_roundtrip() {
+        let identity = default_identity();
+        let json = serde_json::to_string(&identity).unwrap();
+        let decoded: AdapterIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(identity, decoded);
+    }
+
+    #[test]
+    fn adapter_identity_without_optional_fields_roundtrip() {
+        let identity = AdapterIdentity {
+            adapter_id: "test".to_owned(),
+            adapter_version: "0.1.0".to_owned(),
+            host_project: "test-host".to_owned(),
+            runtime_role: None,
+            instance_uuid: None,
+            telemetry_schema_version: TELEMETRY_SCHEMA_VERSION,
+            redaction_policy_version: "v1".to_owned(),
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+        let decoded: AdapterIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(identity, decoded);
+    }
+
+    // ── ConformanceViolation serde roundtrip ─────────────────────────────
+
+    #[test]
+    fn conformance_violation_serde_roundtrip() {
+        let v = ConformanceViolation {
+            code: "test.code".to_owned(),
+            field: "test.field".to_owned(),
+            message: "test message".to_owned(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let decoded: ConformanceViolation = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, decoded);
+    }
+
+    // ── ConformanceReport serde roundtrip and passed logic ───────────────
+
+    #[test]
+    fn conformance_report_passed_when_no_violations() {
+        let report = ConformanceReport::with_violations(5, 5, 3, Vec::new());
+        assert!(report.passed);
+        assert_eq!(report.fixtures_checked, 5);
+        assert_eq!(report.emitted_events, 5);
+        assert_eq!(report.lifecycle_hooks_checked, 3);
+    }
+
+    #[test]
+    fn conformance_report_failed_when_violations_present() {
+        let violations = vec![ConformanceViolation {
+            code: "test".to_owned(),
+            field: "f".to_owned(),
+            message: "m".to_owned(),
+        }];
+        let report = ConformanceReport::with_violations(1, 1, 1, violations);
+        assert!(!report.passed);
+        assert_eq!(report.violations.len(), 1);
+    }
+
+    #[test]
+    fn conformance_report_serde_roundtrip() {
+        let report = ConformanceReport::with_violations(3, 3, 2, Vec::new());
+        let json = serde_json::to_string(&report).unwrap();
+        let decoded: ConformanceReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(report, decoded);
+    }
+
+    // ── ConformanceConfig defaults ──────────────────────────────────────
+
+    #[test]
+    fn conformance_config_default_values() {
+        let config = ConformanceConfig::default();
+        assert_eq!(config.expected_schema_version, TELEMETRY_SCHEMA_VERSION);
+        assert_eq!(config.required_redaction_policy_version, "v1");
+        assert_eq!(
+            config.forbidden_substrings.len(),
+            DEFAULT_REDACTION_FORBIDDEN_PATTERNS.len()
+        );
+    }
+
+    // ── NoopAdapterSink ─────────────────────────────────────────────────
+
+    #[test]
+    fn noop_adapter_sink_accepts_all_operations() {
+        let sink = NoopAdapterSink;
+        let fixture = load_fixture("telemetry-search-v1.json");
+        sink.emit(&fixture).expect("noop emit should succeed");
+        sink.on_lifecycle_event(&AdapterLifecycleEvent::HealthTick {
+            ts: "test".to_owned(),
+        })
+        .expect("noop lifecycle should succeed");
+    }
+
+    // ── validate_identity missing required fields ────────────────────────
+
+    #[test]
+    fn validate_identity_missing_adapter_id() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.adapter_id = String::new();
+        let violations = harness.validate_identity(&identity);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.missing_adapter_id")
+        );
+    }
+
+    #[test]
+    fn validate_identity_missing_adapter_version() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.adapter_version = "  ".to_owned();
+        let violations = harness.validate_identity(&identity);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.missing_adapter_version")
+        );
+    }
+
+    #[test]
+    fn validate_identity_missing_host_project() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.host_project = String::new();
+        let violations = harness.validate_identity(&identity);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.missing_host_project")
+        );
+    }
+
+    #[test]
+    fn validate_identity_redaction_policy_mismatch() {
+        let harness = ConformanceHarness::default();
+        let mut identity = default_identity();
+        identity.redaction_policy_version = "v99".to_owned();
+        let violations = harness.validate_identity(&identity);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.identity.redaction_policy_mismatch")
+        );
+    }
+
+    // ── validate_envelope edge cases ─────────────────────────────────────
+
+    #[test]
+    fn validate_envelope_wrong_schema_version() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+        envelope.v = 99;
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.envelope.schema_version_mismatch")
+        );
+    }
+
+    #[test]
+    fn validate_envelope_empty_timestamp() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+        envelope.ts = "  ".to_owned();
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.envelope.missing_timestamp")
+        );
+    }
+
+    // ── CanonicalHostProject::ALL ───────────────────────────────────────
+
+    #[test]
+    fn canonical_host_project_all_has_four_entries() {
+        assert_eq!(CanonicalHostProject::ALL.len(), 4);
+    }
+
+    #[test]
+    fn canonical_host_project_keys_are_unique() {
+        let keys: Vec<&str> = CanonicalHostProject::ALL
+            .iter()
+            .map(|h| h.host_project_key())
+            .collect();
+        let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        assert_eq!(keys.len(), unique.len(), "host project keys must be unique");
+    }
+
+    #[test]
+    fn canonical_host_project_adapter_ids_are_unique() {
+        let ids: Vec<&str> = CanonicalHostProject::ALL
+            .iter()
+            .map(|h| h.adapter_id())
+            .collect();
+        let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(ids.len(), unique.len(), "adapter IDs must be unique");
+    }
+
+    #[test]
+    fn canonical_host_project_runtime_roles_are_nonempty() {
+        for host in CanonicalHostProject::ALL {
+            let role = host.default_runtime_role();
+            assert!(
+                !role.is_empty(),
+                "{host:?} has empty default_runtime_role"
+            );
+        }
+    }
+
+    // ── AdapterLifecycleEvent serde roundtrip ────────────────────────────
+
+    #[test]
+    fn lifecycle_event_serde_roundtrip() {
+        for event in [
+            AdapterLifecycleEvent::SessionStart {
+                ts: "t1".to_owned(),
+            },
+            AdapterLifecycleEvent::SessionStop {
+                ts: "t2".to_owned(),
+            },
+            AdapterLifecycleEvent::HealthTick {
+                ts: "t3".to_owned(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: AdapterLifecycleEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(event, decoded);
+        }
+    }
+
+    // ── CanonicalHostProject serde roundtrip ─────────────────────────────
+
+    #[test]
+    fn canonical_host_project_serde_roundtrip() {
+        for host in CanonicalHostProject::ALL {
+            let json = serde_json::to_string(&host).unwrap();
+            let decoded: CanonicalHostProject = serde_json::from_str(&json).unwrap();
+            assert_eq!(host, decoded);
+        }
+    }
+
+    // ── HostProjectAttribution serde roundtrip ──────────────────────────
+
+    #[test]
+    fn host_project_attribution_serde_roundtrip() {
+        let attr = HostProjectAttribution {
+            resolved_project_key: "xf".to_owned(),
+            confidence_score: 85,
+            reason_code: "attribution.telemetry_project_key".to_owned(),
+            collision: false,
+        };
+        let json = serde_json::to_string(&attr).unwrap();
+        let decoded: HostProjectAttribution = serde_json::from_str(&json).unwrap();
+        assert_eq!(attr, decoded);
+    }
+
+    // ── ForwardingHostAdapter identity_ref ───────────────────────────────
+
+    #[test]
+    fn forwarding_adapter_identity_ref_matches_identity() {
+        let adapter = ForwardingHostAdapter::for_xf("1.0.0", None);
+        let ref_identity = adapter.identity_ref();
+        let cloned_identity = adapter.identity();
+        assert_eq!(*ref_identity, cloned_identity);
+    }
+
+    // ── DEFAULT_REDACTION_FORBIDDEN_PATTERNS ─────────────────────────────
+
+    #[test]
+    fn default_forbidden_patterns_are_nonempty() {
+        assert!(!DEFAULT_REDACTION_FORBIDDEN_PATTERNS.is_empty());
+        for pattern in DEFAULT_REDACTION_FORBIDDEN_PATTERNS {
+            assert!(!pattern.is_empty(), "forbidden pattern must be nonempty");
+        }
+    }
+
+    // ── ForwardingHostAdapter Debug impl ─────────────────────────────────
+
+    #[test]
+    fn forwarding_adapter_debug_works() {
+        let adapter = ForwardingHostAdapter::for_cass("0.1.0", None);
+        let debug = format!("{adapter:?}");
+        assert!(debug.contains("ForwardingHostAdapter"));
+        assert!(debug.contains("cass-host-adapter"));
+    }
+
+    // ── MCP Agent Mail has control-plane role ────────────────────────────
+
+    #[test]
+    fn mcp_agent_mail_default_role_is_control_plane() {
+        assert_eq!(
+            CanonicalHostProject::McpAgentMailRust.default_runtime_role(),
+            "control-plane"
+        );
+    }
+
+    #[test]
+    fn non_mcp_hosts_default_role_is_query() {
+        for host in [
+            CanonicalHostProject::CodingAgentSessionSearch,
+            CanonicalHostProject::Xf,
+            CanonicalHostProject::Frankenterm,
+        ] {
+            assert_eq!(
+                host.default_runtime_role(),
+                "query",
+                "{host:?} should default to query role"
+            );
+        }
+    }
 }

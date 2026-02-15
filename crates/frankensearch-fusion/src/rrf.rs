@@ -72,6 +72,44 @@ fn sanitize_rrf_k(k: f64) -> f64 {
     }
 }
 
+#[derive(Debug)]
+struct FusedHitScratch<'a> {
+    doc_id: &'a str,
+    rrf_score: f64,
+    lexical_rank: Option<usize>,
+    semantic_rank: Option<usize>,
+    lexical_score: Option<f32>,
+    semantic_score: Option<f32>,
+    in_both_sources: bool,
+}
+
+impl FusedHitScratch<'_> {
+    fn cmp_for_ranking(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .rrf_score
+            .total_cmp(&self.rrf_score)
+            .then(other.in_both_sources.cmp(&self.in_both_sources))
+            .then_with(|| {
+                let a = self.lexical_score.unwrap_or(f32::NEG_INFINITY);
+                let b = other.lexical_score.unwrap_or(f32::NEG_INFINITY);
+                b.total_cmp(&a)
+            })
+            .then_with(|| self.doc_id.cmp(other.doc_id))
+    }
+
+    fn into_owned(self) -> FusedHit {
+        FusedHit {
+            doc_id: self.doc_id.to_owned(),
+            rrf_score: self.rrf_score,
+            lexical_rank: self.lexical_rank,
+            semantic_rank: self.semantic_rank,
+            lexical_score: self.lexical_score,
+            semantic_score: self.semantic_score,
+            in_both_sources: self.in_both_sources,
+        }
+    }
+}
+
 // ─── RRF Fusion ─────────────────────────────────────────────────────────────
 
 /// Fuse lexical and semantic search results using Reciprocal Rank Fusion.
@@ -116,7 +154,7 @@ pub fn rrf_fuse(
     let k = sanitize_rrf_k(config.k);
     // Adjusted for typical ~50% overlap to reduce over-allocation.
     let capacity = (lexical.len() + semantic.len()) * 3 / 4;
-    let mut hits: HashMap<&str, FusedHit> = HashMap::with_capacity(capacity);
+    let mut hits: HashMap<&str, FusedHitScratch<'_>> = HashMap::with_capacity(capacity);
 
     // Score lexical results.
     for (rank, result) in lexical.iter().enumerate() {
@@ -129,8 +167,8 @@ pub fn rrf_fuse(
                 hit.lexical_score = Some(result.score);
                 hit.in_both_sources = true;
             })
-            .or_insert_with(|| FusedHit {
-                doc_id: result.doc_id.clone(),
+            .or_insert_with(|| FusedHitScratch {
+                doc_id: result.doc_id.as_str(),
                 rrf_score: rrf_contribution,
                 lexical_rank: Some(rank),
                 semantic_rank: None,
@@ -151,8 +189,8 @@ pub fn rrf_fuse(
                 fh.semantic_score = Some(hit.score);
                 fh.in_both_sources = true;
             })
-            .or_insert_with(|| FusedHit {
-                doc_id: hit.doc_id.clone(),
+            .or_insert_with(|| FusedHitScratch {
+                doc_id: hit.doc_id.as_str(),
                 rrf_score: rrf_contribution,
                 lexical_rank: None,
                 semantic_rank: Some(rank),
@@ -162,9 +200,7 @@ pub fn rrf_fuse(
             });
     }
 
-    // Sort by 4-level deterministic ordering.
-    let mut results: Vec<FusedHit> = hits.into_values().collect();
-    results.sort_by(FusedHit::cmp_for_ranking);
+    let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();
 
     let overlap_count = results.iter().filter(|h| h.in_both_sources).count();
     let fused_count = results.len();
@@ -184,15 +220,21 @@ pub fn rrf_fuse(
     }
     if window < results.len() {
         let nth_index = window.saturating_sub(1);
-        results.select_nth_unstable_by(nth_index, FusedHit::cmp_for_ranking);
+        results.select_nth_unstable_by(nth_index, FusedHitScratch::cmp_for_ranking);
         results.truncate(window);
     }
 
-    // Sort only the requested ranking window.
-    results.sort_by(FusedHit::cmp_for_ranking);
+    // Deterministic comparator gives a total order, so unstable sort is safe
+    // and avoids stable-sort overhead on large candidate sets.
+    results.sort_unstable_by(FusedHitScratch::cmp_for_ranking);
 
     // Apply offset and limit.
-    let output: Vec<FusedHit> = results.into_iter().skip(offset).take(limit).collect();
+    let output: Vec<FusedHit> = results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(FusedHitScratch::into_owned)
+        .collect();
 
     debug!(
         target: "frankensearch.rrf",

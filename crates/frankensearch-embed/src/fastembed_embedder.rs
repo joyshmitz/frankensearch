@@ -272,8 +272,8 @@ impl Embedder for FastEmbedEmbedder {
             }
 
             let mut output = vec![vec![0.0; DEFAULT_DIMENSION]; texts.len()];
-            let mut non_empty_indices = Vec::new();
-            let mut non_empty_texts = Vec::new();
+            let mut non_empty_indices = Vec::with_capacity(texts.len());
+            let mut non_empty_texts = Vec::with_capacity(texts.len());
 
             for (idx, text) in texts.iter().enumerate() {
                 if !text.is_empty() {

@@ -126,12 +126,25 @@ pub fn blend_two_tier(
 pub fn compute_rank_changes(initial: &[VectorHit], refined: &[VectorHit]) -> RankChanges {
     let initial_rank = build_borrowed_rank_map(initial);
     let refined_rank = build_borrowed_rank_map(refined);
+    compute_rank_changes_with_maps(&initial_rank, &refined_rank)
+}
 
+/// Compute rank changes using precomputed rank maps.
+///
+/// Use this when calling both `compute_rank_changes` and `kendall_tau` on the
+/// same inputs — precompute the maps once via [`build_borrowed_rank_map`] and
+/// pass them to both functions to avoid redundant `HashMap` construction.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn compute_rank_changes_with_maps(
+    initial_rank: &HashMap<&str, usize>,
+    refined_rank: &HashMap<&str, usize>,
+) -> RankChanges {
     let mut promoted = 0;
     let mut demoted = 0;
     let mut stable = 0;
 
-    for (doc_id, old_rank) in &initial_rank {
+    for (doc_id, old_rank) in initial_rank {
         match refined_rank.get(doc_id) {
             Some(new_rank) => match new_rank.cmp(old_rank) {
                 Ordering::Less => promoted += 1,
@@ -155,18 +168,17 @@ pub fn compute_rank_changes(initial: &[VectorHit], refined: &[VectorHit]) -> Ran
     }
 }
 
-/// Compute Kendall's tau rank correlation between two rankings.
+/// Compute Kendall's tau using a precomputed refined rank map.
 ///
-/// Uses merge-sort-based inversion counting for O(n log n) performance
-/// instead of the naive O(n^2) pairwise comparison.
-///
-/// Returns `None` when fewer than two common documents exist.
+/// Use this when calling both `compute_rank_changes` and `kendall_tau` on the
+/// same inputs — precompute the refined rank map via [`build_borrowed_rank_map`]
+/// and pass it to both functions.
 #[must_use]
-pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> {
-    let refined_rank = build_borrowed_rank_map(refined);
-
-    // Collect refined ranks for common documents in initial-rank order.
-    // Dedup by doc_id so repeated docs in `initial` contribute once.
+#[allow(clippy::implicit_hasher)]
+pub fn kendall_tau_with_refined_rank(
+    initial: &[VectorHit],
+    refined_rank: &HashMap<&str, usize>,
+) -> Option<f64> {
     let mut seen: HashSet<&str> = HashSet::with_capacity(initial.len());
     let mut refined_ranks = Vec::with_capacity(initial.len().min(refined_rank.len()));
     for hit in initial {
@@ -183,7 +195,6 @@ pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> 
         return None;
     }
 
-    // An inversion in this array corresponds to a discordant pair.
     let discordant = merge_sort_inversions(&mut refined_ranks);
 
     let n_u64 = u64::try_from(n).ok()?;
@@ -199,6 +210,18 @@ pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> 
     #[allow(clippy::cast_precision_loss)]
     let denominator = total_pairs as f64;
     Some(numerator / denominator)
+}
+
+/// Compute Kendall's tau rank correlation between two rankings.
+///
+/// Uses merge-sort-based inversion counting for O(n log n) performance
+/// instead of the naive O(n^2) pairwise comparison.
+///
+/// Returns `None` when fewer than two common documents exist.
+#[must_use]
+pub fn kendall_tau(initial: &[VectorHit], refined: &[VectorHit]) -> Option<f64> {
+    let refined_rank = build_borrowed_rank_map(refined);
+    kendall_tau_with_refined_rank(initial, &refined_rank)
 }
 
 /// Count inversions in a slice using merge sort. O(n log n).
@@ -269,7 +292,11 @@ const fn sanitize_score(score: f32) -> f32 {
     }
 }
 
-fn build_borrowed_rank_map(hits: &[VectorHit]) -> HashMap<&str, usize> {
+/// Build a rank map from `doc_id` to position for a list of vector hits.
+///
+/// First occurrence of each `doc_id` determines its rank.
+#[must_use]
+pub fn build_borrowed_rank_map(hits: &[VectorHit]) -> HashMap<&str, usize> {
     let mut ranks = HashMap::with_capacity(hits.len());
     for (rank, hit) in hits.iter().enumerate() {
         ranks.entry(hit.doc_id.as_str()).or_insert(rank);
@@ -658,6 +685,225 @@ mod tests {
                 (tau + 1.0).abs() <= f64::EPSILON,
                 "reverse ordering should produce tau=-1.0, got {tau}"
             );
+        }
+    }
+
+    // ---- Tests for rank-map caching APIs (bd-1wgy) ----
+
+    use super::{
+        build_borrowed_rank_map, compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
+    };
+
+    #[test]
+    fn build_borrowed_rank_map_basic() {
+        let hits = vec![hit("a", 1.0, 0), hit("b", 0.9, 1), hit("c", 0.8, 2)];
+        let map = build_borrowed_rank_map(&hits);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["a"], 0);
+        assert_eq!(map["b"], 1);
+        assert_eq!(map["c"], 2);
+    }
+
+    #[test]
+    fn build_borrowed_rank_map_empty() {
+        let map = build_borrowed_rank_map(&[]);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn build_borrowed_rank_map_single() {
+        let hits = vec![hit("only", 1.0, 0)];
+        let map = build_borrowed_rank_map(&hits);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["only"], 0);
+    }
+
+    #[test]
+    fn build_borrowed_rank_map_first_occurrence_wins() {
+        // Duplicate doc_id: first occurrence should determine rank.
+        let hits = vec![hit("dup", 1.0, 0), hit("other", 0.9, 1), hit("dup", 0.5, 2)];
+        let map = build_borrowed_rank_map(&hits);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["dup"], 0, "first occurrence at rank 0 should win");
+        assert_eq!(map["other"], 1);
+    }
+
+    #[test]
+    fn compute_rank_changes_with_maps_matches_original() {
+        let initial = vec![hit("a", 1.0, 0), hit("b", 0.9, 1), hit("c", 0.8, 2)];
+        let refined = vec![hit("b", 1.0, 1), hit("a", 0.9, 0), hit("d", 0.7, 3)];
+
+        let direct = compute_rank_changes(&initial, &refined);
+
+        let initial_map = build_borrowed_rank_map(&initial);
+        let refined_map = build_borrowed_rank_map(&refined);
+        let via_maps = compute_rank_changes_with_maps(&initial_map, &refined_map);
+
+        assert_eq!(direct.promoted, via_maps.promoted);
+        assert_eq!(direct.demoted, via_maps.demoted);
+        assert_eq!(direct.stable, via_maps.stable);
+    }
+
+    #[test]
+    fn compute_rank_changes_with_maps_empty() {
+        let empty = std::collections::HashMap::new();
+        let changes = compute_rank_changes_with_maps(&empty, &empty);
+        assert_eq!(changes.promoted, 0);
+        assert_eq!(changes.demoted, 0);
+        assert_eq!(changes.stable, 0);
+    }
+
+    #[test]
+    fn compute_rank_changes_with_maps_all_new() {
+        let initial_hits = vec![hit("a", 1.0, 0), hit("b", 0.9, 1)];
+        let refined_hits = vec![hit("x", 1.0, 2), hit("y", 0.9, 3)];
+        let initial_map = build_borrowed_rank_map(&initial_hits);
+        let refined_map = build_borrowed_rank_map(&refined_hits);
+        let changes = compute_rank_changes_with_maps(&initial_map, &refined_map);
+        assert_eq!(changes.promoted, 2, "all new docs are promoted");
+        assert_eq!(changes.demoted, 2, "all old docs are demoted");
+        assert_eq!(changes.stable, 0);
+    }
+
+    #[test]
+    fn compute_rank_changes_with_maps_identical() {
+        let hits = vec![hit("a", 1.0, 0), hit("b", 0.9, 1)];
+        let map = build_borrowed_rank_map(&hits);
+        let changes = compute_rank_changes_with_maps(&map, &map);
+        assert_eq!(changes.stable, 2);
+        assert_eq!(changes.promoted, 0);
+        assert_eq!(changes.demoted, 0);
+    }
+
+    #[test]
+    fn kendall_tau_with_refined_rank_matches_original() {
+        let initial = vec![
+            hit("a", 1.0, 0),
+            hit("b", 0.9, 1),
+            hit("c", 0.8, 2),
+            hit("d", 0.7, 3),
+        ];
+        let refined = vec![
+            hit("c", 1.0, 2),
+            hit("x", 0.9, 4),
+            hit("a", 0.8, 0),
+            hit("d", 0.7, 3),
+        ];
+
+        let direct = kendall_tau(&initial, &refined).expect("tau via original");
+
+        let refined_map = build_borrowed_rank_map(&refined);
+        let via_map = kendall_tau_with_refined_rank(&initial, &refined_map).expect("tau via map");
+
+        assert!(
+            (direct - via_map).abs() < 1e-12,
+            "expected same tau: direct={direct}, via_map={via_map}"
+        );
+    }
+
+    #[test]
+    fn kendall_tau_with_refined_rank_identical() {
+        let hits = vec![hit("a", 1.0, 0), hit("b", 0.9, 1), hit("c", 0.8, 2)];
+        let map = build_borrowed_rank_map(&hits);
+        let tau = kendall_tau_with_refined_rank(&hits, &map).expect("tau for identical");
+        assert!(
+            (tau - 1.0).abs() <= f64::EPSILON,
+            "identical rankings should give tau=1.0, got {tau}"
+        );
+    }
+
+    #[test]
+    fn kendall_tau_with_refined_rank_reversed() {
+        let initial = vec![hit("a", 1.0, 0), hit("b", 0.9, 1), hit("c", 0.8, 2)];
+        let reversed = vec![hit("c", 1.0, 2), hit("b", 0.9, 1), hit("a", 0.8, 0)];
+        let map = build_borrowed_rank_map(&reversed);
+        let tau = kendall_tau_with_refined_rank(&initial, &map).expect("tau for reversed");
+        assert!(
+            (tau + 1.0).abs() <= f64::EPSILON,
+            "reversed rankings should give tau=-1.0, got {tau}"
+        );
+    }
+
+    #[test]
+    fn kendall_tau_with_refined_rank_insufficient_overlap() {
+        let initial = vec![hit("a", 1.0, 0)];
+        let refined = vec![hit("b", 0.9, 1)];
+        let map = build_borrowed_rank_map(&refined);
+        assert!(kendall_tau_with_refined_rank(&initial, &map).is_none());
+    }
+
+    #[test]
+    fn precompute_once_use_twice_pattern() {
+        // Demonstrates the intended usage pattern: build maps once, use for both
+        // rank changes and kendall_tau.
+        let initial = vec![
+            hit("a", 1.0, 0),
+            hit("b", 0.9, 1),
+            hit("c", 0.8, 2),
+            hit("d", 0.7, 3),
+        ];
+        let refined = vec![
+            hit("b", 1.0, 1),
+            hit("c", 0.95, 2),
+            hit("a", 0.9, 0),
+            hit("e", 0.6, 4),
+        ];
+
+        let initial_map = build_borrowed_rank_map(&initial);
+        let refined_map = build_borrowed_rank_map(&refined);
+
+        let changes = compute_rank_changes_with_maps(&initial_map, &refined_map);
+        let tau = kendall_tau_with_refined_rank(&initial, &refined_map).expect("tau");
+
+        // Verify results match the non-map versions.
+        let direct_changes = compute_rank_changes(&initial, &refined);
+        let direct_tau = kendall_tau(&initial, &refined).expect("direct tau");
+
+        assert_eq!(changes.promoted, direct_changes.promoted);
+        assert_eq!(changes.demoted, direct_changes.demoted);
+        assert_eq!(changes.stable, direct_changes.stable);
+        assert!(
+            (tau - direct_tau).abs() < 1e-12,
+            "tau mismatch: precomputed={tau}, direct={direct_tau}"
+        );
+    }
+
+    #[test]
+    fn kendall_tau_with_refined_rank_deterministic_permutations() {
+        // Verify the map-based API matches the original across many permutations.
+        let sizes = [3_usize, 5, 8, 16];
+        for &n in &sizes {
+            let initial: Vec<VectorHit> = (0..n)
+                .map(|i| hit(&format!("doc-{i:04}"), 1.0, 0))
+                .collect();
+
+            for seed in 0_u64..8 {
+                let mut order: Vec<usize> = (0..n).collect();
+                let n_u64 = u64::try_from(n).expect("size fits into u64");
+                shuffle_deterministic(&mut order, seed.wrapping_add(n_u64));
+
+                let refined: Vec<VectorHit> = order
+                    .iter()
+                    .map(|&idx| hit(&format!("doc-{idx:04}"), 0.5, 0))
+                    .collect();
+
+                let direct = kendall_tau(&initial, &refined);
+                let map = build_borrowed_rank_map(&refined);
+                let via_map = kendall_tau_with_refined_rank(&initial, &map);
+
+                assert_eq!(
+                    direct.is_some(),
+                    via_map.is_some(),
+                    "n={n}, seed={seed}: Some/None mismatch"
+                );
+
+                if let (Some(d), Some(m)) = (direct, via_map) {
+                    assert!(
+                        (d - m).abs() < 1e-12,
+                        "n={n}, seed={seed}: direct={d}, via_map={m}"
+                    );
+                }
+            }
         }
     }
 }
