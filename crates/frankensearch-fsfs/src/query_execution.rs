@@ -1487,4 +1487,835 @@ mod tests {
             "normal mode guardrail should preserve safety semantics"
         );
     }
+
+    // ─── bd-olv6 tests begin ───
+
+    // --- DegradedRetrievalMode severity ---
+
+    #[test]
+    fn degraded_mode_severity_monotonic() {
+        use super::DegradedRetrievalMode::*;
+        let modes = [Normal, EmbedDeferred, LexicalOnly, MetadataOnly, Paused];
+        for pair in modes.windows(2) {
+            assert!(
+                pair[0].severity() < pair[1].severity(),
+                "{:?} should be less severe than {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_mode_next_more_restrictive() {
+        use super::DegradedRetrievalMode::*;
+        assert_eq!(Normal.next_more_restrictive(), EmbedDeferred);
+        assert_eq!(EmbedDeferred.next_more_restrictive(), LexicalOnly);
+        assert_eq!(LexicalOnly.next_more_restrictive(), MetadataOnly);
+        assert_eq!(MetadataOnly.next_more_restrictive(), Paused);
+        assert_eq!(Paused.next_more_restrictive(), Paused);
+    }
+
+    #[test]
+    fn degraded_mode_next_less_restrictive() {
+        use super::DegradedRetrievalMode::*;
+        assert_eq!(Paused.next_less_restrictive(), MetadataOnly);
+        assert_eq!(MetadataOnly.next_less_restrictive(), LexicalOnly);
+        assert_eq!(LexicalOnly.next_less_restrictive(), EmbedDeferred);
+        assert_eq!(EmbedDeferred.next_less_restrictive(), Normal);
+        assert_eq!(Normal.next_less_restrictive(), Normal);
+    }
+
+    // --- DegradationOverride forced_mode ---
+
+    #[test]
+    fn degradation_override_auto_returns_none() {
+        assert_eq!(DegradationOverride::Auto.forced_mode(), None);
+    }
+
+    #[test]
+    fn degradation_override_force_variants() {
+        assert_eq!(
+            DegradationOverride::ForceNormal.forced_mode(),
+            Some(DegradedRetrievalMode::Normal)
+        );
+        assert_eq!(
+            DegradationOverride::ForceEmbedDeferred.forced_mode(),
+            Some(DegradedRetrievalMode::EmbedDeferred)
+        );
+        assert_eq!(
+            DegradationOverride::ForceLexicalOnly.forced_mode(),
+            Some(DegradedRetrievalMode::LexicalOnly)
+        );
+        assert_eq!(
+            DegradationOverride::ForceMetadataOnly.forced_mode(),
+            Some(DegradedRetrievalMode::MetadataOnly)
+        );
+        assert_eq!(
+            DegradationOverride::ForcePause.forced_mode(),
+            Some(DegradedRetrievalMode::Paused)
+        );
+    }
+
+    // --- DegradationSignals ---
+
+    #[test]
+    fn degradation_signals_default() {
+        let signals = DegradationSignals::default();
+        assert_eq!(signals.pressure_state, PressureState::Normal);
+        assert_eq!(signals.backpressure_mode, BackpressureMode::Normal);
+        assert!(!signals.quality_circuit_open);
+    }
+
+    // --- DegradationPolicy ---
+
+    #[test]
+    fn degradation_policy_default_matches_performance() {
+        let policy = super::DegradationPolicy::default();
+        let perf = super::DegradationPolicy::for_profile(PressureProfile::Performance);
+        assert_eq!(policy, perf);
+    }
+
+    #[test]
+    fn degradation_policy_normalized_clamps_zero() {
+        let policy = DegradationPolicy {
+            escalate_after: 0,
+            recover_after: 0,
+        };
+        let normalized = policy.normalized();
+        assert_eq!(normalized.escalate_after, 1);
+        assert_eq!(normalized.recover_after, 1);
+    }
+
+    #[test]
+    fn degradation_policy_normalized_preserves_nonzero() {
+        let policy = DegradationPolicy {
+            escalate_after: 5,
+            recover_after: 3,
+        };
+        let normalized = policy.normalized();
+        assert_eq!(normalized.escalate_after, 5);
+        assert_eq!(normalized.recover_after, 3);
+    }
+
+    // --- mode_from_pressure ---
+
+    #[test]
+    fn mode_from_pressure_mapping() {
+        assert_eq!(
+            super::mode_from_pressure(PressureState::Normal),
+            DegradedRetrievalMode::Normal
+        );
+        assert_eq!(
+            super::mode_from_pressure(PressureState::Constrained),
+            DegradedRetrievalMode::EmbedDeferred
+        );
+        assert_eq!(
+            super::mode_from_pressure(PressureState::Degraded),
+            DegradedRetrievalMode::LexicalOnly
+        );
+        assert_eq!(
+            super::mode_from_pressure(PressureState::Emergency),
+            DegradedRetrievalMode::MetadataOnly
+        );
+    }
+
+    // --- target_mode ---
+
+    #[test]
+    fn target_mode_normal_no_backpressure() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Normal,
+            backpressure_mode: BackpressureMode::Normal,
+            quality_circuit_open: false,
+        };
+        assert_eq!(super::target_mode(signals), DegradedRetrievalMode::Normal);
+    }
+
+    #[test]
+    fn target_mode_normal_saturated() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Normal,
+            backpressure_mode: BackpressureMode::Saturated,
+            quality_circuit_open: false,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::LexicalOnly
+        );
+    }
+
+    #[test]
+    fn target_mode_normal_high_watermark() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Normal,
+            backpressure_mode: BackpressureMode::HighWatermark,
+            quality_circuit_open: false,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::EmbedDeferred
+        );
+    }
+
+    #[test]
+    fn target_mode_normal_circuit_open() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Normal,
+            backpressure_mode: BackpressureMode::Normal,
+            quality_circuit_open: true,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::EmbedDeferred
+        );
+    }
+
+    #[test]
+    fn target_mode_constrained_normal_backpressure() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Constrained,
+            backpressure_mode: BackpressureMode::Normal,
+            quality_circuit_open: false,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::EmbedDeferred
+        );
+    }
+
+    #[test]
+    fn target_mode_constrained_saturated() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Constrained,
+            backpressure_mode: BackpressureMode::Saturated,
+            quality_circuit_open: false,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::LexicalOnly
+        );
+    }
+
+    #[test]
+    fn target_mode_degraded_normal_backpressure() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Degraded,
+            backpressure_mode: BackpressureMode::Normal,
+            quality_circuit_open: false,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::LexicalOnly
+        );
+    }
+
+    #[test]
+    fn target_mode_degraded_circuit_open() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Degraded,
+            backpressure_mode: BackpressureMode::Normal,
+            quality_circuit_open: true,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::MetadataOnly
+        );
+    }
+
+    #[test]
+    fn target_mode_emergency_saturated() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Emergency,
+            backpressure_mode: BackpressureMode::Saturated,
+            quality_circuit_open: false,
+        };
+        assert_eq!(super::target_mode(signals), DegradedRetrievalMode::Paused);
+    }
+
+    #[test]
+    fn target_mode_emergency_not_saturated() {
+        let signals = DegradationSignals {
+            pressure_state: PressureState::Emergency,
+            backpressure_mode: BackpressureMode::Normal,
+            quality_circuit_open: false,
+        };
+        assert_eq!(
+            super::target_mode(signals),
+            DegradedRetrievalMode::MetadataOnly
+        );
+    }
+
+    // --- transition_reason_code ---
+
+    #[test]
+    fn transition_reason_code_all_modes() {
+        assert_eq!(
+            super::transition_reason_code(DegradedRetrievalMode::Normal),
+            "degrade.transition.recovered"
+        );
+        assert_eq!(
+            super::transition_reason_code(DegradedRetrievalMode::EmbedDeferred),
+            "degrade.transition.embed_deferred"
+        );
+        assert_eq!(
+            super::transition_reason_code(DegradedRetrievalMode::LexicalOnly),
+            "degrade.transition.lexical_only"
+        );
+        assert_eq!(
+            super::transition_reason_code(DegradedRetrievalMode::MetadataOnly),
+            "degrade.transition.metadata_only"
+        );
+        assert_eq!(
+            super::transition_reason_code(DegradedRetrievalMode::Paused),
+            "degrade.transition.pause"
+        );
+    }
+
+    // --- status_for_mode ---
+
+    #[test]
+    fn status_for_mode_all_variants() {
+        let normal = status_for_mode(DegradedRetrievalMode::Normal);
+        assert_eq!(normal.banner, "Normal operation");
+
+        let embed = status_for_mode(DegradedRetrievalMode::EmbedDeferred);
+        assert!(embed.banner.contains("quality embedding deferred"));
+
+        let lexical = status_for_mode(DegradedRetrievalMode::LexicalOnly);
+        assert!(lexical.banner.contains("lexical-only"));
+
+        let metadata = status_for_mode(DegradedRetrievalMode::MetadataOnly);
+        assert!(metadata.banner.contains("metadata-only"));
+
+        let paused = status_for_mode(DegradedRetrievalMode::Paused);
+        assert!(paused.banner.contains("Paused"));
+    }
+
+    // --- override_guardrail_for_mode all variants ---
+
+    #[test]
+    fn override_guardrail_all_modes() {
+        use super::override_guardrail_for_mode;
+        assert!(override_guardrail_for_mode(DegradedRetrievalMode::Normal).contains("optional"));
+        assert!(
+            override_guardrail_for_mode(DegradedRetrievalMode::EmbedDeferred).contains("resume")
+        );
+        assert!(
+            override_guardrail_for_mode(DegradedRetrievalMode::LexicalOnly).contains("emergency")
+        );
+        assert!(
+            override_guardrail_for_mode(DegradedRetrievalMode::MetadataOnly).contains("pause")
+        );
+        assert!(
+            override_guardrail_for_mode(DegradedRetrievalMode::Paused).contains("writes remain")
+        );
+    }
+
+    // --- stage_timeout ---
+
+    #[test]
+    fn stage_timeout_clamps_to_min() {
+        // 10 * 1/3 = ~3, but min is 20
+        assert_eq!(super::stage_timeout(10, 1, 3, 20, 120), 20);
+    }
+
+    #[test]
+    fn stage_timeout_clamps_to_max() {
+        // 1000 * 1/1 = 1000, but max is 120
+        assert_eq!(super::stage_timeout(1000, 1, 1, 20, 120), 120);
+    }
+
+    #[test]
+    fn stage_timeout_within_bounds() {
+        // 300 * 1/3 = 100, within [20, 120]
+        assert_eq!(super::stage_timeout(300, 1, 3, 20, 120), 100);
+    }
+
+    // --- rrf_contribution ---
+
+    #[test]
+    fn rrf_contribution_rank_0() {
+        let contrib = super::rrf_contribution(60.0, 0);
+        // 1 / (60 + 0 + 1) = 1/61
+        assert!((contrib - 1.0 / 61.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_contribution_rank_1() {
+        let contrib = super::rrf_contribution(60.0, 1);
+        // 1 / (60 + 1 + 1) = 1/62
+        assert!((contrib - 1.0 / 62.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rrf_contribution_decreases_with_rank() {
+        let c0 = super::rrf_contribution(60.0, 0);
+        let c1 = super::rrf_contribution(60.0, 1);
+        let c10 = super::rrf_contribution(60.0, 10);
+        assert!(c0 > c1);
+        assert!(c1 > c10);
+    }
+
+    // --- sanitize_score ---
+
+    #[test]
+    fn sanitize_score_nan_becomes_neg_infinity() {
+        assert_eq!(super::sanitize_score(f32::NAN), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn sanitize_score_normal_value_unchanged() {
+        assert_eq!(super::sanitize_score(1.5), 1.5);
+    }
+
+    #[test]
+    fn sanitize_score_infinity_unchanged() {
+        assert_eq!(super::sanitize_score(f32::INFINITY), f32::INFINITY);
+    }
+
+    // --- sanitize_fused_score ---
+
+    #[test]
+    fn sanitize_fused_score_nan_becomes_zero() {
+        assert_eq!(super::sanitize_fused_score(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn sanitize_fused_score_infinity_becomes_zero() {
+        assert_eq!(super::sanitize_fused_score(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn sanitize_fused_score_finite_unchanged() {
+        assert!((super::sanitize_fused_score(0.5) - 0.5).abs() < f64::EPSILON);
+    }
+
+    // --- sanitize_non_negative ---
+
+    #[test]
+    fn sanitize_non_negative_negative_becomes_zero() {
+        assert_eq!(super::sanitize_non_negative(-1.0), 0.0);
+    }
+
+    #[test]
+    fn sanitize_non_negative_nan_becomes_zero() {
+        assert_eq!(super::sanitize_non_negative(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn sanitize_non_negative_positive_unchanged() {
+        assert!((super::sanitize_non_negative(0.5) - 0.5).abs() < f64::EPSILON);
+    }
+
+    // --- sanitize_signal ---
+
+    #[test]
+    fn sanitize_signal_none_becomes_zero() {
+        assert_eq!(super::sanitize_signal(None), 0.0);
+    }
+
+    #[test]
+    fn sanitize_signal_nan_becomes_zero() {
+        assert_eq!(super::sanitize_signal(Some(f64::NAN)), 0.0);
+    }
+
+    #[test]
+    fn sanitize_signal_clamped_above_1() {
+        assert!((super::sanitize_signal(Some(2.0)) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_signal_clamped_below_0() {
+        assert_eq!(super::sanitize_signal(Some(-0.5)), 0.0);
+    }
+
+    #[test]
+    fn sanitize_signal_valid_value() {
+        assert!((super::sanitize_signal(Some(0.75)) - 0.75).abs() < f64::EPSILON);
+    }
+
+    // --- sanitize_max_prior_boost ---
+
+    #[test]
+    fn sanitize_max_prior_boost_zero_defaults_to_001() {
+        assert!((super::sanitize_max_prior_boost(0.0) - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_max_prior_boost_negative_defaults_to_001() {
+        assert!((super::sanitize_max_prior_boost(-1.0) - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_max_prior_boost_capped_at_005() {
+        assert!((super::sanitize_max_prior_boost(1.0) - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sanitize_max_prior_boost_valid_value() {
+        assert!((super::sanitize_max_prior_boost(0.02) - 0.02).abs() < f64::EPSILON);
+    }
+
+    // --- option_score ---
+
+    #[test]
+    fn option_score_none_is_neg_infinity() {
+        assert_eq!(super::option_score(None), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn option_score_some_nan_is_neg_infinity() {
+        assert_eq!(super::option_score(Some(f32::NAN)), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn option_score_some_value() {
+        assert_eq!(super::option_score(Some(1.5)), 1.5);
+    }
+
+    // --- FusionPolicy ---
+
+    #[test]
+    fn fusion_policy_default_rrf_k() {
+        let policy = super::FusionPolicy::default();
+        assert!((policy.rrf_k - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fusion_policy_effective_k_valid() {
+        let policy = super::FusionPolicy { rrf_k: 42.0 };
+        assert!((policy.effective_k() - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fusion_policy_effective_k_nan_fallback() {
+        let policy = super::FusionPolicy { rrf_k: f64::NAN };
+        assert!((policy.effective_k() - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fusion_policy_effective_k_zero_fallback() {
+        let policy = super::FusionPolicy { rrf_k: 0.0 };
+        assert!((policy.effective_k() - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fusion_policy_effective_k_negative_fallback() {
+        let policy = super::FusionPolicy { rrf_k: -1.0 };
+        assert!((policy.effective_k() - 60.0).abs() < f64::EPSILON);
+    }
+
+    // --- RankingPriorWeights ---
+
+    #[test]
+    fn ranking_prior_weights_default() {
+        let weights = super::RankingPriorWeights::default();
+        assert!((weights.recency - 0.12).abs() < f64::EPSILON);
+        assert!((weights.path - 0.08).abs() < f64::EPSILON);
+        assert!((weights.project - 0.05).abs() < f64::EPSILON);
+    }
+
+    // --- RankingPriorTuning ---
+
+    #[test]
+    fn ranking_prior_tuning_default_matches_performance() {
+        let default = RankingPriorTuning::default();
+        let perf = RankingPriorTuning::for_profile(PressureProfile::Performance);
+        assert_eq!(default.enabled, perf.enabled);
+        assert!((default.max_total_boost - perf.max_total_boost).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ranking_prior_tuning_boost_disabled_returns_zero() {
+        let tuning = RankingPriorTuning {
+            enabled: false,
+            ..RankingPriorTuning::default()
+        };
+        let boost = tuning.boost_for(RankingPriorSignals::new(Some(1.0), Some(1.0), Some(1.0)));
+        assert!(boost.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ranking_prior_tuning_normalized_scales_weights_if_sum_exceeds_max() {
+        let tuning = RankingPriorTuning {
+            enabled: true,
+            weights: super::RankingPriorWeights::new(1.0, 1.0, 1.0),
+            max_total_boost: 0.01,
+        };
+        let normalized = tuning.normalized();
+        let sum = normalized.weights.recency + normalized.weights.path + normalized.weights.project;
+        assert!(sum <= normalized.max_total_boost + 1e-12);
+    }
+
+    #[test]
+    fn ranking_prior_tuning_boost_clamped() {
+        let tuning = RankingPriorTuning::for_profile(PressureProfile::Performance).normalized();
+        let boost = tuning.boost_for(RankingPriorSignals::new(Some(1.0), Some(1.0), Some(1.0)));
+        assert!(boost >= 0.0);
+        assert!(boost <= tuning.max_total_boost + 1e-12);
+    }
+
+    // --- RankingPriorSignals ---
+
+    #[test]
+    fn ranking_prior_signals_default() {
+        let signals = RankingPriorSignals::default();
+        assert!(signals.recency.is_none());
+        assert!(signals.path.is_none());
+        assert!(signals.project.is_none());
+    }
+
+    #[test]
+    fn ranking_prior_signals_new() {
+        let signals = RankingPriorSignals::new(Some(0.5), Some(0.3), None);
+        assert_eq!(signals.recency, Some(0.5));
+        assert_eq!(signals.path, Some(0.3));
+        assert!(signals.project.is_none());
+    }
+
+    // --- Candidate constructors ---
+
+    #[test]
+    fn lexical_candidate_new() {
+        let c = LexicalCandidate::new("doc-x", 2.5);
+        assert_eq!(c.doc_id, "doc-x");
+        assert!((c.score - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn semantic_candidate_new() {
+        let c = SemanticCandidate::new("doc-y", 0.9);
+        assert_eq!(c.doc_id, "doc-y");
+        assert!((c.score - 0.9).abs() < f32::EPSILON);
+    }
+
+    // --- QueryExecutionOrchestrator ---
+
+    #[test]
+    fn orchestrator_default() {
+        let o = QueryExecutionOrchestrator::default();
+        assert!((o.fusion_policy.rrf_k - 60.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn orchestrator_new_custom_k() {
+        let o = QueryExecutionOrchestrator::new(super::FusionPolicy { rrf_k: 42.0 });
+        assert!((o.fusion_policy.rrf_k - 42.0).abs() < f64::EPSILON);
+    }
+
+    // --- fuse_rankings offset ---
+
+    #[test]
+    fn fuse_rankings_offset_skips_top_results() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let lexical = vec![
+            LexicalCandidate::new("doc-a", 10.0),
+            LexicalCandidate::new("doc-b", 9.0),
+            LexicalCandidate::new("doc-c", 8.0),
+        ];
+        let semantic = vec![];
+
+        let all = orchestrator.fuse_rankings(&lexical, &semantic, 10, 0);
+        let offset = orchestrator.fuse_rankings(&lexical, &semantic, 10, 1);
+
+        assert_eq!(all.len(), 3);
+        assert_eq!(offset.len(), 2);
+        assert_eq!(offset[0].doc_id, all[1].doc_id);
+    }
+
+    #[test]
+    fn fuse_rankings_limit_caps_results() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let lexical = vec![
+            LexicalCandidate::new("doc-a", 10.0),
+            LexicalCandidate::new("doc-b", 9.0),
+            LexicalCandidate::new("doc-c", 8.0),
+        ];
+        let fused = orchestrator.fuse_rankings(&lexical, &[], 2, 0);
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn fuse_rankings_empty_inputs() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let fused = orchestrator.fuse_rankings(&[], &[], 10, 0);
+        assert!(fused.is_empty());
+    }
+
+    // --- fused_cmp ---
+
+    #[test]
+    fn fused_cmp_score_descending() {
+        let a = super::FusedCandidate {
+            doc_id: "a".to_owned(),
+            fused_score: 0.9,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        let b = super::FusedCandidate {
+            doc_id: "b".to_owned(),
+            fused_score: 0.8,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        assert_eq!(super::fused_cmp(&a, &b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn fused_cmp_in_both_tiebreak() {
+        let a = super::FusedCandidate {
+            doc_id: "a".to_owned(),
+            fused_score: 0.5,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: true,
+        };
+        let b = super::FusedCandidate {
+            doc_id: "b".to_owned(),
+            fused_score: 0.5,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        // a in_both=true should sort first (compare right.in_both > left.in_both → Less)
+        assert_eq!(super::fused_cmp(&a, &b), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn fused_cmp_doc_id_tiebreak() {
+        let a = super::FusedCandidate {
+            doc_id: "alpha".to_owned(),
+            fused_score: 0.5,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        let b = super::FusedCandidate {
+            doc_id: "beta".to_owned(),
+            fused_score: 0.5,
+            prior_boost: 0.0,
+            lexical_rank: None,
+            semantic_rank: None,
+            lexical_score: None,
+            semantic_score: None,
+            in_both_sources: false,
+        };
+        // "alpha" < "beta" alphabetically → a sorts first
+        assert_eq!(super::fused_cmp(&a, &b), std::cmp::Ordering::Less);
+    }
+
+    // --- DegradationStateMachine ---
+
+    #[test]
+    fn degradation_state_machine_for_profile() {
+        let machine = DegradationStateMachine::for_profile(PressureProfile::Strict);
+        assert_eq!(machine.mode(), DegradedRetrievalMode::Normal);
+        assert_eq!(machine.override_mode(), DegradationOverride::Auto);
+    }
+
+    #[test]
+    fn degradation_state_machine_stable_transition() {
+        let mut machine = DegradationStateMachine::default();
+        let t = machine.observe(DegradationSignals::default());
+        assert!(!t.changed);
+        assert_eq!(t.reason_code, "degrade.transition.stable");
+        assert_eq!(t.to, DegradedRetrievalMode::Normal);
+    }
+
+    #[test]
+    fn degradation_state_machine_override_stable() {
+        let mut machine = DegradationStateMachine::default();
+        machine.set_override(DegradationOverride::ForceNormal);
+        let t = machine.observe(DegradationSignals::default());
+        assert!(!t.changed);
+        assert_eq!(t.reason_code, "degrade.override.stable");
+    }
+
+    #[test]
+    fn degradation_state_machine_override_applied_then_stable() {
+        let mut machine = DegradationStateMachine::default();
+        machine.set_override(DegradationOverride::ForceLexicalOnly);
+        let t1 = machine.observe(DegradationSignals::default());
+        assert!(t1.changed);
+        assert_eq!(t1.reason_code, "degrade.override.applied");
+        assert_eq!(t1.to, DegradedRetrievalMode::LexicalOnly);
+
+        let t2 = machine.observe(DegradationSignals::default());
+        assert!(!t2.changed);
+        assert_eq!(t2.reason_code, "degrade.override.stable");
+    }
+
+    #[test]
+    fn degradation_transition_context_state_stable() {
+        let t = DegradationTransition {
+            from: DegradedRetrievalMode::Normal,
+            to: DegradedRetrievalMode::Normal,
+            changed: false,
+            reason_code: "degrade.transition.stable",
+            status: status_for_mode(DegradedRetrievalMode::Normal),
+            override_mode: DegradationOverride::Auto,
+        };
+        assert_eq!(t.transition_context(), "state_stable");
+    }
+
+    #[test]
+    fn degradation_transition_context_manual_override_hold() {
+        let t = DegradationTransition {
+            from: DegradedRetrievalMode::Paused,
+            to: DegradedRetrievalMode::Paused,
+            changed: false,
+            reason_code: "degrade.override.stable",
+            status: status_for_mode(DegradedRetrievalMode::Paused),
+            override_mode: DegradationOverride::ForcePause,
+        };
+        assert_eq!(t.transition_context(), "manual_override_hold");
+    }
+
+    // --- cancellation directive reason codes ---
+
+    #[test]
+    fn cancellation_directive_after_initial_results() {
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let d = orchestrator.cancellation_directive(CancellationPoint::AfterInitialResults);
+        assert_eq!(d.action, CancellationAction::EmitInitialResults);
+        assert_eq!(d.reason_code, "query.cancel.after_initial_results");
+    }
+
+    // --- embed_deferred plan ---
+
+    #[test]
+    fn plan_embed_deferred_includes_semantic() {
+        let planner = QueryPlanner::from_fsfs(&FsfsConfig::default());
+        let intent = planner.classify_intent("how does fusion work");
+        let budget = planner.budget_for_decision(&intent, Some(10));
+        let orchestrator = QueryExecutionOrchestrator::default();
+
+        let plan =
+            orchestrator.plan_with_mode(&intent, &budget, DegradedRetrievalMode::EmbedDeferred);
+        let names = stage_names(&plan);
+
+        assert!(names.contains(&RetrievalStage::FastSemanticRetrieve));
+        assert!(!names.contains(&RetrievalStage::QualitySemanticRetrieve));
+        assert_eq!(plan.reason_code, "query.execution.embed_deferred");
+    }
+
+    // ─── bd-olv6 tests end ───
 }

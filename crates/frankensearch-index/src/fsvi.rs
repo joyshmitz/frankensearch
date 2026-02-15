@@ -904,6 +904,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn create_accepts_embedder_fields_at_u8_max_len() {
+        let path = temp_path("embedder_fields_u8_max.fsvi");
+        let max_len = usize::from(u8::MAX);
+        let embedder_id = "x".repeat(max_len);
+        let embedder_revision = "y".repeat(max_len);
+
+        let mut writer =
+            VectorIndexWriter::create(&path, &embedder_id, &embedder_revision, 1, Quantization::F16)
+                .unwrap();
+        writer.write_record("doc-0", &[1.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert_eq!(index.embedder_id().len(), max_len);
+        assert_eq!(index.embedder_revision().len(), max_len);
+
+        fs::remove_file(&path).ok();
+    }
+
     // ─── Empty index ────────────────────────────────────────────────────
 
     #[test]
@@ -919,6 +939,24 @@ mod tests {
         assert_eq!(index.record_count(), 0);
         assert_eq!(index.dimension(), 384);
         assert_eq!(index.embedder_id(), "empty-embedder");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn zero_dimension_vectors_roundtrip() {
+        let path = temp_path("zero_dimension.fsvi");
+        let mut writer =
+            VectorIndexWriter::create(&path, "zero-dim", "rev0", 0, Quantization::F16).unwrap();
+        writer.write_record("doc-0", &[]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert_eq!(index.dimension(), 0);
+        assert_eq!(index.record_count(), 1);
+        assert_eq!(index.doc_id_at(0), "doc-0");
+        assert!(index.vector_f16_at(0).is_empty());
+        assert!(index.vector_f32_at(0).is_empty());
 
         fs::remove_file(&path).ok();
     }
@@ -1106,6 +1144,26 @@ mod tests {
         assert_eq!(parsed.embedder_id, "potion-128M");
         assert_eq!(parsed.embedder_revision, "abc123def");
         assert_eq!(parsed.record_count, 42);
+    }
+
+    #[test]
+    fn header_bytes_encode_magic_and_format_version_constants() {
+        let header = FsviHeader {
+            version: FORMAT_VERSION,
+            dimension: 8,
+            quantization: Quantization::F16,
+            embedder_id: "embedder".to_owned(),
+            embedder_revision: "rev".to_owned(),
+            record_count: 1,
+            header_size: 0,
+        };
+        let bytes = header.to_bytes();
+
+        assert_eq!(&bytes[0..4], &MAGIC);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), FORMAT_VERSION);
+
+        let parsed = FsviHeader::from_bytes(&bytes, "test").unwrap();
+        assert_eq!(parsed.version, FORMAT_VERSION);
     }
 
     #[test]
