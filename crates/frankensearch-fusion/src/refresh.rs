@@ -446,7 +446,20 @@ impl RefreshWorker {
         // Assemble records.
         let mut records = Vec::with_capacity(jobs.len());
         for (i, job) in jobs.iter().enumerate() {
-            let fast_embedding = fast_embeddings[i].clone();
+            let Some(fast_embedding) = fast_embeddings.get(i).cloned() else {
+                // Embedder returned fewer vectors than inputs — skip this doc
+                // and requeue so it can be retried next cycle.
+                warn!(
+                    target: "frankensearch.refresh",
+                    doc_id = %job.doc_id,
+                    expected = jobs.len(),
+                    got = fast_embeddings.len(),
+                    "fast embedder returned fewer vectors than inputs, requeueing"
+                );
+                self.queue.requeue(job.clone());
+                self.metrics.docs_failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
             let quality_embedding = quality_embeddings.as_ref().and_then(|q| q.get(i).cloned());
 
             records.push(EmbeddedRecord {

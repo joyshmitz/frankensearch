@@ -681,6 +681,13 @@ impl SloMaterializationConfig {
                 reason: "must be positive and monotonic (warn <= error <= critical)".to_owned(),
             });
         }
+        if self.min_requests == 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "min_requests".to_owned(),
+                value: "0".to_owned(),
+                reason: "must be >= 1 to prevent division by zero in SLO evaluation".to_owned(),
+            });
+        }
         Ok(())
     }
 }
