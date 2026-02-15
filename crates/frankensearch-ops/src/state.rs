@@ -735,7 +735,7 @@ impl ControlPlaneMetrics {
     /// Approximate renderer frame rate.
     #[must_use]
     pub fn estimated_fps(&self) -> f64 {
-        if self.frame_time_ms <= 0.0 {
+        if !self.frame_time_ms.is_finite() || self.frame_time_ms <= 0.0 {
             0.0
         } else {
             1000.0 / self.frame_time_ms
@@ -751,6 +751,13 @@ impl ControlPlaneMetrics {
         let lag = self.ingestion_lag_events;
         let dead = self.dead_letter_events;
         let discovery = self.discovery_latency_ms;
+        // Non-finite throughput is treated as zero (worst-case) so that
+        // lag-gated rules fire correctly when telemetry produces NaN/Inf.
+        let throughput = if self.event_throughput_eps.is_finite() {
+            self.event_throughput_eps
+        } else {
+            0.0
+        };
 
         if lag >= Self::LAG_CRIT_EVENTS
             || storage_ratio >= Self::STORAGE_CRIT_RATIO
@@ -758,7 +765,7 @@ impl ControlPlaneMetrics {
             || fps <= Self::FPS_CRIT
             || discovery >= Self::DISCOVERY_CRIT_MS
             || dead >= Self::DEAD_LETTER_CRIT
-            || (lag >= 5_000 && self.event_throughput_eps < 0.5)
+            || (lag >= 5_000 && throughput < 0.5)
         {
             return ControlPlaneHealth::Critical;
         }
@@ -769,7 +776,7 @@ impl ControlPlaneMetrics {
             || fps <= Self::FPS_WARN
             || discovery >= Self::DISCOVERY_WARN_MS
             || dead >= Self::DEAD_LETTER_WARN
-            || (lag > 0 && self.event_throughput_eps < 1.0)
+            || (lag > 0 && throughput < 1.0)
         {
             return ControlPlaneHealth::Degraded;
         }
@@ -1445,4 +1452,757 @@ mod tests {
         assert_eq!(stop.attribution_confidence_score, 20);
         assert!(!stop.attribution_collision);
     }
+
+    // ─── bd-244k tests begin ───
+
+    #[test]
+    fn normalize_hint_none() {
+        assert_eq!(normalize_hint(None), None);
+    }
+
+    #[test]
+    fn normalize_hint_empty() {
+        assert_eq!(normalize_hint(Some("")), None);
+    }
+
+    #[test]
+    fn normalize_hint_whitespace_only() {
+        assert_eq!(normalize_hint(Some("   ")), None);
+    }
+
+    #[test]
+    fn normalize_hint_trims() {
+        assert_eq!(normalize_hint(Some("  value  ")), Some("value".to_owned()));
+    }
+
+    #[test]
+    fn normalize_hint_preserves_clean() {
+        assert_eq!(normalize_hint(Some("val")), Some("val".to_owned()));
+    }
+
+    #[test]
+    fn control_plane_health_badge_healthy() {
+        assert_eq!(ControlPlaneHealth::Healthy.badge(), "CP:OK");
+    }
+
+    #[test]
+    fn control_plane_health_badge_degraded() {
+        assert_eq!(ControlPlaneHealth::Degraded.badge(), "CP:WARN");
+    }
+
+    #[test]
+    fn control_plane_health_badge_critical() {
+        assert_eq!(ControlPlaneHealth::Critical.badge(), "CP:CRIT");
+    }
+
+    #[test]
+    fn control_plane_health_display_healthy() {
+        assert_eq!(format!("{}", ControlPlaneHealth::Healthy), "healthy");
+    }
+
+    #[test]
+    fn control_plane_health_display_degraded() {
+        assert_eq!(format!("{}", ControlPlaneHealth::Degraded), "degraded");
+    }
+
+    #[test]
+    fn control_plane_health_display_critical() {
+        assert_eq!(format!("{}", ControlPlaneHealth::Critical), "critical");
+    }
+
+    #[test]
+    fn control_plane_health_serde_roundtrip() {
+        for variant in [
+            ControlPlaneHealth::Healthy,
+            ControlPlaneHealth::Degraded,
+            ControlPlaneHealth::Critical,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let decoded: ControlPlaneHealth = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, variant);
+        }
+        // snake_case rename_all
+        let json = serde_json::to_string(&ControlPlaneHealth::Healthy).unwrap();
+        assert_eq!(json, "\"healthy\"");
+    }
+
+    #[test]
+    fn control_plane_metrics_default_field_values() {
+        let m = ControlPlaneMetrics::default();
+        assert_eq!(m.ingestion_lag_events, 0);
+        assert_eq!(m.storage_bytes, 0);
+        assert_eq!(m.storage_limit_bytes, 1);
+        assert!((m.frame_time_ms - 16.0).abs() < f64::EPSILON);
+        assert_eq!(m.discovery_latency_ms, 0);
+        assert!((m.event_throughput_eps - 0.0).abs() < f64::EPSILON);
+        assert_eq!(m.rss_bytes, 0);
+        assert_eq!(m.rss_limit_bytes, 1);
+        assert_eq!(m.dead_letter_events, 0);
+    }
+
+    #[test]
+    fn ratio_as_f64_zero_denom() {
+        assert!((ControlPlaneMetrics::ratio_as_f64(100, 0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ratio_as_f64_normal() {
+        let ratio = ControlPlaneMetrics::ratio_as_f64(500, 1000);
+        assert!((ratio - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn ratio_as_f64_full() {
+        let ratio = ControlPlaneMetrics::ratio_as_f64(1000, 1000);
+        assert!((ratio - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn ratio_as_f64_over_100_percent() {
+        let ratio = ControlPlaneMetrics::ratio_as_f64(2000, 1000);
+        assert!((ratio - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn storage_utilization_direct() {
+        let m = ControlPlaneMetrics {
+            storage_bytes: 800,
+            storage_limit_bytes: 1000,
+            ..ControlPlaneMetrics::default()
+        };
+        assert!((m.storage_utilization() - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn rss_utilization_direct() {
+        let m = ControlPlaneMetrics {
+            rss_bytes: 950,
+            rss_limit_bytes: 1000,
+            ..ControlPlaneMetrics::default()
+        };
+        assert!((m.rss_utilization() - 0.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn estimated_fps_normal() {
+        let m = ControlPlaneMetrics {
+            frame_time_ms: 16.0,
+            ..ControlPlaneMetrics::default()
+        };
+        assert!((m.estimated_fps() - 62.5).abs() < 0.1);
+    }
+
+    #[test]
+    fn estimated_fps_zero_frame_time() {
+        let m = ControlPlaneMetrics {
+            frame_time_ms: 0.0,
+            ..ControlPlaneMetrics::default()
+        };
+        assert!((m.estimated_fps() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn estimated_fps_negative_frame_time() {
+        let m = ControlPlaneMetrics {
+            frame_time_ms: -5.0,
+            ..ControlPlaneMetrics::default()
+        };
+        assert!((m.estimated_fps() - 0.0).abs() < f64::EPSILON);
+    }
+
+    fn healthy_metrics() -> ControlPlaneMetrics {
+        ControlPlaneMetrics {
+            ingestion_lag_events: 0,
+            storage_bytes: 0,
+            storage_limit_bytes: 1000,
+            frame_time_ms: 10.0, // 100 fps
+            discovery_latency_ms: 0,
+            event_throughput_eps: 100.0,
+            rss_bytes: 0,
+            rss_limit_bytes: 1000,
+            dead_letter_events: 0,
+        }
+    }
+
+    #[test]
+    fn health_all_healthy() {
+        assert_eq!(healthy_metrics().health(), ControlPlaneHealth::Healthy);
+    }
+
+    #[test]
+    fn health_lag_warn_boundary() {
+        let mut m = healthy_metrics();
+        m.ingestion_lag_events = 999;
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+        m.ingestion_lag_events = 1_000;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_lag_crit_boundary() {
+        let mut m = healthy_metrics();
+        m.ingestion_lag_events = 9_999;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+        m.ingestion_lag_events = 10_000;
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_storage_warn_boundary() {
+        let mut m = healthy_metrics();
+        m.storage_bytes = 799;
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+        m.storage_bytes = 800; // 0.80 ratio
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_storage_crit_boundary() {
+        let mut m = healthy_metrics();
+        m.storage_bytes = 949;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+        m.storage_bytes = 950; // 0.95 ratio
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_rss_warn_boundary() {
+        let mut m = healthy_metrics();
+        m.rss_bytes = 799;
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+        m.rss_bytes = 800;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_rss_crit_boundary() {
+        let mut m = healthy_metrics();
+        m.rss_bytes = 949;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+        m.rss_bytes = 950;
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_fps_warn_boundary() {
+        let mut m = healthy_metrics();
+        // fps = 1000 / frame_time_ms
+        // fps=30.0 → frame_time=33.33 → Degraded boundary
+        m.frame_time_ms = 33.0; // fps ~30.3 > 30 → Healthy
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+        m.frame_time_ms = 34.0; // fps ~29.4 <= 30 → Degraded
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_fps_crit_boundary() {
+        let mut m = healthy_metrics();
+        m.frame_time_ms = 66.0; // fps ~15.15 > 15 → Degraded
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+        m.frame_time_ms = 67.0; // fps ~14.9 <= 15 → Critical
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_discovery_warn_boundary() {
+        let mut m = healthy_metrics();
+        m.discovery_latency_ms = 1_999;
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+        m.discovery_latency_ms = 2_000;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_discovery_crit_boundary() {
+        let mut m = healthy_metrics();
+        m.discovery_latency_ms = 4_999;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+        m.discovery_latency_ms = 5_000;
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_dead_letter_warn_boundary() {
+        let mut m = healthy_metrics();
+        m.dead_letter_events = 0;
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+        m.dead_letter_events = 1;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_dead_letter_crit_boundary() {
+        let mut m = healthy_metrics();
+        m.dead_letter_events = 19;
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+        m.dead_letter_events = 20;
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_combined_lag_throughput_crit() {
+        let mut m = healthy_metrics();
+        m.ingestion_lag_events = 5_000;
+        m.event_throughput_eps = 0.4; // lag>=5000 && eps<0.5 → Critical
+        assert_eq!(m.health(), ControlPlaneHealth::Critical);
+    }
+
+    #[test]
+    fn health_combined_lag_throughput_degraded() {
+        let mut m = healthy_metrics();
+        m.ingestion_lag_events = 1; // lag>0
+        m.event_throughput_eps = 0.9; // eps<1.0 → Degraded
+        assert_eq!(m.health(), ControlPlaneHealth::Degraded);
+    }
+
+    #[test]
+    fn health_combined_lag_throughput_not_degraded_when_throughput_ok() {
+        let mut m = healthy_metrics();
+        m.ingestion_lag_events = 1;
+        m.event_throughput_eps = 1.0; // not < 1.0 → stays Healthy
+        assert_eq!(m.health(), ControlPlaneHealth::Healthy);
+    }
+
+    #[test]
+    fn self_check_report_format_verification() {
+        let m = ControlPlaneMetrics {
+            ingestion_lag_events: 0,
+            storage_bytes: 500,
+            storage_limit_bytes: 1000,
+            frame_time_ms: 16.0,
+            discovery_latency_ms: 100,
+            event_throughput_eps: 50.0,
+            rss_bytes: 200,
+            rss_limit_bytes: 1000,
+            dead_letter_events: 3,
+        };
+        let report = m.self_check_report();
+        assert!(report.starts_with("health: "));
+        assert!(report.contains("ingestion_lag_events: 0"));
+        assert!(report.contains("500/1000"));
+        assert!(report.contains("200/1000"));
+        assert!(report.contains("dead_letter_events: 3"));
+        assert!(report.contains("discovery_latency_ms: 100"));
+        assert!(report.contains("event_throughput_eps: 50.00"));
+    }
+
+    #[test]
+    fn instance_lifecycle_default() {
+        let lc = InstanceLifecycle::default();
+        assert_eq!(lc.state, LifecycleState::Started);
+        assert_eq!(lc.severity, LifecycleSeverity::Info);
+        assert_eq!(lc.reason_code, "lifecycle.started");
+        assert_eq!(lc.last_transition_ms, 0);
+        assert_eq!(lc.last_heartbeat_ms, 0);
+        assert_eq!(lc.restart_count, 0);
+    }
+
+    #[test]
+    fn instance_lifecycle_new_preserves_timestamp() {
+        let lc = InstanceLifecycle::new(42);
+        assert_eq!(lc.last_transition_ms, 42);
+        assert_eq!(lc.last_heartbeat_ms, 42);
+    }
+
+    #[test]
+    fn apply_signal_start_from_healthy_stays_started() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        assert_eq!(lc.state, LifecycleState::Healthy);
+
+        // Start from Healthy → stays Started (not restarting)
+        let t = lc.apply_signal(LifecycleSignal::Start, 30, None);
+        assert_eq!(t.from, LifecycleState::Healthy);
+        assert_eq!(t.to, LifecycleState::Started);
+        assert!(t.changed);
+        assert_eq!(lc.severity, LifecycleSeverity::Info);
+        assert_eq!(lc.restart_count, 0);
+    }
+
+    #[test]
+    fn apply_signal_start_from_degraded_stays_started() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Degraded, 20, None);
+        assert_eq!(lc.state, LifecycleState::Degraded);
+
+        let t = lc.apply_signal(LifecycleSignal::Start, 30, None);
+        assert_eq!(t.from, LifecycleState::Degraded);
+        assert_eq!(t.to, LifecycleState::Started);
+        assert!(t.changed);
+        assert_eq!(lc.severity, LifecycleSeverity::Info);
+        assert_eq!(lc.restart_count, 0);
+    }
+
+    #[test]
+    fn apply_signal_start_from_stale_is_restart() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        lc.mark_stale_if_heartbeat_gap(10_000, 5_000);
+        assert_eq!(lc.state, LifecycleState::Stale);
+
+        let t = lc.apply_signal(LifecycleSignal::Start, 10_001, None);
+        assert_eq!(t.to, LifecycleState::Recovering);
+        assert_eq!(lc.restart_count, 1);
+        assert_eq!(lc.severity, LifecycleSeverity::Warn);
+        assert_eq!(lc.reason_code, "lifecycle.restart");
+    }
+
+    #[test]
+    fn apply_signal_custom_reason_code() {
+        let mut lc = InstanceLifecycle::new(10);
+        let t = lc.apply_signal(
+            LifecycleSignal::Degraded,
+            20,
+            Some("custom.reason".to_owned()),
+        );
+        assert_eq!(t.reason_code, "custom.reason");
+        assert_eq!(lc.reason_code, "custom.reason");
+    }
+
+    #[test]
+    fn apply_signal_degraded_severity() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Degraded, 20, None);
+        assert_eq!(lc.severity, LifecycleSeverity::Warn);
+        assert_eq!(lc.state, LifecycleState::Degraded);
+    }
+
+    #[test]
+    fn apply_signal_recovering_severity() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Recovering, 20, None);
+        assert_eq!(lc.severity, LifecycleSeverity::Warn);
+        assert_eq!(lc.state, LifecycleState::Recovering);
+    }
+
+    #[test]
+    fn apply_signal_stop_severity() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        lc.apply_signal(LifecycleSignal::Stop, 30, None);
+        assert_eq!(lc.severity, LifecycleSeverity::Info);
+        assert_eq!(lc.state, LifecycleState::Stopped);
+    }
+
+    #[test]
+    fn apply_signal_unchanged_does_not_update_transition_ts() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        assert_eq!(lc.last_transition_ms, 20);
+        // second heartbeat: Healthy→Healthy, changed=false
+        let t = lc.apply_signal(LifecycleSignal::Heartbeat, 30, None);
+        assert!(!t.changed);
+        assert_eq!(lc.last_transition_ms, 20); // unchanged
+        assert_eq!(lc.last_heartbeat_ms, 30); // updated
+    }
+
+    #[test]
+    fn mark_stale_already_stale_returns_none() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        lc.mark_stale_if_heartbeat_gap(10_000, 5_000);
+        assert_eq!(lc.state, LifecycleState::Stale);
+        // already stale → None
+        assert!(lc.mark_stale_if_heartbeat_gap(20_000, 5_000).is_none());
+    }
+
+    #[test]
+    fn mark_stale_within_deadline_returns_none() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 100, None);
+        // deadline = 100 + 5000 = 5100; now_ms=5099 < 5100 → None
+        assert!(lc.mark_stale_if_heartbeat_gap(5099, 5000).is_none());
+        assert_eq!(lc.state, LifecycleState::Healthy);
+    }
+
+    #[test]
+    fn mark_stale_at_deadline_returns_some() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.apply_signal(LifecycleSignal::Heartbeat, 100, None);
+        // deadline = 100 + 5000 = 5100; now_ms=5100 >= 5100 → Some
+        let t = lc.mark_stale_if_heartbeat_gap(5100, 5000);
+        assert!(t.is_some());
+        let t = t.unwrap();
+        assert_eq!(t.from, LifecycleState::Healthy);
+        assert_eq!(t.to, LifecycleState::Stale);
+        assert!(t.changed);
+    }
+
+    #[test]
+    fn lifecycle_signal_serde_roundtrip() {
+        for signal in [
+            LifecycleSignal::Start,
+            LifecycleSignal::Heartbeat,
+            LifecycleSignal::Degraded,
+            LifecycleSignal::Recovering,
+            LifecycleSignal::Stop,
+        ] {
+            let json = serde_json::to_string(&signal).unwrap();
+            let decoded: LifecycleSignal = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, signal);
+        }
+        // snake_case
+        assert_eq!(
+            serde_json::to_string(&LifecycleSignal::Heartbeat).unwrap(),
+            "\"heartbeat\""
+        );
+    }
+
+    #[test]
+    fn lifecycle_tracker_config_default_values() {
+        let c = LifecycleTrackerConfig::default();
+        assert_eq!(c.stale_after_ms, 30_000);
+        assert_eq!(c.stop_after_ms, 120_000);
+        assert_eq!(c.max_retained_events, 4_096);
+    }
+
+    #[test]
+    fn lifecycle_tracker_config_normalized_no_clamping() {
+        let c = LifecycleTrackerConfig {
+            stale_after_ms: 100,
+            stop_after_ms: 200,
+            max_retained_events: 50,
+        }
+        .normalized();
+        assert_eq!(c.stale_after_ms, 100);
+        assert_eq!(c.stop_after_ms, 200);
+        assert_eq!(c.max_retained_events, 50);
+    }
+
+    #[test]
+    fn fleet_snapshot_default_empty() {
+        let snap = FleetSnapshot::default();
+        assert_eq!(snap.instance_count(), 0);
+        assert_eq!(snap.healthy_count(), 0);
+        assert_eq!(snap.total_docs(), 0);
+        assert_eq!(snap.total_pending_jobs(), 0);
+        assert_eq!(snap.stale_count(), 0);
+        assert!(snap.lifecycle_events().is_empty());
+    }
+
+    #[test]
+    fn fleet_snapshot_stale_count_with_stale() {
+        let mut lifecycle = HashMap::new();
+        let mut stale = InstanceLifecycle::new(10);
+        stale.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        stale.mark_stale_if_heartbeat_gap(10_000, 5_000);
+        lifecycle.insert("stale-1".to_string(), stale);
+
+        let healthy = InstanceLifecycle::new(10);
+        lifecycle.insert("healthy-1".to_string(), healthy);
+
+        let snap = FleetSnapshot {
+            lifecycle,
+            ..FleetSnapshot::default()
+        };
+        assert_eq!(snap.stale_count(), 1);
+    }
+
+    #[test]
+    fn fleet_snapshot_attribution_for_hit_miss() {
+        let mut attribution = HashMap::new();
+        attribution.insert(
+            "inst-1".to_string(),
+            InstanceAttribution::unknown(Some("proj"), None, "test"),
+        );
+        let snap = FleetSnapshot {
+            attribution,
+            ..FleetSnapshot::default()
+        };
+        assert!(snap.attribution_for("inst-1").is_some());
+        assert!(snap.attribution_for("nonexistent").is_none());
+    }
+
+    #[test]
+    fn fleet_snapshot_lifecycle_for_hit_miss() {
+        let mut lifecycle = HashMap::new();
+        lifecycle.insert("inst-1".to_string(), InstanceLifecycle::new(0));
+        let snap = FleetSnapshot {
+            lifecycle,
+            ..FleetSnapshot::default()
+        };
+        assert!(snap.lifecycle_for("inst-1").is_some());
+        assert!(snap.lifecycle_for("nonexistent").is_none());
+    }
+
+    #[test]
+    fn fleet_snapshot_lifecycle_events_accessor() {
+        let events = vec![LifecycleEvent {
+            instance_id: "i1".to_string(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test".to_string(),
+            at_ms: 100,
+            attribution_confidence_score: 80,
+            attribution_collision: false,
+        }];
+        let snap = FleetSnapshot {
+            lifecycle_events: events.clone(),
+            ..FleetSnapshot::default()
+        };
+        assert_eq!(snap.lifecycle_events().len(), 1);
+        assert_eq!(snap.lifecycle_events()[0].instance_id, "i1");
+    }
+
+    #[test]
+    fn app_state_default_matches_new() {
+        let d = AppState::default();
+        let n = AppState::new();
+        assert!(!d.has_data());
+        assert!(!n.has_data());
+        assert_eq!(d.fleet().instance_count(), n.fleet().instance_count());
+        assert_eq!(d.connection_status(), n.connection_status());
+        assert_eq!(d.control_plane_health(), n.control_plane_health());
+    }
+
+    #[test]
+    fn app_state_last_update_none_then_some() {
+        let mut state = AppState::new();
+        assert!(state.last_update().is_none());
+        state.update_fleet(FleetSnapshot::default());
+        assert!(state.last_update().is_some());
+    }
+
+    #[test]
+    fn app_state_control_plane_metrics_accessor() {
+        let mut state = AppState::new();
+        let m = ControlPlaneMetrics {
+            ingestion_lag_events: 42,
+            ..ControlPlaneMetrics::default()
+        };
+        state.update_control_plane(m);
+        assert_eq!(state.control_plane_metrics().ingestion_lag_events, 42);
+    }
+
+    #[test]
+    fn instance_attribution_unknown_with_none_hints() {
+        let attr = InstanceAttribution::unknown(None, None, "no_hints");
+        assert!(attr.project_key_hint.is_none());
+        assert!(attr.host_name_hint.is_none());
+        assert_eq!(attr.resolved_project, "unknown");
+        assert_eq!(attr.confidence_score, 20);
+        assert!(!attr.collision);
+        // evidence trace should NOT contain project_key_hint or host_name_hint entries
+        assert!(
+            !attr
+                .evidence_trace
+                .iter()
+                .any(|e| e.starts_with("project_key_hint="))
+        );
+        assert!(
+            !attr
+                .evidence_trace
+                .iter()
+                .any(|e| e.starts_with("host_name_hint="))
+        );
+        assert!(attr.evidence_trace.iter().any(|e| e == "reason=no_hints"));
+        assert!(
+            attr.evidence_trace
+                .iter()
+                .any(|e| e == "resolved_project=unknown")
+        );
+    }
+
+    #[test]
+    fn instance_attribution_unknown_empty_hints_normalized() {
+        let attr = InstanceAttribution::unknown(Some("  "), Some(""), "whitespace");
+        assert!(attr.project_key_hint.is_none());
+        assert!(attr.host_name_hint.is_none());
+    }
+
+    #[test]
+    fn instance_attribution_serde_roundtrip() {
+        let attr = InstanceAttribution::unknown(Some("proj"), Some("host"), "serde_test");
+        let json = serde_json::to_string(&attr).unwrap();
+        let decoded: InstanceAttribution = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, attr);
+    }
+
+    #[test]
+    fn lifecycle_event_serde_roundtrip() {
+        let event = LifecycleEvent {
+            instance_id: "i-42".to_string(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "test.heartbeat".to_string(),
+            at_ms: 1000,
+            attribution_confidence_score: 90,
+            attribution_collision: false,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: LifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn project_lifecycle_tracker_default() {
+        let tracker = ProjectLifecycleTracker::default();
+        assert!(tracker.event_log().is_empty());
+        assert!(tracker.attribution_snapshot().is_empty());
+        assert!(tracker.lifecycle_snapshot().is_empty());
+    }
+
+    #[test]
+    fn project_lifecycle_tracker_accessors_after_ingest() {
+        let mut tracker = ProjectLifecycleTracker::new(LifecycleTrackerConfig::default());
+        let instances = vec![discovery_instance(
+            "inst-acc",
+            Some("xf"),
+            Some("xf-host"),
+            100,
+            DiscoveryStatus::Active,
+        )];
+        tracker.ingest_discovery(100, &instances);
+        assert_eq!(tracker.attribution_snapshot().len(), 1);
+        assert!(tracker.attribution_for("inst-acc").is_some());
+        assert!(tracker.lifecycle_for("inst-acc").is_some());
+        assert_eq!(tracker.lifecycle_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_restart_count_saturates() {
+        let mut lc = InstanceLifecycle::new(10);
+        lc.restart_count = u32::MAX;
+        lc.apply_signal(LifecycleSignal::Stop, 20, None);
+        let t = lc.apply_signal(LifecycleSignal::Start, 30, None);
+        assert_eq!(t.to, LifecycleState::Recovering);
+        assert_eq!(lc.restart_count, u32::MAX); // saturating_add
+    }
+
+    #[test]
+    fn lifecycle_transition_changed_flag_same_state() {
+        let mut lc = InstanceLifecycle::new(10);
+        // Started → Started (Start from non-stopped/stale)
+        let t = lc.apply_signal(LifecycleSignal::Start, 20, None);
+        assert_eq!(t.from, LifecycleState::Started);
+        assert_eq!(t.to, LifecycleState::Started);
+        assert!(!t.changed);
+    }
+
+    #[test]
+    fn app_state_connection_status_reflects_stale() {
+        let mut state = AppState::new();
+        let mut lifecycle = HashMap::new();
+        let mut stale = InstanceLifecycle::new(10);
+        stale.apply_signal(LifecycleSignal::Heartbeat, 20, None);
+        stale.mark_stale_if_heartbeat_gap(10_000, 5_000);
+        lifecycle.insert("inst-s".to_string(), stale);
+
+        let snap = FleetSnapshot {
+            instances: vec![InstanceInfo {
+                id: "inst-s".to_string(),
+                project: "p".to_string(),
+                pid: None,
+                healthy: false,
+                doc_count: 0,
+                pending_jobs: 0,
+            }],
+            lifecycle,
+            ..FleetSnapshot::default()
+        };
+        state.update_fleet(snap);
+        assert!(state.connection_status().contains("1 stale"));
+    }
+
+    // ─── bd-244k tests end ───
 }

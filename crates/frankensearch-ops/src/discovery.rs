@@ -165,13 +165,23 @@ impl Default for DiscoveryConfig {
 impl DiscoveryConfig {
     #[must_use]
     pub const fn normalized(self) -> Self {
-        if self.prune_after_ms < self.stale_after_ms {
-            Self {
-                stale_after_ms: self.stale_after_ms,
-                prune_after_ms: self.stale_after_ms,
-            }
+        // Enforce minimum 1ms to prevent zero-thresholds from causing
+        // immediate stale/prune of all instances on every poll cycle.
+        let stale = if self.stale_after_ms == 0 {
+            1
         } else {
-            self
+            self.stale_after_ms
+        };
+        let prune = if self.prune_after_ms < stale {
+            stale
+        } else if self.prune_after_ms == 0 {
+            1
+        } else {
+            self.prune_after_ms
+        };
+        Self {
+            stale_after_ms: stale,
+            prune_after_ms: prune,
         }
     }
 }
@@ -979,4 +989,549 @@ mod tests {
         assert_eq!(prune.stale_instances, 0);
         assert!(engine.snapshot().is_empty());
     }
+
+    // ─── bd-3l9h tests begin ───
+
+    #[test]
+    fn signal_kind_as_str_all_variants() {
+        assert_eq!(DiscoverySignalKind::Process.as_str(), "process");
+        assert_eq!(DiscoverySignalKind::Socket.as_str(), "socket");
+        assert_eq!(
+            DiscoverySignalKind::ControlEndpoint.as_str(),
+            "control_endpoint"
+        );
+        assert_eq!(DiscoverySignalKind::Heartbeat.as_str(), "heartbeat");
+    }
+
+    #[test]
+    fn signal_kind_serde_roundtrip() {
+        for kind in [
+            DiscoverySignalKind::Process,
+            DiscoverySignalKind::Socket,
+            DiscoverySignalKind::ControlEndpoint,
+            DiscoverySignalKind::Heartbeat,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: DiscoverySignalKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind);
+        }
+        // snake_case
+        assert_eq!(
+            serde_json::to_string(&DiscoverySignalKind::ControlEndpoint).unwrap(),
+            "\"control_endpoint\""
+        );
+    }
+
+    #[test]
+    fn signal_kind_ord() {
+        let mut kinds = vec![
+            DiscoverySignalKind::Heartbeat,
+            DiscoverySignalKind::Process,
+            DiscoverySignalKind::Socket,
+        ];
+        kinds.sort();
+        // PartialOrd/Ord derive follows declaration order
+        assert_eq!(kinds[0], DiscoverySignalKind::Process);
+    }
+
+    #[test]
+    fn discovery_status_serde_roundtrip() {
+        for status in [DiscoveryStatus::Active, DiscoveryStatus::Stale] {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: DiscoveryStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+        assert_eq!(
+            serde_json::to_string(&DiscoveryStatus::Active).unwrap(),
+            "\"active\""
+        );
+    }
+
+    #[test]
+    fn discovered_instance_healthy_active() {
+        let inst = DiscoveredInstance {
+            instance_id: "i1".to_owned(),
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            version: None,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            status: DiscoveryStatus::Active,
+            sources: vec![],
+            identity_keys: vec![],
+        };
+        assert!(inst.healthy());
+    }
+
+    #[test]
+    fn discovered_instance_healthy_stale() {
+        let inst = DiscoveredInstance {
+            instance_id: "i2".to_owned(),
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            version: None,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            status: DiscoveryStatus::Stale,
+            sources: vec![],
+            identity_keys: vec![],
+        };
+        assert!(!inst.healthy());
+    }
+
+    #[test]
+    fn discovery_config_default_values() {
+        let c = DiscoveryConfig::default();
+        assert_eq!(c.stale_after_ms, 30_000);
+        assert_eq!(c.prune_after_ms, 300_000);
+    }
+
+    #[test]
+    fn discovery_config_normalized_valid() {
+        let c = DiscoveryConfig {
+            stale_after_ms: 100,
+            prune_after_ms: 200,
+        }
+        .normalized();
+        assert_eq!(c.stale_after_ms, 100);
+        assert_eq!(c.prune_after_ms, 200);
+    }
+
+    #[test]
+    fn discovery_config_normalized_clamps() {
+        let c = DiscoveryConfig {
+            stale_after_ms: 500,
+            prune_after_ms: 100,
+        }
+        .normalized();
+        assert_eq!(c.stale_after_ms, 500);
+        assert_eq!(c.prune_after_ms, 500);
+    }
+
+    #[test]
+    fn discovery_config_serde_roundtrip() {
+        let c = DiscoveryConfig::default();
+        let json = serde_json::to_string(&c).unwrap();
+        let decoded: DiscoveryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, c);
+    }
+
+    #[test]
+    fn discovery_stats_default_all_zeros() {
+        let s = DiscoveryStats::default();
+        assert_eq!(s.sources_polled, 0);
+        assert_eq!(s.sightings_observed, 0);
+        assert_eq!(s.duplicates_merged, 0);
+        assert_eq!(s.stale_instances, 0);
+        assert_eq!(s.pruned_instances, 0);
+    }
+
+    #[test]
+    fn discovery_stats_serde_roundtrip() {
+        let s = DiscoveryStats {
+            sources_polled: 3,
+            sightings_observed: 10,
+            duplicates_merged: 1,
+            stale_instances: 2,
+            pruned_instances: 0,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let decoded: DiscoveryStats = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn normalized_folded_none() {
+        assert_eq!(normalized_folded(None), None);
+    }
+
+    #[test]
+    fn normalized_folded_empty() {
+        assert_eq!(normalized_folded(Some("")), None);
+    }
+
+    #[test]
+    fn normalized_folded_whitespace() {
+        assert_eq!(normalized_folded(Some("   ")), None);
+    }
+
+    #[test]
+    fn normalized_folded_trims_and_lowercases() {
+        assert_eq!(
+            normalized_folded(Some("  VALUE  ")),
+            Some("value".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalized_exact_none() {
+        assert_eq!(normalized_exact(None), None);
+    }
+
+    #[test]
+    fn normalized_exact_empty() {
+        assert_eq!(normalized_exact(Some("")), None);
+    }
+
+    #[test]
+    fn normalized_exact_whitespace() {
+        assert_eq!(normalized_exact(Some("   ")), None);
+    }
+
+    #[test]
+    fn normalized_exact_trims_preserves_case() {
+        assert_eq!(
+            normalized_exact(Some("  VALUE  ")),
+            Some("VALUE".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalized_endpoint_none() {
+        assert_eq!(normalized_endpoint(None), None);
+    }
+
+    #[test]
+    fn normalized_endpoint_no_scheme() {
+        assert_eq!(
+            normalized_endpoint(Some("localhost:9000")),
+            Some("localhost:9000".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalized_endpoint_lowercases_scheme_and_host() {
+        assert_eq!(
+            normalized_endpoint(Some("HTTP://MYHOST:8080/path")),
+            Some("http://myhost:8080/path".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalized_endpoint_preserves_path_case() {
+        assert_eq!(
+            normalized_endpoint(Some("http://host/MyPath")),
+            Some("http://host/MyPath".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalized_endpoint_empty_authority() {
+        assert_eq!(
+            normalized_endpoint(Some("HTTP:///path")),
+            Some("http:///path".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalize_host_port_ipv6() {
+        assert_eq!(normalize_host_port("[::1]:8080"), "[::1]:8080".to_owned());
+    }
+
+    #[test]
+    fn normalize_host_port_ipv6_uppercase() {
+        assert_eq!(
+            normalize_host_port("[FE80::1]:8080"),
+            "[fe80::1]:8080".to_owned()
+        );
+    }
+
+    #[test]
+    fn normalize_host_port_with_port() {
+        assert_eq!(normalize_host_port("MyHost:9090"), "myhost:9090".to_owned());
+    }
+
+    #[test]
+    fn normalize_host_port_bare() {
+        assert_eq!(normalize_host_port("MyHost"), "myhost".to_owned());
+    }
+
+    #[test]
+    fn normalize_endpoint_authority_with_userinfo() {
+        assert_eq!(
+            normalize_endpoint_authority("user@MyHost:8080"),
+            "user@myhost:8080".to_owned()
+        );
+    }
+
+    #[test]
+    fn normalize_endpoint_authority_no_userinfo() {
+        assert_eq!(
+            normalize_endpoint_authority("MyHost:8080"),
+            "myhost:8080".to_owned()
+        );
+    }
+
+    #[test]
+    fn stable_instance_id_deterministic() {
+        let id1 = stable_instance_id("seed-abc");
+        let id2 = stable_instance_id("seed-abc");
+        assert_eq!(id1, id2);
+        assert!(id1.starts_with("inst-"));
+    }
+
+    #[test]
+    fn stable_instance_id_different_seeds() {
+        let id1 = stable_instance_id("seed-1");
+        let id2 = stable_instance_id("seed-2");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn identity_keys_with_instance_key_hint() {
+        let sighting = InstanceSighting {
+            source: DiscoverySignalKind::Process,
+            observed_at_ms: 100,
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            instance_key_hint: Some("my-instance".to_owned()),
+            control_endpoint: None,
+            socket_path: None,
+            heartbeat_path: None,
+            version: None,
+        };
+        let keys = sighting.identity_keys();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], "instance:my-instance");
+    }
+
+    #[test]
+    fn identity_keys_instance_key_hint_lowercased() {
+        let sighting = InstanceSighting {
+            source: DiscoverySignalKind::Process,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: None,
+            pid: None,
+            instance_key_hint: Some("MY-INSTANCE".to_owned()),
+            control_endpoint: None,
+            socket_path: None,
+            heartbeat_path: None,
+            version: None,
+        };
+        let keys = sighting.identity_keys();
+        assert!(keys.contains(&"instance:my-instance".to_owned()));
+    }
+
+    #[test]
+    fn identity_keys_host_pid_lowercases_host() {
+        let sighting = InstanceSighting {
+            source: DiscoverySignalKind::Process,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: Some("MY-HOST".to_owned()),
+            pid: Some(42),
+            instance_key_hint: None,
+            control_endpoint: None,
+            socket_path: None,
+            heartbeat_path: None,
+            version: None,
+        };
+        let keys = sighting.identity_keys();
+        assert!(keys.contains(&"hostpid:my-host:42".to_owned()));
+    }
+
+    #[test]
+    fn identity_keys_host_without_pid_no_hostpid_key() {
+        let sighting = InstanceSighting {
+            source: DiscoverySignalKind::Process,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: Some("host-a".to_owned()),
+            pid: None,
+            instance_key_hint: None,
+            control_endpoint: None,
+            socket_path: None,
+            heartbeat_path: None,
+            version: None,
+        };
+        let keys = sighting.identity_keys();
+        assert!(!keys.iter().any(|k| k.starts_with("hostpid:")));
+        // Falls back
+        assert!(keys.iter().any(|k| k.starts_with("fallback:")));
+    }
+
+    #[test]
+    fn identity_keys_multiple_signals() {
+        let sighting = InstanceSighting {
+            source: DiscoverySignalKind::Process,
+            observed_at_ms: 1,
+            project_key_hint: None,
+            host_name: Some("host".to_owned()),
+            pid: Some(99),
+            instance_key_hint: Some("inst-x".to_owned()),
+            control_endpoint: Some("http://host:8080/ctrl".to_owned()),
+            socket_path: Some("/tmp/test.sock".to_owned()),
+            heartbeat_path: Some("/tmp/hb".to_owned()),
+            version: None,
+        };
+        let keys = sighting.identity_keys();
+        assert!(keys.iter().any(|k| k.starts_with("instance:")));
+        assert!(keys.iter().any(|k| k.starts_with("hostpid:")));
+        assert!(keys.iter().any(|k| k.starts_with("endpoint:")));
+        assert!(keys.iter().any(|k| k.starts_with("socket:")));
+        assert!(keys.iter().any(|k| k.starts_with("heartbeat:")));
+        assert!(!keys.iter().any(|k| k.starts_with("fallback:")));
+    }
+
+    #[test]
+    fn engine_empty_snapshot() {
+        let engine = DiscoveryEngine::new(DiscoveryConfig::default());
+        assert!(engine.snapshot().is_empty());
+    }
+
+    #[test]
+    fn engine_poll_no_sources() {
+        let mut engine = DiscoveryEngine::new(DiscoveryConfig::default());
+        let stats = engine.poll(100, &mut []);
+        assert_eq!(stats.sources_polled, 0);
+        assert_eq!(stats.sightings_observed, 0);
+        assert!(engine.snapshot().is_empty());
+    }
+
+    #[test]
+    fn engine_merge_self_noop() {
+        let mut engine = DiscoveryEngine::new(DiscoveryConfig::default());
+        assert!(!engine.merge_instances("a", "a"));
+    }
+
+    #[test]
+    fn engine_merge_nonexistent_from() {
+        let mut engine = DiscoveryEngine::new(DiscoveryConfig::default());
+        assert!(!engine.merge_instances("nonexistent", "also-nonexistent"));
+    }
+
+    #[test]
+    fn static_source_returns_sightings() {
+        let sightings = vec![process_sighting(10, "cass", "host-a", 42)];
+        let mut source = StaticDiscoverySource::new(sightings.clone());
+        let collected = source.collect(100);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].source, DiscoverySignalKind::Process);
+        // Collect returns same sightings each time
+        let again = source.collect(200);
+        assert_eq!(again.len(), 1);
+    }
+
+    #[test]
+    fn refresh_lowercase_hint_none_candidate() {
+        let mut current = Some("existing".to_owned());
+        refresh_lowercase_hint(&mut current, None, true);
+        assert_eq!(current.as_deref(), Some("existing"));
+    }
+
+    #[test]
+    fn refresh_lowercase_hint_prefer_true_updates() {
+        let mut current = Some("old".to_owned());
+        refresh_lowercase_hint(&mut current, Some("NEW"), true);
+        assert_eq!(current.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn refresh_lowercase_hint_prefer_false_keeps() {
+        let mut current = Some("old".to_owned());
+        refresh_lowercase_hint(&mut current, Some("new"), false);
+        assert_eq!(current.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn refresh_lowercase_hint_none_current_always_updates() {
+        let mut current = None;
+        refresh_lowercase_hint(&mut current, Some("VALUE"), false);
+        assert_eq!(current.as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn refresh_pid_hint_none_candidate() {
+        let mut current = Some(42);
+        refresh_pid_hint(&mut current, None, 100, 50);
+        assert_eq!(current, Some(42));
+    }
+
+    #[test]
+    fn refresh_pid_hint_newer_updates() {
+        let mut current = Some(42);
+        refresh_pid_hint(&mut current, Some(99), 100, 50);
+        assert_eq!(current, Some(99));
+    }
+
+    #[test]
+    fn refresh_pid_hint_older_keeps() {
+        let mut current = Some(42);
+        refresh_pid_hint(&mut current, Some(99), 30, 50);
+        assert_eq!(current, Some(42));
+    }
+
+    #[test]
+    fn refresh_pid_hint_none_current_updates() {
+        let mut current = None;
+        refresh_pid_hint(&mut current, Some(99), 30, 50);
+        assert_eq!(current, Some(99));
+    }
+
+    #[test]
+    fn refresh_version_hint_none_candidate() {
+        let mut current = Some("1.0".to_owned());
+        refresh_version_hint(&mut current, None, 100, 50);
+        assert_eq!(current.as_deref(), Some("1.0"));
+    }
+
+    #[test]
+    fn refresh_version_hint_newer_updates() {
+        let mut current = Some("1.0".to_owned());
+        refresh_version_hint(&mut current, Some("2.0"), 100, 50);
+        assert_eq!(current.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn refresh_version_hint_older_keeps() {
+        let mut current = Some("2.0".to_owned());
+        refresh_version_hint(&mut current, Some("1.0"), 30, 50);
+        assert_eq!(current.as_deref(), Some("2.0"));
+    }
+
+    #[test]
+    fn instance_sighting_serde_roundtrip() {
+        let sighting = process_sighting(42, "proj", "host", 99);
+        let json = serde_json::to_string(&sighting).unwrap();
+        let decoded: InstanceSighting = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, sighting);
+    }
+
+    #[test]
+    fn discovered_instance_serde_roundtrip() {
+        let inst = DiscoveredInstance {
+            instance_id: "i1".to_owned(),
+            project_key_hint: Some("proj".to_owned()),
+            host_name: Some("host".to_owned()),
+            pid: Some(42),
+            version: Some("1.0".to_owned()),
+            first_seen_ms: 10,
+            last_seen_ms: 20,
+            status: DiscoveryStatus::Active,
+            sources: vec![DiscoverySignalKind::Process],
+            identity_keys: vec!["hostpid:host:42".to_owned()],
+        };
+        let json = serde_json::to_string(&inst).unwrap();
+        let decoded: DiscoveredInstance = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, inst);
+    }
+
+    #[test]
+    fn engine_snapshot_sorted_by_instance_id() {
+        let mut engine = DiscoveryEngine::new(DiscoveryConfig::default());
+        let mut source = StaticDiscoverySource::new(vec![
+            process_sighting(10, "b", "host-b", 2),
+            process_sighting(10, "a", "host-a", 1),
+        ]);
+        engine.poll(10, &mut [&mut source]);
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot[0].instance_id < snapshot[1].instance_id);
+    }
+
+    // ─── bd-3l9h tests end ───
 }
