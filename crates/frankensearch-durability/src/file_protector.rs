@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -391,7 +391,14 @@ impl FileProtector {
         let trailer = serialize_repair_trailer(&header, &repair_symbols)?;
 
         let sidecar_path = Self::sidecar_path(path);
-        fs::write(&sidecar_path, trailer)?;
+        // Write through a File handle so we can fsync before returning.
+        // A bare fs::write() is not durable: the kernel may buffer the data
+        // and a power loss before writeback would silently lose the sidecar.
+        {
+            let mut file = fs::File::create(&sidecar_path)?;
+            file.write_all(&trailer)?;
+            file.sync_all()?;
+        }
 
         info!(
             path = %path.display(),
