@@ -3,9 +3,10 @@ use std::path::PathBuf;
 /// Unified error type covering all failure modes across the frankensearch search pipeline.
 ///
 /// Every variant includes an actionable error message guiding the consumer toward resolution.
-/// The `TwoTierSearcher` catches transient errors and degrades gracefully: `EmbeddingFailed`
-/// falls back to hash embedding, `RerankFailed` skips reranking, `SearchTimeout` yields
-/// initial results. Only `IndexNotFound` and `InvalidConfig` prevent search from starting.
+/// The `TwoTierSearcher` catches transient errors and degrades gracefully: fast embedding
+/// failures can still yield lexical-only initial results when lexical retrieval is available,
+/// `RerankFailed` skips reranking, and `SearchTimeout` yields initial results.
+/// Only `IndexNotFound` and `InvalidConfig` prevent search from starting.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     // === Embedding errors ===
@@ -22,7 +23,7 @@ pub enum SearchError {
 
     /// Embedding inference failed for a given model.
     #[error(
-        "Embedding failed for {model}: {source}. Transient error; retry or fall back to hash embedder."
+        "Embedding failed for {model}: {source}. Transient error; retry or use lexical fallback when configured."
     )]
     EmbeddingFailed {
         /// Which model failed.

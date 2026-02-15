@@ -13,8 +13,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::collectors::{
-    TELEMETRY_SCHEMA_VERSION, TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent,
-    TelemetryInstance,
+    TELEMETRY_SCHEMA_VERSION, TelemetryCorrelation, TelemetryEmbedderInfo, TelemetryEmbeddingJob,
+    TelemetryEnvelope, TelemetryEvent, TelemetryInstance, TelemetrySearchMetrics,
+    TelemetrySearchResults,
 };
 use crate::error::{SearchError, SearchResult};
 
@@ -611,29 +612,42 @@ impl ConformanceHarness {
                 instance,
                 correlation,
                 query,
+                results,
+                metrics,
                 ..
-            } => validate_search_event(instance, correlation, query.text.as_str(), &mut violations),
+            } => validate_search_event(
+                instance,
+                correlation,
+                query.text.as_str(),
+                results,
+                metrics,
+                &mut violations,
+            ),
             TelemetryEvent::Embedding {
                 instance,
                 correlation,
+                job,
+                embedder,
                 duration_ms,
                 ..
-            } => validate_duration_event(
-                "embedding",
+            } => validate_embedding_event(
                 instance,
                 correlation,
+                job,
+                embedder,
                 *duration_ms,
                 &mut violations,
             ),
             TelemetryEvent::Index {
                 instance,
                 correlation,
+                dimension,
                 duration_ms,
                 ..
-            } => validate_duration_event(
-                "index",
+            } => validate_index_event(
                 instance,
                 correlation,
+                *dimension,
                 *duration_ms,
                 &mut violations,
             ),
@@ -642,13 +656,28 @@ impl ConformanceHarness {
                 correlation,
                 sample,
             } => {
-                validate_resource_event(instance, correlation, sample.interval_ms, &mut violations);
+                validate_resource_event(
+                    instance,
+                    correlation,
+                    sample.cpu_pct,
+                    sample.interval_ms,
+                    sample.load_avg_1m,
+                    &mut violations,
+                );
             }
             TelemetryEvent::Lifecycle {
                 instance,
                 correlation,
+                reason,
+                uptime_ms,
                 ..
-            } => validate_lifecycle_event(instance, correlation, &mut violations),
+            } => validate_lifecycle_event(
+                instance,
+                correlation,
+                reason.as_deref(),
+                *uptime_ms,
+                &mut violations,
+            ),
         }
 
         violations.extend(validate_redaction_forbidden_substrings(
@@ -759,6 +788,8 @@ fn validate_search_event(
     instance: &TelemetryInstance,
     correlation: &TelemetryCorrelation,
     query_text: &str,
+    results: &TelemetrySearchResults,
+    metrics: &TelemetrySearchMetrics,
     violations: &mut Vec<ConformanceViolation>,
 ) {
     validate_instance("search.instance", instance, violations);
@@ -776,6 +807,31 @@ fn validate_search_event(
             code: "adapter.event.search.query_too_long".to_owned(),
             field: "search.query.text".to_owned(),
             message: format!("query length {char_count} exceeds 500"),
+        });
+    }
+    if metrics.latency_us == 0 {
+        violations.push(violation(
+            "adapter.event.search.zero_latency",
+            "search.metrics.latency_us",
+            "latency_us should be > 0 for completed search telemetry",
+        ));
+    }
+    let source_total = results.lexical_count.saturating_add(results.semantic_count);
+    if results.result_count > 0 && source_total == 0 {
+        violations.push(violation(
+            "adapter.event.search.missing_source_counts",
+            "search.results",
+            "result_count > 0 requires lexical_count or semantic_count to be non-zero",
+        ));
+    }
+    if source_total > 0 && results.result_count > source_total {
+        violations.push(ConformanceViolation {
+            code: "adapter.event.search.result_count_exceeds_sources".to_owned(),
+            field: "search.results.result_count".to_owned(),
+            message: format!(
+                "result_count {} exceeds lexical_count + semantic_count ({source_total})",
+                results.result_count
+            ),
         });
     }
 }
@@ -798,10 +854,68 @@ fn validate_duration_event(
     }
 }
 
+fn validate_embedding_event(
+    instance: &TelemetryInstance,
+    correlation: &TelemetryCorrelation,
+    job: &TelemetryEmbeddingJob,
+    embedder: &TelemetryEmbedderInfo,
+    duration_ms: u64,
+    violations: &mut Vec<ConformanceViolation>,
+) {
+    validate_duration_event("embedding", instance, correlation, duration_ms, violations);
+    if job.job_id.trim().is_empty() {
+        violations.push(violation(
+            "adapter.event.embedding.missing_job_id",
+            "embedding.job.job_id",
+            "job_id must be non-empty",
+        ));
+    }
+    if job.doc_count == 0 {
+        violations.push(violation(
+            "adapter.event.embedding.zero_doc_count",
+            "embedding.job.doc_count",
+            "doc_count should be > 0",
+        ));
+    }
+    if embedder.id.trim().is_empty() {
+        violations.push(violation(
+            "adapter.event.embedding.missing_embedder_id",
+            "embedding.embedder.id",
+            "embedder id must be non-empty",
+        ));
+    }
+    if embedder.dimension == 0 {
+        violations.push(violation(
+            "adapter.event.embedding.zero_dimension",
+            "embedding.embedder.dimension",
+            "dimension should be > 0",
+        ));
+    }
+}
+
+fn validate_index_event(
+    instance: &TelemetryInstance,
+    correlation: &TelemetryCorrelation,
+    dimension: usize,
+    duration_ms: u64,
+    violations: &mut Vec<ConformanceViolation>,
+) {
+    validate_duration_event("index", instance, correlation, duration_ms, violations);
+    if dimension == 0 {
+        violations.push(violation(
+            "adapter.event.index.zero_dimension",
+            "index.dimension",
+            "dimension should be > 0",
+        ));
+    }
+}
+
 fn validate_resource_event(
     instance: &TelemetryInstance,
     correlation: &TelemetryCorrelation,
+    cpu_pct: f64,
     interval_ms: u64,
+    load_avg_1m: Option<f64>,
     violations: &mut Vec<ConformanceViolation>,
 ) {
     validate_instance("resource.instance", instance, violations);
@@ -813,15 +927,53 @@ fn validate_resource_event(
             "interval_ms must be greater than zero",
         ));
     }
+    if !cpu_pct.is_finite() {
+        violations.push(violation(
+            "adapter.event.resource.invalid_cpu_pct",
+            "resource.sample.cpu_pct",
+            "cpu_pct must be finite",
+        ));
+    } else if !(0.0..=100.0).contains(&cpu_pct) {
+        violations.push(ConformanceViolation {
+            code: "adapter.event.resource.cpu_pct_out_of_range".to_owned(),
+            field: "resource.sample.cpu_pct".to_owned(),
+            message: format!("cpu_pct {cpu_pct} must be in [0, 100]"),
+        });
+    }
+    if let Some(load_avg_1m) = load_avg_1m
+        && (!load_avg_1m.is_finite() || load_avg_1m < 0.0)
+    {
+        violations.push(ConformanceViolation {
+            code: "adapter.event.resource.invalid_load_avg_1m".to_owned(),
+            field: "resource.sample.load_avg_1m".to_owned(),
+            message: format!("load_avg_1m {load_avg_1m} must be finite and >= 0"),
+        });
+    }
 }
 
 fn validate_lifecycle_event(
     instance: &TelemetryInstance,
     correlation: &TelemetryCorrelation,
+    reason: Option<&str>,
+    uptime_ms: Option<u64>,
     violations: &mut Vec<ConformanceViolation>,
 ) {
     validate_instance("lifecycle.instance", instance, violations);
     validate_correlation("lifecycle.correlation", correlation, violations);
+    if reason.is_some_and(|text| text.trim().is_empty()) {
+        violations.push(violation(
+            "adapter.event.lifecycle.empty_reason",
+            "lifecycle.reason",
+            "reason must be non-empty when provided",
+        ));
+    }
+    if uptime_ms.is_some_and(|uptime| uptime == 0) {
+        violations.push(violation(
+            "adapter.event.lifecycle.zero_uptime",
+            "lifecycle.uptime_ms",
+            "uptime_ms should be > 0 when provided",
+        ));
+    }
 }
 
 fn validate_correlation(
@@ -1235,6 +1387,16 @@ mod tests {
                 ts: "now".to_owned(),
             })
             .unwrap();
+        adapter
+            .on_lifecycle_event(&AdapterLifecycleEvent::HealthTick {
+                ts: "tick".to_owned(),
+            })
+            .unwrap();
+        adapter
+            .on_lifecycle_event(&AdapterLifecycleEvent::SessionStop {
+                ts: "later".to_owned(),
+            })
+            .unwrap();
 
         {
             let emitted = sink.emitted.lock().unwrap();
@@ -1245,10 +1407,18 @@ mod tests {
 
         {
             let lifecycle = sink.lifecycle.lock().unwrap();
-            assert_eq!(lifecycle.len(), 1);
+            assert_eq!(lifecycle.len(), 3);
             assert!(matches!(
                 lifecycle[0],
                 AdapterLifecycleEvent::SessionStart { .. }
+            ));
+            assert!(matches!(
+                lifecycle[1],
+                AdapterLifecycleEvent::HealthTick { .. }
+            ));
+            assert!(matches!(
+                lifecycle[2],
+                AdapterLifecycleEvent::SessionStop { .. }
             ));
             drop(lifecycle);
         }
@@ -1842,6 +2012,158 @@ mod tests {
             violations
                 .iter()
                 .any(|v| v.code == "adapter.envelope.missing_timestamp")
+        );
+    }
+
+    #[test]
+    fn validate_envelope_search_zero_latency_and_source_mismatch_are_reported() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-search-v1.json");
+        if let TelemetryEvent::Search {
+            results, metrics, ..
+        } = &mut envelope.event
+        {
+            metrics.latency_us = 0;
+            results.result_count = 7;
+            results.lexical_count = 0;
+            results.semantic_count = 0;
+        } else {
+            panic!("search fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.search.zero_latency")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.search.missing_source_counts")
+        );
+    }
+
+    #[test]
+    fn validate_envelope_embedding_required_fields_are_enforced() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-embedding-v1.json");
+        if let TelemetryEvent::Embedding {
+            job,
+            embedder,
+            duration_ms,
+            ..
+        } = &mut envelope.event
+        {
+            job.job_id.clear();
+            job.doc_count = 0;
+            embedder.id = " ".to_owned();
+            embedder.dimension = 0;
+            *duration_ms = 0;
+        } else {
+            panic!("embedding fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.embedding.missing_job_id")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.embedding.zero_doc_count")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.embedding.missing_embedder_id")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.embedding.zero_dimension")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.embedding.zero_duration")
+        );
+    }
+
+    #[test]
+    fn validate_envelope_index_zero_dimension_is_reported() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-index-v1.json");
+        if let TelemetryEvent::Index { dimension, .. } = &mut envelope.event {
+            *dimension = 0;
+        } else {
+            panic!("index fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.index.zero_dimension")
+        );
+    }
+
+    #[test]
+    fn validate_envelope_resource_numeric_ranges_are_enforced() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-resource-v1.json");
+        if let TelemetryEvent::Resource { sample, .. } = &mut envelope.event {
+            sample.cpu_pct = 123.45;
+            sample.load_avg_1m = Some(-2.0);
+            sample.interval_ms = 0;
+        } else {
+            panic!("resource fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.resource.cpu_pct_out_of_range")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.resource.invalid_load_avg_1m")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.resource.zero_interval")
+        );
+    }
+
+    #[test]
+    fn validate_envelope_lifecycle_optional_fields_are_validated_when_present() {
+        let harness = ConformanceHarness::default();
+        let mut envelope = load_fixture("telemetry-lifecycle-v1.json");
+        if let TelemetryEvent::Lifecycle {
+            reason, uptime_ms, ..
+        } = &mut envelope.event
+        {
+            *reason = Some("  ".to_owned());
+            *uptime_ms = Some(0);
+        } else {
+            panic!("lifecycle fixture shape changed");
+        }
+
+        let violations = harness.validate_envelope(&envelope);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.lifecycle.empty_reason")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == "adapter.event.lifecycle.zero_uptime")
         );
     }
 
