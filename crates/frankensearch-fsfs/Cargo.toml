@@ -23,8 +23,8 @@ frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true }
 frankensearch-tui = { workspace = true }
 asupersync = { workspace = true }
-fsqlite = { path = "/data/projects/frankensqlite/crates/fsqlite" }
-fsqlite-types = { path = "/data/projects/frankensqlite/crates/fsqlite-types" }
+fsqlite = { path = "../../../frankensqlite/crates/fsqlite" }
+fsqlite-types = { path = "../../../frankensqlite/crates/fsqlite-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toon-rust = { workspace = true }
