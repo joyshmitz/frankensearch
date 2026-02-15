@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::OnceLock;
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
@@ -17,12 +18,42 @@ pub const PARALLEL_THRESHOLD: usize = 10_000;
 /// Chunk size per Rayon task in the parallel scan path.
 pub const PARALLEL_CHUNK_SIZE: usize = 1_024;
 
+/// Configurable parameters for vector search parallelism.
+///
+/// Controls when and how the brute-force scan switches from sequential
+/// to Rayon-parallel execution. Use [`SearchParams::default()`] for the
+/// standard settings (threshold = 10,000, chunk size = 1,024, parallel
+/// enabled via `FRANKENSEARCH_PARALLEL_SEARCH` env var).
+#[derive(Debug, Clone, Copy)]
+pub struct SearchParams {
+    /// Minimum record count to trigger parallel scanning.
+    /// Below this threshold, search runs sequentially.
+    pub parallel_threshold: usize,
+    /// Number of records processed per Rayon chunk in parallel mode.
+    pub parallel_chunk_size: usize,
+    /// Whether parallel scanning is allowed at all. When `false`, search
+    /// always runs sequentially regardless of record count.
+    pub parallel_enabled: bool,
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
+        Self {
+            parallel_threshold: PARALLEL_THRESHOLD,
+            parallel_chunk_size: PARALLEL_CHUNK_SIZE,
+            parallel_enabled: parallel_search_enabled(),
+        }
+    }
+}
+
 // Thread-local scratch buffers for vector decode operations.
 // Reused across search calls and Rayon chunks to avoid per-call allocation.
 thread_local! {
     static F16_SCRATCH: RefCell<Vec<f16>> = const { RefCell::new(Vec::new()) };
     static F32_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
+
+static PARALLEL_SEARCH_ENABLED_CACHE: OnceLock<bool> = OnceLock::new();
 
 /// Take the thread-local f16 scratch buffer, resized to `dim`.
 fn take_f16_scratch(dim: usize) -> Vec<f16> {
@@ -114,6 +145,33 @@ impl VectorIndex {
             PARALLEL_THRESHOLD,
             PARALLEL_CHUNK_SIZE,
             parallel_search_enabled(),
+        )
+    }
+
+    /// Brute-force cosine-similarity top-k search with configurable parallelism.
+    ///
+    /// Behaves identically to [`search_top_k`](Self::search_top_k) but uses the
+    /// caller-supplied [`SearchParams`] instead of the compiled-in defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` when `query.len()` does not
+    /// match index dimensionality, and `SearchError::IndexCorrupted` for
+    /// malformed vector slab contents.
+    pub fn search_top_k_with_params(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        params: SearchParams,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_internal(
+            query,
+            limit,
+            filter,
+            params.parallel_threshold,
+            params.parallel_chunk_size,
+            params.parallel_enabled,
         )
     }
 
@@ -509,8 +567,10 @@ fn merge_partial_heaps(
 }
 
 fn parallel_search_enabled() -> bool {
-    let value = std::env::var("FRANKENSEARCH_PARALLEL_SEARCH").ok();
-    parse_parallel_search_env(value.as_deref())
+    *PARALLEL_SEARCH_ENABLED_CACHE.get_or_init(|| {
+        let value = std::env::var("FRANKENSEARCH_PARALLEL_SEARCH").ok();
+        parse_parallel_search_env(value.as_deref())
+    })
 }
 
 fn parse_parallel_search_env(value: Option<&str>) -> bool {
@@ -1377,5 +1437,116 @@ mod tests {
             parallel.is_err(),
             "parallel path should surface doc_id errors"
         );
+    }
+
+    // --- SearchParams tests ---
+
+    #[test]
+    fn search_params_default_matches_constants() {
+        let params = SearchParams::default();
+        assert_eq!(params.parallel_threshold, PARALLEL_THRESHOLD);
+        assert_eq!(params.parallel_chunk_size, PARALLEL_CHUNK_SIZE);
+    }
+
+    #[test]
+    fn search_top_k_with_params_matches_default_search() {
+        let path = temp_index_path("with-params-default");
+        let mut rows = Vec::new();
+        for i in 0..32 {
+            let rank = f32::from(u16::try_from(32 - i).expect("fits u16"));
+            rows.push((format!("doc-{i:03}"), vec![rank, 0.0, 0.0, 0.0]));
+        }
+        let refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vec)| (doc_id.as_str(), vec.clone()))
+            .collect();
+        write_index(&path, &refs).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let default_hits = index.search_top_k(&query, 5, None).expect("default search");
+        let params_hits = index
+            .search_top_k_with_params(&query, 5, None, SearchParams::default())
+            .expect("params search");
+
+        assert_eq!(default_hits.len(), params_hits.len());
+        for (left, right) in default_hits.iter().zip(params_hits.iter()) {
+            assert_eq!(left.doc_id, right.doc_id);
+            assert_eq!(left.index, right.index);
+            assert!((left.score - right.score).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn search_top_k_with_params_custom_threshold() {
+        let path = temp_index_path("with-params-custom");
+        let mut rows = Vec::new();
+        for i in 0..64 {
+            let rank = f32::from(u16::try_from(64 - i).expect("fits u16"));
+            rows.push((format!("doc-{i:03}"), vec![rank, 0.0, 0.0, 0.0]));
+        }
+        let refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vec)| (doc_id.as_str(), vec.clone()))
+            .collect();
+        write_index(&path, &refs).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        // Force parallel with low threshold
+        let parallel_params = SearchParams {
+            parallel_threshold: 1,
+            parallel_chunk_size: 8,
+            parallel_enabled: true,
+        };
+        // Force sequential
+        let sequential_params = SearchParams {
+            parallel_threshold: usize::MAX,
+            parallel_chunk_size: PARALLEL_CHUNK_SIZE,
+            parallel_enabled: true,
+        };
+
+        let parallel = index
+            .search_top_k_with_params(&query, 10, None, parallel_params)
+            .expect("parallel search");
+        let sequential = index
+            .search_top_k_with_params(&query, 10, None, sequential_params)
+            .expect("sequential search");
+
+        assert_eq!(parallel.len(), sequential.len());
+        for (left, right) in parallel.iter().zip(sequential.iter()) {
+            assert_eq!(left.doc_id, right.doc_id);
+            assert!((left.score - right.score).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn search_top_k_with_params_disabled_parallel() {
+        let path = temp_index_path("with-params-disabled");
+        write_index(
+            &path,
+            &[
+                ("doc-a", vec![1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", vec![0.8, 0.0, 0.0, 0.0]),
+            ],
+        )
+        .expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let params = SearchParams {
+            parallel_threshold: 1, // would trigger parallel...
+            parallel_chunk_size: 1,
+            parallel_enabled: false, // ...but disabled
+        };
+        let hits = index
+            .search_top_k_with_params(&query, 2, None, params)
+            .expect("search with disabled parallel");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "doc-a");
+        assert_eq!(hits[1].doc_id, "doc-b");
     }
 }

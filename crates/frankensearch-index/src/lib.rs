@@ -30,7 +30,7 @@ pub use hnsw::{
 };
 pub use mrl::{MrlConfig, MrlSearchStats};
 pub use quantization::ScalarQuantizer;
-pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD};
+pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{cosine_similarity_f16, dot_product_f16_f32, dot_product_f32_f32};
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,

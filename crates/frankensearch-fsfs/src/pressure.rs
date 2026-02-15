@@ -1854,27 +1854,27 @@ mod tests {
 
     #[test]
     fn normalize_pct_nan_returns_zero() {
-        assert_eq!(normalize_pct(f64::NAN), 0.0);
+        assert!(normalize_pct(f64::NAN).abs() < f64::EPSILON);
     }
 
     #[test]
     fn normalize_pct_negative_returns_zero() {
-        assert_eq!(normalize_pct(-5.0), 0.0);
+        assert!(normalize_pct(-5.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn normalize_pct_negative_infinity_returns_zero() {
-        assert_eq!(normalize_pct(f64::NEG_INFINITY), 0.0);
+        assert!(normalize_pct(f64::NEG_INFINITY).abs() < f64::EPSILON);
     }
 
     #[test]
     fn normalize_pct_positive_infinity_returns_zero() {
-        assert_eq!(normalize_pct(f64::INFINITY), 0.0);
+        assert!(normalize_pct(f64::INFINITY).abs() < f64::EPSILON);
     }
 
     #[test]
     fn normalize_pct_zero_returns_zero() {
-        assert_eq!(normalize_pct(0.0), 0.0);
+        assert!(normalize_pct(0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1894,8 +1894,8 @@ mod tests {
     #[test]
     fn pressure_signal_new_normalizes_fields() {
         let sig = PressureSignal::new(-1.0, f64::NAN, 999.0, 50.0);
-        assert_eq!(sig.cpu_pct, 0.0);
-        assert_eq!(sig.memory_pct, 0.0);
+        assert!(sig.cpu_pct.abs() < f64::EPSILON);
+        assert!(sig.memory_pct.abs() < f64::EPSILON);
         assert!((sig.io_pct - 200.0).abs() < f64::EPSILON);
         assert!((sig.load_pct - 50.0).abs() < f64::EPSILON);
     }
@@ -1922,7 +1922,7 @@ mod tests {
         let curr = PressureSignal::new(0.0, 0.0, 0.0, 0.0);
         // alpha > 1.0 clamped to 1.0 → fully current
         let full_current = curr.ewma(prev, 5.0);
-        assert_eq!(full_current.cpu_pct, 0.0);
+        assert!(full_current.cpu_pct.abs() < f64::EPSILON);
         // alpha < 0.0 clamped to 0.0 → fully previous
         let full_prev = curr.ewma(prev, -1.0);
         assert!((full_prev.cpu_pct - 100.0).abs() < f64::EPSILON);
@@ -1941,28 +1941,28 @@ mod tests {
     #[test]
     fn calibration_metrics_new_normalizes_pct_fields() {
         let m = CalibrationMetrics::new(100, -5.0, 0.5, f64::NAN, 300.0);
-        assert_eq!(m.observed_coverage_pct, 0.0);
+        assert!(m.observed_coverage_pct.abs() < f64::EPSILON);
         assert!((m.e_value - 0.5).abs() < f64::EPSILON);
-        assert_eq!(m.drift_pct, 0.0);
+        assert!(m.drift_pct.abs() < f64::EPSILON);
         assert!((m.confidence_pct - 200.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn calibration_metrics_e_value_nan_becomes_zero() {
         let m = CalibrationMetrics::new(100, 95.0, f64::NAN, 5.0, 80.0);
-        assert_eq!(m.e_value, 0.0);
+        assert!(m.e_value.abs() < f64::EPSILON);
     }
 
     #[test]
     fn calibration_metrics_e_value_infinity_becomes_zero() {
         let m = CalibrationMetrics::new(100, 95.0, f64::INFINITY, 5.0, 80.0);
-        assert_eq!(m.e_value, 0.0);
+        assert!(m.e_value.abs() < f64::EPSILON);
     }
 
     #[test]
     fn calibration_metrics_e_value_negative_becomes_zero() {
         let m = CalibrationMetrics::new(100, 95.0, -0.5, 5.0, 80.0);
-        assert_eq!(m.e_value, 0.0);
+        assert!(m.e_value.abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2212,7 +2212,7 @@ mod tests {
             read_bytes: 1_000_000,
             write_bytes: 1_000_000,
         };
-        assert_eq!(c.io_pct_for_interval(Duration::from_secs(1), current), 0.0);
+        assert!(c.io_pct_for_interval(Duration::from_secs(1), current).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2228,7 +2228,7 @@ mod tests {
             read_bytes: 1_000_000,
             write_bytes: 1_000_000,
         };
-        assert_eq!(c.io_pct_for_interval(Duration::ZERO, current), 0.0);
+        assert!(c.io_pct_for_interval(Duration::ZERO, current).abs() < f64::EPSILON);
     }
 
     // --- parse functions ---
@@ -2545,7 +2545,7 @@ mod tests {
         let mut machine = DegradationStateMachine::default();
         // First escalate to MetadataOnly
         let sig = DegradationSignal::new(PressureState::Emergency, false, false);
-        machine.observe(sig, 1);
+        let _ = machine.observe(sig, 1);
         assert_eq!(machine.stage(), DegradationStage::MetadataOnly);
 
         // Calibration fallback to LexicalOnly (less severe) → should be skipped

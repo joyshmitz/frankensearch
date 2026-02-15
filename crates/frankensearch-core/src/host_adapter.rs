@@ -1675,10 +1675,7 @@ mod tests {
     fn canonical_host_project_runtime_roles_are_nonempty() {
         for host in CanonicalHostProject::ALL {
             let role = host.default_runtime_role();
-            assert!(
-                !role.is_empty(),
-                "{host:?} has empty default_runtime_role"
-            );
+            assert!(!role.is_empty(), "{host:?} has empty default_runtime_role");
         }
     }
 

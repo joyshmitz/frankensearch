@@ -885,11 +885,15 @@ impl FsWatcher {
             last_event_ts_ms: event.event_ts_ms,
         };
 
-        if let Some(previous) = self.pending.insert(event.path, next)
-            && previous.last_event_ts_ms <= next.last_event_ts_ms
-        {
+        if let Some(existing) = self.pending.get_mut(&event.path) {
             self.stats.events_debounced = self.stats.events_debounced.saturating_add(1);
+            // Out-of-order events should not overwrite newer pending state.
+            if next.last_event_ts_ms >= existing.last_event_ts_ms {
+                *existing = next;
+            }
+            return "watcher.event.queued";
         }
+        self.pending.insert(event.path, next);
 
         "watcher.event.queued"
     }
@@ -1394,6 +1398,42 @@ mod tests {
 
             watcher.stop(&cx).await;
             assert!(!watcher.is_running());
+        });
+    }
+
+    #[test]
+    fn watcher_out_of_order_event_does_not_overwrite_newer_pending_kind() {
+        run_test_with_cx(|cx| async move {
+            let mut watcher =
+                FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+            watcher.start(&cx, 2).await.expect("watcher start");
+
+            let path = PathBuf::from("/home/tester/docs/guide.md");
+            assert_eq!(
+                watcher.enqueue_event(WatchEvent::new(
+                    path.clone(),
+                    WatchEventKind::Delete,
+                    220,
+                    0,
+                )),
+                "watcher.event.queued"
+            );
+            // Older event arrives later: it must not clobber the newer delete state.
+            assert_eq!(
+                watcher.enqueue_event(WatchEvent::new(
+                    path.clone(),
+                    WatchEventKind::Modify,
+                    100,
+                    32,
+                )),
+                "watcher.event.queued"
+            );
+
+            let dispatch = watcher.flush_ready(800, PressureState::Normal, DegradationStage::Full);
+            assert_eq!(dispatch.actions.len(), 1);
+            assert_eq!(dispatch.actions[0].path, path);
+            assert_eq!(dispatch.actions[0].kind, WatcherActionKind::Tombstone);
+            assert_eq!(watcher.stats().events_debounced, 1);
         });
     }
 

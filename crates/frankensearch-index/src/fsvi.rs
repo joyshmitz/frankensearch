@@ -627,6 +627,8 @@ impl VectorIndexWriter {
         dimension: u16,
         quantization: Quantization,
     ) -> SearchResult<Self> {
+        validate_header_field_len("embedder_id", embedder_id)?;
+        validate_header_field_len("embedder_revision", embedder_revision)?;
         let file = File::create(path).map_err(SearchError::Io)?;
         let writer = BufWriter::with_capacity(WRITE_BUFFER_SIZE, file);
 
@@ -773,6 +775,17 @@ impl VectorIndexWriter {
     }
 }
 
+fn validate_header_field_len(field: &str, value: &str) -> SearchResult<()> {
+    if value.len() > usize::from(u8::MAX) {
+        return Err(SearchError::InvalidConfig {
+            field: field.to_owned(),
+            value: value.len().to_string(),
+            reason: format!("byte length must be <= {}", u8::MAX),
+        });
+    }
+    Ok(())
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /// Round `val` up to the next multiple of `align`.
@@ -861,6 +874,34 @@ mod tests {
         }
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn create_rejects_embedder_id_longer_than_u8() {
+        let path = temp_path("embedder_id_too_long.fsvi");
+        let too_long = "x".repeat(usize::from(u8::MAX) + 1);
+        let result = VectorIndexWriter::create(&path, &too_long, "r1", 8, Quantization::F16);
+        assert!(
+            matches!(
+                result,
+                Err(SearchError::InvalidConfig { ref field, .. }) if field == "embedder_id"
+            ),
+            "expected InvalidConfig(embedder_id), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn create_rejects_embedder_revision_longer_than_u8() {
+        let path = temp_path("embedder_revision_too_long.fsvi");
+        let too_long = "x".repeat(usize::from(u8::MAX) + 1);
+        let result = VectorIndexWriter::create(&path, "embedder", &too_long, 8, Quantization::F16);
+        assert!(
+            matches!(
+                result,
+                Err(SearchError::InvalidConfig { ref field, .. }) if field == "embedder_revision"
+            ),
+            "expected InvalidConfig(embedder_revision), got {result:?}"
+        );
     }
 
     // ─── Empty index ────────────────────────────────────────────────────

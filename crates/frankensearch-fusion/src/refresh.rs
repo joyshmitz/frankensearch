@@ -15,6 +15,7 @@
 //! The worker loops until the parent `Cx` is cancelled. On cancellation it
 //! finishes the current batch before exiting.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +27,10 @@ use tracing::{debug, error, info, warn};
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::SearchResult;
 use frankensearch_core::traits::Embedder;
-use frankensearch_index::TwoTierIndex;
+use frankensearch_index::{
+    TwoTierIndex, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
+    VECTOR_INDEX_QUALITY_FILENAME, VectorIndex,
+};
 
 use crate::cache::IndexCache;
 use crate::queue::{EmbeddingJob, EmbeddingQueue};
@@ -474,7 +478,92 @@ impl RefreshWorker {
             builder.set_quality_embedder_id(quality.id());
         }
 
-        for record in records {
+        // Keep only the latest update per doc_id from this cycle.
+        let mut latest_by_doc_id = HashMap::new();
+        let mut consumed = vec![false; records.len()];
+        for (idx, record) in records.iter().enumerate() {
+            if let Some(previous) = latest_by_doc_id.insert(record.doc_id.as_str(), idx) {
+                consumed[previous] = true;
+            }
+        }
+
+        // Merge with the previously built index so incremental cycles don't
+        // drop documents that were not part of this queue drain.
+        let fast_path = self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let fallback_path = self.config.index_dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
+        let existing_fast_path = if fast_path.exists() {
+            Some(fast_path)
+        } else if fallback_path.exists() {
+            Some(fallback_path)
+        } else {
+            None
+        };
+
+        if let Some(existing_fast_path) = existing_fast_path {
+            let fast_index = VectorIndex::open(&existing_fast_path)?;
+
+            let quality_path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            let existing_quality = if quality_path.exists() {
+                Some(VectorIndex::open(&quality_path)?)
+            } else {
+                None
+            };
+
+            // Preserve prior quality embedder metadata when the current worker
+            // is not configured with a quality embedder but a quality tier exists.
+            if self.quality_embedder.is_none()
+                && let Some(ref quality_index) = existing_quality
+            {
+                builder.set_quality_embedder_id(quality_index.embedder_id());
+            }
+
+            let mut quality_index_by_doc_id = HashMap::new();
+            if let Some(ref quality_index) = existing_quality {
+                quality_index_by_doc_id.reserve(quality_index.record_count());
+                for quality_idx in 0..quality_index.record_count() {
+                    let doc_id = quality_index.doc_id_at(quality_idx)?;
+                    quality_index_by_doc_id
+                        .entry(doc_id.to_owned())
+                        .or_insert(quality_idx);
+                }
+            }
+
+            for fast_idx in 0..fast_index.record_count() {
+                let doc_id = fast_index.doc_id_at(fast_idx)?;
+                if let Some(&record_idx) = latest_by_doc_id.get(doc_id) {
+                    let record = &records[record_idx];
+                    builder.add_record(
+                        record.doc_id.clone(),
+                        &record.fast_embedding,
+                        record.quality_embedding.as_deref(),
+                    )?;
+                    consumed[record_idx] = true;
+                    continue;
+                }
+
+                let fast_embedding = fast_index.vector_at_f32(fast_idx)?;
+                let quality_embedding = if let Some(ref quality_index) = existing_quality {
+                    if let Some(&quality_idx) = quality_index_by_doc_id.get(doc_id) {
+                        Some(quality_index.vector_at_f32(quality_idx)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                builder.add_record(
+                    doc_id.to_owned(),
+                    &fast_embedding,
+                    quality_embedding.as_deref(),
+                )?;
+            }
+        }
+
+        for (idx, record) in records.iter().enumerate() {
+            if consumed[idx] {
+                continue;
+            }
             builder.add_record(
                 &record.doc_id,
                 &record.fast_embedding,
@@ -506,6 +595,7 @@ mod tests {
     use frankensearch_core::config::TwoTierConfig;
     use frankensearch_core::error::SearchError;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
+    use frankensearch_index::{VECTOR_INDEX_FAST_FILENAME, VectorIndex};
 
     use super::*;
     use crate::cache::SentinelFileDetector;
@@ -633,12 +723,10 @@ mod tests {
 
     /// Seed an initial index on disk (required for `IndexCache::open`).
     fn seed_index(dir: &Path, dimension: usize) -> TwoTierIndex {
-        let mut builder = TwoTierIndex::create(dir, TwoTierConfig::default()).unwrap();
-        builder.set_fast_embedder_id("stub-fast");
-        // Add a single seed record so the index is valid.
-        let embedding = vec![0.1; dimension];
-        builder.add_fast_record("__seed__", &embedding).unwrap();
-        builder.finish().unwrap()
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let writer = VectorIndex::create(&fast_path, "stub-fast", dimension).unwrap();
+        writer.finish().unwrap();
+        TwoTierIndex::open(dir, TwoTierConfig::default()).unwrap()
     }
 
     fn make_cache(dir: &Path, dimension: usize) -> Arc<IndexCache> {
@@ -814,6 +902,33 @@ mod tests {
             let count = worker.run_cycle(&cx).await.unwrap();
             assert_eq!(count, 3);
             assert_eq!(queue.pending_count(), 2);
+        });
+    }
+
+    #[test]
+    fn incremental_rebuild_preserves_docs_not_in_current_batch() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("preserve-existing");
+            let queue = make_queue(100);
+            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+
+            submit(&queue, "doc-1", "First");
+            submit(&queue, "doc-2", "Second");
+            worker.run_cycle(&cx).await.expect("first cycle");
+
+            submit(&queue, "doc-3", "Third");
+            worker.run_cycle(&cx).await.expect("second cycle");
+
+            let current = cache.current();
+            assert_eq!(
+                current.doc_count(),
+                3,
+                "second incremental cycle must preserve previously indexed docs"
+            );
+            let doc_ids = current.doc_ids();
+            assert!(doc_ids.iter().any(|id| id == "doc-1"));
+            assert!(doc_ids.iter().any(|id| id == "doc-2"));
+            assert!(doc_ids.iter().any(|id| id == "doc-3"));
         });
     }
 
