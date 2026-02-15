@@ -950,5 +950,30 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn append_to_preexisting_empty_file_writes_header() {
+        let path = temp_wal_path("pre-empty");
+        let dim = 3;
+
+        // Create an empty file before calling append_wal_batch.
+        // This simulates the race window the TOCTOU fix addresses:
+        // another process might create the file between our existence
+        // check and our open call.
+        std::fs::File::create(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let entries = vec![WalEntry {
+            doc_id: "doc-0".to_owned(),
+            doc_id_hash: crate::fnv1a_hash(b"doc-0"),
+            embedding: vec![1.0, 2.0, 3.0],
+        }];
+        append_wal_batch(&path, &entries, dim, Quantization::F16, false).unwrap();
+
+        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].doc_id, "doc-0");
+        std::fs::remove_file(&path).ok();
+    }
+
     // ─── bd-vbzm tests end ───
 }
