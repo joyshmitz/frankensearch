@@ -140,13 +140,19 @@ pub fn ips_estimate(
     }
 
     // Compute clipped importance weights.
+    // NaN/non-positive clipping_threshold → fall back to default 100.0.
+    let clip = if config.clipping_threshold.is_finite() && config.clipping_threshold > 0.0 {
+        config.clipping_threshold
+    } else {
+        100.0
+    };
     let weights: Vec<f64> = observations
         .iter()
         .zip(target_propensities.iter())
         .map(|(obs, &target_p)| {
             let logging_p = obs.logging_propensity.max(1e-10); // avoid division by zero
             let w = target_p / logging_p;
-            w.clamp(0.0, config.clipping_threshold)
+            w.clamp(0.0, clip)
         })
         .collect();
 
@@ -234,13 +240,18 @@ pub fn dr_estimate(
     }
 
     // Compute clipped importance weights.
+    let clip = if config.clipping_threshold.is_finite() && config.clipping_threshold > 0.0 {
+        config.clipping_threshold
+    } else {
+        100.0
+    };
     let weights: Vec<f64> = observations
         .iter()
         .zip(target_propensities.iter())
         .map(|(obs, &target_p)| {
             let logging_p = obs.logging_propensity.max(1e-10);
             let w = target_p / logging_p;
-            w.clamp(0.0, config.clipping_threshold)
+            w.clamp(0.0, clip)
         })
         .collect();
 
@@ -603,4 +614,194 @@ mod tests {
         assert!(result.confidence_interval_95 >= 0.0);
         assert!(result.confidence_interval_95.is_finite());
     }
+
+    // ─── bd-zm66 tests begin ───
+
+    #[test]
+    fn ope_config_default_exact_values() {
+        let config = OpeConfig::default();
+        assert!(
+            (config.clipping_threshold - 100.0).abs() < f64::EPSILON,
+            "default clipping_threshold should be 100.0"
+        );
+        assert!(
+            (config.min_effective_sample_size - 10.0).abs() < f64::EPSILON,
+            "default min_effective_sample_size should be 10.0"
+        );
+    }
+
+    #[test]
+    fn logged_observation_debug_format() {
+        let obs = LoggedObservation {
+            query: "test query".into(),
+            doc_id: "doc-42".into(),
+            rank: 3,
+            reward: 0.75,
+            logging_propensity: 0.4,
+        };
+        let debug = format!("{obs:?}");
+        assert!(debug.contains("test query"));
+        assert!(debug.contains("doc-42"));
+        assert!(debug.contains("0.75"));
+        assert!(debug.contains("0.4"));
+    }
+
+    #[test]
+    fn ope_result_debug_format() {
+        let result = OpeResult {
+            estimated_reward: 0.55,
+            effective_sample_size: 42.0,
+            n_observations: 100,
+            reliable: true,
+            confidence_interval_95: 0.03,
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("0.55"));
+        assert!(debug.contains("42"));
+        assert!(debug.contains("100"));
+        assert!(debug.contains("true"));
+    }
+
+    #[test]
+    fn ips_near_zero_logging_propensity_floor() {
+        // logging_propensity = 0.0 should be floored to 1e-10
+        let obs = vec![LoggedObservation {
+            query: "q".into(),
+            doc_id: "d".into(),
+            rank: 0,
+            reward: 1.0,
+            logging_propensity: 0.0, // would cause div-by-zero without floor
+        }];
+        let target_p = vec![0.5];
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        // weight = 0.5 / 1e-10 = 5e9 -> clipped to 100.0
+        assert!(result.estimated_reward.is_finite());
+        assert!((result.estimated_reward - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ips_varying_target_propensities() {
+        // Two observations with different target propensities
+        let obs = vec![
+            LoggedObservation {
+                query: "q1".into(),
+                doc_id: "d1".into(),
+                rank: 0,
+                reward: 1.0,
+                logging_propensity: 0.5,
+            },
+            LoggedObservation {
+                query: "q2".into(),
+                doc_id: "d2".into(),
+                rank: 1,
+                reward: 1.0,
+                logging_propensity: 0.5,
+            },
+        ];
+        let target_p = vec![0.8, 0.2]; // different target propensities
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        // weights: [0.8/0.5=1.6, 0.2/0.5=0.4]
+        // IPS = (1.0*1.6 + 1.0*0.4) / 2 = 1.0
+        assert!((result.estimated_reward - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dr_with_negative_residuals() {
+        // reward < prediction for all observations
+        let obs = vec![
+            LoggedObservation {
+                query: "q1".into(),
+                doc_id: "d1".into(),
+                rank: 0,
+                reward: 0.2,
+                logging_propensity: 0.5,
+            },
+            LoggedObservation {
+                query: "q2".into(),
+                doc_id: "d2".into(),
+                rank: 1,
+                reward: 0.3,
+                logging_propensity: 0.5,
+            },
+        ];
+        let target_p = vec![0.5; 2]; // weight = 1.0
+        let predictions = vec![0.8, 0.9]; // predictions > rewards
+        let config = OpeConfig::default();
+        let result = dr_estimate(&obs, &target_p, &predictions, &config);
+        // DR = (1/2) * sum(pred + 1.0 * (reward - pred))
+        //    = (1/2) * sum(reward)
+        //    = (0.2 + 0.3) / 2 = 0.25
+        assert!(
+            (result.estimated_reward - 0.25).abs() < 1e-10,
+            "DR with negative residuals: {}",
+            result.estimated_reward
+        );
+    }
+
+    #[test]
+    fn dr_confidence_interval_non_negative() {
+        let obs = make_observations(30);
+        let target_p: Vec<f64> = (0..30)
+            .map(|i| (f64::from(i) % 4.0).mul_add(0.1, 0.3))
+            .collect();
+        let predictions: Vec<f64> = obs.iter().map(|o| o.reward * 0.8).collect();
+        let config = OpeConfig::default();
+        let result = dr_estimate(&obs, &target_p, &predictions, &config);
+        assert!(result.confidence_interval_95 >= 0.0);
+        assert!(result.confidence_interval_95.is_finite());
+    }
+
+    #[test]
+    fn ess_two_equal_weights() {
+        let weights = vec![3.0, 3.0];
+        let ess = effective_sample_size(&weights);
+        // ESS = (3+3)^2 / (9+9) = 36/18 = 2.0
+        assert!((ess - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ips_negative_target_propensity_clamped() {
+        // Negative target propensity should be clamped to 0 via clamp(0.0, threshold)
+        let obs = vec![LoggedObservation {
+            query: "q".into(),
+            doc_id: "d".into(),
+            rank: 0,
+            reward: 1.0,
+            logging_propensity: 0.5,
+        }];
+        let target_p = vec![-0.3]; // negative -> weight = -0.6 -> clamped to 0
+        let config = OpeConfig::default();
+        let result = ips_estimate(&obs, &target_p, &config);
+        assert!(
+            result.estimated_reward.abs() < 1e-10,
+            "negative target propensity should yield zero contribution"
+        );
+    }
+
+    #[test]
+    fn ips_weight_exactly_at_clipping_threshold() {
+        // weight = exactly threshold -> NOT clipped (clamp includes upper bound)
+        let obs = vec![LoggedObservation {
+            query: "q".into(),
+            doc_id: "d".into(),
+            rank: 0,
+            reward: 1.0,
+            logging_propensity: 0.1,
+        }];
+        let target_p = vec![1.0]; // weight = 1.0/0.1 = 10.0
+        let config = OpeConfig {
+            clipping_threshold: 10.0,
+            ..Default::default()
+        };
+        let result = ips_estimate(&obs, &target_p, &config);
+        // weight exactly at threshold (10.0), not clipped
+        assert!(
+            (result.estimated_reward - 10.0).abs() < 1e-10,
+            "weight at threshold should not be reduced"
+        );
+    }
+
+    // ─── bd-zm66 tests end ───
 }

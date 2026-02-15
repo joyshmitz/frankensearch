@@ -271,11 +271,10 @@ pub fn normalize_artifact_file_name(file: &str) -> String {
 #[must_use]
 pub fn normalize_replay_command(command: &str) -> String {
     let trimmed = command.trim();
-    let raw = if trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() >= 2 {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
+    let raw = trimmed
+        .strip_prefix('`')
+        .and_then(|s| s.strip_suffix('`'))
+        .unwrap_or(trimmed);
 
     let mut normalized = String::with_capacity(raw.len());
     let mut in_single_quotes = false;

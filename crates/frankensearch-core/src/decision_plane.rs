@@ -160,10 +160,17 @@ impl LossVector {
     /// Weights should sum to 1.0 but this is not enforced.
     #[must_use]
     pub fn weighted_total(&self, w_quality: f64, w_latency: f64, w_resource: f64) -> f64 {
-        self.quality.mul_add(
+        let total = self.quality.mul_add(
             w_quality,
             self.latency.mul_add(w_latency, self.resource * w_resource),
-        )
+        );
+        // NaN from any non-finite field or weight → worst-case loss so
+        // the action is never silently preferred over a valid alternative.
+        if total.is_finite() {
+            total
+        } else {
+            f64::MAX
+        }
     }
 }
 
@@ -1399,4 +1406,145 @@ mod tests {
         assert_eq!(decoded.state, PipelineState::Nominal);
         assert_eq!(decoded.query_class, QueryClass::NaturalLanguage);
     }
+
+    // ─── bd-2jqx tests begin ───
+
+    #[test]
+    fn loss_vector_serde_roundtrip() {
+        let loss = LossVector {
+            quality: 0.42,
+            latency: 0.31,
+            resource: 0.19,
+        };
+        let json = serde_json::to_string(&loss).unwrap();
+        let decoded: LossVector = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, loss);
+    }
+
+    #[test]
+    fn loss_weights_presets_exact_values() {
+        let lf = LossWeights::LATENCY_FIRST;
+        assert!((lf.quality - 0.2).abs() < 1e-10);
+        assert!((lf.latency - 0.6).abs() < 1e-10);
+        assert!((lf.resource - 0.2).abs() < 1e-10);
+
+        let qf = LossWeights::QUALITY_FIRST;
+        assert!((qf.quality - 0.7).abs() < 1e-10);
+        assert!((qf.latency - 0.1).abs() < 1e-10);
+        assert!((qf.resource - 0.2).abs() < 1e-10);
+    }
+
+    #[test]
+    fn resource_usage_default_is_zero() {
+        let usage = ResourceUsage::default();
+        assert_eq!(usage.embed_calls, 0);
+        assert_eq!(usage.rerank_calls, 0);
+        assert_eq!(usage.phase2_ms, 0);
+        assert_eq!(usage.total_ms, 0);
+    }
+
+    #[test]
+    fn resource_usage_serde_roundtrip() {
+        let usage = ResourceUsage {
+            embed_calls: 3,
+            rerank_calls: 1,
+            phase2_ms: 150,
+            total_ms: 320,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let decoded: ResourceUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, usage);
+    }
+
+    #[test]
+    fn evidence_record_without_optional_fields() {
+        let record = EvidenceRecord::new(
+            EvidenceEventType::Alert,
+            ReasonCode::CIRCUIT_OPEN_LATENCY,
+            "High latency detected",
+            Severity::Warn,
+            PipelineState::DegradedQuality,
+            "circuit_breaker",
+        );
+        assert!(record.action.is_none());
+        assert!(record.expected_loss.is_none());
+        assert!(record.query_class.is_none());
+
+        // Should still serialize/deserialize cleanly with None fields.
+        let json = serde_json::to_string(&record).unwrap();
+        let decoded: EvidenceRecord = serde_json::from_str(&json).unwrap();
+        assert!(decoded.action.is_none());
+        assert!(decoded.expected_loss.is_none());
+        assert!(decoded.query_class.is_none());
+    }
+
+    #[test]
+    fn reason_code_with_numbers_and_underscores() {
+        // Numbers in parts are valid.
+        assert!(ReasonCode::new("ns1.sub2.detail3").is_valid());
+        // Underscores in parts are valid.
+        assert!(ReasonCode::new("long_ns.sub_part.detail_code").is_valid());
+        // Hyphens are NOT valid.
+        assert!(!ReasonCode::new("ns.sub.detail-code").is_valid());
+        // Spaces are NOT valid.
+        assert!(!ReasonCode::new("ns.sub.detail code").is_valid());
+    }
+
+    #[test]
+    fn calibration_fallback_reason_serde_roundtrip() {
+        let reasons = [
+            CalibrationFallbackReason::InsufficientData,
+            CalibrationFallbackReason::DistributionShift,
+            CalibrationFallbackReason::ErrorTooHigh,
+            CalibrationFallbackReason::ModelChanged,
+            CalibrationFallbackReason::ManualReset,
+        ];
+        for reason in reasons {
+            let json = serde_json::to_string(&reason).unwrap();
+            let decoded: CalibrationFallbackReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, reason);
+        }
+    }
+
+    #[test]
+    fn exhausted_dimension_returns_first_by_check_order() {
+        let usage = ResourceUsage {
+            embed_calls: 10,
+            rerank_calls: 5,
+            phase2_ms: 400,
+            total_ms: 600,
+        };
+        let budget = ResourceBudget {
+            max_embed_calls: Some(5),
+            max_rerank_calls: Some(3),
+            max_phase2_ms: Some(200),
+            max_total_ms: Some(500),
+        };
+        // All dimensions are exhausted; should return the first checked.
+        assert_eq!(usage.exhausted_dimension(&budget), Some("embed_calls"));
+    }
+
+    #[test]
+    fn pipeline_state_hash_distinct() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(PipelineState::Nominal);
+        set.insert(PipelineState::DegradedQuality);
+        set.insert(PipelineState::CircuitOpen);
+        set.insert(PipelineState::Probing);
+        assert_eq!(set.len(), 4);
+    }
+
+    #[test]
+    fn loss_vector_weighted_total_zero_weights() {
+        let loss = LossVector {
+            quality: 1.0,
+            latency: 1.0,
+            resource: 1.0,
+        };
+        let total = loss.weighted_total(0.0, 0.0, 0.0);
+        assert!(total.abs() < 1e-10);
+    }
+
+    // ─── bd-2jqx tests end ───
 }

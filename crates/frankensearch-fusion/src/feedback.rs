@@ -215,9 +215,8 @@ impl FeedbackCollector {
 
         // Update boost.
         entry.raw_boost += weight * 0.1; // Scale factor to keep boosts reasonable.
-        entry.raw_boost = entry
-            .raw_boost
-            .clamp(self.config.min_boost, self.config.max_boost);
+        let (lo, hi) = self.safe_boost_bounds();
+        entry.raw_boost = entry.raw_boost.clamp(lo, hi);
 
         if is_positive {
             entry.positive_signals = entry.positive_signals.saturating_add(1);
@@ -243,7 +242,8 @@ impl FeedbackCollector {
         map.get(doc_id).map_or(1.0, |entry| {
             let elapsed_hours = (self.elapsed_secs() - entry.last_signal_secs) / 3600.0;
             let effective = self.apply_decay(entry.raw_boost, elapsed_hours);
-            effective.clamp(self.config.min_boost, self.config.max_boost)
+            let (lo, hi) = self.safe_boost_bounds();
+            effective.clamp(lo, hi)
         })
     }
 
@@ -267,7 +267,8 @@ impl FeedbackCollector {
             if let Some(entry) = map.get(doc_id.as_str()) {
                 let elapsed_hours = (now_secs - entry.last_signal_secs) / 3600.0;
                 let effective = self.apply_decay(entry.raw_boost, elapsed_hours);
-                let clamped = effective.clamp(self.config.min_boost, self.config.max_boost);
+                let (lo, hi) = self.safe_boost_bounds();
+                let clamped = effective.clamp(lo, hi);
                 *score *= clamped;
             }
         }
@@ -283,7 +284,15 @@ impl FeedbackCollector {
     pub fn cleanup(&self) -> usize {
         let mut map = self.boost_map.write().expect("feedback boost map poisoned");
         let now_secs = self.elapsed_secs();
-        let threshold = self.config.cleanup_threshold;
+        // NaN cleanup_threshold → retain everything (never cleanup is safer than
+        // always cleanup).
+        let threshold = if self.config.cleanup_threshold.is_finite()
+            && self.config.cleanup_threshold >= 0.0
+        {
+            self.config.cleanup_threshold
+        } else {
+            return 0;
+        };
 
         let before = map.len();
         map.retain(|_, entry| {
@@ -352,6 +361,26 @@ impl FeedbackCollector {
 
     // ─── Internal ─────────────────────────────────────────────────────
 
+    /// Returns `(lo, hi)` boost bounds that are safe for `clamp()`.
+    /// Guards against NaN bounds and inverted min > max (which panics in debug).
+    fn safe_boost_bounds(&self) -> (f64, f64) {
+        let lo = if self.config.min_boost.is_finite() {
+            self.config.min_boost
+        } else {
+            0.5
+        };
+        let hi = if self.config.max_boost.is_finite() {
+            self.config.max_boost
+        } else {
+            2.0
+        };
+        if lo <= hi {
+            (lo, hi)
+        } else {
+            (hi, lo)
+        }
+    }
+
     fn signal_weight(&self, signal: &FeedbackSignal) -> f64 {
         match signal {
             FeedbackSignal::Click { .. } => self.config.signal_weights.click,
@@ -369,7 +398,11 @@ impl FeedbackCollector {
     }
 
     fn apply_decay(&self, raw_boost: f64, elapsed_hours: f64) -> f64 {
-        if elapsed_hours <= 0.0 || self.config.decay_halflife_hours <= 0.0 {
+        if !elapsed_hours.is_finite()
+            || elapsed_hours <= 0.0
+            || !self.config.decay_halflife_hours.is_finite()
+            || self.config.decay_halflife_hours <= 0.0
+        {
             return raw_boost;
         }
         let decay_factor = (-elapsed_hours / self.config.decay_halflife_hours).exp2();
@@ -752,4 +785,159 @@ mod tests {
         assert_eq!(select.doc_id(), "c");
         assert_eq!(skip.doc_id(), "d");
     }
+
+    // ─── bd-1xsz tests begin ───
+
+    #[test]
+    fn apply_boosts_disabled_is_noop() {
+        let fc = FeedbackCollector::with_defaults(); // disabled
+        let mut results = vec![("doc1".to_string(), 0.8), ("doc2".to_string(), 0.7)];
+        fc.apply_boosts(&mut results);
+        assert!((results[0].1 - 0.8).abs() < f64::EPSILON);
+        assert!((results[1].1 - 0.7).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cleanup_empty_returns_zero() {
+        let fc = FeedbackCollector::new(enabled_config());
+        assert_eq!(fc.cleanup(), 0);
+    }
+
+    #[test]
+    fn import_invalid_json_returns_error() {
+        let fc = FeedbackCollector::new(enabled_config());
+        let result = fc.import_boost_map("not json at all {{{");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_accessor_returns_construction_config() {
+        let config = FeedbackConfig {
+            max_boost: 5.0,
+            min_boost: 0.1,
+            ..enabled_config()
+        };
+        let fc = FeedbackCollector::new(config.clone());
+        assert_eq!(fc.config(), &config);
+    }
+
+    #[test]
+    fn apply_boosts_empty_results_is_noop() {
+        let fc = FeedbackCollector::new(enabled_config());
+        fc.record_signal(&FeedbackSignal::Select {
+            doc_id: "doc1".into(),
+        });
+        let mut results: Vec<(String, f64)> = vec![];
+        fc.apply_boosts(&mut results);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn multiple_clicks_accumulate_boost() {
+        let fc = FeedbackCollector::new(enabled_config());
+
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+        let boost_after_one = fc.get_boost("doc1");
+
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+        let boost_after_two = fc.get_boost("doc1");
+
+        assert!(
+            boost_after_two > boost_after_one,
+            "second click should increase boost: {boost_after_two} > {boost_after_one}"
+        );
+    }
+
+    #[test]
+    fn max_entries_allows_update_to_existing_doc() {
+        let config = FeedbackConfig {
+            max_entries: 2,
+            ..enabled_config()
+        };
+        let fc = FeedbackCollector::new(config);
+
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc2".into(),
+            rank: 1,
+        });
+        // Map is full (2 entries).
+        assert_eq!(fc.len(), 2);
+
+        // New doc should be rejected.
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc3".into(),
+            rank: 1,
+        });
+        assert_eq!(fc.len(), 2);
+
+        // Existing doc should still be updatable.
+        let boost_before = fc.get_boost("doc1");
+        fc.record_signal(&FeedbackSignal::Click {
+            doc_id: "doc1".into(),
+            rank: 1,
+        });
+        let boost_after = fc.get_boost("doc1");
+        assert!(
+            boost_after > boost_before,
+            "existing doc update: {boost_after} > {boost_before}"
+        );
+    }
+
+    #[test]
+    fn document_boost_serde_roundtrip() {
+        let boost = DocumentBoost {
+            raw_boost: 1.5,
+            positive_signals: 3,
+            negative_signals: 1,
+            last_signal_secs: 42.0,
+        };
+        let json = serde_json::to_string(&boost).unwrap();
+        let back: DocumentBoost = serde_json::from_str(&json).unwrap();
+        assert!((back.raw_boost - 1.5).abs() < f64::EPSILON);
+        assert_eq!(back.positive_signals, 3);
+        assert_eq!(back.negative_signals, 1);
+    }
+
+    #[test]
+    fn feedback_config_default_values() {
+        let config = FeedbackConfig::default();
+        assert!(!config.enabled);
+        assert!((config.decay_halflife_hours - 168.0).abs() < f64::EPSILON);
+        assert!((config.max_boost - 2.0).abs() < f64::EPSILON);
+        assert!((config.min_boost - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.max_entries, 100_000);
+        assert!((config.cleanup_threshold - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn signal_weights_default_values() {
+        let w = SignalWeights::default();
+        assert!((w.click - 1.0).abs() < f64::EPSILON);
+        assert!((w.dwell_long - 2.0).abs() < f64::EPSILON);
+        assert!((w.select - 3.0).abs() < f64::EPSILON);
+        assert!((w.skip - (-0.5)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn signal_debug_format() {
+        let click = FeedbackSignal::Click {
+            doc_id: "abc".into(),
+            rank: 5,
+        };
+        let debug = format!("{click:?}");
+        assert!(debug.contains("Click"));
+        assert!(debug.contains("abc"));
+    }
+
+    // ─── bd-1xsz tests end ───
 }

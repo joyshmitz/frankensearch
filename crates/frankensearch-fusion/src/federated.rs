@@ -353,10 +353,11 @@ fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
     let k = sanitize_rrf_k(k);
     let mut docs: HashMap<String, AggregateDoc> = HashMap::new();
     for shard in shards {
-        let weight = shard.weight.max(0.0);
-        if weight <= 0.0 {
+        // NaN.max(0.0) propagates NaN — guard explicitly.
+        if !shard.weight.is_finite() || shard.weight <= 0.0 {
             continue;
         }
+        let weight = shard.weight;
 
         for (rank, hit) in shard.hits.iter().enumerate() {
             let contribution = weight * rank_contribution(k, rank);
@@ -382,10 +383,11 @@ fn fuse_weighted(
     let mut docs: HashMap<String, AggregateDoc> = HashMap::new();
 
     for shard in shards {
-        let weight = shard.weight.max(0.0);
-        if weight <= 0.0 || shard.hits.is_empty() {
+        // NaN.max(0.0) propagates NaN — guard explicitly.
+        if !shard.weight.is_finite() || shard.weight <= 0.0 || shard.hits.is_empty() {
             continue;
         }
+        let weight = shard.weight;
 
         let raw_scores: Vec<f32> = shard.hits.iter().map(|hit| hit.score).collect();
         let normalized = normalize_scores_with_method(&raw_scores, normalization);

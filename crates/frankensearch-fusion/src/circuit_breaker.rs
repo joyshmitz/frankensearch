@@ -237,9 +237,22 @@ impl CircuitBreaker {
                 let trip_time = self.last_trip_time_ms.load(Ordering::Acquire);
 
                 if elapsed_ms.saturating_sub(trip_time) >= self.config.half_open_interval_ms {
-                    // Transition Open → HalfOpen for a probe
-                    self.state
-                        .store(CircuitState::HalfOpen as u32, Ordering::Release);
+                    // Transition Open → HalfOpen for a probe.
+                    // Use CAS so exactly one thread wins the race; losers
+                    // fall through to skip (avoiding multiple probe queries).
+                    if self
+                        .state
+                        .compare_exchange(
+                            CircuitState::Open as u32,
+                            CircuitState::HalfOpen as u32,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        self.skip_count.fetch_add(1, Ordering::Relaxed);
+                        return (true, Vec::new());
+                    }
                     self.consecutive_successes.store(0, Ordering::Release);
                     self.probe_count.fetch_add(1, Ordering::Relaxed);
 
@@ -284,6 +297,9 @@ impl CircuitBreaker {
                 tau_improvement,
             } => {
                 *latency_ms > self.config.latency_threshold_ms
+                    // NaN tau_improvement or NaN improvement_threshold → treat as
+                    // failure (we cannot confirm quality tier was useful).
+                    || !tau_improvement.is_finite()
                     || *tau_improvement < self.config.improvement_threshold
             }
             QualityOutcome::Slow { .. }
@@ -417,8 +433,19 @@ impl CircuitBreaker {
     }
 
     fn trip(&self) -> Vec<EvidenceRecord> {
-        self.state
-            .store(CircuitState::Open as u32, Ordering::Release);
+        // CAS Closed→Open: if another thread already tripped, skip duplicate.
+        if self
+            .state
+            .compare_exchange(
+                CircuitState::Closed as u32,
+                CircuitState::Open as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Vec::new();
+        }
         self.last_trip_time_ms
             .store(self.elapsed_ms(), Ordering::Release);
         self.consecutive_failures.store(0, Ordering::Release);
@@ -446,8 +473,19 @@ impl CircuitBreaker {
     }
 
     fn reset(&self) -> Vec<EvidenceRecord> {
-        self.state
-            .store(CircuitState::Closed as u32, Ordering::Release);
+        // CAS HalfOpen→Closed: if another thread already reset, skip duplicate.
+        if self
+            .state
+            .compare_exchange(
+                CircuitState::HalfOpen as u32,
+                CircuitState::Closed as u32,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Vec::new();
+        }
         self.consecutive_failures.store(0, Ordering::Release);
         self.consecutive_successes.store(0, Ordering::Release);
         self.reset_count.fetch_add(1, Ordering::Relaxed);

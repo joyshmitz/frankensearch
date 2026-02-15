@@ -135,6 +135,15 @@ pub async fn rerank_step(
                     score.original_rank
                 );
             }
+            // Guard against NaN/Inf rerank scores — downstream consumers may use
+            // ordinary float comparisons that silently fail on non-finite values.
+            if !score.score.is_finite() {
+                tracing::warn!(
+                    doc_id = %score.doc_id,
+                    "reranker returned non-finite score; skipping"
+                );
+                continue;
+            }
             candidates[candidate_idx].rerank_score = Some(score.score);
             candidates[candidate_idx].source = ScoreSource::Reranked;
         } else {

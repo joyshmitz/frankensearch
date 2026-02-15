@@ -154,6 +154,10 @@ impl PhaseGate {
         self.observations += 1;
 
         let delta = obs.quality_score - obs.fast_score;
+        // NaN delta silently biases toward SkipQuality — discard the observation.
+        if !delta.is_finite() {
+            return Vec::new();
+        }
         let e_factor = self.compute_e_factor(delta, obs.user_signal);
 
         // Clamp e_factor to avoid numerical explosion.
@@ -161,13 +165,15 @@ impl PhaseGate {
         self.e_value *= e_factor;
 
         // Track win counts for diagnostics.
-        if delta > self.config.min_delta {
+        // NaN min_delta → treat as 0.0 (any positive delta is a quality win).
+        let min_delta = sanitize_min_delta(self.config.min_delta);
+        if delta > min_delta {
             self.quality_wins += 1;
         } else {
             self.fast_wins += 1;
         }
 
-        let threshold = 1.0 / self.config.alpha;
+        let threshold = 1.0 / sanitize_alpha(self.config.alpha);
 
         // Check for decision: quality adds value.
         if self.e_value >= threshold {
@@ -252,7 +258,7 @@ impl PhaseGate {
             observations: self.observations,
             quality_wins: self.quality_wins,
             fast_wins: self.fast_wins,
-            threshold: 1.0 / self.config.alpha,
+            threshold: 1.0 / sanitize_alpha(self.config.alpha),
         }
     }
 
@@ -276,7 +282,8 @@ impl PhaseGate {
     /// - `= 1.0` when tied (no evidence)
     fn compute_e_factor(&self, delta: f64, user_signal: Option<bool>) -> f64 {
         // Base e-factor from score delta.
-        let base = if delta.abs() < self.config.min_delta {
+        let min_delta = sanitize_min_delta(self.config.min_delta);
+        let base = if delta.abs() < min_delta {
             // Tie: no evidence.
             1.0
         } else if delta > 0.0 {
@@ -354,6 +361,28 @@ pub struct PhaseGateDiagnostics {
     pub fast_wins: u64,
     /// Decision threshold (1/alpha).
     pub threshold: f64,
+}
+
+// ─── Sanitization Helpers ────────────────────────────────────────────────────
+
+/// Sanitize alpha to a valid significance level in `(0, 1)`.
+/// Returns the default 0.05 for non-finite, zero, negative, or >= 1.0 values.
+fn sanitize_alpha(alpha: f64) -> f64 {
+    if alpha.is_finite() && alpha > 0.0 && alpha < 1.0 {
+        alpha
+    } else {
+        0.05
+    }
+}
+
+/// Sanitize `min_delta` to a non-negative finite value.
+/// Returns 0.0 for NaN, negative, or infinite values (any positive delta is a win).
+fn sanitize_min_delta(min_delta: f64) -> f64 {
+    if min_delta.is_finite() && min_delta >= 0.0 {
+        min_delta
+    } else {
+        0.0
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -776,4 +805,163 @@ mod tests {
         assert!(gate.e_value().is_finite());
         assert!(gate.e_value() <= 100.0);
     }
+
+    // ─── bd-f3la tests begin ───
+
+    #[test]
+    fn phase_decision_serde_roundtrip() {
+        for decision in [PhaseDecision::SkipQuality, PhaseDecision::AlwaysRefine] {
+            let json = serde_json::to_string(&decision).unwrap();
+            let back: PhaseDecision = serde_json::from_str(&json).unwrap();
+            assert_eq!(decision, back);
+        }
+    }
+
+    #[test]
+    fn phase_observation_debug_format() {
+        let obs = PhaseObservation {
+            fast_score: 0.8,
+            quality_score: 0.9,
+            user_signal: Some(true),
+        };
+        let debug = format!("{obs:?}");
+        assert!(debug.contains("PhaseObservation"));
+        assert!(debug.contains("0.8"));
+        assert!(debug.contains("0.9"));
+    }
+
+    #[test]
+    fn should_skip_quality_false_for_always_refine() {
+        let mut gate = PhaseGate::new(test_config());
+
+        // Drive to AlwaysRefine decision.
+        for _ in 0..50 {
+            gate.update(&quality_better_obs(0.5));
+            if gate.decision() == Some(PhaseDecision::AlwaysRefine) {
+                assert!(
+                    !gate.should_skip_quality(),
+                    "AlwaysRefine should NOT skip quality"
+                );
+                return;
+            }
+        }
+        panic!("Expected AlwaysRefine within 50 observations");
+    }
+
+    #[test]
+    fn config_accessor_matches_construction() {
+        let config = PhaseGateConfig {
+            alpha: 0.10,
+            timeout_queries: 200,
+            min_delta: 0.05,
+            enabled: true,
+        };
+        let gate = PhaseGate::new(config.clone());
+        assert_eq!(*gate.config(), config);
+    }
+
+    #[test]
+    fn phase_gate_debug_format() {
+        let gate = PhaseGate::with_defaults();
+        let debug = format!("{gate:?}");
+        assert!(debug.contains("PhaseGate"));
+        assert!(debug.contains("e_value"));
+    }
+
+    #[test]
+    fn timeout_evidence_message_contains_stats() {
+        let config = PhaseGateConfig {
+            timeout_queries: 3,
+            min_delta: 0.001,
+            ..test_config()
+        };
+        let mut gate = PhaseGate::new(config);
+
+        gate.update(&quality_better_obs(0.1));
+        gate.update(&quality_better_obs(0.1));
+        let evidence = gate.update(&quality_better_obs(0.1));
+
+        // If decision was reached before timeout, skip this check.
+        if gate.observations() >= 3 && !evidence.is_empty() {
+            let record = &evidence[0];
+            // Timeout evidence should contain stats in the message.
+            let msg = &record.reason_human;
+            assert!(
+                msg.contains("quality_wins") || msg.contains("always refine"),
+                "expected stats or decision in message: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_evidence_has_transition_event_type() {
+        let mut gate = PhaseGate::new(test_config());
+
+        // Reach a decision first.
+        for _ in 0..50 {
+            gate.update(&quality_better_obs(0.5));
+            if gate.decision().is_some() {
+                break;
+            }
+        }
+        assert!(gate.decision().is_some());
+
+        let evidence = gate.reset();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].event_type, EvidenceEventType::Transition);
+        assert_eq!(evidence[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn small_negative_delta_counted_as_fast_win() {
+        let mut gate = PhaseGate::new(PhaseGateConfig {
+            min_delta: 0.1,
+            ..test_config()
+        });
+
+        // Delta = -0.05, abs(delta) < min_delta → counted as fast win (tie goes to fast).
+        let obs = PhaseObservation {
+            fast_score: 0.55,
+            quality_score: 0.50,
+            user_signal: None,
+        };
+        gate.update(&obs);
+
+        let diag = gate.diagnostics();
+        assert_eq!(diag.fast_wins, 1);
+        assert_eq!(diag.quality_wins, 0);
+        // E-value should stay at 1.0 (tie).
+        assert!((diag.e_value - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn observations_counter_increments_per_update() {
+        let mut gate = PhaseGate::new(test_config());
+        assert_eq!(gate.observations(), 0);
+
+        gate.update(&quality_better_obs(0.1));
+        assert_eq!(gate.observations(), 1);
+
+        gate.update(&fast_better_obs(0.1));
+        assert_eq!(gate.observations(), 2);
+
+        gate.update(&tied_obs());
+        assert_eq!(gate.observations(), 3);
+    }
+
+    #[test]
+    fn quality_wins_fast_wins_accurate_counting() {
+        let mut gate = PhaseGate::new(test_config());
+
+        gate.update(&quality_better_obs(0.2)); // quality wins
+        gate.update(&fast_better_obs(0.2)); // fast wins
+        gate.update(&tied_obs()); // tie → fast wins
+        gate.update(&quality_better_obs(0.3)); // quality wins
+
+        let diag = gate.diagnostics();
+        assert_eq!(diag.quality_wins, 2);
+        assert_eq!(diag.fast_wins, 2); // 1 explicit + 1 tie
+    }
+
+    // ─── bd-f3la tests end ───
 }
