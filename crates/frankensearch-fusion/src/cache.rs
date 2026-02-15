@@ -110,7 +110,11 @@ impl IndexSentinel {
             value: "<serialization>".to_owned(),
             reason: e.to_string(),
         })?;
-        std::fs::write(&path, json)?;
+        {
+            let mut file = std::fs::File::create(&path)?;
+            std::io::Write::write_all(&mut file, json.as_bytes())?;
+            file.sync_all()?;
+        }
         debug!(
             target: "frankensearch.cache",
             path = %path.display(),

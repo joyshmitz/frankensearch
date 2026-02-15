@@ -1159,7 +1159,12 @@ pub fn write_verification_marker(manifest: &ModelManifest, model_dir: &Path) {
     let Ok(json) = serde_json::to_string_pretty(&marker) else {
         return;
     };
-    let _ = fs::write(model_dir.join(VERIFIED_MARKER_FILE), json);
+    let _ = (|| -> std::io::Result<()> {
+        let mut file = File::create(model_dir.join(VERIFIED_MARKER_FILE))?;
+        std::io::Write::write_all(&mut file, json.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
 }
 
 /// Check whether a valid verification marker exists for the given manifest and directory.

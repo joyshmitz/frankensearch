@@ -988,7 +988,7 @@ pub fn write_version_cache(cache: &VersionCheckCache) -> SearchResult<()> {
         subsystem: "fsfs.version_cache.json",
         source: Box::new(e),
     })?;
-    fs::write(&path, json).map_err(|e| SearchError::SubsystemError {
+    write_durable(&path, json).map_err(|e| SearchError::SubsystemError {
         subsystem: "fsfs.version_cache.write",
         source: Box::new(e),
     })?;
@@ -1135,7 +1135,7 @@ pub fn write_rollback_manifest(manifest: &RollbackManifest) -> SearchResult<()> 
         subsystem: "fsfs.backup.json",
         source: Box::new(e),
     })?;
-    fs::write(&path, json).map_err(|e| SearchError::SubsystemError {
+    write_durable(&path, json).map_err(|e| SearchError::SubsystemError {
         subsystem: "fsfs.backup.write",
         source: Box::new(e),
     })?;
@@ -3017,7 +3017,7 @@ impl FsfsRuntime {
                 source: Box::new(source),
             }
         })?;
-        fs::write(path, json)?;
+        write_durable(path, json)?;
         Ok(())
     }
 
@@ -4503,7 +4503,7 @@ impl FsfsRuntime {
                 source: Box::new(error),
             }
         })?;
-        fs::write(index_root.join(FSFS_VECTOR_MANIFEST_FILE), vector_manifest)?;
+        write_durable(index_root.join(FSFS_VECTOR_MANIFEST_FILE), vector_manifest)?;
 
         let lexical_manifest = serde_json::to_string_pretty(manifests).map_err(|error| {
             SearchError::SubsystemError {
@@ -4511,7 +4511,7 @@ impl FsfsRuntime {
                 source: Box::new(error),
             }
         })?;
-        fs::write(
+        write_durable(
             index_root.join(FSFS_LEXICAL_MANIFEST_FILE),
             lexical_manifest,
         )?;
@@ -4531,7 +4531,7 @@ impl FsfsRuntime {
                 source: Box::new(error),
             }
         })?;
-        fs::write(index_root.join(FSFS_SENTINEL_FILE), json)?;
+        write_durable(index_root.join(FSFS_SENTINEL_FILE), json)?;
         Ok(())
     }
 
@@ -5534,6 +5534,16 @@ const fn degradation_controller_config_for_profile(
     DegradationControllerConfig {
         consecutive_healthy_required: anti_flap_readings.saturating_add(extra_recovery_readings),
     }
+}
+
+/// Write `data` to `path` with fsync so the content is durable even under
+/// sudden power loss.  Used for manifest, sentinel, and other metadata files
+/// whose silent loss would leave the index in an inconsistent state.
+fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(data.as_ref())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
