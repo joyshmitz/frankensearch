@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{ErrorKind, Write};
@@ -179,6 +179,9 @@ const FSFS_SENTINEL_FILE: &str = "index_sentinel.json";
 const FSFS_VECTOR_MANIFEST_FILE: &str = "vector/index_manifest.json";
 const FSFS_LEXICAL_MANIFEST_FILE: &str = "lexical/index_manifest.json";
 const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
+const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
+const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
+const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
 
 #[derive(Debug, Clone)]
 struct IndexCandidate {
@@ -188,10 +191,11 @@ struct IndexCandidate {
     ingestion_class: IngestionClass,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexDiscoveryStats {
     discovered_files: usize,
     skipped_files: usize,
+    reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +217,7 @@ struct IndexSentinel {
     discovered_files: usize,
     indexed_files: usize,
     skipped_files: usize,
+    reason_codes: Vec<String>,
     total_canonical_bytes: u64,
     source_hash_hex: String,
 }
@@ -3722,24 +3727,32 @@ impl FsfsRuntime {
         let canonicalize_start = Instant::now();
         let mut manifests = Vec::new();
         let mut documents = Vec::new();
+        let mut observed_reason_codes: BTreeSet<String> =
+            stats.reason_codes.iter().cloned().collect();
         let mut semantic_doc_count = 0_usize;
         let mut content_skipped_files = 0_usize;
         for candidate in candidates {
             let bytes = match fs::read(&candidate.file_path) {
                 Ok(bytes) => bytes,
                 Err(error) if is_ignorable_index_walk_error(&error) => {
+                    if error.kind() == ErrorKind::PermissionDenied {
+                        observed_reason_codes
+                            .insert(REASON_DISCOVERY_FILE_PERMISSION_DENIED.to_owned());
+                    }
                     content_skipped_files = content_skipped_files.saturating_add(1);
                     continue;
                 }
                 Err(error) => return Err(error.into()),
             };
             if is_probably_binary(&bytes) {
+                observed_reason_codes.insert(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_owned());
                 content_skipped_files = content_skipped_files.saturating_add(1);
                 continue;
             }
             let raw_text = String::from_utf8_lossy(&bytes);
             let canonical = canonicalizer.canonicalize(&raw_text);
             if canonical.trim().is_empty() {
+                observed_reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
                 content_skipped_files = content_skipped_files.saturating_add(1);
                 continue;
             }
@@ -3867,6 +3880,7 @@ impl FsfsRuntime {
             discovered_files: stats.discovered_files,
             indexed_files,
             skipped_files,
+            reason_codes: observed_reason_codes.into_iter().collect(),
             total_canonical_bytes,
             source_hash_hex,
         };
@@ -4004,6 +4018,7 @@ impl FsfsRuntime {
     ) -> SearchResult<IndexDiscoveryStats> {
         let mut discovered_files = 0_usize;
         let mut skipped_files = 0_usize;
+        let mut reason_codes = BTreeSet::new();
         let mount_overrides = self.config.discovery.mount_override_map();
         let mount_table = MountTable::new(read_system_mounts(), &mount_overrides);
 
@@ -4039,6 +4054,7 @@ impl FsfsRuntime {
             let Some(file_type) = entry.file_type() else {
                 if path_is_symlink && !self.config.discovery.follow_symlinks {
                     skipped_files = skipped_files.saturating_add(1);
+                    reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
                 }
                 continue;
             };
@@ -4052,10 +4068,12 @@ impl FsfsRuntime {
             let entry_path = entry.path().to_path_buf();
             if entry_path.starts_with(index_root) {
                 skipped_files = skipped_files.saturating_add(1);
+                reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
                 continue;
             }
             if path_is_symlink && !self.config.discovery.follow_symlinks {
                 skipped_files = skipped_files.saturating_add(1);
+                reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
                 continue;
             }
 
@@ -4066,12 +4084,13 @@ impl FsfsRuntime {
             };
 
             discovered_files = discovered_files.saturating_add(1);
-            let mut candidate = DiscoveryCandidate::new(&entry_path, metadata.len())
-                .with_symlink(path_is_symlink);
+            let mut candidate =
+                DiscoveryCandidate::new(&entry_path, metadata.len()).with_symlink(path_is_symlink);
             if let Some((mount_entry, _policy)) = mount_table.lookup(&entry_path) {
                 candidate = candidate.with_mount_category(mount_entry.category);
             }
             let decision = self.config.discovery.evaluate_candidate(&candidate);
+            reason_codes.extend(decision.reason_codes.iter().cloned());
             if !matches!(decision.scope, DiscoveryScopeDecision::Include)
                 || !decision.ingestion_class.is_indexed()
             {
@@ -4096,6 +4115,7 @@ impl FsfsRuntime {
         Ok(IndexDiscoveryStats {
             discovered_files,
             skipped_files,
+            reason_codes: reason_codes.into_iter().collect(),
         })
     }
 
@@ -6415,6 +6435,7 @@ mod tests {
             discovered_files: 1,
             indexed_files: 1,
             skipped_files: 0,
+            reason_codes: vec!["test.reason".to_owned()],
             total_canonical_bytes: 21,
             source_hash_hex: "feedface".to_owned(),
         };

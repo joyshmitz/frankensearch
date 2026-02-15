@@ -238,7 +238,7 @@ mod tests {
     use frankensearch_core::traits::l2_normalize;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Test double: counts how many times embed() is called.
+    /// Test double: counts how many times `embed()` is called.
     struct CountingEmbedder {
         dim: usize,
         calls: AtomicUsize,
@@ -273,11 +273,11 @@ mod tests {
             self.dim
         }
 
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "counting-test"
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "Counting Test Embedder"
         }
 
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn delegates_trait_methods_to_inner() {
         let inner = Arc::new(CountingEmbedder::new(64));
-        let cached = CachedEmbedder::new(inner.clone(), 16);
+        let cached = CachedEmbedder::new(inner, 16);
 
         assert_eq!(cached.dimension(), 64);
         assert_eq!(cached.id(), "counting-test");
@@ -418,8 +418,10 @@ mod tests {
             cached.embed(&cx, "same").await.unwrap();
             assert_eq!(inner.call_count(), 1);
             assert_eq!(cached.cache_stats().entries, 1);
+            // Re-embed same query — should be a cache hit, not a duplicate insert
+            cached.embed(&cx, "same").await.unwrap();
+            assert_eq!(inner.call_count(), 1);
+            assert_eq!(cached.cache_stats().entries, 1);
         });
-        // Manually verify the internal state didn't double-insert
-        assert_eq!(cached.cache_stats().entries, 1);
     }
 }

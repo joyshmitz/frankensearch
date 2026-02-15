@@ -1,7 +1,15 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use frankensearch_core::{
+    ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY,
+    E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody, ExitStatus, ManifestBody,
+    ModelVersion, Platform, ReplayBody, ReplayEventType, Suite, build_artifact_entries,
+    render_artifacts_index, sha256_checksum, validate_event_envelope, validate_manifest_envelope,
+};
 use frankensearch_fsfs::interaction_primitives::{
     InteractionBudget, InteractionCycleTiming, InteractionSnapshot, LatencyBucket, LatencyPhase,
     PhaseTiming, ScreenAction, SearchInteractionDispatch, SearchInteractionEvent,
@@ -44,6 +52,27 @@ struct ReplayFailureArtifact {
     mismatch_index: usize,
     snapshot_ref: String,
     replay_command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DeluxeTuiUnifiedE2eBundle {
+    manifest: E2eEnvelope<ManifestBody>,
+    events: Vec<E2eEnvelope<EventBody>>,
+    replay: Vec<E2eEnvelope<ReplayBody>>,
+}
+
+const DELUXE_TUI_RUN_ID: &str = "01JAH9A2W8F8Q6GQ4C7M3N2P2S";
+const DELUXE_TUI_TS: &str = "2026-02-14T00:00:06Z";
+const DELUXE_TUI_LANE_ID: &str = "tui.deluxe";
+const DELUXE_TUI_REASON_START: &str = "e2e.tui.scenario_start";
+const DELUXE_TUI_REASON_PASS: &str = "e2e.tui.scenario_pass";
+const DELUXE_TUI_REASON_REPLAY_MISMATCH: &str = "e2e.tui.replay_mismatch";
+const DELUXE_TUI_ARTIFACT_FILE: &str = "deluxe_tui_artifact.json";
+const DELUXE_TUI_REPLAY_FAILURE_FILE: &str = "deluxe_tui_replay_failure.json";
+
+#[inline]
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).expect("test counters must fit in u32"))
 }
 
 const fn mode_label(mode: DegradedRetrievalMode) -> &'static str {
@@ -180,6 +209,325 @@ fn replay_failure_artifact(
         snapshot_ref: snapshot_ref.to_owned(),
         replay_command: replay_command.to_owned(),
     })
+}
+
+fn render_events_jsonl(events: &[E2eEnvelope<EventBody>]) -> String {
+    events
+        .iter()
+        .map(|event| serde_json::to_string(event).expect("event envelope serialization must work"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_deluxe_tui_unified_bundle(
+    scenario: &str,
+    artifact: &DeluxeTuiE2eArtifact,
+    failure: Option<&ReplayFailureArtifact>,
+) -> DeluxeTuiUnifiedE2eBundle {
+    let failed = failure.is_some();
+    let outcome = if failed {
+        E2eOutcome::Fail
+    } else {
+        E2eOutcome::Pass
+    };
+    let exit_status = if failed {
+        ExitStatus::Fail
+    } else {
+        ExitStatus::Pass
+    };
+    let reason_code = if failed {
+        DELUXE_TUI_REASON_REPLAY_MISMATCH
+    } else {
+        DELUXE_TUI_REASON_PASS
+    };
+
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "action_count".to_owned(),
+        usize_to_f64(artifact.action_trace.len()),
+    );
+    metrics.insert(
+        "snapshot_count".to_owned(),
+        usize_to_f64(artifact.snapshots.len()),
+    );
+    metrics.insert(
+        "viewport_height".to_owned(),
+        usize_to_f64(artifact.viewport_height),
+    );
+    if let Some(replay_failure) = failure {
+        metrics.insert(
+            "mismatch_index".to_owned(),
+            usize_to_f64(replay_failure.mismatch_index),
+        );
+    }
+
+    let event_bodies = vec![
+        EventBody {
+            event_type: E2eEventType::E2eStart,
+            correlation: Correlation {
+                event_id: String::new(),
+                root_request_id: String::new(),
+                parent_event_id: None,
+            },
+            severity: E2eSeverity::Info,
+            lane_id: None,
+            oracle_id: None,
+            outcome: None,
+            reason_code: Some(DELUXE_TUI_REASON_START.to_owned()),
+            context: Some(format!("starting {scenario}")),
+            metrics: None,
+        },
+        EventBody {
+            event_type: E2eEventType::LaneStart,
+            correlation: Correlation {
+                event_id: String::new(),
+                root_request_id: String::new(),
+                parent_event_id: None,
+            },
+            severity: E2eSeverity::Info,
+            lane_id: Some(DELUXE_TUI_LANE_ID.to_owned()),
+            oracle_id: None,
+            outcome: None,
+            reason_code: Some(DELUXE_TUI_REASON_START.to_owned()),
+            context: Some("drive deterministic deluxe TUI interaction snapshots".to_owned()),
+            metrics: Some(metrics.clone()),
+        },
+        EventBody {
+            event_type: E2eEventType::Assertion,
+            correlation: Correlation {
+                event_id: String::new(),
+                root_request_id: String::new(),
+                parent_event_id: None,
+            },
+            severity: if failed {
+                E2eSeverity::Warn
+            } else {
+                E2eSeverity::Info
+            },
+            lane_id: None,
+            oracle_id: Some("tui.replay_consistency".to_owned()),
+            outcome: Some(outcome),
+            reason_code: Some(reason_code.to_owned()),
+            context: Some("verify deterministic replay + snapshot checksums".to_owned()),
+            metrics: Some(metrics),
+        },
+        EventBody {
+            event_type: E2eEventType::LaneEnd,
+            correlation: Correlation {
+                event_id: String::new(),
+                root_request_id: String::new(),
+                parent_event_id: None,
+            },
+            severity: if failed {
+                E2eSeverity::Warn
+            } else {
+                E2eSeverity::Info
+            },
+            lane_id: Some(DELUXE_TUI_LANE_ID.to_owned()),
+            oracle_id: None,
+            outcome: Some(outcome),
+            reason_code: Some(reason_code.to_owned()),
+            context: None,
+            metrics: None,
+        },
+        EventBody {
+            event_type: E2eEventType::E2eEnd,
+            correlation: Correlation {
+                event_id: String::new(),
+                root_request_id: String::new(),
+                parent_event_id: None,
+            },
+            severity: if failed {
+                E2eSeverity::Warn
+            } else {
+                E2eSeverity::Info
+            },
+            lane_id: None,
+            oracle_id: None,
+            outcome: Some(outcome),
+            reason_code: Some(reason_code.to_owned()),
+            context: None,
+            metrics: None,
+        },
+    ];
+
+    let events: Vec<E2eEnvelope<EventBody>> = event_bodies
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut event)| {
+            event.correlation = Correlation {
+                event_id: format!("{scenario}-evt-{index:02}"),
+                root_request_id: format!("{scenario}-root"),
+                parent_event_id: None,
+            };
+            E2eEnvelope::new(E2E_SCHEMA_EVENT, DELUXE_TUI_RUN_ID, DELUXE_TUI_TS, event)
+        })
+        .collect();
+
+    let mut replay = vec![
+        E2eEnvelope::new(
+            E2E_SCHEMA_REPLAY,
+            DELUXE_TUI_RUN_ID,
+            DELUXE_TUI_TS,
+            ReplayBody {
+                replay_type: ReplayEventType::Query,
+                offset_ms: 0,
+                seq: 1,
+                payload: serde_json::json!({
+                    "scenario": scenario,
+                    "mode": artifact.mode,
+                    "viewport_height": artifact.viewport_height,
+                }),
+            },
+        ),
+        E2eEnvelope::new(
+            E2E_SCHEMA_REPLAY,
+            DELUXE_TUI_RUN_ID,
+            DELUXE_TUI_TS,
+            ReplayBody {
+                replay_type: ReplayEventType::Signal,
+                offset_ms: 1,
+                seq: 2,
+                payload: serde_json::json!({
+                    "action_trace": artifact.action_trace,
+                    "snapshot_refs": artifact
+                        .snapshots
+                        .iter()
+                        .map(|snapshot| snapshot.snapshot_ref.clone())
+                        .collect::<Vec<_>>(),
+                }),
+            },
+        ),
+    ];
+    if let Some(replay_failure) = failure {
+        replay.push(E2eEnvelope::new(
+            E2E_SCHEMA_REPLAY,
+            DELUXE_TUI_RUN_ID,
+            DELUXE_TUI_TS,
+            ReplayBody {
+                replay_type: ReplayEventType::Signal,
+                offset_ms: 2,
+                seq: 3,
+                payload: serde_json::to_value(replay_failure)
+                    .expect("replay failure artifact should serialize"),
+            },
+        ));
+    }
+
+    let artifact_json =
+        serde_json::to_string(artifact).expect("deluxe tui artifact should serialize");
+    let replay_failure_json = failure
+        .map(|item| serde_json::to_string(item).expect("replay failure artifact should serialize"));
+    let structured_events_jsonl = render_events_jsonl(&events);
+    #[allow(clippy::cast_possible_truncation)]
+    let event_count = u64::try_from(events.len()).expect("event count must fit in u64");
+
+    let mut artifact_inputs = vec![
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+            bytes: structured_events_jsonl.as_bytes(),
+            line_count: Some(event_count),
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+            bytes: artifact.replay_command.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: DELUXE_TUI_ARTIFACT_FILE,
+            bytes: artifact_json.as_bytes(),
+            line_count: None,
+        },
+    ];
+    if let Some(payload) = replay_failure_json.as_ref() {
+        artifact_inputs.push(ArtifactEmissionInput {
+            file: DELUXE_TUI_REPLAY_FAILURE_FILE,
+            bytes: payload.as_bytes(),
+            line_count: None,
+        });
+    }
+
+    let mut artifacts =
+        build_artifact_entries(artifact_inputs).expect("deluxe tui artifact entries must validate");
+    let artifacts_index_json =
+        render_artifacts_index(&artifacts).expect("artifacts index payload must render");
+    artifacts.push(ArtifactEntry {
+        file: E2E_ARTIFACT_ARTIFACTS_INDEX_JSON.to_owned(),
+        checksum: sha256_checksum(artifacts_index_json.as_bytes()),
+        line_count: None,
+    });
+    artifacts.sort_by(|left, right| left.file.cmp(&right.file));
+
+    let manifest = E2eEnvelope::new(
+        E2E_SCHEMA_MANIFEST,
+        DELUXE_TUI_RUN_ID,
+        DELUXE_TUI_TS,
+        ManifestBody {
+            suite: Suite::Fsfs,
+            determinism_tier: DeterminismTier::BitExact,
+            seed: 73,
+            config_hash: format!("tui.replay.{}", sha256_checksum(artifact_json.as_bytes())),
+            index_version: Some("fsfs-deluxe-tui-e2e-v1".to_owned()),
+            model_versions: vec![
+                ModelVersion {
+                    name: "potion-128M".to_owned(),
+                    revision: "contract-v1".to_owned(),
+                    digest: None,
+                },
+                ModelVersion {
+                    name: "all-MiniLM-L6-v2".to_owned(),
+                    revision: "contract-v1".to_owned(),
+                    digest: None,
+                },
+            ],
+            platform: Platform {
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
+                rustc: "nightly-2026-02-14".to_owned(),
+            },
+            clock_mode: ClockMode::Simulated,
+            tie_break_policy: "doc_id_lexical".to_owned(),
+            artifacts,
+            duration_ms: 120,
+            exit_status,
+        },
+    );
+
+    DeluxeTuiUnifiedE2eBundle {
+        manifest,
+        events,
+        replay,
+    }
+}
+
+fn assert_deluxe_tui_unified_bundle_is_valid(
+    bundle: &DeluxeTuiUnifiedE2eBundle,
+    expected_reason_code: &str,
+) {
+    validate_manifest_envelope(&bundle.manifest).expect("manifest should satisfy validator");
+    for event in &bundle.events {
+        validate_event_envelope(event).expect("event should satisfy validator");
+    }
+    assert!(bundle.events.iter().any(|event| {
+        event
+            .body
+            .reason_code
+            .as_deref()
+            .is_some_and(|reason| reason == expected_reason_code)
+    }));
+
+    let artifact_files: Vec<&str> = bundle
+        .manifest
+        .body
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.file.as_str())
+        .collect();
+    assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
+    assert!(artifact_files.contains(&DELUXE_TUI_ARTIFACT_FILE));
 }
 
 fn run_scenario(
@@ -335,6 +683,19 @@ fn scenario_tui_search_navigation_explain_flow_is_replayable() {
 
     let replayed = replay_roundtrip_events(&first.replay_json);
     assert_eq!(replayed.len(), 3);
+
+    let bundle = build_deluxe_tui_unified_bundle(
+        "scenario_tui_search_navigation_explain_flow_is_replayable",
+        &first,
+        None,
+    );
+    let bundle_again = build_deluxe_tui_unified_bundle(
+        "scenario_tui_search_navigation_explain_flow_is_replayable",
+        &second,
+        None,
+    );
+    assert_eq!(bundle, bundle_again);
+    assert_deluxe_tui_unified_bundle_is_valid(&bundle, DELUXE_TUI_REASON_PASS);
 }
 
 #[test]
@@ -441,4 +802,19 @@ fn scenario_tui_replay_failures_emit_reproducible_artifacts() {
     let decoded: ReplayFailureArtifact =
         serde_json::from_str(&serialized).expect("artifact should round-trip");
     assert_eq!(decoded, failure);
+
+    let failure_bundle = build_deluxe_tui_unified_bundle(scenario, &artifact, Some(&failure));
+    let failure_bundle_again =
+        build_deluxe_tui_unified_bundle(scenario, &artifact, Some(&failure_again));
+    assert_eq!(failure_bundle, failure_bundle_again);
+    assert_deluxe_tui_unified_bundle_is_valid(&failure_bundle, DELUXE_TUI_REASON_REPLAY_MISMATCH);
+
+    let artifact_files: Vec<&str> = failure_bundle
+        .manifest
+        .body
+        .artifacts
+        .iter()
+        .map(|item| item.file.as_str())
+        .collect();
+    assert!(artifact_files.contains(&DELUXE_TUI_REPLAY_FAILURE_FILE));
 }

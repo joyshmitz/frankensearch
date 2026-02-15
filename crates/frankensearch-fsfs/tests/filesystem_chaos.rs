@@ -76,6 +76,8 @@ struct IndexSentinel {
     indexed: usize,
     #[serde(rename = "skipped_files")]
     skipped: usize,
+    #[serde(default)]
+    reason_codes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +277,7 @@ fn assert_binary_chaos_result(
     scenario_id: &str,
     expected_reason: &str,
     min_skipped: usize,
+    required_sentinel_reason_codes: &[&str],
     expect_zero_indexed: bool,
     expected_manifest_reason: Option<&str>,
     expect_manifest_empty: bool,
@@ -308,6 +311,17 @@ fn assert_binary_chaos_result(
             result.sentinel.indexed >= 1,
             "expected at least one indexed file for {scenario_id}, got sentinel={:?}",
             result.sentinel
+        );
+    }
+    for expected_code in required_sentinel_reason_codes {
+        assert!(
+            result
+                .sentinel
+                .reason_codes
+                .iter()
+                .any(|code| code == expected_code),
+            "expected sentinel reason code {expected_code} for {scenario_id}, got {:?}",
+            result.sentinel.reason_codes
         );
     }
 
@@ -406,10 +420,16 @@ fn scenario_cli_chaos_binary_blob_skip() {
 
 #[test]
 fn scenario_cli_chaos_permission_denied_binary_run() {
+    let required_reasons: Vec<&str> = if cfg!(unix) {
+        vec!["discovery.file.permission_denied"]
+    } else {
+        Vec::new()
+    };
     assert_binary_chaos_result(
         "cli-chaos-permission-denied",
         CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
         1,
+        &required_reasons,
         false,
         Some("index.plan.full_semantic_lexical"),
         false,
@@ -422,6 +442,7 @@ fn scenario_cli_chaos_symlink_loop_binary_run() {
         "cli-chaos-symlink-loop",
         CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP,
         0,
+        &["discovery.file.excluded"],
         false,
         Some("index.plan.full_semantic_lexical"),
         false,
@@ -434,6 +455,7 @@ fn scenario_cli_chaos_mount_boundary_binary_run() {
         "cli-chaos-mount-boundary",
         CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY,
         1,
+        &["discovery.root.rejected"],
         true,
         None,
         true,
@@ -446,6 +468,7 @@ fn scenario_cli_chaos_giant_log_skip_binary_run() {
         "cli-chaos-giant-log-skip",
         CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
         1,
+        &["discovery.file.too_large"],
         false,
         Some("index.plan.full_semantic_lexical"),
         false,
@@ -458,6 +481,7 @@ fn scenario_cli_chaos_binary_blob_skip_binary_run() {
         "cli-chaos-binary-blob-skip",
         CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED,
         1,
+        &["discovery.file.binary_blocked"],
         false,
         Some("index.plan.full_semantic_lexical"),
         false,

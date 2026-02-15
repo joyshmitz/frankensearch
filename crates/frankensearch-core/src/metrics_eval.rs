@@ -517,7 +517,7 @@ pub fn quality_comparison(
 pub struct RunStabilityVerdict {
     /// Whether the run is stable enough for meaningful comparison.
     pub stable: bool,
-    /// Coefficient of variation (std_dev / mean). `None` if mean is zero.
+    /// Coefficient of variation (`std_dev` / mean). `None` if mean is zero.
     pub cv: Option<f64>,
     /// Number of samples after outlier removal (if trimming was applied).
     pub effective_sample_count: usize,
@@ -566,8 +566,8 @@ pub fn detect_outliers_iqr(samples: &[f64], iqr_factor: f64) -> Vec<usize> {
     let q3 = percentile_sorted(&sorted, 0.75);
     let iqr = q3 - q1;
 
-    let lower_fence = q1 - iqr_factor * iqr;
-    let upper_fence = q3 + iqr_factor * iqr;
+    let lower_fence = iqr_factor.mul_add(-iqr, q1);
+    let upper_fence = iqr_factor.mul_add(iqr, q3);
 
     let mut outliers: Vec<usize> = samples
         .iter()
@@ -1259,5 +1259,214 @@ mod tests {
             cmp.metrics.len(),
             "TSV data rows should match metric count"
         );
+    }
+
+    // ─── Coefficient of Variation ───────────────────────────────────────
+
+    #[test]
+    fn cv_stable_samples() {
+        let samples = vec![100.0, 101.0, 99.0, 100.5, 99.5];
+        let cv = coefficient_of_variation(&samples).unwrap();
+        assert!(cv < 0.01, "stable samples should have low CV, got {cv}");
+    }
+
+    #[test]
+    fn cv_high_variance_samples() {
+        let samples = vec![10.0, 100.0, 50.0, 200.0, 5.0];
+        let cv = coefficient_of_variation(&samples).unwrap();
+        assert!(cv > 0.5, "high-variance samples should have high CV, got {cv}");
+    }
+
+    #[test]
+    fn cv_returns_none_for_empty() {
+        assert!(coefficient_of_variation(&[]).is_none());
+    }
+
+    #[test]
+    fn cv_returns_none_for_zero_mean() {
+        let samples = vec![-1.0, 1.0, -1.0, 1.0];
+        assert!(
+            coefficient_of_variation(&samples).is_none(),
+            "CV undefined when mean is zero"
+        );
+    }
+
+    #[test]
+    fn cv_identical_values_is_zero() {
+        let samples = vec![42.0; 10];
+        let cv = coefficient_of_variation(&samples).unwrap();
+        assert!(cv.abs() < 1e-10, "identical values should have CV=0, got {cv}");
+    }
+
+    #[test]
+    fn cv_single_sample() {
+        let cv = coefficient_of_variation(&[5.0]).unwrap();
+        assert!(cv.abs() < 1e-10, "single sample should have CV=0, got {cv}");
+    }
+
+    // ─── IQR Outlier Detection ──────────────────────────────────────────
+
+    #[test]
+    fn iqr_detects_clear_outlier() {
+        let samples = vec![10.0, 11.0, 10.5, 10.2, 10.8, 100.0];
+        let outliers = detect_outliers_iqr(&samples, 1.5);
+        assert_eq!(outliers, vec![5], "index 5 (value 100.0) should be an outlier");
+    }
+
+    #[test]
+    fn iqr_no_outliers_in_tight_distribution() {
+        let samples = vec![50.0, 51.0, 49.0, 50.5, 49.5, 50.2];
+        let outliers = detect_outliers_iqr(&samples, 1.5);
+        assert!(outliers.is_empty(), "tight distribution should have no outliers");
+    }
+
+    #[test]
+    fn iqr_returns_empty_for_small_samples() {
+        assert!(detect_outliers_iqr(&[1.0, 2.0, 3.0], 1.5).is_empty());
+        assert!(detect_outliers_iqr(&[1.0, 2.0], 1.5).is_empty());
+        assert!(detect_outliers_iqr(&[1.0], 1.5).is_empty());
+        assert!(detect_outliers_iqr(&[], 1.5).is_empty());
+    }
+
+    #[test]
+    fn iqr_detects_both_low_and_high_outliers() {
+        let samples = vec![1.0, 49.0, 50.0, 51.0, 50.5, 49.5, 200.0];
+        let outliers = detect_outliers_iqr(&samples, 1.5);
+        assert!(outliers.contains(&0), "index 0 (value 1.0) should be a low outlier");
+        assert!(
+            outliers.contains(&6),
+            "index 6 (value 200.0) should be a high outlier"
+        );
+    }
+
+    #[test]
+    fn iqr_stricter_factor_catches_more() {
+        let samples = vec![10.0, 11.0, 10.5, 10.2, 10.8, 14.0, 7.0];
+        let mild = detect_outliers_iqr(&samples, 1.5);
+        let strict = detect_outliers_iqr(&samples, 0.5);
+        assert!(
+            strict.len() >= mild.len(),
+            "stricter factor should catch at least as many outliers"
+        );
+    }
+
+    #[test]
+    fn iqr_invalid_factor_returns_empty() {
+        let samples = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!(detect_outliers_iqr(&samples, f64::NAN).is_empty());
+        assert!(detect_outliers_iqr(&samples, f64::INFINITY).is_empty());
+        assert!(detect_outliers_iqr(&samples, -1.0).is_empty());
+    }
+
+    // ─── Trim Outliers ──────────────────────────────────────────────────
+
+    #[test]
+    fn trim_removes_outlier_values() {
+        let samples = vec![10.0, 11.0, 10.5, 10.2, 10.8, 100.0];
+        let trimmed = trim_outliers(&samples, 1.5);
+        assert!(!trimmed.contains(&100.0), "outlier should be removed");
+        assert_eq!(trimmed.len(), 5);
+    }
+
+    #[test]
+    fn trim_preserves_order() {
+        let samples = vec![10.0, 11.0, 10.5, 10.2, 10.8, 100.0];
+        let trimmed = trim_outliers(&samples, 1.5);
+        assert_eq!(trimmed, vec![10.0, 11.0, 10.5, 10.2, 10.8]);
+    }
+
+    #[test]
+    fn trim_returns_all_when_no_outliers() {
+        let samples = vec![50.0, 51.0, 49.0, 50.5];
+        let trimmed = trim_outliers(&samples, 1.5);
+        assert_eq!(trimmed, samples);
+    }
+
+    #[test]
+    fn trim_returns_all_for_small_samples() {
+        let samples = vec![1.0, 100.0, 50.0];
+        let trimmed = trim_outliers(&samples, 1.5);
+        assert_eq!(trimmed, samples, "fewer than 4 samples should not be trimmed");
+    }
+
+    // ─── Run Stability Verdict ──────────────────────────────────────────
+
+    #[test]
+    fn stability_passes_for_tight_distribution() {
+        // Values within a 1% range — no IQR outliers at k=1.5.
+        let samples = vec![
+            100.0, 100.3, 100.1, 100.4, 100.2, 100.5, 100.15, 100.35, 100.25, 100.45,
+        ];
+        let verdict = verify_run_stability(&samples, 0.05, 5);
+        assert!(verdict.stable, "tight distribution should pass: {}", verdict.reason);
+        assert_eq!(verdict.outlier_count, 0);
+        assert_eq!(verdict.effective_sample_count, 10);
+        assert!(verdict.cv.unwrap() < 0.05);
+    }
+
+    #[test]
+    fn stability_fails_for_high_cv() {
+        let samples = vec![10.0, 50.0, 100.0, 5.0, 200.0, 15.0, 80.0, 45.0];
+        let verdict = verify_run_stability(&samples, 0.05, 3);
+        assert!(!verdict.stable, "high-variance run should fail stability");
+        assert!(verdict.reason.contains("coefficient of variation"));
+    }
+
+    #[test]
+    fn stability_fails_for_too_few_samples_after_trimming() {
+        // 10 inliers + 2 extreme outliers. IQR detects the 2 outliers,
+        // leaving 10 effective samples. Require min_samples=11 to trigger fail.
+        let samples = vec![
+            10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 999.0, 1000.0,
+        ];
+        let verdict = verify_run_stability(&samples, 0.10, 11);
+        assert!(
+            !verdict.stable,
+            "should fail when effective samples < min after trimming: {}",
+            verdict.reason
+        );
+        assert!(verdict.reason.contains("insufficient samples"));
+        assert_eq!(verdict.outlier_count, 2);
+        assert_eq!(verdict.effective_sample_count, 10);
+    }
+
+    #[test]
+    fn stability_fails_for_empty_samples() {
+        let verdict = verify_run_stability(&[], 0.10, 5);
+        assert!(!verdict.stable);
+        assert!(verdict.reason.contains("no samples"));
+    }
+
+    #[test]
+    fn stability_passes_after_outlier_removal() {
+        let mut samples = vec![100.0, 101.0, 99.0, 100.5, 99.5, 100.2, 99.8, 100.1, 99.9];
+        samples.push(999.0);
+        let verdict = verify_run_stability(&samples, 0.05, 5);
+        assert!(
+            verdict.stable,
+            "should pass after removing the outlier: {}",
+            verdict.reason
+        );
+        assert_eq!(verdict.outlier_count, 1);
+        assert_eq!(verdict.effective_sample_count, 9);
+    }
+
+    #[test]
+    fn stability_cv_none_for_zero_mean_passes() {
+        let samples = vec![0.0; 10];
+        let verdict = verify_run_stability(&samples, 0.05, 5);
+        assert!(verdict.stable, "zero-mean, zero-variance should pass");
+        assert!(verdict.cv.is_none());
+    }
+
+    #[test]
+    fn stability_verdict_reports_diagnostics() {
+        let samples = vec![10.0, 10.1, 10.2, 10.3, 10.4, 10.5, 10.6, 10.7];
+        let verdict = verify_run_stability(&samples, 0.10, 5);
+        assert!(verdict.stable);
+        assert!(verdict.cv.is_some());
+        assert_eq!(verdict.effective_sample_count, 8);
+        assert_eq!(verdict.outlier_count, 0);
+        assert!(verdict.reason.is_empty(), "stable verdict should have empty reason");
     }
 }

@@ -106,8 +106,9 @@ pub use host_adapter::{
 };
 pub use metrics_eval::{
     BootstrapCi, BootstrapComparison, QualityComparison, QualityMetric, QualityMetricComparison,
-    QualityMetricSamples, bootstrap_ci, bootstrap_compare, map_at_k, mrr, ndcg_at_k,
-    quality_comparison, recall_at_k,
+    QualityMetricSamples, RunStabilityVerdict, bootstrap_ci, bootstrap_compare,
+    coefficient_of_variation, detect_outliers_iqr, map_at_k, mrr, ndcg_at_k, quality_comparison,
+    recall_at_k, trim_outliers, verify_run_stability,
 };
 pub use observability_lint::{
     LintFinding, LintReport, LintRuleId, LintSeverity, lint_component_coverage, lint_record,
