@@ -28,7 +28,7 @@ use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::host_adapter::HostAdapter;
+use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, Reranker};
 use frankensearch_core::types::{
@@ -36,9 +36,10 @@ use frankensearch_core::types::{
     SearchPhase, VectorHit,
 };
 use frankensearch_core::{
-    EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LiveSearchFrame,
-    LiveSearchStreamEmitter, RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase,
-    SearchStreamHealth, TelemetryCorrelation, TelemetryInstance,
+    EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
+    LifecycleState, LiveSearchFrame, LiveSearchStreamEmitter, ResourceCollectorSample,
+    RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase, SearchStreamHealth,
+    TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
 };
 use frankensearch_embed::CachedEmbedder;
 use frankensearch_index::TwoTierIndex;
@@ -281,6 +282,22 @@ impl TwoTierSearcher {
             .as_ref()
             .map(|_| next_telemetry_identifier("root"));
         let mut telemetry_initial_event_id: Option<String> = None;
+        let mut telemetry_last_event_id: Option<String> = None;
+        let search_started_at = Instant::now();
+
+        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+            self.emit_host_lifecycle_hook(&AdapterLifecycleEvent::SessionStart {
+                ts: telemetry_timestamp_now(),
+            });
+            telemetry_last_event_id = self.emit_lifecycle_telemetry(
+                root_request_id,
+                None,
+                LifecycleState::Started,
+                LifecycleSeverity::Info,
+                None,
+                Some(0),
+            );
+        }
 
         // Phase 1: Initial (fast tier).
         let phase1_start = Instant::now();
@@ -302,6 +319,16 @@ impl TwoTierSearcher {
             Ok(results) => results,
             Err(err) => {
                 self.export_error(&err);
+                if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                    self.emit_session_stop_telemetry(
+                        root_request_id,
+                        telemetry_last_event_id.clone(),
+                        LifecycleState::Degraded,
+                        LifecycleSeverity::Error,
+                        Some(err.to_string()),
+                        search_started_at.elapsed(),
+                    );
+                }
                 return Err(err);
             }
         };
@@ -323,6 +350,16 @@ impl TwoTierSearcher {
                 initial_latency,
                 root_request_id,
                 None,
+            );
+            if telemetry_initial_event_id.is_some() {
+                telemetry_last_event_id = telemetry_initial_event_id.clone();
+            }
+            self.emit_phase_health_telemetry(
+                root_request_id,
+                telemetry_initial_event_id
+                    .clone()
+                    .or_else(|| telemetry_last_event_id.clone()),
+                search_started_at.elapsed(),
             );
         }
 
@@ -371,7 +408,7 @@ impl TwoTierSearcher {
                     metrics.skip_reason = Some(timeout_error.to_string());
                     self.export_error(&timeout_error);
                     if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
-                        let _ = self.emit_search_telemetry(
+                        let refinement_failed_event_id = self.emit_search_telemetry(
                             semantic_query,
                             query_class,
                             SearchEventPhase::RefinementFailed,
@@ -381,6 +418,14 @@ impl TwoTierSearcher {
                             phase2_latency,
                             root_request_id,
                             telemetry_initial_event_id.clone(),
+                        );
+                        if let Some(event_id) = &refinement_failed_event_id {
+                            telemetry_last_event_id = Some(event_id.clone());
+                        }
+                        self.emit_phase_health_telemetry(
+                            root_request_id,
+                            refinement_failed_event_id.or_else(|| telemetry_last_event_id.clone()),
+                            search_started_at.elapsed(),
                         );
                     }
                     on_phase(SearchPhase::RefinementFailed {
@@ -395,7 +440,7 @@ impl TwoTierSearcher {
                         let refined_count = refined_results.len();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
-                            let _ = self.emit_search_telemetry(
+                            let refined_event_id = self.emit_search_telemetry(
                                 semantic_query,
                                 query_class,
                                 SearchEventPhase::Refined,
@@ -405,6 +450,14 @@ impl TwoTierSearcher {
                                 phase2_latency,
                                 root_request_id,
                                 telemetry_initial_event_id.clone(),
+                            );
+                            if let Some(event_id) = &refined_event_id {
+                                telemetry_last_event_id = Some(event_id.clone());
+                            }
+                            self.emit_phase_health_telemetry(
+                                root_request_id,
+                                refined_event_id.or_else(|| telemetry_last_event_id.clone()),
+                                search_started_at.elapsed(),
                             );
                         }
                         self.export_search_metrics(query_class, &metrics, refined_count, true);
@@ -425,6 +478,16 @@ impl TwoTierSearcher {
                         });
                     }
                     Err(SearchError::Cancelled { phase, reason }) => {
+                        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+                            self.emit_session_stop_telemetry(
+                                root_request_id,
+                                telemetry_last_event_id.clone(),
+                                LifecycleState::Degraded,
+                                LifecycleSeverity::Warn,
+                                Some(format!("cancelled:{phase}:{reason}")),
+                                search_started_at.elapsed(),
+                            );
+                        }
                         return Err(SearchError::Cancelled { phase, reason });
                     }
                     Err(err) => {
@@ -433,7 +496,7 @@ impl TwoTierSearcher {
                         metrics.skip_reason = Some(format!("{err}"));
                         self.export_error(&err);
                         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
-                            let _ = self.emit_search_telemetry(
+                            let refinement_failed_event_id = self.emit_search_telemetry(
                                 semantic_query,
                                 query_class,
                                 SearchEventPhase::RefinementFailed,
@@ -443,6 +506,15 @@ impl TwoTierSearcher {
                                 phase2_latency,
                                 root_request_id,
                                 telemetry_initial_event_id.clone(),
+                            );
+                            if let Some(event_id) = &refinement_failed_event_id {
+                                telemetry_last_event_id = Some(event_id.clone());
+                            }
+                            self.emit_phase_health_telemetry(
+                                root_request_id,
+                                refinement_failed_event_id
+                                    .or_else(|| telemetry_last_event_id.clone()),
+                                search_started_at.elapsed(),
                             );
                         }
                         on_phase(SearchPhase::RefinementFailed {
@@ -459,6 +531,17 @@ impl TwoTierSearcher {
             metrics.skip_reason = Some("fast_only".to_owned());
         } else {
             metrics.skip_reason = Some("no_quality_embedder".to_owned());
+        }
+
+        if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+            self.emit_session_stop_telemetry(
+                root_request_id,
+                telemetry_last_event_id,
+                LifecycleState::Stopped,
+                LifecycleSeverity::Info,
+                metrics.skip_reason.clone(),
+                search_started_at.elapsed(),
+            );
         }
 
         Ok(metrics)
@@ -1028,6 +1111,139 @@ impl TwoTierSearcher {
         }
 
         Some(event_id)
+    }
+
+    fn emit_host_lifecycle_hook(&self, event: &AdapterLifecycleEvent) {
+        let Some(host_adapter) = self.host_adapter.as_ref() else {
+            return;
+        };
+        if let Err(err) = host_adapter.on_lifecycle_event(event) {
+            self.export_error(&err);
+            tracing::warn!(error = %err, "host adapter lifecycle hook failed");
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_lifecycle_telemetry(
+        &self,
+        root_request_id: &str,
+        parent_event_id: Option<String>,
+        state: LifecycleState,
+        severity: LifecycleSeverity,
+        reason: Option<String>,
+        uptime_ms: Option<u64>,
+    ) -> Option<String> {
+        let host_adapter = self.host_adapter.as_ref()?;
+
+        let event_id = next_telemetry_identifier("evt");
+        let telemetry_instance = telemetry_instance_for_adapter(host_adapter.as_ref());
+        let telemetry_correlation = TelemetryCorrelation {
+            event_id: event_id.clone(),
+            root_request_id: root_request_id.to_owned(),
+            parent_event_id,
+        };
+        let envelope = TelemetryEnvelope::new(
+            telemetry_timestamp_now(),
+            TelemetryEvent::Lifecycle {
+                instance: telemetry_instance,
+                correlation: telemetry_correlation,
+                state,
+                severity,
+                reason,
+                uptime_ms,
+            },
+        );
+
+        if let Err(err) = host_adapter.emit_telemetry(&envelope) {
+            self.export_error(&err);
+            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+        }
+
+        Some(event_id)
+    }
+
+    fn emit_resource_telemetry(
+        &self,
+        root_request_id: &str,
+        parent_event_id: Option<String>,
+    ) -> Option<String> {
+        let host_adapter = self.host_adapter.as_ref()?;
+
+        let event_id = next_telemetry_identifier("evt");
+        let telemetry_instance = telemetry_instance_for_adapter(host_adapter.as_ref());
+        let telemetry_correlation = TelemetryCorrelation {
+            event_id: event_id.clone(),
+            root_request_id: root_request_id.to_owned(),
+            parent_event_id,
+        };
+        let envelope = self.runtime_metrics_collector.emit_resource(
+            telemetry_timestamp_now(),
+            telemetry_instance,
+            telemetry_correlation,
+            ResourceCollectorSample {
+                cpu_pct: 0.0,
+                rss_bytes: 0,
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+                interval_ms: self
+                    .runtime_metrics_collector
+                    .config()
+                    .collection_interval_ms,
+                load_avg_1m: None,
+                pressure_profile: None,
+            },
+        );
+
+        if let Err(err) = host_adapter.emit_telemetry(&envelope) {
+            self.export_error(&err);
+            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+        }
+
+        Some(event_id)
+    }
+
+    fn emit_phase_health_telemetry(
+        &self,
+        root_request_id: &str,
+        parent_event_id: Option<String>,
+        uptime: Duration,
+    ) {
+        self.emit_host_lifecycle_hook(&AdapterLifecycleEvent::HealthTick {
+            ts: telemetry_timestamp_now(),
+        });
+        let uptime_ms = Some(u64::try_from(uptime.as_millis()).unwrap_or(u64::MAX));
+        let _ = self.emit_lifecycle_telemetry(
+            root_request_id,
+            parent_event_id.clone(),
+            LifecycleState::Healthy,
+            LifecycleSeverity::Info,
+            None,
+            uptime_ms,
+        );
+        let _ = self.emit_resource_telemetry(root_request_id, parent_event_id);
+    }
+
+    fn emit_session_stop_telemetry(
+        &self,
+        root_request_id: &str,
+        parent_event_id: Option<String>,
+        state: LifecycleState,
+        severity: LifecycleSeverity,
+        reason: Option<String>,
+        uptime: Duration,
+    ) {
+        self.emit_host_lifecycle_hook(&AdapterLifecycleEvent::SessionStop {
+            ts: telemetry_timestamp_now(),
+        });
+        let uptime_ms = Some(u64::try_from(uptime.as_millis()).unwrap_or(u64::MAX));
+        let _ = self.emit_lifecycle_telemetry(
+            root_request_id,
+            parent_event_id,
+            state,
+            severity,
+            reason,
+            uptime_ms,
+        );
     }
 }
 
@@ -1603,6 +1819,10 @@ mod tests {
 
         fn telemetry_events(&self) -> Vec<TelemetryEnvelope> {
             self.telemetry.lock().expect("telemetry lock").clone()
+        }
+
+        fn lifecycle_events(&self) -> Vec<AdapterLifecycleEvent> {
+            self.lifecycle.lock().expect("lifecycle lock").clone()
         }
     }
 
@@ -2754,6 +2974,100 @@ mod tests {
 
             let snapshot = searcher.runtime_metrics_collector.snapshot();
             assert_eq!(snapshot.embedding_events_emitted, 2);
+        });
+    }
+
+    #[test]
+    fn host_adapter_receives_lifecycle_and_resource_events_with_runtime_hooks() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
+
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality)
+                .with_host_adapter(adapter.clone());
+
+            let _ = searcher
+                .search(&cx, "lifecycle telemetry", 5, |_| None, |_| {})
+                .await
+                .expect("search should succeed");
+
+            let emitted = adapter.telemetry_events();
+            let lifecycle_events: Vec<_> = emitted
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    TelemetryEvent::Lifecycle {
+                        correlation,
+                        state,
+                        severity,
+                        uptime_ms,
+                        ..
+                    } => Some((correlation, state, severity, uptime_ms)),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                lifecycle_events.len() >= 3,
+                "expected start/health/stop lifecycle telemetry events"
+            );
+            assert!(lifecycle_events.iter().any(|(_, state, severity, _)| {
+                **state == LifecycleState::Started && **severity == LifecycleSeverity::Info
+            }));
+            assert!(
+                lifecycle_events
+                    .iter()
+                    .any(|(_, state, severity, uptime_ms)| {
+                        **state == LifecycleState::Stopped
+                            && **severity == LifecycleSeverity::Info
+                            && uptime_ms.is_some()
+                    })
+            );
+            assert!(
+                lifecycle_events
+                    .iter()
+                    .any(|(_, state, _, _)| **state == LifecycleState::Healthy)
+            );
+
+            let resource_events: Vec<_> = emitted
+                .iter()
+                .filter_map(|envelope| match &envelope.event {
+                    TelemetryEvent::Resource { sample, .. } => Some(sample),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !resource_events.is_empty(),
+                "expected resource telemetry from phase health emission"
+            );
+            assert!(
+                resource_events.iter().all(|sample| sample.interval_ms > 0),
+                "resource interval should always be non-zero"
+            );
+            assert!(resource_events.iter().all(|sample| {
+                sample.cpu_pct.is_finite() && (0.0..=100.0).contains(&sample.cpu_pct)
+            }));
+            let collector_snapshot = searcher.runtime_metrics_collector.snapshot();
+            assert!(
+                collector_snapshot.resource_events_emitted >= 1,
+                "phase health should emit at least one resource event"
+            );
+
+            let lifecycle_hooks = adapter.lifecycle_events();
+            assert!(matches!(
+                lifecycle_hooks.first(),
+                Some(AdapterLifecycleEvent::SessionStart { .. })
+            ));
+            assert!(
+                lifecycle_hooks
+                    .iter()
+                    .any(|event| matches!(event, AdapterLifecycleEvent::HealthTick { .. }))
+            );
+            assert!(matches!(
+                lifecycle_hooks.last(),
+                Some(AdapterLifecycleEvent::SessionStop { .. })
+            ));
         });
     }
 
