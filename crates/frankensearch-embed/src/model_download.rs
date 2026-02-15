@@ -963,6 +963,209 @@ mod tests {
         assert!(second.is_dir());
     }
 
+    // ─── bd-r476 tests begin ───
+
+    #[test]
+    fn response_content_length_found() {
+        let headers = vec![("Content-Length".to_owned(), "42".to_owned())];
+        assert_eq!(response_content_length(&headers), Some(42));
+    }
+
+    #[test]
+    fn response_content_length_missing() {
+        let headers = vec![("X-Custom".to_owned(), "value".to_owned())];
+        assert_eq!(response_content_length(&headers), None);
+    }
+
+    #[test]
+    fn response_content_length_invalid_value() {
+        let headers = vec![("Content-Length".to_owned(), "not-a-number".to_owned())];
+        assert_eq!(response_content_length(&headers), None);
+    }
+
+    #[test]
+    fn response_content_length_case_insensitive() {
+        let headers = vec![("content-length".to_owned(), "100".to_owned())];
+        assert_eq!(response_content_length(&headers), Some(100));
+
+        let headers_upper = vec![("CONTENT-LENGTH".to_owned(), "200".to_owned())];
+        assert_eq!(response_content_length(&headers_upper), Some(200));
+    }
+
+    #[test]
+    fn response_content_length_trims_whitespace() {
+        let headers = vec![("Content-Length".to_owned(), "  300  ".to_owned())];
+        assert_eq!(response_content_length(&headers), Some(300));
+    }
+
+    #[test]
+    fn sha256_digest_hex_known_empty() {
+        // SHA-256 of empty data
+        let hash = sha256_hex(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_digest_hex_always_64_chars() {
+        let hash = sha256_hex(b"test");
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sha256_digest_hex_lowercase() {
+        let hash = sha256_hex(b"ABC");
+        // Hex should be lowercase
+        assert_eq!(hash, hash.to_lowercase());
+    }
+
+    #[test]
+    fn format_bytes_boundary_values() {
+        // Just below KB
+        assert_eq!(format_bytes(1023), "1023 B");
+        // Exactly KB
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        // Just below MB
+        let near_mb = 1024 * 1024 - 1;
+        let fmt_kb = format_bytes(near_mb);
+        assert!(fmt_kb.contains("KB"));
+        // Exactly MB
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        // Just below GB
+        let near_gb = 1024 * 1024 * 1024 - 1;
+        let fmt_mb = format_bytes(near_gb);
+        assert!(fmt_mb.contains("MB"));
+        // Exactly GB
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
+    }
+
+    #[test]
+    fn format_bytes_large_values() {
+        let ten_gb = 10 * 1024 * 1024 * 1024_u64;
+        let result = format_bytes(ten_gb);
+        assert!(result.contains("GB"));
+        assert!(result.contains("10.0"));
+    }
+
+    #[test]
+    fn temp_file_guard_armed_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("temp.bin");
+        std::fs::write(&path, b"data").unwrap();
+        assert!(path.exists());
+        {
+            let _guard = TempFileGuard::new(path.clone());
+            // guard drops here, armed=true
+        }
+        assert!(!path.exists(), "armed guard should remove file on drop");
+    }
+
+    #[test]
+    fn temp_file_guard_disarmed_does_not_clean_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.bin");
+        std::fs::write(&path, b"data").unwrap();
+        assert!(path.exists());
+        {
+            let mut guard = TempFileGuard::new(path.clone());
+            guard.disarm();
+            // guard drops here, armed=false
+        }
+        assert!(path.exists(), "disarmed guard should leave file intact");
+    }
+
+    #[test]
+    fn temp_file_guard_armed_nonexistent_file_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.bin");
+        {
+            let _guard = TempFileGuard::new(path);
+            // guard drops on nonexistent file — should not panic
+        }
+    }
+
+    #[test]
+    fn download_progress_debug() {
+        let progress = DownloadProgress {
+            file_name: "model.onnx".to_owned(),
+            bytes_downloaded: 0,
+            total_bytes: Some(100),
+            files_completed: 0,
+            files_total: 1,
+            speed_bytes_per_sec: 0.0,
+            eta_seconds: None,
+        };
+        let debug = format!("{progress:?}");
+        assert!(debug.contains("DownloadProgress"));
+        assert!(debug.contains("model.onnx"));
+    }
+
+    #[test]
+    fn download_progress_clone() {
+        let progress = DownloadProgress {
+            file_name: "file.bin".to_owned(),
+            bytes_downloaded: 42,
+            total_bytes: Some(100),
+            files_completed: 1,
+            files_total: 2,
+            speed_bytes_per_sec: 1000.0,
+            eta_seconds: Some(0.058),
+        };
+        #[allow(clippy::redundant_clone)]
+        let cloned = progress.clone();
+        assert_eq!(cloned.file_name, "file.bin");
+        assert_eq!(cloned.bytes_downloaded, 42);
+        assert_eq!(cloned.total_bytes, Some(100));
+        assert_eq!(cloned.files_completed, 1);
+        assert_eq!(cloned.files_total, 2);
+    }
+
+    #[test]
+    fn download_config_clone_and_debug() {
+        let config = DownloadConfig::default();
+        let cloned = config.clone();
+        assert_eq!(cloned.max_retries, config.max_retries);
+        assert_eq!(cloned.user_agent, config.user_agent);
+        let debug = format!("{config:?}");
+        assert!(debug.contains("DownloadConfig"));
+        assert!(debug.contains("max_retries"));
+    }
+
+    #[test]
+    fn model_downloader_with_defaults_creates_valid_instance() {
+        let _downloader = ModelDownloader::with_defaults();
+    }
+
+    #[test]
+    fn download_progress_display_zero_total_bytes_no_percent() {
+        let progress = DownloadProgress {
+            file_name: "test.bin".to_owned(),
+            bytes_downloaded: 500,
+            total_bytes: Some(0),
+            files_completed: 0,
+            files_total: 1,
+            speed_bytes_per_sec: 0.0,
+            eta_seconds: None,
+        };
+        let display = progress.to_string();
+        // total_bytes=0 is filtered out, so no percentage
+        assert!(!display.contains('%'));
+    }
+
+    #[test]
+    fn create_unique_staging_dir_creates_parent_if_needed() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("deeply").join("nested").join("dir");
+        let result = create_unique_staging_dir(&nested).expect("should create nested dir");
+        assert!(result.is_dir());
+        assert!(nested.is_dir());
+    }
+
+    // ─── bd-r476 tests end ───
+
     #[test]
     fn download_model_rejects_non_production_ready_manifest() {
         let mut manifest = ModelManifest::minilm_v2();

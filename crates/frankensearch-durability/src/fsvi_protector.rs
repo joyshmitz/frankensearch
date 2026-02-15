@@ -622,4 +622,301 @@ mod tests {
         let _ = std::fs::remove_file(&sidecar);
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
     }
+
+    // ─── bd-c2u4 tests begin ───
+
+    #[test]
+    fn sidecar_path_nested_dirs() {
+        let path = PathBuf::from("/a/b/c/deep/index.fsvi");
+        assert_eq!(
+            FsviProtector::sidecar_path(&path),
+            PathBuf::from("/a/b/c/deep/index.fsvi.fec")
+        );
+    }
+
+    #[test]
+    fn sidecar_path_relative() {
+        let path = PathBuf::from("data/my.fsvi");
+        assert_eq!(
+            FsviProtector::sidecar_path(&path),
+            PathBuf::from("data/my.fsvi.fec")
+        );
+    }
+
+    #[test]
+    fn sidecar_path_multiple_dots() {
+        let path = PathBuf::from("/tmp/index.fast.v2.fsvi");
+        assert_eq!(
+            FsviProtector::sidecar_path(&path),
+            PathBuf::from("/tmp/index.fast.v2.fsvi.fec")
+        );
+    }
+
+    #[test]
+    fn sidecar_path_bare_name() {
+        let path = PathBuf::from("index.fsvi");
+        assert_eq!(
+            FsviProtector::sidecar_path(&path),
+            PathBuf::from("index.fsvi.fec")
+        );
+    }
+
+    #[test]
+    fn fsvi_verify_result_eq_intact() {
+        assert_eq!(FsviVerifyResult::Intact, FsviVerifyResult::Intact);
+    }
+
+    #[test]
+    fn fsvi_verify_result_eq_no_sidecar() {
+        assert_eq!(FsviVerifyResult::NoSidecar, FsviVerifyResult::NoSidecar);
+    }
+
+    #[test]
+    fn fsvi_verify_result_eq_corrupted_same() {
+        assert_eq!(
+            FsviVerifyResult::Corrupted { repairable: true },
+            FsviVerifyResult::Corrupted { repairable: true }
+        );
+    }
+
+    #[test]
+    fn fsvi_verify_result_ne_corrupted_different_repairable() {
+        assert_ne!(
+            FsviVerifyResult::Corrupted { repairable: true },
+            FsviVerifyResult::Corrupted { repairable: false }
+        );
+    }
+
+    #[test]
+    fn fsvi_verify_result_ne_different_variants() {
+        assert_ne!(FsviVerifyResult::Intact, FsviVerifyResult::NoSidecar);
+        assert_ne!(
+            FsviVerifyResult::Intact,
+            FsviVerifyResult::Corrupted { repairable: true }
+        );
+    }
+
+    #[test]
+    fn fsvi_verify_result_clone() {
+        let original = FsviVerifyResult::Corrupted { repairable: true };
+        let cloned = original;
+        assert_eq!(original, cloned);
+    }
+
+    #[test]
+    fn fsvi_verify_result_debug() {
+        let intact_debug = format!("{:?}", FsviVerifyResult::Intact);
+        assert!(intact_debug.contains("Intact"));
+
+        let corrupted_debug = format!("{:?}", FsviVerifyResult::Corrupted { repairable: false });
+        assert!(corrupted_debug.contains("Corrupted"));
+        assert!(corrupted_debug.contains("repairable"));
+    }
+
+    #[test]
+    fn fsvi_protection_result_clone() {
+        let result = super::FsviProtectionResult {
+            sidecar_path: PathBuf::from("/tmp/test.fec"),
+            source_size: 1000,
+            repair_size: 200,
+            overhead_ratio: 0.2,
+            k_source: 4,
+            r_repair: 4,
+            source_hash: 12345,
+            encode_time: std::time::Duration::from_millis(5),
+        };
+        #[allow(clippy::redundant_clone)]
+        let cloned = result.clone();
+        assert_eq!(cloned.source_size, 1000);
+        assert_eq!(cloned.k_source, 4);
+        assert_eq!(cloned.source_hash, 12345);
+    }
+
+    #[test]
+    fn fsvi_repair_result_clone() {
+        let result = super::FsviRepairResult {
+            bytes_written: 500,
+            symbols_used: 3,
+            decode_time: std::time::Duration::from_millis(10),
+            source_hash_before: 111,
+            source_hash_after: 222,
+        };
+        #[allow(clippy::redundant_clone)]
+        let cloned = result.clone();
+        assert_eq!(cloned.bytes_written, 500);
+        assert_eq!(cloned.symbols_used, 3);
+        assert_eq!(cloned.source_hash_before, 111);
+        assert_eq!(cloned.source_hash_after, 222);
+    }
+
+    #[test]
+    fn repair_no_sidecar_returns_error() {
+        let protector = make_protector();
+        let path = temp_path("repair-no-sidecar");
+
+        std::fs::write(&path, b"some data").expect("write");
+
+        let err = protector.repair(&path);
+        assert!(err.is_err());
+        let err_str = format!("{}", err.unwrap_err());
+        assert!(err_str.contains("no .fec sidecar"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verify_and_repair_no_sidecar_returns_false() {
+        let protector = make_protector();
+        let path = temp_path("vandr-no-sidecar");
+
+        std::fs::write(&path, b"payload").expect("write");
+
+        let result = protector.verify_and_repair(&path).expect("should succeed");
+        assert!(!result, "no sidecar should return Ok(false)");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn protect_result_has_valid_k_and_r() {
+        let protector = make_protector();
+        let path = temp_path("k-and-r");
+
+        std::fs::write(&path, vec![42_u8; 1024]).expect("write");
+        let result = protector.protect_atomic(&path).expect("protect");
+
+        assert!(result.k_source > 0, "k_source must be positive");
+        assert!(result.r_repair > 0, "r_repair must be positive");
+        assert!(result.source_size == 1024);
+        assert!(result.source_hash != 0);
+        assert!(!result.encode_time.is_zero() || result.encode_time == std::time::Duration::ZERO);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&result.sidecar_path);
+    }
+
+    #[test]
+    fn protect_empty_file_zero_overhead() {
+        let protector = make_protector();
+        let path = temp_path("empty-file");
+
+        std::fs::write(&path, b"").expect("write empty");
+        let result = protector.protect_atomic(&path).expect("protect");
+
+        assert_eq!(result.source_size, 0);
+        // overhead_ratio should be 0.0 when source_size is 0
+        assert!(
+            (result.overhead_ratio - 0.0).abs() < f32::EPSILON,
+            "empty file should have 0.0 overhead_ratio"
+        );
+
+        let sidecar = FsviProtector::sidecar_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    #[test]
+    fn repair_result_hashes_differ_on_corruption() {
+        let protector = make_protector();
+        let path = temp_path("hash-diff");
+
+        let payload = vec![77_u8; 600];
+        std::fs::write(&path, &payload).expect("write");
+        let protection = protector.protect_atomic(&path).expect("protect");
+
+        // Corrupt
+        std::fs::write(&path, vec![0_u8; 600]).expect("corrupt");
+
+        let repair = protector.repair(&path).expect("repair");
+        assert_ne!(
+            repair.source_hash_before, repair.source_hash_after,
+            "corrupted vs repaired hashes should differ"
+        );
+        assert!(repair.bytes_written > 0);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&protection.sidecar_path);
+        let backup = PathBuf::from(format!("{}.corrupted", path.display()));
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn protect_different_payloads_produce_different_hashes() {
+        let protector = make_protector();
+        let path = temp_path("diff-hash");
+
+        std::fs::write(&path, vec![1_u8; 500]).expect("write 1");
+        let result1 = protector.protect_atomic(&path).expect("protect 1");
+        let hash1 = result1.source_hash;
+
+        std::fs::write(&path, vec![2_u8; 500]).expect("write 2");
+        let result2 = protector.protect_atomic(&path).expect("protect 2");
+        let hash2 = result2.source_hash;
+
+        assert_ne!(
+            hash1, hash2,
+            "different payloads should produce different hashes"
+        );
+
+        let sidecar = FsviProtector::sidecar_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
+    }
+
+    #[test]
+    fn metrics_count_after_multiple_protect() {
+        let protector = make_protector();
+        let path = temp_path("multi-metrics");
+
+        std::fs::write(&path, vec![10_u8; 256]).expect("write");
+        protector.protect_atomic(&path).expect("protect 1");
+        protector.protect_atomic(&path).expect("protect 2");
+        protector.protect_atomic(&path).expect("protect 3");
+
+        let snap = protector.metrics_snapshot();
+        assert!(
+            snap.encode_ops >= 3,
+            "expected at least 3 encode ops, got {}",
+            snap.encode_ops
+        );
+
+        let sidecar = FsviProtector::sidecar_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&sidecar);
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
+    }
+
+    #[test]
+    fn fsvi_protection_result_debug() {
+        let result = super::FsviProtectionResult {
+            sidecar_path: PathBuf::from("/tmp/t.fec"),
+            source_size: 100,
+            repair_size: 20,
+            overhead_ratio: 0.2,
+            k_source: 1,
+            r_repair: 1,
+            source_hash: 999,
+            encode_time: std::time::Duration::from_nanos(500),
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("FsviProtectionResult"));
+        assert!(debug.contains("source_size"));
+    }
+
+    #[test]
+    fn fsvi_repair_result_debug() {
+        let result = super::FsviRepairResult {
+            bytes_written: 100,
+            symbols_used: 2,
+            decode_time: std::time::Duration::from_millis(1),
+            source_hash_before: 1,
+            source_hash_after: 2,
+        };
+        let debug = format!("{result:?}");
+        assert!(debug.contains("FsviRepairResult"));
+        assert!(debug.contains("bytes_written"));
+    }
+
+    // ─── bd-c2u4 tests end ───
 }

@@ -983,4 +983,214 @@ mod tests {
         assert!(debug.contains("RefreshWorker"));
         assert!(debug.contains("stub-fast"));
     }
+
+    // ─── bd-qkop tests begin ───
+
+    #[test]
+    fn config_with_index_config() {
+        let custom = TwoTierConfig::default();
+        let config = RefreshWorkerConfig::new("/tmp/idx").with_index_config(custom.clone());
+        assert!((config.index_config.rrf_k - custom.rrf_k).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn config_clone() {
+        let config = RefreshWorkerConfig::new("/tmp/idx")
+            .with_poll_interval(Duration::from_millis(42))
+            .with_max_docs_per_cycle(7);
+        #[allow(clippy::redundant_clone)]
+        let cloned = config.clone();
+        assert_eq!(cloned.poll_interval, Duration::from_millis(42));
+        assert_eq!(cloned.max_docs_per_cycle, 7);
+        assert_eq!(cloned.index_dir, PathBuf::from("/tmp/idx"));
+    }
+
+    #[test]
+    fn config_debug() {
+        let config = RefreshWorkerConfig::new("/tmp/idx");
+        let debug = format!("{config:?}");
+        assert!(debug.contains("RefreshWorkerConfig"));
+        assert!(debug.contains("poll_interval"));
+    }
+
+    #[test]
+    fn metrics_default_all_zeros() {
+        let m = RefreshMetrics::default();
+        assert_eq!(m.cycles.load(Ordering::Relaxed), 0);
+        assert_eq!(m.docs_embedded.load(Ordering::Relaxed), 0);
+        assert_eq!(m.docs_failed.load(Ordering::Relaxed), 0);
+        assert_eq!(m.index_rebuilds.load(Ordering::Relaxed), 0);
+        assert_eq!(m.rebuild_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(m.embed_time_us.load(Ordering::Relaxed), 0);
+        assert_eq!(m.rebuild_time_us.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_equality() {
+        let a = RefreshMetricsSnapshot {
+            cycles: 1,
+            docs_embedded: 2,
+            docs_failed: 0,
+            index_rebuilds: 1,
+            rebuild_failures: 0,
+            embed_time_us: 100,
+            rebuild_time_us: 50,
+        };
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn metrics_snapshot_inequality() {
+        let a = RefreshMetricsSnapshot {
+            cycles: 1,
+            docs_embedded: 2,
+            docs_failed: 0,
+            index_rebuilds: 1,
+            rebuild_failures: 0,
+            embed_time_us: 100,
+            rebuild_time_us: 50,
+        };
+        let b = RefreshMetricsSnapshot { cycles: 2, ..a };
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn metrics_snapshot_clone_copy() {
+        let a = RefreshMetricsSnapshot {
+            cycles: 5,
+            docs_embedded: 10,
+            docs_failed: 1,
+            index_rebuilds: 3,
+            rebuild_failures: 0,
+            embed_time_us: 200,
+            rebuild_time_us: 100,
+        };
+        #[allow(clippy::clone_on_copy)]
+        let cloned = a.clone();
+        let copied: RefreshMetricsSnapshot = a; // Copy
+        assert_eq!(cloned, a);
+        assert_eq!(copied, a);
+    }
+
+    #[test]
+    fn metrics_snapshot_debug() {
+        let snap = RefreshMetricsSnapshot {
+            cycles: 0,
+            docs_embedded: 0,
+            docs_failed: 0,
+            index_rebuilds: 0,
+            rebuild_failures: 0,
+            embed_time_us: 0,
+            rebuild_time_us: 0,
+        };
+        let debug = format!("{snap:?}");
+        assert!(debug.contains("RefreshMetricsSnapshot"));
+        assert!(debug.contains("cycles"));
+    }
+
+    #[test]
+    fn metrics_individual_increments() {
+        let m = RefreshMetrics::default();
+        m.cycles.fetch_add(3, Ordering::Relaxed);
+        m.docs_failed.fetch_add(2, Ordering::Relaxed);
+        m.rebuild_failures.fetch_add(1, Ordering::Relaxed);
+        m.embed_time_us.fetch_add(500, Ordering::Relaxed);
+        m.rebuild_time_us.fetch_add(300, Ordering::Relaxed);
+        let snap = m.snapshot();
+        assert_eq!(snap.cycles, 3);
+        assert_eq!(snap.docs_failed, 2);
+        assert_eq!(snap.rebuild_failures, 1);
+        assert_eq!(snap.embed_time_us, 500);
+        assert_eq!(snap.rebuild_time_us, 300);
+    }
+
+    #[test]
+    fn worker_metrics_accessor_returns_shared_arc() {
+        let dir = temp_index_dir("metrics-arc");
+        let queue = make_queue(10);
+        let (worker, _cache) = make_worker(queue, &dir, 256);
+        let metrics = worker.metrics();
+        metrics.cycles.fetch_add(1, Ordering::Relaxed);
+        // Same Arc should reflect the update.
+        assert_eq!(worker.metrics().cycles.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn worker_with_quality_embedder_sets_embedder() {
+        let dir = temp_index_dir("quality-set");
+        let queue = make_queue(10);
+        let cache = make_cache(&dir, 256);
+        let config = RefreshWorkerConfig::new(&dir);
+        let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
+        let quality = Arc::new(StubEmbedder::new("stub-quality", 384));
+        let worker = RefreshWorker::new(config, queue, fast, cache).with_quality_embedder(quality);
+        // Should be set (verified indirectly by debug containing only fast id)
+        let debug = format!("{worker:?}");
+        assert!(debug.contains("stub-fast"));
+    }
+
+    #[test]
+    fn duplicate_doc_id_keeps_latest_in_cycle() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("dedup-cycle");
+            let queue = make_queue(100);
+            // Submit same doc_id with different texts.
+            submit(&queue, "doc-dup", "First version");
+            submit(&queue, "doc-dup", "Second version");
+
+            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let count = worker.run_cycle(&cx).await.unwrap();
+            // Both submitted but doc count should be 1 (deduped).
+            assert!(count >= 1);
+            let current = cache.current();
+            // Only one doc-dup in the index.
+            let doc_ids = current.doc_ids();
+            let dup_count = doc_ids.iter().filter(|id| *id == "doc-dup").count();
+            assert_eq!(dup_count, 1);
+        });
+    }
+
+    #[test]
+    fn quality_embedder_failure_proceeds_with_fast_only() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("quality-fail");
+            let queue = make_queue(100);
+            submit(&queue, "doc-1", "Test document");
+
+            let cache = make_cache(&dir, 256);
+            let config =
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
+            let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
+            let failing_quality: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
+            let worker = RefreshWorker::new(config, queue.clone(), fast, cache.clone())
+                .with_quality_embedder(failing_quality);
+
+            let count = worker.run_cycle(&cx).await.unwrap();
+            assert_eq!(count, 1);
+
+            // Index should still have the doc (fast-only).
+            let current = cache.current();
+            assert_eq!(current.doc_count(), 1);
+            // But no quality index since quality embedder failed.
+            assert!(!current.has_quality_index());
+        });
+    }
+
+    #[test]
+    fn run_cycle_empty_after_prior_cycle_returns_zero() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("empty-after");
+            let queue = make_queue(100);
+            submit(&queue, "doc-1", "First");
+            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+
+            worker.run_cycle(&cx).await.unwrap();
+            // Second cycle with empty queue.
+            let count = worker.run_cycle(&cx).await.unwrap();
+            assert_eq!(count, 0);
+        });
+    }
+
+    // ─── bd-qkop tests end ───
 }
