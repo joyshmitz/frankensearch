@@ -236,7 +236,15 @@ impl FlashRankReranker {
                 .copy_from_slice(&pair.token_type_ids);
         }
 
-        let shape = [batch_size as i64, seq_len as i64];
+        let batch_i64 = i64::try_from(batch_size).map_err(|_| SearchError::RerankFailed {
+            model: model_name.to_owned(),
+            source: format!("batch_size {batch_size} exceeds i64::MAX").into(),
+        })?;
+        let seq_i64 = i64::try_from(seq_len).map_err(|_| SearchError::RerankFailed {
+            model: model_name.to_owned(),
+            source: format!("seq_len {seq_len} exceeds i64::MAX").into(),
+        })?;
+        let shape = [batch_i64, seq_i64];
 
         let input_ids_tensor =
             ort::value::Tensor::from_array((shape.as_slice(), flat_input_ids.as_slice()))

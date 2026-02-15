@@ -306,9 +306,15 @@ fn slice_mean(values: &[f64]) -> f64 {
     values.iter().sum::<f64>() / usize_to_f64(values.len())
 }
 
+fn all_finite(values: &[f64]) -> bool {
+    values.iter().all(|value| value.is_finite())
+}
+
 /// Linear interpolation percentile on a pre-sorted slice.
 fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
-    debug_assert!(!sorted.is_empty());
+    if sorted.is_empty() {
+        return 0.0;
+    }
     if sorted.len() == 1 {
         return sorted[0];
     }
@@ -335,7 +341,12 @@ pub fn bootstrap_ci(
     n_resamples: usize,
     seed: u64,
 ) -> Option<BootstrapCi> {
-    if scores.is_empty() || n_resamples == 0 || confidence <= 0.0 || confidence >= 1.0 {
+    if scores.is_empty()
+        || !all_finite(scores)
+        || n_resamples == 0
+        || confidence <= 0.0
+        || confidence >= 1.0
+    {
         return None;
     }
 
@@ -397,6 +408,8 @@ pub fn bootstrap_compare(
 ) -> Option<BootstrapComparison> {
     if scores_a.is_empty()
         || scores_a.len() != scores_b.len()
+        || !all_finite(scores_a)
+        || !all_finite(scores_b)
         || n_resamples == 0
         || confidence <= 0.0
         || confidence >= 1.0
@@ -533,7 +546,7 @@ pub struct RunStabilityVerdict {
 /// when the mean is zero because it would require division by zero).
 #[must_use]
 pub fn coefficient_of_variation(samples: &[f64]) -> Option<f64> {
-    if samples.is_empty() {
+    if samples.is_empty() || !all_finite(samples) {
         return None;
     }
     let mean = slice_mean(samples);
@@ -622,6 +635,16 @@ pub fn verify_run_stability(
             effective_sample_count: 0,
             outlier_count: 0,
             reason: "no samples provided".to_owned(),
+        };
+    }
+
+    if !all_finite(samples) {
+        return RunStabilityVerdict {
+            stable: false,
+            cv: None,
+            effective_sample_count: samples.iter().filter(|x| x.is_finite()).count(),
+            outlier_count: 0,
+            reason: "samples contain non-finite values".to_owned(),
         };
     }
 
@@ -926,6 +949,13 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_ci_rejects_non_finite_scores() {
+        assert!(bootstrap_ci(&[0.5, f64::NAN, 0.7], 0.95, 1000, 42).is_none());
+        assert!(bootstrap_ci(&[0.5, f64::INFINITY, 0.7], 0.95, 1000, 42).is_none());
+        assert!(bootstrap_ci(&[0.5, f64::NEG_INFINITY, 0.7], 0.95, 1000, 42).is_none());
+    }
+
+    #[test]
     fn bootstrap_ci_rejects_zero_resamples() {
         assert!(bootstrap_ci(&[0.5, 0.6], 0.95, 0, 42).is_none());
     }
@@ -998,6 +1028,12 @@ mod tests {
     #[test]
     fn bootstrap_compare_rejects_mismatched_lengths() {
         assert!(bootstrap_compare(&[0.5, 0.6], &[0.5], 0.95, 1000, 42).is_none());
+    }
+
+    #[test]
+    fn bootstrap_compare_rejects_non_finite_scores() {
+        assert!(bootstrap_compare(&[0.5, f64::NAN], &[0.4, 0.3], 0.95, 1000, 42).is_none());
+        assert!(bootstrap_compare(&[0.5, 0.6], &[0.4, f64::INFINITY], 0.95, 1000, 42).is_none());
     }
 
     #[test]
@@ -1274,7 +1310,10 @@ mod tests {
     fn cv_high_variance_samples() {
         let samples = vec![10.0, 100.0, 50.0, 200.0, 5.0];
         let cv = coefficient_of_variation(&samples).unwrap();
-        assert!(cv > 0.5, "high-variance samples should have high CV, got {cv}");
+        assert!(
+            cv > 0.5,
+            "high-variance samples should have high CV, got {cv}"
+        );
     }
 
     #[test]
@@ -1292,10 +1331,19 @@ mod tests {
     }
 
     #[test]
+    fn cv_returns_none_for_non_finite_samples() {
+        assert!(coefficient_of_variation(&[1.0, f64::NAN, 2.0]).is_none());
+        assert!(coefficient_of_variation(&[1.0, f64::INFINITY, 2.0]).is_none());
+    }
+
+    #[test]
     fn cv_identical_values_is_zero() {
         let samples = vec![42.0; 10];
         let cv = coefficient_of_variation(&samples).unwrap();
-        assert!(cv.abs() < 1e-10, "identical values should have CV=0, got {cv}");
+        assert!(
+            cv.abs() < 1e-10,
+            "identical values should have CV=0, got {cv}"
+        );
     }
 
     #[test]
@@ -1310,14 +1358,21 @@ mod tests {
     fn iqr_detects_clear_outlier() {
         let samples = vec![10.0, 11.0, 10.5, 10.2, 10.8, 100.0];
         let outliers = detect_outliers_iqr(&samples, 1.5);
-        assert_eq!(outliers, vec![5], "index 5 (value 100.0) should be an outlier");
+        assert_eq!(
+            outliers,
+            vec![5],
+            "index 5 (value 100.0) should be an outlier"
+        );
     }
 
     #[test]
     fn iqr_no_outliers_in_tight_distribution() {
         let samples = vec![50.0, 51.0, 49.0, 50.5, 49.5, 50.2];
         let outliers = detect_outliers_iqr(&samples, 1.5);
-        assert!(outliers.is_empty(), "tight distribution should have no outliers");
+        assert!(
+            outliers.is_empty(),
+            "tight distribution should have no outliers"
+        );
     }
 
     #[test]
@@ -1332,7 +1387,10 @@ mod tests {
     fn iqr_detects_both_low_and_high_outliers() {
         let samples = vec![1.0, 49.0, 50.0, 51.0, 50.5, 49.5, 200.0];
         let outliers = detect_outliers_iqr(&samples, 1.5);
-        assert!(outliers.contains(&0), "index 0 (value 1.0) should be a low outlier");
+        assert!(
+            outliers.contains(&0),
+            "index 0 (value 1.0) should be a low outlier"
+        );
         assert!(
             outliers.contains(&6),
             "index 6 (value 200.0) should be a high outlier"
@@ -1386,7 +1444,10 @@ mod tests {
     fn trim_returns_all_for_small_samples() {
         let samples = vec![1.0, 100.0, 50.0];
         let trimmed = trim_outliers(&samples, 1.5);
-        assert_eq!(trimmed, samples, "fewer than 4 samples should not be trimmed");
+        assert_eq!(
+            trimmed, samples,
+            "fewer than 4 samples should not be trimmed"
+        );
     }
 
     // ─── Run Stability Verdict ──────────────────────────────────────────
@@ -1398,7 +1459,11 @@ mod tests {
             100.0, 100.3, 100.1, 100.4, 100.2, 100.5, 100.15, 100.35, 100.25, 100.45,
         ];
         let verdict = verify_run_stability(&samples, 0.05, 5);
-        assert!(verdict.stable, "tight distribution should pass: {}", verdict.reason);
+        assert!(
+            verdict.stable,
+            "tight distribution should pass: {}",
+            verdict.reason
+        );
         assert_eq!(verdict.outlier_count, 0);
         assert_eq!(verdict.effective_sample_count, 10);
         assert!(verdict.cv.unwrap() < 0.05);
@@ -1438,6 +1503,13 @@ mod tests {
     }
 
     #[test]
+    fn stability_fails_for_non_finite_samples() {
+        let verdict = verify_run_stability(&[10.0, f64::NAN, 10.2, 10.1], 0.10, 3);
+        assert!(!verdict.stable);
+        assert!(verdict.reason.contains("non-finite"));
+    }
+
+    #[test]
     fn stability_passes_after_outlier_removal() {
         let mut samples = vec![100.0, 101.0, 99.0, 100.5, 99.5, 100.2, 99.8, 100.1, 99.9];
         samples.push(999.0);
@@ -1467,6 +1539,9 @@ mod tests {
         assert!(verdict.cv.is_some());
         assert_eq!(verdict.effective_sample_count, 8);
         assert_eq!(verdict.outlier_count, 0);
-        assert!(verdict.reason.is_empty(), "stable verdict should have empty reason");
+        assert!(
+            verdict.reason.is_empty(),
+            "stable verdict should have empty reason"
+        );
     }
 }
