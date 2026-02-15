@@ -442,6 +442,27 @@ impl ModelManifest {
                     "must not be empty",
                 ));
             }
+            // Reject path traversal and absolute paths to prevent writes
+            // outside the staging/model directory.
+            for component in std::path::Path::new(&file.name).components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        return Err(invalid_manifest_field(
+                            "files[].name",
+                            &file.name,
+                            "must not contain '..' path traversal",
+                        ));
+                    }
+                    std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                        return Err(invalid_manifest_field(
+                            "files[].name",
+                            &file.name,
+                            "must be a relative path without root",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             if file.uses_placeholder_checksum() {
                 continue;
             }

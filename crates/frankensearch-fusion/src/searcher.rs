@@ -733,14 +733,18 @@ impl TwoTierSearcher {
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         // Build quality VectorHits for blending.
+        let doc_ids = self.index.doc_ids();
         let quality_hits: Vec<VectorHit> = fast_indices
             .iter()
             .zip(quality_scores.iter())
-            .map(|(&idx, &score)| VectorHit {
-                #[allow(clippy::cast_possible_truncation)]
-                index: idx as u32,
-                score,
-                doc_id: self.index.doc_ids()[idx].clone(),
+            .filter_map(|(&idx, &score)| {
+                let doc_id = doc_ids.get(idx)?.clone();
+                Some(VectorHit {
+                    #[allow(clippy::cast_possible_truncation)]
+                    index: idx as u32,
+                    score,
+                    doc_id,
+                })
             })
             .collect();
 
@@ -3096,6 +3100,519 @@ mod tests {
             "mapped lookup diverged from linear oracle: diff={diff}"
         );
     }
+
+    // ─── bd-3a7q tests begin ───
+
+    #[test]
+    fn scaled_budget_negative_multiplier_returns_zero() {
+        assert_eq!(scaled_budget(10, -1.0), 0);
+        assert_eq!(scaled_budget(100, -0.5), 0);
+    }
+
+    #[test]
+    fn scaled_budget_exact_one_multiplier() {
+        assert_eq!(scaled_budget(7, 1.0), 7);
+        assert_eq!(scaled_budget(1, 1.0), 1);
+    }
+
+    #[test]
+    fn scaled_budget_large_values_do_not_panic() {
+        let result = scaled_budget(usize::MAX / 2, 2.0);
+        assert!(result >= 1);
+    }
+
+    #[test]
+    fn scaled_budget_fractional_rounds_up() {
+        // 3 * 0.4 = 1.2 → ceil = 2
+        assert_eq!(scaled_budget(3, 0.4), 2);
+        // 5 * 0.3 = 1.5 → ceil = 2
+        assert_eq!(scaled_budget(5, 0.3), 2);
+    }
+
+    #[test]
+    fn embedder_tier_for_stage_quality_always_returns_quality() {
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Quality, ModelCategory::HashEmbedder),
+            EmbedderTier::Quality
+        );
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Quality, ModelCategory::StaticEmbedder),
+            EmbedderTier::Quality
+        );
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Quality, ModelCategory::TransformerEmbedder),
+            EmbedderTier::Quality
+        );
+    }
+
+    #[test]
+    fn embedder_tier_for_stage_fast_maps_category() {
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Fast, ModelCategory::HashEmbedder),
+            EmbedderTier::Hash
+        );
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Fast, ModelCategory::StaticEmbedder),
+            EmbedderTier::Fast
+        );
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Fast, ModelCategory::TransformerEmbedder),
+            EmbedderTier::Quality
+        );
+    }
+
+    #[test]
+    fn embedder_tier_for_stage_background_maps_same_as_fast() {
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Background, ModelCategory::HashEmbedder),
+            EmbedderTier::Hash
+        );
+        assert_eq!(
+            embedder_tier_for_stage(EmbeddingStage::Background, ModelCategory::StaticEmbedder),
+            EmbedderTier::Fast
+        );
+        assert_eq!(
+            embedder_tier_for_stage(
+                EmbeddingStage::Background,
+                ModelCategory::TransformerEmbedder
+            ),
+            EmbedderTier::Quality
+        );
+    }
+
+    #[test]
+    fn next_telemetry_identifier_has_prefix_and_is_unique() {
+        let id1 = next_telemetry_identifier("root");
+        let id2 = next_telemetry_identifier("root");
+        assert!(id1.starts_with("root-"));
+        assert!(id2.starts_with("root-"));
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn next_telemetry_identifier_sequence_is_zero_padded() {
+        let id = next_telemetry_identifier("evt");
+        let suffix = id.strip_prefix("evt-").expect("should have prefix");
+        assert_eq!(suffix.len(), 20, "sequence number should be 20 digits");
+    }
+
+    #[test]
+    fn telemetry_timestamp_now_is_nonempty_numeric() {
+        let ts = telemetry_timestamp_now();
+        assert!(!ts.is_empty());
+        assert!(ts.parse::<u128>().is_ok(), "should be a numeric string");
+    }
+
+    #[test]
+    fn vector_hits_to_scored_results_truncates_to_k() {
+        let hits: Vec<VectorHit> = (0..10)
+            .map(|i| VectorHit {
+                index: i,
+                score: (10 - i) as f32,
+                doc_id: format!("doc-{i}"),
+            })
+            .collect();
+        let results = vector_hits_to_scored_results(&hits, 3);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].doc_id, "doc-0");
+        assert_eq!(results[2].doc_id, "doc-2");
+    }
+
+    #[test]
+    fn vector_hits_to_scored_results_empty_hits() {
+        let results = vector_hits_to_scored_results(&[], 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn vector_hits_to_scored_results_sets_correct_fields() {
+        let hits = vec![VectorHit {
+            index: 0,
+            score: 0.95,
+            doc_id: "my-doc".to_owned(),
+        }];
+        let results = vector_hits_to_scored_results(&hits, 10);
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.doc_id, "my-doc");
+        assert_eq!(r.score, 0.95);
+        assert_eq!(r.source, ScoreSource::SemanticFast);
+        assert_eq!(r.fast_score, Some(0.95));
+        assert!(r.quality_score.is_none());
+        assert!(r.lexical_score.is_none());
+        assert!(r.rerank_score.is_none());
+        assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn fused_hits_hybrid_source_classification() {
+        let fused = vec![frankensearch_core::types::FusedHit {
+            doc_id: "hybrid-doc".to_owned(),
+            rrf_score: 2.0,
+            lexical_rank: Some(0),
+            semantic_rank: Some(1),
+            lexical_score: Some(3.0),
+            semantic_score: Some(0.8),
+            in_both_sources: true,
+        }];
+        let results = fused_hits_to_scored_results(&fused, &[]);
+        assert_eq!(results[0].source, ScoreSource::Hybrid);
+        assert_eq!(results[0].fast_score, Some(0.8));
+        assert_eq!(results[0].lexical_score, Some(3.0));
+    }
+
+    #[test]
+    fn fused_hits_semantic_only_source() {
+        let fused = vec![frankensearch_core::types::FusedHit {
+            doc_id: "sem-only".to_owned(),
+            rrf_score: 1.0,
+            lexical_rank: None,
+            semantic_rank: Some(0),
+            lexical_score: None,
+            semantic_score: Some(0.9),
+            in_both_sources: false,
+        }];
+        let results = fused_hits_to_scored_results(&fused, &[]);
+        assert_eq!(results[0].source, ScoreSource::SemanticFast);
+    }
+
+    #[test]
+    fn fused_hits_lexical_only_source() {
+        let fused = vec![frankensearch_core::types::FusedHit {
+            doc_id: "lex-only".to_owned(),
+            rrf_score: 1.0,
+            lexical_rank: Some(0),
+            semantic_rank: None,
+            lexical_score: Some(2.5),
+            semantic_score: None,
+            in_both_sources: false,
+        }];
+        let results = fused_hits_to_scored_results(&fused, &[]);
+        assert_eq!(results[0].source, ScoreSource::Lexical);
+    }
+
+    #[test]
+    fn normalize_for_negation_match_lowercases() {
+        assert_eq!(normalize_for_negation_match("HELLO"), "hello");
+        assert_eq!(normalize_for_negation_match("MiXeD"), "mixed");
+    }
+
+    #[test]
+    fn normalize_for_negation_match_nfc_composing() {
+        // e + combining acute = NFC café
+        let decomposed = "caf\u{0065}\u{0301}";
+        let result = normalize_for_negation_match(decomposed);
+        assert_eq!(result, "café");
+    }
+
+    #[test]
+    fn term_is_word_like_alphanumeric_and_underscore() {
+        assert!(term_is_word_like("hello"));
+        assert!(term_is_word_like("hello_world"));
+        assert!(term_is_word_like("abc123"));
+        assert!(term_is_word_like("_"));
+    }
+
+    #[test]
+    fn term_is_word_like_false_for_special_chars() {
+        assert!(!term_is_word_like("hello.world"));
+        assert!(!term_is_word_like("src/main"));
+        assert!(!term_is_word_like("a-b"));
+        assert!(!term_is_word_like("foo bar"));
+    }
+
+    #[test]
+    fn term_is_word_like_empty_is_true() {
+        // all chars satisfy predicate vacuously
+        assert!(term_is_word_like(""));
+    }
+
+    #[test]
+    fn is_word_char_boundaries() {
+        assert!(is_word_char('a'));
+        assert!(is_word_char('Z'));
+        assert!(is_word_char('5'));
+        assert!(is_word_char('_'));
+        assert!(!is_word_char(' '));
+        assert!(!is_word_char('.'));
+        assert!(!is_word_char('-'));
+        assert!(!is_word_char('/'));
+    }
+
+    #[test]
+    fn contains_term_with_word_boundaries_exact_match() {
+        assert!(contains_term_with_word_boundaries("hello world", "hello"));
+        assert!(contains_term_with_word_boundaries("hello world", "world"));
+    }
+
+    #[test]
+    fn contains_term_with_word_boundaries_rejects_substring() {
+        assert!(!contains_term_with_word_boundaries("theorem", "he"));
+        assert!(!contains_term_with_word_boundaries("unhelpful", "help"));
+    }
+
+    #[test]
+    fn contains_term_with_word_boundaries_punctuation_boundary() {
+        assert!(contains_term_with_word_boundaries("(hello) world", "hello"));
+        assert!(contains_term_with_word_boundaries("say hello!", "hello"));
+    }
+
+    #[test]
+    fn contains_term_with_word_boundaries_start_and_end() {
+        assert!(contains_term_with_word_boundaries("he", "he"));
+        assert!(contains_term_with_word_boundaries("he said", "he"));
+        assert!(contains_term_with_word_boundaries("said he", "he"));
+    }
+
+    #[test]
+    fn contains_negative_term_word_like_uses_boundaries() {
+        assert!(!contains_negative_term("the theorem proves it", "he"));
+        assert!(contains_negative_term("he went home", "he"));
+    }
+
+    #[test]
+    fn contains_negative_term_non_word_uses_substring() {
+        assert!(contains_negative_term(
+            "path=/workspace/src/main.rs",
+            "src/main.rs"
+        ));
+    }
+
+    #[test]
+    fn find_negative_match_empty_term_skipped() {
+        let mut parsed = ParsedQuery::parse("query");
+        parsed.negative_terms.push(String::new());
+        let result = find_negative_match("any document text", &parsed);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_negative_match_phrase_substring() {
+        let parsed = ParsedQuery::parse(r#"query NOT "danger zone""#);
+        let matched = find_negative_match("entering the danger zone now", &parsed);
+        assert_eq!(matched, Some("danger zone".to_owned()));
+    }
+
+    #[test]
+    fn find_negative_match_phrase_not_found() {
+        let parsed = ParsedQuery::parse(r#"query NOT "exact phrase""#);
+        let matched = find_negative_match("different text entirely", &parsed);
+        assert!(matched.is_none());
+    }
+
+    #[test]
+    fn should_exclude_document_returns_false_when_text_fn_returns_none() {
+        let parsed = ParsedQuery::parse("query -unsafe");
+        let result = should_exclude_document("doc-1", &parsed, &|_| None, "test");
+        assert!(!result);
+    }
+
+    #[test]
+    fn should_exclude_document_returns_true_when_text_matches_negation() {
+        let parsed = ParsedQuery::parse("query -unsafe");
+        let result = should_exclude_document(
+            "doc-1",
+            &parsed,
+            &|_| Some("unsafe code".to_owned()),
+            "test",
+        );
+        assert!(result);
+    }
+
+    #[test]
+    fn should_exclude_document_returns_false_when_text_doesnt_match() {
+        let parsed = ParsedQuery::parse("query -unsafe");
+        let result =
+            should_exclude_document("doc-1", &parsed, &|_| Some("safe code".to_owned()), "test");
+        assert!(!result);
+    }
+
+    #[test]
+    fn filter_scored_results_by_negations_empty_input() {
+        let parsed = ParsedQuery::parse("query -foo");
+        let results = filter_scored_results_by_negations(vec![], &parsed, &|_| None, "test");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn filter_vector_hits_by_negations_empty_input() {
+        let parsed = ParsedQuery::parse("query -foo");
+        let results = filter_vector_hits_by_negations(vec![], &parsed, &|_| None, "test");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn builder_with_lexical_sets_lexical() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_lexical(Arc::new(StubLexical));
+        let debug = format!("{searcher:?}");
+        assert!(debug.contains("has_lexical: true"));
+    }
+
+    #[test]
+    fn builder_without_lexical() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+        let debug = format!("{searcher:?}");
+        assert!(debug.contains("has_lexical: false"));
+    }
+
+    #[test]
+    fn builder_with_host_adapter_shows_in_debug() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let adapter = Arc::new(RecordingHostAdapter::new("test-project"));
+        let searcher =
+            TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_host_adapter(adapter);
+        let debug = format!("{searcher:?}");
+        assert!(debug.contains("has_host_adapter: true"));
+    }
+
+    #[test]
+    fn builder_with_reranker_shows_in_debug() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+
+        struct DummyReranker;
+        impl Reranker for DummyReranker {
+            fn rerank<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                _query: &'a str,
+                _docs: &'a [frankensearch_core::traits::RerankDocument],
+            ) -> SearchFuture<'a, Vec<frankensearch_core::traits::RerankScore>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+            fn id(&self) -> &str {
+                "dummy"
+            }
+            fn model_name(&self) -> &str {
+                "dummy-reranker"
+            }
+        }
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_reranker(Arc::new(DummyReranker));
+        let debug = format!("{searcher:?}");
+        assert!(debug.contains("has_reranker: true"));
+    }
+
+    #[test]
+    fn should_run_quality_false_when_fast_only() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let quality = Arc::new(StubEmbedder::new("quality", 4));
+        let config = TwoTierConfig {
+            fast_only: true,
+            ..TwoTierConfig::default()
+        };
+        let searcher = TwoTierSearcher::new(index, fast, config).with_quality_embedder(quality);
+        assert!(!searcher.should_run_quality());
+    }
+
+    #[test]
+    fn should_run_quality_false_when_no_quality_embedder() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+        assert!(!searcher.should_run_quality());
+    }
+
+    #[test]
+    fn should_run_quality_true_when_quality_embedder_and_not_fast_only() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let quality = Arc::new(StubEmbedder::new("quality", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_quality_embedder(quality);
+        assert!(searcher.should_run_quality());
+    }
+
+    #[test]
+    fn live_search_stream_initially_empty() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+        let health = searcher.live_search_stream_health();
+        assert_eq!(health.emitted_total, 0);
+        assert_eq!(health.buffered, 0);
+        let drained = searcher.drain_live_search_stream(10);
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn debug_shows_quality_embedder_id() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let quality = Arc::new(StubEmbedder::new("my-quality", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_quality_embedder(quality);
+        let debug = format!("{searcher:?}");
+        assert!(debug.contains("my-quality"));
+    }
+
+    #[test]
+    fn debug_shows_none_quality_when_not_set() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+        let debug = format!("{searcher:?}");
+        assert!(debug.contains("quality_embedder: None"));
+    }
+
+    #[test]
+    fn search_collect_with_text_returns_refined_when_quality_available() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality);
+
+            let (results, metrics) = searcher
+                .search_collect_with_text(&cx, "test", 5, |_| None)
+                .await
+                .unwrap();
+
+            assert!(!results.is_empty());
+            assert!(metrics.quality_embed_ms > 0.0);
+            // When quality refinement succeeds, results should contain quality scores
+            assert!(results.iter().any(|r| r.quality_score.is_some()));
+        });
+    }
+
+    #[test]
+    fn with_runtime_metrics_collector_replaces_default() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let custom_collector = Arc::new(RuntimeMetricsCollector::default());
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_runtime_metrics_collector(custom_collector.clone());
+
+        // Verify via Arc pointer equality
+        assert!(Arc::ptr_eq(
+            &searcher.runtime_metrics_collector,
+            &custom_collector
+        ));
+    }
+
+    #[test]
+    fn with_live_search_stream_emitter_replaces_default() {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let custom_emitter = Arc::new(LiveSearchStreamEmitter::default());
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_live_search_stream_emitter(custom_emitter.clone());
+
+        assert!(Arc::ptr_eq(
+            &searcher.live_search_stream_emitter,
+            &custom_emitter
+        ));
+    }
+
+    // ─── bd-3a7q tests end ───
 
     #[test]
     #[ignore = "performance probe"]
