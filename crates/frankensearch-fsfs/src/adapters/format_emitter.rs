@@ -22,8 +22,7 @@ use crate::output_schema::{
     OutputEnvelope, OutputMeta, SearchHitPayload, SearchPayload, encode_envelope_toon,
 };
 use crate::stream_protocol::{
-    StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_ndjson,
-    encode_stream_frame_toon,
+    StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_toon,
 };
 
 const SUBSYSTEM: &str = "fsfs_format_emitter";
@@ -109,8 +108,16 @@ where
 {
     match format {
         OutputFormat::Jsonl => {
-            let line = encode_stream_frame_ndjson(frame)?;
-            writer.write_all(line.as_bytes()).map_err(write_err)
+            // Write directly to the writer to avoid an intermediate String allocation.
+            serde_json::to_writer(&mut *writer, frame).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: SUBSYSTEM,
+                    source: Box::new(io::Error::other(format!(
+                        "failed to serialize stream frame as NDJSON: {source}"
+                    ))),
+                }
+            })?;
+            writer.write_all(b"\n").map_err(write_err)
         }
         OutputFormat::Toon => {
             let toon = encode_stream_frame_toon(frame)?;

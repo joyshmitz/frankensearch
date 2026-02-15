@@ -344,18 +344,25 @@ const fn retry_directive_for_error(
 /// # Errors
 ///
 /// Returns `SearchError::SubsystemError` if serialization fails.
+///
+/// # Panics
+///
+/// Panics if `serde_json` produces non-UTF-8 output (cannot happen in practice).
 pub fn encode_stream_frame_ndjson<T>(frame: &StreamFrame<T>) -> SearchResult<String>
 where
     T: Serialize,
 {
-    let mut line = serde_json::to_string(frame).map_err(|source| SearchError::SubsystemError {
+    // Pre-size buffer: typical stream frame is ~2 KB.
+    let mut buf = Vec::with_capacity(2048);
+    serde_json::to_writer(&mut buf, frame).map_err(|source| SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
         source: Box::new(io::Error::other(format!(
             "failed to encode stream frame as NDJSON: {source}"
         ))),
     })?;
-    line.push('\n');
-    Ok(line)
+    buf.push(b'\n');
+    // serde_json always produces valid UTF-8; unwrap is safe here.
+    Ok(String::from_utf8(buf).expect("serde_json output is valid UTF-8"))
 }
 
 /// Decode one NDJSON frame line.

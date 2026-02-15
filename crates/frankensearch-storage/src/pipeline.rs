@@ -1798,6 +1798,637 @@ mod tests {
             );
         });
     }
+
+    // ─── Utility function tests (bd-1vp2) ───────────────────────────────
+
+    #[test]
+    fn truncate_chars_empty_string() {
+        assert_eq!(truncate_chars("", 10), "");
+    }
+
+    #[test]
+    fn truncate_chars_shorter_than_limit() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_chars_exact_boundary() {
+        assert_eq!(truncate_chars("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_chars_one_over_boundary() {
+        assert_eq!(truncate_chars("abcdef", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_chars_multibyte_unicode() {
+        // 3 chars: each 3 bytes in UTF-8
+        let input = "\u{1F600}\u{1F601}\u{1F602}";
+        let result = truncate_chars(input, 2);
+        assert_eq!(result.chars().count(), 2);
+    }
+
+    #[test]
+    fn is_hash_embedder_prefix_match() {
+        assert!(is_hash_embedder("fnv1a-384"));
+        assert!(is_hash_embedder("fnv1a-256"));
+        assert!(is_hash_embedder("fnv1a-"));
+    }
+
+    #[test]
+    fn is_hash_embedder_legacy_id() {
+        assert!(is_hash_embedder("hash/fnv1a"));
+    }
+
+    #[test]
+    fn is_hash_embedder_non_hash() {
+        assert!(!is_hash_embedder("fast-tier"));
+        assert!(!is_hash_embedder("quality-tier"));
+        assert!(!is_hash_embedder(""));
+        assert!(!is_hash_embedder("fnv1a"));
+    }
+
+    #[test]
+    fn ensure_non_empty_rejects_empty() {
+        let err = ensure_non_empty("", "doc_id").unwrap_err();
+        assert!(err.to_string().contains("doc_id"));
+    }
+
+    #[test]
+    fn ensure_non_empty_rejects_whitespace_only() {
+        let err = ensure_non_empty("   ", "worker_id").unwrap_err();
+        assert!(err.to_string().contains("worker_id"));
+    }
+
+    #[test]
+    fn ensure_non_empty_accepts_valid() {
+        assert!(ensure_non_empty("hello", "field").is_ok());
+    }
+
+    #[test]
+    fn ingest_action_name_all_variants() {
+        assert_eq!(ingest_action_name(&IngestAction::New), "new");
+        assert_eq!(ingest_action_name(&IngestAction::Updated), "updated");
+        assert_eq!(ingest_action_name(&IngestAction::Unchanged), "unchanged");
+        assert_eq!(
+            ingest_action_name(&IngestAction::Skipped {
+                reason: "test".to_owned()
+            }),
+            "skipped"
+        );
+    }
+
+    #[test]
+    fn resolve_correlation_id_explicit() {
+        let result = resolve_correlation_id("doc-1", Some("corr-42".to_owned()));
+        assert_eq!(result, "corr-42");
+    }
+
+    #[test]
+    fn resolve_correlation_id_empty_falls_back() {
+        let result = resolve_correlation_id("doc-1", Some(String::new()));
+        assert!(result.starts_with("ingest-doc-1-"));
+    }
+
+    #[test]
+    fn resolve_correlation_id_whitespace_falls_back() {
+        let result = resolve_correlation_id("doc-1", Some("   ".to_owned()));
+        assert!(result.starts_with("ingest-doc-1-"));
+    }
+
+    #[test]
+    fn resolve_correlation_id_none_falls_back() {
+        let result = resolve_correlation_id("doc-x", None);
+        assert!(result.starts_with("ingest-doc-x-"));
+    }
+
+    #[test]
+    fn with_correlation_metadata_from_none() {
+        let result = with_correlation_metadata(None, "corr-1");
+        let obj = result.as_object().expect("should be object");
+        assert_eq!(
+            obj.get("correlation_id").unwrap().as_str().unwrap(),
+            "corr-1"
+        );
+    }
+
+    #[test]
+    fn with_correlation_metadata_from_object() {
+        let mut map = Map::new();
+        map.insert("key".to_owned(), Value::String("value".to_owned()));
+        let result = with_correlation_metadata(Some(Value::Object(map)), "corr-2");
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("key").unwrap().as_str().unwrap(), "value");
+        assert_eq!(
+            obj.get("correlation_id").unwrap().as_str().unwrap(),
+            "corr-2"
+        );
+    }
+
+    #[test]
+    fn with_correlation_metadata_from_non_object_value() {
+        let result = with_correlation_metadata(Some(Value::Number(42.into())), "corr-3");
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("payload").unwrap().as_u64().unwrap(), 42);
+        assert_eq!(
+            obj.get("correlation_id").unwrap().as_str().unwrap(),
+            "corr-3"
+        );
+    }
+
+    #[test]
+    fn extract_correlation_id_present() {
+        let mut map = Map::new();
+        map.insert(
+            "correlation_id".to_owned(),
+            Value::String("found".to_owned()),
+        );
+        let value = Value::Object(map);
+        assert_eq!(extract_correlation_id(Some(&value)).unwrap(), "found");
+    }
+
+    #[test]
+    fn extract_correlation_id_missing_key() {
+        let map = Map::new();
+        let value = Value::Object(map);
+        assert!(extract_correlation_id(Some(&value)).is_none());
+    }
+
+    #[test]
+    fn extract_correlation_id_non_object() {
+        let value = Value::String("not-an-object".to_owned());
+        assert!(extract_correlation_id(Some(&value)).is_none());
+    }
+
+    #[test]
+    fn extract_correlation_id_none_metadata() {
+        assert!(extract_correlation_id(None).is_none());
+    }
+
+    #[test]
+    fn usize_to_u64_normal() {
+        assert_eq!(usize_to_u64(42), 42_u64);
+        assert_eq!(usize_to_u64(0), 0_u64);
+    }
+
+    #[test]
+    fn duration_as_u64_normal() {
+        assert_eq!(duration_as_u64(100), 100_u64);
+        assert_eq!(duration_as_u64(0), 0_u64);
+    }
+
+    #[test]
+    fn duration_as_u64_overflow() {
+        assert_eq!(duration_as_u64(u128::MAX), u64::MAX);
+    }
+
+    // ─── Type defaults and serde (bd-1vp2) ──────────────────────────────
+
+    #[test]
+    fn ingest_request_new_defaults() {
+        let req = IngestRequest::new("d1", "hello");
+        assert_eq!(req.doc_id, "d1");
+        assert_eq!(req.text, "hello");
+        assert!(req.source_path.is_none());
+        assert!(req.metadata.is_none());
+        assert!(req.correlation_id.is_none());
+        assert!(req.enqueue_quality);
+    }
+
+    #[test]
+    fn pipeline_config_default_values() {
+        let cfg = PipelineConfig::default();
+        assert_eq!(cfg.fast_priority, 1);
+        assert_eq!(cfg.quality_priority, 0);
+        assert_eq!(cfg.process_batch_size, 32);
+        assert_eq!(cfg.worker_idle_sleep_ms, 25);
+        assert_eq!(cfg.worker_max_idle_cycles, Some(1));
+    }
+
+    #[test]
+    fn batch_ingest_result_default_all_zeros() {
+        let r = BatchIngestResult::default();
+        assert_eq!(r.requested, 0);
+        assert_eq!(r.inserted, 0);
+        assert_eq!(r.updated, 0);
+        assert_eq!(r.unchanged, 0);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.fast_jobs_enqueued, 0);
+        assert_eq!(r.quality_jobs_enqueued, 0);
+    }
+
+    #[test]
+    fn batch_process_result_default_all_zeros() {
+        let r = BatchProcessResult::default();
+        assert_eq!(r.jobs_claimed, 0);
+        assert_eq!(r.jobs_completed, 0);
+        assert_eq!(r.jobs_failed, 0);
+        assert_eq!(r.jobs_skipped, 0);
+        assert_eq!(r.embed_time, Duration::ZERO);
+        assert_eq!(r.total_time, Duration::ZERO);
+    }
+
+    #[test]
+    fn worker_report_default_all_zeros() {
+        let r = WorkerReport::default();
+        assert_eq!(r.reclaimed_on_startup, 0);
+        assert_eq!(r.batches_processed, 0);
+        assert_eq!(r.jobs_completed, 0);
+        assert_eq!(r.jobs_failed, 0);
+        assert_eq!(r.jobs_skipped, 0);
+        assert_eq!(r.idle_cycles, 0);
+    }
+
+    #[test]
+    fn pipeline_metrics_snapshot_default() {
+        let snap = PipelineMetricsSnapshot::default();
+        assert_eq!(snap.total_ingest_calls, 0);
+        assert_eq!(snap.total_ingest_inserted, 0);
+        assert_eq!(snap.total_ingest_updated, 0);
+        assert_eq!(snap.total_ingest_unchanged, 0);
+        assert_eq!(snap.total_ingest_skipped, 0);
+        assert_eq!(snap.total_jobs_claimed, 0);
+        assert_eq!(snap.total_jobs_completed, 0);
+        assert_eq!(snap.total_jobs_failed, 0);
+        assert_eq!(snap.total_jobs_skipped, 0);
+        assert_eq!(snap.total_embed_time_us, 0);
+        assert_eq!(snap.total_reclaimed, 0);
+    }
+
+    #[test]
+    fn pipeline_metrics_default_snapshot_is_zero() {
+        let metrics = PipelineMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_ingest_calls, 0);
+        assert_eq!(snap.total_jobs_completed, 0);
+        assert_eq!(snap.total_embed_time_us, 0);
+    }
+
+    #[test]
+    fn in_memory_vector_sink_default_is_empty() {
+        let sink = InMemoryVectorSink::default();
+        assert!(sink.entries().is_empty());
+    }
+
+    #[test]
+    fn in_memory_vector_sink_persist_accumulates() {
+        let sink = InMemoryVectorSink::default();
+        sink.persist("doc-1", "fast", &[1.0, 2.0]).unwrap();
+        sink.persist("doc-2", "fast", &[3.0, 4.0]).unwrap();
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].doc_id, "doc-1");
+        assert_eq!(entries[1].doc_id, "doc-2");
+    }
+
+    #[test]
+    fn ingest_request_serde_roundtrip() {
+        let req = IngestRequest {
+            doc_id: "d1".to_owned(),
+            text: "hello".to_owned(),
+            source_path: Some("/tmp/f.rs".to_owned()),
+            metadata: Some(Value::Bool(true)),
+            correlation_id: Some("corr-99".to_owned()),
+            enqueue_quality: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: IngestRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn ingest_action_serde_roundtrip_all_variants() {
+        for action in [
+            IngestAction::New,
+            IngestAction::Updated,
+            IngestAction::Unchanged,
+            IngestAction::Skipped {
+                reason: "empty".to_owned(),
+            },
+        ] {
+            let json = serde_json::to_string(&action).unwrap();
+            let decoded: IngestAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, action);
+        }
+    }
+
+    #[test]
+    fn pipeline_config_serde_roundtrip() {
+        let cfg = PipelineConfig {
+            fast_priority: 5,
+            quality_priority: 3,
+            process_batch_size: 64,
+            worker_idle_sleep_ms: 50,
+            worker_max_idle_cycles: Some(10),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: PipelineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, cfg);
+    }
+
+    #[test]
+    fn batch_process_result_serde_roundtrip() {
+        let r = BatchProcessResult {
+            jobs_claimed: 10,
+            jobs_completed: 8,
+            jobs_failed: 1,
+            jobs_skipped: 1,
+            embed_time: Duration::from_millis(42),
+            total_time: Duration::from_millis(100),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: BatchProcessResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, r);
+    }
+
+    #[test]
+    fn worker_report_serde_roundtrip() {
+        let r = WorkerReport {
+            reclaimed_on_startup: 3,
+            batches_processed: 5,
+            jobs_completed: 40,
+            jobs_failed: 2,
+            jobs_skipped: 1,
+            idle_cycles: 7,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: WorkerReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, r);
+    }
+
+    // ─── Edge case tests requiring storage (bd-1vp2) ────────────────────
+
+    #[test]
+    fn ingest_empty_doc_id_rejected() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let err = runner
+            .ingest(IngestRequest::new("", "content"))
+            .expect_err("empty doc_id should fail");
+        assert!(err.to_string().contains("doc_id"), "error: {err}");
+    }
+
+    #[test]
+    fn ingest_whitespace_only_doc_id_rejected() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let err = runner
+            .ingest(IngestRequest::new("   ", "content"))
+            .expect_err("whitespace doc_id should fail");
+        assert!(err.to_string().contains("doc_id"), "error: {err}");
+    }
+
+    #[test]
+    fn ingest_whitespace_only_text_skipped() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None,
+            sink,
+        );
+
+        let result = runner
+            .ingest(IngestRequest::new("doc-ws", "   \t\n  "))
+            .expect("whitespace text should not error");
+        assert!(
+            matches!(result.action, IngestAction::Skipped { .. }),
+            "expected Skipped, got {:?}",
+            result.action
+        );
+        assert!(!result.fast_job_enqueued);
+        assert!(!result.quality_job_enqueued);
+    }
+
+    #[test]
+    fn process_batch_empty_worker_id_rejected() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            let err = runner
+                .process_batch(&cx, "")
+                .await
+                .expect_err("empty worker_id should fail");
+            assert!(err.to_string().contains("worker_id"), "error: {err}");
+        });
+    }
+
+    #[test]
+    fn run_worker_empty_worker_id_rejected() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            let shutdown = AtomicBool::new(false);
+            let err = runner
+                .run_worker(&cx, "", &shutdown)
+                .await
+                .expect_err("empty worker_id should fail");
+            assert!(err.to_string().contains("worker_id"), "error: {err}");
+        });
+    }
+
+    #[test]
+    fn process_batch_no_jobs_returns_zero_claimed() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            let result = runner
+                .process_batch(&cx, "idle-worker")
+                .await
+                .expect("empty batch should succeed");
+            assert_eq!(result.jobs_claimed, 0);
+            assert_eq!(result.jobs_completed, 0);
+            assert_eq!(result.jobs_failed, 0);
+            assert_eq!(result.jobs_skipped, 0);
+        });
+    }
+
+    #[test]
+    fn ingest_without_quality_embedder_skips_quality_job() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            None, // no quality embedder
+            sink,
+        );
+
+        let result = runner
+            .ingest(IngestRequest::new("doc-nq", "no quality"))
+            .expect("ingest should succeed");
+        assert!(result.fast_job_enqueued);
+        assert!(!result.quality_job_enqueued);
+    }
+
+    #[test]
+    fn ingest_with_enqueue_quality_false_skips_quality() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let quality = Arc::new(StubEmbedder::new("quality-tier", 4, None, 2.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            Some(quality),
+            sink,
+        );
+
+        let mut req = IngestRequest::new("doc-noq", "skip quality");
+        req.enqueue_quality = false;
+        let result = runner.ingest(req).expect("ingest should succeed");
+        assert!(result.fast_job_enqueued);
+        assert!(!result.quality_job_enqueued);
+    }
+
+    #[test]
+    fn runner_config_accessor_returns_configured_values() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let custom_config = PipelineConfig {
+            fast_priority: 10,
+            quality_priority: 5,
+            process_batch_size: 64,
+            worker_idle_sleep_ms: 100,
+            worker_max_idle_cycles: Some(99),
+        };
+        let runner = make_runner(JobQueueConfig::default(), custom_config, fast, None, sink);
+
+        let cfg = runner.config();
+        assert_eq!(cfg.fast_priority, 10);
+        assert_eq!(cfg.quality_priority, 5);
+        assert_eq!(cfg.process_batch_size, 64);
+        assert_eq!(cfg.worker_idle_sleep_ms, 100);
+        assert_eq!(cfg.worker_max_idle_cycles, Some(99));
+    }
+
+    #[test]
+    fn runner_debug_shows_embedder_ids() {
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("fast-tier", 2, None, 1.0));
+        let quality = Arc::new(StubEmbedder::new("quality-tier", 4, None, 2.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            Some(quality),
+            sink,
+        );
+
+        let debug = format!("{runner:?}");
+        assert!(debug.contains("fast-tier"), "debug: {debug}");
+        assert!(debug.contains("quality-tier"), "debug: {debug}");
+    }
+
+    #[test]
+    fn fallback_correlation_id_contains_doc_id() {
+        let id = fallback_correlation_id("my-doc");
+        assert!(id.starts_with("ingest-my-doc-"));
+    }
+
+    #[test]
+    fn pipeline_error_creates_subsystem_error() {
+        let err = pipeline_error("test message");
+        match err {
+            SearchError::SubsystemError { subsystem, .. } => {
+                assert_eq!(subsystem, "storage_pipeline");
+            }
+            other => panic!("expected SubsystemError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persisted_embedding_clone_and_eq() {
+        let e = PersistedEmbedding {
+            doc_id: "d".to_owned(),
+            embedder_id: "e".to_owned(),
+            embedding: vec![1.0, 2.0],
+        };
+        let e2 = e.clone();
+        assert_eq!(e, e2);
+    }
+
+    #[test]
+    fn ingest_result_clone_and_serde() {
+        let r = IngestResult {
+            doc_id: "d".to_owned(),
+            action: IngestAction::New,
+            fast_job_enqueued: true,
+            quality_job_enqueued: false,
+            correlation_id: "c".to_owned(),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: IngestResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, r);
+    }
+
+    #[test]
+    fn ingest_same_as_fast_embedder_id_skips_quality() {
+        // When quality embedder has the SAME id as fast, quality job should not be enqueued
+        let sink = Arc::new(InMemoryVectorSink::default());
+        let fast = Arc::new(StubEmbedder::new("shared-tier", 2, None, 1.0));
+        let quality = Arc::new(StubEmbedder::new("shared-tier", 4, None, 2.0));
+        let runner = make_runner(
+            JobQueueConfig::default(),
+            PipelineConfig::default(),
+            fast,
+            Some(quality),
+            sink,
+        );
+
+        let result = runner
+            .ingest(IngestRequest::new("doc-dup-tier", "same tier"))
+            .expect("ingest should succeed");
+        assert!(result.fast_job_enqueued);
+        assert!(
+            !result.quality_job_enqueued,
+            "quality should be skipped when same as fast"
+        );
+    }
 }
 
 // ─── Integration tests (bd-3w1.17) ─────────────────────────────────────────

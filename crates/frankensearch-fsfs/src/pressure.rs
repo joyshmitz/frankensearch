@@ -1673,6 +1673,895 @@ mod tests {
         assert!((parsed - 1.5).abs() < f64::EPSILON);
     }
 
+    // ─── bd-29u4 tests begin ───
+
+    // --- PressureState ---
+
+    #[test]
+    fn pressure_state_severity_ordering() {
+        assert_eq!(PressureState::Normal.severity(), 0);
+        assert_eq!(PressureState::Constrained.severity(), 1);
+        assert_eq!(PressureState::Degraded.severity(), 2);
+        assert_eq!(PressureState::Emergency.severity(), 3);
+        assert!(PressureState::Normal.severity() < PressureState::Emergency.severity());
+    }
+
+    #[test]
+    fn pressure_state_serde_roundtrip() {
+        for state in [
+            PressureState::Normal,
+            PressureState::Constrained,
+            PressureState::Degraded,
+            PressureState::Emergency,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: PressureState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn pressure_state_serde_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PressureState::Normal).unwrap(),
+            "\"normal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PressureState::Emergency).unwrap(),
+            "\"emergency\""
+        );
+    }
+
+    // --- DegradationStage ---
+
+    #[test]
+    fn degradation_stage_severity_ordering() {
+        assert_eq!(DegradationStage::Full.severity(), 0);
+        assert_eq!(DegradationStage::EmbedDeferred.severity(), 1);
+        assert_eq!(DegradationStage::LexicalOnly.severity(), 2);
+        assert_eq!(DegradationStage::MetadataOnly.severity(), 3);
+        assert_eq!(DegradationStage::Paused.severity(), 4);
+    }
+
+    #[test]
+    fn degradation_stage_step_toward_full_all_variants() {
+        assert_eq!(
+            DegradationStage::Paused.step_toward_full(),
+            DegradationStage::MetadataOnly
+        );
+        assert_eq!(
+            DegradationStage::MetadataOnly.step_toward_full(),
+            DegradationStage::LexicalOnly
+        );
+        assert_eq!(
+            DegradationStage::LexicalOnly.step_toward_full(),
+            DegradationStage::EmbedDeferred
+        );
+        assert_eq!(
+            DegradationStage::EmbedDeferred.step_toward_full(),
+            DegradationStage::Full
+        );
+        assert_eq!(
+            DegradationStage::Full.step_toward_full(),
+            DegradationStage::Full
+        );
+    }
+
+    #[test]
+    fn degradation_stage_reason_code_all_variants() {
+        assert_eq!(
+            DegradationStage::Full.stage_reason_code(),
+            "degrade.stage.full"
+        );
+        assert_eq!(
+            DegradationStage::EmbedDeferred.stage_reason_code(),
+            "degrade.stage.embed_deferred"
+        );
+        assert_eq!(
+            DegradationStage::LexicalOnly.stage_reason_code(),
+            "degrade.stage.lexical_only"
+        );
+        assert_eq!(
+            DegradationStage::MetadataOnly.stage_reason_code(),
+            "degrade.stage.metadata_only"
+        );
+        assert_eq!(
+            DegradationStage::Paused.stage_reason_code(),
+            "degrade.stage.paused"
+        );
+    }
+
+    #[test]
+    fn degradation_stage_recovery_gate_full_is_none() {
+        assert!(DegradationStage::Full.recovery_gate(3).is_none());
+    }
+
+    #[test]
+    fn degradation_stage_recovery_gate_embed_deferred_requires_quality_circuit_closed() {
+        let gate = DegradationStage::EmbedDeferred.recovery_gate(3).unwrap();
+        assert_eq!(gate.max_pressure_for_recovery, PressureState::Normal);
+        assert!(gate.require_quality_circuit_closed);
+        assert!(!gate.require_pause_cleared);
+        assert_eq!(gate.consecutive_healthy_required, 3);
+    }
+
+    #[test]
+    fn degradation_stage_recovery_gate_paused_requires_pause_cleared() {
+        let gate = DegradationStage::Paused.recovery_gate(5).unwrap();
+        assert!(gate.require_pause_cleared);
+        assert_eq!(gate.consecutive_healthy_required, 5);
+    }
+
+    #[test]
+    fn degradation_stage_serde_roundtrip() {
+        for stage in [
+            DegradationStage::Full,
+            DegradationStage::EmbedDeferred,
+            DegradationStage::LexicalOnly,
+            DegradationStage::MetadataOnly,
+            DegradationStage::Paused,
+        ] {
+            let json = serde_json::to_string(&stage).unwrap();
+            let back: DegradationStage = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, stage);
+        }
+    }
+
+    // --- DegradationOverride ---
+
+    #[test]
+    fn degradation_override_forced_stage_all_variants() {
+        assert_eq!(DegradationOverride::Auto.forced_stage(), None);
+        assert_eq!(
+            DegradationOverride::ForceFull.forced_stage(),
+            Some(DegradationStage::Full)
+        );
+        assert_eq!(
+            DegradationOverride::ForceEmbedDeferred.forced_stage(),
+            Some(DegradationStage::EmbedDeferred)
+        );
+        assert_eq!(
+            DegradationOverride::ForceLexicalOnly.forced_stage(),
+            Some(DegradationStage::LexicalOnly)
+        );
+        assert_eq!(
+            DegradationOverride::ForceMetadataOnly.forced_stage(),
+            Some(DegradationStage::MetadataOnly)
+        );
+        assert_eq!(
+            DegradationOverride::ForcePaused.forced_stage(),
+            Some(DegradationStage::Paused)
+        );
+    }
+
+    #[test]
+    fn degradation_override_serde_roundtrip() {
+        for over in [
+            DegradationOverride::Auto,
+            DegradationOverride::ForceFull,
+            DegradationOverride::ForceEmbedDeferred,
+            DegradationOverride::ForceLexicalOnly,
+            DegradationOverride::ForceMetadataOnly,
+            DegradationOverride::ForcePaused,
+        ] {
+            let json = serde_json::to_string(&over).unwrap();
+            let back: DegradationOverride = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, over);
+        }
+    }
+
+    // --- normalize_pct ---
+
+    #[test]
+    fn normalize_pct_nan_returns_zero() {
+        assert_eq!(normalize_pct(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn normalize_pct_negative_returns_zero() {
+        assert_eq!(normalize_pct(-5.0), 0.0);
+    }
+
+    #[test]
+    fn normalize_pct_negative_infinity_returns_zero() {
+        assert_eq!(normalize_pct(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn normalize_pct_positive_infinity_returns_zero() {
+        assert_eq!(normalize_pct(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn normalize_pct_zero_returns_zero() {
+        assert_eq!(normalize_pct(0.0), 0.0);
+    }
+
+    #[test]
+    fn normalize_pct_normal_value_passes_through() {
+        assert!((normalize_pct(50.0) - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn normalize_pct_caps_at_200() {
+        assert!((normalize_pct(999.0) - 200.0).abs() < f64::EPSILON);
+        assert!((normalize_pct(200.0) - 200.0).abs() < f64::EPSILON);
+        assert!((normalize_pct(201.0) - 200.0).abs() < f64::EPSILON);
+    }
+
+    // --- PressureSignal ---
+
+    #[test]
+    fn pressure_signal_new_normalizes_fields() {
+        let sig = PressureSignal::new(-1.0, f64::NAN, 999.0, 50.0);
+        assert_eq!(sig.cpu_pct, 0.0);
+        assert_eq!(sig.memory_pct, 0.0);
+        assert!((sig.io_pct - 200.0).abs() < f64::EPSILON);
+        assert!((sig.load_pct - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pressure_signal_score_returns_max_field() {
+        let sig = PressureSignal::new(10.0, 80.0, 30.0, 50.0);
+        assert!((sig.score() - 80.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pressure_signal_ewma_blends_with_previous() {
+        let prev = PressureSignal::new(100.0, 100.0, 100.0, 100.0);
+        let curr = PressureSignal::new(0.0, 0.0, 0.0, 0.0);
+        let blended = curr.ewma(prev, 0.5);
+        // 0.5 * 0.0 + 0.5 * 100.0 = 50.0
+        assert!((blended.cpu_pct - 50.0).abs() < f64::EPSILON);
+        assert!((blended.memory_pct - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pressure_signal_ewma_alpha_clamped() {
+        let prev = PressureSignal::new(100.0, 100.0, 100.0, 100.0);
+        let curr = PressureSignal::new(0.0, 0.0, 0.0, 0.0);
+        // alpha > 1.0 clamped to 1.0 → fully current
+        let full_current = curr.ewma(prev, 5.0);
+        assert_eq!(full_current.cpu_pct, 0.0);
+        // alpha < 0.0 clamped to 0.0 → fully previous
+        let full_prev = curr.ewma(prev, -1.0);
+        assert!((full_prev.cpu_pct - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pressure_signal_serde_roundtrip() {
+        let sig = PressureSignal::new(42.5, 55.0, 10.0, 33.3);
+        let json = serde_json::to_string(&sig).unwrap();
+        let back: PressureSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sig);
+    }
+
+    // --- CalibrationMetrics ---
+
+    #[test]
+    fn calibration_metrics_new_normalizes_pct_fields() {
+        let m = CalibrationMetrics::new(100, -5.0, 0.5, f64::NAN, 300.0);
+        assert_eq!(m.observed_coverage_pct, 0.0);
+        assert!((m.e_value - 0.5).abs() < f64::EPSILON);
+        assert_eq!(m.drift_pct, 0.0);
+        assert!((m.confidence_pct - 200.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn calibration_metrics_e_value_nan_becomes_zero() {
+        let m = CalibrationMetrics::new(100, 95.0, f64::NAN, 5.0, 80.0);
+        assert_eq!(m.e_value, 0.0);
+    }
+
+    #[test]
+    fn calibration_metrics_e_value_infinity_becomes_zero() {
+        let m = CalibrationMetrics::new(100, 95.0, f64::INFINITY, 5.0, 80.0);
+        assert_eq!(m.e_value, 0.0);
+    }
+
+    #[test]
+    fn calibration_metrics_e_value_negative_becomes_zero() {
+        let m = CalibrationMetrics::new(100, 95.0, -0.5, 5.0, 80.0);
+        assert_eq!(m.e_value, 0.0);
+    }
+
+    #[test]
+    fn calibration_metrics_serde_roundtrip() {
+        let m = CalibrationMetrics::new(500, 95.0, 0.10, 4.0, 88.0);
+        let json = serde_json::to_string(&m).unwrap();
+        let back: CalibrationMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, m);
+    }
+
+    // --- Config defaults and validation ---
+
+    #[test]
+    fn degradation_controller_config_default() {
+        let cfg = DegradationControllerConfig::default();
+        assert_eq!(cfg.consecutive_healthy_required, 3);
+    }
+
+    #[test]
+    fn degradation_controller_config_validate_zero_consecutive() {
+        let cfg = DegradationControllerConfig {
+            consecutive_healthy_required: 0,
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn degradation_controller_config_validate_ok() {
+        let cfg = DegradationControllerConfig {
+            consecutive_healthy_required: 1,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn pressure_controller_config_default_values() {
+        let cfg = PressureControllerConfig::default();
+        assert_eq!(cfg.profile, PressureProfile::Performance);
+        assert!((cfg.ewma_alpha - 0.3).abs() < f64::EPSILON);
+        assert!((cfg.hysteresis_pct - 5.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.consecutive_required, 3);
+    }
+
+    #[test]
+    fn pressure_controller_config_validate_alpha_out_of_range() {
+        let cfg = PressureControllerConfig {
+            ewma_alpha: 1.5,
+            ..PressureControllerConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "pressure.ewma_alpha")
+        );
+    }
+
+    #[test]
+    fn pressure_controller_config_validate_hysteresis_out_of_range() {
+        let cfg = PressureControllerConfig {
+            hysteresis_pct: 31.0,
+            ..PressureControllerConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(err, SearchError::InvalidConfig { ref field, .. } if field == "pressure.hysteresis_pct")
+        );
+    }
+
+    #[test]
+    fn pressure_controller_config_validate_consecutive_zero() {
+        let cfg = PressureControllerConfig {
+            consecutive_required: 0,
+            ..PressureControllerConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_default_values() {
+        let cfg = CalibrationGuardConfig::default();
+        assert_eq!(cfg.min_sample_count, 200);
+        assert!((cfg.target_coverage_pct - 95.0).abs() < f64::EPSILON);
+        assert!((cfg.min_e_value - 0.05).abs() < f64::EPSILON);
+        assert!((cfg.max_drift_pct - 15.0).abs() < f64::EPSILON);
+        assert!((cfg.min_confidence_pct - 70.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.breach_consecutive_required, 2);
+        assert_eq!(cfg.fallback_stage, DegradationStage::LexicalOnly);
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_min_sample_count_zero() {
+        let cfg = CalibrationGuardConfig {
+            min_sample_count: 0,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_target_coverage_out_of_range() {
+        let cfg = CalibrationGuardConfig {
+            target_coverage_pct: 101.0,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_e_value_negative() {
+        let cfg = CalibrationGuardConfig {
+            min_e_value: -0.1,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_e_value_nan() {
+        let cfg = CalibrationGuardConfig {
+            min_e_value: f64::NAN,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_max_drift_out_of_range() {
+        let cfg = CalibrationGuardConfig {
+            max_drift_pct: -1.0,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_min_confidence_out_of_range() {
+        let cfg = CalibrationGuardConfig {
+            min_confidence_pct: 101.0,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn calibration_guard_config_validate_breach_consecutive_zero() {
+        let cfg = CalibrationGuardConfig {
+            breach_consecutive_required: 0,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    // --- CalibrationGuardState breach kinds ---
+
+    #[test]
+    fn calibration_guard_evalue_breach() {
+        let mut guard = CalibrationGuardState::default();
+        // coverage ok (96 > 95), e_value too low (0.01 < 0.05)
+        let d = guard.evaluate(CalibrationMetrics::new(500, 96.0, 0.01, 5.0, 80.0));
+        assert_eq!(d.status, CalibrationGuardStatus::Breach);
+        assert_eq!(d.reason_code, REASON_CALIBRATION_EVALUE_BREACH);
+        assert_eq!(
+            d.breach_kind,
+            Some(CalibrationBreachKind::EValueBelowThreshold)
+        );
+    }
+
+    #[test]
+    fn calibration_guard_drift_breach() {
+        let mut guard = CalibrationGuardState::default();
+        // coverage ok, e_value ok (0.10 > 0.05), drift too high (20 > 15)
+        let d = guard.evaluate(CalibrationMetrics::new(500, 96.0, 0.10, 20.0, 80.0));
+        assert_eq!(d.status, CalibrationGuardStatus::Breach);
+        assert_eq!(d.reason_code, REASON_CALIBRATION_DRIFT_BREACH);
+        assert_eq!(
+            d.breach_kind,
+            Some(CalibrationBreachKind::DriftAboveThreshold)
+        );
+    }
+
+    #[test]
+    fn calibration_guard_confidence_breach() {
+        let mut guard = CalibrationGuardState::default();
+        // coverage ok, e_value ok, drift ok (5 < 15), confidence too low (60 < 70)
+        let d = guard.evaluate(CalibrationMetrics::new(500, 96.0, 0.10, 5.0, 60.0));
+        assert_eq!(d.status, CalibrationGuardStatus::Breach);
+        assert_eq!(d.reason_code, REASON_CALIBRATION_CONFIDENCE_BREACH);
+        assert_eq!(
+            d.breach_kind,
+            Some(CalibrationBreachKind::ConfidenceBelowThreshold)
+        );
+    }
+
+    #[test]
+    fn calibration_guard_state_new_with_invalid_config() {
+        let cfg = CalibrationGuardConfig {
+            breach_consecutive_required: 0,
+            ..CalibrationGuardConfig::default()
+        };
+        assert!(CalibrationGuardState::new(cfg).is_err());
+    }
+
+    #[test]
+    fn calibration_guard_state_config_accessor() {
+        let guard = CalibrationGuardState::default();
+        assert_eq!(guard.config().min_sample_count, 200);
+    }
+
+    // --- HostPressureCollector ---
+
+    #[test]
+    fn host_pressure_collector_default() {
+        let c = HostPressureCollector::default();
+        assert!((c.io_ceiling_mib_per_sec - 64.0).abs() < f64::EPSILON);
+        assert!(c.previous_io.is_none());
+    }
+
+    #[test]
+    fn host_pressure_collector_new_rejects_zero() {
+        assert!(HostPressureCollector::new(0.0).is_err());
+    }
+
+    #[test]
+    fn host_pressure_collector_new_rejects_negative() {
+        assert!(HostPressureCollector::new(-10.0).is_err());
+    }
+
+    #[test]
+    fn host_pressure_collector_new_rejects_nan() {
+        assert!(HostPressureCollector::new(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn host_pressure_collector_new_rejects_infinity() {
+        assert!(HostPressureCollector::new(f64::INFINITY).is_err());
+    }
+
+    #[test]
+    fn host_pressure_collector_new_valid() {
+        let c = HostPressureCollector::new(128.0).unwrap();
+        assert!((c.io_ceiling_mib_per_sec - 128.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn io_pct_no_previous_returns_zero() {
+        let c = HostPressureCollector::default();
+        let current = ProcIoCounters {
+            read_bytes: 1_000_000,
+            write_bytes: 1_000_000,
+        };
+        assert_eq!(c.io_pct_for_interval(Duration::from_secs(1), current), 0.0);
+    }
+
+    #[test]
+    fn io_pct_zero_elapsed_returns_zero() {
+        let c = HostPressureCollector {
+            io_ceiling_mib_per_sec: 64.0,
+            previous_io: Some(ProcIoCounters {
+                read_bytes: 0,
+                write_bytes: 0,
+            }),
+        };
+        let current = ProcIoCounters {
+            read_bytes: 1_000_000,
+            write_bytes: 1_000_000,
+        };
+        assert_eq!(c.io_pct_for_interval(Duration::ZERO, current), 0.0);
+    }
+
+    // --- parse functions ---
+
+    #[test]
+    fn parse_proc_self_io_missing_read_bytes() {
+        let err = parse_proc_self_io("write_bytes: 100\n").unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn parse_proc_self_io_invalid_value() {
+        let err = parse_proc_self_io("read_bytes: abc\nwrite_bytes: 100\n").unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn parse_self_status_rss_missing_vmrss() {
+        let err = parse_self_status_rss_mb("Name:\tfsfs\nVmSize:\t1000 kB\n").unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn parse_load_avg_empty() {
+        let err = parse_load_avg_1m("").unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn parse_load_avg_invalid_value() {
+        let err = parse_load_avg_1m("abc 1.0 0.5\n").unwrap_err();
+        assert!(matches!(err, SearchError::InvalidConfig { .. }));
+    }
+
+    #[test]
+    fn parse_u64_field_valid() {
+        assert_eq!(parse_u64_field("test", "42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_u64_field_invalid() {
+        assert!(parse_u64_field("test", "not_a_number").is_err());
+    }
+
+    // --- RecoveryGate ---
+
+    #[test]
+    fn recovery_gate_satisfied_when_pressure_at_max() {
+        let gate = RecoveryGate {
+            max_pressure_for_recovery: PressureState::Constrained,
+            require_quality_circuit_closed: false,
+            require_pause_cleared: false,
+            consecutive_healthy_required: 3,
+        };
+        let signal = DegradationSignal::new(PressureState::Constrained, false, false);
+        assert!(gate.is_satisfied(signal));
+    }
+
+    #[test]
+    fn recovery_gate_not_satisfied_when_pressure_too_high() {
+        let gate = RecoveryGate {
+            max_pressure_for_recovery: PressureState::Normal,
+            require_quality_circuit_closed: false,
+            require_pause_cleared: false,
+            consecutive_healthy_required: 3,
+        };
+        let signal = DegradationSignal::new(PressureState::Constrained, false, false);
+        assert!(!gate.is_satisfied(signal));
+    }
+
+    #[test]
+    fn recovery_gate_not_satisfied_when_quality_circuit_open() {
+        let gate = RecoveryGate {
+            max_pressure_for_recovery: PressureState::Normal,
+            require_quality_circuit_closed: true,
+            require_pause_cleared: false,
+            consecutive_healthy_required: 3,
+        };
+        let signal = DegradationSignal::new(PressureState::Normal, true, false);
+        assert!(!gate.is_satisfied(signal));
+    }
+
+    #[test]
+    fn recovery_gate_not_satisfied_when_pause_not_cleared() {
+        let gate = RecoveryGate {
+            max_pressure_for_recovery: PressureState::Degraded,
+            require_quality_circuit_closed: false,
+            require_pause_cleared: true,
+            consecutive_healthy_required: 3,
+        };
+        let signal = DegradationSignal::new(PressureState::Normal, false, true);
+        assert!(!gate.is_satisfied(signal));
+    }
+
+    // --- DegradationSignal ---
+
+    #[test]
+    fn degradation_signal_serde_roundtrip() {
+        let sig = DegradationSignal::new(PressureState::Degraded, true, false);
+        let json = serde_json::to_string(&sig).unwrap();
+        let back: DegradationSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, sig);
+    }
+
+    // --- DegradationStateMachine ---
+
+    #[test]
+    fn degradation_state_machine_new_with_invalid_config() {
+        let cfg = DegradationControllerConfig {
+            consecutive_healthy_required: 0,
+        };
+        assert!(DegradationStateMachine::new(cfg).is_err());
+    }
+
+    #[test]
+    fn degradation_state_machine_accessors() {
+        let machine = DegradationStateMachine::default();
+        assert_eq!(machine.stage(), DegradationStage::Full);
+        assert_eq!(machine.override_mode(), DegradationOverride::Auto);
+    }
+
+    // --- PressureController ---
+
+    #[test]
+    fn pressure_controller_new_with_invalid_config() {
+        let cfg = PressureControllerConfig {
+            consecutive_required: 0,
+            ..PressureControllerConfig::default()
+        };
+        assert!(PressureController::new(cfg).is_err());
+    }
+
+    #[test]
+    fn pressure_controller_config_accessor() {
+        let c = PressureController::from_profile(PressureProfile::Strict);
+        assert_eq!(c.config().profile, PressureProfile::Strict);
+    }
+
+    #[test]
+    fn pressure_controller_from_profile_strict() {
+        let c = PressureController::from_profile(PressureProfile::Strict);
+        assert_eq!(c.state(), PressureState::Normal);
+        assert_eq!(c.config().profile, PressureProfile::Strict);
+    }
+
+    #[test]
+    fn pressure_controller_from_profile_degraded() {
+        let c = PressureController::from_profile(PressureProfile::Degraded);
+        assert_eq!(c.state(), PressureState::Normal);
+        assert_eq!(c.config().profile, PressureProfile::Degraded);
+    }
+
+    // --- DegradationTrigger serde ---
+
+    #[test]
+    fn degradation_trigger_serde_roundtrip() {
+        for trigger in [
+            DegradationTrigger::Stable,
+            DegradationTrigger::PressureEscalation,
+            DegradationTrigger::QualityCircuitOpen,
+            DegradationTrigger::HardPause,
+            DegradationTrigger::Recovery,
+            DegradationTrigger::CalibrationBreach,
+            DegradationTrigger::OperatorOverride,
+        ] {
+            let json = serde_json::to_string(&trigger).unwrap();
+            let back: DegradationTrigger = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, trigger);
+        }
+    }
+
+    // --- CalibrationGuardStatus / CalibrationBreachKind serde ---
+
+    #[test]
+    fn calibration_guard_status_serde_roundtrip() {
+        for status in [
+            CalibrationGuardStatus::Healthy,
+            CalibrationGuardStatus::Watch,
+            CalibrationGuardStatus::Breach,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: CalibrationGuardStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn calibration_breach_kind_serde_roundtrip() {
+        for kind in [
+            CalibrationBreachKind::CoverageBelowTarget,
+            CalibrationBreachKind::EValueBelowThreshold,
+            CalibrationBreachKind::DriftAboveThreshold,
+            CalibrationBreachKind::ConfidenceBelowThreshold,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: CalibrationBreachKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    // --- Capability enums serde ---
+
+    #[test]
+    fn query_capability_mode_serde_roundtrip() {
+        for mode in [
+            QueryCapabilityMode::Hybrid,
+            QueryCapabilityMode::LexicalOnly,
+            QueryCapabilityMode::MetadataOnly,
+            QueryCapabilityMode::Paused,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: QueryCapabilityMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    #[test]
+    fn indexing_capability_mode_serde_roundtrip() {
+        for mode in [
+            IndexingCapabilityMode::Full,
+            IndexingCapabilityMode::DeferEmbedding,
+            IndexingCapabilityMode::MetadataOnly,
+            IndexingCapabilityMode::Paused,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: IndexingCapabilityMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    #[test]
+    fn capability_state_serde_roundtrip() {
+        for state in [CapabilityState::Enabled, CapabilityState::Disabled] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: CapabilityState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn write_state_serde_roundtrip() {
+        for state in [WriteState::Enabled, WriteState::Paused] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: WriteState = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+    }
+
+    #[test]
+    fn integrity_state_serde_roundtrip() {
+        let json = serde_json::to_string(&IntegrityState::Preserved).unwrap();
+        let back: IntegrityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, IntegrityState::Preserved);
+    }
+
+    // --- DegradationContract embed_deferred and metadata_only ---
+
+    #[test]
+    fn degradation_contract_embed_deferred() {
+        let c = DegradationStage::EmbedDeferred.contract();
+        assert_eq!(c.query_mode, QueryCapabilityMode::Hybrid);
+        assert_eq!(c.indexing_mode, IndexingCapabilityMode::DeferEmbedding);
+        assert_eq!(c.semantic_search, CapabilityState::Enabled);
+        assert_eq!(c.writes, WriteState::Enabled);
+    }
+
+    #[test]
+    fn degradation_contract_metadata_only() {
+        let c = DegradationStage::MetadataOnly.contract();
+        assert_eq!(c.query_mode, QueryCapabilityMode::MetadataOnly);
+        assert_eq!(c.indexing_mode, IndexingCapabilityMode::MetadataOnly);
+        assert_eq!(c.semantic_search, CapabilityState::Disabled);
+        assert_eq!(c.lexical_search, CapabilityState::Disabled);
+        assert_eq!(c.writes, WriteState::Enabled);
+    }
+
+    // --- DegradationSignal auto_target_stage edge case ---
+
+    #[test]
+    fn degradation_signal_constrained_with_quality_circuit_stays_embed_deferred() {
+        // quality_circuit_open + constrained → still EmbedDeferred (constrained dominates)
+        let sig = DegradationSignal::new(PressureState::Constrained, true, false);
+        assert_eq!(sig.auto_target_stage(), DegradationStage::EmbedDeferred);
+    }
+
+    // --- PressureController stable reason code ---
+
+    #[test]
+    fn pressure_controller_stable_when_already_at_target() {
+        let mut controller = PressureController::from_profile(PressureProfile::Performance);
+        let low = PressureSignal::new(10.0, 10.0, 10.0, 10.0);
+        let t = controller.observe(low, 1);
+        assert_eq!(t.reason_code, "pressure.state.stable");
+        assert!(!t.changed);
+        assert_eq!(t.from, PressureState::Normal);
+        assert_eq!(t.to, PressureState::Normal);
+    }
+
+    // --- Quality circuit open trigger identification ---
+
+    #[test]
+    fn degradation_machine_quality_circuit_trigger() {
+        let mut machine = DegradationStateMachine::default();
+        let sig = DegradationSignal::new(PressureState::Normal, true, false);
+        let t = machine.observe(sig, 1);
+        assert_eq!(t.to, DegradationStage::EmbedDeferred);
+        assert_eq!(t.trigger, DegradationTrigger::QualityCircuitOpen);
+    }
+
+    // --- Calibration guard fallback not applied when already at higher severity ---
+
+    #[test]
+    fn calibration_fallback_skipped_when_already_more_severe() {
+        let mut machine = DegradationStateMachine::default();
+        // First escalate to MetadataOnly
+        let sig = DegradationSignal::new(PressureState::Emergency, false, false);
+        machine.observe(sig, 1);
+        assert_eq!(machine.stage(), DegradationStage::MetadataOnly);
+
+        // Calibration fallback to LexicalOnly (less severe) → should be skipped
+        let mut guard = CalibrationGuardState::new(CalibrationGuardConfig {
+            breach_consecutive_required: 1,
+            fallback_stage: DegradationStage::LexicalOnly,
+            ..CalibrationGuardConfig::default()
+        })
+        .unwrap();
+        let decision = guard.evaluate(CalibrationMetrics::new(800, 70.0, 0.90, 1.0, 90.0));
+        let result = machine.apply_calibration_guard(sig, &decision, 99);
+        assert!(result.is_none());
+    }
+
+    // ─── bd-29u4 tests end ───
+
     #[test]
     fn io_pct_is_derived_from_byte_delta_and_interval() {
         let collector = HostPressureCollector {

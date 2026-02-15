@@ -1479,6 +1479,799 @@ mod tests {
         });
     }
 
+    // ─── QueuePolicy / LaneBudget / SchedulerPolicy normalization ─────
+
+    #[test]
+    fn queue_policy_normalized_zero_high_watermark() {
+        let policy = QueuePolicy {
+            high_watermark: 0,
+            hard_limit: 0,
+            drop_oldest_on_saturation: false,
+            scheduler: SchedulerPolicy::default(),
+        };
+        let n = policy.normalized();
+        assert_eq!(n.high_watermark, 1, "zero high_watermark should become 1");
+        assert_eq!(
+            n.hard_limit, 1,
+            "hard_limit < high_watermark should be clamped"
+        );
+    }
+
+    #[test]
+    fn queue_policy_normalized_hard_limit_below_high_watermark() {
+        let policy = QueuePolicy {
+            high_watermark: 10,
+            hard_limit: 5,
+            drop_oldest_on_saturation: true,
+            scheduler: SchedulerPolicy::default(),
+        };
+        let n = policy.normalized();
+        assert_eq!(n.high_watermark, 10);
+        assert_eq!(
+            n.hard_limit, 10,
+            "hard_limit should be raised to high_watermark"
+        );
+    }
+
+    #[test]
+    fn queue_policy_default_values() {
+        let d = QueuePolicy::default();
+        assert_eq!(d.high_watermark, 4_096);
+        assert_eq!(d.hard_limit, 8_192);
+        assert!(d.drop_oldest_on_saturation);
+    }
+
+    #[test]
+    fn lane_budget_normalized_all_zeros() {
+        let budget = LaneBudget {
+            backfill: 0,
+            watch_event: 0,
+            replay: 0,
+        };
+        let n = budget.normalized(100);
+        assert_eq!(n.backfill, 100);
+        assert_eq!(n.watch_event, 100);
+        assert_eq!(n.replay, 100);
+    }
+
+    #[test]
+    fn lane_budget_normalized_hard_limit_zero() {
+        let budget = LaneBudget {
+            backfill: 0,
+            watch_event: 0,
+            replay: 0,
+        };
+        let n = budget.normalized(0);
+        assert_eq!(n.backfill, 1, "zero hard_limit should use minimum=1");
+        assert_eq!(n.watch_event, 1);
+        assert_eq!(n.replay, 1);
+    }
+
+    #[test]
+    fn lane_budget_normalized_preserves_nonzero() {
+        let budget = LaneBudget {
+            backfill: 42,
+            watch_event: 7,
+            replay: 99,
+        };
+        let n = budget.normalized(1000);
+        assert_eq!(n.backfill, 42);
+        assert_eq!(n.watch_event, 7);
+        assert_eq!(n.replay, 99);
+    }
+
+    #[test]
+    fn lane_budget_default_values() {
+        let d = LaneBudget::default();
+        assert_eq!(d.backfill, 8_192);
+        assert_eq!(d.watch_event, 8_192);
+        assert_eq!(d.replay, 8_192);
+    }
+
+    #[test]
+    fn scheduler_policy_normalized_zero_starvation_guard() {
+        let sp = SchedulerPolicy {
+            mode: SchedulerMode::FairShare,
+            starvation_guard: 0,
+            lane_budget: LaneBudget::default(),
+        };
+        let n = sp.normalized(100);
+        assert_eq!(
+            n.starvation_guard, 1,
+            "zero starvation_guard should become 1"
+        );
+    }
+
+    #[test]
+    fn scheduler_policy_default_values() {
+        let d = SchedulerPolicy::default();
+        assert_eq!(d.starvation_guard, 3);
+        assert!(matches!(d.mode, SchedulerMode::FairShare));
+    }
+
+    // ─── StartupBootstrapPlan::for_machine scale tiers ──────────────
+
+    #[test]
+    fn startup_plan_medium_machine() {
+        let plan = StartupBootstrapPlan::for_machine(50_000, 60);
+        assert_eq!(plan.initial_backfill_batch_size, 1_000);
+        assert_eq!(plan.watcher_activation_threshold_pct, 75);
+        assert!(plan.parallel_backfill_workers >= 1);
+    }
+
+    #[test]
+    fn startup_plan_small_machine() {
+        let plan = StartupBootstrapPlan::for_machine(500, 40);
+        assert_eq!(plan.initial_backfill_batch_size, 256);
+        assert_eq!(plan.watcher_activation_threshold_pct, 90);
+        assert!(plan.parallel_backfill_workers >= 1);
+    }
+
+    #[test]
+    fn startup_plan_zero_roots() {
+        let plan = StartupBootstrapPlan::for_machine(0, 50);
+        assert_eq!(plan.initial_backfill_batch_size, 256);
+        assert_eq!(plan.parallel_backfill_workers, 1);
+    }
+
+    #[test]
+    fn startup_plan_zero_cpu_budget() {
+        let plan = StartupBootstrapPlan::for_machine(1000, 0);
+        assert!(plan.parallel_backfill_workers >= 1);
+    }
+
+    #[test]
+    fn startup_plan_boundary_10001() {
+        let plan = StartupBootstrapPlan::for_machine(10_001, 80);
+        assert_eq!(plan.initial_backfill_batch_size, 1_000);
+        assert_eq!(plan.watcher_activation_threshold_pct, 75);
+    }
+
+    #[test]
+    fn startup_plan_boundary_100001() {
+        let plan = StartupBootstrapPlan::for_machine(100_001, 80);
+        assert_eq!(plan.initial_backfill_batch_size, 2_000);
+        assert_eq!(plan.watcher_activation_threshold_pct, 60);
+    }
+
+    // ─── FsWatcherConfig normalization and throttle_for ─────────────
+
+    #[test]
+    fn fs_watcher_config_normalized_zeros() {
+        let cfg = FsWatcherConfig {
+            debounce_ms: 0,
+            batch_size: 0,
+            poll_interval_ms: 0,
+        };
+        let n = cfg.normalized();
+        assert_eq!(n.debounce_ms, 1);
+        assert_eq!(n.batch_size, 1);
+        assert_eq!(n.poll_interval_ms, 1);
+    }
+
+    #[test]
+    fn fs_watcher_config_default_values() {
+        let d = FsWatcherConfig::default();
+        assert_eq!(d.debounce_ms, 500);
+        assert_eq!(d.batch_size, 100);
+        assert_eq!(d.poll_interval_ms, 2_000);
+    }
+
+    #[test]
+    fn throttle_for_normal_full() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Normal, DegradationStage::Full);
+        assert_eq!(t.debounce_ms, 500);
+        assert_eq!(t.batch_size, 100);
+        assert!(!t.suspended);
+        assert_eq!(t.reason_code, "watcher.throttle.normal");
+    }
+
+    #[test]
+    fn throttle_for_metadata_only_suspends() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Normal, DegradationStage::MetadataOnly);
+        assert!(t.suspended);
+        assert_eq!(t.debounce_ms, 10_000);
+        assert_eq!(t.batch_size, 1);
+        assert_eq!(t.reason_code, "watcher.throttle.suspended");
+    }
+
+    #[test]
+    fn throttle_for_paused_suspends() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Normal, DegradationStage::Paused);
+        assert!(t.suspended);
+        assert_eq!(t.reason_code, "watcher.throttle.suspended");
+    }
+
+    #[test]
+    fn throttle_for_lexical_only_heavy_pressure() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Normal, DegradationStage::LexicalOnly);
+        assert!(!t.suspended);
+        assert_eq!(t.debounce_ms, 5_000);
+        assert_eq!(t.batch_size, 10);
+        assert_eq!(t.reason_code, "watcher.throttle.heavy_pressure");
+    }
+
+    #[test]
+    fn throttle_for_degraded_pressure() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Degraded, DegradationStage::Full);
+        assert!(!t.suspended);
+        assert_eq!(t.debounce_ms, 5_000);
+        assert_eq!(t.batch_size, 10);
+        assert_eq!(t.reason_code, "watcher.throttle.heavy_pressure");
+    }
+
+    #[test]
+    fn throttle_for_emergency_pressure() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Emergency, DegradationStage::Full);
+        assert!(!t.suspended);
+        assert_eq!(t.debounce_ms, 5_000);
+        assert_eq!(t.batch_size, 10);
+        assert_eq!(t.reason_code, "watcher.throttle.heavy_pressure");
+    }
+
+    #[test]
+    fn throttle_for_embed_deferred_constrained() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Normal, DegradationStage::EmbedDeferred);
+        assert!(!t.suspended);
+        assert_eq!(t.debounce_ms, 2_000);
+        assert_eq!(t.batch_size, 25);
+        assert_eq!(t.reason_code, "watcher.throttle.constrained");
+    }
+
+    #[test]
+    fn throttle_for_constrained_pressure() {
+        let cfg = FsWatcherConfig::default();
+        let t = cfg.throttle_for(PressureState::Constrained, DegradationStage::Full);
+        assert!(!t.suspended);
+        assert_eq!(t.debounce_ms, 2_000);
+        assert_eq!(t.batch_size, 25);
+        assert_eq!(t.reason_code, "watcher.throttle.constrained");
+    }
+
+    #[test]
+    fn throttle_for_small_batch_under_cap() {
+        let cfg = FsWatcherConfig {
+            debounce_ms: 100,
+            batch_size: 5,
+            poll_interval_ms: 1000,
+        };
+        let t = cfg.throttle_for(PressureState::Degraded, DegradationStage::Full);
+        assert_eq!(t.batch_size, 5, "batch_size < 10 should be preserved");
+    }
+
+    // ─── WatchEvent / IndexedFileCheckpoint / ObservedFileState ─────
+
+    #[test]
+    fn watch_event_new_defaults() {
+        let ev = WatchEvent::new("/test/file.rs", WatchEventKind::Create, 42, 1024);
+        assert_eq!(ev.path, PathBuf::from("/test/file.rs"));
+        assert_eq!(ev.kind, WatchEventKind::Create);
+        assert_eq!(ev.event_ts_ms, 42);
+        assert_eq!(ev.byte_len, 1024);
+        assert!(matches!(
+            ev.change_detection,
+            crate::mount_info::ChangeDetectionStrategy::Watch
+        ));
+    }
+
+    #[test]
+    fn watch_event_with_change_detection() {
+        use crate::mount_info::ChangeDetectionStrategy;
+        let ev = WatchEvent::new("/test/file.rs", WatchEventKind::Modify, 100, 50)
+            .with_change_detection(ChangeDetectionStrategy::Poll);
+        assert!(matches!(ev.change_detection, ChangeDetectionStrategy::Poll));
+    }
+
+    #[test]
+    fn indexed_file_checkpoint_new() {
+        let cp = IndexedFileCheckpoint::new("/corpus/doc.md", 999);
+        assert_eq!(cp.path, PathBuf::from("/corpus/doc.md"));
+        assert_eq!(cp.indexed_mtime_ms, 999);
+    }
+
+    #[test]
+    fn observed_file_state_present() {
+        let obs = ObservedFileState::present("/corpus/doc.md", 1234);
+        assert_eq!(obs.path, PathBuf::from("/corpus/doc.md"));
+        assert_eq!(obs.observed_mtime_ms, Some(1234));
+    }
+
+    #[test]
+    fn observed_file_state_missing() {
+        let obs = ObservedFileState::missing("/corpus/deleted.md");
+        assert_eq!(obs.path, PathBuf::from("/corpus/deleted.md"));
+        assert!(obs.observed_mtime_ms.is_none());
+    }
+
+    // ─── WatcherStats default ───────────────────────────────────────
+
+    #[test]
+    fn watcher_stats_default_all_zero() {
+        let stats = super::WatcherStats::default();
+        assert_eq!(stats.watching_dirs, 0);
+        assert_eq!(stats.events_received, 0);
+        assert_eq!(stats.events_debounced, 0);
+        assert_eq!(stats.files_reindexed, 0);
+        assert_eq!(stats.files_skipped, 0);
+        assert_eq!(stats.errors, 0);
+        assert!(stats.last_event_ts_ms.is_none());
+    }
+
+    // ─── OrchestrationState accessors ───────────────────────────────
+
+    #[test]
+    fn orchestration_state_new_initial_values() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let state = OrchestrationState::new(policy, startup);
+        assert_eq!(state.phase(), OrchestrationPhase::Bootstrap);
+        assert_eq!(state.backpressure_mode(), BackpressureMode::Normal);
+        assert_eq!(state.last_applied_seq(), 0);
+        assert_eq!(state.backlog_depth(), 0);
+        let sp = state.startup_plan();
+        assert_eq!(
+            sp.initial_backfill_batch_size,
+            startup.initial_backfill_batch_size
+        );
+    }
+
+    #[test]
+    fn orchestration_state_from_resume_recovering() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let token = super::ResumeToken {
+            last_applied_seq: 42,
+            backlog_depth: 5,
+            backpressure_mode: BackpressureMode::HighWatermark,
+            phase: OrchestrationPhase::Backfill,
+            generated_at_ms: 100,
+        };
+        let state = OrchestrationState::from_resume(policy, startup, &token);
+        assert_eq!(state.phase(), OrchestrationPhase::Recovering);
+        assert_eq!(state.last_applied_seq(), 42);
+        assert_eq!(state.backpressure_mode(), BackpressureMode::HighWatermark);
+    }
+
+    // ─── mark_backfill_complete with empty queue ────────────────────
+
+    #[test]
+    fn mark_backfill_complete_empty_queue_goes_to_watch() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        state.mark_backfill_complete();
+        assert_eq!(state.phase(), OrchestrationPhase::Watch);
+    }
+
+    // ─── pop_work empty ─────────────────────────────────────────────
+
+    #[test]
+    fn pop_work_empty_returns_none() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        assert!(state.pop_work().is_none());
+    }
+
+    // ─── cancel_work draining transition ────────────────────────────
+
+    #[test]
+    fn cancel_work_draining_clears_to_watch() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        let _ = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "doc/1.md".to_owned(),
+            revision: 1,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 1,
+        });
+        state.mark_backfill_complete();
+        assert_eq!(state.phase(), OrchestrationPhase::Draining);
+        let cancelled = state.cancel_work(1).expect("should cancel");
+        assert_eq!(cancelled.stream_seq, 1);
+        assert_eq!(state.phase(), OrchestrationPhase::Watch);
+    }
+
+    #[test]
+    fn cancel_work_not_found() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        assert!(state.cancel_work(999).is_err());
+    }
+
+    // ─── apply_replay_seq duplicate ─────────────────────────────────
+
+    #[test]
+    fn apply_replay_seq_duplicate_is_ok() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        state.apply_replay_seq(1).expect("first apply");
+        assert_eq!(state.last_applied_seq(), 1);
+        state.apply_replay_seq(1).expect("duplicate should be ok");
+        assert_eq!(state.last_applied_seq(), 1);
+    }
+
+    // ─── snapshot_resume_token ───────────────────────────────────────
+
+    #[test]
+    fn snapshot_resume_token_captures_state() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        let _ = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "doc/1.md".to_owned(),
+            revision: 1,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 1,
+        });
+        state.apply_replay_seq(1).unwrap();
+        let token = state.snapshot_resume_token(9999);
+        assert_eq!(token.last_applied_seq, 1);
+        assert_eq!(token.backlog_depth, 1);
+        assert_eq!(token.generated_at_ms, 9999);
+        assert_eq!(token.phase, OrchestrationPhase::Backfill);
+    }
+
+    // ─── push_work phase transitions ────────────────────────────────
+
+    #[test]
+    fn push_watch_event_transitions_bootstrap_to_watch() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        assert_eq!(state.phase(), OrchestrationPhase::Bootstrap);
+        let _ = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "doc/1.md".to_owned(),
+            revision: 1,
+            kind: WorkKind::WatchEvent,
+            event_ts_ms: 1,
+        });
+        assert_eq!(state.phase(), OrchestrationPhase::Watch);
+    }
+
+    #[test]
+    fn push_replay_transitions_to_recovering() {
+        let policy = QueuePolicy::default();
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        let _ = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "doc/1.md".to_owned(),
+            revision: 1,
+            kind: WorkKind::Replay,
+            event_ts_ms: 1,
+        });
+        assert_eq!(state.phase(), OrchestrationPhase::Recovering);
+    }
+
+    // ─── mode_for_depth via push/pop ────────────────────────────────
+
+    #[test]
+    fn backpressure_mode_transitions() {
+        let policy = QueuePolicy {
+            high_watermark: 2,
+            hard_limit: 4,
+            drop_oldest_on_saturation: true,
+            scheduler: SchedulerPolicy::default(),
+        };
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        assert_eq!(state.backpressure_mode(), BackpressureMode::Normal);
+
+        let _ = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "a".to_owned(),
+            revision: 1,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 1,
+        });
+        assert_eq!(state.backpressure_mode(), BackpressureMode::Normal);
+
+        let _ = state.push_work(WorkItem {
+            stream_seq: 2,
+            file_key: "b".to_owned(),
+            revision: 2,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 2,
+        });
+        assert_eq!(state.backpressure_mode(), BackpressureMode::HighWatermark);
+
+        let _ = state.push_work(WorkItem {
+            stream_seq: 3,
+            file_key: "c".to_owned(),
+            revision: 3,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 3,
+        });
+        let _ = state.push_work(WorkItem {
+            stream_seq: 4,
+            file_key: "d".to_owned(),
+            revision: 4,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 4,
+        });
+        assert_eq!(state.backpressure_mode(), BackpressureMode::Saturated);
+
+        state.pop_work();
+        state.pop_work();
+        state.pop_work();
+        assert_eq!(state.backpressure_mode(), BackpressureMode::Normal);
+    }
+
+    // ─── latency-sensitive replay fallback ───────────────────────────
+
+    #[test]
+    fn latency_sensitive_replay_before_backfill() {
+        let policy = QueuePolicy {
+            high_watermark: 8,
+            hard_limit: 16,
+            drop_oldest_on_saturation: true,
+            scheduler: SchedulerPolicy {
+                mode: SchedulerMode::LatencySensitive,
+                starvation_guard: 3,
+                lane_budget: LaneBudget::default(),
+            },
+        };
+        let startup = StartupBootstrapPlan::for_machine(1_000, 50);
+        let mut state = OrchestrationState::new(policy, startup);
+        let _ = state.push_work(WorkItem {
+            stream_seq: 1,
+            file_key: "backfill".to_owned(),
+            revision: 1,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 1,
+        });
+        let _ = state.push_work(WorkItem {
+            stream_seq: 2,
+            file_key: "replay".to_owned(),
+            revision: 2,
+            kind: WorkKind::Replay,
+            event_ts_ms: 2,
+        });
+        let first = state.pop_work().unwrap();
+        assert_eq!(
+            first.kind,
+            WorkKind::Replay,
+            "replay should come before backfill in latency-sensitive mode"
+        );
+    }
+
+    // ─── FsWatcher enqueue when not running ─────────────────────────
+
+    #[test]
+    fn watcher_enqueue_not_running_rejects() {
+        let mut watcher = FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+        assert!(!watcher.is_running());
+        let reason = watcher.enqueue_event(WatchEvent::new(
+            "/test/file.rs",
+            WatchEventKind::Create,
+            100,
+            64,
+        ));
+        assert_eq!(reason, "watcher.reject.not_running");
+        assert_eq!(watcher.stats().errors, 1);
+    }
+
+    #[test]
+    fn watcher_flush_not_running_empty() {
+        let mut watcher = FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+        let dispatch = watcher.flush_ready(1000, PressureState::Normal, DegradationStage::Full);
+        assert_eq!(dispatch.reason_code, "watcher.flush.not_running");
+        assert!(dispatch.actions.is_empty());
+    }
+
+    #[test]
+    fn watcher_enqueue_static_mount_skips() {
+        run_test_with_cx(|cx| async move {
+            use crate::mount_info::ChangeDetectionStrategy;
+            let mut watcher =
+                FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+            watcher.start(&cx, 1).await.expect("start");
+            let ev = WatchEvent::new("/test/file.rs", WatchEventKind::Create, 100, 64)
+                .with_change_detection(ChangeDetectionStrategy::Static);
+            let reason = watcher.enqueue_event(ev);
+            assert_eq!(reason, "watcher.skip.static_mount");
+            assert_eq!(watcher.stats().files_skipped, 1);
+        });
+    }
+
+    #[test]
+    fn watcher_start_zero_dirs_errors() {
+        run_test_with_cx(|cx| async move {
+            let mut watcher =
+                FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+            let result = watcher.start(&cx, 0).await;
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn watcher_stop_clears_pending() {
+        run_test_with_cx(|cx| async move {
+            let mut watcher =
+                FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+            watcher.start(&cx, 1).await.expect("start");
+            watcher.enqueue_event(WatchEvent::new(
+                "/test/file.rs",
+                WatchEventKind::Create,
+                100,
+                64,
+            ));
+            assert_eq!(watcher.pending_depth(), 1);
+            watcher.stop(&cx).await;
+            assert_eq!(watcher.pending_depth(), 0);
+            assert!(!watcher.is_running());
+            assert_eq!(watcher.stats().watching_dirs, 0);
+        });
+    }
+
+    // ─── plan_catchup edge cases ────────────────────────────────────
+
+    #[test]
+    fn plan_catchup_both_empty() {
+        let actions = FsWatcher::plan_catchup(&[], &[]);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn plan_catchup_empty_indexed_all_new() {
+        let observed = vec![
+            ObservedFileState::present("/a.md", 100),
+            ObservedFileState::present("/b.md", 200),
+        ];
+        let actions = FsWatcher::plan_catchup(&[], &observed);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|a| a.kind == WatcherActionKind::Reindex));
+        assert!(
+            actions
+                .iter()
+                .all(|a| a.reason_code == "watcher.catchup.new_file")
+        );
+    }
+
+    #[test]
+    fn plan_catchup_empty_observed_all_tombstones() {
+        let indexed = vec![
+            IndexedFileCheckpoint::new("/a.md", 100),
+            IndexedFileCheckpoint::new("/b.md", 200),
+        ];
+        let actions = FsWatcher::plan_catchup(&indexed, &[]);
+        assert_eq!(actions.len(), 2);
+        assert!(
+            actions
+                .iter()
+                .all(|a| a.kind == WatcherActionKind::Tombstone)
+        );
+        assert!(
+            actions
+                .iter()
+                .all(|a| a.reason_code == "watcher.catchup.missing_from_snapshot")
+        );
+    }
+
+    #[test]
+    fn plan_catchup_same_mtime_no_action() {
+        let indexed = vec![IndexedFileCheckpoint::new("/a.md", 100)];
+        let observed = vec![ObservedFileState::present("/a.md", 100)];
+        let actions = FsWatcher::plan_catchup(&indexed, &observed);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn plan_catchup_older_observed_no_action() {
+        let indexed = vec![IndexedFileCheckpoint::new("/a.md", 200)];
+        let observed = vec![ObservedFileState::present("/a.md", 100)];
+        let actions = FsWatcher::plan_catchup(&indexed, &observed);
+        assert!(actions.is_empty());
+    }
+
+    // ─── flush_ready suspended ──────────────────────────────────────
+
+    #[test]
+    fn flush_ready_suspended_returns_empty() {
+        run_test_with_cx(|cx| async move {
+            let mut watcher =
+                FsWatcher::new(FsWatcherConfig::default(), DiscoveryConfig::default());
+            watcher.start(&cx, 1).await.expect("start");
+            watcher.enqueue_event(WatchEvent::new(
+                "/test/file.rs",
+                WatchEventKind::Create,
+                100,
+                64,
+            ));
+            let dispatch =
+                watcher.flush_ready(100_000, PressureState::Normal, DegradationStage::Paused);
+            assert_eq!(dispatch.reason_code, "watcher.flush.suspended");
+            assert!(dispatch.actions.is_empty());
+            assert_eq!(
+                watcher.pending_depth(),
+                1,
+                "pending should be preserved when suspended"
+            );
+        });
+    }
+
+    // ─── WorkItem / ResumeToken / QueuePushResult struct coverage ───
+
+    #[test]
+    fn work_item_clone_eq() {
+        let item = WorkItem {
+            stream_seq: 1,
+            file_key: "test.md".to_owned(),
+            revision: 42,
+            kind: WorkKind::Backfill,
+            event_ts_ms: 100,
+        };
+        let cloned = item.clone();
+        assert_eq!(item, cloned);
+    }
+
+    #[test]
+    fn resume_token_clone_eq() {
+        let token = super::ResumeToken {
+            last_applied_seq: 10,
+            backlog_depth: 3,
+            backpressure_mode: BackpressureMode::Normal,
+            phase: OrchestrationPhase::Watch,
+            generated_at_ms: 42,
+        };
+        let cloned = token.clone();
+        assert_eq!(token, cloned);
+    }
+
+    #[test]
+    fn watcher_throttle_clone() {
+        let throttle = super::WatcherThrottle {
+            debounce_ms: 100,
+            batch_size: 10,
+            suspended: false,
+            reason_code: "test",
+        };
+        let cloned = throttle;
+        assert_eq!(throttle, cloned);
+    }
+
+    #[test]
+    fn watcher_action_clone() {
+        let action = super::WatcherAction {
+            path: PathBuf::from("/test"),
+            kind: WatcherActionKind::Reindex,
+            reason_code: "test",
+        };
+        let cloned = action.clone();
+        assert_eq!(action, cloned);
+    }
+
+    #[test]
+    fn watcher_dispatch_clone() {
+        let dispatch = super::WatcherDispatch {
+            throttle: super::WatcherThrottle {
+                debounce_ms: 100,
+                batch_size: 10,
+                suspended: false,
+                reason_code: "test",
+            },
+            reason_code: "test",
+            actions: vec![],
+            deferred_count: 0,
+        };
+        let cloned = dispatch.clone();
+        assert_eq!(dispatch, cloned);
+    }
+
     #[test]
     fn watcher_catchup_plans_new_changed_and_deleted_files() {
         let indexed = vec![

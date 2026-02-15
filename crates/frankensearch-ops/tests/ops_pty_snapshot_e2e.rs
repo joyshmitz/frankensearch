@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use frankensearch_core::{
-    ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier, DiffEntry,
-    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    build_artifact_entries, normalize_replay_command, render_artifacts_index, sha256_checksum,
+    validate_event_envelope, validate_manifest_envelope, ArtifactEmissionInput, ArtifactEntry,
+    ClockMode, Correlation, DeterminismTier, DiffEntry, E2eEnvelope, E2eEventType, E2eOutcome,
+    E2eSeverity, EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody,
+    ReplayEventType, SnapshotDiffBody, Suite, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON,
+    E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPRO_LOCK,
     E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT, E2E_SCHEMA_EVENT,
-    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2E_SCHEMA_SNAPSHOT_DIFF, E2eEnvelope, E2eEventType,
-    E2eOutcome, E2eSeverity, EventBody, ExitStatus, ManifestBody, ModelVersion, Platform,
-    ReplayBody, ReplayEventType, SnapshotDiffBody, Suite, build_artifact_entries,
-    normalize_replay_command, render_artifacts_index, sha256_checksum, validate_event_envelope,
-    validate_manifest_envelope,
+    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2E_SCHEMA_SNAPSHOT_DIFF,
 };
 use frankensearch_ops::data_source::TimeWindow;
 use frankensearch_ops::state::{FleetSnapshot, ResourceMetrics, SearchMetrics};
@@ -18,8 +18,8 @@ use frankensearch_ops::{
     OpsApp, ViewPreset,
 };
 use frankensearch_tui::{InputEvent, ReplayPlayer, ReplayRecorder};
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 
 const OPS_RUN_ID: &str = "01HQXG5M7P3KZFV9N2RSTW6YAB";
@@ -240,6 +240,26 @@ fn replay_command_for(test_name: &str) -> String {
     ))
 }
 
+fn ops_env_json_payload() -> String {
+    serde_json::json!({
+        "schema": "frankensearch.e2e.env.v1",
+        "captured_env": [],
+        "suite": "ops",
+    })
+    .to_string()
+}
+
+fn ops_repro_lock_payload(exit_status: ExitStatus) -> String {
+    let status = match exit_status {
+        ExitStatus::Pass => "pass",
+        ExitStatus::Fail => "fail",
+        ExitStatus::Error => "error",
+    };
+    format!(
+        "schema=frankensearch.e2e.repro-lock.v1\nsuite=ops\nrun_id={OPS_RUN_ID}\nexit_status={status}\nseed={OPS_SEED}\n"
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> ScenarioOutput {
     let base_snapshot = MockDataSource::sample().fleet_snapshot();
@@ -449,6 +469,13 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
     let structured_event_line_count = usize_to_u64(events.len());
     let terminal_transcript = transcript_lines.join("\n");
     let replay_command = replay_command_for(test_name);
+    let exit_status = if force_snapshot_diff_failure {
+        ExitStatus::Fail
+    } else {
+        ExitStatus::Pass
+    };
+    let env_json = ops_env_json_payload();
+    let repro_lock = ops_repro_lock_payload(exit_status);
 
     let (evidence_jsonl, evidence_line_count) = render_evidence_jsonl(app.state.fleet());
     let snapshot_matrix_json =
@@ -522,6 +549,16 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
             line_count: None,
         },
         ArtifactEmissionInput {
+            file: E2E_ARTIFACT_ENV_JSON,
+            bytes: env_json.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPRO_LOCK,
+            bytes: repro_lock.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
             file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
             bytes: replay_command.as_bytes(),
             line_count: None,
@@ -562,12 +599,6 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
         .expect("config payload should serialize")
         .as_bytes(),
     );
-
-    let exit_status = if force_snapshot_diff_failure {
-        ExitStatus::Fail
-    } else {
-        ExitStatus::Pass
-    };
 
     let end_outcome = if force_snapshot_diff_failure {
         E2eOutcome::Fail
@@ -652,6 +683,15 @@ fn ops_snapshot_matrix_covers_multi_size_accessibility_and_density_modes() {
     assert_eq!(output.manifest.body.suite, Suite::Ops);
     assert_eq!(output.manifest.body.exit_status, ExitStatus::Pass);
     assert!(output.snapshot_diff.is_none());
+    let artifact_files: Vec<&str> = output
+        .manifest
+        .body
+        .artifacts
+        .iter()
+        .map(|entry| entry.file.as_str())
+        .collect();
+    assert!(artifact_files.contains(&E2E_ARTIFACT_ENV_JSON));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK));
 
     assert!(
         output
@@ -717,6 +757,8 @@ fn ops_failure_bundle_includes_transcript_snapshot_diff_and_replay_entrypoint() 
         .map(|entry| entry.file.as_str())
         .collect();
     assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_ENV_JSON));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK));
     assert!(artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT));
     assert!(artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
     assert!(artifact_files.contains(&E2E_ARTIFACT_TERMINAL_TRANSCRIPT_TXT));

@@ -1,5 +1,6 @@
 //! Brute-force top-k vector search over an opened [`crate::VectorIndex`].
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -15,6 +16,41 @@ use crate::{Quantization, VectorIndex, dot_product_f16_f32, dot_product_f32_f32}
 pub const PARALLEL_THRESHOLD: usize = 10_000;
 /// Chunk size per Rayon task in the parallel scan path.
 pub const PARALLEL_CHUNK_SIZE: usize = 1_024;
+
+// Thread-local scratch buffers for vector decode operations.
+// Reused across search calls and Rayon chunks to avoid per-call allocation.
+thread_local! {
+    static F16_SCRATCH: RefCell<Vec<f16>> = const { RefCell::new(Vec::new()) };
+    static F32_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take the thread-local f16 scratch buffer, resized to `dim`.
+fn take_f16_scratch(dim: usize) -> Vec<f16> {
+    F16_SCRATCH.with_borrow_mut(|v| {
+        let mut s = std::mem::take(v);
+        s.resize(dim, f16::from_f32(0.0));
+        s
+    })
+}
+
+/// Return an f16 scratch buffer to thread-local storage for reuse.
+fn return_f16_scratch(buf: Vec<f16>) {
+    F16_SCRATCH.with_borrow_mut(|v| *v = buf);
+}
+
+/// Take the thread-local f32 scratch buffer, resized to `dim`.
+fn take_f32_scratch(dim: usize) -> Vec<f32> {
+    F32_SCRATCH.with_borrow_mut(|v| {
+        let mut s = std::mem::take(v);
+        s.resize(dim, 0.0_f32);
+        s
+    })
+}
+
+/// Return an f32 scratch buffer to thread-local storage for reuse.
+fn return_f32_scratch(buf: Vec<f32>) {
+    F32_SCRATCH.with_borrow_mut(|v| *v = buf);
+}
 
 #[derive(Debug, Clone, Copy)]
 struct HeapEntry {
@@ -126,7 +162,7 @@ impl VectorIndex {
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         match self.quantization() {
             Quantization::F16 => {
-                let mut scratch = vec![f16::from_f32(0.0); self.dimension()];
+                let mut scratch = take_f16_scratch(self.dimension());
                 for index in 0..self.record_count() {
                     if !self.passes_search_filter(filter, index)? {
                         continue;
@@ -134,9 +170,10 @@ impl VectorIndex {
                     let score = self.score_f16(index, query, &mut scratch)?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                 }
+                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
-                let mut scratch = vec![0.0_f32; self.dimension()];
+                let mut scratch = take_f32_scratch(self.dimension());
                 for index in 0..self.record_count() {
                     if !self.passes_search_filter(filter, index)? {
                         continue;
@@ -144,6 +181,7 @@ impl VectorIndex {
                     let score = self.score_f32(index, query, &mut scratch)?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                 }
+                return_f32_scratch(scratch);
             }
         }
         Ok(heap)
@@ -162,11 +200,12 @@ impl VectorIndex {
             .map(|chunk_index| {
                 let start = chunk_index * chunk_size;
                 let end = (start + chunk_size).min(self.record_count());
-                if let Some(active_filter) = filter {
-                    self.scan_range_chunk_filtered(start, end, query, limit, active_filter)
-                } else {
-                    self.scan_range_chunk(start, end, query, limit)
-                }
+                filter.map_or_else(
+                    || self.scan_range_chunk(start, end, query, limit),
+                    |active_filter| {
+                        self.scan_range_chunk_filtered(start, end, query, limit, active_filter)
+                    },
+                )
             })
             .collect();
 
@@ -183,7 +222,7 @@ impl VectorIndex {
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         match self.quantization() {
             Quantization::F16 => {
-                let mut scratch = vec![f16::from_f32(0.0); self.dimension()];
+                let mut scratch = take_f16_scratch(self.dimension());
                 for index in start..end {
                     if self.is_deleted(index) {
                         continue;
@@ -191,9 +230,10 @@ impl VectorIndex {
                     let score = self.score_f16(index, query, &mut scratch)?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                 }
+                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
-                let mut scratch = vec![0.0_f32; self.dimension()];
+                let mut scratch = take_f32_scratch(self.dimension());
                 for index in start..end {
                     if self.is_deleted(index) {
                         continue;
@@ -201,6 +241,7 @@ impl VectorIndex {
                     let score = self.score_f32(index, query, &mut scratch)?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                 }
+                return_f32_scratch(scratch);
             }
         }
         Ok(heap)
@@ -217,7 +258,7 @@ impl VectorIndex {
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
         match self.quantization() {
             Quantization::F16 => {
-                let mut scratch = vec![f16::from_f32(0.0); self.dimension()];
+                let mut scratch = take_f16_scratch(self.dimension());
                 for index in start..end {
                     if !self.passes_search_filter(Some(filter), index)? {
                         continue;
@@ -225,9 +266,10 @@ impl VectorIndex {
                     let score = self.score_f16(index, query, &mut scratch)?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                 }
+                return_f16_scratch(scratch);
             }
             Quantization::F32 => {
-                let mut scratch = vec![0.0_f32; self.dimension()];
+                let mut scratch = take_f32_scratch(self.dimension());
                 for index in start..end {
                     if !self.passes_search_filter(Some(filter), index)? {
                         continue;
@@ -235,6 +277,7 @@ impl VectorIndex {
                     let score = self.score_f32(index, query, &mut scratch)?;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                 }
+                return_f32_scratch(scratch);
             }
         }
         Ok(heap)
@@ -309,10 +352,6 @@ impl VectorIndex {
             }
         }
 
-        hits.sort_by(|left, right| {
-            left.cmp_by_score(right)
-                .then_with(|| left.index.cmp(&right.index))
-        });
         Ok(hits)
     }
 
@@ -1225,23 +1264,6 @@ mod tests {
         // Lower index wins the tiebreak
         assert!(candidate_is_better(left, right));
         assert!(!candidate_is_better(right, left));
-    }
-
-    #[test]
-    fn compare_best_first_orders_descending_by_score() {
-        let high = HeapEntry::new(0, 0.9);
-        let low = HeapEntry::new(1, 0.1);
-        assert_eq!(compare_best_first(&high, &low), Ordering::Less);
-        assert_eq!(compare_best_first(&low, &high), Ordering::Greater);
-    }
-
-    #[test]
-    fn compare_best_first_nan_ranks_after_finite() {
-        let finite = HeapEntry::new(0, 0.5);
-        let nan = HeapEntry::new(1, f32::NAN);
-        // NaN maps to NEG_INFINITY, so finite ranks before NaN
-        assert_eq!(compare_best_first(&finite, &nan), Ordering::Less);
-        assert_eq!(compare_best_first(&nan, &finite), Ordering::Greater);
     }
 
     #[test]

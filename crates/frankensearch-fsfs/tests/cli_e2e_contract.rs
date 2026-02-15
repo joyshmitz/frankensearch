@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use frankensearch_core::{E2eOutcome, ExitStatus};
+use frankensearch_core::{
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPRO_LOCK,
+    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, ExitStatus,
+};
 use frankensearch_fsfs::{
     CLI_E2E_SCHEMA_VERSION, CliE2eArtifactBundle, CliE2eRunConfig, CliE2eScenarioKind,
     build_default_cli_e2e_bundles, default_cli_e2e_scenarios, replay_command_for_scenario,
@@ -85,6 +88,39 @@ fn scenario_cli_degrade_path() {
         bundle
             .replay_command
             .contains("--exact scenario_cli_degrade_path")
+    );
+}
+
+#[test]
+fn scenario_cli_manifest_lists_required_artifacts() {
+    let scenario = scenario_by_kind(CliE2eScenarioKind::Search);
+    let bundle =
+        CliE2eArtifactBundle::build(&CliE2eRunConfig::default(), &scenario, ExitStatus::Pass);
+    bundle.validate().expect("bundle must validate");
+
+    let artifact_files = bundle
+        .manifest
+        .body
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.file.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL),
+        "manifest must list structured events artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON),
+        "manifest must list artifacts index artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_ENV_JSON),
+        "manifest must list env metadata artifact"
+    );
+    assert!(
+        artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK),
+        "manifest must list reproducibility lock artifact"
     );
 }
 

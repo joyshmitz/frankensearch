@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use frankensearch_core::{
     ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
-    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
-    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY,
-    E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody, ExitStatus, ManifestBody,
-    ModelVersion, Platform, ReplayBody, ReplayEventType, Suite, build_artifact_entries,
-    render_artifacts_index, sha256_checksum, validate_event_envelope, validate_manifest_envelope,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT,
+    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity,
+    EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody, ReplayEventType,
+    Suite, build_artifact_entries, render_artifacts_index, sha256_checksum,
+    validate_event_envelope, validate_manifest_envelope,
 };
 use frankensearch_fsfs::interaction_primitives::{
     InteractionBudget, InteractionCycleTiming, InteractionSnapshot, LatencyBucket, LatencyPhase,
@@ -69,6 +70,33 @@ const DELUXE_TUI_REASON_PASS: &str = "e2e.tui.scenario_pass";
 const DELUXE_TUI_REASON_REPLAY_MISMATCH: &str = "e2e.tui.replay_mismatch";
 const DELUXE_TUI_ARTIFACT_FILE: &str = "deluxe_tui_artifact.json";
 const DELUXE_TUI_REPLAY_FAILURE_FILE: &str = "deluxe_tui_replay_failure.json";
+
+fn deluxe_tui_env_json_payload(scenario: &str, mode: &str) -> String {
+    serde_json::json!({
+        "schema": "frankensearch.e2e.env.v1",
+        "captured_env": [],
+        "suite": "fsfs.deluxe_tui",
+        "scenario": scenario,
+        "mode": mode,
+    })
+    .to_string()
+}
+
+fn deluxe_tui_repro_lock_payload(
+    exit_status: ExitStatus,
+    event_count: u64,
+    replay_command: &str,
+) -> String {
+    let status = match exit_status {
+        ExitStatus::Pass => "pass",
+        ExitStatus::Fail => "fail",
+        ExitStatus::Error => "error",
+    };
+    let replay_checksum = sha256_checksum(replay_command.as_bytes());
+    format!(
+        "schema=frankensearch.e2e.repro-lock.v1\nsuite=fsfs.deluxe_tui\nrun_id={DELUXE_TUI_RUN_ID}\nexit_status={status}\nevent_count={event_count}\nreplay_command_checksum={replay_checksum}\n"
+    )
+}
 
 #[inline]
 fn usize_to_f64(value: usize) -> f64 {
@@ -437,12 +465,25 @@ fn build_deluxe_tui_unified_bundle(
     let structured_events_jsonl = render_events_jsonl(&events);
     #[allow(clippy::cast_possible_truncation)]
     let event_count = u64::try_from(events.len()).expect("event count must fit in u64");
+    let env_json = deluxe_tui_env_json_payload(scenario, &artifact.mode);
+    let repro_lock =
+        deluxe_tui_repro_lock_payload(exit_status, event_count, &artifact.replay_command);
 
     let mut artifact_inputs = vec![
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
             bytes: structured_events_jsonl.as_bytes(),
             line_count: Some(event_count),
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_ENV_JSON,
+            bytes: env_json.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPRO_LOCK,
+            bytes: repro_lock.as_bytes(),
+            line_count: None,
         },
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
@@ -543,6 +584,8 @@ fn assert_deluxe_tui_unified_bundle_is_valid(
         .map(|artifact| artifact.file.as_str())
         .collect();
     assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_ENV_JSON));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK));
     assert!(artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT));
     assert!(artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
     assert!(artifact_files.contains(&DELUXE_TUI_ARTIFACT_FILE));

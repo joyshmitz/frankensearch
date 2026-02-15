@@ -9,11 +9,12 @@ use std::collections::BTreeMap;
 
 use frankensearch_core::{
     ArtifactEmissionInput, ArtifactEntry, ClockMode, Correlation, DeterminismTier,
-    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
-    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY,
-    E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody, ExitStatus, ManifestBody,
-    ModelVersion, Platform, ReplayBody, ReplayEventType, Suite, build_artifact_entries,
-    render_artifacts_index, sha256_checksum, validate_event_envelope, validate_manifest_envelope,
+    E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+    E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT,
+    E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity,
+    EventBody, ExitStatus, ManifestBody, ModelVersion, Platform, ReplayBody, ReplayEventType,
+    Suite, build_artifact_entries, render_artifacts_index, sha256_checksum,
+    validate_event_envelope, validate_manifest_envelope,
 };
 use serde::{Deserialize, Serialize};
 
@@ -408,6 +409,8 @@ const fn scenario_exit_status(scenario: &CliE2eScenario) -> ExitStatus {
 
 fn artifact_entries(replay_command: &str, events: &[E2eEnvelope<EventBody>]) -> Vec<ArtifactEntry> {
     let structured_events_jsonl = render_events_jsonl(events);
+    let env_json = cli_env_json_payload();
+    let repro_lock = cli_repro_lock_payload(events.len(), replay_command);
     #[allow(clippy::cast_possible_truncation)]
     let line_count = u64::try_from(events.len()).expect("event count must fit in u64");
     let mut entries = build_artifact_entries([
@@ -415,6 +418,16 @@ fn artifact_entries(replay_command: &str, events: &[E2eEnvelope<EventBody>]) -> 
             file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
             bytes: structured_events_jsonl.as_bytes(),
             line_count: Some(line_count),
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_ENV_JSON,
+            bytes: env_json.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPRO_LOCK,
+            bytes: repro_lock.as_bytes(),
+            line_count: None,
         },
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
@@ -432,6 +445,22 @@ fn artifact_entries(replay_command: &str, events: &[E2eEnvelope<EventBody>]) -> 
     });
     entries.sort_by(|left, right| left.file.cmp(&right.file));
     entries
+}
+
+fn cli_env_json_payload() -> String {
+    serde_json::json!({
+        "schema": "frankensearch.e2e.env.v1",
+        "captured_env": [],
+        "suite": "fsfs.cli",
+    })
+    .to_string()
+}
+
+fn cli_repro_lock_payload(event_count: usize, replay_command: &str) -> String {
+    let replay_checksum = sha256_checksum(replay_command.as_bytes());
+    format!(
+        "schema=frankensearch.e2e.repro-lock.v1\nsuite=fsfs.cli\nevent_count={event_count}\nreplay_command_checksum={replay_checksum}\n"
+    )
 }
 
 fn render_events_jsonl(events: &[E2eEnvelope<EventBody>]) -> String {
@@ -548,7 +577,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use frankensearch_core::{
-        ArtifactEntry, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
+        ArtifactEntry, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON,
+        E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPRO_LOCK,
         E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2eOutcome, render_artifacts_index, sha256_checksum,
     };
 
@@ -606,6 +636,8 @@ mod tests {
             .collect();
 
         assert!(artifact_files.contains(&"structured_events.jsonl"));
+        assert!(artifact_files.contains(&"env.json"));
+        assert!(artifact_files.contains(&"repro.lock"));
         assert!(artifact_files.contains(&"artifacts_index.json"));
         assert!(artifact_files.contains(&"replay_command.txt"));
         assert!(
@@ -646,6 +678,20 @@ mod tests {
                 .get(E2E_ARTIFACT_REPLAY_COMMAND_TXT)
                 .copied(),
             Some(expected_replay_checksum.as_str())
+        );
+
+        let expected_env_checksum = sha256_checksum(super::cli_env_json_payload().as_bytes());
+        assert_eq!(
+            artifact_checksums.get(E2E_ARTIFACT_ENV_JSON).copied(),
+            Some(expected_env_checksum.as_str())
+        );
+
+        let expected_repro_lock_checksum = sha256_checksum(
+            super::cli_repro_lock_payload(bundle.events.len(), &bundle.replay_command).as_bytes(),
+        );
+        assert_eq!(
+            artifact_checksums.get(E2E_ARTIFACT_REPRO_LOCK).copied(),
+            Some(expected_repro_lock_checksum.as_str())
         );
 
         let mut index_inputs: Vec<ArtifactEntry> = bundle
@@ -722,6 +768,307 @@ mod tests {
                     .as_deref()
                     .is_some_and(|code| code == bundle.scenario.expected_reason_code)
             }));
+        }
+    }
+
+    // --- CliE2eScenarioKind Display tests ---
+
+    #[test]
+    fn scenario_kind_display_all() {
+        assert_eq!(CliE2eScenarioKind::Index.to_string(), "index");
+        assert_eq!(CliE2eScenarioKind::Search.to_string(), "search");
+        assert_eq!(CliE2eScenarioKind::Explain.to_string(), "explain");
+        assert_eq!(CliE2eScenarioKind::Degrade.to_string(), "degrade");
+    }
+
+    // --- CliE2eScenarioKind serde roundtrip ---
+
+    #[test]
+    fn scenario_kind_serde_roundtrip() {
+        let kinds = [
+            CliE2eScenarioKind::Index,
+            CliE2eScenarioKind::Search,
+            CliE2eScenarioKind::Explain,
+            CliE2eScenarioKind::Degrade,
+        ];
+        for kind in &kinds {
+            let json = serde_json::to_string(kind).unwrap();
+            let decoded: CliE2eScenarioKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(*kind, decoded);
+        }
+    }
+
+    // --- replay_command_for_scenario tests ---
+
+    #[test]
+    fn replay_command_regular_targets_cli_e2e_contract() {
+        let scenario = super::CliE2eScenario {
+            id: "cli-index-baseline".to_owned(),
+            kind: CliE2eScenarioKind::Index,
+            args: vec![],
+            expected_exit_code: 0,
+            expected_reason_code: "test".to_owned(),
+            summary: "test".to_owned(),
+        };
+        let cmd = super::replay_command_for_scenario(&scenario);
+        assert!(cmd.contains("--test cli_e2e_contract"));
+        assert!(cmd.contains("scenario_cli_index_baseline"));
+        assert!(!cmd.contains("filesystem_chaos"));
+    }
+
+    #[test]
+    fn replay_command_chaos_targets_filesystem_chaos() {
+        let scenario = super::CliE2eScenario {
+            id: "cli-chaos-permission-denied".to_owned(),
+            kind: CliE2eScenarioKind::Degrade,
+            args: vec![],
+            expected_exit_code: 0,
+            expected_reason_code: "test".to_owned(),
+            summary: "test".to_owned(),
+        };
+        let cmd = super::replay_command_for_scenario(&scenario);
+        assert!(cmd.contains("--test filesystem_chaos"));
+        assert!(cmd.contains("scenario_cli_chaos_permission_denied"));
+    }
+
+    #[test]
+    fn replay_command_replaces_dashes_with_underscores() {
+        let scenario = super::CliE2eScenario {
+            id: "a-b-c".to_owned(),
+            kind: CliE2eScenarioKind::Search,
+            args: vec![],
+            expected_exit_code: 0,
+            expected_reason_code: "test".to_owned(),
+            summary: "test".to_owned(),
+        };
+        let cmd = super::replay_command_for_scenario(&scenario);
+        assert!(cmd.contains("scenario_a_b_c"));
+    }
+
+    // --- scenario_exit_status tests ---
+
+    #[test]
+    fn scenario_exit_status_pass_for_zero() {
+        let scenario = super::CliE2eScenario {
+            id: "x".to_owned(),
+            kind: CliE2eScenarioKind::Index,
+            args: vec![],
+            expected_exit_code: 0,
+            expected_reason_code: "test".to_owned(),
+            summary: "test".to_owned(),
+        };
+        assert_eq!(super::scenario_exit_status(&scenario), ExitStatus::Pass);
+    }
+
+    #[test]
+    fn scenario_exit_status_fail_for_nonzero() {
+        let scenario = super::CliE2eScenario {
+            id: "x".to_owned(),
+            kind: CliE2eScenarioKind::Index,
+            args: vec![],
+            expected_exit_code: 1,
+            expected_reason_code: "test".to_owned(),
+            summary: "test".to_owned(),
+        };
+        assert_eq!(super::scenario_exit_status(&scenario), ExitStatus::Fail);
+    }
+
+    // --- CliE2eRunConfig::default tests ---
+
+    #[test]
+    fn default_config_has_valid_fields() {
+        let config = CliE2eRunConfig::default();
+        assert!(!config.run_id.is_empty());
+        assert!(!config.ts.is_empty());
+        assert!(config.ts.ends_with('Z'));
+        assert!(config.config_hash.starts_with("sha256:"));
+        assert!(!config.platform.os.is_empty());
+        assert!(!config.platform.arch.is_empty());
+    }
+
+    // --- Scenario catalog invariants ---
+
+    #[test]
+    fn default_scenario_ids_are_unique() {
+        let scenarios = default_cli_e2e_scenarios();
+        let ids: Vec<&str> = scenarios.iter().map(|s| s.id.as_str()).collect();
+        let mut deduped = ids.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(ids.len(), deduped.len(), "duplicate scenario IDs");
+    }
+
+    #[test]
+    fn default_scenarios_have_nonempty_fields() {
+        for scenario in default_cli_e2e_scenarios() {
+            assert!(!scenario.id.is_empty());
+            assert!(!scenario.args.is_empty());
+            assert!(!scenario.summary.is_empty());
+            assert!(!scenario.expected_reason_code.is_empty());
+        }
+    }
+
+    #[test]
+    fn chaos_scenario_ids_are_unique() {
+        let scenarios = default_cli_e2e_filesystem_chaos_scenarios();
+        let ids: Vec<&str> = scenarios.iter().map(|s| s.id.as_str()).collect();
+        let mut deduped = ids.clone();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(ids.len(), deduped.len(), "duplicate chaos scenario IDs");
+    }
+
+    #[test]
+    fn chaos_scenarios_are_all_degrade_kind() {
+        for scenario in default_cli_e2e_filesystem_chaos_scenarios() {
+            assert_eq!(
+                scenario.kind,
+                CliE2eScenarioKind::Degrade,
+                "chaos scenario '{}' should be Degrade kind",
+                scenario.id
+            );
+        }
+    }
+
+    #[test]
+    fn chaos_scenarios_all_expect_zero_exit() {
+        for scenario in default_cli_e2e_filesystem_chaos_scenarios() {
+            assert_eq!(
+                scenario.expected_exit_code, 0,
+                "chaos scenario '{}' should expect exit 0",
+                scenario.id
+            );
+        }
+    }
+
+    // --- empty_correlation ---
+
+    #[test]
+    fn empty_correlation_has_empty_fields() {
+        let c = super::empty_correlation();
+        assert!(c.event_id.is_empty());
+        assert!(c.root_request_id.is_empty());
+        assert!(c.parent_event_id.is_none());
+    }
+
+    // --- scenario_event_bodies ---
+
+    #[test]
+    fn scenario_event_bodies_produces_five_events() {
+        let scenario = super::CliE2eScenario {
+            id: "test-scenario".to_owned(),
+            kind: CliE2eScenarioKind::Search,
+            args: vec!["search".to_owned(), "query".to_owned()],
+            expected_exit_code: 0,
+            expected_reason_code: "test.pass".to_owned(),
+            summary: "test summary".to_owned(),
+        };
+        let events = super::scenario_event_bodies(&scenario, ExitStatus::Pass);
+        assert_eq!(events.len(), 5);
+    }
+
+    #[test]
+    fn scenario_event_bodies_start_and_end_framing() {
+        use frankensearch_core::E2eEventType;
+        let scenario = super::CliE2eScenario {
+            id: "t".to_owned(),
+            kind: CliE2eScenarioKind::Index,
+            args: vec!["index".to_owned()],
+            expected_exit_code: 0,
+            expected_reason_code: "test".to_owned(),
+            summary: "t".to_owned(),
+        };
+        let events = super::scenario_event_bodies(&scenario, ExitStatus::Pass);
+        assert_eq!(events[0].event_type, E2eEventType::E2eStart);
+        assert_eq!(events[1].event_type, E2eEventType::LaneStart);
+        assert_eq!(events[2].event_type, E2eEventType::Assertion);
+        assert_eq!(events[3].event_type, E2eEventType::LaneEnd);
+        assert_eq!(events[4].event_type, E2eEventType::E2eEnd);
+    }
+
+    #[test]
+    fn scenario_event_bodies_fail_exit_produces_warn_severity() {
+        use frankensearch_core::E2eSeverity;
+        let scenario = super::CliE2eScenario {
+            id: "fail".to_owned(),
+            kind: CliE2eScenarioKind::Search,
+            args: vec![],
+            expected_exit_code: 1,
+            expected_reason_code: "test.fail".to_owned(),
+            summary: "fail".to_owned(),
+        };
+        let events = super::scenario_event_bodies(&scenario, ExitStatus::Fail);
+        // Assertion and E2eEnd events should be Warn for fail status.
+        assert_eq!(events[2].severity, E2eSeverity::Warn);
+        assert_eq!(events[4].severity, E2eSeverity::Warn);
+    }
+
+    // --- Reason code constants ---
+
+    #[test]
+    fn reason_code_constants_follow_naming_pattern() {
+        let codes = [
+            CLI_E2E_REASON_FILESYSTEM_PERMISSION_DENIED,
+            CLI_E2E_REASON_FILESYSTEM_SYMLINK_LOOP,
+            CLI_E2E_REASON_FILESYSTEM_MOUNT_BOUNDARY,
+            CLI_E2E_REASON_FILESYSTEM_GIANT_LOG_SKIPPED,
+            CLI_E2E_REASON_FILESYSTEM_BINARY_BLOB_SKIPPED,
+            super::CLI_E2E_REASON_SCENARIO_START,
+            super::CLI_E2E_REASON_SCENARIO_PASS,
+            super::CLI_E2E_REASON_SCENARIO_DEGRADE,
+        ];
+        for code in &codes {
+            assert!(
+                code.starts_with("e2e."),
+                "reason code '{code}' should start with 'e2e.'"
+            );
+            assert!(!code.is_empty());
+        }
+    }
+
+    // --- Schema version constant ---
+
+    #[test]
+    fn schema_version_constant_is_nonempty() {
+        assert!(!CLI_E2E_SCHEMA_VERSION.is_empty());
+        assert!(CLI_E2E_SCHEMA_VERSION.starts_with("fsfs."));
+    }
+
+    // --- CliE2eScenario serde roundtrip ---
+
+    #[test]
+    fn scenario_serde_roundtrip() {
+        let scenario = super::CliE2eScenario {
+            id: "roundtrip".to_owned(),
+            kind: CliE2eScenarioKind::Explain,
+            args: vec![
+                "explain".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            expected_exit_code: 0,
+            expected_reason_code: "test.pass".to_owned(),
+            summary: "roundtrip test".to_owned(),
+        };
+        let json = serde_json::to_string(&scenario).unwrap();
+        let decoded: super::CliE2eScenario = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, scenario.id);
+        assert_eq!(decoded.kind, scenario.kind);
+        assert_eq!(decoded.args, scenario.args);
+    }
+
+    // --- Bundle event IDs contain scenario ID ---
+
+    #[test]
+    fn bundle_event_ids_contain_scenario_id() {
+        let config = CliE2eRunConfig::default();
+        let scenario = default_cli_e2e_scenarios().into_iter().next().unwrap();
+        let bundle = super::CliE2eArtifactBundle::build(&config, &scenario, ExitStatus::Pass);
+        for event in &bundle.events {
+            assert!(
+                event.body.correlation.event_id.contains(&scenario.id),
+                "event ID should contain scenario ID"
+            );
         }
     }
 }

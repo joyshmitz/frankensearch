@@ -1907,4 +1907,653 @@ mod tests {
             "no job id should appear in more than one claimed batch"
         );
     }
+
+    // ─── Utility function tests (bd-1erd) ───────────────────────────────
+
+    #[test]
+    fn job_status_as_str_all_variants() {
+        assert_eq!(JobStatus::Pending.as_str(), "pending");
+        assert_eq!(JobStatus::Processing.as_str(), "processing");
+        assert_eq!(JobStatus::Completed.as_str(), "completed");
+        assert_eq!(JobStatus::Failed.as_str(), "failed");
+        assert_eq!(JobStatus::Skipped.as_str(), "skipped");
+    }
+
+    #[test]
+    fn job_status_from_str_all_valid() {
+        assert_eq!(JobStatus::from_str("pending"), Some(JobStatus::Pending));
+        assert_eq!(
+            JobStatus::from_str("processing"),
+            Some(JobStatus::Processing)
+        );
+        assert_eq!(JobStatus::from_str("completed"), Some(JobStatus::Completed));
+        assert_eq!(JobStatus::from_str("failed"), Some(JobStatus::Failed));
+        assert_eq!(JobStatus::from_str("skipped"), Some(JobStatus::Skipped));
+    }
+
+    #[test]
+    fn job_status_from_str_invalid() {
+        assert!(JobStatus::from_str("").is_none());
+        assert!(JobStatus::from_str("unknown").is_none());
+        assert!(JobStatus::from_str("PENDING").is_none());
+    }
+
+    #[test]
+    fn job_status_serde_roundtrip() {
+        for status in [
+            JobStatus::Pending,
+            JobStatus::Processing,
+            JobStatus::Completed,
+            JobStatus::Failed,
+            JobStatus::Skipped,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: JobStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn queue_error_kind_as_str() {
+        use super::QueueErrorKind;
+        assert_eq!(QueueErrorKind::NotFound.as_str(), "not_found");
+        assert_eq!(QueueErrorKind::Conflict.as_str(), "conflict");
+        assert_eq!(QueueErrorKind::Validation.as_str(), "validation");
+    }
+
+    #[test]
+    fn queue_error_display_format() {
+        use super::QueueError;
+        let err = QueueError {
+            kind: super::QueueErrorKind::NotFound,
+            message: "missing doc".to_owned(),
+        };
+        assert_eq!(err.to_string(), "not_found: missing doc");
+    }
+
+    #[test]
+    fn compute_retry_delay_ms_zero_exponent() {
+        use super::compute_retry_delay_ms;
+        assert_eq!(compute_retry_delay_ms(100, 0), 100);
+    }
+
+    #[test]
+    fn compute_retry_delay_ms_exponential_growth() {
+        use super::compute_retry_delay_ms;
+        assert_eq!(compute_retry_delay_ms(100, 1), 200);
+        assert_eq!(compute_retry_delay_ms(100, 2), 400);
+        assert_eq!(compute_retry_delay_ms(100, 3), 800);
+    }
+
+    #[test]
+    fn compute_retry_delay_ms_capped_at_max() {
+        use super::compute_retry_delay_ms;
+        // At high exponent, should cap at MAX_RETRY_DELAY_MS (30_000)
+        let result = compute_retry_delay_ms(100, 15);
+        assert!(result <= 30_000, "delay {result} should not exceed 30_000");
+    }
+
+    #[test]
+    fn compute_retry_delay_ms_at_max_backoff_exponent() {
+        use super::compute_retry_delay_ms;
+        // Exponent beyond MAX_BACKOFF_EXPONENT (20) is clamped
+        let at_max = compute_retry_delay_ms(1, 20);
+        let beyond_max = compute_retry_delay_ms(1, 25);
+        assert_eq!(at_max, beyond_max);
+    }
+
+    #[test]
+    fn compute_retry_delay_ms_zero_base() {
+        use super::compute_retry_delay_ms;
+        assert_eq!(compute_retry_delay_ms(0, 5), 0);
+    }
+
+    #[test]
+    fn is_hash_embedder_matches() {
+        use super::is_hash_embedder;
+        assert!(is_hash_embedder("fnv1a-384"));
+        assert!(is_hash_embedder("fnv1a-256"));
+        assert!(is_hash_embedder("fnv1a-"));
+        assert!(is_hash_embedder("hash/fnv1a"));
+    }
+
+    #[test]
+    fn is_hash_embedder_non_match() {
+        use super::is_hash_embedder;
+        assert!(!is_hash_embedder("all-MiniLM-L6-v2"));
+        assert!(!is_hash_embedder(""));
+        assert!(!is_hash_embedder("fnv1a"));
+    }
+
+    #[test]
+    fn ensure_non_empty_rejects_empty() {
+        use super::ensure_non_empty;
+        let err = ensure_non_empty("", "field").unwrap_err();
+        assert!(err.to_string().contains("field"));
+    }
+
+    #[test]
+    fn ensure_non_empty_rejects_whitespace() {
+        use super::ensure_non_empty;
+        let err = ensure_non_empty("   \t\n", "worker_id").unwrap_err();
+        assert!(err.to_string().contains("worker_id"));
+    }
+
+    #[test]
+    fn ensure_non_empty_accepts_valid() {
+        use super::ensure_non_empty;
+        assert!(ensure_non_empty("hello", "field").is_ok());
+    }
+
+    #[test]
+    fn usize_to_i64_normal() {
+        use super::usize_to_i64;
+        assert_eq!(usize_to_i64(0).unwrap(), 0_i64);
+        assert_eq!(usize_to_i64(42).unwrap(), 42_i64);
+    }
+
+    #[test]
+    fn i64_to_usize_normal() {
+        use super::i64_to_usize;
+        assert_eq!(i64_to_usize(0).unwrap(), 0_usize);
+        assert_eq!(i64_to_usize(100).unwrap(), 100_usize);
+    }
+
+    #[test]
+    fn i64_to_usize_negative_fails() {
+        use super::i64_to_usize;
+        assert!(i64_to_usize(-1).is_err());
+    }
+
+    #[test]
+    fn usize_to_u64_normal_value() {
+        use super::usize_to_u64;
+        assert_eq!(usize_to_u64(0), 0_u64);
+        assert_eq!(usize_to_u64(99), 99_u64);
+    }
+
+    #[test]
+    fn duration_as_u64_normal_value() {
+        use super::duration_as_u64;
+        assert_eq!(duration_as_u64(0), 0_u64);
+        assert_eq!(duration_as_u64(1_000_000), 1_000_000_u64);
+    }
+
+    #[test]
+    fn duration_as_u64_overflow() {
+        use super::duration_as_u64;
+        assert_eq!(duration_as_u64(u128::MAX), u64::MAX);
+    }
+
+    // ─── Type defaults and serde (bd-1erd) ──────────────────────────────
+
+    #[test]
+    fn enqueue_request_new_fields() {
+        let req = EnqueueRequest::new("d1", "emb-1", [5_u8; 32], 3);
+        assert_eq!(req.doc_id, "d1");
+        assert_eq!(req.embedder_id, "emb-1");
+        assert_eq!(req.content_hash, [5_u8; 32]);
+        assert_eq!(req.priority, 3);
+    }
+
+    #[test]
+    fn enqueue_request_serde_roundtrip() {
+        let req = EnqueueRequest::new("doc", "emb", [7_u8; 32], 1);
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: EnqueueRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, req);
+    }
+
+    #[test]
+    fn batch_enqueue_result_default() {
+        let r = super::BatchEnqueueResult::default();
+        assert_eq!(r.inserted, 0);
+        assert_eq!(r.replaced, 0);
+        assert_eq!(r.deduplicated, 0);
+        assert_eq!(r.skipped_hash_embedder, 0);
+    }
+
+    #[test]
+    fn batch_enqueue_result_record_all_outcomes() {
+        use super::{BatchEnqueueResult, EnqueueOutcome};
+        let mut r = BatchEnqueueResult::default();
+        r.record(EnqueueOutcome::Inserted);
+        r.record(EnqueueOutcome::Replaced);
+        r.record(EnqueueOutcome::Deduplicated);
+        r.record(EnqueueOutcome::HashEmbedderSkipped);
+        assert_eq!(r.inserted, 1);
+        assert_eq!(r.replaced, 1);
+        assert_eq!(r.deduplicated, 1);
+        assert_eq!(r.skipped_hash_embedder, 1);
+    }
+
+    #[test]
+    fn queue_depth_default_all_zeros() {
+        let d = QueueDepth::default();
+        assert_eq!(d.pending, 0);
+        assert_eq!(d.ready_pending, 0);
+        assert_eq!(d.processing, 0);
+        assert_eq!(d.completed, 0);
+        assert_eq!(d.failed, 0);
+        assert_eq!(d.skipped, 0);
+    }
+
+    #[test]
+    fn queue_depth_serde_roundtrip() {
+        let d = QueueDepth {
+            pending: 5,
+            ready_pending: 3,
+            processing: 2,
+            completed: 10,
+            failed: 1,
+            skipped: 0,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let decoded: QueueDepth = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, d);
+    }
+
+    #[test]
+    fn job_queue_config_default_values() {
+        let cfg = JobQueueConfig::default();
+        assert_eq!(cfg.batch_size, 32);
+        assert_eq!(cfg.visibility_timeout_ms, 30_000);
+        assert_eq!(cfg.max_retries, 3);
+        assert_eq!(cfg.retry_base_delay_ms, 100);
+        assert_eq!(cfg.stale_job_threshold_ms, 300_000);
+        assert_eq!(cfg.backpressure_threshold, 10_000);
+    }
+
+    #[test]
+    fn job_queue_config_serde_roundtrip() {
+        let cfg = JobQueueConfig {
+            batch_size: 64,
+            visibility_timeout_ms: 5_000,
+            max_retries: 5,
+            retry_base_delay_ms: 200,
+            stale_job_threshold_ms: 60_000,
+            backpressure_threshold: 1_000,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let decoded: JobQueueConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, cfg);
+    }
+
+    #[test]
+    fn job_queue_metrics_default_snapshot_all_zeros() {
+        use super::JobQueueMetrics;
+        let metrics = JobQueueMetrics::default();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_enqueued, 0);
+        assert_eq!(snap.total_completed, 0);
+        assert_eq!(snap.total_failed, 0);
+        assert_eq!(snap.total_skipped, 0);
+        assert_eq!(snap.total_retried, 0);
+        assert_eq!(snap.total_deduplicated, 0);
+        assert_eq!(snap.total_batches_processed, 0);
+        assert_eq!(snap.total_embed_time_us, 0);
+    }
+
+    #[test]
+    fn job_queue_metrics_snapshot_default() {
+        use super::JobQueueMetricsSnapshot;
+        let snap = JobQueueMetricsSnapshot::default();
+        assert_eq!(snap.total_enqueued, 0);
+        assert_eq!(snap.total_completed, 0);
+    }
+
+    #[test]
+    fn fail_result_serde_roundtrip_retried() {
+        let r = FailResult::Retried {
+            retry_count: 2,
+            delay_ms: 200,
+            next_attempt_at_ms: 1_000_000,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: FailResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, r);
+    }
+
+    #[test]
+    fn fail_result_serde_roundtrip_terminal() {
+        let r = FailResult::TerminalFailed { retry_count: 4 };
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: FailResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, r);
+    }
+
+    #[test]
+    fn claimed_job_serde_roundtrip() {
+        let job = ClaimedJob {
+            job_id: 42,
+            doc_id: "doc-1".to_owned(),
+            embedder_id: "emb-1".to_owned(),
+            priority: 5,
+            retry_count: 1,
+            max_retries: 3,
+            submitted_at: 1_000_000,
+            content_hash: Some([9_u8; 32]),
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let decoded: ClaimedJob = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, job);
+    }
+
+    #[test]
+    fn claimed_job_without_content_hash() {
+        let job = ClaimedJob {
+            job_id: 1,
+            doc_id: "d".to_owned(),
+            embedder_id: "e".to_owned(),
+            priority: 0,
+            retry_count: 0,
+            max_retries: 0,
+            submitted_at: 0,
+            content_hash: None,
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let decoded: ClaimedJob = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.content_hash, None);
+    }
+
+    // ─── Edge case tests requiring storage (bd-1erd) ────────────────────
+
+    #[test]
+    fn enqueue_batch_empty_returns_default() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let result = queue
+            .enqueue_batch(&[])
+            .expect("empty batch should succeed");
+        assert_eq!(result, super::BatchEnqueueResult::default());
+    }
+
+    #[test]
+    fn claim_batch_zero_size_returns_empty() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let claimed = queue
+            .claim_batch("worker", 0)
+            .expect("zero batch should succeed");
+        assert!(claimed.is_empty());
+    }
+
+    #[test]
+    fn claim_batch_empty_worker_id_rejected() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .claim_batch("", 1)
+            .expect_err("empty worker_id should fail");
+        assert!(err.to_string().contains("worker_id"), "error: {err}");
+    }
+
+    #[test]
+    fn claim_batch_whitespace_worker_id_rejected() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .claim_batch("   ", 1)
+            .expect_err("whitespace worker_id should fail");
+        assert!(err.to_string().contains("worker_id"), "error: {err}");
+    }
+
+    #[test]
+    fn complete_missing_job_returns_error() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .complete(99999)
+            .expect_err("completing nonexistent job should fail");
+        assert!(err.to_string().contains("not_found"), "error: {err}");
+    }
+
+    #[test]
+    fn complete_pending_job_returns_conflict() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(storage.as_ref(), "doc-cp", 50);
+
+        let hash = [50_u8; 32];
+        queue.enqueue("doc-cp", "emb", &hash, 0).unwrap();
+
+        // Get job_id from the pending row
+        let rows = storage
+            .connection()
+            .query("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
+            .expect("query should succeed");
+        let job_id = match rows[0].get(0) {
+            Some(SqliteValue::Integer(id)) => *id,
+            _ => panic!("expected integer job_id"),
+        };
+
+        let err = queue
+            .complete(job_id)
+            .expect_err("completing pending job should fail");
+        assert!(err.to_string().contains("not processing"), "error: {err}");
+    }
+
+    #[test]
+    fn fail_missing_job_returns_error() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .fail(99999, "error message")
+            .expect_err("failing nonexistent job should fail");
+        assert!(err.to_string().contains("not_found"), "error: {err}");
+    }
+
+    #[test]
+    fn fail_empty_error_rejected() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .fail(1, "")
+            .expect_err("empty error message should be rejected");
+        assert!(err.to_string().contains("error"), "error: {err}");
+    }
+
+    #[test]
+    fn skip_missing_job_returns_error() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .skip(99999, "reason")
+            .expect_err("skipping nonexistent job should fail");
+        assert!(err.to_string().contains("not_found"), "error: {err}");
+    }
+
+    #[test]
+    fn skip_empty_reason_rejected() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .skip(1, "")
+            .expect_err("empty reason should be rejected");
+        assert!(err.to_string().contains("reason"), "error: {err}");
+    }
+
+    #[test]
+    fn skip_completed_job_returns_conflict() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(storage.as_ref(), "doc-sc", 51);
+
+        let hash = [51_u8; 32];
+        queue.enqueue("doc-sc", "emb", &hash, 0).unwrap();
+        let claimed = claim_single(&queue, "worker-sc");
+        queue.complete(claimed.job_id).unwrap();
+
+        let err = queue
+            .skip(claimed.job_id, "too late")
+            .expect_err("skipping completed job should fail");
+        assert!(
+            err.to_string().contains("cannot be skipped"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn skip_pending_job_succeeds() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(storage.as_ref(), "doc-sp", 52);
+
+        let hash = [52_u8; 32];
+        queue.enqueue("doc-sp", "emb", &hash, 0).unwrap();
+
+        // Get job_id from pending row
+        let rows = storage
+            .connection()
+            .query("SELECT job_id FROM embedding_jobs WHERE status = 'pending' LIMIT 1;")
+            .expect("query should succeed");
+        let job_id = match rows[0].get(0) {
+            Some(SqliteValue::Integer(id)) => *id,
+            _ => panic!("expected integer job_id"),
+        };
+
+        queue.skip(job_id, "not needed").unwrap();
+
+        let depth = queue.queue_depth().unwrap();
+        assert_eq!(depth.pending, 0);
+        assert_eq!(depth.skipped, 1);
+    }
+
+    #[test]
+    fn reclaim_stale_jobs_no_stale_returns_zero() {
+        let (queue, storage) = queue_fixture(JobQueueConfig::default());
+        insert_document(storage.as_ref(), "doc-ns", 53);
+
+        let hash = [53_u8; 32];
+        queue.enqueue("doc-ns", "emb", &hash, 0).unwrap();
+
+        // Don't claim — jobs are pending, not processing
+        let reclaimed = queue.reclaim_stale_jobs().unwrap();
+        assert_eq!(reclaimed, 0);
+    }
+
+    #[test]
+    fn queue_config_accessor_returns_configured_values() {
+        let cfg = JobQueueConfig {
+            batch_size: 99,
+            ..JobQueueConfig::default()
+        };
+        let (queue, _storage) = queue_fixture(cfg);
+        assert_eq!(queue.config().batch_size, 99);
+    }
+
+    #[test]
+    fn queue_with_metrics_uses_shared_metrics() {
+        use super::JobQueueMetrics;
+        let storage = Arc::new(Storage::open_in_memory().expect("storage"));
+        let metrics = Arc::new(JobQueueMetrics::default());
+        let queue = PersistentJobQueue::with_metrics(
+            storage,
+            JobQueueConfig::default(),
+            Arc::clone(&metrics),
+        );
+
+        // Verify the queue uses the shared metrics
+        insert_document(queue.storage.as_ref(), "doc-wm", 54);
+        queue.enqueue("doc-wm", "emb", &[54_u8; 32], 0).unwrap();
+        assert_eq!(metrics.snapshot().total_enqueued, 1);
+    }
+
+    #[test]
+    fn enqueue_missing_document_rejected() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let err = queue
+            .enqueue("nonexistent", "emb", &[1_u8; 32], 0)
+            .expect_err("enqueue for missing doc should fail");
+        assert!(err.to_string().contains("not_found"), "error: {err}");
+    }
+
+    #[test]
+    fn claim_batch_respects_config_batch_size_cap() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            batch_size: 2, // cap
+            ..JobQueueConfig::default()
+        });
+
+        for i in 0u8..5 {
+            let doc_id = format!("doc-cap-{i}");
+            insert_document(storage.as_ref(), &doc_id, i);
+            queue.enqueue(&doc_id, "emb", &[i; 32], 0).unwrap();
+        }
+
+        // Request 10 but cap is 2
+        let claimed = queue.claim_batch("worker", 10).unwrap();
+        assert_eq!(claimed.len(), 2, "should be capped at config batch_size");
+    }
+
+    #[test]
+    fn queue_depth_empty_queue() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let depth = queue.queue_depth().unwrap();
+        assert_eq!(depth, QueueDepth::default());
+    }
+
+    #[test]
+    fn not_found_error_contains_entity_and_key() {
+        use super::not_found_error;
+        let err = not_found_error("documents", "doc-99");
+        assert!(err.to_string().contains("documents"), "error: {err}");
+        assert!(err.to_string().contains("doc-99"), "error: {err}");
+    }
+
+    #[test]
+    fn conflict_error_contains_message() {
+        use super::conflict_error;
+        let err = conflict_error("job changed status".to_owned());
+        assert!(
+            err.to_string().contains("job changed status"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn queue_error_creates_subsystem_error() {
+        use super::{QueueErrorKind, queue_error};
+        let err = queue_error(QueueErrorKind::Validation, "bad input".to_owned());
+        match err {
+            frankensearch_core::SearchError::SubsystemError { subsystem, .. } => {
+                assert_eq!(subsystem, "storage");
+            }
+            other => panic!("expected SubsystemError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_enqueue_result_serde_roundtrip() {
+        use super::BatchEnqueueResult;
+        let r = BatchEnqueueResult {
+            inserted: 5,
+            replaced: 2,
+            deduplicated: 3,
+            skipped_hash_embedder: 1,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let decoded: BatchEnqueueResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, r);
+    }
+
+    #[test]
+    fn job_queue_metrics_snapshot_serde_roundtrip() {
+        use super::JobQueueMetricsSnapshot;
+        let snap = JobQueueMetricsSnapshot {
+            total_enqueued: 10,
+            total_completed: 8,
+            total_failed: 1,
+            total_skipped: 1,
+            total_retried: 2,
+            total_deduplicated: 3,
+            total_batches_processed: 5,
+            total_embed_time_us: 42_000,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let decoded: JobQueueMetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, snap);
+    }
+
+    #[test]
+    fn queue_error_kind_serde_roundtrip() {
+        use super::QueueErrorKind;
+        for kind in [
+            QueueErrorKind::NotFound,
+            QueueErrorKind::Conflict,
+            QueueErrorKind::Validation,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: QueueErrorKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind);
+        }
+    }
 }

@@ -874,4 +874,460 @@ mod tests {
     fn extra_enums_used_in_schema_tests() {
         let _ = CancellationAction::EmitInitialResults;
     }
+
+    // --- normalize_confidence tests ---
+
+    #[test]
+    fn normalize_confidence_clamps_above_1000() {
+        assert_eq!(super::normalize_confidence(1_500), 1_000);
+        assert_eq!(super::normalize_confidence(u16::MAX), 1_000);
+    }
+
+    #[test]
+    fn normalize_confidence_passes_through_at_and_below_1000() {
+        assert_eq!(super::normalize_confidence(1_000), 1_000);
+        assert_eq!(super::normalize_confidence(500), 500);
+        assert_eq!(super::normalize_confidence(0), 0);
+    }
+
+    // --- budget_profile_confidence tests ---
+
+    #[test]
+    fn budget_profile_confidence_all_profiles() {
+        use super::budget_profile_confidence;
+        assert_eq!(budget_profile_confidence(QueryBudgetProfile::Empty), 1_000);
+        assert_eq!(
+            budget_profile_confidence(QueryBudgetProfile::IdentifierFocused),
+            900
+        );
+        assert_eq!(budget_profile_confidence(QueryBudgetProfile::Balanced), 850);
+        assert_eq!(
+            budget_profile_confidence(QueryBudgetProfile::SemanticFocused),
+            800
+        );
+        assert_eq!(
+            budget_profile_confidence(QueryBudgetProfile::SafeFallback),
+            700
+        );
+    }
+
+    #[test]
+    fn budget_profile_confidence_ordering() {
+        use super::budget_profile_confidence;
+        // Higher confidence for simpler profiles.
+        assert!(
+            budget_profile_confidence(QueryBudgetProfile::Empty)
+                >= budget_profile_confidence(QueryBudgetProfile::IdentifierFocused)
+        );
+        assert!(
+            budget_profile_confidence(QueryBudgetProfile::IdentifierFocused)
+                >= budget_profile_confidence(QueryBudgetProfile::Balanced)
+        );
+        assert!(
+            budget_profile_confidence(QueryBudgetProfile::Balanced)
+                >= budget_profile_confidence(QueryBudgetProfile::SemanticFocused)
+        );
+        assert!(
+            budget_profile_confidence(QueryBudgetProfile::SemanticFocused)
+                >= budget_profile_confidence(QueryBudgetProfile::SafeFallback)
+        );
+    }
+
+    // --- utility_confidence tests ---
+
+    #[test]
+    fn utility_confidence_extreme_values() {
+        use super::utility_confidence;
+        // utility_score clamped to [-100, 100], then scaled: (bounded+100)*5
+        assert_eq!(utility_confidence(-100), 0);
+        assert_eq!(utility_confidence(100), 1_000);
+        assert_eq!(utility_confidence(0), 500);
+    }
+
+    #[test]
+    fn utility_confidence_clamps_beyond_range() {
+        use super::utility_confidence;
+        // Values beyond [-100, 100] are clamped.
+        assert_eq!(utility_confidence(-999), utility_confidence(-100));
+        assert_eq!(utility_confidence(999), utility_confidence(100));
+    }
+
+    // --- bounded_signal tests ---
+
+    #[test]
+    fn bounded_signal_zero_input_is_zero() {
+        assert_eq!(super::bounded_signal(0.0, 500), 0);
+    }
+
+    #[test]
+    fn bounded_signal_one_returns_max() {
+        assert_eq!(super::bounded_signal(1.0, 500), 500);
+    }
+
+    #[test]
+    fn bounded_signal_negative_clamped_to_zero() {
+        assert_eq!(super::bounded_signal(-1.0, 500), 0);
+    }
+
+    #[test]
+    fn bounded_signal_above_one_clamped_to_max() {
+        assert_eq!(super::bounded_signal(5.0, 300), 300);
+    }
+
+    #[test]
+    fn bounded_signal_zero_max_is_zero() {
+        assert_eq!(super::bounded_signal(0.5, 0), 0);
+    }
+
+    // --- phase_token tests ---
+
+    #[test]
+    fn phase_token_initial() {
+        assert_eq!(super::phase_token(ExplanationPhase::Initial), "initial");
+    }
+
+    #[test]
+    fn phase_token_refined() {
+        assert_eq!(super::phase_token(ExplanationPhase::Refined), "refined");
+    }
+
+    // --- ScoreComponentSource Display tests ---
+
+    #[test]
+    fn score_component_source_display_all() {
+        assert_eq!(
+            ScoreComponentSource::LexicalBm25.to_string(),
+            "lexical_bm25"
+        );
+        assert_eq!(
+            ScoreComponentSource::SemanticFast.to_string(),
+            "semantic_fast"
+        );
+        assert_eq!(
+            ScoreComponentSource::SemanticQuality.to_string(),
+            "semantic_quality"
+        );
+        assert_eq!(ScoreComponentSource::Rerank.to_string(), "rerank");
+    }
+
+    // --- PolicyDomain Display tests ---
+
+    #[test]
+    fn policy_domain_display_all() {
+        assert_eq!(PolicyDomain::QueryIntent.to_string(), "query_intent");
+        assert_eq!(
+            PolicyDomain::RetrievalBudget.to_string(),
+            "retrieval_budget"
+        );
+        assert_eq!(PolicyDomain::QueryExecution.to_string(), "query_execution");
+        assert_eq!(PolicyDomain::Degradation.to_string(), "degradation");
+        assert_eq!(PolicyDomain::Discovery.to_string(), "discovery");
+    }
+
+    // --- Builder pattern tests ---
+
+    #[test]
+    fn payload_with_trace_sets_trace() {
+        use crate::evidence::TraceLink;
+        let ranking = RankingExplanation::from_hit_explanation(
+            "doc-1",
+            &HitExplanation {
+                final_score: 0.5,
+                phase: ExplanationPhase::Initial,
+                rank_movement: None,
+                components: vec![],
+            },
+            "test",
+            800,
+        );
+        let trace = TraceLink {
+            trace_id: "trace-abc".to_owned(),
+            event_id: "event-123".to_owned(),
+            parent_event_id: None,
+            claim_id: None,
+            policy_id: None,
+        };
+        let payload = FsfsExplanationPayload::new("test query", ranking).with_trace(trace);
+        assert_eq!(payload.trace.as_ref().unwrap().trace_id, "trace-abc");
+    }
+
+    #[test]
+    fn policy_decision_with_metadata_adds_entries() {
+        let decision = PolicyDecisionExplanation {
+            domain: PolicyDomain::Discovery,
+            decision: "Include".to_owned(),
+            reason_code: "test".to_owned(),
+            confidence_per_mille: 500,
+            summary: "test".to_owned(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let decision = decision
+            .with_metadata("key1", "val1")
+            .with_metadata("key2", "val2");
+        assert_eq!(decision.metadata.len(), 2);
+        assert_eq!(decision.metadata.get("key1"), Some(&"val1".to_owned()));
+    }
+
+    // --- to_toon with trace ---
+
+    #[test]
+    fn toon_output_includes_trace_when_present() {
+        use crate::evidence::TraceLink;
+        let ranking = RankingExplanation::from_hit_explanation(
+            "doc-5",
+            &HitExplanation {
+                final_score: 0.3,
+                phase: ExplanationPhase::Refined,
+                rank_movement: None,
+                components: vec![],
+            },
+            "test.reason",
+            750,
+        );
+        let trace = TraceLink {
+            trace_id: "t-001".to_owned(),
+            event_id: "e-001".to_owned(),
+            parent_event_id: None,
+            claim_id: None,
+            policy_id: None,
+        };
+        let payload = FsfsExplanationPayload::new("search query", ranking).with_trace(trace);
+        let toon = payload.to_toon();
+        assert!(toon.contains("trace_id: t-001"));
+        assert!(toon.contains("event_id: e-001"));
+    }
+
+    #[test]
+    fn toon_output_omits_trace_when_absent() {
+        let ranking = RankingExplanation::from_hit_explanation(
+            "doc-6",
+            &HitExplanation {
+                final_score: 0.1,
+                phase: ExplanationPhase::Initial,
+                rank_movement: None,
+                components: vec![],
+            },
+            "test.reason",
+            600,
+        );
+        let payload = FsfsExplanationPayload::new("query", ranking);
+        let toon = payload.to_toon();
+        assert!(!toon.contains("trace_id"));
+    }
+
+    // --- Serde roundtrip ---
+
+    #[test]
+    fn payload_serde_roundtrip() {
+        let ranking = RankingExplanation::from_hit_explanation(
+            "doc-rt",
+            &HitExplanation {
+                final_score: 0.65,
+                phase: ExplanationPhase::Initial,
+                rank_movement: None,
+                components: vec![ScoreComponent {
+                    source: ExplainedSource::LexicalBm25 {
+                        matched_terms: vec!["test".to_owned()],
+                        tf: 1.0,
+                        idf: 1.5,
+                    },
+                    raw_score: 5.0,
+                    normalized_score: 0.7,
+                    rrf_contribution: 0.01,
+                    weight: 0.5,
+                }],
+            },
+            "roundtrip.test",
+            850,
+        );
+        let payload = FsfsExplanationPayload::new("roundtrip query", ranking);
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: FsfsExplanationPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.query, payload.query);
+        assert_eq!(decoded.schema_version, payload.schema_version);
+        assert_eq!(decoded.ranking.doc_id, payload.ranking.doc_id);
+        assert_eq!(
+            decoded.ranking.components.len(),
+            payload.ranking.components.len()
+        );
+    }
+
+    // --- RankMovementSnapshot from conversion ---
+
+    #[test]
+    fn rank_movement_snapshot_from_core() {
+        use super::RankMovementSnapshot;
+        let movement = RankMovement {
+            initial_rank: 5,
+            refined_rank: 2,
+            delta: -3,
+            reason: "quality boost".to_owned(),
+        };
+        let snapshot = RankMovementSnapshot::from(&movement);
+        assert_eq!(snapshot.initial_rank, 5);
+        assert_eq!(snapshot.refined_rank, 2);
+        assert_eq!(snapshot.delta, -3);
+        assert_eq!(snapshot.reason, "quality boost");
+    }
+
+    // --- source_from_explained tests ---
+
+    #[test]
+    fn source_from_explained_maps_all_variants() {
+        use super::source_from_explained;
+        assert_eq!(
+            source_from_explained(&ExplainedSource::LexicalBm25 {
+                matched_terms: vec![],
+                tf: 0.0,
+                idf: 0.0,
+            }),
+            ScoreComponentSource::LexicalBm25
+        );
+        assert_eq!(
+            source_from_explained(&ExplainedSource::SemanticFast {
+                embedder: String::new(),
+                cosine_sim: 0.0,
+            }),
+            ScoreComponentSource::SemanticFast
+        );
+        assert_eq!(
+            source_from_explained(&ExplainedSource::SemanticQuality {
+                embedder: String::new(),
+                cosine_sim: 0.0,
+            }),
+            ScoreComponentSource::SemanticQuality
+        );
+        assert_eq!(
+            source_from_explained(&ExplainedSource::Rerank {
+                model: String::new(),
+                logit: 0.0,
+                sigmoid: 0.0,
+            }),
+            ScoreComponentSource::Rerank
+        );
+    }
+
+    // --- component_confidence_per_mille edge cases ---
+
+    #[test]
+    fn component_confidence_zero_scores() {
+        let component = ScoreComponent {
+            source: ExplainedSource::LexicalBm25 {
+                matched_terms: vec![],
+                tf: 0.0,
+                idf: 0.0,
+            },
+            raw_score: 0.0,
+            normalized_score: 0.0,
+            rrf_contribution: 0.0,
+            weight: 0.0,
+        };
+        let conf = super::component_confidence_per_mille(&component);
+        assert_eq!(conf, 0);
+    }
+
+    #[test]
+    fn component_confidence_max_scores_clamped() {
+        let component = ScoreComponent {
+            source: ExplainedSource::Rerank {
+                model: "test".to_owned(),
+                logit: 10.0,
+                sigmoid: 1.0,
+            },
+            raw_score: 100.0,
+            normalized_score: 1.0,
+            rrf_contribution: 1.0,
+            weight: 1.0,
+        };
+        let conf = super::component_confidence_per_mille(&component);
+        assert!(
+            conf <= 1_000,
+            "confidence should be clamped to 1000, got {conf}"
+        );
+        assert!(
+            conf > 500,
+            "high scores should yield high confidence, got {conf}"
+        );
+    }
+
+    // --- Schema version constant ---
+
+    #[test]
+    fn schema_version_constant_is_nonempty() {
+        assert!(!super::EXPLANATION_PAYLOAD_SCHEMA_VERSION.is_empty());
+        assert!(super::EXPLANATION_PAYLOAD_SCHEMA_VERSION.starts_with("fsfs."));
+    }
+
+    // --- ScoreComponentSource serde roundtrip ---
+
+    #[test]
+    fn score_component_source_serde_roundtrip() {
+        let sources = [
+            ScoreComponentSource::LexicalBm25,
+            ScoreComponentSource::SemanticFast,
+            ScoreComponentSource::SemanticQuality,
+            ScoreComponentSource::Rerank,
+        ];
+        for source in &sources {
+            let json = serde_json::to_string(source).unwrap();
+            let decoded: ScoreComponentSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(*source, decoded);
+        }
+    }
+
+    // --- PolicyDomain serde roundtrip ---
+
+    #[test]
+    fn policy_domain_serde_roundtrip() {
+        let domains = [
+            PolicyDomain::QueryIntent,
+            PolicyDomain::RetrievalBudget,
+            PolicyDomain::QueryExecution,
+            PolicyDomain::Degradation,
+            PolicyDomain::Discovery,
+        ];
+        for domain in &domains {
+            let json = serde_json::to_string(domain).unwrap();
+            let decoded: PolicyDomain = serde_json::from_str(&json).unwrap();
+            assert_eq!(*domain, decoded);
+        }
+    }
+
+    // --- Payload new sets defaults correctly ---
+
+    #[test]
+    fn payload_new_defaults() {
+        let ranking = RankingExplanation::from_hit_explanation(
+            "d",
+            &HitExplanation {
+                final_score: 0.0,
+                phase: ExplanationPhase::Initial,
+                rank_movement: None,
+                components: vec![],
+            },
+            "r",
+            0,
+        );
+        let payload = FsfsExplanationPayload::new("q", ranking);
+        assert_eq!(
+            payload.schema_version,
+            super::EXPLANATION_PAYLOAD_SCHEMA_VERSION
+        );
+        assert!(payload.trace.is_none());
+        assert!(payload.policy_decisions.is_empty());
+    }
+
+    // --- Discovery with empty reason_codes ---
+
+    #[test]
+    fn discovery_policy_empty_reason_codes_uses_fallback() {
+        let discovery = DiscoveryDecision {
+            scope: DiscoveryScopeDecision::Exclude,
+            ingestion_class: IngestionClass::LexicalOnly,
+            utility_score: -50,
+            reason_codes: vec![],
+        };
+        let policy = PolicyDecisionExplanation::from(&discovery);
+        assert_eq!(policy.reason_code, "discovery.reason.unknown");
+    }
 }

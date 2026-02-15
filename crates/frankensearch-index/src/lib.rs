@@ -2620,4 +2620,367 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    // ─── Quantization edge cases ────────────────────────────────────────
+
+    #[test]
+    fn quantization_bytes_per_element() {
+        assert_eq!(Quantization::F32.bytes_per_element(), 4);
+        assert_eq!(Quantization::F16.bytes_per_element(), 2);
+    }
+
+    #[test]
+    fn quantization_from_wire_valid() {
+        let path = Path::new("test.fsvi");
+        assert_eq!(Quantization::from_wire(0, path).unwrap(), Quantization::F32);
+        assert_eq!(Quantization::from_wire(1, path).unwrap(), Quantization::F16);
+    }
+
+    #[test]
+    fn quantization_from_wire_invalid() {
+        let path = Path::new("test.fsvi");
+        assert!(Quantization::from_wire(2, path).is_err());
+        assert!(Quantization::from_wire(255, path).is_err());
+    }
+
+    // ─── align_up edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn align_up_zero_alignment() {
+        assert_eq!(align_up(42, 0).unwrap(), 42);
+    }
+
+    #[test]
+    fn align_up_already_aligned() {
+        assert_eq!(align_up(128, 64).unwrap(), 128);
+    }
+
+    #[test]
+    fn align_up_zero_value() {
+        assert_eq!(align_up(0, 64).unwrap(), 0);
+    }
+
+    #[test]
+    fn align_up_one_over() {
+        assert_eq!(align_up(65, 64).unwrap(), 128);
+    }
+
+    // ─── fnv1a_hash edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn fnv1a_hash_empty_input() {
+        let hash = fnv1a_hash(b"");
+        assert_eq!(hash, 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn fnv1a_hash_deterministic() {
+        let h1 = fnv1a_hash(b"hello");
+        let h2 = fnv1a_hash(b"hello");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn fnv1a_hash_different_inputs_differ() {
+        let h1 = fnv1a_hash(b"doc-a");
+        let h2 = fnv1a_hash(b"doc-b");
+        assert_ne!(h1, h2);
+    }
+
+    // ─── is_tombstoned_flags ────────────────────────────────────────────
+
+    #[test]
+    fn tombstone_flag_logic() {
+        assert!(!is_tombstoned_flags(0x0000));
+        assert!(is_tombstoned_flags(RECORD_FLAG_TOMBSTONE));
+        assert!(is_tombstoned_flags(0x0003)); // tombstone + custom
+        assert!(!is_tombstoned_flags(0x0002)); // only custom
+    }
+
+    // ─── validate_header_string ─────────────────────────────────────────
+
+    #[test]
+    fn validate_header_string_empty_embedder_id_rejected() {
+        let result = validate_header_string("", "embedder_id");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_header_string_empty_embedder_revision_ok() {
+        let result = validate_header_string("", "embedder_revision");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_header_string_normal_ok() {
+        let result = validate_header_string("potion-128M", "embedder_id");
+        assert!(result.is_ok());
+    }
+
+    // ─── VectorMetadata clone/eq ────────────────────────────────────────
+
+    #[test]
+    fn vector_metadata_clone_eq() {
+        let meta = VectorMetadata {
+            embedder_id: "test".to_owned(),
+            embedder_revision: "v1".to_owned(),
+            dimension: 256,
+            quantization: Quantization::F16,
+            record_count: 100,
+            vectors_offset: 1024,
+        };
+        let cloned = meta.clone();
+        assert_eq!(meta, cloned);
+    }
+
+    // ─── VectorIndex::create validation ─────────────────────────────────
+
+    #[test]
+    fn create_zero_dimension_rejected() {
+        let path = temp_index_path("zero-dim");
+        let result = VectorIndex::create(&path, "test", 0);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchError::InvalidConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn create_empty_embedder_id_rejected() {
+        let path = temp_index_path("empty-embedder");
+        let result = VectorIndex::create(&path, "", 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_with_revision_empty_revision_ok() {
+        let path = temp_index_path("empty-rev");
+        let writer =
+            VectorIndex::create_with_revision(&path, "test", "", 4, Quantization::F16).unwrap();
+        writer.finish().unwrap();
+        let index = VectorIndex::open(&path).unwrap();
+        assert_eq!(index.embedder_revision(), "");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── VectorIndexWriter rejection cases ──────────────────────────────
+
+    #[test]
+    fn write_record_nan_embedding_rejected() {
+        let path = temp_index_path("nan-embed");
+        let mut writer = VectorIndex::create(&path, "test", 3).unwrap();
+        let result = writer.write_record("doc", &[1.0, f32::NAN, 0.0]);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("non-finite"),
+            "expected non-finite error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn write_record_inf_embedding_rejected() {
+        let path = temp_index_path("inf-embed");
+        let mut writer = VectorIndex::create(&path, "test", 3).unwrap();
+        let result = writer.write_record("doc", &[1.0, f32::INFINITY, 0.0]);
+        assert!(result.is_err());
+    }
+
+    // ─── VectorIndex::open edge cases ───────────────────────────────────
+
+    #[test]
+    fn open_nonexistent_file_returns_index_not_found() {
+        let path = temp_index_path("nonexistent-open");
+        let result = VectorIndex::open(&path);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchError::IndexNotFound { .. }
+        ));
+    }
+
+    #[test]
+    fn open_truncated_file_detected() {
+        let path = temp_index_path("truncated-open");
+        let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.write_record("doc-0", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &data[..data.len() - 4]).unwrap();
+
+        let result = VectorIndex::open(&path);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("truncated") || err.contains("too small") || err.contains("extends"),
+            "expected truncation error, got: {err}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── FSVI constants ─────────────────────────────────────────────────
+
+    #[test]
+    fn fsvi_magic_is_four_bytes() {
+        assert_eq!(FSVI_MAGIC.len(), 4);
+        assert_eq!(&FSVI_MAGIC, b"FSVI");
+    }
+
+    #[test]
+    fn fsvi_version_is_one() {
+        assert_eq!(FSVI_VERSION, 1);
+    }
+
+    #[test]
+    fn record_size_is_sixteen() {
+        assert_eq!(RECORD_SIZE_BYTES, 16);
+    }
+
+    // ─── vector_at_f16 on f16 index ─────────────────────────────────────
+
+    #[test]
+    fn vector_at_f16_roundtrip() {
+        let path = temp_index_path("f16-at-roundtrip");
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "test", "r1", 3, Quantization::F16).unwrap();
+        writer.write_record("doc", &[0.5, -0.5, 1.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let f16_vec = index.vector_at_f16(0).unwrap();
+        assert_eq!(f16_vec.len(), 3);
+        assert!((f16_vec[0].to_f32() - 0.5).abs() < 0.01);
+        assert!((f16_vec[1].to_f32() - (-0.5)).abs() < 0.01);
+        assert!((f16_vec[2].to_f32() - 1.0).abs() < 0.01);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── vector_at_f16 on f32 index (converts) ─────────────────────────
+
+    #[test]
+    fn vector_at_f16_from_f32_index() {
+        let path = temp_index_path("f16-from-f32");
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "test", "r1", 3, Quantization::F32).unwrap();
+        writer.write_record("doc", &[0.25, -0.75, 1.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let f16_vec = index.vector_at_f16(0).unwrap();
+        assert_eq!(f16_vec.len(), 3);
+        assert!((f16_vec[0].to_f32() - 0.25).abs() < 0.01);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── metadata accessor ──────────────────────────────────────────────
+
+    #[test]
+    fn metadata_accessor_returns_consistent_data() {
+        let path = temp_index_path("metadata-accessor");
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "emb-1", "rev-9", 16, Quantization::F32)
+                .unwrap();
+        writer.write_record("d", &[0.0; 16]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let meta = index.metadata();
+        assert_eq!(meta.embedder_id, "emb-1");
+        assert_eq!(meta.embedder_revision, "rev-9");
+        assert_eq!(meta.dimension, 16);
+        assert_eq!(meta.quantization, Quantization::F32);
+        assert_eq!(meta.record_count, 1);
+        assert_eq!(meta.vectors_offset % 64, 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── is_deleted accessor ────────────────────────────────────────────
+
+    #[test]
+    fn is_deleted_false_for_live_record() {
+        let path = temp_index_path("is-deleted-live");
+        let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.write_record("doc", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert!(!index.is_deleted(0));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── tombstone_ratio empty index ────────────────────────────────────
+
+    #[test]
+    fn tombstone_ratio_empty_index_is_zero() {
+        let path = temp_index_path("tomb-ratio-empty");
+        let writer = VectorIndex::create(&path, "test", 4).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert!(index.tombstone_ratio().abs() < f64::EPSILON);
+        assert!(!index.needs_vacuum());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── WalConfig default ──────────────────────────────────────────────
+
+    #[test]
+    fn wal_config_default_values() {
+        let cfg = WalConfig::default();
+        assert!(cfg.compaction_threshold > 0);
+        assert!(cfg.compaction_ratio > 0.0);
+    }
+
+    // ─── F32 roundtrip with explicit revision ───────────────────────────
+
+    #[test]
+    fn f32_roundtrip_with_revision() {
+        let path = temp_index_path("f32-rev-roundtrip");
+        let original = vec![std::f32::consts::PI, std::f32::consts::E, 0.0, -1.0];
+        let mut writer =
+            VectorIndex::create_with_revision(&path, "f32-emb", "rev-42", 4, Quantization::F32)
+                .unwrap();
+        writer.write_record("doc", &original).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let recovered = index.vector_at_f32(0).unwrap();
+        assert_eq!(recovered, original, "f32 must roundtrip exactly");
+        assert_eq!(index.embedder_revision(), "rev-42");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ─── Header CRC corruption by flipping data byte ────────────────────
+
+    #[test]
+    fn header_crc_detects_embedder_id_corruption() {
+        let path = temp_index_path("crc-embedder-corrupt");
+        let mut writer = VectorIndex::create(&path, "test-embedder-long", 4).unwrap();
+        writer.write_record("doc", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut data = std::fs::read(&path).unwrap();
+        // Flip a byte in the embedder_id region (after magic+version+id_len = 8 bytes)
+        data[10] ^= 0xFF;
+        std::fs::write(&path, &data).unwrap();
+
+        let result = VectorIndex::open(&path);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("CRC") || err.contains("crc"),
+            "expected CRC error, got: {err}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }

@@ -3,11 +3,12 @@ use std::time::Duration;
 
 use frankensearch_core::{
     ArtifactEmissionInput, ArtifactEntry as E2eArtifactEntry, ClockMode, Correlation,
-    DeterminismTier, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_REPLAY_COMMAND_TXT,
-    E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL, E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY,
-    E2eEnvelope, E2eEventType, E2eOutcome, E2eSeverity, EventBody, EvidenceEventType, ExitStatus,
-    ExplainedSource, ExplanationPhase, HitExplanation, ManifestBody, ModelVersion, PipelineState,
-    Platform, ReplayBody, ReplayEventType, ScoreComponent, Severity, Suite, build_artifact_entries,
+    DeterminismTier, E2E_ARTIFACT_ARTIFACTS_INDEX_JSON, E2E_ARTIFACT_ENV_JSON,
+    E2E_ARTIFACT_REPLAY_COMMAND_TXT, E2E_ARTIFACT_REPRO_LOCK, E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
+    E2E_SCHEMA_EVENT, E2E_SCHEMA_MANIFEST, E2E_SCHEMA_REPLAY, E2eEnvelope, E2eEventType,
+    E2eOutcome, E2eSeverity, EventBody, EvidenceEventType, ExitStatus, ExplainedSource,
+    ExplanationPhase, HitExplanation, ManifestBody, ModelVersion, PipelineState, Platform,
+    ReplayBody, ReplayEventType, ScoreComponent, Severity, Suite, build_artifact_entries,
     render_artifacts_index, sha256_checksum, validate_envelope, validate_event_envelope,
     validate_manifest_envelope,
 };
@@ -36,6 +37,26 @@ const PRIVACY_TS: &str = "2026-02-14T00:00:04Z";
 const PRIVACY_REASON_PASS: &str = "e2e.privacy.redaction_pass";
 const PRIVACY_REASON_LEAK: &str = "e2e.privacy.redaction_leak";
 const PRIVACY_REPLAY_COMMAND: &str = "cargo test -p frankensearch-fsfs --test privacy_redaction_suite -- --nocapture --exact redaction_assertions_cover_logs_evidence_explain_and_streamed_outputs";
+
+fn privacy_env_json_payload() -> String {
+    serde_json::json!({
+        "schema": "frankensearch.e2e.env.v1",
+        "captured_env": [],
+        "suite": "fsfs.privacy",
+    })
+    .to_string()
+}
+
+fn privacy_repro_lock_payload(exit_status: ExitStatus, finding_count: usize) -> String {
+    let status = match exit_status {
+        ExitStatus::Pass => "pass",
+        ExitStatus::Fail => "fail",
+        ExitStatus::Error => "error",
+    };
+    format!(
+        "schema=frankensearch.e2e.repro-lock.v1\nsuite=fsfs.privacy\nrun_id={PRIVACY_RUN_ID}\nexit_status={status}\nfinding_count={finding_count}\n"
+    )
+}
 
 #[inline]
 fn usize_to_f64(value: usize) -> f64 {
@@ -304,11 +325,23 @@ fn build_privacy_unified_bundle(
     )];
 
     let event_count = u64::try_from(events.len()).expect("event count fits in u64");
+    let env_json = privacy_env_json_payload();
+    let repro_lock = privacy_repro_lock_payload(exit_status, report.findings.len());
     let mut artifacts = build_artifact_entries([
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL,
             bytes: events_jsonl.as_bytes(),
             line_count: Some(event_count),
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_ENV_JSON,
+            bytes: env_json.as_bytes(),
+            line_count: None,
+        },
+        ArtifactEmissionInput {
+            file: E2E_ARTIFACT_REPRO_LOCK,
+            bytes: repro_lock.as_bytes(),
+            line_count: None,
         },
         ArtifactEmissionInput {
             file: E2E_ARTIFACT_REPLAY_COMMAND_TXT,
@@ -638,6 +671,8 @@ fn redaction_assertions_cover_logs_evidence_explain_and_streamed_outputs() {
         .map(|artifact| artifact.file.as_str())
         .collect();
     assert!(artifact_files.contains(&E2E_ARTIFACT_STRUCTURED_EVENTS_JSONL));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_ENV_JSON));
+    assert!(artifact_files.contains(&E2E_ARTIFACT_REPRO_LOCK));
     assert!(artifact_files.contains(&E2E_ARTIFACT_REPLAY_COMMAND_TXT));
     assert!(artifact_files.contains(&E2E_ARTIFACT_ARTIFACTS_INDEX_JSON));
     assert!(artifact_files.contains(&"leak_report.json"));

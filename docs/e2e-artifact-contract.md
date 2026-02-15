@@ -27,6 +27,8 @@ All artifact files live in a single directory per run:
 ```
 <output_dir>/<run_id>/
   manifest.json
+  env.json
+  repro.lock
   structured_events.jsonl
   oracle-report.json
   replay.jsonl
@@ -43,6 +45,7 @@ Rules:
 - File extensions: `.json` for single objects, `.jsonl` for line-delimited, `.txt` for plain text.
 - No nested subdirectories within a run directory.
 - Absent optional artifacts simply omit the file.
+- Every pack must include `env.json` and `repro.lock`.
 - Failed runs must include `artifacts_index.json` and `replay_command.txt`.
 - Failed ops/UI runs must include `terminal_transcript.txt`.
 
@@ -95,6 +98,8 @@ The manifest is the entry point for any artifact pack. Required body fields:
     "clock_mode": "simulated|frozen|realtime",
     "tie_break_policy": "doc_id_lexical",
     "artifacts": [
+      { "file": "env.json", "checksum": "sha256:..." },
+      { "file": "repro.lock", "checksum": "sha256:..." },
       { "file": "structured_events.jsonl", "checksum": "sha256:...", "line_count": 147 },
       { "file": "oracle-report.json", "checksum": "sha256:..." }
     ],
@@ -124,6 +129,8 @@ Required manifest body fields:
 Additional manifest contract rules enforced by schema/validator:
 
 - `artifacts` must include a `structured_events.jsonl` entry.
+- `artifacts` must include an `env.json` entry.
+- `artifacts` must include a `repro.lock` entry.
 - If `exit_status` is `fail` or `error`, `artifacts` must include:
   - `artifacts_index.json`
   - `replay_command.txt`

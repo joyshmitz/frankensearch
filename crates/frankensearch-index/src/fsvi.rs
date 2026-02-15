@@ -1020,6 +1020,176 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    // ─── Quantization ────────────────────────────────────────────────────
+
+    #[test]
+    fn quantization_element_size_f32() {
+        assert_eq!(Quantization::F32.element_size(), 4);
+    }
+
+    #[test]
+    fn quantization_element_size_f16() {
+        assert_eq!(Quantization::F16.element_size(), 2);
+    }
+
+    #[test]
+    fn quantization_from_u8_valid() {
+        assert_eq!(Quantization::from_u8(0).unwrap(), Quantization::F32);
+        assert_eq!(Quantization::from_u8(1).unwrap(), Quantization::F16);
+    }
+
+    #[test]
+    fn quantization_from_u8_invalid() {
+        assert!(Quantization::from_u8(2).is_err());
+        assert!(Quantization::from_u8(255).is_err());
+    }
+
+    // ─── Header roundtrip ───────────────────────────────────────────────
+
+    #[test]
+    fn header_to_bytes_from_bytes_roundtrip() {
+        let header = FsviHeader {
+            version: FORMAT_VERSION,
+            dimension: 256,
+            quantization: Quantization::F16,
+            embedder_id: "potion-128M".to_owned(),
+            embedder_revision: "abc123def".to_owned(),
+            record_count: 42,
+            header_size: 0,
+        };
+        let bytes = header.to_bytes();
+        let parsed = FsviHeader::from_bytes(&bytes, "test").unwrap();
+        assert_eq!(parsed.version, FORMAT_VERSION);
+        assert_eq!(parsed.dimension, 256);
+        assert_eq!(parsed.quantization, Quantization::F16);
+        assert_eq!(parsed.embedder_id, "potion-128M");
+        assert_eq!(parsed.embedder_revision, "abc123def");
+        assert_eq!(parsed.record_count, 42);
+    }
+
+    #[test]
+    fn header_from_bytes_bad_magic() {
+        let mut bytes = vec![0u8; 30];
+        bytes[0..4].copy_from_slice(b"XYZW");
+        let result = FsviHeader::from_bytes(&bytes, "test");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("bad magic"),
+            "expected bad magic error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn header_from_bytes_too_small() {
+        let bytes = vec![0u8; 10];
+        let result = FsviHeader::from_bytes(&bytes, "test");
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("too small"),
+            "expected too small error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn header_from_bytes_wrong_version() {
+        let header = FsviHeader {
+            version: FORMAT_VERSION,
+            dimension: 4,
+            quantization: Quantization::F16,
+            embedder_id: "t".to_owned(),
+            embedder_revision: "r".to_owned(),
+            record_count: 0,
+            header_size: 0,
+        };
+        let mut bytes = header.to_bytes();
+        // Patch version to 99 and fix CRC
+        bytes[4] = 99;
+        bytes[5] = 0;
+        let result = FsviHeader::from_bytes(&bytes, "test");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            SearchError::IndexVersionMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn header_clone() {
+        let header = FsviHeader {
+            version: FORMAT_VERSION,
+            dimension: 384,
+            quantization: Quantization::F32,
+            embedder_id: "test".to_owned(),
+            embedder_revision: "v1".to_owned(),
+            record_count: 10,
+            header_size: 30,
+        };
+        let cloned = header.clone();
+        assert_eq!(cloned.version, header.version);
+        assert_eq!(cloned.dimension, header.dimension);
+        assert_eq!(cloned.quantization, header.quantization);
+        assert_eq!(cloned.embedder_id, header.embedder_id);
+        assert_eq!(cloned.embedder_revision, header.embedder_revision);
+        assert_eq!(cloned.record_count, header.record_count);
+    }
+
+    #[test]
+    fn header_empty_embedder_fields() {
+        let header = FsviHeader {
+            version: FORMAT_VERSION,
+            dimension: 2,
+            quantization: Quantization::F16,
+            embedder_id: String::new(),
+            embedder_revision: String::new(),
+            record_count: 0,
+            header_size: 0,
+        };
+        let bytes = header.to_bytes();
+        let parsed = FsviHeader::from_bytes(&bytes, "test").unwrap();
+        assert_eq!(parsed.embedder_id, "");
+        assert_eq!(parsed.embedder_revision, "");
+    }
+
+    // ─── read helpers truncation ────────────────────────────────────────
+
+    #[test]
+    fn read_u16_truncated() {
+        let data = [0u8; 1];
+        assert!(read_u16(&data, 0).is_err());
+    }
+
+    #[test]
+    fn read_u32_truncated() {
+        let data = [0u8; 3];
+        assert!(read_u32(&data, 0).is_err());
+    }
+
+    #[test]
+    fn read_u64_truncated() {
+        let data = [0u8; 7];
+        assert!(read_u64(&data, 0).is_err());
+    }
+
+    #[test]
+    fn read_u16_valid() {
+        let bytes = 0x1234_u16.to_le_bytes();
+        assert_eq!(read_u16(&bytes, 0).unwrap(), 0x1234);
+    }
+
+    #[test]
+    fn read_u32_valid() {
+        let bytes = 0x1234_5678_u32.to_le_bytes();
+        assert_eq!(read_u32(&bytes, 0).unwrap(), 0x1234_5678);
+    }
+
+    #[test]
+    fn read_u64_valid() {
+        let bytes = 0x1234_5678_9ABC_DEF0_u64.to_le_bytes();
+        assert_eq!(read_u64(&bytes, 0).unwrap(), 0x1234_5678_9ABC_DEF0);
+    }
+
     // ─── Align helper ───────────────────────────────────────────────────
 
     #[test]
@@ -1029,6 +1199,166 @@ mod tests {
         assert_eq!(align_up(63, 64), 64);
         assert_eq!(align_up(64, 64), 64);
         assert_eq!(align_up(65, 64), 128);
+    }
+
+    #[test]
+    fn align_up_various_alignments() {
+        assert_eq!(align_up(0, 1), 0);
+        assert_eq!(align_up(1, 1), 1);
+        assert_eq!(align_up(5, 4), 8);
+        assert_eq!(align_up(8, 8), 8);
+        assert_eq!(align_up(9, 8), 16);
+    }
+
+    // ─── Writer count ───────────────────────────────────────────────────
+
+    #[test]
+    fn writer_count_increments() {
+        let path = temp_path("writer_count.fsvi");
+        let mut writer =
+            VectorIndexWriter::create(&path, "test", "r1", 2, Quantization::F16).unwrap();
+        assert_eq!(writer.count(), 0);
+        writer.write_record("doc-0", &[1.0, 0.0]).unwrap();
+        assert_eq!(writer.count(), 1);
+        writer.write_record("doc-1", &[0.0, 1.0]).unwrap();
+        assert_eq!(writer.count(), 2);
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── Truncated file detection ───────────────────────────────────────
+
+    #[test]
+    fn truncated_file_detected() {
+        let path = temp_path("truncated.fsvi");
+        let mut writer =
+            VectorIndexWriter::create(&path, "test", "r1", 4, Quantization::F16).unwrap();
+        writer
+            .write_record("doc-0", &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        writer.finish().unwrap();
+
+        // Truncate the file to remove part of the vector slab
+        let data = fs::read(&path).unwrap();
+        let truncated = &data[..data.len() - 4];
+        fs::write(&path, truncated).unwrap();
+
+        let result = VectorIndex::open(&path);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("too small") || err.contains("truncated"),
+            "expected size error, got: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── CRC corruption in header (data-only) ──────────────────────────
+
+    #[test]
+    fn header_crc_corruption_specific_byte() {
+        let path = temp_path("crc_specific.fsvi");
+        let mut writer =
+            VectorIndexWriter::create(&path, "test", "r1", 2, Quantization::F16).unwrap();
+        writer.write_record("doc-0", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+
+        let mut data = fs::read(&path).unwrap();
+        // Corrupt the dimension field (bytes 6-7)
+        data[6] ^= 0xFF;
+        fs::write(&path, &data).unwrap();
+
+        let result = VectorIndex::open(&path);
+        assert!(result.is_err());
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── vector_f16_at direct access ────────────────────────────────────
+
+    #[test]
+    fn vector_f16_at_returns_correct_values() {
+        let path = temp_path("f16_at.fsvi");
+        let mut writer =
+            VectorIndexWriter::create(&path, "test", "r1", 3, Quantization::F16).unwrap();
+        writer.write_record("doc-0", &[0.5, -0.5, 1.0]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let f16_vec = index.vector_f16_at(0);
+        assert_eq!(f16_vec.len(), 3);
+        assert!((f16_vec[0].to_f32() - 0.5).abs() < 0.01);
+        assert!((f16_vec[1].to_f32() - (-0.5)).abs() < 0.01);
+        assert!((f16_vec[2].to_f32() - 1.0).abs() < 0.01);
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── Accessors on reader ────────────────────────────────────────────
+
+    #[test]
+    fn reader_accessors() {
+        let path = temp_path("accessors.fsvi");
+        let mut writer =
+            VectorIndexWriter::create(&path, "my-embedder", "rev42", 8, Quantization::F32)
+                .unwrap();
+        writer.write_record("doc-x", &[0.0; 8]).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert_eq!(index.record_count(), 1);
+        assert_eq!(index.dimension(), 8);
+        assert_eq!(index.embedder_id(), "my-embedder");
+        assert_eq!(index.embedder_revision(), "rev42");
+        assert_eq!(index.quantization(), Quantization::F32);
+        assert_eq!(index.doc_id_at(0), "doc-x");
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── F32 vector_f32_at exact round-trip ─────────────────────────────
+
+    #[test]
+    fn f32_vector_exact_roundtrip() {
+        let path = temp_path("f32_exact.fsvi");
+        let original = vec![std::f32::consts::PI, std::f32::consts::E, 0.0, -1.0];
+        let mut writer =
+            VectorIndexWriter::create(&path, "test", "r1", 4, Quantization::F32).unwrap();
+        writer.write_record("doc", &original).unwrap();
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        let recovered = index.vector_f32_at(0);
+        assert_eq!(recovered, original, "f32 should roundtrip exactly");
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ─── Multiple records f16 spot-check ────────────────────────────────
+
+    #[test]
+    fn multi_record_f16_spot_check() {
+        let path = temp_path("multi_f16.fsvi");
+        let dim = 4;
+        let mut writer =
+            VectorIndexWriter::create(&path, "test", "r1", dim, Quantization::F16).unwrap();
+        for i in 0..5_u32 {
+            let vec: Vec<f32> = (0..dim)
+                .map(|d| (i * dim as u32 + d as u32) as f32 * 0.1)
+                .collect();
+            writer.write_record(&format!("rec-{i}"), &vec).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let index = VectorIndex::open(&path).unwrap();
+        assert_eq!(index.record_count(), 5);
+        assert_eq!(index.doc_id_at(4), "rec-4");
+
+        let v2 = index.vector_f32_at(2);
+        assert_eq!(v2.len(), dim as usize);
+        assert!((v2[0] - 0.8).abs() < 0.01);
+
+        fs::remove_file(&path).ok();
     }
 
     // ─── Doc ID retrieval ───────────────────────────────────────────────

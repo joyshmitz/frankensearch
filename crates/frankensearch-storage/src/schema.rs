@@ -666,4 +666,292 @@ mod tests {
             let _ = std::fs::remove_file(target);
         }
     }
+
+    // ── Schema version constant ─────────────────────────────────────────
+
+    #[test]
+    fn schema_version_is_six() {
+        assert_eq!(SCHEMA_VERSION, 6);
+    }
+
+    // ── Migration array invariants ──────────────────────────────────────
+
+    #[test]
+    fn migrations_cover_all_versions_one_through_latest() {
+        for version in 1..=SCHEMA_VERSION {
+            assert!(
+                super::MIGRATIONS.iter().any(|m| m.version == version),
+                "missing migration for version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrations_are_ascending_order() {
+        for window in super::MIGRATIONS.windows(2) {
+            assert!(
+                window[0].version < window[1].version,
+                "migration versions not ascending: {} >= {}",
+                window[0].version,
+                window[1].version
+            );
+        }
+    }
+
+    #[test]
+    fn migrations_have_no_empty_statements() {
+        for migration in super::MIGRATIONS {
+            assert!(
+                !migration.statements.is_empty(),
+                "migration {} has empty statements",
+                migration.version
+            );
+        }
+    }
+
+    // ── LATEST_SCHEMA invariants ────────────────────────────────────────
+
+    #[test]
+    fn latest_schema_is_nonempty() {
+        assert!(
+            !super::LATEST_SCHEMA.is_empty(),
+            "LATEST_SCHEMA must have at least one statement"
+        );
+    }
+
+    // ── All tables exist after bootstrap ─────────────────────────────────
+
+    #[test]
+    fn bootstrap_creates_all_expected_tables() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap(&conn).expect("bootstrap should succeed");
+
+        let expected_tables = [
+            "documents",
+            "embedding_jobs",
+            "embedding_status",
+            "content_hashes",
+            "index_metadata",
+            "index_build_history",
+            "search_history",
+            "bookmarks",
+            "schema_version",
+        ];
+
+        for table in expected_tables {
+            let params = [SqliteValue::Text(table.to_owned())];
+            let rows = conn
+                .query_with_params(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1;",
+                    &params,
+                )
+                .expect("sqlite_master query should succeed");
+            assert!(
+                !rows.is_empty(),
+                "table '{table}' should exist after bootstrap"
+            );
+        }
+    }
+
+    // ── All indices exist after bootstrap ────────────────────────────────
+
+    #[test]
+    fn bootstrap_creates_all_expected_indices() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap(&conn).expect("bootstrap should succeed");
+
+        let expected_indices = [
+            "idx_documents_content_hash",
+            "idx_documents_updated_at",
+            "idx_embedding_status_pending",
+            "idx_jobs_pending",
+            "idx_jobs_processing",
+            "idx_build_history_index",
+            "idx_history_query",
+            "idx_history_ts",
+            "idx_bookmarks_doc_query",
+        ];
+
+        for idx in expected_indices {
+            assert!(
+                index_exists(&conn, idx),
+                "index '{idx}' should exist after bootstrap"
+            );
+        }
+    }
+
+    // ── row_i64 edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn row_i64_wrong_type_returns_error() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute("CREATE TABLE test_row (val TEXT);")
+            .expect("create");
+        let params = [SqliteValue::Text("hello".to_owned())];
+        conn.execute_with_params("INSERT INTO test_row(val) VALUES (?1);", &params)
+            .expect("insert");
+
+        let rows = conn
+            .query("SELECT val FROM test_row LIMIT 1;")
+            .expect("query");
+        let row = rows.first().expect("should have a row");
+        let err = super::row_i64(row, 0, "test_field").expect_err("text should not parse as i64");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected type") || msg.contains("test_field"),
+            "error should mention type mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn row_i64_missing_column_returns_error() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute("CREATE TABLE test_row2 (val INTEGER);")
+            .expect("create");
+        let params = [SqliteValue::Integer(42)];
+        conn.execute_with_params("INSERT INTO test_row2(val) VALUES (?1);", &params)
+            .expect("insert");
+
+        let rows = conn
+            .query("SELECT val FROM test_row2 LIMIT 1;")
+            .expect("query");
+        let row = rows.first().expect("should have a row");
+        let err = super::row_i64(row, 99, "missing_col").expect_err("out-of-bounds index");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing column") || msg.contains("missing_col"),
+            "error should mention missing column: {msg}"
+        );
+    }
+
+    #[test]
+    fn row_i64_valid_integer_returns_value() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute("CREATE TABLE test_row3 (val INTEGER);")
+            .expect("create");
+        let params = [SqliteValue::Integer(42)];
+        conn.execute_with_params("INSERT INTO test_row3(val) VALUES (?1);", &params)
+            .expect("insert");
+
+        let rows = conn
+            .query("SELECT val FROM test_row3 LIMIT 1;")
+            .expect("query");
+        let row = rows.first().expect("should have a row");
+        let value = super::row_i64(row, 0, "val").expect("should extract integer");
+        assert_eq!(value, 42);
+    }
+
+    // ── current_version on empty table ──────────────────────────────────
+
+    #[test]
+    fn current_version_optional_empty_table_returns_none() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
+            .expect("create table");
+        let result = current_version_optional(&conn).expect("should not error");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn current_version_empty_table_returns_error() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
+            .expect("create table");
+        let err = current_version(&conn).expect_err("should fail on empty table");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no rows"),
+            "error should mention no rows: {msg}"
+        );
+    }
+
+    // ── storage_error ───────────────────────────────────────────────────
+
+    #[test]
+    fn storage_error_wraps_io_error() {
+        let io_err = std::io::Error::other("test error");
+        let err = storage_error(io_err);
+        match &err {
+            frankensearch_core::SearchError::SubsystemError { subsystem, .. } => {
+                assert_eq!(*subsystem, "storage");
+            }
+            other => panic!("expected SubsystemError, got: {other:?}"),
+        }
+    }
+
+    // ── Tables are queryable after bootstrap ─────────────────────────────
+
+    #[test]
+    fn tables_accept_basic_queries_after_bootstrap() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap(&conn).expect("bootstrap should succeed");
+
+        // Verify each table is queryable
+        for query in [
+            "SELECT COUNT(*) FROM documents;",
+            "SELECT COUNT(*) FROM embedding_jobs;",
+            "SELECT COUNT(*) FROM embedding_status;",
+            "SELECT COUNT(*) FROM content_hashes;",
+            "SELECT COUNT(*) FROM index_metadata;",
+            "SELECT COUNT(*) FROM index_build_history;",
+            "SELECT COUNT(*) FROM search_history;",
+            "SELECT COUNT(*) FROM bookmarks;",
+        ] {
+            conn.query(query)
+                .unwrap_or_else(|_| panic!("query should succeed: {query}"));
+        }
+    }
+
+    // ── Schema version is always latest after bootstrap ──────────────────
+
+    #[test]
+    fn schema_version_row_contains_latest_after_fresh_bootstrap() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap(&conn).expect("bootstrap should succeed");
+
+        let rows = conn
+            .query("SELECT version FROM schema_version ORDER BY version DESC;")
+            .expect("query schema_version");
+        assert!(!rows.is_empty(), "schema_version table should have rows");
+
+        let version = super::row_i64(&rows[0], 0, "version").expect("extract version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    // ── index_exists helper returns false for nonexistent ─────────────────
+
+    #[test]
+    fn index_exists_returns_false_for_nonexistent_index() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap(&conn).expect("bootstrap should succeed");
+        assert!(!index_exists(&conn, "idx_nonexistent_never_created"));
+    }
+
+    // ── Insert and query documents table ─────────────────────────────────
+
+    #[test]
+    fn documents_table_accepts_insert_and_select() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        bootstrap(&conn).expect("bootstrap should succeed");
+
+        let params = [
+            SqliteValue::Text("doc-001".to_owned()),
+            SqliteValue::Text("/path/to/file.rs".to_owned()),
+            SqliteValue::Text("fn main() {}".to_owned()),
+            SqliteValue::Blob(vec![0xAB, 0xCD]),
+            SqliteValue::Integer(12),
+            SqliteValue::Integer(1000),
+            SqliteValue::Integer(1000),
+        ];
+        conn.execute_with_params(
+            "INSERT INTO documents(doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+            &params,
+        )
+        .expect("insert should succeed");
+
+        let rows = conn
+            .query("SELECT doc_id FROM documents WHERE doc_id = 'doc-001';")
+            .expect("select should succeed");
+        assert_eq!(rows.len(), 1);
+    }
 }

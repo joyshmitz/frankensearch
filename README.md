@@ -6,6 +6,22 @@
 
 Two-tier hybrid local search for Rust and the `fsfs` standalone CLI: fast first-pass results, then quality refinement.
 
+## Quick Navigation
+
+- [Install In One Line](#install-in-one-line)
+- [Quick Start](#quick-start-60-seconds)
+- [How It Works](#how-it-works)
+- [Architecture Breakdown](#architecture-breakdown)
+- [Algorithms Used](#algorithms-used)
+- [Library Integration Quickstart (Rust)](#library-integration-quickstart-rust)
+- [Feature-Flag Decision Table](#feature-flag-decision-table)
+- [Config Recipes](#config-recipes)
+- [Troubleshooting by Symptom](#troubleshooting-by-symptom)
+- [Reference Appendix](#reference-appendix)
+- [Key Source Files](#key-source-files)
+- [Glossary](#glossary)
+- [Knob Impact Matrix](#knob-impact-matrix)
+
 ## Install In One Line
 
 ```bash

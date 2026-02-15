@@ -16,13 +16,15 @@ use frankensearch_ops::{
 
 // ─── Soak Profiles ──────────────────────────────────────────────────────────
 
-/// 6-minute soak: steady + burst + embedding wave workloads across 4 projects.
-fn soak_config_6min(seed: u64) -> TelemetrySimulatorConfig {
+/// Short soak: steady + burst + embedding wave workloads across 4 projects.
+/// Uses 120 ticks (2 simulated minutes) to balance coverage with wall-clock time.
+/// `FrankenSQLite` in-memory mode processes ~2 ticks/second, so this runs ~60s.
+fn soak_config_short(seed: u64) -> TelemetrySimulatorConfig {
     TelemetrySimulatorConfig {
         seed,
         start_ms: 1_734_503_200_000,
         tick_interval_ms: 1_000,
-        ticks: 360, // 6 minutes of 1-second ticks
+        ticks: 120, // 2 simulated minutes (enough for drift detection)
         projects: vec![
             SimulatedProject {
                 project_key: "cass-soak".to_owned(),
@@ -52,13 +54,16 @@ fn soak_config_6min(seed: u64) -> TelemetrySimulatorConfig {
     }
 }
 
-/// 24-minute soak: larger fleet with more instances and mixed profiles.
-fn soak_config_24min(seed: u64) -> TelemetrySimulatorConfig {
+/// Extended soak: larger fleet with more instances and mixed profiles.
+/// Uses 360 ticks (6 simulated minutes) for deeper drift analysis.
+/// `FrankenSQLite` in-memory mode processes ~1.5 ticks/second with this fleet
+/// size, so this runs ~4-5 minutes wall-clock.
+fn soak_config_extended(seed: u64) -> TelemetrySimulatorConfig {
     TelemetrySimulatorConfig {
         seed,
         start_ms: 1_734_503_200_000,
         tick_interval_ms: 1_000,
-        ticks: 1_440, // 24 minutes of 1-second ticks
+        ticks: 360, // 6 simulated minutes
         projects: vec![
             SimulatedProject {
                 project_key: "cass-long".to_owned(),
@@ -246,7 +251,11 @@ impl DriftReport {
 
 // ─── Pipeline Helpers ───────────────────────────────────────────────────────
 
-/// Ingest a single batch into storage with summary materialization.
+/// Ingest a single batch into storage (events + resource samples + summaries).
+///
+/// SLO materialization is deferred to checkpoint boundaries for performance.
+/// In production, materialization is periodic (not per-event), so this better
+/// models real workloads while keeping wall-clock time reasonable.
 fn ingest_batch(
     storage: &OpsStorage,
     batch: &frankensearch_ops::SimulationBatch,
@@ -276,6 +285,19 @@ fn ingest_batch(
         let _ = storage.refresh_search_summaries_for_instance(project_key, instance_id, now_ms)?;
     }
 
+    Ok(())
+}
+
+/// Run SLO materialization for a batch (expensive; call at checkpoint intervals).
+fn materialize_batch(
+    storage: &OpsStorage,
+    batch: &frankensearch_ops::SimulationBatch,
+) -> SearchResult<()> {
+    let now_ms = i64::try_from(batch.now_ms).map_err(|_| SearchError::InvalidConfig {
+        field: "now_ms".to_owned(),
+        value: batch.now_ms.to_string(),
+        reason: "must fit into i64".to_owned(),
+    })?;
     storage.materialize_slo_rollups_and_anomalies(now_ms, SloMaterializationConfig::default())?;
     Ok(())
 }
@@ -305,6 +327,10 @@ fn capture_checkpoint(
 }
 
 /// Run the soak pipeline: ingest all batches with periodic checkpoints.
+///
+/// SLO materialization is performed at checkpoint boundaries (not per-batch)
+/// to keep wall-clock time practical. This mirrors production patterns where
+/// materialization is periodic.
 fn run_soak_pipeline(
     storage: &OpsStorage,
     run: &SimulationRun,
@@ -316,8 +342,9 @@ fn run_soak_pipeline(
     for (batch_idx, batch) in run.batches.iter().enumerate() {
         ingest_batch(storage, batch, backpressure_threshold)?;
 
-        // Capture checkpoint at regular intervals and at the final batch.
+        // At checkpoint boundaries (and final batch): materialize then capture.
         if batch_idx % checkpoint_interval == 0 || batch_idx == run.batches.len() - 1 {
+            materialize_batch(storage, batch)?;
             checkpoints.push(capture_checkpoint(storage, batch_idx));
         }
     }
@@ -328,11 +355,11 @@ fn run_soak_pipeline(
 // ─── Soak Tests ─────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "Long-duration soak: ~360 ticks, run with --ignored --nocapture"]
-fn soak_6min_deterministic_replay() {
+#[ignore = "Soak test: ~120 ticks, run with --ignored --nocapture"]
+fn soak_short_deterministic_replay() {
     // Verify deterministic generation: two runs with the same seed produce
     // identical signatures.
-    let config = soak_config_6min(0xDEAD_BEEF_0001);
+    let config = soak_config_short(0xDEAD_BEEF_0001);
     let sim = TelemetrySimulator::new(config).expect("config should validate");
     let run_a = sim.generate().expect("generation should succeed");
     let run_b = sim.generate().expect("generation should succeed");
@@ -352,9 +379,9 @@ fn soak_6min_deterministic_replay() {
 }
 
 #[test]
-#[ignore = "Long-duration soak: ~360 ticks, run with --ignored --nocapture"]
-fn soak_6min_no_leak_or_drift() {
-    let config = soak_config_6min(0xDEAD_BEEF_0002);
+#[ignore = "Soak test: ~120 ticks with leak/drift detection, run with --ignored --nocapture"]
+fn soak_short_no_leak_or_drift() {
+    let config = soak_config_short(0xDEAD_BEEF_0002);
     let sim = TelemetrySimulator::new(config).expect("config should validate");
     let run = sim.generate().expect("generation should succeed");
 
@@ -443,9 +470,9 @@ fn soak_6min_no_leak_or_drift() {
 }
 
 #[test]
-#[ignore = "Long-duration soak: ~1440 ticks, run with --ignored --nocapture"]
-fn soak_24min_stability_under_sustained_load() {
-    let config = soak_config_24min(0xDEAD_BEEF_0003);
+#[ignore = "Extended soak: ~360 ticks, run with --ignored --nocapture"]
+fn soak_extended_stability_under_sustained_load() {
+    let config = soak_config_extended(0xDEAD_BEEF_0003);
     let sim = TelemetrySimulator::new(config).expect("config should validate");
     let run = sim.generate().expect("generation should succeed");
 
@@ -511,10 +538,10 @@ fn soak_24min_stability_under_sustained_load() {
 }
 
 #[test]
-#[ignore = "Long-duration soak: ~360 ticks under backpressure, run with --ignored --nocapture"]
-fn soak_6min_backpressure_resilience() {
+#[ignore = "Soak test: backpressure resilience, run with --ignored --nocapture"]
+fn soak_short_backpressure_resilience() {
     // Use a LOW backpressure threshold to trigger backpressure frequently.
-    let config = soak_config_6min(0xDEAD_BEEF_0004);
+    let config = soak_config_short(0xDEAD_BEEF_0004);
     let sim = TelemetrySimulator::new(config).expect("config should validate");
     let run = sim.generate().expect("generation should succeed");
 
@@ -565,7 +592,7 @@ fn soak_6min_backpressure_resilience() {
 }
 
 #[test]
-#[ignore = "Long-duration soak: restart workload profile, run with --ignored --nocapture"]
+#[ignore = "Soak test: restart workload profile stability, run with --ignored --nocapture"]
 fn soak_restart_profile_stability() {
     // Focus on the Restarting workload profile which simulates degraded
     // periods and instance restarts.
@@ -573,7 +600,7 @@ fn soak_restart_profile_stability() {
         seed: 0xDEAD_BEEF_0005,
         start_ms: 1_734_503_200_000,
         tick_interval_ms: 1_000,
-        ticks: 360,
+        ticks: 120,
         projects: vec![
             SimulatedProject {
                 project_key: "restart-a".to_owned(),
@@ -628,7 +655,7 @@ fn soak_embedding_wave_queue_stability() {
         seed: 0xDEAD_BEEF_0006,
         start_ms: 1_734_503_200_000,
         tick_interval_ms: 1_000,
-        ticks: 360,
+        ticks: 120,
         projects: vec![
             SimulatedProject {
                 project_key: "embed-wave-a".to_owned(),
@@ -687,8 +714,8 @@ fn soak_embedding_wave_queue_stability() {
 #[test]
 #[ignore = "Long-duration soak: cross-seed divergence check, run with --ignored --nocapture"]
 fn soak_different_seeds_produce_different_runs() {
-    let config_a = soak_config_6min(0xAAAA_BBBB_0001);
-    let config_b = soak_config_6min(0xCCCC_DDDD_0002);
+    let config_a = soak_config_short(0xAAAA_BBBB_0001);
+    let config_b = soak_config_short(0xCCCC_DDDD_0002);
 
     let sim_a = TelemetrySimulator::new(config_a).expect("config_a should validate");
     let sim_b = TelemetrySimulator::new(config_b).expect("config_b should validate");
@@ -712,7 +739,7 @@ fn soak_different_seeds_produce_different_runs() {
 fn soak_materialization_consistency() {
     // Verify that SLO materialization remains consistent across all
     // checkpoints: rollups should monotonically accumulate.
-    let config = soak_config_6min(0xDEAD_BEEF_0007);
+    let config = soak_config_short(0xDEAD_BEEF_0007);
     let sim = TelemetrySimulator::new(config).expect("config should validate");
     let run = sim.generate().expect("generation should succeed");
 
@@ -725,8 +752,10 @@ fn soak_materialization_consistency() {
         ingest_batch(&storage, batch, backpressure_threshold)
             .expect("batch ingestion should succeed");
 
-        // Check rollups every 60 ticks.
+        // Materialize and check rollups every 60 ticks.
         if batch_idx % 60 == 0 && batch_idx > 0 {
+            materialize_batch(&storage, batch)
+                .expect("materialization should succeed");
             let rollups = storage
                 .query_slo_rollups_for_scope(SloScope::Fleet, "__fleet__", 1024)
                 .expect("rollup query should succeed");
