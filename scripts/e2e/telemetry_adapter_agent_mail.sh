@@ -82,7 +82,7 @@ run_e2e() {
   telemetry_adapter_run_rch_cargo \
     "e2e.mcp_agent_mail_host_repo_migration_check" \
     "/data/projects/mcp_agent_mail_rust" \
-    cargo check -p mcp-agent-mail-search-core --all-targets --features frankensearch-migration
+    cargo check -p mcp-agent-mail-search-core --all-targets
 }
 
 if [[ "$MODE" == "unit" || "$MODE" == "all" ]]; then

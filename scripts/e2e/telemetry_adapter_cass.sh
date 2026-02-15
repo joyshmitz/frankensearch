@@ -78,7 +78,7 @@ run_e2e() {
   telemetry_adapter_run_rch_cargo \
     "e2e.cass_host_repo_migration_check" \
     "/data/projects/coding_agent_session_search" \
-    cargo +nightly check --all-targets --features frankensearch-migration
+    cargo check --all-targets
 }
 
 if [[ "$MODE" == "unit" || "$MODE" == "all" ]]; then

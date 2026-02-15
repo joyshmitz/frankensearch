@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly TELEMETRY_ADAPTER_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TELEMETRY_ADAPTER_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+readonly TELEMETRY_ADAPTER_REPO_ROOT
 readonly TELEMETRY_ADAPTER_LOG_ROOT="${TELEMETRY_ADAPTER_REPO_ROOT}/test_logs/telemetry_adapters"
 
 TELEMETRY_ADAPTER_FINALIZED=0
@@ -12,6 +13,9 @@ TELEMETRY_ADAPTER_LAST_FAILURE_STAGE=""
 TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE=""
 TELEMETRY_ADAPTER_ACTIVE_STAGE=""
 TELEMETRY_ADAPTER_EXECUTION_MODE="live"
+TELEMETRY_ADAPTER_STAGE_STARTED_COUNT=0
+TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT=0
+TELEMETRY_ADAPTER_RCH_TIMEOUT_SECS="${TELEMETRY_ADAPTER_RCH_TIMEOUT_SECS:-420}"
 
 telemetry_adapter_escape_json() {
   local value="${1:-}"
@@ -41,6 +45,14 @@ telemetry_adapter_emit_event() {
     "$(telemetry_adapter_escape_json "$reason_code")" \
     "$(telemetry_adapter_escape_json "$detail")" \
     >>"$TELEMETRY_ADAPTER_EVENTS_JSONL"
+}
+
+telemetry_adapter_mark_stage_started() {
+  TELEMETRY_ADAPTER_STAGE_STARTED_COUNT=$((TELEMETRY_ADAPTER_STAGE_STARTED_COUNT + 1))
+}
+
+telemetry_adapter_mark_stage_completed() {
+  TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT=$((TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT + 1))
 }
 
 telemetry_adapter_require_command() {
@@ -85,10 +97,9 @@ telemetry_adapter_init() {
   TELEMETRY_ADAPTER_SUMMARY_JSON="${TELEMETRY_ADAPTER_RUN_DIR}/summary.json"
   TELEMETRY_ADAPTER_SUMMARY_MD="${TELEMETRY_ADAPTER_RUN_DIR}/summary.md"
   TELEMETRY_ADAPTER_MANIFEST_JSON="${TELEMETRY_ADAPTER_RUN_DIR}/manifest.json"
-  TELEMETRY_ADAPTER_CARGO_TARGET_DIR="${TELEMETRY_ADAPTER_RUN_DIR}/cargo-target"
+  TELEMETRY_ADAPTER_CARGO_TARGET_DIR="target/telemetry-adapter/${TELEMETRY_ADAPTER_RUN_ID}"
 
   mkdir -p "$TELEMETRY_ADAPTER_RUN_DIR"
-  mkdir -p "$TELEMETRY_ADAPTER_CARGO_TARGET_DIR"
 
   : >"$TELEMETRY_ADAPTER_EVENTS_JSONL"
   : >"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT"
@@ -106,7 +117,7 @@ telemetry_adapter_record_command_header() {
   shift
   local -a cmd=("$@")
   {
-    printf '$ (cd %q && CARGO_TARGET_DIR=%q rch exec --' "$repo" "$TELEMETRY_ADAPTER_CARGO_TARGET_DIR"
+    printf '$ (cd %q && CARGO_TARGET_DIR=%q' "$repo" "$TELEMETRY_ADAPTER_CARGO_TARGET_DIR"
     printf ' %q' "${cmd[@]}"
     printf ')\n'
   } >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT"
@@ -121,15 +132,26 @@ telemetry_adapter_run_rch_cargo() {
   local end_ts
   local duration_s
   local exit_code
+  local timeout_seconds="${TELEMETRY_ADAPTER_RCH_TIMEOUT_SECS}"
+  local timeout_reason=""
+  local -a stage_cmd
 
   TELEMETRY_ADAPTER_ACTIVE_STAGE="$stage"
+  telemetry_adapter_mark_stage_started
+
+  stage_cmd=(rch exec -- "${cargo_cmd[@]}")
+  if command -v timeout >/dev/null 2>&1; then
+    if [[ "$timeout_seconds" =~ ^[0-9]+$ ]] && (( timeout_seconds > 0 )); then
+      stage_cmd=(timeout -s TERM "${timeout_seconds}" "${stage_cmd[@]}")
+    fi
+  fi
 
   telemetry_adapter_emit_event \
     "$stage" \
     "started" \
     "telemetry_adapter.stage.started" \
-    "running cargo command through rch (execution_mode=${TELEMETRY_ADAPTER_EXECUTION_MODE})"
-  telemetry_adapter_record_command_header "$repo" "${cargo_cmd[@]}"
+    "running cargo command through rch (execution_mode=${TELEMETRY_ADAPTER_EXECUTION_MODE}, timeout_s=${timeout_seconds})"
+  telemetry_adapter_record_command_header "$repo" "${stage_cmd[@]}"
 
   if telemetry_adapter_is_dry; then
     telemetry_adapter_emit_event \
@@ -138,6 +160,7 @@ telemetry_adapter_run_rch_cargo() {
       "telemetry_adapter.stage.skipped_dry_run" \
       "dry-run: skipped command execution"
     printf '[%s] dry-run: skipped command execution\n' "$stage" >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT"
+    telemetry_adapter_mark_stage_completed
     TELEMETRY_ADAPTER_ACTIVE_STAGE=""
     return 0
   fi
@@ -145,7 +168,7 @@ telemetry_adapter_run_rch_cargo() {
   start_ts="$(date +%s)"
   if (
     cd "$repo" &&
-    CARGO_TARGET_DIR="$TELEMETRY_ADAPTER_CARGO_TARGET_DIR" rch exec -- "${cargo_cmd[@]}"
+    CARGO_TARGET_DIR="$TELEMETRY_ADAPTER_CARGO_TARGET_DIR" "${stage_cmd[@]}"
   ) >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT" 2>&1; then
     end_ts="$(date +%s)"
     duration_s=$((end_ts - start_ts))
@@ -154,13 +177,33 @@ telemetry_adapter_run_rch_cargo() {
       "ok" \
       "telemetry_adapter.stage.ok" \
       "completed in ${duration_s}s"
+    telemetry_adapter_mark_stage_completed
     TELEMETRY_ADAPTER_ACTIVE_STAGE=""
     return 0
+  else
+    exit_code=$?
   fi
 
-  exit_code=$?
   end_ts="$(date +%s)"
   duration_s=$((end_ts - start_ts))
+
+  if [[ "$exit_code" -eq 124 || "$exit_code" -eq 137 ]]; then
+    timeout_reason="telemetry_adapter.stage.timeout"
+    TELEMETRY_ADAPTER_LAST_FAILURE_STAGE="$stage"
+    TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE="$exit_code"
+    TELEMETRY_ADAPTER_RUN_STATUS="fail"
+    TELEMETRY_ADAPTER_RUN_REASON_CODE="$timeout_reason"
+    TELEMETRY_ADAPTER_RUN_MESSAGE="stage ${stage} timed out (exit_code=${exit_code}, timeout_s=${timeout_seconds}, duration_s=${duration_s})"
+    telemetry_adapter_emit_event \
+      "$stage" \
+      "fail" \
+      "$timeout_reason" \
+      "exit_code=${exit_code} timeout_s=${timeout_seconds} duration_s=${duration_s}"
+    telemetry_adapter_mark_stage_completed
+    TELEMETRY_ADAPTER_ACTIVE_STAGE=""
+    return "$exit_code"
+  fi
+
   TELEMETRY_ADAPTER_LAST_FAILURE_STAGE="$stage"
   TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE="$exit_code"
   TELEMETRY_ADAPTER_RUN_STATUS="fail"
@@ -171,6 +214,7 @@ telemetry_adapter_run_rch_cargo() {
     "fail" \
     "telemetry_adapter.stage.failed" \
     "exit_code=${exit_code} duration_s=${duration_s}"
+  telemetry_adapter_mark_stage_completed
   TELEMETRY_ADAPTER_ACTIVE_STAGE=""
   return "$exit_code"
 }
@@ -188,7 +232,7 @@ telemetry_adapter_write_manifest() {
   local status="$1"
   local reason_code="$2"
   cat >"$TELEMETRY_ADAPTER_MANIFEST_JSON" <<EOF_MANIFEST
-{"schema":"telemetry-adapter-e2e-manifest-v1","v":1,"host":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_HOST")","mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_MODE")","execution_mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EXECUTION_MODE")","run_id":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_RUN_ID")","status":"$(telemetry_adapter_escape_json "$status")","reason_code":"$(telemetry_adapter_escape_json "$reason_code")","ts":"$(telemetry_adapter_now_iso)","artifacts":{"events":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EVENTS_JSONL")","transcript":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_TRANSCRIPT_TXT")","replay":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_REPLAY_TXT")","summary_json":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_SUMMARY_JSON")","summary_md":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_SUMMARY_MD")"}}
+{"schema":"telemetry-adapter-e2e-manifest-v1","v":1,"host":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_HOST")","mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_MODE")","execution_mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EXECUTION_MODE")","run_id":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_RUN_ID")","status":"$(telemetry_adapter_escape_json "$status")","reason_code":"$(telemetry_adapter_escape_json "$reason_code")","stage_started_count":${TELEMETRY_ADAPTER_STAGE_STARTED_COUNT},"stage_completed_count":${TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT},"active_stage":"$(telemetry_adapter_escape_json "${TELEMETRY_ADAPTER_ACTIVE_STAGE}")","ts":"$(telemetry_adapter_now_iso)","artifacts":{"events":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EVENTS_JSONL")","transcript":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_TRANSCRIPT_TXT")","replay":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_REPLAY_TXT")","summary_json":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_SUMMARY_JSON")","summary_md":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_SUMMARY_MD")"}}
 EOF_MANIFEST
 }
 
@@ -200,7 +244,7 @@ telemetry_adapter_finalize() {
   TELEMETRY_ADAPTER_FINALIZED=1
 
   cat >"$TELEMETRY_ADAPTER_SUMMARY_JSON" <<EOF_SUMMARY_JSON
-{"host":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_HOST")","mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_MODE")","execution_mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EXECUTION_MODE")","run_id":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_RUN_ID")","status":"$(telemetry_adapter_escape_json "$status")","reason_code":"$(telemetry_adapter_escape_json "$reason_code")","message":"$(telemetry_adapter_escape_json "$message")","events":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EVENTS_JSONL")","transcript":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_TRANSCRIPT_TXT")","replay":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_REPLAY_TXT")","summary_md":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_SUMMARY_MD")","manifest":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_MANIFEST_JSON")","ts":"$(telemetry_adapter_now_iso)"}
+{"host":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_HOST")","mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_MODE")","execution_mode":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EXECUTION_MODE")","run_id":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_RUN_ID")","status":"$(telemetry_adapter_escape_json "$status")","reason_code":"$(telemetry_adapter_escape_json "$reason_code")","message":"$(telemetry_adapter_escape_json "$message")","stage_started_count":${TELEMETRY_ADAPTER_STAGE_STARTED_COUNT},"stage_completed_count":${TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT},"active_stage":"$(telemetry_adapter_escape_json "${TELEMETRY_ADAPTER_ACTIVE_STAGE}")","events":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_EVENTS_JSONL")","transcript":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_TRANSCRIPT_TXT")","replay":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_REPLAY_TXT")","summary_md":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_SUMMARY_MD")","manifest":"$(telemetry_adapter_escape_json "$TELEMETRY_ADAPTER_MANIFEST_JSON")","ts":"$(telemetry_adapter_now_iso)"}
 EOF_SUMMARY_JSON
 
   cat >"$TELEMETRY_ADAPTER_SUMMARY_MD" <<EOF_SUMMARY_MD
@@ -213,6 +257,9 @@ EOF_SUMMARY_JSON
 - status: ${status}
 - reason_code: ${reason_code}
 - message: ${message}
+- stage_started_count: ${TELEMETRY_ADAPTER_STAGE_STARTED_COUNT}
+- stage_completed_count: ${TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT}
+- active_stage: ${TELEMETRY_ADAPTER_ACTIVE_STAGE:-none}
 - events: ${TELEMETRY_ADAPTER_EVENTS_JSONL}
 - transcript: ${TELEMETRY_ADAPTER_TRANSCRIPT_TXT}
 - replay: ${TELEMETRY_ADAPTER_REPLAY_TXT}
@@ -241,6 +288,12 @@ telemetry_adapter_on_exit() {
   fi
 
   if [[ "$exit_code" -eq 0 && "$TELEMETRY_ADAPTER_RUN_STATUS" == "ok" ]]; then
+    if [[ -n "${TELEMETRY_ADAPTER_ACTIVE_STAGE}" || "$TELEMETRY_ADAPTER_STAGE_STARTED_COUNT" -ne "$TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT" ]]; then
+      local incomplete_stage="${TELEMETRY_ADAPTER_ACTIVE_STAGE:-unknown-stage}"
+      local incomplete_message="incomplete stage accounting detected (active_stage=${incomplete_stage}, started=${TELEMETRY_ADAPTER_STAGE_STARTED_COUNT}, completed=${TELEMETRY_ADAPTER_STAGE_COMPLETED_COUNT})"
+      telemetry_adapter_finalize "fail" "$incomplete_message" "telemetry_adapter.session.incomplete"
+      return 0
+    fi
     local ok_message="${TELEMETRY_ADAPTER_RUN_MESSAGE:-telemetry adapter lane passed}"
     telemetry_adapter_finalize "ok" "$ok_message" "$TELEMETRY_ADAPTER_RUN_REASON_CODE"
     return 0
