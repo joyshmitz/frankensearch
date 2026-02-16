@@ -785,14 +785,20 @@ impl SloMaterializationConfig {
                 reason: "must be > 0".to_owned(),
             });
         }
-        if self.error_budget_ratio <= 0.0 || self.error_budget_ratio > 1.0 {
+        if !self.error_budget_ratio.is_finite()
+            || self.error_budget_ratio <= 0.0
+            || self.error_budget_ratio > 1.0
+        {
             return Err(SearchError::InvalidConfig {
                 field: "error_budget_ratio".to_owned(),
                 value: self.error_budget_ratio.to_string(),
-                reason: "must be in (0, 1]".to_owned(),
+                reason: "must be finite and in (0, 1]".to_owned(),
             });
         }
-        if self.warn_burn_rate <= 0.0
+        if !self.warn_burn_rate.is_finite()
+            || !self.error_burn_rate.is_finite()
+            || !self.critical_burn_rate.is_finite()
+            || self.warn_burn_rate <= 0.0
             || self.error_burn_rate < self.warn_burn_rate
             || self.critical_burn_rate < self.error_burn_rate
         {
@@ -802,10 +808,14 @@ impl SloMaterializationConfig {
                     "{}/{}/{}",
                     self.warn_burn_rate, self.error_burn_rate, self.critical_burn_rate
                 ),
-                reason: "must be positive and monotonic (warn <= error <= critical)".to_owned(),
+                reason: "must be finite, positive and monotonic (warn <= error <= critical)"
+                    .to_owned(),
             });
         }
-        if self.warn_latency_multiplier <= 0.0
+        if !self.warn_latency_multiplier.is_finite()
+            || !self.error_latency_multiplier.is_finite()
+            || !self.critical_latency_multiplier.is_finite()
+            || self.warn_latency_multiplier <= 0.0
             || self.error_latency_multiplier < self.warn_latency_multiplier
             || self.critical_latency_multiplier < self.error_latency_multiplier
         {
@@ -817,7 +827,8 @@ impl SloMaterializationConfig {
                     self.error_latency_multiplier,
                     self.critical_latency_multiplier
                 ),
-                reason: "must be positive and monotonic (warn <= error <= critical)".to_owned(),
+                reason: "must be finite, positive and monotonic (warn <= error <= critical)"
+                    .to_owned(),
             });
         }
         if self.min_requests == 0 {
@@ -5249,6 +5260,33 @@ mod tests {
     #[test]
     fn slo_materialization_config_validate_ok() {
         assert!(SloMaterializationConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_nan_error_budget() {
+        let cfg = SloMaterializationConfig {
+            error_budget_ratio: f64::NAN,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_nan_burn_rate() {
+        let cfg = SloMaterializationConfig {
+            warn_burn_rate: f64::NAN,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn slo_materialization_config_validate_inf_latency_multiplier() {
+        let cfg = SloMaterializationConfig {
+            warn_latency_multiplier: f64::INFINITY,
+            ..SloMaterializationConfig::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     // --- OpsRetentionPolicy ---

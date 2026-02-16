@@ -3398,18 +3398,13 @@ mod tests {
         let _ = wal::remove_wal(&wal::wal_path_for(&path));
 
         // Assert failure
+        let hit_count = hits.len();
         assert_eq!(
-            hits.len(),
-            2,
-            "Should have exactly 2 hits (A and B), found {}",
-            hits.len()
+            hit_count, 2,
+            "Should have exactly 2 hits (A and B), found {hit_count}"
         );
         let b_count = hits.iter().filter(|h| h.doc_id == "doc-B").count();
-        assert_eq!(
-            b_count, 1,
-            "Should have exactly 1 'doc-B', found {}",
-            b_count
-        );
+        assert_eq!(b_count, 1, "Should have exactly 1 'doc-B', found {b_count}");
     }
 
     // ─── bd-1fh4 tests end ────────────────────────────────────────────

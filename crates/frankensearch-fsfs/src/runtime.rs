@@ -4052,6 +4052,7 @@ impl FsfsRuntime {
 
     #[allow(clippy::too_many_lines)]
     async fn run_one_shot_index_scaffold(&self, cx: &Cx, command: CliCommand) -> SearchResult<()> {
+        const BATCH_SIZE: usize = 512;
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
@@ -4127,7 +4128,6 @@ impl FsfsRuntime {
         let mut embedding_elapsed_ms = 0_u128;
 
         // 3. Process in batches
-        const BATCH_SIZE: usize = 512;
         for chunk in candidates.chunks(BATCH_SIZE) {
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
