@@ -863,7 +863,7 @@ fn collect_snapshot_for_root(
     }
 
     // Handle single-file roots explicitly to avoid walk errors
-    let metadata = fs::symlink_metadata(root).map_err(|error| SearchError::Io(error))?;
+    let metadata = fs::symlink_metadata(root).map_err(SearchError::Io)?;
     if metadata.is_file() {
         let mut candidate = DiscoveryCandidate::new(root, metadata.len());
         if let Some(category) = lookup_mount_category(mount_table, root) {
