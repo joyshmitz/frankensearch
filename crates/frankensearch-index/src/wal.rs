@@ -316,16 +316,45 @@ pub(crate) fn append_wal_batch(
     compaction_gen: u8,
     fsync: bool,
 ) -> SearchResult<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(wal_path)?;
+    // Try to create a new WAL file atomically. If successful, we are the creator
+    // and responsible for writing the header.
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(wal_path);
 
-    // Use file length instead of a separate exists() check to avoid a TOCTOU
-    // race between checking existence and opening.
-    if file.metadata()?.len() == 0 {
-        write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
-    }
+    let mut file = match created {
+        Ok(mut file) => {
+            write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // File exists, open in append mode.
+            let file = OpenOptions::new().append(true).open(wal_path)?;
+            let existing_len = file.metadata()?.len();
+            if existing_len < WAL_HEADER_SIZE as u64 {
+                // Empty or truncated file — the creator likely crashed before
+                // flushing the header. Truncate and write a fresh header so
+                // subsequent reads can parse the WAL correctly. No valid data
+                // can exist in a file smaller than the header.
+                drop(file);
+                warn!(
+                    path = %wal_path.display(),
+                    existing_len,
+                    "WAL file smaller than header; truncating and writing fresh header"
+                );
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(wal_path)?;
+                write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
+                file
+            } else {
+                file
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     // Build batch bytes.
     let mut batch = Vec::new();

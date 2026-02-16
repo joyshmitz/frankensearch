@@ -28,8 +28,8 @@ const NON_FINITE_SCORE_FALLBACK: f32 = 0.0;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ScorePair {
-    fast: f32,
-    quality: f32,
+    fast: Option<f32>,
+    quality: Option<f32>,
     index: u32,
 }
 
@@ -76,7 +76,12 @@ pub fn blend_two_tier(
                 index: hit.index,
                 ..ScorePair::default()
             });
-        entry.fast = normalized;
+        // fast_results are sorted best-first. Keep the first (best) score.
+        if entry.fast.is_none() {
+            entry.fast = Some(normalized);
+            // Keep the index associated with the best fast score
+            entry.index = hit.index;
+        }
     }
 
     for (hit, normalized) in quality_results.iter().zip(quality_scores.into_iter()) {
@@ -86,13 +91,18 @@ pub fn blend_two_tier(
                 index: hit.index,
                 ..ScorePair::default()
             });
-        entry.quality = normalized;
+        // quality_results are sorted best-first. Keep the first (best) score.
+        if entry.quality.is_none() {
+            entry.quality = Some(normalized);
+        }
     }
 
     let mut blended: Vec<VectorHit> = merged
         .into_iter()
         .map(|(doc_id, pair)| {
-            let score = alpha.mul_add(pair.quality, (1.0 - alpha) * pair.fast);
+            let fast = pair.fast.unwrap_or(0.0);
+            let quality = pair.quality.unwrap_or(0.0);
+            let score = alpha.mul_add(quality, (1.0 - alpha) * fast);
             VectorHit {
                 index: pair.index,
                 score: sanitize_score(score),

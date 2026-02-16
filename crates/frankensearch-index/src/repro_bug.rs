@@ -47,7 +47,7 @@ mod tests {
         // Manually create the "post-compaction" main index that includes both A and B.
         let mut compact_writer = VectorIndex::create_with_revision(&path, "test", "v1", dim, Quantization::F16)
             .unwrap()
-            .with_generation(1); // Simulate correct compaction increment
+            .with_generation(2); // Simulate correct compaction increment
         compact_writer.write_record("doc-A", &[1.0, 0.0, 0.0, 0.0]).unwrap();
         compact_writer.write_record("doc-B", &[0.0, 1.0, 0.0, 0.0]).unwrap();
         compact_writer.finish().unwrap(); // Overwrites `path` with new index containing A and B.

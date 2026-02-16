@@ -113,7 +113,7 @@ impl HnswIndex {
         let mut doc_ids = Vec::with_capacity(index.record_count());
         let mut vectors = Vec::with_capacity(index.record_count());
         for i in 0..index.record_count() {
-            if index.is_tombstoned(i)? {
+            if index.is_deleted(i) {
                 continue;
             }
             doc_ids.push(index.doc_id_at(i)?.to_owned());
@@ -282,7 +282,7 @@ impl HnswIndex {
         }
         let mut live_position = 0_usize;
         for i in 0..index.record_count() {
-            if index.is_tombstoned(i)? {
+            if index.is_deleted(i) {
                 continue;
             }
             let Some(expected_doc_id) = self.doc_ids.get(live_position) else {
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn build_from_vector_index_excludes_tombstoned_records() {
         let path = temp_path("tombstone-filter", "fsvi");
-        let index = write_index(
+        let mut index = write_index(
             &path,
             &[
                 normalized_vector(1, 16),
@@ -907,7 +907,7 @@ mod tests {
         let deleted = index
             .soft_delete("doc-0001")
             .expect("soft_delete should succeed");
-        assert_eq!(deleted, 1);
+        assert!(deleted);
 
         let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
         assert_eq!(ann.len(), 2, "ANN should only index live vectors");

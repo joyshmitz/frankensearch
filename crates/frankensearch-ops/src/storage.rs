@@ -1309,23 +1309,34 @@ impl OpsStorage {
                 event.validate()?;
             }
 
-            let mut to_insert: Vec<&SearchEventRecord> = Vec::with_capacity(ordered_events.len());
             let mut seen_event_ids: BTreeSet<&str> = BTreeSet::new();
+            let mut inserted = 0_usize;
             let mut deduplicated = 0_usize;
             for event in ordered_events {
-                if !seen_event_ids.insert(event.event_id.as_str())
-                    || search_event_exists(conn, &event.event_id)?
-                {
+                if !seen_event_ids.insert(event.event_id.as_str()) {
                     deduplicated = deduplicated.saturating_add(1);
-                } else {
-                    to_insert.push(event);
+                    continue;
+                }
+
+                match insert_search_event_row(conn, event)? {
+                    0 => {
+                        // Another writer may have inserted the same event_id between
+                        // dedup filtering and this transaction's insert attempt.
+                        deduplicated = deduplicated.saturating_add(1);
+                    }
+                    1 => {
+                        inserted = inserted.saturating_add(1);
+                    }
+                    affected => {
+                        return Err(SearchError::SubsystemError {
+                            subsystem: "ops-storage",
+                            source: Box::new(io::Error::other(format!(
+                                "unexpected row count from search_events insert: {affected}"
+                            ))),
+                        });
+                    }
                 }
             }
-
-            for event in &to_insert {
-                insert_search_event_row(conn, event)?;
-            }
-            let inserted = to_insert.len();
 
             Ok((inserted, deduplicated))
         })
@@ -2378,16 +2389,6 @@ fn unix_timestamp_ms() -> SearchResult<i64> {
         .duration_since(UNIX_EPOCH)
         .map_err(ops_error)?;
     i64::try_from(since_epoch.as_millis()).map_err(ops_error)
-}
-
-fn search_event_exists(conn: &Connection, event_id: &str) -> SearchResult<bool> {
-    let existing = conn
-        .query_with_params(
-            "SELECT 1 FROM search_events WHERE event_id = ?1;",
-            &[SqliteValue::Text(event_id.to_owned())],
-        )
-        .map_err(ops_error)?;
-    Ok(!existing.is_empty())
 }
 
 fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
@@ -3766,6 +3767,27 @@ mod tests {
         assert_eq!(metrics.total_deduplicated, 1);
         assert_eq!(metrics.total_failed_records, 0);
         assert_eq!(metrics.total_backpressured_batches, 0);
+    }
+
+    #[test]
+    fn ingest_search_events_batch_reports_mixed_new_and_existing_events() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        seed_project_and_instance(storage.connection());
+
+        let existing = sample_search_event("event-mixed-existing", 10);
+        storage
+            .ingest_search_events_batch(std::slice::from_ref(&existing), 64)
+            .expect("seed ingest should succeed");
+
+        let fresh = sample_search_event("event-mixed-fresh", 20);
+        let result = storage
+            .ingest_search_events_batch(&[existing, fresh], 64)
+            .expect("mixed ingest should succeed");
+
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.deduplicated, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(search_event_count(storage.connection()), 2);
     }
 
     #[test]

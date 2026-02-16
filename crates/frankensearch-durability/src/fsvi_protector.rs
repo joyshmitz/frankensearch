@@ -181,15 +181,10 @@ impl FsviProtector {
         })
     }
 
-    /// Fast-path integrity verification using `xxh3_64`.
+    /// Verify integrity using the sidecar.
     ///
-    /// Computes the hash of the FSVI file and compares it against the
-    /// hash stored in the sidecar trailer. This takes <1ms regardless
-    /// of file size (limited by memory bandwidth, not CPU).
-    ///
-    /// If the fast path detects corruption, falls back to the full
-    /// CRC-based verification for detailed diagnostics.
-    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
+    /// This performs a full CRC32 check of the source file against the
+    /// hash stored in the sidecar trailer.
     pub fn verify(&self, fsvi_path: &Path) -> SearchResult<FsviVerifyResult> {
         let sidecar_path = Self::sidecar_path(fsvi_path);
 
@@ -201,25 +196,13 @@ impl FsviProtector {
             return Ok(FsviVerifyResult::NoSidecar);
         }
 
-        // Fast path: xxh3 hash check
-        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
-        let len = file.metadata().map_err(SearchError::Io)?.len();
-        let actual_hash = if len == 0 {
-            xxh3_64(&[])
-        } else {
-            // SAFETY: mmap is read-only.
-            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
-            xxh3_64(&mmap)
-        };
-
         // Read the sidecar to get the stored hash from the trailer
         let verify = self.protector.verify_file(fsvi_path, &sidecar_path)?;
 
         if verify.healthy {
             debug!(
                 path = %fsvi_path.display(),
-                hash = actual_hash,
-                "FSVI integrity verified (fast path)"
+                "FSVI integrity verified"
             );
             return Ok(FsviVerifyResult::Intact);
         }

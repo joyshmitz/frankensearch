@@ -1626,15 +1626,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
 
             {
-                let control = lock_or_recover(&watcher.control);
-                let worker = control
+                let worker = lock_or_recover(&watcher.control)
                     .worker
                     .as_ref()
-                    .expect("worker handle should be retained");
-                assert!(
-                    worker.is_finished(),
-                    "expected initial worker to have exited"
-                );
+                    .expect("worker handle should be retained")
+                    .is_finished();
+                assert!(worker, "expected initial worker to have exited");
             }
 
             // Create the root and start again. This should replace the finished handle.
@@ -1643,13 +1640,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
 
             {
-                let control = lock_or_recover(&watcher.control);
-                let worker = control
+                let finished = lock_or_recover(&watcher.control)
                     .worker
                     .as_ref()
-                    .expect("worker handle should exist after restart");
+                    .expect("worker handle should exist after restart")
+                    .is_finished();
                 assert!(
-                    !worker.is_finished(),
+                    !finished,
                     "watcher should replace finished worker handle on restart"
                 );
             }

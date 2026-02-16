@@ -1170,7 +1170,7 @@ mod tests {
         )
         .expect("write fast index");
 
-        let fast_index = VectorIndex::open(&fast_path).expect("open fast index");
+        let mut fast_index = VectorIndex::open(&fast_path).expect("open fast index");
         let deleted = fast_index
             .soft_delete("doc-b")
             .expect("soft delete should succeed");

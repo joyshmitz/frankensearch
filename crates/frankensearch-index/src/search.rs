@@ -11,8 +11,8 @@ use rayon::prelude::*;
 
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
-    dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, Quantization,
-    VectorIndex,
+    Quantization, VectorIndex, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32,
+    dot_product_f32_f32,
 };
 
 /// Record-count threshold where search switches from sequential to Rayon.
