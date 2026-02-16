@@ -113,6 +113,9 @@ impl HnswIndex {
         let mut doc_ids = Vec::with_capacity(index.record_count());
         let mut vectors = Vec::with_capacity(index.record_count());
         for i in 0..index.record_count() {
+            if index.is_tombstoned(i)? {
+                continue;
+            }
             doc_ids.push(index.doc_id_at(i)?.to_owned());
             vectors.push(index.vector_at_f32(i)?);
         }
@@ -274,15 +277,30 @@ impl HnswIndex {
     ///
     /// Propagates decoding errors from `VectorIndex::doc_id_at`.
     pub fn matches_vector_index(&self, index: &VectorIndex) -> SearchResult<bool> {
-        if self.dimension != index.dimension() || self.len() != index.record_count() {
+        if self.dimension != index.dimension() {
             return Ok(false);
         }
-        for i in 0..self.doc_ids.len() {
-            if self.doc_ids[i] != index.doc_id_at(i)? {
+        let mut live_position = 0_usize;
+        for i in 0..index.record_count() {
+            if index.is_tombstoned(i)? {
+                continue;
+            }
+            let Some(expected_doc_id) = self.doc_ids.get(live_position) else {
+                return Ok(false);
+            };
+            if expected_doc_id != index.doc_id_at(i)? {
                 return Ok(false);
             }
+            let Some(expected_vector) = self.vectors.get(live_position) else {
+                return Ok(false);
+            };
+            let candidate_vector = index.vector_at_f32(i)?;
+            if !vectors_close(expected_vector, &candidate_vector) {
+                return Ok(false);
+            }
+            live_position = live_position.saturating_add(1);
         }
-        Ok(true)
+        Ok(live_position == self.doc_ids.len())
     }
 
     /// Number of indexed vectors.
@@ -431,6 +449,23 @@ fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
         }
     }
     vector
+}
+
+fn vectors_close(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(&l, &r)| vector_component_close(l, r))
+}
+
+fn vector_component_close(left: f32, right: f32) -> bool {
+    if left.to_bits() == right.to_bits() {
+        return true;
+    }
+    let diff = (left - right).abs();
+    let scale = left.abs().max(right.abs()).max(1.0);
+    diff <= (f32::EPSILON * 8.0 * scale)
 }
 
 fn estimate_recall(ef_search: usize, k: usize) -> f64 {
@@ -837,6 +872,54 @@ mod tests {
         let index_b = write_index(&path_b, &[normalized_vector(1, 16)]).expect("index_b");
         let ann = HnswIndex::build_from_vector_index(&index_a, HnswConfig::default()).expect("ann");
         assert!(!ann.matches_vector_index(&index_b).expect("matches"));
+    }
+
+    #[test]
+    fn matches_returns_false_when_vectors_change_but_doc_ids_do_not() {
+        let path_a = temp_path("match-vec-a", "fsvi");
+        let path_b = temp_path("match-vec-b", "fsvi");
+        let index_a = write_index(
+            &path_a,
+            &[normalized_vector(1, 16), normalized_vector(2, 16)],
+        )
+        .expect("index_a");
+        let index_b = write_index(
+            &path_b,
+            &[normalized_vector(3, 16), normalized_vector(4, 16)],
+        )
+        .expect("index_b");
+        let ann = HnswIndex::build_from_vector_index(&index_a, HnswConfig::default()).expect("ann");
+        assert!(!ann.matches_vector_index(&index_b).expect("matches"));
+    }
+
+    #[test]
+    fn build_from_vector_index_excludes_tombstoned_records() {
+        let path = temp_path("tombstone-filter", "fsvi");
+        let index = write_index(
+            &path,
+            &[
+                normalized_vector(1, 16),
+                normalized_vector(2, 16),
+                normalized_vector(3, 16),
+            ],
+        )
+        .expect("index");
+        let deleted = index
+            .soft_delete("doc-0001")
+            .expect("soft_delete should succeed");
+        assert_eq!(deleted, 1);
+
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        assert_eq!(ann.len(), 2, "ANN should only index live vectors");
+
+        let query = normalized_vector(2, 16);
+        let hits = ann
+            .knn_search(&query, 10, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert!(
+            !hits.iter().any(|hit| hit.doc_id == "doc-0001"),
+            "ANN should never return tombstoned doc IDs"
+        );
     }
 
     // ── normalize_for_dist_dot ──────────────────────────────────────────
