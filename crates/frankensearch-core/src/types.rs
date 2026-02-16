@@ -110,6 +110,8 @@ pub struct FusedHit {
     pub lexical_rank: Option<usize>,
     /// Rank in the semantic (vector) source, if present.
     pub semantic_rank: Option<usize>,
+    /// Internal vector index, if present.
+    pub semantic_index: Option<u32>,
     /// Raw BM25 score from lexical search, if applicable.
     pub lexical_score: Option<f32>,
     /// Raw cosine similarity from semantic search, if applicable.
@@ -171,6 +173,8 @@ pub struct ScoredResult {
     pub score: f32,
     /// Which search backend produced this result.
     pub source: ScoreSource,
+    /// Internal vector index, if applicable.
+    pub index: Option<u32>,
     /// Score from fast-tier semantic search, if applicable.
     pub fast_score: Option<f32>,
     /// Score from quality-tier semantic search, if applicable.

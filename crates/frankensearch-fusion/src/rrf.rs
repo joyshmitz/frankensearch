@@ -87,6 +87,7 @@ struct FusedHitScratch<'a> {
     rrf_score: f64,
     lexical_rank: Option<usize>,
     semantic_rank: Option<usize>,
+    semantic_index: Option<u32>,
     graph_rank: Option<usize>,
     lexical_score: Option<f32>,
     semantic_score: Option<f32>,
@@ -114,6 +115,7 @@ impl FusedHitScratch<'_> {
             rrf_score: self.rrf_score,
             lexical_rank: self.lexical_rank,
             semantic_rank: self.semantic_rank,
+            semantic_index: self.semantic_index,
             lexical_score: self.lexical_score,
             semantic_score: self.semantic_score,
             in_both_sources: self.in_both_sources,
@@ -220,6 +222,7 @@ pub fn rrf_fuse_with_graph(
                 rrf_score: rrf_contribution,
                 lexical_rank: Some(rank),
                 semantic_rank: None,
+                semantic_index: result.index,
                 graph_rank: None,
                 lexical_score: Some(result.score),
                 semantic_score: None,
@@ -244,12 +247,14 @@ pub fn rrf_fuse_with_graph(
                 fh.rrf_score += rrf_contribution;
                 fh.semantic_rank = Some(rank);
                 fh.semantic_score = Some(hit.score);
+                fh.semantic_index = Some(hit.index);
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: hit.doc_id.as_str(),
                 rrf_score: rrf_contribution,
                 lexical_rank: None,
                 semantic_rank: Some(rank),
+                semantic_index: Some(hit.index),
                 graph_rank: None,
                 lexical_score: None,
                 semantic_score: Some(hit.score),
@@ -279,6 +284,7 @@ pub fn rrf_fuse_with_graph(
                     rrf_score: rrf_contribution,
                     lexical_rank: None,
                     semantic_rank: None,
+                    semantic_index: result.index,
                     graph_rank: Some(rank),
                     lexical_score: None,
                     semantic_score: None,
