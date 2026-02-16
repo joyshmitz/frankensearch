@@ -579,7 +579,11 @@ impl TwoTierSearcher {
                 },
             }
         } else if self.should_run_quality() {
-            metrics.skip_reason = Some("no_fast_phase_candidates".to_owned());
+            if initial_hits.is_empty() {
+                metrics.skip_reason = Some("no_fast_phase_candidates".to_owned());
+            } else {
+                metrics.skip_reason = Some("vector_index_unavailable".to_owned());
+            }
         } else if self.config.fast_only {
             metrics.skip_reason = Some("fast_only".to_owned());
         } else {

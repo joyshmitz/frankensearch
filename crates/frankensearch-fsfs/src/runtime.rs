@@ -4087,167 +4087,206 @@ impl FsfsRuntime {
             stats.skipped_files
         );
 
+        fs::create_dir_all(index_root.join("vector"))?;
+        fs::create_dir_all(index_root.join("cache"))?;
+
+        // 1. Resolve and probe embedder
+        let mut embedder = self.resolve_fast_embedder()?;
+        if let Err(error) = embedder.embed(cx, "probe").await {
+            warn!(
+                embedder = embedder.id(),
+                error = %error,
+                "fsfs semantic embedder probe failed; falling back to hash embeddings"
+            );
+            embedder = Arc::new(HashEmbedder::new(
+                embedder.dimension().max(1),
+                HashAlgorithm::FnvModular,
+            ));
+        }
+
+        // 2. Prepare indexes
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+        let mut vector_writer =
+            VectorIndex::create(&vector_path, embedder.id(), embedder.dimension())?;
+
+        let lexical_path = index_root.join("lexical");
+        let lexical_index = TantivyIndex::create(&lexical_path)?;
+
         let canonicalizer = DefaultCanonicalizer::default();
-        let canonicalize_start = Instant::now();
         let mut manifests = Vec::new();
-        let mut documents = Vec::new();
         let mut observed_reason_codes: BTreeSet<String> =
             stats.reason_codes.iter().cloned().collect();
         let mut semantic_doc_count = 0_usize;
         let mut content_skipped_files = 0_usize;
-        for candidate in candidates {
-            let bytes = match fs::read(&candidate.file_path) {
-                Ok(bytes) => bytes,
-                Err(error) if is_ignorable_index_walk_error(&error) => {
-                    if error.kind() == ErrorKind::PermissionDenied {
-                        observed_reason_codes
-                            .insert(REASON_DISCOVERY_FILE_PERMISSION_DENIED.to_owned());
+        let mut processed_files = 0_usize;
+
+        let canonicalize_start = Instant::now();
+        // We'll track cumulative timings for the batched phases
+        let mut lexical_elapsed_ms = 0_u128;
+        let mut vector_elapsed_ms = 0_u128;
+        let mut embedding_elapsed_ms = 0_u128;
+
+        // 3. Process in batches
+        const BATCH_SIZE: usize = 512;
+        for chunk in candidates.chunks(BATCH_SIZE) {
+            let mut chunk_docs = Vec::with_capacity(chunk.len());
+
+            // Read & Canonicalize
+            for candidate in chunk {
+                let bytes = match fs::read(&candidate.file_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) if is_ignorable_index_walk_error(&error) => {
+                        if error.kind() == ErrorKind::PermissionDenied {
+                            observed_reason_codes
+                                .insert(REASON_DISCOVERY_FILE_PERMISSION_DENIED.to_owned());
+                        }
+                        content_skipped_files = content_skipped_files.saturating_add(1);
+                        continue;
                     }
+                    Err(error) => return Err(error.into()),
+                };
+
+                if is_probably_binary(&bytes) {
+                    observed_reason_codes.insert(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_owned());
                     content_skipped_files = content_skipped_files.saturating_add(1);
                     continue;
                 }
-                Err(error) => return Err(error.into()),
-            };
-            if is_probably_binary(&bytes) {
-                observed_reason_codes.insert(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_owned());
-                content_skipped_files = content_skipped_files.saturating_add(1);
-                continue;
-            }
-            let raw_text = String::from_utf8_lossy(&bytes);
-            let canonical = canonicalizer.canonicalize(&raw_text);
-            if canonical.trim().is_empty() {
-                observed_reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
-                content_skipped_files = content_skipped_files.saturating_add(1);
-                continue;
-            }
 
-            let canonical_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
-            let ingestion_class = format!("{:?}", candidate.ingestion_class).to_ascii_lowercase();
-            let reason_code = match candidate.ingestion_class {
-                IngestionClass::FullSemanticLexical => "index.plan.full_semantic_lexical",
-                IngestionClass::LexicalOnly => "index.plan.lexical_only",
-                IngestionClass::MetadataOnly => "index.plan.metadata_only",
-                IngestionClass::Skip => "index.plan.skip",
-            }
-            .to_owned();
+                let raw_text = String::from_utf8_lossy(&bytes);
+                let canonical = canonicalizer.canonicalize(&raw_text);
+                if canonical.trim().is_empty() {
+                    observed_reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
+                    content_skipped_files = content_skipped_files.saturating_add(1);
+                    continue;
+                }
 
-            manifests.push(IndexManifestEntry {
-                file_key: candidate.file_key.clone(),
-                revision: i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX),
-                ingestion_class: ingestion_class.clone(),
-                canonical_bytes,
-                reason_code,
-            });
-
-            let file_name = candidate
-                .file_path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or_default()
+                let canonical_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
+                let ingestion_class =
+                    format!("{:?}", candidate.ingestion_class).to_ascii_lowercase();
+                let reason_code = match candidate.ingestion_class {
+                    IngestionClass::FullSemanticLexical => "index.plan.full_semantic_lexical",
+                    IngestionClass::LexicalOnly => "index.plan.lexical_only",
+                    IngestionClass::MetadataOnly => "index.plan.metadata_only",
+                    IngestionClass::Skip => "index.plan.skip",
+                }
                 .to_owned();
-            let doc = IndexableDocument::new(candidate.file_key, canonical)
-                .with_title(file_name)
-                .with_metadata("source_path", candidate.file_path.display().to_string())
-                .with_metadata("ingestion_class", ingestion_class)
-                .with_metadata("source_modified_ms", candidate.modified_ms.to_string());
-            if matches!(
-                candidate.ingestion_class,
-                IngestionClass::FullSemanticLexical
-            ) {
-                semantic_doc_count = semantic_doc_count.saturating_add(1);
+
+                manifests.push(IndexManifestEntry {
+                    file_key: candidate.file_key.clone(),
+                    revision: i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX),
+                    ingestion_class: ingestion_class.clone(),
+                    canonical_bytes,
+                    reason_code,
+                });
+
+                let file_name = candidate
+                    .file_path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let doc = IndexableDocument::new(candidate.file_key.clone(), canonical)
+                    .with_title(file_name)
+                    .with_metadata("source_path", candidate.file_path.display().to_string())
+                    .with_metadata("ingestion_class", ingestion_class)
+                    .with_metadata("source_modified_ms", candidate.modified_ms.to_string());
+
+                if matches!(
+                    candidate.ingestion_class,
+                    IngestionClass::FullSemanticLexical
+                ) {
+                    semantic_doc_count = semantic_doc_count.saturating_add(1);
+                }
+                processed_files = processed_files.saturating_add(1);
+                chunk_docs.push((candidate.ingestion_class, doc));
             }
-            documents.push((candidate.ingestion_class, doc));
+
+            // Lexical Indexing
+            let lexical_start = Instant::now();
+            let lexical_batch = chunk_docs
+                .iter()
+                .filter(|(class, _)| {
+                    !matches!(class, IngestionClass::MetadataOnly | IngestionClass::Skip)
+                })
+                .map(|(_, doc)| doc.clone())
+                .collect::<Vec<_>>();
+            if !lexical_batch.is_empty() {
+                lexical_index.index_documents(cx, &lexical_batch).await?;
+            }
+            lexical_elapsed_ms = lexical_elapsed_ms
+                .saturating_add(lexical_start.elapsed().as_millis());
+
+            // Semantic Embedding & Vector Writing
+            let semantic_docs = chunk_docs
+                .iter()
+                .filter(|(class, _)| matches!(class, IngestionClass::FullSemanticLexical))
+                .map(|(_, doc)| doc)
+                .collect::<Vec<_>>();
+
+            if !semantic_docs.is_empty() {
+                let semantic_texts = semantic_docs
+                    .iter()
+                    .map(|doc| doc.content.as_str())
+                    .collect::<Vec<_>>();
+
+                let embed_start = Instant::now();
+                let embeddings_result = embedder.embed_batch(cx, &semantic_texts).await;
+                embedding_elapsed_ms = embedding_elapsed_ms
+                    .saturating_add(embed_start.elapsed().as_millis());
+
+                match embeddings_result {
+                    Ok(embeddings) => {
+                        if embeddings.len() != semantic_docs.len() {
+                            return Err(frankensearch_core::SearchError::EmbeddingFailed {
+                                model: embedder.id().to_string(),
+                                source: format!(
+                                    "embed_batch returned {} vectors for {} documents",
+                                    embeddings.len(),
+                                    semantic_docs.len(),
+                                )
+                                .into(),
+                            });
+                        }
+                        let vector_start = Instant::now();
+                        for (doc, embedding) in semantic_docs.iter().zip(embeddings.into_iter()) {
+                            vector_writer.write_record(&doc.id, &embedding)?;
+                        }
+                        vector_elapsed_ms = vector_elapsed_ms
+                            .saturating_add(vector_start.elapsed().as_millis());
+                    }
+                    Err(error) => {
+                        // If embedding fails for a chunk, we skip vector indexing for this chunk
+                        // rather than crashing the whole process or switching models mid-stream.
+                        warn!(
+                            chunk_size = semantic_docs.len(),
+                            error = %error,
+                            "semantic embedding failed for batch; skipping vectors for these files"
+                        );
+                    }
+                }
+            }
         }
+
         let canonicalize_elapsed_ms = canonicalize_start.elapsed().as_millis();
-        info!(
-            indexed_candidates = documents.len(),
-            semantic_candidates = semantic_doc_count,
-            skipped_after_read = content_skipped_files,
-            elapsed_ms = canonicalize_elapsed_ms,
-            "fsfs canonicalization stage completed"
-        );
+
+        // 4. Commit and Finish
+        let lexical_commit_start = Instant::now();
+        lexical_index.commit(cx).await?;
+        lexical_elapsed_ms = lexical_elapsed_ms
+            .saturating_add(lexical_commit_start.elapsed().as_millis());
+
+        let vector_finish_start = Instant::now();
+        vector_writer.finish()?;
+        vector_elapsed_ms = vector_elapsed_ms
+            .saturating_add(vector_finish_start.elapsed().as_millis());
 
         manifests.sort_by(|left, right| left.file_key.cmp(&right.file_key));
-
         let source_hash_hex = index_source_hash_hex(&manifests);
-        let indexed_files = documents.len();
+        let indexed_files = processed_files;
         let skipped_files = stats.discovered_files.saturating_sub(indexed_files);
         let total_canonical_bytes = manifests.iter().fold(0_u64, |acc, entry| {
             acc.saturating_add(entry.canonical_bytes)
         });
-
-        fs::create_dir_all(index_root.join("vector"))?;
-        fs::create_dir_all(index_root.join("cache"))?;
-
-        let lexical_docs = documents
-            .iter()
-            .filter(|(class, _)| {
-                !matches!(class, IngestionClass::MetadataOnly | IngestionClass::Skip)
-            })
-            .map(|(_, doc)| doc.clone())
-            .collect::<Vec<_>>();
-        let lexical_start = Instant::now();
-        let lexical_index = TantivyIndex::create(&index_root.join("lexical"))?;
-        lexical_index.index_documents(cx, &lexical_docs).await?;
-        lexical_index.commit(cx).await?;
-        let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
-
-        let embed_start = Instant::now();
-        let mut embedder = self.resolve_fast_embedder()?;
-        let semantic_docs = documents
-            .iter()
-            .filter(|(class, _)| matches!(class, IngestionClass::FullSemanticLexical))
-            .map(|(_, doc)| doc)
-            .collect::<Vec<_>>();
-        let semantic_texts = semantic_docs
-            .iter()
-            .map(|doc| doc.content.as_str())
-            .collect::<Vec<_>>();
-        let semantic_embeddings = if semantic_texts.is_empty() {
-            Vec::new()
-        } else {
-            match embedder.embed_batch(cx, &semantic_texts).await {
-                Ok(embeddings) => embeddings,
-                Err(error) => {
-                    warn!(
-                        embedder = embedder.id(),
-                        error = %error,
-                        "fsfs semantic embedder failed; falling back to hash embeddings"
-                    );
-                    let fallback: Arc<dyn Embedder> = Arc::new(HashEmbedder::new(
-                        embedder.dimension().max(1),
-                        HashAlgorithm::FnvModular,
-                    ));
-                    embedder = fallback;
-                    embedder.embed_batch(cx, &semantic_texts).await?
-                }
-            }
-        };
-        let embed_elapsed_ms = embed_start.elapsed().as_millis();
-
-        // Validate embed_batch returned exactly as many vectors as inputs.
-        // zip() silently drops trailing documents if the embedder returns
-        // fewer vectors, which corrupts the index by losing documents.
-        if semantic_embeddings.len() != semantic_docs.len() {
-            return Err(frankensearch_core::SearchError::EmbeddingFailed {
-                model: embedder.id().to_string(),
-                source: format!(
-                    "embed_batch returned {} vectors for {} documents",
-                    semantic_embeddings.len(),
-                    semantic_docs.len(),
-                )
-                .into(),
-            });
-        }
-
-        let vector_start = Instant::now();
-        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-        let mut writer = VectorIndex::create(&vector_path, embedder.id(), embedder.dimension())?;
-        for (doc, embedding) in semantic_docs.iter().zip(semantic_embeddings.into_iter()) {
-            writer.write_record(&doc.id, &embedding)?;
-        }
-        writer.finish()?;
-        let vector_elapsed_ms = vector_start.elapsed().as_millis();
 
         self.write_index_artifacts(&index_root, &manifests)?;
         let sentinel = IndexSentinel {
@@ -4281,13 +4320,12 @@ impl FsfsRuntime {
             indexed_files,
             skipped_files,
             total_canonical_bytes,
-            lexical_docs = lexical_docs.len(),
             semantic_docs = semantic_doc_count,
             embedder = embedder.id(),
             discovery_elapsed_ms,
             canonicalize_elapsed_ms,
             lexical_elapsed_ms,
-            embedding_elapsed_ms = embed_elapsed_ms,
+            embedding_elapsed_ms,
             vector_elapsed_ms,
             total_elapsed_ms = elapsed_ms,
             source_hash = sentinel.source_hash_hex,
@@ -4306,6 +4344,7 @@ impl FsfsRuntime {
 
         Ok(())
     }
+
 
     fn resolve_target_root(&self) -> SearchResult<PathBuf> {
         let raw = self
