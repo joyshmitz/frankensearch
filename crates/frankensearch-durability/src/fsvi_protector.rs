@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use frankensearch_core::{SearchError, SearchResult};
 use fsqlite_core::raptorq_integration::SymbolCodec;
+use memmap2::Mmap;
 use tracing::{debug, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -97,13 +98,20 @@ impl FsviProtector {
     ///
     /// The protection is crash-safe: either the complete sidecar is
     /// visible at the `.fec` path, or it isn't. No partial writes.
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn protect_atomic(&self, fsvi_path: &Path) -> SearchResult<FsviProtectionResult> {
         let start = Instant::now();
 
         // Read source and compute xxh3 hash
-        let source_bytes = fs::read(fsvi_path).map_err(SearchError::Io)?;
-        let source_hash = xxh3_64(&source_bytes);
-        let source_size = source_bytes.len() as u64;
+        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+        let len = file.metadata().map_err(SearchError::Io)?.len();
+        let (source_hash, source_size) = if len == 0 {
+            (xxh3_64(&[]), 0)
+        } else {
+            // SAFETY: mmap is read-only.
+            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+            (xxh3_64(&mmap), mmap.len() as u64)
+        };
 
         // Generate repair symbols via the inner protector
         let protection = self.protector.protect_file(fsvi_path)?;
@@ -181,6 +189,7 @@ impl FsviProtector {
     ///
     /// If the fast path detects corruption, falls back to the full
     /// CRC-based verification for detailed diagnostics.
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn verify(&self, fsvi_path: &Path) -> SearchResult<FsviVerifyResult> {
         let sidecar_path = Self::sidecar_path(fsvi_path);
 
@@ -193,8 +202,15 @@ impl FsviProtector {
         }
 
         // Fast path: xxh3 hash check
-        let source_bytes = fs::read(fsvi_path).map_err(SearchError::Io)?;
-        let actual_hash = xxh3_64(&source_bytes);
+        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+        let len = file.metadata().map_err(SearchError::Io)?.len();
+        let actual_hash = if len == 0 {
+            xxh3_64(&[])
+        } else {
+            // SAFETY: mmap is read-only.
+            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+            xxh3_64(&mmap)
+        };
 
         // Read the sidecar to get the stored hash from the trailer
         let verify = self.protector.verify_file(fsvi_path, &sidecar_path)?;
@@ -228,6 +244,7 @@ impl FsviProtector {
     /// On success, the corrupted file is overwritten with the repaired data.
     /// A backup of the corrupted file is created at `<path>.corrupted` before
     /// overwriting.
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair(&self, fsvi_path: &Path) -> SearchResult<FsviRepairResult> {
         let start = Instant::now();
         let sidecar_path = Self::sidecar_path(fsvi_path);
@@ -240,8 +257,16 @@ impl FsviProtector {
         }
 
         // Compute hash before repair
-        let source_before = fs::read(fsvi_path).map_err(SearchError::Io)?;
-        let hash_before = xxh3_64(&source_before);
+        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+        let len = file.metadata().map_err(SearchError::Io)?.len();
+        let hash_before = if len == 0 {
+            xxh3_64(&[])
+        } else {
+            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+            xxh3_64(&mmap)
+        };
+        // Close file before backup (rename)
+        drop(file);
 
         // Create backup of corrupted file
         let backup_path = PathBuf::from(format!("{}.corrupted", fsvi_path.display()));
@@ -261,7 +286,7 @@ impl FsviProtector {
                 // Clean up unnecessary backup
                 let _ = fs::remove_file(&backup_path);
                 Ok(FsviRepairResult {
-                    bytes_written: source_before.len(),
+                    bytes_written: usize::try_from(len).unwrap_or(usize::MAX),
                     symbols_used: 0,
                     decode_time,
                     source_hash_before: hash_before,
@@ -272,8 +297,15 @@ impl FsviProtector {
                 bytes_written,
                 symbols_used,
             } => {
-                let repaired_bytes = fs::read(fsvi_path).map_err(SearchError::Io)?;
-                let hash_after = xxh3_64(&repaired_bytes);
+                // Verify hash after repair
+                let repaired_file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+                let repaired_len = repaired_file.metadata().map_err(SearchError::Io)?.len();
+                let hash_after = if repaired_len == 0 {
+                    xxh3_64(&[])
+                } else {
+                    let mmap = unsafe { Mmap::map(&repaired_file).map_err(SearchError::Io)? };
+                    xxh3_64(&mmap)
+                };
 
                 info!(
                     path = %fsvi_path.display(),

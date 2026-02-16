@@ -1,6 +1,6 @@
 //! Graph-ranking phase-1 hook (feature-gated).
 //!
-//! This module implements a lightweight query-biased PageRank variant on the
+//! This module implements a lightweight query-biased `PageRank` variant on the
 //! optional `DocumentGraph` supplied by the caller.
 
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ const DEFAULT_RESTART_PROBABILITY: f64 = 0.15;
 const DEFAULT_MAX_ITERATIONS: usize = 20;
 const DEFAULT_TOLERANCE: f64 = 1e-6;
 
-/// Query-biased PageRank engine for optional graph signal generation.
+/// Query-biased `PageRank` engine for optional graph signal generation.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphRanker {
     restart_probability: f64,
@@ -108,7 +108,8 @@ impl GraphRanker {
     }
 
     fn outgoing_weight_sums(graph: &DocumentGraph) -> HashMap<GraphDocId, f64> {
-        graph.adjacency()
+        graph
+            .adjacency()
             .iter()
             .map(|(doc_id, edges)| {
                 let sum = edges

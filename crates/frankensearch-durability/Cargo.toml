@@ -17,6 +17,7 @@ tantivy = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

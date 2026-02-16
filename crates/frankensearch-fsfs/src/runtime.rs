@@ -426,7 +426,14 @@ impl LiveIngestPipeline {
                 self.prune_indexes(&rel_key)?;
                 return Ok(true);
             }
-            Err(error) if is_ignorable_index_walk_error(&error) => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::IsADirectory | ErrorKind::PermissionDenied | ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(false);
+            }
             Err(error) => return Err(error.into()),
         };
 

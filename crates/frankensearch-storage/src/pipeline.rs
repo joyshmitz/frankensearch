@@ -626,7 +626,31 @@ impl StorageBackedJobRunner {
                 );
                 continue;
             }
-            self.queue.complete(job.job_id)?;
+            if let Err(error) = self.queue.complete(job.job_id) {
+                if crate::job_queue::is_queue_conflict(&error) {
+                    let skip_reason =
+                        "embedding persisted after completion conflict; skipping reclaimed job";
+                    match self.queue.skip(job.job_id, skip_reason) {
+                        Ok(()) => {}
+                        Err(skip_error) if crate::job_queue::is_queue_conflict(&skip_error) => {}
+                        Err(skip_error) => return Err(skip_error),
+                    }
+                    result.jobs_skipped += 1;
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        stage = "complete_conflict",
+                        worker_id,
+                        correlation_id = %correlation_id,
+                        job_id = job.job_id,
+                        doc_id = %job.doc_id,
+                        embedder_id = %job.embedder_id,
+                        error = %error,
+                        "queue completion raced with lease reclaim; job left non-fatal"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
             result.jobs_completed += 1;
             tracing::info!(
                 target: "frankensearch.storage.pipeline",
@@ -2459,7 +2483,10 @@ mod integration_tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
     use std::collections::HashSet;
+    use std::io;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
 
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
@@ -2467,9 +2494,9 @@ mod integration_tests {
     use frankensearch_core::{Canonicalizer, Embedder, SearchError};
     use fsqlite_types::value::SqliteValue;
 
-    use crate::connection::Storage;
+    use crate::connection::{Storage, StorageConfig, map_storage_error};
     use crate::index_metadata::{BuildTrigger, RecordBuildParams};
-    use crate::job_queue::{JobQueueConfig, PersistentJobQueue};
+    use crate::job_queue::{JobQueueConfig, JobStatus, PersistentJobQueue};
     use crate::schema::SCHEMA_VERSION;
     use crate::staleness::{
         RecommendedAction, StalenessConfig, StalenessLevel, StorageBackedStaleness,
@@ -2548,6 +2575,69 @@ mod integration_tests {
             } else {
                 ModelCategory::StaticEmbedder
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CompletionConflictSink {
+        db_path: PathBuf,
+        entries: Mutex<Vec<PersistedEmbedding>>,
+    }
+
+    impl CompletionConflictSink {
+        fn new(db_path: PathBuf) -> Self {
+            Self {
+                db_path,
+                entries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn entries(&self) -> Vec<PersistedEmbedding> {
+            self.entries
+                .lock()
+                .expect("completion-conflict sink lock poisoned")
+                .clone()
+        }
+    }
+
+    impl EmbeddingVectorSink for CompletionConflictSink {
+        fn persist(&self, doc_id: &str, embedder_id: &str, embedding: &[f32]) -> SearchResult<()> {
+            self.entries
+                .lock()
+                .expect("completion-conflict sink lock poisoned")
+                .push(PersistedEmbedding {
+                    doc_id: doc_id.to_owned(),
+                    embedder_id: embedder_id.to_owned(),
+                    embedding: embedding.to_vec(),
+                });
+
+            let storage = Storage::open(StorageConfig {
+                db_path: self.db_path.clone(),
+                ..StorageConfig::default()
+            })?;
+            let params = [
+                SqliteValue::Text(JobStatus::Pending.as_str().to_owned()),
+                SqliteValue::Text(doc_id.to_owned()),
+                SqliteValue::Text(embedder_id.to_owned()),
+            ];
+            let updated = storage
+                .connection()
+                .execute_with_params(
+                    "UPDATE embedding_jobs \
+                     SET status = ?1, worker_id = NULL, started_at = NULL \
+                     WHERE doc_id = ?2 AND embedder_id = ?3 AND status = 'processing';",
+                    &params,
+                )
+                .map_err(map_storage_error)?;
+            if updated != 1 {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "storage",
+                    source: Box::new(io::Error::other(
+                        "expected one processing job to force completion conflict",
+                    )),
+                });
+            }
+            Ok(())
         }
     }
 
@@ -2995,6 +3085,66 @@ mod integration_tests {
             let depth = runner2.queue.queue_depth().expect("depth");
             assert_eq!(depth.pending, 0);
             assert_eq!(depth.processing, 0);
+        });
+    }
+
+    #[test]
+    fn process_batch_completion_conflict_is_non_fatal_and_drains_job() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let db_path = tempdir.path().join("completion-conflict.sqlite3");
+            let storage = Arc::new(
+                Storage::open(StorageConfig {
+                    db_path: db_path.clone(),
+                    ..StorageConfig::default()
+                })
+                .expect("storage should open"),
+            );
+            let queue = Arc::new(PersistentJobQueue::new(
+                Arc::clone(&storage),
+                JobQueueConfig::default(),
+            ));
+            let sink = Arc::new(CompletionConflictSink::new(db_path));
+            let sink_trait: Arc<dyn EmbeddingVectorSink> = sink.clone();
+            let fast = Arc::new(StubEmbedder::new("fast-tier", 4, None, 1.0));
+            let canonicalizer: Arc<dyn Canonicalizer> = Arc::new(DefaultCanonicalizer::default());
+            let runner = StorageBackedJobRunner::new(
+                Arc::clone(&storage),
+                Arc::clone(&queue),
+                canonicalizer,
+                fast,
+                sink_trait,
+            )
+            .with_config(PipelineConfig {
+                process_batch_size: 1,
+                ..PipelineConfig::default()
+            });
+
+            runner
+                .ingest(IngestRequest::new("doc-complete-conflict", "conflict body"))
+                .expect("ingest should succeed");
+
+            let batch = runner
+                .process_batch(&cx, "worker-conflict")
+                .await
+                .expect("completion conflict should be handled");
+            assert_eq!(batch.jobs_claimed, 1);
+            assert_eq!(batch.jobs_completed, 0);
+            assert_eq!(batch.jobs_skipped, 1);
+            assert_eq!(batch.jobs_failed, 0);
+
+            let entries = sink.entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].doc_id, "doc-complete-conflict");
+
+            let depth = queue.queue_depth().expect("queue depth");
+            assert_eq!(depth.pending, 0);
+            assert_eq!(depth.processing, 0);
+            assert_eq!(depth.skipped, 1);
+
+            let counts = storage.count_by_status("fast-tier").expect("status counts");
+            assert_eq!(counts.embedded, 1);
+            assert_eq!(counts.pending, 0);
         });
     }
 

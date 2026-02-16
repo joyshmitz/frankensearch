@@ -4,16 +4,18 @@
 //!
 //! # Persistence
 //!
-//! This implementation is currently in-memory only. The `hnsw_rs` graph is
-//! rebuilt from the source `VectorIndex` on startup. Previous versions attempted
-//! a custom "CHSW" persistence format that merely dumped vectors, causing
-//! slow "loads" (rebuilds) and double RAM usage. Until graph serialization
-//! is properly implemented, in-memory build is cleaner and more efficient.
+//! Persistence is split into two files:
+//! 1. The main file (e.g. `vector.fast.hnsw`) stores metadata: `doc_ids` and `HnswConfig`.
+//! 2. A sidecar file (`vector.fast.hnsw.graph`) stores the native `hnsw_rs` graph.
+//!
+//! This ensures fast startup by loading the pre-built graph instead of rebuilding it.
 
+use std::path::Path;
 use std::time::Instant;
 
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
-use hnsw_rs::prelude::{DistDot, Hnsw};
+use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo};
+use serde::{Deserialize, Serialize};
 
 use crate::VectorIndex;
 
@@ -28,7 +30,7 @@ pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
 const DIST_DOT_SHRINK: f32 = 0.999_999;
 
 /// ANN construction/runtime parameters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HnswConfig {
     /// HNSW `M` (max connections per node).
     pub m: usize,
@@ -49,6 +51,14 @@ impl Default for HnswConfig {
             max_layer: HNSW_DEFAULT_MAX_LAYER,
         }
     }
+}
+
+/// On-disk metadata for the HNSW index.
+#[derive(Debug, Serialize, Deserialize)]
+struct HnswMeta {
+    doc_ids: Vec<String>,
+    config: HnswConfig,
+    dimension: usize,
 }
 
 /// Diagnostics for one ANN query.
@@ -108,6 +118,79 @@ impl HnswIndex {
             vectors.push(index.vector_at_f32(i)?);
         }
         Self::build_from_parts(doc_ids, vectors, dimension, config)
+    }
+
+    /// Load an ANN index from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::IndexCorrupted` if metadata or graph files are missing/malformed.
+    pub fn load(path: &Path) -> SearchResult<Self> {
+        // 1. Load metadata (JSON)
+        let metadata_bytes = std::fs::read(path).map_err(SearchError::Io)?;
+        let meta: HnswMeta = serde_json::from_slice(&metadata_bytes)
+            .map_err(|e| ann_corrupted(path, format!("failed to parse HNSW metadata: {e}")))?;
+
+        // 2. Load graph + vectors from hnsw_rs sidecar files.
+        let (directory, basename) = dump_location(path)?;
+        let mut reloader = HnswIo::new(&directory, &basename);
+        let hnsw = reloader.load_hnsw::<f32, DistDot>().map_err(|e| {
+            ann_corrupted(path, format!("failed to load HNSW graph sidecar pair: {e}"))
+        })?;
+
+        if hnsw.get_nb_point() != meta.doc_ids.len() {
+            return Err(ann_corrupted(
+                path,
+                format!(
+                    "graph size ({}) mismatch with doc_ids count ({})",
+                    hnsw.get_nb_point(),
+                    meta.doc_ids.len()
+                ),
+            ));
+        }
+
+        Ok(Self {
+            hnsw,
+            doc_ids: meta.doc_ids,
+            dimension: meta.dimension,
+            config: meta.config,
+        })
+    }
+
+    /// Persist ANN index to disk.
+    ///
+    /// Writes metadata to `path` and graph/vector payloads via hnsw_rs
+    /// sidecar files in the same directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::Io` on write failure.
+    pub fn save(&self, path: &Path) -> SearchResult<()> {
+        let (directory, basename) = dump_location(path)?;
+        std::fs::create_dir_all(&directory)?;
+
+        // 1. Save graph + vectors through hnsw_rs.
+        let dumped_basename = self
+            .hnsw
+            .file_dump(&directory, &basename)
+            .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
+        if dumped_basename != basename {
+            return Err(SearchError::Io(std::io::Error::other(format!(
+                "unexpected dump basename '{dumped_basename}', expected '{basename}'"
+            ))));
+        }
+
+        // 2. Save metadata
+        let meta = HnswMeta {
+            doc_ids: self.doc_ids.clone(),
+            config: self.config,
+            dimension: self.dimension,
+        };
+        let metadata_bytes = serde_json::to_vec(&meta)
+            .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
+        std::fs::write(path, metadata_bytes).map_err(SearchError::Io)?;
+
+        Ok(())
     }
 
     /// Run ANN query and return hits plus query diagnostics.
@@ -350,6 +433,28 @@ fn validate_config(config: HnswConfig) -> SearchResult<()> {
         });
     }
     Ok(())
+}
+
+fn ann_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
+    SearchError::IndexCorrupted {
+        path: path.to_path_buf(),
+        detail: detail.into(),
+    }
+}
+
+fn dump_location(path: &Path) -> SearchResult<(std::path::PathBuf, String)> {
+    let directory = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let basename = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| ann_corrupted(path, "metadata path has no valid UTF-8 basename"))?
+        .to_owned();
+    Ok((directory, basename))
 }
 
 fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
@@ -856,5 +961,27 @@ mod tests {
 
         assert_eq!(exact[0].doc_id, approx[0].doc_id);
         assert!((exact[0].score - approx[0].score).abs() < 1e-3);
+    }
+
+    #[test]
+    fn persistence_round_trip() {
+        let fsvi_path = temp_path("persist", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..64).map(|i| normalized_vector(i, 32)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let save_path = temp_path("persist", "hnsw");
+        ann.save(&save_path).expect("save");
+
+        let loaded = HnswIndex::load(&save_path).expect("load");
+        assert_eq!(loaded.len(), 64);
+        assert_eq!(loaded.dimension(), 32);
+
+        let query = normalized_vector(10, 32);
+        let hits = loaded
+            .knn_search(&query, 5, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert_eq!(hits[0].doc_id, "doc-0010");
+        assert!((hits[0].score - 1.0).abs() < 1e-5);
     }
 }

@@ -333,36 +333,112 @@ impl VectorIndex {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<BinaryHeap<MrlHeapEntry>> {
         let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let stride = match self.quantization() {
+            crate::Quantization::F16 => self.dimension() * 2,
+            crate::Quantization::F32 => self.dimension() * 4,
+        };
 
         match self.quantization() {
             crate::Quantization::F16 => {
                 let mut scratch = vec![f16::from_f32(0.0); search_dims];
+                let partial_bytes = search_dims * 2;
+                let mut record_offset = self.records_offset;
+                let mut vector_offset = self.vectors_offset;
+
                 for index in 0..self.record_count() {
-                    if !self.passes_mrl_filter(filter, index)? {
+                    let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
+                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+                    if (flags & 0x0001) != 0 {
+                        record_offset += 16;
+                        vector_offset += stride;
                         continue;
                     }
-                    let score = self.truncated_score_f16(
-                        index,
-                        query_truncated,
-                        &mut scratch,
-                        search_dims,
-                    )?;
-                    insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+
+                    let passed = if let Some(f) = filter {
+                        let hash_bytes = &self.data[record_offset..record_offset + 8];
+                        let hash = u64::from_le_bytes([
+                            hash_bytes[0],
+                            hash_bytes[1],
+                            hash_bytes[2],
+                            hash_bytes[3],
+                            hash_bytes[4],
+                            hash_bytes[5],
+                            hash_bytes[6],
+                            hash_bytes[7],
+                        ]);
+                        if let Some(matches) = f.matches_doc_id_hash(hash, None) {
+                            matches
+                        } else {
+                            let doc_id = self.doc_id_at(index)?;
+                            f.matches(doc_id, None)
+                        }
+                    } else {
+                        true
+                    };
+
+                    if passed {
+                        let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
+                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(2)) {
+                            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
+                        }
+                        let score = dot_product_f16_f32(&scratch, query_truncated)?;
+                        insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                    }
+
+                    record_offset += 16;
+                    vector_offset += stride;
                 }
             }
             crate::Quantization::F32 => {
                 let mut scratch = vec![0.0_f32; search_dims];
+                let partial_bytes = search_dims * 4;
+                let mut record_offset = self.records_offset;
+                let mut vector_offset = self.vectors_offset;
+
                 for index in 0..self.record_count() {
-                    if !self.passes_mrl_filter(filter, index)? {
+                    let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
+                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+                    if (flags & 0x0001) != 0 {
+                        record_offset += 16;
+                        vector_offset += stride;
                         continue;
                     }
-                    let score = self.truncated_score_f32(
-                        index,
-                        query_truncated,
-                        &mut scratch,
-                        search_dims,
-                    )?;
-                    insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+
+                    let passed = if let Some(f) = filter {
+                        let hash_bytes = &self.data[record_offset..record_offset + 8];
+                        let hash = u64::from_le_bytes([
+                            hash_bytes[0],
+                            hash_bytes[1],
+                            hash_bytes[2],
+                            hash_bytes[3],
+                            hash_bytes[4],
+                            hash_bytes[5],
+                            hash_bytes[6],
+                            hash_bytes[7],
+                        ]);
+                        if let Some(matches) = f.matches_doc_id_hash(hash, None) {
+                            matches
+                        } else {
+                            let doc_id = self.doc_id_at(index)?;
+                            f.matches(doc_id, None)
+                        }
+                    } else {
+                        true
+                    };
+
+                    if passed {
+                        let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
+                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(4)) {
+                            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        }
+                        let score = dot_product_f32_f32(&scratch, query_truncated)?;
+                        insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                    }
+
+                    record_offset += 16;
+                    vector_offset += stride;
                 }
             }
         }
@@ -434,30 +510,6 @@ impl VectorIndex {
         }
     }
 
-    // ── Internal: truncated scoring ──────────────────────────────────
-
-    fn truncated_score_f16(
-        &self,
-        index: usize,
-        query: &[f32],
-        scratch: &mut [f16],
-        dims: usize,
-    ) -> SearchResult<f32> {
-        self.decode_f16_partial(index, scratch, dims)?;
-        dot_product_f16_f32(scratch, query)
-    }
-
-    fn truncated_score_f32(
-        &self,
-        index: usize,
-        query: &[f32],
-        scratch: &mut [f32],
-        dims: usize,
-    ) -> SearchResult<f32> {
-        self.decode_f32_partial(index, scratch, dims)?;
-        dot_product_f32_f32(scratch, query)
-    }
-
     /// Decode the first `dims` elements of an f16 stored vector.
     fn decode_f16_partial(
         &self,
@@ -507,25 +559,6 @@ impl VectorIndex {
             ));
         }
         Ok(&self.data[start..end])
-    }
-
-    fn passes_mrl_filter(
-        &self,
-        filter: Option<&dyn SearchFilter>,
-        index: usize,
-    ) -> SearchResult<bool> {
-        let entry = self.record_at(index)?;
-        if super::is_tombstoned_flags(entry.flags) {
-            return Ok(false);
-        }
-        let Some(f) = filter else {
-            return Ok(true);
-        };
-        if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
-            return Ok(matches);
-        }
-        let doc_id = self.doc_id_at(index)?;
-        Ok(f.matches(doc_id, None))
     }
 
     fn resolve_mrl_hits(&self, entries: &[MrlHeapEntry]) -> SearchResult<Vec<VectorHit>> {

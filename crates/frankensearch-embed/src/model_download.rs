@@ -1189,6 +1189,7 @@ mod tests {
         manifest.files[0].sha256 = PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned();
         manifest.files[0].size = 0;
         manifest.files[0].url = None;
+        manifest.download_size_bytes = 0;
         let consent = crate::model_manifest::DownloadConsent::granted(
             crate::model_manifest::ConsentSource::Environment,
         );

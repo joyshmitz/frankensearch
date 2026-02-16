@@ -1,5 +1,3 @@
-// MmapMut (memmap2) requires unsafe for memory-mapped I/O.
-#![allow(unsafe_code)]
 //! Vector index storage and loading for frankensearch.
 //!
 //! This crate implements the FSVI binary format reader/writer plus exact
@@ -68,7 +66,7 @@ use tracing::debug;
 #[cfg(feature = "ann")]
 pub use hnsw::{
     AnnSearchStats, HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_DEFAULT_EF_SEARCH, HNSW_DEFAULT_M,
-    HNSW_DEFAULT_MAX_LAYER, HNSW_MAGIC, HNSW_VERSION, HnswConfig, HnswIndex,
+    HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex,
 };
 pub use mrl::{MrlConfig, MrlSearchStats};
 pub use quantization::ScalarQuantizer;
@@ -187,6 +185,7 @@ impl VectorIndex {
     ///
     /// Returns `SearchError::IndexNotFound` if the file does not exist and
     /// `SearchError::IndexCorrupted` when header/layout validation fails.
+    #[allow(unsafe_code)] // MmapMut::map_mut requires unsafe for memory-mapped I/O.
     pub fn open(path: &Path) -> SearchResult<Self> {
         if !path.exists() {
             return Err(SearchError::IndexNotFound {
@@ -243,19 +242,28 @@ impl VectorIndex {
         let (mut wal_entries, wal_compaction_gen) =
             wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
 
-        // WAL generation must be exactly one ahead of the main index generation.
-        // If they are equal, it means the WAL was already compacted into this
-        // main index (crash after compaction but before WAL deletion).
-        let expected_wal_gen = metadata.compaction_gen.wrapping_add(1);
-        if !wal_entries.is_empty() && wal_compaction_gen != expected_wal_gen {
-            tracing::warn!(
-                path = %path.display(),
-                main_gen = metadata.compaction_gen,
-                wal_gen = wal_compaction_gen,
-                expected_wal_gen,
-                "discarding stale WAL entries (post-compaction artifact)"
-            );
-            wal_entries.clear();
+        // Stale WAL detection:
+        //
+        // A valid WAL must have a generation of `next_generation(main_gen)`.
+        // If WAL.gen == Main.gen, it means the WAL was already compacted into Main
+        // but not deleted (crash during compaction).
+        //
+        // Exception: If WAL.gen is 0, it's a legacy file (created before this
+        // feature existed). We accept 0 as valid to prevent data loss on upgrade,
+        // effectively disabling stale detection for legacy files until they are
+        // next compacted.
+        if !wal_entries.is_empty() && wal_compaction_gen > 0 {
+            let expected_wal_gen = next_generation(metadata.compaction_gen);
+            if wal_compaction_gen != expected_wal_gen {
+                tracing::warn!(
+                    path = %path.display(),
+                    main_gen = metadata.compaction_gen,
+                    wal_gen = wal_compaction_gen,
+                    expected_wal_gen,
+                    "discarding stale/mismatched WAL entries"
+                );
+                wal_entries.clear();
+            }
         }
 
         Ok(Self {
@@ -318,7 +326,7 @@ impl VectorIndex {
             embedder_revision: embedder_revision.to_owned(),
             dimension,
             quantization,
-            compaction_gen: 0,
+            compaction_gen: 1,
             records: Vec::new(),
         })
     }
@@ -605,7 +613,7 @@ impl VectorIndex {
             &wal_entries,
             self.dimension(),
             self.quantization(),
-            self.metadata.compaction_gen.wrapping_add(1),
+            next_generation(self.metadata.compaction_gen),
             self.wal_config.fsync_on_write,
         )?;
 
@@ -655,7 +663,7 @@ impl VectorIndex {
             self.dimension(),
             self.quantization(),
         )?
-        .with_generation(self.metadata.compaction_gen.wrapping_add(1));
+        .with_generation(next_generation(self.metadata.compaction_gen));
 
         // Write all main index entries.
         for i in 0..self.record_count() {
@@ -1032,7 +1040,7 @@ impl VectorIndex {
             &self.wal_entries,
             self.dimension(),
             self.quantization(),
-            self.metadata.compaction_gen.wrapping_add(1),
+            next_generation(self.metadata.compaction_gen),
             self.wal_config.fsync_on_write,
         )?;
 
@@ -1076,29 +1084,6 @@ impl VectorIndex {
             doc_id_len: u16::from_le_bytes([chunk[12], chunk[13]]),
             flags: u16::from_le_bytes([chunk[14], chunk[15]]),
         })
-    }
-
-    /// Raw byte slice for the vector at `index`, without copying or conversion.
-    ///
-    /// Used by `search::search_top_k` to avoid per-vector heap allocation
-    /// in the hot scan loop.
-    pub(crate) fn raw_vector_bytes(&self, index: usize) -> SearchResult<&[u8]> {
-        self.ensure_index(index)?;
-        let start = self.vector_start(index)?;
-        let stride = self
-            .dimension()
-            .checked_mul(self.quantization().bytes_per_element())
-            .ok_or_else(|| index_corrupted(&self.path, "vector stride overflow"))?;
-        let end = start
-            .checked_add(stride)
-            .ok_or_else(|| index_corrupted(&self.path, "raw vector end overflow"))?;
-        if end > self.data.len() {
-            return Err(index_corrupted(
-                &self.path,
-                "raw vector extends past file end",
-            ));
-        }
-        Ok(&self.data[start..end])
     }
 
     fn vector_start(&self, index: usize) -> SearchResult<usize> {
@@ -1629,6 +1614,10 @@ pub(crate) fn fnv1a_hash(bytes: &[u8]) -> u64 {
 
 const fn is_tombstoned_flags(flags: u16) -> bool {
     flags & RECORD_FLAG_TOMBSTONE != 0
+}
+
+const fn next_generation(current: u8) -> u8 {
+    if current == 255 { 1 } else { current + 1 }
 }
 
 #[cfg(test)]

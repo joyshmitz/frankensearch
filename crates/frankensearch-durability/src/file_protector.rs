@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
 use fsqlite_core::raptorq_integration::{DecodeFailureReason, SymbolCodec};
+use memmap2::Mmap;
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -364,9 +365,18 @@ impl FileProtector {
             .is_some_and(|name| name.starts_with('.') || name.contains(".corrupt."))
     }
 
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn protect_file(&self, path: &Path) -> SearchResult<FileProtectionResult> {
-        let source_bytes = fs::read(path)?;
-        let encoded = self.codec.encode(&source_bytes)?;
+        let file = fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let encoded = if len == 0 {
+            self.codec.encode(&[])?
+        } else {
+            // SAFETY: We assume the file is not modified concurrently (advisory).
+            // This is a standard assumption for CLI tools operating on files.
+            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+            self.codec.encode(&mmap)?
+        };
 
         let repair_symbol_count = u32::try_from(encoded.repair_symbols.len()).map_err(|_| {
             SearchError::InvalidConfig {
@@ -416,13 +426,21 @@ impl FileProtector {
         })
     }
 
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn verify_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileVerifyResult> {
-        let source_bytes = fs::read(path)?;
+        let file = fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        let (actual_crc32, actual_len) = if len == 0 {
+            (crc32fast::hash(&[]), 0)
+        } else {
+            // SAFETY: mmap is read-only.
+            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+            (crc32fast::hash(&mmap), saturating_u64(mmap.len()))
+        };
+
         let trailer_bytes = fs::read(sidecar_path)?;
         let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
 
-        let actual_crc32 = crc32fast::hash(&source_bytes);
-        let actual_len = saturating_u64(source_bytes.len());
         let healthy = actual_crc32 == header.source_crc32 && actual_len == header.source_len;
 
         Ok(FileVerifyResult {
@@ -435,21 +453,36 @@ impl FileProtector {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileRepairOutcome> {
         self.metrics.record_repair_attempt();
 
-        let mut source_bytes = Vec::new();
-        match self.verify_file(path, sidecar_path) {
-            Ok(verify) => {
-                if verify.healthy {
-                    return Ok(FileRepairOutcome::NotNeeded);
-                }
-                source_bytes = fs::read(path)?;
+        let source_file = match fs::File::open(path) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let had_source = source_file.is_some();
+
+        // Determine if we have a source file to verify/read
+        if let Some(ref file) = source_file {
+            // Verify first - using mmap
+            let len = file.metadata()?.len();
+            let healthy = if len == 0 {
+                let trailer_bytes = fs::read(sidecar_path)?;
+                let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
+                header.source_crc32 == crc32fast::hash(&[]) && header.source_len == 0
+            } else {
+                let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
+                let trailer_bytes = fs::read(sidecar_path)?;
+                let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
+                let actual_crc32 = crc32fast::hash(&mmap);
+                actual_crc32 == header.source_crc32 && len == header.source_len
+            };
+
+            if healthy {
+                return Ok(FileRepairOutcome::NotNeeded);
             }
-            Err(SearchError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                // Missing source file is recoverable if we have sufficient sidecar symbols.
-            }
-            Err(error) => return Err(error),
         }
 
         let trailer_bytes = fs::read(sidecar_path)?;
@@ -465,6 +498,8 @@ impl FileProtector {
                 });
             }
 
+            // Ensure no source handle is kept while rewriting the destination file.
+            drop(source_file);
             write_durable(path, &[])?;
             self.metrics.record_repair_success();
             info!(
@@ -482,9 +517,21 @@ impl FileProtector {
             .map(|symbol| (symbol.esi, symbol.data))
             .collect();
 
-        let mut symbols =
-            source_symbols_from_bytes(&source_bytes, header.symbol_size, header.k_source)?;
+        // Load source symbols from file (via mmap) if available
+        let mut symbols = if let Some(ref file) = source_file {
+            let len = file.metadata()?.len();
+            if len > 0 {
+                let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
+                source_symbols_from_bytes(&mmap, header.symbol_size, header.k_source)?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         symbols.extend(repair_symbols.iter().cloned());
+        // Avoid holding a read handle on the source path while writing repaired content.
+        drop(source_file);
 
         match self
             .codec
@@ -495,7 +542,8 @@ impl FileProtector {
             } => {
                 let data = normalize_recovered_data(data, &header)?;
                 let recovered_crc32 = crc32fast::hash(&data);
-                if recovered_crc32 != header.source_crc32 && !source_bytes.is_empty() {
+                // We don't have source_bytes vec anymore, but we know if source_file existed.
+                if recovered_crc32 != header.source_crc32 && had_source {
                     warn!(
                         path = %path.display(),
                         expected_crc32 = header.source_crc32,

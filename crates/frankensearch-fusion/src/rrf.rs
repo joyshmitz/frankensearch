@@ -167,6 +167,7 @@ pub fn rrf_fuse(
 
 /// Fuse lexical, semantic, and optional graph-ranked results with weighted RRF.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 #[instrument(
     name = "frankensearch::rrf_fuse_with_graph",
     skip(lexical, semantic, graph),

@@ -24,6 +24,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+#[cfg(feature = "graph")]
+use frankensearch_core::DocumentGraph;
 use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
@@ -53,7 +55,7 @@ use crate::blend::{
 };
 #[cfg(feature = "graph")]
 use crate::graph_rank::GraphRanker;
-use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
+use crate::rrf::{RrfConfig, candidate_count, rrf_fuse, rrf_fuse_with_graph};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -113,6 +115,8 @@ pub struct TwoTierSearcher {
     live_search_stream_emitter: Arc<LiveSearchStreamEmitter>,
     canonicalizer: Box<dyn Canonicalizer>,
     config: TwoTierConfig,
+    #[cfg(feature = "graph")]
+    document_graph: Option<Arc<DocumentGraph>>,
     /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
     embedding_cache_capacity: Option<usize>,
     resource_cpu_state: Mutex<Option<CpuJiffiesSnapshot>>,
@@ -137,6 +141,8 @@ impl TwoTierSearcher {
             live_search_stream_emitter: Arc::new(LiveSearchStreamEmitter::default()),
             canonicalizer: Box::new(DefaultCanonicalizer::default()),
             config,
+            #[cfg(feature = "graph")]
+            document_graph: None,
             embedding_cache_capacity: None,
             resource_cpu_state: Mutex::new(None),
         }
@@ -167,6 +173,14 @@ impl TwoTierSearcher {
     #[must_use]
     pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Attach an optional document graph used for phase-1 graph ranking.
+    #[cfg(feature = "graph")]
+    #[must_use]
+    pub fn with_document_graph(mut self, graph: Arc<DocumentGraph>) -> Self {
+        self.document_graph = Some(graph);
         self
     }
 
@@ -717,33 +731,81 @@ impl TwoTierSearcher {
                 metrics.semantic_candidates = fast_hits.len();
                 metrics.phase1_vectors_searched = self.index.doc_count();
 
-                let _graph_candidates: Option<Vec<frankensearch_core::types::ScoredResult>> =
-                    if self.config.graph_ranking_enabled && self.config.graph_ranking_weight > 0.0 {
-                        #[cfg(feature = "graph")]
-                        {
-                            GraphRanker::new().rank_phase1(cx, semantic_query, semantic_budget)
-                        }
-                        #[cfg(not(feature = "graph"))]
-                        {
-                            None
-                        }
-                    } else {
+                let graph_candidates: Option<Vec<ScoredResult>> = if self
+                    .config
+                    .graph_ranking_enabled
+                    && self.config.graph_ranking_weight > 0.0
+                {
+                    #[cfg(feature = "graph")]
+                    {
+                        self.document_graph.as_ref().and_then(|graph| {
+                            GraphRanker::new().rank_phase1(
+                                cx,
+                                semantic_query,
+                                graph.as_ref(),
+                                &fast_hits,
+                                semantic_budget,
+                            )
+                        })
+                    }
+                    #[cfg(not(feature = "graph"))]
+                    {
                         None
-                    };
+                    }
+                } else {
+                    None
+                };
+                let graph_candidates =
+                    graph_candidates.map(|results| {
+                        if let Some(exclusions) = normalized_exclusions {
+                            filter_scored_results_by_negations(results, exclusions, text_fn, "graph")
+                        } else {
+                            results
+                        }
+                    });
 
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();
                 let results = lexical_results.as_ref().map_or_else(
                     || {
-                        vector_hits_to_scored_results(
-                            &fast_hits,
-                            k,
-                            &self.config,
-                            self.fast_embedder.id(),
+                        graph_candidates.as_ref().map_or_else(
+                            || {
+                                vector_hits_to_scored_results(
+                                    &fast_hits,
+                                    k,
+                                    &self.config,
+                                    self.fast_embedder.id(),
+                                )
+                            },
+                            |graph| {
+                                let fused = rrf_fuse_with_graph(
+                                    &[],
+                                    &fast_hits,
+                                    graph,
+                                    self.config.graph_ranking_weight,
+                                    k,
+                                    0,
+                                    &rrf_config,
+                                );
+                                fused_hits_to_scored_results(&fused, &[])
+                            },
                         )
                     },
                     |lexical| {
-                        let fused = rrf_fuse(lexical, &fast_hits, k, 0, &rrf_config);
+                        let fused = graph_candidates.as_ref().map_or_else(
+                            || rrf_fuse(lexical, &fast_hits, k, 0, &rrf_config),
+                            |graph| {
+                                rrf_fuse_with_graph(
+                                    lexical,
+                                    &fast_hits,
+                                    graph,
+                                    self.config.graph_ranking_weight,
+                                    k,
+                                    0,
+                                    &rrf_config,
+                                )
+                            },
+                        );
                         fused_hits_to_scored_results(&fused, lexical)
                     },
                 );
@@ -867,10 +929,12 @@ impl TwoTierSearcher {
             .collect();
 
         // Look up indices in the fast index for quality scoring.
-        let fast_indices: Vec<usize> = fast_hits
-            .iter()
-            .filter_map(|h| self.index.fast_index_for_doc_id(&h.doc_id).ok().flatten())
-            .collect();
+        let mut fast_indices = Vec::with_capacity(fast_hits.len());
+        for hit in &fast_hits {
+            if let Some(index) = self.index.fast_index_for_doc_id(&hit.doc_id)? {
+                fast_indices.push(index);
+            }
+        }
         metrics.phase2_vectors_searched = fast_indices.len();
 
         let quality_scores = self
@@ -879,19 +943,16 @@ impl TwoTierSearcher {
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         // Build quality VectorHits for blending.
-        let quality_hits: Vec<VectorHit> = fast_indices
-            .iter()
-            .zip(quality_scores.iter())
-            .filter_map(|(&idx, &score)| {
-                let doc_id = self.index.doc_id_at(idx).ok()?.to_owned();
-                Some(VectorHit {
-                    #[allow(clippy::cast_possible_truncation)]
-                    index: idx as u32,
-                    score,
-                    doc_id,
-                })
-            })
-            .collect();
+        let mut quality_hits = Vec::with_capacity(fast_indices.len());
+        for (&idx, &score) in fast_indices.iter().zip(quality_scores.iter()) {
+            let doc_id = self.index.doc_id_at(idx)?.to_owned();
+            quality_hits.push(VectorHit {
+                #[allow(clippy::cast_possible_truncation)]
+                index: idx as u32,
+                score,
+                doc_id,
+            });
+        }
 
         // Blend fast + quality scores.
         let blend_start = Instant::now();
@@ -2516,6 +2577,134 @@ mod tests {
             assert!(
                 metrics.phase1_total_ms >= 0.0,
                 "phase-1 latency should remain well-formed"
+            );
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_ranking_with_document_graph_can_add_graph_only_candidate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let config = TwoTierConfig {
+                graph_ranking_enabled: true,
+                graph_ranking_weight: 1.0,
+                ..TwoTierConfig::default()
+            };
+            let mut graph = DocumentGraph::new();
+            graph.add_edge(
+                "doc-0",
+                "doc-extra",
+                frankensearch_core::EdgeType::Reference,
+                1.0,
+            );
+            let searcher =
+                TwoTierSearcher::new(index, fast, config).with_document_graph(Arc::new(graph));
+
+            let mut initial_docs = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "graph only candidate query",
+                    10,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_docs =
+                                results.into_iter().map(|result| result.doc_id).collect();
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(
+                initial_docs.iter().any(|doc_id| doc_id == "doc-extra"),
+                "graph channel should be able to contribute graph-only candidates",
+            );
+        });
+    }
+
+    #[cfg(feature = "graph")]
+    #[test]
+    fn graph_ranking_candidates_respect_negation_filters() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let config = TwoTierConfig {
+                graph_ranking_enabled: true,
+                graph_ranking_weight: 1.0,
+                ..TwoTierConfig::default()
+            };
+            let mut graph = DocumentGraph::new();
+            graph.add_edge(
+                "doc-0",
+                "doc-extra",
+                frankensearch_core::EdgeType::Reference,
+                1.0,
+            );
+            let searcher =
+                TwoTierSearcher::new(index, fast, config).with_document_graph(Arc::new(graph));
+
+            let mut initial_docs_without_negation = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "graph only candidate query",
+                    10,
+                    |doc_id| {
+                        if doc_id == "doc-extra" {
+                            Some("unsafe edge content".to_owned())
+                        } else {
+                            Some("safe content".to_owned())
+                        }
+                    },
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_docs_without_negation =
+                                results.into_iter().map(|result| result.doc_id).collect();
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(
+                initial_docs_without_negation
+                    .iter()
+                    .any(|doc_id| doc_id == "doc-extra"),
+                "graph channel should contribute graph-only candidate without negation",
+            );
+
+            let mut initial_docs_with_negation = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "graph only candidate query -unsafe",
+                    10,
+                    |doc_id| {
+                        if doc_id == "doc-extra" {
+                            Some("unsafe edge content".to_owned())
+                        } else {
+                            Some("safe content".to_owned())
+                        }
+                    },
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_docs_with_negation =
+                                results.into_iter().map(|result| result.doc_id).collect();
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert!(
+                !initial_docs_with_negation
+                    .iter()
+                    .any(|doc_id| doc_id == "doc-extra"),
+                "graph candidates matching negation should be filtered before fusion",
             );
         });
     }

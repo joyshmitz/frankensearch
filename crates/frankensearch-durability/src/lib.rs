@@ -1,3 +1,5 @@
+// Mmap (memmap2) requires unsafe for memory-mapped I/O in file_protector and fsvi_protector.
+#![allow(unsafe_code)]
 //! Durability primitives for frankensearch.
 //!
 //! This crate provides a thin, library-focused integration layer around

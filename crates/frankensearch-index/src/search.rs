@@ -262,8 +262,10 @@ impl VectorIndex {
 
         match self.quantization() {
             Quantization::F16 => {
+                let stride = dim * 2;
                 // Flags are at offset 14 in 16-byte record
                 let mut flags_offset = self.records_offset + start * 16 + 14;
+                let mut vector_offset = self.vectors_offset + start * stride;
                 let mut scratch = take_f16_scratch(dim);
 
                 for index in start..end {
@@ -273,17 +275,24 @@ impl VectorIndex {
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
                     if (flags & 0x0001) == 0 {
-                        let score = self.score_f16(index, query, scratch.as_mut_slice())?;
+                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(2)) {
+                            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
+                        }
+                        let score = dot_product_f16_f32(&scratch, query)?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
                     flags_offset += 16;
+                    vector_offset += stride;
                 }
 
                 return_f16_scratch(scratch);
             }
             Quantization::F32 => {
+                let stride = dim * 4;
                 let mut flags_offset = self.records_offset + start * 16 + 14;
+                let mut vector_offset = self.vectors_offset + start * stride;
                 let mut scratch = take_f32_scratch(dim);
 
                 for index in start..end {
@@ -291,11 +300,16 @@ impl VectorIndex {
                     let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
 
                     if (flags & 0x0001) == 0 {
-                        let score = self.score_f32(index, query, scratch.as_mut_slice())?;
+                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(4)) {
+                            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        }
+                        let score = dot_product_f32_f32(&scratch, query)?;
                         insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     }
 
                     flags_offset += 16;
+                    vector_offset += stride;
                 }
 
                 return_f32_scratch(scratch);
@@ -317,31 +331,101 @@ impl VectorIndex {
 
         match self.quantization() {
             Quantization::F16 => {
+                let stride = dim * 2;
+                let mut record_offset = self.records_offset + start * 16;
+                let mut vector_offset = self.vectors_offset + start * stride;
                 let mut scratch = take_f16_scratch(dim);
 
                 for index in start..end {
-                    if !self.passes_search_filter(Some(filter), index)? {
+                    let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
+                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+                    if (flags & 0x0001) != 0 {
+                        record_offset += 16;
+                        vector_offset += stride;
                         continue;
                     }
 
-                    let score = self.score_f16(index, query, scratch.as_mut_slice())?;
-                    insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
-                }
+                    let hash_bytes = &self.data[record_offset..record_offset + 8];
+                    let hash = u64::from_le_bytes([
+                        hash_bytes[0],
+                        hash_bytes[1],
+                        hash_bytes[2],
+                        hash_bytes[3],
+                        hash_bytes[4],
+                        hash_bytes[5],
+                        hash_bytes[6],
+                        hash_bytes[7],
+                    ]);
 
+                    let passed = if let Some(matches) = filter.matches_doc_id_hash(hash, None) {
+                        matches
+                    } else {
+                        let doc_id = self.doc_id_at(index)?;
+                        filter.matches(doc_id, None)
+                    };
+
+                    if passed {
+                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(2)) {
+                            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
+                        }
+                        let score = dot_product_f16_f32(&scratch, query)?;
+                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                    }
+
+                    record_offset += 16;
+                    vector_offset += stride;
+                }
                 return_f16_scratch(scratch);
             }
             Quantization::F32 => {
+                let stride = dim * 4;
+                let mut record_offset = self.records_offset + start * 16;
+                let mut vector_offset = self.vectors_offset + start * stride;
                 let mut scratch = take_f32_scratch(dim);
 
                 for index in start..end {
-                    if !self.passes_search_filter(Some(filter), index)? {
+                    let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
+                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+                    if (flags & 0x0001) != 0 {
+                        record_offset += 16;
+                        vector_offset += stride;
                         continue;
                     }
 
-                    let score = self.score_f32(index, query, scratch.as_mut_slice())?;
-                    insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
-                }
+                    let hash_bytes = &self.data[record_offset..record_offset + 8];
+                    let hash = u64::from_le_bytes([
+                        hash_bytes[0],
+                        hash_bytes[1],
+                        hash_bytes[2],
+                        hash_bytes[3],
+                        hash_bytes[4],
+                        hash_bytes[5],
+                        hash_bytes[6],
+                        hash_bytes[7],
+                    ]);
 
+                    let passed = if let Some(matches) = filter.matches_doc_id_hash(hash, None) {
+                        matches
+                    } else {
+                        let doc_id = self.doc_id_at(index)?;
+                        filter.matches(doc_id, None)
+                    };
+
+                    if passed {
+                        let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                        for (slot, chunk) in scratch.iter_mut().zip(vector_bytes.chunks_exact(4)) {
+                            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        }
+                        let score = dot_product_f32_f32(&scratch, query)?;
+                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                    }
+
+                    record_offset += 16;
+                    vector_offset += stride;
+                }
                 return_f32_scratch(scratch);
             }
         }
@@ -445,95 +529,6 @@ impl VectorIndex {
             score: winner.score,
             doc_id: entry.doc_id.clone(),
         })
-    }
-
-    fn score_f16(&self, index: usize, query: &[f32], scratch: &mut [f16]) -> SearchResult<f32> {
-        self.decode_f16_into(index, scratch)?;
-        dot_product_f16_f32(scratch, query)
-    }
-
-    fn score_f32(&self, index: usize, query: &[f32], scratch: &mut [f32]) -> SearchResult<f32> {
-        self.decode_f32_into(index, scratch)?;
-        dot_product_f32_f32(scratch, query)
-    }
-
-    fn decode_f16_into(&self, index: usize, output: &mut [f16]) -> SearchResult<()> {
-        if output.len() != self.dimension() {
-            return Err(SearchError::DimensionMismatch {
-                expected: self.dimension(),
-                found: output.len(),
-            });
-        }
-        let expected_len = self
-            .dimension()
-            .checked_mul(2)
-            .ok_or_else(|| super::index_corrupted(&self.path, "f16 vector byte length overflow"))?;
-        let bytes = self.raw_vector_bytes(index)?;
-        if bytes.len() != expected_len {
-            return Err(super::index_corrupted(
-                &self.path,
-                format!(
-                    "f16 vector byte length mismatch: expected {expected_len}, found {}",
-                    bytes.len()
-                ),
-            ));
-        }
-        for (slot, chunk) in output.iter_mut().zip(bytes.chunks_exact(2)) {
-            *slot = f16::from_le_bytes([chunk[0], chunk[1]]);
-        }
-        Ok(())
-    }
-
-    fn decode_f32_into(&self, index: usize, output: &mut [f32]) -> SearchResult<()> {
-        if output.len() != self.dimension() {
-            return Err(SearchError::DimensionMismatch {
-                expected: self.dimension(),
-                found: output.len(),
-            });
-        }
-        let expected_len = self
-            .dimension()
-            .checked_mul(4)
-            .ok_or_else(|| super::index_corrupted(&self.path, "f32 vector byte length overflow"))?;
-        let bytes = self.raw_vector_bytes(index)?;
-        if bytes.len() != expected_len {
-            return Err(super::index_corrupted(
-                &self.path,
-                format!(
-                    "f32 vector byte length mismatch: expected {expected_len}, found {}",
-                    bytes.len()
-                ),
-            ));
-        }
-        for (slot, chunk) in output.iter_mut().zip(bytes.chunks_exact(4)) {
-            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
-        Ok(())
-    }
-
-    /// Check whether a main-index record passes a `SearchFilter`.
-    ///
-    /// Uses `SearchFilter::matches_doc_id_hash` when available to avoid
-    /// decoding `doc_id` strings in the hot scan loop.
-    /// Falls back to `filter.matches(doc_id, ...)` when hash-only matching
-    /// is not possible.
-    fn passes_search_filter(
-        &self,
-        filter: Option<&dyn SearchFilter>,
-        index: usize,
-    ) -> SearchResult<bool> {
-        let entry = self.record_at(index)?;
-        if super::is_tombstoned_flags(entry.flags) {
-            return Ok(false);
-        }
-        let Some(f) = filter else {
-            return Ok(true);
-        };
-        if let Some(matches) = f.matches_doc_id_hash(entry.doc_id_hash, None) {
-            return Ok(matches);
-        }
-        let doc_id = self.doc_id_at(index)?;
-        Ok(f.matches(doc_id, None))
     }
 
     #[allow(clippy::missing_const_for_fn)]

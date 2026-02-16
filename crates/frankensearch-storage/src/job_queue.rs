@@ -946,6 +946,18 @@ fn conflict_error(message: String) -> SearchError {
     queue_error(QueueErrorKind::Conflict, message)
 }
 
+pub(crate) fn is_queue_conflict(error: &SearchError) -> bool {
+    let SearchError::SubsystemError { subsystem, source } = error else {
+        return false;
+    };
+    if *subsystem != SUBSYSTEM {
+        return false;
+    }
+    source
+        .downcast_ref::<QueueError>()
+        .is_some_and(|queue_error| queue_error.kind == QueueErrorKind::Conflict)
+}
+
 fn queue_error(kind: QueueErrorKind, message: String) -> SearchError {
     SearchError::SubsystemError {
         subsystem: SUBSYSTEM,
@@ -2497,6 +2509,20 @@ mod tests {
             err.to_string().contains("job changed status"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn is_queue_conflict_detects_conflict_errors() {
+        use super::{conflict_error, is_queue_conflict};
+        let err = conflict_error("job changed status".to_owned());
+        assert!(is_queue_conflict(&err));
+    }
+
+    #[test]
+    fn is_queue_conflict_ignores_non_conflict_errors() {
+        use super::{QueueErrorKind, is_queue_conflict, queue_error};
+        let err = queue_error(QueueErrorKind::Validation, "bad input".to_owned());
+        assert!(!is_queue_conflict(&err));
     }
 
     #[test]

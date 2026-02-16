@@ -28,6 +28,13 @@ pub const VECTOR_ANN_FAST_FILENAME: &str = "vector.fast.hnsw";
 #[cfg(feature = "ann")]
 pub const VECTOR_ANN_QUALITY_FILENAME: &str = "vector.quality.hnsw";
 
+#[derive(Debug)]
+enum QualityAlignment {
+    None,
+    Aligned,
+    Mapping(Vec<Option<usize>>),
+}
+
 /// Dual-index container used by progressive search orchestration.
 #[derive(Debug)]
 pub struct TwoTierIndex {
@@ -37,7 +44,7 @@ pub struct TwoTierIndex {
     fast_ann: Option<HnswIndex>,
     #[cfg(feature = "ann")]
     quality_ann: Option<HnswIndex>,
-    quality_lookup: Vec<Option<usize>>,
+    quality_alignment: QualityAlignment,
     config: TwoTierConfig,
 }
 
@@ -61,7 +68,7 @@ impl TwoTierIndex {
         let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
 
         let fast_index = VectorIndex::open(&fast_path)?;
-        let mut quality_lookup = vec![None; fast_index.record_count()];
+        let mut quality_alignment = QualityAlignment::None;
 
         let quality_index = if quality_path.exists() {
             let quality = VectorIndex::open(&quality_path)?;
@@ -74,20 +81,30 @@ impl TwoTierIndex {
                 );
             }
 
-            // Efficient merge-join alignment based on hash sorting.
-            // Both indices are sorted by (doc_id_hash, doc_id).
+            quality_alignment = QualityAlignment::Aligned;
             let mut f_idx = 0;
             let mut q_idx = 0;
             let f_count = fast_index.record_count();
             let q_count = quality.record_count();
             let mut unmatched_quality_docs = 0;
 
+            // Switch `quality_alignment` from `Aligned` to `Mapping` if not already.
+            let ensure_mapping = |quality_alignment: &mut QualityAlignment,
+                                  current_f_idx: usize| {
+                if matches!(quality_alignment, QualityAlignment::Aligned) {
+                    let map = (0..current_f_idx).map(Some).collect();
+                    *quality_alignment = QualityAlignment::Mapping(map);
+                }
+            };
+
             while f_idx < f_count && q_idx < q_count {
                 let f_rec = fast_index.record_at(f_idx)?;
                 let q_rec = quality.record_at(q_idx)?;
 
-                // Skip tombstones (soft-deleted records)
                 if crate::is_tombstoned_flags(f_rec.flags) {
+                    if let QualityAlignment::Mapping(vec) = &mut quality_alignment {
+                        vec.push(None);
+                    }
                     f_idx += 1;
                     continue;
                 }
@@ -96,8 +113,18 @@ impl TwoTierIndex {
                     continue;
                 }
 
+                // If indices diverged, we must be in mapping mode
+                if matches!(quality_alignment, QualityAlignment::Aligned) && f_idx != q_idx {
+                    ensure_mapping(&mut quality_alignment, f_idx);
+                }
+
                 match f_rec.doc_id_hash.cmp(&q_rec.doc_id_hash) {
                     std::cmp::Ordering::Less => {
+                        // Fast has doc, Quality missing
+                        ensure_mapping(&mut quality_alignment, f_idx);
+                        if let QualityAlignment::Mapping(vec) = &mut quality_alignment {
+                            vec.push(None);
+                        }
                         f_idx += 1;
                     }
                     std::cmp::Ordering::Greater => {
@@ -105,18 +132,24 @@ impl TwoTierIndex {
                         q_idx += 1;
                     }
                     std::cmp::Ordering::Equal => {
-                        // Hashes match, verify string equality to handle collisions.
-                        // Accessing doc_id_at is cheap (mmap slice), no allocation.
                         let f_id = fast_index.doc_id_at(f_idx)?;
                         let q_id = quality.doc_id_at(q_idx)?;
 
                         match f_id.cmp(q_id) {
                             std::cmp::Ordering::Equal => {
-                                quality_lookup[f_idx] = Some(q_idx);
+                                if let QualityAlignment::Mapping(vec) = &mut quality_alignment {
+                                    vec.push(Some(q_idx));
+                                }
                                 f_idx += 1;
                                 q_idx += 1;
                             }
-                            std::cmp::Ordering::Less => f_idx += 1,
+                            std::cmp::Ordering::Less => {
+                                ensure_mapping(&mut quality_alignment, f_idx);
+                                if let QualityAlignment::Mapping(vec) = &mut quality_alignment {
+                                    vec.push(None);
+                                }
+                                f_idx += 1;
+                            }
                             std::cmp::Ordering::Greater => {
                                 unmatched_quality_docs += 1;
                                 q_idx += 1;
@@ -126,7 +159,16 @@ impl TwoTierIndex {
                 }
             }
 
-            // Count remaining quality docs as unmatched
+            // Handle trailing fast docs
+            if f_idx < f_count {
+                ensure_mapping(&mut quality_alignment, f_idx);
+                if let QualityAlignment::Mapping(vec) = &mut quality_alignment {
+                    while vec.len() < f_count {
+                        vec.push(None);
+                    }
+                }
+            }
+
             while q_idx < q_count {
                 let q_rec = quality.record_at(q_idx)?;
                 if !crate::is_tombstoned_flags(q_rec.flags) {
@@ -194,7 +236,7 @@ impl TwoTierIndex {
             fast_ann,
             #[cfg(feature = "ann")]
             quality_ann,
-            quality_lookup,
+            quality_alignment,
             config,
         })
     }
@@ -311,7 +353,13 @@ impl TwoTierIndex {
     /// Whether the fast-tier document at `index` has a quality-tier vector.
     #[must_use]
     pub fn has_quality_for_index(&self, index: usize) -> bool {
-        self.quality_lookup.get(index).copied().flatten().is_some()
+        match &self.quality_alignment {
+            QualityAlignment::None => false,
+
+            QualityAlignment::Aligned => true,
+
+            QualityAlignment::Mapping(map) => map.get(index).copied().flatten().is_some(),
+        }
     }
 
     /// Accessor for the configuration used to open this index.
@@ -322,14 +370,27 @@ impl TwoTierIndex {
 
     fn score_quality_for_fast_index(
         &self,
+
         quality_index: &VectorIndex,
+
         query_vec: &[f32],
+
         fast_idx: usize,
     ) -> SearchResult<f32> {
-        let Some(Some(quality_idx)) = self.quality_lookup.get(fast_idx).copied() else {
-            return Ok(0.0);
+        let quality_idx = match &self.quality_alignment {
+            QualityAlignment::None => return Ok(0.0),
+
+            QualityAlignment::Aligned => fast_idx,
+
+            QualityAlignment::Mapping(map) => match map.get(fast_idx).copied().flatten() {
+                Some(idx) => idx,
+
+                None => return Ok(0.0),
+            },
         };
+
         let quality_vector = quality_index.vector_at_f32(quality_idx)?;
+
         dot_product_f32_f32(&quality_vector, query_vec)
     }
 }
@@ -510,7 +571,7 @@ fn resolve_fast_path(dir: &Path) -> SearchResult<PathBuf> {
 #[cfg(feature = "ann")]
 fn maybe_load_or_build_ann(
     vector_index: &VectorIndex,
-    _ann_path: &Path,
+    ann_path: &Path,
     threshold: usize,
     config: &TwoTierConfig,
     tier: &str,
@@ -526,17 +587,70 @@ fn maybe_load_or_build_ann(
         max_layer: HNSW_DEFAULT_MAX_LAYER,
     };
 
-    match HnswIndex::build_from_vector_index(vector_index, ann_config) {
-        Ok(ann) => Some(ann),
+    if ann_path.exists() {
+        match HnswIndex::load(ann_path) {
+            Ok(ann) => match ann.matches_vector_index(vector_index) {
+                Ok(true) => {
+                    let loaded_config = ann.config();
+                    if loaded_config == ann_config {
+                        return Some(ann);
+                    }
+                    warn!(
+                        tier,
+                        ann_path = %ann_path.display(),
+                        ?loaded_config,
+                        ?ann_config,
+                        "ANN sidecar config differs from requested config; rebuilding"
+                    );
+                }
+                Ok(false) => {
+                    warn!(
+                        tier,
+                        ann_path = %ann_path.display(),
+                        "ANN sidecar exists but does not match vector index; rebuilding"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        tier,
+                        ann_path = %ann_path.display(),
+                        ?error,
+                        "failed to validate ANN sidecar; rebuilding"
+                    );
+                }
+            },
+            Err(error) => {
+                warn!(
+                    tier,
+                    ann_path = %ann_path.display(),
+                    ?error,
+                    "failed to load ANN sidecar; rebuilding"
+                );
+            }
+        }
+    }
+
+    let ann = match HnswIndex::build_from_vector_index(vector_index, ann_config) {
+        Ok(ann) => ann,
         Err(error) => {
             warn!(
                 tier,
                 ?error,
                 "failed to build ANN index; using brute-force fallback"
             );
-            None
+            return None;
         }
+    };
+
+    if let Err(error) = ann.save(ann_path) {
+        warn!(
+            tier,
+            ann_path = %ann_path.display(),
+            ?error,
+            "failed to persist ANN sidecar; ANN stays in-memory for this process"
+        );
     }
+    Some(ann)
 }
 
 #[cfg(test)]
