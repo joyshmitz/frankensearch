@@ -463,6 +463,10 @@ fn vector_component_close(left: f32, right: f32) -> bool {
     if left.to_bits() == right.to_bits() {
         return true;
     }
+    // Non-finite values (NaN, Inf) with different bit patterns are never close.
+    if !left.is_finite() || !right.is_finite() {
+        return false;
+    }
     let diff = (left - right).abs();
     let scale = left.abs().max(right.abs()).max(1.0);
     diff <= (f32::EPSILON * 8.0 * scale)

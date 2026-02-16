@@ -22,7 +22,7 @@ use tracing::instrument;
 
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize};
+use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 
 /// Required files for a `Model2Vec` model.
 const REQUIRED_FILES: [&str; 2] = ["tokenizer.json", "model.safetensors"];
@@ -249,7 +249,8 @@ impl Model2VecEmbedder {
         }
 
         // L2 normalize to unit length
-        Ok(l2_normalize(&sum))
+        normalize_in_place(&mut sum);
+        Ok(sum)
     }
 
     /// The directory this model was loaded from.
@@ -262,6 +263,18 @@ impl Model2VecEmbedder {
     #[must_use]
     pub const fn vocab_size(&self) -> usize {
         self.vocab_size
+    }
+}
+
+fn normalize_in_place(vec: &mut [f32]) {
+    let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
+    if norm_sq.is_finite() && norm_sq > f32::EPSILON {
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        for x in vec {
+            *x *= inv_norm;
+        }
+    } else {
+        vec.fill(0.0);
     }
 }
 
