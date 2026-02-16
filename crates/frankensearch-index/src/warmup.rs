@@ -122,15 +122,27 @@ impl Default for AdaptiveConfig {
 
 impl AdaptiveConfig {
     /// Clamp `heat_decay` to `[0.0, 1.0]`.
+    ///
+    /// Non-finite values (NaN/Inf from deserialization) fall back to 0.95.
     #[must_use]
-    pub const fn clamped_heat_decay(&self) -> f64 {
-        self.heat_decay.clamp(0.0, 1.0)
+    pub fn clamped_heat_decay(&self) -> f64 {
+        if self.heat_decay.is_finite() {
+            self.heat_decay.clamp(0.0, 1.0)
+        } else {
+            0.95
+        }
     }
 
     /// Clamp `min_heat` to `[0.0, 1.0]`.
+    ///
+    /// Non-finite values (NaN/Inf from deserialization) fall back to 0.1.
     #[must_use]
-    pub const fn clamped_min_heat(&self) -> f64 {
-        self.min_heat.clamp(0.0, 1.0)
+    pub fn clamped_min_heat(&self) -> f64 {
+        if self.min_heat.is_finite() {
+            self.min_heat.clamp(0.0, 1.0)
+        } else {
+            0.1
+        }
     }
 }
 
@@ -200,7 +212,11 @@ impl HeatMap {
     /// Called once per search cycle: `heat = (heat * decay_factor) as u8`.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn decay(&self, decay_factor: f64) {
-        let factor = decay_factor.clamp(0.0, 1.0);
+        let factor = if decay_factor.is_finite() {
+            decay_factor.clamp(0.0, 1.0)
+        } else {
+            0.0 // Non-finite decay → zero out all heat (safe reset)
+        };
 
         for page in &self.pages {
             let current = page.load(Ordering::Relaxed);
@@ -1010,5 +1026,41 @@ mod tests {
         let deserialized: WarmUpResult = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.pages_touched, 10);
         assert_eq!(deserialized.strategy_name, "adaptive");
+    }
+
+    #[test]
+    fn adaptive_config_nan_heat_decay_uses_default() {
+        let config = AdaptiveConfig {
+            heat_decay: f64::NAN,
+            min_heat: 0.1,
+        };
+        let decay = config.clamped_heat_decay();
+        assert!(decay.is_finite(), "NaN heat_decay must fallback to default");
+        assert!((decay - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn adaptive_config_nan_min_heat_uses_default() {
+        let config = AdaptiveConfig {
+            heat_decay: 0.85,
+            min_heat: f64::NAN,
+        };
+        let min_heat = config.clamped_min_heat();
+        assert!(
+            min_heat.is_finite(),
+            "NaN min_heat must fallback to default"
+        );
+        assert!((min_heat - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn heat_map_decay_nan_factor_zeroes_heat() {
+        let map = HeatMap::new(PAGE_SIZE * 4);
+        map.record_access(0, PAGE_SIZE);
+        assert!(map.heat_at(0) > 0, "heat should be recorded");
+
+        map.decay(f64::NAN);
+        // NaN decay factor → falls back to 0.0 → heat zeroed
+        assert_eq!(map.heat_at(0), 0, "NaN decay factor should zero out heat");
     }
 }

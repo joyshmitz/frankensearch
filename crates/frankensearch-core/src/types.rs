@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::SearchError;
+use crate::explanation::HitExplanation;
 use crate::query_class::QueryClass;
 
 // ---------------------------------------------------------------------------
@@ -178,6 +179,8 @@ pub struct ScoredResult {
     pub lexical_score: Option<f32>,
     /// Cross-encoder score from reranking, if applicable.
     pub rerank_score: Option<f32>,
+    /// Detailed explanation of scoring (if enabled).
+    pub explanation: Option<HitExplanation>,
     /// Arbitrary document metadata (from index stored fields).
     pub metadata: Option<serde_json::Value>,
 }
@@ -278,7 +281,9 @@ impl RankChanges {
     /// Total number of documents tracked.
     #[must_use]
     pub const fn total(&self) -> usize {
-        self.promoted + self.demoted + self.stable
+        self.promoted
+            .saturating_add(self.demoted)
+            .saturating_add(self.stable)
     }
 }
 
@@ -481,6 +486,7 @@ mod tests {
             quality_score: Some(0.9),
             lexical_score: Some(12.5),
             rerank_score: None,
+            explanation: None,
             metadata: Some(serde_json::json!({"tags": ["rust", "search"]})),
         };
         let json = serde_json::to_string(&result).expect("serialize");
@@ -528,6 +534,7 @@ mod tests {
             quality_score: None,
             lexical_score: None,
             rerank_score: None,
+            explanation: None,
             metadata: None,
         }];
         let phase = SearchPhase::RefinementFailed {
@@ -830,6 +837,7 @@ mod tests {
             quality_score: None,
             lexical_score: None,
             rerank_score: None,
+            explanation: None,
             metadata: None,
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -850,6 +858,7 @@ mod tests {
             quality_score: Some(0.9),
             lexical_score: Some(15.0),
             rerank_score: Some(0.95),
+            explanation: None,
             metadata: Some(serde_json::json!({"key": "value"})),
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -871,6 +880,7 @@ mod tests {
             quality_score: None,
             lexical_score: None,
             rerank_score: None,
+            explanation: None,
             metadata: None,
         };
         let cloned = result.clone();
@@ -940,6 +950,16 @@ mod tests {
     }
 
     #[test]
+    fn rank_changes_total_saturates_on_overflow() {
+        let changes = RankChanges {
+            promoted: usize::MAX,
+            demoted: 1,
+            stable: 1,
+        };
+        assert_eq!(changes.total(), usize::MAX);
+    }
+
+    #[test]
     fn search_phase_refined_construction() {
         let phase = SearchPhase::Refined {
             results: vec![ScoredResult {
@@ -950,6 +970,7 @@ mod tests {
                 quality_score: Some(0.9),
                 lexical_score: None,
                 rerank_score: None,
+                explanation: None,
                 metadata: None,
             }],
             latency: Duration::from_millis(120),

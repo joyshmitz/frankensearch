@@ -132,6 +132,8 @@ pub struct VectorMetadata {
     pub dimension: usize,
     /// Stored quantization.
     pub quantization: Quantization,
+    /// Compaction generation counter (0-255) used for stale WAL detection.
+    pub compaction_gen: u8,
     /// Number of records in the index.
     pub record_count: usize,
     /// Byte offset to the aligned vector slab.
@@ -163,12 +165,12 @@ struct RecordEntry {
 
 #[derive(Debug)]
 pub struct VectorIndex {
-    path: PathBuf,
-    data: Vec<u8>,
-    metadata: VectorMetadata,
-    records_offset: usize,
-    strings_offset: usize,
-    vectors_offset: usize,
+    pub(crate) path: PathBuf,
+    pub(crate) data: Vec<u8>,
+    pub(crate) metadata: VectorMetadata,
+    pub(crate) records_offset: usize,
+    pub(crate) strings_offset: usize,
+    pub(crate) vectors_offset: usize,
     /// WAL entries for incremental updates (empty if no WAL exists).
     pub(crate) wal_entries: Vec<wal::WalEntry>,
     /// WAL configuration.
@@ -190,7 +192,7 @@ impl VectorIndex {
         }
 
         let data = fs::read(path)?;
-        let (metadata, header_len) = parse_header(path, &data)?;
+        let (mut metadata, header_len) = parse_header(path, &data)?;
 
         let records_bytes = metadata
             .record_count
@@ -230,7 +232,9 @@ impl VectorIndex {
 
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
-        let wal_entries = wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
+        let (wal_entries, wal_compaction_gen) =
+            wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
+        metadata.compaction_gen = metadata.compaction_gen.max(wal_compaction_gen);
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -292,6 +296,7 @@ impl VectorIndex {
             embedder_revision: embedder_revision.to_owned(),
             dimension,
             quantization,
+            compaction_gen: 0,
             records: Vec::new(),
         })
     }
@@ -578,6 +583,7 @@ impl VectorIndex {
             &wal_entries,
             self.dimension(),
             self.quantization(),
+            self.metadata.compaction_gen.wrapping_add(1),
             self.wal_config.fsync_on_write,
         )?;
 
@@ -626,7 +632,8 @@ impl VectorIndex {
             &self.metadata.embedder_revision,
             self.dimension(),
             self.quantization(),
-        )?;
+        )?
+        .with_generation(self.metadata.compaction_gen.wrapping_add(1));
 
         // Write all main index entries.
         for i in 0..self.record_count() {
@@ -1007,6 +1014,7 @@ impl VectorIndex {
             &self.wal_entries,
             self.dimension(),
             self.quantization(),
+            self.metadata.compaction_gen.wrapping_add(1),
             self.wal_config.fsync_on_write,
         )?;
 
@@ -1105,6 +1113,7 @@ pub struct VectorIndexWriter {
     embedder_revision: String,
     dimension: usize,
     quantization: Quantization,
+    compaction_gen: u8,
     records: Vec<PendingRecord>,
 }
 
@@ -1141,6 +1150,11 @@ impl VectorIndexWriter {
             embedding: embedding.to_vec(),
         });
         Ok(())
+    }
+
+    pub(crate) fn with_generation(mut self, generation: u8) -> Self {
+        self.compaction_gen = generation;
+        self
     }
 
     /// Persist the index to disk, including fsync of file and parent directory.
@@ -1209,6 +1223,7 @@ impl VectorIndexWriter {
             &self.embedder_revision,
             self.dimension,
             self.quantization,
+            self.compaction_gen,
             record_count,
             0,
         )?;
@@ -1255,6 +1270,7 @@ impl VectorIndexWriter {
             &self.embedder_revision,
             self.dimension,
             self.quantization,
+            self.compaction_gen,
             record_count,
             vectors_offset,
         )?;
@@ -1360,7 +1376,10 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
     let quantization_byte = read_array::<1>(path, data, &mut cursor, "quantization")?[0];
     let quantization = Quantization::from_wire(quantization_byte, path)?;
 
-    let _reserved = read_array::<3>(path, data, &mut cursor, "reserved")?;
+    // Use first reserved byte for compaction generation
+    let reserved = read_array::<3>(path, data, &mut cursor, "reserved")?;
+    let compaction_gen = reserved[0];
+    // reserved[1..2] remain unused
 
     let record_count_u64 =
         u64::from_le_bytes(read_array::<8>(path, data, &mut cursor, "record_count")?);
@@ -1384,6 +1403,7 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
             embedder_revision,
             dimension,
             quantization,
+            compaction_gen,
             record_count,
             vectors_offset,
         },
@@ -1429,6 +1449,7 @@ fn build_header_prefix(
     embedder_revision: &str,
     dimension: usize,
     quantization: Quantization,
+    compaction_gen: u8,
     record_count: usize,
     vectors_offset: u64,
 ) -> SearchResult<Vec<u8>> {
@@ -1471,7 +1492,8 @@ fn build_header_prefix(
     out.extend_from_slice(embedder_revision.as_bytes());
     out.extend_from_slice(&dimension_u32.to_le_bytes());
     out.push(quantization as u8);
-    out.extend_from_slice(&[0_u8; 3]);
+    out.push(compaction_gen);
+    out.extend_from_slice(&[0_u8; 2]);
     out.extend_from_slice(&record_count_u64.to_le_bytes());
     out.extend_from_slice(&vectors_offset.to_le_bytes());
     Ok(out)
@@ -2783,6 +2805,7 @@ mod tests {
             embedder_revision: "v1".to_owned(),
             dimension: 256,
             quantization: Quantization::F16,
+            compaction_gen: 0,
             record_count: 100,
             vectors_offset: 1024,
         };

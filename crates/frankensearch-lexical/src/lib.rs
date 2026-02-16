@@ -598,6 +598,7 @@ impl LexicalSearch for TantivyIndex {
                     quality_score: None,
                     lexical_score: Some(bm25_score),
                     rerank_score: None,
+                    explanation: None,
                     metadata,
                 });
             }

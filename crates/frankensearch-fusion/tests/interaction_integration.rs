@@ -136,6 +136,7 @@ impl LexicalSearch for StubLexical {
                         quality_score: None,
                         lexical_score: Some((count - i) as f32 / count as f32),
                         rerank_score: None,
+                        explanation: None,
                         metadata: None,
                     }
                 })

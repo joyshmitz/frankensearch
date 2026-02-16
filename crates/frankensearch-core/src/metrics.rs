@@ -469,8 +469,12 @@ impl HuberEstimator {
     pub fn with_params(k: f64, alpha: f64) -> Self {
         Self {
             estimate: 0.0,
-            k: k.abs().max(0.1),
-            alpha: alpha.clamp(0.001, 1.0),
+            k: if k.is_finite() { k.abs().max(0.1) } else { Self::DEFAULT_K },
+            alpha: if alpha.is_finite() {
+                alpha.clamp(0.001, 1.0)
+            } else {
+                Self::DEFAULT_ALPHA
+            },
             count: 0,
             initialized: false,
         }
@@ -1124,6 +1128,29 @@ mod tests {
         let h2: HuberEstimator = serde_json::from_str(&json).unwrap();
         assert_eq!(h.estimate(), h2.estimate());
         assert_eq!(h.count(), h2.count());
+    }
+
+    #[test]
+    fn huber_nan_alpha_uses_default() {
+        let mut h = HuberEstimator::with_params(1.345, f64::NAN);
+        h.insert(10.0);
+        h.insert(20.0);
+        h.insert(15.0);
+        let est = h.estimate().unwrap();
+        assert!(est.is_finite(), "NaN alpha must not poison estimate");
+        assert!(
+            (est - 10.0).abs() < 11.0,
+            "estimate should be reasonable, got {est}"
+        );
+    }
+
+    #[test]
+    fn huber_nan_k_uses_default() {
+        let mut h = HuberEstimator::with_params(f64::NAN, 0.1);
+        h.insert(10.0);
+        h.insert(20.0);
+        let est = h.estimate().unwrap();
+        assert!(est.is_finite(), "NaN k must not poison estimate");
     }
 
     // ---- HyperLogLog tests ----

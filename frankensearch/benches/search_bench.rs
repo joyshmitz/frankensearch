@@ -66,6 +66,7 @@ fn make_lexical_hits(n: usize) -> Vec<ScoredResult> {
             quality_score: None,
             lexical_score: Some((n - i) as f32),
             rerank_score: None,
+            explanation: None,
             metadata: None,
         })
         .collect()

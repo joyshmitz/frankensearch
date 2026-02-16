@@ -28,6 +28,9 @@ use frankensearch_core::ParsedQuery;
 use frankensearch_core::canonicalize::{Canonicalizer, DefaultCanonicalizer};
 use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::explanation::{
+    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
+};
 use frankensearch_core::host_adapter::{AdapterLifecycleEvent, HostAdapter};
 use frankensearch_core::query_class::QueryClass;
 use frankensearch_core::traits::{Embedder, LexicalSearch, ModelCategory, Reranker};
@@ -52,6 +55,11 @@ use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+struct NormalizedExclusions {
+    terms: Vec<String>,
+    phrases: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CpuJiffiesSnapshot {
     process_jiffies: u64,
@@ -64,7 +72,7 @@ struct CpuJiffiesSnapshot {
     clippy::cast_sign_loss
 )]
 fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
-    if base_candidates == 0 || multiplier <= 0.0 {
+    if base_candidates == 0 || !multiplier.is_finite() || multiplier <= 0.0 {
         return 0;
     }
     let scaled = (base_candidates as f32 * multiplier).ceil() as usize;
@@ -269,6 +277,22 @@ impl TwoTierSearcher {
             return Ok(metrics);
         }
         let parsed_query = ParsedQuery::parse(&canon_query);
+        let normalized_exclusions = if parsed_query.has_negations() {
+            Some(NormalizedExclusions {
+                terms: parsed_query
+                    .negative_terms
+                    .iter()
+                    .map(|t| normalize_for_negation_match(t))
+                    .collect(),
+                phrases: parsed_query
+                    .negative_phrases
+                    .iter()
+                    .map(|p| normalize_for_negation_match(p))
+                    .collect(),
+            })
+        } else {
+            None
+        };
         let semantic_query = if parsed_query.is_positive_empty() {
             canon_query.as_str()
         } else {
@@ -314,6 +338,7 @@ impl TwoTierSearcher {
                 cx,
                 semantic_query,
                 &parsed_query,
+                normalized_exclusions.as_ref(),
                 k,
                 query_class,
                 &text_fn,
@@ -342,9 +367,6 @@ impl TwoTierSearcher {
         };
 
         let initial_hits = initial_results.clone();
-        let phase1_has_fast_candidates = initial_hits
-            .iter()
-            .any(|result| result.fast_score.is_some());
         let initial_latency = phase1_start.elapsed();
 
         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
@@ -384,7 +406,9 @@ impl TwoTierSearcher {
         self.export_search_metrics(query_class, &metrics, initial_hits.len(), false);
 
         // Phase 2: Quality refinement (optional).
-        if self.should_run_quality() && phase1_has_fast_candidates {
+        // Runs even if Phase 1 was lexical-only (fast_score is None), effectively
+        // performing a "lexical -> quality rerank" flow.
+        if self.should_run_quality() && !initial_hits.is_empty() {
             let phase2_start = Instant::now();
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
 
@@ -688,7 +712,14 @@ impl TwoTierSearcher {
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();
                 let results = lexical_results.as_ref().map_or_else(
-                    || vector_hits_to_scored_results(&fast_hits, k),
+                    || {
+                        vector_hits_to_scored_results(
+                            &fast_hits,
+                            k,
+                            &self.config,
+                            self.fast_embedder.id(),
+                        )
+                    },
                     |lexical| {
                         let fused = rrf_fuse(lexical, &fast_hits, k, 0, &rrf_config);
                         fused_hits_to_scored_results(&fused, lexical)
@@ -874,8 +905,9 @@ impl TwoTierSearcher {
         #[allow(unused_mut)] // mut needed when `rerank` feature is enabled
         let mut results: Vec<ScoredResult> = blended
             .iter()
+            .enumerate()
             .take(k)
-            .map(|hit| {
+            .map(|(rank, hit)| {
                 let initial = initial_by_doc.get(hit.doc_id.as_str()).copied();
                 let fast_score = fast_scores_by_doc.get(hit.doc_id.as_str()).copied();
                 let quality_score = quality_scores_by_doc.get(hit.doc_id.as_str()).copied();
@@ -884,6 +916,76 @@ impl TwoTierSearcher {
                 } else {
                     initial.map_or(ScoreSource::SemanticFast, |result| result.source)
                 };
+
+                let explanation = if self.config.explain {
+                    let mut components = Vec::new();
+
+                    // Fast component
+                    if let Some(s) = fast_score {
+                        components.push(ScoreComponent {
+                            source: ExplainedSource::SemanticFast {
+                                embedder: self.fast_embedder.id().to_owned(),
+                                cosine_sim: f64::from(s),
+                            },
+                            raw_score: f64::from(s),
+                            normalized_score: f64::from(s),
+                            rrf_contribution: 0.0,
+                            weight: 1.0 - f64::from(blend_factor),
+                        });
+                    }
+
+                    // Quality component
+                    if let Some(s) = quality_score {
+                        components.push(ScoreComponent {
+                            source: ExplainedSource::SemanticQuality {
+                                embedder: self.quality_embedder.as_ref().map_or_else(
+                                    || "quality-embedder".to_owned(),
+                                    |e| e.id().to_owned(),
+                                ),
+                                cosine_sim: f64::from(s),
+                            },
+                            raw_score: f64::from(s),
+                            normalized_score: f64::from(s),
+                            rrf_contribution: 0.0,
+                            weight: f64::from(blend_factor),
+                        });
+                    }
+
+                    // Rank movement
+                    let rank_movement = initial_rank.get(hit.doc_id.as_str()).map(|&i_rank| {
+                        let refined_rank = i64::try_from(rank).unwrap_or(i64::MAX);
+                        let initial_rank = i64::try_from(i_rank).unwrap_or(i64::MAX);
+                        let delta_i64 = refined_rank - initial_rank;
+                        let delta = i32::try_from(delta_i64).unwrap_or_else(|_| {
+                            if delta_i64.is_negative() {
+                                i32::MIN
+                            } else {
+                                i32::MAX
+                            }
+                        });
+                        let reason = match delta.cmp(&0) {
+                            std::cmp::Ordering::Less => "promoted",
+                            std::cmp::Ordering::Greater => "demoted",
+                            std::cmp::Ordering::Equal => "stable",
+                        };
+                        RankMovement {
+                            initial_rank: i_rank,
+                            refined_rank: rank,
+                            delta,
+                            reason: reason.to_owned(),
+                        }
+                    });
+
+                    Some(HitExplanation {
+                        final_score: f64::from(hit.score),
+                        components,
+                        phase: ExplanationPhase::Refined,
+                        rank_movement,
+                    })
+                } else {
+                    None
+                };
+
                 ScoredResult {
                     doc_id: hit.doc_id.clone(),
                     score: hit.score,
@@ -892,6 +994,7 @@ impl TwoTierSearcher {
                     quality_score,
                     lexical_score: initial.and_then(|result| result.lexical_score),
                     rerank_score: None,
+                    explanation,
                     metadata: initial.and_then(|result| result.metadata.clone()),
                 }
             })
@@ -1413,7 +1516,7 @@ fn read_proc_total_jiffies() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let raw = std::fs::read_to_string("/proc/stat").ok()?;
-        return parse_proc_total_jiffies(raw.as_str());
+        parse_proc_total_jiffies(raw.as_str())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1425,7 +1528,7 @@ fn read_proc_process_jiffies() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let raw = std::fs::read_to_string("/proc/self/stat").ok()?;
-        return parse_proc_process_jiffies(raw.as_str());
+        parse_proc_process_jiffies(raw.as_str())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1437,7 +1540,7 @@ fn read_proc_status_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let raw = std::fs::read_to_string("/proc/self/status").ok()?;
-        return parse_proc_status_rss_bytes(raw.as_str());
+        parse_proc_status_rss_bytes(raw.as_str())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1449,7 +1552,7 @@ fn read_proc_io_bytes() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
         let raw = std::fs::read_to_string("/proc/self/io").ok()?;
-        return parse_proc_io_bytes(raw.as_str());
+        parse_proc_io_bytes(raw.as_str())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1461,7 +1564,7 @@ fn read_proc_load_avg_1m() -> Option<f64> {
     #[cfg(target_os = "linux")]
     {
         let raw = std::fs::read_to_string("/proc/loadavg").ok()?;
-        return parse_proc_load_avg_1m(raw.as_str());
+        parse_proc_load_avg_1m(raw.as_str())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1566,6 +1669,7 @@ fn fused_hits_to_scored_results(
                 quality_score: None,
                 lexical_score: fh.lexical_score,
                 rerank_score: None,
+                explanation: None,
                 metadata: lexical_metadata_by_doc.get(fh.doc_id.as_str()).cloned(),
             }
         })
@@ -1573,18 +1677,46 @@ fn fused_hits_to_scored_results(
 }
 
 /// Convert `VectorHit` results to `ScoredResult` (semantic-only mode).
-fn vector_hits_to_scored_results(hits: &[VectorHit], k: usize) -> Vec<ScoredResult> {
+fn vector_hits_to_scored_results(
+    hits: &[VectorHit],
+    k: usize,
+    config: &TwoTierConfig,
+    fast_embedder_id: &str,
+) -> Vec<ScoredResult> {
     hits.iter()
         .take(k)
-        .map(|h| ScoredResult {
-            doc_id: h.doc_id.clone(),
-            score: h.score,
-            source: ScoreSource::SemanticFast,
-            fast_score: Some(h.score),
-            quality_score: None,
-            lexical_score: None,
-            rerank_score: None,
-            metadata: None,
+        .map(|h| {
+            let explanation = if config.explain {
+                Some(HitExplanation {
+                    final_score: f64::from(h.score),
+                    components: vec![ScoreComponent {
+                        source: ExplainedSource::SemanticFast {
+                            embedder: fast_embedder_id.to_owned(),
+                            cosine_sim: f64::from(h.score),
+                        },
+                        raw_score: f64::from(h.score),
+                        normalized_score: f64::from(h.score),
+                        rrf_contribution: 0.0,
+                        weight: 1.0,
+                    }],
+                    phase: ExplanationPhase::Initial,
+                    rank_movement: None,
+                })
+            } else {
+                None
+            };
+
+            ScoredResult {
+                doc_id: h.doc_id.clone(),
+                score: h.score,
+                source: ScoreSource::SemanticFast,
+                fast_score: Some(h.score),
+                quality_score: None,
+                lexical_score: None,
+                rerank_score: None,
+                explanation,
+                metadata: None,
+            }
         })
         .collect()
 }
@@ -1904,6 +2036,7 @@ mod tests {
                         quality_score: None,
                         lexical_score: Some((3 - i) as f32),
                         rerank_score: None,
+                        explanation: None,
                         metadata: None,
                     })
                     .collect())
@@ -2908,6 +3041,7 @@ mod tests {
             quality_score: None,
             lexical_score: Some(3.0),
             rerank_score: None,
+            explanation: None,
             metadata: Some(serde_json::json!({
                 "title": "Lexical doc",
                 "section": "api",
@@ -3708,6 +3842,17 @@ mod tests {
     }
 
     #[test]
+    fn scaled_budget_nan_multiplier_returns_zero() {
+        assert_eq!(scaled_budget(10, f32::NAN), 0);
+    }
+
+    #[test]
+    fn scaled_budget_infinity_multiplier_returns_zero() {
+        assert_eq!(scaled_budget(10, f32::INFINITY), 0);
+        assert_eq!(scaled_budget(10, f32::NEG_INFINITY), 0);
+    }
+
+    #[test]
     fn scaled_budget_fractional_rounds_up() {
         // 3 * 0.4 = 1.2 → ceil = 2
         assert_eq!(scaled_budget(3, 0.4), 2);
@@ -3872,7 +4017,8 @@ mod tests {
                 doc_id: format!("doc-{i}"),
             })
             .collect();
-        let results = vector_hits_to_scored_results(&hits, 3);
+        let config = TwoTierConfig::default();
+        let results = vector_hits_to_scored_results(&hits, 3, &config, "test-fast");
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].doc_id, "doc-0");
         assert_eq!(results[2].doc_id, "doc-2");
@@ -3880,7 +4026,8 @@ mod tests {
 
     #[test]
     fn vector_hits_to_scored_results_empty_hits() {
-        let results = vector_hits_to_scored_results(&[], 5);
+        let config = TwoTierConfig::default();
+        let results = vector_hits_to_scored_results(&[], 5, &config, "test-fast");
         assert!(results.is_empty());
     }
 
@@ -3891,7 +4038,8 @@ mod tests {
             score: 0.95,
             doc_id: "my-doc".to_owned(),
         }];
-        let results = vector_hits_to_scored_results(&hits, 10);
+        let config = TwoTierConfig::default();
+        let results = vector_hits_to_scored_results(&hits, 10, &config, "test-fast");
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert_eq!(r.doc_id, "my-doc");

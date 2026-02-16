@@ -354,6 +354,7 @@ impl EvalContext {
                     quality_score: None,
                     lexical_score: Some(*s as f32),
                     rerank_score: None,
+                    explanation: None,
                     metadata: None,
                 })
                 .collect();

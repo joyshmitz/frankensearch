@@ -382,6 +382,7 @@ fn make_lexical(ids: &[&str], scores: &[f32]) -> Vec<ScoredResult> {
             quality_score: None,
             lexical_score: Some(score),
             rerank_score: None,
+            explanation: None,
             metadata: None,
         })
         .collect()

@@ -98,6 +98,7 @@ fn scored(doc_id: &str, score: f32) -> ScoredResult {
         quality_score: None,
         lexical_score: None,
         rerank_score: None,
+        explanation: None,
         metadata: None,
     }
 }

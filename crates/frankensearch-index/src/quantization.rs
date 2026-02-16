@@ -132,8 +132,10 @@ impl ScalarQuantizer {
                     0
                 } else {
                     let normalized = (v - self.mins[i]) / self.scales[i];
+                    let clamped = normalized.round().clamp(0.0, 255.0);
+                    // Guard against NaN to avoid UB in `as u8` cast
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let q = normalized.round().clamp(0.0, 255.0) as u8;
+                    let q = if clamped.is_nan() { 0 } else { clamped as u8 };
                     q
                 }
             })

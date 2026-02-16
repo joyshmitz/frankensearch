@@ -10,6 +10,7 @@ use asupersync::Cx;
 use tracing::instrument;
 
 use frankensearch_core::error::{SearchError, SearchResult};
+use frankensearch_core::explanation::{ExplainedSource, ScoreComponent};
 use frankensearch_core::traits::{RerankDocument, Reranker};
 use frankensearch_core::types::{ScoreSource, ScoredResult};
 
@@ -54,6 +55,7 @@ pub const DEFAULT_MIN_CANDIDATES: usize = 5;
     num_candidates = candidates.len(),
     top_k = top_k_rerank,
 ))]
+#[allow(clippy::too_many_lines)]
 pub async fn rerank_step(
     cx: &Cx,
     reranker: &dyn Reranker,
@@ -152,6 +154,21 @@ pub async fn rerank_step(
             }
             candidates[candidate_idx].rerank_score = Some(score.score);
             candidates[candidate_idx].source = ScoreSource::Reranked;
+
+            if let Some(explanation) = &mut candidates[candidate_idx].explanation {
+                explanation.final_score = f64::from(score.score);
+                explanation.components.push(ScoreComponent {
+                    source: ExplainedSource::Rerank {
+                        model: reranker.id().to_owned(),
+                        logit: 0.0, // Raw logit unavailable from generic Reranker trait
+                        sigmoid: f64::from(score.score),
+                    },
+                    raw_score: f64::from(score.score),
+                    normalized_score: f64::from(score.score),
+                    rrf_contribution: 0.0,
+                    weight: 1.0,
+                });
+            }
         } else {
             tracing::warn!(
                 rank = score.original_rank,
@@ -307,6 +324,7 @@ mod tests {
                 quality_score: None,
                 lexical_score: None,
                 rerank_score: None,
+                explanation: None,
                 metadata: None,
             })
             .collect()

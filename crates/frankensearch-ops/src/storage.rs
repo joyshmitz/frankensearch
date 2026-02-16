@@ -7,18 +7,18 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{
-    SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult, TelemetryEnvelope,
-    TelemetryEvent, TelemetryQueryClass, TELEMETRY_SCHEMA_VERSION,
+    SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult,
+    TELEMETRY_SCHEMA_VERSION, TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
 };
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Current schema version for the ops telemetry database.
 pub const OPS_SCHEMA_VERSION: i64 = 2;
@@ -3339,17 +3339,17 @@ mod tests {
     use std::sync::{Arc, LazyLock, Mutex};
 
     use super::{
-        bootstrap, current_version, evidence_link_id, ops_error, EvidenceLinkRecord,
+        EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
         OpsRetentionPolicy, OpsStorage, ResourceSampleRecord, SearchEventPhase, SearchEventRecord,
-        SloHealth, SloMaterializationConfig, SloScope, SummaryWindow,
-        OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
+        SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
+        evidence_link_id, ops_error,
     };
     use frankensearch_core::{
         LifecycleSeverity, LifecycleState, SearchError,
-        SearchEventPhase as TelemetrySearchEventPhase, TelemetryCorrelation, TelemetryEnvelope,
-        TelemetryEvent, TelemetryInstance, TelemetryQueryClass, TelemetryResourceSample,
-        TelemetrySearchMetrics, TelemetrySearchQuery, TelemetrySearchResults,
-        TELEMETRY_SCHEMA_VERSION,
+        SearchEventPhase as TelemetrySearchEventPhase, TELEMETRY_SCHEMA_VERSION,
+        TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
+        TelemetryQueryClass, TelemetryResourceSample, TelemetrySearchMetrics, TelemetrySearchQuery,
+        TelemetrySearchResults,
     };
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
@@ -3971,9 +3971,11 @@ mod tests {
             .query_open_anomalies_for_scope(SloScope::Project, "project-a", 20)
             .expect("open anomaly query should succeed");
         assert!(!open_project_anomalies.is_empty());
-        assert!(open_project_anomalies
-            .iter()
-            .all(|row| row.reason_code.starts_with("anomaly.")));
+        assert!(
+            open_project_anomalies
+                .iter()
+                .all(|row| row.reason_code.starts_with("anomaly."))
+        );
 
         let timeline = storage
             .query_anomaly_timeline(Some("project-a"), 20)

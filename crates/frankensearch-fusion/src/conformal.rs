@@ -452,7 +452,14 @@ fn validate_alpha(alpha: f32) -> SearchResult<f32> {
 /// `quantile` is clamped to `[0, 1]`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn quantile_index(n: usize, quantile: f64) -> usize {
-    let q = quantile.clamp(0.0, 1.0);
+    // Guard: clamp() propagates NaN, and `as usize` on NaN is saturating-to-zero
+    // but produces a meaningless index. Callers validate via validate_alpha(),
+    // but defense-in-depth: treat non-finite as quantile=1.0 (conservative).
+    let q = if quantile.is_finite() {
+        quantile.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
     #[allow(clippy::cast_precision_loss)]
     let adjusted = ((n as f64 + 1.0) * q).ceil();
     #[allow(clippy::cast_precision_loss)]
@@ -814,4 +821,27 @@ mod tests {
     }
 
     // ─── bd-1epq tests end ───
+
+    // ─── MistyLark session 14: quantile_index NaN defense ───
+
+    #[test]
+    fn quantile_index_nan_falls_back_to_conservative() {
+        // NaN quantile should produce a valid index, not garbage.
+        // Defense-in-depth: treat NaN as 1.0 (most conservative = max index).
+        let idx = quantile_index(10, f64::NAN);
+        assert!(
+            idx < 10,
+            "NaN quantile should produce valid index, got {idx}"
+        );
+        // With q=1.0: adjusted = (10+1)*1.0 = 11.0, bounded = min(11,10) = 10, result = 9
+        assert_eq!(idx, 9);
+    }
+
+    #[test]
+    fn quantile_index_infinity_falls_back_to_conservative() {
+        let idx = quantile_index(10, f64::INFINITY);
+        assert_eq!(idx, 9);
+        let idx_neg = quantile_index(10, f64::NEG_INFINITY);
+        assert_eq!(idx_neg, 9);
+    }
 }

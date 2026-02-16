@@ -270,6 +270,7 @@ mod tests {
             quality_score: None,
             lexical_score: Some(score),
             rerank_score: None,
+            explanation: None,
             metadata: None,
         }
     }

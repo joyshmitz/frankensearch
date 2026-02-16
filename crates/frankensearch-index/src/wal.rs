@@ -131,14 +131,14 @@ pub(crate) fn read_wal(
     path: &Path,
     expected_dimension: usize,
     quantization: Quantization,
-) -> SearchResult<Vec<WalEntry>> {
+) -> SearchResult<(Vec<WalEntry>, u8)> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let data = std::fs::read(path)?;
     if data.len() < WAL_HEADER_SIZE {
         warn!(path = %path.display(), len = data.len(), "WAL file too small, ignoring");
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     parse_wal_bytes(&data, expected_dimension, quantization, path)
 }
@@ -148,7 +148,7 @@ fn parse_wal_bytes(
     expected_dimension: usize,
     quantization: Quantization,
     path: &Path,
-) -> SearchResult<Vec<WalEntry>> {
+) -> SearchResult<(Vec<WalEntry>, u8)> {
     // Header validation.
     if data[..4] != WAL_MAGIC {
         return Err(wal_corrupted(path, "bad magic bytes"));
@@ -172,7 +172,8 @@ fn parse_wal_bytes(
     if wal_quant != quantization {
         return Err(wal_corrupted(path, "quantization mismatch"));
     }
-    // reserved: data[11..16]
+    let compaction_gen = data[11];
+    // reserved: data[12..16]
     let header_crc_stored = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
     let header_crc_computed = crc32_of(&data[..16]);
     if header_crc_stored != header_crc_computed {
@@ -202,7 +203,7 @@ fn parse_wal_bytes(
     }
 
     debug!(path = %path.display(), entries = entries.len(), "loaded WAL entries");
-    Ok(entries)
+    Ok((entries, compaction_gen))
 }
 
 fn parse_batch(
@@ -312,6 +313,7 @@ pub(crate) fn append_wal_batch(
     entries: &[WalEntry],
     dimension: usize,
     quantization: Quantization,
+    compaction_gen: u8,
     fsync: bool,
 ) -> SearchResult<()> {
     let mut file = OpenOptions::new()
@@ -322,7 +324,7 @@ pub(crate) fn append_wal_batch(
     // Use file length instead of a separate exists() check to avoid a TOCTOU
     // race between checking existence and opening.
     if file.metadata()?.len() == 0 {
-        write_wal_header(&mut file, dimension, quantization)?;
+        write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
     }
 
     // Build batch bytes.
@@ -360,13 +362,15 @@ fn write_wal_header(
     writer: &mut impl Write,
     dimension: usize,
     quantization: Quantization,
+    compaction_gen: u8,
 ) -> SearchResult<()> {
     let mut header = Vec::with_capacity(WAL_HEADER_SIZE);
     header.extend_from_slice(&WAL_MAGIC);
     header.extend_from_slice(&WAL_VERSION.to_le_bytes());
     header.extend_from_slice(&(dimension as u32).to_le_bytes());
     header.push(quantization as u8);
-    header.extend_from_slice(&[0u8; 5]); // reserved
+    header.push(compaction_gen);
+    header.extend_from_slice(&[0u8; 4]); // reserved
     let crc = crc32_of(&header);
     header.extend_from_slice(&crc.to_le_bytes());
     writer.write_all(&header)?;
@@ -443,9 +447,10 @@ mod tests {
         let dim = 4;
         let entries = vec![make_entry("doc-0", 1.0, dim), make_entry("doc-1", 2.0, dim)];
 
-        append_wal_batch(&path, &entries, dim, Quantization::F16, false).unwrap();
+        append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false).unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, generation) = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(generation, 0);
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].doc_id, "doc-0");
         assert_eq!(loaded[1].doc_id, "doc-1");
@@ -465,6 +470,7 @@ mod tests {
             &[make_entry("doc-0", 1.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -473,11 +479,13 @@ mod tests {
             &[make_entry("doc-1", 2.0, dim), make_entry("doc-2", 3.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, generation) = read_wal(&path, dim, Quantization::F16).unwrap();
+        assert_eq!(generation, 0);
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].doc_id, "doc-0");
         assert_eq!(loaded[1].doc_id, "doc-1");
@@ -496,6 +504,7 @@ mod tests {
             &[make_entry("doc-good", 1.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -507,7 +516,7 @@ mod tests {
         data.extend_from_slice(&[0xFF; 3]); // truncated entry
         std::fs::write(&path, &data).unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1, "only the good batch should survive");
         assert_eq!(loaded[0].doc_id, "doc-good");
 
@@ -524,6 +533,7 @@ mod tests {
             &[make_entry("doc-good", 1.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -532,6 +542,7 @@ mod tests {
             &[make_entry("doc-bad", 2.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -542,7 +553,7 @@ mod tests {
         data[last_byte] ^= 0xFF;
         std::fs::write(&path, &data).unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(
             loaded.len(),
             1,
@@ -556,7 +567,7 @@ mod tests {
     #[test]
     fn nonexistent_wal_returns_empty() {
         let path = temp_wal_path("nonexistent");
-        let loaded = read_wal(&path, 4, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -568,6 +579,7 @@ mod tests {
             &[make_entry("doc-0", 1.0, 4)],
             4,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -584,9 +596,9 @@ mod tests {
         let dim = 4;
         let entries = vec![make_entry("doc-0", 0.123_456, dim)];
 
-        append_wal_batch(&path, &entries, dim, Quantization::F32, false).unwrap();
+        append_wal_batch(&path, &entries, dim, Quantization::F32, 0, false).unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F32).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F32).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(
             (loaded[0].embedding[0] - 0.123_456).abs() < f32::EPSILON,
@@ -662,7 +674,7 @@ mod tests {
     fn wal_too_small_returns_empty() {
         let path = temp_wal_path("too-small");
         std::fs::write(&path, [0u8; 10]).unwrap();
-        let loaded = read_wal(&path, 4, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
         std::fs::remove_file(&path).ok();
     }
@@ -674,7 +686,8 @@ mod tests {
         header.extend_from_slice(&WAL_VERSION.to_le_bytes());
         header.extend_from_slice(&4_u32.to_le_bytes());
         header.push(Quantization::F16 as u8);
-        header.extend_from_slice(&[0u8; 5]);
+        header.push(0); // compaction_gen
+        header.extend_from_slice(&[0u8; 4]);
         let crc = crc32_of(&header);
         header.extend_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &header).unwrap();
@@ -694,7 +707,8 @@ mod tests {
         header.extend_from_slice(&99_u16.to_le_bytes()); // wrong version
         header.extend_from_slice(&4_u32.to_le_bytes());
         header.push(Quantization::F16 as u8);
-        header.extend_from_slice(&[0u8; 5]);
+        header.push(0); // compaction_gen
+        header.extend_from_slice(&[0u8; 4]);
         let crc = crc32_of(&header);
         header.extend_from_slice(&crc.to_le_bytes());
         std::fs::write(&path, &header).unwrap();
@@ -714,6 +728,7 @@ mod tests {
             &[make_entry("doc-0", 1.0, 4)],
             4,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -733,6 +748,7 @@ mod tests {
             &[make_entry("doc-0", 1.0, 4)],
             4,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -753,8 +769,8 @@ mod tests {
     fn empty_batch_roundtrip() {
         let path = temp_wal_path("empty-batch");
         let dim = 4;
-        append_wal_batch(&path, &[], dim, Quantization::F16, false).unwrap();
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        append_wal_batch(&path, &[], dim, Quantization::F16, 0, false).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
         std::fs::remove_file(&path).ok();
     }
@@ -841,11 +857,12 @@ mod tests {
             &[make_entry("doc-sync", 1.0, dim)],
             dim,
             Quantization::F16,
+            0,
             true,
         )
         .unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-sync");
         std::fs::remove_file(&path).ok();
@@ -860,6 +877,7 @@ mod tests {
             &[make_entry("doc-0", 1.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -872,6 +890,7 @@ mod tests {
             &[make_entry("doc-1", 2.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -882,7 +901,7 @@ mod tests {
         // File should be larger
         assert!(data_after_second.len() > data_after_first.len());
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 2);
         std::fs::remove_file(&path).ok();
     }
@@ -896,6 +915,7 @@ mod tests {
             &[make_entry("doc-good", 1.0, dim)],
             dim,
             Quantization::F16,
+            0,
             false,
         )
         .unwrap();
@@ -906,7 +926,7 @@ mod tests {
         data.extend_from_slice(&1_u32.to_le_bytes());
         std::fs::write(&path, &data).unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-good");
         std::fs::remove_file(&path).ok();
@@ -922,8 +942,8 @@ mod tests {
             embedding: vec![0.123_456, -0.987_654],
         }];
 
-        append_wal_batch(&path, &entries, dim, Quantization::F16, false).unwrap();
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         // F16 has ~3 decimal digits of precision
         assert!((loaded[0].embedding[0] - 0.123_456).abs() < 0.001);
@@ -942,8 +962,8 @@ mod tests {
             embedding: vec![val, -val, 0.0],
         }];
 
-        append_wal_batch(&path, &entries, dim, Quantization::F32, false).unwrap();
-        let loaded = read_wal(&path, dim, Quantization::F32).unwrap();
+        append_wal_batch(&path, &entries, dim, Quantization::F32, 0, false).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F32).unwrap();
         assert!((loaded[0].embedding[0] - val).abs() < f32::EPSILON);
         assert!((loaded[0].embedding[1] + val).abs() < f32::EPSILON);
         assert!(loaded[0].embedding[2].abs() < f32::EPSILON);
@@ -967,9 +987,9 @@ mod tests {
             doc_id_hash: crate::fnv1a_hash(b"doc-0"),
             embedding: vec![1.0, 2.0, 3.0],
         }];
-        append_wal_batch(&path, &entries, dim, Quantization::F16, false).unwrap();
+        append_wal_batch(&path, &entries, dim, Quantization::F16, 0, false).unwrap();
 
-        let loaded = read_wal(&path, dim, Quantization::F16).unwrap();
+        let (loaded, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-0");
         std::fs::remove_file(&path).ok();

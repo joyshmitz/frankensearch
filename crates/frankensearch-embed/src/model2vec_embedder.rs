@@ -52,8 +52,8 @@ const DEFAULT_HF_ID: &str = "minishlab/potion-multilingual-128M";
 pub struct Model2VecEmbedder {
     /// `HuggingFace` BPE tokenizer.
     tokenizer: Tokenizer,
-    /// Embedding matrix: `embeddings[token_id]` → f32 vector of length `dimensions`.
-    embeddings: Vec<Vec<f32>>,
+    /// Flat embedding matrix: `embeddings[token_id * dim .. (token_id + 1) * dim]`.
+    embeddings: Vec<f32>,
     /// Output dimensionality.
     dimensions: usize,
     /// Vocabulary size (number of rows in the embedding matrix).
@@ -225,7 +225,9 @@ impl Model2VecEmbedder {
         for &token_id in token_ids {
             let idx = token_id as usize;
             if idx < self.vocab_size {
-                let row = &self.embeddings[idx];
+                let start = idx * self.dimensions;
+                let end = start + self.dimensions;
+                let row = &self.embeddings[start..end];
                 for (s, r) in sum.iter_mut().zip(row.iter()) {
                     *s += r;
                 }
@@ -331,14 +333,10 @@ fn discover_tensor_name(safetensors: &SafeTensors<'_>) -> Option<String> {
     None
 }
 
-/// Parse raw bytes from a safetensors tensor into a `Vec<Vec<f32>>` matrix.
+/// Parse raw bytes from a safetensors tensor into a flat `Vec<f32>` matrix.
 ///
 /// Expects little-endian f32 data with shape `[vocab_size, dimensions]`.
-fn parse_f32_matrix(
-    data: &[u8],
-    vocab_size: usize,
-    dimensions: usize,
-) -> Result<Vec<Vec<f32>>, String> {
+fn parse_f32_matrix(data: &[u8], vocab_size: usize, dimensions: usize) -> Result<Vec<f32>, String> {
     let expected_bytes = vocab_size * dimensions * 4;
     if data.len() < expected_bytes {
         return Err(format!(
@@ -347,21 +345,23 @@ fn parse_f32_matrix(
         ));
     }
 
-    let mut matrix = Vec::with_capacity(vocab_size);
+    // Pre-allocate the exact size
+    let mut matrix = Vec::with_capacity(vocab_size * dimensions);
 
-    for row_idx in 0..vocab_size {
-        let mut row = Vec::with_capacity(dimensions);
-        let row_offset = row_idx * dimensions * 4;
+    // Parse bytes in 4-byte chunks
+    for chunk in data.chunks_exact(4) {
+        let bytes: [u8; 4] = chunk
+            .try_into()
+            .map_err(|_| "byte slice conversion failed".to_string())?;
+        matrix.push(f32::from_le_bytes(bytes));
+    }
 
-        for col_idx in 0..dimensions {
-            let offset = row_offset + col_idx * 4;
-            let bytes: [u8; 4] = data[offset..offset + 4]
-                .try_into()
-                .map_err(|_| "byte slice conversion failed".to_string())?;
-            row.push(f32::from_le_bytes(bytes));
-        }
-
-        matrix.push(row);
+    if matrix.len() != vocab_size * dimensions {
+        return Err(format!(
+            "parsed element count mismatch: expected {}, got {}",
+            vocab_size * dimensions,
+            matrix.len()
+        ));
     }
 
     Ok(matrix)
@@ -804,9 +804,9 @@ mod tests {
             .collect();
 
         let matrix = parse_f32_matrix(&data, 2, 2).unwrap();
-        assert_eq!(matrix.len(), 2);
-        assert_eq!(matrix[0], vec![1.0, 2.0]);
-        assert_eq!(matrix[1], vec![3.0, 4.0]);
+        assert_eq!(matrix.len(), 4);
+        assert_eq!(&matrix[0..2], &[1.0, 2.0]);
+        assert_eq!(&matrix[2..4], &[3.0, 4.0]);
     }
 
     #[test]

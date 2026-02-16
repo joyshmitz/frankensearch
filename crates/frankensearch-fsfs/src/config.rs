@@ -1237,6 +1237,8 @@ fn expand_home_prefix(path: &Path, home_dir: &Path) -> PathBuf {
     for segment in components {
         match segment {
             Component::Normal(part) => expanded.push(part),
+            Component::CurDir => expanded.push("."),
+            Component::ParentDir => expanded.push(".."),
             _ => return path.to_path_buf(),
         }
     }
@@ -2690,7 +2692,7 @@ fn normalize_reason_codes(reason_codes: &mut Vec<String>) {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::SearchError;
@@ -3042,6 +3044,22 @@ mod tests {
             "[storage]\nsummary_retention_days = 0\n",
             "storage.summary_retention_days",
         );
+    }
+
+    #[test]
+    fn expand_home_prefix_supports_dots() {
+        let home = Path::new("/home/tester");
+
+        let path = Path::new("~/.config/../data/./file.txt");
+        let expanded = super::expand_home_prefix(path, home);
+        assert_eq!(
+            expanded,
+            PathBuf::from("/home/tester/.config/../data/./file.txt")
+        );
+
+        let path_parent = Path::new("~/../outside");
+        let expanded_parent = super::expand_home_prefix(path_parent, home);
+        assert_eq!(expanded_parent, PathBuf::from("/home/tester/../outside"));
     }
 
     #[test]

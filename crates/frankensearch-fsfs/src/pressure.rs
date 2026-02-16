@@ -890,7 +890,11 @@ impl PressureSignal {
 
     #[must_use]
     pub fn ewma(self, previous: Self, alpha: f64) -> Self {
-        let alpha = alpha.clamp(0.0, 1.0);
+        let alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.3 // Default alpha for non-finite input
+        };
         let blend = |current: f64, prior: f64| alpha.mul_add(current, (1.0 - alpha) * prior);
         Self::new(
             blend(self.cpu_pct, previous.cpu_pct),
@@ -1926,6 +1930,19 @@ mod tests {
         // alpha < 0.0 clamped to 0.0 → fully previous
         let full_prev = curr.ewma(prev, -1.0);
         assert!((full_prev.cpu_pct - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pressure_signal_ewma_nan_alpha_uses_default() {
+        let prev = PressureSignal::new(100.0, 100.0, 100.0, 100.0);
+        let curr = PressureSignal::new(50.0, 50.0, 50.0, 50.0);
+        let blended = curr.ewma(prev, f64::NAN);
+        // NaN alpha should fallback to 0.3, so: 0.3 * 50 + 0.7 * 100 = 85.0
+        assert!(
+            (blended.cpu_pct - 85.0).abs() < 0.01,
+            "expected ~85.0, got {}",
+            blended.cpu_pct,
+        );
     }
 
     #[test]

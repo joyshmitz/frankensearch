@@ -143,6 +143,11 @@ telemetry_adapter_classify_stage_failure_reason() {
     return 0
   fi
 
+  if grep -Fq "Project sync failed: rsync failed" <<<"$transcript_tail"; then
+    printf "%s" "telemetry_adapter.stage.remote_worker_sync_failed"
+    return 0
+  fi
+
   if grep -Fq "does not contain this feature" <<<"$transcript_tail"; then
     printf "%s" "telemetry_adapter.stage.invalid_feature_flag"
     return 0
@@ -154,6 +159,23 @@ telemetry_adapter_classify_stage_failure_reason() {
   fi
 
   printf "%s" "telemetry_adapter.stage.failed"
+}
+
+telemetry_adapter_run_local_circuit_fallback() {
+  local repo="$1"
+  shift
+  local -a cargo_cmd=("$@")
+
+  {
+    printf '$ (cd %q && CARGO_TARGET_DIR=%q RCH_MOCK_CIRCUIT_OPEN=1 rch exec --' "$repo" "$TELEMETRY_ADAPTER_CARGO_TARGET_DIR"
+    printf ' %q' "${cargo_cmd[@]}"
+    printf ')\n'
+  } >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT"
+
+  (
+    cd "$repo" &&
+    CARGO_TARGET_DIR="$TELEMETRY_ADAPTER_CARGO_TARGET_DIR" RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- "${cargo_cmd[@]}"
+  ) >>"$TELEMETRY_ADAPTER_TRANSCRIPT_TXT" 2>&1
 }
 
 telemetry_adapter_run_rch_cargo() {
@@ -241,6 +263,48 @@ telemetry_adapter_run_rch_cargo() {
   TELEMETRY_ADAPTER_LAST_FAILURE_STAGE="$stage"
   TELEMETRY_ADAPTER_LAST_FAILURE_EXIT_CODE="$exit_code"
   failure_reason="$(telemetry_adapter_classify_stage_failure_reason "$exit_code")"
+
+  if [[ "$failure_reason" == "telemetry_adapter.stage.remote_path_dependency_missing" || "$failure_reason" == "telemetry_adapter.stage.remote_dependency_resolution_failed" || "$failure_reason" == "telemetry_adapter.stage.remote_worker_sync_failed" ]]; then
+    telemetry_adapter_emit_event \
+      "$stage" \
+      "warn" \
+      "telemetry_adapter.stage.retrying_local_circuit" \
+      "remote dependency issue (${failure_reason}); retrying with local-circuit mode"
+
+    local fallback_start_ts
+    local fallback_end_ts
+    local fallback_duration_s
+    local fallback_exit
+    fallback_start_ts="$(date +%s)"
+    # Keep fallback invocation in condition context so `set -e` does not
+    # short-circuit the script before we can classify/log fallback failures.
+    if telemetry_adapter_run_local_circuit_fallback "$repo" "${cargo_cmd[@]}"; then
+      fallback_exit=0
+      fallback_end_ts="$(date +%s)"
+      fallback_duration_s=$((fallback_end_ts - fallback_start_ts))
+      telemetry_adapter_emit_event \
+        "$stage" \
+        "ok" \
+        "telemetry_adapter.stage.ok_local_circuit_fallback" \
+        "local-circuit fallback succeeded in ${fallback_duration_s}s after ${failure_reason}"
+      telemetry_adapter_mark_stage_completed
+      TELEMETRY_ADAPTER_ACTIVE_STAGE=""
+      return 0
+    else
+      fallback_exit=$?
+      fallback_end_ts="$(date +%s)"
+      fallback_duration_s=$((fallback_end_ts - fallback_start_ts))
+      failure_reason="telemetry_adapter.stage.local_circuit_fallback_failed"
+      exit_code="$fallback_exit"
+      duration_s=$((duration_s + fallback_duration_s))
+      telemetry_adapter_emit_event \
+        "$stage" \
+        "fail" \
+        "$failure_reason" \
+        "local-circuit fallback failed (exit_code=${fallback_exit}, duration_s=${fallback_duration_s})"
+    fi
+  fi
+
   TELEMETRY_ADAPTER_RUN_STATUS="fail"
   TELEMETRY_ADAPTER_RUN_REASON_CODE="$failure_reason"
   TELEMETRY_ADAPTER_RUN_MESSAGE="stage ${stage} failed (reason_code=${failure_reason}, exit_code=${exit_code}, duration_s=${duration_s})"

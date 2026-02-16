@@ -203,9 +203,14 @@ impl InteractionLatencyHooks {
         }
     }
 
+    /// Returns the total component budget in milliseconds.
+    ///
+    /// Uses `u32` to avoid overflow when summing three `u16` fields.
     #[must_use]
-    pub const fn component_budget_ms(self) -> u16 {
-        self.input_to_route_ms + self.route_to_state_ms + self.state_to_render_ms
+    pub const fn component_budget_ms(self) -> u32 {
+        self.input_to_route_ms as u32
+            + self.route_to_state_ms as u32
+            + self.state_to_render_ms as u32
     }
 
     fn validate(self, surface: InteractionSurfaceKind) -> Result<(), ShowcaseInteractionSpecError> {
@@ -219,7 +224,7 @@ impl InteractionLatencyHooks {
                 "latency hooks must all be > 0".to_owned(),
             ));
         }
-        if self.component_budget_ms() > self.frame_budget_ms {
+        if self.component_budget_ms() > u32::from(self.frame_budget_ms) {
             return Err(ShowcaseInteractionSpecError::InvalidLatencyBudget(
                 surface,
                 format!(
@@ -743,7 +748,7 @@ mod tests {
         for surface in &spec.surfaces {
             assert!(
                 surface.latency_hooks.component_budget_ms()
-                    <= surface.latency_hooks.frame_budget_ms
+                    <= u32::from(surface.latency_hooks.frame_budget_ms)
             );
         }
     }

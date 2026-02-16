@@ -1280,6 +1280,7 @@ mod tests {
                 quality_score: None,
                 lexical_score: None,
                 rerank_score: None,
+                explanation: None,
                 metadata: None,
             },
             source_index: "primary".into(),

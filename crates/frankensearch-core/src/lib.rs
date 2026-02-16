@@ -22,6 +22,7 @@ pub mod explanation;
 pub mod filter;
 pub mod fingerprint;
 pub mod generation;
+pub mod graph;
 pub mod host_adapter;
 pub mod metrics_eval;
 pub mod observability_lint;
@@ -100,6 +101,7 @@ pub use generation::{
     ValidationFinding, ValidationResult, VectorArtifact, compute_manifest_hash, require_valid,
     validate_manifest,
 };
+pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
     AdapterIdentity, AdapterLifecycleEvent, AdapterSink, CanonicalHostProject, ConformanceConfig,
     ConformanceHarness, ConformanceReport, ConformanceViolation,

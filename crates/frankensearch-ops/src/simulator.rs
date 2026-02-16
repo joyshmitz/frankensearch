@@ -801,6 +801,7 @@ fn build_results(
             quality_score: Some(0.9),
             lexical_score: Some(4.2),
             rerank_score: None,
+            explanation: None,
             metadata: None,
         });
     }
@@ -1623,6 +1624,7 @@ mod tests {
                     quality_score: None,
                     lexical_score: None,
                     rerank_score: None,
+                    explanation: None,
                     metadata: None,
                 },
                 ScoredResult {
@@ -1633,6 +1635,7 @@ mod tests {
                     quality_score: None,
                     lexical_score: None,
                     rerank_score: None,
+                    explanation: None,
                     metadata: None,
                 },
             ],

@@ -92,7 +92,12 @@ impl S3FifoConfig {
         clippy::cast_precision_loss
     )]
     fn max_small_bytes(&self) -> usize {
-        (self.max_bytes as f64 * self.small_ratio) as usize
+        let ratio = if self.small_ratio.is_finite() {
+            self.small_ratio.clamp(0.0, 1.0)
+        } else {
+            0.10 // Default fallback for NaN/Inf
+        };
+        (self.max_bytes as f64 * ratio) as usize
     }
 
     fn max_main_bytes(&self) -> usize {
@@ -204,14 +209,19 @@ where
 {
     fn get(&self, key: &K) -> Option<V> {
         let mut state = self.state.lock().expect("cache lock poisoned");
+        let alpha = if self.config.hit_rate_alpha.is_finite() {
+            self.config.hit_rate_alpha.clamp(0.0, 1.0)
+        } else {
+            0.01 // Default fallback for NaN/Inf
+        };
         if let Some(entry) = state.entries.get_mut(key) {
             entry.freq = entry.freq.saturating_add(1);
             let value = entry.value.clone();
-            let decay = 1.0 - self.config.hit_rate_alpha;
-            state.hit_rate_ema = decay.mul_add(state.hit_rate_ema, self.config.hit_rate_alpha);
+            let decay = 1.0 - alpha;
+            state.hit_rate_ema = decay.mul_add(state.hit_rate_ema, alpha);
             Some(value)
         } else {
-            state.hit_rate_ema *= 1.0 - self.config.hit_rate_alpha;
+            state.hit_rate_ema *= 1.0 - alpha;
             None
         }
     }
@@ -1055,5 +1065,37 @@ mod tests {
 
         // Entry should still be retrievable (no overflow panic).
         assert_eq!(cache.get(&"sat"), Some(1));
+    }
+
+    #[test]
+    fn nan_small_ratio_uses_default() {
+        let cache = S3FifoCache::new(S3FifoConfig {
+            max_bytes: 1000,
+            small_ratio: f64::NAN,
+            freq_threshold: 1,
+            hit_rate_alpha: 0.1,
+        });
+        // NaN small_ratio should fallback to 0.10; cache should function normally.
+        cache.insert("a", 1, 100);
+        assert_eq!(cache.get(&"a"), Some(1));
+    }
+
+    #[test]
+    fn nan_hit_rate_alpha_does_not_poison_ema() {
+        let cache = S3FifoCache::new(S3FifoConfig {
+            max_bytes: 1000,
+            small_ratio: 0.10,
+            freq_threshold: 1,
+            hit_rate_alpha: f64::NAN,
+        });
+        cache.insert("a", 1, 100);
+        // NaN hit_rate_alpha should fallback to 0.01; hit_rate must stay finite.
+        let _ = cache.get(&"a");
+        let _ = cache.get(&"missing");
+        assert!(
+            cache.hit_rate().is_finite(),
+            "hit_rate must remain finite with NaN alpha, got {}",
+            cache.hit_rate(),
+        );
     }
 }

@@ -212,7 +212,11 @@ impl PressureSensor {
         Self {
             state: ControlState::Normal,
             smoothed: SmoothedReadings::zero(),
-            alpha: alpha.clamp(0.0, 1.0),
+            alpha: if alpha.is_finite() {
+                alpha.clamp(0.0, 1.0)
+            } else {
+                0.3 // Default alpha for non-finite input
+            },
             anti_flap_threshold: anti_flap.max(1),
             consecutive_toward: 0,
             pending_state: None,
@@ -780,6 +784,30 @@ mod tests {
         assert_eq!(sensor.current_state(), ControlState::Normal);
         assert!(sensor.smoothed_readings().cpu_pct.abs() < f64::EPSILON);
         assert!(sensor.smoothed_readings().load_avg.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn nan_alpha_falls_back_to_default() {
+        // NaN alpha should not poison EWMA calculations.
+        let mut sensor = PressureSensor::new(PressureThresholds::default(), f64::NAN, 1);
+        // High CPU sample should still cause transition with fallback alpha.
+        let hot = make_sample(65.0, 100, 0, 0, 0.0);
+        let result = sensor.process_sample(&hot);
+        assert!(result.is_some(), "NaN alpha must not freeze state machine");
+        assert_eq!(sensor.current_state(), ControlState::Constrained);
+        assert!(
+            sensor.smoothed_readings().cpu_pct.is_finite(),
+            "smoothed readings must remain finite"
+        );
+    }
+
+    #[test]
+    fn infinity_alpha_falls_back_to_default() {
+        let mut sensor = PressureSensor::new(PressureThresholds::default(), f64::INFINITY, 1);
+        let hot = make_sample(65.0, 100, 0, 0, 0.0);
+        let result = sensor.process_sample(&hot);
+        assert!(result.is_some(), "Inf alpha must not freeze state machine");
+        assert!(sensor.smoothed_readings().cpu_pct.is_finite());
     }
 
     #[test]

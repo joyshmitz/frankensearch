@@ -115,6 +115,7 @@ fn main() {
                 quality_score: None,
                 lexical_score: Some((n - i) as f32),
                 rerank_score: None,
+                explanation: None,
                 metadata: None,
             })
             .collect();
