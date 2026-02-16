@@ -2922,35 +2922,55 @@ mod tests {
         });
     }
 
+    /// Convert a `ParsedQuery` to `NormalizedExclusions` for testing.
+    fn to_exclusions(parsed: &ParsedQuery) -> NormalizedExclusions {
+        NormalizedExclusions {
+            terms: parsed
+                .negative_terms
+                .iter()
+                .map(|t| normalize_for_negation_match(t))
+                .collect(),
+            phrases: parsed
+                .negative_phrases
+                .iter()
+                .map(|p| normalize_for_negation_match(p))
+                .collect(),
+        }
+    }
+
     #[test]
     fn exclusion_matching_normalizes_unicode_forms() {
         let parsed = ParsedQuery::parse("rust -café");
+        let exclusions = to_exclusions(&parsed);
         let decomposed_text = "safe docs with caf\u{0065}\u{0301} references";
-        let matched = find_negative_match(decomposed_text, &parsed);
+        let matched = find_negative_match(decomposed_text, &exclusions);
         assert_eq!(matched, Some("café".to_owned()));
     }
 
     #[test]
     fn exclusion_term_matching_requires_word_boundaries_for_word_terms() {
         let parsed = ParsedQuery::parse("query -he");
+        let exclusions = to_exclusions(&parsed);
         let text = "the theorem should stay included";
-        let matched = find_negative_match(text, &parsed);
+        let matched = find_negative_match(text, &exclusions);
         assert_eq!(matched, None);
     }
 
     #[test]
     fn exclusion_term_matching_excludes_whole_word_occurrences() {
         let parsed = ParsedQuery::parse("query -he");
+        let exclusions = to_exclusions(&parsed);
         let text = "we saw he walk home";
-        let matched = find_negative_match(text, &parsed);
+        let matched = find_negative_match(text, &exclusions);
         assert_eq!(matched, Some("he".to_owned()));
     }
 
     #[test]
     fn exclusion_term_matching_keeps_substring_behavior_for_path_like_terms() {
         let parsed = ParsedQuery::parse("query -src/main.rs");
+        let exclusions = to_exclusions(&parsed);
         let text = "candidate path=/workspace/src/main.rs.bak";
-        let matched = find_negative_match(text, &parsed);
+        let matched = find_negative_match(text, &exclusions);
         assert_eq!(matched, Some("src/main.rs".to_owned()));
     }
 
@@ -4191,37 +4211,42 @@ mod tests {
     fn find_negative_match_empty_term_skipped() {
         let mut parsed = ParsedQuery::parse("query");
         parsed.negative_terms.push(String::new());
-        let result = find_negative_match("any document text", &parsed);
+        let exclusions = to_exclusions(&parsed);
+        let result = find_negative_match("any document text", &exclusions);
         assert!(result.is_none());
     }
 
     #[test]
     fn find_negative_match_phrase_substring() {
         let parsed = ParsedQuery::parse(r#"query NOT "danger zone""#);
-        let matched = find_negative_match("entering the danger zone now", &parsed);
+        let exclusions = to_exclusions(&parsed);
+        let matched = find_negative_match("entering the danger zone now", &exclusions);
         assert_eq!(matched, Some("danger zone".to_owned()));
     }
 
     #[test]
     fn find_negative_match_phrase_not_found() {
         let parsed = ParsedQuery::parse(r#"query NOT "exact phrase""#);
-        let matched = find_negative_match("different text entirely", &parsed);
+        let exclusions = to_exclusions(&parsed);
+        let matched = find_negative_match("different text entirely", &exclusions);
         assert!(matched.is_none());
     }
 
     #[test]
     fn should_exclude_document_returns_false_when_text_fn_returns_none() {
         let parsed = ParsedQuery::parse("query -unsafe");
-        let result = should_exclude_document("doc-1", &parsed, &|_| None, "test");
+        let exclusions = to_exclusions(&parsed);
+        let result = should_exclude_document("doc-1", &exclusions, &|_| None, "test");
         assert!(!result);
     }
 
     #[test]
     fn should_exclude_document_returns_true_when_text_matches_negation() {
         let parsed = ParsedQuery::parse("query -unsafe");
+        let exclusions = to_exclusions(&parsed);
         let result = should_exclude_document(
             "doc-1",
-            &parsed,
+            &exclusions,
             &|_| Some("unsafe code".to_owned()),
             "test",
         );
@@ -4231,22 +4256,25 @@ mod tests {
     #[test]
     fn should_exclude_document_returns_false_when_text_doesnt_match() {
         let parsed = ParsedQuery::parse("query -unsafe");
+        let exclusions = to_exclusions(&parsed);
         let result =
-            should_exclude_document("doc-1", &parsed, &|_| Some("safe code".to_owned()), "test");
+            should_exclude_document("doc-1", &exclusions, &|_| Some("safe code".to_owned()), "test");
         assert!(!result);
     }
 
     #[test]
     fn filter_scored_results_by_negations_empty_input() {
         let parsed = ParsedQuery::parse("query -foo");
-        let results = filter_scored_results_by_negations(vec![], &parsed, &|_| None, "test");
+        let exclusions = to_exclusions(&parsed);
+        let results = filter_scored_results_by_negations(vec![], &exclusions, &|_| None, "test");
         assert!(results.is_empty());
     }
 
     #[test]
     fn filter_vector_hits_by_negations_empty_input() {
         let parsed = ParsedQuery::parse("query -foo");
-        let results = filter_vector_hits_by_negations(vec![], &parsed, &|_| None, "test");
+        let exclusions = to_exclusions(&parsed);
+        let results = filter_vector_hits_by_negations(vec![], &exclusions, &|_| None, "test");
         assert!(results.is_empty());
     }
 
