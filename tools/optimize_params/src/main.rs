@@ -350,6 +350,7 @@ impl EvalContext {
                     doc_id: self.doc_ids[*i].clone(),
                     score: *s as f32,
                     source: ScoreSource::Lexical,
+                    index: None,
                     fast_score: None,
                     quality_score: None,
                     lexical_score: Some(*s as f32),

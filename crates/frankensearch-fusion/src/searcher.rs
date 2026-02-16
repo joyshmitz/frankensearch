@@ -1087,6 +1087,7 @@ impl TwoTierSearcher {
                     doc_id: hit.doc_id.clone(),
                     score: hit.score,
                     source,
+                    index: None,
                     fast_score,
                     quality_score,
                     lexical_score: initial.and_then(|result| result.lexical_score),
