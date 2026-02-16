@@ -711,13 +711,19 @@ pub fn deterministic_hash(seed: MaskSeed, value: &str) -> String {
 /// Apply deterministic truncation to a value.
 ///
 /// Keeps the first `max_len` characters and appends `...` if truncated.
+/// Uses character count (not byte length) so multi-byte UTF-8 is handled
+/// correctly.
 #[must_use]
 pub fn deterministic_truncate(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        return value.to_string();
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_len).collect();
+    if chars.next().is_some() {
+        // More chars remain — value was actually truncated.
+        format!("{truncated}...")
+    } else {
+        // All chars fit within max_len — return the original value.
+        value.to_string()
     }
-    let truncated: String = value.chars().take(max_len).collect();
-    format!("{truncated}...")
 }
 
 // ─── Policy Engine ──────────────────────────────────────────────────────────
@@ -1190,6 +1196,35 @@ mod tests {
     fn truncate_exact_length() {
         let result = deterministic_truncate("exactly10!", 10);
         assert_eq!(result, "exactly10!");
+    }
+
+    #[test]
+    fn truncate_multibyte_chars_within_limit() {
+        // "café" = 4 chars, 5 bytes (é is 2 bytes in UTF-8).
+        // With max_len=4, all chars fit — no truncation should occur.
+        let result = deterministic_truncate("café", 4);
+        assert_eq!(result, "café");
+    }
+
+    #[test]
+    fn truncate_multibyte_chars_exceeding_limit() {
+        // "café" = 4 chars; max_len=3 → keep first 3 chars + "...".
+        let result = deterministic_truncate("café", 3);
+        assert_eq!(result, "caf...");
+    }
+
+    #[test]
+    fn truncate_cjk_within_limit() {
+        // 3 CJK chars = 9 bytes; max_len=3 chars → all fit.
+        let result = deterministic_truncate("日本語", 3);
+        assert_eq!(result, "日本語");
+    }
+
+    #[test]
+    fn truncate_cjk_exceeding_limit() {
+        // 3 CJK chars; max_len=2 → keep first 2 + "...".
+        let result = deterministic_truncate("日本語", 2);
+        assert_eq!(result, "日本...");
     }
 
     // ─── Policy Engine ──────────────────────────────────────────────────

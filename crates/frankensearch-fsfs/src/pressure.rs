@@ -13,6 +13,8 @@ use std::time::Duration;
 
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
+use sysinfo::System;
 
 use crate::config::PressureProfile;
 
@@ -1173,14 +1175,13 @@ pub struct ProcIoCounters {
 pub struct HostPressureCollector {
     io_ceiling_mib_per_sec: f64,
     previous_io: Option<ProcIoCounters>,
+    #[cfg(not(target_os = "linux"))]
+    system: System,
 }
 
 impl Default for HostPressureCollector {
     fn default() -> Self {
-        Self {
-            io_ceiling_mib_per_sec: DEFAULT_IO_CEILING_MIB_PER_SEC,
-            previous_io: None,
-        }
+        Self::new(DEFAULT_IO_CEILING_MIB_PER_SEC).expect("default config valid")
     }
 }
 
@@ -1199,6 +1200,13 @@ impl HostPressureCollector {
         Ok(Self {
             io_ceiling_mib_per_sec,
             previous_io: None,
+            #[cfg(not(target_os = "linux"))]
+            system: {
+                let mut s = System::new();
+                s.refresh_cpu_all();
+                s.refresh_memory();
+                s
+            },
         })
     }
 
@@ -1235,8 +1243,34 @@ impl HostPressureCollector {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (interval, memory_ceiling_mb);
-            Ok(PressureSignal::new(0.0, 0.0, 0.0, 0.0))
+            let _ = interval;
+            self.system.refresh_cpu_all();
+            self.system.refresh_memory();
+
+            let cpu_pct = f64::from(self.system.global_cpu_usage());
+
+            // RSS: sysinfo gives us per-process info via Pid lookup.
+            let pid = sysinfo::get_current_pid().ok();
+            let rss_bytes = pid
+                .and_then(|p| {
+                    self.system
+                        .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+                    self.system.process(p).map(sysinfo::Process::memory)
+                })
+                .unwrap_or(0);
+            
+            let effective_memory_ceiling_mb = memory_ceiling_mb.max(1);
+            let memory_pct = normalize_pct(
+                (rss_bytes as f64 / (effective_memory_ceiling_mb as f64 * 1024.0 * 1024.0)) * 100.0,
+            );
+
+            // IO and Load are harder to get portably/cheaply without async or extra crates.
+            // For now, we report 0.0 for IO/Load on non-Linux, which is better than nothing.
+            // Ideally we'd use get_process_io_counters if available.
+            let io_pct = 0.0;
+            let load_pct = 0.0;
+
+            Ok(PressureSignal::new(cpu_pct, memory_pct, io_pct, load_pct))
         }
     }
 

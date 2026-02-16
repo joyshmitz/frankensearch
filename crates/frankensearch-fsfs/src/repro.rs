@@ -203,13 +203,34 @@ impl Default for RetentionPolicy {
 
 impl RetentionPolicy {
     /// Determine which tier a pack belongs to based on age in days.
+    ///
+    /// If `hot_days > warm_days` (which can happen via `Deserialize`
+    /// bypassing the constructor), `warm_days` is treated as at least
+    /// `hot_days` so the Warm tier is never silently unreachable.
+    /// Similarly, when `cold_max_days > 0` and `cold_max_days < warm_days`,
+    /// `cold_max_days` is clamped up to the effective warm boundary.
     #[must_use]
     pub const fn tier_for_age(&self, age_days: u16) -> Option<RetentionTier> {
+        // Clamp thresholds so tiers are always reachable even if
+        // deserialized values violate hot_days <= warm_days <= cold_max_days.
+        let effective_warm = if self.warm_days >= self.hot_days {
+            self.warm_days
+        } else {
+            self.hot_days
+        };
+        let effective_cold = if self.cold_max_days == 0 {
+            0 // keep forever
+        } else if self.cold_max_days >= effective_warm {
+            self.cold_max_days
+        } else {
+            effective_warm
+        };
+
         if age_days <= self.hot_days {
             Some(RetentionTier::Hot)
-        } else if age_days <= self.warm_days {
+        } else if age_days <= effective_warm {
             Some(RetentionTier::Warm)
-        } else if self.cold_max_days == 0 || age_days <= self.cold_max_days {
+        } else if effective_cold == 0 || age_days <= effective_cold {
             Some(RetentionTier::Cold)
         } else {
             None // expired
@@ -1046,6 +1067,40 @@ mod tests {
 
         assert_eq!(policy.tier_for_age(180), Some(RetentionTier::Cold));
         assert_eq!(policy.tier_for_age(181), None); // expired
+    }
+
+    #[test]
+    fn retention_inverted_hot_warm_still_reachable() {
+        // Deserialize can set hot_days > warm_days, which would make Warm
+        // unreachable without the effective_warm clamp.
+        let policy = RetentionPolicy {
+            hot_days: 100,
+            warm_days: 50,
+            cold_max_days: 0,
+        };
+        // Below hot_days → Hot.
+        assert_eq!(policy.tier_for_age(50), Some(RetentionTier::Hot));
+        assert_eq!(policy.tier_for_age(100), Some(RetentionTier::Hot));
+        // Above hot_days → effective_warm is clamped to hot_days, so Warm
+        // tier has zero width; jump straight to Cold (keep-forever).
+        assert_eq!(policy.tier_for_age(101), Some(RetentionTier::Cold));
+    }
+
+    #[test]
+    fn retention_inverted_cold_less_than_warm() {
+        // cold_max_days < warm_days is contradictory; the Cold tier gets
+        // clamped to zero-width (effective_cold = effective_warm), so
+        // anything beyond warm_days is immediately expired.
+        let policy = RetentionPolicy {
+            hot_days: 7,
+            warm_days: 90,
+            cold_max_days: 30, // less than warm_days
+        };
+        assert_eq!(policy.tier_for_age(7), Some(RetentionTier::Hot));
+        assert_eq!(policy.tier_for_age(50), Some(RetentionTier::Warm));
+        assert_eq!(policy.tier_for_age(90), Some(RetentionTier::Warm));
+        // effective_cold = effective_warm = 90, so 91 → expired.
+        assert_eq!(policy.tier_for_age(91), None);
     }
 
     #[test]
