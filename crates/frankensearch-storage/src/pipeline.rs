@@ -1253,7 +1253,13 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.buffer
                 .lock()
-                .expect("log buffer lock poisoned")
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!(
+                        target: "frankensearch.pipeline",
+                        "test log buffer lock poisoned; using recovered state"
+                    );
+                    poisoned.into_inner()
+                })
                 .extend_from_slice(buf);
             Ok(buf.len())
         }
@@ -1275,7 +1281,13 @@ mod tests {
             .finish();
         let result = tracing::subscriber::with_default(subscriber, run);
         let logs = {
-            let guard = buffer.lock().expect("log buffer lock poisoned");
+            let guard = buffer.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "frankensearch.pipeline",
+                    "test log buffer lock poisoned; using recovered state"
+                );
+                poisoned.into_inner()
+            });
             String::from_utf8_lossy(&guard).into_owned()
         };
         (result, logs)

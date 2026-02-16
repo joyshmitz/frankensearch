@@ -3563,7 +3563,13 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.buffer
                 .lock()
-                .expect("log buffer lock poisoned")
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!(
+                        target: "frankensearch.ops.storage",
+                        "test log buffer lock poisoned; using recovered state"
+                    );
+                    poisoned.into_inner()
+                })
                 .extend_from_slice(buf);
             Ok(buf.len())
         }
@@ -3574,7 +3580,13 @@ mod tests {
     }
 
     fn with_captured_logs<R>(run: impl FnOnce() -> R) -> (R, String) {
-        let _capture_guard = LOG_CAPTURE_LOCK.lock().expect("log capture lock poisoned");
+        let _capture_guard = LOG_CAPTURE_LOCK.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                target: "frankensearch.ops.storage",
+                "test log capture lock poisoned; using recovered state"
+            );
+            poisoned.into_inner()
+        });
         let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer_buffer = Arc::clone(&buffer);
         let subscriber = tracing_subscriber::fmt()
@@ -3586,7 +3598,13 @@ mod tests {
             .finish();
         let result = tracing::subscriber::with_default(subscriber, run);
         let logs = {
-            let guard = buffer.lock().expect("log buffer lock poisoned");
+            let guard = buffer.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(
+                    target: "frankensearch.ops.storage",
+                    "test log buffer lock poisoned; using recovered state"
+                );
+                poisoned.into_inner()
+            });
             String::from_utf8_lossy(&guard).into_owned()
         };
         (result, logs)
