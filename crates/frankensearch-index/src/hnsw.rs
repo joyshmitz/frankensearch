@@ -54,7 +54,6 @@ impl Default for HnswConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct HnswMeta {
     doc_ids: Vec<String>,
-    vectors: Vec<Vec<f32>>,
     config: HnswConfig,
     dimension: usize,
 }
@@ -84,7 +83,6 @@ pub struct AnnSearchStats {
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistDot>,
     doc_ids: Vec<String>,
-    vectors: Vec<Vec<f32>>,
     dimension: usize,
     config: HnswConfig,
 }
@@ -122,34 +120,47 @@ impl HnswIndex {
         Self::build_from_parts(doc_ids, vectors, dimension, config)
     }
 
-    /// Load an ANN index from disk.
+    /// Load an ANN index from disk, rebuilding the graph using vectors from `source_index`.
+    ///
+    /// The persistent `.hnsw` file only contains metadata and `doc_ids`. The actual
+    /// vector data is read from the provided `VectorIndex` to save disk space and
+    /// ensure consistency.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::IndexCorrupted` if metadata or graph files are missing/malformed.
-    pub fn load(path: &Path) -> SearchResult<Self> {
-        // Load metadata + vectors, then rebuild graph from vectors.
+    /// Returns `SearchError::IndexCorrupted` if metadata is missing/malformed or
+    /// if referenced documents are missing from `source_index`.
+    pub fn load(path: &Path, source_index: &VectorIndex) -> SearchResult<Self> {
         let metadata_bytes = std::fs::read(path).map_err(SearchError::Io)?;
         let meta: HnswMeta = serde_json::from_slice(&metadata_bytes)
             .map_err(|e| ann_corrupted(path, format!("failed to parse HNSW metadata: {e}")))?;
 
-        if meta.doc_ids.len() != meta.vectors.len() {
+        if meta.dimension != source_index.dimension() {
             return Err(ann_corrupted(
                 path,
                 format!(
-                    "metadata mismatch: doc_ids={} vectors={}",
-                    meta.doc_ids.len(),
-                    meta.vectors.len()
+                    "dimension mismatch: hnsw={} source={}",
+                    meta.dimension,
+                    source_index.dimension()
                 ),
             ));
         }
 
-        Self::build_from_parts(meta.doc_ids, meta.vectors, meta.dimension, meta.config)
+        // Rehydrate vectors from source index
+        let mut vectors = Vec::with_capacity(meta.doc_ids.len());
+        for doc_id in &meta.doc_ids {
+            let idx = source_index.find_index_by_doc_id(doc_id)?.ok_or_else(|| {
+                ann_corrupted(path, format!("doc_id '{doc_id}' missing from source index"))
+            })?;
+            vectors.push(source_index.vector_at_f32(idx)?);
+        }
+
+        Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
     }
 
-    /// Persist ANN index to disk.
+    /// Persist ANN index metadata to disk.
     ///
-    /// Writes metadata + vectors to `path`.
+    /// Writes `doc_ids` and config. Does NOT write vectors (they are stored in `VectorIndex`).
     ///
     /// # Errors
     ///
@@ -163,7 +174,6 @@ impl HnswIndex {
 
         let meta = HnswMeta {
             doc_ids: self.doc_ids.clone(),
-            vectors: self.vectors.clone(),
             config: self.config,
             dimension: self.dimension,
         };
@@ -273,6 +283,10 @@ impl HnswIndex {
 
     /// Returns true when this ANN index matches row order and shape of a `VectorIndex`.
     ///
+    /// Since `HnswIndex` no longer stores vectors, this only checks:
+    /// 1. Dimension match.
+    /// 2. `doc_id` sequence match (ignoring tombstones in `VectorIndex`).
+    ///
     /// # Errors
     ///
     /// Propagates decoding errors from `VectorIndex::doc_id_at`.
@@ -286,20 +300,17 @@ impl HnswIndex {
                 continue;
             }
             let Some(expected_doc_id) = self.doc_ids.get(live_position) else {
+                // HNSW has fewer docs than VectorIndex
                 return Ok(false);
             };
             if expected_doc_id != index.doc_id_at(i)? {
                 return Ok(false);
             }
-            let Some(expected_vector) = self.vectors.get(live_position) else {
-                return Ok(false);
-            };
-            let candidate_vector = index.vector_at_f32(i)?;
-            if !vectors_close(expected_vector, &candidate_vector) {
-                return Ok(false);
-            }
+            // We implicitly assume vectors match if doc_ids match, as HNSW
+            // is built *from* the VectorIndex on load.
             live_position = live_position.saturating_add(1);
         }
+        // Check if HNSW has extra docs
         Ok(live_position == self.doc_ids.len())
     }
 
@@ -348,7 +359,6 @@ impl HnswIndex {
                 reason: format!("doc_id count {} must match vector count", doc_ids.len()),
             });
         }
-        let mut source_vectors = Vec::with_capacity(vectors.len());
         let mut normalized_vectors = Vec::with_capacity(vectors.len());
         for (idx, vector) in vectors.into_iter().enumerate() {
             if vector.len() != dimension {
@@ -364,7 +374,6 @@ impl HnswIndex {
                     reason: "all vector values must be finite".to_owned(),
                 });
             }
-            source_vectors.push(vector.clone());
             normalized_vectors.push(normalize_for_dist_dot(vector));
         }
 
@@ -387,7 +396,7 @@ impl HnswIndex {
         Ok(Self {
             hnsw,
             doc_ids,
-            vectors: source_vectors,
+            // vectors: source_vectors, // Removed!
             dimension,
             config,
         })
@@ -782,6 +791,42 @@ mod tests {
             matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "vector"),
             "expected InvalidConfig for non-finite vector, got {error:?}"
         );
+    }
+
+    // ── vector_component_close edge cases ────────────────────────────────
+
+    #[test]
+    fn vector_component_close_rejects_infinity_vs_finite() {
+        // Regression: Inf <= (EPSILON * 8 * Inf) was true, causing false positive.
+        assert!(!vector_component_close(f32::INFINITY, 100.0));
+        assert!(!vector_component_close(100.0, f32::INFINITY));
+        assert!(!vector_component_close(f32::NEG_INFINITY, 0.0));
+        assert!(!vector_component_close(0.0, f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn vector_component_close_accepts_identical_infinities() {
+        assert!(vector_component_close(f32::INFINITY, f32::INFINITY));
+        assert!(vector_component_close(f32::NEG_INFINITY, f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn vector_component_close_rejects_opposite_infinities() {
+        assert!(!vector_component_close(f32::INFINITY, f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn vector_component_close_rejects_nan() {
+        assert!(!vector_component_close(f32::NAN, 0.0));
+        assert!(!vector_component_close(0.0, f32::NAN));
+        assert!(!vector_component_close(f32::NAN, f32::NAN));
+    }
+
+    #[test]
+    fn vector_component_close_accepts_equal_values() {
+        assert!(vector_component_close(0.0, 0.0));
+        assert!(vector_component_close(1.0, 1.0));
+        assert!(vector_component_close(-42.5, -42.5));
     }
 
     // ── knn_search_with_stats boundary conditions ───────────────────────

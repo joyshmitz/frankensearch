@@ -27,7 +27,7 @@
 //! ```
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crc32fast::Hasher as Crc32Hasher;
@@ -329,27 +329,28 @@ pub(crate) fn append_wal_batch(
             file
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // File exists, open in append mode.
-            let file = OpenOptions::new().append(true).open(wal_path)?;
+            // File exists — open in write mode (not append) so we can
+            // seek and truncate in-place without releasing the handle.
+            let mut file = OpenOptions::new().write(true).open(wal_path)?;
             let existing_len = file.metadata()?.len();
             if existing_len < WAL_HEADER_SIZE as u64 {
                 // Empty or truncated file — the creator likely crashed before
-                // flushing the header. Truncate and write a fresh header so
-                // subsequent reads can parse the WAL correctly. No valid data
-                // can exist in a file smaller than the header.
-                drop(file);
+                // flushing the header. Truncate in-place and write a fresh
+                // header. We keep the file handle open to avoid a TOCTOU race
+                // where a concurrent writer could land valid data between a
+                // drop and a reopen-with-truncate.
                 warn!(
                     path = %wal_path.display(),
                     existing_len,
                     "WAL file smaller than header; truncating and writing fresh header"
                 );
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(wal_path)?;
+                file.set_len(0)?;
+                file.seek(std::io::SeekFrom::Start(0))?;
                 write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
                 file
             } else {
+                // Seek to end so the batch is appended after existing data.
+                file.seek(std::io::SeekFrom::End(0))?;
                 file
             }
         }
