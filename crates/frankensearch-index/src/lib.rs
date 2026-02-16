@@ -51,6 +51,7 @@ pub mod simd;
 pub mod two_tier;
 pub mod wal;
 pub mod warmup;
+mod repro_soft_delete_rollback;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
