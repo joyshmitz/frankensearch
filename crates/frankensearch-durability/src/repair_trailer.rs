@@ -5,9 +5,9 @@ use frankensearch_core::{SearchError, SearchResult};
 /// Magic prefix for durability sidecar trailers.
 pub const REPAIR_TRAILER_MAGIC: [u8; 4] = *b"FSDR";
 /// Binary trailer version.
-pub const REPAIR_TRAILER_VERSION: u16 = 1;
+pub const REPAIR_TRAILER_VERSION: u16 = 2;
 
-const FIXED_HEADER_BYTES: usize = 4 + 2 + 4 + 4 + 8 + 4 + 4;
+const FIXED_HEADER_BYTES: usize = 4 + 2 + 4 + 4 + 8 + 4 + 8 + 4;
 const TRAILER_CRC_BYTES: usize = 4;
 const MIN_TRAILER_BYTES: usize = FIXED_HEADER_BYTES + TRAILER_CRC_BYTES;
 const LENGTH_PREFIX_BYTES: usize = 8;
@@ -19,6 +19,7 @@ pub struct RepairTrailerHeader {
     pub k_source: u32,
     pub source_len: u64,
     pub source_crc32: u32,
+    pub source_xxh3: u64,
     pub repair_symbol_count: u32,
 }
 
@@ -55,6 +56,7 @@ pub fn serialize_repair_trailer(
     bytes.extend_from_slice(&header.k_source.to_le_bytes());
     bytes.extend_from_slice(&header.source_len.to_le_bytes());
     bytes.extend_from_slice(&header.source_crc32.to_le_bytes());
+    bytes.extend_from_slice(&header.source_xxh3.to_le_bytes());
     bytes.extend_from_slice(&header.repair_symbol_count.to_le_bytes());
 
     for symbol in symbols {
@@ -78,7 +80,9 @@ pub fn serialize_repair_trailer(
 pub fn deserialize_repair_trailer(
     bytes: &[u8],
 ) -> SearchResult<(RepairTrailerHeader, Vec<RepairSymbol>)> {
-    if bytes.len() < MIN_TRAILER_BYTES {
+    // Check for minimum V1 length (30 + 4 = 34 bytes)
+    // V2 length is 38 + 4 = 42 bytes
+    if bytes.len() < 34 {
         return Err(trailer_corruption("repair trailer too short"));
     }
 
@@ -99,17 +103,35 @@ pub fn deserialize_repair_trailer(
     }
 
     let version = read_u16_le(payload, 4)?;
-    if version != REPAIR_TRAILER_VERSION {
-        return Err(trailer_corruption("unsupported repair trailer version"));
-    }
-
-    let header = RepairTrailerHeader {
-        symbol_size: read_u32_le(payload, 6)?,
-        k_source: read_u32_le(payload, 10)?,
-        source_len: read_u64_le(payload, 14)?,
-        source_crc32: read_u32_le(payload, 22)?,
-        repair_symbol_count: read_u32_le(payload, 26)?,
+    let (header, mut cursor) = match version {
+        1 => {
+            let h = RepairTrailerHeader {
+                symbol_size: read_u32_le(payload, 6)?,
+                k_source: read_u32_le(payload, 10)?,
+                source_len: read_u64_le(payload, 14)?,
+                source_crc32: read_u32_le(payload, 22)?,
+                source_xxh3: 0, // V1 has no xxh3
+                repair_symbol_count: read_u32_le(payload, 26)?,
+            };
+            (h, 30)
+        }
+        2 => {
+            if bytes.len() < MIN_TRAILER_BYTES {
+                return Err(trailer_corruption("repair trailer V2 too short"));
+            }
+            let h = RepairTrailerHeader {
+                symbol_size: read_u32_le(payload, 6)?,
+                k_source: read_u32_le(payload, 10)?,
+                source_len: read_u64_le(payload, 14)?,
+                source_crc32: read_u32_le(payload, 22)?,
+                source_xxh3: read_u64_le(payload, 26)?,
+                repair_symbol_count: read_u32_le(payload, 34)?,
+            };
+            (h, 38)
+        }
+        _ => return Err(trailer_corruption("unsupported repair trailer version")),
     };
+
     if header.symbol_size == 0 {
         return Err(trailer_corruption(
             "repair trailer symbol_size must be greater than zero",
@@ -121,7 +143,6 @@ pub fn deserialize_repair_trailer(
         ));
     }
 
-    let mut cursor = FIXED_HEADER_BYTES;
     let mut symbols = Vec::new();
     while cursor < payload.len() {
         if payload.len() - cursor < LENGTH_PREFIX_BYTES {
@@ -236,6 +257,7 @@ mod tests {
             k_source: 10,
             source_len: 123_456,
             source_crc32: 0xABCD_EF01,
+            source_xxh3: 0,
             repair_symbol_count: 2,
         };
         let symbols = vec![
@@ -264,6 +286,7 @@ mod tests {
             k_source: 1,
             source_len: 16,
             source_crc32: 7,
+            source_xxh3: 0,
             repair_symbol_count: 1,
         };
         let symbols = vec![RepairSymbol {
@@ -283,6 +306,7 @@ mod tests {
             k_source: 1,
             source_len: 16,
             source_crc32: 7,
+            source_xxh3: 0,
             repair_symbol_count: 1,
         };
         let symbols = vec![RepairSymbol {
@@ -310,6 +334,7 @@ mod tests {
             k_source: 1,
             source_len: 16,
             source_crc32: 7,
+            source_xxh3: 0,
             repair_symbol_count: 1,
         };
         let symbols = vec![RepairSymbol {
@@ -344,6 +369,7 @@ mod tests {
             k_source: 1,
             source_len: 16,
             source_crc32: 7,
+            source_xxh3: 0,
             repair_symbol_count: 2, // claims 2 symbols
         };
         // Only provide 1 symbol — serialize should fail.
@@ -365,6 +391,7 @@ mod tests {
             k_source: 1,
             source_len: 16,
             source_crc32: 7,
+            source_xxh3: 0,
             repair_symbol_count: 1,
         };
         let symbols = vec![RepairSymbol {
@@ -386,6 +413,7 @@ mod tests {
             k_source: 1,
             source_len: 100,
             source_crc32: 42,
+            source_xxh3: 0,
             repair_symbol_count: 0,
         };
         let symbols: Vec<RepairSymbol> = Vec::new();
@@ -403,6 +431,7 @@ mod tests {
             k_source: 0,
             source_len: 16,
             source_crc32: 7,
+            source_xxh3: 0,
             repair_symbol_count: 1,
         };
         let symbols = vec![RepairSymbol {
@@ -424,6 +453,7 @@ mod tests {
             k_source: 0,
             source_len: 0,
             source_crc32: crc32fast::hash(&[]),
+            source_xxh3: 0,
             repair_symbol_count: 0,
         };
         let symbols: Vec<RepairSymbol> = Vec::new();
@@ -441,6 +471,7 @@ mod tests {
             k_source: 1,
             source_len: 4096,
             source_crc32: 0xDEAD_BEEF,
+            source_xxh3: 0,
             repair_symbol_count: 1,
         };
         let large_data = vec![0xAB_u8; 4096];

@@ -10,6 +10,7 @@ use fsqlite_core::raptorq_integration::{DecodeFailureReason, SymbolCodec};
 use memmap2::Mmap;
 use serde::Serialize;
 use tracing::{debug, info, warn};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::codec::{CodecFacade, DecodedPayload};
 use crate::config::DurabilityConfig;
@@ -24,6 +25,7 @@ pub struct FileProtectionResult {
     pub sidecar_path: PathBuf,
     pub source_len: u64,
     pub source_crc32: u32,
+    pub source_xxh3: u64,
     /// Number of source symbols the file was split into.
     pub k_source: u32,
     pub repair_symbol_count: u32,
@@ -35,6 +37,7 @@ pub struct FileVerifyResult {
     pub healthy: bool,
     pub expected_crc32: u32,
     pub actual_crc32: u32,
+    pub expected_xxh3: u64,
     pub expected_len: u64,
     pub actual_len: u64,
 }
@@ -141,6 +144,7 @@ pub trait DurabilityProvider: Send + Sync {
             sidecar_path: PathBuf::new(),
             source_len: 0,
             source_crc32: 0,
+            source_xxh3: 0,
             k_source: 0,
             repair_symbol_count: 0,
         })
@@ -153,6 +157,7 @@ pub trait DurabilityProvider: Send + Sync {
             healthy: true,
             expected_crc32: 0,
             actual_crc32: 0,
+            expected_xxh3: 0,
             expected_len: 0,
             actual_len: 0,
         })
@@ -369,13 +374,13 @@ impl FileProtector {
     pub fn protect_file(&self, path: &Path) -> SearchResult<FileProtectionResult> {
         let file = fs::File::open(path)?;
         let len = file.metadata()?.len();
-        let encoded = if len == 0 {
-            self.codec.encode(&[])?
+        let (encoded, source_xxh3) = if len == 0 {
+            (self.codec.encode(&[])?, xxh3_64(&[]))
         } else {
             // SAFETY: We assume the file is not modified concurrently (advisory).
             // This is a standard assumption for CLI tools operating on files.
             let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
-            self.codec.encode(&mmap)?
+            (self.codec.encode(&mmap)?, xxh3_64(&mmap))
         };
 
         let repair_symbol_count = u32::try_from(encoded.repair_symbols.len()).map_err(|_| {
@@ -390,6 +395,7 @@ impl FileProtector {
             k_source: encoded.k_source,
             source_len: encoded.source_len,
             source_crc32: encoded.source_crc32,
+            source_xxh3,
             repair_symbol_count,
         };
 
@@ -421,6 +427,7 @@ impl FileProtector {
             sidecar_path,
             source_len: header.source_len,
             source_crc32: header.source_crc32,
+            source_xxh3,
             k_source: header.k_source,
             repair_symbol_count: header.repair_symbol_count,
         })
@@ -447,6 +454,7 @@ impl FileProtector {
             healthy,
             expected_crc32: header.source_crc32,
             actual_crc32,
+            expected_xxh3: header.source_xxh3,
             expected_len: header.source_len,
             actual_len,
         })

@@ -20,6 +20,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::DurabilityConfig;
 use crate::file_protector::{FileProtector, FileRepairOutcome};
 use crate::metrics::DurabilityMetrics;
+use crate::repair_trailer::deserialize_repair_trailer;
 
 /// Result of protecting an FSVI file with repair symbols.
 #[derive(Debug, Clone)]
@@ -102,19 +103,10 @@ impl FsviProtector {
     pub fn protect_atomic(&self, fsvi_path: &Path) -> SearchResult<FsviProtectionResult> {
         let start = Instant::now();
 
-        // Read source and compute xxh3 hash
-        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
-        let len = file.metadata().map_err(SearchError::Io)?.len();
-        let (source_hash, source_size) = if len == 0 {
-            (xxh3_64(&[]), 0)
-        } else {
-            // SAFETY: mmap is read-only.
-            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
-            (xxh3_64(&mmap), mmap.len() as u64)
-        };
-
-        // Generate repair symbols via the inner protector
+        // Generate repair symbols via the inner protector (which now computes xxh3)
         let protection = self.protector.protect_file(fsvi_path)?;
+        let source_size = protection.source_len;
+        let source_hash = protection.source_xxh3;
 
         // Atomic rename: write to temp, then rename
         let sidecar_path = Self::sidecar_path(fsvi_path);
@@ -183,8 +175,9 @@ impl FsviProtector {
 
     /// Verify integrity using the sidecar.
     ///
-    /// This performs a full CRC32 check of the source file against the
-    /// hash stored in the sidecar trailer.
+    /// Tries the xxh3 fast-path first (<1ms). If that fails (hash mismatch or
+    /// V1 trailer), falls back to full CRC32 verification.
+    #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn verify(&self, fsvi_path: &Path) -> SearchResult<FsviVerifyResult> {
         let sidecar_path = Self::sidecar_path(fsvi_path);
 
@@ -196,14 +189,34 @@ impl FsviProtector {
             return Ok(FsviVerifyResult::NoSidecar);
         }
 
-        // Read the sidecar to get the stored hash from the trailer
+        // Fast path: xxh3 hash check
+        let file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+        let len = file.metadata().map_err(SearchError::Io)?.len();
+        let actual_hash = if len == 0 {
+            xxh3_64(&[])
+        } else {
+            // SAFETY: mmap is read-only.
+            let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+            xxh3_64(&mmap)
+        };
+
+        // Read sidecar trailer to get expected hash
+        let trailer_bytes = fs::read(&sidecar_path).map_err(SearchError::Io)?;
+        let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
+
+        if header.source_xxh3 != 0 && actual_hash == header.source_xxh3 {
+            debug!(
+                path = %fsvi_path.display(),
+                hash = actual_hash,
+                "FSVI integrity verified (fast path)"
+            );
+            return Ok(FsviVerifyResult::Intact);
+        }
+
+        // Fallback to full CRC32 check (V1 trailer or corruption)
         let verify = self.protector.verify_file(fsvi_path, &sidecar_path)?;
 
         if verify.healthy {
-            debug!(
-                path = %fsvi_path.display(),
-                "FSVI integrity verified"
-            );
             return Ok(FsviVerifyResult::Intact);
         }
 
@@ -217,8 +230,6 @@ impl FsviProtector {
             "FSVI corruption detected"
         );
 
-        // We consider it repairable if the sidecar itself is intact
-        // (the FileProtector repair logic will determine the actual outcome)
         Ok(FsviVerifyResult::Corrupted { repairable: true })
     }
 

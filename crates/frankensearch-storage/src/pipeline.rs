@@ -520,7 +520,27 @@ impl StorageBackedJobRunner {
 
             let correlation_id = extract_correlation_id(doc.metadata.as_ref())
                 .unwrap_or_else(|| fallback_correlation_id(&job.doc_id));
-            let text = doc.content_preview.as_str();
+
+            let text_cow = if let Some(path) = &doc.source_path {
+                match std::fs::read_to_string(path) {
+                    Ok(raw) => std::borrow::Cow::Owned(self.canonicalizer.canonicalize(&raw)),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "frankensearch.storage.pipeline",
+                            stage = "process_batch",
+                            worker_id,
+                            doc_id = %job.doc_id,
+                            path = %path,
+                            error = %error,
+                            "failed to read source file; falling back to content preview"
+                        );
+                        std::borrow::Cow::Borrowed(doc.content_preview.as_str())
+                    }
+                }
+            } else {
+                std::borrow::Cow::Borrowed(doc.content_preview.as_str())
+            };
+            let text = text_cow.as_ref();
 
             if text.trim().is_empty() {
                 self.queue.skip(job.job_id, "empty content preview")?;
@@ -3526,6 +3546,92 @@ mod integration_tests {
             let counts = runner.storage.count_by_status("fast-tier").expect("counts");
             assert_eq!(counts.embedded, 15);
             assert_eq!(counts.failed, 5);
+        });
+    }
+
+    #[test]
+    fn process_batch_reads_source_file_content_if_available() {
+        use std::io::Write;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            // Create a SpyEmbedder that records the text it sees.
+            #[derive(Debug)]
+            struct SpyEmbedder {
+                captured: Arc<Mutex<Option<String>>>,
+            }
+            impl Embedder for SpyEmbedder {
+                fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                    *self.captured.lock().unwrap() = Some(text.to_owned());
+                    Box::pin(async { Ok(vec![0.0; 4]) })
+                }
+                fn dimension(&self) -> usize {
+                    4
+                }
+                fn id(&self) -> &str {
+                    "spy"
+                }
+                fn model_name(&self) -> &str {
+                    "spy"
+                }
+                fn is_semantic(&self) -> bool {
+                    true
+                }
+                fn category(&self) -> ModelCategory {
+                    ModelCategory::StaticEmbedder
+                }
+            }
+            let captured = Arc::new(Mutex::new(None));
+            let fast = Arc::new(SpyEmbedder {
+                captured: Arc::clone(&captured),
+            });
+
+            let runner = make_runner(
+                JobQueueConfig::default(),
+                PipelineConfig::default(),
+                fast,
+                None,
+                sink,
+            );
+
+            // Create a temp file with content longer than preview limit (400 chars).
+            let long_content = "A".repeat(1000);
+            let mut temp = tempfile::NamedTempFile::new().expect("tempfile");
+            temp.write_all(long_content.as_bytes()).expect("write");
+            let path = temp.path().to_string_lossy().into_owned();
+
+            // Ingest with source_path.
+            let mut req = IngestRequest::new("doc-file", &long_content);
+            req.source_path = Some(path);
+
+            let result = runner.ingest(req).expect("ingest");
+            assert_eq!(result.action, IngestAction::New);
+
+            // Check that the preview is truncated in storage.
+            let doc = runner
+                .storage
+                .get_document("doc-file")
+                .expect("get")
+                .expect("exists");
+            assert_eq!(doc.content_preview.len(), 400);
+
+            // Process batch.
+            let _ = runner
+                .process_batch(&cx, "worker-spy")
+                .await
+                .expect("process");
+
+            // Verify embedder received full content.
+            let captured_text = captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("should have captured text");
+            assert_eq!(
+                captured_text.len(),
+                1000,
+                "embedder should see full content"
+            );
+            assert_eq!(captured_text, long_content);
         });
     }
 }

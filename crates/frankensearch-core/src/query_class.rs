@@ -69,13 +69,13 @@ impl QueryClass {
             return true;
         }
 
-        // No spaces and contains dots or Rust path separators
-        if !s.contains(' ') && (s.contains('.') || s.contains("::")) {
+        // No whitespace and contains dots or Rust path separators
+        if !s.chars().any(char::is_whitespace) && (s.contains('.') || s.contains("::")) {
             return true;
         }
 
         // Issue/ticket ID pattern: prefix-digits (e.g., bd-123, JIRA-456)
-        if !s.contains(' ') && s.contains('-') {
+        if !s.chars().any(char::is_whitespace) && s.contains('-') {
             let parts: Vec<&str> = s.splitn(2, '-').collect();
             if parts.len() == 2
                 && parts[0].chars().all(|c| c.is_ascii_alphanumeric())

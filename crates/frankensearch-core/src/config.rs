@@ -28,6 +28,7 @@ use crate::types::RankChanges;
 /// | `FRANKENSEARCH_QUALITY_TIMEOUT`  | `quality_timeout_ms` | `500`    |
 /// | `FRANKENSEARCH_HNSW_THRESHOLD`   | `hnsw_threshold`   | `50000`    |
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TwoTierConfig {
     /// Weight for quality-tier scores in the blend (0.0–1.0).
     /// Default: 0.7 (70% quality, 30% fast).
@@ -489,9 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn optimized_partial_toml_falls_back_to_defaults() {
-        // TwoTierConfig does not use #[serde(default)], so partial TOML
-        // triggers a parse failure and the loader falls back to full defaults.
+    fn optimized_partial_toml_merges_with_defaults() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -503,10 +502,10 @@ mod tests {
         std::fs::write(&path, "rrf_k = 99.0\n").expect("write partial config");
 
         let loaded = TwoTierConfig::from_optimized_file(&path);
-        // Parse failed → all fields revert to defaults
-        assert!((loaded.rrf_k - TwoTierConfig::default().rrf_k).abs() < 1e-12);
+        // rrf_k should be updated from the file
+        assert!((loaded.rrf_k - 99.0).abs() < 1e-12);
+        // quality_weight should remain default
         assert!((loaded.quality_weight - 0.7).abs() < 1e-12);
-        assert_eq!(loaded.candidate_multiplier, 3);
     }
 
     #[test]

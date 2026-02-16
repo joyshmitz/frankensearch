@@ -33,7 +33,7 @@ pub trait Canonicalizer: Send + Sync {
 /// Applies NFC normalization, markdown stripping, code block collapsing,
 /// low-signal filtering, and length truncation in sequence.
 pub struct DefaultCanonicalizer {
-    /// Maximum character length for canonicalized text. Default: 2000.
+    /// Maximum byte length for canonicalized text (truncated at char boundary). Default: 2000.
     pub max_length: usize,
     /// Maximum lines to keep from the start of a fenced code block. Default: 20.
     pub code_head_lines: usize,
@@ -83,13 +83,18 @@ impl DefaultCanonicalizer {
                 '[' => {
                     // Convert [text](url) → text
                     let mut link_text = String::new();
+                    let mut closed = false;
                     for lc in chars.by_ref() {
                         if lc == ']' {
+                            closed = true;
                             break;
                         }
                         link_text.push(lc);
                     }
-                    if chars.peek() == Some(&'(') {
+
+                    let is_link = closed && chars.peek() == Some(&'(');
+
+                    if is_link {
                         chars.next();
                         let mut depth = 1;
                         for lc in chars.by_ref() {
@@ -102,9 +107,16 @@ impl DefaultCanonicalizer {
                                 }
                             }
                         }
-                    }
-                    result.push_str(&link_text);
-                    if !link_text.is_empty() {
+                        result.push_str(&link_text);
+                        if !link_text.is_empty() {
+                            at_line_start = false;
+                        }
+                    } else {
+                        result.push('[');
+                        result.push_str(&link_text);
+                        if closed {
+                            result.push(']');
+                        }
                         at_line_start = false;
                     }
                 }
