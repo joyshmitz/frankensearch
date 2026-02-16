@@ -244,7 +244,10 @@ impl AppShell {
                     crossterm::event::KeyCode::Char(ch)
                         if !mods.intersects(
                             crossterm::event::KeyModifiers::CONTROL
-                                | crossterm::event::KeyModifiers::ALT,
+                                | crossterm::event::KeyModifiers::ALT
+                                | crossterm::event::KeyModifiers::SUPER
+                                | crossterm::event::KeyModifiers::HYPER
+                                | crossterm::event::KeyModifiers::META,
                         ) =>
                     {
                         self.palette.push_char(*ch);

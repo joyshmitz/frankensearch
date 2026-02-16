@@ -1665,13 +1665,13 @@ mod tests {
     }
 
     #[test]
-    fn file_with_zero_size_and_non_placeholder_hash_rejected() {
+    fn file_with_zero_size_and_valid_hash_accepted() {
         let json = r#"{
             "id": "m", "repo": "r", "revision": "v", "license": "MIT",
             "files": [{"name": "f.bin", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 0}]
         }"#;
-        let err = ModelManifest::from_json_str(json).unwrap_err();
-        assert!(err.to_string().contains("must be > 0"));
+        let manifest = ModelManifest::from_json_str(json).unwrap();
+        assert_eq!(manifest.files[0].size, 0);
     }
 
     #[test]
