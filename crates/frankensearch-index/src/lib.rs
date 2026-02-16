@@ -433,7 +433,19 @@ impl VectorIndex {
             }
             let flags = entry.flags | RECORD_FLAG_TOMBSTONE;
             self.set_record_flags(index, flags)?;
-            let _ = self.soft_delete_wal_entry(doc_id)?;
+            if let Err(err) = self.soft_delete_wal_entry(doc_id) {
+                // Best-effort rollback of the main index tombstone
+                // to maintain consistency if WAL update failed.
+                if let Err(rollback_err) = self.set_record_flags(index, entry.flags) {
+                    tracing::error!(
+                        error = %rollback_err,
+                        doc_id,
+                        index,
+                        "failed to rollback tombstone after WAL error"
+                    );
+                }
+                return Err(err);
+            }
             return Ok(true);
         }
 
@@ -514,34 +526,15 @@ impl VectorIndex {
             });
         }
 
-        let mut writer = Self::create_with_revision(
-            &self.path,
-            &self.metadata.embedder_id,
-            &self.metadata.embedder_revision,
-            self.dimension(),
-            self.quantization(),
-        )?;
-
+        // Collect live entries from main index.
+        let mut sources = Vec::with_capacity(records_before - tombstones_before);
         for index in 0..records_before {
-            if self.is_deleted(index) {
-                continue;
+            if !self.is_deleted(index) {
+                sources.push(MergeSource::Main(index));
             }
-            let doc_id = self.doc_id_at(index)?;
-            let vec = self.vector_at_f32(index)?;
-            writer.write_record(doc_id, &vec)?;
         }
 
-        writer.finish()?;
-
-        let config = self.wal_config.clone();
-        let reloaded = Self::open(&self.path)?;
-        self.data = reloaded.data;
-        self.metadata = reloaded.metadata;
-        self.records_offset = reloaded.records_offset;
-        self.strings_offset = reloaded.strings_offset;
-        self.vectors_offset = reloaded.vectors_offset;
-        self.wal_entries = reloaded.wal_entries;
-        self.wal_config = config;
+        self.rewrite_index(&mut sources, self.metadata.compaction_gen)?;
 
         let records_after = self.record_count();
         let bytes_reclaimed = bytes_before.saturating_sub(self.data.len());
@@ -662,48 +655,34 @@ impl VectorIndex {
             });
         }
 
-        // Create a new writer that will atomically replace the main index.
-        let mut writer = Self::create_with_revision(
-            &self.path,
-            &self.metadata.embedder_id,
-            &self.metadata.embedder_revision,
-            self.dimension(),
-            self.quantization(),
-        )?
-        .with_generation(next_generation(self.metadata.compaction_gen));
-
-        // Write all main index entries.
-        for i in 0..self.record_count() {
-            if self.is_deleted(i) {
-                continue;
+        // Collect all sources.
+        let mut sources = Vec::with_capacity(main_before + wal_count);
+        for i in 0..main_before {
+            if !self.is_deleted(i) {
+                sources.push(MergeSource::Main(i));
             }
-            let doc_id = self.doc_id_at(i)?;
-            let vec = self.vector_at_f32(i)?;
-            writer.write_record(doc_id, &vec)?;
+        }
+        for (idx, _) in self.wal_entries.iter().enumerate() {
+            sources.push(MergeSource::Wal(idx));
         }
 
-        // Write all WAL entries.
-        for entry in &self.wal_entries {
-            writer.write_record(&entry.doc_id, &entry.embedding)?;
-        }
+        // Sort to ensure binary search property.
+        // We can't use sort_by_key easily because we need `self` for Main lookups.
+        sources.sort_by(|a, b| {
+            let (hash_a, id_a) = self.resolve_sort_key(a);
+            let (hash_b, id_b) = self.resolve_sort_key(b);
+            hash_a.cmp(&hash_b).then(id_a.cmp(id_b))
+        });
 
-        // Finish writes atomically (tmp + rename + fsync).
-        writer.finish()?;
+        // Perform the rewrite.
+        self.rewrite_index(&mut sources, next_generation(self.metadata.compaction_gen))?;
 
         // Remove WAL sidecar.
         let wal_path = wal::wal_path_for(&self.path);
         wal::remove_wal(&wal_path)?;
 
-        // Reload the compacted index.
-        let config = self.wal_config.clone();
-        let reloaded = Self::open(&self.path)?;
-        self.data = reloaded.data;
-        self.metadata = reloaded.metadata;
-        self.records_offset = reloaded.records_offset;
-        self.strings_offset = reloaded.strings_offset;
-        self.vectors_offset = reloaded.vectors_offset;
+        // Clear WAL entries in memory (they are now in Main).
         self.wal_entries.clear();
-        self.wal_config = config;
 
         let elapsed = start.elapsed();
         let stats = CompactionStats {
@@ -725,7 +704,209 @@ impl VectorIndex {
         Ok(stats)
     }
 
+    fn resolve_sort_key<'a>(&'a self, source: &MergeSource) -> (u64, &'a str) {
+        match source {
+            MergeSource::Main(idx) => {
+                // These unwraps are safe because we only create Main(idx) for valid indices
+                // and the index is immutable during compaction.
+                let entry = self.record_at(*idx).expect("index corrupted during compaction");
+                let id = self.doc_id_at(*idx).expect("index corrupted during compaction");
+                (entry.doc_id_hash, id)
+            }
+            MergeSource::Wal(idx) => {
+                let entry = &self.wal_entries[*idx];
+                (entry.doc_id_hash, &entry.doc_id)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn rewrite_index(
+        &mut self,
+        sources: &mut [MergeSource],
+        new_gen: u8,
+    ) -> SearchResult<()> {
+        let record_count = sources.len();
+        let records_bytes = record_count.checked_mul(RECORD_SIZE_BYTES).ok_or_else(|| {
+            SearchError::InvalidConfig {
+                field: "record_count".to_owned(),
+                value: record_count.to_string(),
+                reason: "record table size overflow".to_owned(),
+            }
+        })?;
+        let records_bytes_u64 = u64::try_from(records_bytes).unwrap(); // fits if usize fits
+
+        // Pass 1: Build Record Table and calculate layout.
+        // We buffer the Record Table in memory (16 bytes * N).
+        // 10M records = 160MB, which is acceptable.
+        let mut record_table = Vec::with_capacity(records_bytes);
+        let mut current_string_offset = 0u32;
+        let mut string_table_len = 0u64;
+
+        for source in sources.iter() {
+            let (doc_id_hash, doc_id) = self.resolve_sort_key(source);
+            let doc_id_len = doc_id.len();
+            
+            // Validation
+            let len_u16 = u16::try_from(doc_id_len).map_err(|_| SearchError::InvalidConfig {
+                field: "doc_id_len".to_owned(),
+                value: doc_id_len.to_string(),
+                reason: "doc_id length exceeds u16".to_owned(),
+            })?;
+            if current_string_offset.checked_add(doc_id_len as u32).is_none() {
+                 return Err(SearchError::InvalidConfig {
+                    field: "doc_id_offset".to_owned(),
+                    value: "overflow".to_owned(),
+                    reason: "string table offset exceeds u32".to_owned(),
+                });
+            }
+
+            // Append to record table
+            record_table.extend_from_slice(&doc_id_hash.to_le_bytes());
+            record_table.extend_from_slice(&current_string_offset.to_le_bytes());
+            record_table.extend_from_slice(&len_u16.to_le_bytes());
+            record_table.extend_from_slice(&0u16.to_le_bytes()); // Flags cleared (tombstones gone)
+
+            current_string_offset += doc_id_len as u32;
+            string_table_len += doc_id_len as u64;
+        }
+
+        // Calculate layout
+        let provisional_header = build_header_prefix(
+            &self.metadata.embedder_id,
+            &self.metadata.embedder_revision,
+            self.dimension(),
+            self.quantization(),
+            new_gen,
+            record_count,
+            0,
+        )?;
+        let header_len = provisional_header.len() + 4; // + CRC
+        let header_len_u64 = u64::try_from(header_len).unwrap();
+
+        let pre_vector = header_len_u64
+            .checked_add(records_bytes_u64)
+            .and_then(|v| v.checked_add(string_table_len))
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "layout".to_owned(),
+                value: "overflow".to_owned(),
+                reason: "layout offset overflow".to_owned(),
+            })?;
+        
+        let vectors_offset = align_up(pre_vector, VECTOR_ALIGN_BYTES)?;
+        let padding_len = (vectors_offset - pre_vector) as usize;
+
+        // Open temp file
+        let tmp_path = temporary_output_path(&self.path);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        {
+            let mut writer = BufWriter::with_capacity(256 * 1024, &mut file);
+
+            // Pass 2: Write Header and Record Table
+            let mut header_prefix = build_header_prefix(
+                &self.metadata.embedder_id,
+                &self.metadata.embedder_revision,
+                self.dimension(),
+                self.quantization(),
+                new_gen,
+                record_count,
+                vectors_offset,
+            )?;
+            let header_crc = crc32(&header_prefix);
+            header_prefix.extend_from_slice(&header_crc.to_le_bytes());
+            
+            writer.write_all(&header_prefix)?;
+            writer.write_all(&record_table)?;
+
+            // Pass 3: Write String Table
+            for source in sources.iter() {
+                let (_, doc_id) = self.resolve_sort_key(source);
+                writer.write_all(doc_id.as_bytes())?;
+            }
+
+            // Padding
+            if padding_len > 0 {
+                writer.write_all(&vec![0u8; padding_len])?;
+            }
+
+            // Pass 4: Write Vectors
+            match self.quantization() {
+                Quantization::F16 => {
+                    for source in sources.iter() {
+                        match source {
+                            MergeSource::Main(idx) => {
+                                // Fast path: copy raw bytes
+                                let start = self.vector_start(*idx)?;
+                                let len = self.dimension() * 2;
+                                let bytes = &self.data[start..start + len];
+                                writer.write_all(bytes)?;
+                            }
+                            MergeSource::Wal(idx) => {
+                                // Slow path: encode
+                                let entry = &self.wal_entries[*idx];
+                                for &val in &entry.embedding {
+                                    writer.write_all(&f16::from_f32(val).to_le_bytes())?;
+                                }
+                            }
+                        }
+                    }
+                }
+                Quantization::F32 => {
+                    for source in sources.iter() {
+                        match source {
+                            MergeSource::Main(idx) => {
+                                // Fast path: copy raw bytes
+                                let start = self.vector_start(*idx)?;
+                                let len = self.dimension() * 4;
+                                let bytes = &self.data[start..start + len];
+                                writer.write_all(bytes)?;
+                            }
+                            MergeSource::Wal(idx) => {
+                                // Slow path: encode
+                                let entry = &self.wal_entries[*idx];
+                                for &val in &entry.embedding {
+                                    writer.write_all(&val.to_le_bytes())?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            writer.flush()?;
+        }
+
+        file.sync_all()?;
+        fs::rename(&tmp_path, &self.path)?;
+        sync_parent_directory(&self.path)?;
+
+        // Reload
+        let config = self.wal_config.clone();
+        let reloaded = Self::open(&self.path)?;
+        self.data = reloaded.data;
+        self.metadata = reloaded.metadata;
+        self.records_offset = reloaded.records_offset;
+        self.strings_offset = reloaded.strings_offset;
+        self.vectors_offset = reloaded.vectors_offset;
+        // WAL entries are cleared by caller if compacting, or preserved if vacuuming
+        // But vacuum preserves WAL on disk, so open() loads them.
+        // Vacuum caller ignores the reloaded WAL entries? No, vacuum preserves them.
+        // self.vacuum() impl: 
+        //   writer.finish()
+        //   Self::open() -> loads WAL entries
+        //   self.wal_entries = reloaded.wal_entries
+        // So we need to update self.wal_entries from reloaded.
+        self.wal_entries = reloaded.wal_entries;
+        self.wal_config = config;
+
+        Ok(())
+    }
+
     /// Resolve the document id at `index`.
+
     ///
     /// # Errors
     ///
@@ -1114,6 +1295,12 @@ struct PendingRecord {
     doc_id_hash: u64,
     flags: u16,
     embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MergeSource {
+    Main(usize),
+    Wal(usize),
 }
 
 #[derive(Debug)]

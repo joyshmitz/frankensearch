@@ -119,7 +119,11 @@ pub trait WatchIngestPipeline: Send + Sync {
     /// # Errors
     ///
     /// Returns any ingest/indexing failure from the downstream pipeline.
-    fn apply_batch(&self, batch: &[WatchIngestOp]) -> SearchResult<usize>;
+    fn apply_batch(
+        &self,
+        batch: &[WatchIngestOp],
+        rt: &asupersync::runtime::Runtime,
+    ) -> SearchResult<usize>;
 }
 
 /// No-op ingest sink used by tests and dry-run scenarios.
@@ -127,7 +131,11 @@ pub trait WatchIngestPipeline: Send + Sync {
 pub struct NoopWatchIngestPipeline;
 
 impl WatchIngestPipeline for NoopWatchIngestPipeline {
-    fn apply_batch(&self, _batch: &[WatchIngestOp]) -> SearchResult<usize> {
+    fn apply_batch(
+        &self,
+        _batch: &[WatchIngestOp],
+        _rt: &asupersync::runtime::Runtime,
+    ) -> SearchResult<usize> {
         Ok(0)
     }
 }
@@ -442,7 +450,16 @@ impl FsWatcher {
             });
         }
 
-        let outcome = process_event_batch(&self.discovery, self.ingest.as_ref(), events)?;
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "watcher.ingest",
+                source: Box::new(std::io::Error::other(format!(
+                    "failed to create ingest runtime: {error}"
+                ))),
+            })?;
+
+        let outcome = process_event_batch(&self.discovery, self.ingest.as_ref(), events, &rt)?;
         self.stats.add_reindexed(outcome.reindexed);
         self.stats.add_skipped(outcome.skipped);
         Ok(outcome)
@@ -513,6 +530,15 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
     let mut watcher = build_notify_watcher(event_tx)?;
     let mount_table = build_mount_table(&context.discovery);
+
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|error| SearchError::SubsystemError {
+            subsystem: "watcher.ingest",
+            source: Box::new(std::io::Error::other(format!(
+                "failed to create ingest runtime: {error}"
+            ))),
+        })?;
 
     let mut watched_dirs = 0_usize;
     for root in &context.roots {
@@ -591,7 +617,7 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
             continue;
         }
 
-        match process_event_batch(&context.discovery, context.ingest.as_ref(), &ready) {
+        match process_event_batch(&context.discovery, context.ingest.as_ref(), &ready, &rt) {
             Ok(outcome) => {
                 context.stats.add_reindexed(outcome.reindexed);
                 context.stats.add_skipped(outcome.skipped);
@@ -678,6 +704,7 @@ fn process_event_batch(
     discovery: &DiscoveryConfig,
     ingest: &dyn WatchIngestPipeline,
     events: &[WatchEvent],
+    rt: &asupersync::runtime::Runtime,
 ) -> SearchResult<WatchBatchOutcome> {
     let mut ops = Vec::new();
     let mut skipped = 0_usize;
@@ -694,7 +721,7 @@ fn process_event_batch(
     let reindexed = if ops.is_empty() {
         0
     } else {
-        ingest.apply_batch(&ops)?
+        ingest.apply_batch(&ops, rt)?
     };
 
     Ok(WatchBatchOutcome {
@@ -1208,7 +1235,11 @@ mod tests {
     }
 
     impl WatchIngestPipeline for RecordingPipeline {
-        fn apply_batch(&self, batch: &[WatchIngestOp]) -> SearchResult<usize> {
+        fn apply_batch(
+            &self,
+            batch: &[WatchIngestOp],
+            _rt: &asupersync::runtime::Runtime,
+        ) -> SearchResult<usize> {
             if self.fail_next.swap(false, Ordering::AcqRel) {
                 return Err(frankensearch_core::SearchError::SubsystemError {
                     subsystem: "test",

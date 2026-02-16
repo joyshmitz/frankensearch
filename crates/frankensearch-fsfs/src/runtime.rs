@@ -320,15 +320,11 @@ struct LiveIngestPipeline {
 }
 
 impl WatchIngestPipeline for LiveIngestPipeline {
-    fn apply_batch(&self, batch: &[WatchIngestOp]) -> frankensearch_core::SearchResult<usize> {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .map_err(|error| SearchError::SubsystemError {
-                subsystem: "watcher.ingest",
-                source: Box::new(std::io::Error::other(format!(
-                    "failed to create ingest runtime: {error}"
-                ))),
-            })?;
+    fn apply_batch(
+        &self,
+        batch: &[WatchIngestOp],
+        rt: &asupersync::runtime::Runtime,
+    ) -> frankensearch_core::SearchResult<usize> {
         let cx = Cx::for_request();
         rt.block_on(self.apply_batch_inner(&cx, batch))
     }
