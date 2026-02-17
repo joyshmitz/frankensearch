@@ -823,7 +823,11 @@ impl AlertsSloScreen {
             return "density: (no alerts)".to_owned();
         }
         let newest = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
-        let oldest = alerts.iter().map(|alert| alert.ts_ms).min().unwrap_or(newest);
+        let oldest = alerts
+            .iter()
+            .map(|alert| alert.ts_ms)
+            .min()
+            .unwrap_or(newest);
         let span = newest.saturating_sub(oldest);
         if span == 0 {
             return format!("density: {}", Self::sparkline(&[100]));
@@ -831,10 +835,7 @@ impl AlertsSloScreen {
         let mut buckets = [0u64; 12];
         for alert in alerts {
             let from_oldest = alert.ts_ms.saturating_sub(oldest);
-            let idx_u64 = from_oldest
-                .saturating_mul(11)
-                .saturating_div(span)
-                .min(11);
+            let idx_u64 = from_oldest.saturating_mul(11).saturating_div(span).min(11);
             let idx = usize::try_from(idx_u64).unwrap_or(11);
             buckets[idx] = buckets[idx].saturating_add(1);
         }
@@ -979,7 +980,11 @@ impl AlertsSloScreen {
 
     fn build_alert_rows(&self, alerts: &[AlertRow]) -> Vec<Row> {
         let newest_ts = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
-        let oldest_ts = alerts.iter().map(|alert| alert.ts_ms).min().unwrap_or(newest_ts);
+        let oldest_ts = alerts
+            .iter()
+            .map(|alert| alert.ts_ms)
+            .min()
+            .unwrap_or(newest_ts);
         let span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
 
         alerts
@@ -1028,15 +1033,18 @@ impl AlertsSloScreen {
             .map(|(index, row)| {
                 let pulse = Self::slo_pulse(&row);
                 let style = match row.status {
-                    ControlPlaneHealth::Healthy => {
-                        self.palette.style_success().merge(&self.palette.style_row_base(index))
-                    }
-                    ControlPlaneHealth::Degraded => {
-                        self.palette.style_warning().merge(&self.palette.style_row_base(index))
-                    }
-                    ControlPlaneHealth::Critical => {
-                        self.palette.style_error().merge(&self.palette.style_row_base(index))
-                    }
+                    ControlPlaneHealth::Healthy => self
+                        .palette
+                        .style_success()
+                        .merge(&self.palette.style_row_base(index)),
+                    ControlPlaneHealth::Degraded => self
+                        .palette
+                        .style_warning()
+                        .merge(&self.palette.style_row_base(index)),
+                    ControlPlaneHealth::Critical => self
+                        .palette
+                        .style_error()
+                        .merge(&self.palette.style_row_base(index)),
                 };
                 Row::new(vec![
                     row.project,

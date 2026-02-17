@@ -428,11 +428,7 @@ impl IndexResourceScreen {
         if rows.is_empty() {
             return "percentile strip: (no rows)".to_owned();
         }
-        let values: Vec<u8> = rows
-            .iter()
-            .take(24)
-            .map(|row| row.p95_percentile)
-            .collect();
+        let values: Vec<u8> = rows.iter().take(24).map(|row| row.p95_percentile).collect();
         format!("percentile strip: {}", Self::sparkline(&values))
     }
 
@@ -539,6 +535,7 @@ impl IndexResourceScreen {
                 } else {
                     self.palette.style_row_error(index)
                 };
+                let pulse = Self::row_pulse(&row);
 
                 Row::new(vec![
                     row.project,
@@ -552,7 +549,7 @@ impl IndexResourceScreen {
                     format!("{}%", row.docs_percentile),
                     format!("{}%", row.p95_percentile),
                     format!("{}%", row.cpu_percentile),
-                    Self::row_pulse(&row),
+                    pulse,
                 ])
                 .style(style)
             })
