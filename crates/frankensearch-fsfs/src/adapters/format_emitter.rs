@@ -19,10 +19,11 @@ use serde::Serialize;
 
 use super::cli::OutputFormat;
 use crate::output_schema::{
-    OutputEnvelope, OutputMeta, SearchHitPayload, SearchPayload, encode_envelope_toon,
+    CompatibilityMode, OutputEnvelope, OutputMeta, SearchHitPayload, SearchPayload,
+    encode_envelope_toon, validate_envelope,
 };
 use crate::stream_protocol::{
-    StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_toon,
+    StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, encode_stream_frame_toon, validate_stream_frame,
 };
 
 const SUBSYSTEM: &str = "fsfs_format_emitter";
@@ -53,6 +54,27 @@ where
     T: Serialize,
     W: Write,
 {
+    let validation = validate_envelope(envelope, CompatibilityMode::Strict);
+    if !validation.valid {
+        let detail = validation
+            .violations
+            .iter()
+            .map(|violation| {
+                format!(
+                    "{}:{}:{}",
+                    violation.field, violation.code, violation.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(SearchError::SubsystemError {
+            subsystem: SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "output envelope validation failed: {detail}"
+            ))),
+        });
+    }
+
     match format {
         OutputFormat::Json => emit_json(envelope, writer),
         OutputFormat::Toon => emit_toon(envelope, writer),
@@ -106,6 +128,27 @@ where
     T: Serialize,
     W: Write,
 {
+    let validation = validate_stream_frame(frame);
+    if !validation.valid {
+        let detail = validation
+            .violations
+            .iter()
+            .map(|violation| {
+                format!(
+                    "{}:{}:{}",
+                    violation.field, violation.code, violation.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(SearchError::SubsystemError {
+            subsystem: SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "stream frame validation failed: {detail}"
+            ))),
+        });
+    }
+
     match format {
         OutputFormat::Jsonl => {
             // Write directly to the writer to avoid an intermediate String allocation.

@@ -26,13 +26,21 @@ use tracing::instrument;
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
+#[cfg(feature = "lexical")]
+use frankensearch_core::traits::LexicalSearch;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
+#[cfg(all(feature = "durability", feature = "lexical"))]
+use frankensearch_durability::DurableTantivyIndex;
+#[cfg(feature = "durability")]
+use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviProtector};
 use frankensearch_embed::auto_detect::EmbedderStack;
 use frankensearch_index::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME,
 };
+#[cfg(feature = "lexical")]
+use frankensearch_lexical::TantivyIndex;
 
 /// Statistics from a completed index build.
 #[derive(Debug, Clone)]
@@ -197,6 +205,8 @@ impl IndexBuilder {
         let mut errors = Vec::new();
         let mut doc_count = 0usize;
         let mut embed_ms = 0.0f64;
+        #[cfg(feature = "lexical")]
+        let mut lexical_docs = Vec::with_capacity(total);
 
         // Process documents in batches.
         for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
@@ -215,6 +225,8 @@ impl IndexBuilder {
                 {
                     Ok(()) => {
                         doc_count += 1;
+                        #[cfg(feature = "lexical")]
+                        lexical_docs.push(doc.clone());
                     }
                     Err(err) => {
                         tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
@@ -253,6 +265,40 @@ impl IndexBuilder {
                 return Err(error);
             }
         };
+
+        #[cfg(feature = "lexical")]
+        if !lexical_docs.is_empty() {
+            let lexical_path = self.data_dir.join("lexical");
+            let lexical = match TantivyIndex::create(&lexical_path) {
+                Ok(lexical) => lexical,
+                Err(error) => {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = lexical.index_documents(cx, &lexical_docs).await {
+                export_error(metrics_exporter.as_ref(), &error);
+                return Err(error);
+            }
+            if let Err(error) = lexical.commit(cx).await {
+                export_error(metrics_exporter.as_ref(), &error);
+                return Err(error);
+            }
+
+            #[cfg(feature = "durability")]
+            if let Err(error) = protect_lexical_durability(&lexical, &lexical_path) {
+                export_error(metrics_exporter.as_ref(), &error);
+                return Err(error);
+            }
+        }
+
+        #[cfg(feature = "durability")]
+        {
+            if let Err(error) = Self::protect_durability_sidecars(&self.data_dir) {
+                export_error(metrics_exporter.as_ref(), &error);
+                return Err(error);
+            }
+        }
 
         let has_quality = quality_embedder.is_some();
         let index_size_bytes = compute_index_size_bytes(&self.data_dir);
@@ -387,6 +433,42 @@ fn compute_index_size_bytes(data_dir: &Path) -> u64 {
     fast_bytes.saturating_add(file_size_bytes(&quality_path))
 }
 
+#[cfg(feature = "durability")]
+fn protect_durability_sidecars(data_dir: &Path) -> SearchResult<()> {
+    let protector = FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
+
+    let fast_path = {
+        let dedicated = data_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        if dedicated.exists() {
+            dedicated
+        } else {
+            data_dir.join(VECTOR_INDEX_FALLBACK_FILENAME)
+        }
+    };
+    if fast_path.exists() {
+        protector.protect_atomic(&fast_path)?;
+    }
+
+    let quality_path = data_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+    if quality_path.exists() {
+        protector.protect_atomic(&quality_path)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(all(feature = "durability", feature = "lexical"))]
+fn protect_lexical_durability(index: &TantivyIndex, data_dir: &Path) -> SearchResult<()> {
+    let durable = DurableTantivyIndex::new(
+        index.index_handle(),
+        data_dir.to_path_buf(),
+        Arc::new(DefaultSymbolCodec),
+        DurabilityConfig::default(),
+    )?;
+    let _ = durable.protect_segments()?;
+    Ok(())
+}
+
 fn file_size_bytes(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
@@ -407,8 +489,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    #[cfg(feature = "lexical")]
+    use frankensearch_core::traits::LexicalSearch;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
+    #[cfg(feature = "durability")]
+    use frankensearch_durability::FsviProtector;
+    #[cfg(feature = "lexical")]
+    use frankensearch_lexical::TantivyIndex;
 
     use super::*;
 
@@ -623,6 +711,55 @@ mod tests {
                 .unwrap();
 
             assert_eq!(stats.doc_count, 3);
+        });
+    }
+
+    #[cfg(feature = "lexical")]
+    #[test]
+    fn build_wires_lexical_index_when_feature_enabled() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Alpha retrieval content")
+                .add_document("doc-2", "Beta ranking content")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.doc_count, 2);
+
+            let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
+            let hits = lexical.search(&cx, "Alpha", 5).await.unwrap();
+            assert!(!hits.is_empty());
+        });
+    }
+
+    #[cfg(feature = "durability")]
+    #[test]
+    fn build_wires_durability_sidecars_when_feature_enabled() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Durability alpha")
+                .add_document("doc-2", "Durability beta")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.doc_count, 2);
+
+            let fast_path = {
+                let dedicated = dir.path().join(super::VECTOR_INDEX_FAST_FILENAME);
+                if dedicated.exists() {
+                    dedicated
+                } else {
+                    dir.path().join(super::VECTOR_INDEX_FALLBACK_FILENAME)
+                }
+            };
+            let fast_sidecar = FsviProtector::sidecar_path(&fast_path);
+            assert!(fast_sidecar.exists());
         });
     }
 

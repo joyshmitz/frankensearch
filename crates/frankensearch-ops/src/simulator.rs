@@ -1048,7 +1048,7 @@ fn replay_run_into_storage(
         }
 
         stats.final_slo_result = storage
-            .materialize_slo_rollups_and_anomalies(now_ms, SloMaterializationConfig::default())?;
+            .materialize_slo_rollups_and_anomalies(now_ms, SloMaterializationConfig::from_env())?;
     }
 
     Ok(stats)

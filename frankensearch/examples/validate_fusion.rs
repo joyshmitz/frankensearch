@@ -378,6 +378,7 @@ fn make_lexical(ids: &[&str], scores: &[f32]) -> Vec<ScoredResult> {
             doc_id: id.to_string(),
             score,
             source: ScoreSource::Lexical,
+            index: None,
             fast_score: None,
             quality_score: None,
             lexical_score: Some(score),

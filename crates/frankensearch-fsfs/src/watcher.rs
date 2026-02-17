@@ -526,6 +526,7 @@ struct WorkerContext {
     base_batch_size: usize,
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
     let (event_tx, event_rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
     let mut watcher = build_notify_watcher(event_tx)?;

@@ -777,6 +777,27 @@ impl Default for SloMaterializationConfig {
 }
 
 impl SloMaterializationConfig {
+    /// Load SLO overrides from environment variables.
+    ///
+    /// Currently maps the ops contract knob
+    /// `FRANKENSEARCH_OPS_SLO_SEARCH_P99_MS` onto the latency target used by
+    /// rollup evaluation. Invalid values are ignored and defaults are retained.
+    #[must_use]
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(raw) = std::env::var("FRANKENSEARCH_OPS_SLO_SEARCH_P99_MS")
+            && let Some(target_us) = parse_slo_search_p99_ms_override(&raw)
+        {
+            self.target_p95_latency_us = target_us;
+        }
+        self
+    }
+
+    /// Build a config from defaults plus environment overrides.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self::default().with_env_overrides()
+    }
+
     fn validate(self) -> SearchResult<()> {
         if self.target_p95_latency_us == 0 {
             return Err(SearchError::InvalidConfig {
@@ -840,6 +861,14 @@ impl SloMaterializationConfig {
         }
         Ok(())
     }
+}
+
+fn parse_slo_search_p99_ms_override(raw: &str) -> Option<u64> {
+    let ms = raw.parse::<u64>().ok()?;
+    if ms == 0 {
+        return None;
+    }
+    Some(ms.saturating_mul(1_000))
 }
 
 /// Materialized SLO row for dashboards and alerting views.
@@ -3334,7 +3363,7 @@ mod tests {
         EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
         OpsRetentionPolicy, OpsStorage, ResourceSampleRecord, SearchEventPhase, SearchEventRecord,
         SloHealth, SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
-        evidence_link_id, ops_error,
+        evidence_link_id, ops_error, parse_slo_search_p99_ms_override,
     };
     use frankensearch_core::{
         LifecycleSeverity, LifecycleState, SearchError,
@@ -5206,6 +5235,19 @@ mod tests {
         assert!((cfg.error_burn_rate - 2.0).abs() < f64::EPSILON);
         assert!((cfg.critical_burn_rate - 4.0).abs() < f64::EPSILON);
         assert_eq!(cfg.min_requests, 10);
+    }
+
+    #[test]
+    fn parse_slo_search_p99_ms_override_parses_valid_values() {
+        assert_eq!(parse_slo_search_p99_ms_override("1"), Some(1_000));
+        assert_eq!(parse_slo_search_p99_ms_override("500"), Some(500_000));
+    }
+
+    #[test]
+    fn parse_slo_search_p99_ms_override_rejects_invalid_values() {
+        assert_eq!(parse_slo_search_p99_ms_override("0"), None);
+        assert_eq!(parse_slo_search_p99_ms_override("-5"), None);
+        assert_eq!(parse_slo_search_p99_ms_override("abc"), None);
     }
 
     #[test]

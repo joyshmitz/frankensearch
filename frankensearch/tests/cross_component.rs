@@ -94,6 +94,7 @@ fn scored(doc_id: &str, score: f32) -> ScoredResult {
         doc_id: doc_id.to_owned(),
         score,
         source: ScoreSource::Hybrid,
+        index: None,
         fast_score: None,
         quality_score: None,
         lexical_score: None,
@@ -254,16 +255,17 @@ fn normalize_then_blend_empty_sets() {
 
 #[test]
 fn normalize_edge_cases_propagate_through_blend() {
-    // All identical scores → normalization produces 0.5 → blend is 0.5
+    // All identical scores use the robust fallback path and are clamped to [0,1].
+    // Here both inputs clamp to 1.0, so blend also yields 1.0.
     let fast = vec![hit("a", 5.0, 0), hit("b", 5.0, 1)];
     let quality = vec![hit("a", 5.0, 0), hit("b", 5.0, 1)];
 
     let blended = blend_two_tier(&fast, &quality, 0.5);
-    // All equal scores: normalize → 0.5 each. Blend: 0.5*0.5 + 0.5*0.5 = 0.5
+    // All equal high scores: clamp -> 1.0 each. Blend: 0.5*1.0 + 0.5*1.0 = 1.0.
     for h in &blended {
         assert!(
-            (h.score - 0.5).abs() < 1e-5,
-            "expected ~0.5, got {}",
+            (h.score - 1.0).abs() < 1e-5,
+            "expected ~1.0, got {}",
             h.score
         );
     }

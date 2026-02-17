@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Operations control-plane TUI for frankensearch fleet monitoring"
 
+[[bin]]
+name = "frankensearch-ops"
+path = "src/main.rs"
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }

@@ -49,7 +49,7 @@ pub use accessibility::{
 };
 pub use app::OpsApp;
 pub use category::ScreenCategory;
-pub use data_source::{DataSource, MockDataSource};
+pub use data_source::{DataSource, MockDataSource, StorageDataSource};
 pub use discovery::{
     DiscoveredInstance, DiscoveryConfig, DiscoveryEngine, DiscoverySignalKind, DiscoverySource,
     DiscoveryStats, DiscoveryStatus, InstanceSighting, StaticDiscoverySource,

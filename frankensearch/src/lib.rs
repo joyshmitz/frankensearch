@@ -201,9 +201,9 @@ pub use frankensearch_storage::{
 
 #[cfg(feature = "durability")]
 pub use frankensearch_durability::{
-    DurabilityConfig, DurabilityMetrics, FileHealth, FileProtectionResult as ProtectionResult,
-    FileProtector, FileRepairOutcome as RepairResult, FsviProtector, RepairCodec,
-    RepairCodecConfig, VerifyResult as RepairCodecVerifyResult,
+    DefaultSymbolCodec, DurabilityConfig, DurabilityMetrics, FileHealth,
+    FileProtectionResult as ProtectionResult, FileProtector, FileRepairOutcome as RepairResult,
+    FsviProtector, RepairCodec, RepairCodecConfig, VerifyResult as RepairCodecVerifyResult,
 };
 
 // ─── Async runtime re-exports ───────────────────────────────────────────────
@@ -279,6 +279,9 @@ pub use frankensearch_fusion::{
     blend_two_tier, candidate_count, rrf_fuse,
 };
 
+#[cfg(feature = "graph")]
+pub use frankensearch_fusion::GraphRanker;
+
 // ─── Feature-gated embedder re-exports ──────────────────────────────────────
 
 #[cfg(feature = "hash")]
@@ -326,6 +329,9 @@ pub mod prelude {
 
     #[cfg(feature = "durability")]
     pub use crate::{FileProtector, FsviProtector, RepairCodec};
+
+    #[cfg(feature = "graph")]
+    pub use crate::GraphRanker;
 }
 
 #[cfg(test)]

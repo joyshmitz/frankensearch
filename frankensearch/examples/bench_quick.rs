@@ -111,6 +111,7 @@ fn main() {
                 doc_id: format!("doc-{i:06}"),
                 score: (n - i) as f32,
                 source: frankensearch_core::types::ScoreSource::Lexical,
+                index: None,
                 fast_score: None,
                 quality_score: None,
                 lexical_score: Some((n - i) as f32),

@@ -163,19 +163,7 @@ fn main() -> SearchResult<()> {
     let app_runtime = FsfsRuntime::new(resolved_config).with_cli_input(runtime_cli_input);
     let interface_mode = match command {
         CliCommand::Tui => InterfaceMode::Tui,
-        CliCommand::Search
-        | CliCommand::Index
-        | CliCommand::Watch
-        | CliCommand::Status
-        | CliCommand::Explain
-        | CliCommand::Config
-        | CliCommand::Download
-        | CliCommand::Doctor
-        | CliCommand::Update
-        | CliCommand::Completions
-        | CliCommand::Uninstall
-        | CliCommand::Help
-        | CliCommand::Version => InterfaceMode::Cli,
+        _ => InterfaceMode::Cli,
     };
 
     info!(

@@ -18,6 +18,12 @@ use frankensearch_embed::{
 };
 use frankensearch_index::VectorIndex;
 use frankensearch_lexical::{SnippetConfig, TantivyIndex};
+use frankensearch_storage::{
+    EmbeddingVectorSink, IngestAction, IngestRequest, IngestResult, JobQueueConfig,
+    PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
+    StorageConfig as PipelineStorageConfig,
+};
+use fsqlite_types::value::SqliteValue;
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -175,6 +181,93 @@ pub struct DiskBudgetControlPlan {
     pub reason_code: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct SearchPhaseArtifact {
+    phase: SearchOutputPhase,
+    fused: Vec<FusedCandidate>,
+    payload: SearchPayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchFilterClause {
+    PathContains(String),
+    Extension(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchFilterExpr {
+    clauses: Vec<SearchFilterClause>,
+}
+
+impl SearchFilterExpr {
+    fn parse(raw: &str) -> SearchResult<Option<Self>> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+
+        let mut clauses = Vec::new();
+        for token in trimmed.split_whitespace() {
+            if let Some((key, value)) = token.split_once(':') {
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.search.filter".to_owned(),
+                        value: token.to_owned(),
+                        reason: "filter segment has empty value".to_owned(),
+                    });
+                }
+                match key.as_str() {
+                    "path" => {
+                        clauses.push(SearchFilterClause::PathContains(value.to_ascii_lowercase()));
+                    }
+                    "type" | "ext" | "extension" | "lang" => {
+                        let normalized = value.trim_start_matches('.').to_ascii_lowercase();
+                        if normalized.is_empty() {
+                            return Err(SearchError::InvalidConfig {
+                                field: "cli.search.filter".to_owned(),
+                                value: token.to_owned(),
+                                reason: "extension filter must include a non-empty extension"
+                                    .to_owned(),
+                            });
+                        }
+                        clauses.push(SearchFilterClause::Extension(normalized));
+                    }
+                    _ => {
+                        return Err(SearchError::InvalidConfig {
+                            field: "cli.search.filter".to_owned(),
+                            value: token.to_owned(),
+                            reason: format!(
+                                "unsupported filter key `{key}`; supported keys: path,type,ext,extension,lang"
+                            ),
+                        });
+                    }
+                }
+            } else {
+                clauses.push(SearchFilterClause::PathContains(token.to_ascii_lowercase()));
+            }
+        }
+
+        if clauses.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self { clauses }))
+    }
+
+    fn matches_doc_id(&self, doc_id: &str) -> bool {
+        let lowered = doc_id.to_ascii_lowercase();
+        self.clauses.iter().all(|clause| match clause {
+            SearchFilterClause::PathContains(needle) => lowered.contains(needle),
+            SearchFilterClause::Extension(expected) => Path::new(doc_id)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(expected)),
+        })
+    }
+}
+
 const DISK_BUDGET_RATIO_DIVISOR: u64 = 10;
 const DISK_BUDGET_CAP_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DISK_BUDGET_FALLBACK_BYTES: u64 = DISK_BUDGET_CAP_BYTES;
@@ -314,9 +407,46 @@ const fn sanitize_explain_score(score: f64) -> f64 {
 struct LiveIngestPipeline {
     target_root: PathBuf,
     lexical_index: TantivyIndex,
-    vector_index: std::sync::Mutex<VectorIndex>,
+    vector_index: Arc<std::sync::Mutex<VectorIndex>>,
     embedder: Arc<dyn Embedder>,
     canonicalizer: DefaultCanonicalizer,
+    storage_db_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct LiveVectorSink {
+    vector_index: Arc<std::sync::Mutex<VectorIndex>>,
+}
+
+impl EmbeddingVectorSink for LiveVectorSink {
+    fn persist(
+        &self,
+        doc_id: &str,
+        embedding_embedder_id: &str,
+        embedding: &[f32],
+    ) -> SearchResult<()> {
+        let mut vi = self
+            .vector_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = vi.soft_delete(doc_id) {
+            tracing::debug!(
+                file_key = %doc_id,
+                embedder_id = embedding_embedder_id,
+                error = %error,
+                "storage vector sink: soft_delete ignored (doc may be new)"
+            );
+        }
+        vi.append(doc_id, embedding)?;
+        drop(vi);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct StorageBatchContext {
+    storage: Arc<Storage>,
+    runner: StorageBackedJobRunner,
 }
 
 impl WatchIngestPipeline for LiveIngestPipeline {
@@ -340,10 +470,16 @@ impl LiveIngestPipeline {
         Self {
             target_root,
             lexical_index,
-            vector_index: std::sync::Mutex::new(vector_index),
+            vector_index: Arc::new(std::sync::Mutex::new(vector_index)),
             embedder,
             canonicalizer: DefaultCanonicalizer::default(),
+            storage_db_path: None,
         }
+    }
+
+    fn with_storage_db_path(mut self, storage_db_path: PathBuf) -> Self {
+        self.storage_db_path = Some(storage_db_path);
+        self
     }
 
     fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
@@ -400,11 +536,189 @@ impl LiveIngestPipeline {
         Ok(())
     }
 
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn build_storage_batch_context(
+        &self,
+    ) -> frankensearch_core::SearchResult<Option<StorageBatchContext>> {
+        let Some(storage_db_path) = self.storage_db_path.as_ref() else {
+            return Ok(None);
+        };
+
+        let storage = Arc::new(Storage::open(PipelineStorageConfig {
+            db_path: storage_db_path.clone(),
+            ..PipelineStorageConfig::default()
+        })?);
+        let queue = Arc::new(PersistentJobQueue::new(
+            Arc::clone(&storage),
+            JobQueueConfig::default(),
+        ));
+        let sink = Arc::new(LiveVectorSink {
+            vector_index: Arc::clone(&self.vector_index),
+        }) as Arc<dyn EmbeddingVectorSink>;
+
+        let runner = StorageBackedJobRunner::new(
+            Arc::clone(&storage),
+            queue,
+            Arc::new(DefaultCanonicalizer::default()),
+            Arc::clone(&self.embedder),
+            sink,
+        )
+        .with_config(PipelineConfig {
+            worker_max_idle_cycles: Some(1),
+            ..PipelineConfig::default()
+        });
+
+        Ok(Some(StorageBatchContext { storage, runner }))
+    }
+
+    fn enqueue_storage_upsert(
+        storage_ctx: &StorageBatchContext,
+        rel_key: &str,
+        canonical: &str,
+        abs_path: &Path,
+    ) -> frankensearch_core::SearchResult<IngestResult> {
+        let mut request = IngestRequest::new(rel_key.to_owned(), canonical.to_owned());
+        request.source_path = Some(abs_path.display().to_string());
+        request.enqueue_quality = false;
+        storage_ctx.runner.ingest(request)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn drain_storage_jobs(
+        &self,
+        cx: &Cx,
+        storage_ctx: &StorageBatchContext,
+    ) -> frankensearch_core::SearchResult<()> {
+        loop {
+            let batch = storage_ctx
+                .runner
+                .process_batch(cx, "fsfs-watch-live")
+                .await?;
+            if batch.jobs_claimed == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn purge_storage_document(
+        storage_ctx: Option<&StorageBatchContext>,
+        rel_key: &str,
+    ) -> frankensearch_core::SearchResult<()> {
+        let Some(storage_ctx) = storage_ctx else {
+            return Ok(());
+        };
+        storage_ctx.storage.transaction(|conn| {
+            conn.execute_with_params(
+                "DELETE FROM documents WHERE doc_id = ?1;",
+                &[SqliteValue::Text(rel_key.to_owned())],
+            )
+            .map_err(|error| SearchError::SubsystemError {
+                subsystem: "fsfs.watch.storage",
+                source: Box::new(std::io::Error::other(error.to_string())),
+            })?;
+            Ok(())
+        })
+    }
+
+    fn plan_live_vector_upsert(
+        rel_key: &str,
+        revision: i64,
+        ingestion_class: IngestionClass,
+        content_len_bytes: u64,
+    ) -> VectorPipelinePlan {
+        let (tier, reason_code, chunk_count) =
+            if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
+                (
+                    VectorSchedulingTier::FastOnly,
+                    "vector.plan.fast_only_quality_unavailable".to_owned(),
+                    FsfsRuntime::chunk_count_for_bytes(content_len_bytes),
+                )
+            } else {
+                (
+                    VectorSchedulingTier::Skip,
+                    "vector.skip.non_semantic_ingestion_class".to_owned(),
+                    0,
+                )
+            };
+
+        VectorPipelinePlan {
+            file_key: rel_key.to_owned(),
+            revision,
+            chunk_count,
+            batch_size: 1,
+            tier,
+            invalidate_revisions_through: None,
+            reason_code,
+        }
+    }
+
+    async fn apply_live_vector_actions(
+        &self,
+        cx: &Cx,
+        rel_key: &str,
+        revision: i64,
+        canonical: &str,
+        vector_plan: &VectorPipelinePlan,
+    ) -> frankensearch_core::SearchResult<()> {
+        for action in FsfsRuntime::vector_index_write_actions(vector_plan) {
+            match action {
+                VectorIndexWriteAction::InvalidateRevisionsThrough { .. } => {
+                    tracing::debug!(
+                        file_key = %rel_key,
+                        revision,
+                        reason_code = %vector_plan.reason_code,
+                        "watcher ingest: revision invalidation action not yet implemented; continuing"
+                    );
+                }
+                VectorIndexWriteAction::AppendFast { .. } => {
+                    match self.embedder.embed(cx, canonical).await {
+                        Ok(embedding) => {
+                            let mut vi = self
+                                .vector_index
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // soft_delete returns Ok(false) if doc doesn't exist, so Err is a real failure
+                            // (IO/corruption) that must prevent appending.
+                            vi.soft_delete(rel_key)?;
+                            vi.append(rel_key, &embedding)?;
+                        }
+                        Err(error) => {
+                            warn!(
+                                file_key = %rel_key,
+                                error = %error,
+                                reason_code = %vector_plan.reason_code,
+                                "watcher ingest: embedding failed; lexical-only for this file"
+                            );
+                        }
+                    }
+                }
+                VectorIndexWriteAction::AppendQuality { .. } => {
+                    tracing::debug!(
+                        file_key = %rel_key,
+                        revision,
+                        reason_code = %vector_plan.reason_code,
+                        "watcher ingest: quality vector append action skipped (fast-tier live ingest)"
+                    );
+                }
+                VectorIndexWriteAction::MarkLexicalFallback { .. }
+                | VectorIndexWriteAction::Skip { .. } => {
+                    self.soft_delete_vector(rel_key);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::future_not_send)]
     async fn apply_upsert_op(
         &self,
         cx: &Cx,
         file_key: &str,
+        revision: i64,
         ingestion_class: IngestionClass,
+        storage_ctx: Option<&StorageBatchContext>,
     ) -> frankensearch_core::SearchResult<bool> {
         let (abs_path, rel_key) = self.resolve_paths(file_key)?;
 
@@ -413,6 +727,7 @@ impl LiveIngestPipeline {
             IngestionClass::MetadataOnly | IngestionClass::Skip
         ) {
             self.prune_indexes(cx, &rel_key).await?;
+            Self::purge_storage_document(storage_ctx, &rel_key)?;
             return Ok(true);
         }
 
@@ -420,6 +735,7 @@ impl LiveIngestPipeline {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.prune_indexes(cx, &rel_key).await?;
+                Self::purge_storage_document(storage_ctx, &rel_key)?;
                 return Ok(true);
             }
             Err(error)
@@ -435,6 +751,7 @@ impl LiveIngestPipeline {
 
         if is_probably_binary(&bytes) {
             self.prune_indexes(cx, &rel_key).await?;
+            Self::purge_storage_document(storage_ctx, &rel_key)?;
             return Ok(true);
         }
 
@@ -442,6 +759,7 @@ impl LiveIngestPipeline {
         let canonical = self.canonicalizer.canonicalize(&raw_text);
         if canonical.trim().is_empty() {
             self.prune_indexes(cx, &rel_key).await?;
+            Self::purge_storage_document(storage_ctx, &rel_key)?;
             return Ok(true);
         }
 
@@ -454,61 +772,98 @@ impl LiveIngestPipeline {
         self.lexical_index.index_document(cx, &doc).await?;
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
-            match self.embedder.embed(cx, &canonical).await {
-                Ok(embedding) => {
-                    let mut vi = self
-                        .vector_index
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    // soft_delete returns Ok(false) if doc doesn't exist, so Err is a real failure
-                    // (IO/corruption) that must prevent appending.
-                    vi.soft_delete(&rel_key)?;
-                    vi.append(&rel_key, &embedding)?;
-                }
-                Err(error) => {
-                    warn!(
-                        file_key = %rel_key,
-                        error = %error,
-                        "watcher ingest: embedding failed; lexical-only for this file"
+            if let Some(storage_ctx) = storage_ctx {
+                let ingest_result =
+                    Self::enqueue_storage_upsert(storage_ctx, &rel_key, &canonical, &abs_path)?;
+                // Storage pipeline intentionally skips hash-tier queued jobs because hash
+                // vectors are expected to be computed inline. Preserve live watcher behavior by
+                // writing those vectors directly for newly inserted/updated content.
+                if !self.embedder.is_semantic()
+                    && matches!(
+                        ingest_result.action,
+                        IngestAction::New | IngestAction::Updated
+                    )
+                {
+                    let content_len_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
+                    let vector_plan = Self::plan_live_vector_upsert(
+                        &rel_key,
+                        revision,
+                        ingestion_class,
+                        content_len_bytes,
                     );
+                    self.apply_live_vector_actions(
+                        cx,
+                        &rel_key,
+                        revision,
+                        &canonical,
+                        &vector_plan,
+                    )
+                    .await?;
                 }
+            } else {
+                let content_len_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
+                let vector_plan = Self::plan_live_vector_upsert(
+                    &rel_key,
+                    revision,
+                    ingestion_class,
+                    content_len_bytes,
+                );
+                self.apply_live_vector_actions(cx, &rel_key, revision, &canonical, &vector_plan)
+                    .await?;
             }
         } else {
             self.soft_delete_vector(&rel_key);
+            Self::purge_storage_document(storage_ctx, &rel_key)?;
         }
 
         Ok(true)
     }
 
+    #[allow(clippy::future_not_send)]
     async fn apply_delete_op(
         &self,
         cx: &Cx,
         file_key: &str,
+        storage_ctx: Option<&StorageBatchContext>,
     ) -> frankensearch_core::SearchResult<()> {
         let (_abs_path, rel_key) = self.resolve_paths(file_key)?;
-        self.prune_indexes(cx, &rel_key).await
+        self.prune_indexes(cx, &rel_key).await?;
+        Self::purge_storage_document(storage_ctx, &rel_key)
     }
 
+    #[allow(clippy::future_not_send)]
     async fn apply_batch_inner(
         &self,
         cx: &Cx,
         batch: &[WatchIngestOp],
     ) -> frankensearch_core::SearchResult<usize> {
+        let storage_ctx = self.build_storage_batch_context()?;
         let mut count = 0_usize;
 
         for op in batch {
             match op {
                 WatchIngestOp::Upsert {
                     file_key,
+                    revision,
                     ingestion_class,
                     ..
                 } => {
-                    if self.apply_upsert_op(cx, file_key, *ingestion_class).await? {
+                    if self
+                        .apply_upsert_op(
+                            cx,
+                            file_key,
+                            *revision,
+                            *ingestion_class,
+                            storage_ctx.as_ref(),
+                        )
+                        .await?
+                    {
                         count = count.saturating_add(1);
                     }
                 }
                 WatchIngestOp::Delete { file_key, .. } => {
-                    self.apply_delete_op(cx, file_key).await?;
+                    self.apply_delete_op(cx, file_key, storage_ctx.as_ref())
+                        .await?;
                     count = count.saturating_add(1);
                 }
             }
@@ -516,6 +871,9 @@ impl LiveIngestPipeline {
 
         if count > 0 {
             self.lexical_index.commit(cx).await?;
+            if let Some(storage_ctx) = storage_ctx.as_ref() {
+                self.drain_storage_jobs(cx, storage_ctx).await?;
+            }
             info!(
                 batch_size = batch.len(),
                 reindexed = count,
@@ -1926,10 +2284,6 @@ impl FsfsRuntime {
                 print_cli_help();
                 Ok(())
             }
-            CliCommand::Version => {
-                println!("fsfs {}", env!("CARGO_PKG_VERSION"));
-                Ok(())
-            }
             CliCommand::Completions => self.run_completions_command(),
             CliCommand::Update => self.run_update_command(),
             CliCommand::Uninstall => self.run_uninstall_command(),
@@ -2625,13 +2979,6 @@ impl FsfsRuntime {
     }
 
     async fn run_search_command(&self, cx: &Cx) -> SearchResult<()> {
-        if self.cli_input.filter.is_some() {
-            warn!(
-                filter = ?self.cli_input.filter,
-                "fsfs search filter expression is not yet wired; continuing without filter"
-            );
-        }
-
         let query = self
             .cli_input
             .query
@@ -2723,9 +3070,19 @@ impl FsfsRuntime {
         let mut seq = 0_u64;
 
         self.emit_search_stream_started(query, &stream_id, &mut seq, &mut stdout)?;
-        match self.execute_search_payload(cx, query, limit).await {
-            Ok(payload) => {
-                self.emit_search_stream_payload(&payload, &stream_id, &mut seq, &mut stdout)?;
+        match self.execute_search_payloads(cx, query, limit).await {
+            Ok(payloads) => {
+                let payload = payloads.last().cloned().unwrap_or_else(|| {
+                    SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
+                });
+                for stage_payload in &payloads {
+                    self.emit_search_stream_payload(
+                        stage_payload,
+                        &stream_id,
+                        &mut seq,
+                        &mut stdout,
+                    )?;
+                }
                 self.emit_search_stream_terminal_completed(&stream_id, &mut seq, &mut stdout)?;
                 info!(
                     query = query,
@@ -3053,19 +3410,83 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<SearchPayload> {
+        let payloads = self.execute_search_payloads(cx, query, limit).await?;
+        Ok(payloads.last().cloned().unwrap_or_else(|| {
+            SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
+        }))
+    }
+
+    async fn execute_search_payloads(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        let artifacts = self
+            .execute_search_phase_artifacts(cx, query, limit)
+            .await?;
+        Ok(artifacts
+            .into_iter()
+            .map(|artifact| artifact.payload)
+            .collect())
+    }
+
+    fn apply_search_filter(
+        fused: &[FusedCandidate],
+        filter_expr: Option<&SearchFilterExpr>,
+    ) -> Vec<FusedCandidate> {
+        filter_expr.map_or_else(
+            || fused.to_vec(),
+            |expr| {
+                fused
+                    .iter()
+                    .filter(|candidate| expr.matches_doc_id(&candidate.doc_id))
+                    .cloned()
+                    .collect()
+            },
+        )
+    }
+
+    fn build_limited_payload(
+        orchestrator: QueryExecutionOrchestrator,
+        query: &str,
+        phase: SearchOutputPhase,
+        fused: &[FusedCandidate],
+        snippets_by_doc: &HashMap<String, String>,
+        limit: usize,
+    ) -> SearchPayload {
+        let limited = fused.iter().take(limit).cloned().collect::<Vec<_>>();
+        let mut payload =
+            orchestrator.build_search_payload(query, phase, &limited, snippets_by_doc);
+        payload.total_candidates = fused.len();
+        payload
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_search_phase_artifacts(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         let normalized_query = query
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .trim()
             .to_owned();
+        let filter_expr = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         if normalized_query.is_empty() {
-            return Ok(SearchPayload::new(
-                String::new(),
-                SearchOutputPhase::Initial,
-                0,
-                Vec::new(),
-            ));
+            return Ok(vec![SearchPhaseArtifact {
+                phase: SearchOutputPhase::Initial,
+                fused: Vec::new(),
+                payload: SearchPayload::new(
+                    String::new(),
+                    SearchOutputPhase::Initial,
+                    0,
+                    Vec::new(),
+                ),
+            }]);
         }
 
         let search_start = Instant::now();
@@ -3118,6 +3539,21 @@ impl FsfsRuntime {
             }
         }
 
+        let mut quality_embedder = None;
+        if vector_index.is_some() && !self.config.search.fast_only {
+            match self.resolve_quality_embedder() {
+                Ok(Some(embedder)) => quality_embedder = Some(embedder),
+                Ok(None) => {}
+                Err(error) if lexical_available => {
+                    warn!(
+                        error = %error,
+                        "fsfs search continuing without quality embedder after initialization failure"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
         let capabilities = QueryExecutionCapabilities {
             lexical: if lexical_index.is_some() {
                 CapabilityState::Enabled
@@ -3129,7 +3565,11 @@ impl FsfsRuntime {
             } else {
                 CapabilityState::Disabled
             },
-            quality_semantic: CapabilityState::Disabled,
+            quality_semantic: if vector_index.is_some() && quality_embedder.is_some() {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
             rerank: CapabilityState::Disabled,
         };
         let planner = QueryPlanner::from_fsfs(&self.config);
@@ -3218,15 +3658,115 @@ impl FsfsRuntime {
         let orchestrator = QueryExecutionOrchestrator::new(QueryFusionPolicy {
             rrf_k: plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
         });
-        let fused = orchestrator.fuse_rankings(&lexical_candidates, &semantic_candidates, limit, 0);
-        let payload = orchestrator.build_search_payload(
+        let fusion_budget = lexical_candidates
+            .len()
+            .saturating_add(semantic_candidates.len())
+            .max(limit);
+        let fused_initial =
+            orchestrator.fuse_rankings(&lexical_candidates, &semantic_candidates, fusion_budget, 0);
+        let filtered_initial = Self::apply_search_filter(&fused_initial, filter_expr.as_ref());
+        let payload = Self::build_limited_payload(
+            orchestrator,
             &normalized_query,
             SearchOutputPhase::Initial,
-            &fused,
+            &filtered_initial,
             &snippets_by_doc,
+            limit,
         );
-        if let Err(error) =
-            self.persist_explain_session(&index_root, &normalized_query, payload.phase, &fused)
+        let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
+
+        let mut artifacts = vec![SearchPhaseArtifact {
+            phase: SearchOutputPhase::Initial,
+            fused: filtered_initial.clone(),
+            payload: payload.clone(),
+        }];
+
+        if plan.quality_stage.enabled {
+            if let (Some(index), Some(embedder)) =
+                (vector_index.as_ref(), quality_embedder.as_ref())
+            {
+                let quality_budget = plan.quality_stage.candidate_budget.max(limit);
+                let quality_outcome = match embedder.embed(cx, &normalized_query).await {
+                    Ok(query_embedding) => {
+                        match index.search_top_k(&query_embedding, quality_budget, None) {
+                            Ok(hits) => Ok(hits
+                                .into_iter()
+                                .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score))
+                                .collect::<Vec<_>>()),
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+
+                match quality_outcome {
+                    Ok(quality_candidates) => {
+                        let fused_refined = orchestrator.fuse_rankings(
+                            &lexical_candidates,
+                            &quality_candidates,
+                            fusion_budget,
+                            0,
+                        );
+                        let filtered_refined =
+                            Self::apply_search_filter(&fused_refined, filter_expr.as_ref());
+                        let refined_payload = Self::build_limited_payload(
+                            orchestrator,
+                            &normalized_query,
+                            SearchOutputPhase::Refined,
+                            &filtered_refined,
+                            &snippets_by_doc,
+                            limit,
+                        );
+                        artifacts.push(SearchPhaseArtifact {
+                            phase: SearchOutputPhase::Refined,
+                            fused: filtered_refined,
+                            payload: refined_payload,
+                        });
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "fsfs quality refinement failed; falling back to initial phase payload"
+                        );
+                        let failed_payload = Self::build_limited_payload(
+                            orchestrator,
+                            &normalized_query,
+                            SearchOutputPhase::RefinementFailed,
+                            &filtered_initial,
+                            &snippets_by_doc,
+                            limit,
+                        );
+                        artifacts.push(SearchPhaseArtifact {
+                            phase: SearchOutputPhase::RefinementFailed,
+                            fused: filtered_initial.clone(),
+                            payload: failed_payload,
+                        });
+                    }
+                }
+            } else {
+                let failed_payload = Self::build_limited_payload(
+                    orchestrator,
+                    &normalized_query,
+                    SearchOutputPhase::RefinementFailed,
+                    &filtered_initial,
+                    &snippets_by_doc,
+                    limit,
+                );
+                artifacts.push(SearchPhaseArtifact {
+                    phase: SearchOutputPhase::RefinementFailed,
+                    fused: filtered_initial.clone(),
+                    payload: failed_payload,
+                });
+            }
+        }
+
+        if let Some(last) = artifacts.last()
+            && let Err(error) = self.persist_explain_session(
+                &index_root,
+                &normalized_query,
+                last.phase,
+                &last.fused,
+            )
         {
             warn!(
                 error = %error,
@@ -3234,15 +3774,18 @@ impl FsfsRuntime {
                 "failed to persist explain-session context for follow-up `fsfs explain`"
             );
         }
-        let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
+
+        let final_payload = artifacts
+            .last()
+            .map_or(&payload, |artifact| &artifact.payload);
 
         info!(
             phase = "fast_search",
             query = normalized_query,
             lexical_candidates = lexical_candidates.len(),
             semantic_candidates = semantic_candidates.len(),
-            fused_candidates = payload.total_candidates,
-            returned_hits = payload.returned_hits,
+            fused_candidates = final_payload.total_candidates,
+            returned_hits = final_payload.returned_hits,
             lexical_elapsed_ms,
             semantic_elapsed_ms,
             fusion_elapsed_ms,
@@ -3252,8 +3795,8 @@ impl FsfsRuntime {
         info!(
             phase = "fusion",
             rrf_k = plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
-            fused_candidates = payload.total_candidates,
-            returned_hits = payload.returned_hits,
+            fused_candidates = final_payload.total_candidates,
+            returned_hits = final_payload.returned_hits,
             "fsfs search fusion phase completed"
         );
         info!(
@@ -3281,7 +3824,7 @@ impl FsfsRuntime {
             "fsfs search rerank phase status"
         );
 
-        Ok(payload)
+        Ok(artifacts)
     }
 
     fn run_status_command(&self) -> SearchResult<()> {
@@ -4385,6 +4928,29 @@ impl FsfsRuntime {
         }
     }
 
+    fn resolve_storage_db_path(&self) -> SearchResult<PathBuf> {
+        let raw = self.config.storage.db_path.trim();
+        if raw.is_empty() {
+            return Err(SearchError::InvalidConfig {
+                field: "storage.db_path".to_owned(),
+                value: String::new(),
+                reason: "must not be empty".to_owned(),
+            });
+        }
+        if raw == ":memory:" {
+            return Ok(PathBuf::from(raw));
+        }
+        if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+            let home = home_dir().ok_or_else(|| SearchError::InvalidConfig {
+                field: "storage.db_path".to_owned(),
+                value: raw.to_owned(),
+                reason: "home directory not available for ~ expansion".to_owned(),
+            })?;
+            return Ok(home.join(rest));
+        }
+        absolutize_path(Path::new(raw))
+    }
+
     fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
         if cfg!(test) {
             return Ok(Arc::new(HashEmbedder::default_256()));
@@ -4396,10 +4962,28 @@ impl FsfsRuntime {
         Ok(stack.fast_arc())
     }
 
+    fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
+        if cfg!(test) {
+            return Ok(None);
+        }
+
+        let configured_root = PathBuf::from(&self.config.indexing.model_dir);
+        let stack = EmbedderStack::auto_detect_with(Some(&configured_root))
+            .or_else(|_| EmbedderStack::auto_detect())?;
+        Ok(stack.quality_arc())
+    }
+
     /// Build a live ingest pipeline for the watcher by opening existing indexes.
     fn build_live_ingest_pipeline(&self) -> SearchResult<LiveIngestPipeline> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        let storage_db_path = self.resolve_storage_db_path()?;
+        if storage_db_path.as_os_str() != ":memory:"
+            && let Some(parent) = storage_db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
 
         let lexical_path = index_root.join("lexical");
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
@@ -4411,16 +4995,15 @@ impl FsfsRuntime {
         info!(
             target_root = %target_root.display(),
             index_root = %index_root.display(),
+            storage_db_path = %storage_db_path.display(),
             embedder = embedder.id(),
             "live ingest pipeline initialized for watch mode"
         );
 
-        Ok(LiveIngestPipeline::new(
-            target_root,
-            lexical_index,
-            vector_index,
-            embedder,
-        ))
+        Ok(
+            LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
+                .with_storage_db_path(storage_db_path),
+        )
     }
 
     fn collect_index_candidates(
@@ -6189,6 +6772,107 @@ mod tests {
     }
 
     #[test]
+    fn live_ingest_pipeline_wires_storage_runner_for_semantic_upserts() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            fs::create_dir_all(target_root.join("src")).expect("create project source dir");
+            let file_path = target_root.join("src/lib.rs");
+            fs::write(
+                &file_path,
+                "pub fn answer() -> u32 { 42 }\nsemantic storage integration\n",
+            )
+            .expect("write source file");
+
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(index_root.join("vector")).expect("vector dir");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            let lexical_seed = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            lexical_seed
+                .commit(&cx)
+                .await
+                .expect("commit empty lexical");
+            drop(lexical_seed);
+            let vector_writer =
+                VectorIndex::create(&vector_path, "hash", 256).expect("create vector index");
+            vector_writer.finish().expect("finish vector index");
+
+            let db_path = temp.path().join("fsfs-watch-storage.db");
+            let mut config = FsfsConfig::default();
+            config.storage.db_path = db_path.display().to_string();
+
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Watch,
+                target_path: Some(target_root.clone()),
+                index_dir: Some(index_root),
+                watch: true,
+                ..CliInput::default()
+            });
+            let pipeline = runtime
+                .build_live_ingest_pipeline()
+                .expect("build live ingest pipeline");
+            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build ingest runtime");
+
+            let applied = pipeline
+                .apply_batch(
+                    &[WatchIngestOp::Upsert {
+                        file_key: file_path.display().to_string(),
+                        revision: 11,
+                        ingestion_class: IngestionClass::FullSemanticLexical,
+                    }],
+                    &ingest_rt,
+                )
+                .expect("semantic upsert should succeed");
+            assert_eq!(applied, 1);
+
+            let lexical_hits = pipeline
+                .lexical_index
+                .search(&cx, "semantic", 5)
+                .await
+                .expect("search lexical index");
+            assert!(
+                lexical_hits.iter().any(|hit| hit.doc_id == "src/lib.rs"),
+                "lexical index should contain the upserted document"
+            );
+
+            let semantic_query = pipeline
+                .embedder
+                .embed(&cx, "semantic storage integration")
+                .await
+                .expect("embed semantic probe query");
+            let vector_hits = {
+                let vi = pipeline
+                    .vector_index
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                vi.search_top_k(&semantic_query, 10, None)
+                    .expect("vector search")
+            };
+            assert!(
+                vector_hits.iter().any(|hit| hit.doc_id == "src/lib.rs"),
+                "vector index should contain the upserted document"
+            );
+
+            let storage =
+                frankensearch_storage::Storage::open(frankensearch_storage::StorageConfig {
+                    db_path,
+                    ..frankensearch_storage::StorageConfig::default()
+                })
+                .expect("open storage db");
+            let stored = storage
+                .get_document("src/lib.rs")
+                .expect("lookup stored document");
+            assert!(
+                stored.is_some(),
+                "storage pipeline should persist watcher-ingested documents"
+            );
+        });
+    }
+
+    #[test]
     fn live_ingest_upsert_missing_file_deletes_stale_document() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -6228,13 +6912,19 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
+            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build ingest runtime");
             let missing_path = target_root.join("src/ghost.rs");
             let applied = pipeline
-                .apply_batch(&[WatchIngestOp::Upsert {
-                    file_key: missing_path.display().to_string(),
-                    revision: 42,
-                    ingestion_class: IngestionClass::FullSemanticLexical,
-                }])
+                .apply_batch(
+                    &[WatchIngestOp::Upsert {
+                        file_key: missing_path.display().to_string(),
+                        revision: 42,
+                        ingestion_class: IngestionClass::FullSemanticLexical,
+                    }],
+                    &ingest_rt,
+                )
                 .expect("upsert missing file should be treated as delete");
 
             assert_eq!(applied, 1);
@@ -6377,12 +7067,18 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
+            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build ingest runtime");
             let applied = pipeline
-                .apply_batch(&[WatchIngestOp::Upsert {
-                    file_key: binary_path.display().to_string(),
-                    revision: 42,
-                    ingestion_class: IngestionClass::FullSemanticLexical,
-                }])
+                .apply_batch(
+                    &[WatchIngestOp::Upsert {
+                        file_key: binary_path.display().to_string(),
+                        revision: 42,
+                        ingestion_class: IngestionClass::FullSemanticLexical,
+                    }],
+                    &ingest_rt,
+                )
                 .expect("binary upsert should prune stale entries");
 
             assert_eq!(applied, 1);
@@ -6442,12 +7138,18 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
+            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build ingest runtime");
             let applied = pipeline
-                .apply_batch(&[WatchIngestOp::Upsert {
-                    file_key: file_path.display().to_string(),
-                    revision: 7,
-                    ingestion_class: IngestionClass::LexicalOnly,
-                }])
+                .apply_batch(
+                    &[WatchIngestOp::Upsert {
+                        file_key: file_path.display().to_string(),
+                        revision: 7,
+                        ingestion_class: IngestionClass::LexicalOnly,
+                    }],
+                    &ingest_rt,
+                )
                 .expect("lexical-only upsert should succeed");
 
             assert_eq!(applied, 1);
@@ -6522,12 +7224,18 @@ mod tests {
                 vector_index,
                 Arc::new(HashEmbedder::default_256()),
             );
+            let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build ingest runtime");
             let applied = pipeline
-                .apply_batch(&[WatchIngestOp::Upsert {
-                    file_key: file_path.display().to_string(),
-                    revision: 8,
-                    ingestion_class: IngestionClass::MetadataOnly,
-                }])
+                .apply_batch(
+                    &[WatchIngestOp::Upsert {
+                        file_key: file_path.display().to_string(),
+                        revision: 8,
+                        ingestion_class: IngestionClass::MetadataOnly,
+                    }],
+                    &ingest_rt,
+                )
                 .expect("metadata-only upsert should prune stale index entries");
 
             assert_eq!(applied, 1);
@@ -6905,6 +7613,84 @@ mod tests {
                     .iter()
                     .any(|hit| hit.path.contains("auth") || hit.path.contains("README")),
                 "expected auth-related hit path in payload"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_payload_applies_extension_filter() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::create_dir_all(project.join("docs")).expect("create docs dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("docs/auth.md"),
+                "Authentication middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write docs");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                })
+                .run_mode(&cx, InterfaceMode::Cli)
+                .await
+                .expect("index command should succeed");
+
+            let payload = FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Search,
+                    query: Some("authentication middleware".to_owned()),
+                    filter: Some("type:rs".to_owned()),
+                    index_dir: Some(project.join(".frankensearch")),
+                    ..CliInput::default()
+                })
+                .execute_search_payload(&cx, "authentication middleware", 10)
+                .await
+                .expect("search payload");
+
+            assert!(
+                !payload.hits.is_empty(),
+                "expected at least one filtered hit"
+            );
+            assert!(
+                payload.hits.iter().all(|hit| {
+                    std::path::Path::new(&hit.path)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+                }),
+                "all hits should satisfy type:rs filter"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_search_payload_rejects_invalid_filter_key() {
+        run_test_with_cx(|cx| async move {
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                query: Some("auth".to_owned()),
+                filter: Some("owner:me".to_owned()),
+                ..CliInput::default()
+            });
+
+            let error = runtime
+                .execute_search_payload(&cx, "auth", 5)
+                .await
+                .expect_err("invalid filter key should fail");
+            assert!(
+                error.to_string().contains("unsupported filter key"),
+                "unexpected error: {error}"
             );
         });
     }
