@@ -5,15 +5,21 @@
 
 use std::any::Any;
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::presets::ViewState;
 use crate::state::AppState;
@@ -31,6 +37,33 @@ pub struct FleetOverviewScreen {
     palette: SemanticPalette,
     selected_row: usize,
 }
+
+const FLEET_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "Enter",
+        description: "Open project detail",
+    },
+    KeybindingHint {
+        key: "s",
+        description: "Open live stream",
+    },
+    KeybindingHint {
+        key: "t",
+        description: "Open timeline",
+    },
+    KeybindingHint {
+        key: "a",
+        description: "Open analytics",
+    },
+];
 
 impl FleetOverviewScreen {
     /// Create a new fleet overview screen.
@@ -82,7 +115,7 @@ impl FleetOverviewScreen {
     }
 
     /// Update the semantic palette for theme-aware rendering.
-    pub fn set_palette(&mut self, palette: SemanticPalette) {
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
         self.palette = palette;
     }
 
@@ -158,7 +191,7 @@ impl FleetOverviewScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn selected_monitor_lines(&self) -> Vec<Line<'static>> {
+    fn selected_monitor_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let Some(instance) = self.selected_instance() else {
             return vec![Line::from("No instance selected")];
@@ -286,8 +319,8 @@ impl FleetOverviewScreen {
         );
 
         vec![
-            Line::from(vec![
-                Span::styled("Instance: ", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from_spans(vec![
+                Span::styled("Instance: ", Style::new().bold()),
                 Span::raw(instance.id.clone()),
             ]),
             Line::from(format!("Project: {}", instance.project)),
@@ -320,7 +353,7 @@ impl FleetOverviewScreen {
     fn selected_monitor_text(&self) -> String {
         self.selected_monitor_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -368,7 +401,7 @@ impl FleetOverviewScreen {
             .collect()
     }
 
-    fn kpi_tile_lines(&self) -> Vec<Line<'static>> {
+    fn kpi_tile_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let visible = self.visible_instances();
         let visible_count = visible.len();
@@ -437,7 +470,7 @@ impl FleetOverviewScreen {
         ]
     }
 
-    fn status_sparkline_lines(&self) -> Vec<Line<'static>> {
+    fn status_sparkline_lines(&self) -> Vec<Line> {
         let fleet = self.state.fleet();
         let metrics = self.state.control_plane_metrics();
         let visible = self.visible_instances();
@@ -498,7 +531,7 @@ impl FleetOverviewScreen {
         ]
     }
 
-    fn project_summary_lines(&self) -> Vec<Line<'static>> {
+    fn project_summary_lines(&self) -> Vec<Line> {
         #[derive(Default)]
         struct ProjectAccumulator {
             instance_count: usize,
@@ -594,7 +627,7 @@ impl FleetOverviewScreen {
             .collect()
     }
 
-    fn pipeline_health_lines(&self) -> Vec<Line<'static>> {
+    fn pipeline_health_lines(&self) -> Vec<Line> {
         let metrics = self.state.control_plane_metrics();
         let health = self.state.control_plane_health();
         let (badge, phase, error_hint, recovery) = match health {
@@ -675,7 +708,7 @@ impl FleetOverviewScreen {
         }
     }
 
-    fn dashboard_signal_lines(&self) -> Vec<Line<'static>> {
+    fn dashboard_signal_lines(&self) -> Vec<Line> {
         let mut lines = Vec::new();
         lines.extend(self.selected_monitor_lines());
         lines.push(Line::from(String::new()));
@@ -692,13 +725,17 @@ impl FleetOverviewScreen {
     }
 
     /// Build the instance table rows.
-    fn build_rows(&self) -> Vec<Row<'_>> {
+    fn build_rows(&self) -> Vec<Row> {
         let fleet = self.state.fleet();
         self.visible_instances()
             .into_iter()
             .enumerate()
             .map(|(i, inst)| {
-                let health = if inst.healthy { "OK" } else { "WARN" };
+                let health = if inst.healthy {
+                    "[OK] healthy"
+                } else {
+                    "[!!] degraded"
+                };
                 let resources = fleet
                     .resources
                     .get(&inst.id)
@@ -709,16 +746,16 @@ impl FleetOverviewScreen {
                 );
 
                 let style = if i == self.selected_row {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    self.palette.style_highlight().bold()
                 } else if !inst.healthy {
-                    Style::default().fg(ratatui::style::Color::Red)
+                    self.palette.style_row_error(i)
                 } else {
-                    Style::default()
+                    self.palette.style_row_base(i)
                 };
 
                 let cells = if self.view.density.show_inline_metrics() {
                     vec![
-                        health.to_string(),
+                        health.to_owned(),
                         inst.project.clone(),
                         inst.id.clone(),
                         format!("{}", inst.doc_count),
@@ -728,7 +765,7 @@ impl FleetOverviewScreen {
                     ]
                 } else {
                     vec![
-                        health.to_string(),
+                        health.to_owned(),
                         inst.project.clone(),
                         inst.id.clone(),
                         format!("{}", inst.doc_count),
@@ -774,13 +811,13 @@ impl Screen for FleetOverviewScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_lines)]
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
-        let area = frame.area();
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let area = frame.bounds();
+        let p = &self.palette;
+        let border_style = p.style_border();
 
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(5)])
+        let chunks = Flex::vertical()
+            .constraints([Constraint::Fixed(4), Constraint::Min(5)])
             .split(area);
 
         // Header with summary stats.
@@ -796,161 +833,167 @@ impl Screen for FleetOverviewScreen {
             fleet.instance_count(),
             self.view.density,
         );
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("Fleet: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(summary),
+        let header = Paragraph::new(Text::from_lines(vec![
+            Line::from_spans(vec![
+                Span::styled("Fleet: ", Style::new().fg(p.accent).bold()),
+                Span::styled(summary, Style::new().fg(p.fg)),
+            ]),
+            Line::from("legend: [!!] degraded rows are high-priority | keys: Enter/s/t/a"),
         ]))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Fleet Overview "),
         );
-        frame.render_widget(header, chunks[0]);
+        header.render(chunks[0], frame);
 
         let body_chunks = if chunks[1].width >= 120 {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            Flex::horizontal()
+                .constraints([
+                    Constraint::Percentage(68_f32),
+                    Constraint::Percentage(32_f32),
+                ])
                 .split(chunks[1])
         } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+            Flex::vertical()
+                .constraints([
+                    Constraint::Percentage(68_f32),
+                    Constraint::Percentage(32_f32),
+                ])
                 .split(chunks[1])
         };
 
-        let primary_chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let primary_chunks = Flex::vertical()
             .constraints([
-                Constraint::Length(5),
-                Constraint::Length(4),
+                Constraint::Fixed(5),
+                Constraint::Fixed(4),
                 Constraint::Min(5),
             ])
             .split(body_chunks[0]);
 
-        let kpi_tiles = Paragraph::new(self.kpi_tile_lines()).block(
-            Block::default()
+        let kpi_tiles = Paragraph::new(Text::from_lines(self.kpi_tile_lines())).block(
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" KPI Tile Grid "),
         );
-        frame.render_widget(kpi_tiles, primary_chunks[0]);
+        kpi_tiles.render(primary_chunks[0], frame);
 
-        let sparkline = Paragraph::new(self.status_sparkline_lines()).block(
-            Block::default()
+        let sparkline = Paragraph::new(Text::from_lines(self.status_sparkline_lines())).block(
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Status Sparkline Strip "),
         );
-        frame.render_widget(sparkline, primary_chunks[1]);
+        sparkline.render(primary_chunks[1], frame);
 
         // Instance table.
         let show_metrics = self.view.density.show_inline_metrics();
+        let header_style = Style::new().fg(p.accent).bold();
         let header_row = if show_metrics {
             Row::new(vec![
                 "Health", "Project", "Instance", "Docs", "Pending", "CPU", "Attr",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD))
+            .style(header_style)
         } else {
             Row::new(vec![
                 "Health", "Project", "Instance", "Docs", "Pending", "Attr",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD))
+            .style(header_style)
         };
+
+        let instance_block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border_style)
+            .title(" Instances ");
 
         let rows = self.build_rows();
         if rows.is_empty() {
-            let empty = Paragraph::new(self.empty_state_message()).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .title(" Instances "),
-            );
-            frame.render_widget(empty, primary_chunks[2]);
+            let empty = Paragraph::new(Text::from_spans([Span::styled(
+                self.empty_state_message(),
+                Style::new().fg(p.fg_muted),
+            )]))
+            .block(instance_block);
+            empty.render(primary_chunks[2], frame);
         } else {
             let table = if show_metrics {
                 Table::new(
                     rows,
                     [
-                        Constraint::Length(6),
-                        Constraint::Length(12),
-                        Constraint::Length(15),
-                        Constraint::Length(10),
-                        Constraint::Length(10),
-                        Constraint::Length(8),
-                        Constraint::Length(8),
+                        Constraint::Fixed(13),
+                        Constraint::Fixed(12),
+                        Constraint::Fixed(15),
+                        Constraint::Fixed(10),
+                        Constraint::Fixed(10),
+                        Constraint::Fixed(8),
+                        Constraint::Fixed(8),
                     ],
                 )
                 .header(header_row)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(" Instances "),
-                )
+                .block(instance_block)
             } else {
                 Table::new(
                     rows,
                     [
-                        Constraint::Length(6),
-                        Constraint::Length(14),
-                        Constraint::Length(16),
-                        Constraint::Length(10),
-                        Constraint::Length(10),
-                        Constraint::Length(8),
+                        Constraint::Fixed(13),
+                        Constraint::Fixed(14),
+                        Constraint::Fixed(16),
+                        Constraint::Fixed(10),
+                        Constraint::Fixed(10),
+                        Constraint::Fixed(8),
                     ],
                 )
                 .header(header_row)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(" Instances "),
-                )
+                .block(instance_block)
             };
 
-            frame.render_widget(table, primary_chunks[2]);
+            table.render(primary_chunks[2], frame);
         }
 
-        let details = Paragraph::new(self.dashboard_signal_lines()).block(
-            Block::default()
+        let details = Paragraph::new(Text::from_lines(self.dashboard_signal_lines())).block(
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Fleet Dashboard Signals "),
         );
-        frame.render_widget(details, body_chunks[1]);
+        details.render(body_chunks[1], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(key, _mods) = event {
             match key {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.instance_count();
                     if count > 0 && self.selected_row < count - 1 {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Enter => {
+                ftui_core::event::KeyCode::Enter => {
                     if self.instance_count() > 0 {
                         return ScreenAction::Navigate(self.project_screen_id.clone());
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('s') => {
+                ftui_core::event::KeyCode::Char('s') => {
                     return ScreenAction::Navigate(self.live_stream_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('t') => {
+                ftui_core::event::KeyCode::Char('t') => {
                     return ScreenAction::Navigate(self.timeline_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('a') => {
+                ftui_core::event::KeyCode::Char('a') => {
                     return ScreenAction::Navigate(self.analytics_screen_id.clone());
                 }
                 _ => {}
@@ -961,6 +1004,10 @@ impl Screen for FleetOverviewScreen {
 
     fn semantic_role(&self) -> &'static str {
         "grid"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        FLEET_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1061,8 +1108,8 @@ mod tests {
 
         // Move down.
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         let result = screen.handle_input(&event, &ctx);
         assert_eq!(result, ScreenAction::Consumed);
@@ -1075,8 +1122,8 @@ mod tests {
 
         // Move up.
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         let result = screen.handle_input(&event, &ctx);
         assert_eq!(result, ScreenAction::Consumed);
@@ -1108,8 +1155,8 @@ mod tests {
         };
 
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&event, &ctx),
@@ -1141,8 +1188,8 @@ mod tests {
         };
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -1150,8 +1197,8 @@ mod tests {
         );
 
         let timeline = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&timeline, &ctx),
@@ -1159,8 +1206,8 @@ mod tests {
         );
 
         let analytics = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
@@ -1195,8 +1242,8 @@ mod tests {
         };
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -1204,8 +1251,8 @@ mod tests {
         );
 
         let timeline = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&timeline, &ctx),
@@ -1213,8 +1260,8 @@ mod tests {
         );
 
         let analytics = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
@@ -1520,7 +1567,7 @@ mod tests {
         let text = screen
             .dashboard_signal_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Project Summary Cards"));
@@ -1601,7 +1648,7 @@ mod tests {
         let text = screen
             .kpi_tile_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1654,7 +1701,7 @@ mod tests {
         let text = screen
             .status_sparkline_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -1870,7 +1917,7 @@ mod tests {
         let lines = screen.project_summary_lines();
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("No projects"));
@@ -1884,7 +1931,7 @@ mod tests {
         let lines = screen.pipeline_health_lines();
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("GREEN"));
@@ -1910,7 +1957,7 @@ mod tests {
         let lines = screen.pipeline_health_lines();
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("RED"));

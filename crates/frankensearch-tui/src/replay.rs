@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use ftui_core::event::{KeyCode, Modifiers, MouseButton, MouseEventKind};
 use serde::{Deserialize, Serialize};
 
 use crate::input::InputEvent;
@@ -67,9 +67,9 @@ pub enum RecordedEvent {
 }
 
 impl RecordedEvent {
-    /// Create a key event record from crossterm types.
+    /// Create a key event record from key code and modifiers.
     #[must_use]
-    pub fn from_key(key: KeyCode, modifiers: KeyModifiers) -> Self {
+    pub fn from_key(key: KeyCode, modifiers: Modifiers) -> Self {
         Self::Key {
             key: encode_key_code(key),
             modifiers: modifiers.bits(),
@@ -98,7 +98,7 @@ impl RecordedEvent {
         match self {
             Self::Key { key, modifiers } => {
                 let key = decode_key_code(key)?;
-                let mods = KeyModifiers::from_bits(*modifiers)?;
+                let mods = Modifiers::from_bits(*modifiers)?;
                 Some(InputEvent::Key(key, mods))
             }
             Self::Mouse { kind, col, row } => {
@@ -349,17 +349,13 @@ fn encode_key_code(key: KeyCode) -> String {
         KeyCode::Delete => "delete".to_owned(),
         KeyCode::Insert => "insert".to_owned(),
         KeyCode::Null => "null".to_owned(),
-        KeyCode::Esc => "esc".to_owned(),
-        KeyCode::CapsLock => "caps_lock".to_owned(),
-        KeyCode::ScrollLock => "scroll_lock".to_owned(),
-        KeyCode::NumLock => "num_lock".to_owned(),
-        KeyCode::PrintScreen => "print_screen".to_owned(),
-        KeyCode::Pause => "pause".to_owned(),
-        KeyCode::Menu => "menu".to_owned(),
-        KeyCode::KeypadBegin => "keypad_begin".to_owned(),
+        KeyCode::Escape => "esc".to_owned(),
+        KeyCode::MediaPlayPause => "media_play_pause".to_owned(),
+        KeyCode::MediaStop => "media_stop".to_owned(),
+        KeyCode::MediaNextTrack => "media_next_track".to_owned(),
+        KeyCode::MediaPrevTrack => "media_prev_track".to_owned(),
         KeyCode::F(n) => format!("f:{n}"),
         KeyCode::Char(ch) => format!("char:{}", u32::from(ch)),
-        other => format!("debug:{other:?}"),
     }
 }
 
@@ -391,14 +387,11 @@ fn decode_key_code(encoded: &str) -> Option<KeyCode> {
         "delete" | "Delete" => KeyCode::Delete,
         "insert" | "Insert" => KeyCode::Insert,
         "null" | "Null" => KeyCode::Null,
-        "esc" | "Esc" => KeyCode::Esc,
-        "caps_lock" => KeyCode::CapsLock,
-        "scroll_lock" => KeyCode::ScrollLock,
-        "num_lock" => KeyCode::NumLock,
-        "print_screen" => KeyCode::PrintScreen,
-        "pause" => KeyCode::Pause,
-        "menu" => KeyCode::Menu,
-        "keypad_begin" => KeyCode::KeypadBegin,
+        "esc" | "Esc" | "escape" | "Escape" => KeyCode::Escape,
+        "media_play_pause" => KeyCode::MediaPlayPause,
+        "media_stop" => KeyCode::MediaStop,
+        "media_next_track" => KeyCode::MediaNextTrack,
+        "media_prev_track" => KeyCode::MediaPrevTrack,
         _ => return None,
     })
 }
@@ -458,7 +451,7 @@ fn decode_mouse_button(encoded: &str) -> Option<MouseButton> {
 mod tests {
     use std::time::Duration;
 
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use ftui_core::event::{KeyCode, Modifiers};
 
     use super::*;
 
@@ -474,7 +467,7 @@ mod tests {
         let mut recorder = ReplayRecorder::new();
         recorder.start();
 
-        let event = InputEvent::Key(KeyCode::Char('a'), KeyModifiers::NONE);
+        let event = InputEvent::Key(KeyCode::Char('a'), Modifiers::NONE);
         recorder.record(&event);
         recorder.record(&event);
 
@@ -488,7 +481,7 @@ mod tests {
     #[test]
     fn recorder_ignores_when_idle() {
         let mut recorder = ReplayRecorder::new();
-        let event = InputEvent::Key(KeyCode::Char('a'), KeyModifiers::NONE);
+        let event = InputEvent::Key(KeyCode::Char('a'), Modifiers::NONE);
         recorder.record(&event);
         assert!(recorder.is_empty());
     }
@@ -506,7 +499,7 @@ mod tests {
     fn recorder_export_json() {
         let mut recorder = ReplayRecorder::new();
         recorder.start();
-        let event = InputEvent::Key(KeyCode::Enter, KeyModifiers::NONE);
+        let event = InputEvent::Key(KeyCode::Enter, Modifiers::NONE);
         recorder.record(&event);
         recorder.stop();
 
@@ -519,11 +512,11 @@ mod tests {
         let records = vec![
             InputRecord {
                 offset: Duration::from_millis(0),
-                event: RecordedEvent::from_key(KeyCode::Char('a'), KeyModifiers::NONE),
+                event: RecordedEvent::from_key(KeyCode::Char('a'), Modifiers::NONE),
             },
             InputRecord {
                 offset: Duration::from_millis(100),
-                event: RecordedEvent::from_key(KeyCode::Enter, KeyModifiers::NONE),
+                event: RecordedEvent::from_key(KeyCode::Enter, Modifiers::NONE),
             },
         ];
 
@@ -551,7 +544,7 @@ mod tests {
     fn player_pause_resume() {
         let records = vec![InputRecord {
             offset: Duration::ZERO,
-            event: RecordedEvent::from_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            event: RecordedEvent::from_key(KeyCode::Char('x'), Modifiers::NONE),
         }];
 
         let mut player = ReplayPlayer::new(records);
@@ -593,7 +586,7 @@ mod tests {
     fn player_from_json_roundtrip() {
         let records = vec![InputRecord {
             offset: Duration::from_millis(42),
-            event: RecordedEvent::from_key(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            event: RecordedEvent::from_key(KeyCode::Char('q'), Modifiers::CTRL),
         }];
 
         let json = serde_json::to_string(&records).unwrap();
@@ -603,22 +596,18 @@ mod tests {
 
     #[test]
     fn recorded_event_serde() {
-        let event = RecordedEvent::from_key(KeyCode::Enter, KeyModifiers::SHIFT);
+        let event = RecordedEvent::from_key(KeyCode::Enter, Modifiers::SHIFT);
         let json = serde_json::to_string(&event).unwrap();
         let decoded: RecordedEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, RecordedEvent::Key { .. }));
         if let RecordedEvent::Key { modifiers, .. } = decoded {
-            assert_eq!(modifiers, KeyModifiers::SHIFT.bits());
+            assert_eq!(modifiers, Modifiers::SHIFT.bits());
         }
     }
 
     #[test]
     fn recorded_event_mouse() {
-        let event = RecordedEvent::from_mouse(
-            MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            10,
-            20,
-        );
+        let event = RecordedEvent::from_mouse(MouseEventKind::Down(MouseButton::Left), 10, 20);
         let json = serde_json::to_string(&event).unwrap();
         let decoded: RecordedEvent = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, RecordedEvent::Mouse { .. }));
@@ -630,10 +619,10 @@ mod tests {
 
     #[test]
     fn recorded_event_to_input_event_roundtrip() {
-        let key = RecordedEvent::from_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        let key = RecordedEvent::from_key(KeyCode::Char('x'), Modifiers::CTRL);
         assert_eq!(
             key.to_input_event(),
-            Some(InputEvent::Key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            Some(InputEvent::Key(KeyCode::Char('x'), Modifiers::CTRL))
         );
 
         let mouse = RecordedEvent::from_mouse(MouseEventKind::ScrollDown, 4, 8);
@@ -650,13 +639,13 @@ mod tests {
     fn player_advance_input_decodes_recorded_events() {
         let mut player = ReplayPlayer::new(vec![InputRecord {
             offset: Duration::from_millis(7),
-            event: RecordedEvent::from_key(KeyCode::Enter, KeyModifiers::NONE),
+            event: RecordedEvent::from_key(KeyCode::Enter, Modifiers::NONE),
         }]);
         player.play();
 
         let (offset, event) = player.advance_input().expect("decoded event");
         assert_eq!(offset, Duration::from_millis(7));
-        assert_eq!(event, InputEvent::Key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(event, InputEvent::Key(KeyCode::Enter, Modifiers::NONE));
     }
 
     #[test]

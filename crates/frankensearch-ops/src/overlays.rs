@@ -4,35 +4,43 @@
 //! The shell manages the overlay stack; this module provides the visual
 //! presentation for each overlay kind.
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::WrapMode;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    list::{List, ListItem},
+    paragraph::Paragraph,
+};
 
 use frankensearch_tui::overlay::{OverlayKind, OverlayRequest};
 use frankensearch_tui::palette::{CommandPalette, PaletteState};
+
+use crate::theme::SemanticPalette;
 
 // ─── Centered Popup Area ────────────────────────────────────────────────────
 
 /// Compute a centered popup rectangle within the given area.
 #[must_use]
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
+    let popup_layout = Flex::vertical()
         .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(f32::from(100 - percent_y) / 2.0),
+            Constraint::Percentage(f32::from(percent_y)),
+            Constraint::Percentage(f32::from(100 - percent_y) / 2.0),
         ])
         .split(area);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
+    Flex::horizontal()
         .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(f32::from(100 - percent_x) / 2.0),
+            Constraint::Percentage(f32::from(percent_x)),
+            Constraint::Percentage(f32::from(100 - percent_x) / 2.0),
         ])
         .split(popup_layout[1])[1]
 }
@@ -42,136 +50,134 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// Keyboard shortcut entry for the help overlay.
 pub struct HelpEntry {
     /// Key combination (e.g., "Ctrl+P").
-    pub key: &'static str,
+    pub key: String,
     /// Description of what the shortcut does.
-    pub description: &'static str,
+    pub description: String,
+}
+
+fn help_entry(key: &str, description: &str) -> HelpEntry {
+    HelpEntry {
+        key: key.to_owned(),
+        description: description.to_owned(),
+    }
 }
 
 /// Default keyboard shortcuts shown in the help overlay.
 #[must_use]
 pub fn default_help_entries() -> Vec<HelpEntry> {
     vec![
-        HelpEntry {
-            key: "?  / F1",
-            description: "Toggle help",
-        },
-        HelpEntry {
-            key: "q  / Ctrl+C",
-            description: "Quit",
-        },
-        HelpEntry {
-            key: "Ctrl+P / :",
-            description: "Command palette",
-        },
-        HelpEntry {
-            key: "Tab",
-            description: "Next screen",
-        },
-        HelpEntry {
-            key: "Shift+Tab",
-            description: "Previous screen",
-        },
-        HelpEntry {
-            key: "j / Down",
-            description: "Move down",
-        },
-        HelpEntry {
-            key: "k / Up",
-            description: "Move up",
-        },
-        HelpEntry {
-            key: "h / Left",
-            description: "Move left",
-        },
-        HelpEntry {
-            key: "l / Right",
-            description: "Move right",
-        },
-        HelpEntry {
-            key: "Enter",
-            description: "Confirm / select",
-        },
-        HelpEntry {
-            key: "Esc",
-            description: "Dismiss overlay",
-        },
-        HelpEntry {
-            key: "PgUp / PgDn",
-            description: "Page navigation",
-        },
-        HelpEntry {
-            key: "Ctrl+T",
-            description: "Cycle theme",
-        },
-        HelpEntry {
-            key: "Ctrl+Y",
-            description: "Copy to clipboard",
-        },
+        help_entry("? / F1", "Toggle help"),
+        help_entry("q / Ctrl+C", "Quit"),
+        help_entry("Ctrl+P / :", "Command palette"),
+        help_entry("Tab", "Next screen"),
+        help_entry("Shift+Tab", "Previous screen"),
+        help_entry("j / Down", "Move down"),
+        help_entry("k / Up", "Move up"),
+        help_entry("h / Left", "Move left"),
+        help_entry("l / Right", "Move right"),
+        help_entry("Enter", "Confirm / select"),
+        help_entry("Esc", "Dismiss overlay"),
+        help_entry("PgUp / PgDn", "Page navigation"),
+        help_entry("Ctrl+T", "Cycle theme"),
+        help_entry("Ctrl+Y", "Copy to clipboard"),
     ]
 }
 
-/// Render the help overlay showing keyboard shortcuts.
-pub fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
-    let popup = centered_rect(60, 70, area);
-    frame.render_widget(Clear, popup);
+fn parse_screen_help_entries(actions: &[String]) -> Vec<HelpEntry> {
+    actions
+        .iter()
+        .filter_map(|entry| entry.split_once('|'))
+        .map(|(key, description)| help_entry(key.trim(), description.trim()))
+        .collect()
+}
 
-    let entries = default_help_entries();
-    let items: Vec<ListItem<'_>> = entries
+/// Render the help overlay showing keyboard shortcuts.
+pub fn render_help_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    request: &OverlayRequest,
+    palette: &SemanticPalette,
+) {
+    let popup = centered_rect(60, 70, area);
+
+    let mut entries = default_help_entries();
+    let screen_entries = parse_screen_help_entries(&request.actions);
+    if !screen_entries.is_empty() {
+        entries.push(help_entry("──────────────────", "Screen Controls"));
+        entries.extend(screen_entries);
+    }
+    let title = format!(" {} ", request.title);
+    let items: Vec<ListItem> = entries
         .iter()
         .map(|e| {
-            ListItem::new(Line::from(vec![
+            ListItem::new(Line::from_spans(vec![
                 Span::styled(
                     format!("{:<18}", e.key),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::new().fg(palette.accent).bold(),
                 ),
-                Span::raw(e.description),
+                Span::styled(e.description.as_str(), Style::new().fg(palette.fg)),
             ]))
         })
         .collect();
 
     let list = List::new(items).block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
-            .title(" Keyboard Shortcuts ")
-            .title_style(Style::default().add_modifier(Modifier::BOLD)),
+            .border_style(Style::new().fg(palette.border_focused))
+            .title(title.as_str()),
     );
 
-    frame.render_widget(list, popup);
+    list.render(popup, frame);
 }
 
 // ─── Alert Overlay ──────────────────────────────────────────────────────────
 
 /// Render an alert overlay with title and optional body.
-pub fn render_alert_overlay(frame: &mut Frame<'_>, area: Rect, request: &OverlayRequest) {
+pub fn render_alert_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    request: &OverlayRequest,
+    palette: &SemanticPalette,
+) {
     let popup = centered_rect(50, 30, area);
-    frame.render_widget(Clear, popup);
 
     let body_text = request.body.as_deref().unwrap_or("(no details)");
 
-    let content = Paragraph::new(body_text).wrap(Wrap { trim: true }).block(
-        Block::default()
+    let title = format!(" {} ", request.title);
+    let content = Paragraph::new(Line::from(Span::styled(
+        body_text,
+        Style::new().fg(palette.fg),
+    )))
+    .wrap(WrapMode::Word)
+    .block(
+        Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
-            .title(format!(" {} ", request.title))
-            .title_style(Style::default().add_modifier(Modifier::BOLD)),
+            .border_style(Style::new().fg(palette.border_focused))
+            .title(title.as_str()),
     );
 
-    frame.render_widget(content, popup);
+    content.render(popup, frame);
 }
 
 // ─── Confirm Overlay ────────────────────────────────────────────────────────
 
 /// Render a confirmation dialog with action buttons.
-pub fn render_confirm_overlay(frame: &mut Frame<'_>, area: Rect, request: &OverlayRequest) {
+pub fn render_confirm_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    request: &OverlayRequest,
+    palette: &SemanticPalette,
+) {
     let popup = centered_rect(50, 30, area);
-    frame.render_widget(Clear, popup);
 
-    let mut lines: Vec<Line<'_>> = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
     if let Some(body) = &request.body {
-        lines.push(Line::from(body.as_str()));
+        lines.push(Line::from(Span::styled(
+            body.as_str(),
+            Style::new().fg(palette.fg),
+        )));
         lines.push(Line::from(""));
     }
 
@@ -190,26 +196,33 @@ pub fn render_confirm_overlay(frame: &mut Frame<'_>, area: Rect, request: &Overl
             .collect();
         lines.push(Line::from(Span::styled(
             actions_text,
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().fg(palette.accent).bold(),
         )));
     }
 
-    let content = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
-            .title(format!(" {} ", request.title))
-            .title_style(Style::default().add_modifier(Modifier::BOLD)),
-    );
+    let title = format!(" {} ", request.title);
+    let content = Paragraph::new(Text::from_lines(lines))
+        .wrap(WrapMode::Word)
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(palette.border_focused))
+                .title(title.as_str()),
+        );
 
-    frame.render_widget(content, popup);
+    content.render(popup, frame);
 }
 
 // ─── Command Palette Overlay ────────────────────────────────────────────────
 
 /// Render the command palette overlay.
-pub fn render_palette_overlay(frame: &mut Frame<'_>, area: Rect, palette: &CommandPalette) {
+pub fn render_palette_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    palette: &CommandPalette,
+    sem: &SemanticPalette,
+) {
     if palette.state() != &PaletteState::Open {
         return;
     }
@@ -219,11 +232,9 @@ pub fn render_palette_overlay(frame: &mut Frame<'_>, area: Rect, palette: &Comma
     let x = (area.width.saturating_sub(width)) / 2;
     let max_height = area.height.min(16);
     let popup = Rect::new(x, 1, width, max_height);
-    frame.render_widget(Clear, popup);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+    let chunks = Flex::vertical()
+        .constraints([Constraint::Fixed(3), Constraint::Min(1)])
         .split(popup);
 
     // Search input.
@@ -234,64 +245,70 @@ pub fn render_palette_overlay(frame: &mut Frame<'_>, area: Rect, palette: &Comma
     };
 
     let input_style = if palette.query().is_empty() {
-        Style::default().fg(ratatui::style::Color::DarkGray)
+        Style::new().fg(sem.fg_muted)
     } else {
-        Style::default()
+        Style::new().fg(sem.fg)
     };
 
-    let input = Paragraph::new(Span::styled(query_display, input_style)).block(
-        Block::default()
+    let input = Paragraph::new(Line::from_spans([Span::styled(query_display, input_style)])).block(
+        Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ratatui::style::Color::Rgb(100, 160, 240)))
-            .title(" Command Palette ")
-            .title_style(Style::default().add_modifier(Modifier::BOLD)),
+            .border_style(Style::new().fg(sem.border_focused))
+            .title(" Command Palette "),
     );
-    frame.render_widget(input, chunks[0]);
+    input.render(chunks[0], frame);
 
     // Filtered results.
     let filtered = palette.filtered();
     let selected = palette.selected();
 
-    let items: Vec<ListItem<'_>> = filtered
+    let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .map(|(i, action)| {
             let style = if i == selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+                sem.style_highlight()
             } else {
-                Style::default()
+                Style::new().fg(sem.fg)
             };
 
             let mut spans = vec![Span::styled(&action.label, style)];
             if let Some(shortcut) = &action.shortcut {
                 spans.push(Span::styled(
                     format!("  ({shortcut})"),
-                    Style::default().fg(ratatui::style::Color::DarkGray),
+                    Style::new().fg(sem.fg_muted),
                 ));
             }
 
-            ListItem::new(Line::from(spans))
+            ListItem::new(Line::from_spans(spans))
         })
         .collect();
 
     let list = List::new(items).block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(ratatui::style::Color::DarkGray)),
+            .border_style(Style::new().fg(sem.border)),
     );
-    frame.render_widget(list, chunks[1]);
+    list.render(chunks[1], frame);
 }
 
 // ─── Dispatch Overlay Rendering ─────────────────────────────────────────────
 
 /// Render the appropriate overlay based on the request kind.
-pub fn render_overlay(frame: &mut Frame<'_>, area: Rect, request: &OverlayRequest) {
+pub fn render_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    request: &OverlayRequest,
+    palette: &SemanticPalette,
+) {
     match &request.kind {
-        OverlayKind::Help => render_help_overlay(frame, area),
-        OverlayKind::Confirm => render_confirm_overlay(frame, area, request),
-        OverlayKind::Alert | OverlayKind::Custom(_) => render_alert_overlay(frame, area, request),
+        OverlayKind::Help => render_help_overlay(frame, area, request, palette),
+        OverlayKind::Confirm => render_confirm_overlay(frame, area, request, palette),
+        OverlayKind::Alert | OverlayKind::Custom(_) => {
+            render_alert_overlay(frame, area, request, palette);
+        }
     }
 }
 
@@ -417,7 +434,7 @@ mod tests {
     #[test]
     fn help_entry_keys_are_unique() {
         let entries = default_help_entries();
-        let keys: Vec<&str> = entries.iter().map(|e| e.key).collect();
+        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
         for (i, key) in keys.iter().enumerate() {
             for (j, other) in keys.iter().enumerate() {
                 if i != j {

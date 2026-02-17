@@ -102,6 +102,16 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 # System information (CPU, memory, etc.)
 sysinfo = "0.33"
 
+# FrankenTUI terminal UI framework
+ftui-core = { version = "0.2.0", path = "../frankentui/crates/ftui-core" }
+ftui-render = { version = "0.2.0", path = "../frankentui/crates/ftui-render" }
+ftui-style = { version = "0.2.0", path = "../frankentui/crates/ftui-style" }
+ftui-text = { version = "0.2.0", path = "../frankentui/crates/ftui-text" }
+ftui-layout = { version = "0.2.0", path = "../frankentui/crates/ftui-layout" }
+ftui-widgets = { version = "0.2.0", path = "../frankentui/crates/ftui-widgets" }
+ftui-tty = { version = "0.2.0", path = "../frankentui/crates/ftui-tty" }
+ftui-backend = { version = "0.2.0", path = "../frankentui/crates/ftui-backend" }
+
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.
 unsafe_code = "deny"

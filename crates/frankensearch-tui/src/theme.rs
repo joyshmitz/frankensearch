@@ -4,7 +4,7 @@
 //! Ships with dark and light presets. Product crates can define custom
 //! themes by implementing [`ColorScheme`].
 
-use ratatui::style::Color;
+use ftui_render::cell::PackedRgba;
 use serde::{Deserialize, Serialize};
 
 // ─── Theme Presets ──────────────────────────────────────────────────────────
@@ -79,39 +79,39 @@ impl std::fmt::Display for ThemePreset {
 /// for all fields. Use [`Theme::dark`] or [`Theme::light`] for presets.
 pub trait ColorScheme {
     /// Primary background color.
-    fn bg(&self) -> Color;
+    fn bg(&self) -> PackedRgba;
     /// Primary foreground (text) color.
-    fn fg(&self) -> Color;
+    fn fg(&self) -> PackedRgba;
     /// Status bar background.
-    fn status_bar_bg(&self) -> Color;
+    fn status_bar_bg(&self) -> PackedRgba;
     /// Status bar text.
-    fn status_bar_fg(&self) -> Color;
+    fn status_bar_fg(&self) -> PackedRgba;
     /// Selected/focused item highlight.
-    fn highlight_bg(&self) -> Color;
+    fn highlight_bg(&self) -> PackedRgba;
     /// Highlight text.
-    fn highlight_fg(&self) -> Color;
+    fn highlight_fg(&self) -> PackedRgba;
     /// Border color for panels and widgets.
-    fn border(&self) -> Color;
+    fn border(&self) -> PackedRgba;
     /// Muted/secondary text.
-    fn muted(&self) -> Color;
+    fn muted(&self) -> PackedRgba;
     /// Error/alert color.
-    fn error(&self) -> Color;
+    fn error(&self) -> PackedRgba;
     /// Warning color.
-    fn warning(&self) -> Color;
+    fn warning(&self) -> PackedRgba;
     /// Success/ok color.
-    fn success(&self) -> Color;
+    fn success(&self) -> PackedRgba;
     /// Info/accent color.
-    fn info(&self) -> Color;
+    fn info(&self) -> PackedRgba;
     /// Accent color for active tabs and focused borders.
-    fn accent(&self) -> Color {
+    fn accent(&self) -> PackedRgba {
         self.info()
     }
     /// Elevated surface background (cards, panels).
-    fn surface(&self) -> Color {
+    fn surface(&self) -> PackedRgba {
         self.bg()
     }
     /// Dimmed/inactive surface background.
-    fn surface_dim(&self) -> Color {
+    fn surface_dim(&self) -> PackedRgba {
         self.bg()
     }
 }
@@ -139,7 +139,7 @@ pub struct Theme {
     pub surface_dim: SerColor,
 }
 
-/// Serializable wrapper around `ratatui::style::Color`.
+/// Serializable wrapper around `PackedRgba`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SerColor {
     pub r: u8,
@@ -153,10 +153,10 @@ impl SerColor {
         Self { r, g, b }
     }
 
-    /// Convert to ratatui `Color`.
+    /// Convert to `PackedRgba`.
     #[must_use]
-    pub const fn to_ratatui(self) -> Color {
-        Color::Rgb(self.r, self.g, self.b)
+    pub const fn to_color(self) -> PackedRgba {
+        PackedRgba::rgb(self.r, self.g, self.b)
     }
 }
 
@@ -314,50 +314,50 @@ impl Theme {
 }
 
 impl ColorScheme for Theme {
-    fn bg(&self) -> Color {
-        self.bg.to_ratatui()
+    fn bg(&self) -> PackedRgba {
+        self.bg.to_color()
     }
-    fn fg(&self) -> Color {
-        self.fg.to_ratatui()
+    fn fg(&self) -> PackedRgba {
+        self.fg.to_color()
     }
-    fn status_bar_bg(&self) -> Color {
-        self.status_bar_bg.to_ratatui()
+    fn status_bar_bg(&self) -> PackedRgba {
+        self.status_bar_bg.to_color()
     }
-    fn status_bar_fg(&self) -> Color {
-        self.status_bar_fg.to_ratatui()
+    fn status_bar_fg(&self) -> PackedRgba {
+        self.status_bar_fg.to_color()
     }
-    fn highlight_bg(&self) -> Color {
-        self.highlight_bg.to_ratatui()
+    fn highlight_bg(&self) -> PackedRgba {
+        self.highlight_bg.to_color()
     }
-    fn highlight_fg(&self) -> Color {
-        self.highlight_fg.to_ratatui()
+    fn highlight_fg(&self) -> PackedRgba {
+        self.highlight_fg.to_color()
     }
-    fn border(&self) -> Color {
-        self.border.to_ratatui()
+    fn border(&self) -> PackedRgba {
+        self.border.to_color()
     }
-    fn muted(&self) -> Color {
-        self.muted.to_ratatui()
+    fn muted(&self) -> PackedRgba {
+        self.muted.to_color()
     }
-    fn error(&self) -> Color {
-        self.error.to_ratatui()
+    fn error(&self) -> PackedRgba {
+        self.error.to_color()
     }
-    fn warning(&self) -> Color {
-        self.warning.to_ratatui()
+    fn warning(&self) -> PackedRgba {
+        self.warning.to_color()
     }
-    fn success(&self) -> Color {
-        self.success.to_ratatui()
+    fn success(&self) -> PackedRgba {
+        self.success.to_color()
     }
-    fn info(&self) -> Color {
-        self.info.to_ratatui()
+    fn info(&self) -> PackedRgba {
+        self.info.to_color()
     }
-    fn accent(&self) -> Color {
-        self.accent.to_ratatui()
+    fn accent(&self) -> PackedRgba {
+        self.accent.to_color()
     }
-    fn surface(&self) -> Color {
-        self.surface.to_ratatui()
+    fn surface(&self) -> PackedRgba {
+        self.surface.to_color()
     }
-    fn surface_dim(&self) -> Color {
-        self.surface_dim.to_ratatui()
+    fn surface_dim(&self) -> PackedRgba {
+        self.surface_dim.to_color()
     }
 }
 
@@ -415,9 +415,9 @@ mod tests {
     }
 
     #[test]
-    fn ser_color_to_ratatui() {
+    fn ser_color_to_color() {
         let c = SerColor::new(0xff, 0x00, 0x80);
-        assert_eq!(c.to_ratatui(), Color::Rgb(0xff, 0x00, 0x80));
+        assert_eq!(c.to_color(), PackedRgba::rgb(0xff, 0x00, 0x80));
     }
 
     #[test]

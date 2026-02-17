@@ -78,7 +78,7 @@ impl fmt::Display for PanelRole {
 
 /// Layout constraint for a panel within a screen.
 ///
-/// Maps to ratatui `Constraint` semantics but expressed as a portable
+/// Maps to `ftui_layout::Constraint` semantics but expressed as a portable
 /// contract that doesn't depend on the rendering backend.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayoutConstraint {

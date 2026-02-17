@@ -18,8 +18,8 @@ use frankensearch_ops::{
     OpsApp, ViewPreset,
 };
 use frankensearch_tui::{InputEvent, ReplayPlayer, ReplayRecorder};
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
+use ftui_render::frame::Frame;
+use ftui_render::grapheme_pool::GraphemePool;
 use serde::{Deserialize, Serialize};
 
 const OPS_RUN_ID: &str = "01HQXG5M7P3KZFV9N2RSTW6YAB";
@@ -131,21 +131,28 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 fn render_app_text(app: &mut OpsApp, width: u16, height: u16) -> String {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("test backend should initialize");
-    terminal
-        .draw(|frame| app.render(frame))
-        .expect("ops app should render in test backend");
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(width, height, &mut pool);
+    app.render(&mut frame);
 
-    let buffer = terminal.backend().buffer();
     let mut lines = Vec::with_capacity(usize::from(height));
     for y in 0..height {
         let mut line = String::new();
         for x in 0..width {
-            let cell = buffer
-                .cell((x, y))
-                .expect("buffer coordinates should exist in declared viewport");
-            line.push_str(cell.symbol());
+            if let Some(cell) = frame.buffer.get(x, y) {
+                if cell.content.is_continuation() {
+                    continue;
+                }
+                if let Some(ch) = cell.content.as_char() {
+                    line.push(ch);
+                } else if let Some(gid) = cell.content.grapheme_id() {
+                    if let Some(text) = frame.pool.get(gid) {
+                        line.push_str(text);
+                    }
+                } else {
+                    line.push(' ');
+                }
+            }
         }
         lines.push(line.trim_end().to_owned());
     }
@@ -339,8 +346,8 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
     event_seq = event_seq.saturating_add(1);
 
     let goto_timeline = InputEvent::Key(
-        crossterm::event::KeyCode::Char('t'),
-        crossterm::event::KeyModifiers::NONE,
+        ftui_core::event::KeyCode::Char('t'),
+        ftui_core::event::Modifiers::NONE,
     );
     recorder.record(&goto_timeline);
     let _ = app.handle_input(&goto_timeline);
@@ -361,8 +368,8 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
     event_seq = event_seq.saturating_add(1);
 
     let drilldown_project = InputEvent::Key(
-        crossterm::event::KeyCode::Char('g'),
-        crossterm::event::KeyModifiers::NONE,
+        ftui_core::event::KeyCode::Char('g'),
+        ftui_core::event::Modifiers::NONE,
     );
     recorder.record(&drilldown_project);
     let _ = app.handle_input(&drilldown_project);
@@ -399,8 +406,8 @@ fn run_ops_scenario(test_name: &str, force_snapshot_diff_failure: bool) -> Scena
     event_seq = event_seq.saturating_add(1);
 
     let back_to_fleet = InputEvent::Key(
-        crossterm::event::KeyCode::Esc,
-        crossterm::event::KeyModifiers::NONE,
+        ftui_core::event::KeyCode::Escape,
+        ftui_core::event::Modifiers::NONE,
     );
     recorder.record(&back_to_fleet);
     let _ = app.handle_input(&back_to_fleet);

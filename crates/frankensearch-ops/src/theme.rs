@@ -4,7 +4,8 @@
 //! to concrete terminal colors. Screens render using semantic names; the active
 //! palette resolves them to ANSI / RGB values at paint time.
 
-use ratatui::style::{Color, Modifier, Style};
+use ftui_render::cell::PackedRgba;
+use ftui_style::Style;
 use serde::{Deserialize, Serialize};
 
 use crate::preferences::{ContrastMode, DisplayPreferences};
@@ -61,39 +62,39 @@ impl ThemeVariant {
 pub struct SemanticPalette {
     // ── Surface colors ──
     /// Primary background.
-    pub bg: Color,
+    pub bg: PackedRgba,
     /// Elevated surface (panels, cards).
-    pub bg_surface: Color,
+    pub bg_surface: PackedRgba,
     /// Hover / selection highlight.
-    pub bg_highlight: Color,
+    pub bg_highlight: PackedRgba,
 
     // ── Text colors ──
     /// Primary text.
-    pub fg: Color,
+    pub fg: PackedRgba,
     /// Secondary / muted text.
-    pub fg_muted: Color,
+    pub fg_muted: PackedRgba,
     /// Disabled text.
-    pub fg_disabled: Color,
+    pub fg_disabled: PackedRgba,
 
     // ── Semantic status ──
     /// Success / healthy / green indicator.
-    pub success: Color,
+    pub success: PackedRgba,
     /// Warning / degraded / yellow indicator.
-    pub warning: Color,
+    pub warning: PackedRgba,
     /// Error / critical / red indicator.
-    pub error: Color,
+    pub error: PackedRgba,
     /// Informational / accent / blue indicator.
-    pub info: Color,
+    pub info: PackedRgba,
 
     // ── Interactive ──
     /// Accent color for active elements, links, selections.
-    pub accent: Color,
+    pub accent: PackedRgba,
     /// Focus ring / indicator color.
-    pub focus_ring: Color,
+    pub focus_ring: PackedRgba,
     /// Border color for panels in normal state.
-    pub border: Color,
+    pub border: PackedRgba,
     /// Border color for focused panel.
-    pub border_focused: Color,
+    pub border_focused: PackedRgba,
 }
 
 impl SemanticPalette {
@@ -101,20 +102,20 @@ impl SemanticPalette {
     #[must_use]
     pub const fn dark() -> Self {
         Self {
-            bg: Color::Rgb(30, 30, 30),
-            bg_surface: Color::Rgb(45, 45, 45),
-            bg_highlight: Color::Rgb(60, 60, 70),
-            fg: Color::Rgb(220, 220, 220),
-            fg_muted: Color::Rgb(150, 150, 150),
-            fg_disabled: Color::Rgb(90, 90, 90),
-            success: Color::Rgb(80, 200, 120),
-            warning: Color::Rgb(240, 180, 50),
-            error: Color::Rgb(240, 80, 80),
-            info: Color::Rgb(100, 160, 240),
-            accent: Color::Rgb(100, 160, 240),
-            focus_ring: Color::Rgb(100, 180, 255),
-            border: Color::Rgb(70, 70, 70),
-            border_focused: Color::Rgb(100, 180, 255),
+            bg: PackedRgba::rgb(30, 30, 30),
+            bg_surface: PackedRgba::rgb(45, 45, 45),
+            bg_highlight: PackedRgba::rgb(60, 60, 70),
+            fg: PackedRgba::rgb(220, 220, 220),
+            fg_muted: PackedRgba::rgb(150, 150, 150),
+            fg_disabled: PackedRgba::rgb(90, 90, 90),
+            success: PackedRgba::rgb(80, 200, 120),
+            warning: PackedRgba::rgb(240, 180, 50),
+            error: PackedRgba::rgb(240, 80, 80),
+            info: PackedRgba::rgb(100, 160, 240),
+            accent: PackedRgba::rgb(100, 160, 240),
+            focus_ring: PackedRgba::rgb(100, 180, 255),
+            border: PackedRgba::rgb(70, 70, 70),
+            border_focused: PackedRgba::rgb(100, 180, 255),
         }
     }
 
@@ -122,20 +123,20 @@ impl SemanticPalette {
     #[must_use]
     pub const fn light() -> Self {
         Self {
-            bg: Color::Rgb(250, 250, 250),
-            bg_surface: Color::Rgb(240, 240, 240),
-            bg_highlight: Color::Rgb(220, 225, 235),
-            fg: Color::Rgb(30, 30, 30),
-            fg_muted: Color::Rgb(100, 100, 100),
-            fg_disabled: Color::Rgb(170, 170, 170),
-            success: Color::Rgb(40, 160, 80),
-            warning: Color::Rgb(200, 140, 20),
-            error: Color::Rgb(200, 50, 50),
-            info: Color::Rgb(40, 100, 200),
-            accent: Color::Rgb(40, 100, 200),
-            focus_ring: Color::Rgb(30, 90, 200),
-            border: Color::Rgb(200, 200, 200),
-            border_focused: Color::Rgb(30, 90, 200),
+            bg: PackedRgba::rgb(250, 250, 250),
+            bg_surface: PackedRgba::rgb(240, 240, 240),
+            bg_highlight: PackedRgba::rgb(220, 225, 235),
+            fg: PackedRgba::rgb(30, 30, 30),
+            fg_muted: PackedRgba::rgb(100, 100, 100),
+            fg_disabled: PackedRgba::rgb(170, 170, 170),
+            success: PackedRgba::rgb(40, 160, 80),
+            warning: PackedRgba::rgb(200, 140, 20),
+            error: PackedRgba::rgb(200, 50, 50),
+            info: PackedRgba::rgb(40, 100, 200),
+            accent: PackedRgba::rgb(40, 100, 200),
+            focus_ring: PackedRgba::rgb(30, 90, 200),
+            border: PackedRgba::rgb(200, 200, 200),
+            border_focused: PackedRgba::rgb(30, 90, 200),
         }
     }
 
@@ -143,20 +144,20 @@ impl SemanticPalette {
     #[must_use]
     pub const fn high_contrast_dark() -> Self {
         Self {
-            bg: Color::Rgb(0, 0, 0),
-            bg_surface: Color::Rgb(20, 20, 20),
-            bg_highlight: Color::Rgb(40, 40, 60),
-            fg: Color::Rgb(255, 255, 255),
-            fg_muted: Color::Rgb(200, 200, 200),
-            fg_disabled: Color::Rgb(120, 120, 120),
-            success: Color::Rgb(80, 255, 80),
-            warning: Color::Rgb(255, 255, 0),
-            error: Color::Rgb(255, 80, 80),
-            info: Color::Rgb(100, 200, 255),
-            accent: Color::Rgb(100, 200, 255),
-            focus_ring: Color::Rgb(255, 255, 0),
-            border: Color::Rgb(120, 120, 120),
-            border_focused: Color::Rgb(255, 255, 0),
+            bg: PackedRgba::rgb(0, 0, 0),
+            bg_surface: PackedRgba::rgb(20, 20, 20),
+            bg_highlight: PackedRgba::rgb(40, 40, 60),
+            fg: PackedRgba::rgb(255, 255, 255),
+            fg_muted: PackedRgba::rgb(200, 200, 200),
+            fg_disabled: PackedRgba::rgb(120, 120, 120),
+            success: PackedRgba::rgb(80, 255, 80),
+            warning: PackedRgba::rgb(255, 255, 0),
+            error: PackedRgba::rgb(255, 80, 80),
+            info: PackedRgba::rgb(100, 200, 255),
+            accent: PackedRgba::rgb(100, 200, 255),
+            focus_ring: PackedRgba::rgb(255, 255, 0),
+            border: PackedRgba::rgb(120, 120, 120),
+            border_focused: PackedRgba::rgb(255, 255, 0),
         }
     }
 
@@ -164,20 +165,20 @@ impl SemanticPalette {
     #[must_use]
     pub const fn high_contrast_light() -> Self {
         Self {
-            bg: Color::Rgb(255, 255, 255),
-            bg_surface: Color::Rgb(245, 245, 245),
-            bg_highlight: Color::Rgb(200, 210, 230),
-            fg: Color::Rgb(0, 0, 0),
-            fg_muted: Color::Rgb(50, 50, 50),
-            fg_disabled: Color::Rgb(130, 130, 130),
-            success: Color::Rgb(0, 100, 0),
-            warning: Color::Rgb(150, 100, 0),
-            error: Color::Rgb(180, 0, 0),
-            info: Color::Rgb(0, 50, 180),
-            accent: Color::Rgb(0, 50, 180),
-            focus_ring: Color::Rgb(0, 0, 200),
-            border: Color::Rgb(80, 80, 80),
-            border_focused: Color::Rgb(0, 0, 200),
+            bg: PackedRgba::rgb(255, 255, 255),
+            bg_surface: PackedRgba::rgb(245, 245, 245),
+            bg_highlight: PackedRgba::rgb(200, 210, 230),
+            fg: PackedRgba::rgb(0, 0, 0),
+            fg_muted: PackedRgba::rgb(50, 50, 50),
+            fg_disabled: PackedRgba::rgb(130, 130, 130),
+            success: PackedRgba::rgb(0, 100, 0),
+            warning: PackedRgba::rgb(150, 100, 0),
+            error: PackedRgba::rgb(180, 0, 0),
+            info: PackedRgba::rgb(0, 50, 180),
+            accent: PackedRgba::rgb(0, 50, 180),
+            focus_ring: PackedRgba::rgb(0, 0, 200),
+            border: PackedRgba::rgb(80, 80, 80),
+            border_focused: PackedRgba::rgb(0, 0, 200),
         }
     }
 
@@ -203,66 +204,96 @@ impl SemanticPalette {
 
     /// Style for primary text on primary background.
     #[must_use]
-    pub const fn style_default(&self) -> Style {
+    pub fn style_default(&self) -> Style {
         Style::new().fg(self.fg).bg(self.bg)
     }
 
     /// Style for muted / secondary text.
     #[must_use]
-    pub const fn style_muted(&self) -> Style {
+    pub fn style_muted(&self) -> Style {
         Style::new().fg(self.fg_muted).bg(self.bg)
     }
 
     /// Style for a healthy status indicator.
     #[must_use]
-    pub const fn style_success(&self) -> Style {
+    pub fn style_success(&self) -> Style {
         Style::new().fg(self.success)
     }
 
     /// Style for a warning status indicator.
     #[must_use]
-    pub const fn style_warning(&self) -> Style {
+    pub fn style_warning(&self) -> Style {
         Style::new().fg(self.warning)
     }
 
     /// Style for an error / critical status indicator.
     #[must_use]
-    pub const fn style_error(&self) -> Style {
+    pub fn style_error(&self) -> Style {
         Style::new().fg(self.error)
     }
 
     /// Style for an informational indicator.
     #[must_use]
-    pub const fn style_info(&self) -> Style {
+    pub fn style_info(&self) -> Style {
         Style::new().fg(self.info)
     }
 
     /// Style for a focused panel border.
     #[must_use]
-    pub const fn style_focus_border(&self) -> Style {
-        Style::new()
-            .fg(self.border_focused)
-            .add_modifier(Modifier::BOLD)
+    pub fn style_focus_border(&self) -> Style {
+        Style::new().fg(self.border_focused).bold()
     }
 
     /// Style for an unfocused panel border.
     #[must_use]
-    pub const fn style_border(&self) -> Style {
+    pub fn style_border(&self) -> Style {
         Style::new().fg(self.border)
     }
 
     /// Style for selected / highlighted row.
     #[must_use]
-    pub const fn style_highlight(&self) -> Style {
+    pub fn style_highlight(&self) -> Style {
         Style::new().fg(self.fg).bg(self.bg_highlight)
     }
 
     /// Style for accent-colored interactive text (links, active items).
     #[must_use]
-    pub const fn style_accent(&self) -> Style {
+    pub fn style_accent(&self) -> Style {
+        Style::new().fg(self.accent).underline()
+    }
+
+    /// Base striped row style (alternates background for readability).
+    #[must_use]
+    pub fn style_row_base(&self, index: usize) -> Style {
+        if index % 2 == 0 {
+            Style::new().fg(self.fg).bg(self.bg)
+        } else {
+            Style::new().fg(self.fg).bg(self.bg_surface)
+        }
+    }
+
+    /// Muted striped row style.
+    #[must_use]
+    pub fn style_row_muted(&self, index: usize) -> Style {
         Style::new()
-            .fg(self.accent)
-            .add_modifier(Modifier::UNDERLINED)
+            .fg(self.fg_muted)
+            .merge(&self.style_row_base(index))
+    }
+
+    /// Warning striped row style.
+    #[must_use]
+    pub fn style_row_warning(&self, index: usize) -> Style {
+        Style::new()
+            .fg(self.warning)
+            .merge(&self.style_row_base(index))
+    }
+
+    /// Error striped row style.
+    #[must_use]
+    pub fn style_row_error(&self, index: usize) -> Style {
+        Style::new()
+            .fg(self.error)
+            .merge(&self.style_row_base(index))
     }
 }
 
@@ -315,6 +346,7 @@ impl FocusIndicatorSpec {
 mod tests {
     use super::*;
     use crate::preferences::{ContrastMode, FocusVisibility, MotionPreference};
+    use ftui_style::StyleFlags;
 
     #[test]
     fn theme_variant_resolution() {
@@ -363,15 +395,15 @@ mod tests {
     #[test]
     fn high_contrast_dark_fg_is_white_on_black() {
         let p = SemanticPalette::high_contrast_dark();
-        assert_eq!(p.bg, Color::Rgb(0, 0, 0));
-        assert_eq!(p.fg, Color::Rgb(255, 255, 255));
+        assert_eq!(p.bg, PackedRgba::rgb(0, 0, 0));
+        assert_eq!(p.fg, PackedRgba::rgb(255, 255, 255));
     }
 
     #[test]
     fn high_contrast_light_fg_is_black_on_white() {
         let p = SemanticPalette::high_contrast_light();
-        assert_eq!(p.bg, Color::Rgb(255, 255, 255));
-        assert_eq!(p.fg, Color::Rgb(0, 0, 0));
+        assert_eq!(p.bg, PackedRgba::rgb(255, 255, 255));
+        assert_eq!(p.fg, PackedRgba::rgb(0, 0, 0));
     }
 
     #[test]
@@ -407,7 +439,7 @@ mod tests {
     fn focus_border_style_includes_bold() {
         let p = SemanticPalette::dark();
         let s = p.style_focus_border();
-        assert!(s.add_modifier.contains(Modifier::BOLD));
+        assert!(s.attrs.is_some_and(|a| a.contains(StyleFlags::BOLD)));
         assert_eq!(s.fg, Some(p.border_focused));
     }
 

@@ -6,16 +6,23 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_layout::{Constraint, Flex};
+use ftui_render::cell::PackedRgba;
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_core::LifecycleState;
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::data_source::TimeWindow;
 use crate::state::{AppState, LifecycleEvent};
@@ -34,14 +41,6 @@ impl EventSeverity {
             Self::Info => "info",
             Self::Warn => "warn",
             Self::Critical => "critical",
-        }
-    }
-
-    const fn color(self) -> Color {
-        match self {
-            Self::Info => Color::Gray,
-            Self::Warn => Color::Yellow,
-            Self::Critical => Color::Red,
         }
     }
 
@@ -150,6 +149,49 @@ pub struct HistoricalAnalyticsScreen {
     palette: SemanticPalette,
 }
 
+const HISTORICAL_ANALYTICS_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "p",
+        description: "Cycle project filter",
+    },
+    KeybindingHint {
+        key: "r",
+        description: "Cycle reason filter",
+    },
+    KeybindingHint {
+        key: "h",
+        description: "Cycle host filter",
+    },
+    KeybindingHint {
+        key: "e",
+        description: "Toggle compact/full snapshot export",
+    },
+    KeybindingHint {
+        key: "x",
+        description: "Reset filters",
+    },
+    KeybindingHint {
+        key: "g / Enter",
+        description: "Open project detail",
+    },
+    KeybindingHint {
+        key: "l",
+        description: "Open live stream",
+    },
+    KeybindingHint {
+        key: "t",
+        description: "Open timeline",
+    },
+];
+
 impl HistoricalAnalyticsScreen {
     /// Create a new historical analytics cockpit.
     #[must_use]
@@ -200,7 +242,7 @@ impl HistoricalAnalyticsScreen {
         self.restore_selected_row(focused);
     }
 
-    pub fn set_palette(&mut self, palette: SemanticPalette) {
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
         self.palette = palette;
     }
 
@@ -782,15 +824,22 @@ impl HistoricalAnalyticsScreen {
         )
     }
 
-    fn build_correlation_rows(rows: &[CorrelationRow]) -> Vec<Row<'static>> {
+    fn build_correlation_rows(&self, rows: &[CorrelationRow]) -> Vec<Row> {
         rows.iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(index, row)| {
                 let style = if row.stream_correlation >= 80 {
-                    Style::default().fg(Color::Red)
+                    Style::new()
+                        .fg(PackedRgba::rgb(255, 0, 0))
+                        .merge(&self.palette.style_row_base(index))
                 } else if row.stream_correlation >= 50 {
-                    Style::default().fg(Color::Yellow)
+                    Style::new()
+                        .fg(PackedRgba::rgb(255, 255, 0))
+                        .merge(&self.palette.style_row_base(index))
                 } else {
-                    Style::default().fg(Color::Green)
+                    Style::new()
+                        .fg(PackedRgba::rgb(0, 255, 0))
+                        .merge(&self.palette.style_row_base(index))
                 };
 
                 Row::new(vec![
@@ -806,20 +855,34 @@ impl HistoricalAnalyticsScreen {
             .collect()
     }
 
-    fn build_evidence_rows(&self, rows: &[EvidenceRow]) -> Vec<Row<'static>> {
+    fn build_evidence_rows(&self, rows: &[EvidenceRow]) -> Vec<Row> {
         rows.iter()
             .enumerate()
             .map(|(index, row)| {
-                let mut style = Style::default().fg(row.severity.color());
-                if index == self.selected_row {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
+                let severity_badge = format!(
+                    "{} {}",
+                    match row.severity {
+                        EventSeverity::Info => "[I]",
+                        EventSeverity::Warn => "[W]",
+                        EventSeverity::Critical => "[C]",
+                    },
+                    row.severity.label()
+                );
+                let style = if index == self.selected_row {
+                    self.palette.style_highlight().bold()
+                } else {
+                    match row.severity {
+                        EventSeverity::Info => self.palette.style_row_muted(index),
+                        EventSeverity::Warn => self.palette.style_row_warning(index),
+                        EventSeverity::Critical => self.palette.style_row_error(index),
+                    }
+                };
                 Row::new(vec![
                     row.ts_ms.to_string(),
                     row.project.clone(),
                     row.host.clone(),
                     row.instance_id.clone(),
-                    row.severity.label().to_owned(),
+                    severity_badge,
                     row.reason_code.clone(),
                     row.confidence.to_string(),
                     row.replay_handle.clone(),
@@ -875,7 +938,10 @@ impl Screen for HistoricalAnalyticsScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let p = &self.palette;
+        let border_style = p.style_border();
+
         let evidence = self.filtered_evidence_rows();
         let correlation = self.correlation_rows_for_rows(&evidence);
         let replay_summary = self.selected_replay_target_for_rows(&evidence).map_or_else(
@@ -888,22 +954,18 @@ impl Screen for HistoricalAnalyticsScreen {
             },
         );
 
-        let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let area = frame.bounds();
+        let chunks = Flex::vertical()
             .constraints([
-                Constraint::Length(8),
+                Constraint::Fixed(9),
                 Constraint::Min(8),
-                Constraint::Length(10),
+                Constraint::Fixed(10),
             ])
             .split(area);
 
-        let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "Historical Analytics: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+        let header = Paragraph::new(Text::from_lines(vec![
+            Line::from_spans(vec![
+                Span::styled("Historical Analytics: ", Style::new().bold()),
                 Span::raw(format!(
                     "evidence_rows={} projects={} control_health={}",
                     evidence.len(),
@@ -919,27 +981,29 @@ impl Screen for HistoricalAnalyticsScreen {
             ]),
             Line::from(self.trend_window_summary()),
             Line::from(Self::correlation_summary_line(&correlation)),
+            Line::from("legend: [C] critical [W] warn [I] info"),
             Line::from(self.filter_summary()),
             Line::from(self.export_snapshot_line_for_rows(&evidence)),
             Line::from(replay_summary),
-        ])
+        ]))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Historical Analytics + Explainability "),
         );
-        frame.render_widget(header, chunks[0]);
+        header.render(chunks[0], frame);
 
         let correlation_table = Table::new(
-            Self::build_correlation_rows(&correlation),
+            self.build_correlation_rows(&correlation),
             [
                 Constraint::Min(28),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(10),
+                Constraint::Fixed(10),
+                Constraint::Fixed(10),
             ],
         )
         .header(
@@ -951,26 +1015,27 @@ impl Screen for HistoricalAnalyticsScreen {
                 "ConfAvg",
                 "Corr",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(self.palette.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Anomaly/Event Correlation "),
         );
-        frame.render_widget(correlation_table, chunks[1]);
+        correlation_table.render(chunks[1], frame);
 
         let evidence_table = Table::new(
             self.build_evidence_rows(&evidence),
             [
-                Constraint::Length(12),
-                Constraint::Length(12),
-                Constraint::Length(10),
-                Constraint::Length(16),
-                Constraint::Length(8),
-                Constraint::Length(24),
-                Constraint::Length(8),
+                Constraint::Fixed(12),
+                Constraint::Fixed(12),
+                Constraint::Fixed(10),
+                Constraint::Fixed(16),
+                Constraint::Fixed(12),
+                Constraint::Fixed(24),
+                Constraint::Fixed(8),
                 Constraint::Min(26),
             ],
         )
@@ -985,63 +1050,64 @@ impl Screen for HistoricalAnalyticsScreen {
                 "Conf",
                 "Replay",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(self.palette.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Evidence Log + Replay Handles "),
         );
-        frame.render_widget(evidence_table, chunks[2]);
+        evidence_table.render(chunks[2], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(code, _mods) = event {
             match code {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.evidence_count();
                     if count > 0 && self.selected_row < count.saturating_sub(1) {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('p') => {
+                ftui_core::event::KeyCode::Char('p') => {
                     self.cycle_project_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('r') => {
+                ftui_core::event::KeyCode::Char('r') => {
                     self.cycle_reason_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('h') => {
+                ftui_core::event::KeyCode::Char('h') => {
                     self.cycle_host_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('x') => {
+                ftui_core::event::KeyCode::Char('x') => {
                     self.reset_filters();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('e') => {
+                ftui_core::event::KeyCode::Char('e') => {
                     self.compact_export = !self.compact_export;
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Enter => {
+                ftui_core::event::KeyCode::Char('g') | ftui_core::event::KeyCode::Enter => {
                     if self.selected_project().is_some() {
                         return ScreenAction::Navigate(self.project_screen_id.clone());
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('l') => {
+                ftui_core::event::KeyCode::Char('l') => {
                     return ScreenAction::Navigate(self.live_stream_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('t') => {
+                ftui_core::event::KeyCode::Char('t') => {
                     return ScreenAction::Navigate(self.timeline_screen_id.clone());
                 }
                 _ => {}
@@ -1053,6 +1119,10 @@ impl Screen for HistoricalAnalyticsScreen {
 
     fn semantic_role(&self) -> &'static str {
         "analytics"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        HISTORICAL_ANALYTICS_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1229,26 +1299,26 @@ mod tests {
         let ctx = context();
 
         let project = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&project, &ctx), ScreenAction::Consumed);
 
         let reason = InputEvent::Key(
-            crossterm::event::KeyCode::Char('r'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('r'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&reason, &ctx), ScreenAction::Consumed);
 
         let host = InputEvent::Key(
-            crossterm::event::KeyCode::Char('h'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('h'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&host, &ctx), ScreenAction::Consumed);
 
         let reset = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&reset, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.evidence_count(), 3);
@@ -1264,8 +1334,8 @@ mod tests {
         let ctx = context();
 
         let goto = InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&goto, &ctx),
@@ -1273,8 +1343,8 @@ mod tests {
         );
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -1282,8 +1352,8 @@ mod tests {
         );
 
         let timeline = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&timeline, &ctx),
@@ -1301,8 +1371,8 @@ mod tests {
         assert!(compact_line.contains("snapshot(compact)"));
 
         let toggle = InputEvent::Key(
-            crossterm::event::KeyCode::Char('e'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('e'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&toggle, &ctx), ScreenAction::Consumed);
 
@@ -1328,8 +1398,8 @@ mod tests {
         assert_eq!(first_payload.replay_handle, first_target.replay_handle);
 
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
 
@@ -1752,13 +1822,6 @@ mod tests {
         assert_eq!(EventSeverity::Info.label(), "info");
         assert_eq!(EventSeverity::Warn.label(), "warn");
         assert_eq!(EventSeverity::Critical.label(), "critical");
-    }
-
-    #[test]
-    fn event_severity_color_all_variants() {
-        assert_eq!(EventSeverity::Info.color(), Color::Gray);
-        assert_eq!(EventSeverity::Warn.color(), Color::Yellow);
-        assert_eq!(EventSeverity::Critical.color(), Color::Red);
     }
 
     #[test]
@@ -2236,8 +2299,8 @@ mod tests {
         screen.update_state(&sample_state());
         let ctx = context();
         let up = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&up, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 0);
@@ -2249,8 +2312,8 @@ mod tests {
         screen.update_state(&sample_state());
         let ctx = context();
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -2263,8 +2326,8 @@ mod tests {
         screen.selected_row = 2;
         let ctx = context();
         let k = InputEvent::Key(
-            crossterm::event::KeyCode::Char('k'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('k'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&k, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -2276,8 +2339,8 @@ mod tests {
         screen.update_state(&sample_state());
         let ctx = context();
         let j = InputEvent::Key(
-            crossterm::event::KeyCode::Char('j'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('j'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&j, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -2291,8 +2354,8 @@ mod tests {
         let count = screen.evidence_count();
         screen.selected_row = count.saturating_sub(1);
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, count.saturating_sub(1));
@@ -2303,8 +2366,8 @@ mod tests {
         let mut screen = HistoricalAnalyticsScreen::new();
         let ctx = context();
         let f12 = InputEvent::Key(
-            crossterm::event::KeyCode::F(12),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::F(12),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&f12, &ctx), ScreenAction::Ignored);
     }
@@ -2430,8 +2493,8 @@ mod tests {
         screen.update_state(&sample_state());
         let ctx = context();
         let enter = InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         let action = screen.handle_input(&enter, &ctx);
         assert!(matches!(action, ScreenAction::Navigate(_)));
@@ -2465,8 +2528,8 @@ mod tests {
         let ctx = context();
 
         let l = InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&l, &ctx),
@@ -2474,8 +2537,8 @@ mod tests {
         );
 
         let t = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&t, &ctx),

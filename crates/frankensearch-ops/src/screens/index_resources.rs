@@ -6,15 +6,22 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::state::AppState;
 use crate::theme::SemanticPalette;
@@ -77,6 +84,29 @@ pub struct IndexResourceScreen {
     palette: SemanticPalette,
 }
 
+const INDEX_RESOURCES_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "p",
+        description: "Cycle project filter",
+    },
+    KeybindingHint {
+        key: "o",
+        description: "Cycle comparison window",
+    },
+    KeybindingHint {
+        key: "x",
+        description: "Reset filters",
+    },
+];
+
 impl IndexResourceScreen {
     /// Create a new index/resource monitoring screen.
     #[must_use]
@@ -98,7 +128,7 @@ impl IndexResourceScreen {
         self.clamp_selected_row();
     }
 
-    pub fn set_palette(&mut self, palette: SemanticPalette) {
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
         self.palette = palette;
     }
 
@@ -277,7 +307,7 @@ impl IndexResourceScreen {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn summary_lines(&self, rows: &[MonitorRow]) -> Vec<Line<'static>> {
+    fn summary_lines(&self, rows: &[MonitorRow]) -> Vec<Line> {
         if rows.is_empty() {
             return vec![
                 Line::from("No rows for current project filter."),
@@ -350,25 +380,165 @@ impl IndexResourceScreen {
                 "comparison[{}]: p95 Δ{delta_p95_avg:+}us | cpu Δ{delta_cpu_avg:+.1}% | pending Δ{delta_pending_total:+}",
                 self.comparison_window.label(),
             )),
+            Line::from(
+                "legend: unhealthy rows render in alert colors; percentiles are fleet-relative",
+            ),
             Line::from(format!(
                 "Search p95_avg={p95_avg}us | keys: p cycle project, o cycle comparison, x reset filters"
             )),
         ]
     }
 
-    fn build_rows(&self) -> Vec<Row<'static>> {
+    fn ratio_percent_u64(numer: u64, denom: u64) -> u8 {
+        if denom == 0 {
+            return 0;
+        }
+        let rounded = numer
+            .saturating_mul(100)
+            .saturating_add(denom / 2)
+            .saturating_div(denom)
+            .min(100);
+        u8::try_from(rounded).unwrap_or(100)
+    }
+
+    fn spark_char(percent: u8) -> char {
+        const BINS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let idx = (u16::from(percent).saturating_mul(7).saturating_add(50)) / 100;
+        BINS[usize::from(idx.min(7))]
+    }
+
+    fn sparkline(values: &[u8]) -> String {
+        values
+            .iter()
+            .map(|value| Self::spark_char(*value))
+            .collect()
+    }
+
+    fn row_pulse(row: &MonitorRow) -> String {
+        let pending_pressure = Self::ratio_percent_u64(row.pending_jobs, row.docs.max(1));
+        Self::sparkline(&[
+            row.docs_percentile,
+            row.p95_percentile,
+            row.cpu_percentile,
+            pending_pressure,
+        ])
+    }
+
+    fn percentile_heatstrip_line(rows: &[MonitorRow]) -> String {
+        if rows.is_empty() {
+            return "percentile strip: (no rows)".to_owned();
+        }
+        let values: Vec<u8> = rows
+            .iter()
+            .take(24)
+            .map(|row| row.p95_percentile)
+            .collect();
+        format!("percentile strip: {}", Self::sparkline(&values))
+    }
+
+    fn hotspot_line(rows: &[MonitorRow]) -> String {
+        let Some(top) = rows.first() else {
+            return "hotspot: none".to_owned();
+        };
+        format!(
+            "hotspot: {} p95={}us cpu={:.1}% pending={} docs={} pulse={}",
+            top.instance_id,
+            top.p95_latency_us,
+            top.cpu_percent,
+            top.pending_jobs,
+            top.docs,
+            Self::row_pulse(top)
+        )
+    }
+
+    fn comparison_pills_line(&self) -> Line {
+        let mut spans = vec![
+            Span::styled("window:", self.palette.style_muted()),
+            Span::raw(" "),
+        ];
+        let current_hour_style = if matches!(
+            self.comparison_window,
+            ComparisonWindow::CurrentVsPreviousHourEstimate
+        ) {
+            self.palette.style_highlight().bold()
+        } else {
+            self.palette.style_muted()
+        };
+        spans.push(Span::styled("[hour]", current_hour_style));
+        spans.push(Span::raw(" "));
+        let same_hour_style = if matches!(
+            self.comparison_window,
+            ComparisonWindow::CurrentVsSameHourYesterdayEstimate
+        ) {
+            self.palette.style_highlight().bold()
+        } else {
+            self.palette.style_muted()
+        };
+        spans.push(Span::styled("[yesterday]", same_hour_style));
+        spans.push(Span::raw(" "));
+        let filter_label = self
+            .selected_project_filter()
+            .unwrap_or_else(|| "all".to_owned());
+        spans.push(Span::styled(
+            format!("project={filter_label}"),
+            self.palette.style_muted(),
+        ));
+        Line::from_spans(spans)
+    }
+
+    fn selected_context_line(&self, rows: &[MonitorRow]) -> String {
+        if let Some(row) = rows.get(self.selected_row) {
+            return format!(
+                "focus: project={} instance={} p95={}us cpu={:.1}% pending={} pulse={}",
+                row.project,
+                row.instance_id,
+                row.p95_latency_us,
+                row.cpu_percent,
+                row.pending_jobs,
+                Self::row_pulse(row)
+            );
+        }
+        "focus: none".to_owned()
+    }
+
+    fn render_compact(&self, frame: &mut Frame, area: Rect) {
+        let rows = self.row_models();
+        let mut lines = vec![
+            Line::from("Index + Resources"),
+            self.comparison_pills_line(),
+            Line::from(Self::percentile_heatstrip_line(&rows)),
+            Line::from(Self::hotspot_line(&rows)),
+            Line::from(self.selected_context_line(&rows)),
+        ];
+        let visible_lines = usize::from(area.height.saturating_sub(2));
+        if visible_lines > 0 {
+            lines.truncate(visible_lines);
+        } else {
+            lines.truncate(1);
+        }
+        Paragraph::new(Text::from_lines(lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.palette.style_border())
+                    .title(" Index + Resources "),
+            )
+            .render(area, frame);
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
         self.row_models()
             .into_iter()
             .enumerate()
             .map(|(index, row)| {
-                let mut style = if row.healthy {
-                    Style::default()
+                let style = if index == self.selected_row {
+                    self.palette.style_highlight().bold()
+                } else if row.healthy {
+                    self.palette.style_row_base(index)
                 } else {
-                    Style::default().fg(Color::Red)
+                    self.palette.style_row_error(index)
                 };
-                if index == self.selected_row {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
 
                 Row::new(vec![
                     row.project,
@@ -382,6 +552,7 @@ impl IndexResourceScreen {
                     format!("{}%", row.docs_percentile),
                     format!("{}%", row.p95_percentile),
                     format!("{}%", row.cpu_percentile),
+                    Self::row_pulse(&row),
                 ])
                 .style(style)
             })
@@ -408,90 +579,106 @@ impl Screen for IndexResourceScreen {
         "Index + Resources"
     }
 
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
-        let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(6), Constraint::Min(6)])
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let p = &self.palette;
+        let border_style = p.style_border();
+
+        let area = frame.bounds();
+        if area.width < 110 || area.height < 14 {
+            self.render_compact(frame, area);
+            return;
+        }
+
+        let chunks = Flex::vertical()
+            .constraints([Constraint::Fixed(10), Constraint::Min(6)])
             .split(area);
 
         let rows = self.row_models();
-        let summary = Paragraph::new(self.summary_lines(&rows)).block(
-            Block::default()
+        let mut summary_lines = self.summary_lines(&rows);
+        summary_lines.insert(1, self.comparison_pills_line());
+        summary_lines.insert(2, Line::from(Self::percentile_heatstrip_line(&rows)));
+        summary_lines.insert(3, Line::from(Self::hotspot_line(&rows)));
+        summary_lines.push(Line::from(self.selected_context_line(&rows)));
+        let summary = Paragraph::new(Text::from_lines(summary_lines)).block(
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Index + Embedding + Resources "),
         );
-        frame.render_widget(summary, chunks[0]);
+        summary.render(chunks[0], frame);
 
         if rows.is_empty() {
             let empty = Paragraph::new("No index/resource rows available for this filter.").block(
-                Block::default()
+                Block::new()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .border_style(border_style)
                     .title(" Inventory "),
             );
-            frame.render_widget(empty, chunks[1]);
+            empty.render(chunks[1], frame);
             return;
         }
 
         let table = Table::new(
             self.build_rows(),
             [
-                Constraint::Length(12),
-                Constraint::Length(18),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
+                Constraint::Fixed(12),
+                Constraint::Fixed(18),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(10),
+                Constraint::Fixed(10),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(6),
             ],
         )
         .header(
             Row::new(vec![
                 "Project", "Instance", "Docs", "Pending", "CPU", "Mem", "IO", "P95us", "Docs%",
-                "P95%", "CPU%",
+                "P95%", "CPU%", "Pulse",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(self.palette.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Inventory "),
         );
-        frame.render_widget(table, chunks[1]);
+        table.render(chunks[1], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(code, _mods) = event {
             match code {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.row_count();
                     if count > 0 && self.selected_row < count.saturating_sub(1) {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('p') => {
+                ftui_core::event::KeyCode::Char('p') => {
                     self.cycle_project_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('x') => {
+                ftui_core::event::KeyCode::Char('x') => {
                     self.reset_filters();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('o') => {
+                ftui_core::event::KeyCode::Char('o') => {
                     self.cycle_comparison_window();
                     return ScreenAction::Consumed;
                 }
@@ -503,6 +690,10 @@ impl Screen for IndexResourceScreen {
 
     fn semantic_role(&self) -> &'static str {
         "table"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        INDEX_RESOURCES_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -659,8 +850,8 @@ mod tests {
         assert_eq!(screen.row_models().len(), 3);
 
         let cycle = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&cycle, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.row_models().len(), 2);
@@ -669,8 +860,8 @@ mod tests {
         assert_eq!(screen.row_models().len(), 1);
 
         let reset = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&reset, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.row_models().len(), 3);
@@ -683,8 +874,8 @@ mod tests {
         let ctx = context();
 
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -701,7 +892,7 @@ mod tests {
         let text = screen
             .summary_lines(&screen.row_models())
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Index docs="));
@@ -720,20 +911,20 @@ mod tests {
         let initial = screen
             .summary_lines(&screen.row_models())
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(initial.contains("current_hour vs previous_hour_estimate"));
 
         let cycle = InputEvent::Key(
-            crossterm::event::KeyCode::Char('o'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('o'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&cycle, &ctx), ScreenAction::Consumed);
         let after_first = screen
             .summary_lines(&screen.row_models())
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(after_first.contains("current_hour vs same_hour_yesterday_estimate"));
@@ -742,7 +933,7 @@ mod tests {
         let after_second = screen
             .summary_lines(&screen.row_models())
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(after_second.contains("current_hour vs previous_hour_estimate"));
@@ -833,7 +1024,7 @@ mod tests {
         let lines = screen.summary_lines(&[]);
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("No rows"));
@@ -859,8 +1050,8 @@ mod tests {
         screen.selected_row = 0;
         let ctx = context();
         let up = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         screen.handle_input(&up, &ctx);
         assert_eq!(screen.selected_row, 0);
@@ -873,8 +1064,8 @@ mod tests {
         let mut screen = IndexResourceScreen::new();
         let ctx = context();
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Char('z'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('z'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&event, &ctx), ScreenAction::Ignored);
     }

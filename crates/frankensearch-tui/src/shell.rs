@@ -7,18 +7,23 @@
 use std::cell::Cell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ftui_core::geometry::Rect;
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{CachedLayout, CachedTabState};
 use crate::input::{InputEvent, KeyAction, Keymap};
 use crate::overlay::OverlayManager;
 use crate::palette::{CommandPalette, PaletteState};
-use crate::screen::{ScreenAction, ScreenContext, ScreenId, ScreenRegistry};
+use crate::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId, ScreenRegistry};
 use crate::theme::Theme;
 
 // ─── Shell Config ────────────────────────────────────────────────────────────
@@ -120,6 +125,33 @@ pub struct AppShell {
 }
 
 impl AppShell {
+    fn build_help_overlay_request(&self) -> crate::overlay::OverlayRequest {
+        let mut request = crate::overlay::OverlayRequest::new(
+            crate::overlay::OverlayKind::Help,
+            "Keyboard Shortcuts",
+        )
+        .with_body("Global shortcuts + active screen controls");
+
+        if let Some(screen_id) = &self.active_screen
+            && let Some(screen) = self.registry.get(screen_id)
+        {
+            let hints = screen.keybindings();
+            if !hints.is_empty() {
+                request.title = format!("Keyboard Shortcuts · {}", screen.title());
+                request.actions = Self::encode_screen_keybindings(hints);
+            }
+        }
+
+        request
+    }
+
+    fn encode_screen_keybindings(hints: &[KeybindingHint]) -> Vec<String> {
+        hints
+            .iter()
+            .map(|hint| format!("{}|{}", hint.key, hint.description))
+            .collect()
+    }
+
     /// Create a new app shell with the given config.
     #[must_use]
     pub fn new(config: ShellConfig) -> Self {
@@ -204,12 +236,8 @@ impl AppShell {
         }
 
         if self.last_render_area.get().width == 0 || self.last_render_area.get().height == 0 {
-            if let Ok((width, height)) = crossterm::terminal::size() {
-                self.last_render_area.set(Rect::new(0, 0, width, height));
-            } else {
-                // Fallback keeps context sane in non-interactive test harnesses.
-                self.last_render_area.set(Rect::new(0, 0, 80, 24));
-            }
+            // Fallback keeps context sane in non-interactive test harnesses.
+            self.last_render_area.set(Rect::new(0, 0, 80, 24));
         }
 
         // If the command palette is open, route input there first.
@@ -241,19 +269,17 @@ impl AppShell {
                 }
                 // Handle text input for palette search.
                 match key {
-                    crossterm::event::KeyCode::Char(ch)
+                    ftui_core::event::KeyCode::Char(ch)
                         if !mods.intersects(
-                            crossterm::event::KeyModifiers::CONTROL
-                                | crossterm::event::KeyModifiers::ALT
-                                | crossterm::event::KeyModifiers::SUPER
-                                | crossterm::event::KeyModifiers::HYPER
-                                | crossterm::event::KeyModifiers::META,
+                            ftui_core::event::Modifiers::CTRL
+                                | ftui_core::event::Modifiers::ALT
+                                | ftui_core::event::Modifiers::SUPER,
                         ) =>
                     {
                         self.palette.push_char(*ch);
                         return false;
                     }
-                    crossterm::event::KeyCode::Backspace => {
+                    ftui_core::event::KeyCode::Backspace => {
                         self.palette.pop_char();
                         return false;
                     }
@@ -300,10 +326,7 @@ impl AppShell {
                         {
                             self.overlays.dismiss();
                         } else {
-                            self.overlays.push(crate::overlay::OverlayRequest::new(
-                                crate::overlay::OverlayKind::Help,
-                                "Keyboard Shortcuts",
-                            ));
+                            self.overlays.push(self.build_help_overlay_request());
                         }
                         return false;
                     }
@@ -362,8 +385,8 @@ impl AppShell {
     /// Uses cached layout and tab state to avoid redundant allocations
     /// when the terminal dimensions and screen configuration haven't changed.
     #[allow(clippy::too_many_lines)]
-    pub fn render(&mut self, frame: &mut Frame<'_>) {
-        let area = frame.area();
+    pub fn render(&mut self, frame: &mut Frame) {
+        let area = frame.bounds();
         self.last_render_area.set(area);
         let ctx = self.screen_context(area);
 
@@ -438,30 +461,32 @@ impl AppShell {
                 if i > 0 {
                     tab_spans.push(Span::styled(
                         " \u{2502} ",
-                        Style::default().fg(self.config.theme.border.to_ratatui()),
+                        Style::new().fg(self.config.theme.border.to_color()),
                     ));
                 }
                 if i == self.cached_tabs.selected {
                     tab_spans.push(Span::styled(
                         format!(" {title} "),
-                        Style::default()
-                            .fg(self.config.theme.highlight_fg.to_ratatui())
-                            .bg(self.config.theme.accent.to_ratatui())
-                            .add_modifier(Modifier::BOLD),
+                        Style::new()
+                            .fg(self.config.theme.highlight_fg.to_color())
+                            .bg(self.config.theme.accent.to_color())
+                            .bold(),
                     ));
                 } else {
                     tab_spans.push(Span::styled(
                         format!(" {title} "),
-                        Style::default()
-                            .fg(self.config.theme.muted.to_ratatui())
-                            .bg(self.config.theme.bg.to_ratatui()),
+                        Style::new().fg(self.config.theme.muted.to_color()).bg(self
+                            .config
+                            .theme
+                            .bg
+                            .to_color()),
                     ));
                 }
             }
-            let tab_line = Paragraph::new(Line::from(tab_spans))
-                .style(Style::default().bg(self.config.theme.bg.to_ratatui()));
+            let tab_line = Paragraph::new(Line::from_spans(tab_spans))
+                .style(Style::new().bg(self.config.theme.bg.to_color()));
 
-            frame.render_widget(tab_line, bc_rect);
+            tab_line.render(bc_rect, frame);
         }
 
         // Main content area.
@@ -471,17 +496,19 @@ impl AppShell {
             }
         } else {
             // No screen active — render placeholder.
-            let block = Block::default()
+            let block = Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(self.config.theme.border.to_ratatui()))
+                .border_style(Style::new().fg(self.config.theme.border.to_color()))
                 .style(
-                    Style::default()
-                        .bg(self.config.theme.bg.to_ratatui())
-                        .fg(self.config.theme.fg.to_ratatui()),
+                    Style::new().bg(self.config.theme.bg.to_color()).fg(self
+                        .config
+                        .theme
+                        .fg
+                        .to_color()),
                 );
             let placeholder = Paragraph::new("No screens registered").block(block);
-            frame.render_widget(placeholder, content_area);
+            placeholder.render(content_area, frame);
         }
 
         // Status bar.
@@ -495,49 +522,72 @@ impl AppShell {
                 )
             };
 
-            let hints = Self::status_bar_hints(sb_rect.width);
+            let active_screen_hints = self
+                .active_screen
+                .as_ref()
+                .and_then(|id| self.registry.get(id))
+                .map_or(&[][..], |screen| screen.keybindings());
+            let hints = Self::status_bar_hints(sb_rect.width, active_screen_hints);
             let left_content_len =
                 self.status_line.left.len() + status_text.len() + self.status_line.right.len();
             let pad_width = (sb_rect.width as usize).saturating_sub(left_content_len + hints.len());
             let padding = " ".repeat(pad_width);
 
-            let muted_style = Style::default().fg(self.config.theme.muted.to_ratatui());
+            let muted_style = Style::new().fg(self.config.theme.muted.to_color());
 
             let status_spans = vec![
                 Span::styled(
                     &self.status_line.left,
-                    Style::default().fg(self.config.theme.status_bar_fg.to_ratatui()),
+                    Style::new().fg(self.config.theme.status_bar_fg.to_color()),
                 ),
                 Span::styled(
                     status_text,
-                    Style::default()
-                        .fg(self.config.theme.status_bar_fg.to_ratatui())
-                        .add_modifier(Modifier::BOLD),
+                    Style::new()
+                        .fg(self.config.theme.status_bar_fg.to_color())
+                        .bold(),
                 ),
                 Span::styled(
                     &self.status_line.right,
-                    Style::default().fg(self.config.theme.status_bar_fg.to_ratatui()),
+                    Style::new().fg(self.config.theme.status_bar_fg.to_color()),
                 ),
                 Span::raw(padding),
                 Span::styled(hints, muted_style),
             ];
 
-            let status = Paragraph::new(Line::from(status_spans))
-                .style(Style::default().bg(self.config.theme.status_bar_bg.to_ratatui()));
+            let status = Paragraph::new(Line::from_spans(status_spans))
+                .style(Style::new().bg(self.config.theme.status_bar_bg.to_color()));
 
-            frame.render_widget(status, sb_rect);
+            status.render(sb_rect, frame);
         }
     }
 
     /// Build right-aligned keybinding hints for the status bar.
-    fn status_bar_hints(width: u16) -> String {
+    fn status_bar_hints(width: u16, screen_hints: &[KeybindingHint]) -> String {
         if width < 60 {
-            String::new()
-        } else if width < 90 {
+            return String::new();
+        }
+
+        let mut base = if width < 90 {
             "Tab:Nav  ?:Help  ^T:Theme ".to_string()
         } else {
             "Tab:Nav  ?:Help  ^P:Cmd  ^T:Theme  q:Quit ".to_string()
+        };
+
+        if width >= 110 && !screen_hints.is_empty() {
+            let contextual = screen_hints
+                .iter()
+                .take(2)
+                .map(|hint| format!("{} {}", hint.key, hint.description))
+                .collect::<Vec<_>>()
+                .join("  ");
+            if !contextual.is_empty() {
+                base.push_str("| ");
+                base.push_str(&contextual);
+                base.push(' ');
+            }
         }
+
+        base
     }
 }
 
@@ -546,7 +596,7 @@ mod tests {
     use std::any::Any;
     use std::sync::{Arc, Mutex};
 
-    use ratatui::Frame;
+    use ftui_render::frame::Frame;
 
     use crate::screen::{Screen, ScreenAction};
 
@@ -591,8 +641,8 @@ mod tests {
     fn shell_quit_handling() {
         let mut shell = AppShell::new(ShellConfig::default());
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Char('q'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('q'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = shell.handle_input(&event);
         assert!(quit);
@@ -622,7 +672,7 @@ mod tests {
             "capture"
         }
 
-        fn render(&self, _frame: &mut Frame<'_>, _ctx: &ScreenContext) {}
+        fn render(&self, _frame: &mut Frame, _ctx: &ScreenContext) {}
 
         fn handle_input(&mut self, _event: &InputEvent, ctx: &ScreenContext) -> ScreenAction {
             *self.captured.lock().expect("capture lock") =
@@ -652,8 +702,8 @@ mod tests {
 
         shell.last_render_area.set(Rect::new(0, 0, 132, 47));
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&event);
 
@@ -668,8 +718,8 @@ mod tests {
     fn palette_toggle_shortcut_closes_palette_when_open() {
         let mut shell = AppShell::new(ShellConfig::default());
         let toggle = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
 
         let _ = shell.handle_input(&toggle);
@@ -683,14 +733,14 @@ mod tests {
     fn palette_accepts_shift_modified_characters() {
         let mut shell = AppShell::new(ShellConfig::default());
         let open = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&open);
 
         let shifted = InputEvent::Key(
-            crossterm::event::KeyCode::Char('A'),
-            crossterm::event::KeyModifiers::SHIFT,
+            ftui_core::event::KeyCode::Char('A'),
+            ftui_core::event::Modifiers::SHIFT,
         );
         let _ = shell.handle_input(&shifted);
 
@@ -712,8 +762,8 @@ mod tests {
         let _ = shell.handle_input(&resize);
 
         let key = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&key);
 
@@ -757,7 +807,7 @@ mod tests {
             self.title
         }
 
-        fn render(&self, _frame: &mut Frame<'_>, _ctx: &ScreenContext) {}
+        fn render(&self, _frame: &mut Frame, _ctx: &ScreenContext) {}
 
         fn handle_input(&mut self, _event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
             ScreenAction::Ignored
@@ -942,19 +992,19 @@ mod tests {
         let mut shell = AppShell::new(ShellConfig::default());
         // Open palette
         let open = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&open);
 
         // Type "ab"
         let a = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         let b = InputEvent::Key(
-            crossterm::event::KeyCode::Char('b'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('b'),
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&a);
         let _ = shell.handle_input(&b);
@@ -962,8 +1012,8 @@ mod tests {
 
         // Backspace
         let bs = InputEvent::Key(
-            crossterm::event::KeyCode::Backspace,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Backspace,
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&bs);
         assert_eq!(shell.palette.query(), "a");
@@ -973,15 +1023,15 @@ mod tests {
     fn palette_esc_closes() {
         let mut shell = AppShell::new(ShellConfig::default());
         let open = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&open);
         assert_eq!(shell.palette.state(), &PaletteState::Open);
 
         let esc = InputEvent::Key(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Escape,
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&esc);
         assert_eq!(shell.palette.state(), &PaletteState::Closed);
@@ -991,15 +1041,15 @@ mod tests {
     fn palette_enter_closes_and_clears() {
         let mut shell = AppShell::new(ShellConfig::default());
         let open = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&open);
         assert_eq!(shell.palette.state(), &PaletteState::Open);
 
         let enter = InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = shell.handle_input(&enter);
         assert!(!quit);
@@ -1013,16 +1063,16 @@ mod tests {
 
         // Open help overlay with '?'
         let help = InputEvent::Key(
-            crossterm::event::KeyCode::Char('?'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('?'),
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&help);
         assert!(shell.overlays.has_active());
 
         // Dismiss with Esc
         let esc = InputEvent::Key(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Escape,
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&esc);
         assert!(!shell.overlays.has_active());
@@ -1034,8 +1084,8 @@ mod tests {
         shell.last_render_area.set(Rect::new(0, 0, 80, 24));
 
         let help = InputEvent::Key(
-            crossterm::event::KeyCode::Char('?'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('?'),
+            ftui_core::event::Modifiers::NONE,
         );
 
         let _ = shell.handle_input(&help);
@@ -1058,8 +1108,8 @@ mod tests {
         shell.navigate_to(&ScreenId::new("a"));
 
         let tab = InputEvent::Key(
-            crossterm::event::KeyCode::Tab,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Tab,
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&tab);
         assert_eq!(shell.active_screen.as_ref(), Some(&ScreenId::new("b")));
@@ -1074,8 +1124,8 @@ mod tests {
         shell.navigate_to(&ScreenId::new("b"));
 
         let shift_tab = InputEvent::Key(
-            crossterm::event::KeyCode::BackTab,
-            crossterm::event::KeyModifiers::SHIFT,
+            ftui_core::event::KeyCode::BackTab,
+            ftui_core::event::Modifiers::SHIFT,
         );
         let _ = shell.handle_input(&shift_tab);
         assert_eq!(shell.active_screen.as_ref(), Some(&ScreenId::new("a")));
@@ -1093,16 +1143,16 @@ mod tests {
 
         // Open overlay
         let help = InputEvent::Key(
-            crossterm::event::KeyCode::Char('?'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('?'),
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&help);
         assert!(shell.overlays.has_active());
 
         // Send a key that would normally reach the screen
         let x = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         let _ = shell.handle_input(&x);
         // Screen should NOT have received the event
@@ -1113,15 +1163,15 @@ mod tests {
     fn palette_ctrl_char_not_inserted() {
         let mut shell = AppShell::new(ShellConfig::default());
         let open = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&open);
 
         // Ctrl+A should NOT be inserted as text
         let ctrl_a = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&ctrl_a);
         assert_eq!(shell.palette.query(), "");
@@ -1131,14 +1181,14 @@ mod tests {
     fn palette_alt_char_not_inserted() {
         let mut shell = AppShell::new(ShellConfig::default());
         let open = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         let _ = shell.handle_input(&open);
 
         let alt_x = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::ALT,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::ALT,
         );
         let _ = shell.handle_input(&alt_x);
         assert_eq!(shell.palette.query(), "");
@@ -1149,8 +1199,8 @@ mod tests {
         let mut shell = AppShell::new(ShellConfig::default());
         shell.last_render_area.set(Rect::new(0, 0, 80, 24));
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = shell.handle_input(&event);
         assert!(!quit);

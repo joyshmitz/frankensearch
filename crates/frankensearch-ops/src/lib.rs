@@ -19,7 +19,7 @@
 //! │  frankensearch-tui (shared framework)           │
 //! │  Screen, ScreenRegistry, AppShell, Keymap, ...  │
 //! ├─────────────────────────────────────────────────┤
-//! │  ratatui + crossterm                            │
+//! │  /dp/frankentui (ftui-*)                        │
 //! └─────────────────────────────────────────────────┘
 //! ```
 

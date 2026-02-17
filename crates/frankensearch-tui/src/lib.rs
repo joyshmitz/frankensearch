@@ -26,7 +26,7 @@
 //! │  ├─ evidence: JSONL evidence hooks + redaction   │
 //! │  └─ terminal: Mode detection, reconnect handler │
 //! ├─────────────────────────────────────────────────┤
-//! │  ratatui + crossterm                            │
+//! │  FrankenTUI (ftui-*)                             │
 //! └─────────────────────────────────────────────────┘
 //! ```
 //!

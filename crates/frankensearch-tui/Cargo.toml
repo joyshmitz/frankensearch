@@ -10,9 +10,13 @@ description = "Shared TUI framework for frankensearch products (fsfs, ops TUI)"
 [dependencies]
 frankensearch-core = { workspace = true }
 
-# Terminal UI rendering
-ratatui = "0.30"
-crossterm = "0.29"
+# Terminal UI rendering (FrankenTUI)
+ftui-core = { workspace = true }
+ftui-render = { workspace = true }
+ftui-style = { workspace = true }
+ftui-text = { workspace = true }
+ftui-layout = { workspace = true }
+ftui-widgets = { workspace = true }
 
 # Serialization (for keybindings, themes, replay)
 serde = { workspace = true }

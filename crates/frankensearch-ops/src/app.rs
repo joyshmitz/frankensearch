@@ -10,7 +10,7 @@ use frankensearch_tui::palette::{Action, ActionCategory};
 use frankensearch_tui::screen::ScreenId;
 use frankensearch_tui::shell::{AppShell, ShellConfig};
 use frankensearch_tui::theme::Theme;
-use ratatui::Frame;
+use ftui_render::frame::Frame;
 
 use crate::data_source::DataSource;
 use crate::preferences::DisplayPreferences;
@@ -20,6 +20,7 @@ use crate::screens::{
     IndexResourceScreen, LiveSearchStreamScreen, ProjectDetailScreen,
 };
 use crate::state::{AppState, ControlPlaneHealth};
+use crate::theme::SemanticPalette;
 
 // ─── Ops App ─────────────────────────────────────────────────────────────────
 
@@ -173,13 +174,17 @@ impl OpsApp {
     /// Consumers should render via this method (instead of calling
     /// `self.shell.render(...)` directly) so palette/help/alert overlays
     /// are painted on top of the active screen.
-    pub fn render(&mut self, frame: &mut Frame<'_>) {
+    pub fn render(&mut self, frame: &mut Frame) {
         self.shell.render(frame);
-        let area = frame.area();
+        let area = frame.bounds();
+        let palette = SemanticPalette::from_preferences(
+            self.shell.config.theme.preset.is_light(),
+            &self.preferences,
+        );
         if let Some(request) = self.shell.overlays.top() {
-            crate::overlays::render_overlay(frame, area, request);
+            crate::overlays::render_overlay(frame, area, request, &palette);
         }
-        crate::overlays::render_palette_overlay(frame, area, &self.shell.palette);
+        crate::overlays::render_palette_overlay(frame, area, &self.shell.palette, &palette);
     }
 
     /// Dispatch a confirmed palette action by ID.
@@ -220,8 +225,8 @@ impl OpsApp {
                 self.shell.navigate_to(&id);
 
                 let toggle_export_mode = frankensearch_tui::InputEvent::Key(
-                    crossterm::event::KeyCode::Char('e'),
-                    crossterm::event::KeyModifiers::NONE,
+                    ftui_core::event::KeyCode::Char('e'),
+                    ftui_core::event::Modifiers::NONE,
                 );
                 let _ = self.shell.handle_input(&toggle_export_mode);
 
@@ -614,7 +619,7 @@ impl OpsApp {
     const fn is_enter_key(event: &frankensearch_tui::InputEvent) -> bool {
         matches!(
             event,
-            frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Enter, _)
+            frankensearch_tui::InputEvent::Key(ftui_core::event::KeyCode::Enter, _)
         )
     }
 
@@ -622,7 +627,7 @@ impl OpsApp {
         matches!(
             event,
             frankensearch_tui::InputEvent::Key(
-                crossterm::event::KeyCode::Enter | crossterm::event::KeyCode::Char('g'),
+                ftui_core::event::KeyCode::Enter | ftui_core::event::KeyCode::Char('g'),
                 _
             )
         )
@@ -631,7 +636,7 @@ impl OpsApp {
     const fn is_char_key(event: &frankensearch_tui::InputEvent, expected: char) -> bool {
         matches!(
             event,
-            frankensearch_tui::InputEvent::Key(crossterm::event::KeyCode::Char(actual), _)
+            frankensearch_tui::InputEvent::Key(ftui_core::event::KeyCode::Char(actual), _)
             if *actual == expected
         )
     }
@@ -749,8 +754,13 @@ impl OpsApp {
     fn sync_screen_states(&mut self) {
         let state_snapshot = self.state.clone();
         let view_snapshot = self.view.clone();
+        let palette = SemanticPalette::from_preferences(
+            self.shell.config.theme.preset.is_light(),
+            &self.preferences,
+        );
         if let Some(screen) = self.fleet_screen_mut() {
             screen.update_state(&state_snapshot, &view_snapshot);
+            screen.set_palette(palette.clone());
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -760,6 +770,7 @@ impl OpsApp {
         }
         if let Some(screen) = self.project_screen_mut() {
             screen.update_state(&state_snapshot, &view_snapshot);
+            screen.set_palette(palette.clone());
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -769,6 +780,7 @@ impl OpsApp {
         }
         if let Some(screen) = self.live_stream_screen_mut() {
             screen.update_state(&state_snapshot);
+            screen.set_palette(palette.clone());
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -778,6 +790,7 @@ impl OpsApp {
         }
         if let Some(screen) = self.timeline_screen_mut() {
             screen.update_state(&state_snapshot);
+            screen.set_palette(palette.clone());
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -787,6 +800,7 @@ impl OpsApp {
         }
         if let Some(screen) = self.index_screen_mut() {
             screen.update_state(&state_snapshot);
+            screen.set_palette(palette.clone());
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -796,6 +810,7 @@ impl OpsApp {
         }
         if let Some(screen) = self.alerts_screen_mut() {
             screen.update_state(&state_snapshot);
+            screen.set_palette(palette.clone());
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -805,6 +820,7 @@ impl OpsApp {
         }
         if let Some(screen) = self.analytics_screen_mut() {
             screen.update_state(&state_snapshot);
+            screen.set_palette(palette);
         } else {
             tracing::warn!(
                 target: "frankensearch.ops",
@@ -967,8 +983,8 @@ mod tests {
     fn ops_app_quit() {
         let mut app = OpsApp::new(Box::new(MockDataSource::sample()));
         let event = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('q'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('q'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&event);
         assert!(quit);
@@ -1054,16 +1070,16 @@ mod tests {
         assert_eq!(app.shell.palette.state(), &PaletteState::Closed);
 
         let event = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::CONTROL,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::CTRL,
         );
         app.handle_input(&event);
         assert_eq!(app.shell.palette.state(), &PaletteState::Open);
 
         // Esc closes.
         let esc = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Escape,
+            ftui_core::event::Modifiers::NONE,
         );
         app.handle_input(&esc);
         assert_eq!(app.shell.palette.state(), &PaletteState::Closed);
@@ -1075,8 +1091,8 @@ mod tests {
 
         // Open palette.
         let open = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char(':'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char(':'),
+            ftui_core::event::Modifiers::NONE,
         );
         app.handle_input(&open);
         assert_eq!(app.shell.palette.state(), &PaletteState::Open);
@@ -1084,8 +1100,8 @@ mod tests {
         // Type "fleet".
         for ch in "fleet".chars() {
             let event = frankensearch_tui::InputEvent::Key(
-                crossterm::event::KeyCode::Char(ch),
-                crossterm::event::KeyModifiers::NONE,
+                ftui_core::event::KeyCode::Char(ch),
+                ftui_core::event::Modifiers::NONE,
             );
             app.handle_input(&event);
         }
@@ -1103,8 +1119,8 @@ mod tests {
         app.shell.overlays.dismiss();
 
         let enter = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&enter);
         assert!(!quit);
@@ -1119,15 +1135,15 @@ mod tests {
         app.refresh_data();
         app.shell.overlays.dismiss();
         app.handle_input(&frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         ));
         assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.project")));
         assert_eq!(app.view.project_filter.as_deref(), Some("cass"));
 
         let esc = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Escape,
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&esc);
         assert!(!quit);
@@ -1204,8 +1220,8 @@ mod tests {
         assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.alerts")));
 
         let goto_project = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_project);
         assert!(!quit);
@@ -1237,8 +1253,8 @@ mod tests {
         );
 
         let goto_project = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_project);
         assert!(!quit);
@@ -1267,8 +1283,8 @@ mod tests {
         assert_eq!(app.shell.active_screen, Some(ScreenId::new("ops.timeline")));
 
         let goto_project = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_project);
         assert!(!quit);
@@ -1298,8 +1314,8 @@ mod tests {
         let expected_project = app.selected_project_from_timeline();
 
         let goto_analytics = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_analytics);
         assert!(!quit);
@@ -1385,8 +1401,8 @@ mod tests {
         let expected_host = app.selected_host_from_timeline();
 
         let goto_analytics = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_analytics);
         assert!(!quit);
@@ -1435,8 +1451,8 @@ mod tests {
         let expected_project = app.selected_project_from_timeline();
 
         let goto_stream = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_stream);
         assert!(!quit);
@@ -1506,8 +1522,8 @@ mod tests {
         );
 
         let goto_analytics = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_analytics);
         assert!(!quit);
@@ -1576,8 +1592,8 @@ mod tests {
         );
 
         let goto_live_stream = frankensearch_tui::InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         let quit = app.handle_input(&goto_live_stream);
         assert!(!quit);

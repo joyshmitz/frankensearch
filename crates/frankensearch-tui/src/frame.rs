@@ -7,7 +7,8 @@
 
 use std::time::{Duration, Instant};
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
 use tracing::warn;
 
 // ─── Jank Callback ──────────────────────────────────────────────────────────
@@ -394,19 +395,14 @@ impl CachedLayout {
         // Recompute layout.
         let mut constraints = Vec::with_capacity(3);
         if breadcrumbs_visible {
-            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Fixed(1));
         }
         constraints.push(Constraint::Min(1));
         if show_status_bar {
-            constraints.push(Constraint::Length(1));
+            constraints.push(Constraint::Fixed(1));
         }
 
-        let layout_result = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
-
-        self.chunks = layout_result.to_vec();
+        self.chunks = Flex::vertical().constraints(constraints).split(area);
         self.area = area;
         self.show_breadcrumbs = breadcrumbs_visible;
         self.show_status_bar = show_status_bar;

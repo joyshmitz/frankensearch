@@ -6,16 +6,23 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_core::LifecycleState;
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::state::{AppState, ControlPlaneHealth, LifecycleEvent};
 use crate::theme::SemanticPalette;
@@ -37,14 +44,6 @@ impl AlertSeverity {
             Self::Info => "info",
             Self::Warn => "warn",
             Self::Critical => "critical",
-        }
-    }
-
-    const fn color(self) -> Color {
-        match self {
-            Self::Info => Color::Gray,
-            Self::Warn => Color::Yellow,
-            Self::Critical => Color::Red,
         }
     }
 
@@ -131,6 +130,49 @@ pub struct AlertsSloScreen {
     palette: SemanticPalette,
 }
 
+const ALERTS_SLO_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "p",
+        description: "Cycle project filter",
+    },
+    KeybindingHint {
+        key: "s",
+        description: "Cycle severity filter",
+    },
+    KeybindingHint {
+        key: "r",
+        description: "Cycle reason filter",
+    },
+    KeybindingHint {
+        key: "h",
+        description: "Cycle host filter",
+    },
+    KeybindingHint {
+        key: "x",
+        description: "Reset filters",
+    },
+    KeybindingHint {
+        key: "g / Enter",
+        description: "Open project detail",
+    },
+    KeybindingHint {
+        key: "l",
+        description: "Open live stream",
+    },
+    KeybindingHint {
+        key: "t",
+        description: "Open timeline",
+    },
+];
+
 impl AlertsSloScreen {
     /// Create a new alerts/SLO screen.
     #[must_use]
@@ -173,7 +215,7 @@ impl AlertsSloScreen {
         self.restore_selected_alert(focused);
     }
 
-    pub fn set_palette(&mut self, palette: SemanticPalette) {
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
         self.palette = palette;
     }
 
@@ -739,23 +781,235 @@ impl AlertsSloScreen {
         "focus: none".to_owned()
     }
 
-    fn build_alert_rows(&self, alerts: &[AlertRow]) -> Vec<Row<'static>> {
+    fn ratio_percent_u64(numer: u64, denom: u64) -> u8 {
+        if denom == 0 {
+            return 0;
+        }
+        let rounded = numer
+            .saturating_mul(100)
+            .saturating_add(denom / 2)
+            .saturating_div(denom)
+            .min(100);
+        u8::try_from(rounded).unwrap_or(100)
+    }
+
+    fn clamp_percent(value: f64) -> u8 {
+        if !value.is_finite() {
+            return 0;
+        }
+        let bounded = value.clamp(0.0, 100.0).round();
+        let mut percent = 0u8;
+        while percent < 100 && f64::from(percent) < bounded {
+            percent = percent.saturating_add(1);
+        }
+        percent
+    }
+
+    fn spark_char(percent: u8) -> char {
+        const BINS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let idx = (u16::from(percent).saturating_mul(7).saturating_add(50)) / 100;
+        BINS[usize::from(idx.min(7))]
+    }
+
+    fn sparkline(values: &[u8]) -> String {
+        values
+            .iter()
+            .map(|value| Self::spark_char(*value))
+            .collect()
+    }
+
+    fn alert_density_line(alerts: &[AlertRow]) -> String {
+        if alerts.is_empty() {
+            return "density: (no alerts)".to_owned();
+        }
+        let newest = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
+        let oldest = alerts.iter().map(|alert| alert.ts_ms).min().unwrap_or(newest);
+        let span = newest.saturating_sub(oldest);
+        if span == 0 {
+            return format!("density: {}", Self::sparkline(&[100]));
+        }
+        let mut buckets = [0u64; 12];
+        for alert in alerts {
+            let from_oldest = alert.ts_ms.saturating_sub(oldest);
+            let idx_u64 = from_oldest
+                .saturating_mul(11)
+                .saturating_div(span)
+                .min(11);
+            let idx = usize::try_from(idx_u64).unwrap_or(11);
+            buckets[idx] = buckets[idx].saturating_add(1);
+        }
+        let max_bucket = buckets.iter().copied().max().unwrap_or(0).max(1);
+        let normalized: Vec<u8> = buckets
+            .iter()
+            .map(|count| Self::ratio_percent_u64(*count, max_bucket))
+            .collect();
+        format!("density: {}", Self::sparkline(&normalized))
+    }
+
+    fn incident_badge_line(&self, alerts: &[AlertRow], project_rows: &[SloProjectRow]) -> Line {
+        let incident = if alerts
+            .iter()
+            .any(|alert| matches!(alert.severity, AlertSeverity::Critical))
+            || project_rows
+                .iter()
+                .any(|row| matches!(row.status, ControlPlaneHealth::Critical))
+        {
+            ("incident=critical", self.palette.style_error().bold())
+        } else if alerts
+            .iter()
+            .any(|alert| matches!(alert.severity, AlertSeverity::Warn))
+            || project_rows
+                .iter()
+                .any(|row| matches!(row.status, ControlPlaneHealth::Degraded))
+        {
+            ("incident=degraded", self.palette.style_warning().bold())
+        } else if alerts.is_empty() {
+            ("incident=idle", self.palette.style_muted())
+        } else {
+            ("incident=stable", self.palette.style_success().bold())
+        };
+        Line::from_spans(vec![
+            Span::styled("status: ", self.palette.style_muted()),
+            Span::styled(incident.0, incident.1),
+            Span::raw(" "),
+            Span::styled(
+                format!("severity_filter={}", self.severity_filter.label()),
+                self.palette.style_muted(),
+            ),
+        ])
+    }
+
+    fn severity_pills_line(&self) -> Line {
+        let mut spans = vec![
+            Span::styled("filters:", self.palette.style_muted()),
+            Span::raw(" "),
+        ];
+        let filters = [
+            ("all", SeverityFilter::All),
+            ("warn+", SeverityFilter::Warn),
+            ("critical", SeverityFilter::Critical),
+        ];
+        for (index, (label, filter)) in filters.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let style = if *filter == self.severity_filter {
+                self.palette.style_highlight().bold()
+            } else {
+                self.palette.style_muted()
+            };
+            spans.push(Span::styled(format!("[{label}]"), style));
+        }
+        Line::from_spans(spans)
+    }
+
+    fn alert_pulse(row: &AlertRow, newest_ts: u64, span_ms: u64) -> String {
+        let severity_pressure = match row.severity {
+            AlertSeverity::Info => 25,
+            AlertSeverity::Warn => 65,
+            AlertSeverity::Critical => 100,
+        };
+        let suppression_pressure = match row.suppression_state {
+            "active" => 100,
+            "investigating" => 70,
+            _ => 30,
+        };
+        let confidence_pressure = row.confidence;
+        let alert_age = newest_ts.saturating_sub(row.ts_ms);
+        let recency_pressure =
+            100u8.saturating_sub(Self::ratio_percent_u64(alert_age, span_ms.max(1)));
+        Self::sparkline(&[
+            severity_pressure,
+            suppression_pressure,
+            confidence_pressure,
+            recency_pressure,
+        ])
+    }
+
+    fn slo_pulse(row: &SloProjectRow) -> String {
+        let burn_pressure = Self::clamp_percent(row.burn_ratio * 100.0);
+        let unhealthy_pressure = Self::ratio_percent_u64(
+            u64::try_from(row.unhealthy_count).unwrap_or(u64::MAX),
+            u64::try_from(row.instance_count).unwrap_or(1),
+        );
+        let latency_pressure = Self::ratio_percent_u64(row.p95_latency_us, TARGET_P95_US.max(1));
+        let backlog_pressure = Self::ratio_percent_u64(row.pending_jobs.min(4_000), 4_000);
+        Self::sparkline(&[
+            burn_pressure,
+            unhealthy_pressure,
+            latency_pressure,
+            backlog_pressure,
+        ])
+    }
+
+    fn render_compact(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        alerts: &[AlertRow],
+        project_rows: &[SloProjectRow],
+    ) {
+        let mut lines = vec![
+            Line::from_spans(vec![
+                Span::styled("Alerts/SLO: ", Style::new().bold()),
+                Span::raw(Self::alerts_summary_line(alerts)),
+            ]),
+            self.incident_badge_line(alerts, project_rows),
+            self.severity_pills_line(),
+            Line::from(Self::alert_density_line(alerts)),
+            Line::from(Self::slo_summary_line(project_rows)),
+            Line::from(self.selected_context_line(alerts)),
+        ];
+        let visible_lines = usize::from(area.height.saturating_sub(2));
+        if visible_lines > 0 {
+            lines.truncate(visible_lines);
+        } else {
+            lines.truncate(1);
+        }
+        Paragraph::new(Text::from_lines(lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.palette.style_border())
+                    .title(" Alerts + SLO + Capacity "),
+            )
+            .render(area, frame);
+    }
+
+    fn build_alert_rows(&self, alerts: &[AlertRow]) -> Vec<Row> {
+        let newest_ts = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
+        let oldest_ts = alerts.iter().map(|alert| alert.ts_ms).min().unwrap_or(newest_ts);
+        let span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
+
         alerts
             .iter()
             .enumerate()
             .map(|(index, row)| {
-                let mut style = Style::default().fg(row.severity.color());
-                if index == self.selected_row {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
+                let severity_badge = match row.severity {
+                    AlertSeverity::Info => "[I] info",
+                    AlertSeverity::Warn => "[W] warn",
+                    AlertSeverity::Critical => "[C] critical",
+                };
+                let pulse = Self::alert_pulse(row, newest_ts, span_ms);
+                let style = if index == self.selected_row {
+                    self.palette.style_highlight().bold()
+                } else {
+                    match row.severity {
+                        AlertSeverity::Info => self.palette.style_row_muted(index),
+                        AlertSeverity::Warn => self.palette.style_row_warning(index),
+                        AlertSeverity::Critical => self.palette.style_row_error(index),
+                    }
+                };
                 Row::new(vec![
                     row.ts_ms.to_string(),
                     row.project.clone(),
                     row.host.clone(),
                     row.instance_id.clone(),
-                    row.severity.label().to_owned(),
+                    severity_badge.to_owned(),
                     row.confidence.to_string(),
                     row.suppression_state.to_owned(),
+                    pulse,
                     row.reason_code.clone(),
                 ])
                 .style(style)
@@ -763,19 +1017,26 @@ impl AlertsSloScreen {
             .collect()
     }
 
-    fn build_slo_rows(project_rows: &[SloProjectRow]) -> Vec<Row<'static>> {
+    fn build_slo_rows(&self, project_rows: &[SloProjectRow]) -> Vec<Row> {
         let mut rows = project_rows.to_vec();
         if let Some(fleet) = Self::fleet_rollup_row(project_rows) {
             rows.insert(0, fleet);
         }
 
         rows.into_iter()
-            .map(|row| {
-                let mut style = Style::default();
-                style = match row.status {
-                    ControlPlaneHealth::Healthy => style.fg(Color::Green),
-                    ControlPlaneHealth::Degraded => style.fg(Color::Yellow),
-                    ControlPlaneHealth::Critical => style.fg(Color::Red),
+            .enumerate()
+            .map(|(index, row)| {
+                let pulse = Self::slo_pulse(&row);
+                let style = match row.status {
+                    ControlPlaneHealth::Healthy => {
+                        self.palette.style_success().merge(&self.palette.style_row_base(index))
+                    }
+                    ControlPlaneHealth::Degraded => {
+                        self.palette.style_warning().merge(&self.palette.style_row_base(index))
+                    }
+                    ControlPlaneHealth::Critical => {
+                        self.palette.style_error().merge(&self.palette.style_row_base(index))
+                    }
                 };
                 Row::new(vec![
                     row.project,
@@ -788,6 +1049,7 @@ impl AlertsSloScreen {
                     row.backlog_eta_s.to_string(),
                     row.saturation_risk.to_owned(),
                     row.status.to_string(),
+                    pulse,
                 ])
                 .style(style)
             })
@@ -811,51 +1073,60 @@ impl Screen for AlertsSloScreen {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let p = &self.palette;
+        let border_style = p.style_border();
+
         let alerts = self.filtered_alerts();
         let project_rows = self.project_slo_rows();
 
-        let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let area = frame.bounds();
+        if area.width < 120 || area.height < 16 {
+            self.render_compact(frame, area, &alerts, &project_rows);
+            return;
+        }
+
+        let chunks = Flex::vertical()
             .constraints([
-                Constraint::Length(7),
+                Constraint::Fixed(11),
                 Constraint::Min(8),
-                Constraint::Length(9),
+                Constraint::Fixed(10),
             ])
             .split(area);
 
-        let summary = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    "Alerts/SLO: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+        let summary = Paragraph::new(Text::from_lines(vec![
+            Line::from_spans(vec![
+                Span::styled("Alerts/SLO: ", Style::new().bold()),
                 Span::raw(Self::alerts_summary_line(&alerts)),
             ]),
+            self.incident_badge_line(&alerts, &project_rows),
+            self.severity_pills_line(),
+            Line::from(Self::alert_density_line(&alerts)),
             Line::from(Self::slo_summary_line(&project_rows)),
             Line::from(self.capacity_summary_line(&project_rows)),
             Line::from(self.filter_summary()),
             Line::from(self.selected_context_line(&alerts)),
-        ])
+        ]))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Alerts + SLO + Capacity "),
         );
-        frame.render_widget(summary, chunks[0]);
+        summary.render(chunks[0], frame);
 
         let alerts_table = Table::new(
             self.build_alert_rows(&alerts),
             [
-                Constraint::Length(12),
-                Constraint::Length(14),
-                Constraint::Length(10),
-                Constraint::Length(18),
-                Constraint::Length(8),
-                Constraint::Length(6),
-                Constraint::Length(13),
+                Constraint::Fixed(12),
+                Constraint::Fixed(14),
+                Constraint::Fixed(10),
+                Constraint::Fixed(18),
+                Constraint::Fixed(12),
+                Constraint::Fixed(6),
+                Constraint::Fixed(13),
+                Constraint::Fixed(6),
                 Constraint::Min(24),
             ],
         )
@@ -868,31 +1139,34 @@ impl Screen for AlertsSloScreen {
                 "Severity",
                 "Conf",
                 "Suppression",
+                "Pulse",
                 "Reason",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(self.palette.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Active Alerts "),
         );
-        frame.render_widget(alerts_table, chunks[1]);
+        alerts_table.render(chunks[1], frame);
 
         let slo_table = Table::new(
-            Self::build_slo_rows(&project_rows),
+            self.build_slo_rows(&project_rows),
             [
-                Constraint::Length(12),
-                Constraint::Length(6),
-                Constraint::Length(9),
-                Constraint::Length(9),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(10),
-                Constraint::Length(10),
+                Constraint::Fixed(12),
+                Constraint::Fixed(6),
+                Constraint::Fixed(9),
+                Constraint::Fixed(9),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(10),
+                Constraint::Fixed(10),
+                Constraint::Fixed(6),
             ],
         )
         .header(
@@ -907,64 +1181,66 @@ impl Screen for AlertsSloScreen {
                 "ETA(s)",
                 "Risk",
                 "Status",
+                "Pulse",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(self.palette.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" SLO + Capacity by Scope "),
         );
-        frame.render_widget(slo_table, chunks[2]);
+        slo_table.render(chunks[2], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(code, _mods) = event {
             match code {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.alert_count();
                     if count > 0 && self.selected_row < count.saturating_sub(1) {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('p') => {
+                ftui_core::event::KeyCode::Char('p') => {
                     self.cycle_project_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('s') => {
+                ftui_core::event::KeyCode::Char('s') => {
                     self.cycle_severity_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('r') => {
+                ftui_core::event::KeyCode::Char('r') => {
                     self.cycle_reason_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('h') => {
+                ftui_core::event::KeyCode::Char('h') => {
                     self.cycle_host_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('x') => {
+                ftui_core::event::KeyCode::Char('x') => {
                     self.reset_filters();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Enter => {
+                ftui_core::event::KeyCode::Char('g') | ftui_core::event::KeyCode::Enter => {
                     if self.selected_project().is_some() {
                         return ScreenAction::Navigate(self.project_screen_id.clone());
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('l') => {
+                ftui_core::event::KeyCode::Char('l') => {
                     return ScreenAction::Navigate(self.live_stream_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('t') => {
+                ftui_core::event::KeyCode::Char('t') => {
                     return ScreenAction::Navigate(self.timeline_screen_id.clone());
                 }
                 _ => {}
@@ -975,6 +1251,10 @@ impl Screen for AlertsSloScreen {
 
     fn semantic_role(&self) -> &'static str {
         "alert"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        ALERTS_SLO_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1222,20 +1502,20 @@ mod tests {
         let ctx = screen_context();
 
         let severity = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&severity, &ctx), ScreenAction::Consumed);
 
         let project = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&project, &ctx), ScreenAction::Consumed);
 
         let reset = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&reset, &ctx), ScreenAction::Consumed);
         assert!(screen.alert_count() >= 3);
@@ -1270,8 +1550,8 @@ mod tests {
 
         let ctx = screen_context();
         let project = InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&project, &ctx),
@@ -1279,8 +1559,8 @@ mod tests {
         );
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -1288,8 +1568,8 @@ mod tests {
         );
 
         let timeline = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&timeline, &ctx),
@@ -1314,22 +1594,6 @@ mod tests {
         assert_eq!(AlertSeverity::Info.label(), "info");
         assert_eq!(AlertSeverity::Warn.label(), "warn");
         assert_eq!(AlertSeverity::Critical.label(), "critical");
-    }
-
-    #[test]
-    fn severity_colors_are_distinct() {
-        let colors = [
-            AlertSeverity::Info.color(),
-            AlertSeverity::Warn.color(),
-            AlertSeverity::Critical.color(),
-        ];
-        for (i, c) in colors.iter().enumerate() {
-            for (j, other) in colors.iter().enumerate() {
-                if i != j {
-                    assert_ne!(c, other, "severity colors must be distinct");
-                }
-            }
-        }
     }
 
     #[test]
@@ -1695,8 +1959,8 @@ mod tests {
 
         let ctx = screen_context();
         let up = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         screen.handle_input(&up, &ctx);
         assert_eq!(screen.selected_row, 0);
@@ -1711,8 +1975,8 @@ mod tests {
 
         let ctx = screen_context();
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         screen.handle_input(&down, &ctx);
         assert_eq!(screen.selected_row, count.saturating_sub(1));
@@ -1725,8 +1989,8 @@ mod tests {
         let mut screen = AlertsSloScreen::new();
         let ctx = screen_context();
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Char('z'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('z'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&event, &ctx), ScreenAction::Ignored);
     }
@@ -1759,8 +2023,8 @@ mod tests {
         let mut screen = AlertsSloScreen::new();
         let ctx = screen_context();
         let event = InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&event, &ctx), ScreenAction::Consumed);
     }

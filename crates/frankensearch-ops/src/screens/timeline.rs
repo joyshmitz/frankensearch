@@ -5,19 +5,27 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_core::LifecycleState;
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::data_source::TimeWindow;
 use crate::state::{AppState, LifecycleEvent};
+use crate::theme::SemanticPalette;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SeverityFilter {
@@ -71,14 +79,6 @@ impl EventSeverity {
             Self::Critical => "critical",
         }
     }
-
-    const fn color(self) -> Color {
-        match self {
-            Self::Info => Color::Gray,
-            Self::Warn => Color::Yellow,
-            Self::Critical => Color::Red,
-        }
-    }
 }
 
 /// Timeline screen for lifecycle and operational transition events.
@@ -96,7 +96,51 @@ pub struct ActionTimelineScreen {
     project_screen_id: ScreenId,
     live_stream_screen_id: ScreenId,
     analytics_screen_id: ScreenId,
+    palette: SemanticPalette,
 }
+
+const TIMELINE_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "p",
+        description: "Cycle project filter",
+    },
+    KeybindingHint {
+        key: "s",
+        description: "Cycle severity filter",
+    },
+    KeybindingHint {
+        key: "r",
+        description: "Cycle reason filter",
+    },
+    KeybindingHint {
+        key: "h",
+        description: "Cycle host filter",
+    },
+    KeybindingHint {
+        key: "x",
+        description: "Reset filters",
+    },
+    KeybindingHint {
+        key: "g / Enter",
+        description: "Open project detail",
+    },
+    KeybindingHint {
+        key: "l",
+        description: "Open live stream",
+    },
+    KeybindingHint {
+        key: "a",
+        description: "Open analytics",
+    },
+];
 
 impl ActionTimelineScreen {
     /// Create a new timeline screen.
@@ -116,6 +160,7 @@ impl ActionTimelineScreen {
             project_screen_id: ScreenId::new("ops.project"),
             live_stream_screen_id: ScreenId::new("ops.live_stream"),
             analytics_screen_id: ScreenId::new("ops.analytics"),
+            palette: SemanticPalette::dark(),
         }
     }
 
@@ -143,6 +188,10 @@ impl ActionTimelineScreen {
         self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_event(focused);
+    }
+
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
     }
 
     fn all_events(&self) -> Vec<LifecycleEvent> {
@@ -414,36 +463,224 @@ impl ActionTimelineScreen {
         self.restore_selected_event(focused);
     }
 
-    fn build_rows(&self) -> Vec<Row<'static>> {
-        self.filtered_events()
+    fn ratio_percent_u64(numer: u64, denom: u64) -> u8 {
+        if denom == 0 {
+            return 0;
+        }
+        let rounded = numer
+            .saturating_mul(100)
+            .saturating_add(denom / 2)
+            .saturating_div(denom)
+            .min(100);
+        u8::try_from(rounded).unwrap_or(100)
+    }
+
+    fn spark_char(percent: u8) -> char {
+        const BINS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let idx = (u16::from(percent).saturating_mul(7).saturating_add(50)) / 100;
+        BINS[usize::from(idx.min(7))]
+    }
+
+    fn sparkline(values: &[u8]) -> String {
+        values
+            .iter()
+            .map(|value| Self::spark_char(*value))
+            .collect()
+    }
+
+    fn event_pulse(event: &LifecycleEvent, newest_ts: u64, span_ms: u64) -> String {
+        let severity_pressure = match Self::event_severity(event) {
+            EventSeverity::Info => 25,
+            EventSeverity::Warn => 65,
+            EventSeverity::Critical => 100,
+        };
+        let collision_pressure = if event.attribution_collision { 100 } else { 20 };
+        let confidence_pressure = event.attribution_confidence_score;
+        let event_age = newest_ts.saturating_sub(event.at_ms);
+        let recency_pressure =
+            100u8.saturating_sub(Self::ratio_percent_u64(event_age, span_ms.max(1)));
+        Self::sparkline(&[
+            severity_pressure,
+            collision_pressure,
+            confidence_pressure,
+            recency_pressure,
+        ])
+    }
+
+    fn severity_mix_line(events: &[LifecycleEvent]) -> String {
+        let mut info = 0usize;
+        let mut warn = 0usize;
+        let mut critical = 0usize;
+        for event in events {
+            match Self::event_severity(event) {
+                EventSeverity::Info => info = info.saturating_add(1),
+                EventSeverity::Warn => warn = warn.saturating_add(1),
+                EventSeverity::Critical => critical = critical.saturating_add(1),
+            }
+        }
+        format!(
+            "severity mix: critical={critical} warn={warn} info={info} | rows={}",
+            events.len()
+        )
+    }
+
+    fn timeline_density_line(events: &[LifecycleEvent]) -> String {
+        if events.is_empty() {
+            return "density: (no events)".to_owned();
+        }
+        let newest = events.iter().map(|event| event.at_ms).max().unwrap_or(0);
+        let oldest = events
+            .iter()
+            .map(|event| event.at_ms)
+            .min()
+            .unwrap_or(newest);
+        let span = newest.saturating_sub(oldest);
+        if span == 0 {
+            return format!("density: {}", Self::sparkline(&[100]));
+        }
+        let mut buckets = [0u64; 12];
+        for event in events {
+            let from_oldest = event.at_ms.saturating_sub(oldest);
+            let idx_u64 = from_oldest.saturating_mul(11).saturating_div(span).min(11);
+            let idx = usize::try_from(idx_u64).unwrap_or(11);
+            buckets[idx] = buckets[idx].saturating_add(1);
+        }
+        let max_bucket = buckets.iter().copied().max().unwrap_or(0).max(1);
+        let normalized: Vec<u8> = buckets
+            .iter()
+            .map(|count| Self::ratio_percent_u64(*count, max_bucket))
+            .collect();
+        format!("density: {}", Self::sparkline(&normalized))
+    }
+
+    fn incident_badge_line(&self, events: &[LifecycleEvent]) -> Line {
+        let status = if events
+            .iter()
+            .any(|event| matches!(Self::event_severity(event), EventSeverity::Critical))
+        {
+            ("incident=critical", self.palette.style_error().bold())
+        } else if events
+            .iter()
+            .any(|event| matches!(Self::event_severity(event), EventSeverity::Warn))
+        {
+            ("incident=degraded", self.palette.style_warning().bold())
+        } else if events.is_empty() {
+            ("incident=idle", self.palette.style_muted())
+        } else {
+            ("incident=stable", self.palette.style_success().bold())
+        };
+        Line::from_spans(vec![
+            Span::styled("status: ", self.palette.style_muted()),
+            Span::styled(status.0, status.1),
+            Span::raw(" "),
+            Span::styled(
+                format!("severity_filter={}", self.severity_filter.label()),
+                self.palette.style_muted(),
+            ),
+        ])
+    }
+
+    fn severity_pills_line(&self) -> Line {
+        let mut spans = vec![
+            Span::styled("filters:", self.palette.style_muted()),
+            Span::raw(" "),
+        ];
+        let filters = [
+            ("all", SeverityFilter::All),
+            ("info", SeverityFilter::Info),
+            ("warn", SeverityFilter::Warn),
+            ("critical", SeverityFilter::Critical),
+        ];
+        for (index, (label, filter)) in filters.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let style = if *filter == self.severity_filter {
+                self.palette.style_highlight().bold()
+            } else {
+                self.palette.style_muted()
+            };
+            spans.push(Span::styled(format!("[{label}]"), style));
+        }
+        Line::from_spans(spans)
+    }
+
+    fn render_compact(&self, frame: &mut Frame, area: Rect) {
+        let events = self.filtered_events();
+        let mut lines = vec![
+            Line::from_spans(vec![
+                Span::styled("Timeline: ", Style::new().bold()),
+                Span::raw(Self::timeline_summary(&events)),
+            ]),
+            self.incident_badge_line(&events),
+            Line::from(Self::severity_mix_line(&events)),
+            Line::from(Self::timeline_density_line(&events)),
+            self.severity_pills_line(),
+            Line::from(self.selected_context_summary()),
+        ];
+        let visible_lines = usize::from(area.height.saturating_sub(2));
+        if visible_lines > 0 {
+            lines.truncate(visible_lines);
+        } else {
+            lines.truncate(1);
+        }
+        Paragraph::new(Text::from_lines(lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.palette.style_border())
+                    .title(" Action Timeline "),
+            )
+            .render(area, frame);
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
+        let events = self.filtered_events();
+        let newest_ts = events.first().map_or(0, |event| event.at_ms);
+        let oldest_ts = events.last().map_or(newest_ts, |event| event.at_ms);
+        let span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
+        events
             .into_iter()
             .enumerate()
             .map(|(index, event)| {
                 let severity = Self::event_severity(&event);
+                let severity_badge = match severity {
+                    EventSeverity::Info => "[I] info",
+                    EventSeverity::Warn => "[W] warn",
+                    EventSeverity::Critical => "[C] critical",
+                };
                 let transition = format!("{:?}->{:?}", event.from, event.to);
                 let confidence = if event.attribution_collision {
                     format!("{}!", event.attribution_confidence_score)
                 } else {
                     event.attribution_confidence_score.to_string()
                 };
+                let pulse = Self::event_pulse(&event, newest_ts, span_ms);
                 let project = self
                     .project_for_instance(&event.instance_id)
                     .unwrap_or("unknown")
                     .to_owned();
                 let host = Self::host_bucket(&event.instance_id);
-                let mut style = Style::default().fg(severity.color());
-                if index == self.selected_row {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
+                let style = if index == self.selected_row {
+                    self.palette.style_highlight().bold()
+                } else {
+                    match severity {
+                        EventSeverity::Info => self.palette.style_row_muted(index),
+                        EventSeverity::Warn => self.palette.style_row_warning(index),
+                        EventSeverity::Critical => self.palette.style_row_error(index),
+                    }
+                };
                 Row::new(vec![
                     event.at_ms.to_string(),
                     project,
                     host,
                     event.instance_id,
-                    severity.label().to_owned(),
+                    severity_badge.to_owned(),
                     transition,
                     event.reason_code,
                     confidence,
+                    pulse,
                 ])
                 .style(style)
             })
@@ -591,43 +828,56 @@ impl Screen for ActionTimelineScreen {
         "Action Timeline"
     }
 
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let p = &self.palette;
+        let border_style = p.style_border();
+
+        let area = frame.bounds();
+        if area.width < 104 || area.height < 12 {
+            self.render_compact(frame, area);
+            return;
+        }
+
         let events = self.filtered_events();
-        let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(5)])
+        let chunks = Flex::vertical()
+            .constraints([Constraint::Fixed(10), Constraint::Min(6)])
             .split(area);
 
-        let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Timeline: ", Style::default().add_modifier(Modifier::BOLD)),
+        let header = Paragraph::new(Text::from_lines(vec![
+            Line::from_spans(vec![
+                Span::styled("Timeline: ", Style::new().bold()),
                 Span::raw(Self::timeline_summary(&events)),
             ]),
+            self.incident_badge_line(&events),
+            self.severity_pills_line(),
+            Line::from(Self::severity_mix_line(&events)),
+            Line::from(Self::timeline_density_line(&events)),
             Line::from(Self::rolling_counter_summary(&events)),
             Line::from(self.stream_health_summary()),
             Line::from(self.filter_summary()),
             Line::from(self.selected_context_summary()),
-        ])
+        ]))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Action Timeline "),
         );
-        frame.render_widget(header, chunks[0]);
+        header.render(chunks[0], frame);
 
         let table = Table::new(
             self.build_rows(),
             [
-                Constraint::Length(14),
-                Constraint::Length(16),
-                Constraint::Length(12),
-                Constraint::Length(20),
-                Constraint::Length(9),
-                Constraint::Length(22),
+                Constraint::Fixed(14),
+                Constraint::Fixed(16),
+                Constraint::Fixed(12),
+                Constraint::Fixed(20),
+                Constraint::Fixed(12),
+                Constraint::Fixed(22),
                 Constraint::Min(22),
-                Constraint::Length(6),
+                Constraint::Fixed(6),
+                Constraint::Fixed(6),
             ],
         )
         .header(
@@ -640,67 +890,69 @@ impl Screen for ActionTimelineScreen {
                 "Transition",
                 "Reason",
                 "Attr",
+                "Pulse",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(p.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Events "),
         );
-        frame.render_widget(table, chunks[1]);
+        table.render(chunks[1], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(code, _mods) = event {
             match code {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.event_count();
                     if count > 0 && self.selected_row < count.saturating_sub(1) {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('p') => {
+                ftui_core::event::KeyCode::Char('p') => {
                     self.cycle_project_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('s') => {
+                ftui_core::event::KeyCode::Char('s') => {
                     self.cycle_severity_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('r') => {
+                ftui_core::event::KeyCode::Char('r') => {
                     self.cycle_reason_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('h') => {
+                ftui_core::event::KeyCode::Char('h') => {
                     self.cycle_host_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('x') => {
+                ftui_core::event::KeyCode::Char('x') => {
                     self.reset_filters();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('g') | crossterm::event::KeyCode::Enter => {
+                ftui_core::event::KeyCode::Char('g') | ftui_core::event::KeyCode::Enter => {
                     if self.selected_project().is_some() {
                         return ScreenAction::Navigate(self.project_screen_id.clone());
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('l') => {
+                ftui_core::event::KeyCode::Char('l') => {
                     if self.event_count() > 0 {
                         return ScreenAction::Navigate(self.live_stream_screen_id.clone());
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('a') => {
+                ftui_core::event::KeyCode::Char('a') => {
                     if self.event_count() > 0 {
                         return ScreenAction::Navigate(self.analytics_screen_id.clone());
                     }
@@ -714,6 +966,10 @@ impl Screen for ActionTimelineScreen {
 
     fn semantic_role(&self) -> &'static str {
         "log"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        TIMELINE_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -828,8 +1084,8 @@ mod tests {
         let ctx = screen_context();
 
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -839,8 +1095,8 @@ mod tests {
         assert_eq!(screen.selected_row, 2);
 
         let up = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&up, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -947,8 +1203,8 @@ mod tests {
         let ctx = screen_context();
 
         let project = InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&project, &ctx),
@@ -956,8 +1212,8 @@ mod tests {
         );
 
         let project_enter = InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&project_enter, &ctx),
@@ -965,8 +1221,8 @@ mod tests {
         );
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -974,8 +1230,8 @@ mod tests {
         );
 
         let analytics = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
@@ -990,14 +1246,14 @@ mod tests {
         let ctx = screen_context();
 
         let project = InputEvent::Key(
-            crossterm::event::KeyCode::Char('g'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('g'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&project, &ctx), ScreenAction::Consumed);
 
         let project_enter = InputEvent::Key(
-            crossterm::event::KeyCode::Enter,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Enter,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&project_enter, &ctx),
@@ -1005,14 +1261,14 @@ mod tests {
         );
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('l'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('l'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&stream, &ctx), ScreenAction::Consumed);
 
         let analytics = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
@@ -1372,13 +1628,6 @@ mod tests {
         assert_eq!(EventSeverity::Critical.label(), "critical");
     }
 
-    #[test]
-    fn event_severity_colors() {
-        assert_eq!(EventSeverity::Info.color(), Color::Gray);
-        assert_eq!(EventSeverity::Warn.color(), Color::Yellow);
-        assert_eq!(EventSeverity::Critical.color(), Color::Red);
-    }
-
     // --- host_bucket ---
 
     #[test]
@@ -1672,8 +1921,8 @@ mod tests {
         let ctx = screen_context();
 
         let k = InputEvent::Key(
-            crossterm::event::KeyCode::Char('k'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('k'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&k, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 0);
@@ -1686,8 +1935,8 @@ mod tests {
         let ctx = screen_context();
 
         let j = InputEvent::Key(
-            crossterm::event::KeyCode::Char('j'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('j'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&j, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -1702,8 +1951,8 @@ mod tests {
         let ctx = screen_context();
 
         let z = InputEvent::Key(
-            crossterm::event::KeyCode::Char('z'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('z'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&z, &ctx), ScreenAction::Ignored);
     }
@@ -1717,8 +1966,8 @@ mod tests {
         let ctx = screen_context();
 
         let s = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&s, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.severity_filter, SeverityFilter::Info);
@@ -1733,8 +1982,8 @@ mod tests {
         let ctx = screen_context();
 
         let r = InputEvent::Key(
-            crossterm::event::KeyCode::Char('r'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('r'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&r, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.reason_filter_index, 1);
@@ -1749,8 +1998,8 @@ mod tests {
         let ctx = screen_context();
 
         let h = InputEvent::Key(
-            crossterm::event::KeyCode::Char('h'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('h'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&h, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.host_filter_index, 1);
@@ -1768,8 +2017,8 @@ mod tests {
         screen.severity_filter = SeverityFilter::Warn;
 
         let x = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&x, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.project_filter_index, 0);

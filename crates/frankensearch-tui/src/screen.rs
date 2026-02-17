@@ -9,7 +9,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 
-use ratatui::Frame;
+use ftui_render::frame::Frame;
 use serde::{Deserialize, Serialize};
 
 use crate::input::InputEvent;
@@ -57,11 +57,20 @@ pub struct ScreenContext {
     pub focused: bool,
 }
 
+/// Screen-local keybinding hint for contextual help surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeybindingHint {
+    /// Key combination label (e.g., `j / Down`).
+    pub key: &'static str,
+    /// Human-readable action description.
+    pub description: &'static str,
+}
+
 // ─── Screen Trait ───────────────────────────────────────────────────────────
 
 /// Trait that product crates implement for each TUI view.
 ///
-/// Screens handle rendering to a ratatui `Frame` and processing input
+/// Screens handle rendering to an `ftui_render::frame::Frame` and processing input
 /// events. The app shell manages lifecycle, focus, and navigation.
 pub trait Screen: Send {
     /// Unique identifier for this screen.
@@ -71,7 +80,7 @@ pub trait Screen: Send {
     fn title(&self) -> &str;
 
     /// Render the screen content into the provided frame area.
-    fn render(&self, frame: &mut Frame<'_>, ctx: &ScreenContext);
+    fn render(&self, frame: &mut Frame, ctx: &ScreenContext);
 
     /// Handle an input event. Returns a [`ScreenAction`] indicating
     /// what the shell should do next.
@@ -86,6 +95,13 @@ pub trait Screen: Send {
     /// Semantic role for accessibility (screen reader hint).
     fn semantic_role(&self) -> &'static str {
         "region"
+    }
+
+    /// Screen-local keybinding hints shown in contextual help overlays.
+    ///
+    /// The app shell merges these hints with global shortcuts.
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        &[]
     }
 
     /// Downcast support for product crates that need concrete screen state.
@@ -198,7 +214,7 @@ impl Default for ScreenRegistry {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::Frame;
+    use ftui_render::frame::Frame;
 
     use super::*;
 
@@ -225,7 +241,7 @@ mod tests {
             &self.title
         }
 
-        fn render(&self, _frame: &mut Frame<'_>, _ctx: &ScreenContext) {}
+        fn render(&self, _frame: &mut Frame, _ctx: &ScreenContext) {}
 
         fn handle_input(&mut self, _event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
             ScreenAction::Ignored

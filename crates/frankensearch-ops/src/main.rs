@@ -4,55 +4,43 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+use ftui_core::event::Event;
+use ftui_render::buffer::Buffer;
+use ftui_render::diff::BufferDiff;
+use ftui_render::frame::Frame;
+use ftui_render::grapheme_pool::GraphemePool;
+use ftui_tty::{TtyBackend, TtySessionOptions};
+
 use frankensearch_ops::{
     DataSource, MockDataSource, OpsApp, OpsStorage, OpsStorageConfig, StorageDataSource,
 };
 use frankensearch_tui::InputEvent;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    backend: TtyBackend,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self, Box<dyn Error>> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
-        )?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture
-        );
-        let _ = self.terminal.show_cursor();
+        let options = TtySessionOptions {
+            alternate_screen: true,
+            features: BackendFeatures {
+                mouse_capture: true,
+                ..BackendFeatures::default()
+            },
+        };
+        let backend = TtyBackend::open(80, 24, options)?;
+        Ok(Self { backend })
     }
 }
 
 const fn map_event(event: &Event) -> Option<InputEvent> {
     match event {
         Event::Key(key) => Some(InputEvent::Key(key.code, key.modifiers)),
-        Event::Mouse(mouse) => Some(InputEvent::Mouse(mouse.kind, mouse.column, mouse.row)),
-        Event::Resize(width, height) => Some(InputEvent::Resize(*width, *height)),
-        Event::FocusGained | Event::FocusLost | Event::Paste(_) => None,
+        Event::Mouse(mouse) => Some(InputEvent::Mouse(mouse.kind, mouse.x, mouse.y)),
+        Event::Resize { width, height } => Some(InputEvent::Resize(*width, *height)),
+        Event::Focus(_) | Event::Paste(_) | Event::Clipboard(_) | Event::Tick => None,
     }
 }
 
@@ -166,17 +154,32 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let refresh_every = Duration::from_millis(500);
     let mut last_refresh = Instant::now();
+    let mut pool = GraphemePool::new();
+    let mut prev_buffer: Option<Buffer> = None;
 
     loop {
-        terminal.terminal.draw(|frame| app.render(frame))?;
+        let (width, height) = terminal.backend.size()?;
+        let mut frame = Frame::new(width, height, &mut pool);
+        app.render(&mut frame);
+
+        let diff = prev_buffer
+            .as_ref()
+            .map(|prev| BufferDiff::compute(prev, &frame.buffer));
+        terminal
+            .backend
+            .presenter()
+            .present_ui(&frame.buffer, diff.as_ref(), false)?;
+        prev_buffer = Some(frame.buffer);
+
         let timeout = refresh_every.saturating_sub(last_refresh.elapsed());
 
-        if event::poll(timeout)? {
-            let event = event::read()?;
-            if let Some(input) = map_event(&event) {
-                let quit = app.handle_input(&input);
-                if quit || app.should_quit() {
-                    break;
+        if terminal.backend.poll_event(timeout)? {
+            if let Some(event) = terminal.backend.read_event()? {
+                if let Some(input) = map_event(&event) {
+                    let quit = app.handle_input(&input);
+                    if quit || app.should_quit() {
+                        break;
+                    }
                 }
             }
         }

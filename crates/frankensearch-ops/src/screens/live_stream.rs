@@ -6,15 +6,22 @@
 use std::any::Any;
 use std::collections::BTreeSet;
 
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::data_source::TimeWindow;
 use crate::state::{AppState, ControlPlaneHealth};
@@ -48,14 +55,6 @@ impl StreamSeverity {
             Self::Info => "info",
             Self::Warn => "warn",
             Self::Critical => "critical",
-        }
-    }
-
-    const fn color(self) -> Color {
-        match self {
-            Self::Info => Color::Gray,
-            Self::Warn => Color::Yellow,
-            Self::Critical => Color::Red,
         }
     }
 }
@@ -117,6 +116,37 @@ pub struct LiveSearchStreamScreen {
     palette: SemanticPalette,
 }
 
+const LIVE_STREAM_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "p",
+        description: "Cycle project filter",
+    },
+    KeybindingHint {
+        key: "h",
+        description: "Cycle host filter",
+    },
+    KeybindingHint {
+        key: "s",
+        description: "Cycle severity filter",
+    },
+    KeybindingHint {
+        key: "d",
+        description: "Toggle degraded-only mode",
+    },
+    KeybindingHint {
+        key: "x",
+        description: "Reset all filters",
+    },
+];
+
 impl LiveSearchStreamScreen {
     /// Create a new live stream screen.
     #[must_use]
@@ -140,11 +170,11 @@ impl LiveSearchStreamScreen {
         self.clamp_selected_row();
     }
 
-
     /// Update the semantic palette for theme-aware rendering.
-    pub fn set_palette(&mut self, palette: SemanticPalette) {
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
         self.palette = palette;
     }
+
     /// Apply a project filter by value, defaulting to `all` when absent.
     pub fn set_project_filter(&mut self, project: &str) {
         self.project_filter_index = self
@@ -327,7 +357,136 @@ impl LiveSearchStreamScreen {
         self.clamp_selected_row();
     }
 
-    fn build_rows(&self) -> Vec<Row<'static>> {
+    fn ratio_percent_u64(numer: u64, denom: u64) -> u8 {
+        if denom == 0 {
+            return 0;
+        }
+        let rounded = numer
+            .saturating_mul(100)
+            .saturating_add(denom / 2)
+            .saturating_div(denom)
+            .min(100);
+        u8::try_from(rounded).unwrap_or(100)
+    }
+
+    fn spark_char(percent: u8) -> char {
+        const BINS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let idx = (u16::from(percent).saturating_mul(7).saturating_add(50)) / 100;
+        BINS[usize::from(idx.min(7))]
+    }
+
+    fn sparkline(values: &[u8]) -> String {
+        values
+            .iter()
+            .map(|value| Self::spark_char(*value))
+            .collect()
+    }
+
+    fn row_pulse(row: &StreamRowData) -> String {
+        let avg_pressure = Self::ratio_percent_u64(row.avg_latency_us.min(10_000), 10_000);
+        let p95_pressure = Self::ratio_percent_u64(row.p95_latency_us.min(20_000), 20_000);
+        let mem_pressure = Self::ratio_percent_u64(
+            row.memory_bytes.min(2 * 1024 * 1024 * 1024),
+            2 * 1024 * 1024 * 1024,
+        );
+        let refine_rate = Self::ratio_percent_u64(row.refined_count, row.searches.max(1));
+        Self::sparkline(&[avg_pressure, p95_pressure, mem_pressure, refine_rate])
+    }
+
+    fn severity_mix_summary(rows: &[StreamRowData]) -> String {
+        let mut info = 0usize;
+        let mut warn = 0usize;
+        let mut critical = 0usize;
+        for row in rows {
+            match row.severity {
+                StreamSeverity::Info => info = info.saturating_add(1),
+                StreamSeverity::Warn => warn = warn.saturating_add(1),
+                StreamSeverity::Critical => critical = critical.saturating_add(1),
+            }
+        }
+        format!(
+            "severity mix: critical={critical} warn={warn} info={info} | rows={}",
+            rows.len()
+        )
+    }
+
+    fn latency_heatstrip_line(rows: &[StreamRowData]) -> String {
+        if rows.is_empty() {
+            return "p95 heatstrip: (no data)".to_owned();
+        }
+        let values: Vec<u8> = rows
+            .iter()
+            .take(24)
+            .map(|row| Self::ratio_percent_u64(row.p95_latency_us.min(20_000), 20_000))
+            .collect();
+        format!("p95 heatstrip: {}", Self::sparkline(&values))
+    }
+
+    fn severity_pills_line(&self) -> Line {
+        let mut spans = vec![
+            Span::styled("severity:", self.palette.style_muted()),
+            Span::raw(" "),
+        ];
+        let filters = [
+            ("all", StreamSeverityFilter::All),
+            ("info", StreamSeverityFilter::Info),
+            ("warn", StreamSeverityFilter::Warn),
+            ("critical", StreamSeverityFilter::Critical),
+        ];
+        for (index, (label, filter)) in filters.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::raw(" "));
+            }
+            let style = if *filter == self.severity_filter {
+                self.palette.style_highlight().bold()
+            } else {
+                self.palette.style_muted()
+            };
+            spans.push(Span::styled(format!("[{label}]"), style));
+        }
+        spans.push(Span::raw(" "));
+        let degraded_style = if self.degraded_only {
+            self.palette.style_warning().bold()
+        } else {
+            self.palette.style_muted()
+        };
+        spans.push(Span::styled(
+            format!("degraded_only={}", self.degraded_only),
+            degraded_style,
+        ));
+        Line::from_spans(spans)
+    }
+
+    fn render_compact(&self, frame: &mut Frame, area: Rect) {
+        let rows = self.row_data();
+        let mut lines = vec![
+            Line::from_spans(vec![
+                Span::styled("Stream: ", Style::new().bold()),
+                Span::raw(self.stream_health_summary()),
+            ]),
+            Line::from(Self::severity_mix_summary(&rows)),
+            Line::from(Self::latency_heatstrip_line(&rows)),
+            self.severity_pills_line(),
+            Line::from(self.selected_context_summary()),
+        ];
+        let visible_lines = usize::from(area.height.saturating_sub(2));
+        if visible_lines > 0 {
+            lines.truncate(visible_lines);
+        } else {
+            lines.truncate(1);
+        }
+        Paragraph::new(Text::from_lines(lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(self.palette.style_border())
+                    .title(" Live Search Stream "),
+            )
+            .render(area, frame);
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
         self.row_data()
             .into_iter()
             .enumerate()
@@ -344,14 +503,21 @@ impl LiveSearchStreamScreen {
                     format!("{whole}.{frac}%")
                 };
                 let mem_mib = row.memory_bytes / (1024 * 1024);
-                let mut style = if index == self.selected_row {
-                    Style::default().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::default()
+                let severity_badge = match row.severity {
+                    StreamSeverity::Info => "[I] info",
+                    StreamSeverity::Warn => "[W] warn",
+                    StreamSeverity::Critical => "[C] critical",
                 };
-                if index != self.selected_row {
-                    style = style.fg(row.severity.color());
-                }
+                let pulse = Self::row_pulse(&row);
+                let style = if index == self.selected_row {
+                    self.palette.style_highlight().bold()
+                } else {
+                    match row.severity {
+                        StreamSeverity::Info => self.palette.style_row_muted(index),
+                        StreamSeverity::Warn => self.palette.style_row_warning(index),
+                        StreamSeverity::Critical => self.palette.style_row_error(index),
+                    }
+                };
                 Row::new(vec![
                     row.instance_id,
                     row.correlation_id,
@@ -362,7 +528,8 @@ impl LiveSearchStreamScreen {
                     row.p95_latency_us.to_string(),
                     mem_mib.to_string(),
                     refined_rate,
-                    row.severity.label().to_owned(),
+                    pulse,
+                    severity_badge.to_owned(),
                     row.degradation_marker,
                 ])
                 .style(style)
@@ -521,96 +688,110 @@ impl Screen for LiveSearchStreamScreen {
         "Live Search Stream"
     }
 
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
-        let area = frame.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(6), Constraint::Min(5)])
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let p = &self.palette;
+        let border_style = p.style_border();
+
+        let area = frame.bounds();
+        if area.width < 100 || area.height < 12 {
+            self.render_compact(frame, area);
+            return;
+        }
+
+        let rows = self.row_data();
+        let chunks = Flex::vertical()
+            .constraints([Constraint::Fixed(9), Constraint::Min(6)])
             .split(area);
 
-        let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Stream: ", Style::default().add_modifier(Modifier::BOLD)),
+        let header = Paragraph::new(Text::from_lines(vec![
+            Line::from_spans(vec![
+                Span::styled("Stream: ", Style::new().bold()),
                 Span::raw(self.stream_health_summary()),
             ]),
             Line::from(self.rolling_counter_summary()),
+            Line::from(Self::severity_mix_summary(&rows)),
+            Line::from(Self::latency_heatstrip_line(&rows)),
+            self.severity_pills_line(),
             Line::from(self.filter_summary()),
             Line::from(self.selected_context_summary()),
-        ])
+        ]))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Live Search Stream "),
         );
-        frame.render_widget(header, chunks[0]);
+        header.render(chunks[0], frame);
 
         let table = Table::new(
             self.build_rows(),
             [
-                Constraint::Length(14),
-                Constraint::Length(16),
-                Constraint::Length(14),
-                Constraint::Length(10),
-                Constraint::Length(8),
-                Constraint::Length(9),
-                Constraint::Length(9),
-                Constraint::Length(9),
-                Constraint::Length(12),
-                Constraint::Length(9),
+                Constraint::Fixed(14),
+                Constraint::Fixed(16),
+                Constraint::Fixed(14),
+                Constraint::Fixed(10),
+                Constraint::Fixed(8),
+                Constraint::Fixed(9),
+                Constraint::Fixed(9),
+                Constraint::Fixed(9),
+                Constraint::Fixed(12),
+                Constraint::Fixed(6),
+                Constraint::Fixed(12),
                 Constraint::Min(10),
             ],
         )
         .header(
             Row::new(vec![
                 "Instance", "Corr ID", "Project", "Host", "Searches", "Avg(us)", "P95(us)",
-                "Mem(MiB)", "Refined", "Severity", "Marker",
+                "Mem(MiB)", "Refined", "Pulse", "Severity", "Marker",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(p.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Activity "),
         );
-        frame.render_widget(table, chunks[1]);
+        table.render(chunks[1], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(code, _mods) = event {
             match code {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.instance_count();
                     if count > 0 && self.selected_row < count.saturating_sub(1) {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('p') => {
+                ftui_core::event::KeyCode::Char('p') => {
                     self.cycle_project_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('h') => {
+                ftui_core::event::KeyCode::Char('h') => {
                     self.cycle_host_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('s') => {
+                ftui_core::event::KeyCode::Char('s') => {
                     self.cycle_severity_filter();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('d') => {
+                ftui_core::event::KeyCode::Char('d') => {
                     self.degraded_only = !self.degraded_only;
                     self.clamp_selected_row();
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Char('x') => {
+                ftui_core::event::KeyCode::Char('x') => {
                     self.project_filter_index = 0;
                     self.host_filter_index = 0;
                     self.severity_filter = StreamSeverityFilter::All;
@@ -626,6 +807,10 @@ impl Screen for LiveSearchStreamScreen {
 
     fn semantic_role(&self) -> &'static str {
         "log"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        LIVE_STREAM_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -745,8 +930,8 @@ mod tests {
         let ctx = screen_context();
 
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 1);
@@ -754,8 +939,8 @@ mod tests {
         assert_eq!(screen.selected_row, 1);
 
         let up = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&up, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 0);
@@ -772,16 +957,16 @@ mod tests {
         assert_eq!(screen.selected_host_filter(), "all");
 
         let project = InputEvent::Key(
-            crossterm::event::KeyCode::Char('p'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('p'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&project, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_project_filter(), "proj-a");
         assert_eq!(screen.row_data().len(), 1);
 
         let reset = InputEvent::Key(
-            crossterm::event::KeyCode::Char('x'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('x'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&reset, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_project_filter(), "all");
@@ -796,8 +981,8 @@ mod tests {
         let ctx = screen_context();
 
         let degraded = InputEvent::Key(
-            crossterm::event::KeyCode::Char('d'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('d'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&degraded, &ctx), ScreenAction::Consumed);
         let rows = screen.row_data();
@@ -827,16 +1012,16 @@ mod tests {
         let ctx = screen_context();
 
         let host = InputEvent::Key(
-            crossterm::event::KeyCode::Char('h'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('h'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&host, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_host_filter(), "inst");
         assert_eq!(screen.row_data().len(), 2);
 
         let severity = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&severity, &ctx), ScreenAction::Consumed);
         let info_rows = screen.row_data();
@@ -862,16 +1047,6 @@ mod tests {
         assert_eq!(StreamSeverity::Info.label(), "info");
         assert_eq!(StreamSeverity::Warn.label(), "warn");
         assert_eq!(StreamSeverity::Critical.label(), "critical");
-    }
-
-    #[test]
-    fn severity_color_distinct_per_variant() {
-        let info_color = StreamSeverity::Info.color();
-        let warn_color = StreamSeverity::Warn.color();
-        let crit_color = StreamSeverity::Critical.color();
-        assert_ne!(info_color, warn_color);
-        assert_ne!(warn_color, crit_color);
-        assert_ne!(info_color, crit_color);
     }
 
     // --- StreamSeverityFilter ---

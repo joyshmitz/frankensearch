@@ -17,9 +17,15 @@ frankensearch-tui = { workspace = true }
 fsqlite = { path = "../../../frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "../../../frankensqlite/crates/fsqlite-types" }
 
-# Terminal UI rendering
-ratatui = "0.30"
-crossterm = "0.29"
+# Terminal UI rendering (FrankenTUI)
+ftui-core = { workspace = true }
+ftui-render = { workspace = true }
+ftui-style = { workspace = true }
+ftui-text = { workspace = true }
+ftui-layout = { workspace = true }
+ftui-widgets = { workspace = true }
+ftui-tty = { workspace = true }
+ftui-backend = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

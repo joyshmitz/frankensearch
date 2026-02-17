@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
+use ftui_core::event::{KeyCode, Modifiers, MouseEventKind};
 use serde::{Deserialize, Serialize};
 
 // ─── Input Event Abstraction ────────────────────────────────────────────────
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEvent {
     /// A key press with modifiers.
-    Key(KeyCode, KeyModifiers),
+    Key(KeyCode, Modifiers),
     /// A mouse event at a position.
     Mouse(MouseEventKind, u16, u16),
     /// Terminal resize.
@@ -98,7 +98,7 @@ pub struct KeyBinding {
 
 /// Configurable keymap that resolves key events to semantic actions.
 pub struct Keymap {
-    bindings: HashMap<(KeyCode, KeyModifiers), KeyAction>,
+    bindings: HashMap<(KeyCode, Modifiers), KeyAction>,
 }
 
 impl Keymap {
@@ -108,79 +108,70 @@ impl Keymap {
         let mut bindings = HashMap::new();
 
         // Quit
-        bindings.insert((KeyCode::Char('q'), KeyModifiers::NONE), KeyAction::Quit);
-        bindings.insert((KeyCode::Char('c'), KeyModifiers::CONTROL), KeyAction::Quit);
+        bindings.insert((KeyCode::Char('q'), Modifiers::NONE), KeyAction::Quit);
+        bindings.insert((KeyCode::Char('c'), Modifiers::CTRL), KeyAction::Quit);
 
         // Command palette
         bindings.insert(
-            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (KeyCode::Char('p'), Modifiers::CTRL),
             KeyAction::TogglePalette,
         );
         bindings.insert(
-            (KeyCode::Char(':'), KeyModifiers::NONE),
+            (KeyCode::Char(':'), Modifiers::NONE),
             KeyAction::TogglePalette,
         );
 
         // Navigation
-        bindings.insert((KeyCode::Tab, KeyModifiers::NONE), KeyAction::NextScreen);
-        bindings.insert(
-            (KeyCode::BackTab, KeyModifiers::SHIFT),
-            KeyAction::PrevScreen,
-        );
+        bindings.insert((KeyCode::Tab, Modifiers::NONE), KeyAction::NextScreen);
+        bindings.insert((KeyCode::BackTab, Modifiers::SHIFT), KeyAction::PrevScreen);
 
         // Help
-        bindings.insert(
-            (KeyCode::Char('?'), KeyModifiers::NONE),
-            KeyAction::ToggleHelp,
-        );
-        bindings.insert((KeyCode::F(1), KeyModifiers::NONE), KeyAction::ToggleHelp);
+        bindings.insert((KeyCode::Char('?'), Modifiers::NONE), KeyAction::ToggleHelp);
+        bindings.insert((KeyCode::F(1), Modifiers::NONE), KeyAction::ToggleHelp);
 
         // Dismiss
-        bindings.insert((KeyCode::Esc, KeyModifiers::NONE), KeyAction::Dismiss);
+        bindings.insert((KeyCode::Escape, Modifiers::NONE), KeyAction::Dismiss);
 
         // Movement
-        bindings.insert((KeyCode::Up, KeyModifiers::NONE), KeyAction::Up);
-        bindings.insert((KeyCode::Down, KeyModifiers::NONE), KeyAction::Down);
-        bindings.insert((KeyCode::Left, KeyModifiers::NONE), KeyAction::Left);
-        bindings.insert((KeyCode::Right, KeyModifiers::NONE), KeyAction::Right);
-        bindings.insert((KeyCode::Char('k'), KeyModifiers::NONE), KeyAction::Up);
-        bindings.insert((KeyCode::Char('j'), KeyModifiers::NONE), KeyAction::Down);
-        bindings.insert((KeyCode::Char('h'), KeyModifiers::NONE), KeyAction::Left);
-        bindings.insert((KeyCode::Char('l'), KeyModifiers::NONE), KeyAction::Right);
+        bindings.insert((KeyCode::Up, Modifiers::NONE), KeyAction::Up);
+        bindings.insert((KeyCode::Down, Modifiers::NONE), KeyAction::Down);
+        bindings.insert((KeyCode::Left, Modifiers::NONE), KeyAction::Left);
+        bindings.insert((KeyCode::Right, Modifiers::NONE), KeyAction::Right);
+        bindings.insert((KeyCode::Char('k'), Modifiers::NONE), KeyAction::Up);
+        bindings.insert((KeyCode::Char('j'), Modifiers::NONE), KeyAction::Down);
+        bindings.insert((KeyCode::Char('h'), Modifiers::NONE), KeyAction::Left);
+        bindings.insert((KeyCode::Char('l'), Modifiers::NONE), KeyAction::Right);
 
         // Page navigation
-        bindings.insert((KeyCode::PageUp, KeyModifiers::NONE), KeyAction::PageUp);
-        bindings.insert((KeyCode::PageDown, KeyModifiers::NONE), KeyAction::PageDown);
-        bindings.insert((KeyCode::Home, KeyModifiers::NONE), KeyAction::Home);
-        bindings.insert((KeyCode::End, KeyModifiers::NONE), KeyAction::End);
+        bindings.insert((KeyCode::PageUp, Modifiers::NONE), KeyAction::PageUp);
+        bindings.insert((KeyCode::PageDown, Modifiers::NONE), KeyAction::PageDown);
+        bindings.insert((KeyCode::Home, Modifiers::NONE), KeyAction::Home);
+        bindings.insert((KeyCode::End, Modifiers::NONE), KeyAction::End);
 
         // Theme cycling
-        bindings.insert(
-            (KeyCode::Char('t'), KeyModifiers::CONTROL),
-            KeyAction::CycleTheme,
-        );
+        bindings.insert((KeyCode::Char('t'), Modifiers::CTRL), KeyAction::CycleTheme);
 
         // Interaction
-        bindings.insert((KeyCode::Enter, KeyModifiers::NONE), KeyAction::Confirm);
-        bindings.insert((KeyCode::Backspace, KeyModifiers::NONE), KeyAction::Delete);
-        bindings.insert((KeyCode::Char('y'), KeyModifiers::CONTROL), KeyAction::Copy);
+        bindings.insert((KeyCode::Enter, Modifiers::NONE), KeyAction::Confirm);
+        bindings.insert((KeyCode::Backspace, Modifiers::NONE), KeyAction::Delete);
+        bindings.insert((KeyCode::Char('y'), Modifiers::CTRL), KeyAction::Copy);
 
         Self { bindings }
     }
 
     /// Resolve a key event to a semantic action.
     #[must_use]
-    pub fn resolve(&self, key: KeyCode, modifiers: KeyModifiers) -> Option<&KeyAction> {
+    pub fn resolve(&self, key: KeyCode, modifiers: Modifiers) -> Option<&KeyAction> {
         self.bindings.get(&(key, modifiers))
     }
 
     /// Add or override a binding.
-    pub fn bind(&mut self, key: KeyCode, modifiers: KeyModifiers, action: KeyAction) {
+    pub fn bind(&mut self, key: KeyCode, modifiers: Modifiers, action: KeyAction) {
         self.bindings.insert((key, modifiers), action);
     }
 
     /// Remove a binding.
-    pub fn unbind(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+    pub fn unbind(&mut self, key: KeyCode, modifiers: Modifiers) {
         self.bindings.remove(&(key, modifiers));
     }
 
@@ -205,7 +196,7 @@ impl Default for Keymap {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use ftui_core::event::{KeyCode, Modifiers};
 
     use super::*;
 
@@ -219,21 +210,21 @@ mod tests {
     #[test]
     fn resolve_quit_q() {
         let keymap = Keymap::default_bindings();
-        let action = keymap.resolve(KeyCode::Char('q'), KeyModifiers::NONE);
+        let action = keymap.resolve(KeyCode::Char('q'), Modifiers::NONE);
         assert_eq!(action, Some(&KeyAction::Quit));
     }
 
     #[test]
     fn resolve_quit_ctrl_c() {
         let keymap = Keymap::default_bindings();
-        let action = keymap.resolve(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let action = keymap.resolve(KeyCode::Char('c'), Modifiers::CTRL);
         assert_eq!(action, Some(&KeyAction::Quit));
     }
 
     #[test]
     fn resolve_palette_ctrl_p() {
         let keymap = Keymap::default_bindings();
-        let action = keymap.resolve(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        let action = keymap.resolve(KeyCode::Char('p'), Modifiers::CTRL);
         assert_eq!(action, Some(&KeyAction::TogglePalette));
     }
 
@@ -241,11 +232,11 @@ mod tests {
     fn resolve_vim_movement() {
         let keymap = Keymap::default_bindings();
         assert_eq!(
-            keymap.resolve(KeyCode::Char('j'), KeyModifiers::NONE),
+            keymap.resolve(KeyCode::Char('j'), Modifiers::NONE),
             Some(&KeyAction::Down)
         );
         assert_eq!(
-            keymap.resolve(KeyCode::Char('k'), KeyModifiers::NONE),
+            keymap.resolve(KeyCode::Char('k'), Modifiers::NONE),
             Some(&KeyAction::Up)
         );
     }
@@ -255,7 +246,7 @@ mod tests {
         let keymap = Keymap::default_bindings();
         assert!(
             keymap
-                .resolve(KeyCode::Char('z'), KeyModifiers::NONE)
+                .resolve(KeyCode::Char('z'), Modifiers::NONE)
                 .is_none()
         );
     }
@@ -265,10 +256,10 @@ mod tests {
         let mut keymap = Keymap::default_bindings();
         keymap.bind(
             KeyCode::Char('s'),
-            KeyModifiers::CONTROL,
+            Modifiers::CTRL,
             KeyAction::Custom("save".to_string()),
         );
-        let action = keymap.resolve(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let action = keymap.resolve(KeyCode::Char('s'), Modifiers::CTRL);
         assert_eq!(action, Some(&KeyAction::Custom("save".to_string())));
     }
 
@@ -277,13 +268,13 @@ mod tests {
         let mut keymap = Keymap::default_bindings();
         assert!(
             keymap
-                .resolve(KeyCode::Char('q'), KeyModifiers::NONE)
+                .resolve(KeyCode::Char('q'), Modifiers::NONE)
                 .is_some()
         );
-        keymap.unbind(KeyCode::Char('q'), KeyModifiers::NONE);
+        keymap.unbind(KeyCode::Char('q'), Modifiers::NONE);
         assert!(
             keymap
-                .resolve(KeyCode::Char('q'), KeyModifiers::NONE)
+                .resolve(KeyCode::Char('q'), Modifiers::NONE)
                 .is_none()
         );
     }

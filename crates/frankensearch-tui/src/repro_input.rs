@@ -4,7 +4,7 @@ mod tests {
     use crate::shell::{AppShell, ShellConfig};
     use crate::input::InputEvent;
     use crate::palette::PaletteState;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use ftui_core::event::{KeyCode, Modifiers};
 
     #[test]
     fn repro_super_modifier_leaks_into_palette() {
@@ -13,7 +13,7 @@ mod tests {
         // Open palette
         let open = InputEvent::Key(
             KeyCode::Char('p'),
-            KeyModifiers::CONTROL,
+            Modifiers::CTRL,
         );
         shell.handle_input(&open);
         assert_eq!(shell.palette.state(), &PaletteState::Open);
@@ -21,7 +21,7 @@ mod tests {
         // Simulate Cmd+A (Super + 'a')
         let cmd_a = InputEvent::Key(
             KeyCode::Char('a'),
-            KeyModifiers::SUPER,
+            Modifiers::SUPER,
         );
         shell.handle_input(&cmd_a);
 

@@ -6,18 +6,25 @@
 use std::any::Any;
 
 use frankensearch_core::LifecycleState;
-use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Row, Table};
+use ftui_layout::{Constraint, Flex};
+use ftui_render::frame::Frame;
+use ftui_style::Style;
+use ftui_text::{Line, Span, Text};
+use ftui_widgets::{
+    Widget,
+    block::Block,
+    borders::{BorderType, Borders},
+    paragraph::Paragraph,
+    table::{Row, Table},
+};
 
 use frankensearch_tui::Screen;
 use frankensearch_tui::input::InputEvent;
-use frankensearch_tui::screen::{ScreenAction, ScreenContext, ScreenId};
+use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::presets::ViewState;
 use crate::state::AppState;
+use crate::theme::SemanticPalette;
 
 /// Project-scoped dashboard screen.
 pub struct ProjectDetailScreen {
@@ -28,8 +35,36 @@ pub struct ProjectDetailScreen {
     analytics_screen_id: ScreenId,
     state: AppState,
     view: ViewState,
+    palette: SemanticPalette,
     selected_row: usize,
 }
+
+const PROJECT_KEYBINDINGS: &[KeybindingHint] = &[
+    KeybindingHint {
+        key: "j / Down",
+        description: "Move selection down",
+    },
+    KeybindingHint {
+        key: "k / Up",
+        description: "Move selection up",
+    },
+    KeybindingHint {
+        key: "Esc / q",
+        description: "Back to fleet",
+    },
+    KeybindingHint {
+        key: "s",
+        description: "Open live stream",
+    },
+    KeybindingHint {
+        key: "t",
+        description: "Open timeline",
+    },
+    KeybindingHint {
+        key: "a",
+        description: "Open analytics",
+    },
+];
 
 impl ProjectDetailScreen {
     /// Create a new project detail screen.
@@ -43,6 +78,7 @@ impl ProjectDetailScreen {
             analytics_screen_id: ScreenId::new("ops.analytics"),
             state: AppState::new(),
             view: ViewState::default(),
+            palette: SemanticPalette::dark(),
             selected_row: 0,
         }
     }
@@ -77,6 +113,11 @@ impl ProjectDetailScreen {
         } else if self.selected_row >= count {
             self.selected_row = count.saturating_sub(1);
         }
+    }
+
+    /// Update the semantic palette for theme-aware rendering.
+    pub const fn set_palette(&mut self, palette: SemanticPalette) {
+        self.palette = palette;
     }
 
     /// Selected project filter currently in effect.
@@ -119,7 +160,7 @@ impl ProjectDetailScreen {
     fn phase_latency_lines(
         instances: &[&crate::state::InstanceInfo],
         fleet: &crate::state::FleetSnapshot,
-    ) -> Vec<Line<'static>> {
+    ) -> Vec<Line> {
         let mut weighted_count = 0_u64;
         let mut weighted_avg_sum = 0_u128;
         let mut weighted_p95_sum = 0_u128;
@@ -176,7 +217,7 @@ impl ProjectDetailScreen {
     fn anomaly_lines(
         instances: &[&crate::state::InstanceInfo],
         fleet: &crate::state::FleetSnapshot,
-    ) -> Vec<Line<'static>> {
+    ) -> Vec<Line> {
         let mut cards: Vec<(u32, String, String)> = Vec::new();
         for instance in instances {
             let mut score = 0_u32;
@@ -255,7 +296,7 @@ impl ProjectDetailScreen {
         lines
     }
 
-    fn summary_lines(&self) -> Vec<Line<'static>> {
+    fn summary_lines(&self) -> Vec<Line> {
         let Some(project) = self.selected_project() else {
             return vec![Line::from(
                 "No project selected. Press Enter on a fleet row to open Project Detail.",
@@ -351,13 +392,17 @@ impl ProjectDetailScreen {
         lines
     }
 
-    fn build_rows(&self) -> Vec<Row<'static>> {
+    fn build_rows(&self) -> Vec<Row> {
         let fleet = self.state.fleet();
         self.project_instances()
             .into_iter()
             .enumerate()
             .map(|(index, instance)| {
-                let health = if instance.healthy { "OK" } else { "WARN" };
+                let health = if instance.healthy {
+                    "[OK] healthy"
+                } else {
+                    "[!!] degraded"
+                };
                 let search_total = fleet
                     .search_metrics
                     .get(&instance.id)
@@ -375,11 +420,11 @@ impl ProjectDetailScreen {
                     |lifecycle| format!("{:?}", lifecycle.state),
                 );
                 let style = if index == self.selected_row {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    self.palette.style_highlight().bold()
                 } else if !instance.healthy {
-                    Style::default().fg(ratatui::style::Color::Red)
+                    self.palette.style_row_error(index)
                 } else {
-                    Style::default()
+                    self.palette.style_row_base(index)
                 };
 
                 Row::new(vec![
@@ -417,42 +462,45 @@ impl Screen for ProjectDetailScreen {
         "Project Detail"
     }
 
-    fn render(&self, frame: &mut Frame<'_>, _ctx: &ScreenContext) {
-        let area = frame.area();
+    fn render(&self, frame: &mut Frame, _ctx: &ScreenContext) {
+        let area = frame.bounds();
+        let p = &self.palette;
+        let border_style = p.style_border();
         let summary_lines = self.summary_lines();
         let summary_height = u16::try_from(summary_lines.len().saturating_add(2))
             .unwrap_or(14)
             .clamp(6, 14);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
+        let chunks = Flex::vertical()
             .constraints([
-                Constraint::Length(3),
-                Constraint::Length(summary_height),
+                Constraint::Fixed(3),
+                Constraint::Fixed(summary_height),
                 Constraint::Min(5),
             ])
             .split(area);
 
         let project = self.selected_project().unwrap_or("<none>");
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled("Project: ", Style::default().add_modifier(Modifier::BOLD)),
+        let header = Paragraph::new(Line::from_spans(vec![
+            Span::styled("Project: ", Style::new().fg(p.accent).bold()),
             Span::raw(project.to_owned()),
             Span::raw(" | Esc back | s stream | t timeline | a analytics"),
         ]))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Project Detail "),
         );
-        frame.render_widget(header, chunks[0]);
+        header.render(chunks[0], frame);
 
-        let summary = Paragraph::new(summary_lines).block(
-            Block::default()
+        let summary = Paragraph::new(Text::from_lines(summary_lines)).block(
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Summary Cards "),
         );
-        frame.render_widget(summary, chunks[1]);
+        summary.render(chunks[1], frame);
 
         let rows = self.build_rows();
         if rows.is_empty() {
@@ -460,26 +508,27 @@ impl Screen for ProjectDetailScreen {
                 "No instance rows available. Select a project from Fleet Overview to populate this screen.",
             )
             .block(
-                Block::default()
+                Block::new()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
+                    .border_style(border_style)
                     .title(" Instances "),
             );
-            frame.render_widget(empty, chunks[2]);
+            empty.render(chunks[2], frame);
             return;
         }
 
         let table = Table::new(
             rows,
             [
-                Constraint::Length(6),
-                Constraint::Length(16),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(10),
-                Constraint::Length(8),
-                Constraint::Length(8),
-                Constraint::Length(12),
+                Constraint::Fixed(13),
+                Constraint::Fixed(16),
+                Constraint::Fixed(10),
+                Constraint::Fixed(10),
+                Constraint::Fixed(10),
+                Constraint::Fixed(8),
+                Constraint::Fixed(8),
+                Constraint::Fixed(12),
             ],
         )
         .header(
@@ -493,43 +542,44 @@ impl Screen for ProjectDetailScreen {
                 "Attr",
                 "Lifecycle",
             ])
-            .style(Style::default().add_modifier(Modifier::BOLD)),
+            .style(Style::new().fg(p.accent).bold()),
         )
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
+                .border_style(border_style)
                 .title(" Instances "),
         );
-        frame.render_widget(table, chunks[2]);
+        table.render(chunks[2], frame);
     }
 
     fn handle_input(&mut self, event: &InputEvent, _ctx: &ScreenContext) -> ScreenAction {
         if let InputEvent::Key(key, _mods) = event {
             match key {
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                ftui_core::event::KeyCode::Up | ftui_core::event::KeyCode::Char('k') => {
                     if self.selected_row > 0 {
                         self.selected_row -= 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                ftui_core::event::KeyCode::Down | ftui_core::event::KeyCode::Char('j') => {
                     let count = self.row_count();
                     if count > 0 && self.selected_row < count.saturating_sub(1) {
                         self.selected_row += 1;
                     }
                     return ScreenAction::Consumed;
                 }
-                crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('q') => {
+                ftui_core::event::KeyCode::Escape | ftui_core::event::KeyCode::Char('q') => {
                     return ScreenAction::Navigate(self.fleet_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('s') => {
+                ftui_core::event::KeyCode::Char('s') => {
                     return ScreenAction::Navigate(self.live_stream_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('t') => {
+                ftui_core::event::KeyCode::Char('t') => {
                     return ScreenAction::Navigate(self.timeline_screen_id.clone());
                 }
-                crossterm::event::KeyCode::Char('a') => {
+                ftui_core::event::KeyCode::Char('a') => {
                     return ScreenAction::Navigate(self.analytics_screen_id.clone());
                 }
                 _ => {}
@@ -540,6 +590,10 @@ impl Screen for ProjectDetailScreen {
 
     fn semantic_role(&self) -> &'static str {
         "region"
+    }
+
+    fn keybindings(&self) -> &'static [KeybindingHint] {
+        PROJECT_KEYBINDINGS
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -658,7 +712,7 @@ mod tests {
         let text = screen
             .summary_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("No project selected"));
@@ -674,7 +728,7 @@ mod tests {
         let summary = screen
             .summary_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(summary.contains("project=cass"));
@@ -699,7 +753,7 @@ mod tests {
         let summary = screen
             .summary_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -718,7 +772,7 @@ mod tests {
         let summary = screen
             .summary_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -741,8 +795,8 @@ mod tests {
         };
 
         let esc = InputEvent::Key(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Escape,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&esc, &ctx),
@@ -750,8 +804,8 @@ mod tests {
         );
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -759,8 +813,8 @@ mod tests {
         );
 
         let timeline = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&timeline, &ctx),
@@ -768,8 +822,8 @@ mod tests {
         );
 
         let analytics = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
@@ -790,8 +844,8 @@ mod tests {
         };
 
         let analytics = InputEvent::Key(
-            crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('a'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&analytics, &ctx),
@@ -814,8 +868,8 @@ mod tests {
         };
 
         let esc = InputEvent::Key(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Escape,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&esc, &ctx),
@@ -823,8 +877,8 @@ mod tests {
         );
 
         let stream = InputEvent::Key(
-            crossterm::event::KeyCode::Char('s'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('s'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&stream, &ctx),
@@ -832,8 +886,8 @@ mod tests {
         );
 
         let timeline = InputEvent::Key(
-            crossterm::event::KeyCode::Char('t'),
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Char('t'),
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(
             screen.handle_input(&timeline, &ctx),
@@ -895,7 +949,7 @@ mod tests {
         assert!(lines.len() >= 3);
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("0us"), "empty should show 0us");
@@ -920,7 +974,7 @@ mod tests {
         let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("none"), "all healthy should show 'none'");
@@ -943,7 +997,7 @@ mod tests {
         let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("WARN sick-1"));
@@ -967,7 +1021,7 @@ mod tests {
         let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("pending=1500"));
@@ -999,7 +1053,7 @@ mod tests {
         let lines = ProjectDetailScreen::anomaly_lines(&instances, &fleet);
         let text = lines
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("p95=6000us"));
@@ -1038,8 +1092,8 @@ mod tests {
         };
 
         let up = InputEvent::Key(
-            crossterm::event::KeyCode::Up,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Up,
+            ftui_core::event::Modifiers::NONE,
         );
         assert_eq!(screen.handle_input(&up, &ctx), ScreenAction::Consumed);
         assert_eq!(screen.selected_row, 0);
@@ -1059,8 +1113,8 @@ mod tests {
         };
 
         let down = InputEvent::Key(
-            crossterm::event::KeyCode::Down,
-            crossterm::event::KeyModifiers::NONE,
+            ftui_core::event::KeyCode::Down,
+            ftui_core::event::Modifiers::NONE,
         );
         // Move to last row
         assert_eq!(screen.handle_input(&down, &ctx), ScreenAction::Consumed);
@@ -1081,7 +1135,7 @@ mod tests {
         let summary = screen
             .summary_lines()
             .iter()
-            .map(std::string::ToString::to_string)
+            .map(Line::to_plain_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(summary.contains("No visible instances"));
