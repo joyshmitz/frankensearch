@@ -345,6 +345,11 @@ const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
 const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 2;
 const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 2;
 const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
+const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = 0;
+const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 256;
+const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 64;
+const FSFS_SEARCH_UNBOUNDED_VECTOR_FALLBACK_LIMIT: usize = 4_096;
+const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardSearchStage {
@@ -1912,20 +1917,28 @@ impl std::fmt::Display for SemVer {
 const GITHUB_OWNER: &str = "Dicklesworthstone";
 const GITHUB_REPO: &str = "frankensearch";
 
+#[must_use]
+fn is_trusted_release_url(url: &str) -> bool {
+    let expected_prefix = format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases");
+    url.starts_with(&expected_prefix)
+}
+
 /// Fetch the latest release tag from GitHub Releases via `curl`.
 /// Returns `(tag_name, html_url)` on success.
-fn fetch_latest_release_tag() -> SearchResult<(String, String)> {
+fn fetch_latest_release_tag() -> SearchResult<Option<(String, String)>> {
     let url = format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest");
 
     let output = std::process::Command::new("curl")
         .args([
-            "-sSf",
+            "-sS",
             "-H",
             "Accept: application/vnd.github+json",
             "-H",
             "X-GitHub-Api-Version: 2022-11-28",
             "--max-time",
             "10",
+            "-w",
+            "\n%{http_code}",
             &url,
         ])
         .output()
@@ -1943,9 +1956,24 @@ fn fetch_latest_release_tag() -> SearchResult<(String, String)> {
         });
     }
 
-    let body = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (body, status_code) = stdout
+        .rsplit_once('\n')
+        .map_or_else(|| (stdout.as_ref(), ""), |(body, code)| (body, code.trim()));
+
+    if status_code == "404" {
+        return Ok(None);
+    }
+    if !status_code.starts_with('2') {
+        return Err(SearchError::InvalidConfig {
+            field: "update.github_api".into(),
+            value: url,
+            reason: format!("GitHub API request failed with status {status_code}: {body}"),
+        });
+    }
+
     let json: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| SearchError::SubsystemError {
+        serde_json::from_str(body).map_err(|e| SearchError::SubsystemError {
             subsystem: "fsfs.update.json",
             source: Box::new(e),
         })?;
@@ -1964,12 +1992,12 @@ fn fetch_latest_release_tag() -> SearchResult<(String, String)> {
     if tag.is_empty() {
         return Err(SearchError::InvalidConfig {
             field: "update.tag_name".into(),
-            value: body.into_owned(),
+            value: body.to_owned(),
             reason: "no tag_name found in GitHub API response".into(),
         });
     }
 
-    Ok((tag, html_url))
+    Ok(Some((tag, html_url)))
 }
 
 /// Download a release asset to a local path using `curl`.
@@ -2157,12 +2185,35 @@ pub fn version_cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("frankensearch").join("version_check.json"))
 }
 
+#[must_use]
+fn read_version_cache_from_path(path: &Path) -> Option<VersionCheckCache> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 /// Read the version cache from disk. Returns `None` if missing or unreadable.
 #[must_use]
 pub fn read_version_cache() -> Option<VersionCheckCache> {
     let path = version_cache_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&content).ok()
+    read_version_cache_from_path(&path)
+}
+
+fn write_version_cache_to_path(path: &Path, cache: &VersionCheckCache) -> SearchResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| SearchError::SubsystemError {
+            subsystem: "fsfs.version_cache.dir",
+            source: Box::new(e),
+        })?;
+    }
+    let json = serde_json::to_string_pretty(cache).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.version_cache.json",
+        source: Box::new(e),
+    })?;
+    write_durable(path, json).map_err(|e| SearchError::SubsystemError {
+        subsystem: "fsfs.version_cache.write",
+        source: Box::new(e),
+    })?;
+    Ok(())
 }
 
 /// Write the version cache to disk.
@@ -2176,21 +2227,7 @@ pub fn write_version_cache(cache: &VersionCheckCache) -> SearchResult<()> {
         value: String::new(),
         reason: "could not determine cache directory".into(),
     })?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| SearchError::SubsystemError {
-            subsystem: "fsfs.version_cache.dir",
-            source: Box::new(e),
-        })?;
-    }
-    let json = serde_json::to_string_pretty(cache).map_err(|e| SearchError::SubsystemError {
-        subsystem: "fsfs.version_cache.json",
-        source: Box::new(e),
-    })?;
-    write_durable(&path, json).map_err(|e| SearchError::SubsystemError {
-        subsystem: "fsfs.version_cache.write",
-        source: Box::new(e),
-    })?;
-    Ok(())
+    write_version_cache_to_path(&path, cache)
 }
 
 fn epoch_now() -> u64 {
@@ -2204,7 +2241,10 @@ fn epoch_now() -> u64 {
 #[must_use]
 pub fn is_cache_valid(cache: &VersionCheckCache) -> bool {
     let elapsed = epoch_now().saturating_sub(cache.checked_at_epoch);
-    elapsed < cache.ttl_seconds && cache.current_version == env!("CARGO_PKG_VERSION")
+    elapsed < cache.ttl_seconds
+        && cache.current_version == env!("CARGO_PKG_VERSION")
+        && SemVer::parse(&cache.latest_version).is_some()
+        && (cache.release_url.is_empty() || is_trusted_release_url(&cache.release_url))
 }
 
 /// Refresh the version cache by querying GitHub. Writes the result to disk.
@@ -2214,12 +2254,16 @@ pub fn is_cache_valid(cache: &VersionCheckCache) -> bool {
 ///
 /// Returns `SearchError` if the GitHub API call or cache write fails.
 pub fn refresh_version_cache() -> SearchResult<VersionCheckCache> {
-    let (tag, html_url) = fetch_latest_release_tag()?;
+    let current_version = env!("CARGO_PKG_VERSION").to_owned();
+    let (latest_version, release_url) = match fetch_latest_release_tag()? {
+        Some((tag, html_url)) => (tag, html_url),
+        None => (current_version.clone(), String::new()),
+    };
     let cache = VersionCheckCache {
         checked_at_epoch: epoch_now(),
-        current_version: env!("CARGO_PKG_VERSION").to_owned(),
-        latest_version: tag,
-        release_url: html_url,
+        current_version,
+        latest_version,
+        release_url,
         ttl_seconds: VERSION_CACHE_TTL_SECS,
     };
     write_version_cache(&cache)?;
@@ -2249,6 +2293,9 @@ pub fn maybe_print_update_notice(quiet: bool) -> bool {
     let Some(latest) = SemVer::parse(&cache.latest_version) else {
         return false;
     };
+    if !cache.release_url.is_empty() && !is_trusted_release_url(&cache.release_url) {
+        return false;
+    }
     if !latest.is_newer_than(current) {
         return false;
     }
@@ -3175,6 +3222,7 @@ impl FsfsRuntime {
         let current_str = env!("CARGO_PKG_VERSION");
         let check_only = self.cli_input.update_check_only;
         let channel = "stable".to_owned();
+        let mut notes = Vec::new();
 
         let current = SemVer::parse(current_str).ok_or_else(|| SearchError::InvalidConfig {
             field: "update.current_version".into(),
@@ -3183,7 +3231,19 @@ impl FsfsRuntime {
         })?;
 
         // Query GitHub for the latest release.
-        let (tag, html_url) = fetch_latest_release_tag()?;
+        let Some((tag, html_url)) = fetch_latest_release_tag()? else {
+            notes.push("no published GitHub releases found for this channel".to_owned());
+            return Ok(FsfsUpdatePayload {
+                current_version: current_str.to_owned(),
+                latest_version: current.to_string(),
+                update_available: false,
+                check_only,
+                applied: false,
+                channel,
+                release_url: None,
+                notes,
+            });
+        };
         let latest = SemVer::parse(&tag).ok_or_else(|| SearchError::InvalidConfig {
             field: "update.latest_version".into(),
             value: tag.clone(),
@@ -3191,7 +3251,6 @@ impl FsfsRuntime {
         })?;
 
         let update_available = latest.is_newer_than(current);
-        let mut notes = Vec::new();
 
         if !update_available {
             notes.push(format!("fsfs {current_str} is already up to date"));
@@ -3829,8 +3888,7 @@ impl FsfsRuntime {
             .cli_input
             .overrides
             .limit
-            .unwrap_or(self.config.search.default_limit)
-            .max(1);
+            .unwrap_or(self.config.search.default_limit);
 
         if self.cli_input.stream {
             return self.run_search_stream_command(cx, query, limit).await;
@@ -4410,11 +4468,73 @@ impl FsfsRuntime {
         snippets_by_doc: &HashMap<String, String>,
         limit: usize,
     ) -> SearchPayload {
-        let limited = fused.iter().take(limit).cloned().collect::<Vec<_>>();
+        let limited = if limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+            fused.to_vec()
+        } else {
+            fused.iter().take(limit).cloned().collect::<Vec<_>>()
+        };
         let mut payload =
             orchestrator.build_search_payload(query, phase, &limited, snippets_by_doc);
         payload.total_candidates = fused.len();
         payload
+    }
+
+    #[must_use]
+    fn resolve_output_limit(requested_limit: usize, lexical_index: Option<&TantivyIndex>) -> usize {
+        if requested_limit != FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+            return requested_limit.max(1);
+        }
+        lexical_index.map_or(FSFS_SEARCH_UNBOUNDED_VECTOR_FALLBACK_LIMIT, |index| {
+            index.doc_count().max(1)
+        })
+    }
+
+    #[must_use]
+    fn merge_with_lexical_tail(
+        fused_head: &[FusedCandidate],
+        lexical_full: &[LexicalCandidate],
+        filter_expr: Option<&SearchFilterExpr>,
+    ) -> Vec<FusedCandidate> {
+        if lexical_full.is_empty() {
+            return fused_head.to_vec();
+        }
+
+        let mut merged = Vec::with_capacity(fused_head.len().saturating_add(lexical_full.len()));
+        let mut seen = HashSet::with_capacity(fused_head.len().saturating_add(lexical_full.len()));
+
+        for candidate in fused_head {
+            if let Some(expr) = filter_expr
+                && !expr.matches_doc_id(&candidate.doc_id)
+            {
+                continue;
+            }
+            seen.insert(candidate.doc_id.clone());
+            merged.push(candidate.clone());
+        }
+
+        for (rank, lexical) in lexical_full.iter().enumerate() {
+            if seen.contains(&lexical.doc_id) {
+                continue;
+            }
+            if let Some(expr) = filter_expr
+                && !expr.matches_doc_id(&lexical.doc_id)
+            {
+                continue;
+            }
+            seen.insert(lexical.doc_id.clone());
+            merged.push(FusedCandidate {
+                doc_id: lexical.doc_id.clone(),
+                fused_score: f64::from(lexical.score),
+                prior_boost: 0.0,
+                lexical_rank: Some(rank),
+                semantic_rank: None,
+                lexical_score: Some(lexical.score),
+                semantic_score: None,
+                in_both_sources: false,
+            });
+        }
+
+        merged
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4465,6 +4585,8 @@ impl FsfsRuntime {
             }]);
         }
 
+        let output_limit = Self::resolve_output_limit(limit, resources.lexical_index.as_ref());
+        let planning_limit = output_limit.clamp(1, FSFS_SEARCH_SEMANTIC_HEAD_LIMIT);
         let search_start = Instant::now();
         let lexical_available = resources.lexical_index.is_some();
         if !matches!(mode, SearchExecutionMode::LexicalOnly) && resources.vector_index.is_some() {
@@ -4508,7 +4630,8 @@ impl FsfsRuntime {
 
         let capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
         let planner = QueryPlanner::from_fsfs(&self.config);
-        let plan = planner.execution_plan_for_query(&normalized_query, Some(limit), capabilities);
+        let plan =
+            planner.execution_plan_for_query(&normalized_query, Some(planning_limit), capabilities);
 
         info!(
             phase = "query_parse",
@@ -4525,9 +4648,9 @@ impl FsfsRuntime {
         let short_query_budget_cap =
             if normalized_query.chars().count() <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
                 Some(
-                    limit
+                    planning_limit
                         .saturating_mul(FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER)
-                        .max(limit),
+                        .max(planning_limit),
                 )
             } else {
                 None
@@ -4536,18 +4659,18 @@ impl FsfsRuntime {
         let lexical_start = Instant::now();
         let lexical_budget =
             if matches!(mode, SearchExecutionMode::LexicalOnly) && filter_expr.is_none() {
-                limit.saturating_mul(2).max(limit)
+                planning_limit.saturating_mul(2).max(planning_limit)
             } else if matches!(mode, SearchExecutionMode::FastOnly) && filter_expr.is_none() {
-                let planned_budget = plan.lexical_stage.candidate_budget.max(limit);
-                let fast_stage_cap = limit
+                let planned_budget = plan.lexical_stage.candidate_budget.max(planning_limit);
+                let fast_stage_cap = planning_limit
                     .saturating_mul(FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER)
-                    .max(limit);
+                    .max(planning_limit);
                 short_query_budget_cap.map_or_else(
                     || planned_budget.min(fast_stage_cap),
                     |cap| planned_budget.min(fast_stage_cap).min(cap),
                 )
             } else {
-                let planned_budget = plan.lexical_stage.candidate_budget.max(limit);
+                let planned_budget = plan.lexical_stage.candidate_budget.max(planning_limit);
                 if filter_expr.is_none() {
                     short_query_budget_cap.map_or(planned_budget, |cap| planned_budget.min(cap))
                 } else {
@@ -4559,29 +4682,51 @@ impl FsfsRuntime {
             snippet_config.max_chars = FSFS_TUI_FAST_STAGE_SNIPPET_MAX_CHARS;
         }
         let mut snippets_by_doc = HashMap::new();
-        let lexical_candidates = if plan.lexical_stage.enabled {
+        let (lexical_candidates, lexical_head_candidates) = if plan.lexical_stage.enabled {
             if let Some(lexical) = resources.lexical_index.as_ref() {
-                let hits = lexical.search_with_snippets(
+                let snippet_limit = lexical_budget.clamp(1, FSFS_SEARCH_SNIPPET_HEAD_LIMIT);
+                let snippet_hits = lexical.search_with_snippets(
                     cx,
                     &normalized_query,
-                    lexical_budget,
+                    snippet_limit,
                     &snippet_config,
                 )?;
-                for hit in &hits {
+                for hit in &snippet_hits {
                     if let Some(snippet) = hit.snippet.as_ref()
                         && !snippet.trim().is_empty()
                     {
                         snippets_by_doc.insert(hit.doc_id.clone(), snippet.clone());
                     }
                 }
-                hits.into_iter()
-                    .map(|hit| LexicalCandidate::new(hit.doc_id, hit.bm25_score))
-                    .collect::<Vec<_>>()
+
+                let needs_full_lexical = output_limit > snippet_limit
+                    || filter_expr.is_some()
+                    || snippet_hits.is_empty();
+                let full_candidates = if needs_full_lexical {
+                    lexical
+                        .search(cx, &normalized_query, output_limit)
+                        .await?
+                        .into_iter()
+                        .map(|hit| LexicalCandidate::new(hit.doc_id, hit.score))
+                        .collect::<Vec<_>>()
+                } else {
+                    snippet_hits
+                        .into_iter()
+                        .map(|hit| LexicalCandidate::new(hit.doc_id, hit.bm25_score))
+                        .collect::<Vec<_>>()
+                };
+                let lexical_head_budget = lexical_budget.min(planning_limit).max(1);
+                let head_candidates = full_candidates
+                    .iter()
+                    .take(lexical_head_budget)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (full_candidates, head_candidates)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
 
@@ -4589,16 +4734,19 @@ impl FsfsRuntime {
         let semantic_budget = if let Some(short_query_cap) = short_query_budget_cap {
             plan.semantic_stage
                 .candidate_budget
-                .max(limit)
+                .max(planning_limit)
                 .min(short_query_cap)
         } else if matches!(mode, SearchExecutionMode::FastOnly) {
-            plan.semantic_stage.candidate_budget.max(limit).min(
-                limit
-                    .saturating_mul(FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER)
-                    .max(limit),
-            )
+            plan.semantic_stage
+                .candidate_budget
+                .max(planning_limit)
+                .min(
+                    planning_limit
+                        .saturating_mul(FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER)
+                        .max(planning_limit),
+                )
         } else {
-            plan.semantic_stage.candidate_budget.max(limit)
+            plan.semantic_stage.candidate_budget.max(planning_limit)
         };
         let semantic_candidates = if plan.semantic_stage.enabled {
             if let (Some(index), Some(embedder)) = (
@@ -4643,26 +4791,41 @@ impl FsfsRuntime {
         let orchestrator = QueryExecutionOrchestrator::new(QueryFusionPolicy {
             rrf_k: plan.fusion_policy.rrf_k.unwrap_or(self.config.search.rrf_k),
         });
-        let fusion_budget = lexical_candidates
+        let fusion_budget = lexical_head_candidates
             .len()
             .saturating_add(semantic_candidates.len())
-            .max(limit);
+            .max(planning_limit);
+        let fused_initial_head = orchestrator.fuse_rankings(
+            &lexical_head_candidates,
+            &semantic_candidates,
+            fusion_budget,
+            0,
+        );
+        let filtered_initial_head =
+            Self::apply_search_filter(&fused_initial_head, filter_expr.as_ref());
         let fused_initial =
-            orchestrator.fuse_rankings(&lexical_candidates, &semantic_candidates, fusion_budget, 0);
-        let filtered_initial = Self::apply_search_filter(&fused_initial, filter_expr.as_ref());
+            if output_limit > filtered_initial_head.len() && !lexical_candidates.is_empty() {
+                Self::merge_with_lexical_tail(
+                    &filtered_initial_head,
+                    &lexical_candidates,
+                    filter_expr.as_ref(),
+                )
+            } else {
+                filtered_initial_head.clone()
+            };
         let payload = Self::build_limited_payload(
             orchestrator,
             &normalized_query,
             SearchOutputPhase::Initial,
-            &filtered_initial,
+            &fused_initial,
             &snippets_by_doc,
-            limit,
+            output_limit,
         );
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
         let mut artifacts = vec![SearchPhaseArtifact {
             phase: SearchOutputPhase::Initial,
-            fused: filtered_initial.clone(),
+            fused: fused_initial.clone(),
             payload: payload.clone(),
         }];
 
@@ -4671,7 +4834,7 @@ impl FsfsRuntime {
                 resources.vector_index.as_ref(),
                 resources.quality_embedder.as_ref(),
             ) {
-                let quality_budget = plan.quality_stage.candidate_budget.max(limit);
+                let quality_budget = plan.quality_stage.candidate_budget.max(planning_limit);
                 let quality_outcome = match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
                         match index.search_top_k(&query_embedding, quality_budget, None) {
@@ -4687,25 +4850,36 @@ impl FsfsRuntime {
 
                 match quality_outcome {
                     Ok(quality_candidates) => {
-                        let fused_refined = orchestrator.fuse_rankings(
-                            &lexical_candidates,
+                        let fused_refined_head = orchestrator.fuse_rankings(
+                            &lexical_head_candidates,
                             &quality_candidates,
                             fusion_budget,
                             0,
                         );
-                        let filtered_refined =
-                            Self::apply_search_filter(&fused_refined, filter_expr.as_ref());
+                        let filtered_refined_head =
+                            Self::apply_search_filter(&fused_refined_head, filter_expr.as_ref());
+                        let fused_refined = if output_limit > filtered_refined_head.len()
+                            && !lexical_candidates.is_empty()
+                        {
+                            Self::merge_with_lexical_tail(
+                                &filtered_refined_head,
+                                &lexical_candidates,
+                                filter_expr.as_ref(),
+                            )
+                        } else {
+                            filtered_refined_head
+                        };
                         let refined_payload = Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
                             SearchOutputPhase::Refined,
-                            &filtered_refined,
+                            &fused_refined,
                             &snippets_by_doc,
-                            limit,
+                            output_limit,
                         );
                         artifacts.push(SearchPhaseArtifact {
                             phase: SearchOutputPhase::Refined,
-                            fused: filtered_refined,
+                            fused: fused_refined,
                             payload: refined_payload,
                         });
                     }
@@ -4727,13 +4901,13 @@ impl FsfsRuntime {
                             orchestrator,
                             &normalized_query,
                             SearchOutputPhase::RefinementFailed,
-                            &filtered_initial,
+                            &fused_initial,
                             &snippets_by_doc,
-                            limit,
+                            output_limit,
                         );
                         artifacts.push(SearchPhaseArtifact {
                             phase: SearchOutputPhase::RefinementFailed,
-                            fused: filtered_initial.clone(),
+                            fused: fused_initial.clone(),
                             payload: failed_payload,
                         });
                     }
@@ -4743,13 +4917,13 @@ impl FsfsRuntime {
                     orchestrator,
                     &normalized_query,
                     SearchOutputPhase::RefinementFailed,
-                    &filtered_initial,
+                    &fused_initial,
                     &snippets_by_doc,
-                    limit,
+                    output_limit,
                 );
                 artifacts.push(SearchPhaseArtifact {
                     phase: SearchOutputPhase::RefinementFailed,
-                    fused: filtered_initial.clone(),
+                    fused: fused_initial.clone(),
                     payload: failed_payload,
                 });
             }
@@ -7078,7 +7252,7 @@ impl FsfsRuntime {
             .map_err(tui_io_error)?;
         writeln!(
             stdout,
-            "  1) fsfs search \"your query\" --limit 10 --format table     # interactive results"
+            "  1) fsfs search \"your query\" --limit all --format table    # full recall"
         )
         .map_err(tui_io_error)?;
         writeln!(
@@ -7160,12 +7334,16 @@ impl FsfsRuntime {
         let no_color = self.cli_input.no_color || std::env::var_os("NO_COLOR").is_some();
         let status_payload = self.collect_status_payload()?;
         let mode_hint = self.search_mode_hint()?;
-        let result_limit = self
+        let configured_limit = self
             .cli_input
             .overrides
             .limit
-            .unwrap_or(self.config.search.default_limit)
-            .max(1);
+            .unwrap_or(self.config.search.default_limit);
+        let result_limit = if configured_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
+            FSFS_TUI_INTERACTIVE_RESULT_LIMIT
+        } else {
+            configured_limit.max(1)
+        };
         let mut state =
             SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
         let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
@@ -9058,7 +9236,7 @@ fn render_existing_index_dashboard_frame(
 
     Paragraph::new(Text::from_lines(vec![
         Line::from(Span::styled(
-            "fsfs search \"query\" --limit 10",
+            "fsfs search \"query\" --limit all",
             ui_fg(no_color, PackedRgba::rgb(224, 238, 255)),
         )),
         Line::from(Span::styled(
@@ -10750,7 +10928,7 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         out,
         "{}",
         paint(
-            "NEXT: fsfs search \"your query\" --limit 10  |  fsfs search \"query\" --stream --format jsonl",
+            "NEXT: fsfs search \"your query\" --limit all  |  fsfs search \"query\" --stream --format jsonl",
             "38;5;244",
             no_color
         )
@@ -13927,6 +14105,11 @@ mod tests {
 
     #[test]
     fn write_and_read_version_cache_roundtrip() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "fsfs-version-cache-test-{}-{}.json",
+            std::process::id(),
+            super::epoch_now()
+        ));
         let cache = super::VersionCheckCache {
             checked_at_epoch: super::epoch_now(),
             current_version: env!("CARGO_PKG_VERSION").into(),
@@ -13934,12 +14117,11 @@ mod tests {
             release_url: "https://example.com".into(),
             ttl_seconds: 86_400,
         };
-        // Write it.
-        super::write_version_cache(&cache).unwrap();
-        // Read it back.
-        let loaded = super::read_version_cache().unwrap();
+        super::write_version_cache_to_path(&temp_path, &cache).unwrap();
+        let loaded = super::read_version_cache_from_path(&temp_path).unwrap();
         assert_eq!(loaded.latest_version, "v99.0.0");
         assert_eq!(loaded.release_url, "https://example.com");
+        let _ = fs::remove_file(temp_path);
     }
 
     #[test]

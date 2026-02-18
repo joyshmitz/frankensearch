@@ -848,7 +848,7 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            default_limit: 10,
+            default_limit: 0,
             quality_weight: 0.7,
             rrf_k: 60.0,
             quality_timeout_ms: 500,
@@ -2398,11 +2398,11 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
         });
     }
 
-    if !(1_usize..=200_usize).contains(&config.search.default_limit) {
+    if config.search.default_limit > 1_000_000 {
         return Err(SearchError::InvalidConfig {
             field: "search.default_limit".into(),
             value: config.search.default_limit.to_string(),
-            reason: "must be between 1 and 200".into(),
+            reason: "must be 0 (all results) or between 1 and 1000000".into(),
         });
     }
 
@@ -3043,7 +3043,10 @@ mod tests {
             "[indexing]\nembedding_batch_size = 0\n",
             "indexing.embedding_batch_size",
         );
-        assert_invalid_field("[search]\ndefault_limit = 0\n", "search.default_limit");
+        assert_invalid_field(
+            "[search]\ndefault_limit = 1000001\n",
+            "search.default_limit",
+        );
         assert_invalid_field("[search]\nrrf_k = 0.5\n", "search.rrf_k");
         assert_invalid_field(
             "[search]\nquality_timeout_ms = 49\n",
@@ -3442,7 +3445,7 @@ mod tests {
         assert_eq!(result.config.discovery.roots, vec![".".to_string()]);
         assert!(!result.config.discovery.follow_symlinks);
         assert_eq!(result.config.storage.index_dir, ".frankensearch");
-        assert_eq!(result.config.search.default_limit, 10);
+        assert_eq!(result.config.search.default_limit, 0);
     }
 
     #[test]
@@ -4182,7 +4185,7 @@ mod tests {
         let config = super::FsfsConfig::default();
         assert_eq!(config.discovery.roots, vec![".".to_string()]);
         assert_eq!(config.indexing.fast_model, "potion-multilingual-128M");
-        assert_eq!(config.search.default_limit, 10);
+        assert_eq!(config.search.default_limit, 0);
         assert_eq!(config.pressure.profile, super::PressureProfile::Performance);
         assert_eq!(config.tui.theme, super::TuiTheme::Dark);
         assert_eq!(config.storage.index_dir, ".frankensearch");
@@ -4202,7 +4205,7 @@ mod tests {
     #[test]
     fn search_config_default_values() {
         let cfg = super::SearchConfig::default();
-        assert_eq!(cfg.default_limit, 10);
+        assert_eq!(cfg.default_limit, 0);
         assert!((cfg.quality_weight - 0.7).abs() < f64::EPSILON);
         assert!((cfg.rrf_k - 60.0).abs() < f64::EPSILON);
         assert_eq!(cfg.quality_timeout_ms, 500);
@@ -4668,8 +4671,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_default_limit_201_rejected() {
-        assert_invalid_field("[search]\ndefault_limit = 201\n", "search.default_limit");
+    fn validate_default_limit_1000001_rejected() {
+        assert_invalid_field(
+            "[search]\ndefault_limit = 1000001\n",
+            "search.default_limit",
+        );
     }
 
     // ── ConfigLoadResult::to_loaded_event ──

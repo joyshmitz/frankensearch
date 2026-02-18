@@ -394,7 +394,7 @@ where
             }
             "--limit" | "-l" => {
                 let value = expect_value(&tokens, idx, "--limit")?;
-                input.overrides.limit = Some(parse_usize(value, "search.default_limit")?);
+                input.overrides.limit = Some(parse_search_limit(value)?);
                 idx += 2;
             }
             "--format" | "-f" => {
@@ -822,6 +822,13 @@ fn parse_usize(value: &str, field: &str) -> SearchResult<usize> {
         })
 }
 
+fn parse_search_limit(value: &str) -> SearchResult<usize> {
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(0);
+    }
+    parse_usize(value, "search.default_limit")
+}
+
 #[must_use]
 fn is_help_flag(token: &str) -> bool {
     matches!(token, "--help" | "-h")
@@ -1019,6 +1026,12 @@ mod tests {
         assert_eq!(input.overrides.limit, Some(5));
         assert_eq!(input.format, OutputFormat::Csv);
         assert_eq!(input.overrides.explain, Some(true));
+    }
+
+    #[test]
+    fn parse_limit_all_alias() {
+        let input = parse_cli_args(["search", "query", "--limit", "all"]).unwrap();
+        assert_eq!(input.overrides.limit, Some(0));
     }
 
     #[test]
