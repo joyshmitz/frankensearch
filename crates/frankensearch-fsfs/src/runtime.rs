@@ -313,11 +313,28 @@ const INDEXING_TUI_RATE_HISTORY_LIMIT: usize = 96;
 const INDEXING_TUI_SPARKLINE_WIDTH: usize = 28;
 const INDEXING_TUI_EMA_ALPHA: f64 = 0.24;
 const FSFS_TUI_POLL_INTERVAL_MS: u64 = 120;
+const FSFS_TUI_SEARCH_POLL_INTERVAL_MS: u64 = 12;
 const FSFS_TUI_STATUS_REFRESH_MS: u64 = 900;
-const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 32;
-const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 220;
-const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 320;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MS: u64 = 8;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MS: u64 = 140;
+const FSFS_TUI_QUALITY_DEBOUNCE_MS: u64 = 480;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS: u64 = 4;
+const FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS: u64 = 32;
+const FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS: u64 = 8;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS: u64 = 80;
+const FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS: u64 = 360;
+const FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS: u64 = 260;
+const FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS: u64 = 960;
+const FSFS_TUI_TYPING_INTERVAL_MIN_MS: u64 = 20;
+const FSFS_TUI_TYPING_INTERVAL_MAX_MS: u64 = 1_500;
+const FSFS_TUI_TYPING_CADENCE_DEFAULT_MS: u64 = 72;
+const FSFS_TUI_TYPING_CADENCE_ALPHA_PER_MILLE: u64 = 350;
+const FSFS_TUI_LATENCY_FAST_PATH_MS: u64 = 45;
+const FSFS_TUI_LATENCY_SLOW_PATH_MS: u64 = 110;
 const FSFS_TUI_SEARCH_HISTORY_LIMIT: usize = 72;
+const FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION: usize = 384;
+const FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD: usize = 2;
+const FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardSearchStage {
@@ -350,6 +367,51 @@ enum SearchExecutionMode {
     LexicalOnly,
 }
 
+struct SearchExecutionResources {
+    index_root: PathBuf,
+    lexical_index: Option<TantivyIndex>,
+    vector_index: Option<VectorIndex>,
+    fast_embedder: Option<Arc<dyn Embedder>>,
+    quality_embedder: Option<Arc<dyn Embedder>>,
+    fast_embedder_attempted: bool,
+    quality_embedder_attempted: bool,
+}
+
+impl SearchExecutionResources {
+    #[must_use]
+    fn capabilities_for_mode(
+        &self,
+        mode: SearchExecutionMode,
+        fast_only: bool,
+    ) -> QueryExecutionCapabilities {
+        QueryExecutionCapabilities {
+            lexical: if self.lexical_index.is_some() {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
+            fast_semantic: if !matches!(mode, SearchExecutionMode::LexicalOnly)
+                && self.vector_index.is_some()
+                && self.fast_embedder.is_some()
+            {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
+            quality_semantic: if matches!(mode, SearchExecutionMode::Full)
+                && !fast_only
+                && self.vector_index.is_some()
+                && self.quality_embedder.is_some()
+            {
+                CapabilityState::Enabled
+            } else {
+                CapabilityState::Disabled
+            },
+            rerank: CapabilityState::Disabled,
+        }
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct SearchDashboardState {
     status_payload: FsfsStatusPayload,
@@ -370,6 +432,11 @@ struct SearchDashboardState {
     search_invocations: u64,
     latency_history_ms: VecDeque<f64>,
     hits_history: VecDeque<f64>,
+    lexical_debounce_window_ms: u64,
+    semantic_debounce_window_ms: u64,
+    quality_debounce_window_ms: u64,
+    typing_cadence_ewma_ms: Option<u64>,
+    last_query_edit_at: Option<Instant>,
     result_limit: usize,
 }
 
@@ -411,6 +478,11 @@ impl SearchDashboardState {
             search_invocations: 0,
             latency_history_ms: VecDeque::with_capacity(FSFS_TUI_SEARCH_HISTORY_LIMIT),
             hits_history: VecDeque::with_capacity(FSFS_TUI_SEARCH_HISTORY_LIMIT),
+            lexical_debounce_window_ms: FSFS_TUI_LEXICAL_DEBOUNCE_MS,
+            semantic_debounce_window_ms: FSFS_TUI_SEMANTIC_DEBOUNCE_MS,
+            quality_debounce_window_ms: FSFS_TUI_QUALITY_DEBOUNCE_MS,
+            typing_cadence_ewma_ms: None,
+            last_query_edit_at: None,
             result_limit: result_limit.max(1),
         }
     }
@@ -436,6 +508,7 @@ impl SearchDashboardState {
 
     fn mark_query_dirty(&mut self) {
         let now = Instant::now();
+        self.record_query_edit(now);
         self.pending_lexical_refresh = true;
         self.lexical_pending_since = now;
         self.pending_semantic_refresh = true;
@@ -448,11 +521,11 @@ impl SearchDashboardState {
         let now = Instant::now();
         self.pending_lexical_refresh = true;
         self.lexical_pending_since = now
-            .checked_sub(Duration::from_millis(FSFS_TUI_LEXICAL_DEBOUNCE_MS))
+            .checked_sub(Duration::from_millis(self.lexical_debounce_window_ms))
             .unwrap_or(now);
         self.pending_semantic_refresh = true;
         self.semantic_pending_since = now
-            .checked_sub(Duration::from_millis(FSFS_TUI_SEMANTIC_DEBOUNCE_MS))
+            .checked_sub(Duration::from_millis(self.semantic_debounce_window_ms))
             .unwrap_or(now);
         self.pending_quality_refresh = false;
         self.quality_pending_since = now;
@@ -462,21 +535,21 @@ impl SearchDashboardState {
     fn should_refresh_lexical(&self) -> bool {
         self.pending_lexical_refresh
             && self.lexical_pending_since.elapsed()
-                >= Duration::from_millis(FSFS_TUI_LEXICAL_DEBOUNCE_MS)
+                >= Duration::from_millis(self.lexical_debounce_window_ms)
     }
 
     #[must_use]
     fn should_refresh_semantic(&self) -> bool {
         self.pending_semantic_refresh
             && self.semantic_pending_since.elapsed()
-                >= Duration::from_millis(FSFS_TUI_SEMANTIC_DEBOUNCE_MS)
+                >= Duration::from_millis(self.semantic_debounce_window_ms)
     }
 
     #[must_use]
     fn should_refresh_quality(&self) -> bool {
         self.pending_quality_refresh
             && self.quality_pending_since.elapsed()
-                >= Duration::from_millis(FSFS_TUI_QUALITY_DEBOUNCE_MS)
+                >= Duration::from_millis(self.quality_debounce_window_ms)
     }
 
     fn schedule_quality_refresh(&mut self) {
@@ -525,6 +598,7 @@ impl SearchDashboardState {
             let _ = self.latency_history_ms.pop_front();
         }
         self.latency_history_ms.push_back(value.max(0.0));
+        self.recompute_adaptive_debounce();
     }
 
     fn push_hit_sample(&mut self, value: f64) {
@@ -553,6 +627,84 @@ impl SearchDashboardState {
         } else {
             stages
         };
+    }
+
+    fn record_query_edit(&mut self, now: Instant) {
+        if let Some(previous) = self.last_query_edit_at {
+            let delta_ms = u64::try_from(now.saturating_duration_since(previous).as_millis())
+                .unwrap_or(u64::MAX);
+            if (FSFS_TUI_TYPING_INTERVAL_MIN_MS..=FSFS_TUI_TYPING_INTERVAL_MAX_MS)
+                .contains(&delta_ms)
+            {
+                let previous_ewma = self.typing_cadence_ewma_ms.unwrap_or(delta_ms);
+                let alpha = FSFS_TUI_TYPING_CADENCE_ALPHA_PER_MILLE.min(1_000);
+                let retained = previous_ewma.saturating_mul(1_000_u64.saturating_sub(alpha));
+                let incoming = delta_ms.saturating_mul(alpha);
+                let blended = retained.saturating_add(incoming).div_ceil(1_000);
+                self.typing_cadence_ewma_ms = Some(blended);
+            }
+        }
+        self.last_query_edit_at = Some(now);
+        self.recompute_adaptive_debounce();
+    }
+
+    fn recompute_adaptive_debounce(&mut self) {
+        let cadence_ms = self
+            .typing_cadence_ewma_ms
+            .unwrap_or(FSFS_TUI_TYPING_CADENCE_DEFAULT_MS)
+            .clamp(
+                FSFS_TUI_TYPING_INTERVAL_MIN_MS,
+                FSFS_TUI_TYPING_INTERVAL_MAX_MS,
+            );
+        let mut lexical = cadence_ms.div_ceil(6).clamp(
+            FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+            FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
+        );
+        if self.query_input.value().chars().count() <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
+            lexical = lexical.min(FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS);
+        }
+        let mut semantic = lexical.saturating_mul(12).clamp(
+            FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+            FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+        );
+        let mut quality = semantic.saturating_mul(3).saturating_add(40).clamp(
+            FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+            FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+        );
+
+        if let Some(latency_ms) = self.last_search_elapsed_ms {
+            if latency_ms >= FSFS_TUI_LATENCY_SLOW_PATH_MS {
+                semantic = semantic.saturating_add(40).clamp(
+                    FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+                    FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+                );
+                quality = quality.saturating_add(120).clamp(
+                    FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+                    FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+                );
+            } else if latency_ms <= FSFS_TUI_LATENCY_FAST_PATH_MS {
+                semantic = semantic.saturating_sub(20).clamp(
+                    FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
+                    FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+                );
+                quality = quality.saturating_sub(80).clamp(
+                    FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+                    FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
+                );
+            }
+        }
+
+        self.lexical_debounce_window_ms = lexical;
+        self.semantic_debounce_window_ms = semantic;
+        self.quality_debounce_window_ms = quality;
+    }
+
+    #[must_use]
+    fn typing_cadence_ms_label(&self) -> String {
+        format_count_u64(
+            self.typing_cadence_ewma_ms
+                .unwrap_or(FSFS_TUI_TYPING_CADENCE_DEFAULT_MS),
+        )
     }
 }
 
@@ -4132,6 +4284,25 @@ impl FsfsRuntime {
             .collect())
     }
 
+    async fn execute_search_payloads_with_mode_using_resources(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        let artifacts = self
+            .execute_search_phase_artifacts_with_mode_using_resources(
+                cx, query, limit, mode, resources,
+            )
+            .await?;
+        Ok(artifacts
+            .into_iter()
+            .map(|artifact| artifact.payload)
+            .collect())
+    }
+
     fn apply_search_filter(
         fused: &[FusedCandidate],
         filter_expr: Option<&SearchFilterExpr>,
@@ -4171,6 +4342,26 @@ impl FsfsRuntime {
         limit: usize,
         mode: SearchExecutionMode,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        let mut resources = self.prepare_search_execution_resources(mode)?;
+        self.execute_search_phase_artifacts_with_mode_using_resources(
+            cx,
+            query,
+            limit,
+            mode,
+            &mut resources,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_search_phase_artifacts_with_mode_using_resources(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
+    ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         let normalized_query = query
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -4192,97 +4383,47 @@ impl FsfsRuntime {
         }
 
         let search_start = Instant::now();
-        let index_root = self.resolve_status_index_root()?;
-        let lexical_path = index_root.join("lexical");
-        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-
-        let lexical_index = if lexical_path.exists() {
-            Some(TantivyIndex::open(&lexical_path)?)
-        } else {
-            None
-        };
-        let lexical_available = lexical_index.is_some();
-        let vector_index = if vector_path.exists() {
-            match VectorIndex::open(&vector_path) {
-                Ok(index) => Some(index),
-                Err(error) if lexical_available => {
-                    warn!(
-                        error = %error,
-                        path = %vector_path.display(),
-                        "fsfs search falling back to lexical-only mode after vector index load failure"
-                    );
-                    None
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            None
-        };
-
-        if lexical_index.is_none() && vector_index.is_none() {
-            return Err(SearchError::InvalidConfig {
-                field: "cli.index_dir".to_owned(),
-                value: index_root.display().to_string(),
-                reason: "no index found; run `fsfs index <dir>` first".to_owned(),
-            });
+        let lexical_available = resources.lexical_index.is_some();
+        if !matches!(mode, SearchExecutionMode::LexicalOnly) && resources.vector_index.is_some() {
+            self.maybe_prepare_fast_embedder(resources, lexical_available)?;
         }
-
-        let mut fast_embedder = None;
-        if vector_index.is_some() && !matches!(mode, SearchExecutionMode::LexicalOnly) {
-            match self.resolve_fast_embedder() {
-                Ok(embedder) => fast_embedder = Some(embedder),
-                Err(error) if lexical_available => {
-                    info!(
-                        error = %error,
-                        "fsfs search falling back to lexical-only mode after fast embedder init failure"
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        let mut quality_embedder = None;
-        if vector_index.is_some()
-            && matches!(mode, SearchExecutionMode::Full)
+        if matches!(mode, SearchExecutionMode::Full)
             && !self.config.search.fast_only
+            && resources.vector_index.is_some()
         {
-            match self.resolve_quality_embedder() {
-                Ok(Some(embedder)) => quality_embedder = Some(embedder),
-                Ok(None) => {}
-                Err(error) if lexical_available => {
-                    info!(
-                        error = %error,
-                        "fsfs search continuing without quality embedder after initialization failure"
-                    );
-                }
-                Err(error) => return Err(error),
+            if let Some(index) = resources.vector_index.as_ref()
+                && index.dimension() != FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION
+            {
+                resources.quality_embedder = None;
+                resources.quality_embedder_attempted = true;
+                info!(
+                    index_dimension = index.dimension(),
+                    expected_quality_dimension = FSFS_DEFAULT_QUALITY_EMBEDDER_DIMENSION,
+                    "fsfs search skipping quality semantic tier because vector index dimension targets non-quality embedding"
+                );
+            } else if let (Some(index), Some(fast_embedder)) = (
+                resources.vector_index.as_ref(),
+                resources.fast_embedder.as_ref(),
+            ) && index.embedder_id().eq_ignore_ascii_case(fast_embedder.id())
+            {
+                resources.quality_embedder = None;
+                resources.quality_embedder_attempted = true;
+                info!(
+                    index_embedder_id = index.embedder_id(),
+                    fast_embedder_id = fast_embedder.id(),
+                    "fsfs search skipping quality semantic tier because vector index targets fast-tier embedder"
+                );
             }
         }
+        if matches!(mode, SearchExecutionMode::Full)
+            && !self.config.search.fast_only
+            && resources.vector_index.is_some()
+            && !resources.quality_embedder_attempted
+        {
+            self.maybe_prepare_quality_embedder(resources, lexical_available)?;
+        }
 
-        let capabilities = QueryExecutionCapabilities {
-            lexical: if lexical_index.is_some() {
-                CapabilityState::Enabled
-            } else {
-                CapabilityState::Disabled
-            },
-            fast_semantic: if !matches!(mode, SearchExecutionMode::LexicalOnly)
-                && vector_index.is_some()
-                && fast_embedder.is_some()
-            {
-                CapabilityState::Enabled
-            } else {
-                CapabilityState::Disabled
-            },
-            quality_semantic: if matches!(mode, SearchExecutionMode::Full)
-                && vector_index.is_some()
-                && quality_embedder.is_some()
-            {
-                CapabilityState::Enabled
-            } else {
-                CapabilityState::Disabled
-            },
-            rerank: CapabilityState::Disabled,
-        };
+        let capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
         let planner = QueryPlanner::from_fsfs(&self.config);
         let plan = planner.execution_plan_for_query(&normalized_query, Some(limit), capabilities);
 
@@ -4298,12 +4439,33 @@ impl FsfsRuntime {
             "fsfs search query planned"
         );
 
+        let short_query_budget_cap =
+            if normalized_query.chars().count() <= FSFS_SEARCH_SHORT_QUERY_CHAR_THRESHOLD {
+                Some(
+                    limit
+                        .saturating_mul(FSFS_SEARCH_SHORT_QUERY_BUDGET_MULTIPLIER)
+                        .max(limit),
+                )
+            } else {
+                None
+            };
+
         let lexical_start = Instant::now();
-        let lexical_budget = plan.lexical_stage.candidate_budget.max(limit);
+        let lexical_budget =
+            if matches!(mode, SearchExecutionMode::LexicalOnly) && filter_expr.is_none() {
+                limit.saturating_mul(2).max(limit)
+            } else {
+                let planned_budget = plan.lexical_stage.candidate_budget.max(limit);
+                if filter_expr.is_none() {
+                    short_query_budget_cap.map_or(planned_budget, |cap| planned_budget.min(cap))
+                } else {
+                    planned_budget
+                }
+            };
         let snippet_config = SnippetConfig::default();
         let mut snippets_by_doc = HashMap::new();
         let lexical_candidates = if plan.lexical_stage.enabled {
-            if let Some(lexical) = lexical_index.as_ref() {
+            if let Some(lexical) = resources.lexical_index.as_ref() {
                 let hits = lexical.search_with_snippets(
                     cx,
                     &normalized_query,
@@ -4329,9 +4491,24 @@ impl FsfsRuntime {
         let lexical_elapsed_ms = lexical_start.elapsed().as_millis();
 
         let semantic_start = Instant::now();
-        let semantic_budget = plan.semantic_stage.candidate_budget.max(limit);
+        let semantic_budget = if let Some(short_query_cap) = short_query_budget_cap {
+            plan.semantic_stage
+                .candidate_budget
+                .max(limit)
+                .min(short_query_cap)
+        } else if matches!(mode, SearchExecutionMode::FastOnly) {
+            plan.semantic_stage
+                .candidate_budget
+                .max(limit)
+                .min(limit.saturating_mul(3).max(limit))
+        } else {
+            plan.semantic_stage.candidate_budget.max(limit)
+        };
         let semantic_candidates = if plan.semantic_stage.enabled {
-            if let (Some(index), Some(embedder)) = (vector_index.as_ref(), fast_embedder.as_ref()) {
+            if let (Some(index), Some(embedder)) = (
+                resources.vector_index.as_ref(),
+                resources.fast_embedder.as_ref(),
+            ) {
                 match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
                         match index.search_top_k(&query_embedding, semantic_budget, None) {
@@ -4394,9 +4571,10 @@ impl FsfsRuntime {
         }];
 
         if plan.quality_stage.enabled {
-            if let (Some(index), Some(embedder)) =
-                (vector_index.as_ref(), quality_embedder.as_ref())
-            {
+            if let (Some(index), Some(embedder)) = (
+                resources.vector_index.as_ref(),
+                resources.quality_embedder.as_ref(),
+            ) {
                 let quality_budget = plan.quality_stage.candidate_budget.max(limit);
                 let quality_outcome = match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
@@ -4436,10 +4614,19 @@ impl FsfsRuntime {
                         });
                     }
                     Err(error) => {
-                        info!(
-                            error = %error,
-                            "fsfs quality refinement failed; falling back to initial phase payload"
-                        );
+                        if let SearchError::DimensionMismatch { .. } = error {
+                            resources.quality_embedder = None;
+                            resources.quality_embedder_attempted = true;
+                            info!(
+                                error = %error,
+                                "fsfs quality refinement disabled for this session after embedder/index dimension mismatch"
+                            );
+                        } else {
+                            info!(
+                                error = %error,
+                                "fsfs quality refinement failed; falling back to initial phase payload"
+                            );
+                        }
                         let failed_payload = Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -4474,7 +4661,7 @@ impl FsfsRuntime {
 
         if let Some(last) = artifacts.last()
             && let Err(error) = self.persist_explain_session(
-                &index_root,
+                &resources.index_root,
                 &normalized_query,
                 last.phase,
                 &last.fused,
@@ -4482,7 +4669,7 @@ impl FsfsRuntime {
         {
             warn!(
                 error = %error,
-                path = %Self::explain_session_path(&index_root).display(),
+                path = %Self::explain_session_path(&resources.index_root).display(),
                 "failed to persist explain-session context for follow-up `fsfs explain`"
             );
         }
@@ -5804,6 +5991,188 @@ impl FsfsRuntime {
         Ok(stack.quality_arc())
     }
 
+    fn prepare_search_execution_resources(
+        &self,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<SearchExecutionResources> {
+        let index_root = self.resolve_status_index_root()?;
+        let lexical_path = index_root.join("lexical");
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        let lexical_index = if lexical_path.exists() {
+            Some(TantivyIndex::open(&lexical_path)?)
+        } else {
+            None
+        };
+        let lexical_available = lexical_index.is_some();
+
+        let should_open_vector =
+            !matches!(mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
+        let vector_index = if should_open_vector && vector_path.exists() {
+            match VectorIndex::open(&vector_path) {
+                Ok(index) => Some(index),
+                Err(error) if lexical_available => {
+                    warn!(
+                        error = %error,
+                        path = %vector_path.display(),
+                        "fsfs search falling back to lexical-only mode after vector index load failure"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+
+        if lexical_index.is_none() && vector_index.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "no index found; run `fsfs index <dir>` first".to_owned(),
+            });
+        }
+
+        Ok(SearchExecutionResources {
+            index_root,
+            lexical_index,
+            vector_index,
+            fast_embedder: None,
+            quality_embedder: None,
+            fast_embedder_attempted: false,
+            quality_embedder_attempted: false,
+        })
+    }
+
+    fn hash_embedder_for_vector_index(index: &VectorIndex) -> Option<Arc<dyn Embedder>> {
+        let index_embedder_id = index.embedder_id();
+        if index_embedder_id.eq_ignore_ascii_case("fnv1a-256") {
+            return Some(Arc::new(HashEmbedder::default_256()));
+        }
+        if index_embedder_id.eq_ignore_ascii_case("fnv1a-384") {
+            return Some(Arc::new(HashEmbedder::default_384()));
+        }
+        if index_embedder_id.eq_ignore_ascii_case("fnv1a-custom")
+            || index_embedder_id
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("fnv1a-"))
+        {
+            return Some(Arc::new(HashEmbedder::new(
+                index.dimension(),
+                HashAlgorithm::FnvModular,
+            )));
+        }
+        None
+    }
+
+    fn maybe_prepare_fast_embedder(
+        &self,
+        resources: &mut SearchExecutionResources,
+        lexical_available: bool,
+    ) -> SearchResult<()> {
+        if resources.fast_embedder.is_some() || resources.fast_embedder_attempted {
+            return Ok(());
+        }
+        resources.fast_embedder_attempted = true;
+
+        if let Some(index) = resources.vector_index.as_ref()
+            && let Some(embedder) = Self::hash_embedder_for_vector_index(index)
+        {
+            info!(
+                index_embedder_id = index.embedder_id(),
+                fast_embedder_id = embedder.id(),
+                "fsfs search using hash embedder matched to vector index revision"
+            );
+            resources.fast_embedder = Some(embedder);
+            return Ok(());
+        }
+
+        match self.resolve_fast_embedder() {
+            Ok(embedder) => {
+                if let Some(index) = resources.vector_index.as_ref() {
+                    let index_embedder_id = index.embedder_id();
+                    if !index_embedder_id.eq_ignore_ascii_case(embedder.id()) {
+                        info!(
+                            index_embedder_id,
+                            fast_embedder_id = embedder.id(),
+                            "fsfs search disabling fast semantic tier after embedder-id mismatch"
+                        );
+                        return Ok(());
+                    }
+                    let index_dimension = index.dimension();
+                    let embedder_dimension = embedder.dimension();
+                    if embedder_dimension != index_dimension {
+                        info!(
+                            index_dimension,
+                            embedder_dimension,
+                            embedder_id = embedder.id(),
+                            "fsfs search disabling fast semantic tier after embedder/index dimension mismatch"
+                        );
+                        return Ok(());
+                    }
+                }
+                resources.fast_embedder = Some(embedder);
+                Ok(())
+            }
+            Err(error) if lexical_available => {
+                info!(
+                    error = %error,
+                    "fsfs search falling back to lexical-only mode after fast embedder init failure"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn maybe_prepare_quality_embedder(
+        &self,
+        resources: &mut SearchExecutionResources,
+        lexical_available: bool,
+    ) -> SearchResult<()> {
+        if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
+            return Ok(());
+        }
+        resources.quality_embedder_attempted = true;
+        match self.resolve_quality_embedder() {
+            Ok(Some(embedder)) => {
+                if let Some(index) = resources.vector_index.as_ref() {
+                    let index_embedder_id = index.embedder_id();
+                    if !index_embedder_id.eq_ignore_ascii_case(embedder.id()) {
+                        info!(
+                            index_embedder_id,
+                            quality_embedder_id = embedder.id(),
+                            "fsfs search skipping quality semantic tier after embedder-id mismatch"
+                        );
+                        return Ok(());
+                    }
+                    let index_dimension = index.dimension();
+                    let embedder_dimension = embedder.dimension();
+                    if embedder_dimension != index_dimension {
+                        info!(
+                            index_dimension,
+                            embedder_dimension,
+                            embedder_id = embedder.id(),
+                            "fsfs search skipping quality semantic tier after embedder/index dimension mismatch"
+                        );
+                        return Ok(());
+                    }
+                }
+                resources.quality_embedder = Some(embedder);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(error) if lexical_available => {
+                info!(
+                    error = %error,
+                    "fsfs search continuing without quality embedder after initialization failure"
+                );
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Build a live ingest pipeline for the watcher by opening existing indexes.
     fn build_live_ingest_pipeline(&self) -> SearchResult<LiveIngestPipeline> {
         let target_root = self.resolve_target_root()?;
@@ -6703,18 +7072,25 @@ impl FsfsRuntime {
             .max(1);
         let mut state =
             SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color);
+        let mut resources = self.prepare_search_execution_resources(SearchExecutionMode::Full)?;
 
         match FtuiSession::enter() {
             Ok(mut session) => {
-                self.run_search_dashboard_ftui(cx, &mut session, &mut state, no_color)
-                    .await
+                self.run_search_dashboard_ftui(
+                    cx,
+                    &mut session,
+                    &mut state,
+                    &mut resources,
+                    no_color,
+                )
+                .await
             }
             Err(error) => {
                 warn!(
                     error = %error,
                     "interactive fsfs search cockpit unavailable; falling back to ansi interaction"
                 );
-                self.run_search_dashboard_ansi(cx, &mut state, no_color)
+                self.run_search_dashboard_ansi(cx, &mut state, &mut resources, no_color)
                     .await
             }
         }
@@ -6726,19 +7102,23 @@ impl FsfsRuntime {
         cx: &Cx,
         session: &mut FtuiSession,
         state: &mut SearchDashboardState,
+        resources: &mut SearchExecutionResources,
         no_color: bool,
     ) -> SearchResult<()> {
         let mut last_status_refresh = Instant::now();
 
         loop {
             if state.should_refresh_lexical() {
-                self.refresh_search_dashboard_lexical(cx, state).await;
+                self.refresh_search_dashboard_lexical(cx, state, resources)
+                    .await;
             }
             if state.should_refresh_semantic() {
-                self.refresh_search_dashboard_semantic_fast(cx, state).await;
+                self.refresh_search_dashboard_semantic_fast(cx, state, resources)
+                    .await;
             }
             if state.should_refresh_quality() {
-                self.refresh_search_dashboard_quality(cx, state).await;
+                self.refresh_search_dashboard_quality(cx, state, resources)
+                    .await;
             }
 
             session.render(|frame| {
@@ -6747,7 +7127,7 @@ impl FsfsRuntime {
 
             let mut force_status_refresh = false;
             if let Some(event) =
-                session.poll_event(Duration::from_millis(FSFS_TUI_POLL_INTERVAL_MS))?
+                session.poll_event(Duration::from_millis(FSFS_TUI_SEARCH_POLL_INTERVAL_MS))?
             {
                 if state.search_active {
                     match &event {
@@ -6840,6 +7220,7 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         state: &mut SearchDashboardState,
+        resources: &mut SearchExecutionResources,
         no_color: bool,
     ) -> SearchResult<()> {
         let width = tui_terminal_width().clamp(88, 168);
@@ -6914,7 +7295,8 @@ impl FsfsRuntime {
 
             state.query_input.set_value(trimmed.to_owned());
             state.mark_query_dirty();
-            self.refresh_search_dashboard_full(cx, state).await;
+            self.refresh_search_dashboard_full(cx, state, resources)
+                .await;
         }
     }
 
@@ -6923,6 +7305,7 @@ impl FsfsRuntime {
         cx: &Cx,
         state: &mut SearchDashboardState,
         mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
     ) -> SearchResult<Vec<SearchPayload>> {
         let query = state.query_input.value().trim().to_owned();
         if query.is_empty() {
@@ -6932,7 +7315,13 @@ impl FsfsRuntime {
 
         let started = Instant::now();
         let result = self
-            .execute_search_payloads_with_mode(cx, &query, state.result_limit, mode)
+            .execute_search_payloads_with_mode_using_resources(
+                cx,
+                &query,
+                state.result_limit,
+                mode,
+                resources,
+            )
             .await;
 
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -6963,7 +7352,12 @@ impl FsfsRuntime {
         }
     }
 
-    async fn refresh_search_dashboard_lexical(&self, cx: &Cx, state: &mut SearchDashboardState) {
+    async fn refresh_search_dashboard_lexical(
+        &self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+        resources: &mut SearchExecutionResources,
+    ) {
         state.pending_lexical_refresh = false;
         state.clear_pending_quality_refresh();
         if state.query_input.value().trim().is_empty() {
@@ -6973,7 +7367,7 @@ impl FsfsRuntime {
         }
 
         if let Ok(payloads) = self
-            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::LexicalOnly)
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::LexicalOnly, resources)
             .await
         {
             state.set_phase_payloads(payloads, vec![DashboardSearchStage::Lexical]);
@@ -6990,6 +7384,7 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         state: &mut SearchDashboardState,
+        resources: &mut SearchExecutionResources,
     ) {
         state.pending_semantic_refresh = false;
         if state.query_input.value().trim().is_empty() {
@@ -6998,7 +7393,7 @@ impl FsfsRuntime {
         }
 
         match self
-            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::FastOnly)
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::FastOnly, resources)
             .await
         {
             Ok(payloads) => {
@@ -7036,14 +7431,19 @@ impl FsfsRuntime {
         }
     }
 
-    async fn refresh_search_dashboard_quality(&self, cx: &Cx, state: &mut SearchDashboardState) {
+    async fn refresh_search_dashboard_quality(
+        &self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+        resources: &mut SearchExecutionResources,
+    ) {
         state.clear_pending_quality_refresh();
         if state.query_input.value().trim().is_empty() {
             return;
         }
 
         match self
-            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full)
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full, resources)
             .await
         {
             Ok(payloads) => {
@@ -7080,14 +7480,19 @@ impl FsfsRuntime {
         }
     }
 
-    async fn refresh_search_dashboard_full(&self, cx: &Cx, state: &mut SearchDashboardState) {
+    async fn refresh_search_dashboard_full(
+        &self,
+        cx: &Cx,
+        state: &mut SearchDashboardState,
+        resources: &mut SearchExecutionResources,
+    ) {
         if state.query_input.value().trim().is_empty() {
             state.clear_search_results();
             return;
         }
 
         if let Ok(payloads) = self
-            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full)
+            .refresh_search_dashboard_mode(cx, state, SearchExecutionMode::Full, resources)
             .await
         {
             let has_semantic_hits = payloads
@@ -7887,17 +8292,12 @@ fn score_index_root(root: &Path, stats: &RootProbeStats, home: Option<&Path>) ->
     score.saturating_add(size_bonus.min(2_000))
 }
 
-#[allow(clippy::naive_bytecount)]
 fn count_non_empty_lines(content: &str) -> u64 {
-    if content.is_empty() {
-        return 0;
-    }
-    let newline_count = content
-        .as_bytes()
-        .iter()
-        .filter(|&&byte| byte == b'\n')
+    let count = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
         .count();
-    u64::try_from(newline_count.saturating_add(1)).unwrap_or(u64::MAX)
+    u64::try_from(count).unwrap_or(u64::MAX)
 }
 
 fn truncate_middle(text: &str, max_chars: usize) -> String {
@@ -8821,6 +9221,13 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
         .mode_hint
         .as_deref()
         .unwrap_or("Search mode: full hybrid semantic + lexical.");
+    let adaptive_debounce_line = format!(
+        "adaptive debounce={} / {} / {} ms  cadence~{} ms",
+        format_count_u64(state.lexical_debounce_window_ms),
+        format_count_u64(state.semantic_debounce_window_ms),
+        format_count_u64(state.quality_debounce_window_ms),
+        state.typing_cadence_ms_label()
+    );
     let corpus_lines = vec![
         Line::from(Span::styled(
             format!(
@@ -8847,6 +9254,13 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
                 usize::from(right[0].width).saturating_sub(6).max(20),
             ),
             ui_fg(no_color, PackedRgba::rgb(141, 163, 199)),
+        )),
+        Line::from(Span::styled(
+            truncate_tail(
+                &adaptive_debounce_line,
+                usize::from(right[0].width).saturating_sub(6).max(20),
+            ),
+            ui_fg(no_color, PackedRgba::rgb(124, 146, 184)),
         )),
     ];
     Paragraph::new(Text::from_lines(corpus_lines))
@@ -8963,8 +9377,12 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
         Line::from(Span::styled(
             format!(
                 "active rank={} / {}",
-                format_count_usize(state.active_hit_index.saturating_add(1)),
-                format_count_usize(returned_hits.max(1))
+                format_count_usize(if returned_hits == 0 {
+                    0
+                } else {
+                    state.active_hit_index.saturating_add(1)
+                }),
+                format_count_usize(returned_hits)
             ),
             ui_fg(no_color, PackedRgba::rgb(145, 168, 205)),
         )),
@@ -9040,6 +9458,7 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
     .render(layout[2], frame);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_search_dashboard_compact(
     frame: &mut Frame,
     state: &SearchDashboardState,
@@ -9078,6 +9497,15 @@ fn render_search_dashboard_compact(
             }
         ),
         ui_fg(no_color, PackedRgba::rgb(172, 194, 230)),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "adaptive debounce {} / {} / {} ms",
+            format_count_u64(state.lexical_debounce_window_ms),
+            format_count_u64(state.semantic_debounce_window_ms),
+            format_count_u64(state.quality_debounce_window_ms),
+        ),
+        ui_fg(no_color, PackedRgba::rgb(146, 168, 204)),
     )));
     if let Some(error) = state.last_error.as_deref() {
         lines.push(Line::from(Span::styled(
@@ -10595,7 +11023,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{IndexableDocument, LexicalSearch};
@@ -10606,7 +11034,13 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        EmbedderAvailability, FsfsRuntime, IndexStoragePaths, InterfaceMode, LiveIngestPipeline,
+        EmbedderAvailability, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MS, FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
+        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
+        IndexStoragePaths, InterfaceMode, LiveIngestPipeline, SearchDashboardState,
         VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
         degradation_controller_config_for_profile, render_status_table,
     };
@@ -10629,6 +11063,123 @@ mod tests {
         decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+
+    fn test_dashboard_status_payload() -> FsfsStatusPayload {
+        FsfsStatusPayload {
+            version: "0.1.0".to_owned(),
+            index: FsfsIndexStatus {
+                path: "/tmp/.frankensearch".to_owned(),
+                exists: true,
+                indexed_files: Some(128),
+                discovered_files: Some(256),
+                skipped_files: Some(12),
+                last_indexed_ms: None,
+                last_indexed_iso_utc: None,
+                stale_files: Some(5),
+                source_hash_hex: Some("deadbeef".to_owned()),
+                size_bytes: 1024 * 1024,
+                vector_index_bytes: 512 * 1024,
+                lexical_index_bytes: 512 * 1024,
+                metadata_bytes: 0,
+                embedding_cache_bytes: 0,
+            },
+            models: vec![FsfsModelStatus {
+                tier: "quality".to_owned(),
+                name: "all-MiniLM-L6-v2".to_owned(),
+                cache_path: "/tmp/models/all-MiniLM-L6-v2".to_owned(),
+                cached: true,
+                size_bytes: 90_873_196,
+            }],
+            config: FsfsConfigStatus {
+                source: "test".to_owned(),
+                index_dir: ".frankensearch".to_owned(),
+                model_dir: "/tmp/models".to_owned(),
+                rrf_k: 60.0,
+                quality_weight: 0.7,
+                quality_timeout_ms: 500,
+                fast_only: false,
+                pressure_profile: "performance".to_owned(),
+            },
+            runtime: FsfsRuntimeStatus {
+                disk_budget_stage: Some("normal".to_owned()),
+                disk_budget_action: Some("continue".to_owned()),
+                disk_budget_reason_code: Some("degrade.disk.within_budget".to_owned()),
+                disk_budget_bytes: Some(5 * 1024 * 1024 * 1024),
+                tracked_index_bytes: Some(1024 * 1024),
+                storage_pressure_emergency: false,
+            },
+        }
+    }
+
+    #[test]
+    fn search_dashboard_adaptive_debounce_defaults_to_base_windows() {
+        let state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        assert_eq!(
+            state.lexical_debounce_window_ms,
+            FSFS_TUI_LEXICAL_DEBOUNCE_MS
+        );
+        assert_eq!(
+            state.semantic_debounce_window_ms,
+            FSFS_TUI_SEMANTIC_DEBOUNCE_MS
+        );
+        assert_eq!(
+            state.quality_debounce_window_ms,
+            FSFS_TUI_QUALITY_DEBOUNCE_MS
+        );
+    }
+
+    #[test]
+    fn search_dashboard_adaptive_debounce_caps_short_query_lexical_window() {
+        let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        state.query_input.set_value("r".to_owned());
+        state.typing_cadence_ewma_ms = Some(220);
+        state.recompute_adaptive_debounce();
+
+        assert!(state.lexical_debounce_window_ms <= FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS);
+        assert!(
+            (FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS..=FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS)
+                .contains(&state.semantic_debounce_window_ms)
+        );
+        assert!(
+            (FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS..=FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS)
+                .contains(&state.quality_debounce_window_ms)
+        );
+    }
+
+    #[test]
+    fn search_dashboard_adaptive_debounce_backs_off_when_latency_is_slow() {
+        let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        state
+            .query_input
+            .set_value("distributed systems".to_owned());
+        state.typing_cadence_ewma_ms = Some(180);
+        state.push_latency_sample(160.0);
+        state.push_latency_sample(170.0);
+        state.push_latency_sample(155.0);
+        state.recompute_adaptive_debounce();
+
+        assert!(
+            (FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS..=FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS)
+                .contains(&state.lexical_debounce_window_ms)
+        );
+        assert!(state.semantic_debounce_window_ms > FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS);
+        assert!(state.quality_debounce_window_ms > FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS);
+    }
+
+    #[test]
+    fn search_dashboard_record_query_edit_tracks_typing_cadence() {
+        let mut state = SearchDashboardState::new(test_dashboard_status_payload(), None, 10, true);
+        let start = Instant::now();
+        state.record_query_edit(start);
+        state.record_query_edit(start + Duration::from_millis(40));
+        state.record_query_edit(start + Duration::from_millis(46));
+
+        let cadence = state
+            .typing_cadence_ewma_ms
+            .expect("cadence ewma should be set");
+        assert!(cadence >= 35);
+        assert!(cadence <= 60);
+    }
 
     #[test]
     fn runtime_modes_are_callable() {
@@ -10699,6 +11250,12 @@ mod tests {
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].0, "/home/tester");
         assert_eq!(plan[1].0, "/proc");
+    }
+
+    #[test]
+    fn count_non_empty_lines_ignores_blank_and_whitespace_lines() {
+        let text = "alpha\n\n   \n beta \n\t\n\ngamma";
+        assert_eq!(super::count_non_empty_lines(text), 3);
     }
 
     #[test]
