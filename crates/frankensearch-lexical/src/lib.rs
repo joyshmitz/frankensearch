@@ -16,6 +16,14 @@
 //! The `content` and `title` fields are searched with BM25 scoring.
 //! Title matches receive a 2× boost via `QueryParser::set_field_boost`.
 
+pub mod cass_compat;
+
+pub use cass_compat::{
+    CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument, CassFields, CassMergeStatus,
+    CassTantivyIndex, cass_build_preview, cass_build_schema, cass_ensure_tokenizer,
+    cass_fields_from_schema, cass_generate_edge_ngrams, cass_index_dir, cass_schema_hash_matches,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -158,6 +166,17 @@ pub struct LexicalDocHit {
     pub rank: usize,
     /// Tantivy document address inside a segment.
     pub doc_address: DocAddress,
+}
+
+/// Lightweight lexical hit used by hot paths that only need `doc_id` + score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LexicalIdHit {
+    /// Unique document identifier.
+    pub doc_id: String,
+    /// BM25 relevance score.
+    pub bm25_score: f32,
+    /// 0-based rank in the returned page.
+    pub rank: usize,
 }
 
 /// Execute a pre-built Tantivy query with offset pagination.
@@ -617,6 +636,52 @@ impl TantivyIndex {
                 snippet,
                 query_type: explanation,
                 metadata,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Search and return only `(doc_id, score, rank)` rows.
+    ///
+    /// This avoids metadata JSON decoding and is intended for latency-critical
+    /// callers that only require identifiers plus BM25 scores.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if the query cannot be parsed or search fails.
+    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    pub fn search_doc_ids(
+        &self,
+        _cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<LexicalIdHit>> {
+        let query = Self::truncate_query(query);
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parsed = self.parse_query_lenient(query);
+        let searcher = self.reader.searcher();
+        let top_docs = execute_query_with_offset(&searcher, &*parsed, limit, 0)?;
+
+        let mut results = Vec::with_capacity(top_docs.len());
+        for hit in top_docs {
+            let doc = load_doc(&searcher, hit.doc_address)?;
+            let doc_id = doc
+                .get_first(self.fields.id)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    debug!("tantivy document missing id field, using empty doc_id");
+                    ""
+                })
+                .to_owned();
+
+            results.push(LexicalIdHit {
+                doc_id,
+                bm25_score: hit.bm25_score,
+                rank: hit.rank,
             });
         }
 
@@ -1286,6 +1351,24 @@ mod tests {
             assert_eq!(results[0].rank, 0);
             assert_eq!(results[0].query_type, QueryExplanation::Simple);
             assert!(results[0].bm25_score > 0.0);
+        });
+    }
+
+    #[test]
+    fn search_doc_ids_returns_ranked_identifiers() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let docs = sample_docs();
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let results = idx.search_doc_ids(&cx, "Rust", 10).expect("search");
+            assert!(!results.is_empty());
+            for (expected_rank, hit) in results.iter().enumerate() {
+                assert_eq!(hit.rank, expected_rank, "rank should be sequential");
+                assert!(!hit.doc_id.is_empty());
+                assert!(hit.bm25_score.is_finite());
+            }
         });
     }
 
