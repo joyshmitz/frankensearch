@@ -9618,8 +9618,14 @@ impl FtuiSession {
                 ..BackendFeatures::default()
             },
         };
+        #[cfg(unix)]
         let backend = TtyBackend::open(80, 24, options)
             .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
+        #[cfg(not(unix))]
+        let backend = {
+            let _ = options;
+            TtyBackend::new(80, 24)
+        };
         Ok(Self {
             backend,
             grapheme_pool: GraphemePool::new(),

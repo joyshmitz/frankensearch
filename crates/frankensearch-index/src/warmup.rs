@@ -544,6 +544,20 @@ pub fn warm_up_mmap(
     }
 }
 
+#[inline]
+fn advise_willneed(mmap: &memmap2::Mmap, offset: usize, len: usize) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        mmap.advise_range(memmap2::Advice::WillNeed, offset, len)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (mmap, offset, len);
+        Ok(())
+    }
+}
+
 fn mmap_warm_up_full(
     mmap: &memmap2::Mmap,
     config: &WarmUpConfig,
@@ -554,7 +568,7 @@ fn mmap_warm_up_full(
     let actual_bytes = (total_pages.min(max_pages) * PAGE_SIZE).min(mmap.len());
 
     if actual_bytes > 0 {
-        mmap.advise_range(memmap2::Advice::WillNeed, 0, actual_bytes)?;
+        advise_willneed(mmap, 0, actual_bytes)?;
     }
 
     let pages_touched = pages_for_bytes(actual_bytes);
@@ -578,7 +592,7 @@ fn mmap_warm_up_header(
     let actual = header_bytes.min(max_bytes);
 
     if actual > 0 {
-        mmap.advise_range(memmap2::Advice::WillNeed, 0, actual)?;
+        advise_willneed(mmap, 0, actual)?;
     }
 
     let pages_touched = pages_for_bytes(actual);
@@ -627,7 +641,7 @@ fn mmap_warm_up_adaptive(
         let offset = page * PAGE_SIZE;
         let len = PAGE_SIZE.min(mmap.len().saturating_sub(offset));
         if len > 0 {
-            mmap.advise_range(memmap2::Advice::WillNeed, offset, len)?;
+            advise_willneed(mmap, offset, len)?;
             touched += 1;
         }
     }

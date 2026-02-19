@@ -1171,7 +1171,7 @@ pub struct ProcIoCounters {
 }
 
 /// Linux host pressure collector backed by `/proc`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct HostPressureCollector {
     io_ceiling_mib_per_sec: f64,
     previous_io: Option<ProcIoCounters>,

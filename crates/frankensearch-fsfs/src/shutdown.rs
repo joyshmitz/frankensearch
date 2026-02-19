@@ -6,9 +6,21 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+#[cfg(not(windows))]
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
-use signal_hook::iterator::{Handle as SignalHandle, Signals};
+#[cfg(windows)]
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+#[cfg(not(windows))]
+type SignalHandle = signal_hook::iterator::Handle;
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+struct SignalHandle;
 use tracing::{debug, info, warn};
+
+#[cfg(windows)]
+impl SignalHandle {
+    fn close(self) {}
+}
 
 /// Time window where a second `SIGINT` forces immediate exit.
 pub const FORCE_EXIT_WINDOW: Duration = Duration::from_secs(3);
@@ -95,39 +107,52 @@ impl ShutdownCoordinator {
             return Ok(());
         }
 
-        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]).map_err(|error| {
-            self.signal_registration_active
-                .store(false, Ordering::Release);
-            SearchError::SubsystemError {
-                subsystem: "fsfs",
-                source: Box::new(io::Error::other(format!(
-                    "failed to register signal listeners: {error}"
-                ))),
-            }
-        })?;
-        let handle = signals.handle();
+        #[cfg(windows)]
+        {
+            warn!(
+                "signal listener thread is not supported on windows; using shutdown requests only"
+            );
+        }
 
-        let coordinator = Arc::clone(self);
-        let listener = thread::Builder::new()
-            .name("fsfs-signal-listener".to_owned())
-            .spawn(move || {
-                for signal in signals.forever() {
-                    coordinator.handle_signal(signal);
-                }
-            })
-            .map_err(|error| {
-                self.signal_registration_active
-                    .store(false, Ordering::Release);
-                SearchError::SubsystemError {
-                    subsystem: "fsfs",
-                    source: Box::new(io::Error::other(format!(
-                        "failed to start signal listener thread: {error}"
-                    ))),
-                }
-            })?;
+        #[cfg(not(windows))]
+        {
+            let mut signals =
+                signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]).map_err(
+                    |error| {
+                        self.signal_registration_active
+                            .store(false, Ordering::Release);
+                        SearchError::SubsystemError {
+                            subsystem: "fsfs",
+                            source: Box::new(io::Error::other(format!(
+                                "failed to register signal listeners: {error}"
+                            ))),
+                        }
+                    },
+                )?;
+            let handle = signals.handle();
 
-        *lock_or_recover(&self.signal_handle) = Some(handle);
-        *lock_or_recover(&self.signal_listener_thread) = Some(listener);
+            let coordinator = Arc::clone(self);
+            let listener = thread::Builder::new()
+                .name("fsfs-signal-listener".to_owned())
+                .spawn(move || {
+                    for signal in signals.forever() {
+                        coordinator.handle_signal(signal);
+                    }
+                })
+                .map_err(|error| {
+                    self.signal_registration_active
+                        .store(false, Ordering::Release);
+                    SearchError::SubsystemError {
+                        subsystem: "fsfs",
+                        source: Box::new(io::Error::other(format!(
+                            "failed to start signal listener thread: {error}"
+                        ))),
+                    }
+                })?;
+
+            *lock_or_recover(&self.signal_handle) = Some(handle);
+            *lock_or_recover(&self.signal_listener_thread) = Some(listener);
+        }
 
         Ok(())
     }
@@ -233,10 +258,12 @@ impl ShutdownCoordinator {
                 self.request_shutdown(ShutdownReason::Signal(SIGTERM));
                 info!("received SIGTERM, initiating graceful shutdown");
             }
+            #[cfg(not(windows))]
             SIGHUP => {
                 self.request_config_reload();
                 info!("received SIGHUP, config reload queued");
             }
+            #[cfg(not(windows))]
             SIGQUIT => {
                 let dump_count = self.diagnostics_dump_count.fetch_add(1, Ordering::AcqRel) + 1;
                 warn!(

@@ -1408,6 +1408,16 @@ checksums_txt_url() {
   fi
 }
 
+sha256sums_url() {
+  local repo_slug="${FRANKENSEARCH_REPO:-${DEFAULT_REPO_SLUG}}"
+
+  if [[ "${RESOLVED_VERSION}" == "latest" ]]; then
+    printf 'https://github.com/%s/releases/latest/download/SHA256SUMS\n' "${repo_slug}"
+  else
+    printf 'https://github.com/%s/releases/download/%s/SHA256SUMS\n' "${repo_slug}" "${RESOLVED_VERSION}"
+  fi
+}
+
 artifact_url() {
   local repo_slug="${FRANKENSEARCH_REPO:-${DEFAULT_REPO_SLUG}}"
   local artifact
@@ -1521,6 +1531,22 @@ resolve_expected_checksum() {
       # Format: "<hex>  <filename>" per line
       local hash
       hash="$(grep -F "${artifact}" "${checksums_txt}" | awk '{print $1}' | head -n 1 | tr -d '[:space:]')"
+      if [[ "${hash}" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+        printf '%s' "${hash}"
+        return 0
+      fi
+    fi
+  fi
+
+  # Fallback: try SHA256SUMS (dsr release default checksum bundle).
+  local sha256sums_file="${TEMP_DIR}/SHA256SUMS"
+  local sha256sums_download_url
+  sha256sums_download_url="$(sha256sums_url)"
+  info "checksums.txt not found; trying SHA256SUMS from ${sha256sums_download_url}"
+  if http_download "${sha256sums_download_url}" "${sha256sums_file}" 2>/dev/null; then
+    if [[ -f "${sha256sums_file}" && -s "${sha256sums_file}" ]]; then
+      local hash
+      hash="$(grep -F "${artifact}" "${sha256sums_file}" | awk '{print $1}' | head -n 1 | tr -d '[:space:]')"
       if [[ "${hash}" =~ ^[A-Fa-f0-9]{64}$ ]]; then
         printf '%s' "${hash}"
         return 0
@@ -1680,15 +1706,30 @@ verify_installation() {
   info "Verifying installation..."
 
   local version_output=""
-  version_output="$("${target_binary}" --version 2>&1 || true)"
 
-  if [[ -z "${version_output}" ]]; then
-    warn "Binary at ${target_binary} did not produce --version output."
-    warn "The binary may require shared libraries not present on this system."
-    return 1
+  if version_output="$("${target_binary}" version 2>&1)"; then
+    if [[ -z "${version_output}" ]]; then
+      warn "Binary at ${target_binary} returned success for 'version' but produced no output."
+      return 1
+    fi
+    ok "Binary verification passed: ${version_output}"
+    return 0
   fi
 
-  ok "Binary verification passed: ${version_output}"
+  # Fallback for tools that expose --version instead of a version subcommand.
+  if version_output="$("${target_binary}" --version 2>&1)"; then
+    if [[ -z "${version_output}" ]]; then
+      warn "Binary at ${target_binary} returned success for '--version' but produced no output."
+      return 1
+    fi
+    ok "Binary verification passed (--version): ${version_output}"
+    return 0
+  fi
+
+  warn "Binary at ${target_binary} did not pass version checks."
+  warn "Command output: ${version_output}"
+  warn "The binary may require shared libraries not present on this system."
+  return 1
 }
 
 print_plan() {
