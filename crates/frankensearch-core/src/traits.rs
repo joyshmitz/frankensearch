@@ -212,6 +212,142 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+// ─── Synchronous Embedder Bridge ─────────────────────────────────────────
+
+/// Synchronous embedding interface for host projects that call embedders from
+/// non-async contexts.
+///
+/// Implement this trait for embedders whose `embed` operations are inherently
+/// synchronous (e.g., hash embedders, CPU-only ONNX inference). The companion
+/// [`SyncEmbedderAdapter`] wraps any `SyncEmbed` implementor into a full
+/// async [`Embedder`], suitable for use anywhere frankensearch expects one.
+///
+/// # Example
+///
+/// ```ignore
+/// use frankensearch_core::traits::{SyncEmbed, SyncEmbedderAdapter, Embedder};
+///
+/// struct MyHashEmbedder { dim: usize }
+///
+/// impl SyncEmbed for MyHashEmbedder {
+///     fn embed_sync(&self, text: &str) -> SearchResult<Vec<f32>> { /* ... */ }
+///     fn dimension(&self) -> usize { self.dim }
+///     fn id(&self) -> &str { "my-hash" }
+///     fn model_name(&self) -> &str { "My Hash Embedder" }
+///     fn is_semantic(&self) -> bool { false }
+///     fn category(&self) -> ModelCategory { ModelCategory::HashEmbedder }
+/// }
+///
+/// // Use it as a full async Embedder:
+/// let adapted: Box<dyn Embedder> = Box::new(SyncEmbedderAdapter(MyHashEmbedder { dim: 256 }));
+/// ```
+pub trait SyncEmbed: Send + Sync {
+    /// Synchronously embed a single text into a vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when embedding fails (for example model load,
+    /// inference, or input validation failures).
+    fn embed_sync(&self, text: &str) -> SearchResult<Vec<f32>>;
+
+    /// Synchronously embed a batch of texts.
+    ///
+    /// Default implementation calls [`embed_sync`](Self::embed_sync) for each text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SearchError`] encountered while embedding any item
+    /// in the batch.
+    fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed_sync(t)).collect()
+    }
+
+    /// The output dimensionality of embedding vectors.
+    fn dimension(&self) -> usize;
+
+    /// Unique, stable identifier for this embedder (stored in index headers).
+    fn id(&self) -> &str;
+
+    /// Human-readable model name.
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+
+    /// Whether the embedder is loaded and operational.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    /// Whether this embedder produces semantically meaningful vectors.
+    fn is_semantic(&self) -> bool;
+
+    /// The speed/quality category of this embedder.
+    fn category(&self) -> ModelCategory;
+
+    /// Default progressive tier assignment.
+    fn tier(&self) -> ModelTier {
+        self.category().default_tier()
+    }
+
+    /// Whether this model supports Matryoshka Representation Learning.
+    fn supports_mrl(&self) -> bool {
+        false
+    }
+}
+
+/// Adapts a [`SyncEmbed`] implementor into a full async [`Embedder`].
+///
+/// The sync `embed_sync()` call is wrapped in `Box::pin(async move { ... })`,
+/// which is zero-cost for pure computation (hash embedders) and acceptable for
+/// blocking ONNX inference when called from a `spawn_blocking` context.
+pub struct SyncEmbedderAdapter<T: SyncEmbed>(pub T);
+
+impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
+    fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move { self.0.embed_sync(text) })
+    }
+
+    fn embed_batch<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move { self.0.embed_batch_sync(texts) })
+    }
+
+    fn dimension(&self) -> usize {
+        self.0.dimension()
+    }
+
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.0.model_name()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.0.is_ready()
+    }
+
+    fn is_semantic(&self) -> bool {
+        self.0.is_semantic()
+    }
+
+    fn category(&self) -> ModelCategory {
+        self.0.category()
+    }
+
+    fn tier(&self) -> ModelTier {
+        self.0.tier()
+    }
+
+    fn supports_mrl(&self) -> bool {
+        self.0.supports_mrl()
+    }
+}
+
 // ─── Embedding Utilities ──────────────────────────────────────────────────
 
 /// L2-normalizes a vector to unit length.
@@ -338,6 +474,90 @@ pub trait Reranker: Send + Sync {
     }
 }
 
+// ─── Synchronous Reranker Bridge ────────────────────────────────────────────
+
+/// Synchronous reranking interface for host projects that call rerankers from
+/// non-async contexts.
+///
+/// Implement this trait for rerankers whose `rerank` operations are inherently
+/// synchronous (e.g., blocking ONNX inference). The companion
+/// [`SyncRerankerAdapter`] wraps any `SyncRerank` implementor into a full
+/// async [`Reranker`], suitable for use anywhere frankensearch expects one.
+pub trait SyncRerank: Send + Sync {
+    /// Synchronously rerank documents against a query.
+    ///
+    /// Returns documents sorted by descending cross-encoder score.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError`] when reranking fails (for example model load,
+    /// inference, or input validation failures).
+    fn rerank_sync(
+        &self,
+        query: &str,
+        documents: &[RerankDocument],
+    ) -> SearchResult<Vec<RerankScore>>;
+
+    /// A unique identifier for this reranker model.
+    fn id(&self) -> &str;
+
+    /// Human-friendly reranker model name.
+    fn model_name(&self) -> &str;
+
+    /// Maximum supported token length for query+document pair input.
+    fn max_length(&self) -> usize {
+        512
+    }
+
+    /// Whether this reranker is loaded and ready for inference.
+    fn is_available(&self) -> bool {
+        true
+    }
+}
+
+/// Adapts a [`SyncRerank`] implementor into a full async [`Reranker`].
+///
+/// The sync `rerank_sync()` call is wrapped in `Box::pin(async move { ... })`,
+/// which is acceptable for blocking ONNX inference when called from a
+/// `spawn_blocking` context.
+pub struct SyncRerankerAdapter<T: SyncRerank>(pub T);
+
+impl<T: SyncRerank + 'static> Reranker for SyncRerankerAdapter<T> {
+    fn rerank<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        query: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> SearchFuture<'a, Vec<RerankScore>> {
+        Box::pin(async move {
+            let mut scores = self.0.rerank_sync(query, documents)?;
+            scores.sort_by(|lhs, rhs| {
+                rhs.score
+                    .total_cmp(&lhs.score)
+                    .then_with(|| lhs.original_rank.cmp(&rhs.original_rank))
+                    .then_with(|| lhs.doc_id.cmp(&rhs.doc_id))
+            });
+            Ok(scores)
+        })
+    }
+
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+
+    fn model_name(&self) -> &str {
+        self.0.model_name()
+    }
+
+    fn max_length(&self) -> usize {
+        self.0.max_length()
+    }
+
+    fn is_available(&self) -> bool {
+        self.0.is_available()
+    }
+}
+
 // ─── Lexical Search Trait ───────────────────────────────────────────────────
 
 /// Trait for full-text lexical search backends.
@@ -439,7 +659,45 @@ impl MetricsExporter for NoOpMetricsExporter {
 
 #[cfg(test)]
 mod tests {
+    use asupersync::test_utils::run_test_with_cx;
+
     use super::*;
+
+    struct UnsortedSyncReranker;
+
+    impl SyncRerank for UnsortedSyncReranker {
+        fn rerank_sync(
+            &self,
+            _query: &str,
+            _documents: &[RerankDocument],
+        ) -> SearchResult<Vec<RerankScore>> {
+            Ok(vec![
+                RerankScore {
+                    doc_id: "doc-a".to_owned(),
+                    score: 0.8,
+                    original_rank: 2,
+                },
+                RerankScore {
+                    doc_id: "doc-b".to_owned(),
+                    score: 0.8,
+                    original_rank: 1,
+                },
+                RerankScore {
+                    doc_id: "doc-c".to_owned(),
+                    score: 0.3,
+                    original_rank: 0,
+                },
+            ])
+        }
+
+        fn id(&self) -> &'static str {
+            "unsorted-sync-reranker"
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Unsorted Sync Reranker"
+        }
+    }
 
     #[test]
     fn model_category_display() {
@@ -551,6 +809,36 @@ mod tests {
     #[test]
     fn metrics_exporter_trait_is_object_safe() {
         fn _takes_dyn_metrics_exporter(_: &dyn MetricsExporter) {}
+    }
+
+    #[test]
+    fn sync_reranker_adapter_sorts_descending_for_trait_contract() {
+        run_test_with_cx(|cx| async move {
+            let adapter = SyncRerankerAdapter(UnsortedSyncReranker);
+            let docs = vec![
+                RerankDocument {
+                    doc_id: "doc-a".to_owned(),
+                    text: "alpha".to_owned(),
+                },
+                RerankDocument {
+                    doc_id: "doc-b".to_owned(),
+                    text: "beta".to_owned(),
+                },
+                RerankDocument {
+                    doc_id: "doc-c".to_owned(),
+                    text: "gamma".to_owned(),
+                },
+            ];
+            let scores = adapter
+                .rerank(&cx, "query", &docs)
+                .await
+                .expect("adapter rerank should succeed");
+            let ids = scores
+                .iter()
+                .map(|score| score.doc_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec!["doc-b", "doc-a", "doc-c"]);
+        });
     }
 
     #[test]

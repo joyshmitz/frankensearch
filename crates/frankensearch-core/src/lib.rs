@@ -129,7 +129,8 @@ pub use query_class::QueryClass;
 pub use traits::{
     Embedder, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
     NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
-    SharedMetricsExporter, cosine_similarity, l2_normalize, truncate_embedding,
+    SharedMetricsExporter, SyncEmbed, SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
+    cosine_similarity, l2_normalize, truncate_embedding,
 };
 pub use types::{
     EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument, PhaseMetrics, RankChanges,

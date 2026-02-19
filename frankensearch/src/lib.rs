@@ -235,7 +235,8 @@ pub use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetric
 // Traits
 pub use frankensearch_core::traits::{
     Embedder, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
-    NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter,
+    NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
+    SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
 };
 
 // Reranker support types
@@ -302,6 +303,9 @@ pub use frankensearch_lexical::TantivyIndex;
 
 #[cfg(feature = "rerank")]
 pub use frankensearch_rerank::{FlashRankReranker, rerank_step};
+
+#[cfg(feature = "fastembed-reranker")]
+pub use frankensearch_rerank::FastEmbedReranker;
 
 // ─── IndexBuilder convenience API ────────────────────────────────────────────
 

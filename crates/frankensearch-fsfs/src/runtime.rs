@@ -366,12 +366,17 @@ const FSFS_SEARCH_FAST_STAGE_BUDGET_MULTIPLIER: usize = 2;
 const FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL: usize = 0;
 // This controls fast-phase head breadth, not final output cardinality.
 const FSFS_SEARCH_SEMANTIC_HEAD_LIMIT: usize = 1_000;
+// Progressive widening step (sqrt(output_limit - semantic_head_limit) * step).
+const FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP: usize = 16;
 const FSFS_SEARCH_SNIPPET_HEAD_LIMIT: usize = 200;
 const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v1";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v1";
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
+const FSFS_DAEMON_REQUEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
+const FSFS_DAEMON_RESPONSE_MAX_BYTES: usize = 4 << 20; // 4 MiB
+const FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS: u64 = 5_000;
 const FSFS_DAEMON_CONNECT_MAX_ATTEMPTS: usize = 80;
 const FSFS_DAEMON_CONNECT_RETRY_DELAY_MS: u64 = 25;
 
@@ -578,7 +583,6 @@ impl Drop for SocketPathGuard {
 
 #[derive(Debug, Clone, Copy)]
 struct SemanticRecallDecisionInput {
-    requested_limit: usize,
     output_limit: usize,
     planning_limit: usize,
     semantic_stage_enabled: bool,
@@ -586,6 +590,18 @@ struct SemanticRecallDecisionInput {
     lexical_stage_enabled: bool,
     lexical_head_count: usize,
     lexical_full_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticGateDecisionInput<'a> {
+    mode: SearchExecutionMode,
+    intent: QueryIntentClass,
+    query: &'a str,
+    output_limit: usize,
+    lexical_head_candidates: &'a [LexicalCandidate],
+    semantic_stage_enabled: bool,
+    lexical_stage_enabled: bool,
+    force_full_semantic_recall: bool,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -4343,8 +4359,18 @@ impl FsfsRuntime {
                 break;
             }
 
-            let request = Self::parse_search_serve_request(raw)?;
-            let response = self
+            let request = match Self::parse_search_serve_request(raw) {
+                Ok(request) => request,
+                Err(error) => {
+                    let response =
+                        Self::search_serve_error_response(String::new(), "full", error.to_string());
+                    Self::emit_search_serve_json_line(&response)?;
+                    continue;
+                }
+            };
+            let request_query = request.query.clone();
+            let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+            let response = match self
                 .execute_search_serve_request(
                     cx,
                     request,
@@ -4352,7 +4378,15 @@ impl FsfsRuntime {
                     &mut hot_cache,
                     hot_cache_enabled,
                 )
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => Self::search_serve_error_response(
+                    request_query,
+                    request_mode,
+                    error.to_string(),
+                ),
+            };
             Self::emit_search_serve_json_line(&response)?;
         }
 
@@ -4399,11 +4433,47 @@ impl FsfsRuntime {
         let hot_cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
 
         loop {
-            let (mut stream, _) = listener.accept().map_err(SearchError::Io)?;
-            let mut raw_request = String::new();
-            stream
-                .read_to_string(&mut raw_request)
-                .map_err(SearchError::Io)?;
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(SearchError::Io(error)),
+            };
+            if let Err(error) = stream.set_read_timeout(Some(Duration::from_millis(
+                FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
+            ))) {
+                warn!(
+                    error = %error,
+                    "fsfs daemon failed to set socket read timeout; skipping request"
+                );
+                continue;
+            }
+            if let Err(error) = stream.set_write_timeout(Some(Duration::from_millis(
+                FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS,
+            ))) {
+                warn!(
+                    error = %error,
+                    "fsfs daemon failed to set socket write timeout; skipping request"
+                );
+                continue;
+            }
+
+            let raw_request = match Self::read_search_serve_socket_request(&mut stream) {
+                Ok(Some(raw_request)) => raw_request,
+                Ok(None) => continue,
+                Err(error) => {
+                    let response =
+                        Self::search_serve_error_response(String::new(), "full", error.to_string());
+                    if let Err(write_error) =
+                        Self::write_search_serve_socket_response(&mut stream, &response)
+                    {
+                        warn!(
+                            error = %write_error,
+                            "fsfs daemon failed to write socket error response"
+                        );
+                    }
+                    continue;
+                }
+            };
             let raw = raw_request.trim();
             if raw.is_empty() {
                 continue;
@@ -4413,25 +4483,38 @@ impl FsfsRuntime {
                 break;
             }
 
-            let request = Self::parse_search_serve_request(raw)?;
-            let response = self
-                .execute_search_serve_request(
-                    cx,
-                    request,
-                    &mut resources,
-                    &mut hot_cache,
-                    hot_cache_enabled,
-                )
-                .await?;
-
-            let response_bytes =
-                serde_json::to_vec(&response).map_err(|source| SearchError::SubsystemError {
-                    subsystem: "fsfs.search.serve",
-                    source: Box::new(source),
-                })?;
-            stream.write_all(&response_bytes).map_err(SearchError::Io)?;
-            stream.write_all(b"\n").map_err(SearchError::Io)?;
-            stream.flush().map_err(SearchError::Io)?;
+            let response = match Self::parse_search_serve_request(raw) {
+                Ok(request) => {
+                    let request_query = request.query.clone();
+                    let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
+                    match self
+                        .execute_search_serve_request(
+                            cx,
+                            request,
+                            &mut resources,
+                            &mut hot_cache,
+                            hot_cache_enabled,
+                        )
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => Self::search_serve_error_response(
+                            request_query,
+                            request_mode,
+                            error.to_string(),
+                        ),
+                    }
+                }
+                Err(error) => {
+                    Self::search_serve_error_response(String::new(), "full", error.to_string())
+                }
+            };
+            if let Err(error) = Self::write_search_serve_socket_response(&mut stream, &response) {
+                warn!(
+                    error = %error,
+                    "fsfs daemon failed to write socket response"
+                );
+            }
         }
 
         Ok(())
@@ -4548,6 +4631,60 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    fn search_serve_error_response(
+        query: impl Into<String>,
+        mode: impl Into<String>,
+        error: impl Into<String>,
+    ) -> SearchServeResponse {
+        SearchServeResponse {
+            ok: false,
+            query: query.into(),
+            mode: mode.into(),
+            cached: false,
+            payloads: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_search_serve_socket_request(stream: &mut UnixStream) -> SearchResult<Option<String>> {
+        let mut raw_request = String::new();
+        let read_limit = FSFS_DAEMON_REQUEST_MAX_BYTES.saturating_add(1);
+        {
+            let mut limited_reader = (&mut *stream).take(read_limit as u64);
+            limited_reader
+                .read_to_string(&mut raw_request)
+                .map_err(SearchError::Io)?;
+        }
+        if raw_request.trim().is_empty() {
+            return Ok(None);
+        }
+        if raw_request.len() > FSFS_DAEMON_REQUEST_MAX_BYTES {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.serve.request".to_owned(),
+                value: "<payload>".to_owned(),
+                reason: format!("request exceeds {FSFS_DAEMON_REQUEST_MAX_BYTES} bytes limit"),
+            });
+        }
+        Ok(Some(raw_request))
+    }
+
+    #[cfg(unix)]
+    fn write_search_serve_socket_response(
+        stream: &mut UnixStream,
+        response: &SearchServeResponse,
+    ) -> SearchResult<()> {
+        let response_bytes =
+            serde_json::to_vec(response).map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.search.serve",
+                source: Box::new(source),
+            })?;
+        stream.write_all(&response_bytes).map_err(SearchError::Io)?;
+        stream.write_all(b"\n").map_err(SearchError::Io)?;
+        stream.flush().map_err(SearchError::Io)?;
+        Ok(())
+    }
+
     fn search_payloads_via_daemon(
         &self,
         query: &str,
@@ -4580,9 +4717,22 @@ impl FsfsRuntime {
             let _ = stream.shutdown(Shutdown::Write);
 
             let mut raw_response = String::new();
-            stream
-                .read_to_string(&mut raw_response)
-                .map_err(SearchError::Io)?;
+            {
+                let response_read_limit = FSFS_DAEMON_RESPONSE_MAX_BYTES.saturating_add(1);
+                let mut limited_reader = (&mut stream).take(response_read_limit as u64);
+                limited_reader
+                    .read_to_string(&mut raw_response)
+                    .map_err(SearchError::Io)?;
+            }
+            if raw_response.len() > FSFS_DAEMON_RESPONSE_MAX_BYTES {
+                return Err(SearchError::InvalidConfig {
+                    field: "cli.daemon".to_owned(),
+                    value: "search".to_owned(),
+                    reason: format!(
+                        "daemon response exceeded {FSFS_DAEMON_RESPONSE_MAX_BYTES} bytes"
+                    ),
+                });
+            }
             let response = serde_json::from_str::<SearchServeResponse>(raw_response.trim())
                 .map_err(|source| SearchError::SubsystemError {
                     subsystem: "fsfs.search.daemon",
@@ -4699,7 +4849,11 @@ impl FsfsRuntime {
         hasher.update(index_root.display().to_string().as_bytes());
         let digest = format!("{:x}", hasher.finalize());
         let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
-        Ok(std::env::temp_dir().join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))
+        let runtime_base = dirs::runtime_dir()
+            .or_else(|| dirs::cache_dir().map(|dir| dir.join("run")))
+            .unwrap_or_else(std::env::temp_dir);
+        let socket_dir = runtime_base.join("frankensearch").join("daemon");
+        Ok(socket_dir.join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))
     }
 
     fn emit_search_stream_started<W: Write>(
@@ -5316,17 +5470,73 @@ impl FsfsRuntime {
     }
 
     #[must_use]
+    fn resolve_planning_limit(output_limit: usize) -> usize {
+        if output_limit <= FSFS_SEARCH_SEMANTIC_HEAD_LIMIT {
+            return output_limit.max(1);
+        }
+        let overflow = output_limit.saturating_sub(FSFS_SEARCH_SEMANTIC_HEAD_LIMIT);
+        let widening =
+            Self::integer_sqrt(overflow).saturating_mul(FSFS_SEARCH_SEMANTIC_HEAD_PROGRESSIVE_STEP);
+        FSFS_SEARCH_SEMANTIC_HEAD_LIMIT
+            .saturating_add(widening)
+            .min(output_limit)
+            .max(1)
+    }
+
+    #[must_use]
+    const fn integer_sqrt(value: usize) -> usize {
+        if value <= 1 {
+            return value;
+        }
+        let mut low = 1_usize;
+        let mut high = value;
+        let mut answer = 1_usize;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            if mid <= value / mid {
+                answer = mid;
+                low = mid.saturating_add(1);
+            } else {
+                high = mid.saturating_sub(1);
+            }
+        }
+        answer
+    }
+
+    #[must_use]
     const fn should_force_full_semantic_recall(input: SemanticRecallDecisionInput) -> bool {
         if !input.semantic_stage_enabled || !input.semantic_index_available {
             return false;
-        }
-        if input.requested_limit == FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL {
-            return true;
         }
         input.output_limit > input.planning_limit
             && (!input.lexical_stage_enabled
                 || input.lexical_head_count == 0
                 || input.lexical_full_count < input.output_limit)
+    }
+
+    #[must_use]
+    fn semantic_gate_decision(input: SemanticGateDecisionInput<'_>) -> SemanticVoiDecision {
+        if !input.semantic_stage_enabled {
+            SemanticVoiDecision {
+                run_semantic: false,
+                posterior_useful: 0.0,
+                expected_loss_run: 1.0,
+                expected_loss_skip: 0.0,
+                reason_code: "semantic.voi.skip.stage_disabled",
+            }
+        } else if input.force_full_semantic_recall {
+            SemanticVoiDecision::force_run("semantic.voi.force.full_recall")
+        } else if !input.lexical_stage_enabled || input.lexical_head_candidates.is_empty() {
+            SemanticVoiDecision::force_run("semantic.voi.force.no_lexical_head")
+        } else {
+            Self::semantic_voi_decision(
+                input.mode,
+                input.intent,
+                input.query,
+                input.output_limit,
+                input.lexical_head_candidates,
+            )
+        }
     }
 
     #[must_use]
@@ -5587,7 +5797,7 @@ impl FsfsRuntime {
                 .saturating_add(index.wal_record_count())
         });
         let output_limit = Self::resolve_output_limit(limit, lexical_doc_count, vector_doc_count);
-        let planning_limit = output_limit.clamp(1, FSFS_SEARCH_SEMANTIC_HEAD_LIMIT);
+        let planning_limit = Self::resolve_planning_limit(output_limit);
         let search_start = Instant::now();
         let lexical_available = resources.lexical_index.is_some();
 
@@ -5710,7 +5920,6 @@ impl FsfsRuntime {
         let semantic_start = Instant::now();
         let force_full_semantic_recall =
             Self::should_force_full_semantic_recall(SemanticRecallDecisionInput {
-                requested_limit: limit,
                 output_limit,
                 planning_limit,
                 semantic_stage_enabled: plan.semantic_stage.enabled,
@@ -5719,6 +5928,10 @@ impl FsfsRuntime {
                 lexical_head_count: lexical_head_candidates.len(),
                 lexical_full_count: lexical_candidates.len(),
             });
+        let lexical_tail_complete = filter_expr.is_none()
+            && plan.lexical_stage.enabled
+            && !lexical_candidates.is_empty()
+            && lexical_candidates.len() >= output_limit;
         let semantic_budget_floor = if force_full_semantic_recall {
             output_limit
         } else {
@@ -5747,25 +5960,21 @@ impl FsfsRuntime {
                 .candidate_budget
                 .max(semantic_budget_floor)
         };
-        let semantic_decision = if !plan.semantic_stage.enabled {
-            SemanticVoiDecision {
-                run_semantic: false,
-                posterior_useful: 0.0,
-                expected_loss_run: 1.0,
-                expected_loss_skip: 0.0,
-                reason_code: "semantic.voi.skip.stage_disabled",
-            }
-        } else if !plan.lexical_stage.enabled || lexical_head_candidates.is_empty() {
-            SemanticVoiDecision::force_run("semantic.voi.force.no_lexical_head")
+        let semantic_budget = if force_full_semantic_recall || !lexical_tail_complete {
+            semantic_budget
         } else {
-            Self::semantic_voi_decision(
-                mode,
-                plan.intent.intent,
-                &normalized_query,
-                output_limit,
-                &lexical_head_candidates,
-            )
+            semantic_budget.min(planning_limit)
         };
+        let semantic_decision = Self::semantic_gate_decision(SemanticGateDecisionInput {
+            mode,
+            intent: plan.intent.intent,
+            query: &normalized_query,
+            output_limit,
+            lexical_head_candidates: &lexical_head_candidates,
+            semantic_stage_enabled: plan.semantic_stage.enabled,
+            lexical_stage_enabled: plan.lexical_stage.enabled,
+            force_full_semantic_recall,
+        });
         info!(
             phase = "semantic_gate",
             mode_override = ?mode,
@@ -5774,6 +5983,7 @@ impl FsfsRuntime {
             semantic_budget,
             output_limit,
             force_full_semantic_recall,
+            lexical_tail_complete,
             run_semantic = semantic_decision.run_semantic,
             posterior_useful_per_mille = f64_to_per_mille(semantic_decision.posterior_useful),
             expected_loss_run_per_mille = f64_to_per_mille(semantic_decision.expected_loss_run),
@@ -5887,11 +6097,16 @@ impl FsfsRuntime {
                 resources.quality_embedder.as_ref(),
             ) {
                 let quality_budget_floor = planning_limit;
+                let quality_budget_ceiling = if lexical_tail_complete {
+                    planning_limit
+                } else {
+                    output_limit
+                };
                 let quality_budget = plan
                     .quality_stage
                     .candidate_budget
                     .max(quality_budget_floor)
-                    .min(output_limit);
+                    .min(quality_budget_ceiling);
                 let quality_outcome = match embedder.embed(cx, &normalized_query).await {
                     Ok(query_embedding) => {
                         match index.search_top_k(&query_embedding, quality_budget, None) {
@@ -12840,15 +13055,16 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     use super::{
-        ContextPreviewFormat, EmbedderAvailability, FSFS_SEARCH_SNIPPET_HEAD_LIMIT,
-        FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MS,
-        FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS, FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS,
-        FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS, FSFS_TUI_QUALITY_DEBOUNCE_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS,
-        FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus, FsfsIndexStatus, FsfsModelStatus,
-        FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, InterfaceMode,
-        LiveIngestPipeline, SearchDashboardState, SearchExecutionMode, SemanticRecallDecisionInput,
+        ContextPreviewFormat, EmbedderAvailability, FSFS_DAEMON_REQUEST_MAX_BYTES,
+        FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MAX_MS, FSFS_TUI_LEXICAL_DEBOUNCE_MIN_MS,
+        FSFS_TUI_LEXICAL_DEBOUNCE_MS, FSFS_TUI_LEXICAL_DEBOUNCE_SHORT_QUERY_CAP_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MAX_MS, FSFS_TUI_QUALITY_DEBOUNCE_MIN_MS,
+        FSFS_TUI_QUALITY_DEBOUNCE_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MAX_MS,
+        FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
+        FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
+        IndexStoragePaths, InterfaceMode, LiveIngestPipeline, SearchDashboardState,
+        SearchExecutionMode, SemanticGateDecisionInput, SemanticRecallDecisionInput,
         VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
         is_likely_html_fragment, normalize_html_fragment_for_markdown, render_status_table,
@@ -13180,10 +13396,129 @@ mod tests {
     }
 
     #[test]
+    fn search_serve_error_response_marks_failed_reply_with_message() {
+        let response =
+            FsfsRuntime::search_serve_error_response("query text", "full", "parse failure");
+        assert!(!response.ok);
+        assert_eq!(response.query, "query text");
+        assert_eq!(response.mode, "full");
+        assert!(!response.cached);
+        assert!(response.payloads.is_empty());
+        assert_eq!(response.error.as_deref(), Some("parse failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_search_serve_socket_request_rejects_oversized_payload() {
+        use std::io::Write as _;
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut writer, mut reader) = UnixStream::pair().expect("socket pair");
+        let payload = "x".repeat(FSFS_DAEMON_REQUEST_MAX_BYTES.saturating_add(1));
+        let writer_task = thread::spawn(move || {
+            writer
+                .write_all(payload.as_bytes())
+                .expect("write oversized payload");
+            writer
+                .shutdown(Shutdown::Write)
+                .expect("shutdown write side");
+        });
+
+        let error = FsfsRuntime::read_search_serve_socket_request(&mut reader)
+            .expect_err("oversized request should fail");
+        writer_task.join().expect("writer thread");
+        match error {
+            frankensearch_core::SearchError::InvalidConfig { field, .. } => {
+                assert_eq!(field, "cli.serve.request");
+            }
+            other => panic!("expected InvalidConfig for oversized request, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_daemon_socket_path_uses_namespaced_runtime_directory() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let path = runtime
+            .default_daemon_socket_path()
+            .expect("daemon socket path");
+        let rendered = path.to_string_lossy();
+        assert!(
+            rendered.contains("frankensearch/daemon"),
+            "socket path should be namespaced under a per-user runtime/cache directory: {rendered}"
+        );
+        assert!(
+            rendered.ends_with(".sock"),
+            "daemon socket path should end with .sock: {rendered}"
+        );
+    }
+
+    #[test]
+    fn semantic_gate_forces_run_for_full_recall_even_when_voi_would_skip() {
+        let lexical = vec![
+            LexicalCandidate::new("src/main.rs", 7.2),
+            LexicalCandidate::new("src/lib.rs", 2.1),
+            LexicalCandidate::new("README.md", 1.6),
+        ];
+        let voi = FsfsRuntime::semantic_voi_decision(
+            SearchExecutionMode::FastOnly,
+            QueryIntentClass::ShortKeyword,
+            "test",
+            20_000,
+            &lexical,
+        );
+        assert!(!voi.run_semantic);
+
+        let gate = FsfsRuntime::semantic_gate_decision(SemanticGateDecisionInput {
+            mode: SearchExecutionMode::FastOnly,
+            intent: QueryIntentClass::ShortKeyword,
+            query: "test",
+            output_limit: 20_000,
+            lexical_head_candidates: &lexical,
+            semantic_stage_enabled: true,
+            lexical_stage_enabled: true,
+            force_full_semantic_recall: true,
+        });
+        assert!(gate.run_semantic);
+        assert_eq!(gate.reason_code, "semantic.voi.force.full_recall");
+    }
+
+    #[test]
+    fn semantic_gate_uses_voi_when_not_forced() {
+        let lexical = vec![
+            LexicalCandidate::new("src/main.rs", 7.2),
+            LexicalCandidate::new("src/lib.rs", 2.1),
+            LexicalCandidate::new("README.md", 1.6),
+        ];
+        let gate = FsfsRuntime::semantic_gate_decision(SemanticGateDecisionInput {
+            mode: SearchExecutionMode::FastOnly,
+            intent: QueryIntentClass::ShortKeyword,
+            query: "test",
+            output_limit: 20_000,
+            lexical_head_candidates: &lexical,
+            semantic_stage_enabled: true,
+            lexical_stage_enabled: true,
+            force_full_semantic_recall: false,
+        });
+        assert!(!gate.run_semantic);
+        assert_eq!(gate.reason_code, "semantic.voi.skip");
+    }
+
+    #[test]
     fn resolve_output_limit_preserves_explicit_limit() {
         assert_eq!(
             FsfsRuntime::resolve_output_limit(42, Some(1_000), Some(2_000)),
             42
+        );
+    }
+
+    #[test]
+    fn resolve_output_limit_preserves_explicit_limit_above_known_counts() {
+        assert_eq!(
+            FsfsRuntime::resolve_output_limit(10_000, Some(250), Some(180)),
+            10_000
         );
     }
 
@@ -13214,10 +13549,21 @@ mod tests {
     }
 
     #[test]
-    fn should_force_full_semantic_recall_when_unbounded_requested() {
-        assert!(FsfsRuntime::should_force_full_semantic_recall(
+    fn resolve_planning_limit_preserves_small_limit() {
+        assert_eq!(FsfsRuntime::resolve_planning_limit(128), 128);
+        assert_eq!(FsfsRuntime::resolve_planning_limit(1_000), 1_000);
+    }
+
+    #[test]
+    fn resolve_planning_limit_progressively_widens_without_hard_cap() {
+        assert_eq!(FsfsRuntime::resolve_planning_limit(5_000), 2_008);
+        assert!(FsfsRuntime::resolve_planning_limit(200_000) > 1_000);
+    }
+
+    #[test]
+    fn should_not_force_full_semantic_recall_when_unbounded_and_lexical_coverage_complete() {
+        assert!(!FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
                 output_limit: 5_000,
                 planning_limit: 1_000,
                 semantic_stage_enabled: true,
@@ -13233,7 +13579,6 @@ mod tests {
     fn should_force_full_semantic_recall_when_lexical_stage_disabled() {
         assert!(FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: 5_000,
                 output_limit: 5_000,
                 planning_limit: 1_000,
                 semantic_stage_enabled: true,
@@ -13249,7 +13594,6 @@ mod tests {
     fn should_force_full_semantic_recall_when_lexical_head_is_empty() {
         assert!(FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: 5_000,
                 output_limit: 5_000,
                 planning_limit: 1_000,
                 semantic_stage_enabled: true,
@@ -13265,7 +13609,6 @@ mod tests {
     fn should_not_force_full_semantic_recall_when_within_head_budget() {
         assert!(!FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: 800,
                 output_limit: 800,
                 planning_limit: 1_000,
                 semantic_stage_enabled: true,
@@ -13281,7 +13624,6 @@ mod tests {
     fn should_not_force_full_semantic_recall_when_lexical_coverage_is_complete() {
         assert!(!FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: 5_000,
                 output_limit: 5_000,
                 planning_limit: 1_000,
                 semantic_stage_enabled: true,
@@ -13297,7 +13639,6 @@ mod tests {
     fn should_not_force_full_semantic_recall_when_semantic_stage_disabled() {
         assert!(!FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: 5_000,
                 output_limit: 5_000,
                 planning_limit: 1_000,
                 semantic_stage_enabled: false,
@@ -13313,7 +13654,6 @@ mod tests {
     fn should_not_force_full_semantic_recall_without_semantic_index() {
         assert!(!FsfsRuntime::should_force_full_semantic_recall(
             SemanticRecallDecisionInput {
-                requested_limit: 5_000,
                 output_limit: 5_000,
                 planning_limit: 1_000,
                 semantic_stage_enabled: true,

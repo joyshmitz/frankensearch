@@ -947,6 +947,8 @@ install_systemd_user_daemon_service() {
   local service_name="frankensearch-fsfs-daemon.service"
   local systemd_user_dir="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
   local service_path="${systemd_user_dir}/${service_name}"
+  local escaped_fsfs_bin="${fsfs_bin//\\/\\\\}"
+  escaped_fsfs_bin="${escaped_fsfs_bin//\"/\\\"}"
 
   mkdir -p "${systemd_user_dir}" || {
     warn "Could not create ${systemd_user_dir}; skipping daemon service install."
@@ -965,7 +967,7 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=${fsfs_bin} serve --daemon --format jsonl --no-color
+ExecStart="${escaped_fsfs_bin}" serve --daemon --format jsonl --no-color
 Restart=on-failure
 RestartSec=1
 
@@ -1109,7 +1111,18 @@ install_daemon_service() {
 }
 
 maybe_install_daemon_service() {
-  if ! should_run_config_step \
+  if [[ "${NO_CONFIGURE}" == true ]]; then
+    info "Skipping daemon service install because --no-configure was provided."
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    info "Non-interactive mode detected; enabling daemon service install by default."
+    install_daemon_service
+    return 0
+  fi
+
+  if ! should_run_optional_step \
     "daemon service install" \
     "Install and start a background fsfs daemon service for faster searches?" \
     "yes"; then

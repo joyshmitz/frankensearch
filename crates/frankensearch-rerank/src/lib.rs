@@ -23,7 +23,13 @@
 
 pub mod pipeline;
 
+#[cfg(feature = "fastembed-reranker")]
+pub mod fastembed_reranker;
+
 pub use pipeline::{DEFAULT_MIN_CANDIDATES, DEFAULT_TOP_K_RERANK, rerank_step};
+
+#[cfg(feature = "fastembed-reranker")]
+pub use fastembed_reranker::FastEmbedReranker;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
