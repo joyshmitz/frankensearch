@@ -57,13 +57,13 @@ rayon = "1.10"
 
 # SIMD and f16 quantization (unconditional for frankensearch-index)
 half = "2.4"
-wide = "0.7"
+wide = "1.1.1"
 
 # Memory-mapped I/O
 memmap2 = "0.9"
 
 # Embedder dependencies (feature-gated per crate)
-fastembed = "5.8.0"
+fastembed = "5.9.0"
 safetensors = "0.7.0"
 tokenizers = "0.22.2"
 
@@ -71,8 +71,8 @@ tokenizers = "0.22.2"
 tantivy = "0.25.0"
 
 # ONNX Runtime for cross-encoder reranking
-ort = "2.0.0-rc.10"
-ndarray = "0.16"
+ort = "2.0.0-rc.11"
+ndarray = "0.17"
 
 # HNSW approximate nearest neighbors
 hnsw_rs = "0.3"
@@ -87,20 +87,20 @@ unicode-normalization = "0.1"
 dirs = "6"
 
 # TOML parsing for configuration surfaces
-toml = "1.0.2"
+toml = "1.0.3"
 
 # SHA-256 verification for model manifests
 sha2 = "0.10"
 
 # Benchmarking
-criterion = { version = "0.7.0", features = ["html_reports"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.6"
 
 # Date/time formatting/parsing for telemetry RFC3339 timestamps
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
 
 # System information (CPU, memory, etc.)
-sysinfo = "0.36.1"
+sysinfo = "0.38.2"
 
 # FrankenTUI terminal UI framework
 ftui-core = { version = "0.2.0", path = "../frankentui/crates/ftui-core" }
@@ -111,6 +111,7 @@ ftui-layout = { version = "0.2.0", path = "../frankentui/crates/ftui-layout" }
 ftui-widgets = { version = "0.2.0", path = "../frankentui/crates/ftui-widgets" }
 ftui-tty = { version = "0.2.0", path = "../frankentui/crates/ftui-tty" }
 ftui-backend = { version = "0.2.0", path = "../frankentui/crates/ftui-backend" }
+ftui-extras = { version = "0.2.0", path = "../frankentui/crates/ftui-extras" }
 
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.

@@ -64,3 +64,46 @@
 
 ## Notes
 - External dependency warnings from `/data/projects/fast_cmaes` are still printed during checks, but they do not fail builds for this workspace.
+
+---
+
+## 2026-02-18 Follow-up Update
+
+### Summary
+- Ran `cargo update --verbose` and `cargo update --verbose --ignore-rust-version`
+- Updated workspace dependency constraints and lockfile to latest practical versions in this environment
+- Revalidated formatting and workspace compile after upgrades
+
+### Workspace manifest updates
+- `fastembed`: `5.8.0 -> 5.9.0`
+- `ort`: `2.0.0-rc.10 -> 2.0.0-rc.11`
+- `ndarray`: `0.16 -> 0.17`
+- `toml`: `1.0.2 -> 1.0.3`
+- `criterion`: `0.7.0 -> 0.8.2`
+- `time`: `0.3 -> 0.3.47`
+- `sysinfo`: `0.36.1 -> 0.38.2`
+- `wide`: `0.7 -> 1.1.1`
+
+### Lockfile updates observed
+- `fastembed 5.8.0 -> 5.9.0`
+- `ort 2.0.0-rc.10 -> 2.0.0-rc.11`
+- `ort-sys 2.0.0-rc.10 -> 2.0.0-rc.11`
+- `ndarray 0.16.1 -> 0.17.2`
+- `criterion 0.7.0 -> 0.8.2`
+- `criterion-plot 0.6.0 -> 0.8.2`
+- `sysinfo 0.36.1 -> 0.38.2`
+- `time 0.3.45 -> 0.3.47`
+- `time-core 0.1.7 -> 0.1.8`
+- `time-macros 0.2.25 -> 0.2.27`
+- `wide 1.1.1` added
+- plus related transitive graph updates/removals
+
+### Post-update validation
+- `cargo fmt` ✅
+- `cargo fmt --check` ✅
+- `cargo check --workspace` ✅
+
+### Clippy status
+- `cargo clippy --workspace --all-targets -- -D warnings` ❌
+- Current failure is concentrated in `crates/frankensearch-lexical/src/cass_compat.rs` with strict pedantic/nursery lint violations (e.g. `missing_errors_doc`, `too_many_lines`, `iter_with_drain`, `derive_partial_eq_without_eq`, etc.).
+- These are style/lint policy failures, not dependency-resolution or compile failures. No rollback was applied because core compile and tests for dependent cass integration remained functional.
