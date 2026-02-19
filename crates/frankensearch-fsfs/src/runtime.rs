@@ -4091,7 +4091,18 @@ impl FsfsRuntime {
 
         let started = Instant::now();
         let payloads = if search_runtime.cli_input.daemon {
-            search_runtime.search_payloads_via_daemon(query, limit)?
+            match search_runtime.search_payloads_via_daemon(query, limit) {
+                Ok(payloads) => payloads,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "fsfs daemon-backed search unavailable; falling back to in-process retrieval"
+                    );
+                    search_runtime
+                        .execute_search_payloads_cached_for_cli(cx, query, limit)
+                        .await?
+                }
+            }
         } else {
             search_runtime
                 .execute_search_payloads_cached_for_cli(cx, query, limit)
@@ -4294,7 +4305,7 @@ impl FsfsRuntime {
 
     async fn run_search_serve_command(&self, cx: &Cx) -> SearchResult<()> {
         #[cfg(unix)]
-        if self.cli_input.daemon_socket.is_some() {
+        if self.cli_input.daemon || self.cli_input.daemon_socket.is_some() {
             return self.run_search_serve_socket_command(cx).await;
         }
 
@@ -9332,8 +9343,12 @@ fn print_cli_help() {
     println!("Usage: fsfs <command> [options]");
     println!();
     println!("Commands:");
-    println!("  search <query>            Search indexed corpus");
-    println!("  serve                     Run long-lived query server over stdin/stdout");
+    println!(
+        "  search <query>            Search indexed corpus (daemon-backed by default on unix)"
+    );
+    println!(
+        "  serve [--daemon]          Run long-lived query server (stdio by default, socket daemon with --daemon)"
+    );
     println!("  index [path]              Build/update index");
     println!("  watch [path]              Alias for index --watch");
     println!("  explain <result-id>       Explain ranking details");
@@ -9348,6 +9363,7 @@ fn print_cli_help() {
     println!("  version                   Show version");
     println!();
     println!("Global flags: --verbose/-v --quiet/-q --no-color --format --config");
+    println!("Search flags: --daemon --no-daemon --daemon-socket <path> --stream");
 }
 
 const fn completion_script(shell: CompletionShell) -> &'static str {

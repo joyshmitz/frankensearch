@@ -316,6 +316,7 @@ where
         command_source,
         ..CliInput::default()
     };
+    let mut daemon_preference: Option<bool> = None;
 
     if command == CliCommand::Help {
         return Ok(input);
@@ -440,14 +441,25 @@ where
                 idx += 1;
             }
             "--daemon" => {
-                if command != CliCommand::Search {
+                if !matches!(command, CliCommand::Search | CliCommand::Serve) {
                     return Err(SearchError::InvalidConfig {
                         field: "cli.flag".into(),
                         value: "--daemon".into(),
-                        reason: "--daemon is only valid for the search command".into(),
+                        reason: "--daemon is only valid for search or serve commands".into(),
                     });
                 }
-                input.daemon = true;
+                daemon_preference = Some(true);
+                idx += 1;
+            }
+            "--no-daemon" => {
+                if !matches!(command, CliCommand::Search | CliCommand::Serve) {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--no-daemon".into(),
+                        reason: "--no-daemon is only valid for search or serve commands".into(),
+                    });
+                }
+                daemon_preference = Some(false);
                 idx += 1;
             }
             "--daemon-socket" => {
@@ -664,9 +676,28 @@ where
     }
 
     normalize_stream_settings(&mut input)?;
+    apply_daemon_settings(&mut input, daemon_preference);
     validate_required_args(&input)?;
 
     Ok(input)
+}
+
+fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) {
+    if let Some(explicit_preference) = daemon_preference {
+        input.daemon = explicit_preference;
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        // Default search path uses daemon transport to amortize startup/index warmup.
+        input.daemon = input.command == CliCommand::Search && !input.stream;
+    }
+
+    #[cfg(not(unix))]
+    {
+        input.daemon = false;
+    }
 }
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
@@ -890,6 +921,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-e"
             | "--stream"
             | "--daemon"
+            | "--no-daemon"
             | "--daemon-socket"
             | "--watch"
             | "--model"
@@ -1097,9 +1129,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_accepts_daemon_flag() {
+        let input = parse_cli_args(["serve", "--daemon"]).expect("parse");
+        assert_eq!(input.command, CliCommand::Serve);
+        assert!(input.daemon);
+    }
+
+    #[test]
+    fn parse_search_defaults_to_daemon_on_unix() {
+        let input = parse_cli_args(["search", "query"]).expect("parse");
+        #[cfg(unix)]
+        assert!(input.daemon);
+        #[cfg(not(unix))]
+        assert!(!input.daemon);
+    }
+
+    #[test]
+    fn parse_no_daemon_disables_auto_daemon_transport() {
+        let input = parse_cli_args(["search", "query", "--no-daemon"]).expect("parse");
+        assert!(!input.daemon);
+    }
+
+    #[test]
     fn parse_stream_flag() {
         let input = parse_cli_args(["search", "test", "--stream"]).unwrap();
         assert!(input.stream);
+        assert!(!input.daemon);
         assert_eq!(input.format, OutputFormat::Jsonl);
         assert!(!input.format_explicit);
     }
@@ -1122,11 +1177,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_daemon_rejects_non_search_command() {
+    fn parse_daemon_rejects_non_search_or_serve_command() {
         let err = parse_cli_args(["status", "--daemon"]).expect_err("must fail");
         assert!(
             err.to_string()
-                .contains("--daemon is only valid for the search command")
+                .contains("--daemon is only valid for search or serve commands")
+        );
+    }
+
+    #[test]
+    fn parse_no_daemon_rejects_non_search_or_serve_command() {
+        let err = parse_cli_args(["status", "--no-daemon"]).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("--no-daemon is only valid for search or serve commands")
         );
     }
 
