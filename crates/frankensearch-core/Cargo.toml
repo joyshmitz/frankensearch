@@ -3,7 +3,7 @@ name = "frankensearch-core"
 version = "0.1.0"
 description = "Core traits, types, and error types for frankensearch"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]

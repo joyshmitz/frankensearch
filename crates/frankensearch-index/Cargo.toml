@@ -3,7 +3,7 @@ name = "frankensearch-index"
 version = "0.1.0"
 description = "FSVI vector index, SIMD dot product, and top-k search for frankensearch"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [features]

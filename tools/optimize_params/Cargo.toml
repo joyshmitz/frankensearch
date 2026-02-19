@@ -3,7 +3,7 @@ name = "optimize-params"
 version = "0.1.0"
 description = "CMA-ES hyperparameter optimizer for frankensearch fusion pipeline"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [[bin]]

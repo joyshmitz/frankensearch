@@ -3,7 +3,7 @@ name = "frankensearch-rerank"
 version = "0.1.0"
 description = "FlashRank cross-encoder reranking for frankensearch"
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
