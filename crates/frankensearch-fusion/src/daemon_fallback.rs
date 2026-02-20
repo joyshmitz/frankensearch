@@ -549,7 +549,11 @@ impl SyncRerank for DaemonFallbackReranker {
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp, clippy::cast_precision_loss, clippy::unnecessary_literal_bound)]
+#[allow(
+    clippy::float_cmp,
+    clippy::cast_precision_loss,
+    clippy::unnecessary_literal_bound
+)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

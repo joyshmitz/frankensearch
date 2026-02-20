@@ -478,12 +478,14 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     fn index_exists(conn: &Connection, index_name: &str) -> bool {
-        let params = [SqliteValue::Text(index_name.to_owned())];
+        // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
+        // storage cursor on sqlite_master's root page with bound parameters.
+        // Safe here because callers pass trusted test constants only.
+        let sql = format!(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = '{index_name}' LIMIT 1;"
+        );
         let rows = conn
-            .query_with_params(
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?1 LIMIT 1;",
-                &params,
-            )
+            .query(&sql)
             .map_err(storage_error)
             .expect("sqlite_master query should succeed");
         !rows.is_empty()
@@ -739,12 +741,14 @@ mod tests {
         ];
 
         for table in expected_tables {
-            let params = [SqliteValue::Text(table.to_owned())];
+            // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
+            // storage cursor on sqlite_master's root page with bound parameters.
+            // Safe here because values are trusted test constants.
+            let sql = format!(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1;"
+            );
             let rows = conn
-                .query_with_params(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1;",
-                    &params,
-                )
+                .query(&sql)
                 .expect("sqlite_master query should succeed");
             assert!(
                 !rows.is_empty(),
