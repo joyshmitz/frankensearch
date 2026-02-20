@@ -2652,7 +2652,18 @@ fn path_matches_pattern(pattern: &str, normalized_path: &str, components: &[Stri
     }
 
     if trimmed.contains('*') {
-        return wildcard_match(normalized_path, trimmed);
+        if wildcard_match(normalized_path, trimmed) {
+            return true;
+        }
+        // Relative patterns (no leading /) should match against any path suffix.
+        if !pattern.starts_with('/') {
+            for (i, _) in normalized_path.match_indices('/') {
+                if wildcard_match(&normalized_path[i + 1..], trimmed) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     if trimmed.contains('/') {

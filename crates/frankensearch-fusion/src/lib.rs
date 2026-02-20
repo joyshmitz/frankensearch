@@ -16,6 +16,7 @@ pub mod cache;
 pub mod calibration;
 pub mod circuit_breaker;
 pub mod conformal;
+pub mod daemon_fallback;
 pub mod federated;
 pub mod feedback;
 #[cfg(feature = "graph")]
@@ -54,6 +55,7 @@ pub use conformal::{
     AdaptiveConformalState, AdaptiveConformalUpdate, ConformalSearchCalibration,
     MondrianConformalCalibration,
 };
+pub use daemon_fallback::{DaemonFallbackEmbedder, DaemonFallbackReranker, NoopDaemonClient};
 pub use federated::{FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher};
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
 #[cfg(feature = "graph")]

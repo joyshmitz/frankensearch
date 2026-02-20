@@ -14,6 +14,7 @@ pub mod collectors;
 pub mod commit_replay;
 pub mod config;
 pub mod contract_sanity;
+pub mod daemon;
 pub mod decision_plane;
 pub mod distributed_observability;
 pub mod e2e_artifact;
@@ -62,6 +63,7 @@ pub use contract_sanity::{
     ContractViolationDiagnostic, MAX_SCHEMA_VERSION_LAG, ViolationSeverity, classify_version,
     classify_version_against, replay_command_for_reason,
 };
+pub use daemon::{DaemonClient, DaemonError, DaemonRetryConfig, apply_jitter, next_request_id};
 pub use decision_plane::{
     CalibrationFallbackReason, CalibrationStatus, CalibrationThresholds, DecisionContext,
     DecisionOutcome, EvidenceEventType, EvidenceRecord, ExhaustionPolicy, LossVector, LossWeights,

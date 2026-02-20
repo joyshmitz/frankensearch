@@ -238,6 +238,7 @@ pub use frankensearch_core::traits::{
     NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
     SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
 };
+pub use frankensearch_core::{DaemonClient, DaemonError, DaemonRetryConfig};
 
 // Reranker support types
 pub use frankensearch_core::traits::{RerankDocument, RerankScore};
@@ -276,8 +277,9 @@ pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex};
 // ─── Fusion and search orchestration (always available) ─────────────────────
 
 pub use frankensearch_fusion::{
-    FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher, RrfConfig, TwoTierSearcher,
-    blend_two_tier, candidate_count, rrf_fuse,
+    DaemonFallbackEmbedder, DaemonFallbackReranker, FederatedConfig, FederatedFusion, FederatedHit,
+    FederatedSearcher, NoopDaemonClient, RrfConfig, TwoTierSearcher, blend_two_tier,
+    candidate_count, rrf_fuse,
 };
 
 #[cfg(feature = "graph")]
