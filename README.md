@@ -1,8 +1,16 @@
 # frankensearch
 
+<div align="center">
+  <img src="frankensearch_illustration.webp" alt="frankensearch - Two-tier hybrid local search for Rust">
+</div>
+
+<div align="center">
+
 [![CI](https://github.com/Dicklesworthstone/frankensearch/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/frankensearch/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/frankensearch.svg)](https://crates.io/crates/frankensearch)
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
+
+</div>
 
 Two-tier hybrid local search for Rust and the `fsfs` standalone CLI: fast first-pass results, then quality refinement.
 

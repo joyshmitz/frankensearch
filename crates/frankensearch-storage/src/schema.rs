@@ -477,18 +477,23 @@ mod tests {
     use fsqlite::Connection;
     use fsqlite_types::value::SqliteValue;
 
-    fn index_exists(conn: &Connection, index_name: &str) -> bool {
-        // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
-        // storage cursor on sqlite_master's root page with bound parameters.
-        // Safe here because callers pass trusted test constants only.
-        let sql = format!(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = '{index_name}' LIMIT 1;"
-        );
-        let rows = conn
-            .query(&sql)
-            .map_err(storage_error)
-            .expect("sqlite_master query should succeed");
-        !rows.is_empty()
+    fn table_exists(conn: &Connection, table_name: &str) -> bool {
+        // Probe table existence with a zero-row SELECT instead of
+        // querying sqlite_master: FrankenSQLite's VDBE cannot open a
+        // storage cursor on sqlite_master's btree root page.
+        conn.query(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
+            .is_ok()
+    }
+
+    fn index_exists(conn: &Connection, table_name: &str, index_name: &str) -> bool {
+        // Probe index existence via INDEXED BY hint instead of querying
+        // sqlite_master: FrankenSQLite's VDBE cannot open a storage
+        // cursor on sqlite_master's btree root page. If the index
+        // doesn't exist, the query errors with "no such index".
+        conn.query(&format!(
+            "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
+        ))
+        .is_ok()
     }
 
     #[test]
@@ -501,15 +506,15 @@ mod tests {
             SCHEMA_VERSION
         );
         assert!(
-            index_exists(&conn, "idx_embedding_status_pending"),
+            index_exists(&conn, "embedding_status", "idx_embedding_status_pending"),
             "latest schema should include pending-status index"
         );
         assert!(
-            index_exists(&conn, "idx_jobs_pending"),
+            index_exists(&conn, "embedding_jobs", "idx_jobs_pending"),
             "latest schema should include queue pending index"
         );
         assert!(
-            index_exists(&conn, "idx_jobs_processing"),
+            index_exists(&conn, "embedding_jobs", "idx_jobs_processing"),
             "latest schema should include queue processing index"
         );
     }
@@ -534,7 +539,7 @@ mod tests {
             SCHEMA_VERSION
         );
         assert!(
-            index_exists(&conn, "idx_history_query"),
+            index_exists(&conn, "search_history", "idx_history_query"),
             "migration should create search history index"
         );
     }
@@ -741,17 +746,8 @@ mod tests {
         ];
 
         for table in expected_tables {
-            // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
-            // storage cursor on sqlite_master's root page with bound parameters.
-            // Safe here because values are trusted test constants.
-            let sql = format!(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table}' LIMIT 1;"
-            );
-            let rows = conn
-                .query(&sql)
-                .expect("sqlite_master query should succeed");
             assert!(
-                !rows.is_empty(),
+                table_exists(&conn, table),
                 "table '{table}' should exist after bootstrap"
             );
         }
@@ -764,22 +760,22 @@ mod tests {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
 
-        let expected_indices = [
-            "idx_documents_content_hash",
-            "idx_documents_updated_at",
-            "idx_embedding_status_pending",
-            "idx_jobs_pending",
-            "idx_jobs_processing",
-            "idx_build_history_index",
-            "idx_history_query",
-            "idx_history_ts",
-            "idx_bookmarks_doc_query",
+        let expected_indices: &[(&str, &str)] = &[
+            ("documents", "idx_documents_content_hash"),
+            ("documents", "idx_documents_updated_at"),
+            ("embedding_status", "idx_embedding_status_pending"),
+            ("embedding_jobs", "idx_jobs_pending"),
+            ("embedding_jobs", "idx_jobs_processing"),
+            ("index_build_history", "idx_build_history_index"),
+            ("search_history", "idx_history_query"),
+            ("search_history", "idx_history_ts"),
+            ("bookmarks", "idx_bookmarks_doc_query"),
         ];
 
-        for idx in expected_indices {
+        for &(table, idx) in expected_indices {
             assert!(
-                index_exists(&conn, idx),
-                "index '{idx}' should exist after bootstrap"
+                index_exists(&conn, table, idx),
+                "index '{idx}' should exist on '{table}' after bootstrap"
             );
         }
     }
@@ -928,7 +924,15 @@ mod tests {
     fn index_exists_returns_false_for_nonexistent_index() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
         bootstrap(&conn).expect("bootstrap should succeed");
-        assert!(!index_exists(&conn, "idx_nonexistent_never_created"));
+        // Use a nonexistent table name: FrankenSQLite's VDBE does not
+        // validate INDEXED BY hints at query-planning time, so probing
+        // a real table with a fake index incorrectly succeeds.  A
+        // nonexistent table reliably triggers the expected failure.
+        assert!(!index_exists(
+            &conn,
+            "table_that_does_not_exist",
+            "idx_nonexistent_never_created"
+        ));
     }
 
     // ── Insert and query documents table ─────────────────────────────────

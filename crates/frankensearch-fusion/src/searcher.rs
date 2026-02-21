@@ -1135,10 +1135,8 @@ impl TwoTierSearcher {
         let search_start = Instant::now();
         let mut fast_hits: Vec<VectorHit> = initial_results
             .iter()
-            .enumerate()
-            .map(|(i, r)| VectorHit {
-                #[allow(clippy::cast_possible_truncation)]
-                index: i as u32,
+            .map(|r| VectorHit {
+                index: r.index.unwrap_or(u32::MAX),
                 // Keep missing semantic-fast source at 0.0 so blending semantics
                 // remain consistent with blend_two_tier contract.
                 score: r.fast_score.unwrap_or(0.0_f32),
@@ -1147,33 +1145,20 @@ impl TwoTierSearcher {
             .collect();
         self.apply_score_calibration_to_hits(&mut fast_hits);
 
-        // Look up indices once and keep doc_ids alongside them to avoid
-        // repeated doc_id table decoding during quality-hit reconstruction.
-        let mut indexed_fast_hits = Vec::with_capacity(fast_hits.len());
-        for hit in &fast_hits {
-            if let Some(index) = self.index.fast_index_for_doc_id(&hit.doc_id)? {
-                indexed_fast_hits.push((index, hit.doc_id.clone()));
-            }
-        }
-        metrics.phase2_vectors_searched = indexed_fast_hits.len();
+        metrics.phase2_vectors_searched = fast_hits.iter().filter(|h| h.index != u32::MAX).count();
 
-        let fast_indices = indexed_fast_hits
-            .iter()
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>();
         let quality_scores = self
             .index
-            .quality_scores_for_indices(&quality_vec, &fast_indices)?;
+            .quality_scores_for_hits(&quality_vec, &fast_hits)?;
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
         // Build quality VectorHits for blending.
-        let mut quality_hits = Vec::with_capacity(indexed_fast_hits.len());
-        for ((idx, doc_id), &score) in indexed_fast_hits.iter().zip(quality_scores.iter()) {
+        let mut quality_hits = Vec::with_capacity(fast_hits.len());
+        for (hit, &score) in fast_hits.iter().zip(quality_scores.iter()) {
             quality_hits.push(VectorHit {
-                #[allow(clippy::cast_possible_truncation)]
-                index: *idx as u32,
+                index: hit.index,
                 score,
-                doc_id: doc_id.clone(),
+                doc_id: hit.doc_id.clone(),
             });
         }
         self.apply_score_calibration_to_hits(&mut quality_hits);
@@ -1217,6 +1202,25 @@ impl TwoTierSearcher {
             .collect();
 
         // Convert blended to scored results.
+        let mut fast_min = f32::INFINITY;
+        let mut fast_max = f32::NEG_INFINITY;
+        let mut qual_min = f32::INFINITY;
+        let mut qual_max = f32::NEG_INFINITY;
+        if self.config.explain {
+            for &s in fast_scores_by_doc.values() {
+                if s.is_finite() {
+                    fast_min = fast_min.min(s);
+                    fast_max = fast_max.max(s);
+                }
+            }
+            for &s in quality_scores_by_doc.values() {
+                if s.is_finite() {
+                    qual_min = qual_min.min(s);
+                    qual_max = qual_max.max(s);
+                }
+            }
+        }
+
         #[allow(unused_mut)] // mut needed when `rerank` feature is enabled
         let mut results: Vec<ScoredResult> = blended
             .iter()
@@ -1235,6 +1239,30 @@ impl TwoTierSearcher {
                 let explanation = if self.config.explain {
                     let mut components = Vec::new();
 
+                    let fast_norm = |s: f32| -> f64 {
+                        if !s.is_finite() {
+                            return 0.0;
+                        }
+                        let range = fast_max - fast_min;
+                        if range > 0.01 {
+                            f64::from(((s - fast_min) / range).clamp(0.0, 1.0))
+                        } else {
+                            f64::from(s.clamp(0.0, 1.0))
+                        }
+                    };
+
+                    let qual_norm = |s: f32| -> f64 {
+                        if !s.is_finite() {
+                            return 0.0;
+                        }
+                        let range = qual_max - qual_min;
+                        if range > 0.01 {
+                            f64::from(((s - qual_min) / range).clamp(0.0, 1.0))
+                        } else {
+                            f64::from(s.clamp(0.0, 1.0))
+                        }
+                    };
+
                     // Fast component
                     if let Some(s) = fast_score {
                         components.push(ScoreComponent {
@@ -1243,7 +1271,7 @@ impl TwoTierSearcher {
                                 cosine_sim: f64::from(s),
                             },
                             raw_score: f64::from(s),
-                            normalized_score: f64::from(s),
+                            normalized_score: fast_norm(s),
                             rrf_contribution: 0.0,
                             weight: 1.0 - f64::from(blend_factor),
                         });
@@ -1260,7 +1288,7 @@ impl TwoTierSearcher {
                                 cosine_sim: f64::from(s),
                             },
                             raw_score: f64::from(s),
-                            normalized_score: f64::from(s),
+                            normalized_score: qual_norm(s),
                             rrf_contribution: 0.0,
                             weight: f64::from(blend_factor),
                         });
@@ -1305,7 +1333,7 @@ impl TwoTierSearcher {
                     doc_id: hit.doc_id.clone(),
                     score: hit.score,
                     source,
-                    index: None,
+                    index: if hit.index == u32::MAX { None } else { Some(hit.index) },
                     fast_score,
                     quality_score,
                     lexical_score: initial.and_then(|result| result.lexical_score),
@@ -1829,7 +1857,6 @@ impl TwoTierSearcher {
         let cpu_pct = cpu_pct_from_jiffies(
             *cpu_state,
             current,
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         );
         *cpu_state = Some(current);
         cpu_pct
@@ -1974,7 +2001,6 @@ fn telemetry_instance_for_adapter(host_adapter: &dyn HostAdapter) -> TelemetryIn
 fn cpu_pct_from_jiffies(
     previous: Option<CpuJiffiesSnapshot>,
     current: CpuJiffiesSnapshot,
-    available_cores: usize,
 ) -> f64 {
     let Some(previous) = previous else {
         return 0.0;
@@ -1984,11 +2010,11 @@ fn cpu_pct_from_jiffies(
         .process_jiffies
         .saturating_sub(previous.process_jiffies);
     let total_delta = current.total_jiffies.saturating_sub(previous.total_jiffies);
-    if process_delta == 0 || total_delta == 0 || available_cores == 0 {
+    if process_delta == 0 || total_delta == 0 {
         return 0.0;
     }
 
-    let raw = (process_delta as f64 / total_delta as f64) * available_cores as f64 * 100.0;
+    let raw = (process_delta as f64 / total_delta as f64) * 100.0;
     raw.clamp(0.0, 100.0)
 }
 
@@ -4792,7 +4818,7 @@ mod tests {
             total_jiffies: 10_000,
         };
         assert!(
-            (cpu_pct_from_jiffies(None, current, 8) - 0.0).abs() < f64::EPSILON,
+            (cpu_pct_from_jiffies(None, current) - 0.0).abs() < f64::EPSILON,
             "first sample should not report synthetic CPU utilization"
         );
     }
@@ -4807,7 +4833,7 @@ mod tests {
             process_jiffies: 200,
             total_jiffies: 1_100,
         };
-        let cpu_pct = cpu_pct_from_jiffies(Some(previous), current, 4);
+        let cpu_pct = cpu_pct_from_jiffies(Some(previous), current);
         assert!(
             (cpu_pct - 100.0).abs() < f64::EPSILON,
             "high deltas should clamp at 100%"

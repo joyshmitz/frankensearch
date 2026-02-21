@@ -102,6 +102,7 @@ impl TwoTierIndex {
                 let q_rec = quality.record_at(q_idx)?;
 
                 if crate::is_tombstoned_flags(f_rec.flags) {
+                    ensure_mapping(&mut quality_alignment, f_idx);
                     if let QualityAlignment::Mapping(vec) = &mut quality_alignment {
                         vec.push(None);
                     }
@@ -324,7 +325,7 @@ impl TwoTierIndex {
                     });
                 }
                 // Re-sort and truncate after merging
-                hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+                hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.index.cmp(&b.index)));
                 if hits.len() > k {
                     hits.truncate(k);
                 }
@@ -353,13 +354,13 @@ impl TwoTierIndex {
     /// Returns `SearchError::DimensionMismatch` if `query_vec` does not match
     /// the quality index dimensionality (when a quality index is present), and
     /// propagates decode/corruption errors from the quality index.
-    pub fn quality_scores_for_indices(
+    pub fn quality_scores_for_hits(
         &self,
         query_vec: &[f32],
-        indices: &[usize],
+        hits: &[VectorHit],
     ) -> SearchResult<Vec<f32>> {
         let Some(quality_index) = &self.quality_index else {
-            return Ok(vec![0.0; indices.len()]);
+            return Ok(vec![0.0; hits.len()]);
         };
 
         if query_vec.len() != quality_index.dimension() {
@@ -369,10 +370,40 @@ impl TwoTierIndex {
             });
         }
 
-        let mut scores = Vec::with_capacity(indices.len());
-        for &fast_idx in indices {
-            let score = self.score_quality_for_fast_index(quality_index, query_vec, fast_idx)?;
-            scores.push(score);
+        let mut scores = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let mut found_score = None;
+
+            let fast_idx = if hit.index == u32::MAX {
+                self.fast_index.find_index_by_doc_id(&hit.doc_id)?
+            } else if (hit.index as usize) < self.fast_index.record_count() {
+                Some(hit.index as usize)
+            } else {
+                None
+            };
+
+            if let Some(idx) = fast_idx {
+                found_score = self.score_quality_for_fast_index(quality_index, query_vec, idx)?;
+            }
+
+            if found_score.is_none() {
+                if let Some(qual_idx) = quality_index.find_index_by_doc_id(&hit.doc_id)? {
+                    let quality_vector = quality_index.vector_at_f32(qual_idx)?;
+                    found_score = Some(dot_product_f32_f32(&quality_vector, query_vec)?);
+                }
+            }
+
+            if found_score.is_none() {
+                let hash = crate::fnv1a_hash(hit.doc_id.as_bytes());
+                for entry in quality_index.wal_entries.iter().rev() {
+                    if entry.doc_id_hash == hash && entry.doc_id == hit.doc_id {
+                        found_score = Some(dot_product_f32_f32(&entry.embedding, query_vec)?);
+                        break;
+                    }
+                }
+            }
+
+            scores.push(found_score.unwrap_or(0.0));
         }
         Ok(scores)
     }
@@ -432,10 +463,18 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError` if index access fails.
     pub fn fast_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
-        let Some(index) = self.fast_index.find_index_by_doc_id(doc_id)? else {
-            return Ok(None);
-        };
-        self.fast_index.vector_at_f32(index).map(Some)
+        if let Some(index) = self.fast_index.find_index_by_doc_id(doc_id)? {
+            return self.fast_index.vector_at_f32(index).map(Some);
+        }
+
+        let hash = crate::fnv1a_hash(doc_id.as_bytes());
+        for entry in self.fast_index.wal_entries.iter().rev() {
+            if entry.doc_id_hash == hash && entry.doc_id == doc_id {
+                return Ok(Some(entry.embedding.clone()));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Quality-tier vector for the given document id when available.
@@ -447,14 +486,25 @@ impl TwoTierIndex {
         let Some(quality_index) = self.quality_index.as_ref() else {
             return Ok(None);
         };
-        let Some(fast_index) = self.fast_index.find_index_by_doc_id(doc_id)? else {
-            return Ok(None);
-        };
-        let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index) else {
-            return Ok(None);
-        };
 
-        quality_index.vector_at_f32(quality_index_pos).map(Some)
+        if let Some(fast_index) = self.fast_index.find_index_by_doc_id(doc_id)? {
+            if let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index) {
+                return quality_index.vector_at_f32(quality_index_pos).map(Some);
+            }
+        }
+
+        if let Some(qual_idx) = quality_index.find_index_by_doc_id(doc_id)? {
+            return quality_index.vector_at_f32(qual_idx).map(Some);
+        }
+
+        let hash = crate::fnv1a_hash(doc_id.as_bytes());
+        for entry in quality_index.wal_entries.iter().rev() {
+            if entry.doc_id_hash == hash && entry.doc_id == doc_id {
+                return Ok(Some(entry.embedding.clone()));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Semantic vector for the given document id, preferring quality tier.
@@ -498,22 +548,22 @@ impl TwoTierIndex {
         query_vec: &[f32],
 
         fast_idx: usize,
-    ) -> SearchResult<f32> {
+    ) -> SearchResult<Option<f32>> {
         let quality_idx = match &self.quality_alignment {
-            QualityAlignment::None => return Ok(0.0),
+            QualityAlignment::None => return Ok(None),
 
             QualityAlignment::Aligned => fast_idx,
 
             QualityAlignment::Mapping(map) => match map.get(fast_idx).copied().flatten() {
                 Some(idx) => idx,
 
-                None => return Ok(0.0),
+                None => return Ok(None),
             },
         };
 
         let quality_vector = quality_index.vector_at_f32(quality_idx)?;
 
-        dot_product_f32_f32(&quality_vector, query_vec)
+        dot_product_f32_f32(&quality_vector, query_vec).map(Some)
     }
 
     fn quality_index_for_fast_index(&self, fast_idx: usize) -> Option<usize> {
@@ -938,8 +988,13 @@ mod tests {
         assert!(!index.has_quality_for_index(1));
         assert!(index.has_quality_for_index(2));
 
+        let hits = vec![
+            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
+            VectorHit { index: 1, score: 0.0, doc_id: "doc-b".to_owned() },
+            VectorHit { index: 2, score: 0.0, doc_id: "doc-c".to_owned() },
+        ];
         let scores = index
-            .quality_scores_for_indices(&[1.0, 0.0, 0.0, 0.0], &[0, 1, 2])
+            .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
             .expect("quality scores");
         assert_eq!(scores.len(), 3);
         assert!((scores[0] - 1.0).abs() < 1e-6);
@@ -959,8 +1014,13 @@ mod tests {
         .expect("write fast index");
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+        let hits = vec![
+            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
+            VectorHit { index: 1, score: 0.0, doc_id: "doc-b".to_owned() },
+            VectorHit { index: 99, score: 0.0, doc_id: "doc-missing".to_owned() },
+        ];
         let scores = index
-            .quality_scores_for_indices(&[1.0, 0.0], &[0, 1, 99])
+            .quality_scores_for_hits(&[1.0, 0.0], &hits)
             .expect("scores");
         assert_eq!(scores, vec![0.0, 0.0, 0.0]);
     }
@@ -1091,8 +1151,11 @@ mod tests {
         assert!(index.has_quality_index());
 
         // Query dimension (4) doesn't match quality dimension (6)
+        let hits = vec![
+            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
+        ];
         let error = index
-            .quality_scores_for_indices(&[1.0, 0.0, 0.0, 0.0], &[0])
+            .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
             .unwrap_err();
         assert!(
             matches!(
@@ -1620,7 +1683,7 @@ mod tests {
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
         let scores = index
-            .quality_scores_for_indices(&[1.0, 0.0], &[])
+            .quality_scores_for_hits(&[1.0, 0.0], &[])
             .expect("empty indices");
         assert!(scores.is_empty());
     }
@@ -1648,8 +1711,12 @@ mod tests {
         assert!(index.has_quality_for_index(0));
         assert!(index.has_quality_for_index(1));
 
+        let hits = vec![
+            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
+            VectorHit { index: 1, score: 0.0, doc_id: "doc-b".to_owned() },
+        ];
         let scores = index
-            .quality_scores_for_indices(&[0.0, 1.0, 0.0], &[0, 1])
+            .quality_scores_for_hits(&[0.0, 1.0, 0.0], &hits)
             .expect("quality scores");
         assert_eq!(scores.len(), 2);
         // doc-a quality = [0,0,1] dot [0,1,0] = 0.0
@@ -1783,8 +1850,11 @@ mod tests {
         assert!(!index.has_quality_index());
 
         // Use a completely different dimension query — should still return 0s
+        let hits = vec![
+            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
+        ];
         let scores = index
-            .quality_scores_for_indices(&[1.0, 2.0, 3.0, 4.0, 5.0], &[0])
+            .quality_scores_for_hits(&[1.0, 2.0, 3.0, 4.0, 5.0], &hits)
             .expect("any dim accepted");
         assert_eq!(scores, vec![0.0]);
     }

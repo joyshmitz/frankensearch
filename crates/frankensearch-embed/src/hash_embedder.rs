@@ -215,8 +215,8 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 
 /// Tokenize text for hash embedding.
 ///
-/// Lowercases, splits on non-alphanumeric characters, and filters
-/// tokens shorter than `MIN_TOKEN_LEN`.
+/// Splits on non-alphanumeric characters and filters
+/// tokens shorter than `MIN_TOKEN_LEN`. Case is intentionally preserved.
 fn tokenize(text: &str) -> Vec<&str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|token| token.len() >= MIN_TOKEN_LEN)

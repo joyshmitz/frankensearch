@@ -27,6 +27,17 @@ pub use cass_compat::{
     cass_regex_query_uncached, cass_sanitize_query, cass_schema_hash_matches,
 };
 
+// Re-export tantivy types that appear in frankensearch-lexical's public API.
+// Consumers can import these from `frankensearch::lexical::` instead of adding
+// a direct tantivy dependency.
+pub use tantivy::collector::TopDocs;
+pub use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+pub use tantivy::schema::{Field, IndexRecordOption, Schema, Value};
+pub use tantivy::{
+    self as tantivy_crate, DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher,
+    TantivyDocument, Term,
+};
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,13 +47,9 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{LexicalSearch, SearchFuture};
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
-use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::schema::{Field, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value};
+use tantivy::schema::{STORED, STRING, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
-use tantivy::{
-    DocAddress, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, TantivyDocument, Term,
-};
 use tracing::{debug, instrument, warn};
 
 // ─── Constants ──────────────────────────────────────────────────────────────

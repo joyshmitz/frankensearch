@@ -740,7 +740,9 @@ fn event_to_ingest_op(discovery: &DiscoveryConfig, event: &WatchEvent) -> Option
         return Some(WatchIngestOp::Delete { file_key, revision });
     }
 
-    let byte_len = event.byte_len.unwrap_or(0);
+    let byte_len = event.byte_len.unwrap_or_else(|| {
+        std::fs::symlink_metadata(&event.path).map(|m| m.len()).unwrap_or(0)
+    });
     let mut candidate =
         DiscoveryCandidate::new(&event.path, byte_len).with_symlink(event.is_symlink);
     if let Some(category) = event.mount_category {
@@ -989,8 +991,19 @@ fn collect_snapshot_for_root(
                 Err(error) => return Err(error.into()),
             };
 
-            if file_type.is_dir() {
-                let mut directory_candidate = DiscoveryCandidate::new(&path, 0);
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if is_ignorable_walk_error(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
+
+            let is_symlink = file_type.is_symlink();
+            if is_symlink && !discovery.follow_symlinks {
+                continue;
+            }
+
+            if metadata.is_dir() {
+                let mut directory_candidate = DiscoveryCandidate::new(&path, 0).with_symlink(is_symlink);
                 if let Some(category) = lookup_mount_category(mount_table, &path) {
                     directory_candidate = directory_candidate.with_mount_category(category);
                 }
@@ -1002,18 +1015,12 @@ fn collect_snapshot_for_root(
                 continue;
             }
 
-            if !file_type.is_file() && !file_type.is_symlink() {
+            if !metadata.is_file() {
                 continue;
             }
 
-            let metadata = match fs::metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(error) if is_ignorable_walk_error(&error) => continue,
-                Err(error) => return Err(error.into()),
-            };
-
             let mut candidate =
-                DiscoveryCandidate::new(&path, metadata.len()).with_symlink(file_type.is_symlink());
+                DiscoveryCandidate::new(&path, metadata.len()).with_symlink(is_symlink);
             if let Some(category) = lookup_mount_category(mount_table, &path) {
                 candidate = candidate.with_mount_category(category);
             }

@@ -3376,31 +3376,22 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     fn table_exists(conn: &Connection, table_name: &str) -> bool {
-        // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
-        // storage cursor on sqlite_master's root page with bound parameters.
-        // Safe here because callers pass trusted test constants only.
-        let sql = format!(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table_name}' LIMIT 1;"
-        );
-        let rows = conn
-            .query(&sql)
-            .map_err(ops_error)
-            .expect("sqlite_master table query should succeed");
-        !rows.is_empty()
+        // Probe table existence with a zero-row SELECT instead of
+        // querying sqlite_master: FrankenSQLite's VDBE cannot open a
+        // storage cursor on sqlite_master's btree root page.
+        conn.query(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
+            .is_ok()
     }
 
-    fn index_exists(conn: &Connection, index_name: &str) -> bool {
-        // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
-        // storage cursor on sqlite_master's root page with bound parameters.
-        // Safe here because callers pass trusted test constants only.
-        let sql = format!(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = '{index_name}' LIMIT 1;"
-        );
-        let rows = conn
-            .query(&sql)
-            .map_err(ops_error)
-            .expect("sqlite_master index query should succeed");
-        !rows.is_empty()
+    fn index_exists(conn: &Connection, table_name: &str, index_name: &str) -> bool {
+        // Probe index existence via INDEXED BY hint instead of querying
+        // sqlite_master: FrankenSQLite's VDBE cannot open a storage
+        // cursor on sqlite_master's btree root page. If the index
+        // doesn't exist, the query errors with "no such index".
+        conn.query(&format!(
+            "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
+        ))
+        .is_ok()
     }
 
     fn migration_row_count(conn: &Connection) -> i64 {
@@ -3712,26 +3703,26 @@ mod tests {
             );
         }
 
-        for index in [
-            "ix_inst_pk_hb",
-            "ix_se_pk_ts",
-            "ix_se_ii_ts",
-            "ix_se_corr",
-            "ix_ss_pk_w",
-            "ix_ejs_pk",
-            "ix_iis_pk",
-            "ix_rs_pk",
-            "ix_at_pk",
-            "ix_at_open",
-            "ix_el_aid",
-            "ix_slo_scope_window",
-            "ix_slo_project_window",
-            "ix_am_scope_state",
-            "ix_am_project_timeline",
+        for (table, index) in [
+            ("instances", "ix_inst_pk_hb"),
+            ("search_events", "ix_se_pk_ts"),
+            ("search_events", "ix_se_ii_ts"),
+            ("search_events", "ix_se_corr"),
+            ("search_summaries", "ix_ss_pk_w"),
+            ("embedding_job_snapshots", "ix_ejs_pk"),
+            ("index_inventory_snapshots", "ix_iis_pk"),
+            ("resource_samples", "ix_rs_pk"),
+            ("alerts_timeline", "ix_at_pk"),
+            ("alerts_timeline", "ix_at_open"),
+            ("evidence_links", "ix_el_aid"),
+            ("slo_rollups", "ix_slo_scope_window"),
+            ("slo_rollups", "ix_slo_project_window"),
+            ("anomaly_materializations", "ix_am_scope_state"),
+            ("anomaly_materializations", "ix_am_project_timeline"),
         ] {
             assert!(
-                index_exists(&conn, index),
-                "expected index {index} to exist"
+                index_exists(&conn, table, index),
+                "expected index {index} to exist on {table}"
             );
         }
     }

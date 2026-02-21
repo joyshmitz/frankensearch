@@ -378,10 +378,23 @@ impl StorageBackedJobRunner {
                 });
             }
 
-            let depth = fetch_queue_depth(conn)?;
-            if depth.ready_pending > self.queue.config().backpressure_threshold {
+            let ready_params = [SqliteValue::Integer(now_ms)];
+            let ready_rows = conn
+                .query_with_params(
+                    "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
+                    &ready_params,
+                )
+                .map_err(map_storage_error)?;
+            let ready_pending = if let Some(row) = ready_rows.first() {
+                usize::try_from(row_i64(row, 0, "embedding_jobs.ready_pending")?)
+                    .unwrap_or(usize::MAX)
+            } else {
+                0
+            };
+
+            if ready_pending > self.queue.config().backpressure_threshold {
                 return Err(SearchError::QueueFull {
-                    pending: depth.ready_pending,
+                    pending: ready_pending,
                     capacity: self.queue.config().backpressure_threshold,
                 });
             }
@@ -600,7 +613,20 @@ impl StorageBackedJobRunner {
             let text = text_cow.as_ref();
 
             if text.trim().is_empty() {
-                self.queue.skip(job.job_id, "empty content preview")?;
+                let skip_reason = "empty content preview";
+                self.queue.skip(job.job_id, skip_reason)?;
+                if let Err(error) = self.storage.mark_skipped(&job.doc_id, &job.embedder_id, skip_reason) {
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        stage = "mark_skipped",
+                        worker_id,
+                        correlation_id = %correlation_id,
+                        doc_id = %job.doc_id,
+                        embedder_id = %job.embedder_id,
+                        error = %error,
+                        "failed to record skipped status"
+                    );
+                }
                 result.jobs_skipped += 1;
                 tracing::info!(
                     target: "frankensearch.storage.pipeline",
@@ -616,8 +642,20 @@ impl StorageBackedJobRunner {
             }
 
             if is_hash_embedder(&job.embedder_id) {
-                self.queue
-                    .skip(job.job_id, "hash embeddings computed on-the-fly")?;
+                let skip_reason = "hash embeddings computed on-the-fly";
+                self.queue.skip(job.job_id, skip_reason)?;
+                if let Err(error) = self.storage.mark_skipped(&job.doc_id, &job.embedder_id, skip_reason) {
+                    tracing::warn!(
+                        target: "frankensearch.storage.pipeline",
+                        stage = "mark_skipped",
+                        worker_id,
+                        correlation_id = %correlation_id,
+                        doc_id = %job.doc_id,
+                        embedder_id = %job.embedder_id,
+                        error = %error,
+                        "failed to record skipped status"
+                    );
+                }
                 result.jobs_skipped += 1;
                 tracing::info!(
                     target: "frankensearch.storage.pipeline",
@@ -838,7 +876,15 @@ impl StorageBackedJobRunner {
 
     fn handle_job_failure(&self, job: &crate::ClaimedJob, error: &SearchError) {
         let error_message = error.to_string();
-        if let Err(fail_err) = self.queue.fail(job.job_id, &error_message) {
+        let fail_result = self.queue.fail(job.job_id, &error_message);
+        
+        let is_terminal = match &fail_result {
+            Ok(crate::job_queue::FailResult::TerminalFailed { .. }) => true,
+            Ok(crate::job_queue::FailResult::Retried { .. }) => false,
+            Err(_) => true,
+        };
+
+        if let Err(fail_err) = fail_result {
             tracing::warn!(
                 target: "frankensearch.storage.pipeline",
                 job_id = job.job_id,
@@ -846,16 +892,19 @@ impl StorageBackedJobRunner {
                 "failed to record job failure in queue"
             );
         }
-        if let Err(mark_err) =
-            self.storage
-                .mark_failed(&job.doc_id, &job.embedder_id, &error_message)
-        {
-            tracing::warn!(
-                target: "frankensearch.storage.pipeline",
-                doc_id = %job.doc_id,
-                error = %mark_err,
-                "failed to mark document as failed in storage"
-            );
+        
+        if is_terminal {
+            if let Err(mark_err) =
+                self.storage
+                    .mark_failed(&job.doc_id, &job.embedder_id, &error_message)
+            {
+                tracing::warn!(
+                    target: "frankensearch.storage.pipeline",
+                    doc_id = %job.doc_id,
+                    error = %mark_err,
+                    "failed to mark document as failed in storage"
+                );
+            }
         }
     }
 

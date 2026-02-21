@@ -454,30 +454,7 @@ impl VectorIndex {
     /// Returns `SearchError::Io` for filesystem write/sync failures and
     /// `SearchError::IndexCorrupted` if the on-disk record table is malformed.
     pub fn soft_delete(&mut self, doc_id: &str) -> SearchResult<bool> {
-        if let Some(index) = self.find_index_by_doc_id(doc_id)? {
-            let entry = self.record_at(index)?;
-            if is_tombstoned_flags(entry.flags) {
-                return Ok(false);
-            }
-            let flags = entry.flags | RECORD_FLAG_TOMBSTONE;
-            self.set_record_flags(index, flags)?;
-            if let Err(err) = self.soft_delete_wal_entry(doc_id) {
-                // Best-effort rollback of the main index tombstone
-                // to maintain consistency if WAL update failed.
-                if let Err(rollback_err) = self.set_record_flags(index, entry.flags) {
-                    tracing::error!(
-                        error = %rollback_err,
-                        doc_id,
-                        index,
-                        "failed to rollback tombstone after WAL error"
-                    );
-                }
-                return Err(err);
-            }
-            return Ok(true);
-        }
-
-        self.soft_delete_wal_entry(doc_id)
+        self.soft_delete_batch(&[doc_id]).map(|count| count > 0)
     }
 
     /// Tombstone a batch of document ids.
@@ -489,11 +466,85 @@ impl VectorIndex {
     /// Returns the first IO/corruption error encountered while updating flags.
     pub fn soft_delete_batch(&mut self, doc_ids: &[&str]) -> SearchResult<usize> {
         let mut deleted = 0usize;
-        for doc_id in doc_ids {
-            if self.soft_delete(doc_id)? {
-                deleted += 1;
+        let mut wal_changed = false;
+        
+        // Track modified main index entries for potential rollback
+        let mut modified_main_entries = Vec::new();
+
+        // Use a fast lookup for WAL entries to delete
+        let mut to_delete_set = std::collections::HashSet::with_capacity(doc_ids.len());
+        for &id in doc_ids {
+            to_delete_set.insert(id);
+        }
+
+        // 1. Mark all matching records in the main index as tombstoned.
+        for &doc_id in doc_ids {
+            let doc_id_hash = fnv1a_hash(doc_id.as_bytes());
+            if let Some(mut index) = self.find_first_hash_match(doc_id_hash)? {
+                while index > 0 {
+                    let prev = self.record_at(index - 1)?;
+                    if prev.doc_id_hash != doc_id_hash {
+                        break;
+                    }
+                    index -= 1;
+                }
+
+                for candidate in index..self.record_count() {
+                    let entry = self.record_at(candidate)?;
+                    if entry.doc_id_hash != doc_id_hash {
+                        break;
+                    }
+                    if !is_tombstoned_flags(entry.flags) {
+                        let candidate_doc_id = self.doc_id_at(candidate)?;
+                        if candidate_doc_id == doc_id {
+                            let flags = entry.flags | RECORD_FLAG_TOMBSTONE;
+                            self.set_record_flags(candidate, flags)?;
+                            modified_main_entries.push((candidate, entry.flags));
+                            deleted += 1;
+                        }
+                    }
+                }
             }
         }
+
+        // 2. Remove all matching records from WAL entries.
+        let original_wal_len = self.wal_entries.len();
+        let filtered: Vec<wal::WalEntry> = self
+            .wal_entries
+            .iter()
+            .filter(|entry| !to_delete_set.contains(entry.doc_id.as_str()))
+            .cloned()
+            .collect();
+            
+        let mut prev_wal = Vec::new();
+        if filtered.len() < original_wal_len {
+            deleted += original_wal_len - filtered.len();
+            wal_changed = true;
+            prev_wal = std::mem::replace(&mut self.wal_entries, filtered);
+        }
+
+        // 3. Rewrite WAL sidecar once if anything was removed.
+        if wal_changed {
+            if let Err(err) = self.rewrite_wal_sidecar() {
+                self.wal_entries = prev_wal;
+                // Rollback main index modifications
+                for (candidate, original_flags) in modified_main_entries {
+                    if let Err(rollback_err) = self.set_record_flags(candidate, original_flags) {
+                        tracing::error!(
+                            error = %rollback_err,
+                            candidate,
+                            "failed to rollback main index flag during soft_delete_batch failure"
+                        );
+                    }
+                }
+                tracing::error!(
+                    error = %err,
+                    "failed to rewrite WAL sidecar during batch delete"
+                );
+                return Err(err);
+            }
+        }
+
         Ok(deleted)
     }
 
@@ -1130,9 +1181,19 @@ impl VectorIndex {
     pub fn get_embeddings(&self, doc_id_hashes: &[u64]) -> Vec<Option<Vec<f16>>> {
         doc_id_hashes
             .iter()
-            .map(|hash| {
-                self.find_index_by_doc_hash(*hash)
-                    .and_then(|index| self.vector_at_f16(index).ok())
+            .map(|&hash| {
+                if let Some(index) = self.find_index_by_doc_hash(hash) {
+                    if let Ok(vec) = self.vector_at_f16(index) {
+                        return Some(vec);
+                    }
+                }
+                for entry in &self.wal_entries {
+                    if entry.doc_id_hash == hash {
+                        // WAL embeddings are f32, we need to convert them to f16
+                        return Some(entry.embedding.iter().map(|&v| half::f16::from_f32(v)).collect());
+                    }
+                }
+                None
             })
             .collect()
     }
@@ -1169,9 +1230,11 @@ impl VectorIndex {
             if entry.doc_id_hash != doc_id_hash {
                 break;
             }
-            let candidate_doc_id = self.doc_id_at(candidate)?;
-            if candidate_doc_id == doc_id {
-                return Ok(Some(candidate));
+            if !is_tombstoned_flags(entry.flags) {
+                let candidate_doc_id = self.doc_id_at(candidate)?;
+                if candidate_doc_id == doc_id {
+                    return Ok(Some(candidate));
+                }
             }
         }
         Ok(None)
@@ -1223,27 +1286,6 @@ impl VectorIndex {
             .flush_range(flags_offset, 2)
             .map_err(SearchError::Io)?;
         Ok(())
-    }
-
-    fn soft_delete_wal_entry(&mut self, doc_id: &str) -> SearchResult<bool> {
-        if !self.wal_entries.iter().any(|entry| entry.doc_id == doc_id) {
-            return Ok(false);
-        }
-        // Remove the entry from the in-memory list only after the disk write
-        // succeeds, so a failed rewrite doesn't leave state inconsistent.
-        let filtered: Vec<wal::WalEntry> = self
-            .wal_entries
-            .iter()
-            .filter(|entry| entry.doc_id != doc_id)
-            .cloned()
-            .collect();
-        let prev = std::mem::replace(&mut self.wal_entries, filtered);
-        if let Err(err) = self.rewrite_wal_sidecar() {
-            // Restore original entries on write failure.
-            self.wal_entries = prev;
-            return Err(err);
-        }
-        Ok(true)
     }
 
     fn rewrite_wal_sidecar(&self) -> SearchResult<()> {

@@ -329,6 +329,51 @@ impl Storage {
         Ok(())
     }
 
+    pub fn mark_skipped(
+        &self,
+        doc_id: &str,
+        embedder_id: &str,
+        reason: &str,
+    ) -> SearchResult<()> {
+        ensure_non_empty(doc_id, "doc_id")?;
+        ensure_non_empty(embedder_id, "embedder_id")?;
+
+        self.transaction(|conn| {
+            if !document_exists(conn, doc_id)? {
+                return Err(not_found_error("documents", doc_id));
+            }
+
+            let params = [
+                SqliteValue::Text(doc_id.to_owned()),
+                SqliteValue::Text(embedder_id.to_owned()),
+                SqliteValue::Text(EmbeddingStatus::Skipped.as_str().to_owned()),
+                SqliteValue::Text(reason.to_owned()),
+            ];
+            conn.execute_with_params(
+                "INSERT INTO embedding_status \
+                 (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+                 VALUES (?1, ?2, NULL, ?3, NULL, ?4, 0) \
+                 ON CONFLICT(doc_id, embedder_id) DO UPDATE SET \
+                 status = excluded.status, \
+                 embedded_at = NULL, \
+                 error_message = excluded.error_message;",
+                &params,
+            )
+            .map_err(storage_error)?;
+            Ok(())
+        })?;
+
+        tracing::debug!(
+            target: "frankensearch.storage",
+            op = "mark_skipped",
+            doc_id,
+            embedder_id,
+            "embedding status updated to skipped"
+        );
+
+        Ok(())
+    }
+
     pub fn count_by_status(&self, embedder_id: &str) -> SearchResult<StatusCounts> {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
@@ -537,17 +582,17 @@ fn upsert_document_with_outcome(
     validate_document(doc)?;
 
     let existing_hash = fetch_content_hash(conn, &doc.doc_id)?;
-    if let Some(hash) = existing_hash
-        && hash == doc.content_hash
-    {
-        return Ok(UpsertOutcome::Unchanged);
-    }
-
+    
+    // Always upsert the document to catch metadata/preview/timestamp changes
     upsert_document(conn, doc)?;
 
-    if existing_hash.is_some() {
-        reset_embedding_status(conn, &doc.doc_id)?;
-        Ok(UpsertOutcome::Updated)
+    if let Some(hash) = existing_hash {
+        if hash == doc.content_hash {
+            Ok(UpsertOutcome::Unchanged)
+        } else {
+            reset_embedding_status(conn, &doc.doc_id)?;
+            Ok(UpsertOutcome::Updated)
+        }
     } else {
         Ok(UpsertOutcome::Inserted)
     }

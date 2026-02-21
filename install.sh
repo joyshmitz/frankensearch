@@ -1,352 +1,394 @@
 #!/usr/bin/env bash
-
+#
+# fsfs installer (frankensearch standalone CLI)
+#
+# One-liner install:
+#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh | bash
+#
+# With cache buster:
+#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh?$(date +%s)" | bash
+#
+# Options:
+#   --version vX.Y.Z   Install specific version (default: latest)
+#   --dest DIR         Install to DIR (default: ~/.local/bin)
+#   --system           Install to /usr/local/bin (requires sudo)
+#   --easy-mode        Auto-update PATH in shell rc files
+#   --verify           Run self-test after install
+#   --from-source      Build from source instead of downloading binary
+#   --quiet            Suppress non-error output
+#   --no-gum           Disable gum formatting even if available
+#
 set -euo pipefail
+umask 022
+shopt -s lastpipe 2>/dev/null || true
 
-# Installer output primitives for fsfs rollout tasks.
-# This script currently focuses on presentation helpers and summary rendering.
+OWNER="${OWNER:-Dicklesworthstone}"
+REPO="${REPO:-frankensearch}"
+BINARY_NAME="fsfs"
+VERSION="${VERSION:-}"
+DEST_DEFAULT="$HOME/.local/bin"
+DEST="${DEST:-$DEST_DEFAULT}"
+EASY=0
+QUIET=0
+VERIFY=0
+FROM_SOURCE=0
+CHECKSUM="${CHECKSUM:-}"
+CHECKSUM_URL="${CHECKSUM_URL:-}"
+ARTIFACT_URL="${ARTIFACT_URL:-}"
+LOCK_FILE="/tmp/fsfs-install.lock"
+SYSTEM=0
+NO_GUM=0
 
-QUIET=false
-NO_GUM=false
-DEMO=false
+# Detect gum for fancy output (https://github.com/charmbracelet/gum)
+HAS_GUM=0
+if command -v gum &> /dev/null && [ -t 1 ]; then
+  HAS_GUM=1
+fi
 
-INSTALL_LOCATION="${INSTALL_LOCATION:-$HOME/.local/bin/fsfs}"
-MODEL_CACHE_LOCATION="${MODEL_CACHE_LOCATION:-$HOME/.cache/frankensearch/models}"
-CONFIGURED_AGENTS="${CONFIGURED_AGENTS:-none}"
-PATH_STATUS="${PATH_STATUS:-not configured}"
-
-USE_COLOR=false
-USE_UNICODE=false
-HAS_GUM=false
-
-ANSI_RESET=""
-ANSI_BLUE=""
-ANSI_GREEN=""
-ANSI_YELLOW=""
-ANSI_RED=""
-ANSI_BOLD=""
-
-SYMBOL_INFO="->"
-SYMBOL_OK="[ok]"
-SYMBOL_WARN="!"
-SYMBOL_ERR="x"
-
-print_usage() {
-  cat <<'USAGE'
-Usage: install.sh [options]
-
-Options:
-  --demo                    Run output helper demo mode.
-  --dest PATH               Installation location shown in summary output.
-  --model-cache PATH        Model cache location shown in summary output.
-  --agents LIST             Configured agents shown in summary output.
-  --path-status TEXT        PATH status shown in summary output.
-  --quiet                   Suppress non-essential info lines.
-  --no-gum                  Force ANSI/plain fallback even when gum exists.
-  --help                    Show this help.
-USAGE
-}
-
-parse_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --demo)
-        DEMO=true
-        shift
-        ;;
-      --dest)
-        INSTALL_LOCATION="${2:-}"
-        shift 2
-        ;;
-      --model-cache)
-        MODEL_CACHE_LOCATION="${2:-}"
-        shift 2
-        ;;
-      --agents)
-        CONFIGURED_AGENTS="${2:-}"
-        shift 2
-        ;;
-      --path-status)
-        PATH_STATUS="${2:-}"
-        shift 2
-        ;;
-      --quiet)
-        QUIET=true
-        shift
-        ;;
-      --no-gum)
-        NO_GUM=true
-        shift
-        ;;
-      --help|-h)
-        print_usage
-        exit 0
-        ;;
-      *)
-        printf 'Unknown argument: %s\n' "$1" >&2
-        print_usage >&2
-        exit 2
-        ;;
-    esac
-  done
-}
-
-configure_output_mode() {
-  local is_tty=false
-  local no_color_requested=false
-  if [[ -t 1 ]]; then
-    is_tty=true
-  fi
-
-  local utf8_locale=false
-  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
-    *UTF-8*|*utf8*|*UTF8*)
-      utf8_locale=true
-      ;;
-  esac
-
-  if [[ -n "${NO_COLOR:-}" ]]; then
-    no_color_requested=true
-    USE_COLOR=false
-  elif [[ "$is_tty" == true ]]; then
-    USE_COLOR=true
-  else
-    USE_COLOR=false
-  fi
-
-  if [[ "$utf8_locale" == true && "$is_tty" == true ]]; then
-    USE_UNICODE=true
-  else
-    USE_UNICODE=false
-  fi
-
-  if [[ "$USE_COLOR" == true ]]; then
-    ANSI_RESET=$'\033[0m'
-    ANSI_BLUE=$'\033[34m'
-    ANSI_GREEN=$'\033[32m'
-    ANSI_YELLOW=$'\033[33m'
-    ANSI_RED=$'\033[31m'
-    ANSI_BOLD=$'\033[1m'
-  fi
-
-  if [[ "$USE_UNICODE" == true ]]; then
-    SYMBOL_INFO="→"
-    SYMBOL_OK="✓"
-    SYMBOL_WARN="▲"
-    SYMBOL_ERR="✗"
-  fi
-
-  if [[ "$NO_GUM" == false && "$is_tty" == true && "$no_color_requested" == false ]] && command -v gum >/dev/null 2>&1; then
-    HAS_GUM=true
-  else
-    HAS_GUM=false
-  fi
-}
-
-emit_line() {
-  local color="$1"
-  local symbol="$2"
-  local message="$3"
-
-  if [[ "$HAS_GUM" == true ]]; then
-    gum style --foreground "$color" "${symbol} ${message}"
-    return
-  fi
-
-  if [[ "$USE_COLOR" == true ]]; then
-    local ansi_color="$ANSI_BLUE"
-    case "$color" in
-      green) ansi_color="$ANSI_GREEN" ;;
-      yellow) ansi_color="$ANSI_YELLOW" ;;
-      red) ansi_color="$ANSI_RED" ;;
-      blue) ansi_color="$ANSI_BLUE" ;;
-    esac
-    printf '%b%s%b %s\n' "$ansi_color" "$symbol" "$ANSI_RESET" "$message"
-  else
-    printf '%s %s\n' "$symbol" "$message"
-  fi
-}
+log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 
 info() {
-  if [[ "$QUIET" == true ]]; then
-    return
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 39 "→ $*"
+  else
+    echo -e "\033[0;34m→\033[0m $*"
   fi
-  emit_line "blue" "$SYMBOL_INFO" "$*"
 }
 
 ok() {
-  emit_line "green" "$SYMBOL_OK" "$*"
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 42 "✓ $*"
+  else
+    echo -e "\033[0;32m✓\033[0m $*"
+  fi
 }
 
 warn() {
-  emit_line "yellow" "$SYMBOL_WARN" "$*"
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 214 "⚠ $*"
+  else
+    echo -e "\033[1;33m⚠\033[0m $*"
+  fi
 }
 
 err() {
-  emit_line "red" "$SYMBOL_ERR" "$*"
-}
-
-banner() {
-  local title="$1"
-
-  if [[ "$HAS_GUM" == true ]]; then
-    gum style --border normal --border-foreground 63 --padding "0 1" "$title"
-    return
-  fi
-
-  local border_width
-  border_width=$(( ${#title} + 2 ))
-  local line
-  line="$(printf '%*s' "$border_width" '' | tr ' ' '─')"
-
-  if [[ "$USE_UNICODE" == true ]]; then
-    if [[ "$USE_COLOR" == true ]]; then
-      printf '%b┌%s┐%b\n' "$ANSI_BLUE" "$line" "$ANSI_RESET"
-      printf '%b│ %s │%b\n' "$ANSI_BLUE" "$title" "$ANSI_RESET"
-      printf '%b└%s┘%b\n' "$ANSI_BLUE" "$line" "$ANSI_RESET"
-    else
-      printf '┌%s┐\n' "$line"
-      printf '│ %s │\n' "$title"
-      printf '└%s┘\n' "$line"
-    fi
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 196 "✗ $*"
   else
-    line="$(printf '%*s' "$border_width" '' | tr ' ' '-')"
-    printf '+%s+\n' "$line"
-    printf '| %s |\n' "$title"
-    printf '+%s+\n' "$line"
+    echo -e "\033[0;31m✗\033[0m $*"
   fi
 }
 
 run_with_spinner() {
   local title="$1"
   shift
-
-  if [[ $# -eq 0 ]]; then
-    err "run_with_spinner requires a command"
-    return 2
-  fi
-
-  if [[ "$HAS_GUM" == true ]]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     gum spin --spinner dot --title "$title" -- "$@"
-    return $?
-  fi
-
-  if [[ ! -t 1 || "$QUIET" == true ]]; then
+  else
+    info "$title"
     "$@"
-    return $?
-  fi
-
-  local frames="|/-\\"
-  local i=0
-  "$@" &
-  local pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    printf '\r%c %s' "${frames:i++%${#frames}:1}" "$title"
-    sleep 0.1
-  done
-
-  wait "$pid"
-  local status=$?
-  printf '\r'
-  if [[ $status -eq 0 ]]; then
-    ok "$title"
-  else
-    err "$title failed"
-  fi
-  return $status
-}
-
-summary_row() {
-  local label="$1"
-  local value="$2"
-
-  if [[ "$HAS_GUM" == true ]]; then
-    gum style --bold "$label:" "$(gum style --foreground 246 "$value")"
-    return
-  fi
-
-  if [[ "$USE_COLOR" == true ]]; then
-    printf '%b%-24s%b %s\n' "$ANSI_BOLD" "${label}:" "$ANSI_RESET" "$value"
-  else
-    printf '%-24s %s\n' "${label}:" "$value"
   fi
 }
 
-final_summary() {
-  local install_location="$1"
-  local cache_location="$2"
-  local configured_agents="$3"
-  local path_status="$4"
-  shift 4
-  local next_steps=("$@")
+resolve_version() {
+  if [ -n "$VERSION" ]; then return 0; fi
 
-  banner "Installation Summary"
-  summary_row "Installation location" "$install_location"
-  summary_row "Model cache location" "$cache_location"
-  summary_row "Configured agents" "$configured_agents"
-  summary_row "PATH status" "$path_status"
+  info "Resolving latest version..."
+  local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
+  local tag
+  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
+    tag=""
+  fi
 
-  if [[ ${#next_steps[@]} -gt 0 ]]; then
-    if [[ "$HAS_GUM" == true ]]; then
-      gum style --bold "Next steps:"
-      local step
-      for step in "${next_steps[@]}"; do
-        gum style "  - $step"
-      done
-    else
-      if [[ "$USE_COLOR" == true ]]; then
-        printf '%bNext steps:%b\n' "$ANSI_BOLD" "$ANSI_RESET"
-      else
-        printf 'Next steps:\n'
+  if [ -n "$tag" ]; then
+    VERSION="$tag"
+    info "Resolved latest version: $VERSION"
+  else
+    # Try redirect-based resolution as fallback
+    local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
+    if tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
+      if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
+        VERSION="$tag"
+        info "Resolved latest version via redirect: $VERSION"
+        return 0
       fi
-      local step
-      for step in "${next_steps[@]}"; do
-        printf '  - %s\n' "$step"
-      done
     fi
+    err "Could not resolve latest version. Use --version vX.Y.Z"
+    exit 1
   fi
 }
 
-demo_mode() {
-  banner "frankensearch installer output demo"
-  info "preflight checks started"
-  run_with_spinner "simulating model download" sleep 1
-  ok "binary install complete"
-  if [[ "$HAS_GUM" == true ]]; then
-    info "gum renderer active"
-  else
-    warn "gum not found; using fallback renderer"
-  fi
-  err "sample failure output"
-  final_summary \
-    "$INSTALL_LOCATION" \
-    "$MODEL_CACHE_LOCATION" \
-    "$CONFIGURED_AGENTS" \
-    "$PATH_STATUS" \
-    "Run 'fsfs --help'" \
-    "Run 'fsfs index <path>'" \
-    "Run 'fsfs search \"query\"'"
+maybe_add_path() {
+  case ":$PATH:" in
+    *:"$DEST":*) return 0;;
+    *)
+      if [ "$EASY" -eq 1 ]; then
+        local UPDATED=0
+        for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+          if [ -e "$rc" ] && [ -w "$rc" ]; then
+            if ! grep -qF "$DEST" "$rc" 2>/dev/null; then
+              printf '\nexport PATH="%s:$PATH"\n' "$DEST" >> "$rc"
+            fi
+            UPDATED=1
+          fi
+        done
+        if [ "$UPDATED" -eq 1 ]; then
+          warn "PATH updated in shell config; restart your shell to use ${BINARY_NAME}"
+        else
+          warn "Add $DEST to PATH to use ${BINARY_NAME}"
+        fi
+      else
+        warn "Add $DEST to PATH to use ${BINARY_NAME}"
+      fi
+    ;;
+  esac
 }
 
-main() {
-  parse_args "$@"
-  configure_output_mode
-
-  if [[ "$DEMO" == true ]]; then
-    demo_mode
+ensure_rust() {
+  if [ "${RUSTUP_INIT_SKIP:-0}" != "0" ]; then
+    info "Skipping rustup install (RUSTUP_INIT_SKIP set)"
     return 0
   fi
-
-  banner "frankensearch installer scaffold"
-  info "output helper subsystem initialized"
-  warn "installer execution stages are not wired in this bead"
-  final_summary \
-    "$INSTALL_LOCATION" \
-    "$MODEL_CACHE_LOCATION" \
-    "$CONFIGURED_AGENTS" \
-    "$PATH_STATUS" \
-    "Re-run with --demo to preview output primitives"
+  if command -v cargo >/dev/null 2>&1 && rustc --version 2>/dev/null | grep -q nightly; then return 0; fi
+  if [ "$EASY" -ne 1 ]; then
+    if [ -t 0 ]; then
+      printf "Install Rust nightly via rustup? (y/N): "
+      read -r ans
+      case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
+    fi
+  fi
+  info "Installing rustup (nightly)"
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
+  export PATH="$HOME/.cargo/bin:$PATH"
+  rustup component add rustfmt clippy || true
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "$@"
+usage() {
+  cat <<EOFU
+Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
+                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] [--no-gum]
+
+Options:
+  --version vX.Y.Z   Install specific version (default: latest)
+  --dest DIR         Install to DIR (default: ~/.local/bin)
+  --system           Install to /usr/local/bin (requires sudo)
+  --easy-mode        Auto-update PATH in shell rc files
+  --verify           Run self-test after install
+  --from-source      Build from source instead of downloading binary
+  --quiet            Suppress non-error output
+  --no-gum           Disable gum formatting even if available
+EOFU
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --version) VERSION="$2"; shift 2;;
+    --dest) DEST="$2"; shift 2;;
+    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
+    --easy-mode) EASY=1; shift;;
+    --verify) VERIFY=1; shift;;
+    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
+    --checksum) CHECKSUM="$2"; shift 2;;
+    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
+    --from-source) FROM_SOURCE=1; shift;;
+    --quiet|-q) QUIET=1; shift;;
+    --no-gum) NO_GUM=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) shift;;
+  esac
+done
+
+# Show header
+if [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style \
+      --border normal \
+      --border-foreground 39 \
+      --padding "0 1" \
+      --margin "1 0" \
+      "$(gum style --foreground 42 --bold 'fsfs installer')" \
+      "$(gum style --foreground 245 'Two-tier hybrid local search')"
+  else
+    echo ""
+    echo -e "\033[1;32mfsfs installer\033[0m"
+    echo -e "\033[0;90mTwo-tier hybrid local search (frankensearch)\033[0m"
+    echo ""
+  fi
 fi
+
+resolve_version
+
+mkdir -p "$DEST"
+OS=$(uname -s | tr 'A-Z' 'a-z')
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) ARCH="x86_64" ;;
+  arm64|aarch64) ARCH="aarch64" ;;
+  *) warn "Unknown arch $ARCH, using as-is" ;;
+esac
+
+TARGET=""
+EXT=""
+case "${OS}-${ARCH}" in
+  linux-x86_64)   TARGET="x86_64-unknown-linux-musl"; EXT="tar.xz" ;;
+  linux-aarch64)  TARGET="aarch64-unknown-linux-musl"; EXT="tar.xz" ;;
+  darwin-x86_64)  TARGET="x86_64-apple-darwin"; EXT="tar.xz" ;;
+  darwin-aarch64) TARGET="aarch64-apple-darwin"; EXT="tar.xz" ;;
+  *) :;;
+esac
+
+# Build artifact filename and download URL.
+# dsr artifact naming: fsfs-${version_bare}-${target_triple}.${ext}
+# Also try versionless: fsfs-${target_triple}.${ext}
+VERSION_BARE="${VERSION#v}"  # strip leading v for artifact naming
+TAR=""
+URL=""
+if [ "$FROM_SOURCE" -eq 0 ]; then
+  if [ -n "$ARTIFACT_URL" ]; then
+    TAR=$(basename "$ARTIFACT_URL")
+    URL="$ARTIFACT_URL"
+  elif [ -n "$TARGET" ]; then
+    TAR="${BINARY_NAME}-${VERSION_BARE}-${TARGET}.${EXT}"
+    URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+  else
+    warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
+    FROM_SOURCE=1
+  fi
+fi
+
+# Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
+LOCK_DIR="${LOCK_FILE}.d"
+LOCKED=0
+if mkdir "$LOCK_DIR" 2>/dev/null; then
+  LOCKED=1
+  echo $$ > "$LOCK_DIR/pid"
+else
+  if [ -f "$LOCK_DIR/pid" ]; then
+    OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+    if [ -n "$OLD_PID" ] && ! kill -0 "$OLD_PID" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        LOCKED=1
+        echo $$ > "$LOCK_DIR/pid"
+      fi
+    fi
+  fi
+  if [ "$LOCKED" -eq 0 ]; then
+    err "Another installer is running (lock $LOCK_DIR)"
+    exit 1
+  fi
+fi
+
+cleanup() {
+  rm -rf "$TMP"
+  if [ "$LOCKED" -eq 1 ]; then rm -rf "$LOCK_DIR"; fi
+}
+
+TMP=$(mktemp -d)
+trap cleanup EXIT
+
+if [ "$FROM_SOURCE" -eq 0 ]; then
+  info "Downloading $URL"
+  if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+    # Try versionless artifact name as fallback
+    FALLBACK_TAR="${BINARY_NAME}-${TARGET}.${EXT}"
+    FALLBACK_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${FALLBACK_TAR}"
+    info "Trying fallback: $FALLBACK_URL"
+    if ! curl -fsSL "$FALLBACK_URL" -o "$TMP/$FALLBACK_TAR"; then
+      warn "Artifact download failed; falling back to build-from-source"
+      FROM_SOURCE=1
+    else
+      TAR="$FALLBACK_TAR"
+    fi
+  fi
+fi
+
+if [ "$FROM_SOURCE" -eq 1 ]; then
+  info "Building from source (requires git, rust nightly)"
+  ensure_rust
+  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  (cd "$TMP/src" && cargo build --release -p frankensearch-fsfs)
+  BIN="$TMP/src/target/release/${BINARY_NAME}"
+  [ -x "$BIN" ] || { err "Build failed"; exit 1; }
+  if [ "$SYSTEM" -eq 1 ]; then
+    sudo install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
+  else
+    install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
+  fi
+  ok "Installed to $DEST/${BINARY_NAME} (source build)"
+  maybe_add_path
+  if [ "$VERIFY" -eq 1 ]; then
+    "$DEST/${BINARY_NAME}" --version || true
+    ok "Self-test complete"
+  fi
+  ok "Done. Binary at: $DEST/${BINARY_NAME}"
+  exit 0
+fi
+
+# Verify checksum
+if [ -z "$CHECKSUM" ]; then
+  if [ -z "$CHECKSUM_URL" ]; then
+    CHECKSUM_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+  fi
+  info "Fetching checksum from ${CHECKSUM_URL}"
+  CHECKSUM_FILE="$TMP/SHA256SUMS"
+  if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+    warn "Checksum not available; skipping verification"
+    CHECKSUM="SKIP"
+  else
+    CHECKSUM=$(grep "  ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
+    if [ -z "$CHECKSUM" ]; then
+      CHECKSUM=$(grep " ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$CHECKSUM" ]; then warn "Checksum for ${TAR} not found; skipping verification"; CHECKSUM="SKIP"; fi
+  fi
+fi
+
+if [ "$CHECKSUM" != "SKIP" ]; then
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
+  elif command -v shasum >/dev/null 2>&1; then
+    echo "$CHECKSUM  $TMP/$TAR" | shasum -a 256 -c - || { err "Checksum mismatch"; exit 1; }
+  else
+    warn "No sha256sum or shasum found; skipping checksum verification"
+  fi
+  ok "Checksum verified"
+fi
+
+# Extract
+info "Extracting"
+case "$TAR" in
+  *.tar.xz)  tar -xJf "$TMP/$TAR" -C "$TMP" ;;
+  *.tar.gz)  tar -xzf "$TMP/$TAR" -C "$TMP" ;;
+  *.zip)     unzip -qo "$TMP/$TAR" -d "$TMP" ;;
+  *)         err "Unknown archive format: $TAR"; exit 1 ;;
+esac
+
+# Find the binary in extracted files
+BIN="$TMP/${BINARY_NAME}"
+if [ ! -x "$BIN" ]; then
+  BIN=$(find "$TMP" -maxdepth 3 -type f -name "${BINARY_NAME}" -perm -111 2>/dev/null | head -n 1)
+fi
+[ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
+
+if [ "$SYSTEM" -eq 1 ]; then
+  sudo install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
+else
+  install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
+fi
+ok "Installed to $DEST/${BINARY_NAME}"
+maybe_add_path
+
+if [ "$VERIFY" -eq 1 ]; then
+  "$DEST/${BINARY_NAME}" --version || true
+  ok "Self-test complete"
+fi
+
+ok "Done. Binary at: $DEST/${BINARY_NAME}"
+echo ""
+info "Quick start:"
+echo "  1. Index a directory:  fsfs index /path/to/your/files"
+echo "  2. Search:             fsfs search \"your query\""
+echo "  3. Interactive TUI:    fsfs"
+echo ""

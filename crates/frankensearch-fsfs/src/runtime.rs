@@ -1464,21 +1464,14 @@ impl EmbeddingVectorSink for LiveVectorSink {
     fn persist(
         &self,
         doc_id: &str,
-        embedding_embedder_id: &str,
+        _embedding_embedder_id: &str,
         embedding: &[f32],
     ) -> SearchResult<()> {
         let mut vi = self
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = vi.soft_delete(doc_id) {
-            tracing::debug!(
-                file_key = %doc_id,
-                embedder_id = embedding_embedder_id,
-                error = %error,
-                "storage vector sink: soft_delete ignored (doc may be new)"
-            );
-        }
+        vi.soft_delete(doc_id)?;
         vi.append(doc_id, embedding)?;
         drop(vi);
         Ok(())
@@ -10891,26 +10884,22 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
                 ),
                 ui_fg(no_color, PackedRgba::rgb(173, 194, 229)),
             )),
-            Line::from(Span::styled(
-                hit.snippet.as_deref().map_or(
-                    "No snippet available for this match.".to_owned(),
-                    |snippet| {
-                        let snippet_trimmed = snippet.trim();
-                        let detection = is_likely_markdown(snippet_trimmed);
-                        let preview_format =
-                            detect_context_preview_format(snippet_trimmed, detection);
-                        let snippet_text = if preview_format == ContextPreviewFormat::Html {
-                            normalize_html_fragment_for_markdown(snippet_trimmed)
-                        } else {
-                            snippet_trimmed.to_owned()
-                        };
-                        truncate_tail(
-                            &snippet_text,
-                            usize::from(left[2].width).saturating_sub(8).max(26),
-                        )
-                    },
-                ),
-                ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
+            Line::from_spans(hit.snippet.as_deref().map_or_else(
+                || {
+                    vec![Span::styled(
+                        "No snippet available for this match.".to_owned(),
+                        ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
+                    )]
+                },
+                |snippet| {
+                    let budget = usize::from(left[2].width).saturating_sub(8).max(26);
+                    html_snippet_to_spans(
+                        snippet.trim(),
+                        ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
+                        ui_fg(no_color, PackedRgba::rgb(152, 174, 211)).bold(),
+                        Some(budget),
+                    )
+                },
             )),
         ]
     } else if let Some(error) = state.last_error.as_deref() {
@@ -11541,15 +11530,15 @@ fn render_search_results_panel(
                     )]
                 },
                 |snippet| {
-                    highlight_text_spans(
-                        &truncate_tail(snippet.trim(), snippet_budget),
-                        query_terms,
+                    html_snippet_to_spans(
+                        snippet.trim(),
                         ui_fg(no_color, PackedRgba::rgb(151, 173, 211)),
                         ui_fg_bg(
                             no_color,
                             PackedRgba::rgb(9, 23, 36),
                             PackedRgba::rgb(255, 202, 123),
                         ),
+                        Some(snippet_budget),
                     )
                 },
             );
@@ -11715,13 +11704,132 @@ fn strip_html_tags(source: &str) -> String {
 }
 
 fn decode_basic_html_entities(source: &str) -> String {
-    source
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        if let Some(semi) = rest.find(';') {
+            let entity = &rest[1..semi];
+            let decoded: Option<char> = match entity {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &rest[semi + 1..];
+            } else {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        } else {
+            out.push('&');
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse a Tantivy HTML snippet into styled spans.
+///
+/// Decodes HTML entities, converts `<b>` regions into `bold_style` spans,
+/// strips any other HTML tags, and truncates the *visible* text to
+/// `max_visible_chars` (if `Some`).
+fn html_snippet_to_spans(
+    html: &str,
+    base_style: Style,
+    bold_style: Style,
+    max_visible_chars: Option<usize>,
+) -> Vec<Span<'static>> {
+    let decoded = decode_basic_html_entities(html);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut rest = decoded.as_str();
+    let mut in_bold = false;
+    let mut buf = String::new();
+    let mut visible_chars = 0usize;
+    let budget = max_visible_chars.unwrap_or(usize::MAX);
+    let mut truncated = false;
+
+    while !rest.is_empty() && !truncated {
+        if let Some(tag_start) = rest.find('<') {
+            let text_before = &rest[..tag_start];
+            for ch in text_before.chars() {
+                if visible_chars >= budget {
+                    truncated = true;
+                    break;
+                }
+                buf.push(ch);
+                visible_chars += 1;
+            }
+            if truncated {
+                break;
+            }
+            rest = &rest[tag_start..];
+            if let Some(tag_end) = rest.find('>') {
+                let tag = &rest[1..tag_end];
+                let tag_lower = tag.to_ascii_lowercase();
+                if tag_lower == "b" || tag_lower == "strong" {
+                    if !buf.is_empty() {
+                        let style = if in_bold { bold_style } else { base_style };
+                        spans.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    in_bold = true;
+                } else if tag_lower == "/b" || tag_lower == "/strong" {
+                    if !buf.is_empty() {
+                        let style = if in_bold { bold_style } else { base_style };
+                        spans.push(Span::styled(std::mem::take(&mut buf), style));
+                    }
+                    in_bold = false;
+                }
+                // skip any other tags silently
+                rest = &rest[tag_end + 1..];
+            } else {
+                // no closing '>' — treat '<' as literal
+                if visible_chars < budget {
+                    buf.push('<');
+                    visible_chars += 1;
+                } else {
+                    truncated = true;
+                }
+                rest = &rest[1..];
+            }
+        } else {
+            for ch in rest.chars() {
+                if visible_chars >= budget {
+                    truncated = true;
+                    break;
+                }
+                buf.push(ch);
+                visible_chars += 1;
+            }
+            rest = "";
+        }
+    }
+    if !buf.is_empty() {
+        let style = if in_bold { bold_style } else { base_style };
+        spans.push(Span::styled(buf, style));
+    }
+    if truncated {
+        spans.push(Span::styled("…".to_owned(), base_style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+    spans
 }
 
 fn wrap_markdown_for_context_panel(text: Text<'static>, width: u16) -> Text<'static> {
@@ -15890,7 +15998,7 @@ mod tests {
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
-            assert_eq!(payload.models.len(), 3);
+            assert_eq!(payload.models.len(), 6);
             assert!(payload.models.iter().all(|entry| entry.state == "missing"));
         });
     }

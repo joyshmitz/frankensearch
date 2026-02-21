@@ -378,31 +378,22 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
 
     fn table_exists(conn: &Connection, table_name: &str) -> bool {
-        // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
-        // storage cursor on sqlite_master's root page with bound parameters.
-        // Safe here because callers pass trusted test constants only.
-        let sql = format!(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '{table_name}' LIMIT 1;"
-        );
-        let rows = conn
-            .query(&sql)
-            .map_err(catalog_error)
-            .expect("sqlite_master table query should succeed");
-        !rows.is_empty()
+        // Probe table existence with a zero-row SELECT instead of
+        // querying sqlite_master: FrankenSQLite's VDBE cannot open a
+        // storage cursor on sqlite_master's btree root page.
+        conn.query(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
+            .is_ok()
     }
 
-    fn index_exists(conn: &Connection, index_name: &str) -> bool {
-        // Use non-parameterized query: FrankenSQLite's VDBE cannot open a
-        // storage cursor on sqlite_master's root page with bound parameters.
-        // Safe here because callers pass trusted test constants only.
-        let sql = format!(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = '{index_name}' LIMIT 1;"
-        );
-        let rows = conn
-            .query(&sql)
-            .map_err(catalog_error)
-            .expect("sqlite_master index query should succeed");
-        !rows.is_empty()
+    fn index_exists(conn: &Connection, table_name: &str, index_name: &str) -> bool {
+        // Probe index existence via INDEXED BY hint instead of querying
+        // sqlite_master: FrankenSQLite's VDBE cannot open a storage
+        // cursor on sqlite_master's btree root page. If the index
+        // doesn't exist, the query errors with "no such index".
+        conn.query(&format!(
+            "SELECT 1 FROM \"{table_name}\" INDEXED BY \"{index_name}\" LIMIT 0"
+        ))
+        .is_ok()
     }
 
     #[test]
@@ -424,11 +415,21 @@ mod tests {
             INDEX_CATALOG_REVISIONS,
             INDEX_CATALOG_CLEANUP,
             INDEX_CATALOG_CONTENT_HASH,
+        ] {
+            assert!(
+                index_exists(&conn, "fsfs_catalog_files", index),
+                "missing required index {index}"
+            );
+        }
+        for index in [
             INDEX_CHANGELOG_REPLAY,
             INDEX_CHANGELOG_FILE_REVISION,
             INDEX_CHANGELOG_PENDING_APPLY,
         ] {
-            assert!(index_exists(&conn, index), "missing required index {index}");
+            assert!(
+                index_exists(&conn, "fsfs_catalog_changelog", index),
+                "missing required index {index}"
+            );
         }
     }
 
@@ -608,8 +609,8 @@ mod tests {
             INDEX_CATALOG_CONTENT_HASH,
         ] {
             assert!(
-                index_exists(&conn, index),
-                "catalog index {index} should exist in sqlite_master"
+                index_exists(&conn, "fsfs_catalog_files", index),
+                "catalog index {index} should exist after bootstrap"
             );
         }
 
@@ -619,8 +620,8 @@ mod tests {
             INDEX_CHANGELOG_PENDING_APPLY,
         ] {
             assert!(
-                index_exists(&conn, index),
-                "changelog index {index} should exist in sqlite_master"
+                index_exists(&conn, "fsfs_catalog_changelog", index),
+                "changelog index {index} should exist after bootstrap"
             );
         }
 

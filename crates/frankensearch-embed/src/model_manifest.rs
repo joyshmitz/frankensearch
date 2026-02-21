@@ -75,6 +75,15 @@ impl ModelFile {
         is_valid_sha256_hex(&self.sha256) && !self.uses_placeholder_checksum()
     }
 
+    /// Get the local filename (basename) for saving.
+    ///
+    /// For paths like `"onnx/model.onnx"`, returns `"model.onnx"`.
+    /// This handles HuggingFace repos that restructure files into subdirectories.
+    #[must_use]
+    pub fn local_name(&self) -> &str {
+        self.name.rsplit('/').next().unwrap_or(&self.name)
+    }
+
     /// Return the download URL for this file, preferring the explicit `url`
     /// field and falling back to the standard `HuggingFace` `/resolve/` path.
     #[must_use]
@@ -325,6 +334,232 @@ impl ModelManifest {
         }
     }
 
+    // ==================== Bake-off Eligible Models ====================
+
+    /// Snowflake Arctic Embed S manifest.
+    ///
+    /// Dimension: 384. Small, fast model with MiniLM-compatible dimension.
+    /// Verified checksums from HuggingFace.
+    #[must_use]
+    pub fn snowflake_arctic_s() -> Self {
+        const REVISION: &str = "e596f507467533e48a2e17c007f0e1dacc837b33";
+        const REPO: &str = "Snowflake/snowflake-arctic-embed-s";
+        Self {
+            id: "snowflake-arctic-embed-s".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Snowflake Arctic Embed S".to_owned()),
+            description: Some(
+                "Small, fast embedding model with MiniLM-compatible 384 dimensions".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".to_owned(),
+                    sha256: "579c1f1778a0993eb0d2a1403340ffb491c769247fb46acc4f5cf8ac5b89c1e1"
+                        .to_owned(),
+                    size: 133_093_492,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854"
+                        .to_owned(),
+                    size: 711_649,
+                    url: None,
+                },
+                ModelFile {
+                    name: "config.json".to_owned(),
+                    sha256: "4e519aa92ec40943356032afe458c8829d70c5766b109e4a57490b82f72dcfb7"
+                        .to_owned(),
+                    size: 703,
+                    url: None,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".to_owned(),
+                    sha256: "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a"
+                        .to_owned(),
+                    size: 695,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".to_owned(),
+                    sha256: "9ca59277519f6e3692c8685e26b94d4afca2d5438deff66483db495e48735810"
+                        .to_owned(),
+                    size: 1_433,
+                    url: None,
+                },
+            ],
+            license: "Apache-2.0".to_owned(),
+            dimension: Some(384),
+            tier: Some(ModelTier::Quality),
+            download_size_bytes: 133_807_972,
+        }
+    }
+
+    /// Nomic Embed Text v1.5 manifest.
+    ///
+    /// Dimension: 768. Long context support with Matryoshka embedding capability.
+    /// Verified checksums from HuggingFace.
+    #[must_use]
+    pub fn nomic_embed() -> Self {
+        const REVISION: &str = "e5cf08aadaa33385f5990def41f7a23405aec398";
+        const REPO: &str = "nomic-ai/nomic-embed-text-v1.5";
+        Self {
+            id: "nomic-embed-text-v1.5".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Nomic Embed Text v1.5".to_owned()),
+            description: Some(
+                "Long context embedding model with Matryoshka capability (768 dims)".to_owned(),
+            ),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".to_owned(),
+                    sha256: "147d5aa88c2101237358e17796cf3a227cead1ec304ec34b465bb08e9d952965"
+                        .to_owned(),
+                    size: 547_310_275,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+                        .to_owned(),
+                    size: 711_396,
+                    url: None,
+                },
+                ModelFile {
+                    name: "config.json".to_owned(),
+                    sha256: "0168e0883705b0bf8f2b381e10f45a9f3e1ef4b13869b43c160e4c8a70ddf442"
+                        .to_owned(),
+                    size: 2_331,
+                    url: None,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".to_owned(),
+                    sha256: "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a"
+                        .to_owned(),
+                    size: 695,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".to_owned(),
+                    sha256: "d7e0000bcc80134debd2222220427e6bf5fa20a669f40a0d0d1409cc18e0a9bc"
+                        .to_owned(),
+                    size: 1_191,
+                    url: None,
+                },
+            ],
+            license: "Apache-2.0".to_owned(),
+            dimension: Some(768),
+            tier: Some(ModelTier::Quality),
+            download_size_bytes: 548_025_888,
+        }
+    }
+
+    /// Jina Reranker v1 Turbo EN manifest.
+    ///
+    /// Fast, optimized for English. Verified checksums from HuggingFace.
+    #[must_use]
+    pub fn jina_reranker_turbo() -> Self {
+        const REVISION: &str = "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2";
+        const REPO: &str = "jinaai/jina-reranker-v1-turbo-en";
+        Self {
+            id: "jina-reranker-v1-turbo-en".to_owned(),
+            version: "v1".to_owned(),
+            display_name: Some("Jina Reranker v1 Turbo EN".to_owned()),
+            description: Some("Fast cross-encoder reranker optimized for English".to_owned()),
+            repo: REPO.to_owned(),
+            revision: REVISION.to_owned(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model.onnx".to_owned(),
+                    sha256: "c1296c66c119de645fa9cdee536d8637740efe85224cfa270281e50f213aa565"
+                        .to_owned(),
+                    size: 151_296_975,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer.json".to_owned(),
+                    sha256: "0046da43cc8c424b317f56b092b0512aaaa65c4f925d2f16af9d9eeb4d0ef902"
+                        .to_owned(),
+                    size: 2_030_772,
+                    url: None,
+                },
+                ModelFile {
+                    name: "config.json".to_owned(),
+                    sha256: "e050ff6a15ae9295e84882fa0e98051bd8754856cd5201395ebf00ce9f2d609b"
+                        .to_owned(),
+                    size: 1_206,
+                    url: None,
+                },
+                ModelFile {
+                    name: "special_tokens_map.json".to_owned(),
+                    sha256: "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f"
+                        .to_owned(),
+                    size: 280,
+                    url: None,
+                },
+                ModelFile {
+                    name: "tokenizer_config.json".to_owned(),
+                    sha256: "d291c6652d96d56ffdbcf1ea19d9bae5ed79003f7648c627e725a619227ce8fa"
+                        .to_owned(),
+                    size: 1_215,
+                    url: None,
+                },
+            ],
+            license: "Apache-2.0".to_owned(),
+            dimension: None, // Cross-encoder produces scores, not embeddings
+            tier: Some(ModelTier::Reranker),
+            download_size_bytes: 153_330_448,
+        }
+    }
+
+    // ==================== Lookup & Listing Functions ====================
+
+    /// Get manifest by embedder name.
+    #[must_use]
+    pub fn for_embedder(name: &str) -> Option<Self> {
+        match name {
+            "minilm" => Some(Self::minilm_v2()),
+            "snowflake-arctic-s" => Some(Self::snowflake_arctic_s()),
+            "nomic-embed" => Some(Self::nomic_embed()),
+            "potion-128m" => Some(Self::potion_128m()),
+            _ => None,
+        }
+    }
+
+    /// Get manifest by reranker name.
+    #[must_use]
+    pub fn for_reranker(name: &str) -> Option<Self> {
+        match name {
+            "ms-marco" => Some(Self::ms_marco_reranker()),
+            "jina-reranker-turbo" => Some(Self::jina_reranker_turbo()),
+            _ => None,
+        }
+    }
+
+    /// Get all bake-off eligible embedder manifests.
+    #[must_use]
+    pub fn bakeoff_embedder_candidates() -> Vec<Self> {
+        vec![Self::snowflake_arctic_s(), Self::nomic_embed()]
+    }
+
+    /// Get all bake-off eligible reranker manifests.
+    #[must_use]
+    pub fn bakeoff_reranker_candidates() -> Vec<Self> {
+        vec![Self::jina_reranker_turbo()]
+    }
+
+    /// Get all bake-off eligible model manifests (embedders + rerankers).
+    #[must_use]
+    pub fn bakeoff_candidates() -> Vec<Self> {
+        let mut candidates = Self::bakeoff_embedder_candidates();
+        candidates.extend(Self::bakeoff_reranker_candidates());
+        candidates
+    }
+
     /// Return the compiled-in catalog of all built-in model manifests.
     ///
     /// This is the single source of truth for what models frankensearch needs.
@@ -337,6 +572,9 @@ impl ModelManifest {
                 Self::potion_128m(),
                 Self::minilm_v2(),
                 Self::ms_marco_reranker(),
+                Self::snowflake_arctic_s(),
+                Self::nomic_embed(),
+                Self::jina_reranker_turbo(),
             ],
         }
     }
@@ -401,6 +639,18 @@ impl ModelManifest {
             return self.download_size_bytes;
         }
         self.files.iter().map(|file| file.size).sum()
+    }
+
+    /// Alias for [`total_size_bytes`](Self::total_size_bytes).
+    #[must_use]
+    pub fn total_size(&self) -> u64 {
+        self.total_size_bytes()
+    }
+
+    /// HuggingFace download URL for a specific file in this manifest.
+    #[must_use]
+    pub fn download_url(&self, file: &ModelFile) -> String {
+        file.download_url(&self.repo, &self.revision)
     }
 
     /// Validate manifest fields for shape and checksum format.
@@ -649,6 +899,49 @@ pub enum ModelState {
         latest_revision: String,
     },
     Cancelled,
+}
+
+impl ModelState {
+    /// Whether the model is ready for use.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Whether a download is in progress.
+    #[must_use]
+    pub fn is_downloading(&self) -> bool {
+        matches!(self, Self::Downloading { .. })
+    }
+
+    /// Whether user consent is needed.
+    #[must_use]
+    pub fn needs_consent(&self) -> bool {
+        matches!(self, Self::NeedsConsent)
+    }
+
+    /// Human-readable summary of the state.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::NotInstalled => "not installed".into(),
+            Self::NeedsConsent => "needs consent".into(),
+            Self::Downloading { progress_pct, .. } => {
+                format!("downloading ({progress_pct}%)")
+            }
+            Self::Verifying => "verifying".into(),
+            Self::Ready => "ready".into(),
+            Self::Disabled { reason } => format!("disabled: {reason}"),
+            Self::VerificationFailed { reason } => format!("verification failed: {reason}"),
+            Self::UpdateAvailable {
+                current_revision,
+                latest_revision,
+            } => {
+                format!("update available: {current_revision} -> {latest_revision}")
+            }
+            Self::Cancelled => "cancelled".into(),
+        }
+    }
 }
 
 /// Where a consent decision came from.
@@ -2312,15 +2605,18 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_contains_all_three_models() {
+    fn builtin_catalog_contains_all_models() {
         let catalog = ModelManifest::builtin_catalog();
         assert_eq!(catalog.schema_version, MANIFEST_SCHEMA_VERSION);
-        assert_eq!(catalog.models.len(), 3);
+        assert_eq!(catalog.models.len(), 6);
 
         let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"potion-multilingual-128m"));
         assert!(ids.contains(&"all-minilm-l6-v2"));
         assert!(ids.contains(&"ms-marco-minilm-l-6-v2"));
+        assert!(ids.contains(&"snowflake-arctic-embed-s"));
+        assert!(ids.contains(&"nomic-embed-text-v1.5"));
+        assert!(ids.contains(&"jina-reranker-v1-turbo-en"));
 
         catalog.validate().unwrap();
     }
@@ -2340,6 +2636,9 @@ mod tests {
             ModelManifest::potion_128m(),
             ModelManifest::minilm_v2(),
             ModelManifest::ms_marco_reranker(),
+            ModelManifest::snowflake_arctic_s(),
+            ModelManifest::nomic_embed(),
+            ModelManifest::jina_reranker_turbo(),
         ];
 
         for manifest in manifests {

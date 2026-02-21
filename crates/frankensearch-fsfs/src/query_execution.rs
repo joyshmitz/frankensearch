@@ -772,6 +772,12 @@ impl QueryExecutionOrchestrator {
         });
 
         for (rank, candidate) in lexical_ranked.iter().enumerate() {
+            if let Some(existing) = merged.get(&candidate.doc_id)
+                && existing.lexical_rank.is_some()
+            {
+                continue;
+            }
+
             let contribution = rrf_contribution(k, rank);
             let lexical_score = sanitize_score(candidate.score);
             merged
@@ -802,6 +808,12 @@ impl QueryExecutionOrchestrator {
         });
 
         for (rank, candidate) in semantic_ranked.iter().enumerate() {
+            if let Some(existing) = merged.get(&candidate.doc_id)
+                && existing.semantic_rank.is_some()
+            {
+                continue;
+            }
+
             let contribution = rrf_contribution(k, rank);
             let semantic_score = sanitize_score(candidate.score);
             merged

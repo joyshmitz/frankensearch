@@ -461,6 +461,13 @@ impl VectorIndex {
             let truncated_emb = &entry.embedding[..search_dims.min(entry.embedding.len())];
             let truncated_query = &query_truncated[..truncated_emb.len()];
             let score = dot_product_f32_f32(truncated_emb, truncated_query)?;
+
+            // Guard: corrupt WAL embeddings (e.g. from crash recovery) can
+            // produce NaN/Inf scores. Skip them rather than polluting results.
+            if !score.is_finite() {
+                continue;
+            }
+
             insert_mrl_candidate(
                 heap,
                 MrlHeapEntry {
