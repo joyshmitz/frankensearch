@@ -430,8 +430,21 @@ impl PersistentJobQueue {
                 )));
             }
 
+            let target_status = JobStatus::Completed.as_str();
+            let delete_params = [
+                SqliteValue::Text(state.doc_id.clone()),
+                SqliteValue::Text(state.embedder_id.clone()),
+                SqliteValue::Text(target_status.to_owned()),
+            ];
+            conn.execute_with_params(
+                "DELETE FROM embedding_jobs \
+                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+                &delete_params,
+            )
+            .map_err(map_storage_error)?;
+
             let params = [
-                SqliteValue::Text(JobStatus::Completed.as_str().to_owned()),
+                SqliteValue::Text(target_status.to_owned()),
                 SqliteValue::Integer(now_ms),
                 SqliteValue::Integer(job_id),
             ];
@@ -488,8 +501,21 @@ impl PersistentJobQueue {
 
             let retry_count = state.retry_count.saturating_add(1);
             if retry_count > state.max_retries {
+                let target_status = JobStatus::Failed.as_str();
+                let delete_params = [
+                    SqliteValue::Text(state.doc_id.clone()),
+                    SqliteValue::Text(state.embedder_id.clone()),
+                    SqliteValue::Text(target_status.to_owned()),
+                ];
+                conn.execute_with_params(
+                    "DELETE FROM embedding_jobs \
+                     WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+                    &delete_params,
+                )
+                .map_err(map_storage_error)?;
+
                 let params = [
-                    SqliteValue::Text(JobStatus::Failed.as_str().to_owned()),
+                    SqliteValue::Text(target_status.to_owned()),
                     SqliteValue::Integer(i64::from(retry_count)),
                     SqliteValue::Integer(now_ms),
                     SqliteValue::Text(error.to_owned()),
@@ -576,8 +602,21 @@ impl PersistentJobQueue {
                 )));
             }
 
+            let target_status = JobStatus::Skipped.as_str();
+            let delete_params = [
+                SqliteValue::Text(state.doc_id.clone()),
+                SqliteValue::Text(state.embedder_id.clone()),
+                SqliteValue::Text(target_status.to_owned()),
+            ];
+            conn.execute_with_params(
+                "DELETE FROM embedding_jobs \
+                 WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
+                &delete_params,
+            )
+            .map_err(map_storage_error)?;
+
             let params = [
-                SqliteValue::Text(JobStatus::Skipped.as_str().to_owned()),
+                SqliteValue::Text(target_status.to_owned()),
                 SqliteValue::Integer(now_ms),
                 SqliteValue::Text(reason.to_owned()),
                 SqliteValue::Integer(job_id),
@@ -794,12 +833,14 @@ pub(crate) enum EnqueueOutcome {
     HashEmbedderSkipped,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct JobState {
     status: JobStatus,
     retry_count: u32,
     max_retries: u32,
     started_at: Option<i64>,
+    doc_id: String,
+    embedder_id: String,
 }
 
 pub(crate) fn enqueue_inner(
@@ -877,7 +918,7 @@ fn load_job_state(conn: &Connection, job_id: i64) -> SearchResult<Option<JobStat
     let params = [SqliteValue::Integer(job_id)];
     let rows = conn
         .query_with_params(
-            "SELECT status, retry_count, max_retries, started_at \
+            "SELECT status, retry_count, max_retries, started_at, doc_id, embedder_id \
              FROM embedding_jobs \
              WHERE job_id = ?1 \
              LIMIT 1;",
@@ -901,6 +942,8 @@ fn load_job_state(conn: &Connection, job_id: i64) -> SearchResult<Option<JobStat
         retry_count: row_u32(row, 1, "embedding_jobs.retry_count")?,
         max_retries: row_u32(row, 2, "embedding_jobs.max_retries")?,
         started_at: row_optional_i64(row, 3)?,
+        doc_id: row_text(row, 4, "embedding_jobs.doc_id")?.to_owned(),
+        embedder_id: row_text(row, 5, "embedding_jobs.embedder_id")?.to_owned(),
     }))
 }
 

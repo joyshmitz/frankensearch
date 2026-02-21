@@ -74,6 +74,20 @@ impl QueryClass {
             return true;
         }
 
+        // camelCase, PascalCase, or snake_case
+        if !s.chars().any(char::is_whitespace) {
+            if s.contains('_') {
+                return true;
+            }
+            let has_lower = s.chars().any(|c| c.is_lowercase());
+            let has_upper = s.chars().any(|c| c.is_uppercase());
+            let first_upper = s.chars().next().is_some_and(|c| c.is_uppercase());
+            let rest_lower = s.chars().skip(1).all(|c| c.is_lowercase());
+            if has_lower && has_upper && !(first_upper && rest_lower) {
+                return true;
+            }
+        }
+
         // Issue/ticket ID pattern: prefix-digits (e.g., bd-123, JIRA-456, my-project-789)
         if !s.chars().any(char::is_whitespace) && s.contains('-') {
             let parts: Vec<&str> = s.rsplitn(2, '-').collect();

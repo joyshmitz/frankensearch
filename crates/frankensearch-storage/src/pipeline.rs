@@ -17,6 +17,7 @@ use crate::document::{DocumentRecord, EmbeddingStatus, upsert_document};
 use crate::job_queue::{
     EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner, fetch_queue_depth,
 };
+use crate::schema::row_i64;
 
 const PIPELINE_SUBSYSTEM: &str = "storage_pipeline";
 const CORRELATION_METADATA_KEY: &str = "correlation_id";

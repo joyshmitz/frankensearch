@@ -436,7 +436,7 @@ fn current_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
     row_i64(row, 0, "schema_version.version").map(Some)
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
+pub(crate) fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
     match row.get(index) {
         Some(SqliteValue::Integer(value)) => Ok(*value),
         Some(other) => Err(SearchError::SubsystemError {

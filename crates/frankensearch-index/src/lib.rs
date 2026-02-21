@@ -686,14 +686,18 @@ impl VectorIndex {
             })?;
         }
 
-        let wal_entries: Vec<wal::WalEntry> = entries
-            .iter()
-            .map(|(doc_id, embedding)| wal::WalEntry {
-                doc_id: doc_id.clone(),
-                doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
-                embedding: embedding.clone(),
-            })
-            .collect();
+        let mut wal_entries: Vec<wal::WalEntry> = Vec::with_capacity(entries.len());
+        let mut seen = std::collections::HashSet::new();
+        for (doc_id, embedding) in entries.iter().rev() {
+            if seen.insert(doc_id) {
+                wal_entries.push(wal::WalEntry {
+                    doc_id: doc_id.clone(),
+                    doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
+                    embedding: embedding.clone(),
+                });
+            }
+        }
+        wal_entries.reverse();
 
         // Write to WAL file.
         let wal_path = wal::wal_path_for(&self.path);
@@ -1225,15 +1229,15 @@ impl VectorIndex {
         doc_id_hashes
             .iter()
             .map(|&hash| {
-                if let Some(index) = self.find_index_by_doc_hash(hash) {
-                    if let Ok(vec) = self.vector_at_f16(index) {
-                        return Some(vec);
-                    }
-                }
-                for entry in &self.wal_entries {
+                for entry in self.wal_entries.iter().rev() {
                     if entry.doc_id_hash == hash {
                         // WAL embeddings are f32, we need to convert them to f16
                         return Some(entry.embedding.iter().map(|&v| half::f16::from_f32(v)).collect());
+                    }
+                }
+                if let Some(index) = self.find_index_by_doc_hash(hash) {
+                    if let Ok(vec) = self.vector_at_f16(index) {
+                        return Some(vec);
                     }
                 }
                 None

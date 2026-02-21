@@ -374,32 +374,32 @@ impl TwoTierIndex {
         for hit in hits {
             let mut found_score = None;
 
-            let fast_idx = if hit.index == u32::MAX {
-                self.fast_index.find_index_by_doc_id(&hit.doc_id)?
-            } else if (hit.index as usize) < self.fast_index.record_count() {
-                Some(hit.index as usize)
-            } else {
-                None
-            };
+            let hash = crate::fnv1a_hash(hit.doc_id.as_bytes());
+            for entry in quality_index.wal_entries.iter().rev() {
+                if entry.doc_id_hash == hash && entry.doc_id == hit.doc_id {
+                    found_score = Some(dot_product_f32_f32(&entry.embedding, query_vec)?);
+                    break;
+                }
+            }
 
-            if let Some(idx) = fast_idx {
-                found_score = self.score_quality_for_fast_index(quality_index, query_vec, idx)?;
+            if found_score.is_none() {
+                let fast_idx = if hit.index == u32::MAX {
+                    self.fast_index.find_index_by_doc_id(&hit.doc_id)?
+                } else if (hit.index as usize) < self.fast_index.record_count() {
+                    Some(hit.index as usize)
+                } else {
+                    None
+                };
+
+                if let Some(idx) = fast_idx {
+                    found_score = self.score_quality_for_fast_index(quality_index, query_vec, idx)?;
+                }
             }
 
             if found_score.is_none() {
                 if let Some(qual_idx) = quality_index.find_index_by_doc_id(&hit.doc_id)? {
                     let quality_vector = quality_index.vector_at_f32(qual_idx)?;
                     found_score = Some(dot_product_f32_f32(&quality_vector, query_vec)?);
-                }
-            }
-
-            if found_score.is_none() {
-                let hash = crate::fnv1a_hash(hit.doc_id.as_bytes());
-                for entry in quality_index.wal_entries.iter().rev() {
-                    if entry.doc_id_hash == hash && entry.doc_id == hit.doc_id {
-                        found_score = Some(dot_product_f32_f32(&entry.embedding, query_vec)?);
-                        break;
-                    }
                 }
             }
 
@@ -463,15 +463,15 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError` if index access fails.
     pub fn fast_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
-        if let Some(index) = self.fast_index.find_index_by_doc_id(doc_id)? {
-            return self.fast_index.vector_at_f32(index).map(Some);
-        }
-
         let hash = crate::fnv1a_hash(doc_id.as_bytes());
         for entry in self.fast_index.wal_entries.iter().rev() {
             if entry.doc_id_hash == hash && entry.doc_id == doc_id {
                 return Ok(Some(entry.embedding.clone()));
             }
+        }
+
+        if let Some(index) = self.fast_index.find_index_by_doc_id(doc_id)? {
+            return self.fast_index.vector_at_f32(index).map(Some);
         }
 
         Ok(None)
@@ -487,6 +487,13 @@ impl TwoTierIndex {
             return Ok(None);
         };
 
+        let hash = crate::fnv1a_hash(doc_id.as_bytes());
+        for entry in quality_index.wal_entries.iter().rev() {
+            if entry.doc_id_hash == hash && entry.doc_id == doc_id {
+                return Ok(Some(entry.embedding.clone()));
+            }
+        }
+
         if let Some(fast_index) = self.fast_index.find_index_by_doc_id(doc_id)? {
             if let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index) {
                 return quality_index.vector_at_f32(quality_index_pos).map(Some);
@@ -495,13 +502,6 @@ impl TwoTierIndex {
 
         if let Some(qual_idx) = quality_index.find_index_by_doc_id(doc_id)? {
             return quality_index.vector_at_f32(qual_idx).map(Some);
-        }
-
-        let hash = crate::fnv1a_hash(doc_id.as_bytes());
-        for entry in quality_index.wal_entries.iter().rev() {
-            if entry.doc_id_hash == hash && entry.doc_id == doc_id {
-                return Ok(Some(entry.embedding.clone()));
-            }
         }
 
         Ok(None)

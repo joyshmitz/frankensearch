@@ -43,26 +43,19 @@ fn robust_normalize(scores: &mut [f32]) {
     }
 
     let range = max - min;
-    // If range is significant, use min-max to align distributions.
-    // If range is tiny (e.g. single result or all identical), preserve absolute value
-    // but clamp to [0, 1] (assuming cosine-ish input).
-    if range > 0.01 {
-        for score in scores.iter_mut() {
-            if score.is_finite() {
-                *score = ((*score - min) / range).clamp(0.0, 1.0);
+    let t = (range / 0.01).clamp(0.0, 1.0);
+
+    for score in scores.iter_mut() {
+        if score.is_finite() {
+            let norm = if range > f32::EPSILON {
+                (*score - min) / range
             } else {
-                *score = NON_FINITE_SCORE_FALLBACK;
-            }
-        }
-    } else {
-        // Fallback: clamp to [0, 1].
-        // This avoids turning "0.99" into "0.5" just because it's the only result.
-        for score in scores.iter_mut() {
-            if score.is_finite() {
-                *score = score.clamp(0.0, 1.0);
-            } else {
-                *score = NON_FINITE_SCORE_FALLBACK;
-            }
+                1.0
+            };
+            let blended = t * norm + (1.0 - t) * *score;
+            *score = blended.clamp(0.0, 1.0);
+        } else {
+            *score = NON_FINITE_SCORE_FALLBACK;
         }
     }
 }

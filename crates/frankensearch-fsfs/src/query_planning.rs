@@ -830,6 +830,19 @@ fn identifier_signal_count(query: &str) -> u16 {
         signals = signals.saturating_add(1);
     }
 
+    if !query.contains(' ') {
+        if query.contains('_') {
+            signals = signals.saturating_add(1);
+        }
+        let has_lower = query.chars().any(|c| c.is_lowercase());
+        let has_upper = query.chars().any(|c| c.is_uppercase());
+        let first_upper = query.chars().next().is_some_and(|c| c.is_uppercase());
+        let rest_lower = query.chars().skip(1).all(|c| c.is_lowercase());
+        if has_lower && has_upper && !(first_upper && rest_lower) {
+            signals = signals.saturating_add(1);
+        }
+    }
+
     signals
 }
 
