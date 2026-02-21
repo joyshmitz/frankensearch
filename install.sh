@@ -319,7 +319,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
-    "$DEST/${BINARY_NAME}" --version || true
+    "$DEST/${BINARY_NAME}" version || true
     ok "Self-test complete"
   fi
   ok "Done. Binary at: $DEST/${BINARY_NAME}"
@@ -381,7 +381,7 @@ ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/${BINARY_NAME}" --version || true
+  "$DEST/${BINARY_NAME}" version || true
   ok "Self-test complete"
 fi
 
