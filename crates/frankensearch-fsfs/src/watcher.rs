@@ -986,7 +986,13 @@ fn collect_snapshot_for_root(
     }
 
     let mut stack = vec![root.to_path_buf()];
+    let mut visited_dirs = HashSet::new();
     while let Some(dir_path) = stack.pop() {
+        let canonical_dir = dir_path.canonicalize().unwrap_or_else(|_| dir_path.clone());
+        if !visited_dirs.insert(canonical_dir) {
+            continue;
+        }
+
         let dir_entries = match fs::read_dir(&dir_path) {
             Ok(entries) => entries,
             Err(error) if is_ignorable_walk_error(&error) => continue,
