@@ -25,7 +25,6 @@ impl TerminalGuard {
     fn enter() -> Result<Self, Box<dyn Error>> {
         let options = TtySessionOptions {
             alternate_screen: true,
-            intercept_signals: true,
             features: BackendFeatures {
                 mouse_capture: true,
                 ..BackendFeatures::default()
@@ -41,7 +40,7 @@ const fn map_event(event: &Event) -> Option<InputEvent> {
         Event::Key(key) => Some(InputEvent::Key(key.code, key.modifiers)),
         Event::Mouse(mouse) => Some(InputEvent::Mouse(mouse.kind, mouse.x, mouse.y)),
         Event::Resize { width, height } => Some(InputEvent::Resize(*width, *height)),
-        Event::Focus(_) | Event::Paste(_) | Event::Clipboard(_) | Event::Ime(_) | Event::Tick => {
+        Event::Focus(_) | Event::Paste(_) | Event::Clipboard(_) | Event::Tick => {
             None
         }
     }

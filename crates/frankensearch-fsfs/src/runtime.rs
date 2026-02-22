@@ -10250,7 +10250,6 @@ impl FtuiSession {
     fn enter() -> SearchResult<Self> {
         let options = TtySessionOptions {
             alternate_screen: true,
-            intercept_signals: true,
             features: BackendFeatures {
                 mouse_capture: true,
                 ..BackendFeatures::default()
@@ -12044,7 +12043,7 @@ fn render_context_radar_markdown_text(
     preview_format: ContextPreviewFormat,
     no_color: bool,
     width: u16,
-) -> Text<'static> {
+) -> Text {
     let width = width.max(12);
     let markdown_source = if preview_format == ContextPreviewFormat::Html {
         normalize_html_fragment_for_markdown(source)
@@ -12264,7 +12263,7 @@ fn html_snippet_to_spans(
     spans
 }
 
-fn wrap_markdown_for_context_panel(text: Text<'static>, width: u16) -> Text<'static> {
+fn wrap_markdown_for_context_panel(text: Text, width: u16) -> Text {
     let width = usize::from(width);
     if width == 0 {
         return text;
