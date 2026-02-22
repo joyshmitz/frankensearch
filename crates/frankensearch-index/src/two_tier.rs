@@ -325,7 +325,11 @@ impl TwoTierIndex {
                     });
                 }
                 // Re-sort and truncate after merging
-                hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.index.cmp(&b.index)));
+                hits.sort_by(|a, b| {
+                    b.score
+                        .total_cmp(&a.score)
+                        .then_with(|| a.index.cmp(&b.index))
+                });
                 if hits.len() > k {
                     hits.truncate(k);
                 }
@@ -392,7 +396,8 @@ impl TwoTierIndex {
                 };
 
                 if let Some(idx) = fast_idx {
-                    found_score = self.score_quality_for_fast_index(quality_index, query_vec, idx)?;
+                    found_score =
+                        self.score_quality_for_fast_index(quality_index, query_vec, idx)?;
                 }
             }
 
@@ -995,9 +1000,21 @@ mod tests {
         assert!(index.has_quality_for_index(2));
 
         let hits = vec![
-            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
-            VectorHit { index: 1, score: 0.0, doc_id: "doc-b".to_owned() },
-            VectorHit { index: 2, score: 0.0, doc_id: "doc-c".to_owned() },
+            VectorHit {
+                index: 0,
+                score: 0.0,
+                doc_id: "doc-a".to_owned(),
+            },
+            VectorHit {
+                index: 1,
+                score: 0.0,
+                doc_id: "doc-b".to_owned(),
+            },
+            VectorHit {
+                index: 2,
+                score: 0.0,
+                doc_id: "doc-c".to_owned(),
+            },
         ];
         let scores = index
             .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
@@ -1021,9 +1038,21 @@ mod tests {
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
         let hits = vec![
-            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
-            VectorHit { index: 1, score: 0.0, doc_id: "doc-b".to_owned() },
-            VectorHit { index: 99, score: 0.0, doc_id: "doc-missing".to_owned() },
+            VectorHit {
+                index: 0,
+                score: 0.0,
+                doc_id: "doc-a".to_owned(),
+            },
+            VectorHit {
+                index: 1,
+                score: 0.0,
+                doc_id: "doc-b".to_owned(),
+            },
+            VectorHit {
+                index: 99,
+                score: 0.0,
+                doc_id: "doc-missing".to_owned(),
+            },
         ];
         let scores = index
             .quality_scores_for_hits(&[1.0, 0.0], &hits)
@@ -1157,9 +1186,11 @@ mod tests {
         assert!(index.has_quality_index());
 
         // Query dimension (4) doesn't match quality dimension (6)
-        let hits = vec![
-            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
-        ];
+        let hits = vec![VectorHit {
+            index: 0,
+            score: 0.0,
+            doc_id: "doc-a".to_owned(),
+        }];
         let error = index
             .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
             .unwrap_err();
@@ -1718,8 +1749,16 @@ mod tests {
         assert!(index.has_quality_for_index(1));
 
         let hits = vec![
-            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
-            VectorHit { index: 1, score: 0.0, doc_id: "doc-b".to_owned() },
+            VectorHit {
+                index: 0,
+                score: 0.0,
+                doc_id: "doc-a".to_owned(),
+            },
+            VectorHit {
+                index: 1,
+                score: 0.0,
+                doc_id: "doc-b".to_owned(),
+            },
         ];
         let scores = index
             .quality_scores_for_hits(&[0.0, 1.0, 0.0], &hits)
@@ -1856,9 +1895,11 @@ mod tests {
         assert!(!index.has_quality_index());
 
         // Use a completely different dimension query — should still return 0s
-        let hits = vec![
-            VectorHit { index: 0, score: 0.0, doc_id: "doc-a".to_owned() },
-        ];
+        let hits = vec![VectorHit {
+            index: 0,
+            score: 0.0,
+            doc_id: "doc-a".to_owned(),
+        }];
         let scores = index
             .quality_scores_for_hits(&[1.0, 2.0, 3.0, 4.0, 5.0], &hits)
             .expect("any dim accepted");

@@ -477,7 +477,7 @@ impl VectorIndex {
     pub fn soft_delete_batch(&mut self, doc_ids: &[&str]) -> SearchResult<usize> {
         let mut deleted = 0usize;
         let mut wal_changed = false;
-        
+
         // Track modified main index entries for potential rollback
         let mut modified_main_entries = Vec::new();
 
@@ -525,7 +525,7 @@ impl VectorIndex {
             .filter(|entry| !to_delete_set.contains(entry.doc_id.as_str()))
             .cloned()
             .collect();
-            
+
         let mut prev_wal = Vec::new();
         if filtered.len() < original_wal_len {
             deleted += original_wal_len - filtered.len();
@@ -712,7 +712,8 @@ impl VectorIndex {
 
         // Deduplicate existing WAL entries by doc_id before extending.
         for new_entry in &wal_entries {
-            self.wal_entries.retain(|existing| existing.doc_id != new_entry.doc_id);
+            self.wal_entries
+                .retain(|existing| existing.doc_id != new_entry.doc_id);
         }
         // Add to in-memory entries (immediately searchable).
         self.wal_entries.extend(wal_entries);
@@ -789,7 +790,10 @@ impl VectorIndex {
         }
 
         // Perform the rewrite.
-        self.rewrite_index(&deduped_sources, next_generation(self.metadata.compaction_gen))?;
+        self.rewrite_index(
+            &deduped_sources,
+            next_generation(self.metadata.compaction_gen),
+        )?;
 
         // Remove WAL sidecar.
         let wal_path = wal::wal_path_for(&self.path);
@@ -848,13 +852,12 @@ impl VectorIndex {
                 reason: "record table size overflow".to_owned(),
             }
         })?;
-        let records_bytes_u64 = u64::try_from(records_bytes).map_err(|_| {
-            SearchError::InvalidConfig {
+        let records_bytes_u64 =
+            u64::try_from(records_bytes).map_err(|_| SearchError::InvalidConfig {
                 field: "record_count".to_owned(),
                 value: record_count.to_string(),
                 reason: "record table size does not fit in u64".to_owned(),
-            }
-        })?;
+            })?;
 
         // Pass 1: Build Record Table and calculate layout.
         // We buffer the Record Table in memory (16 bytes * N).
@@ -904,12 +907,10 @@ impl VectorIndex {
             0,
         )?;
         let header_len = provisional_header.len() + 4; // + CRC
-        let header_len_u64 = u64::try_from(header_len).map_err(|_| {
-            SearchError::InvalidConfig {
-                field: "header".to_owned(),
-                value: header_len.to_string(),
-                reason: "header length does not fit in u64".to_owned(),
-            }
+        let header_len_u64 = u64::try_from(header_len).map_err(|_| SearchError::InvalidConfig {
+            field: "header".to_owned(),
+            value: header_len.to_string(),
+            reason: "header length does not fit in u64".to_owned(),
         })?;
 
         let pre_vector = header_len_u64
@@ -1232,7 +1233,13 @@ impl VectorIndex {
                 for entry in self.wal_entries.iter().rev() {
                     if entry.doc_id_hash == hash {
                         // WAL embeddings are f32, we need to convert them to f16
-                        return Some(entry.embedding.iter().map(|&v| half::f16::from_f32(v)).collect());
+                        return Some(
+                            entry
+                                .embedding
+                                .iter()
+                                .map(|&v| half::f16::from_f32(v))
+                                .collect(),
+                        );
                     }
                 }
                 if let Some(index) = self.find_index_by_doc_hash(hash) {
