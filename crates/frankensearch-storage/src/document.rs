@@ -329,12 +329,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn mark_skipped(
-        &self,
-        doc_id: &str,
-        embedder_id: &str,
-        reason: &str,
-    ) -> SearchResult<()> {
+    pub fn mark_skipped(&self, doc_id: &str, embedder_id: &str, reason: &str) -> SearchResult<()> {
         ensure_non_empty(doc_id, "doc_id")?;
         ensure_non_empty(embedder_id, "embedder_id")?;
 
@@ -582,7 +577,7 @@ fn upsert_document_with_outcome(
     validate_document(doc)?;
 
     let existing_hash = fetch_content_hash(conn, &doc.doc_id)?;
-    
+
     // Always upsert the document to catch metadata/preview/timestamp changes
     upsert_document(conn, doc)?;
 

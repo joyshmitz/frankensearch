@@ -629,7 +629,10 @@ impl StorageBackedJobRunner {
             if text.trim().is_empty() {
                 let skip_reason = "empty content preview";
                 self.queue.skip(job.job_id, skip_reason)?;
-                if let Err(error) = self.storage.mark_skipped(&job.doc_id, &job.embedder_id, skip_reason) {
+                if let Err(error) =
+                    self.storage
+                        .mark_skipped(&job.doc_id, &job.embedder_id, skip_reason)
+                {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "mark_skipped",
@@ -658,7 +661,10 @@ impl StorageBackedJobRunner {
             if is_hash_embedder(&job.embedder_id) {
                 let skip_reason = "hash embeddings computed on-the-fly";
                 self.queue.skip(job.job_id, skip_reason)?;
-                if let Err(error) = self.storage.mark_skipped(&job.doc_id, &job.embedder_id, skip_reason) {
+                if let Err(error) =
+                    self.storage
+                        .mark_skipped(&job.doc_id, &job.embedder_id, skip_reason)
+                {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
                         stage = "mark_skipped",
