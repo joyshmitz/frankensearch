@@ -38,7 +38,7 @@ frankensearch-ops = { version = "0.1.0", path = "crates/frankensearch-ops" }
 
 # Async runtime (structured concurrency, NO tokio)
 # test-internals enables LabRuntime for deterministic testing
-asupersync = { version = "0.2.0", path = "../asupersync", features = ["proc-macros", "test-internals"] }
+asupersync = { version = "0.2.5", features = ["proc-macros", "test-internals"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -103,15 +103,15 @@ time = { version = "0.3.47", features = ["formatting", "parsing"] }
 sysinfo = "0.38.2"
 
 # FrankenTUI terminal UI framework
-ftui-core = { version = "0.2.0", path = "../frankentui/crates/ftui-core" }
-ftui-render = { version = "0.2.0", path = "../frankentui/crates/ftui-render" }
-ftui-style = { version = "0.2.0", path = "../frankentui/crates/ftui-style" }
-ftui-text = { version = "0.2.0", path = "../frankentui/crates/ftui-text" }
-ftui-layout = { version = "0.2.0", path = "../frankentui/crates/ftui-layout" }
-ftui-widgets = { version = "0.2.0", path = "../frankentui/crates/ftui-widgets" }
-ftui-tty = { version = "0.2.0", path = "../frankentui/crates/ftui-tty" }
-ftui-backend = { version = "0.2.0", path = "../frankentui/crates/ftui-backend" }
-ftui-extras = { version = "0.2.0", path = "../frankentui/crates/ftui-extras" }
+ftui-core = "0.2.1"
+ftui-render = "0.2.1"
+ftui-style = "0.2.1"
+ftui-text = "0.2.1"
+ftui-layout = "0.2.1"
+ftui-widgets = "0.2.1"
+ftui-tty = "0.2.1"
+ftui-backend = "0.2.1"
+ftui-extras = "0.2.1"
 
 [workspace.lints.rust]
 # `deny` instead of `forbid` so crates that need unsafe (e.g. mmap) can opt in.

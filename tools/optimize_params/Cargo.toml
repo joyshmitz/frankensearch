@@ -5,6 +5,7 @@ description = "CMA-ES hyperparameter optimizer for frankensearch fusion pipeline
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
+publish = false
 
 [[bin]]
 name = "optimize-params"
