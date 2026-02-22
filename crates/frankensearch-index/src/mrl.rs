@@ -333,7 +333,8 @@ impl VectorIndex {
         search_dims: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<BinaryHeap<MrlHeapEntry>> {
-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let max_elements = self.record_count();
+        let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
         let stride = match self.quantization() {
             crate::Quantization::F16 => self.dimension() * 2,
             crate::Quantization::F32 => self.dimension() * 4,

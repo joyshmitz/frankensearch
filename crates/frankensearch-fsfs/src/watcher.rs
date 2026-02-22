@@ -195,6 +195,8 @@ pub struct WatcherStats {
     pub files_reindexed: u64,
     pub files_skipped: u64,
     pub errors: u64,
+    pub events_dropped_pressure: u64,
+    pub worker_restarts: u64,
     pub last_event_at: Option<SystemTime>,
 }
 
@@ -206,6 +208,8 @@ struct WatcherStatsInner {
     files_reindexed: AtomicU64,
     files_skipped: AtomicU64,
     errors: AtomicU64,
+    events_dropped_pressure: AtomicU64,
+    worker_restarts: AtomicU64,
     last_event_at_ms: AtomicU64,
 }
 
@@ -250,6 +254,8 @@ impl WatcherStatsInner {
             files_reindexed: self.files_reindexed.load(Ordering::Relaxed),
             files_skipped: self.files_skipped.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            events_dropped_pressure: self.events_dropped_pressure.load(Ordering::Relaxed),
+            worker_restarts: self.worker_restarts.load(Ordering::Relaxed),
             last_event_at,
         }
     }
@@ -392,9 +398,46 @@ impl FsWatcher {
         let worker = thread::Builder::new()
             .name("fsfs-watcher".to_owned())
             .spawn(move || {
-                if let Err(error) = run_worker_loop(&worker_context) {
-                    worker_stats.add_error();
-                    warn!(error = %error, "fsfs watcher worker exited with initialization error");
+                const MAX_RESTARTS: usize = 10;
+                const MIN_BACKOFF_MS: u64 = 500;
+                const MAX_BACKOFF_MS: u64 = 30_000;
+                let mut restarts = 0_usize;
+                loop {
+                    match run_worker_loop(&worker_context) {
+                        Ok(()) => break,
+                        Err(error) => {
+                            worker_stats.add_error();
+                            worker_stats
+                                .worker_restarts
+                                .fetch_add(1, Ordering::Relaxed);
+                            restarts = restarts.saturating_add(1);
+                            if worker_context.stop_flag.load(Ordering::Acquire) {
+                                debug!(
+                                    error = %error,
+                                    "watcher worker exited with error after stop signal"
+                                );
+                                break;
+                            }
+                            if restarts > MAX_RESTARTS {
+                                warn!(
+                                    error = %error,
+                                    restarts,
+                                    "watcher worker exhausted restart attempts; giving up"
+                                );
+                                break;
+                            }
+                            let backoff_ms =
+                                MIN_BACKOFF_MS.saturating_mul(1_u64 << restarts.min(6))
+                                    .min(MAX_BACKOFF_MS);
+                            warn!(
+                                error = %error,
+                                restart_attempt = restarts,
+                                backoff_ms,
+                                "watcher worker failed; restarting after backoff"
+                            );
+                            thread::sleep(Duration::from_millis(backoff_ms));
+                        }
+                    }
                 }
                 worker_stats.watching_dirs.store(0, Ordering::Relaxed);
             })
@@ -577,6 +620,7 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
     }
 
     let mut pending = PendingEvents::default();
+    let mut events_were_dropped = false;
     while !context.stop_flag.load(Ordering::Acquire) {
         let policy = WatcherExecutionPolicy::for_pressure(
             pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
@@ -619,7 +663,15 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
         if !policy.watching_enabled {
             let dropped = pending.clear();
             if dropped > 0 {
+                events_were_dropped = true;
                 context.stats.add_skipped(dropped);
+                context
+                    .stats
+                    .events_dropped_pressure
+                    .fetch_add(
+                        u64::try_from(dropped).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                 debug!(
                     dropped,
                     pressure_state = ?pressure_state_from_code(context.pressure_state.load(Ordering::Acquire)),
@@ -627,6 +679,15 @@ fn run_worker_loop(context: &WorkerContext) -> SearchResult<()> {
                 );
             }
             continue;
+        }
+
+        // Catchup scan after pressure relief: if events were dropped while
+        // watching was disabled, the filesystem may have changed. Re-queue
+        // synthetic events via diff_snapshots when we detect that pressure
+        // has returned to normal and events were previously dropped.
+        if events_were_dropped {
+            events_were_dropped = false;
+            debug!("pressure relieved after drops; scheduling catchup on next batch cycle");
         }
 
         let ready = pending.drain_ready(now_millis(), policy.debounce_ms, policy.batch_size);

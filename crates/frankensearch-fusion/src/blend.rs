@@ -43,7 +43,11 @@ fn robust_normalize(scores: &mut [f32]) {
     }
 
     let range = max - min;
-    let t = (range / 0.01).clamp(0.0, 1.0);
+    let t = if range > 0.01 {
+        ((range - 0.01) / 0.04).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     for score in scores.iter_mut() {
         if score.is_finite() {

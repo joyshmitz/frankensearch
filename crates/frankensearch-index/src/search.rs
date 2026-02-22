@@ -189,7 +189,8 @@ impl VectorIndex {
                 self.scan_sequential(query, limit, filter)?
             }
         } else {
-            BinaryHeap::with_capacity(limit.saturating_add(1))
+            let max_wal = self.wal_entries.len();
+            BinaryHeap::with_capacity(limit.min(max_wal).saturating_add(1))
         };
 
         // Merge WAL entries into the same heap.
@@ -321,7 +322,8 @@ impl VectorIndex {
         query: &[f32],
         limit: usize,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let max_elements = end.saturating_sub(start);
+        let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
         let dim = self.dimension();
         let mut cutoff = f32::NEG_INFINITY;
 
@@ -393,7 +395,8 @@ impl VectorIndex {
         limit: usize,
         filter: &dyn SearchFilter,
     ) -> SearchResult<BinaryHeap<HeapEntry>> {
-        let mut heap = BinaryHeap::with_capacity(limit.saturating_add(1));
+        let max_elements = end.saturating_sub(start);
+        let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
         let dim = self.dimension();
         let mut cutoff = f32::NEG_INFINITY;
 
@@ -682,7 +685,12 @@ fn merge_partial_heaps(
     partial_heaps: Vec<BinaryHeap<HeapEntry>>,
     limit: usize,
 ) -> BinaryHeap<HeapEntry> {
-    let mut merged = BinaryHeap::with_capacity(limit.saturating_add(1));
+    let mut total_elements = 0_usize;
+    for heap in &partial_heaps {
+        total_elements = total_elements.saturating_add(heap.len());
+    }
+    let capacity = limit.min(total_elements).saturating_add(1);
+    let mut merged = BinaryHeap::with_capacity(capacity);
     for heap in partial_heaps {
         for entry in heap {
             insert_candidate(&mut merged, entry, limit);

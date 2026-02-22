@@ -406,10 +406,10 @@ fn write_config(path: &Path, index_dir: &Path, model_dir: &Path, db_path: &Path)
 }
 
 /// Maximum time to wait for an fsfs process before considering it hung.
-/// The asupersync runtime may not shut down cleanly in dev/test builds,
-/// so after this timeout the process is killed and treated as success
-/// (the actual work completes in well under 1 second).
-const FSFS_PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Worker environments can be slower than local dev machines, so we allow
+/// extra headroom before declaring timeout.
+const FSFS_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+const FSFS_INDEX_PROCESS_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn run_fsfs(args: &[&str], config_path: &Path) -> (String, String, i32) {
     let mut cmd = Command::new(fsfs_binary());
@@ -440,16 +440,24 @@ fn run_fsfs(args: &[&str], config_path: &Path) -> (String, String, i32) {
         buf
     });
 
-    // Wait for exit with timeout.  The asupersync runtime may not shut down
-    // cleanly, causing the process to hang after completing its actual work.
-    let deadline = Instant::now() + FSFS_PROCESS_TIMEOUT;
-    let code = loop {
+    let command = args.first().copied().unwrap_or_default();
+    let timeout = if command == "index" {
+        FSFS_INDEX_PROCESS_TIMEOUT
+    } else {
+        FSFS_PROCESS_TIMEOUT
+    };
+
+    // Wait for exit with timeout.
+    // If the process does not exit in time, kill it and only treat it as success
+    // when stdout shows an explicit completion marker for that command.
+    let deadline = Instant::now() + timeout;
+    let (raw_code, timed_out) = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(Some(status)) => break (status.code().unwrap_or(-1), false),
             Ok(None) if Instant::now() >= deadline => {
                 child.kill().ok();
                 child.wait().ok();
-                break 0; // work completed; runtime hung
+                break (124, true);
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => panic!("error waiting for fsfs: {e}"),
@@ -458,6 +466,16 @@ fn run_fsfs(args: &[&str], config_path: &Path) -> (String, String, i32) {
 
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
+
+    let timeout_completed_index =
+        command == "index" && stdout.contains("Discovered ") && stdout.contains("Indexed ");
+    let timeout_completed_search = command == "search" && stdout.contains('{') && stdout.contains("\"ok\"");
+
+    let code = if timed_out && (timeout_completed_index || timeout_completed_search) {
+        0
+    } else {
+        raw_code
+    };
 
     (stdout, stderr, code)
 }

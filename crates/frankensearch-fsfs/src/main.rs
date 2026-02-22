@@ -714,13 +714,6 @@ fn apply_cli_env_overrides(
         cli_input.verbose = verbose;
     }
 
-    if !cli_input.update_check_only
-        && let Some(check_only) =
-            parse_env_bool(env_map, "FRANKENSEARCH_CHECK_UPDATES", "FSFS_CHECK_UPDATES")?
-    {
-        cli_input.update_check_only = check_only;
-    }
-
     Ok(())
 }
 
@@ -836,11 +829,9 @@ mod tests {
         let env = HashMap::from([
             ("FRANKENSEARCH_NO_COLOR".to_owned(), "1".to_owned()),
             ("FRANKENSEARCH_VERBOSE".to_owned(), "true".to_owned()),
-            ("FRANKENSEARCH_CHECK_UPDATES".to_owned(), "yes".to_owned()),
         ]);
         apply_cli_env_overrides(&mut input, &env).expect("apply env");
         assert!(input.no_color);
         assert!(input.verbose);
-        assert!(input.update_check_only);
     }
 }

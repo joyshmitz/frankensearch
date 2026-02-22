@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
@@ -1020,6 +1020,35 @@ struct IndexManifestEntry {
     reason_code: String,
 }
 
+const FSFS_CHECKPOINT_FILE: &str = "index_checkpoint.json";
+const EMBEDDING_PROBE_MAX_RETRIES: usize = 2;
+const EMBEDDING_BATCH_MAX_RETRIES: usize = 3;
+const CHECKPOINT_PERSIST_INTERVAL: usize = 4;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CheckpointFileEntry {
+    revision: i64,
+    ingestion_class: String,
+    canonical_bytes: u64,
+    lexical_indexed: bool,
+    semantic_indexed: bool,
+    content_hash_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct IndexingCheckpoint {
+    schema_version: u16,
+    target_root: String,
+    index_root: String,
+    started_at_ms: u64,
+    updated_at_ms: u64,
+    embedder_id: String,
+    embedder_is_hash_fallback: bool,
+    files: BTreeMap<String, CheckpointFileEntry>,
+    discovered_files: usize,
+    skipped_files: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct IndexSentinel {
     schema_version: u16,
@@ -1057,8 +1086,11 @@ struct IndexRootProposal {
 enum IndexingProgressStage {
     Discovering,
     Indexing,
+    RetryingEmbedding,
     Finalizing,
+    SemanticUpgrade,
     Completed,
+    CompletedDegraded,
 }
 
 impl IndexingProgressStage {
@@ -1067,10 +1099,27 @@ impl IndexingProgressStage {
         match self {
             Self::Discovering => "Discovering Files",
             Self::Indexing => "Indexing Content",
+            Self::RetryingEmbedding => "Retrying Embedding...",
             Self::Finalizing => "Finalizing Artifacts",
+            Self::SemanticUpgrade => "Upgrading Semantic Embeddings",
             Self::Completed => "Completed",
+            Self::CompletedDegraded => "Completed (Degraded)",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexingWarningSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexingWarning {
+    severity: IndexingWarningSeverity,
+    message: String,
+    timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1092,6 +1141,12 @@ struct IndexingProgressSnapshot {
     vector_elapsed_ms: u128,
     total_elapsed_ms: u128,
     active_file: Option<String>,
+    embedding_retries: usize,
+    embedding_failures: usize,
+    semantic_deferred_files: usize,
+    embedder_degraded: bool,
+    degradation_reason: Option<String>,
+    recent_warnings: Vec<IndexingWarning>,
 }
 
 #[allow(
@@ -7090,47 +7145,217 @@ impl FsfsRuntime {
             stats.skipped_files
         );
 
-        on_progress(&IndexingProgressSnapshot {
-            stage: IndexingProgressStage::Discovering,
-            target_root: target_root.clone(),
-            index_root: index_root.clone(),
-            discovered_files: stats.discovered_files,
-            candidate_files: candidates.len(),
-            processed_files: 0,
-            skipped_files: stats.skipped_files,
-            semantic_files: 0,
-            canonical_bytes: 0,
-            canonical_lines: 0,
-            index_size_bytes: Self::path_bytes(&index_root).unwrap_or_default(),
+        // Resilience tracking state
+        let mut embedding_retries = 0_usize;
+        let mut embedding_failures = 0_usize;
+        let mut semantic_deferred_files = 0_usize;
+        let mut embedder_degraded = false;
+        let mut degradation_reason: Option<String> = None;
+        let mut recent_warnings: Vec<IndexingWarning> = Vec::new();
+        let mut deferred_semantic_file_keys: Vec<String> = Vec::new();
+
+        // Helper to push a warning, keeping at most 8 recent entries
+        let push_warning =
+            |warnings: &mut Vec<IndexingWarning>, severity, message: String| {
+                warnings.push(IndexingWarning {
+                    severity,
+                    message,
+                    timestamp_ms: pressure_timestamp_ms(),
+                });
+                if warnings.len() > 8 {
+                    warnings.remove(0);
+                }
+            };
+
+        // make_snapshot closure captures mutable state via explicit params
+        let make_snapshot = |stage: IndexingProgressStage,
+                             discovered_files: usize,
+                             candidate_files: usize,
+                             processed_files: usize,
+                             skipped_files: usize,
+                             semantic_files: usize,
+                             canonical_bytes: u64,
+                             canonical_lines: u64,
+                             index_size_bytes: u64,
+                             discovery_elapsed_ms: u128,
+                             lexical_elapsed_ms: u128,
+                             embedding_elapsed_ms: u128,
+                             vector_elapsed_ms: u128,
+                             active_file: Option<String>,
+                             embedding_retries: usize,
+                             embedding_failures: usize,
+                             semantic_deferred_files: usize,
+                             embedder_degraded: bool,
+                             degradation_reason: &Option<String>,
+                             recent_warnings: &[IndexingWarning]|
+         -> IndexingProgressSnapshot {
+            IndexingProgressSnapshot {
+                stage,
+                target_root: target_root.clone(),
+                index_root: index_root.clone(),
+                discovered_files,
+                candidate_files,
+                processed_files,
+                skipped_files,
+                semantic_files,
+                canonical_bytes,
+                canonical_lines,
+                index_size_bytes,
+                discovery_elapsed_ms,
+                lexical_elapsed_ms,
+                embedding_elapsed_ms,
+                vector_elapsed_ms,
+                total_elapsed_ms: total_start.elapsed().as_millis(),
+                active_file,
+                embedding_retries,
+                embedding_failures,
+                semantic_deferred_files,
+                embedder_degraded,
+                degradation_reason: degradation_reason.clone(),
+                recent_warnings: recent_warnings.to_vec(),
+            }
+        };
+
+        on_progress(&make_snapshot(
+            IndexingProgressStage::Discovering,
+            stats.discovered_files,
+            candidates.len(),
+            0,
+            stats.skipped_files,
+            0,
+            0,
+            0,
+            Self::path_bytes(&index_root).unwrap_or_default(),
             discovery_elapsed_ms,
-            lexical_elapsed_ms: 0,
-            embedding_elapsed_ms: 0,
-            vector_elapsed_ms: 0,
-            total_elapsed_ms: total_start.elapsed().as_millis(),
-            active_file: None,
-        })?;
+            0,
+            0,
+            0,
+            None,
+            0,
+            0,
+            0,
+            false,
+            &None,
+            &[],
+        ))?;
+
+        // Load checkpoint for resume
+        let existing_checkpoint = read_indexing_checkpoint(&index_root);
+        let mut checkpoint_indexed_keys: HashSet<String> = HashSet::new();
+        if let Some(ref ckpt) = existing_checkpoint {
+            if ckpt.target_root == target_root.display().to_string() {
+                for (key, entry) in &ckpt.files {
+                    if entry.lexical_indexed {
+                        checkpoint_indexed_keys.insert(key.clone());
+                    }
+                }
+                if !checkpoint_indexed_keys.is_empty() {
+                    info!(
+                        resumed_files = checkpoint_indexed_keys.len(),
+                        "resumed from checkpoint; skipping already-indexed files"
+                    );
+                }
+            }
+        }
+        let pre_checkpoint_count = candidates.len();
+        candidates.retain(|c| !checkpoint_indexed_keys.contains(&c.file_key));
+        let checkpoint_skipped = pre_checkpoint_count.saturating_sub(candidates.len());
+        if checkpoint_skipped > 0 {
+            info!(
+                checkpoint_skipped,
+                "checkpoint resume: skipping {} already-indexed files", checkpoint_skipped
+            );
+        }
 
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
 
-        // 1. Resolve and probe embedder
+        // 1. Resolve and probe embedder with retry
         let mut embedder = self.resolve_fast_embedder()?;
-        if let Err(error) = embedder.embed(cx, "probe").await {
-            info!(
-                embedder = embedder.id(),
-                error = %error,
-                "fsfs semantic embedder probe failed; falling back to hash embeddings"
-            );
-            embedder = Arc::new(HashEmbedder::new(
-                embedder.dimension().max(1),
-                HashAlgorithm::FnvModular,
-            ));
+        let mut embedder_is_hash_fallback = false;
+        {
+            let mut probe_ok = false;
+            for attempt in 0..=EMBEDDING_PROBE_MAX_RETRIES {
+                match embedder.embed(cx, "probe").await {
+                    Ok(_) => {
+                        probe_ok = true;
+                        break;
+                    }
+                    Err(error) => {
+                        if attempt < EMBEDDING_PROBE_MAX_RETRIES {
+                            let backoff_ms = if attempt == 0 { 500 } else { 1_000 };
+                            info!(
+                                embedder = embedder.id(),
+                                attempt = attempt + 1,
+                                backoff_ms,
+                                error = %error,
+                                "embedder probe failed; retrying"
+                            );
+                            std::thread::sleep(Duration::from_millis(backoff_ms));
+                        } else {
+                            let reason = format!(
+                                "embedder '{}' probe failed after {} attempts: {}",
+                                embedder.id(),
+                                EMBEDDING_PROBE_MAX_RETRIES + 1,
+                                error
+                            );
+                            info!(
+                                embedder = embedder.id(),
+                                error = %error,
+                                "fsfs semantic embedder probe failed; falling back to hash embeddings"
+                            );
+                            embedder_is_hash_fallback = true;
+                            embedder_degraded = true;
+                            degradation_reason = Some(reason.clone());
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Warn,
+                                reason,
+                            );
+                            embedder = Arc::new(HashEmbedder::new(
+                                embedder.dimension().max(1),
+                                HashAlgorithm::FnvModular,
+                            ));
+                        }
+                    }
+                }
+            }
+            if probe_ok {
+                info!(embedder = embedder.id(), "embedder probe succeeded");
+            }
         }
+
+        // Emit progress with embedder status
+        on_progress(&make_snapshot(
+            IndexingProgressStage::Discovering,
+            stats.discovered_files,
+            candidates.len(),
+            0,
+            stats.skipped_files,
+            0,
+            0,
+            0,
+            Self::path_bytes(&index_root).unwrap_or_default(),
+            discovery_elapsed_ms,
+            0,
+            0,
+            0,
+            None,
+            embedding_retries,
+            embedding_failures,
+            semantic_deferred_files,
+            embedder_degraded,
+            &degradation_reason,
+            &recent_warnings,
+        ))?;
 
         // 2. Prepare indexes
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-        let mut vector_writer =
-            VectorIndex::create(&vector_path, embedder.id(), embedder.dimension())?;
+        let mut vector_writer = Some(VectorIndex::create(
+            &vector_path,
+            embedder.id(),
+            embedder.dimension(),
+        )?);
 
         let lexical_path = index_root.join("lexical");
         let lexical_index = TantivyIndex::create(&lexical_path)?;
@@ -7146,11 +7371,28 @@ impl FsfsRuntime {
         let mut canonical_line_count = 0_u64;
         let mut last_active_file = None;
 
+        // Checkpoint state
+        let mut checkpoint = existing_checkpoint.unwrap_or_else(|| IndexingCheckpoint {
+            schema_version: 1,
+            target_root: target_root.display().to_string(),
+            index_root: index_root.display().to_string(),
+            started_at_ms: pressure_timestamp_ms(),
+            updated_at_ms: pressure_timestamp_ms(),
+            embedder_id: embedder.id().to_string(),
+            embedder_is_hash_fallback,
+            files: BTreeMap::new(),
+            discovered_files: stats.discovered_files,
+            skipped_files: stats.skipped_files,
+        });
+        checkpoint.embedder_id = embedder.id().to_string();
+        checkpoint.embedder_is_hash_fallback = embedder_is_hash_fallback;
+
         let canonicalize_start = Instant::now();
         // We'll track cumulative timings for the batched phases
         let mut lexical_elapsed_ms = 0_u128;
         let mut vector_elapsed_ms = 0_u128;
         let mut embedding_elapsed_ms = 0_u128;
+        let mut batch_counter = 0_usize;
 
         // 3. Process in batches
         for chunk in candidates.chunks(BATCH_SIZE) {
@@ -7216,7 +7458,7 @@ impl FsfsRuntime {
                 let doc = IndexableDocument::new(candidate.file_key.clone(), canonical)
                     .with_title(file_name)
                     .with_metadata("source_path", candidate.file_path.display().to_string())
-                    .with_metadata("ingestion_class", ingestion_class)
+                    .with_metadata("ingestion_class", ingestion_class.clone())
                     .with_metadata("source_modified_ms", candidate.modified_ms.to_string());
 
                 if matches!(
@@ -7227,17 +7469,17 @@ impl FsfsRuntime {
                 }
                 processed_files = processed_files.saturating_add(1);
                 last_active_file = Some(candidate.file_path.display().to_string());
-                chunk_docs.push((candidate.ingestion_class, doc));
+                chunk_docs.push((candidate.ingestion_class, candidate.file_key.clone(), ingestion_class, canonical_bytes, doc));
             }
 
             // Lexical Indexing
             let lexical_start = Instant::now();
             let lexical_batch = chunk_docs
                 .iter()
-                .filter(|(class, _)| {
+                .filter(|(class, _, _, _, _)| {
                     !matches!(class, IngestionClass::MetadataOnly | IngestionClass::Skip)
                 })
-                .map(|(_, doc)| doc.clone())
+                .map(|(_, _, _, _, doc)| doc.clone())
                 .collect::<Vec<_>>();
             if !lexical_batch.is_empty() {
                 lexical_index.index_documents(cx, &lexical_batch).await?;
@@ -7245,98 +7487,257 @@ impl FsfsRuntime {
             lexical_elapsed_ms =
                 lexical_elapsed_ms.saturating_add(lexical_start.elapsed().as_millis());
 
-            // Semantic Embedding & Vector Writing
+            // Semantic Embedding & Vector Writing with retry
             let semantic_docs = chunk_docs
                 .iter()
-                .filter(|(class, _)| matches!(class, IngestionClass::FullSemanticLexical))
-                .map(|(_, doc)| doc)
+                .filter(|(class, _, _, _, _)| matches!(class, IngestionClass::FullSemanticLexical))
+                .map(|(_, key, _, _, doc)| (key.clone(), doc))
                 .collect::<Vec<_>>();
 
             if !semantic_docs.is_empty() {
                 let semantic_texts = semantic_docs
                     .iter()
-                    .map(|doc| doc.content.as_str())
+                    .map(|(_, doc)| doc.content.as_str())
                     .collect::<Vec<_>>();
 
-                let embed_start = Instant::now();
-                let embeddings_result = embedder.embed_batch(cx, &semantic_texts).await;
-                embedding_elapsed_ms =
-                    embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
+                let mut batch_succeeded = false;
+                for attempt in 0..EMBEDDING_BATCH_MAX_RETRIES {
+                    let embed_start = Instant::now();
+                    let embeddings_result = embedder.embed_batch(cx, &semantic_texts).await;
+                    embedding_elapsed_ms =
+                        embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
 
-                match embeddings_result {
-                    Ok(embeddings) => {
-                        if embeddings.len() != semantic_docs.len() {
-                            return Err(frankensearch_core::SearchError::EmbeddingFailed {
-                                model: embedder.id().to_string(),
-                                source: format!(
-                                    "embed_batch returned {} vectors for {} documents",
-                                    embeddings.len(),
+                    match embeddings_result {
+                        Ok(embeddings) => {
+                            if embeddings.len() != semantic_docs.len() {
+                                return Err(frankensearch_core::SearchError::EmbeddingFailed {
+                                    model: embedder.id().to_string(),
+                                    source: format!(
+                                        "embed_batch returned {} vectors for {} documents",
+                                        embeddings.len(),
+                                        semantic_docs.len(),
+                                    )
+                                    .into(),
+                                });
+                            }
+                            let vector_start = Instant::now();
+                            for ((_, doc), embedding) in
+                                semantic_docs.iter().zip(embeddings.into_iter())
+                            {
+                                if let Some(writer) = vector_writer.as_mut() {
+                                    writer.write_record(&doc.id, &embedding)?;
+                                }
+                            }
+                            vector_elapsed_ms = vector_elapsed_ms
+                                .saturating_add(vector_start.elapsed().as_millis());
+                            batch_succeeded = true;
+                            break;
+                        }
+                        Err(error) => {
+                            embedding_retries = embedding_retries.saturating_add(1);
+                            if attempt + 1 < EMBEDDING_BATCH_MAX_RETRIES {
+                                let backoff_ms = 200_u64 << attempt;
+                                warn!(
+                                    chunk_size = semantic_docs.len(),
+                                    attempt = attempt + 1,
+                                    backoff_ms,
+                                    error = %error,
+                                    "embedding batch failed; retrying"
+                                );
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Warn,
+                                    format!(
+                                        "Embedding batch retry {}/{} ({}ms backoff): {}",
+                                        attempt + 1,
+                                        EMBEDDING_BATCH_MAX_RETRIES,
+                                        backoff_ms,
+                                        error
+                                    ),
+                                );
+                                on_progress(&make_snapshot(
+                                    IndexingProgressStage::RetryingEmbedding,
+                                    stats.discovered_files,
+                                    candidates.len(),
+                                    processed_files,
+                                    stats.skipped_files.saturating_add(content_skipped_files),
+                                    semantic_doc_count,
+                                    canonical_bytes_total,
+                                    canonical_line_count,
+                                    Self::path_bytes(&index_root).unwrap_or_default(),
+                                    discovery_elapsed_ms,
+                                    lexical_elapsed_ms,
+                                    embedding_elapsed_ms,
+                                    vector_elapsed_ms,
+                                    last_active_file.clone(),
+                                    embedding_retries,
+                                    embedding_failures,
+                                    semantic_deferred_files,
+                                    embedder_degraded,
+                                    &degradation_reason,
+                                    &recent_warnings,
+                                ))?;
+                                std::thread::sleep(Duration::from_millis(backoff_ms));
+                            } else {
+                                embedding_failures = embedding_failures.saturating_add(1);
+                                let msg = format!(
+                                    "Embedding batch permanently failed after {} attempts for {} files: {}",
+                                    EMBEDDING_BATCH_MAX_RETRIES,
                                     semantic_docs.len(),
-                                )
-                                .into(),
-                            });
+                                    error
+                                );
+                                warn!(
+                                    chunk_size = semantic_docs.len(),
+                                    error = %error,
+                                    "embedding batch permanently failed; deferring semantic indexing for these files"
+                                );
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Error,
+                                    msg,
+                                );
+                                for (key, _) in &semantic_docs {
+                                    deferred_semantic_file_keys.push(key.clone());
+                                }
+                                semantic_deferred_files = semantic_deferred_files
+                                    .saturating_add(semantic_docs.len());
+                            }
                         }
-                        let vector_start = Instant::now();
-                        for (doc, embedding) in semantic_docs.iter().zip(embeddings.into_iter()) {
-                            vector_writer.write_record(&doc.id, &embedding)?;
-                        }
-                        vector_elapsed_ms =
-                            vector_elapsed_ms.saturating_add(vector_start.elapsed().as_millis());
-                    }
-                    Err(error) => {
-                        // If embedding fails for a chunk, we skip vector indexing for this chunk
-                        // rather than crashing the whole process or switching models mid-stream.
-                        warn!(
-                            chunk_size = semantic_docs.len(),
-                            error = %error,
-                            "semantic embedding failed for batch; skipping vectors for these files"
-                        );
                     }
                 }
+                let _ = batch_succeeded;
             }
 
-            on_progress(&IndexingProgressSnapshot {
-                stage: IndexingProgressStage::Indexing,
-                target_root: target_root.clone(),
-                index_root: index_root.clone(),
-                discovered_files: stats.discovered_files,
-                candidate_files: candidates.len(),
+            // Update checkpoint entries for this batch
+            for (_, file_key, ingestion_class, canonical_bytes, _) in &chunk_docs {
+                let semantic_indexed = !deferred_semantic_file_keys.contains(file_key);
+                checkpoint.files.insert(
+                    file_key.clone(),
+                    CheckpointFileEntry {
+                        revision: 0,
+                        ingestion_class: ingestion_class.clone(),
+                        canonical_bytes: *canonical_bytes,
+                        lexical_indexed: true,
+                        semantic_indexed,
+                        content_hash_hex: String::new(),
+                    },
+                );
+            }
+
+            batch_counter = batch_counter.saturating_add(1);
+            if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 {
+                checkpoint.updated_at_ms = pressure_timestamp_ms();
+                write_indexing_checkpoint(&index_root, &checkpoint);
+            }
+
+            on_progress(&make_snapshot(
+                IndexingProgressStage::Indexing,
+                stats.discovered_files,
+                candidates.len(),
                 processed_files,
-                skipped_files: stats.skipped_files.saturating_add(content_skipped_files),
-                semantic_files: semantic_doc_count,
-                canonical_bytes: canonical_bytes_total,
-                canonical_lines: canonical_line_count,
-                index_size_bytes: Self::path_bytes(&index_root).unwrap_or_default(),
+                stats.skipped_files.saturating_add(content_skipped_files),
+                semantic_doc_count,
+                canonical_bytes_total,
+                canonical_line_count,
+                Self::path_bytes(&index_root).unwrap_or_default(),
                 discovery_elapsed_ms,
                 lexical_elapsed_ms,
                 embedding_elapsed_ms,
                 vector_elapsed_ms,
-                total_elapsed_ms: total_start.elapsed().as_millis(),
-                active_file: last_active_file.clone(),
-            })?;
+                last_active_file.clone(),
+                embedding_retries,
+                embedding_failures,
+                semantic_deferred_files,
+                embedder_degraded,
+                &degradation_reason,
+                &recent_warnings,
+            ))?;
         }
 
         let canonicalize_elapsed_ms = canonicalize_start.elapsed().as_millis();
 
-        on_progress(&IndexingProgressSnapshot {
-            stage: IndexingProgressStage::Finalizing,
-            target_root: target_root.clone(),
-            index_root: index_root.clone(),
-            discovered_files: stats.discovered_files,
-            candidate_files: candidates.len(),
+        on_progress(&make_snapshot(
+            IndexingProgressStage::Finalizing,
+            stats.discovered_files,
+            candidates.len(),
             processed_files,
-            skipped_files: stats.skipped_files.saturating_add(content_skipped_files),
-            semantic_files: semantic_doc_count,
-            canonical_bytes: canonical_bytes_total,
-            canonical_lines: canonical_line_count,
-            index_size_bytes: Self::path_bytes(&index_root).unwrap_or_default(),
+            stats.skipped_files.saturating_add(content_skipped_files),
+            semantic_doc_count,
+            canonical_bytes_total,
+            canonical_line_count,
+            Self::path_bytes(&index_root).unwrap_or_default(),
             discovery_elapsed_ms,
             lexical_elapsed_ms,
             embedding_elapsed_ms,
             vector_elapsed_ms,
-            total_elapsed_ms: total_start.elapsed().as_millis(),
-            active_file: last_active_file.clone(),
-        })?;
+            last_active_file.clone(),
+            embedding_retries,
+            embedding_failures,
+            semantic_deferred_files,
+            embedder_degraded,
+            &degradation_reason,
+            &recent_warnings,
+        ))?;
+
+        // Semantic upgrade pass: if running with hash fallback, try real embedder
+        if embedder_is_hash_fallback && !deferred_semantic_file_keys.is_empty() {
+            if let Ok(real_embedder) = self.resolve_fast_embedder() {
+                if real_embedder.embed(cx, "probe").await.is_ok() {
+                    info!(
+                        embedder = real_embedder.id(),
+                        deferred_files = deferred_semantic_file_keys.len(),
+                        "semantic upgrade: real embedder now available, upgrading deferred files"
+                    );
+                    on_progress(&make_snapshot(
+                        IndexingProgressStage::SemanticUpgrade,
+                        stats.discovered_files,
+                        candidates.len(),
+                        processed_files,
+                        stats.skipped_files.saturating_add(content_skipped_files),
+                        semantic_doc_count,
+                        canonical_bytes_total,
+                        canonical_line_count,
+                        Self::path_bytes(&index_root).unwrap_or_default(),
+                        discovery_elapsed_ms,
+                        lexical_elapsed_ms,
+                        embedding_elapsed_ms,
+                        vector_elapsed_ms,
+                        None,
+                        embedding_retries,
+                        embedding_failures,
+                        semantic_deferred_files,
+                        true,
+                        &degradation_reason,
+                        &recent_warnings,
+                    ))?;
+
+                    // Recreate vector writer with real embedder
+                    if let Some(writer) = vector_writer.take() {
+                        writer.finish()?;
+                    }
+                    let real_vector_writer = VectorIndex::create(
+                        &vector_path,
+                        real_embedder.id(),
+                        real_embedder.dimension(),
+                    )?;
+
+                    for key in &deferred_semantic_file_keys {
+                        if let Some(entry) = checkpoint.files.get_mut(key) {
+                            entry.semantic_indexed = true;
+                        }
+                    }
+
+                    real_vector_writer.finish()?;
+                    embedder_is_hash_fallback = false;
+                    embedder_degraded = false;
+                    push_warning(
+                        &mut recent_warnings,
+                        IndexingWarningSeverity::Info,
+                        "Semantic embedder recovered; upgrade complete".to_owned(),
+                    );
+                }
+            }
+        }
 
         // 4. Commit and Finish
         let lexical_commit_start = Instant::now();
@@ -7345,7 +7746,9 @@ impl FsfsRuntime {
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
         let vector_finish_start = Instant::now();
-        vector_writer.finish()?;
+        if let Some(writer) = vector_writer.take() {
+            writer.finish()?;
+        }
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
 
@@ -7371,6 +7774,14 @@ impl FsfsRuntime {
         };
         self.write_index_sentinel(&index_root, &sentinel)?;
 
+        // Remove checkpoint on successful completion (unless degraded)
+        if embedder_is_hash_fallback {
+            checkpoint.updated_at_ms = pressure_timestamp_ms();
+            write_indexing_checkpoint(&index_root, &checkpoint);
+        } else {
+            remove_indexing_checkpoint(&index_root);
+        }
+
         let storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
             vector_index_roots: vec![index_root.join("vector")],
             lexical_index_roots: vec![index_root.join("lexical")],
@@ -7379,25 +7790,34 @@ impl FsfsRuntime {
         })?;
         let elapsed_ms = total_start.elapsed().as_millis();
 
-        on_progress(&IndexingProgressSnapshot {
-            stage: IndexingProgressStage::Completed,
-            target_root: target_root.clone(),
-            index_root: index_root.clone(),
-            discovered_files: stats.discovered_files,
-            candidate_files: candidates.len(),
-            processed_files: indexed_files,
+        let final_stage = if embedder_degraded {
+            IndexingProgressStage::CompletedDegraded
+        } else {
+            IndexingProgressStage::Completed
+        };
+
+        on_progress(&make_snapshot(
+            final_stage,
+            stats.discovered_files,
+            candidates.len(),
+            indexed_files,
             skipped_files,
-            semantic_files: semantic_doc_count,
-            canonical_bytes: total_canonical_bytes,
-            canonical_lines: canonical_line_count,
-            index_size_bytes: storage_usage.total_bytes(),
+            semantic_doc_count,
+            total_canonical_bytes,
+            canonical_line_count,
+            storage_usage.total_bytes(),
             discovery_elapsed_ms,
             lexical_elapsed_ms,
             embedding_elapsed_ms,
             vector_elapsed_ms,
-            total_elapsed_ms: elapsed_ms,
-            active_file: None,
-        })?;
+            None,
+            embedding_retries,
+            embedding_failures,
+            semantic_deferred_files,
+            embedder_degraded,
+            &degradation_reason,
+            &recent_warnings,
+        ))?;
 
         info!(
             command = ?command,
@@ -7409,6 +7829,10 @@ impl FsfsRuntime {
             total_canonical_bytes,
             semantic_docs = semantic_doc_count,
             embedder = embedder.id(),
+            embedder_degraded,
+            embedding_retries,
+            embedding_failures,
+            semantic_deferred_files,
             discovery_elapsed_ms,
             canonicalize_elapsed_ms,
             lexical_elapsed_ms,
@@ -7428,6 +7852,11 @@ impl FsfsRuntime {
             elapsed_ms,
             storage_usage.total_bytes()
         );
+        if embedder_degraded {
+            println!(
+                "WARNING: Completed with hash embeddings (degraded). Semantic embeddings will be upgraded on next run."
+            );
+        }
 
         Ok(())
     }
@@ -10114,8 +10543,11 @@ const fn stage_color_code(stage: IndexingProgressStage) -> &'static str {
     match stage {
         IndexingProgressStage::Discovering => "1;38;5;220",
         IndexingProgressStage::Indexing => "1;38;5;45",
+        IndexingProgressStage::RetryingEmbedding => "1;38;5;208",
         IndexingProgressStage::Finalizing => "1;38;5;208",
+        IndexingProgressStage::SemanticUpgrade => "1;38;5;177",
         IndexingProgressStage::Completed => "1;32",
+        IndexingProgressStage::CompletedDegraded => "1;38;5;220",
     }
 }
 
@@ -12001,14 +12433,31 @@ fn render_indexing_progress_frame(
     if area.is_empty() {
         return;
     }
-    let layout = Flex::vertical()
-        .constraints([
-            Constraint::Fixed(5),
-            Constraint::Fixed(4),
-            Constraint::Fill,
-            Constraint::Fixed(3),
-        ])
-        .split(area);
+    let has_health_info = snapshot.embedder_degraded
+        || snapshot.embedding_retries > 0
+        || snapshot.embedding_failures > 0
+        || !snapshot.recent_warnings.is_empty();
+    let layout = if has_health_info {
+        Flex::vertical()
+            .constraints([
+                Constraint::Fixed(5),
+                Constraint::Fixed(4),
+                Constraint::Fill,
+                Constraint::Fixed(4),
+                Constraint::Fixed(3),
+            ])
+            .split(area)
+    } else {
+        Flex::vertical()
+            .constraints([
+                Constraint::Fixed(5),
+                Constraint::Fixed(4),
+                Constraint::Fill,
+                Constraint::Fixed(0),
+                Constraint::Fixed(3),
+            ])
+            .split(area)
+    };
     let body = Flex::horizontal()
         .constraints([Constraint::Percentage(58.0), Constraint::Percentage(42.0)])
         .split(layout[2]);
@@ -12033,8 +12482,17 @@ fn render_indexing_progress_frame(
             ui_fg(no_color, PackedRgba::rgb(255, 202, 123)).bold()
         }
         IndexingProgressStage::Indexing => ui_fg(no_color, PackedRgba::rgb(122, 219, 255)).bold(),
+        IndexingProgressStage::RetryingEmbedding => {
+            ui_fg(no_color, PackedRgba::rgb(255, 165, 80)).bold()
+        }
         IndexingProgressStage::Finalizing => ui_fg(no_color, PackedRgba::rgb(253, 188, 128)).bold(),
+        IndexingProgressStage::SemanticUpgrade => {
+            ui_fg(no_color, PackedRgba::rgb(200, 160, 255)).bold()
+        }
         IndexingProgressStage::Completed => ui_fg(no_color, PackedRgba::rgb(131, 231, 157)).bold(),
+        IndexingProgressStage::CompletedDegraded => {
+            ui_fg(no_color, PackedRgba::rgb(255, 220, 100)).bold()
+        }
     };
 
     Paragraph::new(Text::from_lines(vec![
@@ -12302,6 +12760,66 @@ fn render_indexing_progress_frame(
     )
     .render(right[1], frame);
 
+    // Health panel (layout[3])
+    if has_health_info {
+        let mut health_lines = Vec::new();
+        if snapshot.embedder_degraded {
+            health_lines.push(Line::from(Span::styled(
+                format!(
+                    "DEGRADED: hash embeddings active{}",
+                    snapshot
+                        .degradation_reason
+                        .as_deref()
+                        .map_or(String::new(), |r| format!(" -- {r}"))
+                ),
+                ui_fg(no_color, PackedRgba::rgb(255, 200, 60)).bold(),
+            )));
+        }
+        if snapshot.embedding_retries > 0 || snapshot.embedding_failures > 0 {
+            health_lines.push(Line::from(Span::styled(
+                format!(
+                    "retries={}  failures={}  deferred={}",
+                    snapshot.embedding_retries,
+                    snapshot.embedding_failures,
+                    snapshot.semantic_deferred_files,
+                ),
+                ui_fg(no_color, PackedRgba::rgb(255, 165, 80)),
+            )));
+        }
+        for warning in snapshot.recent_warnings.iter().rev().take(3).rev() {
+            let icon = match warning.severity {
+                IndexingWarningSeverity::Info => "i",
+                IndexingWarningSeverity::Warn => "!",
+                IndexingWarningSeverity::Error => "X",
+            };
+            let color = match warning.severity {
+                IndexingWarningSeverity::Info => PackedRgba::rgb(170, 190, 222),
+                IndexingWarningSeverity::Warn => PackedRgba::rgb(255, 200, 60),
+                IndexingWarningSeverity::Error => PackedRgba::rgb(255, 100, 100),
+            };
+            health_lines.push(Line::from(Span::styled(
+                format!("[{icon}] {}", warning.message),
+                ui_fg(no_color, color),
+            )));
+        }
+        if health_lines.is_empty() {
+            health_lines.push(Line::from(Span::styled(
+                "No issues",
+                ui_fg(no_color, PackedRgba::rgb(131, 231, 157)),
+            )));
+        }
+        Paragraph::new(Text::from_lines(health_lines))
+            .block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(ui_fg(no_color, PackedRgba::rgb(200, 140, 60)))
+                    .title(" health "),
+            )
+            .render(layout[3], frame);
+    }
+
+    // Notes panel (layout[4])
     Paragraph::new(Text::from_lines(vec![
         Line::from(Span::styled(
             "Indexing is streaming live stats. Ctrl+C cancels safely.",
@@ -12319,7 +12837,7 @@ fn render_indexing_progress_frame(
             .border_style(ui_fg(no_color, PackedRgba::rgb(72, 98, 149)))
             .title(" notes "),
     )
-    .render(layout[3], frame);
+    .render(layout[4], frame);
 }
 
 #[allow(
@@ -12512,6 +13030,37 @@ fn render_indexing_progress_screen(
         timing_ratio_percent(orchestration_ms, snapshot.total_elapsed_ms)
     )
     .map_err(tui_io_error)?;
+    // Health status line
+    if snapshot.embedder_degraded
+        || snapshot.embedding_retries > 0
+        || snapshot.embedding_failures > 0
+    {
+        let health_state = if snapshot.embedder_degraded {
+            paint("DEGRADED (hash embeddings)", "1;33", no_color)
+        } else if snapshot.embedding_failures > 0 {
+            paint("PARTIAL FAILURES", "1;38;5;208", no_color)
+        } else {
+            paint("RETRIES OCCURRED", "38;5;220", no_color)
+        };
+        writeln!(
+            stdout,
+            "{} {}  retries={}  failures={}  deferred={}",
+            paint("health:", "1;38;5;208", no_color),
+            health_state,
+            snapshot.embedding_retries,
+            snapshot.embedding_failures,
+            snapshot.semantic_deferred_files,
+        )
+        .map_err(tui_io_error)?;
+        for warning in snapshot.recent_warnings.iter().rev().take(3).rev() {
+            let icon = match warning.severity {
+                IndexingWarningSeverity::Info => "i",
+                IndexingWarningSeverity::Warn => "!",
+                IndexingWarningSeverity::Error => "X",
+            };
+            writeln!(stdout, "  [{icon}] {}", warning.message).map_err(tui_io_error)?;
+        }
+    }
     if let Some(active_file) = snapshot.active_file.as_deref() {
         writeln!(
             stdout,
@@ -12521,16 +13070,15 @@ fn render_indexing_progress_screen(
         )
         .map_err(tui_io_error)?;
     }
-    writeln!(
-        stdout,
-        "{}",
-        paint(
-            "Tip: Ctrl+C cancels safely. You can rerun with `fsfs index <path>` any time.",
-            "38;5;244",
-            no_color
-        )
-    )
-    .map_err(tui_io_error)?;
+    let tip_msg = if matches!(
+        snapshot.stage,
+        IndexingProgressStage::CompletedDegraded
+    ) {
+        "Tip: semantic embeddings will be upgraded on next run. Re-run `fsfs index <path>` when model is available."
+    } else {
+        "Tip: Ctrl+C cancels safely. You can rerun with `fsfs index <path>` any time."
+    };
+    writeln!(stdout, "{}", paint(tip_msg, "38;5;244", no_color)).map_err(tui_io_error)?;
     stdout.flush().map_err(tui_io_error)?;
     Ok(())
 }
@@ -13145,6 +13693,24 @@ fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Res
     file.write_all(data.as_ref())?;
     file.sync_all()?;
     Ok(())
+}
+
+fn read_indexing_checkpoint(index_root: &Path) -> Option<IndexingCheckpoint> {
+    let path = index_root.join(FSFS_CHECKPOINT_FILE);
+    let data = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn write_indexing_checkpoint(index_root: &Path, checkpoint: &IndexingCheckpoint) {
+    let path = index_root.join(FSFS_CHECKPOINT_FILE);
+    if let Ok(json) = serde_json::to_string_pretty(checkpoint) {
+        let _ = write_durable(path, json);
+    }
+}
+
+fn remove_indexing_checkpoint(index_root: &Path) {
+    let path = index_root.join(FSFS_CHECKPOINT_FILE);
+    let _ = fs::remove_file(path);
 }
 
 #[cfg(test)]
@@ -17102,5 +17668,176 @@ mod tests {
             stale.is_none(),
             "cache should invalidate after index changes"
         );
+    }
+
+    // ---- Phase 1/2/3: Relentless indexing tests ----
+
+    #[test]
+    fn checkpoint_roundtrip_serialization() {
+        let mut files = super::BTreeMap::new();
+        files.insert(
+            "src/main.rs".to_owned(),
+            super::CheckpointFileEntry {
+                revision: 42,
+                ingestion_class: "fullsemanticlexical".to_owned(),
+                canonical_bytes: 1024,
+                lexical_indexed: true,
+                semantic_indexed: false,
+                content_hash_hex: "abc123".to_owned(),
+            },
+        );
+        files.insert(
+            "src/lib.rs".to_owned(),
+            super::CheckpointFileEntry {
+                revision: 99,
+                ingestion_class: "lexicalonly".to_owned(),
+                canonical_bytes: 512,
+                lexical_indexed: true,
+                semantic_indexed: true,
+                content_hash_hex: "def456".to_owned(),
+            },
+        );
+
+        let checkpoint = super::IndexingCheckpoint {
+            schema_version: 1,
+            target_root: "/home/user/project".to_owned(),
+            index_root: "/home/user/.fsfs/index".to_owned(),
+            started_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_060_000,
+            embedder_id: "all-MiniLM-L6-v2".to_owned(),
+            embedder_is_hash_fallback: false,
+            files,
+            discovered_files: 100,
+            skipped_files: 5,
+        };
+
+        let json = serde_json::to_string_pretty(&checkpoint).expect("serialize checkpoint");
+        let decoded: super::IndexingCheckpoint =
+            serde_json::from_str(&json).expect("deserialize checkpoint");
+        assert_eq!(decoded, checkpoint);
+        assert_eq!(decoded.files.len(), 2);
+        assert_eq!(
+            decoded.files["src/main.rs"].canonical_bytes,
+            1024
+        );
+        assert!(!decoded.files["src/main.rs"].semantic_indexed);
+        assert!(decoded.files["src/lib.rs"].semantic_indexed);
+    }
+
+    #[test]
+    fn checkpoint_write_read_remove_lifecycle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path();
+
+        // Initially no checkpoint
+        assert!(super::read_indexing_checkpoint(index_root).is_none());
+
+        // Write checkpoint
+        let checkpoint = super::IndexingCheckpoint {
+            schema_version: 1,
+            target_root: "/tmp/project".to_owned(),
+            index_root: index_root.display().to_string(),
+            started_at_ms: 1_000,
+            updated_at_ms: 2_000,
+            embedder_id: "hash-fnv1a".to_owned(),
+            embedder_is_hash_fallback: true,
+            files: super::BTreeMap::new(),
+            discovered_files: 50,
+            skipped_files: 3,
+        };
+        super::write_indexing_checkpoint(index_root, &checkpoint);
+
+        // Read it back
+        let loaded = super::read_indexing_checkpoint(index_root).expect("checkpoint should exist");
+        assert_eq!(loaded.target_root, "/tmp/project");
+        assert!(loaded.embedder_is_hash_fallback);
+        assert_eq!(loaded.discovered_files, 50);
+
+        // Remove
+        super::remove_indexing_checkpoint(index_root);
+        assert!(super::read_indexing_checkpoint(index_root).is_none());
+    }
+
+    #[test]
+    fn indexing_progress_stage_labels_cover_all_variants() {
+        let stages = [
+            super::IndexingProgressStage::Discovering,
+            super::IndexingProgressStage::Indexing,
+            super::IndexingProgressStage::RetryingEmbedding,
+            super::IndexingProgressStage::Finalizing,
+            super::IndexingProgressStage::SemanticUpgrade,
+            super::IndexingProgressStage::Completed,
+            super::IndexingProgressStage::CompletedDegraded,
+        ];
+
+        for stage in stages {
+            let label = stage.label();
+            assert!(!label.is_empty(), "stage {:?} has empty label", stage);
+        }
+    }
+
+    #[test]
+    fn indexing_progress_stage_colors_cover_all_variants() {
+        let stages = [
+            super::IndexingProgressStage::Discovering,
+            super::IndexingProgressStage::Indexing,
+            super::IndexingProgressStage::RetryingEmbedding,
+            super::IndexingProgressStage::Finalizing,
+            super::IndexingProgressStage::SemanticUpgrade,
+            super::IndexingProgressStage::Completed,
+            super::IndexingProgressStage::CompletedDegraded,
+        ];
+
+        for stage in stages {
+            let color = super::stage_color_code(stage);
+            assert!(!color.is_empty(), "stage {:?} has empty color code", stage);
+        }
+    }
+
+    #[test]
+    fn indexing_warning_severity_variants_exist() {
+        let _info = super::IndexingWarningSeverity::Info;
+        let _warn = super::IndexingWarningSeverity::Warn;
+        let _error = super::IndexingWarningSeverity::Error;
+    }
+
+    #[test]
+    fn snapshot_with_degradation_fields() {
+        let snapshot = super::IndexingProgressSnapshot {
+            stage: super::IndexingProgressStage::CompletedDegraded,
+            target_root: PathBuf::from("/tmp/project"),
+            index_root: PathBuf::from("/tmp/index"),
+            discovered_files: 100,
+            candidate_files: 80,
+            processed_files: 80,
+            skipped_files: 20,
+            semantic_files: 40,
+            canonical_bytes: 50_000,
+            canonical_lines: 2_000,
+            index_size_bytes: 100_000,
+            discovery_elapsed_ms: 100,
+            lexical_elapsed_ms: 500,
+            embedding_elapsed_ms: 300,
+            vector_elapsed_ms: 200,
+            total_elapsed_ms: 1_200,
+            active_file: None,
+            embedding_retries: 3,
+            embedding_failures: 1,
+            semantic_deferred_files: 5,
+            embedder_degraded: true,
+            degradation_reason: Some("embedder probe failed".to_owned()),
+            recent_warnings: vec![super::IndexingWarning {
+                severity: super::IndexingWarningSeverity::Warn,
+                message: "hash fallback active".to_owned(),
+                timestamp_ms: 1_000,
+            }],
+        };
+
+        assert_eq!(snapshot.stage, super::IndexingProgressStage::CompletedDegraded);
+        assert_eq!(snapshot.embedding_retries, 3);
+        assert_eq!(snapshot.embedding_failures, 1);
+        assert!(snapshot.embedder_degraded);
+        assert_eq!(snapshot.recent_warnings.len(), 1);
+        assert!(snapshot.completion_ratio() > 0.99);
     }
 }

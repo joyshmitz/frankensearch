@@ -463,9 +463,18 @@ impl FileProtector {
     #[allow(clippy::too_many_lines)]
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileRepairOutcome> {
+        self.repair_file_internal(path, path, sidecar_path)
+    }
+
+    fn repair_file_internal(
+        &self,
+        dest_path: &Path,
+        source_path: &Path,
+        sidecar_path: &Path,
+    ) -> SearchResult<FileRepairOutcome> {
         self.metrics.record_repair_attempt();
 
-        let source_file = match fs::File::open(path) {
+        let source_file = match fs::File::open(source_path) {
             Ok(f) => Some(f),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
@@ -506,10 +515,10 @@ impl FileProtector {
 
             // Ensure no source handle is kept while rewriting the destination file.
             drop(source_file);
-            write_durable(path, &[])?;
+            write_durable(dest_path, &[])?;
             self.metrics.record_repair_success();
             info!(
-                path = %path.display(),
+                path = %dest_path.display(),
                 "durability repair completed (empty payload sidecar)"
             );
             return Ok(FileRepairOutcome::Repaired {
@@ -534,7 +543,7 @@ impl FileProtector {
                     // garbage. We skip loading source symbols to avoid OOM on large files
                     // and rely entirely on repair symbols.
                     warn!(
-                        path = %path.display(),
+                        path = %dest_path.display(),
                         len,
                         "source length matches header but CRC failed; skipping source symbols"
                     );
@@ -567,7 +576,7 @@ impl FileProtector {
                 if recovered_crc32 != header.source_crc32 {
                     self.metrics.record_repair_failure();
                     warn!(
-                        path = %path.display(),
+                        path = %dest_path.display(),
                         expected_crc32 = header.source_crc32,
                         recovered_crc32,
                         "decoded payload failed crc verification"
@@ -579,10 +588,10 @@ impl FileProtector {
                     });
                 }
 
-                write_durable(path, &data)?;
+                write_durable(dest_path, &data)?;
                 self.metrics.record_repair_success();
                 info!(
-                    path = %path.display(),
+                    path = %dest_path.display(),
                     bytes_written = data.len(),
                     symbols_used,
                     "durability repair completed"
@@ -600,7 +609,7 @@ impl FileProtector {
             } => {
                 self.metrics.record_repair_failure();
                 warn!(
-                    path = %path.display(),
+                    path = %dest_path.display(),
                     ?reason,
                     symbols_received,
                     k_required,
@@ -683,7 +692,8 @@ impl FileProtector {
         }
 
         let repair_start = Instant::now();
-        let outcome = self.repair_file(path, &sidecar);
+        let source_path_to_read = if had_source { &backup_path } else { path };
+        let outcome = self.repair_file_internal(path, source_path_to_read, &sidecar);
         let repair_time = repair_start.elapsed();
 
         self.finalize_repair(

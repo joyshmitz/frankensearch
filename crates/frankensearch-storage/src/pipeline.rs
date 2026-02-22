@@ -106,6 +106,7 @@ pub struct BatchProcessResult {
     pub jobs_completed: usize,
     pub jobs_failed: usize,
     pub jobs_skipped: usize,
+    pub terminal_failures: usize,
     pub embed_time: Duration,
     pub total_time: Duration,
 }
@@ -118,6 +119,7 @@ pub struct WorkerReport {
     pub jobs_failed: usize,
     pub jobs_skipped: usize,
     pub idle_cycles: usize,
+    pub terminal_failures_encountered: usize,
 }
 
 #[derive(Debug, Default)]
@@ -686,7 +688,9 @@ impl StorageBackedJobRunner {
                 Ok(embedder) => embedder,
                 Err(error) => {
                     let error_message = error.to_string();
-                    self.handle_job_failure(job, &error);
+                    if self.handle_job_failure(job, &error) {
+                        result.terminal_failures += 1;
+                    }
                     result.jobs_failed += 1;
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
@@ -703,7 +707,9 @@ impl StorageBackedJobRunner {
             let embedding = match embedder.embed(cx, text).await {
                 Ok(embedding) => embedding,
                 Err(error) => {
-                    self.handle_job_failure(job, &error);
+                    if self.handle_job_failure(job, &error) {
+                        result.terminal_failures += 1;
+                    }
                     result.jobs_failed += 1;
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
@@ -723,7 +729,9 @@ impl StorageBackedJobRunner {
                 .vector_sink
                 .persist(&job.doc_id, &job.embedder_id, &embedding);
             if let Err(error) = write_result {
-                self.handle_job_failure(job, &error);
+                if self.handle_job_failure(job, &error) {
+                    result.terminal_failures += 1;
+                }
                 result.jobs_failed += 1;
                 tracing::warn!(
                     target: "frankensearch.storage.pipeline",
@@ -739,7 +747,9 @@ impl StorageBackedJobRunner {
             }
 
             if let Err(error) = self.storage.mark_embedded(&job.doc_id, &job.embedder_id) {
-                self.handle_job_failure(job, &error);
+                if self.handle_job_failure(job, &error) {
+                    result.terminal_failures += 1;
+                }
                 result.jobs_failed += 1;
                 tracing::warn!(
                     target: "frankensearch.storage.pipeline",
@@ -854,6 +864,7 @@ impl StorageBackedJobRunner {
             report.jobs_completed += batch.jobs_completed;
             report.jobs_failed += batch.jobs_failed;
             report.jobs_skipped += batch.jobs_skipped;
+            report.terminal_failures_encountered += batch.terminal_failures;
         }
 
         tracing::info!(
@@ -865,6 +876,7 @@ impl StorageBackedJobRunner {
             jobs_completed = report.jobs_completed,
             jobs_failed = report.jobs_failed,
             jobs_skipped = report.jobs_skipped,
+            terminal_failures_encountered = report.terminal_failures_encountered,
             idle_cycles = report.idle_cycles,
             "storage-backed embedding worker exited"
         );
@@ -886,10 +898,13 @@ impl StorageBackedJobRunner {
         )))
     }
 
-    fn handle_job_failure(&self, job: &crate::ClaimedJob, error: &SearchError) {
+    /// Handle a job failure by recording it in the queue and optionally
+    /// marking the document as failed in storage. Returns `true` if the
+    /// failure was terminal (no more retries).
+    fn handle_job_failure(&self, job: &crate::ClaimedJob, error: &SearchError) -> bool {
         let error_message = error.to_string();
         let fail_result = self.queue.fail(job.job_id, &error_message);
-        
+
         let is_terminal = match &fail_result {
             Ok(crate::job_queue::FailResult::TerminalFailed { .. }) => true,
             Ok(crate::job_queue::FailResult::Retried { .. }) => false,
@@ -904,7 +919,7 @@ impl StorageBackedJobRunner {
                 "failed to record job failure in queue"
             );
         }
-        
+
         if is_terminal {
             if let Err(mark_err) =
                 self.storage
@@ -918,6 +933,8 @@ impl StorageBackedJobRunner {
                 );
             }
         }
+
+        is_terminal
     }
 
     fn record_ingest_metrics(&self, tx_result: &IngestTxResult) {
@@ -2556,6 +2573,7 @@ mod tests {
             jobs_completed: 8,
             jobs_failed: 1,
             jobs_skipped: 1,
+            terminal_failures: 0,
             embed_time: Duration::from_millis(42),
             total_time: Duration::from_millis(100),
         };
@@ -2573,6 +2591,7 @@ mod tests {
             jobs_failed: 2,
             jobs_skipped: 1,
             idle_cycles: 7,
+            terminal_failures_encountered: 0,
         };
         let json = serde_json::to_string(&r).unwrap();
         let decoded: WorkerReport = serde_json::from_str(&json).unwrap();

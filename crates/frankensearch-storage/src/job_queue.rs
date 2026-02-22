@@ -763,6 +763,44 @@ impl PersistentJobQueue {
         fetch_queue_depth(self.storage.connection())
     }
 
+    /// Reset all terminally-failed jobs for a given embedder back to pending.
+    ///
+    /// This is called on startup when the embedder changes or becomes newly
+    /// available, giving previously failed jobs another chance.
+    ///
+    /// Returns the number of resurrected jobs.
+    pub fn resurrect_terminal_failures(&self, embedder_id: &str) -> SearchResult<usize> {
+        let now_ms = unix_timestamp_ms()?;
+        let resurrected = self.storage.transaction(|conn| {
+            let params = [
+                SqliteValue::Text(embedder_id.to_owned()),
+                SqliteValue::Integer(now_ms),
+            ];
+            let count = conn
+                .execute_with_params(
+                    "UPDATE embedding_jobs \
+                     SET status = 'pending', retry_count = 0, error = NULL, \
+                         started_at = NULL, next_attempt_at = ?2 \
+                     WHERE embedder_id = ?1 AND status = 'failed';",
+                    &params,
+                )
+                .map_err(map_storage_error)?;
+            Ok(count)
+        })?;
+
+        if resurrected > 0 {
+            tracing::info!(
+                target: "frankensearch.storage",
+                op = "queue.resurrect",
+                embedder_id,
+                resurrected,
+                "resurrected terminally-failed embedding jobs"
+            );
+        }
+
+        Ok(resurrected)
+    }
+
     fn record_enqueue_outcome(&self, outcome: EnqueueOutcome) {
         match outcome {
             EnqueueOutcome::Inserted | EnqueueOutcome::Replaced => {
@@ -2634,5 +2672,95 @@ mod tests {
             let decoded: QueueErrorKind = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, kind);
         }
+    }
+
+    #[test]
+    fn resurrect_terminal_failures_resets_failed_jobs() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            max_retries: 0,
+            retry_base_delay_ms: 0,
+            ..JobQueueConfig::default()
+        });
+        insert_document(storage.as_ref(), "doc-resurrect-1", 50);
+        insert_document(storage.as_ref(), "doc-resurrect-2", 51);
+
+        let hash1 = [50_u8; 32];
+        let hash2 = [51_u8; 32];
+        queue
+            .enqueue("doc-resurrect-1", "embedder-A", &hash1, 0)
+            .expect("enqueue 1");
+        queue
+            .enqueue("doc-resurrect-2", "embedder-A", &hash2, 0)
+            .expect("enqueue 2");
+
+        // Claim and fail both (max_retries=0 means terminal on first fail)
+        let claimed1 = claim_single(&queue, "worker-1");
+        let result1 = queue.fail(claimed1.job_id, "test-error-1").unwrap();
+        assert!(matches!(result1, FailResult::TerminalFailed { .. }));
+
+        let claimed2 = claim_single(&queue, "worker-1");
+        let result2 = queue.fail(claimed2.job_id, "test-error-2").unwrap();
+        assert!(matches!(result2, FailResult::TerminalFailed { .. }));
+
+        // Verify both are in failed state
+        let depth_before = queue.queue_depth().unwrap();
+        assert_eq!(depth_before.failed, 2);
+        assert_eq!(depth_before.pending, 0);
+
+        // Resurrect
+        let resurrected = queue
+            .resurrect_terminal_failures("embedder-A")
+            .expect("resurrect should succeed");
+        assert_eq!(resurrected, 2);
+
+        // Verify they're back to pending
+        let depth_after = queue.queue_depth().unwrap();
+        assert_eq!(depth_after.failed, 0);
+        assert_eq!(depth_after.pending, 2);
+    }
+
+    #[test]
+    fn resurrect_terminal_failures_only_affects_matching_embedder() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            max_retries: 0,
+            retry_base_delay_ms: 0,
+            ..JobQueueConfig::default()
+        });
+        insert_document(storage.as_ref(), "doc-multi-1", 60);
+        insert_document(storage.as_ref(), "doc-multi-2", 61);
+
+        let hash1 = [60_u8; 32];
+        let hash2 = [61_u8; 32];
+        queue
+            .enqueue("doc-multi-1", "embedder-A", &hash1, 0)
+            .expect("enqueue A");
+        queue
+            .enqueue("doc-multi-2", "embedder-B", &hash2, 0)
+            .expect("enqueue B");
+
+        // Fail both
+        let claimed1 = claim_single(&queue, "worker-1");
+        queue.fail(claimed1.job_id, "error").unwrap();
+        let claimed2 = claim_single(&queue, "worker-1");
+        queue.fail(claimed2.job_id, "error").unwrap();
+
+        // Only resurrect embedder-A
+        let resurrected = queue
+            .resurrect_terminal_failures("embedder-A")
+            .expect("resurrect");
+        assert_eq!(resurrected, 1);
+
+        let depth = queue.queue_depth().unwrap();
+        assert_eq!(depth.failed, 1); // embedder-B still failed
+        assert_eq!(depth.pending, 1); // embedder-A resurrected
+    }
+
+    #[test]
+    fn resurrect_terminal_failures_returns_zero_when_none_failed() {
+        let (queue, _storage) = queue_fixture(JobQueueConfig::default());
+        let resurrected = queue
+            .resurrect_terminal_failures("nonexistent-embedder")
+            .expect("resurrect should succeed on empty queue");
+        assert_eq!(resurrected, 0);
     }
 }
