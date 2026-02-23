@@ -359,21 +359,26 @@ impl StorageBackedJobRunner {
         let tx_result = self.storage.transaction(|conn| {
             let fast_dedup =
                 dedup_state_for_doc(conn, &request.doc_id, &content_hash, &fast_embedder_id)?;
-            let quality_needs_requeue = if fast_dedup.state == DedupState::Unchanged
-                && quality_requested
-            {
+            let quality_dedup = if quality_requested {
                 if let Some(quality_embedder_id) = maybe_quality_embedder_id.as_deref() {
-                    dedup_state_for_doc(conn, &request.doc_id, &content_hash, quality_embedder_id)?
-                        .state
-                        != DedupState::Unchanged
+                    Some(dedup_state_for_doc(
+                        conn,
+                        &request.doc_id,
+                        &content_hash,
+                        quality_embedder_id,
+                    )?)
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             };
 
-            if fast_dedup.state == DedupState::Unchanged && !quality_needs_requeue {
+            let fast_needs_enqueue = fast_dedup.state != DedupState::Unchanged;
+            let quality_needs_enqueue =
+                quality_dedup.map_or(false, |q| q.state != DedupState::Unchanged);
+
+            if !fast_needs_enqueue && !quality_needs_enqueue {
                 upsert_document(conn, &document)?;
                 return Ok(IngestTxResult {
                     action: IngestAction::Unchanged,
@@ -403,58 +408,32 @@ impl StorageBackedJobRunner {
                 });
             }
 
-            if fast_dedup.state == DedupState::Unchanged {
-                upsert_document(conn, &document)?;
-                let quality_job_enqueued =
-                    if let Some(quality_embedder_id) = maybe_quality_embedder_id.as_ref() {
-                        let quality_request = EnqueueRequest::new(
-                            request.doc_id.clone(),
-                            quality_embedder_id.clone(),
-                            content_hash,
-                            self.config.quality_priority,
-                        );
-                        let quality_outcome = enqueue_inner(
-                            conn,
-                            &quality_request,
-                            now_ms,
-                            self.queue.config().max_retries,
-                        )?;
-                        matches!(
-                            quality_outcome,
-                            EnqueueOutcome::Inserted | EnqueueOutcome::Replaced
-                        )
-                    } else {
-                        false
-                    };
-
-                return Ok(IngestTxResult {
-                    action: IngestAction::Unchanged,
-                    fast_job_enqueued: false,
-                    quality_job_enqueued,
-                });
-            }
-
             upsert_document(conn, &document)?;
-            if fast_dedup.had_existing_row {
+            
+            if fast_dedup.state == DedupState::Changed {
                 reset_embedding_status(conn, &request.doc_id)?;
             }
 
             let _ = record_content_hash(conn, &content_hash_hex, &request.doc_id, now_ms)?;
 
-            let fast_request = EnqueueRequest::new(
-                request.doc_id.clone(),
-                fast_embedder_id.clone(),
-                content_hash,
-                self.config.fast_priority,
-            );
-            let fast_outcome =
-                enqueue_inner(conn, &fast_request, now_ms, self.queue.config().max_retries)?;
-            let fast_job_enqueued = matches!(
-                fast_outcome,
-                EnqueueOutcome::Inserted | EnqueueOutcome::Replaced
-            );
+            let mut fast_job_enqueued = false;
+            if fast_needs_enqueue {
+                let fast_request = EnqueueRequest::new(
+                    request.doc_id.clone(),
+                    fast_embedder_id.clone(),
+                    content_hash,
+                    self.config.fast_priority,
+                );
+                let fast_outcome =
+                    enqueue_inner(conn, &fast_request, now_ms, self.queue.config().max_retries)?;
+                fast_job_enqueued = matches!(
+                    fast_outcome,
+                    EnqueueOutcome::Inserted | EnqueueOutcome::Replaced
+                );
+            }
 
-            let quality_job_enqueued = if quality_requested {
+            let mut quality_job_enqueued = false;
+            if quality_needs_enqueue {
                 if let Some(quality_embedder_id) = maybe_quality_embedder_id.as_ref() {
                     let quality_request = EnqueueRequest::new(
                         request.doc_id.clone(),
@@ -468,16 +447,12 @@ impl StorageBackedJobRunner {
                         now_ms,
                         self.queue.config().max_retries,
                     )?;
-                    matches!(
+                    quality_job_enqueued = matches!(
                         quality_outcome,
                         EnqueueOutcome::Inserted | EnqueueOutcome::Replaced
-                    )
-                } else {
-                    false
+                    );
                 }
-            } else {
-                false
-            };
+            }
 
             let action = match fast_dedup.state {
                 DedupState::New => IngestAction::New,

@@ -2383,22 +2383,42 @@ fn detect_target_triple() -> String {
         ("x86_64", "macos") => "x86_64-apple-darwin".into(),
         ("aarch64", "linux") => "aarch64-unknown-linux-musl".into(),
         ("aarch64", "macos") => "aarch64-apple-darwin".into(),
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc".into(),
+        ("aarch64", "windows") => "aarch64-pc-windows-msvc".into(),
         _ => format!("{arch}-unknown-{os}"),
     }
 }
 
 /// Build the download URL for a release asset.
 fn release_asset_url(tag: &str, triple: &str) -> String {
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    let ext = if triple.contains("windows") { "zip" } else { "tar.xz" };
     format!(
-        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{triple}.tar.xz"
+        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{version}-{triple}.{ext}"
     )
 }
 
-/// Build the download URL for the per-artifact checksum sidecar.
-fn release_checksum_url(tag: &str, triple: &str) -> String {
+/// Build the download URL for the release-level SHA256SUMS file.
+fn release_checksum_url(tag: &str) -> String {
     format!(
-        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/fsfs-{triple}.tar.xz.sha256"
+        "https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/{tag}/SHA256SUMS"
     )
+}
+
+/// Extract the expected SHA-256 hash for a given asset filename from a
+/// SHA256SUMS-format file (each line: `<hash>  <filename>`).
+fn extract_hash_from_sums(sums_content: &str, asset_filename: &str) -> Option<String> {
+    for line in sums_content.lines() {
+        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 {
+            let hash = parts[0].trim();
+            let name = parts[1].trim();
+            if name == asset_filename || name.ends_with(asset_filename) {
+                return Some(hash.to_owned());
+            }
+        }
+    }
+    None
 }
 
 // ─── Version Check Cache ───────────────────────────────────────────────────
@@ -3533,12 +3553,15 @@ impl FsfsRuntime {
         // Full update: download, verify, replace.
         let triple = detect_target_triple();
         let asset_url = release_asset_url(&tag, &triple);
-        let checksum_url = release_checksum_url(&tag, &triple);
+        let checksum_url = release_checksum_url(&tag);
+        let version = tag.strip_prefix('v').unwrap_or(&tag);
+        let ext = if triple.contains("windows") { "zip" } else { "tar.xz" };
+        let asset_filename = format!("fsfs-{version}-{triple}.{ext}");
 
         let temp_dir = create_secure_update_temp_dir()?;
 
-        let archive_path = temp_dir.join(format!("fsfs-{triple}.tar.xz"));
-        let checksum_path = temp_dir.join(format!("fsfs-{triple}.tar.xz.sha256"));
+        let archive_path = temp_dir.join(&asset_filename);
+        let checksum_path = temp_dir.join("SHA256SUMS");
 
         // Download archive.
         notes.push(format!("downloading {asset_url}"));
@@ -3547,10 +3570,9 @@ impl FsfsRuntime {
         // Download and verify checksum.
         let expected_hash = if download_release_asset(&checksum_url, &checksum_path).is_ok() {
             let content = fs::read_to_string(&checksum_path).unwrap_or_default();
-            let hash = content.split_whitespace().next().unwrap_or("").to_owned();
-            if hash.is_empty() { None } else { Some(hash) }
+            extract_hash_from_sums(&content, &asset_filename)
         } else {
-            notes.push("checksum sidecar not available; skipping verification".into());
+            notes.push("SHA256SUMS not available; skipping verification".into());
             None
         };
 
@@ -3566,32 +3588,53 @@ impl FsfsRuntime {
             notes.push("SHA-256 checksum verified".into());
         }
 
-        validate_tar_archive_paths(&archive_path)?;
-
-        // Extract binary from the tar.xz archive.
+        // Extract binary from the archive.
         let extract_dir = temp_dir.join("extract");
         fs::create_dir_all(&extract_dir).map_err(|e| SearchError::SubsystemError {
             subsystem: "fsfs.update.extract_dir",
             source: Box::new(e),
         })?;
 
-        let tar_status = std::process::Command::new("tar")
-            .args(["-xJf"])
-            .arg(&archive_path)
-            .arg("-C")
-            .arg(&extract_dir)
-            .status()
-            .map_err(|e| SearchError::SubsystemError {
-                subsystem: "fsfs.update.tar",
-                source: Box::new(e),
-            })?;
+        let is_zip = ext == "zip";
+        if !is_zip {
+            validate_tar_archive_paths(&archive_path)?;
+            let tar_status = std::process::Command::new("tar")
+                .args(["-xJf"])
+                .arg(&archive_path)
+                .arg("-C")
+                .arg(&extract_dir)
+                .status()
+                .map_err(|e| SearchError::SubsystemError {
+                    subsystem: "fsfs.update.tar",
+                    source: Box::new(e),
+                })?;
 
-        if !tar_status.success() {
-            return Err(SearchError::InvalidConfig {
-                field: "update.extract".into(),
-                value: archive_path.display().to_string(),
-                reason: "tar extraction failed".into(),
-            });
+            if !tar_status.success() {
+                return Err(SearchError::InvalidConfig {
+                    field: "update.extract".into(),
+                    value: archive_path.display().to_string(),
+                    reason: "tar extraction failed".into(),
+                });
+            }
+        } else {
+            let unzip_status = std::process::Command::new("tar")
+                .args(["-xf"])
+                .arg(&archive_path)
+                .arg("-C")
+                .arg(&extract_dir)
+                .status()
+                .map_err(|e| SearchError::SubsystemError {
+                    subsystem: "fsfs.update.unzip",
+                    source: Box::new(e),
+                })?;
+
+            if !unzip_status.success() {
+                return Err(SearchError::InvalidConfig {
+                    field: "update.extract".into(),
+                    value: archive_path.display().to_string(),
+                    reason: "zip extraction failed".into(),
+                });
+            }
         }
 
         // Find the extracted binary (search up to 2 levels deep).
@@ -8386,8 +8429,16 @@ impl FsfsRuntime {
         }
 
         if self.index_artifacts_exist()? {
-            self.run_search_dashboard_tui(cx).await?;
-            return Ok(());
+            eprintln!("fsfs: entering search dashboard (press '/' to search, 'q' to quit)");
+            let start = std::time::Instant::now();
+            let result = self.run_search_dashboard_tui(cx).await;
+            if let Err(ref error) = result {
+                eprintln!("fsfs: search dashboard error: {error}");
+                eprintln!("hint: run `fsfs status` or `fsfs search <query>` as an alternative");
+            } else if start.elapsed() < std::time::Duration::from_secs(2) {
+                eprintln!("fsfs: search dashboard exited. Run `fsfs search <query>` for CLI search.");
+            }
+            return result;
         }
 
         eprint!("Scanning for indexable directories...");
@@ -17007,14 +17058,36 @@ mod tests {
     fn release_asset_url_format() {
         let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl");
         assert!(url.contains("v0.2.0"));
-        assert!(url.contains("fsfs-x86_64-unknown-linux-musl.tar.xz"));
+        assert!(url.contains("fsfs-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
         assert!(url.starts_with("https://github.com/"));
     }
 
     #[test]
+    fn release_asset_url_windows_uses_zip() {
+        let url = super::release_asset_url("v1.1.2", "x86_64-pc-windows-msvc");
+        assert!(url.contains("fsfs-1.1.2-x86_64-pc-windows-msvc.zip"));
+    }
+
+    #[test]
     fn release_checksum_url_format() {
-        let url = super::release_checksum_url("v0.2.0", "x86_64-unknown-linux-musl");
-        assert!(url.ends_with(".tar.xz.sha256"));
+        let url = super::release_checksum_url("v0.2.0");
+        assert!(url.ends_with("/SHA256SUMS"));
+    }
+
+    #[test]
+    fn extract_hash_from_sums_finds_matching_entry() {
+        let sums = "abc123  fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\ndef456  fsfs-1.0.0-aarch64-apple-darwin.tar.xz\n";
+        let hash =
+            super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
+        assert_eq!(hash, Some("def456".to_owned()));
+    }
+
+    #[test]
+    fn extract_hash_from_sums_returns_none_for_missing() {
+        let sums = "abc123  fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz\n";
+        let hash =
+            super::extract_hash_from_sums(sums, "fsfs-1.0.0-aarch64-apple-darwin.tar.xz");
+        assert_eq!(hash, None);
     }
 
     #[test]
@@ -17548,8 +17621,8 @@ mod tests {
         assert!(asset.contains(".tar.xz"));
         assert!(asset.contains("github.com"));
 
-        let checksum = super::release_checksum_url("v1.0.0", "aarch64-apple-darwin");
-        assert!(checksum.ends_with(".sha256"));
+        let checksum = super::release_checksum_url("v1.0.0");
+        assert!(checksum.ends_with("/SHA256SUMS"));
     }
 
     #[test]
@@ -17622,6 +17695,12 @@ mod tests {
             vector_elapsed_ms: 3_000,
             total_elapsed_ms: 20_000,
             active_file: None,
+            embedding_retries: 0,
+            embedding_failures: 0,
+            semantic_deferred_files: 0,
+            embedder_degraded: false,
+            degradation_reason: None,
+            recent_warnings: Vec::new(),
         };
         assert!(snapshot.files_per_second() > 0.0);
         assert!(snapshot.lines_per_second() > 0.0);
