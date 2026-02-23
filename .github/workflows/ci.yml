@@ -537,7 +537,8 @@ jobs:
             strip "${binary_path}" || true
           fi
 
-          archive_base="fsfs-${TAG_NAME}-${TARGET_TRIPLE}"
+          version_bare="${TAG_NAME#v}"
+          archive_base="fsfs-${version_bare}-${TARGET_TRIPLE}"
           mkdir -p dist
           cp "${binary_path}" "dist/${binary_name}"
           if [[ "${archive_extension}" == "zip" ]]; then

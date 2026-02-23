@@ -3698,7 +3698,7 @@ impl FsfsRuntime {
 
         // Verify the new binary runs.
         let verify = std::process::Command::new(&current_exe)
-            .arg("--version")
+            .arg("version")
             .output();
         match verify {
             Ok(out) if out.status.success() => {
@@ -3766,7 +3766,7 @@ impl FsfsRuntime {
         // Verify the restored binary.
         if let Ok(current_exe) = std::env::current_exe() {
             let verify = std::process::Command::new(&current_exe)
-                .arg("--version")
+                .arg("version")
                 .output();
             if let Ok(out) = verify
                 && out.status.success()

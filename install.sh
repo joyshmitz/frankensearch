@@ -97,7 +97,7 @@ resolve_version() {
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   local tag
-  if ! tag=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
+  if ! tag=$(curl -fsSL --connect-timeout 30 --max-time 60 -H "Accept: application/vnd.github.v3+json" "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
     tag=""
   fi
 
@@ -107,7 +107,7 @@ resolve_version() {
   else
     # Try redirect-based resolution as fallback
     local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
-    if tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
+    if tag=$(curl -fsSL --connect-timeout 30 --max-time 60 -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
       if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
         VERSION="$tag"
         info "Resolved latest version via redirect: $VERSION"
@@ -159,7 +159,7 @@ ensure_rust() {
     fi
   fi
   info "Installing rustup (nightly)"
-  curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
+  curl -fsSL --connect-timeout 30 --max-time 300 https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly --profile minimal
   export PATH="$HOME/.cargo/bin:$PATH"
   rustup component add rustfmt clippy || true
 }
@@ -290,12 +290,12 @@ trap cleanup EXIT
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
-  if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+  if ! curl -fL# --connect-timeout 30 --max-time 1800 "$URL" -o "$TMP/$TAR"; then
     # Try versionless artifact name as fallback
     FALLBACK_TAR="${BINARY_NAME}-${TARGET}.${EXT}"
     FALLBACK_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${FALLBACK_TAR}"
     info "Trying fallback: $FALLBACK_URL"
-    if ! curl -fsSL "$FALLBACK_URL" -o "$TMP/$FALLBACK_TAR"; then
+    if ! curl -fL# --connect-timeout 30 --max-time 1800 "$FALLBACK_URL" -o "$TMP/$FALLBACK_TAR"; then
       warn "Artifact download failed; falling back to build-from-source"
       FROM_SOURCE=1
     else
@@ -307,7 +307,11 @@ fi
 if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building from source (requires git, rust nightly)"
   ensure_rust
-  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  if [ -n "$VERSION" ]; then
+    git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  else
+    git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  fi
   (cd "$TMP/src" && cargo build --release -p frankensearch-fsfs)
   BIN="$TMP/src/target/release/${BINARY_NAME}"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }
@@ -319,8 +323,11 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
-    "$DEST/${BINARY_NAME}" version || true
-    ok "Self-test complete"
+    if ! SELF_TEST_OUTPUT=$("$DEST/${BINARY_NAME}" version 2>&1); then
+      err "Self-test failed: $SELF_TEST_OUTPUT"
+      exit 1
+    fi
+    ok "Self-test complete: $SELF_TEST_OUTPUT"
   fi
   ok "Done. Binary at: $DEST/${BINARY_NAME}"
   exit 0
@@ -333,7 +340,7 @@ if [ -z "$CHECKSUM" ]; then
   fi
   info "Fetching checksum from ${CHECKSUM_URL}"
   CHECKSUM_FILE="$TMP/SHA256SUMS"
-  if ! curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+  if ! curl -fsSL --connect-timeout 30 --max-time 60 "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
     warn "Checksum not available; skipping verification"
     CHECKSUM="SKIP"
   else
@@ -348,12 +355,13 @@ fi
 if [ "$CHECKSUM" != "SKIP" ]; then
   if command -v sha256sum >/dev/null 2>&1; then
     echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
+    ok "Checksum verified"
   elif command -v shasum >/dev/null 2>&1; then
     echo "$CHECKSUM  $TMP/$TAR" | shasum -a 256 -c - || { err "Checksum mismatch"; exit 1; }
+    ok "Checksum verified"
   else
     warn "No sha256sum or shasum found; skipping checksum verification"
   fi
-  ok "Checksum verified"
 fi
 
 # Extract
@@ -381,8 +389,11 @@ ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
-  "$DEST/${BINARY_NAME}" version || true
-  ok "Self-test complete"
+  if ! SELF_TEST_OUTPUT=$("$DEST/${BINARY_NAME}" version 2>&1); then
+    err "Self-test failed: $SELF_TEST_OUTPUT"
+    exit 1
+  fi
+  ok "Self-test complete: $SELF_TEST_OUTPUT"
 fi
 
 ok "Done. Binary at: $DEST/${BINARY_NAME}"
