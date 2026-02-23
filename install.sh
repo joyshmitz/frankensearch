@@ -203,16 +203,18 @@ done
 if [ "$QUIET" -eq 0 ]; then
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style \
-      --border normal \
+      --border rounded \
       --border-foreground 39 \
-      --padding "0 1" \
+      --padding "0 2" \
       --margin "1 0" \
-      "$(gum style --foreground 42 --bold 'fsfs installer')" \
-      "$(gum style --foreground 245 'Two-tier hybrid local search')"
+      "$(gum style --foreground 42 --bold '⚡ fsfs installer')" \
+      "$(gum style --foreground 245 'Two-tier hybrid local search (frankensearch)')"
   else
     echo ""
-    echo -e "\033[1;32mfsfs installer\033[0m"
-    echo -e "\033[0;90mTwo-tier hybrid local search (frankensearch)\033[0m"
+    echo -e "  \033[1;36m╭─────────────────────────────────────────╮\033[0m"
+    echo -e "  \033[1;36m│\033[0m  \033[1;32m⚡ fsfs installer\033[0m                       \033[1;36m│\033[0m"
+    echo -e "  \033[1;36m│\033[0m  \033[0;90mTwo-tier hybrid local search\033[0m            \033[1;36m│\033[0m"
+    echo -e "  \033[1;36m╰─────────────────────────────────────────╯\033[0m"
     echo ""
   fi
 fi
@@ -288,14 +290,64 @@ cleanup() {
 TMP=$(mktemp -d)
 trap cleanup EXIT
 
+download_with_progress() {
+  local url="$1" dest="$2" label="${3:-Downloading}"
+  local size_bytes="" size_human=""
+
+  # Probe content-length for a helpful pre-download message
+  if size_bytes=$(curl -fsSL --connect-timeout 10 --max-time 15 -I "$url" 2>/dev/null \
+        | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r'); then
+    if [ -n "$size_bytes" ] && [ "$size_bytes" -gt 0 ] 2>/dev/null; then
+      if [ "$size_bytes" -ge 1073741824 ]; then
+        size_human="$(awk "BEGIN{printf \"%.1f GB\", $size_bytes/1073741824}")"
+      elif [ "$size_bytes" -ge 1048576 ]; then
+        size_human="$(awk "BEGIN{printf \"%.0f MB\", $size_bytes/1048576}")"
+      else
+        size_human="$(awk "BEGIN{printf \"%.0f KB\", $size_bytes/1024}")"
+      fi
+    fi
+  fi
+
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    # ── gum: rich styled output ──
+    if [ -n "$size_human" ]; then
+      gum style --foreground 39 "$(printf '↓ %s  %s  (%s)' "$label" "$(gum style --faint --italic "$(basename "$url")")" \
+        "$(gum style --bold --foreground 213 "$size_human")")"
+    else
+      gum style --foreground 39 "↓ ${label}"
+    fi
+    # Use gum spin wrapping curl progress (curl still writes its bar to stderr)
+    if ! curl -fL --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"; then
+      return 1
+    fi
+  elif [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
+    # ── Interactive terminal: styled ANSI progress ──
+    if [ -n "$size_human" ]; then
+      printf '\033[1;36m↓\033[0m %s \033[2m%s\033[0m  \033[1;35m%s\033[0m\n' \
+        "$label" "$(basename "$url")" "$size_human"
+    else
+      printf '\033[1;36m↓\033[0m %s \033[2m%s\033[0m\n' "$label" "$(basename "$url")"
+    fi
+    if ! curl -fL --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest" 2>&1; then
+      return 1
+    fi
+  else
+    # ── Non-interactive / quiet: silent download ──
+    info "$label"
+    if ! curl -fsSL --connect-timeout 30 --max-time 1800 "$url" -o "$dest"; then
+      return 1
+    fi
+  fi
+  return 0
+}
+
 if [ "$FROM_SOURCE" -eq 0 ]; then
-  info "Downloading $URL"
-  if ! curl -fL# --connect-timeout 30 --max-time 1800 "$URL" -o "$TMP/$TAR"; then
+  if ! download_with_progress "$URL" "$TMP/$TAR" "Downloading ${BINARY_NAME} ${VERSION}"; then
     # Try versionless artifact name as fallback
     FALLBACK_TAR="${BINARY_NAME}-${TARGET}.${EXT}"
     FALLBACK_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${FALLBACK_TAR}"
-    info "Trying fallback: $FALLBACK_URL"
-    if ! curl -fL# --connect-timeout 30 --max-time 1800 "$FALLBACK_URL" -o "$TMP/$FALLBACK_TAR"; then
+    warn "Primary download failed; trying fallback artifact..."
+    if ! download_with_progress "$FALLBACK_URL" "$TMP/$FALLBACK_TAR" "Downloading fallback artifact"; then
       warn "Artifact download failed; falling back to build-from-source"
       FROM_SOURCE=1
     else
@@ -396,10 +448,35 @@ if [ "$VERIFY" -eq 1 ]; then
   ok "Self-test complete: $SELF_TEST_OUTPUT"
 fi
 
-ok "Done. Binary at: $DEST/${BINARY_NAME}"
-echo ""
-info "Quick start:"
-echo "  1. Index a directory:  fsfs index /path/to/your/files"
-echo "  2. Search:             fsfs search \"your query\""
-echo "  3. Interactive TUI:    fsfs"
-echo ""
+if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  echo ""
+  gum style \
+    --border rounded \
+    --border-foreground 42 \
+    --padding "0 2" \
+    --margin "0" \
+    "$(gum style --foreground 42 --bold '✓ Installation complete!')" \
+    "" \
+    "$(gum style --foreground 245 "Binary:  $(gum style --bold "$DEST/${BINARY_NAME}")")" \
+    "$(gum style --foreground 245 "Version: $(gum style --bold "${VERSION}")")" \
+    "" \
+    "$(gum style --foreground 39 --bold 'Quick start:')" \
+    "$(gum style --foreground 245 '  fsfs index /path/to/files   Index a directory')" \
+    "$(gum style --foreground 245 '  fsfs search "your query"    Search your index')" \
+    "$(gum style --foreground 245 '  fsfs                        Interactive TUI')"
+  echo ""
+else
+  echo ""
+  echo -e "  \033[1;32m╭─────────────────────────────────────────╮\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[1;32m✓ Installation complete!\033[0m                 \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m                                         \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  Binary:  \033[1m$DEST/${BINARY_NAME}\033[0m"
+  echo -e "  \033[1;32m│\033[0m  Version: \033[1m${VERSION}\033[0m"
+  echo -e "  \033[1;32m│\033[0m                                         \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[1;36mQuick start:\033[0m                          \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs index /path/to/files\033[0m           \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs search \"your query\"\033[0m            \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs\033[0m  \033[2m(interactive TUI)\033[0m          \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m╰─────────────────────────────────────────╯\033[0m"
+  echo ""
+fi
