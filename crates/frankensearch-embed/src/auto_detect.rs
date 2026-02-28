@@ -1530,7 +1530,7 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 /// Returns a cached `ApiEmbedder` for the quality tier.
 #[cfg(feature = "api")]
 fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
-    use crate::api_embedder::{ApiEmbedder, ApiEmbedderConfig};
+    use crate::api_embedder::ApiEmbedder;
     use crate::api_provider::{GeminiProvider, OpenAiProvider};
 
     let explicit_provider = std::env::var("FRANKENSEARCH_API_PROVIDER").ok();
