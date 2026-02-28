@@ -37,6 +37,8 @@ pub enum ModelCategory {
     StaticEmbedder,
     /// Transformer inference (MiniLM/BGE): highest quality but slower.
     TransformerEmbedder,
+    /// Cloud API embeddings (OpenAI, Gemini): high quality, network-dependent latency.
+    ApiEmbedder,
 }
 
 impl fmt::Display for ModelCategory {
@@ -45,6 +47,7 @@ impl fmt::Display for ModelCategory {
             Self::HashEmbedder => write!(f, "hash_embedder"),
             Self::StaticEmbedder => write!(f, "static_embedder"),
             Self::TransformerEmbedder => write!(f, "transformer_embedder"),
+            Self::ApiEmbedder => write!(f, "api_embedder"),
         }
     }
 }
@@ -55,7 +58,7 @@ impl ModelCategory {
     pub const fn default_tier(self) -> ModelTier {
         match self {
             Self::HashEmbedder | Self::StaticEmbedder => ModelTier::Fast,
-            Self::TransformerEmbedder => ModelTier::Quality,
+            Self::TransformerEmbedder | Self::ApiEmbedder => ModelTier::Quality,
         }
     }
 

@@ -12,6 +12,7 @@ hash = []
 model2vec = ["dep:safetensors", "dep:tokenizers"]
 fastembed = ["dep:fastembed"]
 download = ["asupersync/tls", "asupersync/tls-webpki-roots"]
+api = ["asupersync/tls", "asupersync/tls-webpki-roots"]
 bundled-default-models = ["model2vec", "fastembed"]
 
 [dependencies]

@@ -107,3 +107,14 @@ pub mod model_download;
 
 #[cfg(feature = "download")]
 pub use model_download::{DownloadConfig, DownloadProgress, ModelDownloader};
+
+#[cfg(feature = "api")]
+pub mod api_provider;
+
+#[cfg(feature = "api")]
+pub mod api_embedder;
+
+#[cfg(feature = "api")]
+pub use api_embedder::ApiEmbedder;
+#[cfg(feature = "api")]
+pub use api_provider::{ApiProvider, GeminiProvider, OpenAiProvider};

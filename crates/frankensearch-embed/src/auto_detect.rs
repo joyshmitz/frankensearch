@@ -30,9 +30,9 @@ use asupersync::Cx;
     any(feature = "model2vec", feature = "fastembed")
 ))]
 use asupersync::sync::OnceCell;
-#[cfg(not(any(feature = "model2vec", feature = "fastembed")))]
+#[cfg(not(any(feature = "model2vec", feature = "fastembed", feature = "api")))]
 use tracing::info;
-#[cfg(any(feature = "model2vec", feature = "fastembed"))]
+#[cfg(any(feature = "model2vec", feature = "fastembed", feature = "api"))]
 use tracing::{info, warn};
 
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -315,7 +315,8 @@ impl EmbedderStack {
     ) -> SearchResult<Self> {
         materialize_bundled_default_models(model_root);
         let quality = detect_quality_embedder(model_root)
-            .or_else(|| maybe_lazy_quality_embedder(model_root, policy));
+            .or_else(|| maybe_lazy_quality_embedder(model_root, policy))
+            .or_else(detect_api_embedder);
         let fast = detect_fast_embedder(model_root)
             .or_else(|| maybe_lazy_fast_embedder(model_root, policy))
             .or_else(hash_fallback_embedder)
@@ -340,7 +341,8 @@ impl EmbedderStack {
     )))]
     fn auto_detect_with_policy(model_root: Option<&Path>) -> SearchResult<Self> {
         materialize_bundled_default_models(model_root);
-        let quality = detect_quality_embedder(model_root);
+        let quality = detect_quality_embedder(model_root)
+            .or_else(detect_api_embedder);
         let fast = detect_fast_embedder(model_root)
             .or_else(hash_fallback_embedder)
             .ok_or_else(|| SearchError::EmbedderUnavailable {
@@ -1516,6 +1518,74 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 
 #[cfg(not(feature = "hash"))]
 fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
+    None
+}
+
+/// Detect API-based embedder from environment variables.
+///
+/// Checks for `OPENAI_API_KEY` or `GEMINI_API_KEY`, with optional
+/// `FRANKENSEARCH_API_PROVIDER`, `FRANKENSEARCH_API_MODEL`, and
+/// `FRANKENSEARCH_API_DIMENSION` overrides.
+///
+/// Returns a cached `ApiEmbedder` for the quality tier.
+#[cfg(feature = "api")]
+fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
+    use crate::api_embedder::{ApiEmbedder, ApiEmbedderConfig};
+    use crate::api_provider::{GeminiProvider, OpenAiProvider};
+
+    let explicit_provider = std::env::var("FRANKENSEARCH_API_PROVIDER").ok();
+    let explicit_model = std::env::var("FRANKENSEARCH_API_MODEL").ok();
+    let explicit_dim: Option<usize> = std::env::var("FRANKENSEARCH_API_DIMENSION")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
+    let provider: Box<dyn crate::api_provider::ApiProvider> =
+        match explicit_provider.as_deref() {
+            Some("gemini") => {
+                let key = std::env::var("GEMINI_API_KEY").ok()?;
+                match explicit_model.as_deref() {
+                    Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
+                    _ => Box::new(GeminiProvider::text_embedding_004(key)),
+                }
+            }
+            Some("openai") | None => {
+                let key = std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .or_else(|| std::env::var("GEMINI_API_KEY").ok())?;
+
+                // If we got a Gemini key but no explicit provider, use Gemini.
+                if std::env::var("OPENAI_API_KEY").is_err() {
+                    Box::new(GeminiProvider::text_embedding_004(key))
+                } else {
+                    match explicit_model.as_deref() {
+                        Some("text-embedding-3-large") => {
+                            Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
+                        }
+                        _ => {
+                            Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim))
+                        }
+                    }
+                }
+            }
+            Some(other) => {
+                warn!(provider = other, "unknown FRANKENSEARCH_API_PROVIDER value");
+                return None;
+            }
+        };
+
+    info!(
+        provider = provider.provider_name(),
+        model = provider.api_model_id(),
+        dimension = provider.dimension(),
+        "detected API embedder from environment"
+    );
+
+    let embedder = ApiEmbedder::with_defaults(provider);
+    Some(Arc::new(embedder.cached_default()))
+}
+
+#[cfg(not(feature = "api"))]
+fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
     None
 }
 
