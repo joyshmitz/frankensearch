@@ -2163,7 +2163,9 @@ const fn embedder_tier_for_stage(stage: EmbeddingStage, category: ModelCategory)
         EmbeddingStage::Fast | EmbeddingStage::Background => match category {
             ModelCategory::HashEmbedder => EmbedderTier::Hash,
             ModelCategory::StaticEmbedder => EmbedderTier::Fast,
-            ModelCategory::TransformerEmbedder | ModelCategory::ApiEmbedder => EmbedderTier::Quality,
+            ModelCategory::TransformerEmbedder | ModelCategory::ApiEmbedder => {
+                EmbedderTier::Quality
+            }
         },
     }
 }

@@ -341,8 +341,7 @@ impl EmbedderStack {
     )))]
     fn auto_detect_with_policy(model_root: Option<&Path>) -> SearchResult<Self> {
         materialize_bundled_default_models(model_root);
-        let quality = detect_quality_embedder(model_root)
-            .or_else(detect_api_embedder);
+        let quality = detect_quality_embedder(model_root).or_else(detect_api_embedder);
         let fast = detect_fast_embedder(model_root)
             .or_else(hash_fallback_embedder)
             .ok_or_else(|| SearchError::EmbedderUnavailable {
@@ -1539,53 +1538,48 @@ fn detect_api_embedder() -> Option<Arc<dyn Embedder>> {
         .ok()
         .and_then(|s| s.parse().ok());
 
-    let provider: Box<dyn crate::api_provider::ApiProvider> =
-        match explicit_provider.as_deref() {
-            Some("gemini") => {
-                let key = std::env::var("GEMINI_API_KEY").ok()?;
-                match explicit_model.as_deref() {
-                    Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
-                    _ => Box::new(GeminiProvider::text_embedding_004(key)),
-                }
+    let provider: Box<dyn crate::api_provider::ApiProvider> = match explicit_provider.as_deref() {
+        Some("gemini") => {
+            let key = std::env::var("GEMINI_API_KEY").ok()?;
+            match explicit_model.as_deref() {
+                Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
+                _ => Box::new(GeminiProvider::text_embedding_004(key)),
             }
-            Some("openai") => {
-                // Explicit OpenAI — require OPENAI_API_KEY.
-                let key = std::env::var("OPENAI_API_KEY").ok()?;
+        }
+        Some("openai") => {
+            // Explicit OpenAI — require OPENAI_API_KEY.
+            let key = std::env::var("OPENAI_API_KEY").ok()?;
+            match explicit_model.as_deref() {
+                Some("text-embedding-3-large") => {
+                    Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
+                }
+                _ => Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim)),
+            }
+        }
+        None => {
+            // Auto-detect: prefer OpenAI if OPENAI_API_KEY is set,
+            // otherwise fall back to Gemini if GEMINI_API_KEY is set.
+            if let Ok(key) = std::env::var("OPENAI_API_KEY") {
                 match explicit_model.as_deref() {
                     Some("text-embedding-3-large") => {
                         Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
                     }
-                    _ => {
-                        Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim))
-                    }
+                    _ => Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim)),
                 }
-            }
-            None => {
-                // Auto-detect: prefer OpenAI if OPENAI_API_KEY is set,
-                // otherwise fall back to Gemini if GEMINI_API_KEY is set.
-                if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                    match explicit_model.as_deref() {
-                        Some("text-embedding-3-large") => {
-                            Box::new(OpenAiProvider::text_embedding_3_large(key, explicit_dim))
-                        }
-                        _ => {
-                            Box::new(OpenAiProvider::text_embedding_3_small(key, explicit_dim))
-                        }
-                    }
-                } else if let Ok(key) = std::env::var("GEMINI_API_KEY") {
-                    match explicit_model.as_deref() {
-                        Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
-                        _ => Box::new(GeminiProvider::text_embedding_004(key)),
-                    }
-                } else {
-                    return None;
+            } else if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+                match explicit_model.as_deref() {
+                    Some("embedding-001") => Box::new(GeminiProvider::embedding_001(key)),
+                    _ => Box::new(GeminiProvider::text_embedding_004(key)),
                 }
-            }
-            Some(other) => {
-                warn!(provider = other, "unknown FRANKENSEARCH_API_PROVIDER value");
+            } else {
                 return None;
             }
-        };
+        }
+        Some(other) => {
+            warn!(provider = other, "unknown FRANKENSEARCH_API_PROVIDER value");
+            return None;
+        }
+    };
 
     info!(
         provider = provider.provider_name(),

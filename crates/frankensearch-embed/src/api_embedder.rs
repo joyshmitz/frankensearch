@@ -9,10 +9,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use asupersync::Cx;
 use asupersync::bytes::Buf;
 use asupersync::http::body::{Body, Frame};
 use asupersync::http::h1::{HttpClient, HttpClientConfig, Method, RedirectPolicy};
-use asupersync::Cx;
 use tracing::{debug, warn};
 
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -209,8 +209,7 @@ impl ApiEmbedder {
 
             // Collect response body.
             let mut response_body = Vec::new();
-            while let Some(frame) =
-                poll_fn(|cx| Pin::new(&mut response.body).poll_frame(cx)).await
+            while let Some(frame) = poll_fn(|cx| Pin::new(&mut response.body).poll_frame(cx)).await
             {
                 match frame {
                     Ok(Frame::Data(mut chunk)) => {
@@ -282,16 +281,17 @@ impl Embedder for ApiEmbedder {
     fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             let results = self.request_batch(&[text]).await?;
-            results.into_iter().next().ok_or_else(|| {
-                SearchError::EmbeddingFailed {
+            results
+                .into_iter()
+                .next()
+                .ok_or_else(|| SearchError::EmbeddingFailed {
                     model: self.provider.embedder_id().to_owned(),
                     source: "empty response from API".into(),
-                }
-            })
-            .map(|mut v| {
-                l2_normalize(&mut v);
-                v
-            })
+                })
+                .map(|mut v| {
+                    l2_normalize(&mut v);
+                    v
+                })
         })
     }
 

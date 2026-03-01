@@ -150,7 +150,10 @@ impl ApiProvider for OpenAiProvider {
 
     fn request_headers(&self) -> Vec<(String, String)> {
         vec![
-            ("authorization".to_owned(), format!("Bearer {}", self.api_key)),
+            (
+                "authorization".to_owned(),
+                format!("Bearer {}", self.api_key),
+            ),
             ("content-type".to_owned(), "application/json".to_owned()),
         ]
     }
@@ -187,22 +190,18 @@ impl ApiProvider for OpenAiProvider {
             });
         }
 
-        let data = v
-            .get("data")
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| SearchError::EmbeddingFailed {
+        let data = v.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+            SearchError::EmbeddingFailed {
                 model: self.embedder_id.clone(),
                 source: "missing 'data' array in response".into(),
-            })?;
+            }
+        })?;
 
         // Sort by index field to ensure correct ordering.
         let mut indexed: Vec<(usize, Vec<f32>)> = data
             .iter()
             .map(|item| {
-                let idx = item
-                    .get("index")
-                    .and_then(|i| i.as_u64())
-                    .unwrap_or(0) as usize;
+                let idx = item.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                 let emb = item
                     .get("embedding")
                     .and_then(|e| e.as_array())
