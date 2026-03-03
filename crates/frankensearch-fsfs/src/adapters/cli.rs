@@ -139,6 +139,14 @@ pub enum CliCommand {
     Version,
     /// Run long-lived query server mode over stdin/stdout.
     Serve,
+    /// Append vectors to WAL without full rebuild.
+    AppendBatch,
+    /// Soft-delete documents with tombstone markers.
+    Delete,
+    /// Merge WAL into main FSVI file.
+    Compact,
+    /// Start daemon that polls WAL and hot-reloads index.
+    Daemon,
 }
 
 impl CliCommand {
@@ -159,6 +167,10 @@ impl CliCommand {
         "help",
         "tui",
         "version",
+        "append-batch",
+        "delete",
+        "compact",
+        "daemon",
     ];
 }
 
@@ -238,6 +250,14 @@ pub struct CliInput {
     pub no_color: bool,
     /// Whether `--expand` was requested (LLM query expansion for search).
     pub expand: bool,
+    /// Input file path for append-batch (reads JSONL from file instead of stdin).
+    pub input_file: Option<PathBuf>,
+    /// Doc IDs to delete (for delete command).
+    pub delete_ids: Vec<String>,
+    /// Whether `--prefix` was requested (prefix match for delete).
+    pub delete_prefix: bool,
+    /// Daemon poll interval in milliseconds.
+    pub daemon_poll_ms: Option<u64>,
 }
 
 /// Config subcommand actions.
@@ -377,6 +397,14 @@ where
     if command == CliCommand::Config && idx < tokens.len() && !tokens[idx].starts_with('-') {
         let action = parse_config_action(&tokens, &mut idx)?;
         input.config_action = Some(action);
+    }
+
+    // For delete command, capture positional doc IDs before flags.
+    if command == CliCommand::Delete {
+        while idx < tokens.len() && !tokens[idx].starts_with('-') {
+            input.delete_ids.push(tokens[idx].clone());
+            idx += 1;
+        }
     }
 
     if command == CliCommand::Watch {
@@ -615,6 +643,41 @@ where
                 input.expand = true;
                 idx += 1;
             }
+            "--file" => {
+                if command != CliCommand::AppendBatch {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--file".into(),
+                        reason: "--file is only valid for the append-batch command".into(),
+                    });
+                }
+                let value = expect_value(&tokens, idx, "--file")?;
+                input.input_file = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--prefix" => {
+                if command != CliCommand::Delete {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--prefix".into(),
+                        reason: "--prefix is only valid for the delete command".into(),
+                    });
+                }
+                input.delete_prefix = true;
+                idx += 1;
+            }
+            "--poll-ms" => {
+                if command != CliCommand::Daemon {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.flag".into(),
+                        value: "--poll-ms".into(),
+                        reason: "--poll-ms is only valid for the daemon command".into(),
+                    });
+                }
+                let value = expect_value(&tokens, idx, "--poll-ms")?;
+                input.daemon_poll_ms = Some(parse_usize(value, "daemon.poll_ms")? as u64);
+                idx += 2;
+            }
             "--filter" => {
                 let value = expect_value(&tokens, idx, "--filter")?;
                 input.filter = Some(value.to_string());
@@ -749,6 +812,13 @@ fn validate_required_args(input: &CliInput) -> SearchResult<()> {
             reason: "stream mode is not supported with daemon transport".into(),
         });
     }
+    if input.command == CliCommand::Delete && input.delete_ids.is_empty() {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.delete.ids".into(),
+            value: String::new(),
+            reason: "delete command requires at least one document ID argument".into(),
+        });
+    }
     Ok(())
 }
 
@@ -810,6 +880,10 @@ fn parse_command(token: &str) -> SearchResult<CliCommand> {
         "help" | "h" => Ok(CliCommand::Help),
         "tui" => Ok(CliCommand::Tui),
         "version" | "ver" => Ok(CliCommand::Version),
+        "append-batch" | "append" | "ab" => Ok(CliCommand::AppendBatch),
+        "delete" | "del" => Ok(CliCommand::Delete),
+        "compact" => Ok(CliCommand::Compact),
+        "daemon" => Ok(CliCommand::Daemon),
         _ => Err(SearchError::InvalidConfig {
             field: "cli.command".into(),
             value: token.into(),
@@ -958,6 +1032,9 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--config"
             | "--index-dir"
             | "--expand"
+            | "--file"
+            | "--prefix"
+            | "--poll-ms"
     )
 }
 

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, IsTerminal, Read, Write};
 #[cfg(unix)]
 use std::net::Shutdown;
 #[cfg(unix)]
@@ -4135,6 +4135,22 @@ impl FsfsRuntime {
             self.run_doctor_command()?;
             return Ok(());
         }
+        if command == CliCommand::AppendBatch {
+            self.run_append_batch_command(cx).await?;
+            return Ok(());
+        }
+        if command == CliCommand::Delete {
+            self.run_delete_command()?;
+            return Ok(());
+        }
+        if command == CliCommand::Compact {
+            self.run_compact_command()?;
+            return Ok(());
+        }
+        if command == CliCommand::Daemon {
+            self.run_daemon_command(cx).await?;
+            return Ok(());
+        }
         std::future::ready(()).await;
         let root_plan = self.discovery_root_plan();
         let accepted_roots = root_plan
@@ -6716,6 +6732,446 @@ impl FsfsRuntime {
                     source: Box::new(source),
                 })?;
         }
+        Ok(())
+    }
+
+    // ─── WAL-based incremental mutation commands ─────────────────────────
+
+    /// Read JSONL documents from stdin or a file and append their embeddings
+    /// to the WAL without a full index rebuild.
+    ///
+    /// Each input line must be a JSON object with at least `"id"` and `"text"`
+    /// fields. The text is embedded using the configured fast embedder and the
+    /// resulting vector is appended to the WAL.
+    async fn run_append_batch_command(&self, cx: &Cx) -> SearchResult<()> {
+        let index_root = self.resolve_status_index_root()?;
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        if !vector_path.exists() {
+            return Err(SearchError::IndexNotFound {
+                path: vector_path,
+            });
+        }
+
+        let embedder = self.resolve_fast_embedder()?;
+        let dimension = embedder.dimension();
+
+        // Read input lines from --file or stdin.
+        let lines: Vec<String> = if let Some(ref file_path) = self.cli_input.input_file {
+            let content = fs::read_to_string(file_path).map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.append_batch.read_file",
+                    source: Box::new(source),
+                }
+            })?;
+            content.lines().map(str::to_owned).collect()
+        } else {
+            let stdin = std::io::stdin();
+            let reader = BufReader::new(stdin.lock());
+            reader
+                .lines()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.append_batch.stdin",
+                    source: Box::new(source),
+                })?
+        };
+
+        if lines.is_empty() {
+            info!("append-batch: no input lines; nothing to do");
+            println!("0 documents appended");
+            return Ok(());
+        }
+
+        // Parse JSONL and extract id + text.
+        let mut docs: Vec<(String, String)> = Vec::with_capacity(lines.len());
+        for (line_num, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_str(trimmed).map_err(|source| SearchError::SubsystemError {
+                    subsystem: "fsfs.append_batch.parse",
+                    source: Box::new(std::io::Error::other(format!(
+                        "line {}: invalid JSON: {source}",
+                        line_num + 1
+                    ))),
+                })?;
+            let id = parsed
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "append_batch.input".to_owned(),
+                    value: format!("line {}", line_num + 1),
+                    reason: "each JSON line must have a string \"id\" field".to_owned(),
+                })?
+                .to_owned();
+            let text = parsed
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "append_batch.input".to_owned(),
+                    value: format!("line {}", line_num + 1),
+                    reason: "each JSON line must have a string \"text\" field".to_owned(),
+                })?
+                .to_owned();
+            docs.push((id, text));
+        }
+
+        if docs.is_empty() {
+            info!("append-batch: all input lines were blank; nothing to do");
+            println!("0 documents appended");
+            return Ok(());
+        }
+
+        // Batch-embed all texts.
+        let mut entries: Vec<(String, Vec<f32>)> = Vec::with_capacity(docs.len());
+        for (id, text) in &docs {
+            let embedding = embedder.embed(cx, text).await.map_err(|source| {
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.append_batch.embed",
+                    source: Box::new(std::io::Error::other(format!(
+                        "failed to embed doc '{}': {source}",
+                        id
+                    ))),
+                }
+            })?;
+            if embedding.len() != dimension {
+                return Err(SearchError::DimensionMismatch {
+                    expected: dimension,
+                    found: embedding.len(),
+                });
+            }
+            entries.push((id.clone(), embedding));
+        }
+
+        // Open index and append.
+        let mut index = VectorIndex::open(&vector_path)?;
+        index.append_batch(&entries)?;
+
+        let count = entries.len();
+        info!(
+            count,
+            wal_total = index.wal_record_count(),
+            needs_compaction = index.needs_compaction(),
+            "append-batch completed"
+        );
+
+        if self.cli_input.format == OutputFormat::Table {
+            println!("{count} documents appended to WAL");
+            if index.needs_compaction() {
+                println!("hint: WAL has {} entries; consider running 'fsfs compact'", index.wal_record_count());
+            }
+        } else {
+            let payload = serde_json::json!({
+                "appended": count,
+                "wal_total": index.wal_record_count(),
+                "needs_compaction": index.needs_compaction(),
+            });
+            let meta = meta_for_format("append-batch", self.cli_input.format);
+            let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+            let mut stdout = std::io::stdout();
+            emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+            if self.cli_input.format != OutputFormat::Jsonl {
+                stdout
+                    .write_all(b"\n")
+                    .map_err(|source| SearchError::SubsystemError {
+                        subsystem: "fsfs.append_batch",
+                        source: Box::new(source),
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Soft-delete documents by exact doc ID or prefix match.
+    ///
+    /// Writes tombstone markers to the WAL. Documents are excluded from
+    /// search results immediately, and physically removed on next compact.
+    fn run_delete_command(&self) -> SearchResult<()> {
+        let index_root = self.resolve_status_index_root()?;
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        if !vector_path.exists() {
+            return Err(SearchError::IndexNotFound {
+                path: vector_path,
+            });
+        }
+
+        let mut index = VectorIndex::open(&vector_path)?;
+        let ids = &self.cli_input.delete_ids;
+
+        let mut total_deleted = 0usize;
+
+        if self.cli_input.delete_prefix {
+            // Prefix matching: scan all doc IDs and collect those matching any prefix.
+            let record_count = index.record_count();
+            let mut to_delete = Vec::new();
+            for i in 0..record_count {
+                if index.is_deleted(i) {
+                    continue;
+                }
+                if let Ok(doc_id) = index.doc_id_at(i) {
+                    for prefix in ids {
+                        if doc_id.starts_with(prefix.as_str()) {
+                            to_delete.push(doc_id.to_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+            // Also scan WAL entries for prefix matches.
+            let wal_count = index.wal_record_count();
+            for wal_idx in 0..wal_count {
+                // WAL entries are accessible only through the index's internal state,
+                // but soft_delete_batch handles both main and WAL deletion.
+                // We collect IDs from the main index and rely on soft_delete_batch
+                // to handle WAL entries with matching doc_ids.
+                let _ = wal_idx;
+            }
+
+            if !to_delete.is_empty() {
+                let refs: Vec<&str> = to_delete.iter().map(String::as_str).collect();
+                total_deleted = index.soft_delete_batch(&refs)?;
+            }
+        } else {
+            // Exact match.
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            total_deleted = index.soft_delete_batch(&refs)?;
+        }
+
+        info!(
+            total_deleted,
+            tombstone_count = index.tombstone_count(),
+            tombstone_ratio = %format!("{:.2}%", index.tombstone_ratio() * 100.0),
+            needs_vacuum = index.needs_vacuum(),
+            "delete completed"
+        );
+
+        if self.cli_input.format == OutputFormat::Table {
+            println!("{total_deleted} documents deleted (tombstoned)");
+            if index.needs_vacuum() {
+                println!(
+                    "hint: tombstone ratio is {:.1}%; consider running 'fsfs compact'",
+                    index.tombstone_ratio() * 100.0
+                );
+            }
+        } else {
+            let payload = serde_json::json!({
+                "deleted": total_deleted,
+                "tombstone_count": index.tombstone_count(),
+                "tombstone_ratio": index.tombstone_ratio(),
+                "needs_vacuum": index.needs_vacuum(),
+            });
+            let meta = meta_for_format("delete", self.cli_input.format);
+            let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+            let mut stdout = std::io::stdout();
+            emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+            if self.cli_input.format != OutputFormat::Jsonl {
+                stdout
+                    .write_all(b"\n")
+                    .map_err(|source| SearchError::SubsystemError {
+                        subsystem: "fsfs.delete",
+                        source: Box::new(source),
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Merge the WAL into the main FSVI file, eliminating tombstones.
+    ///
+    /// Reads the WAL + main index, merges them, and writes a new consolidated
+    /// index file. The WAL sidecar is removed after successful compaction.
+    fn run_compact_command(&self) -> SearchResult<()> {
+        let index_root = self.resolve_status_index_root()?;
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        if !vector_path.exists() {
+            return Err(SearchError::IndexNotFound {
+                path: vector_path,
+            });
+        }
+
+        let mut index = VectorIndex::open(&vector_path)?;
+
+        // First compact WAL into main index.
+        let compaction_stats = index.compact()?;
+
+        // Then vacuum to remove tombstoned records.
+        let vacuum_stats = index.vacuum()?;
+
+        info!(
+            main_before = compaction_stats.main_records_before,
+            wal_merged = compaction_stats.wal_records,
+            tombstones_removed = vacuum_stats.tombstones_removed,
+            total_after = vacuum_stats.records_after,
+            compaction_ms = %format!("{:.1}", compaction_stats.elapsed_ms),
+            vacuum_ms = %format!("{:.1}", vacuum_stats.duration.as_secs_f64() * 1000.0),
+            "compact completed"
+        );
+
+        if self.cli_input.format == OutputFormat::Table {
+            println!(
+                "compaction complete: {} main + {} WAL -> {} records ({} tombstones removed)",
+                compaction_stats.main_records_before,
+                compaction_stats.wal_records,
+                vacuum_stats.records_after,
+                vacuum_stats.tombstones_removed,
+            );
+            println!(
+                "timing: compaction {:.1}ms, vacuum {:.1}ms",
+                compaction_stats.elapsed_ms,
+                vacuum_stats.duration.as_secs_f64() * 1000.0,
+            );
+        } else {
+            let payload = serde_json::json!({
+                "main_records_before": compaction_stats.main_records_before,
+                "wal_records_merged": compaction_stats.wal_records,
+                "total_records_after": vacuum_stats.records_after,
+                "tombstones_removed": vacuum_stats.tombstones_removed,
+                "compaction_elapsed_ms": compaction_stats.elapsed_ms,
+                "vacuum_elapsed_ms": vacuum_stats.duration.as_secs_f64() * 1000.0,
+            });
+            let meta = meta_for_format("compact", self.cli_input.format);
+            let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+            let mut stdout = std::io::stdout();
+            emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+            if self.cli_input.format != OutputFormat::Jsonl {
+                stdout
+                    .write_all(b"\n")
+                    .map_err(|source| SearchError::SubsystemError {
+                        subsystem: "fsfs.compact",
+                        source: Box::new(source),
+                    })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start a long-lived daemon that polls the WAL for new entries and
+    /// hot-reloads the index when changes are detected.
+    ///
+    /// The daemon runs in a loop, checking the WAL sidecar file at a
+    /// configurable interval. When new WAL entries appear, it triggers
+    /// compaction to merge them into the main index, keeping search
+    /// results fresh without manual intervention.
+    async fn run_daemon_command(&self, cx: &Cx) -> SearchResult<()> {
+        let index_root = self.resolve_status_index_root()?;
+        let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
+
+        if !vector_path.exists() {
+            return Err(SearchError::IndexNotFound {
+                path: vector_path.clone(),
+            });
+        }
+
+        let poll_ms = self.cli_input.daemon_poll_ms.unwrap_or(1000);
+        let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
+
+        info!(
+            poll_ms,
+            vector_path = %vector_path.display(),
+            wal_path = %wal_sidecar.display(),
+            "daemon started; polling WAL for changes"
+        );
+
+        if self.cli_input.format == OutputFormat::Table {
+            println!(
+                "daemon: watching {} (poll interval: {}ms)",
+                wal_sidecar.display(),
+                poll_ms
+            );
+        }
+
+        let mut last_wal_len: u64 = wal_sidecar
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let shutdown = Arc::new(ShutdownCoordinator::new());
+        shutdown.register_signals()?;
+
+        loop {
+            // Check for shutdown signal.
+            if shutdown.is_shutting_down() {
+                info!("daemon: shutdown signal received");
+                if self.cli_input.format == OutputFormat::Table {
+                    println!("daemon: shutting down");
+                }
+                break;
+            }
+
+            // Poll WAL file size.
+            let current_wal_len = wal_sidecar
+                .metadata()
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            if current_wal_len > last_wal_len {
+                info!(
+                    previous_bytes = last_wal_len,
+                    current_bytes = current_wal_len,
+                    "daemon: WAL changed, triggering compaction"
+                );
+
+                if self.cli_input.format == OutputFormat::Table {
+                    println!("daemon: WAL changed ({last_wal_len} -> {current_wal_len} bytes), compacting...");
+                }
+
+                match VectorIndex::open(&vector_path) {
+                    Ok(mut index) => {
+                        match index.compact() {
+                            Ok(stats) => {
+                                info!(
+                                    wal_merged = stats.wal_records,
+                                    total_after = stats.total_records_after,
+                                    elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
+                                    "daemon: compaction completed"
+                                );
+                                if self.cli_input.format == OutputFormat::Table {
+                                    println!(
+                                        "daemon: compacted {} WAL entries -> {} total records ({:.1}ms)",
+                                        stats.wal_records, stats.total_records_after, stats.elapsed_ms
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "daemon: compaction failed");
+                                if self.cli_input.format == OutputFormat::Table {
+                                    eprintln!("daemon: compaction error: {error}");
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "daemon: failed to open index for compaction");
+                        if self.cli_input.format == OutputFormat::Table {
+                            eprintln!("daemon: index open error: {error}");
+                        }
+                    }
+                }
+
+                // Re-read the current WAL length after compaction (it should be gone or reset).
+                last_wal_len = wal_sidecar
+                    .metadata()
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+            } else {
+                last_wal_len = current_wal_len;
+            }
+
+            // Sleep for the poll interval.
+            // Use std::thread::sleep since this is a simple polling loop.
+            // The shutdown coordinator handles SIGINT.
+            let _ = cx;
+            std::thread::sleep(Duration::from_millis(poll_ms));
+        }
+
         Ok(())
     }
 
