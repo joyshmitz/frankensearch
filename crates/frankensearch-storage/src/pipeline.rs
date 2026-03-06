@@ -409,7 +409,7 @@ impl StorageBackedJobRunner {
             }
 
             upsert_document(conn, &document)?;
-            
+
             if fast_dedup.state == DedupState::Changed {
                 reset_embedding_status(conn, &request.doc_id)?;
             }
