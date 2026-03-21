@@ -484,7 +484,7 @@ fn map_lock_error(model: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: "reranker mutex poisoned".into(),
         },
-        LockError::PolledAfterCompletion => SearchError::RerankFailed {
+        LockError::Cancelled => SearchError::RerankFailed {
             model: model.to_owned(),
             source: "reranker lock future polled after completion".into(),
         },
