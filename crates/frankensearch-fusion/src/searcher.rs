@@ -1134,7 +1134,7 @@ impl TwoTierSearcher {
 
         // Get quality scores for top candidates from initial phase.
         let search_start = Instant::now();
-        let mut fast_hits: Vec<VectorHit> = initial_results
+        let fast_hits: Vec<VectorHit> = initial_results
             .iter()
             .map(|r| VectorHit {
                 index: r.index.unwrap_or(u32::MAX),
@@ -1144,7 +1144,11 @@ impl TwoTierSearcher {
                 doc_id: r.doc_id.clone(),
             })
             .collect();
-        self.apply_score_calibration_to_hits(&mut fast_hits);
+        // NOTE: Do NOT calibrate fast_hits here — these scores were already calibrated
+        // in Phase 1 (line ~894) and stored in ScoredResult.fast_score. Applying
+        // calibration again would double-transform the scores, destroying discriminative
+        // power for non-idempotent calibrators (TemperatureScaling, PlattScaling,
+        // IsotonicRegression).
 
         metrics.phase2_vectors_searched = fast_hits.iter().filter(|h| h.index != u32::MAX).count();
 
