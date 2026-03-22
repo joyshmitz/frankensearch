@@ -611,7 +611,7 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 /// Register the tokenizer used by cass-compatible lexical fields.
 ///
 /// Pipeline:
-///   1. `RegexTokenizer` — matches `\w+(?:-\w+)*`, preserving hyphenated
+///   1. `RegexTokenizer` — matches `[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*`, preserving hyphenated
 ///      identifiers like `bd-q3fy` or `POL-358` as single tokens.
 ///   2. `HyphenDecompose` — for each hyphenated token, emits the compound
 ///      form *and* the individual sub-parts (all at the same position) so

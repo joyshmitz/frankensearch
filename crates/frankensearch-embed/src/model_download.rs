@@ -118,11 +118,9 @@ impl ModelDownloader {
     /// Create a new downloader with the given configuration.
     #[must_use]
     pub fn new(config: DownloadConfig) -> Self {
-        let client_config = HttpClientConfig {
-            redirect_policy: RedirectPolicy::Limited(config.max_redirects),
-            user_agent: Some(config.user_agent.clone()),
-            ..HttpClientConfig::default()
-        };
+        let mut client_config = HttpClientConfig::default();
+        client_config.redirect_policy = RedirectPolicy::Limited(config.max_redirects);
+        client_config.user_agent = Some(config.user_agent.clone());
         Self {
             config,
             client: HttpClient::with_config(client_config),

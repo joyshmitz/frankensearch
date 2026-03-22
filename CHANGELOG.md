@@ -25,6 +25,12 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 - Add pluggable cloud API embedding abstraction supporting OpenAI and Gemini backends, with HTTP transport, automatic retry, token-bucket rate limiting, and L2 normalization ([e5b7bab](https://github.com/Dicklesworthstone/frankensearch/commit/e5b7bab7d6a303c3503b6b7e99509d94b484c812), [d37d506](https://github.com/Dicklesworthstone/frankensearch/commit/d37d506da533fa7ded49ceb0b36af3e5214e0a40))
 - Support query-param authentication for Gemini via `request_url()` trait method ([9846bb0](https://github.com/Dicklesworthstone/frankensearch/commit/9846bb03d4e1097138960fd500b44b83e4da426e))
 - Fix rate limiter token drain and separate OpenAI/Gemini auto-detect paths ([e57f2de](https://github.com/Dicklesworthstone/frankensearch/commit/e57f2de8c4fe0f5e557a58be8e5e399acb03834e))
+- Thread `Cx` through download and API embedding pipelines for asupersync 0.2.9 cancellation support ([8e369b4](https://github.com/Dicklesworthstone/frankensearch/commit/8e369b4c640510ea109d751659bd73ff2dde8f2a))
+
+### Tokenizer & Search
+
+- Preserve hyphenated bead IDs (e.g. `bd-q3fy`) in cass tokenizer by replacing `SimpleTokenizer` with a regex tokenizer and `HyphenDecompose` filter; schema bumped v6 to v7 ([11db96a](https://github.com/Dicklesworthstone/frankensearch/commit/11db96ae541659f7422c9b66f98c52f9d294b872))
+- Use `[a-zA-Z0-9]` instead of `\w` in tokenizer regex to exclude underscores, fixing index/query mismatch for underscore-separated terms ([472322f](https://github.com/Dicklesworthstone/frankensearch/commit/472322fdcedea90d72209e79f845875e1d8703e3))
 
 ### In-Memory Vector Index
 
@@ -41,6 +47,7 @@ Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/fra
 - Rename `LockError::PolledAfterCompletion` to `Cancelled` across all crates for clarity ([5151d47](https://github.com/Dicklesworthstone/frankensearch/commit/5151d473b1ff09836c89e381ed49f317f4ec7ffb))
 - Handle `PolledAfterCompletion` LockError variant in embed, lexical, and rerank crates ([1359551](https://github.com/Dicklesworthstone/frankensearch/commit/1359551eaaa8c098474083738e68f8593456921c))
 - Update `asupersync` to 0.2.8 and then 0.2.9 ([ba3ab85](https://github.com/Dicklesworthstone/frankensearch/commit/ba3ab85f0c8a0d713706d15556101cf32fce9683), [ede9fc8](https://github.com/Dicklesworthstone/frankensearch/commit/ede9fc8ec4f64f8e452e02ce9a0fbbd97535c0a8))
+- Remove 6 unreachable duplicate `Cancelled` match arms across lexical, rerank, and embed crates ([3e6b29e](https://github.com/Dicklesworthstone/frankensearch/commit/3e6b29e4a6898ebc9ae9d8dea50eb95e2958c3e3))
 
 ### Build & CI
 
