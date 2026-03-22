@@ -550,12 +550,6 @@ impl TantivyIndex {
                     phase: "tantivy.delete".into(),
                     reason: "writer lock cancelled".into(),
                 },
-                asupersync::sync::LockError::Cancelled => SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(std::io::Error::other(
-                        "writer lock future polled after completion",
-                    )),
-                },
             })?
             .delete_term(term);
         Ok(())
@@ -821,12 +815,6 @@ impl LexicalSearch for TantivyIndex {
                         phase: "tantivy.index".into(),
                         reason: "writer lock cancelled".into(),
                     },
-                    asupersync::sync::LockError::Cancelled => SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other(
-                            "writer lock future polled after completion",
-                        )),
-                    },
                 })?;
 
                 // Delete any existing document with same ID (upsert semantics).
@@ -860,12 +848,6 @@ impl LexicalSearch for TantivyIndex {
                     asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
                         phase: "tantivy.batch_index".into(),
                         reason: "writer lock cancelled".into(),
-                    },
-                    asupersync::sync::LockError::Cancelled => SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other(
-                            "writer lock future polled after completion",
-                        )),
                     },
                 })?;
 
@@ -901,12 +883,6 @@ impl LexicalSearch for TantivyIndex {
                     asupersync::sync::LockError::Cancelled => SearchError::Cancelled {
                         phase: "tantivy.commit".into(),
                         reason: "writer lock cancelled".into(),
-                    },
-                    asupersync::sync::LockError::Cancelled => SearchError::SubsystemError {
-                        subsystem: "tantivy",
-                        source: Box::new(std::io::Error::other(
-                            "writer lock future polled after completion",
-                        )),
                     },
                 })?;
 
