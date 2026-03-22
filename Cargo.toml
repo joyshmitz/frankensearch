@@ -46,7 +46,7 @@ frankensearch-fusion = { version = "0.1.0", path = "crates/frankensearch-fusion"
 frankensearch-rerank = { version = "0.1.0", path = "crates/frankensearch-rerank" }
 frankensearch-storage = { version = "0.1.0", path = "crates/frankensearch-storage" }
 frankensearch-durability = { version = "0.1.0", path = "crates/frankensearch-durability" }
-frankensearch-fsfs = { version = "1.1.4", path = "crates/frankensearch-fsfs" }
+frankensearch-fsfs = { version = "1.1.5", path = "crates/frankensearch-fsfs" }
 frankensearch-tui = { version = "0.1.0", path = "crates/frankensearch-tui" }
 frankensearch-ops = { version = "0.1.0", path = "crates/frankensearch-ops" }
 
