@@ -1,7 +1,7 @@
 //! Brute-force top-k vector search over an opened [`crate::VectorIndex`].
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::OnceLock;
 
 use frankensearch_core::filter::SearchFilter;
@@ -524,11 +524,6 @@ impl VectorIndex {
                 }
             }
             let score = dot_product_f32_f32(&entry.embedding, query)?;
-            // Guard: corrupt WAL embeddings (e.g. from crash recovery) can
-            // produce NaN/Inf scores. Skip them rather than polluting results.
-            if !score.is_finite() {
-                continue;
-            }
             insert_candidate(heap, HeapEntry::new(to_wal_index(idx), score), limit);
         }
         Ok(())
@@ -542,9 +537,6 @@ impl VectorIndex {
         winners.reserve(self.wal_entries.len());
         for (idx, entry) in self.wal_entries.iter().enumerate() {
             let score = dot_product_f32_f32(&entry.embedding, query)?;
-            if !score.is_finite() {
-                continue;
-            }
             winners.push(HeapEntry::new(to_wal_index(idx), score));
         }
         Ok(())
@@ -561,13 +553,40 @@ impl VectorIndex {
     }
 
     fn resolve_sorted_entries(&self, winners: Vec<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
+        // Collect doc_id_hashes for all WAL entries in the result set so that
+        // main-index duplicates can be suppressed in favour of the WAL version.
+        let wal_doc_hashes: HashSet<u64> = winners
+            .iter()
+            .filter(|w| is_wal_index(w.index))
+            .map(|w| {
+                let wal_idx = from_wal_index(w.index);
+                self.wal_entries[wal_idx].doc_id_hash
+            })
+            .collect();
+
+        let mut seen = HashSet::with_capacity(winners.len());
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
             if is_wal_index(winner.index) {
+                let wal_idx = from_wal_index(winner.index);
+                let doc_id_hash = self.wal_entries[wal_idx].doc_id_hash;
+                // Skip WAL-vs-WAL duplicates (keep the first, i.e. highest-scored).
+                if !seen.insert(doc_id_hash) {
+                    continue;
+                }
                 hits.push(self.resolve_wal_hit(&winner)?);
             } else {
                 // Main index entry.
                 if self.is_deleted(winner.index) {
+                    continue;
+                }
+                let record = self.record_at(winner.index)?;
+                // Skip if a WAL entry for the same doc exists (WAL is newer).
+                if wal_doc_hashes.contains(&record.doc_id_hash) {
+                    continue;
+                }
+                // Skip main-vs-main duplicates.
+                if !seen.insert(record.doc_id_hash) {
                     continue;
                 }
                 let index_u32 =
