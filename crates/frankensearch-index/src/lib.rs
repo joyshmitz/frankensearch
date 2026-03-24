@@ -1380,14 +1380,17 @@ impl VectorIndex {
         let tmp_path = PathBuf::from(tmp);
         let _ = wal::remove_wal(&tmp_path);
 
-        wal::append_wal_batch(
+        if let Err(e) = wal::append_wal_batch(
             &tmp_path,
             &self.wal_entries,
             self.dimension(),
             self.quantization(),
             next_generation(self.metadata.compaction_gen),
             self.wal_config.fsync_on_write,
-        )?;
+        ) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
 
         match fs::rename(&tmp_path, &wal_path) {
             Ok(()) => Ok(()),

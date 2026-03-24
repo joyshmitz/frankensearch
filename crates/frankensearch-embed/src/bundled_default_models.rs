@@ -146,16 +146,22 @@ fn embedded_file_entry(
 fn write_atomic_file(path: &Path, bytes: &[u8]) -> SearchResult<()> {
     let pid = std::process::id();
     let tmp_path = path.with_extension(format!("tmp.{pid}"));
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
+    let result = (|| -> SearchResult<()> {
+        let mut file = File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
 
-    if path.exists() {
-        fs::remove_file(path)?;
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
-    fs::rename(tmp_path, path)?;
-    Ok(())
+    result
 }
 
 #[cfg(test)]
