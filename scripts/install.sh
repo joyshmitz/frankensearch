@@ -1836,7 +1836,7 @@ build_from_source() {
   estimate_build_resources
 
   # Clone the repository.
-  local git_args=(clone --depth=1)
+  local git_args=(clone --depth=1 --recurse-submodules)
   if [[ "${RESOLVED_VERSION}" != "latest" ]]; then
     git_args+=(--branch "${RESOLVED_VERSION}")
   fi
@@ -1850,6 +1850,13 @@ build_from_source() {
     return 1
   fi
   ok "Repository cloned."
+
+  # Remove optional workspace members whose path dependencies (e.g. fast_cmaes)
+  # live outside the repository and are unavailable in a fresh clone.
+  if [[ -f "${source_dir}/Cargo.toml" ]]; then
+    sed -i.bak '/"tools\/optimize_params"/d' "${source_dir}/Cargo.toml"
+    rm -f "${source_dir}/Cargo.toml.bak"
+  fi
 
   # Build the fsfs binary.
   # Unset env vars that would redirect cargo output away from the default
