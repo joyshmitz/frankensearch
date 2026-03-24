@@ -152,9 +152,9 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> SearchResult<()> {
         file.sync_all()?;
         drop(file);
 
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
+        // On POSIX, rename() atomically replaces the destination — no need
+        // to remove first.  The explicit remove_file before rename would
+        // create a crash-unsafe window where the file is gone entirely.
         fs::rename(&tmp_path, path)?;
         Ok(())
     })();
