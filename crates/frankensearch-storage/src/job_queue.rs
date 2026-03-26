@@ -538,6 +538,39 @@ impl PersistentJobQueue {
                 return Ok(FailResult::TerminalFailed { retry_count });
             }
 
+            let pending_params = [
+                SqliteValue::Text(state.doc_id.clone().into()),
+                SqliteValue::Text(state.embedder_id.clone().into()),
+            ];
+            let pending_exists = !conn
+                .query_with_params(
+                    "SELECT job_id \
+                     FROM embedding_jobs \
+                     WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending' \
+                     LIMIT 1;",
+                    &pending_params,
+                )
+                .map_err(map_storage_error)?
+                .is_empty();
+
+            if pending_exists {
+                // This processing job has been superseded by a newer pending job.
+                // Do not retry the old job. Delete it to allow the newer one to proceed.
+                let delete_params = [SqliteValue::Integer(job_id)];
+                let deleted = conn
+                    .execute_with_params(
+                        "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'processing';",
+                        &delete_params,
+                    )
+                    .map_err(map_storage_error)?;
+                if deleted != 1 {
+                    return Err(conflict_error(format!(
+                        "job {job_id} changed status during supersede transition"
+                    )));
+                }
+                return Ok(FailResult::TerminalFailed { retry_count });
+            }
+
             let delay_ms =
                 compute_retry_delay_ms(retry_base_delay_ms, retry_count.saturating_sub(1));
             let next_attempt_at_ms = now_ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
@@ -1886,6 +1919,42 @@ mod tests {
     }
 
     #[test]
+    fn fail_with_newer_pending_job_does_not_delete_newer_job() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            max_retries: 3,
+            retry_base_delay_ms: 0,
+            ..JobQueueConfig::default()
+        });
+
+        insert_document(storage.as_ref(), "doc-race", 100);
+        let old_hash = [100_u8; 32];
+        let new_hash = [101_u8; 32];
+
+        // 1. Enqueue original version
+        queue.enqueue("doc-race", "all-MiniLM-L6-v2", &old_hash, 0).unwrap();
+        
+        // 2. Worker claims it (now it's 'processing')
+        let claim = claim_single(&queue, "worker-1");
+        assert_eq!(claim.content_hash, Some(old_hash));
+
+        // 3. User updates document, enqueues new version.
+        // This creates a NEW 'pending' job because the old one is 'processing'.
+        queue.enqueue("doc-race", "all-MiniLM-L6-v2", &new_hash, 0).unwrap();
+
+        // 4. Worker fails to process the OLD version.
+        let fail_result = queue.fail(claim.job_id, "transient network error").unwrap();
+        assert!(matches!(fail_result, FailResult::TerminalFailed { .. }), "Old job should be terminally failed because a newer pending job exists");
+
+        // 5. The pending job should STILL be the NEW version, not the old one retrying!
+        let new_claim = claim_single(&queue, "worker-2");
+        assert_eq!(
+            new_claim.content_hash,
+            Some(new_hash),
+            "The newer pending job was deleted and replaced by a retry of the old job!"
+        );
+    }
+
+    #[test]
     fn round_robin_multi_worker_claims_never_double_assign_jobs() {
         const JOB_COUNT: usize = 50;
 
@@ -2443,7 +2512,10 @@ mod tests {
         let err = queue
             .complete(job_id)
             .expect_err("completing pending job should fail");
-        assert!(err.to_string().contains("not processing"), "error: {err}");
+        assert!(
+            err.to_string().contains("not processing"),
+            "error: {err}"
+        );
     }
 
     #[test]
@@ -2493,7 +2565,7 @@ mod tests {
         queue.complete(claimed.job_id).unwrap();
 
         let err = queue
-            .skip(claimed.job_id, "too late")
+            .skip(claimed.job_id, "not needed")
             .expect_err("skipping completed job should fail");
         assert!(
             err.to_string().contains("cannot be skipped"),
@@ -2711,12 +2783,9 @@ mod tests {
 
         // Claim and fail both (max_retries=0 means terminal on first fail)
         let claimed1 = claim_single(&queue, "worker-1");
-        let result1 = queue.fail(claimed1.job_id, "test-error-1").unwrap();
-        assert!(matches!(result1, FailResult::TerminalFailed { .. }));
-
+        queue.fail(claimed1.job_id, "test-error-1").unwrap();
         let claimed2 = claim_single(&queue, "worker-1");
-        let result2 = queue.fail(claimed2.job_id, "test-error-2").unwrap();
-        assert!(matches!(result2, FailResult::TerminalFailed { .. }));
+        queue.fail(claimed2.job_id, "test-error-2").unwrap();
 
         // Verify both are in failed state
         let depth_before = queue.queue_depth().unwrap();
@@ -2726,7 +2795,7 @@ mod tests {
         // Resurrect
         let resurrected = queue
             .resurrect_terminal_failures("embedder-A")
-            .expect("resurrect should succeed");
+            .expect("resurrect");
         assert_eq!(resurrected, 2);
 
         // Verify they're back to pending

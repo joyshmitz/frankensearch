@@ -16884,10 +16884,15 @@ mod tests {
     #[test]
     fn runtime_search_payload_rejects_invalid_filter_key() {
         run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            std::fs::create_dir_all(&project).unwrap();
+
             let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
                 command: CliCommand::Search,
                 query: Some("auth".to_owned()),
                 filter: Some("owner:me".to_owned()),
+                target_path: Some(project),
                 ..CliInput::default()
             });
 
