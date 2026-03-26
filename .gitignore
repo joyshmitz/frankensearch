@@ -81,3 +81,6 @@ ci-artifacts/
 proptest-regressions/
 test_meminfo
 test_logs/
+
+# Claude Code IDE config
+.claude/
