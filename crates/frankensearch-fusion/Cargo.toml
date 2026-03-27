@@ -19,6 +19,7 @@ frankensearch-index = { workspace = true }
 frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-rerank = { workspace = true, optional = true }
 asupersync = { workspace = true }
+ahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

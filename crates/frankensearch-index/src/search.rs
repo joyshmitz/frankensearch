@@ -1,8 +1,10 @@
 //! Brute-force top-k vector search over an opened [`crate::VectorIndex`].
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::sync::OnceLock;
+
+use ahash::AHashSet;
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};

@@ -16,8 +16,9 @@
 //! This naturally penalizes single-source hits when both tiers are available.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use ahash::{AHashMap, AHashSet};
 use frankensearch_core::{RankChanges, VectorHit};
 use tracing::{debug, instrument};
 
@@ -104,8 +105,8 @@ pub fn blend_two_tier(
     robust_normalize(&mut fast_scores);
     robust_normalize(&mut quality_scores);
 
-    let mut merged: HashMap<&str, ScorePair> =
-        HashMap::with_capacity(fast_results.len() + quality_results.len());
+    let mut merged: AHashMap<&str, ScorePair> =
+        AHashMap::with_capacity(fast_results.len() + quality_results.len());
 
     for (hit, normalized) in fast_results.iter().zip(fast_scores.into_iter()) {
         let entry = merged
@@ -227,7 +228,7 @@ pub fn kendall_tau_with_refined_rank(
     initial: &[VectorHit],
     refined_rank: &HashMap<&str, usize>,
 ) -> Option<f64> {
-    let mut seen: HashSet<&str> = HashSet::with_capacity(initial.len());
+    let mut seen: AHashSet<&str> = AHashSet::with_capacity(initial.len());
     let mut refined_ranks = Vec::with_capacity(initial.len().min(refined_rank.len()));
     for hit in initial {
         let doc_id = hit.doc_id.as_str();

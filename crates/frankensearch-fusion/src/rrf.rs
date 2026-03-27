@@ -12,8 +12,7 @@
 //! Documents appearing in multiple sources get their contributions summed,
 //! which naturally boosts multi-source hits.
 
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use frankensearch_core::{FusedHit, ScoredResult, VectorHit};
 use tracing::{Level, debug, instrument};
 
@@ -197,7 +196,7 @@ pub fn rrf_fuse_with_graph(
     // Adjusted for typical ~50% overlap to reduce over-allocation.
     let graph_len = if graph_weight > 0.0 { graph.len() } else { 0 };
     let capacity = (lexical.len() + semantic.len() + graph_len) * 3 / 4 + 1;
-    let mut hits: HashMap<&str, FusedHitScratch<'_>> = HashMap::with_capacity(capacity);
+    let mut hits: AHashMap<&str, FusedHitScratch<'_>> = AHashMap::with_capacity(capacity);
 
     // Score lexical results.
     for (rank, result) in lexical.iter().enumerate() {
