@@ -16893,7 +16893,7 @@ mod tests {
 
             let index_dir = temp.path().join(".frankensearch");
             let lexical_path = index_dir.join("lexical");
-            let _lexical = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            drop(TantivyIndex::create(&lexical_path).expect("create lexical index"));
             let mut config = FsfsConfig::default();
             config.storage.index_dir = index_dir.display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
@@ -17103,7 +17103,7 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let index_dir = temp.path().join(".frankensearch");
             let lexical_path = index_dir.join("lexical");
-            let _lexical = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            drop(TantivyIndex::create(&lexical_path).expect("create lexical index"));
             let mut config = FsfsConfig::default();
             config.storage.index_dir = index_dir.display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
