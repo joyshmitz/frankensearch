@@ -555,7 +555,7 @@ impl VectorIndex {
     }
 
     fn resolve_sorted_entries(&self, winners: Vec<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
-        let mut seen: HashSet<String> = HashSet::with_capacity(winners.len());
+        let mut seen: AHashSet<String> = AHashSet::with_capacity(winners.len());
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
             if is_wal_index(winner.index) {
