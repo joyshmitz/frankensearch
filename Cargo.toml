@@ -94,6 +94,9 @@ hnsw_rs = "0.3"
 # CRC32 checksums for FSVI index integrity
 crc32fast = "1"
 
+# Fast non-cryptographic hashing for hot-path HashMaps (inspired by fff.nvim)
+ahash = "0.8"
+
 # Unicode normalization
 unicode-normalization = "0.1"
 
