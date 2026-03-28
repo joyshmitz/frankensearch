@@ -1313,7 +1313,7 @@ fn hostname() -> String {
 /// Check whether a PID is alive on the local system.
 #[cfg(unix)]
 #[allow(unsafe_code, clippy::cast_possible_wrap)]
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     // kill(pid, 0) is the canonical Unix check: returns 0 if the process
     // exists (or EPERM if we lack permission, which still means alive).
     // SAFETY: signal 0 does not deliver a signal; it only checks existence.
@@ -1326,7 +1326,7 @@ fn is_pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_pid_alive(_pid: u32) -> bool {
+pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     // Conservative: assume alive on unsupported platforms.
     true
 }

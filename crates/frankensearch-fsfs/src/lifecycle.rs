@@ -935,24 +935,8 @@ impl PidFileContents {
 }
 
 /// Check whether a PID is alive on the local system.
-#[cfg(unix)]
-#[allow(unsafe_code, clippy::cast_possible_wrap)]
 fn pid_is_alive(pid: u32) -> bool {
-    // kill(pid, 0) is the canonical Unix check: returns 0 if the process
-    // exists (or EPERM if we lack permission, which still means alive).
-    // SAFETY: signal 0 does not deliver a signal; it only checks existence.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if ret == 0 {
-        return true;
-    }
-    // EPERM means process exists but we can't signal it — still alive.
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    // Conservative: assume alive on unsupported platforms.
-    true
+    crate::concurrency::is_pid_alive(pid)
 }
 
 /// Manage a PID file at the given path.

@@ -530,7 +530,7 @@ impl TwoTierSearcher {
                 embedder_id: self.fast_embedder.id().to_owned(),
                 vectors_searched: metrics.phase1_vectors_searched,
                 lexical_candidates: metrics.lexical_candidates,
-                fused_count: initial_hits.len(),
+                fused_count: display_hits.len(),
             },
         });
         self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
@@ -1237,7 +1237,10 @@ impl TwoTierSearcher {
                 let quality_score = quality_scores_by_doc.get(hit.doc_id.as_str()).copied();
                 let original_source =
                     initial.map_or(ScoreSource::SemanticFast, |result| result.source);
-                let source = if quality_score.is_some() && original_source != ScoreSource::Lexical {
+                let source = if quality_score.is_some()
+                    && original_source != ScoreSource::Lexical
+                    && original_source != ScoreSource::Hybrid
+                {
                     ScoreSource::SemanticQuality
                 } else {
                     original_source
