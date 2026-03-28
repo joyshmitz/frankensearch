@@ -25,43 +25,63 @@ use tracing::{debug, instrument};
 const DEFAULT_BLEND_FACTOR: f32 = 0.7;
 const NON_FINITE_SCORE_FALLBACK: f32 = 0.0;
 
-fn robust_normalize(scores: &mut [f32]) {
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    let mut saw_finite = false;
+/// Pre-computed normalization bounds for a score set.
+///
+/// Extracted from `robust_normalize` so normalization can be applied inline
+/// during HashMap insertion without materializing an intermediate `Vec<f32>`.
+/// Inspired by fff.nvim's pattern of never creating temporary collections
+/// when the operation can be fused into the consumer loop.
+#[derive(Debug, Clone, Copy)]
+struct NormBounds {
+    min: f32,
+    range: f32,
+    t: f32,
+    saw_finite: bool,
+}
 
-    for &value in scores.iter() {
-        if value.is_finite() {
-            min = min.min(value);
-            max = max.max(value);
-            saw_finite = true;
+impl NormBounds {
+    /// Compute normalization bounds from a score iterator (single pass, no allocation).
+    fn from_scores<'a>(scores: impl Iterator<Item = &'a f32>) -> Self {
+        let mut min = f32::INFINITY;
+        let mut max = f32::NEG_INFINITY;
+        let mut saw_finite = false;
+
+        for &value in scores {
+            if value.is_finite() {
+                min = min.min(value);
+                max = max.max(value);
+                saw_finite = true;
+            }
         }
-    }
 
-    if !saw_finite {
-        scores.fill(NON_FINITE_SCORE_FALLBACK);
-        return;
-    }
-
-    let range = max - min;
-    let t = if range > 0.01 {
-        ((range - 0.01) / 0.04).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-
-    for score in scores.iter_mut() {
-        if score.is_finite() {
-            let norm = if range > f32::EPSILON {
-                (*score - min) / range
-            } else {
-                1.0
-            };
-            let blended = t * norm + (1.0 - t) * *score;
-            *score = blended.clamp(0.0, 1.0);
+        let range = max - min;
+        let t = if range > 0.01 {
+            ((range - 0.01) / 0.04).clamp(0.0, 1.0)
         } else {
-            *score = NON_FINITE_SCORE_FALLBACK;
+            0.0
+        };
+
+        Self {
+            min,
+            range,
+            t,
+            saw_finite,
         }
+    }
+
+    /// Apply normalization to a single score (no allocation).
+    #[inline]
+    fn apply(self, score: f32) -> f32 {
+        if !self.saw_finite || !score.is_finite() {
+            return NON_FINITE_SCORE_FALLBACK;
+        }
+        let norm = if self.range > f32::EPSILON {
+            (score - self.min) / self.range
+        } else {
+            1.0
+        };
+        let blended = self.t * norm + (1.0 - self.t) * score;
+        blended.clamp(0.0, 1.0)
     }
 }
 
@@ -100,15 +120,18 @@ pub fn blend_two_tier(
 ) -> Vec<VectorHit> {
     let alpha = sanitize_blend_factor(blend_factor);
 
-    let mut fast_scores: Vec<f32> = fast_results.iter().map(|hit| hit.score).collect();
-    let mut quality_scores: Vec<f32> = quality_results.iter().map(|hit| hit.score).collect();
-    robust_normalize(&mut fast_scores);
-    robust_normalize(&mut quality_scores);
+    // Compute normalization bounds in one pass per source (no Vec allocation).
+    // Then normalize inline during HashMap insertion — eliminates 2 intermediate
+    // Vec<f32> allocations and 4 redundant data passes from the old approach.
+    let fast_bounds = NormBounds::from_scores(fast_results.iter().map(|h| &h.score));
+    let quality_bounds = NormBounds::from_scores(quality_results.iter().map(|h| &h.score));
 
-    let mut merged: AHashMap<&str, ScorePair> =
-        AHashMap::with_capacity(fast_results.len() + quality_results.len());
+    // Capacity: with ~50% overlap, unique docs ≈ max(fast, quality) * 1.3
+    let capacity = fast_results.len().max(quality_results.len()) * 13 / 10 + 1;
+    let mut merged: AHashMap<&str, ScorePair> = AHashMap::with_capacity(capacity);
 
-    for (hit, normalized) in fast_results.iter().zip(fast_scores.into_iter()) {
+    for hit in fast_results {
+        let normalized = fast_bounds.apply(hit.score);
         let entry = merged
             .entry(hit.doc_id.as_str())
             .or_insert_with(|| ScorePair {
@@ -123,7 +146,8 @@ pub fn blend_two_tier(
         }
     }
 
-    for (hit, normalized) in quality_results.iter().zip(quality_scores.into_iter()) {
+    for hit in quality_results {
+        let normalized = quality_bounds.apply(hit.score);
         let entry = merged
             .entry(hit.doc_id.as_str())
             .or_insert_with(|| ScorePair {
