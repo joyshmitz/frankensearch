@@ -167,14 +167,11 @@ impl LexicalSearch for StubLexical {
 const DIM: usize = 4;
 
 fn build_test_index() -> Arc<TwoTierIndex> {
-    let dir = std::env::temp_dir().join(format!(
-        "frankensearch-interaction-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    // Use a leaked TempDir so the directory survives for the test's lifetime
+    // without needing to thread a handle through every call site.
+    let dir = Box::leak(Box::new(tempfile::tempdir().expect("create test tempdir")))
+        .path()
+        .join("index");
     let mut builder =
         TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create test index");
     builder.set_fast_embedder_id("stub-fast");
