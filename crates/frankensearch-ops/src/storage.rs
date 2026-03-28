@@ -1457,6 +1457,10 @@ impl OpsStorage {
         sample.validate()?;
         let conn = self.connection();
 
+        // Ensure the referenced project and instance exist (FK constraints).
+        ensure_project_exists(conn, &sample.project_key, sample.ts_ms)?;
+        ensure_instance_exists(conn, &sample.instance_id, &sample.project_key, sample.ts_ms)?;
+
         // Delete-then-insert upsert: FrankenSQLite does not yet support
         // ON CONFLICT(...) DO UPDATE and query_with_params may not reliably
         // detect existing rows, so we delete any conflicting row first.
@@ -2450,6 +2454,10 @@ fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> Sear
         return Ok(0);
     }
 
+    // Ensure the referenced project and instance exist (FK constraints).
+    ensure_project_exists(conn, &event.project_key, event.ts_ms)?;
+    ensure_instance_exists(conn, &event.instance_id, &event.project_key, event.ts_ms)?;
+
     let params = [
         SqliteValue::Text(event.event_id.clone().into()),
         SqliteValue::Text(event.project_key.clone().into()),
@@ -2472,6 +2480,65 @@ fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> Sear
         &params,
     )
     .map_err(ops_error)
+}
+
+/// Ensure the `projects` table has a row for `project_key`.
+fn ensure_project_exists(conn: &Connection, project_key: &str, ts_ms: i64) -> SearchResult<()> {
+    let existing = conn
+        .query_with_params(
+            "SELECT 1 FROM projects WHERE project_key = ?1;",
+            &[SqliteValue::Text(project_key.to_owned().into())],
+        )
+        .map_err(ops_error)?;
+    if existing.is_empty() {
+        conn.execute_with_params(
+            "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4);",
+            &[
+                SqliteValue::Text(project_key.to_owned().into()),
+                SqliteValue::Text(project_key.to_owned().into()),
+                SqliteValue::Integer(ts_ms),
+                SqliteValue::Integer(ts_ms),
+            ],
+        )
+        .map_err(ops_error)?;
+    }
+    Ok(())
+}
+
+/// Ensure the `instances` table has a row for `instance_id` under `project_key`.
+fn ensure_instance_exists(
+    conn: &Connection,
+    instance_id: &str,
+    project_key: &str,
+    ts_ms: i64,
+) -> SearchResult<()> {
+    let existing = conn
+        .query_with_params(
+            "SELECT 1 FROM instances WHERE instance_id = ?1;",
+            &[SqliteValue::Text(instance_id.to_owned().into())],
+        )
+        .map_err(ops_error)?;
+    if existing.is_empty() {
+        conn.execute_with_params(
+            "INSERT INTO instances(\
+                 instance_id, project_key, host_name, pid, version, \
+                 first_seen_ms, last_heartbeat_ms, state\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+            &[
+                SqliteValue::Text(instance_id.to_owned().into()),
+                SqliteValue::Text(project_key.to_owned().into()),
+                SqliteValue::Text("auto".to_owned().into()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text("unknown".to_owned().into()),
+                SqliteValue::Integer(ts_ms),
+                SqliteValue::Integer(ts_ms),
+                SqliteValue::Text("started".to_owned().into()),
+            ],
+        )
+        .map_err(ops_error)?;
+    }
+    Ok(())
 }
 
 fn upsert_search_summary_row(
