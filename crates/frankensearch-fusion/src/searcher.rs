@@ -12,7 +12,7 @@
 //!    result or graceful degradation (only fired when quality embedder is available
 //!    and `fast_only` is false).
 
-use std::collections::HashMap;
+use ahash::AHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -2291,7 +2291,7 @@ fn vector_hits_to_scored_results(
     config: &TwoTierConfig,
     fast_embedder_id: &str,
 ) -> Vec<ScoredResult> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = ahash::AHashSet::new();
     hits.iter()
         .filter(|h| seen.insert(&h.doc_id))
         .take(k)
