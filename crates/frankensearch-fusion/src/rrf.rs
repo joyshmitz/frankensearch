@@ -215,6 +215,10 @@ pub fn rrf_fuse_with_graph(
                 hit.rrf_score += rrf_contribution;
                 hit.lexical_rank = Some(rank);
                 hit.lexical_score = Some(result.score);
+                // Compute in_both_sources inline: if semantic was already seen.
+                if hit.semantic_rank.is_some() {
+                    hit.in_both_sources = true;
+                }
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: result.doc_id.as_str(),
@@ -247,6 +251,10 @@ pub fn rrf_fuse_with_graph(
                 fh.semantic_rank = Some(rank);
                 fh.semantic_score = Some(hit.score);
                 fh.semantic_index = Some(hit.index);
+                // Compute in_both_sources inline: if lexical was already seen.
+                if fh.lexical_rank.is_some() {
+                    fh.in_both_sources = true;
+                }
             })
             .or_insert_with(|| FusedHitScratch {
                 doc_id: hit.doc_id.as_str(),
@@ -293,10 +301,8 @@ pub fn rrf_fuse_with_graph(
         }
     }
 
+    // in_both_sources was computed inline during insertion — no separate pass needed.
     let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();
-    for hit in &mut results {
-        hit.in_both_sources = hit.lexical_rank.is_some() && hit.semantic_rank.is_some();
-    }
 
     let overlap_count = tracing::enabled!(target: "frankensearch.rrf", Level::DEBUG)
         .then(|| results.iter().filter(|h| h.in_both_sources).count());

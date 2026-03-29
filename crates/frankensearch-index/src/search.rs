@@ -563,6 +563,11 @@ impl VectorIndex {
     }
 
     fn resolve_sorted_entries(&self, winners: Vec<HeapEntry>) -> SearchResult<Vec<VectorHit>> {
+        // Pre-build a hash set of WAL doc_id hashes for O(1) pre-screening
+        // instead of O(W) linear scan per main-index winner. On hash match,
+        // falls back to string verification for correctness.
+        let wal_hashes: AHashSet<u64> = self.wal_entries.iter().map(|e| e.doc_id_hash).collect();
+
         let mut seen: AHashSet<String> = AHashSet::with_capacity(winners.len());
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
@@ -580,16 +585,20 @@ impl VectorIndex {
                     continue;
                 }
                 let doc_id = self.doc_id_at(winner.index)?.to_owned();
-                // Skip if a WAL entry for the same doc exists (WAL is newer).
-                let doc_id_hash = crate::fnv1a_hash(doc_id.as_bytes());
-                let has_wal_entry = self
-                    .wal_entries
-                    .iter()
-                    .any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);
-                if has_wal_entry {
-                    continue;
+                // Read pre-computed hash from record table instead of recomputing.
+                let record = self.record_at(winner.index)?;
+                let doc_id_hash = record.doc_id_hash;
+                // O(1) hash pre-screen; only linear-scan on hash match.
+                if wal_hashes.contains(&doc_id_hash) {
+                    let has_wal_entry = self
+                        .wal_entries
+                        .iter()
+                        .any(|e| e.doc_id_hash == doc_id_hash && e.doc_id == doc_id);
+                    if has_wal_entry {
+                        continue;
+                    }
                 }
-                // Skip main-vs-main duplicates.
+                // Skip main-vs-main duplicates (String-based for correctness).
                 if !seen.insert(doc_id.clone()) {
                     continue;
                 }
