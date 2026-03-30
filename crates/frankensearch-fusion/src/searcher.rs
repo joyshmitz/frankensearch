@@ -2333,26 +2333,25 @@ fn vector_hits_to_scored_results(
 }
 
 fn filter_scored_results_by_negations(
-    results: Vec<ScoredResult>,
+    mut results: Vec<ScoredResult>,
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
 ) -> Vec<ScoredResult> {
+    // In-place retain avoids allocating a new Vec (fff.nvim pattern:
+    // never allocate when you can mutate in-place).
+    results.retain(|result| !should_exclude_document(&result.doc_id, exclusions, text_fn, source));
     results
-        .into_iter()
-        .filter(|result| !should_exclude_document(&result.doc_id, exclusions, text_fn, source))
-        .collect()
 }
 
 fn filter_vector_hits_by_negations(
-    hits: Vec<VectorHit>,
+    mut hits: Vec<VectorHit>,
     exclusions: &NormalizedExclusions,
     text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
     source: &'static str,
 ) -> Vec<VectorHit> {
-    hits.into_iter()
-        .filter(|hit| !should_exclude_document(&hit.doc_id, exclusions, text_fn, source))
-        .collect()
+    hits.retain(|hit| !should_exclude_document(&hit.doc_id, exclusions, text_fn, source));
+    hits
 }
 
 fn should_exclude_document(
