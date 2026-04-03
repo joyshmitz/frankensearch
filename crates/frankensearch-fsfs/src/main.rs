@@ -323,13 +323,20 @@ fn run_config_command(
             project_config_path,
             user_config_path,
         ),
-        ConfigAction::Set { .. } | ConfigAction::Reset => Err(SearchError::InvalidConfig {
-            field: "config.action".to_owned(),
-            value: "set/reset".to_owned(),
-            reason:
-                "config set/reset are not implemented yet; use a TOML editor with `fsfs config show`/`validate`"
-                    .to_owned(),
-        }),
+        ConfigAction::Set { key, value } => run_config_set_command(
+            cli_input,
+            explicit_config_path,
+            project_config_path,
+            user_config_path,
+            &key,
+            &value,
+        ),
+        ConfigAction::Reset => run_config_reset_command(
+            cli_input,
+            explicit_config_path,
+            project_config_path,
+            user_config_path,
+        ),
     }
 }
 
@@ -486,6 +493,169 @@ fn run_config_init_command(
         created,
         path: path.display().to_string(),
         template,
+    };
+    emit_success_payload("config", &payload, cli_input.format)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigSetPayload {
+    path: String,
+    key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigResetPayload {
+    path: String,
+}
+
+fn resolve_writable_config_path(
+    explicit: Option<&Path>,
+    project: Option<&Path>,
+    user: Option<&Path>,
+) -> SearchResult<PathBuf> {
+    // Prefer: explicit > project > user. At least one must exist or be derivable.
+    explicit
+        .or(project)
+        .or(user)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "config.path".to_owned(),
+            value: String::new(),
+            reason: "unable to determine config path; use --config to specify one".to_owned(),
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_config_set_command(
+    cli_input: &CliInput,
+    explicit_config_path: Option<&Path>,
+    project_config_path: Option<&Path>,
+    user_config_path: Option<&Path>,
+    key: &str,
+    value: &str,
+) -> SearchResult<()> {
+    let path =
+        resolve_writable_config_path(explicit_config_path, project_config_path, user_config_path)?;
+
+    // Load the existing TOML file, or start from an empty table if it doesn't exist.
+    let existing_text = if path.exists() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut doc: toml::Value =
+        existing_text
+            .parse()
+            .map_err(|source: toml::de::Error| SearchError::SubsystemError {
+                subsystem: CONFIG_SUBSYSTEM,
+                source: Box::new(io::Error::other(format!(
+                    "failed to parse existing config at {}: {source}",
+                    path.display()
+                ))),
+            })?;
+
+    // Navigate the dotted key path and set the value.
+    let segments: Vec<&str> = key.split('.').collect();
+    if segments.is_empty() || segments.iter().any(|s| s.is_empty()) {
+        return Err(SearchError::InvalidConfig {
+            field: "config.set.key".to_owned(),
+            value: key.to_owned(),
+            reason: "key must be a non-empty dot-separated path (e.g. 'search.rrf_k')".to_owned(),
+        });
+    }
+
+    // Descend to the parent table, creating intermediate tables as needed.
+    let mut cursor = &mut doc;
+    for &segment in &segments[..segments.len() - 1] {
+        if !cursor.is_table() {
+            *cursor = toml::Value::Table(toml::map::Map::new());
+        }
+        cursor = cursor
+            .as_table_mut()
+            .expect("just ensured table")
+            .entry(segment)
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    }
+    let leaf_key = segments[segments.len() - 1];
+
+    // Parse the value: try bool, then integer, then float, then string.
+    let parsed_value = if value.eq_ignore_ascii_case("true") {
+        toml::Value::Boolean(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        toml::Value::Boolean(false)
+    } else if let Ok(i) = value.parse::<i64>() {
+        toml::Value::Integer(i)
+    } else if let Ok(f) = value.parse::<f64>() {
+        if f.is_finite() {
+            toml::Value::Float(f)
+        } else {
+            // TOML does not support inf/nan — treat as a literal string.
+            toml::Value::String(value.to_owned())
+        }
+    } else {
+        toml::Value::String(value.to_owned())
+    };
+
+    if !cursor.is_table() {
+        *cursor = toml::Value::Table(toml::map::Map::new());
+    }
+    cursor
+        .as_table_mut()
+        .expect("just ensured table")
+        .insert(leaf_key.to_owned(), parsed_value);
+
+    // Write back.
+    let output = toml::to_string_pretty(&doc).map_err(|source| SearchError::SubsystemError {
+        subsystem: CONFIG_SUBSYSTEM,
+        source: Box::new(io::Error::other(format!(
+            "failed to encode config: {source}"
+        ))),
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &output)?;
+
+    if cli_input.format == OutputFormat::Table {
+        println!("set {key}={value} in {}", path.display());
+        return Ok(());
+    }
+    let payload = ConfigSetPayload {
+        path: path.display().to_string(),
+        key: key.to_owned(),
+        value: value.to_owned(),
+    };
+    emit_success_payload("config", &payload, cli_input.format)
+}
+
+fn run_config_reset_command(
+    cli_input: &CliInput,
+    explicit_config_path: Option<&Path>,
+    project_config_path: Option<&Path>,
+    user_config_path: Option<&Path>,
+) -> SearchResult<()> {
+    let path =
+        resolve_writable_config_path(explicit_config_path, project_config_path, user_config_path)?;
+    let template = toml::to_string_pretty(&FsfsConfig::default()).map_err(|source| {
+        SearchError::SubsystemError {
+            subsystem: CONFIG_SUBSYSTEM,
+            source: Box::new(io::Error::other(format!(
+                "failed to encode default config: {source}"
+            ))),
+        }
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, &template)?;
+
+    if cli_input.format == OutputFormat::Table {
+        println!("reset config to defaults at {}", path.display());
+        return Ok(());
+    }
+    let payload = ConfigResetPayload {
+        path: path.display().to_string(),
     };
     emit_success_payload("config", &payload, cli_input.format)
 }

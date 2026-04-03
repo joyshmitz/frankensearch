@@ -430,6 +430,12 @@ pub struct RerankScore {
     pub score: f32,
     /// Position before reranking (for rank-change tracking).
     pub original_rank: usize,
+    /// Raw pre-sigmoid logit, when the backend exposes it.
+    ///
+    /// Some cross-encoder implementations only emit a final score (after sigmoid
+    /// activation). When the raw logit is unavailable, this field is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_logit: Option<f32>,
 }
 
 /// Core trait for cross-encoder reranking models.
@@ -679,16 +685,19 @@ mod tests {
                     doc_id: "doc-a".to_owned(),
                     score: 0.8,
                     original_rank: 2,
+                    raw_logit: None,
                 },
                 RerankScore {
                     doc_id: "doc-b".to_owned(),
                     score: 0.8,
                     original_rank: 1,
+                    raw_logit: None,
                 },
                 RerankScore {
                     doc_id: "doc-c".to_owned(),
                     score: 0.3,
                     original_rank: 0,
+                    raw_logit: None,
                 },
             ])
         }
@@ -784,6 +793,7 @@ mod tests {
             doc_id: "doc-1".into(),
             score: 0.92,
             original_rank: 3,
+            raw_logit: None,
         };
 
         let json = serde_json::to_string(&score).unwrap();

@@ -270,7 +270,9 @@ impl Storage {
             tracing::warn!(
                 target: "frankensearch.storage",
                 symbols = self.config.raptorq_repair_symbols,
-                "raptorq pragma is temporarily disabled due backend btree instability"
+                "raptorq FEC repair symbols requested but currently disabled: \
+                 upstream frankensqlite reserve-byte balancing is unresolved; \
+                 configure raptorq_repair_symbols=0 to suppress this warning"
             );
         }
 

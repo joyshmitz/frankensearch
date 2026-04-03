@@ -860,13 +860,14 @@ impl TwoTierSearcher {
                 (result, start.elapsed())
             },
             || {
-                if let Some(ref lex) = self.lexical {
-                    let start = Instant::now();
-                    let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget));
-                    (Some(result), start.elapsed())
-                } else {
-                    (None, Duration::ZERO)
-                }
+                self.lexical.as_ref().map_or_else(
+                    || (None, Duration::ZERO),
+                    |lex| {
+                        let start = Instant::now();
+                        let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget));
+                        (Some(result), start.elapsed())
+                    },
+                )
             },
         );
 
@@ -1487,37 +1488,6 @@ impl TwoTierSearcher {
         }
 
         Ok(results)
-    }
-
-    /// Run optional lexical search, returning results or None.
-    #[allow(dead_code)]
-    async fn run_lexical(
-        &self,
-        cx: &Cx,
-        query: &str,
-        candidates: usize,
-        metrics: &mut TwoTierMetrics,
-    ) -> SearchResult<Option<Vec<ScoredResult>>> {
-        let Some(lexical) = self.lexical.as_ref() else {
-            return Ok(None);
-        };
-        let start = Instant::now();
-        match lexical.search(cx, query, candidates).await {
-            Ok(results) => {
-                metrics.lexical_search_ms = start.elapsed().as_secs_f64() * 1000.0;
-                metrics.lexical_candidates = results.len();
-                Ok(Some(results))
-            }
-            Err(err) => {
-                metrics.lexical_search_ms = start.elapsed().as_secs_f64() * 1000.0;
-                if matches!(err, SearchError::Cancelled { .. }) {
-                    return Err(err);
-                }
-                self.export_error(&err);
-                tracing::warn!(error = %err, "lexical search failed, continuing without");
-                Ok(None)
-            }
-        }
     }
 
     fn export_search_metrics(

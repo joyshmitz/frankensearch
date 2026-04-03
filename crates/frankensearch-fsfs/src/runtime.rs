@@ -1754,13 +1754,18 @@ impl LiveIngestPipeline {
     ) -> frankensearch_core::SearchResult<()> {
         for action in FsfsRuntime::vector_index_write_actions(vector_plan) {
             match action {
-                VectorIndexWriteAction::InvalidateRevisionsThrough { .. } => {
+                VectorIndexWriteAction::InvalidateRevisionsThrough {
+                    ref file_key,
+                    revision: through_rev,
+                } => {
                     tracing::debug!(
-                        file_key = %rel_key,
-                        revision,
+                        file_key = %file_key,
+                        through_revision = through_rev,
+                        current_revision = revision,
                         reason_code = %vector_plan.reason_code,
-                        "watcher ingest: revision invalidation action not yet implemented; continuing"
+                        "watcher ingest: tombstoning stale vector for revision invalidation"
                     );
+                    self.soft_delete_vector(rel_key);
                 }
                 VectorIndexWriteAction::AppendFast { .. } => {
                     match self.embedder.embed(cx, canonical).await {
@@ -8856,7 +8861,12 @@ impl FsfsRuntime {
     }
 
     /// Build a live ingest pipeline for the watcher by opening existing indexes.
-    fn build_live_ingest_pipeline(&self) -> SearchResult<LiveIngestPipeline> {
+    ///
+    /// Returns the pipeline and a cloned `Arc` to the vector index so callers
+    /// can compact the WAL on graceful shutdown.
+    fn build_live_ingest_pipeline(
+        &self,
+    ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
         let storage_db_path = self.resolve_storage_db_path()?;
@@ -8882,10 +8892,10 @@ impl FsfsRuntime {
             "live ingest pipeline initialized for watch mode"
         );
 
-        Ok(
-            LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
-                .with_storage_db_path(storage_db_path),
-        )
+        let pipeline = LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
+            .with_storage_db_path(storage_db_path);
+        let vi_handle = Arc::clone(&pipeline.vector_index);
+        Ok((pipeline, vi_handle))
     }
 
     fn collect_index_candidates(
@@ -10496,7 +10506,7 @@ impl FsfsRuntime {
 
         if watch_enabled_for_command {
             match self.build_live_ingest_pipeline() {
-                Ok(pipeline) => {
+                Ok((pipeline, vi_handle)) => {
                     let target_root = self.resolve_target_root()?;
                     let watcher = FsWatcher::new(
                         vec![target_root],
@@ -10524,7 +10534,7 @@ impl FsfsRuntime {
                         )
                         .await;
                     watcher.stop().await;
-                    self.finalize_shutdown(cx, reason).await?;
+                    self.finalize_shutdown(cx, reason, Some(&vi_handle)).await?;
                 }
                 Err(ref error) if matches!(error, SearchError::IndexNotFound { .. }) => {
                     warn!(
@@ -10549,7 +10559,7 @@ impl FsfsRuntime {
             return Ok(());
         }
         let reason = self.await_shutdown(cx, shutdown, None, None).await;
-        self.finalize_shutdown(cx, reason).await
+        self.finalize_shutdown(cx, reason, None).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -10702,10 +10712,42 @@ impl FsfsRuntime {
         }
     }
 
-    async fn finalize_shutdown(&self, _cx: &Cx, reason: ShutdownReason) -> SearchResult<()> {
-        // Placeholder for fsync/WAL flush/index checkpoint once these subsystems
-        // are wired into fsfs runtime lanes.
-        std::future::ready(()).await;
+    async fn finalize_shutdown(
+        &self,
+        _cx: &Cx,
+        reason: ShutdownReason,
+        vector_index: Option<&Arc<std::sync::Mutex<VectorIndex>>>,
+    ) -> SearchResult<()> {
+        if let Some(vi_handle) = vector_index {
+            let mut vi = vi_handle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let wal_count = vi.wal_record_count();
+            if wal_count > 0 {
+                info!(
+                    wal_records = wal_count,
+                    "shutdown: compacting WAL into vector index"
+                );
+                match vi.compact() {
+                    Ok(stats) => {
+                        info!(
+                            wal_records = stats.wal_records,
+                            total_after = stats.total_records_after,
+                            elapsed_ms = stats.elapsed_ms,
+                            "shutdown: vector index WAL compaction complete"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            wal_records = wal_count,
+                            "shutdown: WAL compaction failed; \
+                             pending WAL entries will replay on next open"
+                        );
+                    }
+                }
+            }
+        }
         info!(reason = ?reason, "fsfs graceful shutdown finalization completed");
         Ok(())
     }
@@ -16013,7 +16055,7 @@ mod tests {
                 watch: true,
                 ..CliInput::default()
             });
-            let pipeline = runtime
+            let (pipeline, _vi_handle) = runtime
                 .build_live_ingest_pipeline()
                 .expect("build live ingest pipeline");
             let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()

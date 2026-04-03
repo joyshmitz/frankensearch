@@ -212,7 +212,7 @@ impl FlashRankReranker {
         session: &mut Session,
         pairs: &[TokenizedPair],
         model_name: &str,
-    ) -> SearchResult<Vec<f32>> {
+    ) -> SearchResult<Vec<(f32, f32)>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -273,8 +273,11 @@ impl FlashRankReranker {
         // Extract logits from the output tensor using name fallback chain
         let logits = extract_logits(&outputs, model_name, batch_size)?;
 
-        // Apply sigmoid activation to convert logits → probabilities
-        Ok(logits.iter().map(|&logit| sigmoid(logit)).collect())
+        // Return (sigmoid-activated score, raw logit) pairs.
+        Ok(logits
+            .iter()
+            .map(|&logit| (sigmoid(logit), logit))
+            .collect())
     }
 
     /// Directory containing model assets.
@@ -334,7 +337,7 @@ impl Reranker for FlashRankReranker {
             // can never be silently truncated if this block is modified later.
             let mut results = Vec::with_capacity(documents.len());
             for (rank, doc) in documents.iter().enumerate() {
-                let Some(&score) = all_scores.get(rank) else {
+                let Some(&(score, logit)) = all_scores.get(rank) else {
                     return Err(SearchError::RerankFailed {
                         model: self.name.clone(),
                         source: format!(
@@ -349,6 +352,7 @@ impl Reranker for FlashRankReranker {
                     doc_id: doc.doc_id.clone(),
                     score,
                     original_rank: rank,
+                    raw_logit: Some(logit),
                 });
             }
 

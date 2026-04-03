@@ -160,7 +160,7 @@ pub async fn rerank_step(
                 explanation.components.push(ScoreComponent {
                     source: ExplainedSource::Rerank {
                         model: reranker.id().to_owned(),
-                        logit: 0.0, // Raw logit unavailable from generic Reranker trait
+                        logit: f64::from(score.raw_logit.unwrap_or(0.0)),
                         sigmoid: f64::from(score.score),
                     },
                     raw_score: f64::from(score.score),
@@ -242,6 +242,7 @@ mod tests {
                             doc_id: doc.doc_id.clone(),
                             score,
                             original_rank: i,
+                            raw_logit: None,
                         }
                     })
                     .collect())
@@ -300,6 +301,7 @@ mod tests {
                     doc_id: "only".into(),
                     score: 0.5,
                     original_rank: 0,
+                    raw_logit: None,
                 }])
             })
         }
@@ -614,6 +616,7 @@ mod tests {
                             doc_id: doc.doc_id.clone(),
                             score,
                             original_rank: rank,
+                            raw_logit: None,
                         }
                     })
                     .collect();
@@ -729,6 +732,7 @@ mod tests {
                         doc_id: doc.doc_id.clone(),
                         score: 0.5,
                         original_rank: i,
+                        raw_logit: None,
                     })
                     .collect())
             })
@@ -886,6 +890,7 @@ mod tests {
                         doc_id: doc.doc_id.clone(),
                         score: 0.8,
                         original_rank: i + 1000, // Out of range
+                        raw_logit: None,
                     })
                     .collect())
             })
@@ -1191,6 +1196,7 @@ mod tests {
                         doc_id: format!("wrong-{i}"),
                         score: 0.5,
                         original_rank: i,
+                        raw_logit: None,
                     })
                     .collect())
             })

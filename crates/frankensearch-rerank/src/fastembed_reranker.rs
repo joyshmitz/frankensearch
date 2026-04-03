@@ -194,6 +194,7 @@ impl SyncRerank for FastEmbedReranker {
                 doc_id: doc.doc_id.clone(),
                 score: 0.0,
                 original_rank: i,
+                raw_logit: None,
             })
             .collect();
 

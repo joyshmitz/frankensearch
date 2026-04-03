@@ -745,7 +745,17 @@ impl VectorIndex {
                             if let Ok(candidate_doc_id) = self.doc_id_at(candidate) {
                                 if candidate_doc_id == entry.doc_id {
                                     let flags = rec.flags | RECORD_FLAG_TOMBSTONE;
-                                    let _ = self.set_record_flags(candidate, flags);
+                                    if let Err(err) = self.set_record_flags(candidate, flags) {
+                                        tracing::warn!(
+                                            target: "frankensearch.index",
+                                            path = %self.path.display(),
+                                            candidate_index = candidate,
+                                            doc_id = %entry.doc_id,
+                                            error = %err,
+                                            "WAL replay: failed to tombstone superseded record; \
+                                             duplicate may persist until next compaction"
+                                        );
+                                    }
                                     break;
                                 }
                             }

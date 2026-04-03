@@ -501,6 +501,7 @@ impl SyncRerank for DaemonFallbackReranker {
                     doc_id: doc.doc_id.clone(),
                     score: scores.get(index).copied().unwrap_or(0.0),
                     original_rank: index,
+                    raw_logit: None,
                 })
                 .collect()),
             Err(failure) => {
@@ -613,6 +614,7 @@ mod tests {
                     doc_id: doc.doc_id.clone(),
                     score: 10.0 - idx as f32,
                     original_rank: idx,
+                    raw_logit: None,
                 })
                 .collect())
         }

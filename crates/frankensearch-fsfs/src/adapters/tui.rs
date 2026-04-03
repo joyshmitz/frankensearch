@@ -1165,90 +1165,120 @@ pub struct FsfsShowcasePortingSpec {
 }
 
 impl FsfsShowcasePortingSpec {
+    /// Build the porting spec from the shell model's live configuration.
+    ///
+    /// The surface-to-screen mappings are canonical fsfs design decisions, but
+    /// palette routes are filtered against the shell's registered palette actions
+    /// and mappings are filtered to screens present in the navigation model.
     #[must_use]
-    pub fn from_shell(_shell: &FsfsTuiShellModel) -> Self {
+    pub fn from_shell(shell: &FsfsTuiShellModel) -> Self {
+        let registered_screens: BTreeSet<FsfsScreen> =
+            shell.navigation.screen_order.iter().copied().collect();
+        let registered_actions: BTreeSet<&str> = shell
+            .palette
+            .actions
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+
+        // Canonical surface → (screen, routes) mappings. Routes are filtered
+        // to only include actions the shell model actually registers.
+        let canonical_mappings: Vec<(InteractionSurfaceKind, FsfsScreen, Vec<PaletteIntentRoute>)> = vec![
+            (
+                InteractionSurfaceKind::Search,
+                FsfsScreen::Search,
+                vec![
+                    PaletteIntentRoute::new(
+                        PaletteIntent::FocusQuery,
+                        "search.focus_query",
+                        Some(InteractionSurfaceKind::Search),
+                        false,
+                    ),
+                    PaletteIntentRoute::new(
+                        PaletteIntent::RepeatQuery,
+                        "search.repeat_last",
+                        Some(InteractionSurfaceKind::Search),
+                        false,
+                    ),
+                ],
+            ),
+            (
+                InteractionSurfaceKind::Results,
+                FsfsScreen::Search,
+                vec![
+                    PaletteIntentRoute::new(
+                        PaletteIntent::NavigateSurface,
+                        "nav.fsfs.search",
+                        Some(InteractionSurfaceKind::Results),
+                        false,
+                    ),
+                    PaletteIntentRoute::new(
+                        PaletteIntent::ToggleExplainability,
+                        "explain.toggle_panel",
+                        Some(InteractionSurfaceKind::Explainability),
+                        true,
+                    ),
+                ],
+            ),
+            (
+                InteractionSurfaceKind::Operations,
+                FsfsScreen::OpsTimeline,
+                vec![
+                    PaletteIntentRoute::new(
+                        PaletteIntent::OpenTimeline,
+                        "ops.open_timeline",
+                        Some(InteractionSurfaceKind::Operations),
+                        false,
+                    ),
+                    PaletteIntentRoute::new(
+                        PaletteIntent::PauseIndexing,
+                        "index.pause",
+                        Some(InteractionSurfaceKind::Operations),
+                        false,
+                    ),
+                    PaletteIntentRoute::new(
+                        PaletteIntent::ResumeIndexing,
+                        "index.resume",
+                        Some(InteractionSurfaceKind::Operations),
+                        false,
+                    ),
+                ],
+            ),
+            (
+                InteractionSurfaceKind::Explainability,
+                FsfsScreen::Explainability,
+                vec![
+                    PaletteIntentRoute::new(
+                        PaletteIntent::ToggleExplainability,
+                        "explain.toggle_panel",
+                        Some(InteractionSurfaceKind::Explainability),
+                        false,
+                    ),
+                    PaletteIntentRoute::new(
+                        PaletteIntent::ReplayTrace,
+                        REPLAY_TRACE_ACTION_ID,
+                        Some(InteractionSurfaceKind::Explainability),
+                        true,
+                    ),
+                ],
+            ),
+        ];
+
+        let mappings = canonical_mappings
+            .into_iter()
+            .filter(|(_, screen, _)| registered_screens.contains(screen))
+            .map(|(surface, screen, routes)| {
+                let live_routes: Vec<PaletteIntentRoute> = routes
+                    .into_iter()
+                    .filter(|route| registered_actions.contains(route.action_id.as_str()))
+                    .collect();
+                FsfsShowcaseSurfaceMapping::new(surface, screen, live_routes)
+            })
+            .collect();
+
         Self {
             interaction_spec: ShowcaseInteractionSpec::canonical(),
-            mappings: vec![
-                FsfsShowcaseSurfaceMapping::new(
-                    InteractionSurfaceKind::Search,
-                    FsfsScreen::Search,
-                    vec![
-                        PaletteIntentRoute::new(
-                            PaletteIntent::FocusQuery,
-                            "search.focus_query",
-                            Some(InteractionSurfaceKind::Search),
-                            false,
-                        ),
-                        PaletteIntentRoute::new(
-                            PaletteIntent::RepeatQuery,
-                            "search.repeat_last",
-                            Some(InteractionSurfaceKind::Search),
-                            false,
-                        ),
-                    ],
-                ),
-                FsfsShowcaseSurfaceMapping::new(
-                    InteractionSurfaceKind::Results,
-                    FsfsScreen::Search,
-                    vec![
-                        PaletteIntentRoute::new(
-                            PaletteIntent::NavigateSurface,
-                            "nav.fsfs.search",
-                            Some(InteractionSurfaceKind::Results),
-                            false,
-                        ),
-                        PaletteIntentRoute::new(
-                            PaletteIntent::ToggleExplainability,
-                            "explain.toggle_panel",
-                            Some(InteractionSurfaceKind::Explainability),
-                            true,
-                        ),
-                    ],
-                ),
-                FsfsShowcaseSurfaceMapping::new(
-                    InteractionSurfaceKind::Operations,
-                    FsfsScreen::OpsTimeline,
-                    vec![
-                        PaletteIntentRoute::new(
-                            PaletteIntent::OpenTimeline,
-                            "ops.open_timeline",
-                            Some(InteractionSurfaceKind::Operations),
-                            false,
-                        ),
-                        PaletteIntentRoute::new(
-                            PaletteIntent::PauseIndexing,
-                            "index.pause",
-                            Some(InteractionSurfaceKind::Operations),
-                            false,
-                        ),
-                        PaletteIntentRoute::new(
-                            PaletteIntent::ResumeIndexing,
-                            "index.resume",
-                            Some(InteractionSurfaceKind::Operations),
-                            false,
-                        ),
-                    ],
-                ),
-                FsfsShowcaseSurfaceMapping::new(
-                    InteractionSurfaceKind::Explainability,
-                    FsfsScreen::Explainability,
-                    vec![
-                        PaletteIntentRoute::new(
-                            PaletteIntent::ToggleExplainability,
-                            "explain.toggle_panel",
-                            Some(InteractionSurfaceKind::Explainability),
-                            false,
-                        ),
-                        PaletteIntentRoute::new(
-                            PaletteIntent::ReplayTrace,
-                            REPLAY_TRACE_ACTION_ID,
-                            Some(InteractionSurfaceKind::Explainability),
-                            true,
-                        ),
-                    ],
-                ),
-            ],
+            mappings,
         }
     }
 
@@ -1975,7 +2005,7 @@ mod tests {
     }
 
     #[test]
-    fn showcase_mapping_validation_rejects_missing_required_action() {
+    fn showcase_from_shell_filters_out_missing_palette_action() {
         let mut shell = FsfsTuiShellModel::from_config(&FsfsConfig::default());
         shell
             .palette
@@ -1983,14 +2013,19 @@ mod tests {
             .retain(|action| action.id != REPLAY_TRACE_ACTION_ID);
 
         let spec = shell.showcase_porting_spec();
-        let err = spec
-            .validate(&shell)
-            .expect_err("missing required showcase action should fail");
-        assert!(matches!(
-            err,
-            TuiModelValidationError::ShowcaseMappingMissingAction(id)
-                if id == REPLAY_TRACE_ACTION_ID
-        ));
+        // from_shell now filters routes against registered palette actions,
+        // so the removed action should not appear in any mapping.
+        for mapping in &spec.mappings {
+            for route in &mapping.palette_routes {
+                assert_ne!(
+                    route.action_id, REPLAY_TRACE_ACTION_ID,
+                    "route for removed action should have been filtered out"
+                );
+            }
+        }
+        // Validation should still pass since the filtered spec is consistent.
+        spec.validate(&shell)
+            .expect("spec with filtered routes should validate");
     }
 
     // ─── bd-3jpu tests begin ───
