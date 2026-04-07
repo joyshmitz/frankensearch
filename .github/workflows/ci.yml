@@ -425,19 +425,14 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # NOTE: Full builds (with embedded-models / fastembed) require ort/ONNX Runtime,
+    # which only provides prebuilt binaries for aarch64-apple-darwin, x86_64-pc-windows-msvc,
+    # and x86_64-unknown-linux-gnu. Linux musl and x86_64-apple-darwin are only available
+    # as lite builds (--no-default-features) — see release-build-lite job below.
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            build_tool: zigbuild
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            build_tool: zigbuild
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            build_tool: cargo
           - os: macos-15
             target: aarch64-apple-darwin
             build_tool: cargo
@@ -489,16 +484,6 @@ jobs:
           shared-key: release-${{ matrix.target }}-nightly
           cache-targets: true
 
-      - name: Setup Zig (Linux cross-musl builds)
-        if: matrix.build_tool == 'zigbuild'
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.12.0
-
-      - name: Install cargo-zigbuild (Linux cross-musl builds)
-        if: matrix.build_tool == 'zigbuild'
-        run: cargo install cargo-zigbuild --locked
-
       - name: Add Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -508,14 +493,7 @@ jobs:
           set -euo pipefail
           target="${{ matrix.target }}"
           extra_features=""
-          if [[ "${target}" == *"-musl"* ]] || [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
-            extra_features="--features vendored-openssl"
-          fi
-          if [[ "${{ matrix.build_tool }}" == "zigbuild" ]]; then
-            cargo zigbuild -p frankensearch-fsfs --release --target "${target}" ${extra_features}
-          else
-            cargo build -p frankensearch-fsfs --release --target "${target}" ${extra_features}
-          fi
+          cargo build -p frankensearch-fsfs --release --target "${target}" ${extra_features}
 
       - name: Package archive + checksum
         shell: bash
