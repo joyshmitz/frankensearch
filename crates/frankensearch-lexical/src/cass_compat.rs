@@ -1206,7 +1206,10 @@ fn cjk_bigrams(s: &str) -> Vec<String> {
 
 /// Build a query that requires ALL bigrams to match in at least one field.
 /// This mirrors how the tokenizer indexes CJK text.
-fn cass_build_cjk_term_query(bigrams: &[String], fields: &CassFields) -> Option<Box<dyn Query>> {
+fn cass_build_cjk_term_query(
+    bigrams: &[String],
+    fields: &CassFields,
+) -> Option<Box<dyn Query>> {
     if bigrams.is_empty() {
         return None;
     }
@@ -1617,7 +1620,9 @@ mod cass_query_tests {
 
     #[test]
     fn cjk_bigram_single_char_emits_unigram() {
-        let regex_tok = RegexTokenizer::new(r"[\u4E00-\u9FFF]+").unwrap();
+        let regex_tok = RegexTokenizer::new(
+            r"[\u4E00-\u9FFF]+"
+        ).unwrap();
         let mut analyzer = TextAnalyzer::builder(regex_tok)
             .filter(CjkBigramDecompose)
             .build();
@@ -1633,8 +1638,9 @@ mod cass_query_tests {
     #[test]
     fn cjk_bigram_passes_through_ascii() {
         // ASCII tokens should pass through unchanged.
-        let regex_tok =
-            RegexTokenizer::new(r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF]+").unwrap();
+        let regex_tok = RegexTokenizer::new(
+            r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF]+"
+        ).unwrap();
         let mut analyzer = TextAnalyzer::builder(regex_tok)
             .filter(CjkBigramDecompose)
             .build();
