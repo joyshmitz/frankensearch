@@ -2363,13 +2363,12 @@ fn archive_entry_path_is_safe(entry: &str) -> bool {
 
 fn validate_archive_paths(archive_path: &Path, is_zip: bool) -> SearchResult<()> {
     let mut cmd = std::process::Command::new("tar");
-    if is_zip {
-        cmd.args(["-tf"]);
-    } else {
-        cmd.args(["-tJf"]);
+    cmd.arg("--list");
+    if !is_zip {
+        cmd.arg("--xz");
     }
     let listing =
-        cmd.arg("--")
+        cmd.arg("--file")
             .arg(archive_path)
             .output()
             .map_err(|e| SearchError::SubsystemError {
@@ -3639,10 +3638,10 @@ impl FsfsRuntime {
         validate_archive_paths(&archive_path, is_zip)?;
         if !is_zip {
             let tar_status = std::process::Command::new("tar")
-                .args(["-xJf", "-C"])
-                .arg(&extract_dir)
-                .arg("--")
+                .args(["--extract", "--xz", "--file"])
                 .arg(&archive_path)
+                .arg("--directory")
+                .arg(&extract_dir)
                 .status()
                 .map_err(|e| SearchError::SubsystemError {
                     subsystem: "fsfs.update.tar",
@@ -3658,10 +3657,10 @@ impl FsfsRuntime {
             }
         } else {
             let unzip_status = std::process::Command::new("tar")
-                .args(["-xf", "-C"])
-                .arg(&extract_dir)
-                .arg("--")
+                .args(["--extract", "--file"])
                 .arg(&archive_path)
+                .arg("--directory")
+                .arg(&extract_dir)
                 .status()
                 .map_err(|e| SearchError::SubsystemError {
                     subsystem: "fsfs.update.unzip",
