@@ -539,7 +539,14 @@ fn e2e_index_search_verify_recall() {
     // Step 3: Index the corpus
     let index_start = Instant::now();
     let (stdout, stderr, code) = run_fsfs(
-        &["index", corpus_dir.to_str().unwrap(), "--format", "json"],
+        &[
+            "index",
+            corpus_dir.to_str().unwrap(),
+            "--format",
+            "json",
+            "--index-dir",
+            index_dir.to_str().unwrap(),
+        ],
         &config_path,
     );
     let index_elapsed = index_start.elapsed();
@@ -701,7 +708,14 @@ fn e2e_search_empty_query_returns_no_results() {
 
     // Index first
     let (_, _, code) = run_fsfs(
-        &["index", corpus_dir.to_str().unwrap(), "--format", "json"],
+        &[
+            "index",
+            corpus_dir.to_str().unwrap(),
+            "--format",
+            "json",
+            "--index-dir",
+            index_dir.to_str().unwrap(),
+        ],
         &config_path,
     );
     assert_eq!(code, 0, "index failed");
@@ -752,7 +766,14 @@ fn e2e_search_json_output_structural_contract() {
 
     // Index
     let (_, _, code) = run_fsfs(
-        &["index", corpus_dir.to_str().unwrap(), "--format", "json"],
+        &[
+            "index",
+            corpus_dir.to_str().unwrap(),
+            "--format",
+            "json",
+            "--index-dir",
+            index_dir.to_str().unwrap(),
+        ],
         &config_path,
     );
     assert_eq!(code, 0, "index failed");
