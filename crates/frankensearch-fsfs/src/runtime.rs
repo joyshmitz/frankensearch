@@ -3639,10 +3639,10 @@ impl FsfsRuntime {
         validate_archive_paths(&archive_path, is_zip)?;
         if !is_zip {
             let tar_status = std::process::Command::new("tar")
-                .args(["-xJf"])
-                .arg(&archive_path)
-                .arg("-C")
+                .args(["-xJf", "-C"])
                 .arg(&extract_dir)
+                .arg("--")
+                .arg(&archive_path)
                 .status()
                 .map_err(|e| SearchError::SubsystemError {
                     subsystem: "fsfs.update.tar",
@@ -3658,10 +3658,10 @@ impl FsfsRuntime {
             }
         } else {
             let unzip_status = std::process::Command::new("tar")
-                .args(["-xf"])
-                .arg(&archive_path)
-                .arg("-C")
+                .args(["-xf", "-C"])
                 .arg(&extract_dir)
+                .arg("--")
+                .arg(&archive_path)
                 .status()
                 .map_err(|e| SearchError::SubsystemError {
                     subsystem: "fsfs.update.unzip",
