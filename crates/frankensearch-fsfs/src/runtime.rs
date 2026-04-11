@@ -2185,8 +2185,23 @@ const GITHUB_REPO: &str = "frankensearch";
 
 #[must_use]
 fn is_trusted_release_url(url: &str) -> bool {
-    let expected_prefix = format!("https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases");
-    url.starts_with(&expected_prefix)
+    let expected_path = format!("{GITHUB_OWNER}/{GITHUB_REPO}/releases");
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let Some((host, path)) = rest.split_once('/') else {
+        return false;
+    };
+    if host != "github.com" {
+        return false;
+    }
+    if !path.starts_with(&expected_path) {
+        return false;
+    }
+    matches!(
+        path.as_bytes().get(expected_path.len()),
+        None | Some(b'/' | b'?' | b'#')
+    )
 }
 
 /// Fetch the latest release tag from GitHub Releases via `curl`.
@@ -19554,6 +19569,12 @@ mod tests {
         assert!(super::is_trusted_release_url(
             "https://github.com/Dicklesworthstone/frankensearch/releases/download/v0.3.0/SHA256SUMS"
         ));
+        assert!(super::is_trusted_release_url(
+            "https://github.com/Dicklesworthstone/frankensearch/releases?per_page=1"
+        ));
+        assert!(super::is_trusted_release_url(
+            "https://github.com/Dicklesworthstone/frankensearch/releases#latest"
+        ));
     }
 
     #[test]
@@ -19563,6 +19584,12 @@ mod tests {
         ));
         assert!(!super::is_trusted_release_url(
             "https://github.com/attacker/malware/releases"
+        ));
+        assert!(!super::is_trusted_release_url(
+            "https://github.com/Dicklesworthstone/frankensearch/releasesmalicious"
+        ));
+        assert!(!super::is_trusted_release_url(
+            "https://github.com/Dicklesworthstone/frankensearch/releases@evil.com"
         ));
         assert!(!super::is_trusted_release_url(""));
         assert!(!super::is_trusted_release_url(
