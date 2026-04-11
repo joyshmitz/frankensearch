@@ -476,6 +476,13 @@ fn run_config_init_command(
             reason: "unable to determine config path".to_owned(),
         })?;
     let path = target.to_path_buf();
+    if path.exists() && path.is_dir() {
+        return Err(SearchError::InvalidConfig {
+            field: "config.init.path".to_owned(),
+            value: path.display().to_string(),
+            reason: "config path points to a directory".to_owned(),
+        });
+    }
     let template = toml::to_string_pretty(&FsfsConfig::default()).map_err(|source| {
         SearchError::SubsystemError {
             subsystem: CONFIG_SUBSYSTEM,
@@ -970,8 +977,9 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliCommand, ConfigAction, allow_missing_explicit_config, apply_cli_env_overrides,
-        expand_cli_config_path, parse_bool_token, run_config_set_command,
+        CliCommand, ConfigAction, SearchError, allow_missing_explicit_config,
+        apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, run_config_init_command,
+        run_config_set_command,
     };
     use frankensearch_fsfs::CliInput;
     use std::collections::HashMap;
@@ -1077,6 +1085,30 @@ mod tests {
                 .and_then(|v| v.get("fast_only"))
                 .and_then(Value::as_bool),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn config_init_rejects_directory_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config-dir");
+        std::fs::create_dir_all(&path).expect("mkdir config-dir");
+        let cli = CliInput {
+            format: frankensearch_fsfs::OutputFormat::Json,
+            ..CliInput::default()
+        };
+
+        let err = run_config_init_command(&cli, Some(path.as_path()), None, None)
+            .expect_err("init should reject directory path");
+        assert!(
+            matches!(
+                err,
+                SearchError::InvalidConfig {
+                    ref field,
+                    ..
+                } if field == "config.init.path"
+            ),
+            "unexpected error: {err:?}"
         );
     }
 
