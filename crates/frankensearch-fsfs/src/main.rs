@@ -476,13 +476,7 @@ fn run_config_init_command(
             reason: "unable to determine config path".to_owned(),
         })?;
     let path = target.to_path_buf();
-    if path.exists() && path.is_dir() {
-        return Err(SearchError::InvalidConfig {
-            field: "config.init.path".to_owned(),
-            value: path.display().to_string(),
-            reason: "config path points to a directory".to_owned(),
-        });
-    }
+    reject_directory_path(&path, "config.init.path")?;
     let template = toml::to_string_pretty(&FsfsConfig::default()).map_err(|source| {
         SearchError::SubsystemError {
             subsystem: CONFIG_SUBSYSTEM,
@@ -543,6 +537,21 @@ fn resolve_writable_config_path(
             value: String::new(),
             reason: "unable to determine config path; use --config to specify one".to_owned(),
         })
+        .and_then(|path| {
+            reject_directory_path(&path, "config.path")?;
+            Ok(path)
+        })
+}
+
+fn reject_directory_path(path: &Path, field: &'static str) -> SearchResult<()> {
+    if path.exists() && path.is_dir() {
+        return Err(SearchError::InvalidConfig {
+            field: field.to_owned(),
+            value: path.display().to_string(),
+            reason: "config path points to a directory".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -979,7 +988,7 @@ mod tests {
     use super::{
         CliCommand, ConfigAction, SearchError, allow_missing_explicit_config,
         apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, run_config_init_command,
-        run_config_set_command,
+        run_config_reset_command, run_config_set_command,
     };
     use frankensearch_fsfs::CliInput;
     use std::collections::HashMap;
@@ -1107,6 +1116,55 @@ mod tests {
                     ref field,
                     ..
                 } if field == "config.init.path"
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_directory_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config-dir");
+        std::fs::create_dir_all(&path).expect("mkdir config-dir");
+        let cli = CliInput {
+            format: frankensearch_fsfs::OutputFormat::Json,
+            ..CliInput::default()
+        };
+
+        let err = run_config_set_command(
+            &cli,
+            Some(path.as_path()),
+            None,
+            None,
+            "search.fast_only",
+            "true",
+        )
+        .expect_err("set should reject directory path");
+        assert!(
+            matches!(
+                err,
+                SearchError::InvalidConfig { ref field, .. } if field == "config.path"
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn config_reset_rejects_directory_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config-dir");
+        std::fs::create_dir_all(&path).expect("mkdir config-dir");
+        let cli = CliInput {
+            format: frankensearch_fsfs::OutputFormat::Json,
+            ..CliInput::default()
+        };
+
+        let err = run_config_reset_command(&cli, Some(path.as_path()), None, None)
+            .expect_err("reset should reject directory path");
+        assert!(
+            matches!(
+                err,
+                SearchError::InvalidConfig { ref field, .. } if field == "config.path"
             ),
             "unexpected error: {err:?}"
         );
