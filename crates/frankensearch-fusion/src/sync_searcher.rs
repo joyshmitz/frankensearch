@@ -214,7 +214,6 @@ impl SyncTwoTierSearcher {
             }
         };
 
-        metrics.phase2_vectors_searched = quality_scores.len();
         let blend_started = Instant::now();
         let quality_hits = fast_hits
             .iter()
@@ -227,6 +226,7 @@ impl SyncTwoTierSearcher {
                 })
             })
             .collect::<Vec<_>>();
+        metrics.phase2_vectors_searched = quality_hits.len();
         let blended = blend_two_tier(
             &fast_hits,
             &quality_hits,

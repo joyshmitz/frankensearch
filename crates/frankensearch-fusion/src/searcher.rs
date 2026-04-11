@@ -1196,8 +1196,6 @@ impl TwoTierSearcher {
         // power for non-idempotent calibrators (TemperatureScaling, PlattScaling,
         // IsotonicRegression).
 
-        metrics.phase2_vectors_searched = fast_hits.iter().filter(|h| h.index != u32::MAX).count();
-
         let quality_scores = self
             .index
             .quality_scores_for_hits(&quality_vec, &fast_hits)?;
@@ -1216,6 +1214,7 @@ impl TwoTierSearcher {
                 });
             }
         }
+        metrics.phase2_vectors_searched = quality_hits.len();
         self.apply_score_calibration_to_hits(&mut quality_hits);
 
         // Blend fast + quality scores.
