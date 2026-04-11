@@ -71,6 +71,16 @@ struct ConfigStageSnapshot {
     changed_keys: HashSet<String>,
 }
 
+fn allow_missing_explicit_config(command: CliCommand, action: Option<&ConfigAction>) -> bool {
+    if command != CliCommand::Config {
+        return false;
+    }
+    matches!(
+        action,
+        Some(ConfigAction::Init | ConfigAction::Reset | ConfigAction::Set { .. })
+    )
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> SearchResult<()> {
     let mut cli_input = parse_cli_args(std::env::args().skip(1))?;
@@ -96,9 +106,11 @@ fn main() -> SearchResult<()> {
     let mut explicit_config_path = None;
     let mut project_config_path = None;
     let mut user_config_path = None;
+    let allow_missing_config =
+        allow_missing_explicit_config(cli_input.command, cli_input.config_action.as_ref());
     let loaded = if let Some(path) = cli_input.overrides.config_path.as_deref() {
         let config_path = expand_cli_config_path(path, &home_dir);
-        if !config_path.exists() {
+        if !config_path.exists() && !allow_missing_config {
             return Err(SearchError::InvalidConfig {
                 field: "config_file".to_owned(),
                 value: config_path.display().to_string(),
@@ -958,7 +970,8 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_env_overrides, expand_cli_config_path, parse_bool_token, run_config_set_command,
+        CliCommand, ConfigAction, allow_missing_explicit_config, apply_cli_env_overrides,
+        expand_cli_config_path, parse_bool_token, run_config_set_command,
     };
     use frankensearch_fsfs::CliInput;
     use std::collections::HashMap;
@@ -1065,5 +1078,47 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn allow_missing_explicit_config_for_mutating_actions() {
+        assert!(allow_missing_explicit_config(
+            CliCommand::Config,
+            Some(&ConfigAction::Init)
+        ));
+        assert!(allow_missing_explicit_config(
+            CliCommand::Config,
+            Some(&ConfigAction::Reset)
+        ));
+        assert!(allow_missing_explicit_config(
+            CliCommand::Config,
+            Some(&ConfigAction::Set {
+                key: "search.rrf_k".to_owned(),
+                value: "75".to_owned(),
+            })
+        ));
+    }
+
+    #[test]
+    fn allow_missing_explicit_config_rejects_read_actions() {
+        assert!(!allow_missing_explicit_config(CliCommand::Config, None));
+        assert!(!allow_missing_explicit_config(
+            CliCommand::Config,
+            Some(&ConfigAction::Show)
+        ));
+        assert!(!allow_missing_explicit_config(
+            CliCommand::Config,
+            Some(&ConfigAction::Get {
+                key: "search.rrf_k".to_owned(),
+            })
+        ));
+        assert!(!allow_missing_explicit_config(
+            CliCommand::Config,
+            Some(&ConfigAction::Validate)
+        ));
+        assert!(!allow_missing_explicit_config(
+            CliCommand::Search,
+            Some(&ConfigAction::Init)
+        ));
     }
 }
