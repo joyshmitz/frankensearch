@@ -733,20 +733,22 @@ impl TwoTierSearcher {
                     }
                 },
             }
-        } else if self.should_run_quality() {
-            if quality_circuit_open {
-                metrics.skip_reason = Some("circuit_breaker_open".to_owned());
-            } else if quality_phase_gate_skip {
-                metrics.skip_reason = Some("phase_gate_skip_quality".to_owned());
-            } else if initial_hits.is_empty() {
-                metrics.skip_reason = Some("no_fast_phase_candidates".to_owned());
+        } else if metrics.skip_reason.is_none() {
+            if self.should_run_quality() {
+                if quality_circuit_open {
+                    metrics.skip_reason = Some("circuit_breaker_open".to_owned());
+                } else if quality_phase_gate_skip {
+                    metrics.skip_reason = Some("phase_gate_skip_quality".to_owned());
+                } else if initial_hits.is_empty() {
+                    metrics.skip_reason = Some("no_fast_phase_candidates".to_owned());
+                } else {
+                    metrics.skip_reason = Some("vector_index_unavailable".to_owned());
+                }
+            } else if self.config.fast_only {
+                metrics.skip_reason = Some("fast_only".to_owned());
             } else {
-                metrics.skip_reason = Some("vector_index_unavailable".to_owned());
+                metrics.skip_reason = Some("no_quality_embedder".to_owned());
             }
-        } else if self.config.fast_only {
-            metrics.skip_reason = Some("fast_only".to_owned());
-        } else {
-            metrics.skip_reason = Some("no_quality_embedder".to_owned());
         }
 
         if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
@@ -1066,6 +1068,7 @@ impl TwoTierSearcher {
                         error = %embed_err,
                         "fast embedding failed, falling back to lexical-only results"
                     );
+                    metrics.skip_reason = Some("fast_embed_failed".to_owned());
                     Ok(lexical.iter().take(k).cloned().collect())
                 } else {
                     Err(embed_err)
@@ -3577,10 +3580,7 @@ mod tests {
                 !saw_refinement_failed,
                 "skipping refinement should not emit refinement failure"
             );
-            assert_eq!(
-                metrics.skip_reason.as_deref(),
-                Some("vector_index_unavailable")
-            );
+            assert_eq!(metrics.skip_reason.as_deref(), Some("fast_embed_failed"));
         });
     }
 
