@@ -244,6 +244,22 @@ impl TwoTierConfig {
     /// The TOML file uses flat keys matching the field names of `TwoTierConfig`.
     #[must_use]
     pub fn optimized() -> Self {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let exe_data_path = exe_dir.join("../data/optimized_params.toml");
+                if exe_data_path.exists() {
+                    return Self::from_optimized_file(&exe_data_path);
+                }
+            }
+        }
+
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_data_path = cwd.join("data/optimized_params.toml");
+            if cwd_data_path.exists() {
+                return Self::from_optimized_file(&cwd_data_path);
+            }
+        }
+
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let workspace_root = std::path::Path::new(manifest_dir)
             .parent()
@@ -252,6 +268,50 @@ impl TwoTierConfig {
         let path = workspace_root.join("data").join("optimized_params.toml");
 
         Self::from_optimized_file(&path)
+    }
+
+    /// Validates the configuration parameters to prevent degenerate behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::InvalidConfig` if any parameter is out of bounds.
+    pub fn validate(&self) -> Result<(), crate::error::SearchError> {
+        if self.candidate_multiplier < 1 {
+            return Err(crate::error::SearchError::InvalidConfig {
+                field: "candidate_multiplier".to_owned(),
+                value: self.candidate_multiplier.to_string(),
+                reason: "must be >= 1".to_owned(),
+            });
+        }
+        if !self.rrf_k.is_finite() || self.rrf_k <= 0.0 {
+            return Err(crate::error::SearchError::InvalidConfig {
+                field: "rrf_k".to_owned(),
+                value: self.rrf_k.to_string(),
+                reason: "must be finite and > 0.0".to_owned(),
+            });
+        }
+        if !self.quality_weight.is_finite() || !(0.0..=1.0).contains(&self.quality_weight) {
+            return Err(crate::error::SearchError::InvalidConfig {
+                field: "quality_weight".to_owned(),
+                value: self.quality_weight.to_string(),
+                reason: "must be in range [0.0, 1.0]".to_owned(),
+            });
+        }
+        if self.quality_timeout_ms < 10 {
+            return Err(crate::error::SearchError::InvalidConfig {
+                field: "quality_timeout_ms".to_owned(),
+                value: self.quality_timeout_ms.to_string(),
+                reason: "must be >= 10".to_owned(),
+            });
+        }
+        if self.graph_ranking_enabled && (!self.graph_ranking_weight.is_finite() || !(0.0..=1.0).contains(&self.graph_ranking_weight)) {
+            return Err(crate::error::SearchError::InvalidConfig {
+                field: "graph_ranking_weight".to_owned(),
+                value: self.graph_ranking_weight.to_string(),
+                reason: "must be in range [0.0, 1.0]".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Attach a telemetry exporter.

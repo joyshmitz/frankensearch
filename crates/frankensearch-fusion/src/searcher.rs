@@ -146,6 +146,13 @@ impl TwoTierSearcher {
         fast_embedder: Arc<dyn Embedder>,
         config: TwoTierConfig,
     ) -> Self {
+        if let Err(e) = config.validate() {
+            tracing::warn!(
+                error = %e,
+                "Invalid TwoTierConfig supplied; search behavior may be degenerate"
+            );
+        }
+
         Self {
             index,
             fast_embedder,
