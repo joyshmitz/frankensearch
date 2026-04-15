@@ -38,7 +38,7 @@ pub enum SloStatus {
     Red,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InstanceHealth {
     pub lifecycle_state: LifecycleState,
     pub slo_status: SloStatus,
