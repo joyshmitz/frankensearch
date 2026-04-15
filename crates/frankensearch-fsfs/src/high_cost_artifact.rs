@@ -463,7 +463,7 @@ mod tests {
             "/data/archive.zip".to_owned(),
             DefaultAction::IndexFull,
             false,
-            "".to_owned(),
+            String::new(),
             "Rejected - no justification".to_owned(),
             "FSFS_OVERRIDE_REJECTED".to_owned(),
         );

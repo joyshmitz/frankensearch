@@ -195,8 +195,8 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
         );
     });
 
-    let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
-    let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+    let actual_trimmed = actual.trim_end_matches(['\n', '\r']);
+    let expected_trimmed = expected.trim_end_matches(['\n', '\r']);
 
     let actual_value = serde_json::from_str::<serde_json::Value>(actual_trimmed);
     let expected_value = serde_json::from_str::<serde_json::Value>(expected_trimmed);

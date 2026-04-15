@@ -40,8 +40,8 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
         );
     });
 
-    let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
-    let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+    let actual_trimmed = actual.trim_end_matches(['\n', '\r']);
+    let expected_trimmed = expected.trim_end_matches(['\n', '\r']);
 
     if actual_trimmed != expected_trimmed {
         let actual_path = golden_path.with_extension("actual.json");
@@ -55,10 +55,10 @@ fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
 }
 
 fn stabilize_bundle(bundle: &mut CliE2eArtifactBundle) {
-    bundle.manifest.ts = "2026-02-14T00:00:00Z".to_owned();
-    bundle.manifest.run_id = "01JABCDEF00000000000000000".to_owned();
+    "2026-02-14T00:00:00Z".clone_into(&mut bundle.manifest.ts);
+    "01JABCDEF00000000000000000".clone_into(&mut bundle.manifest.run_id);
     for event in &mut bundle.events {
-        event.ts = "2026-02-14T00:00:00Z".to_owned();
+        "2026-02-14T00:00:00Z".clone_into(&mut event.ts);
     }
     // We do not freeze replay_command fully if it varies, but we can set it to a stable string
     bundle.replay_command = format!("frankensearch --seed 42 {}", bundle.scenario.args.join(" "));

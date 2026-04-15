@@ -1141,6 +1141,10 @@ pub struct ContractIndexingConfig {
 pub struct ContractSearchConfig {
     pub default_limit: usize,
     pub quality_weight: f64,
+    #[serde(
+        serialize_with = "serialize_rrf_k",
+        deserialize_with = "deserialize_rrf_k"
+    )]
     pub rrf_k: f64,
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
@@ -2909,6 +2913,28 @@ fn parse_f64(value: &str, field: &str) -> SearchResult<f64> {
         });
     }
     Ok(parsed)
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_rrf_k<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if value.fract() == 0.0 && *value >= 0.0 {
+        let whole = format!("{value:.0}")
+            .parse::<u64>()
+            .map_err(serde::ser::Error::custom)?;
+        serializer.serialize_u64(whole)
+    } else {
+        serializer.serialize_f64(*value)
+    }
+}
+
+fn deserialize_rrf_k<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    f64::deserialize(deserializer)
 }
 
 fn normalize_path(path: &Path) -> String {
