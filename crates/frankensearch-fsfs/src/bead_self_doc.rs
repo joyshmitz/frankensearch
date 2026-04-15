@@ -13,7 +13,7 @@ pub enum WaveAssignment {
     ExceptionRegister,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DebtItem {
     pub id: String,
     pub title: String,
@@ -34,21 +34,21 @@ pub struct DebtItem {
     pub recommended_wave: WaveAssignment,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScoringMetadata {
     pub risk_score: String,
     pub owner_suggestion: String,
     pub wave_assignment: std::collections::HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InventorySource {
     pub issues_jsonl: String,
     pub insights_data_hash: String,
     pub insights_generated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SelfDocInventory {
     pub generated_at: String,
     pub inventory_date: String,

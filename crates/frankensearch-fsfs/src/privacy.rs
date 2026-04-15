@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeDefaults {
     pub default_roots: Vec<String>,
     pub requires_explicit_opt_in_outside_defaults: bool,
@@ -8,13 +8,13 @@ pub struct ScopeDefaults {
     pub precedence: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PathPolicies {
     pub deny_always_globs: Vec<String>,
     pub allow_with_opt_in_globs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactionConfig {
     pub logs_default_action: String,
     pub explain_default_action: String,
@@ -22,21 +22,21 @@ pub struct RedactionConfig {
     pub deterministic_profile_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreatModel {
     pub local_multi_user_assumed: bool,
     pub same_host_read_risk: bool,
     pub mitigations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TelemetryEmissionRules {
     pub raw_content_allowed: bool,
     pub reason_code_required: bool,
     pub redaction_version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopePrivacyContractDefinition {
     pub kind: String, // "fsfs_scope_privacy_contract_definition"
     pub v: u32,       // 1
@@ -48,7 +48,7 @@ pub struct ScopePrivacyContractDefinition {
     pub telemetry_emission_rules: TelemetryEmissionRules,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedactedArtifact {
     pub kind: String, // "fsfs_scope_redacted_artifact"
     pub v: u32,       // 1
@@ -60,7 +60,7 @@ pub struct RedactedArtifact {
     pub redaction_profile: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeScanDecision {
     pub kind: String, // "fsfs_scope_scan_decision"
     pub v: u32,       // 1

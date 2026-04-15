@@ -32,27 +32,27 @@ pub enum SearchPhase {
     RefinementFailed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchQuery {
     pub text: String,
     pub class: QueryClass,
     pub phase: SearchPhase,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchResults {
     pub result_count: u32,
     pub lexical_count: u32,
     pub semantic_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchMetrics {
     pub latency_us: u64,
     pub memory_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchEvent {
     #[serde(rename = "type")]
     pub event_type: String, // "search"
@@ -71,7 +71,7 @@ pub enum EmbeddingStage {
     Background,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingJob {
     pub job_id: String,
     pub queue_depth: u32,
@@ -87,7 +87,7 @@ pub enum EmbedderTier {
     Quality,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbedderIdentity {
     pub id: String,
     pub tier: EmbedderTier,
@@ -104,7 +104,7 @@ pub enum EmbeddingStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EmbeddingEvent {
     #[serde(rename = "type")]
     pub event_type: String, // "embedding"
@@ -127,7 +127,7 @@ pub enum IndexOperation {
     Snapshot,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexInventory {
     pub words: u64,
     pub tokens: u64,
@@ -144,7 +144,7 @@ pub enum IndexStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexEvent {
     #[serde(rename = "type")]
     pub event_type: String, // "index"
@@ -197,7 +197,7 @@ pub enum TelemetrySeverity {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleEvent {
     #[serde(rename = "type")]
     pub event_type: String, // "lifecycle"

@@ -38,7 +38,7 @@ pub enum SloStatus {
     Red,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstanceHealth {
     pub lifecycle_state: LifecycleState,
     pub slo_status: SloStatus,
@@ -91,7 +91,7 @@ pub enum Severity {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnomalySummary {
     pub active_count: u32,
     pub max_severity: Severity,
@@ -127,7 +127,7 @@ pub struct SnapshotResponse {
     pub instances: Vec<InstanceSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StreamSubscribe {
     pub kind: String, // "stream_subscribe"
     pub v: u32,       // 1
@@ -148,7 +148,7 @@ pub enum FrameType {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventPayload {
     pub event_id: String,
     pub topic: Topic,
@@ -186,14 +186,14 @@ pub struct ControlPayload {
     pub reason_code: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeartbeatPayload {
     pub queue_depth: u32,
     pub max_inflight: u32,
     pub unacked: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorPayload {
     pub code: String,
     pub message: String,

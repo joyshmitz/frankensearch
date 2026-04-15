@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractionGatePolicy {
     pub schema: String, // "interaction-matrix-gate-policy-v1"
     pub generated_at: String,
@@ -10,7 +10,7 @@ pub struct InteractionGatePolicy {
     pub required_failure_artifacts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LaneOwnership {
     pub lane_id: String,
     pub owner_lane: String,
@@ -18,7 +18,7 @@ pub struct LaneOwnership {
     pub escalation: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractionLaneOwnership {
     pub schema: String, // "interaction-lane-ownership-v1"
     pub generated_at: String,
@@ -26,7 +26,7 @@ pub struct InteractionLaneOwnership {
     pub lanes: Vec<LaneOwnership>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompositionMatrixGateSummary {
     pub schema: String, // "composition-matrix-gate-summary-v1"
     pub generated_at: String,
@@ -38,14 +38,14 @@ pub struct CompositionMatrixGateSummary {
     pub ownership_artifact: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EscalationMetadata {
     pub thread_id: String,
     pub ownership_artifact: String,
     pub summary_contract: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InteractionFailureSummary {
     pub schema: String, // "interaction-failure-summary-v1"
     pub generated_at: String,

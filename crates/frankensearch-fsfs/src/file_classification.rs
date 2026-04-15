@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SniffHeuristics {
     pub max_probe_bytes: u32,
     pub binary_byte_threshold_pct: Number,
@@ -33,7 +33,7 @@ pub enum UnknownEncodingAction {
     Quarantine,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncodingPolicy {
     pub primary_detectors: Vec<EncodingDetector>,
     pub normalization: NormalizationPolicy,
@@ -55,7 +55,7 @@ pub enum ChecksumMismatchAction {
     Skip,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CorruptPartialPolicy {
     pub truncated_action: TruncatedAction,
     pub checksum_mismatch_action: ChecksumMismatchAction,

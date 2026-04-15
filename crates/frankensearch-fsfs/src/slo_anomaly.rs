@@ -92,7 +92,7 @@ pub struct Deviation {
     pub z_score: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Suppression {
     pub is_suppressed: bool,
     pub policy_id: Option<String>,

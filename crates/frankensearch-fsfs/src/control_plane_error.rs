@@ -26,7 +26,7 @@ pub enum UiSurface {
     FullScreenPanel,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorVariant {
     pub error_type: ErrorType,
     pub default_severity: SeverityClass,
@@ -35,34 +35,34 @@ pub struct ErrorVariant {
     pub recovery_guidance: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorCatalog {
     pub kind: String, // "control_plane_error_catalog"
     pub v: u32,       // 1
     pub variants: Vec<ErrorVariant>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Correlation {
     pub root_request_id: Option<String>,
     pub parent_event_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UiMapping {
     pub surface: UiSurface,
     pub status_badge: String,
     pub escalation_after_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecoveryInfo {
     pub retry_policy: String, // "none", "immediate", "exponential_backoff"
     pub operator_steps: Vec<String>,
     pub suggested_commands: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlPlaneErrorEvent {
     pub kind: String, // "control_plane_error_event"
     pub v: u32,       // 1
@@ -91,7 +91,7 @@ pub enum Window {
     OneHour,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorAggregation {
     pub kind: String, // "control_plane_error_aggregation"
     pub v: u32,       // 1

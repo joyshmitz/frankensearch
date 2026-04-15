@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartupPolicy {
     pub require_attestation: bool,
     pub require_signature: bool,
@@ -10,7 +10,7 @@ pub struct StartupPolicy {
     pub on_hash_mismatch: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceContractDefinition {
     pub kind: String, // "fsfs_provenance_contract"
     pub schema_version: u32,
@@ -19,7 +19,7 @@ pub struct ProvenanceContractDefinition {
     pub reason_codes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BuildProvenance {
     pub source_commit: String,
     pub build_profile: String,
@@ -27,27 +27,27 @@ pub struct BuildProvenance {
     pub target_triple: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeProvenance {
     pub binary_hash_sha256: String,
     pub config_hash_sha256: String,
     pub index_manifest_hash_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactHash {
     pub path: String,
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Signature {
     pub algorithm: String,
     pub key_id: String,
     pub signature_b64: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceAttestationManifest {
     pub kind: String, // "fsfs_provenance_attestation"
     pub schema_version: u32,
@@ -59,7 +59,8 @@ pub struct ProvenanceAttestationManifest {
     pub signature: Option<Signature>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StartupChecks {
     pub attestation_present: bool,
     pub attestation_parsed: bool,
@@ -70,14 +71,14 @@ pub struct StartupChecks {
     pub index_manifest_hash_match: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceAlert {
     pub reason_code: String,
     pub severity: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenanceStartupCheck {
     pub kind: String, // "fsfs_provenance_startup_check"
     pub schema_version: u32,

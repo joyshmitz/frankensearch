@@ -1,25 +1,25 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StrictModeConfig {
     pub deny_on_ambiguity: bool,
     pub cross_mount_default: bool,
     pub follow_symlink_default: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PermissiveModeConfig {
     pub allow_explicit_include_override: bool,
     pub audit_reason_codes_required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverrideModes {
     pub strict: StrictModeConfig,
     pub permissive: PermissiveModeConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TraversalSafety {
     pub symlink_policy: String, // "follow_bounded", etc.
     pub max_symlink_depth: u32,
@@ -28,7 +28,7 @@ pub struct TraversalSafety {
     pub max_mount_hops: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RootDiscoveryContractDefinition {
     pub kind: String, // "fsfs_root_discovery_contract_definition"
     pub v: u32,       // 1
@@ -38,14 +38,14 @@ pub struct RootDiscoveryContractDefinition {
     pub traversal_safety: TraversalSafety,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuleEvaluation {
     pub source: String,
     pub matched: bool,
     pub effect: String, // "noop", "include", "exclude"
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RootDiscoveryDecision {
     pub kind: String, // "fsfs_root_discovery_decision"
     pub v: u32,       // 1
@@ -59,7 +59,7 @@ pub struct RootDiscoveryDecision {
     pub loop_detected: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RootTraversalGuardEvent {
     pub kind: String, // "fsfs_root_traversal_guard_event"
     pub v: u32,       // 1

@@ -16,7 +16,7 @@ pub enum ComparisonMode {
     StatisticalTolerance,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TierMatrixEntry {
     pub tier: DeterminismTier,
     pub comparison_mode: ComparisonMode,
@@ -34,14 +34,14 @@ pub enum NondeterminismSource {
     RandomSampling,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NondeterminismMitigation {
     pub source: NondeterminismSource,
     pub mitigation: String,
     pub requirement_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TestContract {
     pub unit_replay_count_min: u32,
     pub integration_replay_count_min: u32,
@@ -49,7 +49,8 @@ pub struct TestContract {
     pub required_checks: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoggingRequirements {
     pub seed_in_every_log: bool,
     pub config_hash_in_every_log: bool,
@@ -57,7 +58,7 @@ pub struct LoggingRequirements {
     pub mismatch_reason_codes_required: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeterminismContractDefinition {
     pub kind: String, // "fsfs_determinism_contract_definition"
     pub v: u32,       // 1
@@ -68,14 +69,14 @@ pub struct DeterminismContractDefinition {
     pub logging_requirements: LoggingRequirements,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelVersion {
     pub name: String,
     pub version: String,
     pub digest: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlatformInfo {
     pub os: String,
     pub arch: String,
@@ -88,20 +89,20 @@ pub struct FloatPolicy {
     pub max_delta: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QueryFingerprint {
     pub query_hash: String,
     pub canonicalizer_version: String,
     pub corpus_snapshot_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigSignature {
     pub schema_version: String,
     pub config_hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EvidenceBundle {
     pub manifest_hash: String,
     pub artifact_paths: Vec<String>,
@@ -132,7 +133,7 @@ pub struct TolerancePolicy {
     pub max_delta: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MismatchDiagnostic {
     pub reason_code: String,
     pub field_path: String,

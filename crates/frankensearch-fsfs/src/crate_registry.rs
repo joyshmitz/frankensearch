@@ -18,7 +18,7 @@ pub enum BlockingImpact {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlacementRule {
     pub rule_id: String,
     pub id_pattern: String,
@@ -38,7 +38,7 @@ pub struct PlacementRule {
     pub notes: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChangeManagement {
     pub owner: String,
     pub update_workflow: Vec<String>,
@@ -46,7 +46,7 @@ pub struct ChangeManagement {
     pub diagnostic_output: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CratePlacementRegistry {
     pub version: String,
     pub generated_from: String,

@@ -7,21 +7,21 @@ pub struct GiantLogDetector {
     pub redundancy_ratio_threshold: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VendorGeneratedDetector {
     pub vendor_path_patterns: Vec<String>,
     pub generated_markers: Vec<String>,
     pub library_tree_depth_threshold: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArchiveTransientDetector {
     pub archive_extensions: Vec<String>,
     pub transient_directories: Vec<String>,
     pub build_artifact_patterns: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverridePolicy {
     pub allow_user_force_include: bool,
     pub requires_reason: bool,
@@ -36,7 +36,7 @@ pub enum DefaultAction {
     IndexFull,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DefaultActions {
     pub giant_log: DefaultAction,
     pub vendor_tree: DefaultAction,
@@ -79,7 +79,7 @@ pub struct HighCostArtifactDecision {
     pub needs_manual_review: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HighCostOverrideEvent {
     pub kind: String, // "fsfs_high_cost_override_event"
     pub v: u32,       // 1

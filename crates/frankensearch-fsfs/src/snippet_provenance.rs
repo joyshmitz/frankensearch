@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnippetPolicy {
     pub max_snippets_per_result: u32,
     pub context_lines_before: u32,
@@ -10,7 +10,7 @@ pub struct SnippetPolicy {
     pub binary_fallback: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HighlightPolicy {
     pub offset_unit: String,
     pub enforce_grapheme_boundaries: bool,
@@ -18,12 +18,12 @@ pub struct HighlightPolicy {
     pub max_highlights_per_snippet: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProvenancePolicy {
     pub required_fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagnosticsPolicy {
     pub required_fields: Vec<String>,
     pub reason_code_prefixes: Vec<String>,
@@ -45,7 +45,7 @@ pub struct SnippetHighlightProvenanceContractDefinition {
     pub performance_targets: PerformanceTargets,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HighlightRange {
     pub start_byte: u64,
     pub end_byte: u64,
@@ -54,7 +54,7 @@ pub struct HighlightRange {
     pub query_term: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnippetSegment {
     pub segment_id: String,
     pub text: String,
@@ -80,7 +80,7 @@ pub struct Provenance {
     pub score_contributors: Vec<ScoreContributor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Diagnostics {
     pub event: String,
     pub reason_code: String,
@@ -89,7 +89,7 @@ pub struct Diagnostics {
     pub emitted_fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DegradedInfo {
     pub applied: bool,
     pub mode: String,

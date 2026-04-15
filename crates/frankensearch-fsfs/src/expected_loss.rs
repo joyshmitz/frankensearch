@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpectedLossContractDefinition {
     pub kind: String, // "fsfs_expected_loss_contract_definition"
     pub v: u32,       // 1
@@ -11,7 +11,7 @@ pub struct ExpectedLossContractDefinition {
     pub fallback_policy: FallbackPolicy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FallbackPolicy {
     pub required_for_high_risk: bool,
     pub required_fields: Vec<String>,
@@ -63,7 +63,7 @@ pub struct ExpectedLossMatrixRow {
     pub action_losses: Vec<ExpectedLossActionEvaluation>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpectedLossFallbackTrigger {
     pub condition: String,
     pub fallback_action: String,
