@@ -13,9 +13,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::collectors::{
-    TelemetryCorrelation, TelemetryEmbedderInfo, TelemetryEmbeddingJob, TelemetryEnvelope,
-    TelemetryEvent, TelemetryInstance, TelemetrySearchMetrics, TelemetrySearchResults,
-    TELEMETRY_SCHEMA_VERSION,
+    TELEMETRY_SCHEMA_VERSION, TelemetryCorrelation, TelemetryEmbedderInfo, TelemetryEmbeddingJob,
+    TelemetryEnvelope, TelemetryEvent, TelemetryInstance, TelemetrySearchMetrics,
+    TelemetrySearchResults,
 };
 use crate::error::{SearchError, SearchResult};
 
@@ -1509,7 +1509,10 @@ mod tests {
 
         let violations = harness.validate_envelope(&envelope);
         let snapshot = snapshot_violations(&violations);
-        assert_golden_json("adapter_conformance_violations_embedding_invalid_v1", &snapshot);
+        assert_golden_json(
+            "adapter_conformance_violations_embedding_invalid_v1",
+            &snapshot,
+        );
     }
 
     #[test]
@@ -1537,7 +1540,7 @@ mod tests {
                 bytes: 0,
                 docs: 0,
             },
-            dimension: 0,   // invalid
+            dimension: 0, // invalid
             quantization: QuantizationMode::F16,
             status: IndexStatus::Completed,
             duration_ms: 0, // invalid
@@ -1570,7 +1573,7 @@ mod tests {
                 rss_bytes: 0,
                 io_read_bytes: 0,
                 io_write_bytes: 0,
-                interval_ms: 0, // invalid
+                interval_ms: 0,          // invalid
                 load_avg_1m: Some(-1.0), // invalid
                 pressure_profile: None,
             },
@@ -1578,7 +1581,10 @@ mod tests {
 
         let violations = harness.validate_envelope(&envelope);
         let snapshot = snapshot_violations(&violations);
-        assert_golden_json("adapter_conformance_violations_resource_invalid_v1", &snapshot);
+        assert_golden_json(
+            "adapter_conformance_violations_resource_invalid_v1",
+            &snapshot,
+        );
     }
 
     #[test]
@@ -1606,7 +1612,10 @@ mod tests {
 
         let violations = harness.validate_envelope(&envelope);
         let snapshot = snapshot_violations(&violations);
-        assert_golden_json("adapter_conformance_violations_lifecycle_invalid_v1", &snapshot);
+        assert_golden_json(
+            "adapter_conformance_violations_lifecycle_invalid_v1",
+            &snapshot,
+        );
     }
 
     #[test]
@@ -1663,7 +1672,10 @@ mod tests {
 
         let violations = harness.validate_envelope(&envelope);
         let snapshot = snapshot_violations(&violations);
-        assert_golden_json("adapter_conformance_violations_privacy_redaction_v1", &snapshot);
+        assert_golden_json(
+            "adapter_conformance_violations_privacy_redaction_v1",
+            &snapshot,
+        );
     }
 
     #[test]
@@ -1682,7 +1694,10 @@ mod tests {
 
         let violations = harness.validate_envelope(&envelope);
         let snapshot = snapshot_violations(&violations);
-        assert_golden_json("adapter_conformance_violations_filter_fidelity_v1", &snapshot);
+        assert_golden_json(
+            "adapter_conformance_violations_filter_fidelity_v1",
+            &snapshot,
+        );
     }
 
     #[test]
@@ -1699,7 +1714,10 @@ mod tests {
 
         let violations = harness.validate_envelope(&envelope);
         let snapshot = snapshot_violations(&violations);
-        assert_golden_json("adapter_conformance_violations_metadata_redaction_v1", &snapshot);
+        assert_golden_json(
+            "adapter_conformance_violations_metadata_redaction_v1",
+            &snapshot,
+        );
     }
 
     #[test]

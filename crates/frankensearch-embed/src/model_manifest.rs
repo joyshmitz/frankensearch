@@ -270,9 +270,7 @@ impl ModelManifest {
             id: "flashrank-nano".to_owned(),
             version: "v1".to_owned(),
             display_name: Some("FlashRank Nano (Reranker)".to_owned()),
-            description: Some(
-                "FlashRank compact ONNX cross-encoder reranker model".to_owned(),
-            ),
+            description: Some("FlashRank compact ONNX cross-encoder reranker model".to_owned()),
             repo: REPO.to_owned(),
             revision: REVISION.to_owned(),
             files: vec![

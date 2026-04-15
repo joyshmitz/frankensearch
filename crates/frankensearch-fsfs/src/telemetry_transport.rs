@@ -1,6 +1,6 @@
+use crate::control_plane::Topic;
 use serde::{Deserialize, Serialize};
 use serde_json::Number;
-use crate::control_plane::Topic;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrimaryTransportConfig {
@@ -127,8 +127,8 @@ pub struct TransportPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransportStreamFrame {
-    pub kind: String, // "telemetry_transport_stream_frame"
-    pub v: u32,       // 1
+    pub kind: String,       // "telemetry_transport_stream_frame"
+    pub v: u32,             // 1
     pub frame_type: String, // "event", "control", "heartbeat", "error"
     pub transport: TransportType,
     pub connection_id: String,

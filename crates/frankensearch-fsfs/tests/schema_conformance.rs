@@ -111,10 +111,7 @@ fn schema_for_fixture(name: &str) -> &'static str {
 }
 
 fn is_semantic_invalid_fixture(name: &str) -> bool {
-    matches!(
-        name,
-        "crate-placement-registry-invalid-duplicate-v1.json"
-    )
+    matches!(name, "crate-placement-registry-invalid-duplicate-v1.json")
 }
 
 fn load_schema<'a>(
@@ -124,16 +121,18 @@ fn load_schema<'a>(
 ) -> &'a JSONSchema {
     cache.entry(schema_file.to_owned()).or_insert_with(|| {
         let schema_path = schemas.join(schema_file);
-        let raw = fs::read_to_string(&schema_path).unwrap_or_else(|_| {
-            panic!("schema file missing: {}", schema_path.display())
-        });
+        let raw = fs::read_to_string(&schema_path)
+            .unwrap_or_else(|_| panic!("schema file missing: {}", schema_path.display()));
         let schema_json: serde_json::Value =
             serde_json::from_str(&raw).expect("schema should parse as json");
         JSONSchema::options()
             .with_draft(Draft::Draft202012)
             .compile(&schema_json)
             .unwrap_or_else(|error| {
-                panic!("failed to compile schema {}: {error}", schema_path.display())
+                panic!(
+                    "failed to compile schema {}: {error}",
+                    schema_path.display()
+                )
             })
     })
 }
@@ -152,10 +151,12 @@ fn assert_schema_validation(
     let schema = load_schema(cache, schema_root, schema_file);
     let raw = fs::read_to_string(fixture_path)
         .unwrap_or_else(|_| panic!("read fixture {}", fixture_path.display()));
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).unwrap_or_else(|error| {
-            panic!("fixture {} is invalid json: {error}", fixture_path.display())
-        });
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!(
+            "fixture {} is invalid json: {error}",
+            fixture_path.display()
+        )
+    });
     let validation = schema.validate(&value);
     if should_pass {
         if let Err(errors) = validation {
@@ -259,8 +260,7 @@ fn test_fsfs_config_roundtrip_conformance() {
 fn test_fsfs_config_effective_conformance() {
     let path = fixture_dir().join("fsfs-config-effective-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).expect("parse config effective");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse config effective");
     assert_golden_json("fsfs_config_effective_roundtrip_v1", &parsed);
 }
 
@@ -268,8 +268,7 @@ fn test_fsfs_config_effective_conformance() {
 fn test_fsfs_config_load_event_conformance() {
     let path = fixture_dir().join("fsfs-config-load-event-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).expect("parse config load event");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse config load event");
     assert_golden_json("fsfs_config_loaded_event_roundtrip_v1", &parsed);
 }
 
@@ -277,7 +276,8 @@ fn test_fsfs_config_load_event_conformance() {
 fn test_file_classification_contract_conformance() {
     let path = fixture_dir().join("fsfs-file-classification-contract-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::file_classification::FileClassificationContractDefinition = serde_json::from_str(&raw).expect("parse file classification contract");
+    let parsed: frankensearch_fsfs::file_classification::FileClassificationContractDefinition =
+        serde_json::from_str(&raw).expect("parse file classification contract");
     assert_golden_json("fsfs_file_classification_contract_roundtrip_v1", &parsed);
 }
 
@@ -285,7 +285,8 @@ fn test_file_classification_contract_conformance() {
 fn test_file_classification_decision_conformance() {
     let path = fixture_dir().join("fsfs-file-classification-decision-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::file_classification::FileClassificationDecision = serde_json::from_str(&raw).expect("parse file classification decision");
+    let parsed: frankensearch_fsfs::file_classification::FileClassificationDecision =
+        serde_json::from_str(&raw).expect("parse file classification decision");
     assert_golden_json("fsfs_file_classification_decision_roundtrip_v1", &parsed);
 }
 
@@ -293,15 +294,20 @@ fn test_file_classification_decision_conformance() {
 fn test_file_classification_corrupt_event_conformance() {
     let path = fixture_dir().join("fsfs-file-classification-corrupt-event-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::file_classification::FileClassificationCorruptEvent = serde_json::from_str(&raw).expect("parse file classification corrupt event");
-    assert_golden_json("fsfs_file_classification_corrupt_event_roundtrip_v1", &parsed);
+    let parsed: frankensearch_fsfs::file_classification::FileClassificationCorruptEvent =
+        serde_json::from_str(&raw).expect("parse file classification corrupt event");
+    assert_golden_json(
+        "fsfs_file_classification_corrupt_event_roundtrip_v1",
+        &parsed,
+    );
 }
 
 #[test]
 fn test_expected_loss_contract_conformance() {
     let path = fixture_dir().join("fsfs-expected-loss-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::expected_loss::ExpectedLossContractDefinition = serde_json::from_str(&raw).expect("parse expected loss contract");
+    let parsed: frankensearch_fsfs::expected_loss::ExpectedLossContractDefinition =
+        serde_json::from_str(&raw).expect("parse expected loss contract");
     assert_golden_json("fsfs_expected_loss_contract_roundtrip_v1", &parsed);
 }
 
@@ -309,7 +315,8 @@ fn test_expected_loss_contract_conformance() {
 fn test_expected_loss_decision_conformance() {
     let path = fixture_dir().join("fsfs-expected-loss-decision-event-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::expected_loss::ExpectedLossDecisionEvent = serde_json::from_str(&raw).expect("parse expected loss decision");
+    let parsed: frankensearch_fsfs::expected_loss::ExpectedLossDecisionEvent =
+        serde_json::from_str(&raw).expect("parse expected loss decision");
     assert_golden_json("fsfs_expected_loss_decision_roundtrip_v1", &parsed);
 }
 
@@ -317,7 +324,8 @@ fn test_expected_loss_decision_conformance() {
 fn test_expected_loss_matrix_conformance() {
     let path = fixture_dir().join("fsfs-expected-loss-matrix-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::expected_loss::ExpectedLossMatrix = serde_json::from_str(&raw).expect("parse expected loss matrix");
+    let parsed: frankensearch_fsfs::expected_loss::ExpectedLossMatrix =
+        serde_json::from_str(&raw).expect("parse expected loss matrix");
     assert_golden_json("fsfs_expected_loss_matrix_roundtrip_v1", &parsed);
 }
 
@@ -325,7 +333,8 @@ fn test_expected_loss_matrix_conformance() {
 fn test_high_cost_artifact_contract_conformance() {
     let path = fixture_dir().join("fsfs-high-cost-artifact-detectors-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::high_cost_artifact::HighCostArtifactContractDefinition = serde_json::from_str(&raw).expect("parse high cost artifact contract");
+    let parsed: frankensearch_fsfs::high_cost_artifact::HighCostArtifactContractDefinition =
+        serde_json::from_str(&raw).expect("parse high cost artifact contract");
     assert_golden_json("fsfs_high_cost_artifact_contract_roundtrip_v1", &parsed);
 }
 
@@ -333,7 +342,8 @@ fn test_high_cost_artifact_contract_conformance() {
 fn test_high_cost_artifact_decision_conformance() {
     let path = fixture_dir().join("fsfs-high-cost-artifact-detectors-decision-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::high_cost_artifact::HighCostArtifactDecision = serde_json::from_str(&raw).expect("parse high cost artifact decision");
+    let parsed: frankensearch_fsfs::high_cost_artifact::HighCostArtifactDecision =
+        serde_json::from_str(&raw).expect("parse high cost artifact decision");
     assert_golden_json("fsfs_high_cost_artifact_decision_roundtrip_v1", &parsed);
 }
 
@@ -341,7 +351,8 @@ fn test_high_cost_artifact_decision_conformance() {
 fn test_high_cost_artifact_override_conformance() {
     let path = fixture_dir().join("fsfs-high-cost-artifact-detectors-override-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::high_cost_artifact::HighCostOverrideEvent = serde_json::from_str(&raw).expect("parse high cost artifact override");
+    let parsed: frankensearch_fsfs::high_cost_artifact::HighCostOverrideEvent =
+        serde_json::from_str(&raw).expect("parse high cost artifact override");
     assert_golden_json("fsfs_high_cost_artifact_override_roundtrip_v1", &parsed);
 }
 
@@ -349,7 +360,8 @@ fn test_high_cost_artifact_override_conformance() {
 fn test_root_discovery_contract_conformance() {
     let path = fixture_dir().join("fsfs-root-discovery-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::root_discovery::RootDiscoveryContractDefinition = serde_json::from_str(&raw).expect("parse root discovery contract");
+    let parsed: frankensearch_fsfs::root_discovery::RootDiscoveryContractDefinition =
+        serde_json::from_str(&raw).expect("parse root discovery contract");
     assert_golden_json("fsfs_root_discovery_contract_roundtrip_v1", &parsed);
 }
 
@@ -357,7 +369,8 @@ fn test_root_discovery_contract_conformance() {
 fn test_root_discovery_decision_conformance() {
     let path = fixture_dir().join("fsfs-root-discovery-decision-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::root_discovery::RootDiscoveryDecision = serde_json::from_str(&raw).expect("parse root discovery decision");
+    let parsed: frankensearch_fsfs::root_discovery::RootDiscoveryDecision =
+        serde_json::from_str(&raw).expect("parse root discovery decision");
     assert_golden_json("fsfs_root_discovery_decision_roundtrip_v1", &parsed);
 }
 
@@ -365,7 +378,8 @@ fn test_root_discovery_decision_conformance() {
 fn test_root_discovery_guard_event_conformance() {
     let path = fixture_dir().join("fsfs-root-discovery-guard-event-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::root_discovery::RootTraversalGuardEvent = serde_json::from_str(&raw).expect("parse root discovery guard event");
+    let parsed: frankensearch_fsfs::root_discovery::RootTraversalGuardEvent =
+        serde_json::from_str(&raw).expect("parse root discovery guard event");
     assert_golden_json("fsfs_root_discovery_guard_event_roundtrip_v1", &parsed);
 }
 
@@ -373,7 +387,8 @@ fn test_root_discovery_guard_event_conformance() {
 fn test_scope_privacy_contract_conformance() {
     let path = fixture_dir().join("fsfs-scope-privacy-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::privacy::ScopePrivacyContractDefinition = serde_json::from_str(&raw).expect("parse scope privacy contract");
+    let parsed: frankensearch_fsfs::privacy::ScopePrivacyContractDefinition =
+        serde_json::from_str(&raw).expect("parse scope privacy contract");
     assert_golden_json("fsfs_scope_privacy_contract_roundtrip_v1", &parsed);
 }
 
@@ -381,7 +396,8 @@ fn test_scope_privacy_contract_conformance() {
 fn test_scope_redacted_artifact_conformance() {
     let path = fixture_dir().join("fsfs-scope-privacy-redacted-artifact-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::privacy::RedactedArtifact = serde_json::from_str(&raw).expect("parse scope redacted artifact");
+    let parsed: frankensearch_fsfs::privacy::RedactedArtifact =
+        serde_json::from_str(&raw).expect("parse scope redacted artifact");
     assert_golden_json("fsfs_scope_redacted_artifact_roundtrip_v1", &parsed);
 }
 
@@ -389,7 +405,8 @@ fn test_scope_redacted_artifact_conformance() {
 fn test_scope_scan_decision_conformance() {
     let path = fixture_dir().join("fsfs-scope-privacy-scan-decision-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::privacy::ScopeScanDecision = serde_json::from_str(&raw).expect("parse scope scan decision");
+    let parsed: frankensearch_fsfs::privacy::ScopeScanDecision =
+        serde_json::from_str(&raw).expect("parse scope scan decision");
     assert_golden_json("fsfs_scope_scan_decision_roundtrip_v1", &parsed);
 }
 
@@ -398,22 +415,30 @@ fn test_snippet_highlight_provenance_contract_conformance() {
     let path = fixture_dir().join("fsfs-snippet-highlight-provenance-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
     let parsed: frankensearch_fsfs::snippet_provenance::SnippetHighlightProvenanceContractDefinition = serde_json::from_str(&raw).expect("parse snippet highlight provenance contract");
-    assert_golden_json("fsfs_snippet_highlight_provenance_contract_roundtrip_v1", &parsed);
+    assert_golden_json(
+        "fsfs_snippet_highlight_provenance_contract_roundtrip_v1",
+        &parsed,
+    );
 }
 
 #[test]
 fn test_snippet_highlight_provenance_decision_conformance() {
     let path = fixture_dir().join("fsfs-snippet-highlight-provenance-decision-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::snippet_provenance::SnippetHighlightProvenanceDecision = serde_json::from_str(&raw).expect("parse snippet highlight provenance decision");
-    assert_golden_json("fsfs_snippet_highlight_provenance_decision_roundtrip_v1", &parsed);
+    let parsed: frankensearch_fsfs::snippet_provenance::SnippetHighlightProvenanceDecision =
+        serde_json::from_str(&raw).expect("parse snippet highlight provenance decision");
+    assert_golden_json(
+        "fsfs_snippet_highlight_provenance_decision_roundtrip_v1",
+        &parsed,
+    );
 }
 
 #[test]
 fn test_provenance_contract_conformance() {
     let path = fixture_dir().join("fsfs-provenance-attestation-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::provenance::ProvenanceContractDefinition = serde_json::from_str(&raw).expect("parse provenance contract");
+    let parsed: frankensearch_fsfs::provenance::ProvenanceContractDefinition =
+        serde_json::from_str(&raw).expect("parse provenance contract");
     assert_golden_json("fsfs_provenance_contract_roundtrip_v1", &parsed);
 }
 
@@ -421,7 +446,8 @@ fn test_provenance_contract_conformance() {
 fn test_provenance_attestation_manifest_conformance() {
     let path = fixture_dir().join("fsfs-provenance-attestation-manifest-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::provenance::ProvenanceAttestationManifest = serde_json::from_str(&raw).expect("parse provenance attestation manifest");
+    let parsed: frankensearch_fsfs::provenance::ProvenanceAttestationManifest =
+        serde_json::from_str(&raw).expect("parse provenance attestation manifest");
     assert_golden_json("fsfs_provenance_attestation_manifest_roundtrip_v1", &parsed);
 }
 
@@ -429,7 +455,8 @@ fn test_provenance_attestation_manifest_conformance() {
 fn test_provenance_startup_check_conformance() {
     let path = fixture_dir().join("fsfs-provenance-attestation-startup-check-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::provenance::ProvenanceStartupCheck = serde_json::from_str(&raw).expect("parse provenance startup check");
+    let parsed: frankensearch_fsfs::provenance::ProvenanceStartupCheck =
+        serde_json::from_str(&raw).expect("parse provenance startup check");
     assert_golden_json("fsfs_provenance_startup_check_roundtrip_v1", &parsed);
 }
 
@@ -437,7 +464,8 @@ fn test_provenance_startup_check_conformance() {
 fn test_packaging_contract_conformance() {
     let path = fixture_dir().join("fsfs-packaging-release-install-contract-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::packaging::PackagingContractDefinition = serde_json::from_str(&raw).expect("parse packaging contract");
+    let parsed: frankensearch_fsfs::packaging::PackagingContractDefinition =
+        serde_json::from_str(&raw).expect("parse packaging contract");
     assert_golden_json("fsfs_packaging_contract_roundtrip_v1", &parsed);
 }
 
@@ -445,7 +473,8 @@ fn test_packaging_contract_conformance() {
 fn test_release_manifest_conformance() {
     let path = fixture_dir().join("fsfs-packaging-release-install-release-manifest-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::packaging::ReleaseManifest = serde_json::from_str(&raw).expect("parse release manifest");
+    let parsed: frankensearch_fsfs::packaging::ReleaseManifest =
+        serde_json::from_str(&raw).expect("parse release manifest");
     assert_golden_json("fsfs_release_manifest_roundtrip_v1", &parsed);
 }
 
@@ -453,7 +482,8 @@ fn test_release_manifest_conformance() {
 fn test_upgrade_plan_conformance() {
     let path = fixture_dir().join("fsfs-packaging-release-install-upgrade-plan-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::packaging::UpgradePlan = serde_json::from_str(&raw).expect("parse upgrade plan");
+    let parsed: frankensearch_fsfs::packaging::UpgradePlan =
+        serde_json::from_str(&raw).expect("parse upgrade plan");
     assert_golden_json("fsfs_upgrade_plan_roundtrip_v1", &parsed);
 }
 
@@ -469,7 +499,8 @@ fn test_incremental_change_contract_conformance() {
 fn test_incremental_change_decision_conformance() {
     let path = fixture_dir().join("fsfs-incremental-change-detection-decision-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::incremental_change::IncrementalChangeDecision = serde_json::from_str(&raw).expect("parse incremental change decision");
+    let parsed: frankensearch_fsfs::incremental_change::IncrementalChangeDecision =
+        serde_json::from_str(&raw).expect("parse incremental change decision");
     assert_golden_json("fsfs_incremental_change_decision_roundtrip_v1", &parsed);
 }
 
@@ -477,7 +508,8 @@ fn test_incremental_change_decision_conformance() {
 fn test_incremental_recovery_checkpoint_conformance() {
     let path = fixture_dir().join("fsfs-incremental-change-detection-recovery-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::incremental_change::IncrementalRecoveryCheckpoint = serde_json::from_str(&raw).expect("parse incremental change recovery");
+    let parsed: frankensearch_fsfs::incremental_change::IncrementalRecoveryCheckpoint =
+        serde_json::from_str(&raw).expect("parse incremental change recovery");
     assert_golden_json("fsfs_incremental_recovery_checkpoint_roundtrip_v1", &parsed);
 }
 
@@ -485,8 +517,9 @@ fn test_incremental_recovery_checkpoint_conformance() {
 fn test_pressure_profiles_roundtrip_conformance() {
     let path = fixture_dir().join("fsfs-pressure-profiles-contract-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    
-    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse pressure-profiles fixture");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse pressure-profiles fixture");
     assert_golden_json("fsfs_pressure_profiles_roundtrip_v1", &parsed);
 }
 
@@ -514,14 +547,18 @@ fn test_alien_recommendation_card_ingestion_conformance() {
     let raw = fs::read_to_string(&path).expect("read fixture");
     let parsed: frankensearch_fsfs::alien_recommendations::RecommendationCard =
         serde_json::from_str(&raw).expect("parse alien recommendation card ingestion");
-    assert_golden_json("fsfs_alien_recommendation_card_ingestion_roundtrip_v1", &parsed);
+    assert_golden_json(
+        "fsfs_alien_recommendation_card_ingestion_roundtrip_v1",
+        &parsed,
+    );
 }
 
 #[test]
 fn test_determinism_contract_conformance() {
     let path = fixture_dir().join("fsfs-determinism-contract-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::determinism::DeterminismContractDefinition = serde_json::from_str(&raw).expect("parse determinism contract");
+    let parsed: frankensearch_fsfs::determinism::DeterminismContractDefinition =
+        serde_json::from_str(&raw).expect("parse determinism contract");
     assert_golden_json("fsfs_determinism_contract_roundtrip_v1", &parsed);
 }
 
@@ -529,7 +566,8 @@ fn test_determinism_contract_conformance() {
 fn test_determinism_manifest_conformance() {
     let path = fixture_dir().join("fsfs-determinism-manifest-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::determinism::ReproManifest = serde_json::from_str(&raw).expect("parse determinism manifest");
+    let parsed: frankensearch_fsfs::determinism::ReproManifest =
+        serde_json::from_str(&raw).expect("parse determinism manifest");
     assert_golden_json("fsfs_determinism_manifest_roundtrip_v1", &parsed);
 }
 
@@ -588,9 +626,11 @@ fn test_composition_matrix_gate_summary_conformance() {
 
 #[test]
 fn test_bead_self_doc_inventory_conformance() {
-    let path = fixture_dir().join("../../docs/bead-self-documentation-debt-inventory-2026-02-14.json");
+    let path =
+        fixture_dir().join("../../docs/bead-self-documentation-debt-inventory-2026-02-14.json");
     let raw = std::fs::read_to_string(&path).expect("read inventory fixture");
-    let parsed: frankensearch_fsfs::bead_self_doc::SelfDocInventory = serde_json::from_str(&raw).expect("parse self doc inventory");
+    let parsed: frankensearch_fsfs::bead_self_doc::SelfDocInventory =
+        serde_json::from_str(&raw).expect("parse self doc inventory");
     assert_golden_json("bead_self_doc_inventory_roundtrip_v1", &parsed);
 }
 
@@ -647,7 +687,10 @@ fn test_control_plane_stream_frame_control_backpressure_conformance() {
     let raw = fs::read_to_string(&path).expect("read fixture");
     let parsed: frankensearch_fsfs::control_plane::StreamFrame =
         serde_json::from_str(&raw).expect("parse control plane stream frame backpressure");
-    assert_golden_json("control_plane_stream_frame_backpressure_roundtrip_v1", &parsed);
+    assert_golden_json(
+        "control_plane_stream_frame_backpressure_roundtrip_v1",
+        &parsed,
+    );
 }
 
 #[test]
@@ -729,7 +772,8 @@ fn test_control_plane_error_aggregation_conformance() {
 fn test_crate_placement_registry_conformance() {
     let path = fixture_dir().join("crate-placement-registry-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
-    let parsed: frankensearch_fsfs::crate_registry::CratePlacementRegistry = serde_json::from_str(&raw).expect("parse crate placement registry");
+    let parsed: frankensearch_fsfs::crate_registry::CratePlacementRegistry =
+        serde_json::from_str(&raw).expect("parse crate placement registry");
     assert_golden_json("crate_placement_registry_roundtrip_v1", &parsed);
 }
 
@@ -838,7 +882,10 @@ fn test_telemetry_transport_frame_control_backpressure_conformance() {
     let raw = fs::read_to_string(&path).expect("read fixture");
     let parsed: frankensearch_fsfs::telemetry_transport::TransportStreamFrame =
         serde_json::from_str(&raw).expect("parse telemetry transport frame backpressure");
-    assert_golden_json("telemetry_transport_frame_backpressure_roundtrip_v1", &parsed);
+    assert_golden_json(
+        "telemetry_transport_frame_backpressure_roundtrip_v1",
+        &parsed,
+    );
 }
 
 #[test]
@@ -1016,8 +1063,7 @@ fn test_ops_config_definition_conformance() {
 fn test_ops_config_effective_conformance() {
     let path = fixture_dir().join("ops-config-effective-v1.json");
     let raw = fs::read_to_string(&path).expect("read fixture");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&raw).expect("parse ops config effective");
+    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("parse ops config effective");
     assert_golden_json("ops_config_effective_roundtrip_v1", &parsed);
 }
 

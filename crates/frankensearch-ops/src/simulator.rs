@@ -423,7 +423,8 @@ impl TelemetrySimulator {
                     for phase in phases {
                         let phase_label = phase_label(&phase).to_owned();
                         let failure_kind = failure_kind_for_phase(&phase).map(str::to_owned);
-                        let (record_phase, latency_us, result_count) = phase_to_record_fields(&phase);
+                        let (record_phase, latency_us, result_count) =
+                            phase_to_record_fields(&phase);
 
                         let correlation_idx = event_index / 2;
                         let event_id = format!(

@@ -434,7 +434,8 @@ mod tests {
             file_id: "f1".to_owned(),
             size_bytes: 100,
             mtime_ns: 1_000_000_000,
-            content_hash: "abc123def456abc123def456abc123def456abc123def456abc123def456abcd".to_owned(),
+            content_hash: "abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
+                .to_owned(),
         };
         let decision = IncrementalChangeDecision::new(
             "/path".to_owned(),

@@ -1059,9 +1059,7 @@ mod tests {
             },
         };
         if let SearchPhase::Reranked {
-            results,
-            latency,
-            ..
+            results, latency, ..
         } = phase
         {
             assert_eq!(results.len(), 1);

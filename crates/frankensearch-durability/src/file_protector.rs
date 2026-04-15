@@ -488,11 +488,7 @@ impl FileProtector {
     }
 
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
-    pub(crate) fn is_repairable(
-        &self,
-        path: &Path,
-        sidecar_path: &Path,
-    ) -> SearchResult<bool> {
+    pub(crate) fn is_repairable(&self, path: &Path, sidecar_path: &Path) -> SearchResult<bool> {
         let source_file = match fs::File::open(path) {
             Ok(file) => Some(file),
             Err(err) if err.kind() == ErrorKind::NotFound => None,

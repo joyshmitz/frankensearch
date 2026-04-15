@@ -153,14 +153,16 @@ impl FlashRankReranker {
         // Load metadata
         let config_path = model_dir.join(CONFIG_JSON);
         let pad_token_id = if config_path.is_file() {
-            let content = fs::read_to_string(&config_path).map_err(|e| SearchError::ModelLoadFailed {
-                path: config_path.clone(),
-                source: format!("failed to read config.json: {e}").into(),
-            })?;
-            let config: ModelConfig = serde_json::from_str(&content).map_err(|e| SearchError::ModelLoadFailed {
-                path: config_path,
-                source: format!("failed to parse config.json: {e}").into(),
-            })?;
+            let content =
+                fs::read_to_string(&config_path).map_err(|e| SearchError::ModelLoadFailed {
+                    path: config_path.clone(),
+                    source: format!("failed to read config.json: {e}").into(),
+                })?;
+            let config: ModelConfig =
+                serde_json::from_str(&content).map_err(|e| SearchError::ModelLoadFailed {
+                    path: config_path,
+                    source: format!("failed to parse config.json: {e}").into(),
+                })?;
             config.pad_token_id
         } else {
             0
@@ -168,14 +170,17 @@ impl FlashRankReranker {
 
         let tokenizer_config_path = model_dir.join(TOKENIZER_CONFIG_JSON);
         let model_max_len = if tokenizer_config_path.is_file() {
-            let content = fs::read_to_string(&tokenizer_config_path).map_err(|e| SearchError::ModelLoadFailed {
-                path: tokenizer_config_path.clone(),
-                source: format!("failed to read tokenizer_config.json: {e}").into(),
+            let content = fs::read_to_string(&tokenizer_config_path).map_err(|e| {
+                SearchError::ModelLoadFailed {
+                    path: tokenizer_config_path.clone(),
+                    source: format!("failed to read tokenizer_config.json: {e}").into(),
+                }
             })?;
-            let config: TokenizerConfig = serde_json::from_str(&content).map_err(|e| SearchError::ModelLoadFailed {
-                path: tokenizer_config_path,
-                source: format!("failed to parse tokenizer_config.json: {e}").into(),
-            })?;
+            let config: TokenizerConfig =
+                serde_json::from_str(&content).map_err(|e| SearchError::ModelLoadFailed {
+                    path: tokenizer_config_path,
+                    source: format!("failed to parse tokenizer_config.json: {e}").into(),
+                })?;
             config.model_max_length.unwrap_or(max_length)
         } else {
             max_length
@@ -327,10 +332,8 @@ impl FlashRankReranker {
         })?;
         let shape = [batch_i64, seq_i64];
 
-        let mut inputs: Vec<(
-            &str,
-            ort::value::Value<ort::value::TensorValueType<i64>>,
-        )> = Vec::with_capacity(3);
+        let mut inputs: Vec<(&str, ort::value::Value<ort::value::TensorValueType<i64>>)> =
+            Vec::with_capacity(3);
 
         if input_names.iter().any(|n| n == "input_ids") {
             let tensor = ort::value::Tensor::from_array((shape, flat_input_ids))

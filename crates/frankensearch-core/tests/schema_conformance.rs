@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use frankensearch_core::{HitExplanation, RankMovement, ScoreComponent, ExplainedSource, ExplanationPhase};
+use frankensearch_core::{
+    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
+};
 
 fn assert_golden_json<T: serde::Serialize>(name: &str, value: &T) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
@@ -57,6 +59,6 @@ fn test_hit_explanation_conformance() {
             weight: 0.7,
         }],
     };
-    
+
     assert_golden_json("hit_explanation_v1", &explanation);
 }

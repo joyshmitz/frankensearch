@@ -689,19 +689,24 @@ impl TwoTierSearcher {
                         #[cfg(feature = "rerank")]
                         if self.reranker.is_some() {
                             let phase3_start = Instant::now();
-                            match self.run_phase3(
-                                cx,
-                                semantic_query,
-                                k,
-                                refined_results,
-                                &text_fn,
-                                &mut metrics,
-                            ).await {
+                            match self
+                                .run_phase3(
+                                    cx,
+                                    semantic_query,
+                                    k,
+                                    refined_results,
+                                    &text_fn,
+                                    &mut metrics,
+                                )
+                                .await
+                            {
                                 Ok(reranked_results) => {
                                     let phase3_latency = phase3_start.elapsed();
                                     let reranked_count = reranked_results.len();
-                                    
-                                    if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
+
+                                    if let Some(root_request_id) =
+                                        telemetry_root_request_id.as_deref()
+                                    {
                                         let reranked_event_id = self.emit_search_telemetry(
                                             semantic_query,
                                             query_class,
@@ -722,7 +727,11 @@ impl TwoTierSearcher {
                                         results: reranked_results,
                                         latency: phase3_latency + phase2_latency,
                                         metrics: PhaseMetrics {
-                                            embedder_id: self.reranker.as_ref().map_or("none", |r| r.id()).to_owned(),
+                                            embedder_id: self
+                                                .reranker
+                                                .as_ref()
+                                                .map_or("none", |r| r.id())
+                                                .to_owned(),
                                             vectors_searched: metrics.phase2_vectors_searched,
                                             lexical_candidates: metrics.lexical_candidates,
                                             fused_count: reranked_count,
@@ -911,7 +920,8 @@ impl TwoTierSearcher {
         // If the embedder is an API embedder (genuinely async), we sequentially await
         // the futures to avoid blocking the executor inside `rayon::join` and to prevent
         // `poll_immediate` from aborting the Pending futures.
-        let is_async_embedder = self.fast_embedder.category() == frankensearch_core::traits::ModelCategory::ApiEmbedder;
+        let is_async_embedder =
+            self.fast_embedder.category() == frankensearch_core::traits::ModelCategory::ApiEmbedder;
 
         let (embed_timed, lexical_timed) = if is_async_embedder {
             let start_embed = Instant::now();
@@ -1528,7 +1538,9 @@ impl TwoTierSearcher {
                 let mut complete_pool = true;
 
                 for result in results.iter().take(pool) {
-                    if let Some(embedding) = self.index.semantic_vector_for_doc_id(&result.doc_id)? {
+                    if let Some(embedding) =
+                        self.index.semantic_vector_for_doc_id(&result.doc_id)?
+                    {
                         embeddings.push(embedding);
                         scores.push(f64::from(result.score));
                     } else {

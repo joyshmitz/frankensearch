@@ -119,7 +119,11 @@ impl InMemoryVectorIndex {
 
         for entry in &index.wal_entries {
             doc_ids.push(entry.doc_id.clone());
-            let f16_vec: Vec<half::f16> = entry.embedding.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let f16_vec: Vec<half::f16> = entry
+                .embedding
+                .iter()
+                .map(|&v| half::f16::from_f32(v))
+                .collect();
             flat.extend_from_slice(&f16_vec);
         }
 

@@ -20,7 +20,7 @@ pub struct DebtItem {
     pub issue_type: String,
     pub status: String,
     pub priority: u32,
-    pub class: String, // "gate", "program", "exploratory", "implementation"
+    pub class: String,    // "gate", "program", "exploratory", "implementation"
     pub severity: String, // "error", "warning", "info"
     pub has_rationale: bool,
     pub has_evidence: bool,
