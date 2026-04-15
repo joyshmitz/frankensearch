@@ -34,6 +34,7 @@ pub mod orchestration;
 pub mod output_schema;
 pub mod packaging;
 pub mod pressure;
+pub mod pressure_profile_contract;
 pub mod pressure_sensing;
 pub mod privacy;
 pub mod profiling;
@@ -161,6 +162,17 @@ pub use output_schema::{
 pub use pressure::{
     HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
     PressureSnapshot, PressureState, PressureTransition, ProcIoCounters,
+};
+pub use pressure_profile_contract::{
+    DriftProtection, MigrationPolicy, OverrideDecision, OverridePolicy, OverrideSource,
+    PressureProfileResolution, PressureProfilesContractDefinition, ProfileConfig, ProfileField,
+    ProfileId, ProfileSet, ResolutionDiagnostics, SafetyClamp, SchedulerMode,
+    DEFAULT_PRECEDENCE_ORDER, KIND_CONTRACT_DEFINITION as PRESSURE_PROFILE_KIND_CONTRACT,
+    KIND_PROFILE_RESOLUTION as PRESSURE_PROFILE_KIND_RESOLUTION, PRECEDENCE_CLI_OVERRIDE,
+    PRECEDENCE_CONFIG_OVERRIDE, PRECEDENCE_ENV_OVERRIDE, PRECEDENCE_HARD_SAFETY_GUARDS,
+    PRECEDENCE_PROFILE_DEFAULT, REASON_OVERRIDE_APPLIED_CLI, REASON_OVERRIDE_APPLIED_CONFIG,
+    REASON_OVERRIDE_APPLIED_ENV, REASON_OVERRIDE_REJECTED_INVALID, REASON_OVERRIDE_REJECTED_LOCKED,
+    REASON_PROFILE_RESOLUTION_CONFLICT, REASON_PROFILE_RESOLUTION_OK, REASON_SAFETY_CLAMP_PREFIX,
 };
 pub use pressure_sensing::{
     ControlState, HostSampler, PressureSample, PressureSensor,
