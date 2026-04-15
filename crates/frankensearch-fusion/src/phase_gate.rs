@@ -158,7 +158,7 @@ impl PhaseGate {
     /// Returns `true` if the gate has expired due to lack of updates.
     fn is_expired(&self) -> bool {
         if let (Some(expiry), Some(last)) = (self.config.expiry_ms, self.last_updated) {
-            last.elapsed().as_millis() as u64 > expiry
+            u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX) > expiry
         } else {
             false
         }

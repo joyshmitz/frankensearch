@@ -1,5 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Number;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub const FILE_CLASSIFICATION_CONTRACT_KIND: &str = "fsfs_file_classification_contract_definition";
@@ -34,8 +35,25 @@ const FSFS_PARTIAL_HEURISTIC_QUARANTINE: &str = "FSFS_PARTIAL_HEURISTIC_QUARANTI
 const FSFS_CORRUPT_CHECKSUM_MISMATCH: &str = "FSFS_CORRUPT_CHECKSUM_MISMATCH";
 const FSFS_CORRUPT_DECODE_ERROR: &str = "FSFS_CORRUPT_DECODE_ERROR";
 const FSFS_CORRUPT_IO_SHORT_READ: &str = "FSFS_CORRUPT_IO_SHORT_READ";
+const CONFIDENCE_SIGNAL_FIELD_CLASSIFICATION_CONFIDENCE: &str = "classification_confidence";
+const CONFIDENCE_SIGNAL_FIELD_ENCODING_CONFIDENCE: &str = "encoding_confidence";
+const CONFIDENCE_SIGNAL_FIELD_REASON_CODE: &str = "reason_code";
+const CONFIDENCE_SIGNAL_FIELD_UTILITY_PENALTY: &str = "utility_penalty";
+const CONFIDENCE_SIGNAL_FIELD_SKIP_CANDIDATE: &str = "skip_candidate";
+const CONFIDENCE_SIGNAL_FIELD_REQUIRES_MANUAL_REVIEW: &str = "requires_manual_review";
+const MIN_PROBE_BYTES: u32 = 256;
+
+const ALLOWED_CONFIDENCE_SIGNAL_FIELDS: [&str; 6] = [
+    CONFIDENCE_SIGNAL_FIELD_CLASSIFICATION_CONFIDENCE,
+    CONFIDENCE_SIGNAL_FIELD_ENCODING_CONFIDENCE,
+    CONFIDENCE_SIGNAL_FIELD_REASON_CODE,
+    CONFIDENCE_SIGNAL_FIELD_UTILITY_PENALTY,
+    CONFIDENCE_SIGNAL_FIELD_SKIP_CANDIDATE,
+    CONFIDENCE_SIGNAL_FIELD_REQUIRES_MANUAL_REVIEW,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SniffHeuristics {
     pub max_probe_bytes: u32,
     pub binary_byte_threshold_pct: Number,
@@ -91,6 +109,7 @@ pub enum UnknownEncodingAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EncodingPolicy {
     pub primary_detectors: Vec<EncodingDetector>,
     pub normalization: NormalizationPolicy,
@@ -134,6 +153,7 @@ impl ChecksumMismatchAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CorruptPartialPolicy {
     pub truncated_action: TruncatedAction,
     pub checksum_mismatch_action: ChecksumMismatchAction,
@@ -141,13 +161,14 @@ pub struct CorruptPartialPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ConfidenceSignals {
     pub min_confidence_for_text: f64,
     pub min_confidence_for_lossy_decode: f64,
     pub emit_required_fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FileClassificationContractDefinition {
     pub kind: String,
     pub v: u32,
@@ -155,6 +176,17 @@ pub struct FileClassificationContractDefinition {
     pub encoding_policy: EncodingPolicy,
     pub corrupt_partial_policy: CorruptPartialPolicy,
     pub confidence_signals: ConfidenceSignals,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileClassificationContractDefinition {
+    kind: String,
+    v: u32,
+    sniff_heuristics: SniffHeuristics,
+    encoding_policy: EncodingPolicy,
+    corrupt_partial_policy: CorruptPartialPolicy,
+    confidence_signals: ConfidenceSignals,
 }
 
 impl Default for FileClassificationContractDefinition {
@@ -186,19 +218,39 @@ impl Default for FileClassificationContractDefinition {
                 min_confidence_for_text: 0.8,
                 min_confidence_for_lossy_decode: 0.9,
                 emit_required_fields: vec![
-                    "classification_confidence".to_string(),
-                    "encoding_confidence".to_string(),
-                    "reason_code".to_string(),
-                    "utility_penalty".to_string(),
-                    "skip_candidate".to_string(),
-                    "requires_manual_review".to_string(),
+                    CONFIDENCE_SIGNAL_FIELD_CLASSIFICATION_CONFIDENCE.to_string(),
+                    CONFIDENCE_SIGNAL_FIELD_ENCODING_CONFIDENCE.to_string(),
+                    CONFIDENCE_SIGNAL_FIELD_REASON_CODE.to_string(),
+                    CONFIDENCE_SIGNAL_FIELD_UTILITY_PENALTY.to_string(),
+                    CONFIDENCE_SIGNAL_FIELD_SKIP_CANDIDATE.to_string(),
+                    CONFIDENCE_SIGNAL_FIELD_REQUIRES_MANUAL_REVIEW.to_string(),
                 ],
             },
         }
     }
 }
 
+impl<'de> Deserialize<'de> for FileClassificationContractDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawFileClassificationContractDefinition::deserialize(deserializer)?;
+        let contract = Self {
+            kind: raw.kind,
+            v: raw.v,
+            sniff_heuristics: raw.sniff_heuristics,
+            encoding_policy: raw.encoding_policy,
+            corrupt_partial_policy: raw.corrupt_partial_policy,
+            confidence_signals: raw.confidence_signals,
+        };
+        contract.validate().map_err(de::Error::custom)?;
+        Ok(contract)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SniffFeatures {
     pub null_bytes: u32,
     pub non_printable_ratio: f64,
@@ -264,13 +316,14 @@ pub enum IngestAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DownstreamSignals {
     pub utility_penalty: f64,
     pub skip_candidate: bool,
     pub requires_manual_review: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FileClassificationDecision {
     pub kind: String,
     pub v: u32,
@@ -288,35 +341,56 @@ pub struct FileClassificationDecision {
     pub downstream_signals: DownstreamSignals,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileClassificationDecision {
+    kind: String,
+    v: u32,
+    path: String,
+    size_bytes: u64,
+    probe_bytes: u64,
+    sniff_features: SniffFeatures,
+    detected_type: DetectedType,
+    detected_encoding: String,
+    normalization_applied: String,
+    ingest_action: IngestAction,
+    classification_confidence: f64,
+    encoding_confidence: f64,
+    reason_code: String,
+    downstream_signals: DownstreamSignals,
+}
+
+impl<'de> Deserialize<'de> for FileClassificationDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawFileClassificationDecision::deserialize(deserializer)?;
+        let decision = Self {
+            kind: raw.kind,
+            v: raw.v,
+            path: raw.path,
+            size_bytes: raw.size_bytes,
+            probe_bytes: raw.probe_bytes,
+            sniff_features: raw.sniff_features,
+            detected_type: raw.detected_type,
+            detected_encoding: raw.detected_encoding,
+            normalization_applied: raw.normalization_applied,
+            ingest_action: raw.ingest_action,
+            classification_confidence: raw.classification_confidence,
+            encoding_confidence: raw.encoding_confidence,
+            reason_code: raw.reason_code,
+            downstream_signals: raw.downstream_signals,
+        };
+        decision.validate().map_err(de::Error::custom)?;
+        Ok(decision)
+    }
+}
+
 impl FileClassificationDecision {
     #[must_use]
     pub fn satisfies_contract(&self) -> bool {
-        let confidence_ok = (0.0..=1.0).contains(&self.classification_confidence)
-            && (0.0..=1.0).contains(&self.encoding_confidence);
-        let reason_code_ok = self.reason_code.starts_with("FSFS_")
-            && self
-                .reason_code
-                .chars()
-                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_');
-        let encoding_is_none = self.detected_encoding == ENCODING_NONE;
-        let normalization_is_none = self.normalization_applied == NORMALIZATION_NONE;
-        let encoding_contract_ok = match self.detected_type {
-            DetectedType::Binary | DetectedType::Archive | DetectedType::Corrupt => {
-                encoding_is_none && normalization_is_none
-            }
-            DetectedType::Text | DetectedType::Partial => !self.detected_encoding.is_empty(),
-        };
-        let ingest_contract_ok = match self.detected_type {
-            DetectedType::Archive | DetectedType::Corrupt => {
-                matches!(
-                    self.ingest_action,
-                    IngestAction::Skip | IngestAction::Quarantine
-                )
-            }
-            DetectedType::Binary | DetectedType::Text | DetectedType::Partial => true,
-        };
-
-        confidence_ok && reason_code_ok && encoding_contract_ok && ingest_contract_ok
+        self.validate().is_ok()
     }
 }
 
@@ -341,7 +415,7 @@ impl ErrorClass {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FileClassificationCorruptEvent {
     pub kind: String,
     pub v: u32,
@@ -350,6 +424,38 @@ pub struct FileClassificationCorruptEvent {
     pub bytes_recovered: u64,
     pub ingest_action: IngestAction,
     pub reason_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFileClassificationCorruptEvent {
+    kind: String,
+    v: u32,
+    path: String,
+    error_class: ErrorClass,
+    bytes_recovered: u64,
+    ingest_action: IngestAction,
+    reason_code: String,
+}
+
+impl<'de> Deserialize<'de> for FileClassificationCorruptEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawFileClassificationCorruptEvent::deserialize(deserializer)?;
+        let event = Self {
+            kind: raw.kind,
+            v: raw.v,
+            path: raw.path,
+            error_class: raw.error_class,
+            bytes_recovered: raw.bytes_recovered,
+            ingest_action: raw.ingest_action,
+            reason_code: raw.reason_code,
+        };
+        event.validate().map_err(de::Error::custom)?;
+        Ok(event)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +509,19 @@ impl<'a> FileClassificationInput<'a> {
 }
 
 impl FileClassificationContractDefinition {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_kind(
+            &self.kind,
+            FILE_CLASSIFICATION_CONTRACT_KIND,
+            "kind must be fsfs_file_classification_contract_definition",
+        )?;
+        validate_schema_version(self.v)?;
+        self.sniff_heuristics.validate()?;
+        self.encoding_policy.validate()?;
+        self.confidence_signals.validate()?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn classify(&self, input: FileClassificationInput<'_>) -> FileClassificationDecision {
         let capped_probe = self.cap_probe(input.probe);
@@ -764,6 +883,209 @@ impl FileClassificationContractDefinition {
     }
 }
 
+impl SniffHeuristics {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.max_probe_bytes < MIN_PROBE_BYTES {
+            return Err("sniff_heuristics.max_probe_bytes must be >= 256");
+        }
+        validate_percentage(
+            self.binary_byte_threshold_pct.as_f64(),
+            "sniff_heuristics.binary_byte_threshold_pct must be between 0 and 100",
+        )?;
+        validate_percentage(
+            self.high_bit_ratio_threshold_pct.as_f64(),
+            "sniff_heuristics.high_bit_ratio_threshold_pct must be between 0 and 100",
+        )?;
+        if !self.null_byte_hard_binary {
+            return Err("sniff_heuristics.null_byte_hard_binary must be true");
+        }
+        Ok(())
+    }
+}
+
+impl EncodingPolicy {
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.primary_detectors.len() < 2 {
+            return Err("encoding_policy.primary_detectors must contain at least two detectors");
+        }
+        if self.primary_detectors[0] != EncodingDetector::Bom {
+            return Err("encoding_policy.primary_detectors[0] must be bom");
+        }
+        if self.primary_detectors[1] != EncodingDetector::Utf8Validation {
+            return Err("encoding_policy.primary_detectors[1] must be utf8_validation");
+        }
+        Ok(())
+    }
+}
+
+impl ConfidenceSignals {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_unit_interval(
+            self.min_confidence_for_text,
+            "confidence_signals.min_confidence_for_text must be between 0 and 1",
+        )?;
+        validate_unit_interval(
+            self.min_confidence_for_lossy_decode,
+            "confidence_signals.min_confidence_for_lossy_decode must be between 0 and 1",
+        )?;
+        if self.emit_required_fields.len() < 4 {
+            return Err(
+                "confidence_signals.emit_required_fields must contain at least four fields",
+            );
+        }
+
+        let mut unique_fields = BTreeSet::new();
+        for field in &self.emit_required_fields {
+            if !ALLOWED_CONFIDENCE_SIGNAL_FIELDS.contains(&field.as_str()) {
+                return Err(
+                    "confidence_signals.emit_required_fields contains an unsupported field",
+                );
+            }
+            if !unique_fields.insert(field.as_str()) {
+                return Err("confidence_signals.emit_required_fields must be unique");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl SniffFeatures {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_unit_interval(
+            self.non_printable_ratio,
+            "sniff_features.non_printable_ratio must be between 0 and 1",
+        )?;
+        validate_unit_interval(
+            self.high_bit_ratio,
+            "sniff_features.high_bit_ratio must be between 0 and 1",
+        )?;
+        if !matches!(
+            self.bom.as_str(),
+            BOM_NONE | BOM_UTF8 | BOM_UTF16_LE | BOM_UTF16_BE
+        ) {
+            return Err("sniff_features.bom must be one of none|utf8|utf16le|utf16be");
+        }
+        Ok(())
+    }
+}
+
+impl DownstreamSignals {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_unit_interval(
+            self.utility_penalty,
+            "downstream_signals.utility_penalty must be between 0 and 1",
+        )
+    }
+}
+
+impl FileClassificationDecision {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_kind(
+            &self.kind,
+            FILE_CLASSIFICATION_DECISION_KIND,
+            "kind must be fsfs_file_classification_decision",
+        )?;
+        validate_schema_version(self.v)?;
+        if self.path.is_empty() {
+            return Err("path must not be empty");
+        }
+        self.sniff_features.validate()?;
+        validate_unit_interval(
+            self.classification_confidence,
+            "classification_confidence must be between 0 and 1",
+        )?;
+        validate_unit_interval(
+            self.encoding_confidence,
+            "encoding_confidence must be between 0 and 1",
+        )?;
+        if !is_reason_code(&self.reason_code) {
+            return Err("reason_code must match ^FSFS_[A-Z0-9_]+$");
+        }
+        if !is_allowed_detected_encoding(&self.detected_encoding) {
+            return Err("detected_encoding must match the schema contract");
+        }
+        if !matches!(
+            self.normalization_applied.as_str(),
+            "utf8_nfc" | "utf8_nfc_lossy" | NORMALIZATION_NONE
+        ) {
+            return Err("normalization_applied must match the schema contract");
+        }
+        self.downstream_signals.validate()?;
+
+        let encoding_is_none = self.detected_encoding == ENCODING_NONE;
+        let normalization_is_none = self.normalization_applied == NORMALIZATION_NONE;
+        match self.detected_type {
+            DetectedType::Binary => {
+                if !encoding_is_none || !normalization_is_none {
+                    return Err("binary decisions must use none encoding and normalization");
+                }
+            }
+            DetectedType::Archive | DetectedType::Corrupt => {
+                if !encoding_is_none || !normalization_is_none {
+                    return Err(
+                        "archive/corrupt decisions must use none encoding and normalization",
+                    );
+                }
+                if !matches!(
+                    self.ingest_action,
+                    IngestAction::Skip | IngestAction::Quarantine
+                ) {
+                    return Err("archive/corrupt decisions must skip or quarantine");
+                }
+            }
+            DetectedType::Partial => {
+                if encoding_is_none {
+                    return Err("partial decisions must provide a detected encoding");
+                }
+                if matches!(self.ingest_action, IngestAction::Index) {
+                    return Err("partial decisions must not use ingest_action=index");
+                }
+            }
+            DetectedType::Text => {
+                if encoding_is_none {
+                    return Err("text decisions must provide a detected encoding");
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl FileClassificationCorruptEvent {
+    fn validate(&self) -> Result<(), &'static str> {
+        validate_kind(
+            &self.kind,
+            FILE_CLASSIFICATION_CORRUPT_EVENT_KIND,
+            "kind must be fsfs_file_classification_corrupt_event",
+        )?;
+        validate_schema_version(self.v)?;
+        if self.path.is_empty() {
+            return Err("path must not be empty");
+        }
+        if !is_reason_code(&self.reason_code) {
+            return Err("reason_code must match ^FSFS_[A-Z0-9_]+$");
+        }
+        if matches!(self.ingest_action, IngestAction::Index) {
+            return Err("corrupt events must not use ingest_action=index");
+        }
+        if !matches!(
+            (self.error_class, &self.ingest_action),
+            (
+                ErrorClass::Truncated,
+                IngestAction::Skip | IngestAction::Quarantine | IngestAction::IndexPartialWithFlag
+            ) | (
+                ErrorClass::ChecksumMismatch | ErrorClass::DecodeError | ErrorClass::IoShortRead,
+                IngestAction::Skip | IngestAction::Quarantine
+            )
+        ) {
+            return Err("corrupt event ingest_action does not satisfy the schema contract");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum EncodingAssessment {
     Utf8 { bom: &'static str },
@@ -832,6 +1154,53 @@ fn clamp_unit(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
+fn validate_schema_version(value: u32) -> Result<(), &'static str> {
+    if value == FILE_CLASSIFICATION_SCHEMA_VERSION {
+        Ok(())
+    } else {
+        Err("schema version 1")
+    }
+}
+
+fn validate_kind(actual: &str, expected: &str, message: &'static str) -> Result<(), &'static str> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
+fn validate_unit_interval(value: f64, message: &'static str) -> Result<(), &'static str> {
+    if (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
+fn validate_percentage(value: Option<f64>, message: &'static str) -> Result<(), &'static str> {
+    match value {
+        Some(value) if (0.0..=100.0).contains(&value) => Ok(()),
+        _ => Err(message),
+    }
+}
+
+fn is_reason_code(value: &str) -> bool {
+    value.len() > 5
+        && value.starts_with("FSFS_")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn is_allowed_detected_encoding(value: &str) -> bool {
+    value == ENCODING_NONE
+        || (!value.is_empty()
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')))
+}
+
 #[must_use]
 fn is_archive_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -872,11 +1241,14 @@ fn is_archive_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
         ChecksumMismatchAction, DetectedType, ErrorClass, FILE_CLASSIFICATION_CONTRACT_KIND,
         FILE_CLASSIFICATION_CORRUPT_EVENT_KIND, FILE_CLASSIFICATION_DECISION_KIND,
-        FILE_CLASSIFICATION_SCHEMA_VERSION, FileClassificationContractDefinition, IngestAction,
-        IntegrityState, NormalizationPolicy, TruncatedAction,
+        FILE_CLASSIFICATION_SCHEMA_VERSION, FileClassificationContractDefinition,
+        FileClassificationDecision, IngestAction, IntegrityState, NormalizationPolicy,
+        TruncatedAction,
     };
 
     #[test]
@@ -1022,5 +1394,79 @@ mod tests {
             contract.build_corrupt_event("/workspace/tmp/bad.log", ErrorClass::DecodeError, 0);
         assert_eq!(decode_error.ingest_action, IngestAction::Quarantine);
         assert_eq!(decode_error.reason_code, "FSFS_CORRUPT_DECODE_ERROR");
+    }
+
+    #[test]
+    fn contract_definition_rejects_wrong_kind() {
+        let mut value = json!(FileClassificationContractDefinition::default());
+        value["kind"] = json!("wrong_kind");
+
+        let error = serde_json::from_value::<FileClassificationContractDefinition>(value)
+            .expect_err("reject bad kind");
+
+        assert!(
+            error
+                .to_string()
+                .contains("fsfs_file_classification_contract_definition")
+        );
+    }
+
+    #[test]
+    fn contract_definition_rejects_wrong_version() {
+        let mut value = json!(FileClassificationContractDefinition::default());
+        value["v"] = json!(2);
+
+        let error = serde_json::from_value::<FileClassificationContractDefinition>(value)
+            .expect_err("reject bad version");
+
+        assert!(error.to_string().contains("schema version 1"));
+    }
+
+    #[test]
+    fn decision_rejects_unknown_fields() {
+        let contract = FileClassificationContractDefinition::default();
+        let mut value = json!(contract.classify_bytes("/workspace/src/lib.rs", b"hello world\n"));
+        value["extra"] = json!(true);
+
+        let error = serde_json::from_value::<FileClassificationDecision>(value)
+            .expect_err("reject extra field");
+
+        assert!(error.to_string().contains("unknown field `extra`"));
+    }
+
+    #[test]
+    fn decision_rejects_partial_index_action() {
+        let contract = FileClassificationContractDefinition::default();
+        let mut value = json!(contract.classify_with_integrity(
+            "/workspace/logs/partial.md",
+            b"# heading\nbody that was cut off",
+            IntegrityState::Truncated,
+        ));
+        value["ingest_action"] = json!("index");
+
+        let error = serde_json::from_value::<FileClassificationDecision>(value)
+            .expect_err("reject bad partial action");
+
+        assert!(
+            error
+                .to_string()
+                .contains("partial decisions must not use ingest_action=index")
+        );
+    }
+
+    #[test]
+    fn corrupt_event_rejects_non_truncated_partial_action() {
+        let contract = FileClassificationContractDefinition::default();
+        let mut value = json!(contract.build_corrupt_event(
+            "/workspace/tmp/bad.log",
+            ErrorClass::DecodeError,
+            0,
+        ));
+        value["ingest_action"] = json!("index_partial_with_flag");
+
+        let error = serde_json::from_value::<super::FileClassificationCorruptEvent>(value)
+            .expect_err("reject invalid corrupt event action");
+
+        assert!(error.to_string().contains("corrupt event ingest_action"));
     }
 }

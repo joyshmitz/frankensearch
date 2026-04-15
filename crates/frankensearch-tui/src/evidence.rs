@@ -392,8 +392,8 @@ mod tests {
             );
         });
 
-        let actual_trimmed = actual.trim_end_matches(|c| c == '\n' || c == '\r');
-        let expected_trimmed = expected.trim_end_matches(|c| c == '\n' || c == '\r');
+        let actual_trimmed = actual.trim_end_matches(['\n', '\r']);
+        let expected_trimmed = expected.trim_end_matches(['\n', '\r']);
 
         if actual_trimmed != expected_trimmed {
             let actual_path = golden_path.with_extension("actual.json");
