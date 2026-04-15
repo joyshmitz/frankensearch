@@ -610,7 +610,7 @@ pub struct ArtifactEntry {
 // ─── Events ──────────────────────────────────────────────────────────────────
 
 /// Body of the `e2e-event-v1` artifact (one per JSONL line).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EventBody {
     #[serde(rename = "type")]
     pub event_type: E2eEventType,

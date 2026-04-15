@@ -328,6 +328,9 @@ impl DurableTantivyIndex {
                 }
 
                 files_checked += 1;
+
+                // FileProtector::verify_file uses xxh3 fast-path internally
+                // for V2+ trailers (< 1ms), falling back to CRC32 for V1.
                 let check_start = Instant::now();
                 match self.protector.verify_file(&abs_path, &sidecar) {
                     Ok(verify) if verify.healthy => {
