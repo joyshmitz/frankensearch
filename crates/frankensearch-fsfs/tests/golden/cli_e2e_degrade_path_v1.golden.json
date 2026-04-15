@@ -1,0 +1,194 @@
+{
+  "schema_version": "fsfs.cli.e2e.v1",
+  "scenario": {
+    "id": "cli-degrade-path",
+    "kind": "degrade",
+    "args": [
+      "search",
+      "latency fallback lane",
+      "--profile",
+      "degraded",
+      "--format",
+      "json"
+    ],
+    "expected_exit_code": 0,
+    "expected_reason_code": "e2e.cli.degrade_path",
+    "summary": "Exercise degraded query path and reason-coded status"
+  },
+  "manifest": {
+    "v": 1,
+    "schema": "e2e-manifest-v1",
+    "run_id": "01JABCDEF00000000000000000",
+    "ts": "2026-02-14T00:00:00Z",
+    "body": {
+      "suite": "fsfs",
+      "determinism_tier": "semantic",
+      "seed": 42,
+      "config_hash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "index_version": "fsvi-v1",
+      "model_versions": [
+        {
+          "name": "potion-128M",
+          "revision": "contract-v1"
+        },
+        {
+          "name": "all-MiniLM-L6-v2",
+          "revision": "contract-v1"
+        }
+      ],
+      "platform": {
+        "os": "linux",
+        "arch": "x86_64",
+        "rustc": "nightly-2026-02-14"
+      },
+      "clock_mode": "simulated",
+      "tie_break_policy": "doc_id_lexical",
+      "artifacts": [
+        {
+          "file": "artifacts_index.json",
+          "checksum": "sha256:bc36abbd05c5f8f9ee88dcb629350f2d1e059359d804c78d710e042fe3b66f0a"
+        },
+        {
+          "file": "env.json",
+          "checksum": "sha256:f5469feb95a6f6c504503ae8edb56ee9b07c1ab1131f7fa88be4f6f44505e7d9"
+        },
+        {
+          "file": "replay_command.txt",
+          "checksum": "sha256:53c4b5229f3fb063560cf1639ef2d6c55c41511e9d156dfba5a0ca61fcf97719"
+        },
+        {
+          "file": "repro.lock",
+          "checksum": "sha256:8a34d0a200c36813d474816e7d5c2c8a58749b6648638a00f63ecc03dfe7ce8f"
+        },
+        {
+          "file": "structured_events.jsonl",
+          "checksum": "sha256:8d80f855711e46f4782e569710bd89492c7e3898faeab59ec95a54c59a84b725",
+          "line_count": 5
+        }
+      ],
+      "duration_ms": 250,
+      "exit_status": "fail"
+    }
+  },
+  "events": [
+    {
+      "v": 1,
+      "schema": "e2e-event-v1",
+      "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
+      "ts": "2026-02-14T00:00:00Z",
+      "body": {
+        "type": "e2e_start",
+        "correlation": {
+          "event_id": "cli-degrade-path-evt-00",
+          "root_request_id": "cli-degrade-path-root",
+          "parent_event_id": null
+        },
+        "severity": "info",
+        "reason_code": "e2e.cli.scenario_start",
+        "context": "starting cli-degrade-path"
+      }
+    },
+    {
+      "v": 1,
+      "schema": "e2e-event-v1",
+      "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
+      "ts": "2026-02-14T00:00:00Z",
+      "body": {
+        "type": "lane_start",
+        "correlation": {
+          "event_id": "cli-degrade-path-evt-01",
+          "root_request_id": "cli-degrade-path-root",
+          "parent_event_id": null
+        },
+        "severity": "info",
+        "lane_id": "degrade",
+        "reason_code": "e2e.cli.scenario_start",
+        "context": "Exercise degraded query path and reason-coded status",
+        "metrics": {
+          "argv_len": 6
+        }
+      }
+    },
+    {
+      "v": 1,
+      "schema": "e2e-event-v1",
+      "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
+      "ts": "2026-02-14T00:00:00Z",
+      "body": {
+        "type": "assertion",
+        "correlation": {
+          "event_id": "cli-degrade-path-evt-02",
+          "root_request_id": "cli-degrade-path-root",
+          "parent_event_id": null
+        },
+        "severity": "warn",
+        "oracle_id": "cli.exit_status",
+        "outcome": "fail",
+        "reason_code": "e2e.cli.degrade_path",
+        "context": "expected_exit=0"
+      }
+    },
+    {
+      "v": 1,
+      "schema": "e2e-event-v1",
+      "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
+      "ts": "2026-02-14T00:00:00Z",
+      "body": {
+        "type": "lane_end",
+        "correlation": {
+          "event_id": "cli-degrade-path-evt-03",
+          "root_request_id": "cli-degrade-path-root",
+          "parent_event_id": null
+        },
+        "severity": "info",
+        "lane_id": "degrade",
+        "outcome": "fail",
+        "reason_code": "e2e.cli.degrade_path"
+      }
+    },
+    {
+      "v": 1,
+      "schema": "e2e-event-v1",
+      "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
+      "ts": "2026-02-14T00:00:00Z",
+      "body": {
+        "type": "e2e_end",
+        "correlation": {
+          "event_id": "cli-degrade-path-evt-04",
+          "root_request_id": "cli-degrade-path-root",
+          "parent_event_id": null
+        },
+        "severity": "warn",
+        "outcome": "fail",
+        "reason_code": "e2e.cli.degrade_path"
+      }
+    }
+  ],
+  "replay": [
+    {
+      "v": 1,
+      "schema": "e2e-replay-v1",
+      "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
+      "ts": "2026-02-14T00:00:00Z",
+      "body": {
+        "type": "query",
+        "offset_ms": 0,
+        "seq": 1,
+        "payload": {
+          "scenario_id": "cli-degrade-path",
+          "scenario_kind": "degrade",
+          "args": [
+            "search",
+            "latency fallback lane",
+            "--profile",
+            "degraded",
+            "--format",
+            "json"
+          ],
+          "expected_reason_code": "e2e.cli.degrade_path"
+        }
+      }
+    }
+  ],
+  "replay_command": "frankensearch --seed 42 search latency fallback lane --profile degraded --format json"
+}
