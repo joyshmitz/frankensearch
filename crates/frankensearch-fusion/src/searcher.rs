@@ -59,7 +59,9 @@ use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
 use crate::conformal::{AdaptiveConformalState, ConformalSearchCalibration};
 #[cfg(feature = "graph")]
 use crate::graph_rank::GraphRanker;
-use crate::mmr::{MmrConfig, mmr_rerank};
+use crate::mmr::MmrConfig;
+#[cfg(feature = "rerank")]
+use crate::mmr::mmr_rerank;
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse, rrf_fuse_with_graph};
@@ -878,7 +880,9 @@ impl TwoTierSearcher {
         let mut best_results = Vec::new();
         let metrics = self
             .search(cx, query, k, text_fn, |phase| match phase {
-                SearchPhase::Initial { results, .. } | SearchPhase::Refined { results, .. } => {
+                SearchPhase::Initial { results, .. }
+                | SearchPhase::Refined { results, .. }
+                | SearchPhase::Reranked { results, .. } => {
                     best_results = results;
                 }
                 SearchPhase::RefinementFailed { .. } => {
@@ -1173,7 +1177,7 @@ impl TwoTierSearcher {
         query_class: QueryClass,
         k: usize,
         initial_results: &[ScoredResult],
-        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        _text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
         parent_event_id: Option<String>,
@@ -3132,6 +3136,7 @@ mod tests {
                         match phase {
                             SearchPhase::Initial { .. } => got_initial = true,
                             SearchPhase::Refined { .. } => got_refined = true,
+                            SearchPhase::Reranked { .. } => got_refined = true,
                             SearchPhase::RefinementFailed { .. } => {}
                         }
                     },
@@ -3543,7 +3548,7 @@ mod tests {
                         SearchPhase::RefinementFailed { error, .. } => {
                             saw_timeout = matches!(error, SearchError::SearchTimeout { .. });
                         }
-                        SearchPhase::Refined { .. } => {}
+                        SearchPhase::Refined { .. } | SearchPhase::Reranked { .. } => {}
                     },
                 )
                 .await
@@ -3653,6 +3658,7 @@ mod tests {
                         match phase {
                             SearchPhase::Initial { .. } => saw_initial = true,
                             SearchPhase::Refined { .. } => saw_refined = true,
+                            SearchPhase::Reranked { .. } => saw_refined = true,
                             SearchPhase::RefinementFailed { .. } => saw_refinement_failed = true,
                         }
                     },

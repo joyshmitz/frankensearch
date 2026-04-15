@@ -135,18 +135,13 @@ impl Default for OverridePolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DefaultAction {
+    #[default]
     IndexMetadataOnly,
     Skip,
     IndexFull,
-}
-
-impl Default for DefaultAction {
-    fn default() -> Self {
-        Self::IndexMetadataOnly
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

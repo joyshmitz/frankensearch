@@ -11,7 +11,7 @@ pub enum Topic {
     Lifecycle,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetSummary {
     pub detected_instances: u32,
     pub healthy_instances: u32,
