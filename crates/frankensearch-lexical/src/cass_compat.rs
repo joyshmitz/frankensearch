@@ -17,7 +17,7 @@ use tantivy::tokenizer::{
     LowerCaser, RegexTokenizer, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream,
     Tokenizer,
 };
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, UserOperation, doc};
 use tracing::{debug, info, warn};
 
 /// Schema version namespace used for cass-compatible Tantivy indexes.
@@ -266,15 +266,12 @@ impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
 const MERGE_COOLDOWN_MS: i64 = 300_000;
 /// Segment count threshold above which merge is triggered.
 const MERGE_SEGMENT_THRESHOLD: usize = 4;
-/// Cap cass rebuilds to a reasonable Tantivy worker pool size. 8 is the
-/// sweet spot on modern workstations: enough to saturate a typical 4–8-core
-/// laptop and push meaningfully into high-core desktops and servers, without
-/// pushing per-run heap (threads × `CASS_WRITER_HEAP_PER_THREAD_BYTES`) into
-/// multi-GB territory or saturating disk I/O during segment flushes. The
-/// producer side (doc prep) uses rayon's default pool and already scales to
-/// all available cores, so the real ceiling for Tantivy-side parallelism is
-/// the per-machine disk/merge cost, not CPU.
-const CASS_MAX_WRITER_THREADS: usize = 8;
+/// Cap cass rebuilds to a more aggressive Tantivy worker pool size. The
+/// rebuild path is bulk-load oriented and can profit from many more indexing
+/// workers on 32+ core servers than the original workstation-oriented cap.
+///
+/// Operators can still lower this via `CASS_TANTIVY_MAX_WRITER_THREADS`.
+const CASS_MAX_WRITER_THREADS: usize = 32;
 /// Reserve a healthy minimum heap budget so large repairs do not churn tiny
 /// segments and constant flush/merge cycles on multi-million-message corpora.
 const CASS_MIN_WRITER_HEAP_BYTES: usize = 256 * 1024 * 1024;
@@ -284,7 +281,7 @@ const CASS_WRITER_HEAP_PER_THREAD_BYTES: usize = 128 * 1024 * 1024;
 /// During cass bulk rebuilds, delay background merges until there is a
 /// meaningful backlog of segments instead of burning CPU on near-continuous
 /// compaction while the canonical database is still streaming documents in.
-const CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE: usize = 32;
+const CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE: usize = 256;
 
 /// Global last merge timestamp (ms since epoch).
 static LAST_MERGE_TS: AtomicI64 = AtomicI64::new(0);
@@ -430,7 +427,12 @@ fn cass_writer_config() -> CassWriterConfig {
 }
 
 fn cass_writer_config_for_parallelism(available_parallelism: usize) -> CassWriterConfig {
-    let num_threads = available_parallelism.clamp(1, CASS_MAX_WRITER_THREADS);
+    let max_threads = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(CASS_MAX_WRITER_THREADS);
+    let num_threads = available_parallelism.clamp(1, max_threads);
     let heap_size_bytes = num_threads
         .saturating_mul(CASS_WRITER_HEAP_PER_THREAD_BYTES)
         .max(CASS_MIN_WRITER_HEAP_BYTES);
@@ -676,20 +678,18 @@ impl CassTantivyIndex {
         const PARALLEL_PREP_THRESHOLD: usize = 8;
 
         let fields = self.fields;
-        if docs.len() < PARALLEL_PREP_THRESHOLD {
-            for cass_doc in docs {
-                let d = build_cass_tantivy_document(fields, cass_doc);
-                self.writer.add_document(d).map_err(tantivy_err)?;
-            }
-        } else {
-            let prepared: Vec<tantivy::TantivyDocument> = docs
-                .par_iter()
+        let prepared: Vec<tantivy::TantivyDocument> = if docs.len() < PARALLEL_PREP_THRESHOLD {
+            docs.iter()
                 .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
-                .collect();
-            for d in prepared {
-                self.writer.add_document(d).map_err(tantivy_err)?;
-            }
-        }
+                .collect()
+        } else {
+            docs.par_iter()
+                .map(|cass_doc| build_cass_tantivy_document(fields, cass_doc))
+                .collect()
+        };
+        self.writer
+            .run(prepared.into_iter().map(UserOperation::Add))
+            .map_err(tantivy_err)?;
         Ok(())
     }
 }
