@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::error::{SearchError, SearchResult};
 use tantivy::indexer::LogMergePolicy;
+use tantivy::indexer::UserOperation;
 use tantivy::query::{
     AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
@@ -17,7 +18,7 @@ use tantivy::tokenizer::{
     LowerCaser, RegexTokenizer, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream,
     Tokenizer,
 };
-use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, UserOperation, doc};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
 
 /// Schema version namespace used for cass-compatible Tantivy indexes.
@@ -427,7 +428,7 @@ fn cass_writer_config() -> CassWriterConfig {
 }
 
 fn cass_writer_config_for_parallelism(available_parallelism: usize) -> CassWriterConfig {
-    let max_threads = dotenvy::var("CASS_TANTIVY_MAX_WRITER_THREADS")
+    let max_threads = std::env::var("CASS_TANTIVY_MAX_WRITER_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -736,10 +737,7 @@ fn build_cass_tantivy_document(
         fields.content_prefix,
         cass_generate_edge_ngrams(&cass_doc.content),
     );
-    d.add_text(
-        fields.preview,
-        cass_build_preview(&cass_doc.content, 400),
-    );
+    d.add_text(fields.preview, cass_build_preview(&cass_doc.content, 400));
     d
 }
 
@@ -1661,7 +1659,7 @@ mod cass_query_tests {
                 heap_size_bytes: 512 * 1024 * 1024,
             }
         );
-        // At the new `CASS_MAX_WRITER_THREADS` cap: 8 threads × 128 MB = 1 GB.
+        // Eight cores stay below the `CASS_MAX_WRITER_THREADS` cap.
         assert_eq!(
             cass_writer_config_for_parallelism(8),
             CassWriterConfig {
@@ -1669,13 +1667,20 @@ mod cass_query_tests {
                 heap_size_bytes: 1024 * 1024 * 1024,
             }
         );
-        // Above the cap (e.g. 64-core workstation): still clamped to 8 threads
-        // to avoid oversubscribing disk I/O and piling up per-thread heaps.
+        // At the new cap: 32 threads × 128 MB = 4 GB.
+        assert_eq!(
+            cass_writer_config_for_parallelism(32),
+            CassWriterConfig {
+                num_threads: 32,
+                heap_size_bytes: 4 * 1024 * 1024 * 1024,
+            }
+        );
+        // Above the cap (e.g. 64-core workstation): still clamped to 32 threads.
         assert_eq!(
             cass_writer_config_for_parallelism(64),
             CassWriterConfig {
-                num_threads: 8,
-                heap_size_bytes: 1024 * 1024 * 1024,
+                num_threads: 32,
+                heap_size_bytes: 4 * 1024 * 1024 * 1024,
             }
         );
     }
