@@ -2309,6 +2309,53 @@ mod cass_query_tests {
         assert_eq!(tokens, vec!["搜"]);
     }
 
+    fn legacy_cjk_bigram_output(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() || !chars.iter().all(|c| is_cjk(*c)) {
+            return vec![text.to_string()];
+        }
+        if chars.len() == 1 {
+            return vec![text.to_string()];
+        }
+
+        let mut out = Vec::with_capacity(chars.len() - 1);
+        for i in 0..chars.len() - 1 {
+            let mut bigram = String::with_capacity(8);
+            bigram.push(chars[i]);
+            bigram.push(chars[i + 1]);
+            out.push(bigram);
+        }
+        out
+    }
+
+    #[test]
+    fn cjk_bigram_decompose_matches_legacy_reference() {
+        let regex_tok = RegexTokenizer::new(r"[^\s]+").unwrap();
+        let mut analyzer = TextAnalyzer::builder(regex_tok)
+            .filter(CjkBigramDecompose)
+            .build();
+
+        for sample in [
+            "搜",
+            "搜索",
+            "搜索引擎",
+            "あいうえお",
+            "가나다",
+            "hello",
+            "bd-q3fy",
+            "abc搜索",
+            "搜索abc",
+            "中A文",
+        ] {
+            let mut stream = analyzer.token_stream(sample);
+            let mut actual = Vec::new();
+            while stream.advance() {
+                actual.push(stream.token().text.clone());
+            }
+            assert_eq!(actual, legacy_cjk_bigram_output(sample), "sample={sample}");
+        }
+    }
+
     #[test]
     fn cjk_bigram_passes_through_ascii() {
         // ASCII tokens should pass through unchanged.
