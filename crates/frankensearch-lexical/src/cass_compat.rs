@@ -25,7 +25,8 @@ use tracing::{debug, info, warn};
 /// Schema version namespace used for cass-compatible Tantivy indexes.
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-freqs-preview-stored";
+pub const CASS_SCHEMA_HASH: &str =
+    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-freqs-preview-stored";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
