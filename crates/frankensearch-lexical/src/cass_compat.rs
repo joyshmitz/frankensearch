@@ -1047,7 +1047,10 @@ fn build_cass_tantivy_document(
     }
     if let Some(title) = &cass_doc.title {
         d.add_text(fields.title, title);
-        d.add_text(fields.title_prefix, cass_generate_indexable_prefix_terms(title));
+        d.add_text(
+            fields.title_prefix,
+            cass_generate_indexable_prefix_terms(title),
+        );
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(&cass_doc.content);
     d.add_text(fields.content_prefix, content_prefix);
@@ -1089,7 +1092,10 @@ fn build_cass_tantivy_document_ref(
     }
     if let Some(title) = cass_doc.title {
         d.add_text(fields.title, title);
-        d.add_text(fields.title_prefix, cass_generate_indexable_prefix_terms(title));
+        d.add_text(
+            fields.title_prefix,
+            cass_generate_indexable_prefix_terms(title),
+        );
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(cass_doc.content);
     d.add_text(fields.content_prefix, content_prefix);
@@ -2381,19 +2387,24 @@ mod cass_query_tests {
             "Hello搜索World",
             &"alpha beta gamma ".repeat(64),
         ] {
-            let mut legacy_stream = legacy.token_stream(&cass_generate_edge_ngrams(sample));
+            let legacy_input = cass_generate_edge_ngrams(sample);
+            let mut legacy_stream = legacy.token_stream(&legacy_input);
             let mut legacy_tokens = Vec::new();
             while legacy_stream.advance() {
                 legacy_tokens.push(legacy_stream.token().text.clone());
             }
 
-            let mut direct_stream = direct.token_stream(&cass_generate_indexable_prefix_terms(sample));
+            let direct_input = cass_generate_indexable_prefix_terms(sample);
+            let mut direct_stream = direct.token_stream(&direct_input);
             let mut direct_tokens = Vec::new();
             while direct_stream.advance() {
                 direct_tokens.push(direct_stream.token().text.clone());
             }
 
-            assert_eq!(direct_tokens, legacy_tokens, "prefix token mismatch for {sample:?}");
+            assert_eq!(
+                direct_tokens, legacy_tokens,
+                "prefix token mismatch for {sample:?}"
+            );
         }
     }
 
