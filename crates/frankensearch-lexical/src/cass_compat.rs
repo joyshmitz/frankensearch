@@ -18,6 +18,7 @@ use tantivy::schema::{
 use tantivy::tokenizer::RegexTokenizer;
 use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
+    WhitespaceTokenizer,
 };
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
@@ -26,7 +27,7 @@ use tracing::{debug, info, warn};
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
 pub const CASS_SCHEMA_HASH: &str =
-    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-freqs-preview-stored";
+    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-freqs-preview-stored-prefix-direct";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
@@ -1046,7 +1047,7 @@ fn build_cass_tantivy_document(
     }
     if let Some(title) = &cass_doc.title {
         d.add_text(fields.title, title);
-        d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
+        d.add_text(fields.title_prefix, cass_generate_indexable_prefix_terms(title));
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(&cass_doc.content);
     d.add_text(fields.content_prefix, content_prefix);
@@ -1088,7 +1089,7 @@ fn build_cass_tantivy_document_ref(
     }
     if let Some(title) = cass_doc.title {
         d.add_text(fields.title, title);
-        d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
+        d.add_text(fields.title_prefix, cass_generate_indexable_prefix_terms(title));
     }
     let (content_prefix, preview) = cass_build_content_prefix_and_preview(cass_doc.content);
     d.add_text(fields.content_prefix, content_prefix);
@@ -1110,7 +1111,7 @@ pub fn cass_build_schema() -> Schema {
 
     let prefix_text = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
-            .set_tokenizer("hyphen_normalize")
+            .set_tokenizer("cass_prefix_terms")
             .set_index_option(tantivy::schema::IndexRecordOption::WithFreqs),
     );
 
@@ -1219,14 +1220,125 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 ///      Japanese, and Korean text.
 ///   4. `LowerCaser` — normalizes to lowercase.
 ///   5. `RemoveLongFilter` — drops tokens longer than 256 bytes.
-pub fn cass_ensure_tokenizer(index: &mut Index) {
-    let analyzer = TextAnalyzer::builder(CassTokenizer::default())
+fn cass_build_full_text_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(CassTokenizer::default())
         .filter(HyphenDecompose)
         .filter(CjkBigramDecompose)
         .filter(LowerCaser)
         .filter(RemoveLongFilter::limit(256))
-        .build();
-    index.tokenizers().register("hyphen_normalize", analyzer);
+        .build()
+}
+
+fn cass_build_prefix_terms_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(WhitespaceTokenizer::default())
+        .filter(LowerCaser)
+        .build()
+}
+
+pub fn cass_ensure_tokenizer(index: &mut Index) {
+    index
+        .tokenizers()
+        .register("hyphen_normalize", cass_build_full_text_analyzer());
+    index
+        .tokenizers()
+        .register("cass_prefix_terms", cass_build_prefix_terms_analyzer());
+}
+
+fn cass_push_prefix_term(out: &mut String, term: &str) {
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(term);
+}
+
+fn cass_emit_prefix_terms_from_legacy_prefix(prefix: &str, out: &mut String) {
+    let mut cursor = 0usize;
+
+    while let Some((ch, next_cursor)) = next_char_from(prefix, cursor) {
+        if ch.is_ascii_alphanumeric() {
+            let start = cursor;
+            let mut end = next_cursor;
+            let mut scan = next_cursor;
+            while let Some((next_ch, after_next)) = next_char_from(prefix, scan) {
+                if !next_ch.is_ascii_alphanumeric() {
+                    break;
+                }
+                end = after_next;
+                scan = after_next;
+            }
+            cass_push_prefix_term(out, &prefix[start..end]);
+            cursor = end;
+            continue;
+        }
+
+        if is_cass_tokenizer_cjk(ch) {
+            let start = cursor;
+            let mut end = next_cursor;
+            let mut scan = next_cursor;
+            while let Some((next_ch, after_next)) = next_char_from(prefix, scan) {
+                if !is_cass_tokenizer_cjk(next_ch) {
+                    break;
+                }
+                end = after_next;
+                scan = after_next;
+            }
+
+            let run = &prefix[start..end];
+            let mut indices = [0usize; 21];
+            let mut index_count = 0usize;
+            for (i, _) in run.char_indices() {
+                indices[index_count] = i;
+                index_count += 1;
+            }
+            indices[index_count] = run.len();
+            index_count += 1;
+
+            if index_count == 2 {
+                cass_push_prefix_term(out, run);
+            } else {
+                for idx in 0..(index_count - 2) {
+                    cass_push_prefix_term(out, &run[indices[idx]..indices[idx + 2]]);
+                }
+            }
+
+            cursor = end;
+            continue;
+        }
+
+        cursor = next_cursor;
+    }
+}
+
+fn cass_emit_indexable_prefix_terms(
+    word: &str,
+    indices: &[usize],
+    ascii_only: bool,
+    cjk_only: bool,
+    out: &mut String,
+) {
+    if indices.len() < 3 {
+        return;
+    }
+
+    if ascii_only {
+        for &end_idx in &indices[2..] {
+            cass_push_prefix_term(out, &word[..end_idx]);
+        }
+        return;
+    }
+
+    if cjk_only {
+        for prefix_end_idx in 2..indices.len() {
+            for start_idx in 0..(prefix_end_idx - 1) {
+                cass_push_prefix_term(out, &word[indices[start_idx]..indices[start_idx + 2]]);
+            }
+        }
+        return;
+    }
+
+    for &end_idx in &indices[2..] {
+        cass_emit_prefix_terms_from_legacy_prefix(&word[..end_idx], out);
+    }
 }
 
 /// Generate edge n-grams from text for prefix search acceleration.
@@ -1255,13 +1367,44 @@ pub fn cass_generate_edge_ngrams(text: &str) -> String {
             continue;
         }
         for &end_idx in &indices[2..index_count] {
-            if !ngrams.is_empty() {
-                ngrams.push(' ');
-            }
-            ngrams.push_str(&word[..end_idx]);
+            cass_push_prefix_term(&mut ngrams, &word[..end_idx]);
         }
     }
     ngrams
+}
+
+#[must_use]
+fn cass_generate_indexable_prefix_terms(text: &str) -> String {
+    const MAX_NGRAM_INDICES: usize = 21;
+    let mut terms = String::with_capacity(text.len() * 2);
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        let mut indices = [0usize; MAX_NGRAM_INDICES];
+        let mut index_count = 0usize;
+
+        for (i, _) in word.char_indices() {
+            if index_count == MAX_NGRAM_INDICES {
+                break;
+            }
+            indices[index_count] = i;
+            index_count += 1;
+        }
+
+        if index_count < MAX_NGRAM_INDICES {
+            indices[index_count] = word.len();
+            index_count += 1;
+        }
+
+        let ascii_only = word.bytes().all(|byte| byte.is_ascii_alphanumeric());
+        let cjk_only = !word.is_empty() && word.chars().all(is_cass_tokenizer_cjk);
+        cass_emit_indexable_prefix_terms(
+            word,
+            &indices[..index_count],
+            ascii_only,
+            cjk_only,
+            &mut terms,
+        );
+    }
+    terms
 }
 
 /// Build a bounded-length preview from message content.
@@ -1287,7 +1430,7 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
     const PREVIEW_MAX_CHARS: usize = 400;
     const MAX_NGRAM_INDICES: usize = 21;
 
-    let mut ngrams = String::with_capacity(content.len() * 2);
+    let mut prefix_terms = String::with_capacity(content.len() * 2);
     let mut preview = String::with_capacity(content.len().min(PREVIEW_MAX_CHARS + 8));
     let mut preview_chars = 0usize;
     let mut preview_truncated = false;
@@ -1295,19 +1438,9 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
     let mut word_indices = [0usize; MAX_NGRAM_INDICES];
     let mut word_index_count = 0usize;
     let mut word_start = 0usize;
+    let mut word_is_ascii_only = false;
+    let mut word_is_cjk_only = false;
     let mut in_word = false;
-
-    let emit_word_prefixes = |word: &str, indices: &[usize], ngrams: &mut String| {
-        if indices.len() < 3 {
-            return;
-        }
-        for &end_idx in &indices[2..] {
-            if !ngrams.is_empty() {
-                ngrams.push(' ');
-            }
-            ngrams.push_str(&word[..end_idx]);
-        }
-    };
 
     for (byte_idx, ch) in content.char_indices() {
         if preview_chars < PREVIEW_MAX_CHARS {
@@ -1323,9 +1456,15 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
                 word_start = byte_idx;
                 word_indices[0] = 0;
                 word_index_count = 1;
-            } else if word_index_count < MAX_NGRAM_INDICES {
-                word_indices[word_index_count] = byte_idx - word_start;
-                word_index_count += 1;
+                word_is_ascii_only = ch.is_ascii_alphanumeric();
+                word_is_cjk_only = is_cass_tokenizer_cjk(ch);
+            } else {
+                word_is_ascii_only &= ch.is_ascii_alphanumeric();
+                word_is_cjk_only &= is_cass_tokenizer_cjk(ch);
+                if word_index_count < MAX_NGRAM_INDICES {
+                    word_indices[word_index_count] = byte_idx - word_start;
+                    word_index_count += 1;
+                }
             }
             continue;
         }
@@ -1335,10 +1474,12 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
                 word_indices[word_index_count] = byte_idx - word_start;
                 word_index_count += 1;
             }
-            emit_word_prefixes(
+            cass_emit_indexable_prefix_terms(
                 &content[word_start..byte_idx],
                 &word_indices[..word_index_count],
-                &mut ngrams,
+                word_is_ascii_only,
+                word_is_cjk_only,
+                &mut prefix_terms,
             );
             in_word = false;
         }
@@ -1349,10 +1490,12 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
             word_indices[word_index_count] = content.len() - word_start;
             word_index_count += 1;
         }
-        emit_word_prefixes(
+        cass_emit_indexable_prefix_terms(
             &content[word_start..],
             &word_indices[..word_index_count],
-            &mut ngrams,
+            word_is_ascii_only,
+            word_is_cjk_only,
+            &mut prefix_terms,
         );
     }
 
@@ -1360,7 +1503,7 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
         preview.push('…');
     }
 
-    (ngrams, preview)
+    (prefix_terms, preview)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2206,7 +2349,7 @@ mod cass_query_tests {
     }
 
     #[test]
-    fn cass_build_content_prefix_and_preview_matches_existing_helpers() {
+    fn cass_build_content_prefix_and_preview_matches_indexable_helpers() {
         let samples = [
             "",
             "hello world",
@@ -2218,8 +2361,39 @@ mod cass_query_tests {
 
         for sample in samples {
             let (prefix, preview) = cass_build_content_prefix_and_preview(sample);
-            assert_eq!(prefix, cass_generate_edge_ngrams(sample));
+            assert_eq!(prefix, cass_generate_indexable_prefix_terms(sample));
             assert_eq!(preview, cass_build_preview(sample, 400));
+        }
+    }
+
+    #[test]
+    fn cass_indexable_prefix_terms_match_legacy_prefix_analyzer() {
+        let mut legacy = cass_build_full_text_analyzer();
+        let mut direct = cass_build_prefix_terms_analyzer();
+
+        for sample in [
+            "",
+            "hello world",
+            "éclair crème brûlée",
+            "foo_bar baz-qux 12345",
+            "你好 世界 from cass",
+            "搜索引擎测试",
+            "Hello搜索World",
+            &"alpha beta gamma ".repeat(64),
+        ] {
+            let mut legacy_stream = legacy.token_stream(&cass_generate_edge_ngrams(sample));
+            let mut legacy_tokens = Vec::new();
+            while legacy_stream.advance() {
+                legacy_tokens.push(legacy_stream.token().text.clone());
+            }
+
+            let mut direct_stream = direct.token_stream(&cass_generate_indexable_prefix_terms(sample));
+            let mut direct_tokens = Vec::new();
+            while direct_stream.advance() {
+                direct_tokens.push(direct_stream.token().text.clone());
+            }
+
+            assert_eq!(direct_tokens, legacy_tokens, "prefix token mismatch for {sample:?}");
         }
     }
 
