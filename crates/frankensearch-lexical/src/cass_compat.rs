@@ -12,11 +12,12 @@ use tantivy::query::{
 };
 use tantivy::schema::IndexRecordOption;
 use tantivy::schema::{
-    FAST, Field, INDEXED, STORED, STRING, Schema, TEXT, TextFieldIndexing, TextOptions,
+    FAST, Field, INDEXED, STORED, STRING, Schema, TextFieldIndexing, TextOptions,
 };
+#[cfg(test)]
+use tantivy::tokenizer::RegexTokenizer;
 use tantivy::tokenizer::{
-    LowerCaser, RegexTokenizer, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream,
-    Tokenizer,
+    LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer,
 };
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
@@ -24,7 +25,145 @@ use tracing::{debug, info, warn};
 /// Schema version namespace used for cass-compatible Tantivy indexes.
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-cjk-bigrams";
+pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-freqs-preview-stored";
+
+/// Specialized tokenizer for cass lexical fields.
+///
+/// This preserves the current regex tokenizer semantics for:
+/// - ASCII alphanumeric runs
+/// - hyphen-joined ASCII alphanumeric runs
+/// - contiguous runs in the exact CJK ranges covered by the old regex
+///
+/// A dedicated scanner avoids the regex DFA hot path that dominates rebuild
+/// time on large corpora.
+#[derive(Clone, Default)]
+struct CassTokenizer {
+    token: Token,
+}
+
+struct CassTokenStream<'a> {
+    text: &'a str,
+    cursor: usize,
+    token: &'a mut Token,
+}
+
+#[inline]
+fn is_cass_tokenizer_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{3100}'..='\u{312F}'
+            | '\u{3300}'..='\u{33FF}'
+            | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+#[inline]
+fn next_char_from(text: &str, offset: usize) -> Option<(char, usize)> {
+    let ch = text[offset..].chars().next()?;
+    Some((ch, offset + ch.len_utf8()))
+}
+
+impl Tokenizer for CassTokenizer {
+    type TokenStream<'a> = CassTokenStream<'a>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        self.token.reset();
+        CassTokenStream {
+            text,
+            cursor: 0,
+            token: &mut self.token,
+        }
+    }
+}
+
+impl CassTokenStream<'_> {
+    fn scan_ascii_token(&self, mut cursor: usize) -> usize {
+        let mut end = cursor;
+        let mut last_was_ascii_alnum = false;
+
+        while let Some((ch, next_cursor)) = next_char_from(self.text, cursor) {
+            if ch.is_ascii_alphanumeric() {
+                end = next_cursor;
+                cursor = next_cursor;
+                last_was_ascii_alnum = true;
+                continue;
+            }
+
+            if ch == '-'
+                && last_was_ascii_alnum
+                && let Some((next_ch, _)) = next_char_from(self.text, next_cursor)
+                && next_ch.is_ascii_alphanumeric()
+            {
+                end = next_cursor;
+                cursor = next_cursor;
+                last_was_ascii_alnum = false;
+                continue;
+            }
+
+            break;
+        }
+
+        end
+    }
+
+    fn scan_cjk_token(&self, mut cursor: usize) -> usize {
+        let mut end = cursor;
+        while let Some((ch, next_cursor)) = next_char_from(self.text, cursor) {
+            if !is_cass_tokenizer_cjk(ch) {
+                break;
+            }
+            end = next_cursor;
+            cursor = next_cursor;
+        }
+        end
+    }
+}
+
+impl TokenStream for CassTokenStream<'_> {
+    fn advance(&mut self) -> bool {
+        self.token.text.clear();
+        self.token.position = self.token.position.wrapping_add(1);
+
+        while let Some((ch, next_cursor)) = next_char_from(self.text, self.cursor) {
+            if ch.is_ascii_alphanumeric() {
+                let offset_from = self.cursor;
+                let offset_to = self.scan_ascii_token(self.cursor);
+                self.token.offset_from = offset_from;
+                self.token.offset_to = offset_to;
+                self.token.text.push_str(&self.text[offset_from..offset_to]);
+                self.cursor = offset_to;
+                return true;
+            }
+
+            if is_cass_tokenizer_cjk(ch) {
+                let offset_from = self.cursor;
+                let offset_to = self.scan_cjk_token(next_cursor);
+                self.token.offset_from = offset_from;
+                self.token.offset_to = offset_to;
+                self.token.text.push_str(&self.text[offset_from..offset_to]);
+                self.cursor = offset_to;
+                return true;
+            }
+
+            self.cursor = next_cursor;
+        }
+
+        false
+    }
+
+    fn token(&self) -> &Token {
+        self.token
+    }
+
+    fn token_mut(&mut self) -> &mut Token {
+        self.token
+    }
+}
 
 // ─── HyphenDecompose token filter ────────────────────────────────────────────
 //
@@ -908,11 +1047,9 @@ fn build_cass_tantivy_document(
         d.add_text(fields.title, title);
         d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
     }
-    d.add_text(
-        fields.content_prefix,
-        cass_generate_edge_ngrams(&cass_doc.content),
-    );
-    d.add_text(fields.preview, cass_build_preview(&cass_doc.content, 400));
+    let (content_prefix, preview) = cass_build_content_prefix_and_preview(&cass_doc.content);
+    d.add_text(fields.content_prefix, content_prefix);
+    d.add_text(fields.preview, preview);
     d
 }
 
@@ -952,11 +1089,9 @@ fn build_cass_tantivy_document_ref(
         d.add_text(fields.title, title);
         d.add_text(fields.title_prefix, cass_generate_edge_ngrams(title));
     }
-    d.add_text(
-        fields.content_prefix,
-        cass_generate_edge_ngrams(cass_doc.content),
-    );
-    d.add_text(fields.preview, cass_build_preview(cass_doc.content, 400));
+    let (content_prefix, preview) = cass_build_content_prefix_and_preview(cass_doc.content);
+    d.add_text(fields.content_prefix, content_prefix);
+    d.add_text(fields.preview, preview);
     d
 }
 
@@ -972,10 +1107,10 @@ pub fn cass_build_schema() -> Schema {
         )
         .set_stored();
 
-    let text_not_stored = TextOptions::default().set_indexing_options(
+    let prefix_text = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
             .set_tokenizer("hyphen_normalize")
-            .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
+            .set_index_option(tantivy::schema::IndexRecordOption::WithFreqs),
     );
 
     schema_builder.add_text_field("agent", STRING | STORED);
@@ -986,9 +1121,9 @@ pub fn cass_build_schema() -> Schema {
     schema_builder.add_i64_field("created_at", INDEXED | STORED | FAST);
     schema_builder.add_text_field("title", text.clone());
     schema_builder.add_text_field("content", text);
-    schema_builder.add_text_field("title_prefix", text_not_stored.clone());
-    schema_builder.add_text_field("content_prefix", text_not_stored);
-    schema_builder.add_text_field("preview", TEXT | STORED);
+    schema_builder.add_text_field("title_prefix", prefix_text.clone());
+    schema_builder.add_text_field("content_prefix", prefix_text);
+    schema_builder.add_text_field("preview", STORED);
     schema_builder.add_text_field("source_id", STRING | STORED);
     schema_builder.add_text_field("origin_kind", STRING | STORED);
     schema_builder.add_text_field("origin_host", STRING | STORED);
@@ -1073,7 +1208,7 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 /// Register the tokenizer used by cass-compatible lexical fields.
 ///
 /// Pipeline:
-///   1. `RegexTokenizer` — matches ASCII alphanumeric runs (with hyphens)
+///   1. `CassTokenizer` — matches ASCII alphanumeric runs (with hyphens)
 ///      **and** CJK character runs as separate tokens.
 ///   2. `HyphenDecompose` — for each hyphenated token, emits the compound
 ///      form *and* the individual sub-parts (all at the same position) so
@@ -1084,19 +1219,7 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 ///   4. `LowerCaser` — normalizes to lowercase.
 ///   5. `RemoveLongFilter` — drops tokens longer than 256 bytes.
 pub fn cass_ensure_tokenizer(index: &mut Index) {
-    // [a-zA-Z0-9]+ matches ASCII alphanumeric runs; (?:-[a-zA-Z0-9]+)* extends
-    // across hyphens.  We use an explicit character class instead of \w to
-    // exclude underscores — matching the behaviour of the old SimpleTokenizer
-    // and cass_sanitize_query, which both treat `_` as a word boundary.
-    //
-    // The CJK alternation matches runs of CJK Unified Ideographs, Hiragana,
-    // Katakana, Hangul Syllables, and other CJK ranges so they are emitted as
-    // tokens that the CjkBigramDecompose filter can then split into bigrams.
-    let regex_tok = RegexTokenizer::new(
-        r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF\u3100-\u312F\u3300-\u33FF\uF900-\uFAFF]+",
-    )
-    .expect("hyphen-preserving + CJK regex tokenizer pattern must be valid");
-    let analyzer = TextAnalyzer::builder(regex_tok)
+    let analyzer = TextAnalyzer::builder(CassTokenizer::default())
         .filter(HyphenDecompose)
         .filter(CjkBigramDecompose)
         .filter(LowerCaser)
@@ -1111,17 +1234,26 @@ pub fn cass_generate_edge_ngrams(text: &str) -> String {
     const MAX_NGRAM_INDICES: usize = 21;
     let mut ngrams = String::with_capacity(text.len() * 2);
     for word in text.split(|c: char| !c.is_alphanumeric()) {
-        let indices: Vec<usize> = word
-            .char_indices()
-            .map(|(i, _)| i)
-            .chain(std::iter::once(word.len()))
-            .take(MAX_NGRAM_INDICES)
-            .collect();
+        let mut indices = [0usize; MAX_NGRAM_INDICES];
+        let mut index_count = 0usize;
 
-        if indices.len() < 3 {
+        for (i, _) in word.char_indices() {
+            if index_count == MAX_NGRAM_INDICES {
+                break;
+            }
+            indices[index_count] = i;
+            index_count += 1;
+        }
+
+        if index_count < MAX_NGRAM_INDICES {
+            indices[index_count] = word.len();
+            index_count += 1;
+        }
+
+        if index_count < 3 {
             continue;
         }
-        for &end_idx in &indices[2..] {
+        for &end_idx in &indices[2..index_count] {
             if !ngrams.is_empty() {
                 ngrams.push(' ');
             }
@@ -1147,6 +1279,87 @@ pub fn cass_build_preview(content: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[must_use]
+fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
+    const PREVIEW_MAX_CHARS: usize = 400;
+    const MAX_NGRAM_INDICES: usize = 21;
+
+    let mut ngrams = String::with_capacity(content.len() * 2);
+    let mut preview = String::with_capacity(content.len().min(PREVIEW_MAX_CHARS + 8));
+    let mut preview_chars = 0usize;
+    let mut preview_truncated = false;
+
+    let mut word_indices = [0usize; MAX_NGRAM_INDICES];
+    let mut word_index_count = 0usize;
+    let mut word_start = 0usize;
+    let mut in_word = false;
+
+    let emit_word_prefixes = |word: &str, indices: &[usize], ngrams: &mut String| {
+        if indices.len() < 3 {
+            return;
+        }
+        for &end_idx in &indices[2..] {
+            if !ngrams.is_empty() {
+                ngrams.push(' ');
+            }
+            ngrams.push_str(&word[..end_idx]);
+        }
+    };
+
+    for (byte_idx, ch) in content.char_indices() {
+        if preview_chars < PREVIEW_MAX_CHARS {
+            preview.push(ch);
+            preview_chars += 1;
+        } else {
+            preview_truncated = true;
+        }
+
+        if ch.is_alphanumeric() {
+            if !in_word {
+                in_word = true;
+                word_start = byte_idx;
+                word_indices[0] = 0;
+                word_index_count = 1;
+            } else if word_index_count < MAX_NGRAM_INDICES {
+                word_indices[word_index_count] = byte_idx - word_start;
+                word_index_count += 1;
+            }
+            continue;
+        }
+
+        if in_word {
+            if word_index_count < MAX_NGRAM_INDICES {
+                word_indices[word_index_count] = byte_idx - word_start;
+                word_index_count += 1;
+            }
+            emit_word_prefixes(
+                &content[word_start..byte_idx],
+                &word_indices[..word_index_count],
+                &mut ngrams,
+            );
+            in_word = false;
+        }
+    }
+
+    if in_word {
+        if word_index_count < MAX_NGRAM_INDICES {
+            word_indices[word_index_count] = content.len() - word_start;
+            word_index_count += 1;
+        }
+        emit_word_prefixes(
+            &content[word_start..],
+            &word_indices[..word_index_count],
+            &mut ngrams,
+        );
+    }
+
+    if preview_truncated {
+        preview.push('…');
+    }
+
+    (ngrams, preview)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1513,6 +1726,16 @@ fn cjk_bigrams(s: &str) -> Vec<String> {
 
 /// Build a query that requires ALL bigrams to match in at least one field.
 /// This mirrors how the tokenizer indexes CJK text.
+#[inline]
+fn cass_term_query_fields(fields: &CassFields) -> [(Field, IndexRecordOption); 4] {
+    [
+        (fields.title, IndexRecordOption::WithFreqsAndPositions),
+        (fields.content, IndexRecordOption::WithFreqsAndPositions),
+        (fields.title_prefix, IndexRecordOption::WithFreqs),
+        (fields.content_prefix, IndexRecordOption::WithFreqs),
+    ]
+}
+
 fn cass_build_cjk_term_query(bigrams: &[String], fields: &CassFields) -> Option<Box<dyn Query>> {
     if bigrams.is_empty() {
         return None;
@@ -1522,17 +1745,12 @@ fn cass_build_cjk_term_query(bigrams: &[String], fields: &CassFields) -> Option<
     let mut bigram_musts: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     for bigram in bigrams {
         let mut field_shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for field in [
-            fields.title,
-            fields.content,
-            fields.title_prefix,
-            fields.content_prefix,
-        ] {
+        for (field, index_record_option) in cass_term_query_fields(fields) {
             field_shoulds.push((
                 Occur::Should,
                 Box::new(TermQuery::new(
                     Term::from_field_text(field, bigram),
-                    IndexRecordOption::WithFreqsAndPositions,
+                    index_record_option,
                 )),
             ));
         }
@@ -1566,17 +1784,12 @@ fn cass_build_term_query_clauses(
                 }
                 return shoulds;
             }
-            for field in [
-                fields.title,
-                fields.content,
-                fields.title_prefix,
-                fields.content_prefix,
-            ] {
+            for (field, index_record_option) in cass_term_query_fields(fields) {
                 shoulds.push((
                     Occur::Should,
                     Box::new(TermQuery::new(
                         Term::from_field_text(field, term),
-                        IndexRecordOption::WithFreqsAndPositions,
+                        index_record_option,
                     )),
                 ));
             }
@@ -1934,8 +2147,14 @@ mod cass_query_tests {
 
     #[test]
     fn cass_generate_edge_ngrams_emits_expected_prefixes() {
-        assert_eq!(cass_generate_edge_ngrams("hello world"), "he hel hell hello wo wor worl world");
-        assert_eq!(cass_generate_edge_ngrams("éclair"), "éc écl écla éclai éclair");
+        assert_eq!(
+            cass_generate_edge_ngrams("hello world"),
+            "he hel hell hello wo wor worl world"
+        );
+        assert_eq!(
+            cass_generate_edge_ngrams("éclair"),
+            "éc écl écla éclai éclair"
+        );
         assert_eq!(cass_generate_edge_ngrams("x"), "");
     }
 
@@ -1954,6 +2173,53 @@ mod cass_query_tests {
         assert_eq!(cass_build_preview("hello", 10), "hello");
         assert_eq!(cass_build_preview("hello world", 5), "hello…");
         assert_eq!(cass_build_preview("éclair", 3), "écl…");
+    }
+
+    #[test]
+    fn cass_prefix_fields_store_freqs_without_positions() {
+        let schema = cass_build_schema();
+
+        for field_name in ["title_prefix", "content_prefix"] {
+            let field = schema.get_field(field_name).unwrap();
+            let field_entry = schema.get_field_entry(field);
+            assert_eq!(
+                field_entry.field_type().get_index_record_option(),
+                Some(IndexRecordOption::WithFreqs),
+                "unexpected index record option for {field_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_preview_field_is_stored_only() {
+        let schema = cass_build_schema();
+        let field = schema.get_field("preview").unwrap();
+        let field_entry = schema.get_field_entry(field);
+
+        assert!(field_entry.is_stored(), "preview should stay stored");
+        assert_eq!(
+            field_entry.field_type().get_index_record_option(),
+            None,
+            "preview should not be indexed"
+        );
+    }
+
+    #[test]
+    fn cass_build_content_prefix_and_preview_matches_existing_helpers() {
+        let samples = [
+            "",
+            "hello world",
+            "éclair crème brûlée",
+            "foo_bar baz-qux 12345",
+            "你好 世界 from cass",
+            &"alpha beta gamma ".repeat(64),
+        ];
+
+        for sample in samples {
+            let (prefix, preview) = cass_build_content_prefix_and_preview(sample);
+            assert_eq!(prefix, cass_generate_edge_ngrams(sample));
+            assert_eq!(preview, cass_build_preview(sample, 400));
+        }
     }
 
     #[test]
@@ -2076,6 +2342,50 @@ mod cass_query_tests {
             tokens.push(stream.token().text.clone());
         }
         assert_eq!(tokens, vec!["hello", "搜索", "world"]);
+    }
+
+    #[test]
+    fn cass_tokenizer_matches_legacy_regex_boundaries() {
+        let regex_pattern = r"[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*|[\u4E00-\u9FFF\u3400-\u4DBF\u3040-\u309F\u30A0-\u30FF\uAC00-\uD7AF\u3100-\u312F\u3300-\u33FF\uF900-\uFAFF]+";
+        let mut regex = RegexTokenizer::new(regex_pattern).unwrap();
+        let mut custom = CassTokenizer::default();
+
+        for text in [
+            "",
+            "Hello, happy tax payer!",
+            "bd-q3fy foo_bar baz-qux",
+            "abc-123 -- def",
+            "Hello搜索World",
+            "foo搜索-barあいう123",
+            "caf\u{00E9} 𠀀 token",
+            "multi---dash and trailing- hyphen",
+        ] {
+            let mut regex_stream = regex.token_stream(text);
+            let mut regex_tokens = Vec::new();
+            while regex_stream.advance() {
+                let token = regex_stream.token();
+                regex_tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                ));
+            }
+
+            let mut custom_stream = custom.token_stream(text);
+            let mut custom_tokens = Vec::new();
+            while custom_stream.advance() {
+                let token = custom_stream.token();
+                custom_tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                ));
+            }
+
+            assert_eq!(custom_tokens, regex_tokens, "token mismatch for {text:?}");
+        }
     }
 
     #[test]
