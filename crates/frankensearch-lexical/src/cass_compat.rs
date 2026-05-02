@@ -342,13 +342,14 @@ pub struct CjkBigramDecomposeStream<'a, T> {
 impl<T: TokenStream> CjkBigramDecomposeStream<'_, T> {
     fn decompose_cjk(&mut self) {
         let token = self.tail.token();
-        let chars: Vec<char> = token.text.chars().collect();
 
-        // Only decompose tokens that are entirely CJK.
-        if chars.is_empty() || !chars.iter().all(|c| is_cjk(*c)) {
+        // Only decompose tokens that are entirely CJK. Most cass tokens are
+        // ASCII, so reject those before allocating the CJK character buffer.
+        if token.text.is_empty() || !token.text.chars().all(is_cjk) {
             return;
         }
 
+        let chars: Vec<char> = token.text.chars().collect();
         if chars.len() == 1 {
             // Single CJK character: emit as unigram (already the token text).
             return;
