@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 pub const CASS_SCHEMA_VERSION: &str = "v7";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
 pub const CASS_SCHEMA_HASH: &str =
-    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-basic-preview-stored-content-external";
+    "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-basic-prefix-tokenizer-preview-stored-content-external";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
@@ -1196,7 +1196,7 @@ pub fn cass_build_schema() -> Schema {
     let stored_indexed_text = indexed_text.clone().set_stored();
     let prefix_text = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
-            .set_tokenizer("hyphen_normalize")
+            .set_tokenizer("prefix_normalize")
             .set_index_option(tantivy::schema::IndexRecordOption::Basic),
     );
 
@@ -1292,9 +1292,9 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
     Ok(dir)
 }
 
-/// Register the tokenizer used by cass-compatible lexical fields.
+/// Register the tokenizers used by cass-compatible lexical fields.
 ///
-/// Pipeline:
+/// `hyphen_normalize` pipeline:
 ///   1. `CassTokenizer` — matches ASCII alphanumeric runs (with hyphens)
 ///      **and** CJK character runs as separate tokens.
 ///   2. `HyphenDecompose` — for each hyphenated token, emits the compound
@@ -1305,6 +1305,13 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 ///      Japanese, and Korean text.
 ///   4. `CassNormalizeAndLimit` — applies the same lowercase + 256-byte
 ///      length-limit semantics as the old `LowerCaser + RemoveLongFilter`.
+///
+/// `prefix_normalize` is used only for generated edge-ngram fields. Those
+/// values are whitespace-separated prefix terms produced by
+/// `cass_generate_edge_ngrams`, so they cannot contain hyphens. Keeping the CJK
+/// bigram and normalization filters preserves prefix-field query behavior while
+/// avoiding the per-token `HyphenDecompose` layer on the highest-volume basic
+/// postings fields.
 pub fn cass_ensure_tokenizer(index: &mut Index) {
     let analyzer = TextAnalyzer::builder(CassTokenizer::default())
         .filter(HyphenDecompose)
@@ -1312,6 +1319,13 @@ pub fn cass_ensure_tokenizer(index: &mut Index) {
         .filter(CassNormalizeAndLimit)
         .build();
     index.tokenizers().register("hyphen_normalize", analyzer);
+    let prefix_analyzer = TextAnalyzer::builder(CassTokenizer::default())
+        .filter(CjkBigramDecompose)
+        .filter(CassNormalizeAndLimit)
+        .build();
+    index
+        .tokenizers()
+        .register("prefix_normalize", prefix_analyzer);
 }
 
 fn cass_push_prefix_term(out: &mut String, term: &str) {
@@ -2264,6 +2278,73 @@ mod cass_query_tests {
                 field_entry.field_type().get_index_record_option(),
                 Some(IndexRecordOption::Basic),
                 "unexpected index record option for {field_name}"
+            );
+            let tantivy::schema::FieldType::Str(text_options) = field_entry.field_type() else {
+                panic!("{field_name} should be a text field");
+            };
+            assert_eq!(
+                text_options
+                    .get_indexing_options()
+                    .expect("prefix field indexing options")
+                    .tokenizer(),
+                "prefix_normalize",
+                "prefix field should use the cheaper generated-prefix analyzer"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_prefix_analyzer_matches_full_analyzer_for_generated_prefix_terms() {
+        for text in [
+            "",
+            "Hello, happy tax payer!",
+            "bd-q3fy foo_bar baz-qux",
+            "abc-123 -- def",
+            "Hello搜索World",
+            "foo搜索-barあいう123",
+            "caf\u{00E9} 𠀀 token",
+            "multi---dash and trailing- hyphen",
+        ] {
+            let prefix_terms = cass_generate_edge_ngrams(text);
+            let mut full = TextAnalyzer::builder(CassTokenizer::default())
+                .filter(HyphenDecompose)
+                .filter(CjkBigramDecompose)
+                .filter(CassNormalizeAndLimit)
+                .build();
+            let mut prefix = TextAnalyzer::builder(CassTokenizer::default())
+                .filter(CjkBigramDecompose)
+                .filter(CassNormalizeAndLimit)
+                .build();
+
+            let mut full_stream = full.token_stream(&prefix_terms);
+            let mut full_tokens = Vec::new();
+            while full_stream.advance() {
+                let token = full_stream.token();
+                full_tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                    token.position_length,
+                ));
+            }
+
+            let mut prefix_stream = prefix.token_stream(&prefix_terms);
+            let mut prefix_tokens = Vec::new();
+            while prefix_stream.advance() {
+                let token = prefix_stream.token();
+                prefix_tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                    token.position_length,
+                ));
+            }
+
+            assert_eq!(
+                prefix_tokens, full_tokens,
+                "prefix analyzer changed generated edge-ngram tokens for {text:?}"
             );
         }
     }
