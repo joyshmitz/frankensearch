@@ -137,6 +137,7 @@ maybe_add_path() {
         for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
           if [ -e "$rc" ] && [ -w "$rc" ]; then
             if ! grep -qF "$DEST" "$rc" 2>/dev/null; then
+              # shellcheck disable=SC2016
               printf '\nexport PATH="%s:$PATH"\n' "$DEST" >> "$rc"
             fi
             UPDATED=1
@@ -234,7 +235,7 @@ fi
 resolve_version
 
 mkdir -p "$DEST"
-OS=$(uname -s | tr 'A-Z' 'a-z')
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) ARCH="x86_64" ;;
@@ -360,10 +361,24 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
     FALLBACK_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${FALLBACK_TAR}"
     warn "Primary download failed; trying fallback artifact..."
     if ! download_with_progress "$FALLBACK_URL" "$TMP/$FALLBACK_TAR" "Downloading fallback artifact"; then
-      warn "Artifact download failed; falling back to build-from-source"
-      FROM_SOURCE=1
+      # Full Linux artifacts are large and may not be published for every
+      # release. Prefer a published lite binary before falling back to a slow
+      # source build that has to download and embed hundreds of MB of models.
+      LITE_TAR="fsfs-lite-${VERSION_BARE}-${TARGET}.${EXT}"
+      LITE_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${LITE_TAR}"
+      warn "Fallback artifact failed; trying lite release artifact..."
+      if [ -n "$TARGET" ] && download_with_progress "$LITE_URL" "$TMP/$LITE_TAR" "Downloading lite artifact"; then
+        TAR="$LITE_TAR"
+        URL="$LITE_URL"
+        LITE=1
+        warn "Installed lite artifact; run 'fsfs download-models' later for semantic models"
+      else
+        warn "Artifact download failed; falling back to build-from-source"
+        FROM_SOURCE=1
+      fi
     else
       TAR="$FALLBACK_TAR"
+      URL="$FALLBACK_URL"
     fi
   fi
 fi
@@ -431,20 +446,29 @@ fi
 
 # Verify checksum
 if [ -z "$CHECKSUM" ]; then
+  CHECKSUM_URL_DEFAULTED=0
   if [ -z "$CHECKSUM_URL" ]; then
     CHECKSUM_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+    CHECKSUM_URL_DEFAULTED=1
   fi
   info "Fetching checksum from ${CHECKSUM_URL}"
   CHECKSUM_FILE="$TMP/SHA256SUMS"
-  if ! curl -fsSL --connect-timeout 30 --max-time 60 "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-    warn "Checksum not available; skipping verification"
-    CHECKSUM="SKIP"
-  else
+  if curl -fsSL --connect-timeout 30 --max-time 60 "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
     CHECKSUM=$(grep "  ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
     if [ -z "$CHECKSUM" ]; then
       CHECKSUM=$(grep " ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
     fi
-    if [ -z "$CHECKSUM" ]; then warn "Checksum for ${TAR} not found; skipping verification"; CHECKSUM="SKIP"; fi
+  fi
+  if [ -z "$CHECKSUM" ] && [ "$CHECKSUM_URL_DEFAULTED" -eq 1 ]; then
+    SIDECAR_CHECKSUM_URL="${URL}.sha256"
+    info "Fetching checksum sidecar from ${SIDECAR_CHECKSUM_URL}"
+    if curl -fsSL --connect-timeout 30 --max-time 60 "$SIDECAR_CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
+      CHECKSUM=$(awk 'NF >= 1 && $1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$CHECKSUM_FILE")
+    fi
+  fi
+  if [ -z "$CHECKSUM" ]; then
+    warn "Checksum for ${TAR} not found; skipping verification"
+    CHECKSUM="SKIP"
   fi
 fi
 
