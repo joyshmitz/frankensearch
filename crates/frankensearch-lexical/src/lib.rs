@@ -398,6 +398,12 @@ impl TantivyIndex {
                     "writer mutex future reused after completion during {phase}"
                 ))),
             },
+            asupersync::sync::LockError::TimedOut(deadline) => SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: Box::new(std::io::Error::other(format!(
+                    "writer lock acquisition timed out at {deadline:?} during {phase}"
+                ))),
+            },
         }
     }
 
