@@ -598,10 +598,8 @@ fn map_lock_error(model: &str, error: LockError) -> SearchError {
         },
         LockError::TimedOut(deadline) => SearchError::RerankFailed {
             model: model.to_owned(),
-            source: std::io::Error::other(format!(
-                "reranker mutex lock timed out at {deadline:?}"
-            ))
-            .into(),
+            source: std::io::Error::other(format!("reranker mutex lock timed out at {deadline:?}"))
+                .into(),
         },
     }
 }

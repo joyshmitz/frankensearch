@@ -479,8 +479,7 @@ fn map_lock_error(model: &str, phase: &str, error: LockError) -> SearchError {
             }
         }
         LockError::TimedOut(deadline) => {
-            let detail =
-                format!("fastembed mutex lock timed out at {deadline:?} during {phase}");
+            let detail = format!("fastembed mutex lock timed out at {deadline:?} during {phase}");
             SearchError::EmbeddingFailed {
                 model: model.to_owned(),
                 source: std::io::Error::other(detail).into(),
