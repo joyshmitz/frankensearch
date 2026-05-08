@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
+use asupersync::fs::{read as async_file_read, read_to_string as async_file_read_to_string};
 use dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
@@ -1836,7 +1837,7 @@ impl LiveIngestPipeline {
             return Ok(true);
         }
 
-        let bytes = match fs::read(&abs_path) {
+        let bytes = match async_file_read(&abs_path).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 self.prune_indexes(cx, &rel_key).await?;
@@ -6943,8 +6944,9 @@ impl FsfsRuntime {
 
         // Read input lines from --file or stdin.
         let lines: Vec<String> = if let Some(ref file_path) = self.cli_input.input_file {
-            let content =
-                fs::read_to_string(file_path).map_err(|source| SearchError::SubsystemError {
+            let content = async_file_read_to_string(file_path)
+                .await
+                .map_err(|source| SearchError::SubsystemError {
                     subsystem: "fsfs.append_batch.read_file",
                     source: Box::new(source),
                 })?;
@@ -8337,7 +8339,7 @@ impl FsfsRuntime {
 
             // Read & Canonicalize
             for candidate in chunk {
-                let bytes = match fs::read(&candidate.file_path) {
+                let bytes = match async_file_read(&candidate.file_path).await {
                     Ok(bytes) => bytes,
                     Err(error) if is_ignorable_index_walk_error(&error) => {
                         if error.kind() == ErrorKind::PermissionDenied {
@@ -8750,7 +8752,7 @@ impl FsfsRuntime {
                             break;
                         }
 
-                        let bytes = match fs::read(&source_path) {
+                        let bytes = match async_file_read(&source_path).await {
                             Ok(bytes) => bytes,
                             Err(error) if is_ignorable_index_walk_error(&error) => {
                                 warn!(
@@ -15277,6 +15279,37 @@ mod tests {
             ),
             "the synchronous daemon connection retry remains intentionally blocking"
         );
+    }
+
+    #[test]
+    fn async_indexing_reads_use_asupersync_fs_helpers() {
+        let source = include_str!("runtime.rs");
+        let sync_read = ["fs", "::read"].concat();
+        let sync_read_to_string = ["fs", "::read_to_string"].concat();
+
+        for forbidden in [
+            format!("match {sync_read}(&abs_path)"),
+            format!("match {sync_read}(&candidate.file_path)"),
+            format!("match {sync_read}(&source_path)"),
+            format!("= {sync_read_to_string}(file_path)"),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "async fsfs indexing path still contains blocking read: {forbidden}"
+            );
+        }
+
+        for required in [
+            "async_file_read(&abs_path).await",
+            "async_file_read(&candidate.file_path).await",
+            "async_file_read(&source_path).await",
+            "async_file_read_to_string(file_path).await",
+        ] {
+            assert!(
+                source.contains(required),
+                "async fsfs indexing path should use asupersync helper: {required}"
+            );
+        }
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
