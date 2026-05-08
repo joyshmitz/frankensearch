@@ -37,7 +37,7 @@
 //! The retention tier is configurable via `storage.evidence_retention_days` and
 //! `storage.summary_retention_days` in the fsfs config.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 /// Schema version for the repro pack manifest.
 pub const REPRO_SCHEMA_VERSION: u8 = 1;
@@ -52,6 +52,12 @@ pub const INDEX_CHECKSUMS_FILENAME: &str = "index-checksums.json";
 pub const PROVENANCE_ATTESTATION_FILENAME: &str = "provenance-attestation.json";
 pub const REPLAY_META_FILENAME: &str = "replay-meta.json";
 pub const PROVENANCE_SCHEMA_VERSION: u8 = 1;
+/// Schema version for canonical fsfs replay bundle contracts.
+pub const REPLAY_BUNDLE_SCHEMA_VERSION: u8 = 1;
+/// Kind tag for replay bundle contract-definition fixtures.
+pub const REPLAY_BUNDLE_CONTRACT_KIND: &str = "fsfs_replay_bundle_contract_definition";
+/// Kind tag for replay bundle manifest fixtures.
+pub const REPLAY_BUNDLE_MANIFEST_KIND: &str = "fsfs_replay_bundle_manifest";
 
 // ─── Capture Context ────────────────────────────────────────────────────────
 
@@ -875,6 +881,448 @@ impl ReplayEntrypoint {
     }
 }
 
+// ─── Canonical Replay Bundle Contract ───────────────────────────────────────
+
+/// Replay bundle schema version marker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplayBundleSchemaVersion1;
+
+impl Serialize for ReplayBundleSchemaVersion1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(REPLAY_BUNDLE_SCHEMA_VERSION)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReplayBundleSchemaVersion1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        if value == REPLAY_BUNDLE_SCHEMA_VERSION {
+            Ok(Self)
+        } else {
+            Err(de::Error::invalid_value(
+                de::Unexpected::Unsigned(u64::from(value)),
+                &"replay bundle schema version 1",
+            ))
+        }
+    }
+}
+
+/// Kind marker for replay bundle contract definitions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReplayBundleContractKind {
+    /// Current replay bundle contract-definition kind.
+    #[serde(rename = "fsfs_replay_bundle_contract_definition")]
+    Current,
+}
+
+/// Kind marker for concrete replay bundle manifests.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReplayBundleManifestKind {
+    /// Current replay bundle manifest kind.
+    #[serde(rename = "fsfs_replay_bundle_manifest")]
+    Current,
+}
+
+/// Scenario families that the canonical replay bundle can describe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayBundleScenarioKind {
+    /// Search/query replay scenario.
+    Search,
+    /// Index construction or refresh replay scenario.
+    Index,
+    /// Doctor/repair diagnostic scenario.
+    Doctor,
+    /// Audit/evidence review scenario.
+    Audit,
+    /// Scenario that intentionally exercises degraded mode.
+    DegradedMode,
+}
+
+/// Phase labels used in expected replay outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayBundlePhase {
+    /// Fast initial search phase.
+    Initial,
+    /// Quality/refined search phase.
+    Refined,
+    /// Index build or refresh phase.
+    IndexBuild,
+    /// Doctor diagnostic phase.
+    Doctor,
+    /// Audit/reporting phase.
+    Audit,
+    /// Degraded-mode phase.
+    DegradedMode,
+}
+
+/// Expected status for one replay bundle phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayBundleOutcomeStatus {
+    /// Phase must complete successfully.
+    Succeeded,
+    /// Phase is expected to complete with degraded behavior.
+    Degraded,
+    /// Phase must be skipped by policy.
+    Skipped,
+    /// Phase is expected to fail with the declared reason code.
+    Failed,
+}
+
+/// Machine-readable contract definition for canonical replay bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleContractDefinition {
+    /// Contract definition kind tag.
+    pub kind: ReplayBundleContractKind,
+    /// Schema version.
+    pub v: ReplayBundleSchemaVersion1,
+    /// Scenario kinds covered by the replay bundle schema.
+    pub supported_scenarios: Vec<ReplayBundleScenarioKind>,
+    /// Required top-level manifest fields.
+    pub required_top_level_fields: Vec<String>,
+    /// Required command fields.
+    pub required_command_fields: Vec<String>,
+    /// Required environment fields.
+    pub required_environment_fields: Vec<String>,
+    /// Required expected-outcome fields.
+    pub required_expected_outcome_fields: Vec<String>,
+    /// Required artifact manifest fields.
+    pub required_artifact_fields: Vec<String>,
+    /// Validation lanes that must accept/reject bundle fixtures.
+    pub validation_modes: Vec<String>,
+}
+
+impl Default for ReplayBundleContractDefinition {
+    fn default() -> Self {
+        Self {
+            kind: ReplayBundleContractKind::Current,
+            v: ReplayBundleSchemaVersion1,
+            supported_scenarios: vec![
+                ReplayBundleScenarioKind::Search,
+                ReplayBundleScenarioKind::Index,
+                ReplayBundleScenarioKind::Doctor,
+                ReplayBundleScenarioKind::Audit,
+                ReplayBundleScenarioKind::DegradedMode,
+            ],
+            required_top_level_fields: vec![
+                "kind".to_owned(),
+                "v".to_owned(),
+                "bundle_id".to_owned(),
+                "scenario_id".to_owned(),
+                "scenario_kind".to_owned(),
+                "created_at".to_owned(),
+                "command".to_owned(),
+                "environment".to_owned(),
+                "fixture_refs".to_owned(),
+                "expected_phase_outcomes".to_owned(),
+                "artifact_manifest".to_owned(),
+            ],
+            required_command_fields: vec![
+                "client_surface".to_owned(),
+                "argv".to_owned(),
+                "working_dir".to_owned(),
+            ],
+            required_environment_fields: vec![
+                "seed".to_owned(),
+                "config_hash".to_owned(),
+                "snapshot".to_owned(),
+            ],
+            required_expected_outcome_fields: vec![
+                "phase".to_owned(),
+                "status".to_owned(),
+                "artifact_refs".to_owned(),
+            ],
+            required_artifact_fields: vec![
+                "artifact_id".to_owned(),
+                "path".to_owned(),
+                "content_type".to_owned(),
+                "checksum_sha256".to_owned(),
+                "required".to_owned(),
+            ],
+            validation_modes: vec![
+                "json_schema_valid_fixture".to_owned(),
+                "json_schema_invalid_fixture".to_owned(),
+                "rust_deserialize_roundtrip".to_owned(),
+                "script_all_mode".to_owned(),
+            ],
+        }
+    }
+}
+
+/// Command invocation captured by a replay bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleCommand {
+    /// Client surface expected to run the command.
+    pub client_surface: ReplayClientSurface,
+    /// Exact argv vector, including executable name.
+    pub argv: Vec<String>,
+    /// Working directory for replay.
+    pub working_dir: String,
+}
+
+/// Deterministic environment identity for replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleEnvironment {
+    /// Required deterministic seed.
+    pub seed: u64,
+    /// Hash of resolved fsfs configuration.
+    pub config_hash: String,
+    /// Redacted environment snapshot.
+    pub snapshot: EnvSnapshot,
+}
+
+/// Reference to an input fixture consumed by replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleFixtureRef {
+    /// Stable fixture identifier used by phase expectations.
+    pub fixture_id: String,
+    /// Path relative to the repository or bundle root.
+    pub path: String,
+    /// SHA-256 digest for the fixture content.
+    pub checksum_sha256: String,
+}
+
+/// One artifact expected or emitted by replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleArtifactRef {
+    /// Stable artifact identifier used by phase expectations.
+    pub artifact_id: String,
+    /// Path relative to the bundle root.
+    pub path: String,
+    /// MIME type hint.
+    pub content_type: String,
+    /// SHA-256 digest for the artifact content.
+    pub checksum_sha256: String,
+    /// Whether the replay is invalid without this artifact.
+    pub required: bool,
+}
+
+/// Artifact manifest for a replay bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleArtifactManifest {
+    /// Artifacts expected or emitted by the replay.
+    pub artifacts: Vec<ReplayBundleArtifactRef>,
+}
+
+/// Expected outcome for one replay phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleExpectedPhaseOutcome {
+    /// Phase being asserted.
+    pub phase: ReplayBundlePhase,
+    /// Expected status for the phase.
+    pub status: ReplayBundleOutcomeStatus,
+    /// Required reason code for degraded/failed/skipped phases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// Artifact identifiers that must exist for this phase.
+    pub artifact_refs: Vec<String>,
+}
+
+/// Concrete manifest for a canonical fsfs replay bundle.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleManifest {
+    /// Manifest kind tag.
+    pub kind: ReplayBundleManifestKind,
+    /// Schema version.
+    pub v: ReplayBundleSchemaVersion1,
+    /// Stable bundle identifier.
+    pub bundle_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Replay scenario family.
+    pub scenario_kind: ReplayBundleScenarioKind,
+    /// RFC 3339 UTC timestamp for bundle creation.
+    pub created_at: String,
+    /// Canonical command invocation.
+    pub command: ReplayBundleCommand,
+    /// Deterministic environment identity.
+    pub environment: ReplayBundleEnvironment,
+    /// Input fixtures referenced by the replay.
+    pub fixture_refs: Vec<ReplayBundleFixtureRef>,
+    /// Expected phase-level replay outcomes.
+    pub expected_phase_outcomes: Vec<ReplayBundleExpectedPhaseOutcome>,
+    /// Artifact manifest for emitted or required replay outputs.
+    pub artifact_manifest: ReplayBundleArtifactManifest,
+}
+
+impl ReplayBundleManifest {
+    /// Validate replay bundle invariants beyond raw JSON shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason code when the bundle contract is violated.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        require_non_empty("bundle_id", &self.bundle_id)?;
+        require_non_empty("scenario_id", &self.scenario_id)?;
+        require_non_empty("created_at", &self.created_at)?;
+        require_non_empty("command.working_dir", &self.command.working_dir)?;
+        require_non_empty("environment.config_hash", &self.environment.config_hash)?;
+        if !is_sha256_digest(&self.environment.config_hash) {
+            return Err("replay.bundle.environment.config_hash.invalid");
+        }
+        if self.command.argv.is_empty() {
+            return Err("replay.bundle.command.argv.empty");
+        }
+        if self.command.argv.iter().any(|arg| arg.trim().is_empty()) {
+            return Err("replay.bundle.command.argv.blank");
+        }
+        if self.fixture_refs.is_empty() {
+            return Err("replay.bundle.fixture_refs.empty");
+        }
+        if self.expected_phase_outcomes.is_empty() {
+            return Err("replay.bundle.expected_phase_outcomes.empty");
+        }
+        if self.artifact_manifest.artifacts.is_empty() {
+            return Err("replay.bundle.artifact_manifest.empty");
+        }
+        if self.environment.snapshot.redaction_note.trim().is_empty() {
+            return Err("replay.bundle.environment.redaction_note.empty");
+        }
+
+        let mut fixture_ids = std::collections::BTreeSet::new();
+        for fixture in &self.fixture_refs {
+            require_non_empty("fixture.fixture_id", &fixture.fixture_id)?;
+            require_non_empty("fixture.path", &fixture.path)?;
+            if !is_sha256_digest(&fixture.checksum_sha256) {
+                return Err("replay.bundle.fixture.checksum.invalid");
+            }
+            if !fixture_ids.insert(fixture.fixture_id.as_str()) {
+                return Err("replay.bundle.fixture_refs.duplicate_id");
+            }
+        }
+
+        let mut artifact_ids = std::collections::BTreeSet::new();
+        for artifact in &self.artifact_manifest.artifacts {
+            require_non_empty("artifact.artifact_id", &artifact.artifact_id)?;
+            require_non_empty("artifact.path", &artifact.path)?;
+            require_non_empty("artifact.content_type", &artifact.content_type)?;
+            if !is_sha256_digest(&artifact.checksum_sha256) {
+                return Err("replay.bundle.artifact.checksum.invalid");
+            }
+            if !artifact_ids.insert(artifact.artifact_id.as_str()) {
+                return Err("replay.bundle.artifact_manifest.duplicate_id");
+            }
+        }
+
+        for outcome in &self.expected_phase_outcomes {
+            if matches!(
+                outcome.status,
+                ReplayBundleOutcomeStatus::Degraded
+                    | ReplayBundleOutcomeStatus::Failed
+                    | ReplayBundleOutcomeStatus::Skipped
+            ) && outcome
+                .reason_code
+                .as_deref()
+                .is_none_or(|reason| reason.trim().is_empty())
+            {
+                return Err("replay.bundle.expected_phase.reason_code.missing");
+            }
+            for artifact_ref in &outcome.artifact_refs {
+                require_non_empty("expected_phase.artifact_ref", artifact_ref)?;
+                if !artifact_ids.contains(artifact_ref.as_str()) {
+                    return Err("replay.bundle.expected_phase.artifact_ref.unknown");
+                }
+            }
+        }
+
+        for entry in &self.environment.snapshot.variables {
+            require_non_empty("environment.snapshot.key", &entry.key)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReplayBundleManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawReplayBundleManifest {
+            kind: ReplayBundleManifestKind,
+            v: ReplayBundleSchemaVersion1,
+            bundle_id: String,
+            scenario_id: String,
+            scenario_kind: ReplayBundleScenarioKind,
+            created_at: String,
+            command: ReplayBundleCommand,
+            environment: ReplayBundleEnvironment,
+            fixture_refs: Vec<ReplayBundleFixtureRef>,
+            expected_phase_outcomes: Vec<ReplayBundleExpectedPhaseOutcome>,
+            artifact_manifest: ReplayBundleArtifactManifest,
+        }
+
+        let raw = RawReplayBundleManifest::deserialize(deserializer)?;
+        let manifest = Self {
+            kind: raw.kind,
+            v: raw.v,
+            bundle_id: raw.bundle_id,
+            scenario_id: raw.scenario_id,
+            scenario_kind: raw.scenario_kind,
+            created_at: raw.created_at,
+            command: raw.command,
+            environment: raw.environment,
+            fixture_refs: raw.fixture_refs,
+            expected_phase_outcomes: raw.expected_phase_outcomes,
+            artifact_manifest: raw.artifact_manifest,
+        };
+        manifest.validate().map_err(de::Error::custom)?;
+        Ok(manifest)
+    }
+}
+
+fn require_non_empty(field: &'static str, value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() {
+        match field {
+            "bundle_id" => Err("replay.bundle.bundle_id.empty"),
+            "scenario_id" => Err("replay.bundle.scenario_id.empty"),
+            "created_at" => Err("replay.bundle.created_at.empty"),
+            "command.working_dir" => Err("replay.bundle.command.working_dir.empty"),
+            "environment.config_hash" => Err("replay.bundle.environment.config_hash.empty"),
+            "fixture.fixture_id" => Err("replay.bundle.fixture.fixture_id.empty"),
+            "fixture.path" => Err("replay.bundle.fixture.path.empty"),
+            "artifact.artifact_id" => Err("replay.bundle.artifact.artifact_id.empty"),
+            "artifact.path" => Err("replay.bundle.artifact.path.empty"),
+            "artifact.content_type" => Err("replay.bundle.artifact.content_type.empty"),
+            "expected_phase.artifact_ref" => Err("replay.bundle.expected_phase.artifact_ref.empty"),
+            "environment.snapshot.key" => Err("replay.bundle.environment.snapshot.key.empty"),
+            _ => Err("replay.bundle.field.empty"),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+#[must_use]
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| digest.len() == 64 && digest.chars().all(is_lower_hex_digit))
+}
+
+#[must_use]
+const fn is_lower_hex_digit(ch: char) -> bool {
+    matches!(ch, '0'..='9' | 'a'..='f')
+}
+
 // ─── Environment Snapshot ───────────────────────────────────────────────────
 
 /// Captured environment variables (redacted per privacy policy).
@@ -1567,6 +2015,156 @@ mod tests {
             ScreenAction::from_palette_action_id(entrypoint.tui_action_id()),
             Some(ScreenAction::ReplayTrace)
         );
+    }
+
+    // ─── Canonical Replay Bundle Contract ───────────────────────────────
+
+    fn valid_replay_bundle_manifest() -> ReplayBundleManifest {
+        ReplayBundleManifest {
+            kind: ReplayBundleManifestKind::Current,
+            v: ReplayBundleSchemaVersion1,
+            bundle_id: "bundle-search-0001".to_owned(),
+            scenario_id: "search-basic-refine".to_owned(),
+            scenario_kind: ReplayBundleScenarioKind::Search,
+            created_at: "2026-05-08T11:00:00Z".to_owned(),
+            command: ReplayBundleCommand {
+                client_surface: ReplayClientSurface::Cli,
+                argv: vec![
+                    "fsfs".to_owned(),
+                    "search".to_owned(),
+                    "--query".to_owned(),
+                    "hybrid search".to_owned(),
+                    "--replay-bundle".to_owned(),
+                    "artifacts/replay/bundle-search-0001".to_owned(),
+                ],
+                working_dir: "/data/projects/frankensearch".to_owned(),
+            },
+            environment: ReplayBundleEnvironment {
+                seed: 42,
+                config_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+                snapshot: EnvSnapshot {
+                    variables: vec![EnvEntry {
+                        key: "FSFS_REPLAY_SEED".to_owned(),
+                        value: "42".to_owned(),
+                        redacted: false,
+                    }],
+                    redaction_note: "Sensitive values redacted by key policy".to_owned(),
+                },
+            },
+            fixture_refs: vec![ReplayBundleFixtureRef {
+                fixture_id: "query-fixture".to_owned(),
+                path: "schemas/fixtures/search-query-basic.json".to_owned(),
+                checksum_sha256:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_owned(),
+            }],
+            expected_phase_outcomes: vec![
+                ReplayBundleExpectedPhaseOutcome {
+                    phase: ReplayBundlePhase::Initial,
+                    status: ReplayBundleOutcomeStatus::Succeeded,
+                    reason_code: None,
+                    artifact_refs: vec!["initial-results".to_owned()],
+                },
+                ReplayBundleExpectedPhaseOutcome {
+                    phase: ReplayBundlePhase::Refined,
+                    status: ReplayBundleOutcomeStatus::Degraded,
+                    reason_code: Some("fsfs.replay.quality_model_unavailable".to_owned()),
+                    artifact_refs: vec!["refined-results".to_owned()],
+                },
+            ],
+            artifact_manifest: ReplayBundleArtifactManifest {
+                artifacts: vec![
+                    ReplayBundleArtifactRef {
+                        artifact_id: "initial-results".to_owned(),
+                        path: "artifacts/replay/bundle-search-0001/initial.json".to_owned(),
+                        content_type: "application/json".to_owned(),
+                        checksum_sha256:
+                            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                                .to_owned(),
+                        required: true,
+                    },
+                    ReplayBundleArtifactRef {
+                        artifact_id: "refined-results".to_owned(),
+                        path: "artifacts/replay/bundle-search-0001/refined.json".to_owned(),
+                        content_type: "application/json".to_owned(),
+                        checksum_sha256:
+                            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                                .to_owned(),
+                        required: true,
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn replay_bundle_contract_default_covers_required_surfaces() {
+        let contract = ReplayBundleContractDefinition::default();
+
+        assert_eq!(contract.kind, ReplayBundleContractKind::Current);
+        assert!(
+            contract
+                .supported_scenarios
+                .contains(&ReplayBundleScenarioKind::DegradedMode)
+        );
+        assert!(
+            contract
+                .required_top_level_fields
+                .contains(&"command".to_owned())
+        );
+        assert!(
+            contract
+                .required_environment_fields
+                .contains(&"seed".to_owned())
+        );
+        assert!(
+            contract
+                .required_artifact_fields
+                .contains(&"checksum_sha256".to_owned())
+        );
+    }
+
+    #[test]
+    fn replay_bundle_manifest_roundtrips_and_validates() {
+        let manifest = valid_replay_bundle_manifest();
+
+        manifest.validate().expect("valid replay bundle manifest");
+        let json = serde_json::to_string(&manifest).expect("serialize replay bundle manifest");
+        let decoded: ReplayBundleManifest =
+            serde_json::from_str(&json).expect("deserialize replay bundle manifest");
+
+        assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn replay_bundle_manifest_rejects_missing_reason_for_degraded_phase() {
+        let mut manifest = valid_replay_bundle_manifest();
+        for outcome in &mut manifest.expected_phase_outcomes {
+            if matches!(outcome.phase, ReplayBundlePhase::Refined) {
+                outcome.reason_code = None;
+            }
+        }
+        let json = serde_json::to_value(&manifest).expect("serialize manifest");
+        let error = serde_json::from_value::<ReplayBundleManifest>(json)
+            .expect_err("reject degraded phase without reason");
+
+        assert!(error.to_string().contains("reason_code"));
+    }
+
+    #[test]
+    fn replay_bundle_manifest_rejects_unknown_artifact_refs() {
+        let mut manifest = valid_replay_bundle_manifest();
+        for outcome in &mut manifest.expected_phase_outcomes {
+            if matches!(outcome.phase, ReplayBundlePhase::Initial) {
+                outcome.artifact_refs.push("missing-artifact".to_owned());
+            }
+        }
+        let json = serde_json::to_value(&manifest).expect("serialize manifest");
+        let error = serde_json::from_value::<ReplayBundleManifest>(json)
+            .expect_err("reject unknown artifact ref");
+
+        assert!(error.to_string().contains("artifact_ref.unknown"));
     }
 
     // ─── Environment Snapshot ───────────────────────────────────────────

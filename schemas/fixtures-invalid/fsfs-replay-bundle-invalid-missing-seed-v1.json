@@ -1,0 +1,58 @@
+{
+  "kind": "fsfs_replay_bundle_manifest",
+  "v": 1,
+  "bundle_id": "bundle-search-0001",
+  "scenario_id": "search-basic-refine",
+  "scenario_kind": "search",
+  "created_at": "2026-05-08T11:00:00Z",
+  "command": {
+    "client_surface": "cli",
+    "argv": [
+      "fsfs",
+      "search",
+      "--query",
+      "hybrid search"
+    ],
+    "working_dir": "/data/projects/frankensearch"
+  },
+  "environment": {
+    "config_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "snapshot": {
+      "variables": [
+        {
+          "key": "FSFS_REPLAY_SEED",
+          "value": "42",
+          "redacted": false
+        }
+      ],
+      "redaction_note": "Sensitive values redacted by key policy"
+    }
+  },
+  "fixture_refs": [
+    {
+      "fixture_id": "query-fixture",
+      "path": "schemas/fixtures/search-query-basic.json",
+      "checksum_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "expected_phase_outcomes": [
+    {
+      "phase": "initial",
+      "status": "succeeded",
+      "artifact_refs": [
+        "initial-results"
+      ]
+    }
+  ],
+  "artifact_manifest": {
+    "artifacts": [
+      {
+        "artifact_id": "initial-results",
+        "path": "artifacts/replay/bundle-search-0001/initial.json",
+        "content_type": "application/json",
+        "checksum_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "required": true
+      }
+    ]
+  }
+}

@@ -99,6 +99,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-provenance-attestation-") {
         return "fsfs-provenance-attestation-v1.schema.json";
     }
+    if name.starts_with("fsfs-replay-bundle-") {
+        return "fsfs-replay-bundle-v1.schema.json";
+    }
     if name.starts_with("fsfs-root-discovery-") {
         return "fsfs-root-discovery-v1.schema.json";
     }
@@ -491,6 +494,37 @@ fn test_provenance_startup_check_conformance() {
     let parsed: frankensearch_fsfs::provenance::ProvenanceStartupCheck =
         serde_json::from_str(&raw).expect("parse provenance startup check");
     assert_golden_json("fsfs_provenance_startup_check_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_replay_bundle_contract_conformance() {
+    let path = fixture_dir().join("fsfs-replay-bundle-contract-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::ReplayBundleContractDefinition =
+        serde_json::from_str(&raw).expect("parse replay bundle contract");
+    assert_golden_json("fsfs_replay_bundle_contract_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_replay_bundle_manifest_conformance() {
+    let path = fixture_dir().join("fsfs-replay-bundle-manifest-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::ReplayBundleManifest =
+        serde_json::from_str(&raw).expect("parse replay bundle manifest");
+    assert_golden_json("fsfs_replay_bundle_manifest_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_replay_bundle_invalid_fixtures_are_rejected_by_rust() {
+    assert_invalid_rust_fixture::<frankensearch_fsfs::ReplayBundleManifest>(
+        "fsfs-replay-bundle-invalid-missing-command-v1.json",
+    );
+    assert_invalid_rust_fixture::<frankensearch_fsfs::ReplayBundleManifest>(
+        "fsfs-replay-bundle-invalid-missing-artifact-manifest-v1.json",
+    );
+    assert_invalid_rust_fixture::<frankensearch_fsfs::ReplayBundleManifest>(
+        "fsfs-replay-bundle-invalid-missing-seed-v1.json",
+    );
 }
 
 #[test]

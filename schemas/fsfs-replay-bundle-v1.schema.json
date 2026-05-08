@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-replay-bundle-v1.schema.json",
+  "title": "fsfs canonical replay bundle contract v1",
+  "description": "Contract and manifest schema for canonical fsfs replay bundles.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/replayBundleManifest"
+    }
+  ],
+  "$defs": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scenarioKind": {
+      "type": "string",
+      "enum": [
+        "search",
+        "index",
+        "doctor",
+        "audit",
+        "degraded_mode"
+      ]
+    },
+    "clientSurface": {
+      "type": "string",
+      "enum": [
+        "cli",
+        "tui"
+      ]
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "initial",
+        "refined",
+        "index_build",
+        "doctor",
+        "audit",
+        "degraded_mode"
+      ]
+    },
+    "outcomeStatus": {
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "degraded",
+        "skipped",
+        "failed"
+      ]
+    },
+    "stringList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      },
+      "minItems": 1
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "supported_scenarios",
+        "required_top_level_fields",
+        "required_command_fields",
+        "required_environment_fields",
+        "required_expected_outcome_fields",
+        "required_artifact_fields",
+        "validation_modes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "fsfs_replay_bundle_contract_definition"
+        },
+        "v": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "supported_scenarios": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scenarioKind"
+          },
+          "minItems": 5,
+          "uniqueItems": true
+        },
+        "required_top_level_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "required_command_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "required_environment_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "required_expected_outcome_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "required_artifact_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "validation_modes": {
+          "$ref": "#/$defs/stringList"
+        }
+      }
+    },
+    "envEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "value",
+        "redacted"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "value": {
+          "type": "string"
+        },
+        "redacted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "envSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variables",
+        "redaction_note"
+      ],
+      "properties": {
+        "variables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/envEntry"
+          }
+        },
+        "redaction_note": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_surface",
+        "argv",
+        "working_dir"
+      ],
+      "properties": {
+        "client_surface": {
+          "$ref": "#/$defs/clientSurface"
+        },
+        "argv": {
+          "$ref": "#/$defs/stringList"
+        },
+        "working_dir": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "config_hash",
+        "snapshot"
+      ],
+      "properties": {
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "config_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/envSnapshot"
+        }
+      }
+    },
+    "fixtureRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_id",
+        "path",
+        "checksum_sha256"
+      ],
+      "properties": {
+        "fixture_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "checksum_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "path",
+        "content_type",
+        "checksum_sha256",
+        "required"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "content_type": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "checksum_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "artifactManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifacts"
+      ],
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactRef"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "expectedPhaseOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "status",
+        "artifact_refs"
+      ],
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/phase"
+        },
+        "status": {
+          "$ref": "#/$defs/outcomeStatus"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "artifact_refs": {
+          "$ref": "#/$defs/stringList"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "degraded",
+                  "skipped",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason_code"
+            ]
+          }
+        }
+      ]
+    },
+    "replayBundleManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "bundle_id",
+        "scenario_id",
+        "scenario_kind",
+        "created_at",
+        "command",
+        "environment",
+        "fixture_refs",
+        "expected_phase_outcomes",
+        "artifact_manifest"
+      ],
+      "properties": {
+        "kind": {
+          "const": "fsfs_replay_bundle_manifest"
+        },
+        "v": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "bundle_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "scenario_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "scenario_kind": {
+          "$ref": "#/$defs/scenarioKind"
+        },
+        "created_at": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "environment": {
+          "$ref": "#/$defs/environment"
+        },
+        "fixture_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/fixtureRef"
+          },
+          "minItems": 1
+        },
+        "expected_phase_outcomes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/expectedPhaseOutcome"
+          },
+          "minItems": 1
+        },
+        "artifact_manifest": {
+          "$ref": "#/$defs/artifactManifest"
+        }
+      }
+    }
+  }
+}
