@@ -1,0 +1,123 @@
+{
+  "kind": "fsfs_degraded_incident_suite",
+  "v": 1,
+  "suite_id": "fsfs-degraded-incident-smoke-v1",
+  "mode": "smoke",
+  "seed": 424242,
+  "config_hash": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+  "generated_at": "2026-05-08T12:00:00Z",
+  "command": {
+    "client_surface": "cli",
+    "argv": [
+      "fsfs",
+      "incident-suite",
+      "--mode",
+      "smoke",
+      "--seed",
+      "424242",
+      "--format",
+      "jsonl"
+    ],
+    "working_dir": "/data/projects/frankensearch"
+  },
+  "environment": {
+    "seed": 424242,
+    "config_hash": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+    "snapshot": {
+      "variables": [
+        {
+          "key": "FSFS_INCIDENT_SUITE_MODE",
+          "value": "smoke",
+          "redacted": false
+        },
+        {
+          "key": "FSFS_INCIDENT_SUITE_SEED",
+          "value": "424242",
+          "redacted": false
+        },
+        {
+          "key": "RUST_LOG",
+          "value": "info",
+          "redacted": false
+        }
+      ],
+      "redaction_note": "Synthetic suite uses deterministic offline fixtures only"
+    }
+  },
+  "network_policy": "offline_only",
+  "destructive_actions_allowed": false,
+  "structured_log": {
+    "event_schema": "fsfs.degraded_incident.event.v1",
+    "required_fields": [
+      "seed",
+      "config_hash",
+      "suite_id",
+      "scenario_id",
+      "incident",
+      "reason_code",
+      "expected_output"
+    ],
+    "redaction_note": "No raw corpus text or host secrets are emitted"
+  },
+  "artifact_manifest": {
+    "artifacts": [
+      {
+        "artifact_id": "incident-quality-embedder-timeout-events",
+        "path": "artifacts/incidents/incident-quality-embedder-timeout/events.jsonl",
+        "content_type": "application/x-ndjson",
+        "checksum_sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "required": true
+      },
+      {
+        "artifact_id": "incident-corrupt-vector-artifact-events",
+        "path": "artifacts/incidents/incident-corrupt-vector-artifact/events.jsonl",
+        "content_type": "application/x-ndjson",
+        "checksum_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "required": true
+      }
+    ]
+  },
+  "scenarios": [
+    {
+      "scenario_id": "incident-quality-embedder-timeout",
+      "incident": "quality_embedder_timeout",
+      "injection": {
+        "reason_code": "incident.inject.quality_timeout",
+        "trigger": "quality embedder exceeds 150 ms budget",
+        "deterministic_payload": "quality_timeout_ms=151,budget_ms=150"
+      },
+      "expected": {
+        "output": "search_phase_refinement_failed",
+        "status": "degraded",
+        "reason_code": "degrade.advice.timeout",
+        "preserves_initial_results": true,
+        "degradation_stage": "embed_deferred",
+        "artifact_refs": [
+          "incident-quality-embedder-timeout-events"
+        ]
+      },
+      "replay_command": "fsfs incident-suite replay --scenario incident-quality-embedder-timeout --format jsonl"
+    },
+    {
+      "scenario_id": "incident-corrupt-vector-artifact",
+      "incident": "corrupt_vector_artifact",
+      "injection": {
+        "reason_code": "incident.inject.corrupt_vector_artifact",
+        "trigger": "vector artifact header checksum mismatch",
+        "deterministic_payload": "artifact=quality.fsvi,checksum=bad_magic"
+      },
+      "expected": {
+        "output": "doctor_reason_code",
+        "status": "failed",
+        "reason_code": "degrade.advice.index_corrupt",
+        "preserves_initial_results": false,
+        "degradation_stage": "lexical_only",
+        "artifact_refs": [
+          "incident-corrupt-vector-artifact-events"
+        ]
+      },
+      "replay_command": "fsfs incident-suite replay --scenario incident-corrupt-vector-artifact --format jsonl"
+    }
+  ],
+  "replay_command": "fsfs incident-suite --mode smoke --seed 424242 --format jsonl"
+}

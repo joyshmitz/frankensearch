@@ -1,0 +1,54 @@
+{
+  "kind": "fsfs_degraded_incident_suite_contract_definition",
+  "v": 1,
+  "required_incidents": [
+    "quality_embedder_timeout",
+    "model_unavailable",
+    "corrupt_vector_artifact",
+    "lexical_backend_failure",
+    "storage_lock_pressure",
+    "watcher_backlog"
+  ],
+  "supported_modes": [
+    "smoke",
+    "full"
+  ],
+  "required_suite_fields": [
+    "kind",
+    "v",
+    "suite_id",
+    "mode",
+    "seed",
+    "config_hash",
+    "generated_at",
+    "command",
+    "environment",
+    "network_policy",
+    "destructive_actions_allowed",
+    "structured_log",
+    "artifact_manifest",
+    "scenarios",
+    "replay_command"
+  ],
+  "required_scenario_fields": [
+    "scenario_id",
+    "incident",
+    "injection",
+    "expected",
+    "replay_command"
+  ],
+  "required_log_fields": [
+    "seed",
+    "config_hash",
+    "scenario_id",
+    "reason_code"
+  ],
+  "validation_modes": [
+    "json_schema_contract",
+    "json_schema_smoke",
+    "json_schema_full",
+    "json_schema_invalid",
+    "rust_deserialize_roundtrip",
+    "script_smoke_full_modes"
+  ]
+}

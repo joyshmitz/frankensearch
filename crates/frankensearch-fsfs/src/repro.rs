@@ -58,11 +58,18 @@ pub const REPLAY_BUNDLE_SCHEMA_VERSION: u8 = 1;
 pub const REPLAY_BUNDLE_CONTRACT_KIND: &str = "fsfs_replay_bundle_contract_definition";
 /// Kind tag for replay bundle manifest fixtures.
 pub const REPLAY_BUNDLE_MANIFEST_KIND: &str = "fsfs_replay_bundle_manifest";
+/// Schema version for deterministic degraded-mode incident suites.
+pub const DEGRADED_INCIDENT_SUITE_SCHEMA_VERSION: u8 = 1;
+/// Kind tag for degraded-mode incident suite contract fixtures.
+pub const DEGRADED_INCIDENT_SUITE_CONTRACT_KIND: &str =
+    "fsfs_degraded_incident_suite_contract_definition";
+/// Kind tag for concrete degraded-mode incident suite fixtures.
+pub const DEGRADED_INCIDENT_SUITE_KIND: &str = "fsfs_degraded_incident_suite";
 
 // ─── Capture Context ────────────────────────────────────────────────────────
 
 /// What triggered the repro pack capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureReason {
     /// Operator manually requested capture.
@@ -162,7 +169,7 @@ pub struct ArtifactEntry {
 /// - Hot (0-7d): All files present, ready for immediate replay.
 /// - Warm (7-90d): Evidence trimmed to decision/alert events only.
 /// - Cold (90+d): Only manifest and checksums retained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionTier {
     /// Full pack, ready for replay.
@@ -1289,6 +1296,783 @@ impl<'de> Deserialize<'de> for ReplayBundleManifest {
     }
 }
 
+// ─── Degraded-Mode Synthetic Incident Suite ────────────────────────────────
+
+/// Kind marker for degraded-mode incident suite contract definitions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DegradedIncidentSuiteContractKind {
+    /// Current degraded incident suite contract-definition kind.
+    #[serde(rename = "fsfs_degraded_incident_suite_contract_definition")]
+    Current,
+}
+
+/// Kind marker for concrete degraded-mode incident suites.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DegradedIncidentSuiteKindMarker {
+    /// Current degraded incident suite kind.
+    #[serde(rename = "fsfs_degraded_incident_suite")]
+    Current,
+}
+
+/// Execution lane for a deterministic incident suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedIncidentSuiteMode {
+    /// Short lane with representative incidents for fast smoke validation.
+    Smoke,
+    /// Full lane covering every declared incident kind.
+    Full,
+}
+
+/// Incident families covered by the degraded-mode synthetic suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedIncidentKind {
+    /// Quality embedder exceeds the configured latency budget.
+    QualityEmbedderTimeout,
+    /// Quality model cache or revision is unavailable.
+    ModelUnavailable,
+    /// Vector artifact fails checksum/format validation.
+    CorruptVectorArtifact,
+    /// Lexical backend cannot produce the fast-tier candidate set.
+    LexicalBackendFailure,
+    /// Storage/catalog lock pressure prevents normal metadata access.
+    StorageLockPressure,
+    /// Watcher backlog exceeds the deterministic catch-up budget.
+    WatcherBacklog,
+}
+
+/// Expected externally visible output for a synthetic incident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedIncidentExpectedOutput {
+    /// Incident must still emit a fast initial search phase.
+    SearchPhaseInitial,
+    /// Incident must emit a refinement-failed search phase.
+    SearchPhaseRefinementFailed,
+    /// Incident is asserted through a doctor reason code.
+    DoctorReasonCode,
+    /// Incident is asserted through an audit reason code.
+    AuditReasonCode,
+    /// Incident is asserted through a watcher reason code.
+    WatcherReasonCode,
+}
+
+/// Network posture for deterministic incident replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedIncidentNetworkPolicy {
+    /// Suite must not require real network access.
+    OfflineOnly,
+}
+
+/// Deterministic trigger details for one synthetic incident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedIncidentInjection {
+    /// Stable trigger reason code.
+    pub reason_code: String,
+    /// Human-readable trigger summary.
+    pub trigger: String,
+    /// Deterministic payload or fixture selector used by replay.
+    pub deterministic_payload: String,
+}
+
+/// Expected outcome for one degraded incident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedIncidentExpectedOutcome {
+    /// Output surface where the reason code must appear.
+    pub output: DegradedIncidentExpectedOutput,
+    /// Expected terminal status for the incident.
+    pub status: ReplayBundleOutcomeStatus,
+    /// Canonical reason code expected in search/doctor/audit output.
+    pub reason_code: String,
+    /// Whether initial results are still safe to display.
+    pub preserves_initial_results: bool,
+    /// Degradation stage expected after this incident is observed.
+    pub degradation_stage: crate::pressure::DegradationStage,
+    /// Artifact identifiers that must be produced for this scenario.
+    pub artifact_refs: Vec<String>,
+}
+
+/// Structured-log requirements for incident replay evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedIncidentLogSpec {
+    /// Event schema name used by emitted JSONL evidence.
+    pub event_schema: String,
+    /// Required event fields. Must include seed, config hash, scenario ID, and reason code.
+    pub required_fields: Vec<String>,
+    /// Redaction note for emitted evidence.
+    pub redaction_note: String,
+}
+
+/// One deterministic degraded-mode incident scenario.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedIncidentScenario {
+    /// Stable scenario identifier.
+    pub scenario_id: String,
+    /// Incident family under test.
+    pub incident: DegradedIncidentKind,
+    /// Deterministic failure injection.
+    pub injection: DegradedIncidentInjection,
+    /// Expected externally visible outcome.
+    pub expected: DegradedIncidentExpectedOutcome,
+    /// Replay command for this scenario.
+    pub replay_command: String,
+}
+
+/// Machine-readable degraded-mode incident suite contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedIncidentSuiteContractDefinition {
+    /// Contract definition kind tag.
+    pub kind: DegradedIncidentSuiteContractKind,
+    /// Schema version.
+    pub v: u8,
+    /// Incident kinds that the full suite must cover.
+    pub required_incidents: Vec<DegradedIncidentKind>,
+    /// Execution modes supported by the validator.
+    pub supported_modes: Vec<DegradedIncidentSuiteMode>,
+    /// Required top-level suite fields.
+    pub required_suite_fields: Vec<String>,
+    /// Required scenario fields.
+    pub required_scenario_fields: Vec<String>,
+    /// Required structured-log fields.
+    pub required_log_fields: Vec<String>,
+    /// Validation lanes that must accept/reject suite fixtures.
+    pub validation_modes: Vec<String>,
+}
+
+impl Default for DegradedIncidentSuiteContractDefinition {
+    fn default() -> Self {
+        Self {
+            kind: DegradedIncidentSuiteContractKind::Current,
+            v: DEGRADED_INCIDENT_SUITE_SCHEMA_VERSION,
+            required_incidents: all_degraded_incident_kinds(),
+            supported_modes: vec![
+                DegradedIncidentSuiteMode::Smoke,
+                DegradedIncidentSuiteMode::Full,
+            ],
+            required_suite_fields: vec![
+                "kind".to_owned(),
+                "v".to_owned(),
+                "suite_id".to_owned(),
+                "mode".to_owned(),
+                "seed".to_owned(),
+                "config_hash".to_owned(),
+                "generated_at".to_owned(),
+                "command".to_owned(),
+                "environment".to_owned(),
+                "network_policy".to_owned(),
+                "destructive_actions_allowed".to_owned(),
+                "structured_log".to_owned(),
+                "artifact_manifest".to_owned(),
+                "scenarios".to_owned(),
+                "replay_command".to_owned(),
+            ],
+            required_scenario_fields: vec![
+                "scenario_id".to_owned(),
+                "incident".to_owned(),
+                "injection".to_owned(),
+                "expected".to_owned(),
+                "replay_command".to_owned(),
+            ],
+            required_log_fields: vec![
+                "seed".to_owned(),
+                "config_hash".to_owned(),
+                "scenario_id".to_owned(),
+                "reason_code".to_owned(),
+            ],
+            validation_modes: vec![
+                "json_schema_contract".to_owned(),
+                "json_schema_smoke".to_owned(),
+                "json_schema_full".to_owned(),
+                "json_schema_invalid".to_owned(),
+                "rust_deserialize_roundtrip".to_owned(),
+                "script_smoke_full_modes".to_owned(),
+            ],
+        }
+    }
+}
+
+/// Concrete deterministic degraded-mode incident suite.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DegradedIncidentSuite {
+    /// Suite kind tag.
+    pub kind: DegradedIncidentSuiteKindMarker,
+    /// Schema version.
+    pub v: u8,
+    /// Stable suite identifier.
+    pub suite_id: String,
+    /// Execution mode.
+    pub mode: DegradedIncidentSuiteMode,
+    /// Deterministic seed for every scenario.
+    pub seed: u64,
+    /// Hash of the resolved fsfs configuration used by the suite.
+    pub config_hash: String,
+    /// RFC 3339 UTC timestamp for fixture creation.
+    pub generated_at: String,
+    /// Canonical command invocation for the suite.
+    pub command: ReplayBundleCommand,
+    /// Deterministic environment identity.
+    pub environment: ReplayBundleEnvironment,
+    /// Network policy; must be offline-only.
+    pub network_policy: DegradedIncidentNetworkPolicy,
+    /// Must remain false. Suites are validators, not cleanup tools.
+    pub destructive_actions_allowed: bool,
+    /// Structured log contract for emitted JSONL evidence.
+    pub structured_log: DegradedIncidentLogSpec,
+    /// Artifact manifest for scenario evidence.
+    pub artifact_manifest: ReplayBundleArtifactManifest,
+    /// Deterministic incident scenarios.
+    pub scenarios: Vec<DegradedIncidentScenario>,
+    /// Replay command for the entire suite.
+    pub replay_command: String,
+}
+
+impl DegradedIncidentSuite {
+    /// Validate degraded incident suite invariants beyond raw JSON shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason code when the suite contract is violated.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.v != DEGRADED_INCIDENT_SUITE_SCHEMA_VERSION {
+            return Err("degraded.incident_suite.version.invalid");
+        }
+        require_incident_non_empty("suite_id", &self.suite_id)?;
+        require_incident_non_empty("generated_at", &self.generated_at)?;
+        require_incident_non_empty("config_hash", &self.config_hash)?;
+        if !is_sha256_digest(&self.config_hash) {
+            return Err("degraded.incident_suite.config_hash.invalid");
+        }
+        if self.environment.seed != self.seed {
+            return Err("degraded.incident_suite.environment.seed_mismatch");
+        }
+        if self.environment.config_hash != self.config_hash {
+            return Err("degraded.incident_suite.environment.config_hash_mismatch");
+        }
+        if self.environment.snapshot.redaction_note.trim().is_empty() {
+            return Err("degraded.incident_suite.environment.redaction_note.empty");
+        }
+        if self.destructive_actions_allowed {
+            return Err("degraded.incident_suite.destructive_actions.enabled");
+        }
+        if self.command.argv.is_empty() {
+            return Err("degraded.incident_suite.command.argv.empty");
+        }
+        if self.command.argv.iter().any(|arg| arg.trim().is_empty()) {
+            return Err("degraded.incident_suite.command.argv.blank");
+        }
+        require_incident_non_empty("command.working_dir", &self.command.working_dir)?;
+        require_incident_non_empty(
+            "structured_log.event_schema",
+            &self.structured_log.event_schema,
+        )?;
+        require_incident_non_empty(
+            "structured_log.redaction_note",
+            &self.structured_log.redaction_note,
+        )?;
+        require_incident_non_empty("replay_command", &self.replay_command)?;
+        if contains_forbidden_incident_command(&self.command.argv.join(" "))
+            || contains_forbidden_incident_command(&self.replay_command)
+        {
+            return Err("degraded.incident_suite.command.forbidden");
+        }
+        for field in ["seed", "config_hash", "scenario_id", "reason_code"] {
+            if !self
+                .structured_log
+                .required_fields
+                .iter()
+                .any(|required| required == field)
+            {
+                return Err("degraded.incident_suite.structured_log.required_field.missing");
+            }
+        }
+        if self.artifact_manifest.artifacts.is_empty() {
+            return Err("degraded.incident_suite.artifact_manifest.empty");
+        }
+        if self.scenarios.is_empty() {
+            return Err("degraded.incident_suite.scenarios.empty");
+        }
+
+        let mut artifact_ids = std::collections::BTreeSet::new();
+        for artifact in &self.artifact_manifest.artifacts {
+            require_incident_non_empty("artifact.artifact_id", &artifact.artifact_id)?;
+            require_incident_non_empty("artifact.path", &artifact.path)?;
+            require_incident_non_empty("artifact.content_type", &artifact.content_type)?;
+            if !is_sha256_digest(&artifact.checksum_sha256) {
+                return Err("degraded.incident_suite.artifact.checksum.invalid");
+            }
+            if !artifact_ids.insert(artifact.artifact_id.as_str()) {
+                return Err("degraded.incident_suite.artifact_manifest.duplicate_id");
+            }
+        }
+
+        let mut scenario_ids = std::collections::BTreeSet::new();
+        let mut incidents = std::collections::BTreeSet::new();
+        for scenario in &self.scenarios {
+            validate_degraded_incident_scenario(scenario, &artifact_ids)?;
+            if !scenario_ids.insert(scenario.scenario_id.as_str()) {
+                return Err("degraded.incident_suite.scenario.duplicate_id");
+            }
+            incidents.insert(scenario.incident);
+        }
+
+        if matches!(self.mode, DegradedIncidentSuiteMode::Full) {
+            for incident in all_degraded_incident_kinds() {
+                if !incidents.contains(&incident) {
+                    return Err("degraded.incident_suite.full.coverage.missing");
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for DegradedIncidentSuite {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawDegradedIncidentSuite {
+            kind: DegradedIncidentSuiteKindMarker,
+            v: u8,
+            suite_id: String,
+            mode: DegradedIncidentSuiteMode,
+            seed: u64,
+            config_hash: String,
+            generated_at: String,
+            command: ReplayBundleCommand,
+            environment: ReplayBundleEnvironment,
+            network_policy: DegradedIncidentNetworkPolicy,
+            destructive_actions_allowed: bool,
+            structured_log: DegradedIncidentLogSpec,
+            artifact_manifest: ReplayBundleArtifactManifest,
+            scenarios: Vec<DegradedIncidentScenario>,
+            replay_command: String,
+        }
+
+        let raw = RawDegradedIncidentSuite::deserialize(deserializer)?;
+        let suite = Self {
+            kind: raw.kind,
+            v: raw.v,
+            suite_id: raw.suite_id,
+            mode: raw.mode,
+            seed: raw.seed,
+            config_hash: raw.config_hash,
+            generated_at: raw.generated_at,
+            command: raw.command,
+            environment: raw.environment,
+            network_policy: raw.network_policy,
+            destructive_actions_allowed: raw.destructive_actions_allowed,
+            structured_log: raw.structured_log,
+            artifact_manifest: raw.artifact_manifest,
+            scenarios: raw.scenarios,
+            replay_command: raw.replay_command,
+        };
+        suite.validate().map_err(de::Error::custom)?;
+        Ok(suite)
+    }
+}
+
+/// Build the canonical degraded incident suite contract definition.
+#[must_use]
+pub fn degraded_incident_suite_contract_definition() -> DegradedIncidentSuiteContractDefinition {
+    DegradedIncidentSuiteContractDefinition::default()
+}
+
+/// Build the deterministic smoke-mode degraded incident suite fixture.
+#[must_use]
+pub fn degraded_incident_smoke_suite() -> DegradedIncidentSuite {
+    degraded_incident_suite(
+        DegradedIncidentSuiteMode::Smoke,
+        "fsfs-degraded-incident-smoke-v1",
+        vec![
+            incident_quality_embedder_timeout(),
+            incident_corrupt_vector_artifact(),
+        ],
+    )
+}
+
+/// Build the deterministic full-mode degraded incident suite fixture.
+#[must_use]
+pub fn degraded_incident_full_suite() -> DegradedIncidentSuite {
+    degraded_incident_suite(
+        DegradedIncidentSuiteMode::Full,
+        "fsfs-degraded-incident-full-v1",
+        vec![
+            incident_quality_embedder_timeout(),
+            incident_model_unavailable(),
+            incident_corrupt_vector_artifact(),
+            incident_lexical_backend_failure(),
+            incident_storage_lock_pressure(),
+            incident_watcher_backlog(),
+        ],
+    )
+}
+
+#[must_use]
+fn all_degraded_incident_kinds() -> Vec<DegradedIncidentKind> {
+    vec![
+        DegradedIncidentKind::QualityEmbedderTimeout,
+        DegradedIncidentKind::ModelUnavailable,
+        DegradedIncidentKind::CorruptVectorArtifact,
+        DegradedIncidentKind::LexicalBackendFailure,
+        DegradedIncidentKind::StorageLockPressure,
+        DegradedIncidentKind::WatcherBacklog,
+    ]
+}
+
+fn degraded_incident_suite(
+    mode: DegradedIncidentSuiteMode,
+    suite_id: &str,
+    scenarios: Vec<DegradedIncidentScenario>,
+) -> DegradedIncidentSuite {
+    let seed = 424_242;
+    let config_hash = "sha256:1212121212121212121212121212121212121212121212121212121212121212";
+    DegradedIncidentSuite {
+        kind: DegradedIncidentSuiteKindMarker::Current,
+        v: DEGRADED_INCIDENT_SUITE_SCHEMA_VERSION,
+        suite_id: suite_id.to_owned(),
+        mode,
+        seed,
+        config_hash: config_hash.to_owned(),
+        generated_at: "2026-05-08T12:00:00Z".to_owned(),
+        command: ReplayBundleCommand {
+            client_surface: ReplayClientSurface::Cli,
+            argv: vec![
+                "fsfs".to_owned(),
+                "incident-suite".to_owned(),
+                "--mode".to_owned(),
+                mode_arg(mode).to_owned(),
+                "--seed".to_owned(),
+                seed.to_string(),
+                "--format".to_owned(),
+                "jsonl".to_owned(),
+            ],
+            working_dir: "/data/projects/frankensearch".to_owned(),
+        },
+        environment: ReplayBundleEnvironment {
+            seed,
+            config_hash: config_hash.to_owned(),
+            snapshot: EnvSnapshot {
+                variables: vec![
+                    EnvEntry {
+                        key: "FSFS_INCIDENT_SUITE_MODE".to_owned(),
+                        value: mode_arg(mode).to_owned(),
+                        redacted: false,
+                    },
+                    EnvEntry {
+                        key: "FSFS_INCIDENT_SUITE_SEED".to_owned(),
+                        value: seed.to_string(),
+                        redacted: false,
+                    },
+                    EnvEntry {
+                        key: "RUST_LOG".to_owned(),
+                        value: "info".to_owned(),
+                        redacted: false,
+                    },
+                ],
+                redaction_note: "Synthetic suite uses deterministic offline fixtures only"
+                    .to_owned(),
+            },
+        },
+        network_policy: DegradedIncidentNetworkPolicy::OfflineOnly,
+        destructive_actions_allowed: false,
+        structured_log: DegradedIncidentLogSpec {
+            event_schema: "fsfs.degraded_incident.event.v1".to_owned(),
+            required_fields: vec![
+                "seed".to_owned(),
+                "config_hash".to_owned(),
+                "suite_id".to_owned(),
+                "scenario_id".to_owned(),
+                "incident".to_owned(),
+                "reason_code".to_owned(),
+                "expected_output".to_owned(),
+            ],
+            redaction_note: "No raw corpus text or host secrets are emitted".to_owned(),
+        },
+        artifact_manifest: ReplayBundleArtifactManifest {
+            artifacts: scenario_artifacts(&scenarios),
+        },
+        scenarios,
+        replay_command: format!(
+            "fsfs incident-suite --mode {} --seed {seed} --format jsonl",
+            mode_arg(mode)
+        ),
+    }
+}
+
+#[must_use]
+const fn mode_arg(mode: DegradedIncidentSuiteMode) -> &'static str {
+    match mode {
+        DegradedIncidentSuiteMode::Smoke => "smoke",
+        DegradedIncidentSuiteMode::Full => "full",
+    }
+}
+
+fn incident_quality_embedder_timeout() -> DegradedIncidentScenario {
+    scenario(
+        "incident-quality-embedder-timeout",
+        DegradedIncidentKind::QualityEmbedderTimeout,
+        "incident.inject.quality_timeout",
+        "quality embedder exceeds 150 ms budget",
+        "quality_timeout_ms=151,budget_ms=150",
+        DegradedIncidentExpectedOutput::SearchPhaseRefinementFailed,
+        ReplayBundleOutcomeStatus::Degraded,
+        "degrade.advice.timeout",
+        true,
+        crate::pressure::DegradationStage::EmbedDeferred,
+    )
+}
+
+fn incident_model_unavailable() -> DegradedIncidentScenario {
+    scenario(
+        "incident-model-unavailable",
+        DegradedIncidentKind::ModelUnavailable,
+        "incident.inject.model_unavailable",
+        "quality model cache lookup returns unavailable",
+        "model_revision=fixture-missing,download=disabled",
+        DegradedIncidentExpectedOutput::SearchPhaseRefinementFailed,
+        ReplayBundleOutcomeStatus::Degraded,
+        "degrade.advice.quality_model_missing",
+        true,
+        crate::pressure::DegradationStage::EmbedDeferred,
+    )
+}
+
+fn incident_corrupt_vector_artifact() -> DegradedIncidentScenario {
+    scenario(
+        "incident-corrupt-vector-artifact",
+        DegradedIncidentKind::CorruptVectorArtifact,
+        "incident.inject.corrupt_vector_artifact",
+        "vector artifact header checksum mismatch",
+        "artifact=quality.fsvi,checksum=bad_magic",
+        DegradedIncidentExpectedOutput::DoctorReasonCode,
+        ReplayBundleOutcomeStatus::Failed,
+        "degrade.advice.index_corrupt",
+        false,
+        crate::pressure::DegradationStage::LexicalOnly,
+    )
+}
+
+fn incident_lexical_backend_failure() -> DegradedIncidentScenario {
+    scenario(
+        "incident-lexical-backend-failure",
+        DegradedIncidentKind::LexicalBackendFailure,
+        "incident.inject.lexical_backend_failure",
+        "lexical backend returns deterministic query parser failure",
+        "tantivy_query=unterminated_phrase",
+        DegradedIncidentExpectedOutput::SearchPhaseRefinementFailed,
+        ReplayBundleOutcomeStatus::Failed,
+        "fsfs.incident.lexical_backend_failure",
+        false,
+        crate::pressure::DegradationStage::MetadataOnly,
+    )
+}
+
+fn incident_storage_lock_pressure() -> DegradedIncidentScenario {
+    scenario(
+        "incident-storage-lock-pressure",
+        DegradedIncidentKind::StorageLockPressure,
+        "incident.inject.storage_lock_pressure",
+        "catalog write lock exceeds deterministic wait budget",
+        "lock_wait_ms=250,budget_ms=50",
+        DegradedIncidentExpectedOutput::AuditReasonCode,
+        ReplayBundleOutcomeStatus::Degraded,
+        "fsfs.incident.storage_lock_pressure",
+        true,
+        crate::pressure::DegradationStage::LexicalOnly,
+    )
+}
+
+fn incident_watcher_backlog() -> DegradedIncidentScenario {
+    scenario(
+        "incident-watcher-backlog",
+        DegradedIncidentKind::WatcherBacklog,
+        "incident.inject.watcher_backlog",
+        "watcher backlog crosses catch-up watermark",
+        "pending_events=4096,watermark=1024",
+        DegradedIncidentExpectedOutput::WatcherReasonCode,
+        ReplayBundleOutcomeStatus::Degraded,
+        "fsfs.incident.watcher_backlog",
+        true,
+        crate::pressure::DegradationStage::EmbedDeferred,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scenario(
+    scenario_id: &str,
+    incident: DegradedIncidentKind,
+    injection_reason_code: &str,
+    trigger: &str,
+    deterministic_payload: &str,
+    output: DegradedIncidentExpectedOutput,
+    status: ReplayBundleOutcomeStatus,
+    expected_reason_code: &str,
+    preserves_initial_results: bool,
+    degradation_stage: crate::pressure::DegradationStage,
+) -> DegradedIncidentScenario {
+    DegradedIncidentScenario {
+        scenario_id: scenario_id.to_owned(),
+        incident,
+        injection: DegradedIncidentInjection {
+            reason_code: injection_reason_code.to_owned(),
+            trigger: trigger.to_owned(),
+            deterministic_payload: deterministic_payload.to_owned(),
+        },
+        expected: DegradedIncidentExpectedOutcome {
+            output,
+            status,
+            reason_code: expected_reason_code.to_owned(),
+            preserves_initial_results,
+            degradation_stage,
+            artifact_refs: vec![format!("{scenario_id}-events")],
+        },
+        replay_command: format!(
+            "fsfs incident-suite replay --scenario {scenario_id} --format jsonl"
+        ),
+    }
+}
+
+fn scenario_artifacts(scenarios: &[DegradedIncidentScenario]) -> Vec<ReplayBundleArtifactRef> {
+    scenarios
+        .iter()
+        .enumerate()
+        .map(|(index, scenario)| ReplayBundleArtifactRef {
+            artifact_id: format!("{}-events", scenario.scenario_id),
+            path: format!("artifacts/incidents/{}/events.jsonl", scenario.scenario_id),
+            content_type: "application/x-ndjson".to_owned(),
+            checksum_sha256: fixture_digest(index),
+            required: true,
+        })
+        .collect()
+}
+
+fn fixture_digest(index: usize) -> String {
+    let digit = match index {
+        0 => '1',
+        1 => '2',
+        2 => '3',
+        3 => '4',
+        4 => '5',
+        _ => '6',
+    };
+    let digest = std::iter::repeat_n(digit, 64).collect::<String>();
+    format!("sha256:{digest}")
+}
+
+fn validate_degraded_incident_scenario(
+    scenario: &DegradedIncidentScenario,
+    artifact_ids: &std::collections::BTreeSet<&str>,
+) -> Result<(), &'static str> {
+    require_incident_non_empty("scenario.scenario_id", &scenario.scenario_id)?;
+    require_incident_non_empty(
+        "scenario.injection.reason_code",
+        &scenario.injection.reason_code,
+    )?;
+    require_incident_non_empty("scenario.injection.trigger", &scenario.injection.trigger)?;
+    require_incident_non_empty(
+        "scenario.injection.deterministic_payload",
+        &scenario.injection.deterministic_payload,
+    )?;
+    require_incident_non_empty(
+        "scenario.expected.reason_code",
+        &scenario.expected.reason_code,
+    )?;
+    require_incident_non_empty("scenario.replay_command", &scenario.replay_command)?;
+    if contains_forbidden_incident_command(&scenario.replay_command) {
+        return Err("degraded.incident_suite.scenario.replay_command.forbidden");
+    }
+    if scenario.expected.artifact_refs.is_empty() {
+        return Err("degraded.incident_suite.scenario.artifact_refs.empty");
+    }
+    for artifact_ref in &scenario.expected.artifact_refs {
+        require_incident_non_empty("scenario.expected.artifact_ref", artifact_ref)?;
+        if !artifact_ids.contains(artifact_ref.as_str()) {
+            return Err("degraded.incident_suite.scenario.artifact_ref.unknown");
+        }
+    }
+    if matches!(
+        scenario.expected.status,
+        ReplayBundleOutcomeStatus::Degraded
+            | ReplayBundleOutcomeStatus::Failed
+            | ReplayBundleOutcomeStatus::Skipped
+    ) && scenario.expected.reason_code.trim().is_empty()
+    {
+        return Err("degraded.incident_suite.scenario.reason_code.missing");
+    }
+    Ok(())
+}
+
+fn require_incident_non_empty(field: &'static str, value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() {
+        match field {
+            "suite_id" => Err("degraded.incident_suite.suite_id.empty"),
+            "generated_at" => Err("degraded.incident_suite.generated_at.empty"),
+            "config_hash" => Err("degraded.incident_suite.config_hash.empty"),
+            "command.working_dir" => Err("degraded.incident_suite.command.working_dir.empty"),
+            "structured_log.event_schema" => {
+                Err("degraded.incident_suite.structured_log.event_schema.empty")
+            }
+            "structured_log.redaction_note" => {
+                Err("degraded.incident_suite.structured_log.redaction_note.empty")
+            }
+            "replay_command" => Err("degraded.incident_suite.replay_command.empty"),
+            "artifact.artifact_id" => Err("degraded.incident_suite.artifact.artifact_id.empty"),
+            "artifact.path" => Err("degraded.incident_suite.artifact.path.empty"),
+            "artifact.content_type" => Err("degraded.incident_suite.artifact.content_type.empty"),
+            "scenario.scenario_id" => Err("degraded.incident_suite.scenario.scenario_id.empty"),
+            "scenario.injection.reason_code" => {
+                Err("degraded.incident_suite.scenario.injection.reason_code.empty")
+            }
+            "scenario.injection.trigger" => {
+                Err("degraded.incident_suite.scenario.injection.trigger.empty")
+            }
+            "scenario.injection.deterministic_payload" => {
+                Err("degraded.incident_suite.scenario.injection.payload.empty")
+            }
+            "scenario.expected.reason_code" => {
+                Err("degraded.incident_suite.scenario.reason_code.missing")
+            }
+            "scenario.replay_command" => {
+                Err("degraded.incident_suite.scenario.replay_command.empty")
+            }
+            "scenario.expected.artifact_ref" => {
+                Err("degraded.incident_suite.scenario.artifact_ref.empty")
+            }
+            _ => Err("degraded.incident_suite.field.empty"),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+#[must_use]
+fn contains_forbidden_incident_command(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    [
+        "rm -rf",
+        "git clean -fd",
+        "git reset --hard",
+        "curl ",
+        "wget ",
+        "http://",
+        "https://",
+    ]
+    .iter()
+    .any(|token| command.contains(token))
+}
+
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), &'static str> {
     if value.trim().is_empty() {
         match field {
@@ -2165,6 +2949,122 @@ mod tests {
             .expect_err("reject unknown artifact ref");
 
         assert!(error.to_string().contains("artifact_ref.unknown"));
+    }
+
+    // ─── Degraded-Mode Synthetic Incident Suite ────────────────────────
+
+    #[test]
+    fn degraded_incident_contract_default_covers_required_scenarios() {
+        let contract = degraded_incident_suite_contract_definition();
+
+        assert_eq!(contract.kind, DegradedIncidentSuiteContractKind::Current);
+        assert_eq!(contract.v, DEGRADED_INCIDENT_SUITE_SCHEMA_VERSION);
+        assert_eq!(contract.required_incidents, all_degraded_incident_kinds());
+        assert!(
+            contract
+                .supported_modes
+                .contains(&DegradedIncidentSuiteMode::Smoke)
+        );
+        assert!(
+            contract
+                .supported_modes
+                .contains(&DegradedIncidentSuiteMode::Full)
+        );
+        for required in ["seed", "config_hash", "scenario_id", "reason_code"] {
+            assert!(
+                contract
+                    .required_log_fields
+                    .iter()
+                    .any(|field| field == required),
+                "missing required log field {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_incident_smoke_suite_roundtrips_and_validates() {
+        let suite = degraded_incident_smoke_suite();
+
+        assert_eq!(suite.mode, DegradedIncidentSuiteMode::Smoke);
+        assert_eq!(suite.scenarios.len(), 2);
+        assert!(!suite.destructive_actions_allowed);
+        assert_eq!(
+            suite.network_policy,
+            DegradedIncidentNetworkPolicy::OfflineOnly
+        );
+        suite.validate().expect("valid smoke incident suite");
+
+        let json = serde_json::to_string(&suite).expect("serialize smoke incident suite");
+        let decoded: DegradedIncidentSuite =
+            serde_json::from_str(&json).expect("deserialize smoke incident suite");
+
+        assert_eq!(decoded, suite);
+    }
+
+    #[test]
+    fn degraded_incident_full_suite_covers_all_incidents() {
+        let suite = degraded_incident_full_suite();
+        let incidents = suite
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.incident)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected_outputs = suite
+            .scenarios
+            .iter()
+            .map(|scenario| scenario.expected.output)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        suite.validate().expect("valid full incident suite");
+        for incident in all_degraded_incident_kinds() {
+            assert!(
+                incidents.contains(&incident),
+                "missing incident {incident:?}"
+            );
+        }
+        assert!(
+            expected_outputs.contains(&DegradedIncidentExpectedOutput::SearchPhaseRefinementFailed)
+        );
+        assert!(expected_outputs.contains(&DegradedIncidentExpectedOutput::DoctorReasonCode));
+        assert!(expected_outputs.contains(&DegradedIncidentExpectedOutput::AuditReasonCode));
+        assert!(expected_outputs.contains(&DegradedIncidentExpectedOutput::WatcherReasonCode));
+    }
+
+    #[test]
+    fn degraded_incident_suite_rejects_missing_reason_for_failure() {
+        let mut suite = degraded_incident_smoke_suite();
+        for scenario in &mut suite.scenarios {
+            if matches!(
+                scenario.incident,
+                DegradedIncidentKind::CorruptVectorArtifact
+            ) {
+                scenario.expected.reason_code.clear();
+            }
+        }
+        let json = serde_json::to_value(&suite).expect("serialize incident suite");
+        let error = serde_json::from_value::<DegradedIncidentSuite>(json)
+            .expect_err("reject missing reason code");
+
+        assert!(error.to_string().contains("reason_code"));
+    }
+
+    #[test]
+    fn degraded_incident_suite_rejects_destructive_or_incomplete_full_suite() {
+        let mut destructive = degraded_incident_smoke_suite();
+        destructive.destructive_actions_allowed = true;
+        let error = serde_json::from_value::<DegradedIncidentSuite>(
+            serde_json::to_value(&destructive).expect("serialize destructive suite"),
+        )
+        .expect_err("reject destructive incident suite");
+        assert!(error.to_string().contains("destructive_actions"));
+
+        let mut incomplete = degraded_incident_full_suite();
+        let _removed = incomplete.scenarios.pop();
+        let error = serde_json::from_value::<DegradedIncidentSuite>(
+            serde_json::to_value(&incomplete).expect("serialize incomplete suite"),
+        )
+        .expect_err("reject incomplete full suite");
+        assert!(error.to_string().contains("full.coverage"));
     }
 
     // ─── Environment Snapshot ───────────────────────────────────────────

@@ -1,0 +1,561 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-degraded-incident-suite-v1.schema.json",
+  "title": "fsfs degraded-mode synthetic incident suite v1",
+  "description": "Contract and fixture schema for deterministic degraded-mode incident suites.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/incidentSuite"
+    }
+  ],
+  "$defs": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stringList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      },
+      "minItems": 1
+    },
+    "incidentKind": {
+      "type": "string",
+      "enum": [
+        "quality_embedder_timeout",
+        "model_unavailable",
+        "corrupt_vector_artifact",
+        "lexical_backend_failure",
+        "storage_lock_pressure",
+        "watcher_backlog"
+      ]
+    },
+    "suiteMode": {
+      "type": "string",
+      "enum": [
+        "smoke",
+        "full"
+      ]
+    },
+    "clientSurface": {
+      "type": "string",
+      "enum": [
+        "cli",
+        "tui"
+      ]
+    },
+    "outcomeStatus": {
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "degraded",
+        "skipped",
+        "failed"
+      ]
+    },
+    "expectedOutput": {
+      "type": "string",
+      "enum": [
+        "search_phase_initial",
+        "search_phase_refinement_failed",
+        "doctor_reason_code",
+        "audit_reason_code",
+        "watcher_reason_code"
+      ]
+    },
+    "degradationStage": {
+      "type": "string",
+      "enum": [
+        "full",
+        "embed_deferred",
+        "lexical_only",
+        "metadata_only",
+        "paused"
+      ]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "required_incidents",
+        "supported_modes",
+        "required_suite_fields",
+        "required_scenario_fields",
+        "required_log_fields",
+        "validation_modes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "fsfs_degraded_incident_suite_contract_definition"
+        },
+        "v": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "required_incidents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/incidentKind"
+          },
+          "minItems": 6,
+          "uniqueItems": true
+        },
+        "supported_modes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/suiteMode"
+          },
+          "minItems": 2,
+          "uniqueItems": true
+        },
+        "required_suite_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "required_scenario_fields": {
+          "$ref": "#/$defs/stringList"
+        },
+        "required_log_fields": {
+          "$ref": "#/$defs/logFieldList"
+        },
+        "validation_modes": {
+          "$ref": "#/$defs/stringList"
+        }
+      }
+    },
+    "envEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "value",
+        "redacted"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "value": {
+          "type": "string"
+        },
+        "redacted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "envSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "variables",
+        "redaction_note"
+      ],
+      "properties": {
+        "variables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/envEntry"
+          }
+        },
+        "redaction_note": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_surface",
+        "argv",
+        "working_dir"
+      ],
+      "properties": {
+        "client_surface": {
+          "$ref": "#/$defs/clientSurface"
+        },
+        "argv": {
+          "$ref": "#/$defs/stringList"
+        },
+        "working_dir": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seed",
+        "config_hash",
+        "snapshot"
+      ],
+      "properties": {
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "config_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/envSnapshot"
+        }
+      }
+    },
+    "logFieldList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nonEmptyString"
+      },
+      "minItems": 4,
+      "uniqueItems": true,
+      "allOf": [
+        {
+          "contains": {
+            "const": "seed"
+          }
+        },
+        {
+          "contains": {
+            "const": "config_hash"
+          }
+        },
+        {
+          "contains": {
+            "const": "scenario_id"
+          }
+        },
+        {
+          "contains": {
+            "const": "reason_code"
+          }
+        }
+      ]
+    },
+    "structuredLog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_schema",
+        "required_fields",
+        "redaction_note"
+      ],
+      "properties": {
+        "event_schema": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "required_fields": {
+          "$ref": "#/$defs/logFieldList"
+        },
+        "redaction_note": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "artifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "path",
+        "content_type",
+        "checksum_sha256",
+        "required"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "path": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "content_type": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "checksum_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "artifactManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifacts"
+      ],
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifactRef"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "injection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason_code",
+        "trigger",
+        "deterministic_payload"
+      ],
+      "properties": {
+        "reason_code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "trigger": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "deterministic_payload": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "expectedOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "output",
+        "status",
+        "reason_code",
+        "preserves_initial_results",
+        "degradation_stage",
+        "artifact_refs"
+      ],
+      "properties": {
+        "output": {
+          "$ref": "#/$defs/expectedOutput"
+        },
+        "status": {
+          "$ref": "#/$defs/outcomeStatus"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "preserves_initial_results": {
+          "type": "boolean"
+        },
+        "degradation_stage": {
+          "$ref": "#/$defs/degradationStage"
+        },
+        "artifact_refs": {
+          "$ref": "#/$defs/stringList"
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "incident",
+        "injection",
+        "expected",
+        "replay_command"
+      ],
+      "properties": {
+        "scenario_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "incident": {
+          "$ref": "#/$defs/incidentKind"
+        },
+        "injection": {
+          "$ref": "#/$defs/injection"
+        },
+        "expected": {
+          "$ref": "#/$defs/expectedOutcome"
+        },
+        "replay_command": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "incidentSuite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "suite_id",
+        "mode",
+        "seed",
+        "config_hash",
+        "generated_at",
+        "command",
+        "environment",
+        "network_policy",
+        "destructive_actions_allowed",
+        "structured_log",
+        "artifact_manifest",
+        "scenarios",
+        "replay_command"
+      ],
+      "properties": {
+        "kind": {
+          "const": "fsfs_degraded_incident_suite"
+        },
+        "v": {
+          "$ref": "#/$defs/schemaVersion"
+        },
+        "suite_id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "mode": {
+          "$ref": "#/$defs/suiteMode"
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "config_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "generated_at": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "command": {
+          "$ref": "#/$defs/command"
+        },
+        "environment": {
+          "$ref": "#/$defs/environment"
+        },
+        "network_policy": {
+          "const": "offline_only"
+        },
+        "destructive_actions_allowed": {
+          "const": false
+        },
+        "structured_log": {
+          "$ref": "#/$defs/structuredLog"
+        },
+        "artifact_manifest": {
+          "$ref": "#/$defs/artifactManifest"
+        },
+        "scenarios": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scenario"
+          },
+          "minItems": 1
+        },
+        "replay_command": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "full"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "scenarios": {
+                "minItems": 6,
+                "allOf": [
+                  {
+                    "contains": {
+                      "properties": {
+                        "incident": {
+                          "const": "quality_embedder_timeout"
+                        }
+                      },
+                      "required": [
+                        "incident"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "properties": {
+                        "incident": {
+                          "const": "model_unavailable"
+                        }
+                      },
+                      "required": [
+                        "incident"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "properties": {
+                        "incident": {
+                          "const": "corrupt_vector_artifact"
+                        }
+                      },
+                      "required": [
+                        "incident"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "properties": {
+                        "incident": {
+                          "const": "lexical_backend_failure"
+                        }
+                      },
+                      "required": [
+                        "incident"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "properties": {
+                        "incident": {
+                          "const": "storage_lock_pressure"
+                        }
+                      },
+                      "required": [
+                        "incident"
+                      ]
+                    }
+                  },
+                  {
+                    "contains": {
+                      "properties": {
+                        "incident": {
+                          "const": "watcher_backlog"
+                        }
+                      },
+                      "required": [
+                        "incident"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

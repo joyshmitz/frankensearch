@@ -72,6 +72,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-config-") {
         return "fsfs-config-v1.schema.json";
     }
+    if name.starts_with("fsfs-degraded-incident-suite-") {
+        return "fsfs-degraded-incident-suite-v1.schema.json";
+    }
     if name.starts_with("fsfs-determinism-") {
         return "fsfs-determinism-v1.schema.json";
     }
@@ -525,6 +528,83 @@ fn test_replay_bundle_invalid_fixtures_are_rejected_by_rust() {
     assert_invalid_rust_fixture::<frankensearch_fsfs::ReplayBundleManifest>(
         "fsfs-replay-bundle-invalid-missing-seed-v1.json",
     );
+}
+
+#[test]
+fn test_degraded_incident_suite_contract_conformance() {
+    let path = fixture_dir().join("fsfs-degraded-incident-suite-contract-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read degraded incident contract fixture");
+    let parsed: frankensearch_fsfs::DegradedIncidentSuiteContractDefinition =
+        serde_json::from_str(&raw).expect("parse degraded incident suite contract");
+
+    assert_eq!(
+        parsed.kind,
+        frankensearch_fsfs::DegradedIncidentSuiteContractKind::Current
+    );
+    assert_eq!(
+        parsed.required_incidents.len(),
+        frankensearch_fsfs::degraded_incident_full_suite()
+            .scenarios
+            .len()
+    );
+    assert_golden_json(
+        "fsfs_degraded_incident_suite_contract_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_degraded_incident_suite_smoke_conformance() {
+    let path = fixture_dir().join("fsfs-degraded-incident-suite-smoke-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read degraded incident smoke fixture");
+    let parsed: frankensearch_fsfs::DegradedIncidentSuite =
+        serde_json::from_str(&raw).expect("parse degraded incident smoke suite");
+
+    assert_eq!(
+        parsed.mode,
+        frankensearch_fsfs::DegradedIncidentSuiteMode::Smoke
+    );
+    assert_eq!(parsed.scenarios.len(), 2);
+    parsed.validate().expect("valid smoke suite");
+    assert_golden_json("fsfs_degraded_incident_suite_smoke_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_degraded_incident_suite_full_conformance() {
+    let path = fixture_dir().join("fsfs-degraded-incident-suite-full-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read degraded incident full fixture");
+    let parsed: frankensearch_fsfs::DegradedIncidentSuite =
+        serde_json::from_str(&raw).expect("parse degraded incident full suite");
+    let incidents = parsed
+        .scenarios
+        .iter()
+        .map(|scenario| scenario.incident)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(
+        parsed.mode,
+        frankensearch_fsfs::DegradedIncidentSuiteMode::Full
+    );
+    assert_eq!(incidents.len(), 6);
+    assert!(incidents.contains(&frankensearch_fsfs::DegradedIncidentKind::QualityEmbedderTimeout));
+    assert!(incidents.contains(&frankensearch_fsfs::DegradedIncidentKind::ModelUnavailable));
+    assert!(incidents.contains(&frankensearch_fsfs::DegradedIncidentKind::CorruptVectorArtifact));
+    assert!(incidents.contains(&frankensearch_fsfs::DegradedIncidentKind::LexicalBackendFailure));
+    assert!(incidents.contains(&frankensearch_fsfs::DegradedIncidentKind::StorageLockPressure));
+    assert!(incidents.contains(&frankensearch_fsfs::DegradedIncidentKind::WatcherBacklog));
+    parsed.validate().expect("valid full suite");
+    assert_golden_json("fsfs_degraded_incident_suite_full_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_degraded_incident_invalid_fixtures_are_rejected_by_rust() {
+    for fixture in [
+        "fsfs-degraded-incident-suite-invalid-missing-reason-v1.json",
+        "fsfs-degraded-incident-suite-invalid-network-required-v1.json",
+        "fsfs-degraded-incident-suite-invalid-destructive-command-v1.json",
+    ] {
+        assert_invalid_rust_fixture::<frankensearch_fsfs::DegradedIncidentSuite>(fixture);
+    }
 }
 
 #[test]
