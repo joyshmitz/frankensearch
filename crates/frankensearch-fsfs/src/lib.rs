@@ -158,8 +158,16 @@ pub use lexical_pipeline::{
 };
 pub use lifecycle::{
     DaemonPhase, DaemonStatus, DiskBudgetAction, DiskBudgetPolicy, DiskBudgetSnapshot,
-    DiskBudgetStage, HealthStatus, LifecycleTracker, LimitViolation, PidFile, PidFileContents,
+    DiskBudgetStage, HealthStatus, INDEX_FOOTPRINT_ADVISOR_CONTRACT_KIND,
+    INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION, INDEX_FOOTPRINT_ADVISOR_REPORT_KIND,
+    INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION, IndexFootprintAdvisorAction,
+    IndexFootprintAdvisorContractDefinition, IndexFootprintAdvisorPolicy,
+    IndexFootprintAdvisorReport, IndexFootprintAdvisorRisk, IndexFootprintAdvisorSummary,
+    IndexFootprintDomain, IndexFootprintDomainFootprint, IndexFootprintRecommendation,
+    IndexFootprintScenario, LifecycleTracker, LimitViolation, PidFile, PidFileContents,
     ResourceLimits, ResourceUsage, SubsystemHealth, SubsystemId, WatchdogConfig,
+    index_footprint_advisor_contract_definition, index_footprint_advisor_fragmented_fixture,
+    index_footprint_advisor_oversized_fixture, index_footprint_advisor_small_fixture,
 };
 pub use mount_info::{
     ChangeDetectionStrategy, ErrorClass, FsCategory, MountEntry, MountOverride, MountPolicy,

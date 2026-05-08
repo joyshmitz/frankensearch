@@ -1,0 +1,67 @@
+{
+  "kind": "fsfs_index_footprint_advisor_report",
+  "v": 1,
+  "generated_at": "2026-05-08T00:00:00Z",
+  "surface": "fsfs-invalid-missing-replay",
+  "policy_version": "fsfs-index-footprint-advisor-policy-v1",
+  "scenario": "small",
+  "dry_run": true,
+  "automatic_deletion_allowed": false,
+  "budget_bytes": 1024,
+  "total_bytes": 5,
+  "measurements": [
+    {
+      "domain": "vector_index",
+      "bytes": 1,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "fsvi"
+    },
+    {
+      "domain": "lexical_index",
+      "bytes": 1,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "tantivy"
+    },
+    {
+      "domain": "metadata",
+      "bytes": 1,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "sqlite"
+    },
+    {
+      "domain": "model_cache",
+      "bytes": 1,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "model-cache"
+    },
+    {
+      "domain": "artifact",
+      "bytes": 1,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "artifact-manifest"
+    }
+  ],
+  "recommendations": [
+    {
+      "domain": "vector_index",
+      "action": "retention",
+      "reason_code": "index_footprint.small.retention",
+      "risk": "low",
+      "measured_bytes": 1,
+      "projected_savings_bytes": 0,
+      "replay_command": "",
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "rationale": "small: retain current files and only audit policy for vector_index"
+    }
+  ],
+  "summary": {
+    "recommendation_count": 1,
+    "projected_savings_bytes": 0,
+    "highest_risk": "low"
+  }
+}

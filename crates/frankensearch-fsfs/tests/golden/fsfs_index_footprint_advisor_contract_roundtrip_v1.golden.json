@@ -1,0 +1,28 @@
+{
+  "kind": "fsfs_index_footprint_advisor_contract",
+  "v": 1,
+  "dry_run_only": true,
+  "automatic_deletion_allowed": false,
+  "policy_version": "fsfs-index-footprint-advisor-policy-v1",
+  "required_domains": [
+    "vector_index",
+    "lexical_index",
+    "metadata",
+    "model_cache",
+    "artifact"
+  ],
+  "required_actions": [
+    "compaction",
+    "rebuild",
+    "retention",
+    "feature_adjustment"
+  ],
+  "policy": {
+    "small_index_max_bytes": 134217728,
+    "fragmentation_threshold_per_mille": 200,
+    "oversize_threshold_per_mille": 950,
+    "dominant_domain_threshold_per_mille": 500,
+    "minimum_projected_savings_bytes": 1048576
+  },
+  "replay_command_template": "FSFS_INDEX_FOOTPRINT_FIXTURE={scenario} FSFS_INDEX_FOOTPRINT_DOMAIN={domain} cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture"
+}

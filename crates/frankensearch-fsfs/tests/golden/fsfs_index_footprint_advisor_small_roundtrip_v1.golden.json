@@ -1,0 +1,111 @@
+{
+  "kind": "fsfs_index_footprint_advisor_report",
+  "v": 1,
+  "generated_at": "2026-05-08T00:00:00Z",
+  "surface": "fsfs-status-small-fixture",
+  "policy_version": "fsfs-index-footprint-advisor-policy-v1",
+  "scenario": "small",
+  "dry_run": true,
+  "automatic_deletion_allowed": false,
+  "budget_bytes": 536870912,
+  "total_bytes": 36700160,
+  "measurements": [
+    {
+      "domain": "vector_index",
+      "bytes": 8388608,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 8,
+      "source": "fsvi"
+    },
+    {
+      "domain": "lexical_index",
+      "bytes": 6291456,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 7,
+      "source": "tantivy"
+    },
+    {
+      "domain": "metadata",
+      "bytes": 2097152,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 4,
+      "source": "sqlite"
+    },
+    {
+      "domain": "model_cache",
+      "bytes": 18874368,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "model-cache"
+    },
+    {
+      "domain": "artifact",
+      "bytes": 1048576,
+      "reclaimable_bytes": 0,
+      "fragmentation_per_mille": 0,
+      "source": "artifact-manifest"
+    }
+  ],
+  "recommendations": [
+    {
+      "domain": "vector_index",
+      "action": "retention",
+      "reason_code": "index_footprint.small.retention",
+      "risk": "low",
+      "measured_bytes": 8388608,
+      "projected_savings_bytes": 0,
+      "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=vector_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "rationale": "small: retain current files and only audit policy for vector_index"
+    },
+    {
+      "domain": "lexical_index",
+      "action": "retention",
+      "reason_code": "index_footprint.small.retention",
+      "risk": "low",
+      "measured_bytes": 6291456,
+      "projected_savings_bytes": 0,
+      "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=lexical_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "rationale": "small: retain current files and only audit policy for lexical_index"
+    },
+    {
+      "domain": "metadata",
+      "action": "retention",
+      "reason_code": "index_footprint.small.retention",
+      "risk": "low",
+      "measured_bytes": 2097152,
+      "projected_savings_bytes": 0,
+      "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=metadata cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "rationale": "small: retain current files and only audit policy for metadata"
+    },
+    {
+      "domain": "model_cache",
+      "action": "retention",
+      "reason_code": "index_footprint.small.retention",
+      "risk": "low",
+      "measured_bytes": 18874368,
+      "projected_savings_bytes": 0,
+      "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=model_cache cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "rationale": "small: retain current files and only audit policy for model_cache"
+    },
+    {
+      "domain": "artifact",
+      "action": "retention",
+      "reason_code": "index_footprint.small.retention",
+      "risk": "low",
+      "measured_bytes": 1048576,
+      "projected_savings_bytes": 0,
+      "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=artifact cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "rationale": "small: retain current files and only audit policy for artifact"
+    }
+  ],
+  "summary": {
+    "recommendation_count": 5,
+    "projected_savings_bytes": 0,
+    "highest_risk": "low"
+  }
+}

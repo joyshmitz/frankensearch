@@ -96,6 +96,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-incremental-change-detection-") {
         return "fsfs-incremental-change-detection-v1.schema.json";
     }
+    if name.starts_with("fsfs-index-footprint-advisor-") {
+        return "fsfs-index-footprint-advisor-v1.schema.json";
+    }
     if name.starts_with("fsfs-model-cache-diagnostics-") {
         return "fsfs-model-cache-diagnostics-v1.schema.json";
     }
@@ -592,6 +595,68 @@ fn test_model_cache_diagnostics_invalid_fixtures_are_rejected_by_rust() {
         let error = parsed
             .validate()
             .expect_err("invalid model cache diagnostics report should fail validation");
+        assert!(
+            !error.is_empty(),
+            "fixture {fixture} produced an empty validation error"
+        );
+    }
+}
+
+#[test]
+fn test_index_footprint_advisor_contract_conformance() {
+    let path = fixture_dir().join("fsfs-index-footprint-advisor-contract-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::IndexFootprintAdvisorContractDefinition =
+        serde_json::from_str(&raw).expect("parse index footprint advisor contract");
+    parsed
+        .validate()
+        .expect("index footprint advisor contract should validate");
+    assert_golden_json(
+        "fsfs_index_footprint_advisor_contract_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_index_footprint_advisor_reports_conformance() {
+    for (fixture, golden) in [
+        (
+            "fsfs-index-footprint-advisor-small-v1.json",
+            "fsfs_index_footprint_advisor_small_roundtrip_v1",
+        ),
+        (
+            "fsfs-index-footprint-advisor-fragmented-v1.json",
+            "fsfs_index_footprint_advisor_fragmented_roundtrip_v1",
+        ),
+        (
+            "fsfs-index-footprint-advisor-oversized-v1.json",
+            "fsfs_index_footprint_advisor_oversized_roundtrip_v1",
+        ),
+    ] {
+        let path = fixture_dir().join(fixture);
+        let raw = std::fs::read_to_string(&path).expect("read fixture");
+        let parsed: frankensearch_fsfs::IndexFootprintAdvisorReport =
+            serde_json::from_str(&raw).expect("parse index footprint advisor report");
+        parsed
+            .validate()
+            .expect("index footprint advisor report should validate");
+        assert_golden_json(golden, &parsed);
+    }
+}
+
+#[test]
+fn test_index_footprint_advisor_invalid_fixtures_are_rejected_by_rust() {
+    for fixture in [
+        "fsfs-index-footprint-advisor-invalid-auto-delete-v1.json",
+        "fsfs-index-footprint-advisor-invalid-missing-replay-v1.json",
+    ] {
+        let path = invalid_fixture_dir().join(fixture);
+        let raw = std::fs::read_to_string(&path).expect("read invalid fixture");
+        let parsed: frankensearch_fsfs::IndexFootprintAdvisorReport =
+            serde_json::from_str(&raw).expect("parse invalid index footprint advisor report");
+        let error = parsed
+            .validate()
+            .expect_err("invalid index footprint advisor report should fail validation");
         assert!(
             !error.is_empty(),
             "fixture {fixture} produced an empty validation error"

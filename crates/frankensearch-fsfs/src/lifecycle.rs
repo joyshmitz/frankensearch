@@ -390,6 +390,772 @@ impl DiskBudgetPolicy {
     }
 }
 
+// ─── Index Footprint Advisor ────────────────────────────────────────────────
+
+pub const INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION: u32 = 1;
+pub const INDEX_FOOTPRINT_ADVISOR_CONTRACT_KIND: &str = "fsfs_index_footprint_advisor_contract";
+pub const INDEX_FOOTPRINT_ADVISOR_REPORT_KIND: &str = "fsfs_index_footprint_advisor_report";
+pub const INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION: &str = "fsfs-index-footprint-advisor-policy-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFootprintDomain {
+    VectorIndex,
+    LexicalIndex,
+    Metadata,
+    ModelCache,
+    Artifact,
+}
+
+impl IndexFootprintDomain {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VectorIndex => "vector_index",
+            Self::LexicalIndex => "lexical_index",
+            Self::Metadata => "metadata",
+            Self::ModelCache => "model_cache",
+            Self::Artifact => "artifact",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFootprintScenario {
+    Small,
+    Fragmented,
+    Oversized,
+}
+
+impl IndexFootprintScenario {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Fragmented => "fragmented",
+            Self::Oversized => "oversized",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFootprintAdvisorAction {
+    Compaction,
+    Rebuild,
+    Retention,
+    FeatureAdjustment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexFootprintAdvisorRisk {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFootprintAdvisorPolicy {
+    pub small_index_max_bytes: u64,
+    pub fragmentation_threshold_per_mille: u16,
+    pub oversize_threshold_per_mille: u16,
+    pub dominant_domain_threshold_per_mille: u16,
+    pub minimum_projected_savings_bytes: u64,
+}
+
+impl Default for IndexFootprintAdvisorPolicy {
+    fn default() -> Self {
+        Self {
+            small_index_max_bytes: 128 * 1024 * 1024,
+            fragmentation_threshold_per_mille: 200,
+            oversize_threshold_per_mille: 950,
+            dominant_domain_threshold_per_mille: 500,
+            minimum_projected_savings_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl IndexFootprintAdvisorPolicy {
+    #[must_use]
+    pub fn classify(
+        &self,
+        total_bytes: u64,
+        budget_bytes: Option<u64>,
+        measurements: &[IndexFootprintDomainFootprint],
+    ) -> IndexFootprintScenario {
+        if self.is_oversized(total_bytes, budget_bytes, measurements) {
+            return IndexFootprintScenario::Oversized;
+        }
+        if self.is_fragmented(measurements) {
+            return IndexFootprintScenario::Fragmented;
+        }
+        IndexFootprintScenario::Small
+    }
+
+    #[must_use]
+    pub fn action_for(
+        &self,
+        scenario: IndexFootprintScenario,
+        footprint: &IndexFootprintDomainFootprint,
+        total_bytes: u64,
+    ) -> IndexFootprintAdvisorAction {
+        match scenario {
+            IndexFootprintScenario::Small => IndexFootprintAdvisorAction::Retention,
+            IndexFootprintScenario::Fragmented => match footprint.domain {
+                IndexFootprintDomain::VectorIndex | IndexFootprintDomain::Artifact
+                    if self.is_reclaimable(footprint) =>
+                {
+                    IndexFootprintAdvisorAction::Compaction
+                }
+                IndexFootprintDomain::LexicalIndex | IndexFootprintDomain::Metadata
+                    if self.is_reclaimable(footprint) =>
+                {
+                    IndexFootprintAdvisorAction::Rebuild
+                }
+                _ => IndexFootprintAdvisorAction::Retention,
+            },
+            IndexFootprintScenario::Oversized => match footprint.domain {
+                IndexFootprintDomain::ModelCache if self.is_dominant(footprint, total_bytes) => {
+                    IndexFootprintAdvisorAction::FeatureAdjustment
+                }
+                IndexFootprintDomain::Artifact if footprint.reclaimable_bytes > 0 => {
+                    IndexFootprintAdvisorAction::Retention
+                }
+                IndexFootprintDomain::VectorIndex if self.is_reclaimable(footprint) => {
+                    IndexFootprintAdvisorAction::Compaction
+                }
+                IndexFootprintDomain::LexicalIndex | IndexFootprintDomain::Metadata
+                    if self.is_reclaimable(footprint) =>
+                {
+                    IndexFootprintAdvisorAction::Rebuild
+                }
+                _ => IndexFootprintAdvisorAction::Retention,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn build_recommendation(
+        &self,
+        scenario: IndexFootprintScenario,
+        footprint: &IndexFootprintDomainFootprint,
+        total_bytes: u64,
+    ) -> IndexFootprintRecommendation {
+        let action = self.action_for(scenario, footprint, total_bytes);
+        let projected_savings_bytes = match action {
+            IndexFootprintAdvisorAction::Retention if scenario == IndexFootprintScenario::Small => {
+                0
+            }
+            IndexFootprintAdvisorAction::Retention => footprint.reclaimable_bytes,
+            IndexFootprintAdvisorAction::Compaction
+            | IndexFootprintAdvisorAction::Rebuild
+            | IndexFootprintAdvisorAction::FeatureAdjustment => footprint.reclaimable_bytes,
+        };
+        IndexFootprintRecommendation {
+            domain: footprint.domain,
+            action,
+            reason_code: recommendation_reason_code(scenario, action),
+            risk: recommendation_risk(scenario, action),
+            measured_bytes: footprint.bytes,
+            projected_savings_bytes,
+            replay_command: replay_command(scenario, footprint.domain),
+            operator_command: operator_command(action, footprint.domain),
+            rationale: recommendation_rationale(scenario, action, footprint.domain),
+        }
+    }
+
+    #[must_use]
+    fn is_fragmented(&self, measurements: &[IndexFootprintDomainFootprint]) -> bool {
+        measurements.iter().any(|measurement| {
+            measurement.fragmentation_per_mille >= self.fragmentation_threshold_per_mille
+                || measurement.reclaimable_bytes >= self.minimum_projected_savings_bytes
+        })
+    }
+
+    #[must_use]
+    fn is_oversized(
+        &self,
+        total_bytes: u64,
+        budget_bytes: Option<u64>,
+        measurements: &[IndexFootprintDomainFootprint],
+    ) -> bool {
+        if let Some(budget_bytes) = budget_bytes {
+            if budget_bytes > 0
+                && total_bytes.saturating_mul(1000)
+                    >= budget_bytes.saturating_mul(u64::from(self.oversize_threshold_per_mille))
+            {
+                return true;
+            }
+        }
+        total_bytes > self.small_index_max_bytes
+            && measurements
+                .iter()
+                .any(|measurement| self.is_dominant(measurement, total_bytes))
+    }
+
+    #[must_use]
+    fn is_reclaimable(&self, footprint: &IndexFootprintDomainFootprint) -> bool {
+        footprint.fragmentation_per_mille >= self.fragmentation_threshold_per_mille
+            || footprint.reclaimable_bytes >= self.minimum_projected_savings_bytes
+    }
+
+    #[must_use]
+    fn is_dominant(&self, footprint: &IndexFootprintDomainFootprint, total_bytes: u64) -> bool {
+        total_bytes > 0
+            && footprint.bytes.saturating_mul(1000)
+                >= total_bytes.saturating_mul(u64::from(self.dominant_domain_threshold_per_mille))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFootprintAdvisorContractDefinition {
+    pub kind: String,
+    pub v: u32,
+    pub dry_run_only: bool,
+    pub automatic_deletion_allowed: bool,
+    pub policy_version: String,
+    pub required_domains: Vec<IndexFootprintDomain>,
+    pub required_actions: Vec<IndexFootprintAdvisorAction>,
+    pub policy: IndexFootprintAdvisorPolicy,
+    pub replay_command_template: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFootprintDomainFootprint {
+    pub domain: IndexFootprintDomain,
+    pub bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub fragmentation_per_mille: u16,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFootprintRecommendation {
+    pub domain: IndexFootprintDomain,
+    pub action: IndexFootprintAdvisorAction,
+    pub reason_code: String,
+    pub risk: IndexFootprintAdvisorRisk,
+    pub measured_bytes: u64,
+    pub projected_savings_bytes: u64,
+    pub replay_command: String,
+    pub operator_command: String,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFootprintAdvisorSummary {
+    pub recommendation_count: usize,
+    pub projected_savings_bytes: u64,
+    pub highest_risk: IndexFootprintAdvisorRisk,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexFootprintAdvisorReport {
+    pub kind: String,
+    pub v: u32,
+    pub generated_at: String,
+    pub surface: String,
+    pub policy_version: String,
+    pub scenario: IndexFootprintScenario,
+    pub dry_run: bool,
+    pub automatic_deletion_allowed: bool,
+    pub budget_bytes: Option<u64>,
+    pub total_bytes: u64,
+    pub measurements: Vec<IndexFootprintDomainFootprint>,
+    pub recommendations: Vec<IndexFootprintRecommendation>,
+    pub summary: IndexFootprintAdvisorSummary,
+}
+
+#[must_use]
+pub fn index_footprint_advisor_contract_definition() -> IndexFootprintAdvisorContractDefinition {
+    IndexFootprintAdvisorContractDefinition {
+        kind: INDEX_FOOTPRINT_ADVISOR_CONTRACT_KIND.to_owned(),
+        v: INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION,
+        dry_run_only: true,
+        automatic_deletion_allowed: false,
+        policy_version: INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION.to_owned(),
+        required_domains: required_index_footprint_domains().to_vec(),
+        required_actions: vec![
+            IndexFootprintAdvisorAction::Compaction,
+            IndexFootprintAdvisorAction::Rebuild,
+            IndexFootprintAdvisorAction::Retention,
+            IndexFootprintAdvisorAction::FeatureAdjustment,
+        ],
+        policy: IndexFootprintAdvisorPolicy::default(),
+        replay_command_template: "FSFS_INDEX_FOOTPRINT_FIXTURE={scenario} FSFS_INDEX_FOOTPRINT_DOMAIN={domain} cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture".to_owned(),
+    }
+}
+
+#[must_use]
+pub fn index_footprint_advisor_small_fixture() -> IndexFootprintAdvisorReport {
+    index_footprint_advisor_report_fixture(
+        "2026-05-08T00:00:00Z",
+        "fsfs-status-small-fixture",
+        Some(512 * 1024 * 1024),
+        vec![
+            footprint(
+                IndexFootprintDomain::VectorIndex,
+                8 * 1024 * 1024,
+                0,
+                8,
+                "fsvi",
+            ),
+            footprint(
+                IndexFootprintDomain::LexicalIndex,
+                6 * 1024 * 1024,
+                0,
+                7,
+                "tantivy",
+            ),
+            footprint(
+                IndexFootprintDomain::Metadata,
+                2 * 1024 * 1024,
+                0,
+                4,
+                "sqlite",
+            ),
+            footprint(
+                IndexFootprintDomain::ModelCache,
+                18 * 1024 * 1024,
+                0,
+                0,
+                "model-cache",
+            ),
+            footprint(
+                IndexFootprintDomain::Artifact,
+                1024 * 1024,
+                0,
+                0,
+                "artifact-manifest",
+            ),
+        ],
+    )
+}
+
+#[must_use]
+pub fn index_footprint_advisor_fragmented_fixture() -> IndexFootprintAdvisorReport {
+    index_footprint_advisor_report_fixture(
+        "2026-05-08T00:00:00Z",
+        "fsfs-status-fragmented-fixture",
+        Some(2 * 1024 * 1024 * 1024),
+        vec![
+            footprint(
+                IndexFootprintDomain::VectorIndex,
+                420 * 1024 * 1024,
+                96 * 1024 * 1024,
+                260,
+                "fsvi+wal",
+            ),
+            footprint(
+                IndexFootprintDomain::LexicalIndex,
+                280 * 1024 * 1024,
+                72 * 1024 * 1024,
+                240,
+                "tantivy",
+            ),
+            footprint(
+                IndexFootprintDomain::Metadata,
+                80 * 1024 * 1024,
+                16 * 1024 * 1024,
+                205,
+                "sqlite",
+            ),
+            footprint(
+                IndexFootprintDomain::ModelCache,
+                220 * 1024 * 1024,
+                0,
+                0,
+                "model-cache",
+            ),
+            footprint(
+                IndexFootprintDomain::Artifact,
+                140 * 1024 * 1024,
+                48 * 1024 * 1024,
+                360,
+                "artifact-manifest",
+            ),
+        ],
+    )
+}
+
+#[must_use]
+pub fn index_footprint_advisor_oversized_fixture() -> IndexFootprintAdvisorReport {
+    index_footprint_advisor_report_fixture(
+        "2026-05-08T00:00:00Z",
+        "fsfs-status-oversized-fixture",
+        Some(1024 * 1024 * 1024),
+        vec![
+            footprint(
+                IndexFootprintDomain::VectorIndex,
+                380 * 1024 * 1024,
+                64 * 1024 * 1024,
+                190,
+                "fsvi+wal",
+            ),
+            footprint(
+                IndexFootprintDomain::LexicalIndex,
+                240 * 1024 * 1024,
+                24 * 1024 * 1024,
+                90,
+                "tantivy",
+            ),
+            footprint(
+                IndexFootprintDomain::Metadata,
+                90 * 1024 * 1024,
+                8 * 1024 * 1024,
+                80,
+                "sqlite",
+            ),
+            footprint(
+                IndexFootprintDomain::ModelCache,
+                1080 * 1024 * 1024,
+                640 * 1024 * 1024,
+                0,
+                "model-cache",
+            ),
+            footprint(
+                IndexFootprintDomain::Artifact,
+                260 * 1024 * 1024,
+                120 * 1024 * 1024,
+                120,
+                "artifact-manifest",
+            ),
+        ],
+    )
+}
+
+fn index_footprint_advisor_report_fixture(
+    generated_at: &str,
+    surface: &str,
+    budget_bytes: Option<u64>,
+    measurements: Vec<IndexFootprintDomainFootprint>,
+) -> IndexFootprintAdvisorReport {
+    let policy = IndexFootprintAdvisorPolicy::default();
+    let total_bytes = measurements
+        .iter()
+        .map(|measurement| measurement.bytes)
+        .sum::<u64>();
+    let scenario = policy.classify(total_bytes, budget_bytes, &measurements);
+    let recommendations = measurements
+        .iter()
+        .map(|measurement| policy.build_recommendation(scenario, measurement, total_bytes))
+        .collect::<Vec<_>>();
+    let projected_savings_bytes = recommendations
+        .iter()
+        .map(|recommendation| recommendation.projected_savings_bytes)
+        .sum();
+    let recommendation_count = recommendations.len();
+    let highest_risk = recommendations
+        .iter()
+        .map(|recommendation| recommendation.risk)
+        .max_by_key(|risk| risk_rank(*risk))
+        .unwrap_or(IndexFootprintAdvisorRisk::Low);
+
+    IndexFootprintAdvisorReport {
+        kind: INDEX_FOOTPRINT_ADVISOR_REPORT_KIND.to_owned(),
+        v: INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION,
+        generated_at: generated_at.to_owned(),
+        surface: surface.to_owned(),
+        policy_version: INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION.to_owned(),
+        scenario,
+        dry_run: true,
+        automatic_deletion_allowed: false,
+        budget_bytes,
+        total_bytes,
+        measurements,
+        recommendations,
+        summary: IndexFootprintAdvisorSummary {
+            recommendation_count,
+            projected_savings_bytes,
+            highest_risk,
+        },
+    }
+}
+
+impl IndexFootprintAdvisorContractDefinition {
+    /// Validates the index-footprint advisor contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contract allows mutations or omits required
+    /// domains, actions, thresholds, or replay commands.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != INDEX_FOOTPRINT_ADVISOR_CONTRACT_KIND {
+            return Err("unexpected index-footprint advisor contract kind".to_owned());
+        }
+        if self.v != INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION {
+            return Err("unsupported index-footprint advisor contract version".to_owned());
+        }
+        if !self.dry_run_only || self.automatic_deletion_allowed {
+            return Err("index-footprint advisor contract must be dry-run only".to_owned());
+        }
+        if self.policy_version != INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION {
+            return Err("unexpected index-footprint advisor policy version".to_owned());
+        }
+        if required_index_footprint_domains()
+            .iter()
+            .any(|required_domain| !self.required_domains.contains(required_domain))
+        {
+            return Err("index-footprint advisor missing required domain".to_owned());
+        }
+        if required_index_footprint_actions()
+            .iter()
+            .any(|required_action| !self.required_actions.contains(required_action))
+        {
+            return Err("index-footprint advisor missing required action".to_owned());
+        }
+        if self.policy.fragmentation_threshold_per_mille == 0
+            || self.policy.oversize_threshold_per_mille == 0
+            || self.policy.dominant_domain_threshold_per_mille == 0
+            || self.policy.minimum_projected_savings_bytes == 0
+        {
+            return Err("index-footprint advisor thresholds must be nonzero".to_owned());
+        }
+        if !self
+            .replay_command_template
+            .contains("cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite")
+        {
+            return Err("index-footprint advisor missing exact replay template".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl IndexFootprintAdvisorReport {
+    /// Validates an index-footprint advisor report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report can mutate data, omits a domain, or
+    /// publishes a recommendation without projected savings/risk/replay data.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind != INDEX_FOOTPRINT_ADVISOR_REPORT_KIND {
+            return Err("unexpected index-footprint advisor report kind".to_owned());
+        }
+        if self.v != INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION {
+            return Err("unsupported index-footprint advisor report version".to_owned());
+        }
+        if self.generated_at.trim().is_empty() || self.surface.trim().is_empty() {
+            return Err("index-footprint advisor report missing identity fields".to_owned());
+        }
+        if !self.dry_run || self.automatic_deletion_allowed {
+            return Err("index-footprint advisor report must be dry-run only".to_owned());
+        }
+        if self.policy_version != INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION {
+            return Err("unexpected index-footprint advisor policy version".to_owned());
+        }
+        if required_index_footprint_domains()
+            .iter()
+            .any(|required_domain| {
+                !self
+                    .measurements
+                    .iter()
+                    .any(|measurement| measurement.domain == *required_domain)
+            })
+        {
+            return Err("index-footprint advisor report missing domain footprint".to_owned());
+        }
+        for measurement in &self.measurements {
+            measurement.validate()?;
+        }
+        let total_bytes = self
+            .measurements
+            .iter()
+            .map(|measurement| measurement.bytes)
+            .sum::<u64>();
+        if self.total_bytes != total_bytes {
+            return Err("index-footprint advisor total bytes mismatch".to_owned());
+        }
+        if self.recommendations.is_empty() {
+            return Err("index-footprint advisor requires recommendations".to_owned());
+        }
+        for recommendation in &self.recommendations {
+            recommendation.validate()?;
+        }
+        let projected_savings_bytes = self
+            .recommendations
+            .iter()
+            .map(|recommendation| recommendation.projected_savings_bytes)
+            .sum::<u64>();
+        if self.summary.projected_savings_bytes != projected_savings_bytes {
+            return Err("index-footprint advisor projected savings mismatch".to_owned());
+        }
+        if self.summary.recommendation_count != self.recommendations.len() {
+            return Err("index-footprint advisor recommendation count mismatch".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl IndexFootprintDomainFootprint {
+    fn validate(&self) -> Result<(), String> {
+        if self.source.trim().is_empty() {
+            return Err("index-footprint domain source is required".to_owned());
+        }
+        if self.reclaimable_bytes > self.bytes {
+            return Err("index-footprint reclaimable bytes exceed measured bytes".to_owned());
+        }
+        if self.fragmentation_per_mille > 1000 {
+            return Err("index-footprint fragmentation must be at most 1000 per-mille".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl IndexFootprintRecommendation {
+    fn validate(&self) -> Result<(), String> {
+        if !self.reason_code.starts_with("index_footprint.") {
+            return Err("index-footprint recommendation reason code namespace mismatch".to_owned());
+        }
+        if self.rationale.trim().is_empty() {
+            return Err("index-footprint recommendation rationale is required".to_owned());
+        }
+        if self.replay_command.trim().is_empty()
+            || !self
+                .replay_command
+                .contains("cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite")
+        {
+            return Err("index-footprint recommendation missing exact replay command".to_owned());
+        }
+        if self.operator_command.trim().is_empty() {
+            return Err("index-footprint recommendation missing operator command".to_owned());
+        }
+        if !self.operator_command.contains("--dry-run") {
+            return Err("index-footprint recommendation must be dry-run".to_owned());
+        }
+        if self.projected_savings_bytes > self.measured_bytes {
+            return Err("index-footprint projected savings exceed measured bytes".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[must_use]
+fn footprint(
+    domain: IndexFootprintDomain,
+    bytes: u64,
+    reclaimable_bytes: u64,
+    fragmentation_per_mille: u16,
+    source: &str,
+) -> IndexFootprintDomainFootprint {
+    IndexFootprintDomainFootprint {
+        domain,
+        bytes,
+        reclaimable_bytes,
+        fragmentation_per_mille,
+        source: source.to_owned(),
+    }
+}
+
+#[must_use]
+fn required_index_footprint_domains() -> &'static [IndexFootprintDomain] {
+    &[
+        IndexFootprintDomain::VectorIndex,
+        IndexFootprintDomain::LexicalIndex,
+        IndexFootprintDomain::Metadata,
+        IndexFootprintDomain::ModelCache,
+        IndexFootprintDomain::Artifact,
+    ]
+}
+
+#[must_use]
+fn required_index_footprint_actions() -> &'static [IndexFootprintAdvisorAction] {
+    &[
+        IndexFootprintAdvisorAction::Compaction,
+        IndexFootprintAdvisorAction::Rebuild,
+        IndexFootprintAdvisorAction::Retention,
+        IndexFootprintAdvisorAction::FeatureAdjustment,
+    ]
+}
+
+#[must_use]
+fn recommendation_reason_code(
+    scenario: IndexFootprintScenario,
+    action: IndexFootprintAdvisorAction,
+) -> String {
+    let action = match action {
+        IndexFootprintAdvisorAction::Compaction => "compaction",
+        IndexFootprintAdvisorAction::Rebuild => "rebuild",
+        IndexFootprintAdvisorAction::Retention => "retention",
+        IndexFootprintAdvisorAction::FeatureAdjustment => "feature_adjustment",
+    };
+    format!("index_footprint.{}.{}", scenario.as_str(), action)
+}
+
+#[must_use]
+fn recommendation_risk(
+    scenario: IndexFootprintScenario,
+    action: IndexFootprintAdvisorAction,
+) -> IndexFootprintAdvisorRisk {
+    match (scenario, action) {
+        (IndexFootprintScenario::Small, _) | (_, IndexFootprintAdvisorAction::Compaction) => {
+            IndexFootprintAdvisorRisk::Low
+        }
+        (_, IndexFootprintAdvisorAction::Rebuild | IndexFootprintAdvisorAction::Retention) => {
+            IndexFootprintAdvisorRisk::Medium
+        }
+        (_, IndexFootprintAdvisorAction::FeatureAdjustment) => IndexFootprintAdvisorRisk::High,
+    }
+}
+
+#[must_use]
+fn risk_rank(risk: IndexFootprintAdvisorRisk) -> u8 {
+    match risk {
+        IndexFootprintAdvisorRisk::Low => 0,
+        IndexFootprintAdvisorRisk::Medium => 1,
+        IndexFootprintAdvisorRisk::High => 2,
+    }
+}
+
+#[must_use]
+fn replay_command(scenario: IndexFootprintScenario, domain: IndexFootprintDomain) -> String {
+    format!(
+        "FSFS_INDEX_FOOTPRINT_FIXTURE={} FSFS_INDEX_FOOTPRINT_DOMAIN={} cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
+        scenario.as_str(),
+        domain.as_str()
+    )
+}
+
+#[must_use]
+fn operator_command(action: IndexFootprintAdvisorAction, domain: IndexFootprintDomain) -> String {
+    match action {
+        IndexFootprintAdvisorAction::Compaction => {
+            "fsfs compact --dry-run --format json".to_owned()
+        }
+        IndexFootprintAdvisorAction::Rebuild => {
+            format!(
+                "fsfs index --rebuild {} --dry-run --format json",
+                domain.as_str()
+            )
+        }
+        IndexFootprintAdvisorAction::Retention => {
+            "fsfs doctor --retention-audit --dry-run --format json".to_owned()
+        }
+        IndexFootprintAdvisorAction::FeatureAdjustment => {
+            "fsfs config set search.fast_only true --dry-run --format json".to_owned()
+        }
+    }
+}
+
+#[must_use]
+fn recommendation_rationale(
+    scenario: IndexFootprintScenario,
+    action: IndexFootprintAdvisorAction,
+    domain: IndexFootprintDomain,
+) -> String {
+    let action = match action {
+        IndexFootprintAdvisorAction::Compaction => "compact reclaimable fragments",
+        IndexFootprintAdvisorAction::Rebuild => "rebuild the domain to remove stale segments",
+        IndexFootprintAdvisorAction::Retention => "retain current files and only audit policy",
+        IndexFootprintAdvisorAction::FeatureAdjustment => {
+            "adjust feature settings before rebuilding or retaining large caches"
+        }
+    };
+    format!("{}: {} for {}", scenario.as_str(), action, domain.as_str())
+}
+
 // ─── Pressure Sensing & Control-State Model ────────────────────────────────
 
 /// Stable host-pressure control states.
@@ -2021,6 +2787,102 @@ mod tests {
             .expect("usage budget should be available");
         assert_eq!(snapshot.used_bytes, 1_000);
         assert_eq!(snapshot.stage, DiskBudgetStage::NearLimit);
+    }
+
+    #[test]
+    fn index_footprint_advisor_policy_suite_classifies_thresholds() {
+        let policy = IndexFootprintAdvisorPolicy::default();
+
+        let small = index_footprint_advisor_small_fixture();
+        assert_eq!(
+            policy.classify(small.total_bytes, small.budget_bytes, &small.measurements),
+            IndexFootprintScenario::Small
+        );
+
+        let fragmented = index_footprint_advisor_fragmented_fixture();
+        assert_eq!(
+            policy.classify(
+                fragmented.total_bytes,
+                fragmented.budget_bytes,
+                &fragmented.measurements,
+            ),
+            IndexFootprintScenario::Fragmented
+        );
+
+        let oversized = index_footprint_advisor_oversized_fixture();
+        assert_eq!(
+            policy.classify(
+                oversized.total_bytes,
+                oversized.budget_bytes,
+                &oversized.measurements,
+            ),
+            IndexFootprintScenario::Oversized
+        );
+    }
+
+    #[test]
+    fn index_footprint_advisor_policy_suite_selects_deterministic_actions() {
+        let fragmented = index_footprint_advisor_fragmented_fixture();
+        let vector = fragmented
+            .recommendations
+            .iter()
+            .find(|recommendation| recommendation.domain == IndexFootprintDomain::VectorIndex)
+            .expect("vector recommendation");
+        assert_eq!(vector.action, IndexFootprintAdvisorAction::Compaction);
+        assert_eq!(vector.risk, IndexFootprintAdvisorRisk::Low);
+        assert!(vector.operator_command.contains("--dry-run"));
+
+        let lexical = fragmented
+            .recommendations
+            .iter()
+            .find(|recommendation| recommendation.domain == IndexFootprintDomain::LexicalIndex)
+            .expect("lexical recommendation");
+        assert_eq!(lexical.action, IndexFootprintAdvisorAction::Rebuild);
+        assert_eq!(lexical.risk, IndexFootprintAdvisorRisk::Medium);
+        assert!(lexical.operator_command.contains("--dry-run"));
+
+        let oversized = index_footprint_advisor_oversized_fixture();
+        let model_cache = oversized
+            .recommendations
+            .iter()
+            .find(|recommendation| recommendation.domain == IndexFootprintDomain::ModelCache)
+            .expect("model-cache recommendation");
+        assert_eq!(
+            model_cache.action,
+            IndexFootprintAdvisorAction::FeatureAdjustment
+        );
+        assert_eq!(model_cache.risk, IndexFootprintAdvisorRisk::High);
+        assert!(model_cache.operator_command.contains("--dry-run"));
+    }
+
+    #[test]
+    fn index_footprint_advisor_policy_suite_fixtures_validate() {
+        index_footprint_advisor_contract_definition()
+            .validate()
+            .expect("contract should validate");
+
+        for report in [
+            index_footprint_advisor_small_fixture(),
+            index_footprint_advisor_fragmented_fixture(),
+            index_footprint_advisor_oversized_fixture(),
+        ] {
+            report.validate().expect("advisor report should validate");
+            assert!(report.dry_run);
+            assert!(!report.automatic_deletion_allowed);
+            assert_eq!(
+                report.summary.projected_savings_bytes,
+                report
+                    .recommendations
+                    .iter()
+                    .map(|recommendation| recommendation.projected_savings_bytes)
+                    .sum::<u64>()
+            );
+            assert!(report.recommendations.iter().all(|recommendation| {
+                recommendation
+                    .replay_command
+                    .contains("index_footprint_advisor_policy_suite")
+            }));
+        }
     }
 
     // ── LifecycleTracker ──
