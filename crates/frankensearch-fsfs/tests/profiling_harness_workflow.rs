@@ -1,13 +1,16 @@
 use std::collections::BTreeSet;
 
 use frankensearch_fsfs::{
-    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorrectnessAssertion, CorrectnessProofKind,
-    ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE,
-    LatencyDecomposition, LeverSnapshot, OPPORTUNITY_MATRIX_SCHEMA_VERSION,
-    OneLeverIterationProtocol, OpportunityCandidate, OpportunityMatrix,
-    PROFILING_WORKFLOW_SCHEMA_VERSION, PhaseObservation, ProfileKind, ProfileWorkflow,
-    QUERY_LATENCY_OPT_SCHEMA_VERSION, QueryPhase, VerificationProtocol, VerificationResult,
-    crawl_ingest_optimization_track, query_path_lever_catalog, query_path_opportunity_matrix,
+    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorpusProfileSnapshot, CorrectnessAssertion,
+    CorrectnessProofKind, HostProfileSnapshot, ITERATION_REASON_ACCEPTED,
+    ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE, LatencyDecomposition, LeverSnapshot,
+    ModelCacheState, OPPORTUNITY_MATRIX_SCHEMA_VERSION, OneLeverIterationProtocol,
+    OpportunityCandidate, OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, PhaseObservation,
+    ProfileKind, ProfileWorkflow, QUERY_LATENCY_OPT_SCHEMA_VERSION, QueryPhase,
+    SELF_CALIBRATING_PROFILE_SCHEMA_VERSION, SearchProfileMeasurements,
+    SelfCalibratingProfileArtifactKind, SelfCalibratingProfileInput, SelfCalibratingProfileReport,
+    VerificationProtocol, VerificationResult, crawl_ingest_optimization_track,
+    query_path_lever_catalog, query_path_opportunity_matrix,
 };
 
 #[test]
@@ -289,4 +292,59 @@ fn workflow_artifact_manifest_is_reproducible() {
     assert!(artifacts[0].replay_command.contains("--kind flamegraph"));
     assert!(artifacts[1].replay_command.contains("--kind heap"));
     assert!(artifacts[2].replay_command.contains("--kind syscall"));
+}
+
+#[test]
+fn self_calibrating_profile_report_exposes_recommendation_artifacts() {
+    let report = SelfCalibratingProfileReport::from_input(SelfCalibratingProfileInput {
+        run_id: "e2e-self-cal".to_owned(),
+        host: HostProfileSnapshot {
+            host_id: "csd".to_owned(),
+            logical_cpus: 24,
+            total_memory_mib: 128_000,
+            available_memory_mib: 96_000,
+            simd_lanes: 8,
+            model_cache_state: ModelCacheState::Cold,
+        },
+        corpus: CorpusProfileSnapshot {
+            corpus_id: "workspace_sample".to_owned(),
+            document_count: 60_000,
+            total_bytes: 480_000_000,
+            cluster_count: 5,
+            representative_query_count: 30,
+        },
+        measurements: SearchProfileMeasurements {
+            phase1_p95_us: 11_600,
+            phase2_p95_us: 171_000,
+            vector_search_docs_per_ms: 760,
+            peak_memory_mib: 2_048,
+            observed_candidate_multiplier: 3,
+            model_cache_warm_ms: 22,
+            model_cache_cold_ms: 620,
+            quality_uplift_basis_points: 900,
+        },
+        requested_limit: 12,
+    });
+
+    assert_eq!(
+        report.schema_version,
+        SELF_CALIBRATING_PROFILE_SCHEMA_VERSION
+    );
+    assert_eq!(report.recommended_config.candidate_multiplier, 2);
+    assert_eq!(report.recommended_config.hnsw_threshold, 25_000);
+    assert_eq!(report.recommended_config.quality_timeout_ms, 196);
+    assert!(
+        report
+            .reason_codes
+            .contains(&"profile.self_calibrating.phase2_over_budget".to_owned())
+    );
+    assert!(
+        report
+            .reason_codes
+            .contains(&"profile.self_calibrating.model_cache_cold".to_owned())
+    );
+    assert!(report.artifacts.iter().any(|artifact| artifact.kind
+        == SelfCalibratingProfileArtifactKind::StructuredJsonl
+        && artifact.artifact_path.ends_with("profile-events.jsonl")
+        && artifact.replay_command.contains("--run-id e2e-self-cal")));
 }

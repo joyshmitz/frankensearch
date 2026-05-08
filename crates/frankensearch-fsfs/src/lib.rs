@@ -194,13 +194,17 @@ pub use pressure_sensing::{
     PressureThresholds as SensingThresholds, SmoothedReadings, ThresholdPair,
 };
 pub use profiling::{
-    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CrawlIngestHotspot, CrawlIngestOptimizationTrack,
-    CrawlIngestStage, ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE,
-    ITERATION_REASON_NO_CHANGE, IsomorphismProofChecklistItem, IterationValidation, LeverSnapshot,
-    OPPORTUNITY_MATRIX_SCHEMA_VERSION, OneLeverIterationProtocol, OpportunityCandidate,
-    OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileArtifact, ProfileKind,
-    ProfileStep, ProfileWorkflow, RankedOpportunity, RollbackGuardrail,
-    crawl_ingest_opportunity_matrix, crawl_ingest_optimization_track,
+    CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorpusProfileSnapshot, CrawlIngestHotspot,
+    CrawlIngestOptimizationTrack, CrawlIngestStage, HostProfileSnapshot, ITERATION_REASON_ACCEPTED,
+    ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE, IsomorphismProofChecklistItem,
+    IterationValidation, LeverSnapshot, ModelCacheState, OPPORTUNITY_MATRIX_SCHEMA_VERSION,
+    OneLeverIterationProtocol, OpportunityCandidate, OpportunityMatrix,
+    PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileArtifact, ProfileKind, ProfileStep, ProfileWorkflow,
+    RankedOpportunity, RecommendedTwoTierConfig, RollbackGuardrail,
+    SELF_CALIBRATING_PROFILE_SCHEMA_VERSION, SearchProfileMeasurements,
+    SelfCalibratingProfileArtifact, SelfCalibratingProfileArtifactKind,
+    SelfCalibratingProfileInput, SelfCalibratingProfileReport, crawl_ingest_opportunity_matrix,
+    crawl_ingest_optimization_track,
 };
 pub use query_execution::{
     CancellationAction, CancellationDirective, CancellationPoint, DegradationOverride,

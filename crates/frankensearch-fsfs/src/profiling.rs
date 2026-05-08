@@ -2,6 +2,7 @@
 //!
 //! This module defines:
 //! - a deterministic profiling workflow (flamegraph/heap/syscall),
+//! - a self-calibrating host/corpus profile recommendation artifact,
 //! - an impact-confidence-effort opportunity matrix,
 //! - a single-lever iteration validator for behavior-preserving optimization.
 
@@ -15,6 +16,8 @@ pub const PROFILING_WORKFLOW_SCHEMA_VERSION: &str = "fsfs-profiling-workflow-v1"
 pub const OPPORTUNITY_MATRIX_SCHEMA_VERSION: &str = "fsfs-opportunity-matrix-v1";
 /// Schema version for crawl/ingest optimization track planning.
 pub const CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION: &str = "fsfs-crawl-ingest-opt-track-v1";
+/// Schema version for self-calibrating fsfs host/corpus profiles.
+pub const SELF_CALIBRATING_PROFILE_SCHEMA_VERSION: &str = "fsfs-self-calibrating-profile-v1";
 
 /// Reason code emitted when an optimization iteration is accepted.
 pub const ITERATION_REASON_ACCEPTED: &str = "opt.iteration.accepted";
@@ -138,6 +141,432 @@ pub struct ProfileArtifact {
     pub artifact_path: String,
     /// Replay command for deterministic triage.
     pub replay_command: String,
+}
+
+/// Model-cache state observed during a self-calibrating profile run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCacheState {
+    /// Quality model artifacts are present and warm in the OS/model cache.
+    Warm,
+    /// Model artifacts exist, but the run measured a cold-load path.
+    Cold,
+    /// Quality model artifacts are not available on this host.
+    Missing,
+    /// Cache availability was not measured.
+    Unknown,
+}
+
+/// Host capability snapshot used by the profile recommender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostProfileSnapshot {
+    /// Stable host label used in artifact paths.
+    pub host_id: String,
+    /// Logical CPU count available to the process.
+    pub logical_cpus: u16,
+    /// Total host memory in MiB.
+    pub total_memory_mib: u32,
+    /// Currently available memory in MiB at the start of the run.
+    pub available_memory_mib: u32,
+    /// SIMD lane width observed by the profiler.
+    pub simd_lanes: u8,
+    /// Model-cache state observed for quality-tier embeds.
+    pub model_cache_state: ModelCacheState,
+}
+
+impl HostProfileSnapshot {
+    /// Available-memory headroom as a bounded percentage.
+    #[must_use]
+    pub fn memory_headroom_pct(&self) -> u8 {
+        if self.total_memory_mib == 0 {
+            return 0;
+        }
+
+        let raw = (u64::from(self.available_memory_mib) * 100) / u64::from(self.total_memory_mib);
+        u8::try_from(raw.min(100)).unwrap_or(100)
+    }
+}
+
+/// Representative corpus summary for a self-calibrating profile run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpusProfileSnapshot {
+    /// Stable corpus identifier.
+    pub corpus_id: String,
+    /// Number of indexed documents sampled by the profile run.
+    pub document_count: u32,
+    /// Total corpus bytes sampled.
+    pub total_bytes: u64,
+    /// Number of known relevance/query clusters represented.
+    pub cluster_count: u16,
+    /// Number of representative queries used for calibration.
+    pub representative_query_count: u16,
+}
+
+impl CorpusProfileSnapshot {
+    /// Mean document size in bytes, rounded down.
+    #[must_use]
+    pub fn average_document_bytes(&self) -> u64 {
+        if self.document_count == 0 {
+            0
+        } else {
+            self.total_bytes / u64::from(self.document_count)
+        }
+    }
+}
+
+/// Search measurements collected by the self-calibrating profile lane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchProfileMeasurements {
+    /// Phase-1 p95 latency in microseconds.
+    pub phase1_p95_us: u64,
+    /// Phase-2 p95 latency in microseconds.
+    pub phase2_p95_us: u64,
+    /// Vector-search throughput measured as documents scanned per millisecond.
+    pub vector_search_docs_per_ms: u32,
+    /// Peak process memory observed during the run in MiB.
+    pub peak_memory_mib: u32,
+    /// Candidate multiplier used by the sampled run.
+    pub observed_candidate_multiplier: u16,
+    /// Warm-cache model initialization latency in milliseconds.
+    pub model_cache_warm_ms: u32,
+    /// Cold-cache model initialization latency in milliseconds.
+    pub model_cache_cold_ms: u32,
+    /// Quality-tier relevance uplift in basis points over the fast tier.
+    pub quality_uplift_basis_points: u16,
+}
+
+/// Input envelope consumed by the deterministic profile recommender.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfCalibratingProfileInput {
+    /// Stable run id used in artifact paths and replay commands.
+    pub run_id: String,
+    /// Host capabilities and cache state.
+    pub host: HostProfileSnapshot,
+    /// Representative corpus profile.
+    pub corpus: CorpusProfileSnapshot,
+    /// Search-path measurements collected on this host/corpus pair.
+    pub measurements: SearchProfileMeasurements,
+    /// Requested user-facing result limit used for candidate-budget selection.
+    pub requested_limit: u16,
+}
+
+/// Serializable recommendation matching the main `TwoTierConfig` knob names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecommendedTwoTierConfig {
+    /// Quality blend weight in per-mille units (`700` means `0.7`).
+    pub quality_weight_per_mille: u16,
+    /// RRF K constant.
+    pub rrf_k: u16,
+    /// Candidate multiplier to apply per source.
+    pub candidate_multiplier: u16,
+    /// Quality phase timeout in milliseconds.
+    pub quality_timeout_ms: u32,
+    /// Whether the host should skip quality refinement.
+    pub fast_only: bool,
+    /// Minimum corpus size before ANN/HNSW should be preferred.
+    pub hnsw_threshold: u32,
+    /// MRL search dimensions (`0` disables MRL).
+    pub mrl_search_dims: u16,
+    /// Number of candidates to rescore after an MRL scan.
+    pub mrl_rescore_top_k: u16,
+}
+
+impl RecommendedTwoTierConfig {
+    /// Safe default values matching the library's conservative config defaults.
+    #[must_use]
+    pub const fn safe_fallback_defaults() -> Self {
+        Self {
+            quality_weight_per_mille: 700,
+            rrf_k: 60,
+            candidate_multiplier: 3,
+            quality_timeout_ms: 500,
+            fast_only: false,
+            hnsw_threshold: 50_000,
+            mrl_search_dims: 0,
+            mrl_rescore_top_k: 30,
+        }
+    }
+
+    /// Deterministically recommend two-tier knobs for a profile input.
+    #[must_use]
+    pub fn recommend_for(input: &SelfCalibratingProfileInput) -> Self {
+        let fast_only = should_use_fast_only(input);
+        let candidate_multiplier = recommended_candidate_multiplier(input);
+        let hnsw_threshold = recommended_hnsw_threshold(input);
+        let rrf_k = recommended_rrf_k(input, candidate_multiplier);
+        let quality_timeout_ms = recommended_quality_timeout_ms(input, fast_only);
+        let quality_weight_per_mille = recommended_quality_weight_per_mille(input, fast_only);
+
+        Self {
+            quality_weight_per_mille,
+            rrf_k,
+            candidate_multiplier,
+            quality_timeout_ms,
+            fast_only,
+            hnsw_threshold,
+            mrl_search_dims: recommended_mrl_dims(input),
+            mrl_rescore_top_k: recommended_mrl_rescore_top_k(input),
+        }
+    }
+}
+
+/// Artifact kind emitted by the self-calibrating profile lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfCalibratingProfileArtifactKind {
+    /// Structured JSONL event stream from the profiling script.
+    StructuredJsonl,
+    /// Recommendation JSON artifact.
+    RecommendationJson,
+    /// Replay manifest for deterministic reruns.
+    ReplayManifest,
+}
+
+/// Artifact descriptor emitted with a self-calibrating report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfCalibratingProfileArtifact {
+    /// Artifact kind.
+    pub kind: SelfCalibratingProfileArtifactKind,
+    /// Path relative to the profile artifact root.
+    pub artifact_path: String,
+    /// MIME/content type.
+    pub content_type: String,
+    /// Deterministic command that replays this artifact.
+    pub replay_command: String,
+}
+
+impl SelfCalibratingProfileArtifact {
+    /// Build the canonical artifact manifest for a run/corpus pair.
+    #[must_use]
+    pub fn for_run(run_id: &str, corpus_id: &str) -> Vec<Self> {
+        let root = format!("runs/{run_id}/self_calibrating/{corpus_id}");
+        let replay_command =
+            format!("scripts/check_fsfs_self_calibrating_profile.sh --mode e2e --run-id {run_id}");
+
+        vec![
+            Self {
+                kind: SelfCalibratingProfileArtifactKind::StructuredJsonl,
+                artifact_path: format!("{root}/profile-events.jsonl"),
+                content_type: "application/jsonl".to_owned(),
+                replay_command: replay_command.clone(),
+            },
+            Self {
+                kind: SelfCalibratingProfileArtifactKind::RecommendationJson,
+                artifact_path: format!("{root}/recommendation.json"),
+                content_type: "application/json".to_owned(),
+                replay_command: replay_command.clone(),
+            },
+            Self {
+                kind: SelfCalibratingProfileArtifactKind::ReplayManifest,
+                artifact_path: format!("{root}/replay-manifest.json"),
+                content_type: "application/json".to_owned(),
+                replay_command,
+            },
+        ]
+    }
+}
+
+/// Deterministic self-calibrating profile recommendation report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelfCalibratingProfileReport {
+    /// Contract schema version.
+    pub schema_version: String,
+    /// Input profile consumed by the recommender.
+    pub profile: SelfCalibratingProfileInput,
+    /// Recommended production knobs.
+    pub recommended_config: RecommendedTwoTierConfig,
+    /// Conservative fallback knobs used when confidence is too low.
+    pub safe_fallback_defaults: RecommendedTwoTierConfig,
+    /// Confidence in the recommendation from 0 to 100.
+    pub confidence: u8,
+    /// Machine-readable reason codes explaining the recommendation.
+    pub reason_codes: Vec<String>,
+    /// Structured artifacts produced by the e2e profiling lane.
+    pub artifacts: Vec<SelfCalibratingProfileArtifact>,
+}
+
+impl SelfCalibratingProfileReport {
+    /// Build a deterministic recommendation report from measured input.
+    #[must_use]
+    pub fn from_input(profile: SelfCalibratingProfileInput) -> Self {
+        let recommended_config = RecommendedTwoTierConfig::recommend_for(&profile);
+        let confidence = recommendation_confidence(&profile, &recommended_config);
+        let reason_codes = recommendation_reason_codes(&profile, &recommended_config);
+        let artifacts =
+            SelfCalibratingProfileArtifact::for_run(&profile.run_id, &profile.corpus.corpus_id);
+
+        Self {
+            schema_version: SELF_CALIBRATING_PROFILE_SCHEMA_VERSION.to_owned(),
+            profile,
+            recommended_config,
+            safe_fallback_defaults: RecommendedTwoTierConfig::safe_fallback_defaults(),
+            confidence,
+            reason_codes,
+            artifacts,
+        }
+    }
+}
+
+fn should_use_fast_only(input: &SelfCalibratingProfileInput) -> bool {
+    let measurements = &input.measurements;
+    let host = &input.host;
+    let unavailable_quality = matches!(host.model_cache_state, ModelCacheState::Missing);
+    let low_quality_gain = measurements.quality_uplift_basis_points < 500;
+    let phase2_unusable = measurements.phase2_p95_us > 220_000 && low_quality_gain;
+    let memory_constrained = host.memory_headroom_pct() < 15
+        || measurements.peak_memory_mib
+            >= host
+                .available_memory_mib
+                .saturating_mul(9)
+                .checked_div(10)
+                .unwrap_or(0);
+
+    unavailable_quality || phase2_unusable || memory_constrained
+}
+
+fn recommended_candidate_multiplier(input: &SelfCalibratingProfileInput) -> u16 {
+    let measurements = &input.measurements;
+    if measurements.phase1_p95_us > 15_000 || measurements.vector_search_docs_per_ms < 500 {
+        1
+    } else if measurements.phase1_p95_us > 10_000 || measurements.vector_search_docs_per_ms < 900 {
+        2
+    } else if input.corpus.document_count >= 100_000
+        && measurements.quality_uplift_basis_points >= 1_200
+    {
+        4
+    } else {
+        measurements.observed_candidate_multiplier.clamp(2, 3)
+    }
+}
+
+fn recommended_hnsw_threshold(input: &SelfCalibratingProfileInput) -> u32 {
+    if input.corpus.document_count >= 100_000 || input.measurements.vector_search_docs_per_ms < 500
+    {
+        10_000
+    } else if input.corpus.document_count >= 50_000 {
+        25_000
+    } else {
+        RecommendedTwoTierConfig::safe_fallback_defaults().hnsw_threshold
+    }
+}
+
+fn recommended_rrf_k(input: &SelfCalibratingProfileInput, candidate_multiplier: u16) -> u16 {
+    if input.corpus.document_count < 1_000 {
+        45
+    } else if candidate_multiplier >= 4 {
+        75
+    } else {
+        RecommendedTwoTierConfig::safe_fallback_defaults().rrf_k
+    }
+}
+
+fn recommended_quality_timeout_ms(input: &SelfCalibratingProfileInput, fast_only: bool) -> u32 {
+    if fast_only {
+        return 10;
+    }
+
+    let measured_ms = input.measurements.phase2_p95_us.div_ceil(1_000);
+    let with_margin = measured_ms.saturating_add(25).clamp(120, 500);
+    u32::try_from(with_margin).unwrap_or(500)
+}
+
+fn recommended_quality_weight_per_mille(
+    input: &SelfCalibratingProfileInput,
+    fast_only: bool,
+) -> u16 {
+    if fast_only {
+        0
+    } else if input.measurements.quality_uplift_basis_points >= 1_200
+        && input.measurements.phase2_p95_us <= 150_000
+    {
+        800
+    } else if input.measurements.quality_uplift_basis_points < 500
+        || input.measurements.phase2_p95_us > 180_000
+    {
+        550
+    } else {
+        RecommendedTwoTierConfig::safe_fallback_defaults().quality_weight_per_mille
+    }
+}
+
+fn recommended_mrl_dims(input: &SelfCalibratingProfileInput) -> u16 {
+    if input.corpus.document_count >= 100_000 && input.measurements.phase1_p95_us > 10_000 {
+        128
+    } else {
+        RecommendedTwoTierConfig::safe_fallback_defaults().mrl_search_dims
+    }
+}
+
+fn recommended_mrl_rescore_top_k(input: &SelfCalibratingProfileInput) -> u16 {
+    let requested = input.requested_limit.max(1);
+    requested.saturating_mul(3).clamp(30, 150)
+}
+
+fn recommendation_confidence(
+    input: &SelfCalibratingProfileInput,
+    config: &RecommendedTwoTierConfig,
+) -> u8 {
+    let mut confidence = 92_u8;
+
+    if input.corpus.representative_query_count < 12 {
+        confidence = confidence.saturating_sub(20);
+    } else if input.corpus.representative_query_count < 25 {
+        confidence = confidence.saturating_sub(8);
+    }
+
+    if input.corpus.cluster_count < 3 {
+        confidence = confidence.saturating_sub(10);
+    }
+
+    if matches!(input.host.model_cache_state, ModelCacheState::Unknown) {
+        confidence = confidence.saturating_sub(12);
+    }
+
+    if input.host.memory_headroom_pct() < 20 {
+        confidence = confidence.saturating_sub(15);
+    }
+
+    if config.fast_only {
+        confidence = confidence.saturating_sub(10);
+    }
+
+    confidence
+}
+
+fn recommendation_reason_codes(
+    input: &SelfCalibratingProfileInput,
+    config: &RecommendedTwoTierConfig,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    if config.fast_only {
+        reasons.push("profile.self_calibrating.fast_only".to_owned());
+    } else {
+        reasons.push("profile.self_calibrating.quality_enabled".to_owned());
+    }
+
+    if input.measurements.phase1_p95_us > 15_000 {
+        reasons.push("profile.self_calibrating.phase1_over_budget".to_owned());
+    }
+    if input.measurements.phase2_p95_us > 150_000 {
+        reasons.push("profile.self_calibrating.phase2_over_budget".to_owned());
+    }
+    if input.host.memory_headroom_pct() < 20 {
+        reasons.push("profile.self_calibrating.low_memory_headroom".to_owned());
+    }
+    if input.corpus.document_count >= 50_000 {
+        reasons.push("profile.self_calibrating.large_corpus_ann_threshold".to_owned());
+    }
+    if matches!(input.host.model_cache_state, ModelCacheState::Cold) {
+        reasons.push("profile.self_calibrating.model_cache_cold".to_owned());
+    }
+    if config.candidate_multiplier <= 2 {
+        reasons.push("profile.self_calibrating.candidate_budget_constrained".to_owned());
+    } else if config.candidate_multiplier >= 4 {
+        reasons.push("profile.self_calibrating.candidate_budget_expanded".to_owned());
+    }
+
+    reasons
 }
 
 /// One candidate optimization opportunity.
@@ -559,13 +988,48 @@ impl OneLeverIterationProtocol {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CrawlIngestStage, ITERATION_REASON_ACCEPTED,
-        ITERATION_REASON_MULTI_CHANGE, ITERATION_REASON_NO_CHANGE, LeverSnapshot,
-        OneLeverIterationProtocol, OpportunityCandidate, OpportunityMatrix,
-        PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind, ProfileWorkflow,
-        crawl_ingest_opportunity_matrix, crawl_ingest_optimization_track,
+        CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorpusProfileSnapshot, CrawlIngestStage,
+        HostProfileSnapshot, ITERATION_REASON_ACCEPTED, ITERATION_REASON_MULTI_CHANGE,
+        ITERATION_REASON_NO_CHANGE, LeverSnapshot, ModelCacheState, OneLeverIterationProtocol,
+        OpportunityCandidate, OpportunityMatrix, PROFILING_WORKFLOW_SCHEMA_VERSION, ProfileKind,
+        ProfileWorkflow, RecommendedTwoTierConfig, SELF_CALIBRATING_PROFILE_SCHEMA_VERSION,
+        SearchProfileMeasurements, SelfCalibratingProfileArtifactKind, SelfCalibratingProfileInput,
+        SelfCalibratingProfileReport, crawl_ingest_opportunity_matrix,
+        crawl_ingest_optimization_track,
     };
     use std::collections::BTreeSet;
+
+    fn healthy_profile_input() -> SelfCalibratingProfileInput {
+        SelfCalibratingProfileInput {
+            run_id: "run-self-cal-001".to_owned(),
+            host: HostProfileSnapshot {
+                host_id: "host-ci".to_owned(),
+                logical_cpus: 16,
+                total_memory_mib: 64_000,
+                available_memory_mib: 48_000,
+                simd_lanes: 8,
+                model_cache_state: ModelCacheState::Warm,
+            },
+            corpus: CorpusProfileSnapshot {
+                corpus_id: "golden_100".to_owned(),
+                document_count: 2_500,
+                total_bytes: 12_800_000,
+                cluster_count: 5,
+                representative_query_count: 32,
+            },
+            measurements: SearchProfileMeasurements {
+                phase1_p95_us: 8_200,
+                phase2_p95_us: 142_000,
+                vector_search_docs_per_ms: 1_200,
+                peak_memory_mib: 1_024,
+                observed_candidate_multiplier: 3,
+                model_cache_warm_ms: 18,
+                model_cache_cold_ms: 430,
+                quality_uplift_basis_points: 1_300,
+            },
+            requested_limit: 10,
+        }
+    }
 
     #[test]
     fn crawl_ingest_matrix_ranking_is_deterministic() {
@@ -864,5 +1328,128 @@ mod tests {
             vec!["crawl.batch_size", "query.semantic_fanout"]
         );
         assert_eq!(multi_change.reason_code, ITERATION_REASON_MULTI_CHANGE);
+    }
+
+    #[test]
+    fn self_calibrating_profile_recommends_quality_when_host_is_healthy() {
+        let report = SelfCalibratingProfileReport::from_input(healthy_profile_input());
+
+        assert_eq!(
+            report.schema_version,
+            SELF_CALIBRATING_PROFILE_SCHEMA_VERSION
+        );
+        assert!(!report.recommended_config.fast_only);
+        assert_eq!(report.recommended_config.quality_weight_per_mille, 800);
+        assert_eq!(report.recommended_config.candidate_multiplier, 3);
+        assert_eq!(report.recommended_config.quality_timeout_ms, 167);
+        assert_eq!(
+            report.safe_fallback_defaults,
+            RecommendedTwoTierConfig::safe_fallback_defaults()
+        );
+        assert!(report.confidence >= 90);
+        assert!(
+            report
+                .reason_codes
+                .contains(&"profile.self_calibrating.quality_enabled".to_owned())
+        );
+    }
+
+    #[test]
+    fn self_calibrating_profile_constrains_degraded_host_to_fast_only() {
+        let mut input = healthy_profile_input();
+        input.host.available_memory_mib = 4_000;
+        input.host.model_cache_state = ModelCacheState::Missing;
+        input.measurements.phase2_p95_us = 260_000;
+        input.measurements.peak_memory_mib = 3_900;
+        input.measurements.quality_uplift_basis_points = 250;
+
+        let report = SelfCalibratingProfileReport::from_input(input);
+
+        assert!(report.recommended_config.fast_only);
+        assert_eq!(report.recommended_config.quality_weight_per_mille, 0);
+        assert_eq!(report.recommended_config.quality_timeout_ms, 10);
+        assert!(report.confidence < 80);
+        assert!(
+            report
+                .reason_codes
+                .contains(&"profile.self_calibrating.fast_only".to_owned())
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"profile.self_calibrating.low_memory_headroom".to_owned())
+        );
+    }
+
+    #[test]
+    fn self_calibrating_profile_adjusts_large_corpus_budget_and_ann_threshold() {
+        let mut input = healthy_profile_input();
+        input.corpus.corpus_id = "repo_large".to_owned();
+        input.corpus.document_count = 125_000;
+        input.measurements.vector_search_docs_per_ms = 1_100;
+        input.measurements.phase1_p95_us = 9_500;
+
+        let report = SelfCalibratingProfileReport::from_input(input);
+
+        assert_eq!(report.recommended_config.candidate_multiplier, 4);
+        assert_eq!(report.recommended_config.rrf_k, 75);
+        assert_eq!(report.recommended_config.hnsw_threshold, 10_000);
+        assert_eq!(report.recommended_config.mrl_search_dims, 0);
+        assert!(
+            report
+                .reason_codes
+                .contains(&"profile.self_calibrating.large_corpus_ann_threshold".to_owned())
+        );
+        assert!(
+            report
+                .reason_codes
+                .contains(&"profile.self_calibrating.candidate_budget_expanded".to_owned())
+        );
+    }
+
+    #[test]
+    fn self_calibrating_profile_artifacts_include_jsonl_and_replay_command() {
+        let report = SelfCalibratingProfileReport::from_input(healthy_profile_input());
+        let artifact_kinds: BTreeSet<SelfCalibratingProfileArtifactKind> = report
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.kind)
+            .collect();
+
+        assert_eq!(
+            artifact_kinds,
+            BTreeSet::from([
+                SelfCalibratingProfileArtifactKind::StructuredJsonl,
+                SelfCalibratingProfileArtifactKind::RecommendationJson,
+                SelfCalibratingProfileArtifactKind::ReplayManifest,
+            ])
+        );
+        assert!(
+            report
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.content_type == "application/jsonl")
+        );
+        for artifact in &report.artifacts {
+            assert!(artifact.artifact_path.contains("run-self-cal-001"));
+            assert!(artifact.artifact_path.contains("golden_100"));
+            assert!(
+                artifact
+                    .replay_command
+                    .contains("check_fsfs_self_calibrating_profile.sh --mode e2e")
+            );
+        }
+    }
+
+    #[test]
+    fn self_calibrating_profile_report_serializes_stably() {
+        let report = SelfCalibratingProfileReport::from_input(healthy_profile_input());
+        let encoded = serde_json::to_string(&report).expect("serialize profile report");
+        let decoded: SelfCalibratingProfileReport =
+            serde_json::from_str(&encoded).expect("deserialize profile report");
+
+        assert_eq!(decoded, report);
+        assert_eq!(decoded.profile.corpus.average_document_bytes(), 5_120);
+        assert_eq!(decoded.profile.host.memory_headroom_pct(), 75);
     }
 }
