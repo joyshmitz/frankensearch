@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use frankensearch_core::SearchError;
+use frankensearch_fsfs::output_schema::{SearchHitPayload, SearchOutputPhase, SearchPayload};
 use frankensearch_fsfs::{
     ALL_OUTPUT_ERROR_CODES, ALL_OUTPUT_WARNING_CODES, CompactEnvelope, CompactSearchResponse,
     CompatibilityMode, ENVELOPE_FIELDS, FieldPresence, OUTPUT_SCHEMA_MIN_SUPPORTED,
@@ -18,7 +19,8 @@ use frankensearch_fsfs::{
     OutputWarningCode, ResultIdRegistry, STREAM_PROTOCOL_VERSION, STREAM_SCHEMA_VERSION,
     StreamTerminalStatus, builtin_templates, decode_envelope_toon, encode_envelope_toon,
     error_code_for, exit_code, exit_code_for, is_version_compatible, output_error_from,
-    parse_result_id, result_id, validate_envelope, verify_json_toon_parity,
+    parse_result_id, result_id, synthetic_degradation_advice_fixture, validate_envelope,
+    verify_json_toon_parity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -408,6 +410,42 @@ fn json_toon_parity_error_envelope() {
 fn json_toon_parity_warning_envelope() {
     let env = sample_warning_envelope();
     verify_json_toon_parity(&env).expect("JSON/TOON parity must hold for warning envelope");
+}
+
+#[test]
+fn json_toon_parity_search_payload_with_degradation_advice()
+-> Result<(), Box<dyn std::error::Error>> {
+    let timeout_advice = synthetic_degradation_advice_fixture()
+        .into_iter()
+        .find(|advice| advice.reason_code == "degrade.advice.timeout")
+        .ok_or_else(|| std::io::Error::other("timeout advice fixture missing"))?;
+    let payload = SearchPayload::new(
+        "hybrid ranking",
+        SearchOutputPhase::RefinementFailed,
+        1,
+        vec![SearchHitPayload {
+            rank: 1,
+            path: "src/search.rs".to_owned(),
+            score: 0.812,
+            snippet: Some("quality refinement timed out".to_owned()),
+            lexical_rank: Some(1),
+            semantic_rank: Some(2),
+            in_both_sources: true,
+        }],
+    )
+    .with_degradation_advice(vec![timeout_advice]);
+    let env = OutputEnvelope::success(
+        payload,
+        OutputMeta::new("search", "toon").with_request_id("01JK0000000000000000000003"),
+        "2026-02-14T12:00:00Z",
+    );
+
+    verify_json_toon_parity(&env)?;
+    let toon = encode_envelope_toon(&env)?;
+    assert!(toon.contains("degradation_advice"));
+    assert!(toon.contains("degrade.advice.timeout"));
+    assert!(toon.contains("replay_command"));
+    Ok(())
 }
 
 #[test]

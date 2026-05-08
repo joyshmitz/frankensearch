@@ -26,6 +26,7 @@
 //!   optional `removed_in` version. They remain present (possibly null) until
 //!   the `removed_in` version.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 
@@ -33,6 +34,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::degradation_advisor::DegradationAdvice;
 use crate::evidence::{ValidationResult, ValidationViolation};
 
 const SUBSYSTEM: &str = "fsfs_output_schema";
@@ -421,6 +423,8 @@ pub struct SearchPayload {
     pub total_candidates: usize,
     pub returned_hits: usize,
     pub hits: Vec<SearchHitPayload>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub degradation_advice: BTreeMap<String, DegradationAdvice>,
 }
 
 impl SearchPayload {
@@ -438,7 +442,20 @@ impl SearchPayload {
             total_candidates,
             returned_hits,
             hits,
+            degradation_advice: BTreeMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_degradation_advice(
+        mut self,
+        advice: impl IntoIterator<Item = DegradationAdvice>,
+    ) -> Self {
+        self.degradation_advice = advice
+            .into_iter()
+            .map(|item| (item.reason_code.clone(), item))
+            .collect();
+        self
     }
 
     #[must_use]
@@ -1125,12 +1142,23 @@ mod tests {
                 },
             ],
         );
+        let payload = payload.with_degradation_advice(
+            crate::degradation_advisor::synthetic_degradation_advice_fixture(),
+        );
         assert!(!payload.is_empty());
 
         let json = serde_json::to_string(&payload).expect("serialize payload");
         let decoded: SearchPayload = serde_json::from_str(&json).expect("deserialize payload");
         assert_eq!(decoded, payload);
         assert_eq!(decoded.returned_hits, 2);
+        assert_eq!(decoded.degradation_advice.len(), 6);
+        assert_eq!(
+            decoded
+                .degradation_advice
+                .get("degrade.advice.refinement_failed")
+                .map(|advice| advice.reason_code.as_str()),
+            Some("degrade.advice.refinement_failed")
+        );
     }
 
     // ─── OutputEnvelope construction ────────────────────────────────────

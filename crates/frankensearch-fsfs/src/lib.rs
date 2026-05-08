@@ -17,6 +17,7 @@ pub mod config;
 pub mod control_plane;
 pub mod control_plane_error;
 pub mod crate_registry;
+pub mod degradation_advisor;
 pub mod determinism;
 pub mod evidence;
 pub mod expected_loss;
@@ -111,6 +112,12 @@ pub use config::{
     TextSelectionMode, TuiConfig, TuiTheme, default_config_file_path,
     default_project_config_file_path, default_user_config_file_path, emit_config_loaded,
     load_from_layered_sources, load_from_sources, load_from_str,
+};
+pub use degradation_advisor::{
+    AdviceOutputSurface, DEGRADATION_ADVICE_SCHEMA_VERSION, DegradationAdvice,
+    DegradationAdviceInput, DegradationAdviceSeverity, DegradationFailureKind,
+    DegradationNextAction, advice_for_search_error, classify_search_error,
+    synthetic_degradation_advice_fixture,
 };
 pub use evidence::{
     ALL_FSFS_REASON_CODES, FsfsEventFamily, FsfsEvidenceEvent, FsfsReasonCode, ScopeDecision,

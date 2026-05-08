@@ -627,6 +627,47 @@ fn test_progressive_release_quality_gate_pack_conformance() {
 }
 
 #[test]
+fn test_degradation_advice_fixture_conformance() -> serde_json::Result<()> {
+    use frankensearch_fsfs::{
+        DEGRADATION_ADVICE_SCHEMA_VERSION, DegradationAdvice, synthetic_degradation_advice_fixture,
+    };
+
+    let fixture = synthetic_degradation_advice_fixture();
+    let reasons = fixture
+        .iter()
+        .map(|advice| advice.reason_code.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(fixture.len(), 6);
+    assert_eq!(
+        reasons,
+        vec![
+            "degrade.advice.refinement_failed",
+            "degrade.advice.lexical_fallback",
+            "degrade.advice.quality_model_missing",
+            "degrade.advice.timeout",
+            "degrade.advice.index_corrupt",
+            "degrade.advice.cache_miss",
+        ]
+    );
+    assert!(
+        fixture
+            .iter()
+            .all(|advice| advice.schema_version == DEGRADATION_ADVICE_SCHEMA_VERSION)
+    );
+    assert!(
+        fixture
+            .iter()
+            .all(|advice| !advice.next_actions.is_empty() && !advice.replay_command.is_empty())
+    );
+
+    let serialized = serde_json::to_string_pretty(&fixture)?;
+    let parsed: Vec<DegradationAdvice> = serde_json::from_str(&serialized)?;
+    assert_eq!(parsed, fixture);
+    Ok(())
+}
+
+#[test]
 fn test_incremental_change_invalid_fixtures_are_rejected_by_rust() {
     assert_invalid_rust_fixture::<
         frankensearch_fsfs::incremental_change::IncrementalChangeDetectionContractDefinition,

@@ -71,6 +71,9 @@ use crate::config::{
     FsfsConfig, IngestionClass, PressureProfile, RootDiscoveryDecision,
     default_project_config_file_path, default_user_config_file_path,
 };
+use crate::degradation_advisor::{
+    DegradationAdvice, DegradationAdviceInput, DegradationFailureKind, advice_for_search_error,
+};
 use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingExplanation};
 use crate::file_classification::{
     FileClassificationContractDefinition, FileClassificationDecision,
@@ -471,6 +474,7 @@ struct SearchExecutionResources {
     quality_embedder: Option<Arc<dyn Embedder>>,
     fast_embedder_attempted: bool,
     quality_embedder_attempted: bool,
+    degradation_advice: Vec<DegradationAdvice>,
 }
 
 impl SearchExecutionResources {
@@ -6450,6 +6454,11 @@ impl FsfsRuntime {
                                     error = %error,
                                     "fsfs search falling back to lexical-only mode after vector search failure"
                                 );
+                                resources.degradation_advice.push(advice_for_search_error(
+                                    &normalized_query,
+                                    Some(&resources.index_root),
+                                    &error,
+                                ));
                                 Vec::new()
                             }
                             Err(error) => return Err(error),
@@ -6460,6 +6469,11 @@ impl FsfsRuntime {
                             error = %error,
                             "fsfs search falling back to lexical-only mode after query embedding failure"
                         );
+                        resources.degradation_advice.push(advice_for_search_error(
+                            &normalized_query,
+                            Some(&resources.index_root),
+                            &error,
+                        ));
                         Vec::new()
                     }
                     Err(error) => return Err(error),
@@ -6505,7 +6519,8 @@ impl FsfsRuntime {
             &fused_initial,
             &snippets_by_doc,
             output_limit,
-        );
+        )
+        .with_degradation_advice(resources.degradation_advice.clone());
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
         let mut artifacts = vec![SearchPhaseArtifact {
@@ -6594,6 +6609,12 @@ impl FsfsRuntime {
                                 "fsfs quality refinement failed; falling back to initial phase payload"
                             );
                         }
+                        let mut advice = resources.degradation_advice.clone();
+                        advice.push(advice_for_search_error(
+                            &normalized_query,
+                            Some(&resources.index_root),
+                            &error,
+                        ));
                         let failed_payload = Self::build_limited_payload(
                             orchestrator,
                             &normalized_query,
@@ -6601,7 +6622,8 @@ impl FsfsRuntime {
                             &fused_initial,
                             &snippets_by_doc,
                             output_limit,
-                        );
+                        )
+                        .with_degradation_advice(advice);
                         artifacts.push(SearchPhaseArtifact {
                             phase: SearchOutputPhase::RefinementFailed,
                             fused: fused_initial.clone(),
@@ -6610,6 +6632,14 @@ impl FsfsRuntime {
                     }
                 }
             } else {
+                let mut advice = resources.degradation_advice.clone();
+                advice.push(DegradationAdvice::from_input(DegradationAdviceInput {
+                    failure: DegradationFailureKind::MissingQualityModel,
+                    query: &normalized_query,
+                    index_dir: Some(&resources.index_root),
+                    original_error: None,
+                    replay_command: None,
+                }));
                 let failed_payload = Self::build_limited_payload(
                     orchestrator,
                     &normalized_query,
@@ -6617,7 +6647,8 @@ impl FsfsRuntime {
                     &fused_initial,
                     &snippets_by_doc,
                     output_limit,
-                );
+                )
+                .with_degradation_advice(advice);
                 artifacts.push(SearchPhaseArtifact {
                     phase: SearchOutputPhase::RefinementFailed,
                     fused: fused_initial.clone(),
@@ -9122,6 +9153,7 @@ impl FsfsRuntime {
 
         let should_open_vector =
             !matches!(mode, SearchExecutionMode::LexicalOnly) || lexical_index.is_none();
+        let mut degradation_advice = Vec::new();
         let vector_index = if should_open_vector && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index) => Some(index),
@@ -9131,6 +9163,15 @@ impl FsfsRuntime {
                         path = %vector_path.display(),
                         "fsfs search falling back to lexical-only mode after vector index load failure"
                     );
+                    degradation_advice.push(DegradationAdvice::from_input(
+                        DegradationAdviceInput {
+                            failure: DegradationFailureKind::LexicalFallback,
+                            query: "",
+                            index_dir: Some(&index_root),
+                            original_error: Some(&error),
+                            replay_command: None,
+                        },
+                    ));
                     None
                 }
                 Err(error) => return Err(error),
@@ -9155,6 +9196,7 @@ impl FsfsRuntime {
             quality_embedder: None,
             fast_embedder_attempted: false,
             quality_embedder_attempted: false,
+            degradation_advice,
         })
     }
 

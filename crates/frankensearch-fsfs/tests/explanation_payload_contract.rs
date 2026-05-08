@@ -5,7 +5,8 @@ use frankensearch_fsfs::query_execution::{
     DegradationOverride, DegradationStatus, DegradationTransition,
 };
 use frankensearch_fsfs::{
-    CompatibilityMode, DegradedRetrievalMode, FsfsExplanationPayload, OutputEnvelope, OutputMeta,
+    CompatibilityMode, DegradationAdvice, DegradationAdviceInput, DegradationFailureKind,
+    DegradedRetrievalMode, FsfsExplanationPayload, OutputEnvelope, OutputMeta,
     PolicyDecisionExplanation, PolicyDomain, RankingExplanation, TraceLink, validate_envelope,
 };
 
@@ -153,4 +154,39 @@ fn explanation_payload_toon_and_tui_use_stable_labels() {
             .iter()
             .any(|line| line.contains("query_execution"))
     );
+}
+
+#[test]
+fn explanation_payload_includes_degradation_advice_in_json_toon_and_tui()
+-> Result<(), Box<dyn std::error::Error>> {
+    let advice = DegradationAdvice::from_input(DegradationAdviceInput {
+        failure: DegradationFailureKind::Timeout,
+        query: "hybrid ranking",
+        index_dir: Some(std::path::Path::new("/tmp/fsfs-index")),
+        original_error: None,
+        replay_command: Some(
+            "fsfs search --index-dir /tmp/fsfs-index --format json -- hybrid ranking",
+        ),
+    });
+    let payload = FsfsExplanationPayload::new("hybrid ranking", sample_ranking())
+        .with_degradation_advice(advice);
+
+    let json = payload.to_cli_json()?;
+    assert!(json.contains("degrade.advice.timeout"));
+    assert!(json.contains("next_actions"));
+    assert!(json.contains("replay_command"));
+
+    let toon = payload.to_toon();
+    assert!(toon.contains("advice: failure=Timeout"));
+    assert!(toon.contains("degrade.advice.timeout"));
+    assert!(toon.contains("next_action: order=1"));
+
+    let panel = payload.to_tui_panel();
+    assert!(
+        panel
+            .lines
+            .iter()
+            .any(|line| line.contains("degrade.advice.timeout"))
+    );
+    Ok(())
 }

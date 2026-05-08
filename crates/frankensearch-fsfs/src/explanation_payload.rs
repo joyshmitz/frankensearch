@@ -16,6 +16,7 @@ use frankensearch_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::config::DiscoveryDecision;
+use crate::degradation_advisor::DegradationAdvice;
 use crate::evidence::TraceLink;
 use crate::query_execution::{DegradationTransition, FusedCandidate, QueryExecutionPlan};
 use crate::query_planning::{QueryBudgetProfile, QueryIntentDecision, RetrievalBudget};
@@ -31,6 +32,8 @@ pub struct FsfsExplanationPayload {
     pub trace: Option<TraceLink>,
     pub ranking: RankingExplanation,
     pub policy_decisions: Vec<PolicyDecisionExplanation>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub degradation_advice: Vec<DegradationAdvice>,
 }
 
 impl FsfsExplanationPayload {
@@ -42,6 +45,7 @@ impl FsfsExplanationPayload {
             trace: None,
             ranking,
             policy_decisions: Vec::new(),
+            degradation_advice: Vec::new(),
         }
     }
 
@@ -54,6 +58,12 @@ impl FsfsExplanationPayload {
     #[must_use]
     pub fn with_policy_decision(mut self, decision: PolicyDecisionExplanation) -> Self {
         self.policy_decisions.push(decision);
+        self
+    }
+
+    #[must_use]
+    pub fn with_degradation_advice(mut self, advice: DegradationAdvice) -> Self {
+        self.degradation_advice.push(advice);
         self
     }
 
@@ -114,6 +124,23 @@ impl FsfsExplanationPayload {
             ));
         }
 
+        for advice in &self.degradation_advice {
+            lines.push(format!(
+                "  advice: failure={:?} severity={:?} reason={} preserves_initial_results={} replay_command={}",
+                advice.failure,
+                advice.severity,
+                advice.reason_code,
+                advice.preserves_initial_results,
+                advice.replay_command
+            ));
+            for action in &advice.next_actions {
+                lines.push(format!(
+                    "    next_action: order={} reason={} action={}",
+                    action.order, action.reason_code, action.action
+                ));
+            }
+        }
+
         lines.join("\n")
     }
 
@@ -146,6 +173,16 @@ impl FsfsExplanationPayload {
                 decision.reason_code,
                 decision.confidence_per_mille
             ));
+        }
+
+        for advice in &self.degradation_advice {
+            lines.push(format!(
+                "! {:?}: {} [{}]",
+                advice.severity, advice.operator_summary, advice.reason_code
+            ));
+            for action in &advice.next_actions {
+                lines.push(format!("  {}. {}", action.order, action.action));
+            }
         }
 
         TuiExplanationPanel {
