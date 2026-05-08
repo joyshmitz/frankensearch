@@ -73,6 +73,30 @@ Rust validation rejects duplicate fixture IDs, duplicate artifact IDs, unknown
 phase artifact refs, missing command data, missing seed/config hash, missing
 artifact manifests, and malformed SHA-256 digests.
 
+## Operator Workflow Playback Fixtures
+
+`operator_workflow_playback_suite()` provides deterministic playback fixtures
+for common operator workflows that do not require live interaction:
+
+- fsfs search
+- fsfs explain
+- fsfs doctor
+- fsfs audit
+- fsfs degraded mode
+- fsfs profile review
+- ops TUI triage
+
+Each workflow fixture records a stable command vector, replay input sequence,
+expected screen/output snapshots, 16-hex state checksums, reason codes, and
+artifact references. TUI fixtures must pin viewport size with a `resize:*`
+input before assertions.
+
+The replay command embedded in the suite is:
+
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo test -p frankensearch-fsfs --lib operator_workflow_playback -- --nocapture
+```
+
 ## Validation
 
 The contract artifacts are:

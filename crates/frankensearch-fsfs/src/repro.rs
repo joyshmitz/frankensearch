@@ -65,6 +65,10 @@ pub const DEGRADED_INCIDENT_SUITE_CONTRACT_KIND: &str =
     "fsfs_degraded_incident_suite_contract_definition";
 /// Kind tag for concrete degraded-mode incident suite fixtures.
 pub const DEGRADED_INCIDENT_SUITE_KIND: &str = "fsfs_degraded_incident_suite";
+/// Schema discriminator for deterministic operator workflow playback fixtures.
+pub const OPERATOR_WORKFLOW_PLAYBACK_SCHEMA_VERSION: &str = "fsfs-operator-workflow-playback-v1";
+/// Exact replay command for the deterministic operator workflow playback suite.
+pub const OPERATOR_WORKFLOW_PLAYBACK_REPLAY_COMMAND: &str = "RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo test -p frankensearch-fsfs --lib operator_workflow_playback -- --nocapture";
 
 // ─── Capture Context ────────────────────────────────────────────────────────
 
@@ -1294,6 +1298,651 @@ impl<'de> Deserialize<'de> for ReplayBundleManifest {
         manifest.validate().map_err(de::Error::custom)?;
         Ok(manifest)
     }
+}
+
+// ─── Operator Workflow Playback Fixtures ───────────────────────────────────
+
+/// Operator workflow families covered by deterministic playback fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorWorkflowKind {
+    /// Progressive search workflow.
+    Search,
+    /// Explainability drilldown workflow.
+    Explain,
+    /// Doctor/status diagnostics workflow.
+    Doctor,
+    /// Audit/report review workflow.
+    Audit,
+    /// Degraded-mode recovery workflow.
+    DegradedMode,
+    /// Profile and benchmark review workflow.
+    ProfileReview,
+    /// Ops TUI fleet triage workflow.
+    OpsTui,
+}
+
+/// One replayable input step for an operator workflow fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorWorkflowReplayInput {
+    /// Monotonic input sequence number.
+    pub seq: u32,
+    /// Offset from workflow start.
+    pub offset_ms: u64,
+    /// Stable input encoding such as `key:/`, `cmd:search`, or `resize:132x40`.
+    pub input: String,
+    /// Screen expected after applying the input.
+    pub expected_screen: String,
+    /// Stable reason code emitted by this replay step.
+    pub reason_code: String,
+}
+
+/// Deterministic snapshot captured during workflow playback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorWorkflowSnapshot {
+    /// Human-readable stable label.
+    pub label: String,
+    /// Screen or output surface identifier.
+    pub screen_id: String,
+    /// Stable checksum for the redacted rendered state.
+    pub state_checksum: String,
+    /// Reason code expected in the snapshot metadata.
+    pub reason_code: String,
+    /// Artifact identifiers required by this snapshot.
+    pub artifact_refs: Vec<String>,
+}
+
+/// One deterministic workflow playback fixture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorWorkflowPlaybackFixture {
+    /// Stable fixture identifier.
+    pub fixture_id: String,
+    /// Workflow family.
+    pub workflow: OperatorWorkflowKind,
+    /// Surface used to replay the fixture.
+    pub client_surface: ReplayClientSurface,
+    /// Exact command vector for the replay surface.
+    pub command: ReplayBundleCommand,
+    /// Stable replay input sequence.
+    pub replay_inputs: Vec<OperatorWorkflowReplayInput>,
+    /// Expected state snapshots after key navigation/output points.
+    pub snapshots: Vec<OperatorWorkflowSnapshot>,
+    /// Exact command that replays or validates this fixture.
+    pub replay_command: String,
+}
+
+/// Deterministic fixture pack for fsfs and ops operator workflows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorWorkflowPlaybackSuite {
+    /// Contract schema discriminator.
+    pub schema_version: String,
+    /// Stable suite identifier.
+    pub suite_id: String,
+    /// Deterministic playback seed.
+    pub seed: u64,
+    /// Hash of the resolved workflow fixture configuration.
+    pub config_hash: String,
+    /// RFC 3339 UTC timestamp for fixture creation.
+    pub generated_at: String,
+    /// Redacted deterministic environment identity.
+    pub environment: ReplayBundleEnvironment,
+    /// Shared artifact manifest for all workflow fixtures.
+    pub artifact_manifest: ReplayBundleArtifactManifest,
+    /// Workflow fixtures in deterministic order.
+    pub workflows: Vec<OperatorWorkflowPlaybackFixture>,
+    /// Exact command for validating the entire suite.
+    pub replay_command: String,
+}
+
+impl OperatorWorkflowPlaybackSuite {
+    /// Validate suite invariants beyond raw JSON shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable reason code when playback fixture contracts are broken.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != OPERATOR_WORKFLOW_PLAYBACK_SCHEMA_VERSION {
+            return Err("operator.workflow.schema_version.invalid");
+        }
+        require_operator_non_empty("suite_id", &self.suite_id)?;
+        require_operator_non_empty("generated_at", &self.generated_at)?;
+        require_operator_non_empty("config_hash", &self.config_hash)?;
+        require_operator_non_empty("replay_command", &self.replay_command)?;
+        if !is_sha256_digest(&self.config_hash) {
+            return Err("operator.workflow.config_hash.invalid");
+        }
+        if self.environment.seed != self.seed {
+            return Err("operator.workflow.environment.seed_mismatch");
+        }
+        if self.environment.config_hash != self.config_hash {
+            return Err("operator.workflow.environment.config_hash_mismatch");
+        }
+        if self.environment.snapshot.redaction_note.trim().is_empty() {
+            return Err("operator.workflow.environment.redaction_note.empty");
+        }
+        if contains_forbidden_incident_command(&self.replay_command) {
+            return Err("operator.workflow.replay_command.forbidden");
+        }
+        if self.workflows.is_empty() {
+            return Err("operator.workflow.workflows.empty");
+        }
+        if self.artifact_manifest.artifacts.is_empty() {
+            return Err("operator.workflow.artifact_manifest.empty");
+        }
+
+        let mut artifact_ids = std::collections::BTreeSet::new();
+        for artifact in &self.artifact_manifest.artifacts {
+            require_operator_non_empty("artifact.artifact_id", &artifact.artifact_id)?;
+            require_operator_non_empty("artifact.path", &artifact.path)?;
+            require_operator_non_empty("artifact.content_type", &artifact.content_type)?;
+            if !is_sha256_digest(&artifact.checksum_sha256) {
+                return Err("operator.workflow.artifact.checksum.invalid");
+            }
+            if !artifact_ids.insert(artifact.artifact_id.as_str()) {
+                return Err("operator.workflow.artifact.duplicate_id");
+            }
+        }
+
+        let mut fixture_ids = std::collections::BTreeSet::new();
+        let mut covered = std::collections::BTreeSet::new();
+        for fixture in &self.workflows {
+            validate_operator_workflow_fixture(fixture, &artifact_ids)?;
+            if !fixture_ids.insert(fixture.fixture_id.as_str()) {
+                return Err("operator.workflow.fixture.duplicate_id");
+            }
+            covered.insert(fixture.workflow);
+        }
+
+        for required in required_operator_workflows() {
+            if !covered.contains(&required) {
+                return Err("operator.workflow.coverage.missing");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for OperatorWorkflowPlaybackSuite {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawOperatorWorkflowPlaybackSuite {
+            schema_version: String,
+            suite_id: String,
+            seed: u64,
+            config_hash: String,
+            generated_at: String,
+            environment: ReplayBundleEnvironment,
+            artifact_manifest: ReplayBundleArtifactManifest,
+            workflows: Vec<OperatorWorkflowPlaybackFixture>,
+            replay_command: String,
+        }
+
+        let raw = RawOperatorWorkflowPlaybackSuite::deserialize(deserializer)?;
+        let suite = Self {
+            schema_version: raw.schema_version,
+            suite_id: raw.suite_id,
+            seed: raw.seed,
+            config_hash: raw.config_hash,
+            generated_at: raw.generated_at,
+            environment: raw.environment,
+            artifact_manifest: raw.artifact_manifest,
+            workflows: raw.workflows,
+            replay_command: raw.replay_command,
+        };
+        suite.validate().map_err(de::Error::custom)?;
+        Ok(suite)
+    }
+}
+
+/// Build the deterministic operator workflow playback fixture pack.
+#[must_use]
+pub fn operator_workflow_playback_suite() -> OperatorWorkflowPlaybackSuite {
+    let seed = 91_337;
+    let config_hash = "sha256:7777777777777777777777777777777777777777777777777777777777777777";
+    let workflows = vec![
+        operator_search_workflow(),
+        operator_explain_workflow(),
+        operator_doctor_workflow(),
+        operator_audit_workflow(),
+        operator_degraded_workflow(),
+        operator_profile_review_workflow(),
+        operator_ops_tui_workflow(),
+    ];
+
+    OperatorWorkflowPlaybackSuite {
+        schema_version: OPERATOR_WORKFLOW_PLAYBACK_SCHEMA_VERSION.to_owned(),
+        suite_id: "fsfs-operator-workflow-playback-v1".to_owned(),
+        seed,
+        config_hash: config_hash.to_owned(),
+        generated_at: "2026-05-08T16:00:00Z".to_owned(),
+        environment: ReplayBundleEnvironment {
+            seed,
+            config_hash: config_hash.to_owned(),
+            snapshot: EnvSnapshot {
+                variables: vec![
+                    EnvEntry {
+                        key: "FSFS_OPERATOR_REPLAY_SEED".to_owned(),
+                        value: seed.to_string(),
+                        redacted: false,
+                    },
+                    EnvEntry {
+                        key: "FSFS_OPERATOR_REPLAY_MODE".to_owned(),
+                        value: "fixture".to_owned(),
+                        redacted: false,
+                    },
+                    EnvEntry {
+                        key: "FSFS_MODEL_TOKEN".to_owned(),
+                        value: "<redacted>".to_owned(),
+                        redacted: true,
+                    },
+                ],
+                redaction_note: "Operator playback fixtures contain no raw corpus text or secrets"
+                    .to_owned(),
+            },
+        },
+        artifact_manifest: ReplayBundleArtifactManifest {
+            artifacts: operator_workflow_artifacts(&workflows),
+        },
+        workflows,
+        replay_command: OPERATOR_WORKFLOW_PLAYBACK_REPLAY_COMMAND.to_owned(),
+    }
+}
+
+#[must_use]
+fn required_operator_workflows() -> Vec<OperatorWorkflowKind> {
+    vec![
+        OperatorWorkflowKind::Search,
+        OperatorWorkflowKind::Explain,
+        OperatorWorkflowKind::Doctor,
+        OperatorWorkflowKind::Audit,
+        OperatorWorkflowKind::DegradedMode,
+        OperatorWorkflowKind::ProfileReview,
+        OperatorWorkflowKind::OpsTui,
+    ]
+}
+
+fn operator_search_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "fsfs-search-playback",
+        OperatorWorkflowKind::Search,
+        ReplayClientSurface::Tui,
+        &["fsfs", "tui", "--screen", "search"],
+        &[
+            ("resize:132x40", "fsfs.search", "operator.search.resize"),
+            ("key:/", "fsfs.search.query", "operator.search.focus_query"),
+            (
+                "text:rust async cancellation",
+                "fsfs.search.query",
+                "operator.search.type_query",
+            ),
+            (
+                "key:enter",
+                "fsfs.search.results",
+                "operator.search.initial_results",
+            ),
+            (
+                "key:e",
+                "fsfs.search.explain",
+                "operator.search.toggle_explain",
+            ),
+        ],
+        &[
+            ("query_submitted", "fsfs.search.results", "a111111111111111"),
+            ("explain_open", "fsfs.search.explain", "a222222222222222"),
+        ],
+    )
+}
+
+fn operator_explain_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "fsfs-explain-playback",
+        OperatorWorkflowKind::Explain,
+        ReplayClientSurface::Cli,
+        &["fsfs", "explain", "R0", "--format", "toon"],
+        &[
+            (
+                "cmd:explain R0",
+                "fsfs.explain.lookup",
+                "operator.explain.lookup",
+            ),
+            (
+                "cmd:render toon",
+                "fsfs.explain.output",
+                "operator.explain.render",
+            ),
+        ],
+        &[
+            (
+                "policy_card",
+                "fsfs.explain.policy_card",
+                "b111111111111111",
+            ),
+            (
+                "rank_movement",
+                "fsfs.explain.rank_movement",
+                "b222222222222222",
+            ),
+        ],
+    )
+}
+
+fn operator_doctor_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "fsfs-doctor-playback",
+        OperatorWorkflowKind::Doctor,
+        ReplayClientSurface::Cli,
+        &["fsfs", "doctor", "--format", "json"],
+        &[
+            (
+                "cmd:doctor --format json",
+                "fsfs.doctor.checks",
+                "operator.doctor.start",
+            ),
+            (
+                "cmd:doctor model-cache",
+                "fsfs.doctor.model_cache",
+                "operator.doctor.model_cache",
+            ),
+        ],
+        &[
+            ("doctor_summary", "fsfs.doctor.summary", "c111111111111111"),
+            ("doctor_advice", "fsfs.doctor.advice", "c222222222222222"),
+        ],
+    )
+}
+
+fn operator_audit_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "fsfs-audit-playback",
+        OperatorWorkflowKind::Audit,
+        ReplayClientSurface::Cli,
+        &["fsfs", "audit", "--format", "jsonl"],
+        &[
+            (
+                "cmd:audit --format jsonl",
+                "fsfs.audit.scan",
+                "operator.audit.start",
+            ),
+            (
+                "cmd:audit classify-staleness",
+                "fsfs.audit.drift",
+                "operator.audit.classify",
+            ),
+        ],
+        &[
+            ("audit_jsonl", "fsfs.audit.events", "d111111111111111"),
+            ("repair_plan", "fsfs.audit.repair_plan", "d222222222222222"),
+        ],
+    )
+}
+
+fn operator_degraded_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "fsfs-degraded-mode-playback",
+        OperatorWorkflowKind::DegradedMode,
+        ReplayClientSurface::Tui,
+        &["fsfs", "tui", "--profile", "degraded"],
+        &[
+            (
+                "resize:120x32",
+                "fsfs.degraded.banner",
+                "operator.degraded.resize",
+            ),
+            (
+                "key:enter",
+                "fsfs.degraded.initial",
+                "operator.degraded.initial_results",
+            ),
+            (
+                "key:r",
+                "fsfs.degraded.recovery",
+                "operator.degraded.recovery",
+            ),
+        ],
+        &[
+            (
+                "degraded_banner",
+                "fsfs.degraded.banner",
+                "e111111111111111",
+            ),
+            (
+                "recovery_advice",
+                "fsfs.degraded.recovery",
+                "e222222222222222",
+            ),
+        ],
+    )
+}
+
+fn operator_profile_review_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "fsfs-profile-review-playback",
+        OperatorWorkflowKind::ProfileReview,
+        ReplayClientSurface::Cli,
+        &["fsfs", "profile", "review", "--dataset", "small"],
+        &[
+            (
+                "cmd:profile review --dataset small",
+                "fsfs.profile.summary",
+                "operator.profile.start",
+            ),
+            (
+                "cmd:profile compare-baseline",
+                "fsfs.profile.drift",
+                "operator.profile.compare",
+            ),
+        ],
+        &[
+            (
+                "profile_summary",
+                "fsfs.profile.summary",
+                "f111111111111111",
+            ),
+            (
+                "profile_drift",
+                "fsfs.profile.drift_dashboard",
+                "f222222222222222",
+            ),
+        ],
+    )
+}
+
+fn operator_ops_tui_workflow() -> OperatorWorkflowPlaybackFixture {
+    operator_workflow_fixture(
+        "ops-tui-triage-playback",
+        OperatorWorkflowKind::OpsTui,
+        ReplayClientSurface::Tui,
+        &["frankensearch-ops", "--deterministic", "--screen", "fleet"],
+        &[
+            ("resize:132x40", "ops.fleet", "operator.ops.resize"),
+            ("key:t", "ops.timeline", "operator.ops.timeline"),
+            ("key:g", "ops.project", "operator.ops.drilldown"),
+            ("key:esc", "ops.fleet", "operator.ops.recovery"),
+        ],
+        &[
+            ("fleet_overview", "ops.fleet", "0111111111111111"),
+            ("timeline_triage", "ops.timeline", "0222222222222222"),
+            ("project_drilldown", "ops.project", "0333333333333333"),
+        ],
+    )
+}
+
+fn operator_workflow_fixture(
+    fixture_id: &str,
+    workflow: OperatorWorkflowKind,
+    client_surface: ReplayClientSurface,
+    argv: &[&str],
+    inputs: &[(&str, &str, &str)],
+    snapshots: &[(&str, &str, &str)],
+) -> OperatorWorkflowPlaybackFixture {
+    let command = ReplayBundleCommand {
+        client_surface,
+        argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+        working_dir: "/data/projects/frankensearch".to_owned(),
+    };
+    let replay_inputs = inputs
+        .iter()
+        .enumerate()
+        .map(
+            |(index, (input, screen, reason))| OperatorWorkflowReplayInput {
+                seq: u32::try_from(index).expect("operator fixture input index fits u32"),
+                offset_ms: u64::try_from(index)
+                    .expect("operator fixture input index fits u64")
+                    .saturating_mul(25),
+                input: (*input).to_owned(),
+                expected_screen: (*screen).to_owned(),
+                reason_code: (*reason).to_owned(),
+            },
+        )
+        .collect();
+    let snapshots = snapshots
+        .iter()
+        .map(|(label, screen, checksum)| OperatorWorkflowSnapshot {
+            label: (*label).to_owned(),
+            screen_id: (*screen).to_owned(),
+            state_checksum: (*checksum).to_owned(),
+            reason_code: format!("operator.snapshot.{label}"),
+            artifact_refs: vec![format!("{fixture_id}-{label}")],
+        })
+        .collect();
+
+    OperatorWorkflowPlaybackFixture {
+        fixture_id: fixture_id.to_owned(),
+        workflow,
+        client_surface,
+        command,
+        replay_inputs,
+        snapshots,
+        replay_command: OPERATOR_WORKFLOW_PLAYBACK_REPLAY_COMMAND.to_owned(),
+    }
+}
+
+fn operator_workflow_artifacts(
+    workflows: &[OperatorWorkflowPlaybackFixture],
+) -> Vec<ReplayBundleArtifactRef> {
+    let mut artifacts = Vec::new();
+    for (fixture_index, workflow) in workflows.iter().enumerate() {
+        for (snapshot_index, snapshot) in workflow.snapshots.iter().enumerate() {
+            let digit = char::from_digit(
+                u32::try_from((fixture_index + snapshot_index) % 10)
+                    .expect("operator fixture index fits u32"),
+                10,
+            )
+            .expect("digit exists");
+            let digest = std::iter::repeat_n(digit, 64).collect::<String>();
+            let artifact_id = snapshot
+                .artifact_refs
+                .first()
+                .expect("operator workflow snapshot has artifact ref")
+                .clone();
+            artifacts.push(ReplayBundleArtifactRef {
+                artifact_id,
+                path: format!(
+                    "artifacts/operator-workflows/{}/{}.json",
+                    workflow.fixture_id, snapshot.label
+                ),
+                content_type: "application/json".to_owned(),
+                checksum_sha256: format!("sha256:{digest}"),
+                required: true,
+            });
+        }
+    }
+    artifacts
+}
+
+fn validate_operator_workflow_fixture(
+    fixture: &OperatorWorkflowPlaybackFixture,
+    artifact_ids: &std::collections::BTreeSet<&str>,
+) -> Result<(), &'static str> {
+    require_operator_non_empty("fixture.fixture_id", &fixture.fixture_id)?;
+    require_operator_non_empty("fixture.replay_command", &fixture.replay_command)?;
+    require_operator_non_empty("command.working_dir", &fixture.command.working_dir)?;
+    if fixture.command.client_surface != fixture.client_surface {
+        return Err("operator.workflow.fixture.client_surface_mismatch");
+    }
+    if fixture.command.argv.is_empty() {
+        return Err("operator.workflow.fixture.command.argv.empty");
+    }
+    if fixture.command.argv.iter().any(|arg| arg.trim().is_empty()) {
+        return Err("operator.workflow.fixture.command.argv.blank");
+    }
+    if contains_forbidden_incident_command(&fixture.command.argv.join(" "))
+        || contains_forbidden_incident_command(&fixture.replay_command)
+    {
+        return Err("operator.workflow.fixture.command.forbidden");
+    }
+    if fixture.replay_inputs.is_empty() {
+        return Err("operator.workflow.fixture.replay_inputs.empty");
+    }
+    if fixture.snapshots.is_empty() {
+        return Err("operator.workflow.fixture.snapshots.empty");
+    }
+
+    for (expected_seq, input) in fixture.replay_inputs.iter().enumerate() {
+        if input.seq != u32::try_from(expected_seq).expect("operator fixture input index fits u32")
+        {
+            return Err("operator.workflow.fixture.replay_input.seq.non_monotonic");
+        }
+        require_operator_non_empty("replay_input.input", &input.input)?;
+        require_operator_non_empty("replay_input.expected_screen", &input.expected_screen)?;
+        require_operator_non_empty("replay_input.reason_code", &input.reason_code)?;
+        if !input.reason_code.starts_with("operator.") {
+            return Err("operator.workflow.fixture.replay_input.reason_code.invalid");
+        }
+    }
+
+    for snapshot in &fixture.snapshots {
+        require_operator_non_empty("snapshot.label", &snapshot.label)?;
+        require_operator_non_empty("snapshot.screen_id", &snapshot.screen_id)?;
+        require_operator_non_empty("snapshot.state_checksum", &snapshot.state_checksum)?;
+        require_operator_non_empty("snapshot.reason_code", &snapshot.reason_code)?;
+        if !is_fixed_hex(&snapshot.state_checksum, 16) {
+            return Err("operator.workflow.fixture.snapshot.checksum.invalid");
+        }
+        if !snapshot.reason_code.starts_with("operator.snapshot.") {
+            return Err("operator.workflow.fixture.snapshot.reason_code.invalid");
+        }
+        if snapshot.artifact_refs.is_empty() {
+            return Err("operator.workflow.fixture.snapshot.artifact_refs.empty");
+        }
+        for artifact_ref in &snapshot.artifact_refs {
+            require_operator_non_empty("snapshot.artifact_ref", artifact_ref)?;
+            if !artifact_ids.contains(artifact_ref.as_str()) {
+                return Err("operator.workflow.fixture.snapshot.artifact_ref.unknown");
+            }
+        }
+    }
+
+    if fixture.client_surface == ReplayClientSurface::Tui
+        && !fixture
+            .replay_inputs
+            .iter()
+            .any(|input| input.input.starts_with("resize:"))
+    {
+        return Err("operator.workflow.fixture.tui.resize_missing");
+    }
+
+    Ok(())
+}
+
+fn require_operator_non_empty(_field: &'static str, value: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() {
+        return Err("operator.workflow.field.empty");
+    }
+    Ok(())
+}
+
+fn is_fixed_hex(value: &str, len: usize) -> bool {
+    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 // ─── Degraded-Mode Synthetic Incident Suite ────────────────────────────────
@@ -2947,6 +3596,117 @@ mod tests {
         let json = serde_json::to_value(&manifest).expect("serialize manifest");
         let error = serde_json::from_value::<ReplayBundleManifest>(json)
             .expect_err("reject unknown artifact ref");
+
+        assert!(error.to_string().contains("artifact_ref.unknown"));
+    }
+
+    // ─── Operator Workflow Playback Fixtures ──────────────────────────
+
+    #[test]
+    fn operator_workflow_playback_suite_covers_required_workflows() {
+        let suite = operator_workflow_playback_suite();
+
+        suite
+            .validate()
+            .expect("operator workflow playback suite should validate");
+        assert_eq!(
+            suite.schema_version,
+            OPERATOR_WORKFLOW_PLAYBACK_SCHEMA_VERSION
+        );
+        assert_eq!(
+            suite.replay_command,
+            OPERATOR_WORKFLOW_PLAYBACK_REPLAY_COMMAND
+        );
+
+        let covered: std::collections::BTreeSet<_> =
+            suite.workflows.iter().map(|item| item.workflow).collect();
+        assert_eq!(covered, required_operator_workflows().into_iter().collect());
+        assert!(
+            suite
+                .workflows
+                .iter()
+                .any(|workflow| workflow.client_surface == ReplayClientSurface::Tui)
+        );
+        assert!(
+            suite
+                .workflows
+                .iter()
+                .any(|workflow| workflow.client_surface == ReplayClientSurface::Cli)
+        );
+    }
+
+    #[test]
+    fn operator_workflow_playback_navigation_and_outputs_are_replay_safe() {
+        let suite = operator_workflow_playback_suite();
+        let artifact_ids: std::collections::BTreeSet<_> = suite
+            .artifact_manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .collect();
+
+        for workflow in &suite.workflows {
+            let mut expected_seq = 0_u32;
+            let mut previous_offset = 0_u64;
+            for input in &workflow.replay_inputs {
+                assert_eq!(input.seq, expected_seq);
+                assert!(input.offset_ms >= previous_offset);
+                assert!(input.reason_code.starts_with("operator."));
+                assert!(!input.expected_screen.trim().is_empty());
+                expected_seq = expected_seq.saturating_add(1);
+                previous_offset = input.offset_ms;
+            }
+
+            for snapshot in &workflow.snapshots {
+                assert!(is_fixed_hex(&snapshot.state_checksum, 16));
+                assert!(snapshot.reason_code.starts_with("operator.snapshot."));
+                assert!(
+                    snapshot
+                        .artifact_refs
+                        .iter()
+                        .all(|artifact_ref| artifact_ids.contains(artifact_ref.as_str()))
+                );
+            }
+
+            if workflow.client_surface == ReplayClientSurface::Tui {
+                assert!(
+                    workflow
+                        .replay_inputs
+                        .iter()
+                        .any(|input| input.input.starts_with("resize:")),
+                    "TUI workflow {} must pin viewport size",
+                    workflow.fixture_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operator_workflow_playback_suite_roundtrips_through_json() {
+        let suite = operator_workflow_playback_suite();
+        let json = serde_json::to_string(&suite).expect("serialize operator workflow suite");
+        let decoded: OperatorWorkflowPlaybackSuite =
+            serde_json::from_str(&json).expect("deserialize operator workflow suite");
+
+        assert_eq!(decoded, suite);
+    }
+
+    #[test]
+    fn operator_workflow_playback_suite_rejects_unknown_snapshot_artifact_refs() {
+        let mut suite = operator_workflow_playback_suite();
+        suite
+            .workflows
+            .first_mut()
+            .expect("suite has workflows")
+            .snapshots
+            .first_mut()
+            .expect("workflow has snapshots")
+            .artifact_refs
+            .push("missing-artifact".to_owned());
+
+        let json = serde_json::to_value(&suite).expect("serialize operator workflow suite");
+        let error = serde_json::from_value::<OperatorWorkflowPlaybackSuite>(json)
+            .expect_err("unknown snapshot artifact ref should fail validation");
 
         assert!(error.to_string().contains("artifact_ref.unknown"));
     }

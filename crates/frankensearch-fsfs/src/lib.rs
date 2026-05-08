@@ -298,7 +298,10 @@ pub use repro::{
     DegradedIncidentSuite, DegradedIncidentSuiteContractDefinition,
     DegradedIncidentSuiteContractKind, DegradedIncidentSuiteKindMarker, DegradedIncidentSuiteMode,
     EnvEntry, EnvSnapshot, FrameSeqRange, IndexChecksum, IndexChecksums, ModelManifest,
-    ModelSnapshot, PACK_FILES, PROVENANCE_ATTESTATION_FILENAME, ProvenanceAttestation,
+    ModelSnapshot, OPERATOR_WORKFLOW_PLAYBACK_REPLAY_COMMAND,
+    OPERATOR_WORKFLOW_PLAYBACK_SCHEMA_VERSION, OperatorWorkflowKind,
+    OperatorWorkflowPlaybackFixture, OperatorWorkflowPlaybackSuite, OperatorWorkflowReplayInput,
+    OperatorWorkflowSnapshot, PACK_FILES, PROVENANCE_ATTESTATION_FILENAME, ProvenanceAttestation,
     ProvenanceStartupCheck, REPLAY_BUNDLE_CONTRACT_KIND, REPLAY_BUNDLE_MANIFEST_KIND,
     REPLAY_BUNDLE_SCHEMA_VERSION, REPRO_SCHEMA_VERSION, ReplayBundleArtifactManifest,
     ReplayBundleArtifactRef, ReplayBundleCommand, ReplayBundleContractDefinition,
@@ -310,8 +313,8 @@ pub use repro::{
     StartupVerificationAction, StartupVerificationAlert, StartupVerificationOutcome,
     StartupVerificationPolicy, StartupVerificationReport, StartupVerificationStatus,
     VerificationSeverity, degraded_incident_full_suite, degraded_incident_smoke_suite,
-    degraded_incident_suite_contract_definition, files_for_tier, should_capture_env,
-    should_redact_env,
+    degraded_incident_suite_contract_definition, files_for_tier, operator_workflow_playback_suite,
+    should_capture_env, should_redact_env,
 };
 pub use runtime::{
     FsfsRuntime, InterfaceMode, VersionCheckCache, is_cache_valid, maybe_print_update_notice,
