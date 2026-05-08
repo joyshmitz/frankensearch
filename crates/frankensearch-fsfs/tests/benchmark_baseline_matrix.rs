@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -13,10 +14,14 @@ use tempfile::TempDir;
 
 const GOLDEN_SCHEMA_VERSION: &str = "fsfs-benchmark-golden-v1";
 const ARTIFACT_SCHEMA_VERSION: &str = "fsfs-benchmark-artifact-v1";
+const DRIFT_DASHBOARD_SCHEMA_VERSION: &str = "fsfs-benchmark-drift-dashboard-v1";
 const MATRIX_VERSION: &str = "fsfs-benchmark-matrix-v1";
 const GOLDEN_PROFILES: [&str; 3] = ["tiny", "small", "medium"];
 const MAX_ALLOWED_REGRESSION_PCT: u16 = 20;
 const REGRESSION_SCALE: u64 = 100;
+const DRIFT_DASHBOARD_JSON: &str = "benchmark_drift_dashboard.json";
+const DRIFT_DASHBOARD_MARKDOWN: &str = "benchmark_drift_dashboard.md";
+const DRIFT_DASHBOARD_REPLAY_COMMAND: &str = "RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix benchmark_drift_dashboard -- --nocapture";
 
 /// Default bootstrap parameters for statistical regression detection.
 const BOOTSTRAP_CONFIDENCE: f64 = 0.95;
@@ -157,6 +162,59 @@ struct RegressionViolation {
     threshold_pct_x100: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DriftDirection {
+    Improved,
+    Stable,
+    Regressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DriftVerdict {
+    Pass,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DriftRegressionScope {
+    None,
+    SinglePhase,
+    MultiPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BenchmarkDriftEntry {
+    path: BenchmarkPath,
+    metric: ComparatorMetric,
+    baseline_value: u64,
+    current_value: u64,
+    threshold_pct_x100: u64,
+    regression_pct_x100: u64,
+    improvement_pct_x100: u64,
+    direction: DriftDirection,
+    verdict: DriftVerdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BenchmarkDriftDashboard {
+    schema_version: String,
+    matrix_version: String,
+    dataset_profile: String,
+    dataset_version: String,
+    overall_verdict: DriftVerdict,
+    regression_scope: DriftRegressionScope,
+    metric_count: usize,
+    regression_count: usize,
+    warning_count: usize,
+    entries: Vec<BenchmarkDriftEntry>,
+    replay_command: String,
+    markdown_summary: String,
+}
+
 /// Per-iteration sample set for a single metric, enabling bootstrap comparison.
 ///
 /// When `iterations` contains multiple measurements from repeated benchmark runs,
@@ -190,6 +248,12 @@ struct ArtifactBundle {
     manifest_path: PathBuf,
     matrix_path: PathBuf,
     samples_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DriftDashboardBundle {
+    json_path: PathBuf,
+    markdown_path: PathBuf,
 }
 
 fn fixture_dir() -> PathBuf {
@@ -325,6 +389,44 @@ const fn regression_pct_x100(metric: ComparatorMetric, baseline: u64, measured: 
         .saturating_mul(100)
         .saturating_mul(REGRESSION_SCALE)
         / baseline
+}
+
+const fn improvement_pct_x100(metric: ComparatorMetric, baseline: u64, measured: u64) -> u64 {
+    if baseline == 0 {
+        return 0;
+    }
+
+    let improvement_numerator = match metric {
+        ComparatorMetric::IndexingThroughputDocsPerSecond => measured.saturating_sub(baseline),
+        _ => baseline.saturating_sub(measured),
+    };
+
+    improvement_numerator
+        .saturating_mul(100)
+        .saturating_mul(REGRESSION_SCALE)
+        / baseline
+}
+
+const fn drift_direction(metric: ComparatorMetric, baseline: u64, measured: u64) -> DriftDirection {
+    let regression = regression_pct_x100(metric, baseline, measured);
+    let improvement = improvement_pct_x100(metric, baseline, measured);
+    if regression > 0 {
+        DriftDirection::Regressed
+    } else if improvement > 0 {
+        DriftDirection::Improved
+    } else {
+        DriftDirection::Stable
+    }
+}
+
+const fn drift_verdict(regression_pct_x100: u64, threshold_pct_x100: u64) -> DriftVerdict {
+    if regression_pct_x100 > threshold_pct_x100 {
+        DriftVerdict::Fail
+    } else if regression_pct_x100 > 0 {
+        DriftVerdict::Warn
+    } else {
+        DriftVerdict::Pass
+    }
 }
 
 fn evaluate_regressions(
@@ -568,6 +670,218 @@ fn write_artifact_bundle(
     }
 }
 
+fn path_id(path: BenchmarkPath) -> &'static str {
+    match path {
+        BenchmarkPath::Crawl => "crawl",
+        BenchmarkPath::Index => "index",
+        BenchmarkPath::Query => "query",
+        BenchmarkPath::Tui => "tui",
+    }
+}
+
+fn metric_id(metric: ComparatorMetric) -> &'static str {
+    match metric {
+        ComparatorMetric::IndexingThroughputDocsPerSecond => "indexing_throughput_docs_per_second",
+        ComparatorMetric::SearchLatencyP50Ms => "search_latency_p50_ms",
+        ComparatorMetric::SearchLatencyP95Ms => "search_latency_p95_ms",
+        ComparatorMetric::SearchLatencyP99Ms => "search_latency_p99_ms",
+        ComparatorMetric::FastTierLatencyMs => "fast_tier_latency_ms",
+        ComparatorMetric::QualityTierLatencyMs => "quality_tier_latency_ms",
+        ComparatorMetric::IndexingPeakMemoryMb => "indexing_peak_memory_mb",
+        ComparatorMetric::SearchingPeakMemoryMb => "searching_peak_memory_mb",
+        ComparatorMetric::IndexSizeBytesPerDocument => "index_size_bytes_per_document",
+    }
+}
+
+fn verdict_id(verdict: DriftVerdict) -> &'static str {
+    match verdict {
+        DriftVerdict::Pass => "pass",
+        DriftVerdict::Warn => "warn",
+        DriftVerdict::Fail => "fail",
+    }
+}
+
+fn scope_id(scope: DriftRegressionScope) -> &'static str {
+    match scope {
+        DriftRegressionScope::None => "none",
+        DriftRegressionScope::SinglePhase => "single_phase",
+        DriftRegressionScope::MultiPhase => "multi_phase",
+    }
+}
+
+fn pct_x100(value: u64) -> String {
+    format!(
+        "{}.{:02}%",
+        value / REGRESSION_SCALE,
+        value % REGRESSION_SCALE
+    )
+}
+
+fn baseline_observations(
+    matrix: &BenchmarkMatrix,
+    dataset: &GoldenDataset,
+) -> Vec<BenchmarkObservation> {
+    matrix
+        .comparators
+        .iter()
+        .map(|comparator| BenchmarkObservation {
+            metric: comparator.metric,
+            measured_value: baseline_value(dataset, comparator.metric),
+        })
+        .collect()
+}
+
+fn set_observation(
+    observations: &mut [BenchmarkObservation],
+    metric: ComparatorMetric,
+    measured_value: u64,
+) {
+    let observation = observations
+        .iter_mut()
+        .find(|candidate| candidate.metric == metric)
+        .expect("metric observation exists");
+    observation.measured_value = measured_value;
+}
+
+fn classify_regression_scope(entries: &[BenchmarkDriftEntry]) -> DriftRegressionScope {
+    let failing_paths: BTreeSet<_> = entries
+        .iter()
+        .filter(|entry| entry.verdict == DriftVerdict::Fail)
+        .map(|entry| entry.path)
+        .collect();
+
+    match failing_paths.len() {
+        0 => DriftRegressionScope::None,
+        1 => DriftRegressionScope::SinglePhase,
+        _ => DriftRegressionScope::MultiPhase,
+    }
+}
+
+fn render_benchmark_drift_markdown(dashboard: &BenchmarkDriftDashboard) -> String {
+    let mut out = String::new();
+    out.push_str("# Benchmark Drift Dashboard\n\n");
+    write!(
+        &mut out,
+        "- schema_version: {}\n- dataset_profile: {}\n- dataset_version: {}\n- overall_verdict: {}\n- regression_scope: {}\n- replay_command: `{}`\n\n",
+        dashboard.schema_version,
+        dashboard.dataset_profile,
+        dashboard.dataset_version,
+        verdict_id(dashboard.overall_verdict),
+        scope_id(dashboard.regression_scope),
+        dashboard.replay_command,
+    )
+    .expect("write drift dashboard markdown header");
+    out.push_str("| path | metric | baseline | current | threshold | regression | verdict |\n");
+    out.push_str("|---|---|---:|---:|---:|---:|---|\n");
+    for entry in &dashboard.entries {
+        writeln!(
+            &mut out,
+            "| `{}` | `{}` | {} | {} | {} | {} | `{}` |",
+            path_id(entry.path),
+            metric_id(entry.metric),
+            entry.baseline_value,
+            entry.current_value,
+            pct_x100(entry.threshold_pct_x100),
+            pct_x100(entry.regression_pct_x100),
+            verdict_id(entry.verdict),
+        )
+        .expect("write drift dashboard markdown row");
+    }
+    out
+}
+
+fn build_benchmark_drift_dashboard(
+    matrix: &BenchmarkMatrix,
+    dataset: &GoldenDataset,
+    observations: &[BenchmarkObservation],
+) -> BenchmarkDriftDashboard {
+    let entries: Vec<_> = matrix
+        .comparators
+        .iter()
+        .filter_map(|comparator| {
+            let observation = observations
+                .iter()
+                .find(|candidate| candidate.metric == comparator.metric)?;
+            let baseline = baseline_value(dataset, comparator.metric);
+            let threshold_pct_x100 = u64::from(comparator.max_regression_pct) * REGRESSION_SCALE;
+            let regression =
+                regression_pct_x100(comparator.metric, baseline, observation.measured_value);
+
+            Some(BenchmarkDriftEntry {
+                path: comparator.path,
+                metric: comparator.metric,
+                baseline_value: baseline,
+                current_value: observation.measured_value,
+                threshold_pct_x100,
+                regression_pct_x100: regression,
+                improvement_pct_x100: improvement_pct_x100(
+                    comparator.metric,
+                    baseline,
+                    observation.measured_value,
+                ),
+                direction: drift_direction(comparator.metric, baseline, observation.measured_value),
+                verdict: drift_verdict(regression, threshold_pct_x100),
+            })
+        })
+        .collect();
+
+    let regression_count = entries
+        .iter()
+        .filter(|entry| entry.verdict == DriftVerdict::Fail)
+        .count();
+    let warning_count = entries
+        .iter()
+        .filter(|entry| entry.verdict == DriftVerdict::Warn)
+        .count();
+    let overall_verdict = if regression_count > 0 {
+        DriftVerdict::Fail
+    } else if warning_count > 0 {
+        DriftVerdict::Warn
+    } else {
+        DriftVerdict::Pass
+    };
+    let regression_scope = classify_regression_scope(&entries);
+
+    let mut dashboard = BenchmarkDriftDashboard {
+        schema_version: DRIFT_DASHBOARD_SCHEMA_VERSION.to_owned(),
+        matrix_version: matrix.matrix_version.clone(),
+        dataset_profile: dataset.profile.clone(),
+        dataset_version: dataset.dataset_version.clone(),
+        overall_verdict,
+        regression_scope,
+        metric_count: entries.len(),
+        regression_count,
+        warning_count,
+        entries,
+        replay_command: DRIFT_DASHBOARD_REPLAY_COMMAND.to_owned(),
+        markdown_summary: String::new(),
+    };
+    dashboard.markdown_summary = render_benchmark_drift_markdown(&dashboard);
+    dashboard
+}
+
+fn write_benchmark_drift_dashboard_bundle(
+    out_dir: &Path,
+    dashboard: &BenchmarkDriftDashboard,
+) -> DriftDashboardBundle {
+    fs::create_dir_all(out_dir).expect("create drift dashboard output dir");
+    let json_path = out_dir.join(DRIFT_DASHBOARD_JSON);
+    let markdown_path = out_dir.join(DRIFT_DASHBOARD_MARKDOWN);
+
+    fs::write(
+        &json_path,
+        serde_json::to_vec_pretty(dashboard).expect("serialize drift dashboard"),
+    )
+    .expect("write drift dashboard json");
+    fs::write(&markdown_path, dashboard.markdown_summary.as_bytes())
+        .expect("write drift dashboard markdown");
+
+    DriftDashboardBundle {
+        json_path,
+        markdown_path,
+    }
+}
+
 #[test]
 fn benchmark_matrix_covers_crawl_index_query_tui_paths() {
     let matrix = build_baseline_matrix("small");
@@ -789,6 +1103,127 @@ fn artifact_hashes_are_stable_across_repeated_bundle_generation() {
         manifest_b.samples_sha256,
         sha256_hex_for_file(&bundle_b.samples_path)
     );
+}
+
+#[test]
+fn benchmark_drift_dashboard_classifies_single_phase_regression() {
+    let matrix = build_baseline_matrix("small");
+    let dataset = load_golden_dataset("small");
+    let mut observations = baseline_observations(&matrix, &dataset);
+    set_observation(&mut observations, ComparatorMetric::SearchLatencyP95Ms, 40);
+
+    let dashboard = build_benchmark_drift_dashboard(&matrix, &dataset, &observations);
+
+    assert_eq!(dashboard.schema_version, DRIFT_DASHBOARD_SCHEMA_VERSION);
+    assert_eq!(dashboard.overall_verdict, DriftVerdict::Fail);
+    assert_eq!(
+        dashboard.regression_scope,
+        DriftRegressionScope::SinglePhase
+    );
+    assert_eq!(dashboard.regression_count, 1);
+    assert_eq!(dashboard.warning_count, 0);
+    assert_eq!(dashboard.metric_count, matrix.comparators.len());
+
+    let latency = dashboard
+        .entries
+        .iter()
+        .find(|entry| entry.metric == ComparatorMetric::SearchLatencyP95Ms)
+        .expect("p95 latency entry exists");
+    assert_eq!(latency.path, BenchmarkPath::Query);
+    assert_eq!(latency.direction, DriftDirection::Regressed);
+    assert_eq!(latency.verdict, DriftVerdict::Fail);
+    assert!(latency.regression_pct_x100 > latency.threshold_pct_x100);
+    assert!(dashboard.markdown_summary.contains("single_phase"));
+    assert!(dashboard.markdown_summary.contains("search_latency_p95_ms"));
+    assert_eq!(dashboard.replay_command, DRIFT_DASHBOARD_REPLAY_COMMAND);
+}
+
+#[test]
+fn benchmark_drift_dashboard_classifies_multi_phase_regression() {
+    let matrix = build_baseline_matrix("small");
+    let dataset = load_golden_dataset("small");
+    let mut observations = baseline_observations(&matrix, &dataset);
+    set_observation(
+        &mut observations,
+        ComparatorMetric::IndexingThroughputDocsPerSecond,
+        250,
+    );
+    set_observation(&mut observations, ComparatorMetric::SearchLatencyP99Ms, 70);
+
+    let dashboard = build_benchmark_drift_dashboard(&matrix, &dataset, &observations);
+
+    assert_eq!(dashboard.overall_verdict, DriftVerdict::Fail);
+    assert_eq!(dashboard.regression_scope, DriftRegressionScope::MultiPhase);
+    assert_eq!(dashboard.regression_count, 2);
+
+    let failing_paths: BTreeSet<_> = dashboard
+        .entries
+        .iter()
+        .filter(|entry| entry.verdict == DriftVerdict::Fail)
+        .map(|entry| entry.path)
+        .collect();
+    assert_eq!(
+        failing_paths,
+        BTreeSet::from([BenchmarkPath::Index, BenchmarkPath::Query])
+    );
+    assert!(dashboard.markdown_summary.contains("multi_phase"));
+}
+
+#[test]
+fn benchmark_drift_dashboard_warns_inside_threshold() {
+    let matrix = build_baseline_matrix("small");
+    let dataset = load_golden_dataset("small");
+    let mut observations = baseline_observations(&matrix, &dataset);
+    set_observation(
+        &mut observations,
+        ComparatorMetric::SearchingPeakMemoryMb,
+        260,
+    );
+
+    let dashboard = build_benchmark_drift_dashboard(&matrix, &dataset, &observations);
+
+    assert_eq!(dashboard.overall_verdict, DriftVerdict::Warn);
+    assert_eq!(dashboard.regression_scope, DriftRegressionScope::None);
+    assert_eq!(dashboard.regression_count, 0);
+    assert_eq!(dashboard.warning_count, 1);
+    let memory = dashboard
+        .entries
+        .iter()
+        .find(|entry| entry.metric == ComparatorMetric::SearchingPeakMemoryMb)
+        .expect("search memory entry exists");
+    assert_eq!(memory.verdict, DriftVerdict::Warn);
+    assert!(memory.regression_pct_x100 <= memory.threshold_pct_x100);
+}
+
+#[test]
+fn benchmark_drift_dashboard_bundle_is_deterministic() {
+    let matrix = build_baseline_matrix("small");
+    let dataset = load_golden_dataset("small");
+    let observations = baseline_observations(&matrix, &dataset);
+    let dashboard = build_benchmark_drift_dashboard(&matrix, &dataset, &observations);
+    let temp_a = TempDir::new().expect("create drift dashboard temp dir A");
+    let temp_b = TempDir::new().expect("create drift dashboard temp dir B");
+
+    let bundle_a = write_benchmark_drift_dashboard_bundle(temp_a.path(), &dashboard);
+    let bundle_b = write_benchmark_drift_dashboard_bundle(temp_b.path(), &dashboard);
+
+    let json_a = fs::read_to_string(&bundle_a.json_path).expect("read dashboard json A");
+    let json_b = fs::read_to_string(&bundle_b.json_path).expect("read dashboard json B");
+    let markdown_a =
+        fs::read_to_string(&bundle_a.markdown_path).expect("read dashboard markdown A");
+    let markdown_b =
+        fs::read_to_string(&bundle_b.markdown_path).expect("read dashboard markdown B");
+
+    assert_eq!(json_a, json_b);
+    assert_eq!(markdown_a, markdown_b);
+    assert!(json_a.contains(DRIFT_DASHBOARD_REPLAY_COMMAND));
+    assert!(markdown_a.contains(DRIFT_DASHBOARD_REPLAY_COMMAND));
+
+    let parsed: BenchmarkDriftDashboard =
+        serde_json::from_str(&json_a).expect("parse drift dashboard json");
+    assert_eq!(parsed.overall_verdict, DriftVerdict::Pass);
+    assert_eq!(parsed.regression_scope, DriftRegressionScope::None);
+    assert_eq!(parsed.entries.len(), matrix.comparators.len());
 }
 
 // ── Bootstrap statistical regression detection (bd-2hz.9.8) ───────

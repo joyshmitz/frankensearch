@@ -56,6 +56,8 @@ Benchmark reproducibility anchor for this tier:
 - `crates/frankensearch-fsfs/tests/benchmark_baseline_matrix.rs` MUST be treated as the canonical statistical reproducibility lane.
 - Each run MUST preserve the emitted artifact bundle (`benchmark_manifest.json`, `benchmark_matrix.json`, `samples.jsonl`) and replay command (`cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix -- --nocapture`).
 - The manifest MUST carry stable digest fields for dataset and generated artifacts (`dataset_sha256`, `matrix_sha256`, `samples_sha256`).
+- Benchmark drift dashboards MUST emit deterministic JSON (`benchmark_drift_dashboard.json`) and Markdown (`benchmark_drift_dashboard.md`) with the same metric ordering as the matrix, per-metric thresholds, pass/warn/fail verdicts, and a regression scope of `none`, `single_phase`, or `multi_phase`.
+- Dashboard replay MUST use the exact rch command embedded in the artifact: `RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR rch exec -- cargo test -p frankensearch-fsfs --test benchmark_baseline_matrix benchmark_drift_dashboard -- --nocapture`.
 
 ## Non-Determinism Sources and Required Mitigations
 
