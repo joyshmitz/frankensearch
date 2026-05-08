@@ -424,6 +424,7 @@ pub struct RankingPriorSignals {
     pub recency: Option<f64>,
     pub path: Option<f64>,
     pub project: Option<f64>,
+    pub code_structure: Option<f64>,
 }
 
 impl RankingPriorSignals {
@@ -433,7 +434,14 @@ impl RankingPriorSignals {
             recency,
             path,
             project,
+            code_structure: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_code_structure(mut self, code_structure: Option<f64>) -> Self {
+        self.code_structure = code_structure;
+        self
     }
 }
 
@@ -443,6 +451,7 @@ pub struct RankingPriorWeights {
     pub recency: f64,
     pub path: f64,
     pub project: f64,
+    pub code_structure: f64,
 }
 
 impl RankingPriorWeights {
@@ -452,13 +461,20 @@ impl RankingPriorWeights {
             recency,
             path,
             project,
+            code_structure: 0.0,
         }
+    }
+
+    #[must_use]
+    pub const fn with_code_structure(mut self, code_structure: f64) -> Self {
+        self.code_structure = code_structure;
+        self
     }
 }
 
 impl Default for RankingPriorWeights {
     fn default() -> Self {
-        Self::new(0.12, 0.08, 0.05)
+        Self::new(0.12, 0.08, 0.05).with_code_structure(0.07)
     }
 }
 
@@ -480,17 +496,17 @@ impl RankingPriorTuning {
         match profile {
             PressureProfile::Strict => Self {
                 enabled: true,
-                weights: RankingPriorWeights::new(0.03, 0.02, 0.01),
+                weights: RankingPriorWeights::new(0.03, 0.02, 0.01).with_code_structure(0.02),
                 max_total_boost: 0.002,
             },
             PressureProfile::Performance => Self {
                 enabled: true,
-                weights: RankingPriorWeights::new(0.12, 0.08, 0.05),
+                weights: RankingPriorWeights::new(0.12, 0.08, 0.05).with_code_structure(0.07),
                 max_total_boost: 0.01,
             },
             PressureProfile::Degraded => Self {
                 enabled: true,
-                weights: RankingPriorWeights::new(0.06, 0.03, 0.02),
+                weights: RankingPriorWeights::new(0.06, 0.03, 0.02).with_code_structure(0.03),
                 max_total_boost: 0.004,
             },
         }
@@ -503,16 +519,19 @@ impl RankingPriorTuning {
         let mut recency = sanitize_non_negative(raw_weights.recency);
         let mut path = sanitize_non_negative(raw_weights.path);
         let mut project = sanitize_non_negative(raw_weights.project);
-        let sum = recency + path + project;
+        let mut code_structure = sanitize_non_negative(raw_weights.code_structure);
+        let sum = recency + path + project + code_structure;
         if sum > max_total_boost && sum > 0.0 {
             let scale = max_total_boost / sum;
             recency *= scale;
             path *= scale;
             project *= scale;
+            code_structure *= scale;
         }
         Self {
             enabled: self.enabled,
-            weights: RankingPriorWeights::new(recency, path, project),
+            weights: RankingPriorWeights::new(recency, path, project)
+                .with_code_structure(code_structure),
             max_total_boost,
         }
     }
@@ -525,11 +544,15 @@ impl RankingPriorTuning {
         let recency = sanitize_signal(signals.recency);
         let path = sanitize_signal(signals.path);
         let project = sanitize_signal(signals.project);
+        let code_structure = sanitize_signal(signals.code_structure);
         let boost = self.weights.recency.mul_add(
             recency,
-            self.weights
-                .path
-                .mul_add(path, self.weights.project * project),
+            self.weights.path.mul_add(
+                path,
+                self.weights
+                    .project
+                    .mul_add(project, self.weights.code_structure * code_structure),
+            ),
         );
         boost.clamp(0.0, self.max_total_boost)
     }
@@ -2028,6 +2051,7 @@ mod tests {
         assert!((weights.recency - 0.12).abs() < f64::EPSILON);
         assert!((weights.path - 0.08).abs() < f64::EPSILON);
         assert!((weights.project - 0.05).abs() < f64::EPSILON);
+        assert!((weights.code_structure - 0.07).abs() < f64::EPSILON);
     }
 
     // --- RankingPriorTuning ---
@@ -2058,7 +2082,10 @@ mod tests {
             max_total_boost: 0.01,
         };
         let normalized = tuning.normalized();
-        let sum = normalized.weights.recency + normalized.weights.path + normalized.weights.project;
+        let sum = normalized.weights.recency
+            + normalized.weights.path
+            + normalized.weights.project
+            + normalized.weights.code_structure;
         assert!(sum <= normalized.max_total_boost + 1e-12);
     }
 
@@ -2078,6 +2105,7 @@ mod tests {
         assert!(signals.recency.is_none());
         assert!(signals.path.is_none());
         assert!(signals.project.is_none());
+        assert!(signals.code_structure.is_none());
     }
 
     #[test]
@@ -2086,6 +2114,13 @@ mod tests {
         assert_eq!(signals.recency, Some(0.5));
         assert_eq!(signals.path, Some(0.3));
         assert!(signals.project.is_none());
+        assert!(signals.code_structure.is_none());
+    }
+
+    #[test]
+    fn ranking_prior_signals_with_code_structure() {
+        let signals = RankingPriorSignals::new(None, None, None).with_code_structure(Some(0.75));
+        assert_eq!(signals.code_structure, Some(0.75));
     }
 
     // --- Candidate constructors ---

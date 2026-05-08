@@ -12,6 +12,7 @@ pub mod asupersync_cx;
 pub mod bead_self_doc;
 pub mod catalog;
 pub mod cli_e2e;
+pub mod code_structure_sidecar;
 pub mod concurrency;
 pub mod config;
 pub mod control_plane;
@@ -95,6 +96,14 @@ pub use cli_e2e::{
     build_cli_e2e_filesystem_chaos_bundles, build_default_cli_e2e_bundles,
     default_cli_e2e_filesystem_chaos_scenarios, default_cli_e2e_scenarios,
     replay_command_for_scenario,
+};
+pub use code_structure_sidecar::{
+    CODE_STRUCTURE_SIDECAR_SCHEMA_VERSION, CODE_STRUCTURE_TIE_BREAK_CONTRACT,
+    CodeStructureDocument, CodeStructureLanguage, CodeStructureMatchEvidence,
+    CodeStructureMatchedSignal, CodeStructureRankedCandidate, CodeStructureSidecar,
+    CodeStructureSidecarConfig, CodeStructureSignal, CodeStructureSignalKind,
+    DEFAULT_CODE_STRUCTURE_MAX_BOOST, DEFAULT_CODE_STRUCTURE_WEIGHT, detect_language,
+    extract_code_structure_signals,
 };
 pub use concurrency::{
     AccessMode, ContentionMetrics, ContentionPolicy, ContentionSnapshot, LockLevel, LockOrderGuard,
@@ -251,8 +260,8 @@ pub use progressive_quality_gate::{
 pub use query_execution::{
     CancellationAction, CancellationDirective, CancellationPoint, DegradationOverride,
     DegradationStatus, DegradationTransition, DegradedRetrievalMode, FusedCandidate, FusionPolicy,
-    LexicalCandidate, QueryExecutionOrchestrator, QueryExecutionPlan, RetrievalStage,
-    SemanticCandidate, StagePlan,
+    LexicalCandidate, QueryExecutionOrchestrator, QueryExecutionPlan, RankingPriorSignals,
+    RankingPriorTuning, RankingPriorWeights, RetrievalStage, SemanticCandidate, StagePlan,
 };
 pub use query_expansion::{
     ExpandedQuery, ExpansionResult, ExpansionStrategy, LlmBackend, expand_query,
