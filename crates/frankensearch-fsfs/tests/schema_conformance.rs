@@ -72,6 +72,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-config-") {
         return "fsfs-config-v1.schema.json";
     }
+    if name.starts_with("fsfs-corpus-privacy-preflight-") {
+        return "fsfs-corpus-privacy-preflight-v1.schema.json";
+    }
     if name.starts_with("fsfs-degraded-incident-suite-") {
         return "fsfs-degraded-incident-suite-v1.schema.json";
     }
@@ -447,6 +450,69 @@ fn test_scope_scan_decision_conformance() {
     let parsed: frankensearch_fsfs::privacy::ScopeScanDecision =
         serde_json::from_str(&raw).expect("parse scope scan decision");
     assert_golden_json("fsfs_scope_scan_decision_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_corpus_privacy_preflight_contract_conformance() {
+    let path = fixture_dir().join("fsfs-corpus-privacy-preflight-contract-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::privacy::CorpusPrivacyPreflightContractDefinition =
+        serde_json::from_str(&raw).expect("parse corpus privacy preflight contract");
+    parsed
+        .validate()
+        .expect("corpus privacy preflight contract should validate");
+    assert_golden_json(
+        "fsfs_corpus_privacy_preflight_contract_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_corpus_privacy_preflight_report_conformance() {
+    let path = fixture_dir().join("fsfs-corpus-privacy-preflight-report-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::privacy::CorpusPrivacyPreflightReport =
+        serde_json::from_str(&raw).expect("parse corpus privacy preflight report");
+    parsed
+        .validate()
+        .expect("corpus privacy preflight report should validate");
+    assert_golden_json("fsfs_corpus_privacy_preflight_report_roundtrip_v1", &parsed);
+}
+
+#[test]
+fn test_corpus_privacy_preflight_override_conformance() {
+    let path = fixture_dir().join("fsfs-corpus-privacy-preflight-override-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let parsed: frankensearch_fsfs::privacy::CorpusPrivacyPreflightReport =
+        serde_json::from_str(&raw).expect("parse corpus privacy preflight override");
+    parsed
+        .validate()
+        .expect("corpus privacy preflight override should validate");
+    assert_golden_json(
+        "fsfs_corpus_privacy_preflight_override_roundtrip_v1",
+        &parsed,
+    );
+}
+
+#[test]
+fn test_corpus_privacy_preflight_invalid_fixtures_are_rejected_by_rust() {
+    for fixture in [
+        "fsfs-corpus-privacy-preflight-invalid-raw-content-v1.json",
+        "fsfs-corpus-privacy-preflight-invalid-destructive-cleanup-v1.json",
+        "fsfs-corpus-privacy-preflight-invalid-override-missing-reason-v1.json",
+    ] {
+        let path = invalid_fixture_dir().join(fixture);
+        let raw = std::fs::read_to_string(&path).expect("read invalid fixture");
+        let parsed: frankensearch_fsfs::privacy::CorpusPrivacyPreflightReport =
+            serde_json::from_str(&raw).expect("parse invalid corpus privacy preflight report");
+        let error = parsed
+            .validate()
+            .expect_err("invalid corpus privacy preflight report should fail validation");
+        assert!(
+            !error.to_string().is_empty(),
+            "fixture {fixture} produced an empty validation error"
+        );
+    }
 }
 
 #[test]

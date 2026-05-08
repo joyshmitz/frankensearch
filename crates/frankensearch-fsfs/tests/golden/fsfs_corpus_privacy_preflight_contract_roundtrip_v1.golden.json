@@ -1,0 +1,90 @@
+{
+  "kind": "fsfs_corpus_privacy_preflight_contract",
+  "v": 1,
+  "dry_run_only": true,
+  "destructive_cleanup_allowed": false,
+  "redaction_profile": "privacy-preflight-v1-default",
+  "rule_matrix": [
+    {
+      "rule_id": "credential-token",
+      "signal": "credential_token",
+      "default_decision": "skip",
+      "reason_code": "privacy.secret.token",
+      "redaction_action": "mask_excerpt",
+      "override_allowed": true,
+      "false_positive_suppressions": [
+        "documented-placeholder",
+        "test-fixture-token"
+      ]
+    },
+    {
+      "rule_id": "private-key",
+      "signal": "private_key",
+      "default_decision": "skip",
+      "reason_code": "privacy.secret.private_key",
+      "redaction_action": "drop_content",
+      "override_allowed": false,
+      "false_positive_suppressions": []
+    },
+    {
+      "rule_id": "generated-artifact",
+      "signal": "generated_artifact",
+      "default_decision": "defer",
+      "reason_code": "privacy.artifact.generated",
+      "redaction_action": "metadata_only",
+      "override_allowed": true,
+      "false_positive_suppressions": [
+        "checked-in-golden"
+      ]
+    },
+    {
+      "rule_id": "oversized-binary",
+      "signal": "oversized_binary",
+      "default_decision": "defer",
+      "reason_code": "privacy.artifact.oversized_binary",
+      "redaction_action": "metadata_only",
+      "override_allowed": false,
+      "false_positive_suppressions": []
+    },
+    {
+      "rule_id": "sensitive-path",
+      "signal": "sensitive_path",
+      "default_decision": "skip",
+      "reason_code": "privacy.path.sensitive",
+      "redaction_action": "hash_path",
+      "override_allowed": false,
+      "false_positive_suppressions": []
+    },
+    {
+      "rule_id": "personal-data",
+      "signal": "personal_data",
+      "default_decision": "skip",
+      "reason_code": "privacy.personal_data.detected",
+      "redaction_action": "mask_excerpt",
+      "override_allowed": true,
+      "false_positive_suppressions": [
+        "public-contact-page"
+      ]
+    },
+    {
+      "rule_id": "token-doc-false-positive",
+      "signal": "credential_token",
+      "default_decision": "include",
+      "reason_code": "privacy.false_positive.suppressed",
+      "redaction_action": "mask_excerpt",
+      "override_allowed": false,
+      "false_positive_suppressions": [
+        "documented-placeholder"
+      ]
+    }
+  ],
+  "required_report_fields": [
+    "run_id",
+    "dry_run",
+    "config_hash",
+    "redaction_profile",
+    "decisions",
+    "summary",
+    "replay_command"
+  ]
+}

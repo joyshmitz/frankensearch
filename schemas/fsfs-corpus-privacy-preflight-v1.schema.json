@@ -1,0 +1,429 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/fsfs-corpus-privacy-preflight-v1.schema.json",
+  "title": "fsfs Corpus Privacy Preflight Contract v1",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/contractDefinition"
+    },
+    {
+      "$ref": "#/$defs/preflightReport"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^privacy\\.[a-z0-9_.]+$"
+    },
+    "signal": {
+      "type": "string",
+      "enum": [
+        "credential_token",
+        "private_key",
+        "generated_artifact",
+        "oversized_binary",
+        "sensitive_path",
+        "personal_data"
+      ]
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "include",
+        "skip",
+        "defer"
+      ]
+    },
+    "redactionAction": {
+      "type": "string",
+      "enum": [
+        "drop_content",
+        "hash_path",
+        "mask_excerpt",
+        "metadata_only"
+      ]
+    },
+    "contractDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "dry_run_only",
+        "destructive_cleanup_allowed",
+        "redaction_profile",
+        "rule_matrix",
+        "required_report_fields"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_corpus_privacy_preflight_contract"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "dry_run_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "destructive_cleanup_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "redaction_profile": {
+          "type": "string",
+          "const": "privacy-preflight-v1-default"
+        },
+        "rule_matrix": {
+          "type": "array",
+          "minItems": 6,
+          "items": {
+            "$ref": "#/$defs/rule"
+          }
+        },
+        "required_report_fields": {
+          "type": "array",
+          "minItems": 6,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "signal",
+        "default_decision",
+        "reason_code",
+        "redaction_action",
+        "override_allowed",
+        "false_positive_suppressions"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "signal": {
+          "$ref": "#/$defs/signal"
+        },
+        "default_decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "redaction_action": {
+          "$ref": "#/$defs/redactionAction"
+        },
+        "override_allowed": {
+          "type": "boolean"
+        },
+        "false_positive_suppressions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "preflightReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "v",
+        "run_id",
+        "generated_at",
+        "dry_run",
+        "root",
+        "config_hash",
+        "redaction_profile",
+        "replay_command",
+        "destructive_cleanup_allowed",
+        "decisions",
+        "summary"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "fsfs_corpus_privacy_preflight_report"
+        },
+        "v": {
+          "type": "integer",
+          "const": 1
+        },
+        "run_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "generated_at": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dry_run": {
+          "type": "boolean",
+          "const": true
+        },
+        "root": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "config_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "redaction_profile": {
+          "type": "string",
+          "const": "privacy-preflight-v1-default"
+        },
+        "replay_command": {
+          "type": "string",
+          "minLength": 1
+        },
+        "destructive_cleanup_allowed": {
+          "type": "boolean",
+          "const": false
+        },
+        "decisions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/fileDecision"
+          }
+        },
+        "summary": {
+          "$ref": "#/$defs/summary"
+        }
+      }
+    },
+    "fileDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "decision",
+        "reason_code",
+        "signals",
+        "sensitive_classes",
+        "redaction_action",
+        "evidence",
+        "semantic_index_allowed",
+        "lexical_index_allowed",
+        "evidence_emit_allowed"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "signals": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/signal"
+          }
+        },
+        "sensitive_classes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "redaction_action": {
+          "$ref": "#/$defs/redactionAction"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "semantic_index_allowed": {
+          "type": "boolean"
+        },
+        "lexical_index_allowed": {
+          "type": "boolean"
+        },
+        "evidence_emit_allowed": {
+          "type": "boolean",
+          "const": true
+        },
+        "false_positive_suppression_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "override_event": {
+          "$ref": "#/$defs/overrideEvent"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "decision": {
+                "enum": [
+                  "skip",
+                  "defer"
+                ]
+              }
+            },
+            "required": [
+              "decision"
+            ]
+          },
+          "then": {
+            "properties": {
+              "semantic_index_allowed": {
+                "const": false
+              },
+              "lexical_index_allowed": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason_code": {
+                "const": "privacy.false_positive.suppressed"
+              }
+            },
+            "required": [
+              "reason_code"
+            ]
+          },
+          "then": {
+            "required": [
+              "false_positive_suppression_id"
+            ]
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "sample_hash",
+        "redacted_excerpt",
+        "raw_content_present",
+        "redaction_applied"
+      ],
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sample_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "redacted_excerpt": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_content_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "redaction_applied": {
+          "type": "boolean",
+          "const": true
+        }
+      }
+    },
+    "overrideEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_decision",
+        "approved",
+        "reason",
+        "reason_code",
+        "expires_at"
+      ],
+      "properties": {
+        "requested_decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "approved": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason_code": {
+          "$ref": "#/$defs/reasonCode"
+        },
+        "expires_at": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "included",
+        "skipped",
+        "deferred",
+        "overrides_applied",
+        "false_positive_suppressions",
+        "raw_content_present",
+        "destructive_cleanup_allowed"
+      ],
+      "properties": {
+        "included": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deferred": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "overrides_applied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "false_positive_suppressions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_content_present": {
+          "type": "boolean",
+          "const": false
+        },
+        "destructive_cleanup_allowed": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    }
+  }
+}

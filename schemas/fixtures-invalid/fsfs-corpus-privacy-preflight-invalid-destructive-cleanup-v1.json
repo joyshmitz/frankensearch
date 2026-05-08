@@ -1,0 +1,43 @@
+{
+  "kind": "fsfs_corpus_privacy_preflight_report",
+  "v": 1,
+  "run_id": "privacy-preflight-invalid-cleanup",
+  "generated_at": "2026-05-08T00:00:00Z",
+  "dry_run": true,
+  "root": "/home/ubuntu/project",
+  "config_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "redaction_profile": "privacy-preflight-v1-default",
+  "replay_command": "scripts/check_fsfs_corpus_privacy_preflight.sh --mode e2e",
+  "destructive_cleanup_allowed": true,
+  "decisions": [
+    {
+      "path": "/home/ubuntu/project/target/debug/app",
+      "decision": "defer",
+      "reason_code": "privacy.artifact.generated",
+      "signals": [
+        "generated_artifact"
+      ],
+      "sensitive_classes": [],
+      "redaction_action": "metadata_only",
+      "evidence": {
+        "evidence_id": "cleanup-plan",
+        "sample_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "redacted_excerpt": "<metadata-only>",
+        "raw_content_present": false,
+        "redaction_applied": true
+      },
+      "semantic_index_allowed": false,
+      "lexical_index_allowed": false,
+      "evidence_emit_allowed": true
+    }
+  ],
+  "summary": {
+    "included": 0,
+    "skipped": 0,
+    "deferred": 1,
+    "overrides_applied": 0,
+    "false_positive_suppressions": 0,
+    "raw_content_present": false,
+    "destructive_cleanup_allowed": true
+  }
+}

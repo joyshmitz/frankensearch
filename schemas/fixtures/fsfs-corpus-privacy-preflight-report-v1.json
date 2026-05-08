@@ -1,0 +1,137 @@
+{
+  "kind": "fsfs_corpus_privacy_preflight_report",
+  "v": 1,
+  "run_id": "privacy-preflight-smoke-001",
+  "generated_at": "2026-05-08T00:00:00Z",
+  "dry_run": true,
+  "root": "/home/ubuntu/project",
+  "config_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "redaction_profile": "privacy-preflight-v1-default",
+  "replay_command": "scripts/check_fsfs_corpus_privacy_preflight.sh --mode smoke",
+  "destructive_cleanup_allowed": false,
+  "decisions": [
+    {
+      "path": "/home/ubuntu/.ssh/id_ed25519",
+      "decision": "skip",
+      "reason_code": "privacy.secret.private_key",
+      "signals": [
+        "private_key",
+        "sensitive_path"
+      ],
+      "sensitive_classes": [
+        "private_keys",
+        "ssh_material"
+      ],
+      "redaction_action": "drop_content",
+      "evidence": {
+        "evidence_id": "ssh-key",
+        "sample_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "redacted_excerpt": "<redacted:private_key>",
+        "raw_content_present": false,
+        "redaction_applied": true
+      },
+      "semantic_index_allowed": false,
+      "lexical_index_allowed": false,
+      "evidence_emit_allowed": true
+    },
+    {
+      "path": "/home/ubuntu/project/.env",
+      "decision": "skip",
+      "reason_code": "privacy.secret.token",
+      "signals": [
+        "credential_token"
+      ],
+      "sensitive_classes": [
+        "credentials",
+        "tokens"
+      ],
+      "redaction_action": "mask_excerpt",
+      "evidence": {
+        "evidence_id": "env-token",
+        "sample_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "redacted_excerpt": "<redacted:credential_token>",
+        "raw_content_present": false,
+        "redaction_applied": true
+      },
+      "semantic_index_allowed": false,
+      "lexical_index_allowed": false,
+      "evidence_emit_allowed": true
+    },
+    {
+      "path": "/home/ubuntu/project/target/debug/app",
+      "decision": "defer",
+      "reason_code": "privacy.artifact.generated",
+      "signals": [
+        "generated_artifact",
+        "oversized_binary"
+      ],
+      "sensitive_classes": [],
+      "redaction_action": "metadata_only",
+      "evidence": {
+        "evidence_id": "target-binary",
+        "sample_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "redacted_excerpt": "<metadata-only>",
+        "raw_content_present": false,
+        "redaction_applied": true
+      },
+      "semantic_index_allowed": false,
+      "lexical_index_allowed": false,
+      "evidence_emit_allowed": true
+    },
+    {
+      "path": "/home/ubuntu/project/docs/token-format.md",
+      "decision": "include",
+      "reason_code": "privacy.false_positive.suppressed",
+      "signals": [
+        "credential_token"
+      ],
+      "sensitive_classes": [
+        "tokens"
+      ],
+      "redaction_action": "mask_excerpt",
+      "evidence": {
+        "evidence_id": "token-doc",
+        "sample_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "redacted_excerpt": "example token shape <redacted:placeholder>",
+        "raw_content_present": false,
+        "redaction_applied": true
+      },
+      "semantic_index_allowed": true,
+      "lexical_index_allowed": true,
+      "evidence_emit_allowed": true,
+      "false_positive_suppression_id": "documented-placeholder"
+    },
+    {
+      "path": "/home/ubuntu/project/export/customer_dump.bin",
+      "decision": "defer",
+      "reason_code": "privacy.artifact.oversized_binary",
+      "signals": [
+        "oversized_binary",
+        "personal_data"
+      ],
+      "sensitive_classes": [
+        "personal_data"
+      ],
+      "redaction_action": "metadata_only",
+      "evidence": {
+        "evidence_id": "customer-dump",
+        "sample_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "redacted_excerpt": "<metadata-only>",
+        "raw_content_present": false,
+        "redaction_applied": true
+      },
+      "semantic_index_allowed": false,
+      "lexical_index_allowed": false,
+      "evidence_emit_allowed": true
+    }
+  ],
+  "summary": {
+    "included": 1,
+    "skipped": 2,
+    "deferred": 2,
+    "overrides_applied": 0,
+    "false_positive_suppressions": 1,
+    "raw_content_present": false,
+    "destructive_cleanup_allowed": false
+  }
+}

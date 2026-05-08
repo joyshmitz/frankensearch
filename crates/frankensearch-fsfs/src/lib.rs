@@ -203,6 +203,17 @@ pub use pressure_sensing::{
     ControlState, HostSampler, PressureSample, PressureSensor,
     PressureThresholds as SensingThresholds, SmoothedReadings, ThresholdPair,
 };
+pub use privacy::{
+    CORPUS_PRIVACY_PREFLIGHT_CONTRACT_KIND, CORPUS_PRIVACY_PREFLIGHT_REDACTION_PROFILE,
+    CORPUS_PRIVACY_PREFLIGHT_REPORT_KIND, CORPUS_PRIVACY_PREFLIGHT_SCHEMA_VERSION,
+    CorpusPreflightDecision, CorpusPreflightEvidence, CorpusPreflightFileDecision,
+    CorpusPreflightOverride, CorpusPreflightRedactionAction, CorpusPreflightRule,
+    CorpusPreflightSignal, CorpusPreflightSummary, CorpusPrivacyPreflightContractDefinition,
+    CorpusPrivacyPreflightReport, CorpusPrivacyPreflightViolation, PathPolicies, RedactedArtifact,
+    RedactionConfig, ScopeDefaults, ScopePrivacyContractDefinition, ScopeScanDecision,
+    TelemetryEmissionRules, ThreatModel, corpus_privacy_preflight_contract_definition,
+    corpus_privacy_preflight_override_fixture, corpus_privacy_preflight_report_fixture,
+};
 pub use profiling::{
     CRAWL_INGEST_OPT_TRACK_SCHEMA_VERSION, CorpusProfileSnapshot, CrawlIngestHotspot,
     CrawlIngestOptimizationTrack, CrawlIngestStage, HostProfileSnapshot, ITERATION_REASON_ACCEPTED,
