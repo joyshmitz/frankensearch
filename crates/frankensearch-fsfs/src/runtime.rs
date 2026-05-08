@@ -72,6 +72,10 @@ use crate::config::{
     default_project_config_file_path, default_user_config_file_path,
 };
 use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingExplanation};
+use crate::file_classification::{
+    FileClassificationContractDefinition, FileClassificationDecision,
+    IngestAction as FileClassificationIngestAction,
+};
 use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
     ResourceLimits, ResourceUsage, WatchdogConfig,
@@ -315,7 +319,6 @@ const FSFS_VECTOR_INDEX_FILE: &str = "vector/index.fsvi";
 const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
 const EXPLAIN_SESSION_SCHEMA_VERSION: &str = "fsfs.explain.session.v1";
 const REASON_DISCOVERY_FILE_EXCLUDED: &str = "discovery.file.excluded";
-const REASON_DISCOVERY_FILE_BINARY_BLOCKED: &str = "discovery.file.binary_blocked";
 const REASON_DISCOVERY_FILE_PERMISSION_DENIED: &str = "discovery.file.permission_denied";
 const ROOT_PROBE_MAX_DEPTH: usize = 2;
 const ROOT_PROBE_MAX_ENTRIES_PER_DIR: usize = 512;
@@ -1849,6 +1852,7 @@ impl LiveIngestPipeline {
 
         // PDF files are binary but contain extractable text.
         // Try PDF extraction before the generic binary check.
+        let mut classification_metadata = None;
         let canonical = if is_pdf_file(&abs_path) {
             match try_extract_pdf_text(&bytes, &abs_path) {
                 Some(pdf_text) => self.canonicalizer.canonicalize(&pdf_text),
@@ -1858,12 +1862,16 @@ impl LiveIngestPipeline {
                     return Ok(true);
                 }
             }
-        } else if is_probably_binary(&bytes) {
-            self.prune_indexes(cx, &rel_key).await?;
-            Self::purge_storage_document(storage_ctx, &rel_key)?;
-            return Ok(true);
         } else {
+            let classification = classify_file_for_ingest(&abs_path, &bytes);
+            if !file_classification_allows_index(&classification) {
+                self.prune_indexes(cx, &rel_key).await?;
+                Self::purge_storage_document(storage_ctx, &rel_key)?;
+                return Ok(true);
+            }
+
             let raw_text = String::from_utf8_lossy(&bytes);
+            classification_metadata = Some(classification);
             self.canonicalizer.canonicalize(&raw_text)
         };
 
@@ -1878,7 +1886,11 @@ impl LiveIngestPipeline {
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or_default()
             .to_owned();
-        let doc = IndexableDocument::new(rel_key.clone(), canonical.clone()).with_title(file_name);
+        let mut doc =
+            IndexableDocument::new(rel_key.clone(), canonical.clone()).with_title(file_name);
+        if let Some(classification) = classification_metadata.as_ref() {
+            doc = attach_file_classification_metadata(doc, classification);
+        }
         self.lexical_index.index_document(cx, &doc).await?;
 
         if matches!(ingestion_class, IngestionClass::FullSemanticLexical) {
@@ -8179,6 +8191,7 @@ impl FsfsRuntime {
         let lexical_index = TantivyIndex::create(&lexical_path)?;
 
         let canonicalizer = DefaultCanonicalizer::default();
+        let file_classification_contract = FileClassificationContractDefinition::default();
         let mut manifests = Vec::new();
         let mut observed_reason_codes: BTreeSet<String> =
             stats.reason_codes.iter().cloned().collect();
@@ -8233,6 +8246,7 @@ impl FsfsRuntime {
 
                 // PDF files are binary but contain extractable text.
                 // Try PDF extraction before the generic binary check.
+                let mut classification_metadata = None;
                 let canonical = if is_pdf_file(&candidate.file_path) {
                     match try_extract_pdf_text(&bytes, &candidate.file_path) {
                         Some(pdf_text) => canonicalizer.canonicalize(&pdf_text),
@@ -8241,12 +8255,18 @@ impl FsfsRuntime {
                             continue;
                         }
                     }
-                } else if is_probably_binary(&bytes) {
-                    observed_reason_codes.insert(REASON_DISCOVERY_FILE_BINARY_BLOCKED.to_owned());
-                    content_skipped_files = content_skipped_files.saturating_add(1);
-                    continue;
                 } else {
+                    let path_for_contract = candidate.file_path.to_string_lossy();
+                    let classification = file_classification_contract
+                        .classify_bytes(path_for_contract.as_ref(), &bytes);
+                    observed_reason_codes.insert(classification.reason_code.clone());
+                    if !file_classification_allows_index(&classification) {
+                        content_skipped_files = content_skipped_files.saturating_add(1);
+                        continue;
+                    }
+
                     let raw_text = String::from_utf8_lossy(&bytes);
+                    classification_metadata = Some(classification);
                     canonicalizer.canonicalize(&raw_text)
                 };
 
@@ -8284,11 +8304,14 @@ impl FsfsRuntime {
                     .and_then(std::ffi::OsStr::to_str)
                     .unwrap_or_default()
                     .to_owned();
-                let doc = IndexableDocument::new(candidate.file_key.clone(), canonical)
+                let mut doc = IndexableDocument::new(candidate.file_key.clone(), canonical)
                     .with_title(file_name)
                     .with_metadata("source_path", candidate.file_path.display().to_string())
                     .with_metadata("ingestion_class", ingestion_class.clone())
                     .with_metadata("source_modified_ms", candidate.modified_ms.to_string());
+                if let Some(classification) = classification_metadata.as_ref() {
+                    doc = attach_file_classification_metadata(doc, classification);
+                }
 
                 if matches!(
                     candidate.ingestion_class,
@@ -8655,18 +8678,23 @@ impl FsfsRuntime {
                                     break;
                                 }
                             }
-                        } else if is_probably_binary(&bytes) {
-                            upgrade_failed = true;
-                            push_warning(
-                                &mut recent_warnings,
-                                IndexingWarningSeverity::Error,
-                                format!(
-                                    "Semantic upgrade aborted: binary file {}",
-                                    source_path.display()
-                                ),
-                            );
-                            break;
                         } else {
+                            let classification = classify_file_for_ingest(&source_path, &bytes);
+                            if !file_classification_allows_index(&classification) {
+                                upgrade_failed = true;
+                                push_warning(
+                                    &mut recent_warnings,
+                                    IndexingWarningSeverity::Error,
+                                    format!(
+                                        "Semantic upgrade aborted: {} classified as {:?} ({})",
+                                        source_path.display(),
+                                        classification.detected_type,
+                                        classification.reason_code
+                                    ),
+                                );
+                                break;
+                            }
+
                             let raw_text = String::from_utf8_lossy(&bytes);
                             canonicalizer.canonicalize(&raw_text)
                         };
@@ -14837,31 +14865,66 @@ fn index_source_hash_hex(manifests: &[IndexManifestEntry]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-fn is_probably_binary(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    if data.contains(&0) {
-        return true;
-    }
-
-    let control_count = data
-        .iter()
-        .filter(|byte| {
-            matches!(
-                **byte,
-                0x01..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F
-            )
-        })
-        .count();
-    control_count.saturating_mul(5) > data.len()
-}
-
 /// Returns `true` if the file path has a `.pdf` extension (case-insensitive).
 fn is_pdf_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+fn classify_file_for_ingest(path: &Path, bytes: &[u8]) -> FileClassificationDecision {
+    let path_for_contract = path.to_string_lossy();
+    FileClassificationContractDefinition::default()
+        .classify_bytes(path_for_contract.as_ref(), bytes)
+}
+
+fn file_classification_allows_index(decision: &FileClassificationDecision) -> bool {
+    matches!(
+        &decision.ingest_action,
+        FileClassificationIngestAction::Index
+            | FileClassificationIngestAction::IndexPartialWithFlag
+    )
+}
+
+fn attach_file_classification_metadata(
+    doc: IndexableDocument,
+    decision: &FileClassificationDecision,
+) -> IndexableDocument {
+    doc.with_metadata(
+        "file_classification_detected_type",
+        file_classification_type_label(decision),
+    )
+    .with_metadata(
+        "file_classification_ingest_action",
+        file_classification_action_label(decision),
+    )
+    .with_metadata(
+        "file_classification_reason_code",
+        decision.reason_code.clone(),
+    )
+    .with_metadata(
+        "file_classification_confidence",
+        format!("{:.3}", decision.classification_confidence),
+    )
+}
+
+fn file_classification_type_label(decision: &FileClassificationDecision) -> &'static str {
+    match &decision.detected_type {
+        crate::file_classification::DetectedType::Text => "text",
+        crate::file_classification::DetectedType::Binary => "binary",
+        crate::file_classification::DetectedType::Archive => "archive",
+        crate::file_classification::DetectedType::Partial => "partial",
+        crate::file_classification::DetectedType::Corrupt => "corrupt",
+    }
+}
+
+fn file_classification_action_label(decision: &FileClassificationDecision) -> &'static str {
+    match &decision.ingest_action {
+        FileClassificationIngestAction::Index => "index",
+        FileClassificationIngestAction::Skip => "skip",
+        FileClassificationIngestAction::Quarantine => "quarantine",
+        FileClassificationIngestAction::IndexPartialWithFlag => "index_partial_with_flag",
+    }
 }
 
 /// Attempt to extract text from a digital PDF (one with selectable text).
@@ -17163,6 +17226,8 @@ mod tests {
             )
             .expect("write file");
             fs::write(project.join("README.md"), "# demo\nindex me\n").expect("readme");
+            fs::write(project.join("binary.txt"), [0_u8, 17, 2, 144, 0, 31, 7, 0])
+                .expect("binary fixture");
 
             let mut config = FsfsConfig::default();
             config.storage.index_dir = ".frankensearch".to_owned();
@@ -17189,8 +17254,15 @@ mod tests {
                 serde_json::from_str(&sentinel_raw).expect("parse sentinel");
             assert_eq!(sentinel.schema_version, 1);
             assert_eq!(sentinel.command, "index");
-            assert!(sentinel.discovered_files >= 2);
+            assert!(sentinel.discovered_files >= 3);
             assert!(sentinel.indexed_files >= 1);
+            assert!(sentinel.skipped_files >= 1);
+            assert!(
+                sentinel
+                    .reason_codes
+                    .iter()
+                    .any(|code| code == "FSFS_BINARY_NULL_BYTE_DETECTED")
+            );
             assert!(!sentinel.source_hash_hex.is_empty());
 
             let vector_index = VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
