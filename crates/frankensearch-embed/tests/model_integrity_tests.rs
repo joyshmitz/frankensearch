@@ -7,6 +7,7 @@
 //! - `verify_dir_cached()` for the combined cached-verification workflow
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 use frankensearch_embed::{
     MANIFEST_SCHEMA_VERSION, ModelFile, ModelManifest, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD,
@@ -21,7 +22,16 @@ use frankensearch_embed::{
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    lower_hex(hasher.finalize())
+}
+
+fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn make_manifest(file_name: &str, content: &[u8]) -> ModelManifest {

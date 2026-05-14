@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use crate::SearchError;
 
@@ -322,7 +323,16 @@ pub fn compute_manifest_hash(manifest: &GenerationManifest) -> crate::SearchResu
             subsystem: "generation_manifest",
             source: Box::new(source),
         })?;
-    Ok(format!("{:x}", Sha256::digest(serialized)))
+    Ok(lower_hex(Sha256::digest(serialized)))
+}
+
+fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Convert a validation result into a `SearchResult`, producing an error

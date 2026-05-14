@@ -2673,7 +2673,10 @@ mod cass_query_tests {
         let query = cass_build_tantivy_query("搜索", &CassQueryFilters::default(), &fields);
 
         let results = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
+            )
             .expect("search");
         assert!(
             !results.is_empty(),
@@ -2711,7 +2714,10 @@ mod cass_query_tests {
         let query = cass_build_tantivy_query("テスト", &CassQueryFilters::default(), &fields);
 
         let results = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
+            )
             .expect("search");
         assert!(
             !results.is_empty(),
@@ -2749,7 +2755,10 @@ mod cass_query_tests {
         let query = cass_build_tantivy_query("검색", &CassQueryFilters::default(), &fields);
 
         let results = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+            .search(
+                &query,
+                &tantivy::collector::TopDocs::with_limit(10).order_by_score(),
+            )
             .expect("search");
         assert!(
             !results.is_empty(),

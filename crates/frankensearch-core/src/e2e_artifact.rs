@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Number;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use thiserror::Error;
 
 /// Schema version for the e2e artifact envelope.
@@ -319,8 +320,16 @@ pub fn normalize_replay_command(command: &str) -> String {
 /// Compute a canonical SHA-256 checksum string for artifact payload bytes.
 #[must_use]
 pub fn sha256_checksum(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("sha256:{digest:x}")
+    format!("sha256:{}", lower_hex(Sha256::digest(bytes)))
+}
+
+fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Build deterministic manifest artifact entries from raw artifact payloads.

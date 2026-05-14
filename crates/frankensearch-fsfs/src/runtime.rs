@@ -2355,7 +2355,18 @@ fn compute_sha256_of_file(path: &Path) -> SearchResult<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha256_digest_hex(hasher.finalize()))
+}
+
+fn sha256_digest_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    hex
 }
 
 fn create_secure_update_temp_dir() -> SearchResult<PathBuf> {
@@ -5140,7 +5151,7 @@ impl FsfsRuntime {
             .or_else(|_| std::env::current_dir().map_err(SearchError::Io))?;
         let mut hasher = Sha256::new();
         hasher.update(index_root.display().to_string().as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = sha256_digest_hex(hasher.finalize());
         let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
         let runtime_base = dirs::runtime_dir()
             .or_else(|| dirs::cache_dir().map(|dir| dir.join("run")))
@@ -5742,7 +5753,7 @@ impl FsfsRuntime {
         hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
         hasher.update([u8::from(key.fast_only)]);
         hasher.update(key.rrf_k_milli.to_le_bytes());
-        format!("{:x}", hasher.finalize())
+        sha256_digest_hex(hasher.finalize())
     }
 
     fn search_cache_path(&self, key: &SearchCacheKey) -> SearchResult<PathBuf> {
@@ -5783,7 +5794,7 @@ impl FsfsRuntime {
             }
         }
 
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(sha256_digest_hex(hasher.finalize()))
     }
 
     fn try_load_search_payload_cache(

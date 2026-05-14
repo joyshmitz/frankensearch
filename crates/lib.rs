@@ -223,7 +223,12 @@ pub fn execute_query_with_offset(
     let (top_docs, total_count) = searcher
         .search(
             query,
-            &(TopDocs::with_limit(limit).and_offset(offset), Count),
+            &(
+                TopDocs::with_limit(limit)
+                    .and_offset(offset)
+                    .order_by_score(),
+                Count,
+            ),
         )
         .map_err(|e| SearchError::SubsystemError {
             subsystem: "tantivy",
@@ -751,7 +756,7 @@ impl LexicalSearch for TantivyIndex {
 
             let searcher = self.reader.searcher();
             let top_docs = searcher
-                .search(&*parsed, &TopDocs::with_limit(limit))
+                .search(&*parsed, &TopDocs::with_limit(limit).order_by_score())
                 .map_err(|e| SearchError::SubsystemError {
                     subsystem: "tantivy",
                     source: Box::new(e),

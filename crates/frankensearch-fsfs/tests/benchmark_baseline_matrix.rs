@@ -581,7 +581,16 @@ fn sha256_hex_for_file(path: &Path) -> String {
         hasher.update(&buffer[..read]);
     }
 
-    format!("{:x}", hasher.finalize())
+    lower_hex(hasher.finalize())
+}
+
+fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn sample_payload(case: &BenchmarkCase, dataset: &GoldenDataset) -> serde_json::Value {

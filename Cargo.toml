@@ -87,10 +87,10 @@ fastembed = { version = "5.11.0", default-features = false, features = [
     "image-models",
 ] }
 safetensors = "0.7.0"
-tokenizers = "0.22.2"
+tokenizers = "0.23.1"
 
 # Full-text search
-tantivy = "0.25.0"
+tantivy = "0.26.1"
 
 # ONNX Runtime for cross-encoder reranking
 # Match fastembed's TLS choice: rustls-only so musl/aarch64 cross builds
@@ -117,7 +117,7 @@ dirs = "6"
 toml = "1.0.3"
 
 # SHA-256 verification for model manifests
-sha2 = "0.10"
+sha2 = "0.11.0"
 
 # PDF text extraction (digital PDFs with selectable text)
 pdf-extract = "0.10"
