@@ -602,14 +602,9 @@ fn map_lock_error(model: &str, error: LockError) -> SearchError {
             model: model.to_owned(),
             source: "reranker mutex poisoned".into(),
         },
-        LockError::PolledAfterCompletion => SearchError::RerankFailed {
+        other => SearchError::RerankFailed {
             model: model.to_owned(),
-            source: std::io::Error::other("reranker mutex future reused after completion").into(),
-        },
-        LockError::TimedOut(deadline) => SearchError::RerankFailed {
-            model: model.to_owned(),
-            source: std::io::Error::other(format!("reranker mutex lock timed out at {deadline:?}"))
-                .into(),
+            source: std::io::Error::other(format!("reranker mutex lock failed: {other}")).into(),
         },
     }
 }
