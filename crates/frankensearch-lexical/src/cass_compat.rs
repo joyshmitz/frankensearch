@@ -21,9 +21,10 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
 
 /// Schema version namespace used for cass-compatible Tantivy indexes.
-pub const CASS_SCHEMA_VERSION: &str = "v7";
+pub const CASS_SCHEMA_VERSION: &str = "v8";
 /// Content hash used to detect schema/tokenizer changes that require rebuild.
-pub const CASS_SCHEMA_HASH: &str = "tantivy-schema-v7-hyphen-cjk-bigrams-prefix-basic-prefix-tokenizer-preview-stored-content-external";
+pub const CASS_SCHEMA_HASH: &str =
+    "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
 
 /// Specialized tokenizer for cass lexical fields.
 ///
@@ -1387,70 +1388,27 @@ pub fn cass_build_preview(content: &str, max_chars: usize) -> String {
 #[must_use]
 fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
     const PREVIEW_MAX_CHARS: usize = 400;
-    const MAX_NGRAM_INDICES: usize = 21;
+    const CONTENT_PREFIX_MAX_BYTES: usize = 4 * 1024;
 
-    let mut ngrams = String::with_capacity(content.len() * 2);
-    let mut preview = String::with_capacity(content.len().min(PREVIEW_MAX_CHARS + 8));
-    let mut preview_chars = 0usize;
-    let mut preview_truncated = false;
+    let prefix_source = cass_prefix_source(content, CONTENT_PREFIX_MAX_BYTES);
+    (
+        cass_generate_edge_ngrams(prefix_source),
+        cass_build_preview(content, PREVIEW_MAX_CHARS),
+    )
+}
 
-    let mut word_indices = [0usize; MAX_NGRAM_INDICES];
-    let mut word_index_count = 0usize;
-    let mut word_start = 0usize;
-    let mut in_word = false;
-
-    for (byte_idx, ch) in content.char_indices() {
-        if preview_chars < PREVIEW_MAX_CHARS {
-            preview.push(ch);
-            preview_chars += 1;
-        } else {
-            preview_truncated = true;
-        }
-
-        if ch.is_alphanumeric() {
-            if !in_word {
-                in_word = true;
-                word_start = byte_idx;
-                word_indices[0] = 0;
-                word_index_count = 1;
-            } else if word_index_count < MAX_NGRAM_INDICES {
-                word_indices[word_index_count] = byte_idx - word_start;
-                word_index_count += 1;
-            }
-            continue;
-        }
-
-        if in_word {
-            if word_index_count < MAX_NGRAM_INDICES {
-                word_indices[word_index_count] = byte_idx - word_start;
-                word_index_count += 1;
-            }
-            if word_index_count >= 3 {
-                for &end_idx in &word_indices[2..word_index_count] {
-                    cass_push_prefix_term(&mut ngrams, &content[word_start..word_start + end_idx]);
-                }
-            }
-            in_word = false;
-        }
+fn cass_prefix_source(content: &str, max_bytes: usize) -> &str {
+    if content.len() <= max_bytes {
+        return content;
     }
-
-    if in_word {
-        if word_index_count < MAX_NGRAM_INDICES {
-            word_indices[word_index_count] = content.len() - word_start;
-            word_index_count += 1;
+    let mut end = 0usize;
+    for (byte_idx, _) in content.char_indices() {
+        if byte_idx > max_bytes {
+            break;
         }
-        if word_index_count >= 3 {
-            for &end_idx in &word_indices[2..word_index_count] {
-                cass_push_prefix_term(&mut ngrams, &content[word_start..word_start + end_idx]);
-            }
-        }
+        end = byte_idx;
     }
-
-    if preview_truncated {
-        preview.push('…');
-    }
-
-    (ngrams, preview)
+    &content[..end]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2396,6 +2354,26 @@ mod cass_query_tests {
             assert_eq!(prefix, cass_generate_edge_ngrams(sample));
             assert_eq!(preview, cass_build_preview(sample, 400));
         }
+    }
+
+    #[test]
+    fn cass_build_content_prefix_caps_long_message_bodies() {
+        let in_prefix_window = "alpha ".repeat(900);
+        let after_prefix_window = "omega ".repeat(900);
+        let content = format!("{in_prefix_window}{after_prefix_window}");
+
+        let (prefix, preview) = cass_build_content_prefix_and_preview(&content);
+
+        assert_eq!(preview, cass_build_preview(&content, 400));
+        assert!(prefix.contains("alpha"));
+        assert!(
+            !prefix.contains("omega"),
+            "content_prefix should not edge-ngram the whole message body"
+        );
+        assert_eq!(
+            prefix,
+            cass_generate_edge_ngrams(cass_prefix_source(&content, 4 * 1024))
+        );
     }
 
     #[test]
