@@ -4,14 +4,18 @@
 //!
 //! # Persistence
 //!
-//! Persistence stores metadata and row-ordered vectors in one sidecar file
-//! (e.g. `vector.fast.hnsw`), then rebuilds the ANN graph on load.
+//! The metadata sidecar (e.g. `vector.fast.hnsw`) stores `doc_ids`, config and
+//! dimension as JSON. Since format v2 the native `hnsw_rs` graph is also
+//! persisted next to it as `vector.fast.hnsw.graph` + `vector.fast.hnsw.data`,
+//! so `load()` deserializes the prebuilt graph directly instead of rebuilding
+//! it from vectors. Legacy v1 sidecars (metadata only) and any load failure
+//! fall back to the rebuild-from-`VectorIndex` path.
 
 use std::path::Path;
 use std::time::Instant;
 
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
-use hnsw_rs::prelude::{DistDot, Hnsw};
+use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo};
 use serde::{Deserialize, Serialize};
 
 use crate::VectorIndex;
@@ -50,9 +54,18 @@ impl Default for HnswConfig {
     }
 }
 
+/// Current on-disk metadata format. v2 adds the native graph sidecars
+/// (`*.hnsw.graph` + `*.hnsw.data`) alongside the JSON metadata; v1 (legacy,
+/// represented by a missing `format_version`) stored metadata only and always
+/// rebuilt the graph on load.
+const HNSW_META_FORMAT_V2: u32 = 2;
+
 /// On-disk metadata for the HNSW index.
 #[derive(Debug, Serialize, Deserialize)]
 struct HnswMeta {
+    /// Sidecar format. Absent in legacy v1 metadata (deserializes to 0).
+    #[serde(default)]
+    format_version: u32,
     doc_ids: Vec<String>,
     config: HnswConfig,
     dimension: usize,
@@ -146,7 +159,18 @@ impl HnswIndex {
             ));
         }
 
-        // Rehydrate vectors from source index
+        // v2: deserialize the prebuilt native graph directly, skipping the
+        // O(n log n) rebuild. Any problem (missing/corrupt sidecars, point-count
+        // mismatch) returns None and we fall through to the rebuild path, so a
+        // bad graph sidecar degrades to "slow load" rather than a hard failure.
+        if meta.format_version >= HNSW_META_FORMAT_V2
+            && let Some(index) = Self::try_load_native_graph(path, &meta)
+        {
+            return Ok(index);
+        }
+
+        // v1/legacy or fallback: rehydrate vectors from the source index and
+        // rebuild the graph.
         let mut vectors = Vec::with_capacity(meta.doc_ids.len());
         for doc_id in &meta.doc_ids {
             let idx = source_index.find_index_by_doc_id(doc_id)?.ok_or_else(|| {
@@ -158,13 +182,63 @@ impl HnswIndex {
         Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
     }
 
-    /// Persist ANN index metadata to disk.
+    /// Attempt to load the prebuilt native `hnsw_rs` graph for a v2 sidecar.
     ///
-    /// Writes `doc_ids` and config. Does NOT write vectors (they are stored in `VectorIndex`).
+    /// Returns `None` (so the caller rebuilds) if the graph/data sidecars are
+    /// absent, `hnsw_rs` fails to deserialize them, or the loaded point count
+    /// disagrees with the metadata `doc_ids` — never a hard error.
+    fn try_load_native_graph(path: &Path, meta: &HnswMeta) -> Option<Self> {
+        let parent = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let basename = hnsw_sidecar_basename(path).ok()?;
+        let graph = parent.join(format!("{basename}.hnsw.graph"));
+        let data = parent.join(format!("{basename}.hnsw.data"));
+        if !graph.is_file() || !data.is_file() {
+            return None;
+        }
+
+        // `HnswIo::load_hnsw` returns an `Hnsw` borrowed from the `HnswIo`
+        // (`'a: 'b`), so to store it in the `'static` field we must keep the
+        // `HnswIo` alive for the program. With the default `ReloadOptions`
+        // (`datamap: false`) the `HnswIo` holds no bulk data — the graph and
+        // vectors are read into the returned `Hnsw`'s owned storage — so the
+        // leaked shell is only a couple of paths plus an `Arc`. Leaking it
+        // (rather than a self-referential struct or unsafe lifetime transmute)
+        // is the simplest sound way to obtain a `'static` graph, and the cost
+        // is negligible because a persisted load happens about once per
+        // process.
+        let hnsw = Box::leak(Box::new(HnswIo::new(parent, &basename)))
+            .load_hnsw::<f32, DistDot>()
+            .ok()?;
+
+        // Guard against a graph that doesn't match the metadata it shipped with
+        // (e.g. truncated dump, mismatched sidecars). The caller additionally
+        // validates doc_ids against the live VectorIndex.
+        if hnsw.get_nb_point() != meta.doc_ids.len() {
+            return None;
+        }
+
+        Some(Self {
+            hnsw,
+            doc_ids: meta.doc_ids.clone(),
+            dimension: meta.dimension,
+            config: meta.config,
+        })
+    }
+
+    /// Persist the ANN index to disk.
+    ///
+    /// Writes the JSON metadata sidecar (`doc_ids`, config, dimension) at
+    /// `path`, plus the native `hnsw_rs` graph as `{stem}.hnsw.graph` and
+    /// `{stem}.hnsw.data` next to it. Vectors are embedded in the native data
+    /// sidecar by `hnsw_rs`; the `VectorIndex` is only consulted on a v1/legacy
+    /// or fallback rebuild.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::Io` on write failure.
+    /// Returns `SearchError::Io` on write/dump failure.
     pub fn save(&self, path: &Path) -> SearchResult<()> {
         let parent = path
             .parent()
@@ -172,7 +246,18 @@ impl HnswIndex {
             .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
 
+        // Persist the native graph + data sidecars first; only stamp the
+        // metadata as v2 once the graph is durably written, so a partial dump
+        // can never advertise a graph that isn't there.
+        let basename = hnsw_sidecar_basename(path)?;
+        self.hnsw.file_dump(parent, &basename).map_err(|error| {
+            SearchError::Io(std::io::Error::other(format!(
+                "failed to dump HNSW graph: {error}"
+            )))
+        })?;
+
         let meta = HnswMeta {
+            format_version: HNSW_META_FORMAT_V2,
             doc_ids: self.doc_ids.clone(),
             config: self.config,
             dimension: self.dimension,
@@ -401,6 +486,20 @@ impl HnswIndex {
             config,
         })
     }
+}
+
+/// Derive the `hnsw_rs` sidecar basename from the metadata path.
+///
+/// `hnsw_rs` writes `{basename}.hnsw.graph` and `{basename}.hnsw.data`, so for
+/// a metadata path of `dir/vector.fast.hnsw` we use the stem `vector.fast`,
+/// yielding `dir/vector.fast.hnsw.graph` / `.data` — distinct from the
+/// metadata file itself.
+fn hnsw_sidecar_basename(path: &Path) -> SearchResult<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ann_corrupted(path, "ANN sidecar path has no usable file stem"))
 }
 
 fn validate_config(config: HnswConfig) -> SearchResult<()> {
@@ -1094,5 +1193,73 @@ mod tests {
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0010");
         assert!((hits[0].score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn persistence_writes_native_graph_sidecars() {
+        let fsvi_path = temp_path("persist_native", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..64).map(|i| normalized_vector(i, 32)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let save_path = temp_path("persist_native", "hnsw");
+        ann.save(&save_path).expect("save");
+
+        // v2 save writes the native graph + data sidecars next to the metadata.
+        let parent = save_path.parent().expect("parent");
+        let basename = save_path.file_stem().unwrap().to_str().unwrap();
+        assert!(
+            parent.join(format!("{basename}.hnsw.graph")).is_file(),
+            "native graph sidecar should exist"
+        );
+        assert!(
+            parent.join(format!("{basename}.hnsw.data")).is_file(),
+            "native data sidecar should exist"
+        );
+
+        let meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse meta");
+        assert_eq!(meta.format_version, HNSW_META_FORMAT_V2);
+
+        // Load goes through the native graph path and still answers correctly.
+        let loaded = HnswIndex::load(&save_path, &index).expect("native load");
+        assert_eq!(loaded.len(), 64);
+        let query = normalized_vector(7, 32);
+        let hits = loaded
+            .knn_search(&query, 3, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert_eq!(hits[0].doc_id, "doc-0007");
+    }
+
+    #[test]
+    fn load_rebuilds_from_legacy_v1_metadata() {
+        let fsvi_path = temp_path("persist_v1", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..64).map(|i| normalized_vector(i, 32)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let save_path = temp_path("persist_v1", "hnsw");
+        ann.save(&save_path).expect("save");
+
+        // Fabricate a legacy v1 sidecar at a fresh path: identical metadata but
+        // with `format_version` stripped (deserializes to 0) and no graph/data
+        // sidecars beside it. load() must transparently rebuild from the
+        // VectorIndex instead of failing.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("format_version");
+        let v1_path = temp_path("persist_v1_legacy", "hnsw");
+        std::fs::write(&v1_path, serde_json::to_vec(&value).expect("v1 json")).expect("write v1");
+
+        let loaded = HnswIndex::load(&v1_path, &index).expect("v1 rebuild load");
+        assert_eq!(loaded.len(), 64);
+        let query = normalized_vector(10, 32);
+        let hits = loaded
+            .knn_search(&query, 5, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert_eq!(hits[0].doc_id, "doc-0010");
     }
 }
