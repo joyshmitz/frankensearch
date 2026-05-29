@@ -293,15 +293,12 @@ impl TwoTierIndex {
             // get valid indices.
             let mut resolved_hits = Vec::with_capacity(hits.len());
             for mut hit in hits {
-                match self.fast_index.find_index_by_doc_id(&hit.doc_id) {
-                    Ok(Some(pos)) => {
-                        if !self.fast_index.is_deleted(pos) {
-                            hit.index = u32::try_from(pos).unwrap_or(u32::MAX);
-                            resolved_hits.push(hit);
-                        }
-                    }
-                    // doc_id missing or decode error → treat as deleted
-                    _ => {}
+                // doc_id missing or decode error → treat as deleted
+                if let Ok(Some(pos)) = self.fast_index.find_index_by_doc_id(&hit.doc_id)
+                    && !self.fast_index.is_deleted(pos)
+                {
+                    hit.index = u32::try_from(pos).unwrap_or(u32::MAX);
+                    resolved_hits.push(hit);
                 }
             }
             let mut hits = resolved_hits;

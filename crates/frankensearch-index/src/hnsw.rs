@@ -69,6 +69,17 @@ struct HnswMeta {
     doc_ids: Vec<String>,
     config: HnswConfig,
     dimension: usize,
+    /// Deterministic fingerprint of the vectors the persisted graph was built
+    /// from (FNV-1a 64 over sampled f32 vector bytes; see
+    /// [`fingerprint_vectors_from_index`]). Lets v2 load detect "doc IDs match
+    /// but the underlying vectors were silently swapped" and fall back to a
+    /// rebuild rather than serve stale ANN hits.
+    ///
+    /// Absent in legacy v1 metadata (deserializes to 0). A stored value of 0
+    /// also disables fingerprint enforcement, so v2 sidecars produced before
+    /// this field existed (none yet shipped) keep loading.
+    #[serde(default)]
+    vector_fingerprint: u64,
 }
 
 /// Diagnostics for one ANN query.
@@ -98,6 +109,9 @@ pub struct HnswIndex {
     doc_ids: Vec<String>,
     dimension: usize,
     config: HnswConfig,
+    /// Fingerprint of the vectors the graph was built from. See
+    /// [`HnswMeta::vector_fingerprint`].
+    vector_fingerprint: u64,
 }
 
 impl std::fmt::Debug for HnswIndex {
@@ -161,12 +175,20 @@ impl HnswIndex {
 
         // v2: deserialize the prebuilt native graph directly, skipping the
         // O(n log n) rebuild. Any problem (missing/corrupt sidecars, point-count
-        // mismatch) returns None and we fall through to the rebuild path, so a
-        // bad graph sidecar degrades to "slow load" rather than a hard failure.
+        // mismatch, or stale vector fingerprint) returns None and we fall
+        // through to the rebuild path, so a bad graph sidecar degrades to
+        // "slow load" rather than a hard failure.
         if meta.format_version >= HNSW_META_FORMAT_V2
-            && let Some(index) = Self::try_load_native_graph(path, &meta)
+            && let Some(index) = Self::try_load_native_graph(path, &meta, source_index)
         {
             return Ok(index);
+        } else if meta.format_version < HNSW_META_FORMAT_V2 {
+            tracing::warn!(
+                path = %path.display(),
+                format_version = meta.format_version,
+                "loading legacy v1 HNSW sidecar; re-save to upgrade to v2 \
+                 (skips rebuild on next cold load)"
+            );
         }
 
         // v1/legacy or fallback: rehydrate vectors from the source index and
@@ -184,10 +206,21 @@ impl HnswIndex {
 
     /// Attempt to load the prebuilt native `hnsw_rs` graph for a v2 sidecar.
     ///
-    /// Returns `None` (so the caller rebuilds) if the graph/data sidecars are
-    /// absent, `hnsw_rs` fails to deserialize them, or the loaded point count
-    /// disagrees with the metadata `doc_ids` — never a hard error.
-    fn try_load_native_graph(path: &Path, meta: &HnswMeta) -> Option<Self> {
+    /// Returns `None` (so the caller rebuilds) if any of the following hold —
+    /// a degraded sidecar always degrades to "slow load", never a hard error:
+    /// - the `.hnsw.graph` / `.hnsw.data` sidecars are absent,
+    /// - `hnsw_rs` fails to deserialize them,
+    /// - the loaded point count disagrees with the metadata `doc_ids`,
+    /// - the metadata `doc_ids` disagree with the live `VectorIndex`'s
+    ///   doc-id sequence (live tombstones excluded),
+    /// - the persisted vector fingerprint disagrees with the live
+    ///   `VectorIndex`'s fingerprint (i.e. vectors were swapped behind the
+    ///   same doc ids — the case the prompt explicitly calls out).
+    fn try_load_native_graph(
+        path: &Path,
+        meta: &HnswMeta,
+        source_index: &VectorIndex,
+    ) -> Option<Self> {
         let parent = path
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
@@ -197,6 +230,40 @@ impl HnswIndex {
         let data = parent.join(format!("{basename}.hnsw.data"));
         if !graph.is_file() || !data.is_file() {
             return None;
+        }
+
+        // Validate doc-id sequence against the live VectorIndex *before*
+        // touching the (potentially expensive) hnsw_rs load.
+        if !meta_matches_live_doc_ids(meta, source_index).ok()? {
+            tracing::warn!(
+                path = %path.display(),
+                "v2 HNSW sidecar doc_ids disagree with live VectorIndex; rebuilding"
+            );
+            return None;
+        }
+
+        // Validate the vector-content fingerprint against the live VectorIndex.
+        // This is the critical stale-vectors guard: if a caller swaps the FSVI
+        // contents while keeping the same doc IDs in the same order, the
+        // persisted graph would otherwise silently serve hits against vectors
+        // that no longer exist. A fingerprint of 0 means the sidecar was
+        // written before fingerprint enforcement existed — accept it (no v2
+        // sidecars without a fingerprint have ever shipped to users today, but
+        // future-proof the field default just like format_version).
+        if meta.vector_fingerprint != 0 {
+            let live_fp =
+                fingerprint_live_vector_index(source_index, meta.doc_ids.len(), meta.dimension)
+                    .ok()?;
+            if live_fp != meta.vector_fingerprint {
+                tracing::warn!(
+                    path = %path.display(),
+                    expected = meta.vector_fingerprint,
+                    actual = live_fp,
+                    "v2 HNSW sidecar vector fingerprint disagrees with live VectorIndex \
+                     (vectors swapped behind matching doc ids); rebuilding"
+                );
+                return None;
+            }
         }
 
         // `HnswIo::load_hnsw` returns an `Hnsw` borrowed from the `HnswIo`
@@ -225,6 +292,7 @@ impl HnswIndex {
             doc_ids: meta.doc_ids.clone(),
             dimension: meta.dimension,
             config: meta.config,
+            vector_fingerprint: meta.vector_fingerprint,
         })
     }
 
@@ -261,6 +329,7 @@ impl HnswIndex {
             doc_ids: self.doc_ids.clone(),
             config: self.config,
             dimension: self.dimension,
+            vector_fingerprint: self.vector_fingerprint,
         };
         let metadata_bytes = serde_json::to_vec(&meta)
             .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
@@ -444,6 +513,14 @@ impl HnswIndex {
                 reason: format!("doc_id count {} must match vector count", doc_ids.len()),
             });
         }
+        // Fingerprint the raw (un-normalized) input vectors. This is what
+        // VectorIndex::vector_at_f32 returns at load time, so a fresh load from
+        // the live VectorIndex will produce the same digest iff the underlying
+        // bytes are unchanged. Used by the v2 native-graph load path to detect
+        // "doc IDs match but vectors were silently swapped" and trigger a
+        // rebuild (see try_load_native_graph).
+        let vector_fingerprint = fingerprint_vectors(&doc_ids, &vectors);
+
         let mut normalized_vectors = Vec::with_capacity(vectors.len());
         for (idx, vector) in vectors.into_iter().enumerate() {
             if vector.len() != dimension {
@@ -484,6 +561,7 @@ impl HnswIndex {
             // vectors: source_vectors, // Removed!
             dimension,
             config,
+            vector_fingerprint,
         })
     }
 }
@@ -500,6 +578,151 @@ fn hnsw_sidecar_basename(path: &Path) -> SearchResult<String> {
         .filter(|stem| !stem.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| ann_corrupted(path, "ANN sidecar path has no usable file stem"))
+}
+
+/// Number of evenly-spaced vector samples drawn into the persistence
+/// fingerprint. Caps fingerprint cost at O(SAMPLES · dim) bytes hashed even on
+/// 390K-vector indexes, while still catching any localized vector swap because
+/// stride-based sampling will cover the whole index. Doc IDs are mixed in
+/// separately for every record (the cheap part), so a doc-id permutation is
+/// always caught regardless of how many vectors are sampled.
+const FINGERPRINT_VECTOR_SAMPLE_TARGET: usize = 256;
+
+/// FNV-1a 64-bit. Chosen because it is deterministic across processes (unlike
+/// `ahash`) and stdlib (`DefaultHasher` is randomized + deprecated for
+/// persistence), keeps the fingerprint dependency-free, and is plenty for an
+/// integrity-style check — we only need collision resistance against a small
+/// number of accidental byte-level edits, not adversarial inputs.
+const FNV_OFFSET_BASIS_64: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME_64: u64 = 0x0000_0100_0000_01b3;
+
+#[inline]
+fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME_64);
+    }
+    h
+}
+
+/// Feed an `&[f32]` into the FNV-1a state in little-endian byte order without
+/// any unsafe reinterpretation (the crate is `#![forbid(unsafe_code)]`).
+/// One `to_le_bytes()` per element compiles to a tight loop.
+#[inline]
+fn fnv1a_update_f32(mut h: u64, vec: &[f32]) -> u64 {
+    for &f in vec {
+        h = fnv1a_update(h, &f.to_bits().to_le_bytes());
+    }
+    h
+}
+
+/// Compute the persistence fingerprint from the (raw, un-normalized) vectors
+/// and doc IDs used to build the graph.
+///
+/// Stride-samples vectors so the cost stays bounded for large indexes (~256
+/// samples regardless of corpus size). Doc IDs are mixed in for every record,
+/// so doc-id permutations are caught even on un-sampled rows. The output is
+/// stored in the v2 metadata sidecar and re-derived at load time by
+/// [`fingerprint_live_vector_index`] against the live `VectorIndex`; a
+/// mismatch means "doc IDs match but the underlying vector bytes were
+/// silently swapped" → reject the persisted graph.
+fn fingerprint_vectors(doc_ids: &[String], vectors: &[Vec<f32>]) -> u64 {
+    // Mix length so a truncated-but-prefix-matching index doesn't collide.
+    let mut h = fnv1a_update(FNV_OFFSET_BASIS_64, &(doc_ids.len() as u64).to_le_bytes());
+    if vectors.is_empty() {
+        return h;
+    }
+
+    let stride = vectors
+        .len()
+        .div_ceil(FINGERPRINT_VECTOR_SAMPLE_TARGET)
+        .max(1);
+    for (i, doc_id) in doc_ids.iter().enumerate() {
+        // Every doc id contributes — cheap and catches doc-id permutations
+        // even on the un-sampled records.
+        h = fnv1a_update(h, &(i as u64).to_le_bytes());
+        h = fnv1a_update(h, doc_id.as_bytes());
+
+        // Sample raw vector bytes. We always include index 0 and the final
+        // index (stride covers 0 by construction; force-include the last so
+        // truncations are noticed even when len % stride == 1).
+        let sampled = i == 0 || i % stride == 0 || i == vectors.len() - 1;
+        if sampled {
+            h = fnv1a_update_f32(h, &vectors[i]);
+        }
+    }
+    h
+}
+
+/// Compute the fingerprint from a live `VectorIndex`, matching the layout
+/// [`fingerprint_vectors`] produced at build time.
+///
+/// `expected_len` and `expected_dim` come from the persisted metadata. If the
+/// live index has fewer live records than the persisted graph, the digest
+/// will not match and the caller falls back to a rebuild — which is the right
+/// behavior.
+fn fingerprint_live_vector_index(
+    index: &VectorIndex,
+    expected_len: usize,
+    expected_dim: usize,
+) -> SearchResult<u64> {
+    let mut h = fnv1a_update(FNV_OFFSET_BASIS_64, &(expected_len as u64).to_le_bytes());
+
+    // Walk live records (tombstones excluded), in row order — same iteration
+    // order as `build_from_vector_index`.
+    let mut live_idx = 0_usize;
+    let stride = expected_len
+        .div_ceil(FINGERPRINT_VECTOR_SAMPLE_TARGET)
+        .max(1);
+    for raw in 0..index.record_count() {
+        if index.is_deleted(raw) {
+            continue;
+        }
+        if live_idx >= expected_len {
+            // Live index has more records than the persisted graph.
+            break;
+        }
+        let doc_id = index.doc_id_at(raw)?;
+        h = fnv1a_update(h, &(live_idx as u64).to_le_bytes());
+        h = fnv1a_update(h, doc_id.as_bytes());
+
+        let sampled = live_idx == 0 || live_idx % stride == 0 || live_idx + 1 == expected_len;
+        if sampled {
+            let vec = index.vector_at_f32(raw)?;
+            if vec.len() != expected_dim {
+                // Dimension drift — perturb the digest so the caller rejects
+                // and rebuilds rather than asserting.
+                return Ok(h.wrapping_add(1));
+            }
+            h = fnv1a_update_f32(h, &vec);
+        }
+        live_idx += 1;
+    }
+    Ok(h)
+}
+
+/// Verify the metadata `doc_ids` sequence matches the live `VectorIndex`'s
+/// live (non-tombstoned) doc IDs in row order. Same semantics as the public
+/// `matches_vector_index` but doesn't need a constructed `HnswIndex`, so we
+/// can check it before paying for the native graph load.
+fn meta_matches_live_doc_ids(meta: &HnswMeta, index: &VectorIndex) -> SearchResult<bool> {
+    if meta.dimension != index.dimension() {
+        return Ok(false);
+    }
+    let mut live_position = 0_usize;
+    for i in 0..index.record_count() {
+        if index.is_deleted(i) {
+            continue;
+        }
+        let Some(expected_doc_id) = meta.doc_ids.get(live_position) else {
+            return Ok(false);
+        };
+        if expected_doc_id != index.doc_id_at(i)? {
+            return Ok(false);
+        }
+        live_position = live_position.saturating_add(1);
+    }
+    Ok(live_position == meta.doc_ids.len())
 }
 
 fn validate_config(config: HnswConfig) -> SearchResult<()> {
@@ -1261,5 +1484,95 @@ mod tests {
             .knn_search(&query, 5, HNSW_DEFAULT_EF_SEARCH)
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0010");
+    }
+
+    /// Stale-vectors validation: the v2 native-graph load path must reject a
+    /// sidecar whose persisted vector fingerprint disagrees with the live
+    /// `VectorIndex` (i.e. someone swapped the FSVI contents behind matching
+    /// doc IDs), and transparently fall back to rebuild rather than silently
+    /// serving hits against vectors that no longer exist. This is the exact
+    /// scenario the prompt for `frankensearch#25` calls out.
+    #[test]
+    fn load_rejects_v2_sidecar_when_vectors_swapped_under_same_doc_ids() {
+        // Build + save a v2 sidecar over an FSVI where doc-i ≈ basis_i.
+        let fsvi_path = temp_path("persist_swap", "fsvi");
+        let original_vectors: Vec<Vec<f32>> = (0..16).map(|i| normalized_vector(i, 32)).collect();
+        let original_index = write_index(&fsvi_path, &original_vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&original_index, HnswConfig::default())
+            .expect("build");
+
+        let save_path = temp_path("persist_swap", "hnsw");
+        ann.save(&save_path).expect("save v2");
+
+        // Sanity: a load against the *original* FSVI takes the fast path and
+        // returns doc-0007 for query≈doc-0007.
+        let loaded_original =
+            HnswIndex::load(&save_path, &original_index).expect("native load matches");
+        let query = normalized_vector(7, 32);
+        let original_hits = loaded_original
+            .knn_search(&query, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search original");
+        assert_eq!(original_hits[0].doc_id, "doc-0007");
+        // Sanity that the fingerprint actually got stamped.
+        let meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse meta");
+        assert_ne!(
+            meta.vector_fingerprint, 0,
+            "v2 save must stamp a fingerprint"
+        );
+
+        // Now swap vectors behind the same doc IDs (doc-0007 now points at
+        // basis_99) while leaving the .hnsw.graph / .hnsw.data sidecars
+        // unchanged. A naive v2 fast path would return doc-0007 against the
+        // *old* graph; the fingerprint guard forces a rebuild instead.
+        let mut swapped_vectors = original_vectors.clone();
+        swapped_vectors[7] = normalized_vector(99, 32);
+        let swapped_path = temp_path("persist_swap_after", "fsvi");
+        let swapped_index = write_index(&swapped_path, &swapped_vectors).expect("swapped");
+
+        // Copy the v2 metadata + graph + data sidecars next to the swapped FSVI
+        // so the load path's directory layout is plausible.
+        let swap_save_path = temp_path("persist_swap_after", "hnsw");
+        std::fs::copy(&save_path, &swap_save_path).expect("copy meta");
+        let src_parent = save_path.parent().expect("src parent");
+        let dst_parent = swap_save_path.parent().expect("dst parent");
+        let src_stem = save_path.file_stem().unwrap().to_str().unwrap();
+        let dst_stem = swap_save_path.file_stem().unwrap().to_str().unwrap();
+        for ext in ["hnsw.graph", "hnsw.data"] {
+            std::fs::copy(
+                src_parent.join(format!("{src_stem}.{ext}")),
+                dst_parent.join(format!("{dst_stem}.{ext}")),
+            )
+            .expect("copy sidecar");
+        }
+
+        // Load against the swapped FSVI. The fingerprint mismatch must trigger
+        // the rebuild fallback, which sees doc-0007 ≈ basis_99 and therefore
+        // returns doc-0007 *only* when querying ≈ basis_99 — not when querying
+        // basis_7.
+        let loaded_swapped =
+            HnswIndex::load(&swap_save_path, &swapped_index).expect("load after swap");
+        let stale_query = normalized_vector(7, 32);
+        let stale_hits = loaded_swapped
+            .knn_search(&stale_query, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search stale");
+        // The persisted graph would have returned doc-0007 (basis_7) here; the
+        // rebuilt graph against the swapped FSVI returns whichever doc now
+        // *actually* sits near basis_7, which is **not** doc-0007.
+        assert_ne!(
+            stale_hits[0].doc_id, "doc-0007",
+            "fingerprint guard must reject the persisted graph and rebuild against \
+             the swapped FSVI; otherwise we'd return stale ANN hits"
+        );
+
+        // And the rebuilt graph *can* find the swapped doc by its new vector.
+        let new_query = normalized_vector(99, 32);
+        let new_hits = loaded_swapped
+            .knn_search(&new_query, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search new");
+        assert_eq!(
+            new_hits[0].doc_id, "doc-0007",
+            "rebuild path must have picked up the swapped vector for doc-0007"
+        );
     }
 }
