@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::error::{SearchError, SearchResult};
-use tantivy::indexer::{LogMergePolicy, NoMergePolicy};
-use tantivy::indexer::UserOperation;
+use tantivy::SegmentMeta;
+use tantivy::indexer::{LogMergePolicy, MergeCandidate, MergePolicy, NoMergePolicy, UserOperation};
 use tantivy::query::{
     AllQuery, BooleanQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery, TermQuery,
 };
@@ -19,6 +20,24 @@ use tantivy::tokenizer::RegexTokenizer;
 use tantivy::tokenizer::{TextAnalyzer, Token, TokenFilter, TokenStream, Tokenizer};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy, Term, doc};
 use tracing::{debug, info, warn};
+
+/// Adapter that re-wraps an `Arc<dyn MergePolicy>` as a `Box<dyn MergePolicy>`,
+/// so a policy snapshot taken via [`IndexWriter::get_merge_policy`] (which
+/// returns an `Arc`) can be reinstalled via
+/// [`IndexWriter::set_merge_policy`] (which takes a `Box`).
+///
+/// This is the missing glue that lets [`CassTantivyIndex::force_merge_bounded`]
+/// preserve and restore the *exact* previously-configured merge policy
+/// (including any caller customization) instead of resetting to
+/// `LogMergePolicy::default()`.
+#[derive(Debug)]
+struct ArcMergePolicy(Arc<dyn MergePolicy>);
+
+impl MergePolicy for ArcMergePolicy {
+    fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate> {
+        self.0.compute_merge_candidates(segments)
+    }
+}
 
 /// Schema version namespace used for cass-compatible Tantivy indexes.
 pub const CASS_SCHEMA_VERSION: &str = "v8";
@@ -985,24 +1004,43 @@ impl CassTantivyIndex {
     ///
     /// For the duration of the operation a [`NoMergePolicy`] is installed: a
     /// completed `merge()` calls `consider_merge_options()` internally, and the
-    /// default [`LogMergePolicy`] could otherwise schedule its own unbounded
-    /// merge of the remaining same-tier segments — reintroducing exactly the
-    /// mmap pressure we are avoiding. The default merge policy is restored
-    /// before returning so steady-state auto-merge resumes.
+    /// previously installed [`LogMergePolicy`] (or any caller-configured
+    /// policy) could otherwise schedule its own unbounded merge of the
+    /// remaining same-tier segments — reintroducing exactly the mmap pressure
+    /// we are avoiding. The *previously configured* merge policy is preserved
+    /// (via [`IndexWriter::get_merge_policy`]) and restored on return — on both
+    /// the success and the error paths — so any caller-side customization
+    /// (e.g. [`Self::configure_bulk_load_merge_policy`]) is not silently
+    /// dropped. Restoration round-trips the `Arc`-shared policy back through
+    /// tantivy's `Box`-typed setter via a private `ArcMergePolicy` adapter.
     ///
     /// `batch_size` is clamped to a minimum of 2 (a batch of 1 can never make
-    /// progress). The writer is held exclusively for the whole call, which can
-    /// take many minutes on a large index; callers should quiesce ingestion
-    /// first.
+    /// progress).
+    ///
+    /// # Caller contract
+    ///
+    /// The writer lock is held exclusively for the entire call, which can take
+    /// many minutes on a large index. Any other process attempting to acquire
+    /// the writer lock on the same directory fails fast with `LockBusy`.
+    /// Callers must coordinate externally — e.g. stop the ingester before
+    /// invoking this method.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::SubsystemError`] if segment enumeration or any
-    /// individual batch merge fails. The default merge policy is restored even
-    /// on the error path.
+    /// individual batch merge fails. The previous merge policy is restored
+    /// even on the error path.
     pub fn force_merge_bounded(&mut self, batch_size: usize) -> SearchResult<usize> {
         let batch_size = batch_size.max(2);
 
+        // Snapshot the prior merge policy via the cheap Arc clone exposed by
+        // tantivy 0.26, then install NoMergePolicy for the duration of the
+        // bounded loop. The Arc snapshot is the key bit: restoring
+        // `LogMergePolicy::default()` (as a naive implementation would) would
+        // silently discard any caller-side customization such as
+        // [`Self::configure_bulk_load_merge_policy`]'s tuned
+        // `min_num_segments`.
+        let prior = self.writer.get_merge_policy();
         self.writer.set_merge_policy(Box::new(NoMergePolicy));
 
         let mut merges = 0usize;
@@ -1021,9 +1059,13 @@ impl CassTantivyIndex {
             }
         })();
 
-        // Restore steady-state auto-merge regardless of success/failure.
+        // Restore the *original* merge policy (not a fresh default) on every
+        // exit path that is not a panic. Wrapping `prior` in
+        // [`ArcMergePolicy`] lets us hand the previously-shared `Arc` back to
+        // Tantivy through its `Box<dyn MergePolicy>` setter; the inner Arc is
+        // simply re-shared, no rebuilding of policy state.
         self.writer
-            .set_merge_policy(Box::<LogMergePolicy>::default());
+            .set_merge_policy(Box::new(ArcMergePolicy(prior)));
 
         if matches!(outcome, Ok(n) if n > 0) {
             let now_ms = SystemTime::now()
@@ -2829,7 +2871,7 @@ mod cass_query_tests {
             workspace_original: None,
             source_path: format!("/tmp/test/{i}"),
             msg_idx: i,
-            created_at: Some(1_700_000_000_000 + i as i64),
+            created_at: Some(1_700_000_000_000_i64.saturating_add(i.cast_signed())),
             title: Some(format!("doc {i}")),
             content: format!("bounded merge segment number {i}"),
             source_id: "local".to_string(),
@@ -2843,11 +2885,7 @@ mod cass_query_tests {
             idx.add_cass_documents(&[make_doc(i)]).expect("add");
             idx.commit().expect("commit");
         }
-        let before = idx
-            .index
-            .searchable_segment_ids()
-            .expect("segments")
-            .len();
+        let before = idx.index.searchable_segment_ids().expect("segments").len();
         assert!(before > 1, "expected multiple segments, got {before}");
 
         // Bounded merge in batches of 2 must consolidate to a single segment
@@ -2855,11 +2893,7 @@ mod cass_query_tests {
         let merges = idx.force_merge_bounded(2).expect("bounded merge");
         assert!(merges >= 1, "expected at least one bounded merge pass");
 
-        let after = idx
-            .index
-            .searchable_segment_ids()
-            .expect("segments")
-            .len();
+        let after = idx.index.searchable_segment_ids().expect("segments").len();
         assert!(
             after <= 1,
             "bounded merge should consolidate to <=1 segment, got {after}"
@@ -2870,8 +2904,7 @@ mod cass_query_tests {
         reader.reload().expect("reload");
         let searcher = reader.searcher();
         let fields = idx.fields();
-        let query =
-            cass_build_tantivy_query("bounded", &CassQueryFilters::default(), &fields);
+        let query = cass_build_tantivy_query("bounded", &CassQueryFilters::default(), &fields);
         let results = searcher
             .search(
                 &query,
@@ -2882,6 +2915,124 @@ mod cass_query_tests {
             results.len(),
             5,
             "all documents should remain searchable after bounded merge"
+        );
+    }
+
+    /// 100-segment regression: exercises the bounded-merge progression at a
+    /// scale closer to the failure-mode described in #26 (many small segments,
+    /// auto-merge suppressed). With `batch_size = 8` the inner loop must do
+    /// at least `ceil(100 / 8) = 13` initial passes; in practice each pass
+    /// collapses the leading 8 segments to 1, so the total iteration count is
+    /// bounded by `O(N / (B - 1))`. We assert the operation completes and
+    /// leaves at most one segment regardless of exact iteration count.
+    #[test]
+    fn force_merge_bounded_progressively_collapses_many_segments() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+        idx.writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // 100 single-doc commits => 100 segments.
+        for i in 0..100u64 {
+            idx.add_cass_documents(&[CassDocument {
+                agent: "claude".to_string(),
+                workspace: None,
+                workspace_original: None,
+                source_path: format!("/tmp/test100/{i}"),
+                msg_idx: i,
+                created_at: Some(1_700_000_000_000_i64.saturating_add(i.cast_signed())),
+                title: Some(format!("doc {i}")),
+                content: format!("scale test segment {i}"),
+                source_id: "local".to_string(),
+                origin_kind: "local".to_string(),
+                origin_host: None,
+                conversation_id: None,
+            }])
+            .expect("add");
+            idx.commit().expect("commit");
+        }
+        let before = idx.index.searchable_segment_ids().expect("segments").len();
+        assert!(
+            before >= 50,
+            "expected many segments before bounded merge, got {before}"
+        );
+
+        let merges = idx.force_merge_bounded(8).expect("bounded merge");
+        // ceil(100/8) = 13 is the first-pass lower bound; subsequent passes
+        // collapse the residual. We just assert progress was made and the
+        // final segment count is the target.
+        assert!(
+            merges >= 13,
+            "expected at least 13 bounded passes for 100 segments / batch 8, got {merges}"
+        );
+
+        let after = idx.index.searchable_segment_ids().expect("segments").len();
+        assert!(
+            after <= 1,
+            "bounded merge should collapse 100 segments to <=1, got {after}"
+        );
+    }
+
+    /// Regression: the previously-configured merge policy must be *preserved*
+    /// across `force_merge_bounded`, not silently reset to
+    /// `LogMergePolicy::default()`. This is the central correctness gain over
+    /// the obvious "install `NoMergePolicy`, then install `LogMergePolicy` on
+    /// exit" pattern: a caller that has tuned the policy (e.g. via
+    /// [`CassTantivyIndex::configure_bulk_load_merge_policy`]) keeps that
+    /// tuning after recovery instead of having it silently dropped.
+    #[test]
+    fn force_merge_bounded_restores_prior_merge_policy() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut idx = CassTantivyIndex::open_or_create(dir.path()).expect("create");
+
+        // Add a couple of segments so the bounded loop actually runs.
+        idx.writer.set_merge_policy(Box::new(NoMergePolicy));
+        for i in 0..3u64 {
+            idx.add_cass_documents(&[CassDocument {
+                agent: "claude".to_string(),
+                workspace: None,
+                workspace_original: None,
+                source_path: format!("/tmp/restore/{i}"),
+                msg_idx: i,
+                created_at: Some(1_700_000_000_000_i64.saturating_add(i.cast_signed())),
+                title: Some(format!("restore {i}")),
+                content: format!("merge policy restore probe {i}"),
+                source_id: "local".to_string(),
+                origin_kind: "local".to_string(),
+                origin_host: None,
+                conversation_id: None,
+            }])
+            .expect("add");
+            idx.commit().expect("commit");
+        }
+        // Reinstall the bulk-load policy as the "prior" snapshot that
+        // force_merge_bounded should preserve. The bulk-load policy is a
+        // LogMergePolicy with `min_num_segments` set to
+        // `CASS_BULK_LOAD_MIN_SEGMENTS_PER_MERGE` (= 256), which is the
+        // distinctive fingerprint we look for after the bounded merge.
+        idx.configure_bulk_load_merge_policy();
+        let prior_dbg = format!("{:?}", idx.writer.get_merge_policy());
+        assert!(
+            prior_dbg.contains("min_num_segments: 256"),
+            "sanity: prior policy should be the bulk-load LogMergePolicy, got {prior_dbg}"
+        );
+
+        let _ = idx.force_merge_bounded(2).expect("bounded merge");
+
+        let after_dbg = format!("{:?}", idx.writer.get_merge_policy());
+        // The restored policy is wrapped in `ArcMergePolicy(...)` because
+        // `set_merge_policy` requires a `Box` while `get_merge_policy` only
+        // exposes an `Arc`; the wrapper delegates `compute_merge_candidates`
+        // to the inner policy, so steady-state auto-merge behavior is
+        // preserved. The wrapped fingerprint must still carry the
+        // distinctive bulk-load `min_num_segments: 256` — i.e. the caller's
+        // tuning was NOT silently replaced with `LogMergePolicy::default()`.
+        assert!(
+            after_dbg.contains("min_num_segments: 256"),
+            "force_merge_bounded dropped the bulk-load tuning: after = {after_dbg}"
+        );
+        assert!(
+            !after_dbg.contains("NoMergePolicy"),
+            "force_merge_bounded left NoMergePolicy in place: after = {after_dbg}"
         );
     }
 }

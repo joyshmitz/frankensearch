@@ -397,10 +397,10 @@ impl TantivyIndex {
                 phase: phase.into(),
                 reason: "writer lock cancelled".into(),
             },
-            other => SearchError::SubsystemError {
+            asupersync::sync::LockError::PolledAfterCompletion => SearchError::SubsystemError {
                 subsystem: "tantivy",
                 source: Box::new(std::io::Error::other(format!(
-                    "writer mutex lock failed during {phase}: {other}"
+                    "writer mutex future reused after completion during {phase}"
                 ))),
             },
         }
