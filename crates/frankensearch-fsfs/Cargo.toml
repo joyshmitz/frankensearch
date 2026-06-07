@@ -37,7 +37,14 @@ ftui-widgets = { workspace = true }
 ftui-tty = { workspace = true }
 ftui-backend = { workspace = true }
 ftui-extras = { workspace = true, features = ["markdown"] }
-asupersync = { workspace = true }
+# MIGRATION SHIM (temporary): fsfs's binary entrypoints still mint ambient
+# contexts via Cx::for_request() (main.rs:188, runtime.rs:1563, runtime.rs:6880),
+# which asupersync 0.3.2+ cfg-gates behind test-internals. fsfs is a LEAF
+# binary crate — no lib crate or external consumer (e.g. HFDT) has it in
+# their graph, so this does NOT re-leak test-internals downstream. Proper fix:
+# migrate the three sites to runtime-injected contexts (spawn_with_cx /
+# runtime-attached Cx) per the asupersync capability model, then drop this.
+asupersync = { workspace = true, features = ["test-internals"] }
 fsqlite = "0.1.2"
 fsqlite-types = "0.1.2"
 serde = { workspace = true }
@@ -58,7 +65,8 @@ ureq = { version = "3", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+# test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
+asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"
 proptest = { workspace = true }
 jsonschema = { version = "0.17", features = ["draft202012"] }

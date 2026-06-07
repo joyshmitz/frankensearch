@@ -22,6 +22,8 @@ dirs = { workspace = true }
 fastembed = { workspace = true, optional = true }
 
 [dev-dependencies]
+# test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
+asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"
 
 [lints]
