@@ -2,7 +2,7 @@
 
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
-use wide::{f32x8, u32x8};
+use wide::{f32x8, u16x8, u32x8};
 
 // ── SIMD load/decode helpers ────────────────────────────────────────────────
 //
@@ -80,6 +80,20 @@ fn widen8_f16_lanes(h: u32x8) -> f32x8 {
 }
 
 /// Decode 8 little-endian f16 values from a 16-byte block to `f32x8` (SIMD widen).
+///
+/// On little-endian targets (x86/ARM — the only ones the FSVI LE format targets),
+/// the 16 bytes already *are* 8 little-endian `u16` lanes, so they load straight
+/// into a `u16x8` and zero-extend to `u32x8` (one SIMD load + widen) — avoiding the
+/// 8 scalar `from_le_bytes` reads and the stack round-trip of building a `[u32; 8]`.
+#[cfg(target_endian = "little")]
+#[inline(always)]
+fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
+    let lanes = bytemuck::cast::<[u8; 16], u16x8>(*b);
+    widen8_f16_lanes(u32x8::from(lanes))
+}
+
+/// Big-endian fallback: decode each `u16` explicitly as little-endian.
+#[cfg(target_endian = "big")]
 #[inline(always)]
 fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
     let lanes: [u32; 8] = [
@@ -345,6 +359,36 @@ mod tests {
                         "bits={bits:#06x}: scalar={scalar} simd={simd}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The 16-byte SIMD load path must decode to exactly the same lanes as the
+    /// scalar reference for representative patterns (sign, subnormal, zero, large,
+    /// inf, nan), proving the little-endian byte reinterpretation is correct.
+    #[test]
+    fn simd_f16_bytes_load_matches_scalar() {
+        let samples: [f16; 8] = [
+            f16::from_f32(0.0),
+            f16::from_f32(-0.0),
+            f16::from_f32(1.5),
+            f16::from_f32(-2.25),
+            f16::from_bits(0x0001), // smallest positive subnormal
+            f16::from_f32(65504.0), // f16::MAX
+            f16::INFINITY,
+            f16::NAN,
+        ];
+        let mut bytes = [0u8; 16];
+        for (i, v) in samples.iter().enumerate() {
+            bytes[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+        }
+        let out = bytemuck::cast::<f32x8, [f32; 8]>(widen8_f16_bytes(&bytes));
+        for (v, &simd) in samples.iter().zip(out.iter()) {
+            let scalar = v.to_f32();
+            if scalar.is_nan() {
+                assert!(simd.is_nan(), "expected nan for {v:?}");
+            } else {
+                assert_eq!(scalar.to_bits(), simd.to_bits(), "mismatch for {v:?}");
             }
         }
     }

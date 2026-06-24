@@ -42,6 +42,13 @@ determinism/golden risk (all 19 simd + full index lib tests green). Measured hea
 process (`f16_*_new` SIMD vs `f16_*_old` scalar). No dominance-vs-original claim (blocked by
 `bd-ui41`); pre-change before/after ratio only.
 
+_Refinement (same lever):_ the byte path also replaces the 8 scalar `from_le_bytes` + stack
+round-trip with a single little-endian SIMD load (`[u8;16]`→`u16x8`→`u32x8` zero-extend, BE
+fallback retained). Still bit-exact (`simd_f16_bytes_load_matches_scalar`). The in-process
+`f16_bytes_new/old` ratio improved 0.345→0.317 (dim256) / 0.317→0.305 (dim384), ~4–8% on top of
+the SIMD widen. Modest and not cleanly isolated from worker noise, but kept because one SIMD
+load strictly dominates 8 scalar loads (worst case neutral, never a regression).
+
 **Lever:** `dot_product_f32_bytes_f32` (used by f32-quantized FSVI indexes, `search.rs:307,372,492`).
 The old kernel decoded f32s from an open-ended `&stored_bytes[off..]` slice, which the
 compiler could not prove a fixed width for and so did not vectorize the `from_le_bytes`
