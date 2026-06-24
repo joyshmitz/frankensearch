@@ -109,3 +109,26 @@ tracked `f16_slice` workload and conflicts with the stronger in-process old-vs-n
 above, which isolates the f16 accumulator rewrite without cross-run Criterion noise. The
 follow-up is `bd-gfzk`: attack the actual default-path bottleneck, scalar f16-to-f32 decode,
 with an exhaustive correctness proof before rebenchmarking.
+
+### 2026-06-24 — `f16_slice` u16x8 SIMD load (BlackThrush)
+
+**Lever:** mirror the landed `f16_bytes` SIMD-load refinement (`c0e9c80`) onto the slice path
+`widen8_f16_slice` — build a `u16x8` of `to_bits()` lanes and zero-extend to `u32x8` (16-byte
+stack slot + `vpmovzxwd`) instead of materializing a `[u32; 8]`. Bit-exact (20/20 simd tests
+green); the slice path feeds `dot_product_f16_f32` (`in_memory.rs:480`, two-tier quality rescore).
+
+**Measured** (`f16_slice_new` crate vs `f16_slice_old` scalar, in-process; ratios are the only
+worker-robust signal across runs):
+
+| Workload | prior ratio (`[u32;8]`) | this change (`u16x8`) | verdict |
+|----------|------------------------|-----------------------|---------|
+| `dot/dim256/f16_slice` | 0.364 | **0.508** | no gain / hint of regression |
+| `dot/dim384/f16_slice` | 0.394 | **0.420** | no gain (≈ noise) |
+
+**Why reverted:** this run landed on a much slower/contended worker (absolute times ~2× the
+prior run) and the cross-run ratio moved the **wrong way** on dim256 (0.364→0.508). With no
+clean in-process A/B to isolate the load change from the fully-scalar baseline, there is no
+demonstrated gain (and a hint of regression). Per "REVERT ~0-gain", reverted to the committed
+`[u32; 8]` form. The byte-path SIMD load (`c0e9c80`) stays — it showed a consistent directional
+improvement on both dims; the slice path did not. A clean keep/reject would need an in-process
+"SIMD-widen + scalar-load" baseline added to `dot_product.rs` (left for a future pass).
