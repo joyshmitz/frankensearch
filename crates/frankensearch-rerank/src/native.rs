@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use ft_api::{FrankenTorchSession, quantize_per_output_channel_i8};
 use ft_autograd::TensorNodeId;
 use ft_core::ExecutionMode;
+use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -241,7 +242,12 @@ impl Model {
 
 /// Pure-Rust frankentorch cross-encoder reranker.
 pub struct NativeReranker {
-    inner: Mutex<Model>,
+    /// One session per pooled worker so documents can be reranked concurrently.
+    /// `FrankenTorchSession` is not `Sync` (it mutates the autograd tape every
+    /// forward), so parallelism uses a pool rather than a shared session. The
+    /// int8 Linear weights are `Arc`-shared across the pool; only the f32
+    /// embedding/LayerNorm leaves are duplicated per session.
+    pool: Vec<Mutex<Model>>,
     tokenizer: Tokenizer,
     max_length: usize,
     name: String,
@@ -305,21 +311,29 @@ impl NativeReranker {
             });
         }
 
-        // Parse + quantize the weights once; build a session from the shared data.
+        // Parse + quantize the weights once, then build a pool of sessions from
+        // the shared data so documents can be reranked concurrently. Pool size
+        // tracks the rayon worker count (capped to bound the per-session f32
+        // embedding memory, ~47 MB/session for the word-embedding table).
         let shared = parse_weights(&weights_path)?;
-        let model = build_model(&shared)?;
+        let pool_size = rayon::current_num_threads().clamp(1, 8);
+        let mut pool = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            pool.push(Mutex::new(build_model(&shared)?));
+        }
 
         tracing::info!(
             model = MODEL_NAME,
             linear_int8 = shared.qw.len(),
             f32_params = shared.f32_params.len(),
+            pool_size,
             max_length = DEFAULT_MAX_LENGTH,
             model_dir = %dir.display(),
-            "native frankentorch reranker loaded (int8 linear)"
+            "native frankentorch reranker loaded (int8 linear, pooled)"
         );
 
         Ok(Self {
-            inner: Mutex::new(model),
+            pool,
             tokenizer,
             max_length: DEFAULT_MAX_LENGTH,
             name: MODEL_NAME.to_owned(),
@@ -503,37 +517,49 @@ impl SyncRerank for NativeReranker {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        let mut model = self
-            .inner
-            .lock()
-            .map_err(|e| rerank_err("lock", format!("reranker mutex poisoned: {e}")))?;
-
-        let mut out = Vec::with_capacity(documents.len());
-        for (rank, doc) in documents.iter().enumerate() {
-            let encoding = self
-                .tokenizer
-                .encode((query, doc.text.as_str()), true)
-                .map_err(|e| rerank_err("tokenize", e))?;
-            let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-            let mut typ: Vec<i64> = encoding.get_type_ids().iter().map(|&t| i64::from(t)).collect();
-            if ids.len() > self.max_length {
-                ids.truncate(self.max_length);
-                typ.truncate(self.max_length);
-            }
-            let logit = model.forward(&ids, &typ)?;
-            let (score, raw_logit) = if logit.is_finite() {
-                (sigmoid(logit), Some(logit))
-            } else {
-                (0.0, None)
-            };
-            out.push(RerankScore {
-                doc_id: doc.doc_id.clone(),
-                score,
-                original_rank: rank,
-                raw_logit,
-            });
-        }
-        Ok(out)
+        let pool_len = self.pool.len();
+        // Rerank documents concurrently across the session pool. Each rayon
+        // worker uses the pooled session at its own worker index, so a slot is
+        // touched by one thread at a time and its `Mutex` is effectively
+        // uncontended. `par_iter().collect()` is index-preserving, so the output
+        // order (and `original_rank`) follows the input order and the scores are
+        // deterministic regardless of how work is scheduled across workers.
+        documents
+            .par_iter()
+            .enumerate()
+            .map(|(rank, doc)| {
+                let encoding = self
+                    .tokenizer
+                    .encode((query, doc.text.as_str()), true)
+                    .map_err(|e| rerank_err("tokenize", e))?;
+                let mut ids: Vec<i64> =
+                    encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
+                let mut typ: Vec<i64> =
+                    encoding.get_type_ids().iter().map(|&t| i64::from(t)).collect();
+                if ids.len() > self.max_length {
+                    ids.truncate(self.max_length);
+                    typ.truncate(self.max_length);
+                }
+                let slot = rayon::current_thread_index().unwrap_or(0) % pool_len;
+                let logit = {
+                    let mut model = self.pool[slot].lock().map_err(|e| {
+                        rerank_err("lock", format!("reranker mutex poisoned: {e}"))
+                    })?;
+                    model.forward(&ids, &typ)?
+                };
+                let (score, raw_logit) = if logit.is_finite() {
+                    (sigmoid(logit), Some(logit))
+                } else {
+                    (0.0, None)
+                };
+                Ok(RerankScore {
+                    doc_id: doc.doc_id.clone(),
+                    score,
+                    original_rank: rank,
+                    raw_logit,
+                })
+            })
+            .collect()
     }
 
     fn id(&self) -> &str {
