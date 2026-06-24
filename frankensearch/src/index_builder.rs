@@ -364,7 +364,7 @@ impl IndexBuilder {
                 }
                 Err(error) => {
                     export_error(metrics_exporter, &error);
-                    tracing::warn!(
+                    tracing::debug!(
                         doc_id = %doc.id,
                         error = %error,
                         "quality embedding failed, fast-only for this document"
