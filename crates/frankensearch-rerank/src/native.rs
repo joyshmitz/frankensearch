@@ -240,14 +240,28 @@ impl Model {
     }
 }
 
+/// A reranker worker slot: an owned frankentorch session plus a dedicated
+/// single-thread rayon pool. Each forward runs inside `compute.install(...)` so
+/// that every frankentorch op that uses ambient rayon internally (the f32
+/// attention `bmm`, `softmax`, `layer_norm`, the f32 GEMM path, ...) executes on
+/// this one thread instead of fanning rayon work back onto the doc-dispatch
+/// pool. That separation is what makes holding the session `Mutex` across the
+/// whole forward deadlock-free: a forward can never spawn rayon work that lands
+/// on a doc worker that is itself blocked on another slot's lock (the
+/// nested-rayon + `Mutex` deadlock this replaced).
+struct Slot {
+    model: Mutex<Model>,
+    compute: rayon::ThreadPool,
+}
+
 /// Pure-Rust frankentorch cross-encoder reranker.
 pub struct NativeReranker {
-    /// One session per pooled worker so documents can be reranked concurrently.
+    /// One session-slot per worker so documents rerank concurrently.
     /// `FrankenTorchSession` is not `Sync` (it mutates the autograd tape every
-    /// forward), so parallelism uses a pool rather than a shared session. The
-    /// int8 Linear weights are `Arc`-shared across the pool; only the f32
-    /// embedding/LayerNorm leaves are duplicated per session.
-    pool: Vec<Mutex<Model>>,
+    /// forward), so parallelism uses a pool of slots rather than a shared
+    /// session. The int8 Linear weights are `Arc`-shared across the pool; only
+    /// the f32 embedding/LayerNorm leaves are duplicated per session.
+    slots: Vec<Slot>,
     tokenizer: Tokenizer,
     max_length: usize,
     name: String,
@@ -317,9 +331,14 @@ impl NativeReranker {
         // embedding memory, ~47 MB/session for the word-embedding table).
         let shared = parse_weights(&weights_path)?;
         let pool_size = rayon::current_num_threads().clamp(1, 8);
-        let mut pool = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            pool.push(Mutex::new(build_model(&shared)?));
+        let mut slots = Vec::with_capacity(pool_size);
+        for i in 0..pool_size {
+            let compute = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .thread_name(move |_| format!("ee-rerank-compute-{i}"))
+                .build()
+                .map_err(|e| rerank_err("compute_pool", e))?;
+            slots.push(Slot { model: Mutex::new(build_model(&shared)?), compute });
         }
 
         tracing::info!(
@@ -329,11 +348,11 @@ impl NativeReranker {
             pool_size,
             max_length = DEFAULT_MAX_LENGTH,
             model_dir = %dir.display(),
-            "native frankentorch reranker loaded (int8 linear, pooled)"
+            "native frankentorch reranker loaded (int8 linear, pooled, sequential forwards)"
         );
 
         Ok(Self {
-            pool,
+            slots,
             tokenizer,
             max_length: DEFAULT_MAX_LENGTH,
             name: MODEL_NAME.to_owned(),
@@ -517,13 +536,18 @@ impl SyncRerank for NativeReranker {
         if documents.is_empty() {
             return Ok(Vec::new());
         }
-        let pool_len = self.pool.len();
-        // Rerank documents concurrently across the session pool. Each rayon
-        // worker uses the pooled session at its own worker index, so a slot is
-        // touched by one thread at a time and its `Mutex` is effectively
-        // uncontended. `par_iter().collect()` is index-preserving, so the output
-        // order (and `original_rank`) follows the input order and the scores are
-        // deterministic regardless of how work is scheduled across workers.
+        let n_slots = self.slots.len();
+        // Rerank documents concurrently across the session pool. The doc-level
+        // `par_iter` runs on the global rayon pool; each forward is dispatched
+        // onto its slot's dedicated single-thread `compute` pool via `install`,
+        // so the frankentorch ops inside the forward (int8 linear, the f32
+        // attention `bmm`, `softmax`, `layer_norm`, ...) run on that one thread
+        // and never fan rayon work back onto the doc-dispatch workers. That
+        // separation is what makes holding the session `Mutex` across the whole
+        // forward deadlock-free — no worker blocks on a lock while waiting for
+        // inner rayon work owned by another blocked worker. `par_iter().collect()`
+        // is index-preserving, so the output order (and `original_rank`) follows
+        // the input and the scores are deterministic regardless of scheduling.
         documents
             .par_iter()
             .enumerate()
@@ -540,13 +564,14 @@ impl SyncRerank for NativeReranker {
                     ids.truncate(self.max_length);
                     typ.truncate(self.max_length);
                 }
-                let slot = rayon::current_thread_index().unwrap_or(0) % pool_len;
-                let logit = {
-                    let mut model = self.pool[slot].lock().map_err(|e| {
+                let slot = rayon::current_thread_index().unwrap_or(0) % n_slots;
+                let s = &self.slots[slot];
+                let logit = s.compute.install(|| -> SearchResult<f32> {
+                    let mut model = s.model.lock().map_err(|e| {
                         rerank_err("lock", format!("reranker mutex poisoned: {e}"))
                     })?;
-                    model.forward(&ids, &typ)?
-                };
+                    model.forward(&ids, &typ)
+                })?;
                 let (score, raw_logit) = if logit.is_finite() {
                     (sigmoid(logit), Some(logit))
                 } else {
@@ -708,6 +733,49 @@ mod tests {
             assert_eq!(a.raw_logit, b.raw_logit, "logits must be deterministic");
         }
         eprintln!("[native_reranker] determinism across 2 runs OK");
+    }
+
+    #[test]
+    fn many_documents_rerank_without_deadlock() {
+        // Regression guard for the nested-rayon + Mutex deadlock. The fix runs
+        // each forward on its slot's dedicated single-thread rayon pool, so no
+        // frankentorch op (int8 linear, the f32 attention bmm, softmax,
+        // layer_norm, ...) can fan rayon work back onto the doc-dispatch pool
+        // while a worker holds a session Mutex. Reranking far more documents
+        // than the pool size forces multiple rayon workers onto the same slot —
+        // the exact collision that previously hung the multi-doc path. If a
+        // future change re-introduces nesting (a forward spawning rayon work
+        // onto the doc-dispatch pool while holding its session Mutex), this test
+        // deadlocks (CI timeout) rather than silently shipping a hang.
+        if !model_available() {
+            eprintln!("[native_reranker] SKIP many-docs: model dir not present");
+            return;
+        }
+        let reranker = NativeReranker::load(MODEL_DIR).expect("load");
+        // 24 docs >> the 8-session pool cap, so several workers share a slot.
+        let docs: Vec<RerankDocument> = (0..24)
+            .map(|i| doc(&format!("d{i}"), CASES[i % CASES.len()].1))
+            .collect();
+        let scored = reranker
+            .rerank_sync("what is the capital of france", &docs)
+            .expect("many-doc rerank completes (no deadlock)");
+        assert_eq!(scored.len(), docs.len(), "one score per doc");
+        for (i, s) in scored.iter().enumerate() {
+            assert_eq!(s.original_rank, i, "original_rank preserves input order");
+            assert_eq!(s.doc_id, format!("d{i}"));
+            assert!(s.score.is_finite());
+        }
+        // Same input twice -> identical scores (the parallel path is deterministic).
+        let again = reranker
+            .rerank_sync("what is the capital of france", &docs)
+            .expect("rerun");
+        for (a, b) in scored.iter().zip(again.iter()) {
+            assert_eq!(a.raw_logit, b.raw_logit, "parallel rerank must be deterministic");
+        }
+        eprintln!(
+            "[native_reranker] {}-doc concurrent rerank OK (no deadlock, deterministic)",
+            docs.len()
+        );
     }
 
     #[test]
