@@ -98,15 +98,19 @@ fastembed = { version = "5.11.0", default-features = false, features = [
     "image-models",
 ] }
 safetensors = "0.7.0"
-tokenizers = "0.23.1"
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+# frankentorch (pure-Rust tensor lib) for the native cross-encoder reranker backend
+# (frankensearch-rerank `native` feature). Referenced as a relative `/dp` sibling
+# (../frankentorch -> /dp/frankentorch), matching the franken-stack layout used by
+# the other unpublished path-deps; frankentorch is unpublished so it cannot use a
+# registry version like asupersync.
+ft-api = { path = "../frankentorch/crates/ft-api" }
+ft-autograd = { path = "../frankentorch/crates/ft-autograd" }
+ft-core = { path = "../frankentorch/crates/ft-core" }
 
 # Full-text search
 tantivy = "0.26.1"
 
-# ONNX Runtime for cross-encoder reranking
-# Match fastembed's TLS choice: rustls-only so musl/aarch64 cross builds
-# don't need a system OpenSSL toolchain.
-ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
 ndarray = "0.17"
 
 # HNSW approximate nearest neighbors

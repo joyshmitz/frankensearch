@@ -1,7 +1,7 @@
 [package]
 name = "frankensearch-rerank"
 version = "0.2.2"
-description = "Cross-encoder reranking for frankensearch (FlashRank + FastEmbed)"
+description = "Cross-encoder reranking for frankensearch (pure-Rust frankentorch + FastEmbed)"
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
@@ -9,17 +9,21 @@ repository.workspace = true
 [features]
 default = []
 fastembed-reranker = ["dep:fastembed"]
+# Pure-Rust frankentorch cross-encoder reranker backend (no ONNX/ort).
+native = ["dep:ft-api", "dep:ft-autograd", "dep:ft-core"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
 asupersync = { workspace = true }
-ort = { workspace = true }
 tokenizers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 fastembed = { workspace = true, optional = true }
+ft-api = { workspace = true, optional = true }
+ft-autograd = { workspace = true, optional = true }
+ft-core = { workspace = true, optional = true }
 
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
