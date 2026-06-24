@@ -485,17 +485,14 @@ The `publish-crates` lane in `.github/workflows/ci.yml` is intentionally gated a
 
 Required setup:
 - Repository variable: `ENABLE_CRATES_PUBLISH=true`
-- Repository variable: `CRATES_PUBLISH_SEQUENCE` (space-separated crate names in dependency order)
 - Repository secret: `CARGO_REGISTRY_TOKEN` (crates.io publish token)
 
 Behavior:
 - Runs only on stable `v*` tags (skips prerelease tags containing `-`).
-- Verifies tag/version alignment for each crate in `CRATES_PUBLISH_SEQUENCE`.
+- Verifies tag/version alignment for the top-level `frankensearch` crate.
+- Publishes the audited crate sequence in dependency order: `frankensearch-core`, `frankensearch-embed`, `frankensearch-index`, `frankensearch-lexical`, `frankensearch-fusion`, `frankensearch-storage`, `frankensearch`.
 - Runs per-crate `cargo publish --dry-run` checks before real publish.
-- Publishes crates sequentially to reduce crates.io index race failures.
-
-Current boundary:
-- Crates with local-only `fsqlite*` path dependencies are not publishable to crates.io until those dependencies are available as versioned crates. Start `CRATES_PUBLISH_SEQUENCE` with publishable crates only.
+- Publishes crates sequentially to reduce crates.io index race failures and treats already-published crate versions as idempotent success.
 
 ## Troubleshooting by Symptom
 

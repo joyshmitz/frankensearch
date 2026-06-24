@@ -567,19 +567,16 @@ When `publish-crates` is enabled in CI:
   - publishing MUST run only on the canonical repository owner.
 - Secrets/variables:
   - `CARGO_REGISTRY_TOKEN` secret is required.
-  - `CRATES_PUBLISH_SEQUENCE` repository variable is required and MUST be space-separated crate names in dependency order.
+  - `ENABLE_CRATES_PUBLISH=true` repository variable is required to opt into crates.io publishing.
 - Version alignment:
-  - every crate in `CRATES_PUBLISH_SEQUENCE` MUST match the tag version (`vX.Y.Z` -> crate version `X.Y.Z`).
+  - the top-level `frankensearch` crate MUST match the tag version (`vX.Y.Z` -> crate version `X.Y.Z`).
 - Ordered publish behavior:
+  - publish order MUST be `frankensearch-core`, `frankensearch-embed`, `frankensearch-index`, `frankensearch-lexical`, `frankensearch-fusion`, `frankensearch-storage`, then `frankensearch`,
   - for each crate in sequence:
     - run `cargo publish --dry-run` and retry briefly to absorb crates.io index propagation lag,
     - publish only after dry-run success,
+    - treat an already-published crate version as idempotent success,
     - wait between publishes to reduce index race failures.
-
-Current known boundary (2026-02-15):
-
-- Crates depending on local-only `fsqlite*` path dependencies are not publishable to crates.io until those dependencies are available as versioned crates.
-- As a result, `CRATES_PUBLISH_SEQUENCE` SHOULD initially include only crates with fully publishable dependency graphs (for example `frankensearch-core`) until the dependency graph is publish-ready.
 
 ## Required Reason Codes
 
