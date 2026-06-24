@@ -132,3 +132,6 @@ repro_*.rs
 .beads/*.rebuild_*
 .beads/recovery*/
 .beads_recovery/
+
+# Beads recovery scratch (machine-local, never tracked)
+.beads/.br_recovery/
