@@ -23,6 +23,8 @@ hot-path ratios and must not be presented as original-comparator wins.
 |------|-------|-------|---------------------|--------|-------|-------|--------|
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim256/f32_bytes` | 10.839 ms | 3.647 ms | **0.336** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim384/f32_bytes` | 14.084 ms | 5.333 ms | **0.379** | KEEP |
+| 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators (`BlueGull` pinned-worker confirmation) | `dot/dim256/f32_bytes/10000` | 3.4835 ms | 0.66126 ms | **0.190** | KEEP (`vmi1149989`) |
+| 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators (`BlueGull` pinned-worker confirmation) | `dot/dim384/f32_bytes/10000` | 5.1487 ms | 1.8811 ms | **0.365** | KEEP (`vmi1149989`) |
 
 **Lever:** `dot_product_f32_bytes_f32` (used by f32-quantized FSVI indexes, `search.rs:307,372,492`).
 The old kernel decoded f32s from an open-ended `&stored_bytes[off..]` slice, which the
@@ -34,6 +36,19 @@ immune to which rch worker the run landed on. f16 paths were tried with the same
 but **regressed** (decode is scalar-bound there) and were reverted — see
 `docs/NEGATIVE_EVIDENCE.md`. No dominance-vs-original claim (blocked by `bd-ui41`); this is a
 frankensearch pre-change before/after ratio only.
+
+`BlueGull` confirmation command:
+```bash
+RCH_WORKER=vmi1149989 \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench -p frankensearch-index --profile release --bench dot_product
+```
+Same worker conformance gate:
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo test -p frankensearch-index simd --profile release
+```
+Result: 18 relevant SIMD tests passed; RCH reported `remote vmi1149989`.
 
 ## Baselines only
 

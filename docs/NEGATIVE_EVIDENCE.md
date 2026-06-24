@@ -29,6 +29,7 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 | 2026-06-24 | frankensearch-cod-b | `frankensearch/search_bench` requested protocol | `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- cargo bench -p frankensearch --release --bench search_bench -- --sample-size 10` selected RCH worker `ovh-a`, then Cargo rejected `--release` for `cargo bench` with `unexpected argument '--release' found`; `cargo bench --help` lists `--profile <PROFILE-NAME>` instead. | Same protocol blocker as above; successful measurement used `--profile release` and remains per-crate. |
 | 2026-06-24 | frankensearch-cod-b | `frankensearch/search_bench vector_search_topk/top10/{1000,5000,10000}` | Same-worker RCH run on `ovh-a`: `rch exec -- cargo bench -p frankensearch --profile release --bench search_bench -- --sample-size 10`. Results: 1K `944.07 us`, 5K `3.4640 ms`, 10K `1.6642 ms`. | Scaling order is unstable/noisy; use as routing evidence only, not as keep/reject proof. |
 | 2026-06-24 | frankensearch-cod-b | `frankensearch-index/dot_product` release-profile comparison from detached baseline worktree | Three attempts with `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- cargo bench -p frankensearch-index --profile release --bench dot_product -- --sample-size 10 --warm-up-time 1 --measurement-time 3` fell open to local with `no admissible workers: insufficient_slots=8,health_below_fallback=2,hard_preflight=1`; each local fallback was interrupted before measurement. | No release-profile ratio. Bench-profile RCH runs may be routing evidence, but kept wins need an admitted remote release-profile run or an in-process head-to-head harness. |
+| 2026-06-24 | BlueGull (`frankensearch-cod-a`) | `frankensearch-index/dot_product f32_bytes` vs Tantivy/Lucene/Meilisearch-class original | Kept microkernel proof is against the embedded pre-change frankensearch `f32_bytes_old` baseline: pinned RCH worker `vmi1149989` measured `dot/dim256/f32_bytes/10000` at 3.4835 ms old -> 0.66126 ms new (ratio 0.190) and `dot/dim384/f32_bytes/10000` at 5.1487 ms old -> 1.8811 ms new (ratio 0.365). There is still no same-corpus Tantivy/Lucene/Meilisearch-class comparator for this vector-byte kernel or end-to-end workload. | Original-comparator ratio remains blocked by `bd-ui41`; do not claim dominance over Lucene/Tantivy/Meilisearch-class from this microkernel win alone. |
 
 ---
 
@@ -64,6 +65,25 @@ branchless `i32x8`/F16C widen), which is the actual bottleneck.
 
 **Kept from the same experiment:** the `f32_bytes` kernel restructure was a genuine ~3× win
 (decode-bound on open-ended slices, not accumulation) → see `docs/PERF_LEDGER.md`.
+
+### 2026-06-24 — f32 slice multi-accumulator portability check (BlueGull)
+
+**Lever:** apply the same 4-accumulator, 32-element loop shape to `dot_product_f32_f32`.
+
+**Evidence:** after the f16 revert, this command fell back local because RCH had no admissible
+workers:
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench -p frankensearch-index --profile release --bench dot_product
+```
+
+That local fallback measured `dot/dim256/f32_slice` at 1.4206 ms old vs 2.3436 ms new,
+ratio **1.650** (regression). A later pinned-worker run with the source hunk reverted
+measured the slice rows as noise-only routing checks, not a kept source change.
+
+**Decision:** do not ship the f32 slice accumulator rewrite. The committed lever is only
+`dot_product_f32_bytes_f32`, which won on both remote `vmi1149989` and local-fallback checks.
 
 ### 2026-06-24 — detached-worktree f16 accumulator candidate (frankensearch-cod-b)
 
