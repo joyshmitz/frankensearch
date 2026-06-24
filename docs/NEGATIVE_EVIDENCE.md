@@ -13,8 +13,8 @@ Conventions:
 
 Build/bench protocol (per-crate ONLY):
 ```bash
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
-  rch exec -- cargo bench -p <crate> --release
+CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
+  rch exec -- cargo bench -p <crate> --profile release
 ```
 
 ---
@@ -28,6 +28,7 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
 | 2026-06-24 | BlueGull (`frankensearch-cod-a`) | Tantivy/Lucene-class original comparison | README/AGENTS confirm frankensearch is a Tantivy BM25 + semantic/vector hybrid, but no current per-crate harness emits same-corpus ratios against a Tantivy-only incumbent. | Blocker tracked in `bd-ui41`; no dominance claim is valid until this exists. |
 | 2026-06-24 | frankensearch-cod-b | `frankensearch/search_bench` requested protocol | `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- cargo bench -p frankensearch --release --bench search_bench -- --sample-size 10` selected RCH worker `ovh-a`, then Cargo rejected `--release` for `cargo bench` with `unexpected argument '--release' found`; `cargo bench --help` lists `--profile <PROFILE-NAME>` instead. | Same protocol blocker as above; successful measurement used `--profile release` and remains per-crate. |
 | 2026-06-24 | frankensearch-cod-b | `frankensearch/search_bench vector_search_topk/top10/{1000,5000,10000}` | Same-worker RCH run on `ovh-a`: `rch exec -- cargo bench -p frankensearch --profile release --bench search_bench -- --sample-size 10`. Results: 1K `944.07 us`, 5K `3.4640 ms`, 10K `1.6642 ms`. | Scaling order is unstable/noisy; use as routing evidence only, not as keep/reject proof. |
+| 2026-06-24 | frankensearch-cod-b | `frankensearch-index/dot_product` release-profile comparison from detached baseline worktree | Three attempts with `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- cargo bench -p frankensearch-index --profile release --bench dot_product -- --sample-size 10 --warm-up-time 1 --measurement-time 3` fell open to local with `no admissible workers: insufficient_slots=8,health_below_fallback=2,hard_preflight=1`; each local fallback was interrupted before measurement. | No release-profile ratio. Bench-profile RCH runs may be routing evidence, but kept wins need an admitted remote release-profile run or an in-process head-to-head harness. |
 
 ---
 
@@ -63,3 +64,28 @@ branchless `i32x8`/F16C widen), which is the actual bottleneck.
 
 **Kept from the same experiment:** the `f32_bytes` kernel restructure was a genuine ~3× win
 (decode-bound on open-ended slices, not accumulation) → see `docs/PERF_LEDGER.md`.
+
+### 2026-06-24 — detached-worktree f16 accumulator candidate (frankensearch-cod-b)
+
+**Context:** a detached worktree at
+`/data/projects/frankensearch-cod-b-baseline-20260624T221243Z` was used to compare
+`HEAD` plus the `dot_product` bench harness against a 4-accumulator SIMD candidate that was
+not on `main`. The accepted release-profile command could not be admitted by RCH (see
+Measurement blockers), so the only completed same-worker numbers are Cargo's optimized bench
+profile on worker `vmi1152480`.
+
+**Bench-profile RCH before/after (`cargo bench -p frankensearch-index --bench dot_product
+-- --sample-size 10 --warm-up-time 1 --measurement-time 3`):**
+
+| Workload | before median | after median | ratio new/old | verdict |
+|----------|---------------|--------------|---------------|---------|
+| `dot/dim256/f16_bytes/10000` | 7.1007 ms | 3.9052 ms | 0.550 | routing win, not kept |
+| `dot/dim256/f16_slice/10000` | 5.0532 ms | 4.0380 ms | 0.799 | routing win, not kept |
+| `dot/dim384/f16_bytes/10000` | 7.0845 ms | 5.7334 ms | 0.809 | routing win, not kept |
+| `dot/dim384/f16_slice/10000` | 5.6829 ms | 6.0270 ms | 1.061 | regression |
+
+**Decision:** do not land this detached-worktree f16 accumulator candidate. It regresses a
+tracked `f16_slice` workload and conflicts with the stronger in-process old-vs-new evidence
+above, which isolates the f16 accumulator rewrite without cross-run Criterion noise. The
+follow-up is `bd-gfzk`: attack the actual default-path bottleneck, scalar f16-to-f32 decode,
+with an exhaustive correctness proof before rebenchmarking.
