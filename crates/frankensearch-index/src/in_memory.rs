@@ -309,7 +309,10 @@ impl InMemoryVectorIndex {
         // the candidate set is deterministic despite the unstable partition).
         let query_i8 = quantize_i8_query(query);
         let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
+        // Parallel int8 scan (order-preserving collect) so pass-1 matches the
+        // exact path's rayon parallelism — the 3× int8 win then compounds with it.
         let mut scored: Vec<(i32, usize)> = (0..count)
+            .into_par_iter()
             .map(|index| {
                 let start = index * self.dimension;
                 let stored = &self.vectors_i8[start..start + self.dimension];

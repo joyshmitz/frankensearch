@@ -35,6 +35,35 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ## Reverted experiments
 
+### 2026-06-24 — int8 ADC two-pass does NOT beat *parallel* exact at top-10/10k (BlackThrush)
+
+**Self-correction of an earlier overstated result.** The `3ecfad8` bench reported the int8 ADC
+two-pass ~2.6–3× faster than "exact f16", but that baseline (`topk_exact_f16`) was a **serial
+full-sort** pipeline. The **real product** `InMemoryVectorIndex::search_top_k` is **rayon-parallel
++ bounded-heap + cutoff** — much faster. Benching the real shipped methods head-to-head
+(`inmem_topk`, 10k vectors, top-10, mult=20, parallel pass-1):
+
+| Workload | exact `search_top_k` (parallel) | `search_top_k_int8_two_pass` | ratio |
+|----------|--------------------------------|------------------------------|-------|
+| `inmem_topk/dim256` | 306 µs | 373 µs | **1.22 (regression)** |
+| `inmem_topk/dim384` | ~400–700 µs (very noisy) | 393 µs | inconclusive |
+
+**Root cause:** the int8 *kernel* is genuinely ~3× faster (that stands — `33fb45b`), but the
+two-pass **method** materializes all N int8 scores into a `Vec` then selects serially, while the
+exact path never materializes more than the top-k heap and runs across all cores. At 10k the
+already-parallel+cutoff exact is ~300 µs; the two-pass's full-N materialize + serial select eats
+the kernel win. So the int8 ADC two-pass is **not** a win at this scale/path.
+
+**Honest scope of the kept results:** int8 dot ~3× (kernel, real), recall@10 = 1.0 (real). The
+**search-level** speedup only holds vs a *serial* exact — it does **not** beat the product's
+parallel exact at 10k. The lever's real upside is at larger N (100k+, where parallel exact also
+slows and bandwidth matters more) or the mmap FSVI path (page-fault + decode overhead), or with a
+**bounded-heap parallel pass-1** (avoid the full-N materialize). Filed as a follow-up.
+
+**Decision:** the `search_top_k_int8_two_pass` method is kept (correct, opt-in, bit-identical when
+recall=1 — proven by `int8_two_pass_matches_exact_topk`; a foundation), but it carries **no
+verified perf-win claim at 10k**. PERF_LEDGER corrected accordingly.
+
 ### 2026-06-24 — multi-accumulator unrolling of the **f16** dot-product kernels (BlackThrush)
 
 **Lever:** rewrite `dot_product_f16_f32` and `dot_product_f16_bytes_f32` to use 4 independent

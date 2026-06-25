@@ -116,15 +116,26 @@ So the int8 ADC two-pass is **~2.6–3.0× faster on the actual top-k search wor
 bounded-heap selection would only widen the gap). This is the search-level proof, not just a
 kernel ratio.
 
+> **CORRECTION (see `docs/NEGATIVE_EVIDENCE.md`):** the `topk_exact_f16` baseline above is a
+> *serial full-sort* pipeline. The real product `search_top_k` is **rayon-parallel + bounded-heap
+> + cutoff** and is far faster. Benching the **real methods** head-to-head (`inmem_topk`, 10k,
+> top-10) shows the int8 two-pass is **1.22× slower** at dim256 and inconclusive (noisy) at dim384
+> — i.e. **no verified search-level win at 10k vs parallel exact**. The kernel ~3× (`33fb45b`) and
+> recall@10 = 1.0 stand; the ~2.6–3× search ratio holds only vs a *serial* exact. The two-pass's
+> upside is at larger N / the mmap path, or with a bounded-heap parallel pass-1 (it currently
+> materializes all N int8 scores then selects serially, which the parallel exact avoids).
+
 **Wired into the product (`InMemoryVectorIndex::search_top_k_int8_two_pass`):** the in-memory index
 now precomputes an int8 slab (one corpus-wide max-abs scale, ranking-preserving) at construction
-and exposes an opt-in two-pass method — int8 pass-1 (top `limit·mult`, deterministic total-order
-select) → exact f16 rescore with the *same* bounded-heap selection as the exact path. It is
-**bit-identical** to `search_top_k` whenever pass-1 recall is 1 (proven by
+and exposes an opt-in two-pass method — parallel int8 pass-1 (top `limit·mult`, deterministic
+total-order select) → exact f16 rescore with the *same* bounded-heap selection as the exact path.
+It is **bit-identical** to `search_top_k` whenever pass-1 recall is 1 (proven by
 `int8_two_pass_matches_exact_topk`: identical doc-ids + scores at mult=10 over 200 vectors), and
-falls back to exact if the int8 slab is absent. Existing exact paths are untouched. 351/351 index
-lib tests green. **Remaining:** wire the mmap FSVI `search.rs` path (needs an on-disk int8 sidecar
-artifact) + re-measure recall on a real clustered-embedding corpus and tune `mult` (`bd-b5wl`).
+falls back to exact if the int8 slab is absent. Existing exact paths are untouched; 355/355 index
+lib tests green. **It is a correct, opt-in foundation — but carries no verified perf win at 10k**
+(see correction above). **Remaining (`bd-b5wl`):** bounded-heap parallel pass-1 (avoid full-N
+materialize) + measure the crossover scale (100k+); the mmap FSVI `search.rs` path (on-disk int8
+sidecar); recall re-measure on a real clustered-embedding corpus.
 
 These rows are routing evidence for future levers, not wins.
 

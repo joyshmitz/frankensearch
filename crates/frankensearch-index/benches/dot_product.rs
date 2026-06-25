@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32, dot_product_f32_bytes_f32,
-    dot_product_f32_f32,
+    InMemoryVectorIndex, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32,
+    dot_product_f32_bytes_f32, dot_product_f32_f32,
 };
 use half::f16;
 use wide::f32x8;
@@ -385,5 +385,38 @@ fn bench_dot(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_dot);
+/// Bench the **real shipped methods** head-to-head: the exact (rayon-parallel)
+/// `search_top_k` vs the int8 ADC `search_top_k_int8_two_pass` on a 10k in-memory
+/// index. This measures the actual product capability, not an inline approximation.
+fn bench_inmem_topk(c: &mut Criterion) {
+    for &dim in &[256_usize, 384] {
+        let n = 10_000_usize;
+        let corpus = build_corpus(dim, n);
+        let q = &corpus.query;
+        let doc_ids: Vec<String> = (0..n).map(|i| format!("doc-{i}")).collect();
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, corpus.stored_f32.clone(), dim)
+            .expect("build in-memory index");
+
+        let mut group = c.benchmark_group(format!("inmem_topk/dim{dim}"));
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(3));
+
+        group.bench_function(BenchmarkId::new("exact_f16", n), |b| {
+            b.iter(|| black_box(index.search_top_k(black_box(q), 10, None).unwrap()));
+        });
+        group.bench_function(BenchmarkId::new("int8_two_pass_mult20", n), |b| {
+            b.iter(|| {
+                black_box(
+                    index
+                        .search_top_k_int8_two_pass(black_box(q), 10, 20)
+                        .unwrap(),
+                )
+            });
+        });
+
+        group.finish();
+    }
+}
+
+criterion_group!(benches, bench_dot, bench_inmem_topk);
 criterion_main!(benches);
