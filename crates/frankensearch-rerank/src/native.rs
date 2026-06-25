@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use ft_api::{FrankenTorchSession, quantize_per_output_channel_i8};
 use ft_autograd::TensorNodeId;
-use ft_core::ExecutionMode;
+use ft_core::{DType, Device, ExecutionMode, TensorMeta};
 use tokenizers::Tokenizer;
 use wide::f32x8;
 
@@ -199,86 +199,61 @@ fn fast_gelu_inplace(data: &mut [f32]) {
     }
 }
 
-/// Dot product of two contiguous `HD`-length f32 slices (one head's Q·K), 8 lanes
-/// at a time. `HD == 32` so this is exactly 4 fused f32x8 multiply-adds.
-#[inline]
-fn dot_hd(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = f32x8::splat(0.0);
-    let mut c = 0;
-    while c < HD {
-        let mut ab = [0.0f32; 8];
-        let mut bb = [0.0f32; 8];
-        ab.copy_from_slice(&a[c..c + 8]);
-        bb.copy_from_slice(&b[c..c + 8]);
-        acc += f32x8::new(ab) * f32x8::new(bb);
-        c += 8;
-    }
-    acc.to_array().iter().sum()
-}
-
-/// Fused single-document multi-head self-attention. `q`/`k`/`v` are the per-token
-/// projections in `[s_len, H]` row-major layout (the raw Linear outputs, BEFORE any
-/// head reshape); returns the context `[s_len, H]`.
+/// Multi-head self-attention for one document. `qkv` is the fused QKV linear output
+/// `[s_len, 3H]` (Q at column 0, K at column H, V at column 2H); returns the context
+/// `[s_len, H]`.
 ///
-/// Replaces the heads-transpose + 2×`bmm` + softmax tape ops with one pass that
-/// never materializes the transposed Q/Kᵀ and never launches a per-head `gemm`
-/// (profiling found that path running ~5-10× below its FLOP floor — `gemm`'s
-/// packing overhead never amortizes over the tiny `k = HD = 32`). Because each
-/// head's slice is a contiguous 32-wide block, the QKᵀ dot and the ·V accumulation
-/// are tight `f32x8` loops and the `[s_len]` score row is softmaxed in a per-worker
-/// scratch buffer that never hits the heap per (head, query). Parallel over query
-/// rows; intra-forward only (the doc loop is sequential), so the nested-rayon +
-/// `Mutex` deadlock class stays closed. The attention math is identical to the bmm
-/// path (within f32 reassociation), so the ranking is unchanged — validated by the
-/// parity + `forward_batch_matches_per_doc` tests.
+/// The per-query `f32x8` kernel was cheap to launch (no tape, no per-head gemm) but
+/// runs the S² inner loop one dot at a time, which dominates at seq ≥ 256 (it was
+/// ~9× over the FLOP floor — a register-blocked GEMM does the same MACs far faster).
+/// So repack each head's Q/K/V into the head-major layout the batched `bmm` kernel
+/// (`gemm::sgemm`, cache-blocking) wants, do QKᵀ and ·V as two batched GEMMs with a
+/// vectorized softmax between, and transpose the context back. The repacks are
+/// O(S·H); the GEMMs are where the work goes. The `bmm` kernel parallelizes across
+/// the NH head-batches internally and stays intra-forward, so the nested-rayon +
+/// `Mutex` deadlock class remains closed. Bit-exact to the bmm tape path (within f32
+/// reassociation) — validated by parity + `forward_batch_matches_per_doc`.
 fn fused_attention(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
     debug_assert_eq!(qkv.len(), s_len * 3 * H);
-    let mut ctx = vec![0.0f32; s_len * H];
     if s_len == 0 {
-        return ctx;
+        return Vec::new();
     }
-    // `qkv` is the fused QKV linear output `[s_len, 3H]`: Q at column 0, K at column
-    // H, V at column 2H. Each head's HD slice is still contiguous, so the dot / ·V
-    // inner loops are unchanged — only the row stride (3H) and per-operand column
-    // offset differ.
     const STRIDE: usize = 3 * H;
-    let row_attend = |scores: &mut Vec<f32>, i: usize, ctx_row: &mut [f32]| {
-        scores.resize(s_len, 0.0);
+    // Repack into head-major operands: Q/V as [NH, S, HD], K transposed to [NH, HD, S]
+    // so QKᵀ is a plain `bmm(Q, Kᵀ)`.
+    let mut q_hm = vec![0.0f32; NH * s_len * HD];
+    let mut kt = vec![0.0f32; NH * HD * s_len];
+    let mut v_hm = vec![0.0f32; NH * s_len * HD];
+    for j in 0..s_len {
+        let base = j * STRIDE;
         for h in 0..NH {
-            let qoff = i * STRIDE + h * HD;
-            let q_block = &qkv[qoff..qoff + HD];
-            // scores[j] = Q[i,h] · K[j,h]  (softmax applies the 1/√HD `scale`).
-            for (j, sj) in scores.iter_mut().enumerate() {
-                let koff = j * STRIDE + H + h * HD;
-                *sj = dot_hd(q_block, &qkv[koff..koff + HD]);
-            }
-            softmax_row_fused(scores, scale);
-            // ctx[i,h] = Σ_j scores[j] · V[j,h], accumulators kept in registers.
-            let mut acc = [f32x8::splat(0.0); HD / 8];
-            for (j, &sj) in scores.iter().enumerate() {
-                let voff = j * STRIDE + 2 * H + h * HD;
-                let sjv = f32x8::splat(sj);
-                for (c, a) in acc.iter_mut().enumerate() {
-                    let mut buf = [0.0f32; 8];
-                    buf.copy_from_slice(&qkv[voff + c * 8..voff + c * 8 + 8]);
-                    *a += sjv * f32x8::new(buf);
-                }
-            }
-            let out = &mut ctx_row[h * HD..h * HD + HD];
-            for (c, a) in acc.iter().enumerate() {
-                out[c * 8..c * 8 + 8].copy_from_slice(&a.to_array());
+            let (qb, kb, vb) = (base + h * HD, base + H + h * HD, base + 2 * H + h * HD);
+            let hm = (h * s_len + j) * HD;
+            q_hm[hm..hm + HD].copy_from_slice(&qkv[qb..qb + HD]);
+            v_hm[hm..hm + HD].copy_from_slice(&qkv[vb..vb + HD]);
+            let ktbase = h * HD * s_len;
+            for d in 0..HD {
+                kt[ktbase + d * s_len + j] = qkv[kb + d];
             }
         }
-    };
-    if s_len >= 8 && rayon::current_num_threads() > 1 {
-        use rayon::prelude::*;
-        ctx.par_chunks_mut(H)
-            .enumerate()
-            .for_each_init(Vec::new, |scores, (i, row)| row_attend(scores, i, row));
-    } else {
-        let mut scores = Vec::new();
-        for (i, row) in ctx.chunks_mut(H).enumerate() {
-            row_attend(&mut scores, i, row);
+    }
+    // scores[NH, S, S] = Q @ Kᵀ, then in-place fused-scale softmax over the last dim.
+    let qm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
+    let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
+    let mut scores = ft_api::bmm_tensor_contiguous_f32(&q_hm, &kt, &qm, &km)
+        .expect("attn QKᵀ bmm: shapes are internally consistent");
+    fast_softmax_inplace(&mut scores, NH * s_len, s_len, scale);
+    // ctx_hm[NH, S, HD] = scores @ V.
+    let sm = TensorMeta::from_shape(vec![NH, s_len, s_len], DType::F32, Device::Cpu);
+    let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
+    let ctx_hm = ft_api::bmm_tensor_contiguous_f32(&scores, &v_hm, &sm, &vm)
+        .expect("attn ·V bmm: shapes are internally consistent");
+    // Transpose the head-major context back to token-major [S, H].
+    let mut ctx = vec![0.0f32; s_len * H];
+    for h in 0..NH {
+        for i in 0..s_len {
+            let src = (h * s_len + i) * HD;
+            ctx[i * H + h * HD..i * H + h * HD + HD].copy_from_slice(&ctx_hm[src..src + HD]);
         }
     }
     ctx
