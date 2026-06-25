@@ -369,6 +369,21 @@ impl Model {
             .map_err(|e| rerank_err("index_tensor", e))
     }
 
+    /// Fused residual-add + LayerNorm `layer_norm(a + b)` (the "add & norm") in one
+    /// op, so the residual sum is never materialized as its own tensor (2 per layer).
+    fn add_ln(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+        prefix: &str,
+    ) -> SearchResult<TensorNodeId> {
+        let w = self.g(&format!("{prefix}.weight"))?;
+        let bias = self.g(&format!("{prefix}.bias"))?;
+        self.s
+            .tensor_add_layer_norm(a, b, H, Some(w), Some(bias), EPS)
+            .map_err(|e| rerank_err("add_layer_norm", e))
+    }
+
     /// Exact GELU via the vectorized [`fast_gelu`] (A–S erf), replacing the
     /// `tensor_gelu` tape op's scalar libm `erff`. Round-trips through f32 values +
     /// a fresh leaf, consistent with the int8 linear (which already returns a
@@ -514,12 +529,12 @@ impl Model {
             .s
             .tensor_index_select(te, 0, typ_t)
             .map_err(|e| rerank_err("embed.type", e))?;
-        let mut emb = self
+        let emb_wp = self
             .s
             .tensor_add(e_word, e_pos)
             .map_err(|e| rerank_err("embed.add", e))?;
-        emb = self.s.tensor_add(emb, e_typ).map_err(|e| rerank_err("embed.add2", e))?;
-        emb = self.ln(emb, "bert.embeddings.LayerNorm")?;
+        // Fuse the third-embedding add with the embedding LayerNorm.
+        let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
         let scale = 1.0 / (HD as f64).sqrt();
         for i in 0..L {
@@ -527,14 +542,12 @@ impl Model {
             // self-attention (fused-QKV + fused kernel, or separate-QKV + bmm by len)
             let ctx = self.attention(emb, &p, s_len, scale)?;
             let attn = self.linear(ctx, &format!("{p}.attention.output.dense"))?;
-            let sum1 = self.s.tensor_add(emb, attn).map_err(|e| rerank_err("attn.residual", e))?;
-            emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
+            emb = self.add_ln(emb, attn, &format!("{p}.attention.output.LayerNorm"))?;
             // feed-forward
             let inter = self.linear(emb, &format!("{p}.intermediate.dense"))?;
             let inter = self.gelu(inter)?;
             let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
-            let sum2 = self.s.tensor_add(emb, ffn).map_err(|e| rerank_err("ffn.residual", e))?;
-            emb = self.ln(sum2, &format!("{p}.output.LayerNorm"))?;
+            emb = self.add_ln(emb, ffn, &format!("{p}.output.LayerNorm"))?;
         }
         // pooler on [CLS] (row 0) + classifier
         let cls = self
@@ -623,12 +636,12 @@ impl Model {
             .s
             .tensor_index_select(te, 0, typ_t)
             .map_err(|e| rerank_err("embed.type", e))?;
-        let mut emb = self
+        let emb_wp = self
             .s
             .tensor_add(e_word, e_pos)
             .map_err(|e| rerank_err("embed.add", e))?;
-        emb = self.s.tensor_add(emb, e_typ).map_err(|e| rerank_err("embed.add2", e))?;
-        emb = self.ln(emb, "bert.embeddings.LayerNorm")?;
+        // Fuse the third-embedding add with the embedding LayerNorm.
+        let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
         let scale = 1.0 / (HD as f64).sqrt();
         for i in 0..L {
