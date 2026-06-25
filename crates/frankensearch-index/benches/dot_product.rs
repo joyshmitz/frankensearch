@@ -137,6 +137,53 @@ fn dot_f32_bytes_baseline(stored_bytes: &[u8], query: &[f32]) -> f32 {
     result
 }
 
+// ── Full top-k pipelines (exact f16 vs int8 ADC two-pass, bd-b5wl) ───────────
+// These bench the *search-level* cost: score all N, then select top-k. Both pay
+// an N-element sort (conservative — a production bounded heap would be cheaper),
+// so the ratio is dominated by the dot cost the two-pass replaces.
+
+fn topk_exact_f16(stored_f16_bytes: &[Vec<u8>], q: &[f32], k: usize) -> Vec<u32> {
+    let mut scored: Vec<(f32, u32)> = stored_f16_bytes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (dot_product_f16_bytes_f32(b, q).unwrap(), i as u32))
+        .collect();
+    scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    scored.truncate(k);
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
+fn topk_int8_two_pass(
+    stored_i8: &[Vec<i8>],
+    stored_f16_bytes: &[Vec<u8>],
+    q_f32: &[f32],
+    q_i8: &[i8],
+    k: usize,
+    mult: usize,
+) -> Vec<u32> {
+    // Pass 1: int8 dot over all N, keep top (k*mult) candidates.
+    let mut p1: Vec<(i32, u32)> = stored_i8
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (dot_i8_i8(v, q_i8), i as u32))
+        .collect();
+    let cand = (k * mult).min(p1.len());
+    p1.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    // Pass 2: exact f16 rescore of the candidates, keep top k.
+    let mut p2: Vec<(f32, u32)> = p1[..cand]
+        .iter()
+        .map(|&(_, i)| {
+            (
+                dot_product_f16_bytes_f32(&stored_f16_bytes[i as usize], q_f32).unwrap(),
+                i,
+            )
+        })
+        .collect();
+    p2.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    p2.truncate(k);
+    p2.into_iter().map(|(_, i)| i).collect()
+}
+
 // ── Corpus ──────────────────────────────────────────────────────────────────
 
 /// Deterministic pseudo-random f32 in [-1, 1] (xorshift; no rng dep).
@@ -311,6 +358,26 @@ fn bench_dot(c: &mut Criterion) {
                     acc += dot_f32_f32_baseline(black_box(v), black_box(q));
                 }
                 black_box(acc)
+            });
+        });
+
+        // Search-level top-10: exact f16 full scan vs int8 ADC two-pass (mult=20).
+        // Same algorithm validated lossless (recall@10=1.0) by the simd recall test.
+        let k = 10_usize;
+        let mult = 20_usize;
+        group.bench_function(BenchmarkId::new("topk_exact_f16", n), |b| {
+            b.iter(|| black_box(topk_exact_f16(&corpus.stored_f16_bytes, black_box(q), k)));
+        });
+        group.bench_function(BenchmarkId::new("topk_int8_2pass", n), |b| {
+            b.iter(|| {
+                black_box(topk_int8_two_pass(
+                    &corpus.stored_i8,
+                    &corpus.stored_f16_bytes,
+                    black_box(q),
+                    black_box(qi8),
+                    k,
+                    mult,
+                ))
             });
         });
 

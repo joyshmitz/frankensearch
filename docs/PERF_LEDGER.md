@@ -102,8 +102,20 @@ random L2-normalized vectors, averaged over 25 queries). So at a modest multipli
 is **lossless** here. Both ADC gates now pass: ~3× pass-1 speed **and** recall = 1.0. **Caveat:**
 random vectors have wide angular spread; real (clustered) embeddings may need a higher `mult` —
 the production wiring must re-measure recall on a real corpus and tune `mult`/quant granularity.
-Remaining for the product win: int8 sidecar + two-pass scan wiring + the recall gate on a real
-corpus (`bd-b5wl`).
+
+**End-to-end search-level ratio (`topk_exact_f16` vs `topk_int8_2pass`, k=10, mult=20, n=10k):**
+full top-10 pipeline (score all N + select), measured same-process:
+
+| dim | exact f16 top-k | int8 two-pass top-k | ratio |
+|-----|-----------------|---------------------|-------|
+| 256 | 1.213 ms | 469 µs | **0.387** (~2.6×) |
+| 384 | 1.794 ms | 607 µs | **0.339** (~3.0×) |
+
+So the int8 ADC two-pass is **~2.6–3.0× faster on the actual top-k search workload with recall@10
+= 1.0** (mult=20, random vectors; both pipelines pay a conservative N-element sort, so production
+bounded-heap selection would only widen the gap). This is the search-level proof, not just a
+kernel ratio. Remaining for the product win: wire it into `search.rs`/`in_memory.rs` behind an
+int8 sidecar (additive, exact f16 fallback) + re-measure recall on a real corpus (`bd-b5wl`).
 
 These rows are routing evidence for future levers, not wins.
 
