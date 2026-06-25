@@ -35,6 +35,29 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ## Reverted experiments
 
+### 2026-06-25 — SIMD-widen int8 dot (`i16x16::dot`/`vpmaddwd`) is SLOWER on this build (BlackThrush)
+
+**Lever:** rewrite `dot_i8_i8` from scalar `i16::from` widening (16 `movsx` per 8 elems) to a
+fully-SIMD 16-wide kernel: `[i8;16]` → `i8x16` → `i16x16` (sign-extend) → `i16x16::dot`
+(`vpmaddwd`, pairwise products → `i32x8`). Correct (`dot_i8_i8_matches_scalar` green incl. the
+all-(−128)/512-dim overflow case), but measured a **regression** vs the committed scalar-widen
+kernel:
+
+| Workload | int8/f16 ratio (scalar-widen, kept) | int8/f16 ratio (SIMD-widen) |
+|----------|-------------------------------------|-----------------------------|
+| `dot/dim256/i8_dot` | 0.331 | **0.508** |
+| `dot/dim384/i8_dot` | 0.311 | **0.442** |
+
+(in-process int8-vs-f16 ratio; higher = int8 got relatively slower). Normalizing for worker
+speed, the SIMD-widen int8 dot is ~1.5× **slower** than scalar-widen.
+
+**Why it fails:** this is an **SSE2-class build** (no AVX2/SSE4.1 — consistent with the ~1 ns/elem
+f32 dots seen elsewhere). `i8→i16` `vpmovsxbw` and 256-bit `i16x16` are then *emulated* (unpack +
+arithmetic-shift over two SSE registers), which costs more than 16 plain scalar `movsx`. "Portable
+SIMD" loses to scalar when the target lacks the widening instruction. Reverted to scalar-widen.
+**Do not re-attempt** without either a runtime AVX2/SSE4.1 dispatch or `-Ctarget-cpu` that enables
+those features (which the published library cannot assume).
+
 ### 2026-06-24 — int8 ADC two-pass does NOT beat *parallel* exact at top-10/10k (BlackThrush)
 
 **Self-correction of an earlier overstated result.** The `3ecfad8` bench reported the int8 ADC
