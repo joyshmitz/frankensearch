@@ -64,21 +64,23 @@ impl QueryClass {
 
     /// Heuristic check for identifier-like queries.
     fn looks_like_identifier(s: &str) -> bool {
-        // Path separators are identifier-like for single-token queries.
-        if !s.chars().any(char::is_whitespace) && (s.contains('/') || s.contains('\\')) {
-            return true;
-        }
-
-        // No whitespace and contains dots or Rust path separators
-        if !s.chars().any(char::is_whitespace) && (s.contains('.') || s.contains("::")) {
-            return true;
-        }
-
-        // camelCase, PascalCase, or snake_case
+        // Whitespace presence gates every single-token heuristic below; compute it
+        // once instead of rescanning the string for each check (the prior code ran
+        // `chars().any(is_whitespace)` up to four times). Grouping the no-whitespace
+        // checks under one guard is behaviour-identical — every branch returns
+        // `true`, so the result is unchanged regardless of check order.
         if !s.chars().any(char::is_whitespace) {
+            // Path separators, dots, or Rust path separators.
+            if s.contains('/') || s.contains('\\') || s.contains('.') || s.contains("::") {
+                return true;
+            }
+
+            // snake_case.
             if s.contains('_') {
                 return true;
             }
+
+            // camelCase / PascalCase (mixed case that isn't one capitalized word).
             let has_lower = s.chars().any(char::is_lowercase);
             let has_upper = s.chars().any(char::is_uppercase);
             let first_upper = s.chars().next().is_some_and(char::is_uppercase);
@@ -86,23 +88,22 @@ impl QueryClass {
             if has_lower && has_upper && !(first_upper && rest_lower) {
                 return true;
             }
-        }
 
-        // Issue/ticket ID pattern: prefix-digits (e.g., bd-123, JIRA-456, my-project-789)
-        if !s.chars().any(char::is_whitespace) && s.contains('-') {
-            let parts: Vec<&str> = s.rsplitn(2, '-').collect();
-            if parts.len() == 2
-                // parts[0] is the suffix (digits), parts[1] is the prefix
-                && parts[0].chars().all(|c| c.is_ascii_digit())
-                && parts[1].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && !parts[0].is_empty()
-                && !parts[1].is_empty()
+            // Issue/ticket ID pattern: prefix-digits (e.g., bd-123, JIRA-456,
+            // my-project-789). `rsplit_once` borrows both halves — no `Vec` alloc.
+            if let Some((prefix, suffix)) = s.rsplit_once('-')
+                && !prefix.is_empty()
+                && !suffix.is_empty()
+                && suffix.chars().all(|c| c.is_ascii_digit())
+                && prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 return true;
             }
         }
 
-        // Starts with common code prefixes
+        // Starts with common code prefixes (these contain a space).
         if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
             return true;
         }

@@ -28,5 +28,9 @@ unicode-normalization = { workspace = true }
 name = "canonicalize"
 harness = false
 
+[[bench]]
+name = "query_class"
+harness = false
+
 [lints]
 workspace = true
