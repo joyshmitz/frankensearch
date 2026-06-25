@@ -16,12 +16,16 @@
 //!   rch exec -- cargo bench -p frankensearch-index --bench dot_product
 //! ```
 
+// Benchmark-only quantization rounds f32 -> i8 (a deliberate, bounded truncation).
+#![allow(clippy::cast_possible_truncation)]
+
 use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    dot_product_f16_bytes_f32, dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
+    dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32, dot_product_f32_bytes_f32,
+    dot_product_f32_f32,
 };
 use half::f16;
 use wide::f32x8;
@@ -147,24 +151,41 @@ fn gen_f32(state: &mut u64) -> f32 {
 
 struct Corpus {
     query: Vec<f32>,
+    query_i8: Vec<i8>,
     stored_f32: Vec<Vec<f32>>,
     stored_f16: Vec<Vec<f16>>,
     stored_f16_bytes: Vec<Vec<u8>>,
     stored_f32_bytes: Vec<Vec<u8>>,
+    stored_i8: Vec<Vec<i8>>,
+}
+
+/// Symmetric int8 quantization of a unit-range f32 (`gen_f32` yields [-1, 1]).
+fn quantize_i8(x: f32) -> i8 {
+    let scaled = (x * 127.0).round();
+    if scaled >= 127.0 {
+        127
+    } else if scaled <= -127.0 {
+        -127
+    } else {
+        scaled as i8
+    }
 }
 
 fn build_corpus(dim: usize, n: usize) -> Corpus {
     let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ (dim as u64).wrapping_mul(0x1234_5678);
     let query: Vec<f32> = (0..dim).map(|_| gen_f32(&mut state)).collect();
+    let query_i8: Vec<i8> = query.iter().copied().map(quantize_i8).collect();
 
     let mut stored_f32 = Vec::with_capacity(n);
     let mut stored_f16 = Vec::with_capacity(n);
     let mut stored_f16_bytes = Vec::with_capacity(n);
     let mut stored_f32_bytes = Vec::with_capacity(n);
+    let mut stored_i8 = Vec::with_capacity(n);
 
     for _ in 0..n {
         let v: Vec<f32> = (0..dim).map(|_| gen_f32(&mut state)).collect();
         let v16: Vec<f16> = v.iter().copied().map(f16::from_f32).collect();
+        let vi8: Vec<i8> = v.iter().copied().map(quantize_i8).collect();
         let mut b16 = Vec::with_capacity(dim * 2);
         for x in &v16 {
             b16.extend_from_slice(&x.to_le_bytes());
@@ -177,14 +198,17 @@ fn build_corpus(dim: usize, n: usize) -> Corpus {
         stored_f16.push(v16);
         stored_f16_bytes.push(b16);
         stored_f32_bytes.push(b32);
+        stored_i8.push(vi8);
     }
 
     Corpus {
         query,
+        query_i8,
         stored_f32,
         stored_f16,
         stored_f16_bytes,
         stored_f32_bytes,
+        stored_i8,
     }
 }
 
@@ -199,6 +223,19 @@ fn bench_dot(c: &mut Criterion) {
         group.sample_size(10);
         group.measurement_time(Duration::from_secs(3));
         group.throughput(criterion::Throughput::Elements(n as u64));
+
+        // int8 ADC pass-1 candidate (bd-b5wl): is an int8 dot actually faster than
+        // the optimized f16 dot? Compare `i8_dot` head-to-head with `f16_bytes_new`.
+        let qi8 = &corpus.query_i8;
+        group.bench_function(BenchmarkId::new("i8_dot", n), |b| {
+            b.iter(|| {
+                let mut acc = 0_i64;
+                for v in &corpus.stored_i8 {
+                    acc += i64::from(dot_i8_i8(black_box(v), black_box(qi8)));
+                }
+                black_box(acc)
+            });
+        });
 
         // f16_bytes — the dominant production path.
         group.bench_function(BenchmarkId::new("f16_bytes_new", n), |b| {

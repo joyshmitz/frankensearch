@@ -73,7 +73,28 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
 ```
 Result: 18 relevant SIMD tests passed; RCH reported `remote vmi1149989`.
 
-## Baselines only
+## Foundational primitives & lever validations (not yet product wins)
+
+These are measured de-risking results for levers that are not yet wired into the search
+path. They are **not** search speedups — they tell us whether a bigger build is worth it.
+
+### int8 dot kernel (`dot_i8_i8`) — validates the `bd-b5wl` ADC pass-1 premise
+
+Added a tested, exported symmetric int8 dot primitive (`crates/frankensearch-index/src/simd.rs`,
+SIMD via `wide::i16x8::mul_widen`; exhaustive-ish correctness test incl. the i32 overflow
+worst case). Benched head-to-head against the optimized f16 dot **in the same process/run**:
+
+| Workload | `i8_dot` (int8) | `f16_bytes_new` (optimized f16) | int8/f16 ratio |
+|----------|-----------------|---------------------------------|----------------|
+| `dot/dim256` (n=10k) | 368 µs | 1.113 ms | **0.331** (~3.0×) |
+| `dot/dim384` (n=10k) | 505 µs | 1.622 ms | **0.311** (~3.2×) |
+
+**Conclusion:** scoring all N with int8 is ~3× faster than the current exact f16 scan (½ the
+bytes + integer `mul_widen` MAC, no f16 decode). This **validates building the int8 ADC two-pass
+scan** (`bd-b5wl`): a pass-1 int8 sweep over all N + an exact f16 rescore of only `k·mult`
+candidates should net ~2.5–3× on the vector scan. **Caveat:** this is a kernel-throughput ratio,
+**not** a search speedup — the product win requires the sidecar + two-pass wiring + a recall@10
+gate (it's approximate). The primitive is unused by the search path until that lands.
 
 These rows are routing evidence for future levers, not wins.
 

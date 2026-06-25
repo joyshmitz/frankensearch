@@ -2,7 +2,7 @@
 
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
-use wide::{f32x8, u16x8, u32x8};
+use wide::{f32x8, i16x8, i32x8, u16x8, u32x8};
 
 // ── SIMD load/decode helpers ────────────────────────────────────────────────
 //
@@ -287,6 +287,59 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
     Ok(result)
 }
 
+/// Symmetric int8 dot product (both operands int8-quantized) returning the raw
+/// `i32` inner product `Σ stored[i] * query[i]`.
+///
+/// This is the candidate **pass-1 kernel** for an int8 ADC two-pass scan (`bd-b5wl`):
+/// quantized vectors are 1 byte/elem (half the bandwidth of f16) and the multiply
+/// accumulates in integer lanes. `i16::mul_widen` keeps every product in full i32
+/// precision, so the only overflow bound is the i32 accumulator (a 512-dim dot of
+/// ±127 values peaks at ~8.3M, far below i32::MAX) — exact for any realistic dim.
+///
+/// Lengths are assumed equal (caller-guaranteed in the scan); a short tail is
+/// handled scalar. Returns the raw integer dot; the caller applies the dequant
+/// scale.
+#[must_use]
+pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
+    let mut sum = i32x8::splat(0);
+
+    let mut stored_chunks = stored.chunks_exact(8);
+    let mut query_chunks = query.chunks_exact(8);
+    for (s, q) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
+        let sv = i16x8::from([
+            i16::from(s[0]),
+            i16::from(s[1]),
+            i16::from(s[2]),
+            i16::from(s[3]),
+            i16::from(s[4]),
+            i16::from(s[5]),
+            i16::from(s[6]),
+            i16::from(s[7]),
+        ]);
+        let qv = i16x8::from([
+            i16::from(q[0]),
+            i16::from(q[1]),
+            i16::from(q[2]),
+            i16::from(q[3]),
+            i16::from(q[4]),
+            i16::from(q[5]),
+            i16::from(q[6]),
+            i16::from(q[7]),
+        ]);
+        sum += sv.mul_widen(qv);
+    }
+
+    let mut result = sum.reduce_add();
+    for (s, q) in stored_chunks
+        .remainder()
+        .iter()
+        .zip(query_chunks.remainder())
+    {
+        result += i32::from(*s) * i32::from(*q);
+    }
+    result
+}
+
 fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = f32x8::splat(0.0);
     let mut a_chunks = a.chunks_exact(8);
@@ -391,6 +444,25 @@ mod tests {
                 assert_eq!(scalar.to_bits(), simd.to_bits(), "mismatch for {v:?}");
             }
         }
+    }
+
+    #[test]
+    fn dot_i8_i8_matches_scalar() {
+        fn scalar(a: &[i8], b: &[i8]) -> i32 {
+            a.iter().zip(b).map(|(&x, &y)| i32::from(x) * i32::from(y)).sum()
+        }
+        // Lengths that exercise the 8-wide loop, a partial tail, and extremes.
+        let to_i8 = |i: usize, m: usize| -> i8 {
+            i8::try_from(i32::try_from(i * m % 255).expect("< 255") - 127).expect("in range")
+        };
+        for len in [0_usize, 1, 7, 8, 9, 16, 17, 256, 384, 385] {
+            let a: Vec<i8> = (0..len).map(|i| to_i8(i, 37)).collect();
+            let b: Vec<i8> = (0..len).map(|i| to_i8(i, 53)).collect();
+            assert_eq!(dot_i8_i8(&a, &b), scalar(&a, &b), "len={len}");
+        }
+        // Worst-case magnitude: all -128 * -128 over 512 dims must not overflow i32.
+        let a = vec![i8::MIN; 512];
+        assert_eq!(dot_i8_i8(&a, &a), 512 * 128 * 128);
     }
 
     fn scalar_dot_f32(a: &[f32], b: &[f32]) -> f32 {
