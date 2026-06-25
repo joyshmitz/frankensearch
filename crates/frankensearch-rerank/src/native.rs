@@ -45,6 +45,12 @@ const DEFAULT_MAX_LENGTH: usize = 512;
 /// still giving the int8 GEMM a large enough row count to amortize weight loads.
 /// A single document longer than this is still processed alone (one-doc chunk).
 const MAX_BATCH_TOKENS: usize = 2048;
+/// Sequence-length crossover for the attention implementation: at or below this the
+/// fused per-query kernel wins (no transpose materialization / per-head gemm
+/// launch); above it the cache-blocking `gemm` bmm wins (it amortizes the K/V
+/// re-reads the fused loop repeats per query). Measured on M4: fused is ahead at
+/// ~130/294 tokens, behind at 512.
+const FUSED_ATTN_MAX_SEQ: usize = 384;
 const MODEL_NAME: &str = "ms-marco-minilm-l-6-v2";
 const SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
 const SAFETENSORS_FALLBACK: &str = "model.safetensors";
@@ -192,6 +198,86 @@ fn fast_gelu_inplace(data: &mut [f32]) {
     }
 }
 
+/// Dot product of two contiguous `HD`-length f32 slices (one head's Q·K), 8 lanes
+/// at a time. `HD == 32` so this is exactly 4 fused f32x8 multiply-adds.
+#[inline]
+fn dot_hd(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = f32x8::splat(0.0);
+    let mut c = 0;
+    while c < HD {
+        let mut ab = [0.0f32; 8];
+        let mut bb = [0.0f32; 8];
+        ab.copy_from_slice(&a[c..c + 8]);
+        bb.copy_from_slice(&b[c..c + 8]);
+        acc += f32x8::new(ab) * f32x8::new(bb);
+        c += 8;
+    }
+    acc.to_array().iter().sum()
+}
+
+/// Fused single-document multi-head self-attention. `q`/`k`/`v` are the per-token
+/// projections in `[s_len, H]` row-major layout (the raw Linear outputs, BEFORE any
+/// head reshape); returns the context `[s_len, H]`.
+///
+/// Replaces the heads-transpose + 2×`bmm` + softmax tape ops with one pass that
+/// never materializes the transposed Q/Kᵀ and never launches a per-head `gemm`
+/// (profiling found that path running ~5-10× below its FLOP floor — `gemm`'s
+/// packing overhead never amortizes over the tiny `k = HD = 32`). Because each
+/// head's slice is a contiguous 32-wide block, the QKᵀ dot and the ·V accumulation
+/// are tight `f32x8` loops and the `[s_len]` score row is softmaxed in a per-worker
+/// scratch buffer that never hits the heap per (head, query). Parallel over query
+/// rows; intra-forward only (the doc loop is sequential), so the nested-rayon +
+/// `Mutex` deadlock class stays closed. The attention math is identical to the bmm
+/// path (within f32 reassociation), so the ranking is unchanged — validated by the
+/// parity + `forward_batch_matches_per_doc` tests.
+fn fused_attention(q: &[f32], k: &[f32], v: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
+    debug_assert_eq!(q.len(), s_len * H);
+    let mut ctx = vec![0.0f32; s_len * H];
+    if s_len == 0 {
+        return ctx;
+    }
+    let row_attend = |scores: &mut Vec<f32>, i: usize, ctx_row: &mut [f32]| {
+        scores.resize(s_len, 0.0);
+        for h in 0..NH {
+            let qoff = i * H + h * HD;
+            let q_block = &q[qoff..qoff + HD];
+            // scores[j] = Q[i,h] · K[j,h]  (softmax applies the 1/√HD `scale`).
+            for (j, sj) in scores.iter_mut().enumerate() {
+                let koff = j * H + h * HD;
+                *sj = dot_hd(q_block, &k[koff..koff + HD]);
+            }
+            softmax_row_fused(scores, scale);
+            // ctx[i,h] = Σ_j scores[j] · V[j,h], accumulators kept in registers.
+            let mut acc = [f32x8::splat(0.0); HD / 8];
+            for (j, &sj) in scores.iter().enumerate() {
+                let voff = j * H + h * HD;
+                let sjv = f32x8::splat(sj);
+                for (c, a) in acc.iter_mut().enumerate() {
+                    let mut buf = [0.0f32; 8];
+                    buf.copy_from_slice(&v[voff + c * 8..voff + c * 8 + 8]);
+                    *a += sjv * f32x8::new(buf);
+                }
+            }
+            let out = &mut ctx_row[h * HD..h * HD + HD];
+            for (c, a) in acc.iter().enumerate() {
+                out[c * 8..c * 8 + 8].copy_from_slice(&a.to_array());
+            }
+        }
+    };
+    if s_len >= 8 && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        ctx.par_chunks_mut(H)
+            .enumerate()
+            .for_each_init(Vec::new, |scores, (i, row)| row_attend(scores, i, row));
+    } else {
+        let mut scores = Vec::new();
+        for (i, row) in ctx.chunks_mut(H).enumerate() {
+            row_attend(&mut scores, i, row);
+        }
+    }
+    ctx
+}
+
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
 /// f32 scales, plus its f32 bias. The three buffers are `Arc`-shared so the parsed
 /// weights are stored once and cloned cheaply into every pooled session.
@@ -309,8 +395,13 @@ impl Model {
     /// projections (each `[s_len, H]`) returns the context `[s_len, H]`. Shared by
     /// the single-pair [`Self::forward`] and the batched [`Self::forward_batch`]
     /// (which calls it on each document's contiguous token slice), so the two paths
-    /// compute byte-identical attention — the batched path is therefore parity-exact
-    /// with the per-doc path, not an approximation.
+    /// compute identical attention — the batched path is parity-exact.
+    ///
+    /// Hybrid: for short/medium sequences the [`fused_attention`] kernel wins (it
+    /// avoids the heads-transpose materialization and the per-head `gemm` launch
+    /// overhead that dominate there); for long sequences the `bmm` path wins (the
+    /// `gemm` crate's cache-blocking amortizes the K/V re-reads that the naive fused
+    /// loop repeats per query). `FUSED_ATTN_MAX_SEQ` is the measured crossover.
     fn attn_block(
         &mut self,
         q: TensorNodeId,
@@ -319,6 +410,28 @@ impl Model {
         s_len: usize,
         scale: f64,
     ) -> SearchResult<TensorNodeId> {
+        if s_len <= FUSED_ATTN_MAX_SEQ {
+            let ctx_vals = {
+                let qv = self
+                    .s
+                    .tensor_values_f32_borrowed(q)
+                    .map_err(|e| rerank_err("attn.q_vals", e))?;
+                let kv = self
+                    .s
+                    .tensor_values_f32_borrowed(k)
+                    .map_err(|e| rerank_err("attn.k_vals", e))?;
+                let vv = self
+                    .s
+                    .tensor_values_f32_borrowed(v)
+                    .map_err(|e| rerank_err("attn.v_vals", e))?;
+                fused_attention(qv, kv, vv, s_len, scale as f32)
+            };
+            return self
+                .s
+                .tensor_variable_f32(ctx_vals, vec![s_len, H], false)
+                .map_err(|e| rerank_err("attn.ctx", e));
+        }
+        // Long-sequence path: batched f32 bmm with in-place fused-scale softmax.
         let q = self.heads(q, s_len)?;
         let k = self.heads(k, s_len)?;
         let v = self.heads(v, s_len)?;
@@ -327,11 +440,6 @@ impl Model {
             .tensor_transpose(k, 1, 2)
             .map_err(|e| rerank_err("attn.kt", e))?; // [NH, HD, S]
         let scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
-        // Fused scale + vectorized-exp softmax, IN PLACE on the scores storage. The
-        // scores tensor is a single-use intermediate (only the `probs·V` bmm below
-        // reads it), so mutating it directly avoids the per-layer extract+reinsert of
-        // the wide `[NH, S, S]` attention matrix — the dominant softmax overhead. The
-        // mutated node IS `probs`.
         {
             let slice = self
                 .s
