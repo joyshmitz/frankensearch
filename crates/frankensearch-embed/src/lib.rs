@@ -53,6 +53,11 @@ mod lite_fallback {
     /// Returns a summary with zero writes. Callers should check for models
     /// on disk at the standard location (`~/.local/share/frankensearch/models/`)
     /// and prompt the user to run `fsfs download-models` if they are missing.
+    ///
+    /// # Errors
+    ///
+    /// This lite fallback currently does not return an error; the `Result`
+    /// mirrors the bundled-model API used when embedded models are enabled.
     pub fn ensure_default_semantic_models(
         model_root: Option<&Path>,
     ) -> SearchResult<EmbeddedModelInstallSummary> {

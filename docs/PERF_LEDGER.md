@@ -15,9 +15,11 @@ Criterion runs use the equivalent `--profile release` form and record that proto
 mismatch in `docs/NEGATIVE_EVIDENCE.md`.
 
 The dominance baseline is a Tantivy/Lucene/Meilisearch-class original comparator
-on identical corpora and query streams. Until `bd-ui41` lands that harness, rows
-below are limited to frankensearch pre-change baselines or before/after local
-hot-path ratios and must not be presented as original-comparator wins.
+on identical corpora and query streams. The `bd-ui41` comparator harness now
+lives in `frankensearch/benches/search_bench.rs`; its current result is negative
+and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
+pre-change baselines or before/after local hot-path ratios unless explicitly
+marked as original-comparator wins.
 
 | Date | Crate | Lever | Workload (bench id) | Before | After | Ratio | Status |
 |------|-------|-------|---------------------|--------|-------|-------|--------|

@@ -403,7 +403,7 @@ fn emit_bold_verify_summary(fixtures: &[BoldVerifyFixture]) {
     let cx = asupersync::Cx::for_testing();
     let sha = git_sha();
     let worker = worker_id();
-    let command = "RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_EMIT,RUST_LOG CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=warn rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3";
+    let command = "CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3";
 
     for fixture in fixtures {
         for query in BOLD_VERIFY_TOP10_QUERIES

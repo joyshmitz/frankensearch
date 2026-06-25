@@ -147,7 +147,7 @@ fn main() {
 }
 
 fn env_truthy(name: &str) -> bool {
-    env::var(name).ok().is_some_and(|value| {
+    env::var(name).is_ok_and(|value| {
         let normalized = value.trim();
         normalized == "1"
             || normalized.eq_ignore_ascii_case("true")

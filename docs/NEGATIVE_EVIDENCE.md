@@ -42,31 +42,32 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 Tantivy `search_doc_ids` vs frankensearch hash embedding + FSVI vector search + Tantivy candidates
 + RRF fusion. This is a **negative dominance check**, not a reverted source lever.
 
-**Measured command:** `RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_EMIT
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b FRANKENSEARCH_BOLD_VERIFY_EMIT=1
-rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench
-bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3`
+**Measured command:** `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a
+rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch
+--features lexical --profile release --bench search_bench bold_verify_tantivy_class
+-- --sample-size 10 --warm-up-time 1 --measurement-time 3`
 
-**Evidence:** RCH worker `vmi1227854`, git `cc45775` plus the local comparator harness, Criterion
-`new/estimates.json` under
-`/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_tantivy_class`. Ratios are
-frankensearch mean time / Tantivy-class mean time:
+**Evidence:** the full per-crate Criterion pass completed on RCH worker `vmi1152480`. A filtered
+summary rerun on RCH worker `hz2` emitted the machine-readable BOLD rows below; the emit flag must
+be passed inside `rch exec -- env ...` because the wrapper does not preserve that outer environment
+variable. The rows use the same fixed corpus/query harness and report
+frankensearch p50 / Tantivy-class p50:
 
-| Workload | Tantivy-class mean | frankensearch mean | ratio |
-|----------|--------------------|--------------------|-------|
-| `limit_all_limit_all/10000` | 5.670 ms | 14.170 ms | **2.50x slower** |
-| `top10_exact_identifier/10000` | 99.945 us | 655.294 us | **6.56x slower** |
-| `top10_exact_identifier/100000` | 1.024 ms | 3.836 ms | **3.75x slower** |
-| `top10_short_keyword/10000` | 46.947 us | 574.426 us | **12.24x slower** |
-| `top10_short_keyword/100000` | 162.510 us | 2.985 ms | **18.37x slower** |
-| `top10_quoted_phrase/10000` | 107.002 us | 651.956 us | **6.09x slower** |
-| `top10_quoted_phrase/100000` | 779.212 us | 3.816 ms | **4.90x slower** |
-| `top10_natural_language/10000` | 154.082 us | 756.347 us | **4.91x slower** |
-| `top10_natural_language/100000` | 686.750 us | 3.684 ms | **5.36x slower** |
-| `top10_high_fanout/10000` | 72.079 us | 685.378 us | **9.51x slower** |
-| `top10_high_fanout/100000` | 594.738 us | 3.428 ms | **5.76x slower** |
-| `top10_zero_hit/10000` | 22.383 us | 500.257 us | **22.35x slower** |
-| `top10_zero_hit/100000` | 25.526 us | 2.711 ms | **106.19x slower** |
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | ratio |
+|----------|-------------|-------------------|-------------------|-------|
+| `top10_exact_identifier/10000` | `2e78365a46a7c3b9` | 449 us | 1.716 ms | **3.82x slower** |
+| `top10_short_keyword/10000` | `2e78365a46a7c3b9` | 92 us | 1.616 ms | **17.57x slower** |
+| `top10_quoted_phrase/10000` | `2e78365a46a7c3b9` | 145 us | 1.711 ms | **11.80x slower** |
+| `top10_natural_language/10000` | `2e78365a46a7c3b9` | 352 us | 1.661 ms | **4.72x slower** |
+| `top10_high_fanout/10000` | `2e78365a46a7c3b9` | 317 us | 1.749 ms | **5.52x slower** |
+| `top10_zero_hit/10000` | `2e78365a46a7c3b9` | 80 us | 1.450 ms | **18.12x slower** |
+| `limit_all_limit_all/10000` | `2e78365a46a7c3b9` | 6.324 ms | 12.318 ms | **1.95x slower** |
+| `top10_exact_identifier/100000` | `13f1b0153f5adec9` | 2.260 ms | 8.143 ms | **3.60x slower** |
+| `top10_short_keyword/100000` | `13f1b0153f5adec9` | 515 us | 4.082 ms | **7.93x slower** |
+| `top10_quoted_phrase/100000` | `13f1b0153f5adec9` | 1.040 ms | 6.412 ms | **6.17x slower** |
+| `top10_natural_language/100000` | `13f1b0153f5adec9` | 1.641 ms | 5.756 ms | **3.51x slower** |
+| `top10_high_fanout/100000` | `13f1b0153f5adec9` | 647 us | 3.742 ms | **5.78x slower** |
+| `top10_zero_hit/100000` | `13f1b0153f5adec9` | 48 us | 2.827 ms | **58.90x slower** |
 
 **Decision:** no Lucene/Tantivy/Meilisearch-class win exists for the current hash-hybrid path.
 Future bold claims need a new lever that changes the cost model (ANN/int8 slab reuse, lexical
