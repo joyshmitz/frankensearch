@@ -196,6 +196,37 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-25 — `normalize_whitespace` ASCII byte-scan fast path is SLOWER (BlackThrush)
+
+**Lever:** `normalize_whitespace` (runs on every document at index time) walks `text.chars()` and
+pushes char-by-char, then does a trailing `trim_end`/`truncate` pass. The candidate added an
+`is_ascii()`-guarded byte path that scanned bytes, bulk-copied each non-whitespace run with one
+`push_str`, and emitted the separating space inline (no trailing-trim pass). A custom `is_ws_ascii`
+predicate (`b' ' | 0x09..=0x0d`) was used — **not** `u8::is_ascii_whitespace`, which excludes
+`\x0b` (vertical tab) and would diverge from `char::is_whitespace`. Byte-identity proven across
+vertical-tab/form-feed/mixed cases (`normalize_whitespace_ascii_matches`, 34/34 canonicalize tests
+green).
+
+**Measured command (per-crate, local fallback — RCH had no admissible workers):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-core --bench canonicalize normalize_whitespace
+```
+
+In-process old-vs-new A/B (`normalize_whitespace` group, 40× multi-line doc with newline +
+multi-space runs):
+
+| Workload | old (char path) | new (ASCII byte scan) | ratio new/old | verdict |
+|----------|-----------------|-----------------------|---------------|---------|
+| `normalize_whitespace` (~2.2 KB) | 3.415 µs | 3.910 µs | **1.145** | regression |
+
+**Why it fails:** safe Rust cannot bulk-append a known-ASCII byte slice to a `String` without
+`std::str::from_utf8` **re-validating** every run — that per-run validation scan costs more than
+the char-by-char path saves, and std's `chars()`/`String::push` already have ASCII fast paths so
+the original is near-optimal. The only way to skip validation is `from_utf8_unchecked` (`unsafe`),
+and the crate is `deny(unsafe_code)`. **Do not re-attempt** the byte-scan rewrite of
+`normalize_whitespace` under the safe-Rust constraint. Reverted source + bench (stash, not landed).
+
 ### 2026-06-25 — `search_minimal` lexical trait hook regresses decisive BOLD rows (BlackThrush)
 
 **Lever:** add a `LexicalSearch::search_minimal` hook and route the non-semantic hash-tier
