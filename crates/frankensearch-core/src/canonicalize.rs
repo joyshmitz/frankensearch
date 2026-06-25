@@ -84,18 +84,23 @@ impl Default for DefaultCanonicalizer {
 /// mirrors the ASCII fast paths in Lucene/Tantivy's analysis chains. Output is
 /// byte-identical to `text.nfc().collect()` for every input.
 #[inline]
-fn nfc_normalize(text: &str) -> String {
+fn nfc_normalize(text: &str) -> Cow<'_, str> {
     if text.is_ascii() {
-        text.to_owned()
+        // ASCII is already NFC, so borrow the input — no whole-document copy. The
+        // next pipeline stage (`strip_markdown_and_code`) only needs a `&str` and
+        // allocates its own buffer, so the prior `to_owned()` here was pure waste
+        // on the common (ASCII) path.
+        Cow::Borrowed(text)
     } else {
-        text.nfc().collect()
+        Cow::Owned(text.nfc().collect())
     }
 }
 
 impl Canonicalizer for DefaultCanonicalizer {
     fn canonicalize(&self, text: &str) -> String {
-        // 1. NFC Unicode normalization (critical for hash stability)
-        let normalized: String = nfc_normalize(text);
+        // 1. NFC Unicode normalization (critical for hash stability). ASCII text
+        //    borrows the input (no copy); non-ASCII allocates the normalized form.
+        let normalized = nfc_normalize(text);
         // 2. Strip markdown and collapse code blocks
         let stripped = self.strip_markdown_and_code(&normalized);
         // 3. Normalize whitespace
@@ -110,8 +115,8 @@ impl Canonicalizer for DefaultCanonicalizer {
     }
 
     fn canonicalize_query(&self, query: &str) -> String {
-        // Queries are short — just NFC normalize and trim
-        let normalized: String = nfc_normalize(query);
+        // Queries are short — just NFC normalize and trim (ASCII borrows the input).
+        let normalized = nfc_normalize(query);
         let trimmed = normalized.trim();
         truncate_to_chars(trimmed, self.max_length)
     }

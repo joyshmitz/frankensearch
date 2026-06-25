@@ -96,6 +96,24 @@ fn bench_nfc(c: &mut Criterion) {
     }
     group.finish();
 
+    // nfc_normalize ASCII path: old returned `text.to_owned()` (whole-doc copy)
+    // before strip_markdown_and_code (which copies again); new borrows the input
+    // (Cow::Borrowed) since ASCII is already NFC — the copy was pure waste.
+    fn nfc_ascii_old(text: &str) -> String {
+        text.to_owned()
+    }
+    fn nfc_ascii_new(text: &str) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(text)
+    }
+    let mut ng = c.benchmark_group("nfc_ascii_copy");
+    ng.bench_with_input("old", ascii_doc.as_str(), |b, t| {
+        b.iter(|| black_box(nfc_ascii_old(black_box(t))));
+    });
+    ng.bench_with_input("new", ascii_doc.as_str(), |b, t| {
+        b.iter(|| black_box(nfc_ascii_new(black_box(t))));
+    });
+    ng.finish();
+
     // filter_low_signal: old (full-doc to_lowercase) vs new (ASCII compare).
     let mut fg = c.benchmark_group("filter_low_signal");
     for (name, text) in [("ascii_doc", &ascii_doc), ("ascii_short", &ascii_short)] {
