@@ -130,22 +130,26 @@ the *same* bounded-heap selection as the exact path. **Bit-identical** to `searc
 pass-1 recall is 1 (`int8_two_pass_matches_exact_topk`: identical doc-ids + scores), exact
 fallback if the int8 slab is absent. Existing exact paths untouched; 355/355 index lib tests green.
 
-**Real-method head-to-head (`inmem_topk`, top-10, mult=20) vs the parallel exact `search_top_k`:**
+**Real-method head-to-head (`inmem_topk`, top-10) vs the parallel exact `search_top_k`:**
 
-| Workload | exact `search_top_k` | `search_top_k_int8_two_pass` | ratio |
-|----------|----------------------|------------------------------|-------|
-| dim256/n10k | 866 µs | 622 µs | 0.72 |
-| dim384/n10k | 1.147 ms | 762 µs | 0.66 |
-| dim384/**n100k** | 8.72 ms | 6.54 ms | **0.75 (~1.3×)** |
+The candidate budget `limit·mult` is the selection-overhead knob. `int8_two_pass_recall_at_10`
+shows recall@10 = **1.0 down to mult=2** for random (well-separated) vectors, so the original
+mult=20 was 10× more candidates than needed. Re-benched at **mult=5**:
 
-Honest read: a **modest, scale-/core-dependent win** — ~1.3–1.5× when dots dominate (100k, or
-fewer cores), but **~tied at 10k on high-core hosts** (a prior run measured 1.09× there). The
-top-`limit·mult` candidate selection + serial merge offset much of the int8 kernel's 3×; the win
-grows with N. This is a **real but modest** improvement, far from the 2.6–3× serial-baseline
-figure — recorded honestly, not as a headline win. **Remaining (`bd-t8tv`/`bd-b5wl`):** the mmap
-FSVI `search.rs` path (on-disk int8 sidecar, where exact also pays page-faults + decode); recall
-re-measure on a real clustered-embedding corpus; tune `mult` down (less selection overhead) while
-holding recall.
+| Workload | exact `search_top_k` | `int8_two_pass` mult=5 | ratio | (mult=20 ratio) |
+|----------|----------------------|------------------------|-------|-----------------|
+| dim256/n10k | 328 µs | 223 µs | **0.68** | 0.72–1.09 (worker-var) |
+| dim384/n10k | 397 µs | 278 µs | **0.70** | 0.66 |
+| dim384/**n100k** | 2.02 ms | 1.34 ms | **0.67** | 0.75 |
+
+At mult=5 the win is a **robust ~1.4–1.5× across 10k AND 100k** (consistent on both fast and slow
+workers), no longer the worker-dependent tie seen at mult=20. Smaller candidate budget = less
+top-`k·mult` selection + merge overhead, so more of the int8 kernel's 3× survives. Still
+bit-identical to exact when recall=1. **Honest scope:** ~1.4–1.5× (not the 2.6–3× serial-baseline
+figure); recall=1.0 is for *random* vectors — clustered real embeddings may need a higher mult, so
+the production path must re-measure recall on a representative corpus. **Remaining (`bd-t8tv`):**
+the mmap FSVI `search.rs` path (on-disk int8 sidecar, where exact also pays page-faults + decode —
+likely a larger win); real-corpus recall + mult tuning.
 
 These rows are routing evidence for future levers, not wins.
 

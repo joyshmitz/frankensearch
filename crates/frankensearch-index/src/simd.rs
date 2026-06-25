@@ -497,7 +497,12 @@ mod tests {
             }
         }
 
-        let (dim, n, k, mult, queries) = (128_usize, 3000_usize, 10_usize, 20_usize, 25_usize);
+        let (dim, n, k, queries) = (128_usize, 3000_usize, 10_usize, 25_usize);
+        // recall@k for a given mult == fraction of the exact top-k that land in the
+        // int8 top-(k*mult) candidate set (pass-2 rescores exactly, so any candidate
+        // that is truly top-k is recovered). Monotonic in mult; sweep to find the
+        // smallest candidate budget that still holds recall (smaller => less select).
+        let mults = [2_usize, 3, 5, 10, 20];
         let mut state = 0x1234_5678_9abc_def0_u64;
         let mut vecs_f16: Vec<Vec<f16>> = Vec::with_capacity(n);
         let mut vecs_i8: Vec<Vec<i8>> = Vec::with_capacity(n);
@@ -508,7 +513,7 @@ mod tests {
             vecs_i8.push(v.iter().map(|&x| quant_i8(x)).collect());
         }
 
-        let mut total_recall = 0.0_f64;
+        let mut recall_sums = vec![0.0_f64; mults.len()];
         for _ in 0..queries {
             let mut q: Vec<f32> = (0..dim).map(|_| xorshift(&mut state)).collect();
             normalize(&mut q);
@@ -528,19 +533,23 @@ mod tests {
                 .enumerate()
                 .map(|(i, iv)| (dot_i8_i8(iv, &qi8), i))
                 .collect();
-            let cand = (k * mult).min(p1.len());
-            p1.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            let mut p2: Vec<(f32, usize)> = p1[..cand]
-                .iter()
-                .map(|&(_, i)| (dot_product_f16_f32(&vecs_f16[i], &q).expect("dot"), i))
-                .collect();
-            p2.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-            let hit = p2[..k].iter().filter(|&&(_, i)| exact_set.contains(&i)).count();
-            total_recall += hit as f64 / k as f64;
+            p1.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+            for (mi, &mult) in mults.iter().enumerate() {
+                let cand = (k * mult).min(p1.len());
+                let cand_set: std::collections::HashSet<usize> =
+                    p1[..cand].iter().map(|&(_, i)| i).collect();
+                let hit = exact_set.iter().filter(|i| cand_set.contains(i)).count();
+                recall_sums[mi] += hit as f64 / k as f64;
+            }
         }
-        let avg = total_recall / queries as f64;
-        println!("int8 two-pass recall@{k} (mult={mult}, n={n}, dim={dim}): {avg:.4}");
-        assert!(avg >= 0.80, "int8 two-pass recall@{k} too low: {avg:.4}");
+        for (mi, &mult) in mults.iter().enumerate() {
+            let avg = recall_sums[mi] / queries as f64;
+            println!("int8 two-pass recall@{k} mult={mult} (n={n}, dim={dim}): {avg:.4}");
+        }
+        // Gate on the largest mult; smaller mults are reported for tuning.
+        let avg_max = recall_sums[mults.len() - 1] / queries as f64;
+        assert!(avg_max >= 0.80, "int8 two-pass recall@{k} too low: {avg_max:.4}");
     }
 
     fn scalar_dot_f32(a: &[f32], b: &[f32]) -> f32 {

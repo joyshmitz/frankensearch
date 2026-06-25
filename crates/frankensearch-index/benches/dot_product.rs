@@ -405,11 +405,14 @@ fn bench_inmem_topk(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("exact_f16", n), |b| {
             b.iter(|| black_box(index.search_top_k(black_box(q), 10, None).unwrap()));
         });
-        group.bench_function(BenchmarkId::new("int8_two_pass_mult20", n), |b| {
+        // mult=5: recall@10 = 1.0 holds down to mult=2 for random vectors
+        // (int8_two_pass_recall_at_10), so a small candidate budget minimizes the
+        // selection overhead that was offsetting the kernel win at mult=20.
+        group.bench_function(BenchmarkId::new("int8_two_pass_mult5", n), |b| {
             b.iter(|| {
                 black_box(
                     index
-                        .search_top_k_int8_two_pass(black_box(q), 10, 20)
+                        .search_top_k_int8_two_pass(black_box(q), 10, 5)
                         .unwrap(),
                 )
             });
