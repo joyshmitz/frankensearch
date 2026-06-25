@@ -10,7 +10,7 @@ repository.workspace = true
 default = []
 fastembed-reranker = ["dep:fastembed"]
 # Pure-Rust frankentorch cross-encoder reranker backend (no ONNX/ort).
-native = ["dep:ft-api", "dep:ft-autograd", "dep:ft-core"]
+native = ["dep:ft-api", "dep:ft-autograd", "dep:ft-core", "dep:wide", "dep:rayon"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -24,6 +24,11 @@ fastembed = { workspace = true, optional = true }
 ft-api = { workspace = true, optional = true }
 ft-autograd = { workspace = true, optional = true }
 ft-core = { workspace = true, optional = true }
+# SIMD-vectorized exp for the attention softmax fast path (native reranker only).
+wide = { workspace = true, optional = true }
+# Row-parallel attention softmax (native reranker only; intra-forward, never
+# doc-level — the sequential doc loop keeps the nested-rayon deadlock impossible).
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)

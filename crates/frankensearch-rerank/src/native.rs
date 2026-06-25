@@ -28,6 +28,7 @@ use ft_api::{FrankenTorchSession, quantize_per_output_channel_i8};
 use ft_autograd::TensorNodeId;
 use ft_core::ExecutionMode;
 use tokenizers::Tokenizer;
+use wide::f32x8;
 
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{RerankDocument, RerankScore, SyncRerank};
@@ -48,6 +49,73 @@ fn rerank_err(ctx: &str, e: impl std::fmt::Display) -> SearchError {
         model: MODEL_NAME.to_owned(),
         source: format!("{ctx}: {e}").into(),
     }
+}
+
+/// In-place fused scale + numerically-stable softmax for one attention-score row.
+/// Computes `softmax(scale · row)` over `row` (one head's query position), using
+/// `wide`'s 8-wide polynomial `exp` (~1-2 ULP) instead of scalar libm `expf`.
+/// `scale > 0`, so the argmax (hence the stabilising max-subtraction) is
+/// unchanged by the scale: `exp(scale·(x − max)) == exp(scale·x)/exp(scale·max)`.
+fn softmax_row_fused(row: &mut [f32], scale: f32) {
+    let n = row.len();
+    let mut max_raw = f32::NEG_INFINITY;
+    for &x in row.iter() {
+        max_raw = max_raw.max(x);
+    }
+    let max_v = f32x8::splat(max_raw);
+    let scale_v = f32x8::splat(scale);
+    let mut sum_v = f32x8::splat(0.0);
+    let mut i = 0;
+    while i + 8 <= n {
+        let mut buf = [0.0f32; 8];
+        buf.copy_from_slice(&row[i..i + 8]);
+        let e = ((f32x8::new(buf) - max_v) * scale_v).exp();
+        row[i..i + 8].copy_from_slice(&e.to_array());
+        sum_v += e;
+        i += 8;
+    }
+    let mut sum: f32 = sum_v.to_array().iter().sum();
+    while i < n {
+        let e = ((row[i] - max_raw) * scale).exp();
+        row[i] = e;
+        sum += e;
+        i += 1;
+    }
+    let inv = 1.0 / sum;
+    for x in row.iter_mut() {
+        *x *= inv;
+    }
+}
+
+/// Fused scale + softmax over the last dim of the attention scores `[rows, n]`
+/// (row-major), returning the same buffer/layout. Replaces the separate
+/// `mul_scalar` + `tensor_softmax` tape ops with one vectorized pass.
+///
+/// Profiling showed the attention softmax is the dominant *growing* f32 frame —
+/// ~24% of the per-doc forward wall-clock at seq 512 (12·S² scalar `expf` calls,
+/// which ONNX/MLAS fuses + vectorizes). Softmax normalisation makes the ~1e-6
+/// relative exp error immaterial to the ranking (validated against the
+/// numpy/ONNX reference: ranking + logit tolerance unchanged). Rows are
+/// independent, so they parallelize across the forward's ambient rayon pool —
+/// matching the multicore the stock softmax kernel had. This stays intra-forward
+/// (the doc loop is sequential), so the nested-rayon + `Mutex` deadlock class
+/// remains closed by construction.
+fn fast_softmax_last_dim(mut data: Vec<f32>, rows: usize, n: usize, scale: f32) -> Vec<f32> {
+    debug_assert_eq!(data.len(), rows * n);
+    if n == 0 {
+        return data;
+    }
+    // Parallelize only when there is enough work to amortise the fan-out and a
+    // pool is actually available; otherwise stay serial (small seq / 1 thread).
+    if rows >= 8 && rows * n >= 8192 && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        data.par_chunks_exact_mut(n)
+            .for_each(|row| softmax_row_fused(row, scale));
+    } else {
+        data.chunks_exact_mut(n)
+            .for_each(|row| softmax_row_fused(row, scale));
+    }
+    data
 }
 
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
@@ -187,15 +255,21 @@ impl Model {
                 .s
                 .tensor_transpose(k, 1, 2)
                 .map_err(|e| rerank_err("attn.kt", e))?; // [NH, HD, S]
-            let mut scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
-            scores = self
+            let scores = self.s.tensor_bmm(q, kt).map_err(|e| rerank_err("attn.qk", e))?;
+            // Fused scale + vectorized-exp softmax over the last dim, replacing the
+            // separate `mul_scalar` + `tensor_softmax` tape ops. The int8 linear
+            // already returns detached f32 leaves, so round-tripping the scores
+            // through f32 values + a fresh f32 leaf here matches the forward's
+            // existing structure (no live autograd graph to preserve).
+            let score_vals = self
                 .s
-                .tensor_mul_scalar(scores, scale)
-                .map_err(|e| rerank_err("attn.scale", e))?;
+                .tensor_values_f32(scores)
+                .map_err(|e| rerank_err("attn.scores_vals", e))?;
+            let prob_vals = fast_softmax_last_dim(score_vals, NH * s_len, s_len, scale as f32);
             let probs = self
                 .s
-                .tensor_softmax(scores, 2)
-                .map_err(|e| rerank_err("attn.softmax", e))?;
+                .tensor_variable_f32(prob_vals, vec![NH, s_len, s_len], false)
+                .map_err(|e| rerank_err("attn.softmax_fast", e))?;
             let ctx = self.s.tensor_bmm(probs, v).map_err(|e| rerank_err("attn.ctx", e))?;
             let ctx = self
                 .s
