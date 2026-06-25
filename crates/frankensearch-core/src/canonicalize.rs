@@ -192,19 +192,27 @@ fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> 
 
 /// Strip markdown formatting from a single line.
 fn strip_markdown_line(line: &str) -> String {
-    let mut result = line.to_string();
-
-    // Remove bold/italic markers
-    result = result.replace("**", "");
-    result = result.replace("__", "");
-    result = result.replace('*', "");
-    result = strip_italic_underscores(&result);
-
-    // Remove inline code backticks
-    result = result.replace('`', "");
-
-    // Convert links [text](url) to just text
-    result = strip_markdown_links(&result);
+    // Fast path: lines containing no inline-markdown characters skip the entire
+    // replace/link/italic chain (each pass allocates + scans the line but is a
+    // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
+    // Byte-identical to the full path; the header/blockquote/list stripping below
+    // still applies. Plain prose and most code-comment text hit this path.
+    let mut result = if line
+        .bytes()
+        .any(|b| matches!(b, b'*' | b'_' | b'`' | b'['))
+    {
+        // Remove bold/italic markers
+        let mut r = line.replace("**", "");
+        r = r.replace("__", "");
+        r = r.replace('*', "");
+        r = strip_italic_underscores(&r);
+        // Remove inline code backticks
+        r = r.replace('`', "");
+        // Convert links [text](url) to just text
+        strip_markdown_links(&r)
+    } else {
+        line.to_string()
+    };
 
     // Remove headers (# prefix)
     result = result.trim_start_matches('#').trim_start().to_string();

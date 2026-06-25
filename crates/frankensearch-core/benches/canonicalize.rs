@@ -47,6 +47,26 @@ fn filter_new(text: &str) -> bool {
     LOW_SIGNAL.iter().any(|p| t.eq_ignore_ascii_case(p))
 }
 
+/// Old `strip_markdown_line` inline chain: 4 allocating no-op passes per line.
+fn md_old(line: &str) -> String {
+    line.replace("**", "")
+        .replace("__", "")
+        .replace('*', "")
+        .replace('`', "")
+}
+
+/// New: skip the chain entirely when the line has no inline-markdown chars.
+fn md_new(line: &str) -> String {
+    if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
+        line.replace("**", "")
+            .replace("__", "")
+            .replace('*', "")
+            .replace('`', "")
+    } else {
+        line.to_owned()
+    }
+}
+
 fn bench_nfc(c: &mut Criterion) {
     let ascii_short = "fn main() { let x = retry_backoff(3); }".to_owned();
     let ascii_doc = "The quick brown fox jumps over the lazy dog. ".repeat(50);
@@ -78,6 +98,31 @@ fn bench_nfc(c: &mut Criterion) {
         });
     }
     fg.finish();
+
+    // strip_markdown_line inline chain: old (always replace) vs new (skip if clean).
+    let plain_doc = "fn retry(n: usize) -> bool { backoff(n) }\nThe quick brown fox jumps.\n\
+                     let x = compute_value(a, b) + 1;\nplain prose with no markup here.\n"
+        .repeat(20);
+    let mut mg = c.benchmark_group("strip_markdown_inline");
+    mg.bench_function("old", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for line in plain_doc.lines() {
+                acc += md_old(black_box(line)).len();
+            }
+            black_box(acc)
+        });
+    });
+    mg.bench_function("new", |b| {
+        b.iter(|| {
+            let mut acc = 0usize;
+            for line in plain_doc.lines() {
+                acc += md_new(black_box(line)).len();
+            }
+            black_box(acc)
+        });
+    });
+    mg.finish();
 }
 
 criterion_group!(benches, bench_nfc);
