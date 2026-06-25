@@ -22,6 +22,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
@@ -42,11 +43,12 @@ pub struct InMemoryVectorIndex {
     doc_ids: Vec<String>,
     /// Flat f16 vector slab: `doc_ids.len() * dimension` elements.
     vectors: Vec<f16>,
-    /// Flat int8 vector slab (same row-major layout) for the int8 ADC pass-1
-    /// of [`InMemoryVectorIndex::search_top_k_int8_two_pass`]. Quantized with a
-    /// single corpus-wide max-abs scale, which preserves the dot-product ranking
-    /// (the scale is a per-query constant). Empty iff the corpus is empty.
-    vectors_i8: Vec<i8>,
+    /// Lazily-built flat int8 vector slab (same row-major layout) for the int8 ADC
+    /// pass-1 of [`InMemoryVectorIndex::search_top_k_int8_two_pass`]. Quantized with
+    /// a single corpus-wide max-abs scale, which preserves the dot-product ranking
+    /// (the scale is a per-query constant). Built on first two-pass use so exact-only
+    /// callers pay neither the quantization work nor its `N·d`-byte footprint.
+    vectors_i8: OnceLock<Vec<i8>>,
     /// Vector dimensionality.
     dimension: usize,
 }
@@ -127,11 +129,10 @@ impl InMemoryVectorIndex {
             }
             flat.extend(vec.into_iter().map(f16::from_f32));
         }
-        let vectors_i8 = quantize_i8_slab(&flat);
         Ok(Self {
             doc_ids,
             vectors: flat,
-            vectors_i8,
+            vectors_i8: OnceLock::new(),
             dimension,
         })
     }
@@ -170,11 +171,10 @@ impl InMemoryVectorIndex {
             flat.extend_from_slice(&f16_vec);
         }
 
-        let vectors_i8 = quantize_i8_slab(&flat);
         Ok(Self {
             doc_ids,
             vectors: flat,
-            vectors_i8,
+            vectors_i8: OnceLock::new(),
             dimension,
         })
     }
@@ -306,12 +306,11 @@ impl InMemoryVectorIndex {
         if limit == 0 || count == 0 {
             return Ok(Vec::new());
         }
-        if self.vectors_i8.len() != self.vectors.len() || self.dimension == 0 {
-            return self.search_top_k(query, limit, None);
-        }
-
         let query_i8 = quantize_i8_query(query);
         let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
+        // Build the int8 slab once, on first use — exact-only callers never pay the
+        // O(N·d) quantization or its `N·d`-byte footprint at construction time.
+        let vectors_i8 = self.vectors_i8.get_or_init(|| quantize_i8_slab(&self.vectors));
 
         // Pass 1: parallel **bounded-heap** int8 scan — each chunk keeps only its
         // top `candidate_count` (never materializing all N scores, unlike a
@@ -330,7 +329,7 @@ impl InMemoryVectorIndex {
                 let mut heap = BinaryHeap::with_capacity(candidate_count.min(end - start) + 1);
                 for index in start..end {
                     let offset = index * self.dimension;
-                    let stored = &self.vectors_i8[offset..offset + self.dimension];
+                    let stored = &vectors_i8[offset..offset + self.dimension];
                     let score = dot_i8_i8(stored, &query_i8) as f32;
                     insert_candidate(&mut heap, HeapEntry::new(index, score), candidate_count);
                 }
