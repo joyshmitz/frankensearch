@@ -96,6 +96,15 @@ candidates should net ~2.5–3× on the vector scan. **Caveat:** this is a kerne
 **not** a search speedup — the product win requires the sidecar + two-pass wiring + a recall@10
 gate (it's approximate). The primitive is unused by the search path until that lands.
 
+**Recall gate measured (`int8_two_pass_recall_at_10`):** int8 pass-1 (top `k·mult`) + exact f16
+rescore recovers the true f16 top-10 with **recall@10 = 1.0000** at `mult=20` (top-200 of 3000
+random L2-normalized vectors, averaged over 25 queries). So at a modest multiplier the two-pass
+is **lossless** here. Both ADC gates now pass: ~3× pass-1 speed **and** recall = 1.0. **Caveat:**
+random vectors have wide angular spread; real (clustered) embeddings may need a higher `mult` —
+the production wiring must re-measure recall on a real corpus and tune `mult`/quant granularity.
+Remaining for the product win: int8 sidecar + two-pass scan wiring + the recall gate on a real
+corpus (`bd-b5wl`).
+
 These rows are routing evidence for future levers, not wins.
 
 Command:

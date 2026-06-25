@@ -465,6 +465,84 @@ mod tests {
         assert_eq!(dot_i8_i8(&a, &a), 512 * 128 * 128);
     }
 
+    /// End-to-end quality gate for the int8 ADC two-pass (`bd-b5wl`): does an int8
+    /// pass-1 (top `k*mult` candidates) + exact f16 rescore recover the true f16
+    /// top-k? Self-contained over random L2-normalized vectors. Prints the measured
+    /// recall@10 (run with `-- --nocapture`) and asserts a conservative floor.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn int8_two_pass_recall_at_10() {
+        fn xorshift(s: &mut u64) -> f32 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            ((*s >> 40) as f32 / (1_u64 << 24) as f32).mul_add(2.0, -1.0)
+        }
+        fn normalize(v: &mut [f32]) {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 1e-9 {
+                for x in v.iter_mut() {
+                    *x /= n;
+                }
+            }
+        }
+        fn quant_i8(x: f32) -> i8 {
+            let s = (x * 127.0).round();
+            if s >= 127.0 {
+                127
+            } else if s <= -127.0 {
+                -127
+            } else {
+                s as i8
+            }
+        }
+
+        let (dim, n, k, mult, queries) = (128_usize, 3000_usize, 10_usize, 20_usize, 25_usize);
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        let mut vecs_f16: Vec<Vec<f16>> = Vec::with_capacity(n);
+        let mut vecs_i8: Vec<Vec<i8>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v: Vec<f32> = (0..dim).map(|_| xorshift(&mut state)).collect();
+            normalize(&mut v);
+            vecs_f16.push(v.iter().map(|&x| f16::from_f32(x)).collect());
+            vecs_i8.push(v.iter().map(|&x| quant_i8(x)).collect());
+        }
+
+        let mut total_recall = 0.0_f64;
+        for _ in 0..queries {
+            let mut q: Vec<f32> = (0..dim).map(|_| xorshift(&mut state)).collect();
+            normalize(&mut q);
+            let qi8: Vec<i8> = q.iter().map(|&x| quant_i8(x)).collect();
+
+            let mut exact: Vec<(f32, usize)> = vecs_f16
+                .iter()
+                .enumerate()
+                .map(|(i, fv)| (dot_product_f16_f32(fv, &q).expect("dot"), i))
+                .collect();
+            exact.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            let exact_set: std::collections::HashSet<usize> =
+                exact[..k].iter().map(|&(_, i)| i).collect();
+
+            let mut p1: Vec<(i32, usize)> = vecs_i8
+                .iter()
+                .enumerate()
+                .map(|(i, iv)| (dot_i8_i8(iv, &qi8), i))
+                .collect();
+            let cand = (k * mult).min(p1.len());
+            p1.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            let mut p2: Vec<(f32, usize)> = p1[..cand]
+                .iter()
+                .map(|&(_, i)| (dot_product_f16_f32(&vecs_f16[i], &q).expect("dot"), i))
+                .collect();
+            p2.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+            let hit = p2[..k].iter().filter(|&&(_, i)| exact_set.contains(&i)).count();
+            total_recall += hit as f64 / k as f64;
+        }
+        let avg = total_recall / queries as f64;
+        println!("int8 two-pass recall@{k} (mult={mult}, n={n}, dim={dim}): {avg:.4}");
+        assert!(avg >= 0.80, "int8 two-pass recall@{k} too low: {avg:.4}");
+    }
+
     fn scalar_dot_f32(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
