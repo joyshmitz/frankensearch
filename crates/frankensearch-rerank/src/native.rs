@@ -202,38 +202,83 @@ fn fast_gelu_inplace(data: &mut [f32]) {
     }
 }
 
-/// Multi-head self-attention for one document. `qkv` is the fused QKV linear output
-/// `[s_len, 3H]` (Q at column 0, K at column H, V at column 2H); returns the context
-/// `[s_len, H]`.
+/// Reusable per-document attention scratch. Holds the head-major repack operands and
+/// the two `bmm` output buffers so a whole forward's worth of attention calls (every
+/// document × every layer) reuse one set of allocations instead of allocating —
+/// and zero-filling — fresh `Vec`s each call. The score buffer dominates (`NH·S²`),
+/// so eliding its per-call realloc is the bulk of the win. Buffers only ever grow
+/// (`ensure`), and every element each `bmm`/repack touches is overwritten, so reuse
+/// is bit-identical to fresh allocation.
+#[derive(Default)]
+struct AttnScratch {
+    q_hm: Vec<f32>,
+    kt: Vec<f32>,
+    v_hm: Vec<f32>,
+    scores: Vec<f32>,
+    ctx_hm: Vec<f32>,
+}
+
+impl AttnScratch {
+    /// Grow (never shrink) every buffer to hold one document's full self-attention at
+    /// sequence length `s_len`. The CLS-only path uses strict prefixes of these.
+    fn ensure(&mut self, s_len: usize) {
+        let hm = s_len * H; // NH * s_len * HD == s_len * H
+        let sc = NH * s_len * s_len;
+        if self.q_hm.len() < hm {
+            self.q_hm.resize(hm, 0.0);
+        }
+        if self.kt.len() < hm {
+            self.kt.resize(hm, 0.0);
+        }
+        if self.v_hm.len() < hm {
+            self.v_hm.resize(hm, 0.0);
+        }
+        if self.scores.len() < sc {
+            self.scores.resize(sc, 0.0);
+        }
+        if self.ctx_hm.len() < hm {
+            self.ctx_hm.resize(hm, 0.0);
+        }
+    }
+}
+
+/// Multi-head self-attention for one document, writing the `[s_len, H]` context into
+/// `out`. `qkv` is the fused QKV linear output `[s_len, 3H]` (Q at column 0, K at
+/// column H, V at column 2H).
 ///
 /// The per-query `f32x8` kernel was cheap to launch (no tape, no per-head gemm) but
 /// runs the S² inner loop one dot at a time, which dominates at seq ≥ 256 (it was
 /// ~9× over the FLOP floor — a register-blocked GEMM does the same MACs far faster).
 /// So repack each head's Q/K/V into the head-major layout the batched `bmm` kernel
 /// (`gemm::sgemm`, cache-blocking) wants, do QKᵀ and ·V as two batched GEMMs with a
-/// vectorized softmax between, and transpose the context back. The repacks are
-/// O(S·H); the GEMMs are where the work goes. The `bmm` kernel parallelizes across
-/// the NH head-batches internally and stays intra-forward, so the nested-rayon +
-/// `Mutex` deadlock class remains closed. Bit-exact to the bmm tape path (within f32
-/// reassociation) — validated by parity + `forward_batch_matches_per_doc`.
-fn fused_attention(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
+/// vectorized softmax between, and transpose the context back. The repacks and both
+/// GEMM outputs land in the caller's reused `scratch`, so the hot loop does not
+/// allocate. The `bmm` kernel parallelizes across the NH head-batches internally and
+/// stays intra-forward, so the nested-rayon + `Mutex` deadlock class remains closed.
+/// Bit-exact to the bmm tape path (within f32 reassociation) — validated by parity +
+/// `forward_batch_matches_per_doc`.
+fn fused_attention(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: f32, out: &mut [f32]) {
     debug_assert_eq!(qkv.len(), s_len * 3 * H);
+    debug_assert_eq!(out.len(), s_len * H);
     if s_len == 0 {
-        return Vec::new();
+        return;
     }
     const STRIDE: usize = 3 * H;
+    scratch.ensure(s_len);
+    let hm = s_len * H;
+    let sc = NH * s_len * s_len;
+    let AttnScratch { q_hm, kt, v_hm, scores, ctx_hm } = scratch;
+    let (q_hm, kt, v_hm) = (&mut q_hm[..hm], &mut kt[..hm], &mut v_hm[..hm]);
+    let scores = &mut scores[..sc];
+    let ctx_hm = &mut ctx_hm[..hm];
     // Repack into head-major operands: Q/V as [NH, S, HD], K transposed to [NH, HD, S]
-    // so QKᵀ is a plain `bmm(Q, Kᵀ)`.
-    let mut q_hm = vec![0.0f32; NH * s_len * HD];
-    let mut kt = vec![0.0f32; NH * HD * s_len];
-    let mut v_hm = vec![0.0f32; NH * s_len * HD];
-    // Q and V: contiguous head-major copies (each token's HD block is contiguous).
+    // so QKᵀ is a plain `bmm(Q, Kᵀ)`. Q/V are contiguous head-major copies.
     for j in 0..s_len {
         let base = j * STRIDE;
         for h in 0..NH {
-            let hm = (h * s_len + j) * HD;
-            q_hm[hm..hm + HD].copy_from_slice(&qkv[base + h * HD..base + h * HD + HD]);
-            v_hm[hm..hm + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+            let hmj = (h * s_len + j) * HD;
+            q_hm[hmj..hmj + HD].copy_from_slice(&qkv[base + h * HD..base + h * HD + HD]);
+            v_hm[hmj..hmj + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
         }
     }
     // Kᵀ: each output row `kt[h, d, :]` is written sequentially (contiguous stores)
@@ -250,50 +295,57 @@ fn fused_attention(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
     // scores[NH, S, S] = Q @ Kᵀ, then in-place fused-scale softmax over the last dim.
     let qm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
     let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
-    let mut scores = ft_api::bmm_tensor_contiguous_f32(&q_hm, &kt, &qm, &km)
+    ft_api::bmm_tensor_contiguous_f32_into(q_hm, kt, &qm, &km, scores)
         .expect("attn QKᵀ bmm: shapes are internally consistent");
-    fast_softmax_inplace(&mut scores, NH * s_len, s_len, scale);
+    fast_softmax_inplace(scores, NH * s_len, s_len, scale);
     // ctx_hm[NH, S, HD] = scores @ V.
     let sm = TensorMeta::from_shape(vec![NH, s_len, s_len], DType::F32, Device::Cpu);
     let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
-    let ctx_hm = ft_api::bmm_tensor_contiguous_f32(&scores, &v_hm, &sm, &vm)
+    ft_api::bmm_tensor_contiguous_f32_into(scores, v_hm, &sm, &vm, ctx_hm)
         .expect("attn ·V bmm: shapes are internally consistent");
-    // Transpose the head-major context back to token-major [S, H].
-    let mut ctx = vec![0.0f32; s_len * H];
+    // Transpose the head-major context back to token-major [S, H] into `out`.
     for h in 0..NH {
         for i in 0..s_len {
             let src = (h * s_len + i) * HD;
-            ctx[i * H + h * HD..i * H + h * HD + HD].copy_from_slice(&ctx_hm[src..src + HD]);
+            out[i * H + h * HD..i * H + h * HD + HD].copy_from_slice(&ctx_hm[src..src + HD]);
         }
     }
-    ctx
 }
 
-/// Self-attention for the `[CLS]` query ONLY (token 0), returning its `[H]` context.
+/// Self-attention for the `[CLS]` query ONLY (token 0), writing its `[H]` context into
+/// `out`.
 ///
 /// The reranker's logit is read solely from `[CLS]` of the final layer, so the last
 /// encoder layer never needs any other token's attention output. `[CLS]` still attends
 /// to every key, so K/V are repacked in full, but Q is a single row — the two `bmm`s
 /// collapse to `[1, HD] @ [HD, S]` and `[1, S] @ [S, HD]` per head (m = 1), i.e. ~S×
 /// less attention work than the full `fused_attention`. Bit-exact to row 0 of it.
-fn fused_attention_cls(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
+/// Reuses the same `scratch` (strict prefixes of the full-attention buffers).
+fn fused_attention_cls(scratch: &mut AttnScratch, qkv: &[f32], s_len: usize, scale: f32, out: &mut [f32]) {
     debug_assert_eq!(qkv.len(), s_len * 3 * H);
+    debug_assert_eq!(out.len(), H);
     if s_len == 0 {
-        return vec![0.0f32; H];
+        out.fill(0.0);
+        return;
     }
     const STRIDE: usize = 3 * H;
-    // Q[CLS] head-major [NH, 1, HD] (token 0's query), K transposed [NH, HD, S], V [NH, S, HD].
-    let mut q_cls = vec![0.0f32; NH * HD];
-    let mut kt = vec![0.0f32; NH * HD * s_len];
-    let mut v_hm = vec![0.0f32; NH * s_len * HD];
+    scratch.ensure(s_len);
+    let hm = s_len * H;
+    let sc = NH * s_len;
+    let AttnScratch { q_hm, kt, v_hm, scores, ctx_hm } = scratch;
+    // Q[CLS] head-major [NH, 1, HD] (token 0's query) uses the first NH*HD == H slots.
+    let q_cls = &mut q_hm[..H];
+    let (kt, v_hm) = (&mut kt[..hm], &mut v_hm[..hm]);
+    let scores = &mut scores[..sc];
+    let ctx_hm = &mut ctx_hm[..H];
     for h in 0..NH {
         q_cls[h * HD..h * HD + HD].copy_from_slice(&qkv[h * HD..h * HD + HD]);
     }
     for j in 0..s_len {
         let base = j * STRIDE;
         for h in 0..NH {
-            let hm = (h * s_len + j) * HD;
-            v_hm[hm..hm + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+            let hmj = (h * s_len + j) * HD;
+            v_hm[hmj..hmj + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
         }
     }
     for h in 0..NH {
@@ -308,14 +360,15 @@ fn fused_attention_cls(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
     // scores [NH, 1, S] = Q[CLS] @ Kᵀ, then fused-scale softmax over the S keys (one row per head).
     let qm = TensorMeta::from_shape(vec![NH, 1, HD], DType::F32, Device::Cpu);
     let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
-    let mut scores = ft_api::bmm_tensor_contiguous_f32(&q_cls, &kt, &qm, &km)
+    ft_api::bmm_tensor_contiguous_f32_into(q_cls, kt, &qm, &km, scores)
         .expect("attn CLS QKᵀ bmm: shapes are internally consistent");
-    fast_softmax_inplace(&mut scores, NH, s_len, scale);
+    fast_softmax_inplace(scores, NH, s_len, scale);
     // ctx_hm [NH, 1, HD] = scores @ V — already laid out as the [H] CLS context (head-major HD blocks).
     let sm = TensorMeta::from_shape(vec![NH, 1, s_len], DType::F32, Device::Cpu);
     let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
-    ft_api::bmm_tensor_contiguous_f32(&scores, &v_hm, &sm, &vm)
-        .expect("attn CLS ·V bmm: shapes are internally consistent")
+    ft_api::bmm_tensor_contiguous_f32_into(scores, v_hm, &sm, &vm, ctx_hm)
+        .expect("attn CLS ·V bmm: shapes are internally consistent");
+    out.copy_from_slice(ctx_hm);
 }
 
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
@@ -413,7 +466,8 @@ impl Model {
     /// fused attention, add+LN, vectorized GELU), so the result is bit-identical,
     /// but the per-op tape-node creation / leaf allocation / truncation are gone.
     /// Self-attention is per document (each `[lenₙ, H]` slice) via
-    /// [`fused_attention`], so this path is for chunks where every doc is short.
+    /// [`fused_attention`], so this path is for chunks where every doc is short. The
+    /// `scratch` is reused across documents and layers to avoid per-call allocation.
     fn encoder_layer_raw(
         &self,
         emb: Vec<f32>,
@@ -422,15 +476,16 @@ impl Model {
         lens: &[usize],
         p: &str,
         scale: f32,
+        scratch: &mut AttnScratch,
     ) -> SearchResult<Vec<f32>> {
         // Fused QKV projection (batched over all the chunk's tokens).
         let qkv = self.linear_raw(&emb, total, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
-        // Per-document self-attention into one re-concatenated [total, H] context.
+        // Per-document self-attention written straight into one re-concatenated
+        // [total, H] context (no per-doc temporary).
         let mut ctx = vec![0.0f32; total * H];
         for (&off, &len) in offsets.iter().zip(lens) {
             let qkv_doc = &qkv[off * 3 * H..(off + len) * 3 * H];
-            let ctx_doc = fused_attention(qkv_doc, len, scale);
-            ctx[off * H..(off + len) * H].copy_from_slice(&ctx_doc);
+            fused_attention(scratch, qkv_doc, len, scale, &mut ctx[off * H..(off + len) * H]);
         }
         let attn = self.linear_raw(&ctx, total, &format!("{p}.attention.output.dense"))?;
         let emb = self.add_ln_raw(&emb, &attn, total, &format!("{p}.attention.output.LayerNorm"))?;
@@ -460,16 +515,17 @@ impl Model {
         total: usize,
         p: &str,
         scale: f32,
+        scratch: &mut AttnScratch,
     ) -> SearchResult<Vec<f32>> {
         let n_docs = lens.len();
         // Fused QKV over all tokens (K/V needed in full for the CLS query's attention).
         let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
-        // CLS-only self-attention per document into a compact [n_docs, H] context.
+        // CLS-only self-attention per document written straight into a compact
+        // [n_docs, H] context.
         let mut ctx = vec![0.0f32; n_docs * H];
         for (n, (&off, &len)) in offsets.iter().zip(lens).enumerate() {
             let qkv_doc = &qkv[off * 3 * H..(off + len) * 3 * H];
-            let cls = fused_attention_cls(qkv_doc, len, scale);
-            ctx[n * H..(n + 1) * H].copy_from_slice(&cls);
+            fused_attention_cls(scratch, qkv_doc, len, scale, &mut ctx[n * H..(n + 1) * H]);
         }
         let attn = self.linear_raw(&ctx, n_docs, &format!("{p}.attention.output.dense"))?;
         // Residual is the input layer's CLS rows (the first token of each doc).
@@ -588,7 +644,10 @@ impl Model {
                 .s
                 .tensor_values_f32_borrowed(qkv)
                 .map_err(|e| rerank_err("attn.qkv_vals", e))?;
-            fused_attention(qkv_v, s_len, scale as f32)
+            let mut scratch = AttnScratch::default();
+            let mut ctx = vec![0.0f32; s_len * H];
+            fused_attention(&mut scratch, qkv_v, s_len, scale as f32, &mut ctx);
+            ctx
         };
         self.s
             .tensor_variable_f32(ctx_vals, vec![s_len, H], false)
@@ -816,17 +875,23 @@ impl Model {
             // tape path. The FINAL layer computes only each doc's `[CLS]` row (the
             // sole token the pooler reads), skipping ~S× of its attn-out + FFN work.
             let scale_f = scale as f32;
+            // One attention scratch reused across every layer (and document) of this
+            // chunk's forward, so the head-major repacks + the two bmm outputs are
+            // allocated once instead of per attention call.
+            let mut scratch = AttnScratch::default();
             let mut emb_vals = self
                 .s
                 .tensor_values_f32(emb)
                 .map_err(|e| rerank_err("batch.emb_extract", e))?;
             for i in 0..L - 1 {
                 let p = format!("bert.encoder.layer.{i}");
-                emb_vals = self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f)?;
+                emb_vals =
+                    self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f, &mut scratch)?;
             }
             let p_last = format!("bert.encoder.layer.{}", L - 1);
-            let cls_vals =
-                self.encoder_layer_cls(&emb_vals, &offsets, &lens, total, &p_last, scale_f)?;
+            let cls_vals = self.encoder_layer_cls(
+                &emb_vals, &offsets, &lens, total, &p_last, scale_f, &mut scratch,
+            )?;
             emb = self
                 .s
                 .tensor_variable_f32(cls_vals, vec![n_docs, H], false)
