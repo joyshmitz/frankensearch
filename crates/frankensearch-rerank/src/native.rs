@@ -46,12 +46,15 @@ const DEFAULT_MAX_LENGTH: usize = 512;
 /// still giving the int8 GEMM a large enough row count to amortize weight loads.
 /// A single document longer than this is still processed alone (one-doc chunk).
 const MAX_BATCH_TOKENS: usize = 2048;
-/// Sequence-length crossover for the attention implementation: at or below this the
-/// fused per-query kernel wins (no transpose materialization / per-head gemm
-/// launch); above it the cache-blocking `gemm` bmm wins (it amortizes the K/V
-/// re-reads the fused loop repeats per query). Measured on M4: fused is ahead at
-/// ~130/294 tokens, behind at 512.
-const FUSED_ATTN_MAX_SEQ: usize = 384;
+/// Max per-document sequence length that the tape-free raw forward path handles.
+/// The raw path's attention is itself a cache-blocking `gemm` bmm now (see
+/// [`fused_attention`]), so it has no per-query disadvantage at long sequences —
+/// it's strictly the tape path minus the per-op tape overhead, plus the CLS-only
+/// final layer. We therefore route everything up to the default max length through
+/// it; only configurations with a larger `max_length` fall back to the tape bmm
+/// path. (Was 384, the crossover of the OLD per-query fused attention vs the tape
+/// bmm — obsolete since the raw attention became a gemm.)
+const FUSED_ATTN_MAX_SEQ: usize = DEFAULT_MAX_LENGTH;
 const MODEL_NAME: &str = "ms-marco-minilm-l-6-v2";
 const SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
 const SAFETENSORS_FALLBACK: &str = "model.safetensors";
