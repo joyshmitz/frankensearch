@@ -37,6 +37,7 @@ const H: usize = 384;
 const L: usize = 6;
 const NH: usize = 12;
 const HD: usize = H / NH; // 32
+const INTER: usize = 4 * H; // 1536 — FFN intermediate width
 const EPS: f64 = 1e-12;
 const DEFAULT_MAX_LENGTH: usize = 512;
 /// Token budget per batched forward. Documents are reranked in chunks whose total
@@ -311,6 +312,10 @@ struct Model {
     /// int8-quantized Linear weights (attention QKV/output, FFN, pooler,
     /// classifier), keyed by the layer prefix (the weight name minus `.weight`).
     qw: HashMap<String, QLinear>,
+    /// Raw f32 values for the LayerNorm weight/bias parameters (same data as the
+    /// `w` leaves, shared via `Arc`), so the tape-free fused-layer path can call the
+    /// `add_layer_norm` kernel directly without round-tripping through the session.
+    raw_params: HashMap<String, Arc<Vec<f32>>>,
     /// Autograd tape node count captured right after the persistent weights are
     /// loaded. Each forward pass truncates the tape back to this boundary to free
     /// that pass's intermediate activations, so the session does not grow
@@ -326,6 +331,81 @@ impl Model {
             .get(name)
             .copied()
             .ok_or_else(|| rerank_err("weights", format!("missing weight tensor {name}")))
+    }
+
+    /// `y = layer(x)` via the int8 kernel directly on raw f32 buffers (no tape
+    /// node) — the tape-free counterpart of [`Self::linear`]. Output width is the
+    /// QLinear's `out`; input width is its `in_`.
+    fn linear_raw(&self, x: &[f32], m: usize, prefix: &str) -> SearchResult<Vec<f32>> {
+        let q = self
+            .qw
+            .get(prefix)
+            .ok_or_else(|| rerank_err("linear_raw", format!("missing linear weights {prefix}")))?;
+        debug_assert_eq!(x.len(), m * q.in_);
+        let y = if q.packed {
+            ft_api::linear_int8_dynamic_prepacked_f32(
+                x, m, q.in_, &q.w_i8, &q.w_scales, q.out, Some(&q.bias),
+            )
+        } else {
+            ft_api::linear_int8_dynamic_f32(x, m, q.in_, &q.w_i8, &q.w_scales, q.out, Some(&q.bias))
+        };
+        Ok(y)
+    }
+
+    /// `layer_norm(a + b)` on raw f32 buffers (no tape node) — the tape-free
+    /// counterpart of [`Self::add_ln`].
+    fn add_ln_raw(&self, a: &[f32], b: &[f32], m: usize, prefix: &str) -> SearchResult<Vec<f32>> {
+        let w = self
+            .raw_params
+            .get(&format!("{prefix}.weight"))
+            .ok_or_else(|| rerank_err("add_ln_raw", format!("missing {prefix}.weight")))?;
+        let bias = self
+            .raw_params
+            .get(&format!("{prefix}.bias"))
+            .ok_or_else(|| rerank_err("add_ln_raw", format!("missing {prefix}.bias")))?;
+        Ok(ft_api::add_layer_norm_forward_f32(
+            a,
+            b,
+            Some(w),
+            Some(bias),
+            m,
+            H,
+            EPS as f32,
+        ))
+    }
+
+    /// One encoder layer entirely on raw f32 buffers — no tape nodes, no session
+    /// round-trips. Calls the SAME optimized kernels the tape path uses (int8 GEMM,
+    /// fused attention, add+LN, vectorized GELU), so the result is bit-identical,
+    /// but the per-op tape-node creation / leaf allocation / truncation are gone.
+    /// Self-attention is per document (each `[lenₙ, H]` slice) via
+    /// [`fused_attention`], so this path is for chunks where every doc is short.
+    fn encoder_layer_raw(
+        &self,
+        emb: Vec<f32>,
+        total: usize,
+        offsets: &[usize],
+        lens: &[usize],
+        p: &str,
+        scale: f32,
+    ) -> SearchResult<Vec<f32>> {
+        // Fused QKV projection (batched over all the chunk's tokens).
+        let qkv = self.linear_raw(&emb, total, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
+        // Per-document self-attention into one re-concatenated [total, H] context.
+        let mut ctx = vec![0.0f32; total * H];
+        for (&off, &len) in offsets.iter().zip(lens) {
+            let qkv_doc = &qkv[off * 3 * H..(off + len) * 3 * H];
+            let ctx_doc = fused_attention(qkv_doc, len, scale);
+            ctx[off * H..(off + len) * H].copy_from_slice(&ctx_doc);
+        }
+        let attn = self.linear_raw(&ctx, total, &format!("{p}.attention.output.dense"))?;
+        let emb = self.add_ln_raw(&emb, &attn, total, &format!("{p}.attention.output.LayerNorm"))?;
+        // FFN: [total, H] -> [total, INTER] -> GELU -> [total, H].
+        let mut inter = self.linear_raw(&emb, total, &format!("{p}.intermediate.dense"))?;
+        debug_assert_eq!(inter.len(), total * INTER);
+        fast_gelu_inplace(&mut inter);
+        let ffn = self.linear_raw(&inter, total, &format!("{p}.output.dense"))?;
+        self.add_ln_raw(&emb, &ffn, total, &format!("{p}.output.LayerNorm"))
     }
 
     /// y = x @ Wᵀ + b via the int8 dynamic-quant kernel (weight stored row-major
@@ -352,14 +432,6 @@ impl Model {
                 .tensor_linear_int8_dynamic(x, &w_i8, &w_scales, out, in_, Some(&bias))
                 .map_err(|e| rerank_err("linear.int8", e))
         }
-    }
-
-    fn ln(&mut self, x: TensorNodeId, prefix: &str) -> SearchResult<TensorNodeId> {
-        let w = self.g(&format!("{prefix}.weight"))?;
-        let b = self.g(&format!("{prefix}.bias"))?;
-        self.s
-            .tensor_layer_norm(x, vec![H], Some(w), Some(b), EPS)
-            .map_err(|e| rerank_err("layer_norm", e))
     }
 
     fn idx(&mut self, vals: &[i64]) -> SearchResult<TensorNodeId> {
@@ -424,7 +496,9 @@ impl Model {
     /// loop repeats per query). `FUSED_ATTN_MAX_SEQ` is the measured crossover.
     /// Short/medium-sequence attention: `qkv` is the fused QKV linear output
     /// `[s_len, 3H]`; runs the [`fused_attention`] kernel over it (reading borrowed,
-    /// writing one fresh ctx leaf).
+    /// writing one fresh ctx leaf). Tape-path reference for the single-pair
+    /// [`Self::forward`]; production goes through the tape-free `encoder_layer_raw`.
+    #[cfg(test)]
     fn attn_fused(&mut self, qkv: TensorNodeId, s_len: usize, scale: f64) -> SearchResult<TensorNodeId> {
         let ctx_vals = {
             let qkv_v = self
@@ -477,7 +551,9 @@ impl Model {
     /// Self-attention for one document's `[s_len, H]` activation `emb`: routes to the
     /// fused-QKV + fused-attention kernel for short/medium sequences (one int8 GEMM
     /// for Q/K/V, no transpose/per-head-launch overhead), or the separate-QKV + bmm
-    /// path for long sequences. Returns the context `[s_len, H]`.
+    /// path for long sequences. Returns the context `[s_len, H]`. Used by the
+    /// single-pair [`Self::forward`] reference; production uses `encoder_layer_raw`.
+    #[cfg(test)]
     fn attention(
         &mut self,
         emb: TensorNodeId,
@@ -644,30 +720,35 @@ impl Model {
         let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
         let scale = 1.0 / (HD as f64).sqrt();
-        for i in 0..L {
-            let p = format!("bert.encoder.layer.{i}");
-            // Self-attention per document (each on its own [lenₙ, H] slice), then
-            // re-concatenate the contexts back into one [total, H] activation. When
-            // every doc in the chunk is short, take the fused-QKV + fused-attention
-            // path (one batched int8 GEMM for Q/K/V, then the fused kernel per doc);
-            // otherwise fall back to separate-QKV + bmm (rare: a long doc in the
-            // chunk), which avoids both the fused kernel's long-seq slowdown and a
-            // strided column split.
-            let mut ctx_parts = Vec::with_capacity(n_docs);
-            if lens.iter().all(|&l| l <= FUSED_ATTN_MAX_SEQ) {
-                let qkv = self.linear(emb, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
-                for n in 0..n_docs {
-                    let (off, len) = (offsets[n], lens[n]);
-                    let qkv_n = self
-                        .s
-                        .tensor_narrow(qkv, 0, off, len)
-                        .map_err(|e| rerank_err("batch.qkv_narrow", e))?;
-                    ctx_parts.push(self.attn_fused(qkv_n, len, scale)?);
-                }
-            } else {
+        if lens.iter().all(|&l| l <= FUSED_ATTN_MAX_SEQ) {
+            // Tape-free fused-layer path (every doc short): extract the activation
+            // once, run all 6 encoder layers entirely on raw f32 buffers through the
+            // SAME optimized kernels (fused QKV + fused attention + add&norm +
+            // vectorized GELU) with no per-op tape-node creation / leaf allocation /
+            // truncation, then reinsert once for the pooler. Bit-identical to the
+            // tape path.
+            let scale_f = scale as f32;
+            let mut emb_vals = self
+                .s
+                .tensor_values_f32(emb)
+                .map_err(|e| rerank_err("batch.emb_extract", e))?;
+            for i in 0..L {
+                let p = format!("bert.encoder.layer.{i}");
+                emb_vals = self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f)?;
+            }
+            emb = self
+                .s
+                .tensor_variable_f32(emb_vals, vec![total, H], false)
+                .map_err(|e| rerank_err("batch.emb_reinsert", e))?;
+        } else {
+            // Long-document path: separate-QKV + cache-blocking bmm attention through
+            // the tape (a long doc in the chunk; rare).
+            for i in 0..L {
+                let p = format!("bert.encoder.layer.{i}");
                 let q = self.linear(emb, &format!("{p}.attention.self.query"))?;
                 let k = self.linear(emb, &format!("{p}.attention.self.key"))?;
                 let v = self.linear(emb, &format!("{p}.attention.self.value"))?;
+                let mut ctx_parts = Vec::with_capacity(n_docs);
                 for n in 0..n_docs {
                     let (off, len) = (offsets[n], lens[n]);
                     let qn = self
@@ -684,20 +765,17 @@ impl Model {
                         .map_err(|e| rerank_err("batch.v_narrow", e))?;
                     ctx_parts.push(self.attn_bmm(qn, kn, vn, len, scale)?);
                 }
+                let ctx = self
+                    .s
+                    .tensor_cat(&ctx_parts, 0)
+                    .map_err(|e| rerank_err("batch.ctx_cat", e))?; // [total, H]
+                let attn = self.linear(ctx, &format!("{p}.attention.output.dense"))?;
+                emb = self.add_ln(emb, attn, &format!("{p}.attention.output.LayerNorm"))?;
+                let inter = self.linear(emb, &format!("{p}.intermediate.dense"))?;
+                let inter = self.gelu(inter)?;
+                let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
+                emb = self.add_ln(emb, ffn, &format!("{p}.output.LayerNorm"))?;
             }
-            let ctx = self
-                .s
-                .tensor_cat(&ctx_parts, 0)
-                .map_err(|e| rerank_err("batch.ctx_cat", e))?; // [total, H]
-            let attn = self.linear(ctx, &format!("{p}.attention.output.dense"))?;
-            let sum1 = self.s.tensor_add(emb, attn).map_err(|e| rerank_err("attn.residual", e))?;
-            emb = self.ln(sum1, &format!("{p}.attention.output.LayerNorm"))?;
-            // Batched feed-forward.
-            let inter = self.linear(emb, &format!("{p}.intermediate.dense"))?;
-            let inter = self.gelu(inter)?;
-            let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
-            let sum2 = self.s.tensor_add(emb, ffn).map_err(|e| rerank_err("ffn.residual", e))?;
-            emb = self.ln(sum2, &format!("{p}.output.LayerNorm"))?;
         }
         // Pooler on each document's [CLS] row (the first token of each doc, i.e.
         // row `offsets[n]` in the concatenated activation) → [N, H].
@@ -1041,16 +1119,18 @@ fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     session.no_grad_enter();
     let mut w = HashMap::with_capacity(shared.f32_params.len());
+    let mut raw_params = HashMap::with_capacity(shared.f32_params.len());
     for (name, (vals, shape)) in &shared.f32_params {
         let node = session
             .tensor_variable_f32(vals.as_ref().clone(), shape.clone(), false)
             .map_err(|e| rerank_err("build_model", format!("create f32 tensor {name}: {e}")))?;
         w.insert(name.clone(), node);
+        raw_params.insert(name.clone(), Arc::clone(vals));
     }
     // Tape boundary AFTER the persistent f32 leaves are created; each forward
     // truncates back to here to free intermediates while keeping parameters.
     let weights_boundary = session.autograd_graph_node_count();
-    Ok(Model { s: session, w, qw: shared.qw.clone(), weights_boundary })
+    Ok(Model { s: session, w, qw: shared.qw.clone(), raw_params, weights_boundary })
 }
 
 #[inline]
