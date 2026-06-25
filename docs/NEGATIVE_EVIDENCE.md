@@ -196,6 +196,34 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-25 — caching the Tantivy `QueryParser` is zero-gain (parse dominates) (BlackThrush)
+
+**Lever:** `TantivyIndex::parse_query_lenient` rebuilt a `QueryParser::for_index(..)` +
+`set_field_boost(..)` on every BM25 search. Since the schema/tokenizers are fixed for the index's
+lifetime and `parse_query_lenient` takes `&self`, the parser was cached as a struct field (built
+once in the constructor) and reused. Correct and `Sync` (compiled; 79 lexical lib tests green).
+
+**Measured command (per-crate):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-lexical --bench query_parser
+```
+
+In-process old-vs-new A/B (`query_parser` group; `old` reconstructs the parser per query, `new`
+reuses a cached one; both run the identical lenient parse of a 7-token query):
+
+| Workload | old (reconstruct + parse) | new (cached + parse) | ratio new/old | verdict |
+|----------|---------------------------|----------------------|---------------|---------|
+| `query_parser` | 8384.1 ns | 8336.3 ns | **0.994** | noise / no gain |
+
+**Why it fails:** `QueryParser::for_index` is cheap (~tens of ns: an `Arc` tokenizer-manager clone
++ a small default-fields `Vec` + a boost map). The actual lenient *parse* — tokenizing the query
+through both field analyzers and building term queries — costs ~8.3 µs and dominates, so the
+construction it eliminates is <1% of the per-query cost, lost in noise. Reverted source + bench
+(stashed, not landed). The real lexical materialization gap is `load_doc` (full docstore
+decompress per hit in `search`/`search_doc_ids`), which needs a fast/columnar `id` field — an
+index-format change, tracked separately; **not** the parser.
+
 ### 2026-06-25 — `normalize_whitespace` ASCII byte-scan fast path is SLOWER (BlackThrush)
 
 **Lever:** `normalize_whitespace` (runs on every document at index time) walks `text.chars()` and
