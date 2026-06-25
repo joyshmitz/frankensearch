@@ -266,6 +266,55 @@ fn fused_attention(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
     ctx
 }
 
+/// Self-attention for the `[CLS]` query ONLY (token 0), returning its `[H]` context.
+///
+/// The reranker's logit is read solely from `[CLS]` of the final layer, so the last
+/// encoder layer never needs any other token's attention output. `[CLS]` still attends
+/// to every key, so K/V are repacked in full, but Q is a single row — the two `bmm`s
+/// collapse to `[1, HD] @ [HD, S]` and `[1, S] @ [S, HD]` per head (m = 1), i.e. ~S×
+/// less attention work than the full `fused_attention`. Bit-exact to row 0 of it.
+fn fused_attention_cls(qkv: &[f32], s_len: usize, scale: f32) -> Vec<f32> {
+    debug_assert_eq!(qkv.len(), s_len * 3 * H);
+    if s_len == 0 {
+        return vec![0.0f32; H];
+    }
+    const STRIDE: usize = 3 * H;
+    // Q[CLS] head-major [NH, 1, HD] (token 0's query), K transposed [NH, HD, S], V [NH, S, HD].
+    let mut q_cls = vec![0.0f32; NH * HD];
+    let mut kt = vec![0.0f32; NH * HD * s_len];
+    let mut v_hm = vec![0.0f32; NH * s_len * HD];
+    for h in 0..NH {
+        q_cls[h * HD..h * HD + HD].copy_from_slice(&qkv[h * HD..h * HD + HD]);
+    }
+    for j in 0..s_len {
+        let base = j * STRIDE;
+        for h in 0..NH {
+            let hm = (h * s_len + j) * HD;
+            v_hm[hm..hm + HD].copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+        }
+    }
+    for h in 0..NH {
+        for d in 0..HD {
+            let col = H + h * HD + d;
+            let row = &mut kt[h * HD * s_len + d * s_len..h * HD * s_len + d * s_len + s_len];
+            for (j, slot) in row.iter_mut().enumerate() {
+                *slot = qkv[j * STRIDE + col];
+            }
+        }
+    }
+    // scores [NH, 1, S] = Q[CLS] @ Kᵀ, then fused-scale softmax over the S keys (one row per head).
+    let qm = TensorMeta::from_shape(vec![NH, 1, HD], DType::F32, Device::Cpu);
+    let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
+    let mut scores = ft_api::bmm_tensor_contiguous_f32(&q_cls, &kt, &qm, &km)
+        .expect("attn CLS QKᵀ bmm: shapes are internally consistent");
+    fast_softmax_inplace(&mut scores, NH, s_len, scale);
+    // ctx_hm [NH, 1, HD] = scores @ V — already laid out as the [H] CLS context (head-major HD blocks).
+    let sm = TensorMeta::from_shape(vec![NH, 1, s_len], DType::F32, Device::Cpu);
+    let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
+    ft_api::bmm_tensor_contiguous_f32(&scores, &v_hm, &sm, &vm)
+        .expect("attn CLS ·V bmm: shapes are internally consistent")
+}
+
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
 /// f32 scales, plus its f32 bias. The three buffers are `Arc`-shared so the parsed
 /// weights are stored once and cloned cheaply into every pooled session.
@@ -388,6 +437,55 @@ impl Model {
         fast_gelu_inplace(&mut inter);
         let ffn = self.linear_raw(&inter, total, &format!("{p}.output.dense"))?;
         self.add_ln_raw(&emb, &ffn, total, &format!("{p}.output.LayerNorm"))
+    }
+
+    /// The FINAL encoder layer, computing ONLY each document's `[CLS]` row.
+    ///
+    /// The pooler reads the logit from `[CLS]` of the last layer alone, so the other
+    /// tokens' layer outputs are dead. The QKV projection still runs over all tokens
+    /// (CLS attends to every key, so K/V are needed in full), but attention is the
+    /// CLS-query-only [`fused_attention_cls`], and the attn-out projection, residual
+    /// add+LN, and the whole FFN then run on just `n_docs` rows (one `[CLS]` per doc)
+    /// instead of `total`. Returns `[n_docs, H]` — exactly the pooler's input, so no
+    /// post-hoc CLS gather is needed. Bit-exact to the `[CLS]` rows of
+    /// [`encoder_layer_raw`] (same kernels, same reductions).
+    fn encoder_layer_cls(
+        &self,
+        emb: &[f32],
+        offsets: &[usize],
+        lens: &[usize],
+        total: usize,
+        p: &str,
+        scale: f32,
+    ) -> SearchResult<Vec<f32>> {
+        let n_docs = lens.len();
+        // Fused QKV over all tokens (K/V needed in full for the CLS query's attention).
+        let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
+        // CLS-only self-attention per document into a compact [n_docs, H] context.
+        let mut ctx = vec![0.0f32; n_docs * H];
+        for (n, (&off, &len)) in offsets.iter().zip(lens).enumerate() {
+            let qkv_doc = &qkv[off * 3 * H..(off + len) * 3 * H];
+            let cls = fused_attention_cls(qkv_doc, len, scale);
+            ctx[n * H..(n + 1) * H].copy_from_slice(&cls);
+        }
+        let attn = self.linear_raw(&ctx, n_docs, &format!("{p}.attention.output.dense"))?;
+        // Residual is the input layer's CLS rows (the first token of each doc).
+        let mut emb_cls = vec![0.0f32; n_docs * H];
+        for (n, &off) in offsets.iter().enumerate() {
+            emb_cls[n * H..(n + 1) * H].copy_from_slice(&emb[off * H..off * H + H]);
+        }
+        let emb_cls = self.add_ln_raw(
+            &emb_cls,
+            &attn,
+            n_docs,
+            &format!("{p}.attention.output.LayerNorm"),
+        )?;
+        // FFN on just the CLS rows: [n_docs, H] -> [n_docs, INTER] -> GELU -> [n_docs, H].
+        let mut inter = self.linear_raw(&emb_cls, n_docs, &format!("{p}.intermediate.dense"))?;
+        debug_assert_eq!(inter.len(), n_docs * INTER);
+        fast_gelu_inplace(&mut inter);
+        let ffn = self.linear_raw(&inter, n_docs, &format!("{p}.output.dense"))?;
+        self.add_ln_raw(&emb_cls, &ffn, n_docs, &format!("{p}.output.LayerNorm"))
     }
 
     /// y = x @ Wᵀ + b via the int8 dynamic-quant kernel (weight stored row-major
@@ -702,26 +800,35 @@ impl Model {
         let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
         let scale = 1.0 / (HD as f64).sqrt();
+        // True once the final layer has already collapsed the activation to one
+        // `[CLS]` row per document (`[n_docs, H]`), so the pooler gathers identity
+        // rows instead of the per-doc offsets.
+        let mut cls_prepacked = false;
         if lens.iter().all(|&l| l <= FUSED_ATTN_MAX_SEQ) {
             // Tape-free fused-layer path (every doc short): extract the activation
-            // once, run all 6 encoder layers entirely on raw f32 buffers through the
+            // once, run the encoder layers entirely on raw f32 buffers through the
             // SAME optimized kernels (fused QKV + fused attention + add&norm +
             // vectorized GELU) with no per-op tape-node creation / leaf allocation /
             // truncation, then reinsert once for the pooler. Bit-identical to the
-            // tape path.
+            // tape path. The FINAL layer computes only each doc's `[CLS]` row (the
+            // sole token the pooler reads), skipping ~S× of its attn-out + FFN work.
             let scale_f = scale as f32;
             let mut emb_vals = self
                 .s
                 .tensor_values_f32(emb)
                 .map_err(|e| rerank_err("batch.emb_extract", e))?;
-            for i in 0..L {
+            for i in 0..L - 1 {
                 let p = format!("bert.encoder.layer.{i}");
                 emb_vals = self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f)?;
             }
+            let p_last = format!("bert.encoder.layer.{}", L - 1);
+            let cls_vals =
+                self.encoder_layer_cls(&emb_vals, &offsets, &lens, total, &p_last, scale_f)?;
             emb = self
                 .s
-                .tensor_variable_f32(emb_vals, vec![total, H], false)
+                .tensor_variable_f32(cls_vals, vec![n_docs, H], false)
                 .map_err(|e| rerank_err("batch.emb_reinsert", e))?;
+            cls_prepacked = true;
         } else {
             // Long-document path: separate-QKV + cache-blocking bmm attention through
             // the tape (a long doc in the chunk; rare).
@@ -759,9 +866,14 @@ impl Model {
                 emb = self.add_ln(emb, ffn, &format!("{p}.output.LayerNorm"))?;
             }
         }
-        // Pooler on each document's [CLS] row (the first token of each doc, i.e.
-        // row `offsets[n]` in the concatenated activation) → [N, H].
-        let cls_idx: Vec<i64> = offsets.iter().map(|&o| o as i64).collect();
+        // Pooler on each document's [CLS] row → [N, H]. When the final layer already
+        // emitted one CLS row per doc (`cls_prepacked`), those are rows 0..n_docs;
+        // otherwise CLS is the first token of each doc, row `offsets[n]`.
+        let cls_idx: Vec<i64> = if cls_prepacked {
+            (0..n_docs as i64).collect()
+        } else {
+            offsets.iter().map(|&o| o as i64).collect()
+        };
         let cls_t = self.idx(&cls_idx)?;
         let cls = self
             .s
