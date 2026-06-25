@@ -12,6 +12,8 @@
 //! Query canonicalization is simpler (NFC + trim only) since queries are
 //! typically short natural language.
 
+use std::borrow::Cow;
+
 use unicode_normalization::UnicodeNormalization;
 
 /// Low-signal content to filter out (exact matches, case-insensitive).
@@ -194,7 +196,11 @@ fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> 
 }
 
 /// Strip markdown formatting from a single line.
-fn strip_markdown_line(line: &str) -> String {
+///
+/// Returns a borrowed slice for the common case (plain line, no inline markdown),
+/// so a plain document flows through `canonicalize` with no per-line allocation;
+/// the inline-markdown slow path returns an owned `String`.
+fn strip_markdown_line(line: &str) -> Cow<'_, str> {
     // Fast path: lines containing no inline-markdown characters skip the entire
     // replace/link/italic chain (each pass allocates + scans the line but is a
     // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
@@ -210,21 +216,24 @@ fn strip_markdown_line(line: &str) -> String {
         r = r.replace('`', "");
         // Convert links [text](url) to just text
         let r = strip_markdown_links(&r);
-        strip_prefixes_and_list_marker(&r)
+        // `r` is a local owned buffer, so the borrowed result can't escape — take
+        // ownership for the return (the slow path allocates regardless).
+        Cow::Owned(strip_prefixes_and_list_marker(&r).into_owned())
     } else {
         // Fast path: no inline markdown, so operate directly on the borrowed
-        // `line` — the prefix/blockquote trims and list-marker strip only need a
-        // `&str`. This drops the prior `line.to_string()` copy; only the final
-        // owned String (from `strip_list_marker`) is allocated. Byte-identical.
+        // `line`. The prefix/blockquote trims and list-marker strip all return
+        // borrowed `&str` slices, so a plain line flows through with **zero**
+        // allocations — only the caller's single `push_str` copies the bytes.
+        // Byte-identical to the prior owned-String path.
         strip_prefixes_and_list_marker(line)
     }
 }
 
 /// Strip leading header (`#`) / blockquote (`>`) prefixes plus their leading
-/// whitespace as a single `&str` chain (no intermediate allocations), then remove
-/// any list marker (which allocates the final owned String). Byte-identical to the
-/// prior two-`to_string` trim chain — same trims in the same order.
-fn strip_prefixes_and_list_marker(s: &str) -> String {
+/// whitespace as a single `&str` chain, then remove any list marker. Returns a
+/// borrowed slice whenever nothing is stripped or only a prefix slice remains —
+/// no allocation. Byte-identical to the prior owned-String trim chain.
+fn strip_prefixes_and_list_marker(s: &str) -> Cow<'_, str> {
     let prefix_stripped = s
         .trim_start_matches('#')
         .trim_start()
@@ -340,15 +349,15 @@ fn strip_markdown_links(text: &str) -> String {
 ///
 /// Strips unordered (`- `, `+ `) and ordered (`1. `, `10. `) markers.
 /// Does NOT strip arbitrary numbers (`3.14159` stays intact).
-fn strip_list_marker(line: &str) -> String {
+fn strip_list_marker(line: &str) -> Cow<'_, str> {
     let trimmed = line.trim_start();
 
     // Check for unordered list markers: "- " or "+ "
     if let Some(rest) = trimmed.strip_prefix("- ") {
-        return rest.to_string();
+        return Cow::Borrowed(rest);
     }
     if let Some(rest) = trimmed.strip_prefix("+ ") {
-        return rest.to_string();
+        return Cow::Borrowed(rest);
     }
 
     // Check for ordered list markers: digits followed by ". "
@@ -366,12 +375,14 @@ fn strip_list_marker(line: &str) -> String {
 
     // Must have at least one digit, followed by ". " (dot then space)
     if digit_count > 0 && chars.next() == Some('.') && chars.peek() == Some(&' ') {
-        chars.next(); // consume the space
-        return chars.collect();
+        // All consumed chars (digits, '.', ' ') are single-byte ASCII, so the
+        // remainder starts at byte offset `digit_count + 2` — a borrowed slice,
+        // byte-identical to the prior `chars.collect()`.
+        return Cow::Borrowed(&trimmed[digit_count + 2..]);
     }
 
-    // Not a list marker, return original
-    line.to_string()
+    // Not a list marker, return original (borrowed).
+    Cow::Borrowed(line)
 }
 
 /// Normalize whitespace: collapse runs to single space, trim.

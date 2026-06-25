@@ -12,6 +12,7 @@
 //!   rch exec -- cargo bench -p frankensearch-core --bench canonicalize
 //! ```
 
+use std::borrow::Cow;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -234,6 +235,54 @@ fn bench_nfc(c: &mut Criterion) {
         });
     });
     sg.finish();
+
+    // Full strip_markdown_and_code inner loop on plain lines: `string` returns a
+    // per-line owned String (the prior behavior — `strip_list_marker` allocated);
+    // `cow` returns a borrowed slice (the Cow change), so a plain line flows into
+    // the result buffer with zero per-line allocation, only the final `push_str`.
+    fn line_to_string(line: &str) -> String {
+        line.trim_start_matches('#')
+            .trim_start()
+            .trim_start_matches('>')
+            .trim_start()
+            .to_owned()
+    }
+    fn line_to_cow(line: &str) -> Cow<'_, str> {
+        Cow::Borrowed(
+            line.trim_start_matches('#')
+                .trim_start()
+                .trim_start_matches('>')
+                .trim_start(),
+        )
+    }
+    let mut cg = c.benchmark_group("strip_markdown_cow");
+    cg.bench_function("string", |b| {
+        b.iter(|| {
+            let mut result = String::with_capacity(plain_doc.len());
+            for line in plain_doc.lines() {
+                let s = line_to_string(black_box(line));
+                if !s.is_empty() {
+                    result.push_str(&s);
+                    result.push('\n');
+                }
+            }
+            black_box(result)
+        });
+    });
+    cg.bench_function("cow", |b| {
+        b.iter(|| {
+            let mut result = String::with_capacity(plain_doc.len());
+            for line in plain_doc.lines() {
+                let s = line_to_cow(black_box(line));
+                if !s.is_empty() {
+                    result.push_str(&s);
+                    result.push('\n');
+                }
+            }
+            black_box(result)
+        });
+    });
+    cg.finish();
 }
 
 criterion_group!(benches, bench_nfc);
