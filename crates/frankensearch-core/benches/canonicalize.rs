@@ -301,6 +301,35 @@ fn bench_nfc(c: &mut Criterion) {
                      fn handle_error_case(self_ref, max_retries) -> bool_result\n"
         .repeat(20);
     debug_assert_eq!(siu_old(&snake_doc), siu_new(&snake_doc));
+    // strip_markdown_line slow-path guarding on a snake_case line (trigger = `_`
+    // only): old ran the full replace chain (**, __, *, `, links) — 4 of which are
+    // whole-line no-op allocating passes; new applies only the `_`-triggered ops.
+    // (strip_italic_underscores runs in both, so it is omitted from the A/B.)
+    fn slow_old(line: &str) -> String {
+        let mut r = line.replace("**", "");
+        r = r.replace("__", "");
+        r = r.replace('*', "");
+        r = r.replace('`', "");
+        r.chars().collect() // models strip_markdown_links no-op (rebuilds the String)
+    }
+    fn slow_new(line: &str) -> String {
+        line.replace("__", "") // only the `_`-triggered replace runs
+    }
+    let snake_lines = "let retry_count = compute_value(self_ref, max_retries_allowed);"
+        .repeat(1)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let snake_line = &snake_lines[0];
+    let mut slg = c.benchmark_group("strip_markdown_slowpath");
+    slg.bench_with_input("old", snake_line.as_str(), |b, t| {
+        b.iter(|| black_box(slow_old(black_box(t))));
+    });
+    slg.bench_with_input("new", snake_line.as_str(), |b, t| {
+        b.iter(|| black_box(slow_new(black_box(t))));
+    });
+    slg.finish();
+
     let mut ig = c.benchmark_group("strip_italic_underscores");
     ig.bench_with_input("old", snake_doc.as_str(), |b, t| {
         b.iter(|| black_box(siu_old(black_box(t))));

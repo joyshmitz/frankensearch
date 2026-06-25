@@ -201,32 +201,54 @@ fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> 
 /// so a plain document flows through `canonicalize` with no per-line allocation;
 /// the inline-markdown slow path returns an owned `String`.
 fn strip_markdown_line(line: &str) -> Cow<'_, str> {
-    // Fast path: lines containing no inline-markdown characters skip the entire
-    // replace/link/italic chain (each pass allocates + scans the line but is a
-    // content no-op when its trigger char — `*` `_` `` ` `` `[` — is absent).
-    // Byte-identical to the full path; the header/blockquote/list stripping below
-    // still applies. Plain prose and most code-comment text hit this path.
-    if line.bytes().any(|b| matches!(b, b'*' | b'_' | b'`' | b'[')) {
-        // Remove bold/italic markers
-        let mut r = line.replace("**", "");
-        r = r.replace("__", "");
-        r = r.replace('*', "");
-        r = strip_italic_underscores(&r);
-        // Remove inline code backticks
-        r = r.replace('`', "");
-        // Convert links [text](url) to just text
-        let r = strip_markdown_links(&r);
-        // `r` is a local owned buffer, so the borrowed result can't escape — take
-        // ownership for the return (the slow path allocates regardless).
-        Cow::Owned(strip_prefixes_and_list_marker(&r).into_owned())
-    } else {
+    // One scan classifies which inline-markdown trigger chars are present. Each
+    // transform below was previously run unconditionally and allocated a whole-line
+    // copy even when its trigger char was absent (a no-op). Guarding each by its
+    // trigger skips those no-op passes — e.g. a `snake_case` line (only `_`) no
+    // longer pays the `**`/`*`/`` ` ``/link passes. Same order, so byte-identical.
+    let mut has_star = false;
+    let mut has_underscore = false;
+    let mut has_backtick = false;
+    let mut has_bracket = false;
+    for b in line.bytes() {
+        match b {
+            b'*' => has_star = true,
+            b'_' => has_underscore = true,
+            b'`' => has_backtick = true,
+            b'[' => has_bracket = true,
+            _ => {}
+        }
+    }
+
+    if !(has_star || has_underscore || has_backtick || has_bracket) {
         // Fast path: no inline markdown, so operate directly on the borrowed
         // `line`. The prefix/blockquote trims and list-marker strip all return
         // borrowed `&str` slices, so a plain line flows through with **zero**
         // allocations — only the caller's single `push_str` copies the bytes.
-        // Byte-identical to the prior owned-String path.
-        strip_prefixes_and_list_marker(line)
+        return strip_prefixes_and_list_marker(line);
     }
+
+    // Apply transforms in the original order, each guarded by its trigger char.
+    let mut r: Cow<'_, str> = Cow::Borrowed(line);
+    if has_star {
+        r = Cow::Owned(r.replace("**", "")); // bold
+    }
+    if has_underscore {
+        r = Cow::Owned(r.replace("__", "")); // bold via underscores
+    }
+    if has_star {
+        r = Cow::Owned(r.replace('*', "")); // remaining italic stars
+    }
+    if has_underscore {
+        r = Cow::Owned(strip_italic_underscores(&r)); // italic underscores
+    }
+    if has_backtick {
+        r = Cow::Owned(r.replace('`', "")); // inline code
+    }
+    if has_bracket {
+        r = Cow::Owned(strip_markdown_links(&r)); // [text](url) → text
+    }
+    Cow::Owned(strip_prefixes_and_list_marker(&r).into_owned())
 }
 
 /// Strip leading header (`#`) / blockquote (`>`) prefixes plus their leading
