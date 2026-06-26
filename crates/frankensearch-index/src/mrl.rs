@@ -335,6 +335,10 @@ impl VectorIndex {
     ) -> SearchResult<BinaryHeap<MrlHeapEntry>> {
         let max_elements = self.record_count();
         let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
+        // Cutoff fast-path: once the bounded heap is full, skip the insert_mrl_candidate
+        // call for scores that cannot enter it — the same guard the exact scan and the
+        // int8 two-pass pass-1 use (the MRL scan previously inserted every vector).
+        let mut cutoff = f32::NEG_INFINITY;
         let stride = match self.quantization() {
             crate::Quantization::F16 => self.dimension() * 2,
             crate::Quantization::F32 => self.dimension() * 4,
@@ -381,7 +385,14 @@ impl VectorIndex {
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
                         let score = dot_product_f16_bytes_f32(vector_bytes, query_truncated)?;
-                        insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                        if heap.len() < limit || nan_safe(score) >= cutoff {
+                            insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                            if heap.len() >= limit
+                                && let Some(&worst) = heap.peek()
+                            {
+                                cutoff = nan_safe(worst.score);
+                            }
+                        }
                     }
 
                     record_offset += 16;
@@ -428,7 +439,14 @@ impl VectorIndex {
                     if passed {
                         let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
                         let score = dot_product_f32_bytes_f32(vector_bytes, query_truncated)?;
-                        insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                        if heap.len() < limit || nan_safe(score) >= cutoff {
+                            insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                            if heap.len() >= limit
+                                && let Some(&worst) = heap.peek()
+                            {
+                                cutoff = nan_safe(worst.score);
+                            }
+                        }
                     }
 
                     record_offset += 16;
