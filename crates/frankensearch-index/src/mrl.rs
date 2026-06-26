@@ -33,8 +33,10 @@ use std::collections::BinaryHeap;
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD};
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
     VectorIndex, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
@@ -194,6 +196,23 @@ fn insert_mrl_candidate(
     }
 }
 
+/// Merge per-chunk bounded heaps into a single top-`limit` heap. The score+index
+/// tie-break is a total order, so the merged top-k is independent of chunk
+/// boundaries (identical to the sequential scan).
+fn merge_mrl_partials(
+    partials: Vec<BinaryHeap<MrlHeapEntry>>,
+    limit: usize,
+) -> BinaryHeap<MrlHeapEntry> {
+    let total: usize = partials.iter().map(BinaryHeap::len).sum();
+    let mut merged = BinaryHeap::with_capacity(limit.min(total).saturating_add(1));
+    for heap in partials {
+        for entry in heap {
+            insert_mrl_candidate(&mut merged, entry, limit);
+        }
+    }
+    merged
+}
+
 // ---------------------------------------------------------------------------
 // VectorIndex extension
 // ---------------------------------------------------------------------------
@@ -333,126 +352,128 @@ impl VectorIndex {
         search_dims: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<BinaryHeap<MrlHeapEntry>> {
-        let max_elements = self.record_count();
-        let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
-        // Cutoff fast-path: once the bounded heap is full, skip the insert_mrl_candidate
-        // call for scores that cannot enter it — the same guard the exact scan and the
-        // int8 two-pass pass-1 use (the MRL scan previously inserted every vector).
-        let mut cutoff = f32::NEG_INFINITY;
+        let count = self.record_count();
         let stride = match self.quantization() {
             crate::Quantization::F16 => self.dimension() * 2,
             crate::Quantization::F32 => self.dimension() * 4,
         };
+        let (partial_bytes, dot): (usize, fn(&[u8], &[f32]) -> SearchResult<f32>) =
+            match self.quantization() {
+                crate::Quantization::F16 => (search_dims * 2, dot_product_f16_bytes_f32),
+                crate::Quantization::F32 => (search_dims * 4, dot_product_f32_bytes_f32),
+            };
 
-        match self.quantization() {
-            crate::Quantization::F16 => {
-                let partial_bytes = search_dims * 2;
-                let mut record_offset = self.records_offset;
-                let mut vector_offset = self.vectors_offset;
+        // Below the parallel threshold, a single sequential chunk avoids rayon
+        // overhead. Above it, scan disjoint record ranges in parallel — the same
+        // structure the exact `scan_parallel` and int8 two-pass pass-1 use; the
+        // MRL truncated scan was previously single-threaded. The merge of the
+        // per-chunk bounded heaps is order-independent (the score+index tie-break
+        // is a total order), so the parallel top-k is identical to the sequential.
+        if count < PARALLEL_THRESHOLD {
+            return self.mrl_scan_chunk(
+                0,
+                count,
+                query_truncated,
+                partial_bytes,
+                stride,
+                dot,
+                limit,
+                filter,
+            );
+        }
+        let chunk_count = count.div_ceil(PARALLEL_CHUNK_SIZE);
+        let partials: SearchResult<Vec<BinaryHeap<MrlHeapEntry>>> = (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk_index| {
+                let start = chunk_index * PARALLEL_CHUNK_SIZE;
+                let end = (start + PARALLEL_CHUNK_SIZE).min(count);
+                self.mrl_scan_chunk(
+                    start,
+                    end,
+                    query_truncated,
+                    partial_bytes,
+                    stride,
+                    dot,
+                    limit,
+                    filter,
+                )
+            })
+            .collect();
+        Ok(merge_mrl_partials(partials?, limit))
+    }
 
-                for index in 0..self.record_count() {
-                    let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
-                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+    /// Scan a single record range `[start, end)` for the MRL truncated phase,
+    /// returning a bounded top-`limit` heap. Runs both sequentially and as the
+    /// per-chunk worker for the parallel scan; `dot` selects the f16/f32 byte
+    /// kernel and `partial_bytes`/`stride` are the per-record vector byte counts.
+    #[allow(clippy::too_many_arguments)]
+    fn mrl_scan_chunk(
+        &self,
+        start: usize,
+        end: usize,
+        query_truncated: &[f32],
+        partial_bytes: usize,
+        stride: usize,
+        dot: fn(&[u8], &[f32]) -> SearchResult<f32>,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<BinaryHeap<MrlHeapEntry>> {
+        let mut heap =
+            BinaryHeap::with_capacity(limit.min(end.saturating_sub(start)).saturating_add(1));
+        let mut cutoff = f32::NEG_INFINITY;
+        let mut record_offset = self.records_offset + start * 16;
+        let mut vector_offset = self.vectors_offset + start * stride;
 
-                    if (flags & 0x0001) != 0 {
-                        record_offset += 16;
-                        vector_offset += stride;
-                        continue;
+        for index in start..end {
+            let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
+            let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+
+            if (flags & 0x0001) != 0 {
+                record_offset += 16;
+                vector_offset += stride;
+                continue;
+            }
+
+            let passed = if let Some(f) = filter {
+                let hash_bytes = &self.data[record_offset..record_offset + 8];
+                let hash = u64::from_le_bytes([
+                    hash_bytes[0],
+                    hash_bytes[1],
+                    hash_bytes[2],
+                    hash_bytes[3],
+                    hash_bytes[4],
+                    hash_bytes[5],
+                    hash_bytes[6],
+                    hash_bytes[7],
+                ]);
+                if let Some(matches) = f.matches_doc_id_hash(hash, None) {
+                    matches
+                } else {
+                    let doc_id = self.doc_id_at(index)?;
+                    f.matches(doc_id, None)
+                }
+            } else {
+                true
+            };
+
+            if passed {
+                let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
+                let score = dot(vector_bytes, query_truncated)?;
+                // Cutoff fast-path: skip the insert_mrl_candidate call for scores
+                // that cannot enter the full bounded heap (same guard the exact
+                // scan + int8 pass-1 use).
+                if heap.len() < limit || nan_safe(score) >= cutoff {
+                    insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
+                    if heap.len() >= limit
+                        && let Some(&worst) = heap.peek()
+                    {
+                        cutoff = nan_safe(worst.score);
                     }
-
-                    let passed = if let Some(f) = filter {
-                        let hash_bytes = &self.data[record_offset..record_offset + 8];
-                        let hash = u64::from_le_bytes([
-                            hash_bytes[0],
-                            hash_bytes[1],
-                            hash_bytes[2],
-                            hash_bytes[3],
-                            hash_bytes[4],
-                            hash_bytes[5],
-                            hash_bytes[6],
-                            hash_bytes[7],
-                        ]);
-                        if let Some(matches) = f.matches_doc_id_hash(hash, None) {
-                            matches
-                        } else {
-                            let doc_id = self.doc_id_at(index)?;
-                            f.matches(doc_id, None)
-                        }
-                    } else {
-                        true
-                    };
-
-                    if passed {
-                        let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
-                        let score = dot_product_f16_bytes_f32(vector_bytes, query_truncated)?;
-                        if heap.len() < limit || nan_safe(score) >= cutoff {
-                            insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
-                            if heap.len() >= limit
-                                && let Some(&worst) = heap.peek()
-                            {
-                                cutoff = nan_safe(worst.score);
-                            }
-                        }
-                    }
-
-                    record_offset += 16;
-                    vector_offset += stride;
                 }
             }
-            crate::Quantization::F32 => {
-                let partial_bytes = search_dims * 4;
-                let mut record_offset = self.records_offset;
-                let mut vector_offset = self.vectors_offset;
 
-                for index in 0..self.record_count() {
-                    let flags_bytes = &self.data[record_offset + 14..record_offset + 16];
-                    let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
-
-                    if (flags & 0x0001) != 0 {
-                        record_offset += 16;
-                        vector_offset += stride;
-                        continue;
-                    }
-
-                    let passed = if let Some(f) = filter {
-                        let hash_bytes = &self.data[record_offset..record_offset + 8];
-                        let hash = u64::from_le_bytes([
-                            hash_bytes[0],
-                            hash_bytes[1],
-                            hash_bytes[2],
-                            hash_bytes[3],
-                            hash_bytes[4],
-                            hash_bytes[5],
-                            hash_bytes[6],
-                            hash_bytes[7],
-                        ]);
-                        if let Some(matches) = f.matches_doc_id_hash(hash, None) {
-                            matches
-                        } else {
-                            let doc_id = self.doc_id_at(index)?;
-                            f.matches(doc_id, None)
-                        }
-                    } else {
-                        true
-                    };
-
-                    if passed {
-                        let vector_bytes = &self.data[vector_offset..vector_offset + partial_bytes];
-                        let score = dot_product_f32_bytes_f32(vector_bytes, query_truncated)?;
-                        if heap.len() < limit || nan_safe(score) >= cutoff {
-                            insert_mrl_candidate(&mut heap, MrlHeapEntry { index, score }, limit);
-                            if heap.len() >= limit
-                                && let Some(&worst) = heap.peek()
-                            {
-                                cutoff = nan_safe(worst.score);
-                            }
-                        }
-                    }
-
-                    record_offset += 16;
-                    vector_offset += stride;
-                }
-            }
+            record_offset += 16;
+            vector_offset += stride;
         }
 
         Ok(heap)
@@ -688,6 +709,54 @@ mod tests {
         assert_eq!(stats.scan_dims, 8);
         assert!(!stats.fell_back_to_full);
         assert!(stats.candidates_rescored > 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrl_search_parallel_path_covers_all_records() {
+        // N above PARALLEL_THRESHOLD (10_000) exercises the parallel chunked MRL
+        // scan. With rescore_top_k = N the truncated scan keeps every record and
+        // rescores all at full dim, so the result must equal the exact full-dim
+        // search_top_k — verifying each parallel chunk's byte offsets cover all
+        // records (no skips/duplicates) and the merge is correct.
+        let dim = 16;
+        let n = 12_000usize;
+        let path = temp_index_path("parallel-path-coverage");
+        let ids: Vec<String> = (0..n).map(|i| format!("doc-{i:05}")).collect();
+        let rows: Vec<(&str, Vec<f32>)> = (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim)
+                    .map(|d| (((i * 31 + d * 7) % 97) as f32) / 97.0)
+                    .collect();
+                (ids[i].as_str(), v)
+            })
+            .collect();
+        write_index(&path, &rows).expect("write index");
+        let index = VectorIndex::open(&path).expect("open");
+
+        let query: Vec<f32> = (0..dim).map(|d| (d as f32 + 1.0) / 16.0).collect();
+        let config = MrlConfig {
+            search_dims: 8,
+            rescore_dims: 0,
+            rescore_top_k: n, // rescore everything → lossless → equals exact top-k
+        };
+        let mrl: Vec<String> = index
+            .mrl_search(&query, 10, &config, None)
+            .expect("mrl")
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
+        let exact: Vec<String> = index
+            .search_top_k(&query, 10, None)
+            .expect("exact")
+            .into_iter()
+            .map(|h| h.doc_id)
+            .collect();
+        assert_eq!(
+            mrl, exact,
+            "parallel MRL scan (rescore-all) must equal the exact full-dim top-k"
+        );
 
         std::fs::remove_file(&path).ok();
     }
