@@ -71,6 +71,58 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-26 — Early BOLD short-circuit before `ScoredResult` allocation is not a keep (BlackThrush)
+
+**Lever tested and reverted:** move the BOLD hash-hybrid lexical short-circuit check before
+`lexical_doc_ids_as_scored`, so saturated lexical rows can return the raw `LexicalIdHit` vector
+instead of allocating temporary `ScoredResult` wrappers first. This was intentionally scoped to
+the BOLD harness path after the rejected Tantivy fast-field attempt, leaving the Tantivy incumbent
+and `TantivyIndex::search_doc_ids` comparator untouched.
+
+**Measured command (RCH local fallback; no admissible workers:
+`insufficient_slots=4,hard_preflight=1`; per-crate, warm target dir):**
+```bash
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_COMMAND='RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=off cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+  RUST_LOG=off \
+  cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify/summary.md`
+and `summary.jsonl`. The BOLD summary completed; the remaining Criterion process was interrupted
+afterward because the `#[instrument]` close-event tracing still emitted massive output despite
+`RUST_LOG=off`.
+
+**Decision:** rejected and reverted. The isolated 100k natural-language/high-fanout p50 wins are
+not acceptable because the same lever leaves the main 10k rows slower and badly regresses the
+100k zero-hit row. It is also only a harness allocation reorder, not a library search primitive.
+
+| Workload | Tantivy-class p50 | Candidate frankensearch p50 | Candidate / Tantivy-class | Decision |
+|----------|-------------------|------------------------------|----------------------------|----------|
+| `top10_exact_identifier/10000` | 105 us | 105 us | 1.000 | zero-gain |
+| `top10_short_keyword/10000` | 134 us | 197 us | **1.470x slower** | reverted |
+| `top10_quoted_phrase/10000` | 121 us | 211 us | **1.744x slower** | reverted |
+| `top10_natural_language/10000` | 120 us | 222 us | **1.850x slower** | reverted |
+| `top10_high_fanout/10000` | 176 us | 188 us | **1.068x slower** | reverted |
+| `top10_zero_hit/10000` | 18 us | 21 us | **1.167x slower** | reverted |
+| `limit_all/10000` | 7.033 ms | 7.160 ms | 1.018 | zero-gain |
+| `top10_exact_identifier/100000` | 1.256 ms | 1.262 ms | 1.005 | zero-gain |
+| `top10_short_keyword/100000` | 324 us | 317 us | 0.978 | zero-gain/no keep |
+| `top10_quoted_phrase/100000` | 1.148 ms | 1.290 ms | **1.124x slower** | reverted |
+| `top10_natural_language/100000` | 988 us | 789 us | 0.799 | isolated/no keep |
+| `top10_high_fanout/100000` | 677 us | 638 us | 0.942 | isolated/no keep |
+| `top10_zero_hit/100000` | 67 us | 174 us | **2.597x slower** | reverted |
+
+**Future route:** the next real lever is not another harness-side wrapper allocation skip. Target
+the actual `search_doc_ids` materialization primitive without touching the incumbent comparator,
+or suppress/avoid per-hit `#[instrument]` close-event logging in the measurement harness before
+trusting very small microsecond deltas.
+
 ### 2026-06-26 — Tantivy fast `id` column is a comparator-poisoning loss (BlackThrush)
 
 **Lever tested and reverted:** mark the Tantivy `id` text field as `FAST` and make
