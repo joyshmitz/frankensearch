@@ -37,6 +37,10 @@ name = "fingerprint"
 harness = false
 
 [[bench]]
+name = "filter_prescreen"
+harness = false
+
+[[bench]]
 name = "parsed_query"
 harness = false
 

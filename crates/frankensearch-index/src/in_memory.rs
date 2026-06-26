@@ -24,7 +24,7 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{SearchFilter, fnv1a_hash};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use half::f16;
 use rayon::prelude::*;
@@ -49,6 +49,13 @@ pub struct InMemoryVectorIndex {
     /// (the scale is a per-query constant). Built on first two-pass use so exact-only
     /// callers pay neither the quantization work nor its `N·d`-byte footprint.
     vectors_i8: OnceLock<Vec<i8>>,
+    /// Lazily-built FNV-1a hashes of `doc_ids` (same `frankensearch_core::filter`
+    /// hash that `BitsetFilter` uses). Lets the filtered scan call
+    /// `SearchFilter::matches_doc_id_hash` with a precomputed hash instead of
+    /// re-hashing each `doc_id` string per vector (the FSVI `search.rs` scan already
+    /// does this). Built on first *filtered* search, so unfiltered callers pay
+    /// neither the hashing nor the `8·N`-byte footprint.
+    doc_id_hashes: OnceLock<Vec<u64>>,
     /// Vector dimensionality.
     dimension: usize,
 }
@@ -133,6 +140,7 @@ impl InMemoryVectorIndex {
             doc_ids,
             vectors: flat,
             vectors_i8: OnceLock::new(),
+            doc_id_hashes: OnceLock::new(),
             dimension,
         })
     }
@@ -175,6 +183,7 @@ impl InMemoryVectorIndex {
             doc_ids,
             vectors: flat,
             vectors_i8: OnceLock::new(),
+            doc_id_hashes: OnceLock::new(),
             dimension,
         })
     }
@@ -381,6 +390,19 @@ impl InMemoryVectorIndex {
         Ok(merge_partial_heaps(partial_heaps?, limit))
     }
 
+    /// Lazily-built FNV-1a hashes of every `doc_id` (matches the hash
+    /// `BitsetFilter` computes), so the filtered scan can pre-screen by hash via
+    /// `SearchFilter::matches_doc_id_hash` instead of re-hashing each `doc_id`
+    /// string per vector. Built once on first filtered search.
+    fn doc_id_hashes(&self) -> &[u64] {
+        self.doc_id_hashes.get_or_init(|| {
+            self.doc_ids
+                .iter()
+                .map(|id| fnv1a_hash(id.as_bytes()))
+                .collect()
+        })
+    }
+
     fn scan_range(
         &self,
         start: usize,
@@ -393,11 +415,21 @@ impl InMemoryVectorIndex {
         let mut heap = BinaryHeap::with_capacity(limit.min(max_elements).saturating_add(1));
         let mut cutoff = f32::NEG_INFINITY;
 
+        // When filtering, pre-screen by precomputed doc_id hash (one HashSet lookup)
+        // instead of re-hashing the doc_id string per vector; fall back to the
+        // string/metadata path only when the filter can't decide by hash.
+        let doc_id_hashes = filter.map(|_| self.doc_id_hashes());
+
         for index in start..end {
-            if let Some(f) = filter
-                && !f.matches(&self.doc_ids[index], None)
-            {
-                continue;
+            if let Some(f) = filter {
+                let passed = match doc_id_hashes.and_then(|h| f.matches_doc_id_hash(h[index], None))
+                {
+                    Some(decided) => decided,
+                    None => f.matches(&self.doc_ids[index], None),
+                };
+                if !passed {
+                    continue;
+                }
             }
             let stored = self.vector_slice(index);
             let score = dot_product_f16_f32(stored, query)?;
@@ -962,6 +994,36 @@ mod tests {
             let num: usize = hit.doc_id.strip_prefix("doc-").unwrap().parse().unwrap();
             assert!(num % 2 == 1, "filter should exclude even docs");
         }
+    }
+
+    #[test]
+    fn search_with_bitset_filter_uses_precomputed_hash_path() {
+        // BitsetFilter resolves via matches_doc_id_hash (the precomputed-hash
+        // prescreen). Result must equal the allowed doc-id set's top-k — i.e. the
+        // precomputed hashes match BitsetFilter's own hashing.
+        use frankensearch_core::filter::BitsetFilter;
+        let dim = 8;
+        let doc_ids: Vec<String> = (0..20).map(|i| format!("doc-{i}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..20)
+            .map(|i| make_normalized_vec(dim, i as f32))
+            .collect();
+        let allowed: Vec<String> = doc_ids.iter().step_by(3).cloned().collect(); // doc-0,3,6,...
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+        let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
+
+        let query = make_normalized_vec(dim, 6.0);
+        let hits = index.search_top_k(&query, 20, Some(&filter)).unwrap();
+
+        assert!(!hits.is_empty());
+        for hit in &hits {
+            assert!(
+                allowed.contains(&hit.doc_id),
+                "bitset filter must only return allowed doc-ids; got {}",
+                hit.doc_id
+            );
+        }
+        // Every allowed doc should be returned (limit 20 ≥ allowed count).
+        assert_eq!(hits.len(), allowed.len());
     }
 
     #[test]

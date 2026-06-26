@@ -157,6 +157,7 @@ negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-06-24 | frankensearch-index | **branchless SIMD f16→f32 widen** (default path) | `dot/dim384/f16_bytes` | 7.363 ms | 2.332 ms | **0.317** | KEEP |
 | 2026-06-24 | frankensearch-index | branchless SIMD f16→f32 widen | `dot/dim256/f16_slice` | 3.699 ms | 1.348 ms | **0.364** | KEEP |
 | 2026-06-24 | frankensearch-index | branchless SIMD f16→f32 widen | `dot/dim384/f16_slice` | 5.536 ms | 2.181 ms | **0.394** | KEEP |
+| 2026-06-26 | frankensearch-index | **in-memory filtered scan: precomputed-hash prescreen** (`matches_doc_id_hash` with a lazy `doc_id_hashes` slab) instead of re-hashing each `doc_id` string per vector via `matches()` — matches the FSVI scan, which already did this | `filter_prescreen` (10k `BitsetFilter` checks) | 183.5 µs | 88.4 µs | **0.482 (~2.08×)** | KEEP (BlackThrush) |
 
 **Lever (ParsedQuery no-negation fast path):** `ParsedQuery::parse` runs per search query (the
 searcher parses for `-term`/`NOT "phrase"` negations). The committed parser always materialized a
@@ -332,6 +333,26 @@ pre-change before/after ratio only (no dominance-vs-original claim; blocked by `
 ```bash
 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
   rch exec -- cargo bench -p frankensearch-core --bench canonicalize
+```
+
+**Lever (in-memory filtered-scan prescreen):** the FSVI on-disk scan (`search.rs`) already
+pre-screens filters with a **precomputed `doc_id_hash`** via `SearchFilter::matches_doc_id_hash`,
+but `InMemoryVectorIndex::scan_range` called plain `matches(doc_id)` — which for a `BitsetFilter`
+**re-hashes the doc_id string every vector** (`fnv1a_hash` per element). In a selective filtered
+scan the filter check is the dominant per-(excluded-)vector cost, so this was a real waste. Added a
+lazy `doc_id_hashes: OnceLock<Vec<u64>>` (built on first *filtered* search with the same
+`frankensearch_core::filter::fnv1a_hash` that `BitsetFilter` uses — so it's bit-correct;
+exact/unfiltered callers pay nothing) and switched the scan to `matches_doc_id_hash(precomputed)`
+with a fallback to `matches()` for filters that can't decide by hash (e.g. metadata filters).
+Behaviour-identical (17 in-memory + 15 filter tests + new `search_with_bitset_filter_uses_precomputed_hash_path`
++ 357 index lib serial all green). Measured `matches` re-hash vs `matches_doc_id_hash` precomputed
+over 10k `BitsetFilter` checks (`benches/filter_prescreen.rs`): 183.5 µs → 88.4 µs, **0.482
+(~2.08×)** — the per-vector filter-check cost the in-memory filtered scan now saves, bringing it to
+parity with the FSVI scan.
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-core --bench filter_prescreen
 ```
 
 **Lever (bd-gfzk):** `dot_product_f16_bytes_f32` / `dot_product_f16_f32` — the **default
