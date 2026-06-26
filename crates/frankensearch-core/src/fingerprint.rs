@@ -143,12 +143,13 @@ fn semantic_simhash(tokens: &[&str]) -> u64 {
 }
 
 fn apply_hash_votes(hash: u64, bit_weights: &mut [i32; 64]) {
+    // Branchless vote: the bit value (0/1) maps to a vote of -1/+1 via `2*b - 1`.
+    // The prior `if (bit set) { +1 } else { -1 }` is a data-dependent branch on
+    // effectively-random hash bits (~50% misprediction); the arithmetic form has
+    // no branch. Bit-identical to the conditional (`semantic_simhash` unchanged).
     for (bit, weight) in bit_weights.iter_mut().enumerate() {
-        if hash & (1_u64 << bit) == 0 {
-            *weight -= 1;
-        } else {
-            *weight += 1;
-        }
+        let vote = 2 * ((hash >> bit) & 1) as i32 - 1;
+        *weight += vote;
     }
 }
 

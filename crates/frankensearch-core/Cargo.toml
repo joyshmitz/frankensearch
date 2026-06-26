@@ -32,5 +32,9 @@ harness = false
 name = "query_class"
 harness = false
 
+[[bench]]
+name = "fingerprint"
+harness = false
+
 [lints]
 workspace = true
