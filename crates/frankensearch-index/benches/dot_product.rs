@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    InMemoryVectorIndex, dot_i8_i8, dot_i8_i8_4acc, dot_product_f16_bytes_f32, dot_product_f16_f32,
+    InMemoryVectorIndex, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32,
     dot_product_f32_bytes_f32, dot_product_f32_f32,
 };
 use half::f16;
@@ -46,6 +46,46 @@ fn dot_f32_f32_baseline(a: &[f32], b: &[f32]) -> f32 {
     let mut result = sum.reduce_add();
     for (x, y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
         result += x * y;
+    }
+    result
+}
+
+/// The original single-`i32x8`-accumulator i8 dot (pre-4-accumulator change), kept
+/// here so `i8_dot` (now 4 accumulators) can be benched head-to-head against it.
+fn dot_i8_i8_baseline(stored: &[i8], query: &[i8]) -> i32 {
+    let mut sum = wide::i32x8::splat(0);
+    let mut stored_chunks = stored.chunks_exact(8);
+    let mut query_chunks = query.chunks_exact(8);
+    for (s, q) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
+        let sv = wide::i16x8::from([
+            i16::from(s[0]),
+            i16::from(s[1]),
+            i16::from(s[2]),
+            i16::from(s[3]),
+            i16::from(s[4]),
+            i16::from(s[5]),
+            i16::from(s[6]),
+            i16::from(s[7]),
+        ]);
+        let qv = wide::i16x8::from([
+            i16::from(q[0]),
+            i16::from(q[1]),
+            i16::from(q[2]),
+            i16::from(q[3]),
+            i16::from(q[4]),
+            i16::from(q[5]),
+            i16::from(q[6]),
+            i16::from(q[7]),
+        ]);
+        sum += sv.mul_widen(qv);
+    }
+    let mut result = sum.reduce_add();
+    for (s, q) in stored_chunks
+        .remainder()
+        .iter()
+        .zip(query_chunks.remainder())
+    {
+        result += i32::from(*s) * i32::from(*q);
     }
     result
 }
@@ -283,14 +323,14 @@ fn bench_dot(c: &mut Criterion) {
                 black_box(acc)
             });
         });
-        // Unlike the decode-bound f16 dot, the i8 decode is a cheap sign-extend, so the
-        // pass-1 kernel may be sum-chain-bound → 4 accumulators (integer-exact, so a
-        // bit-identical change). Probe whether it beats the single accumulator.
-        group.bench_function(BenchmarkId::new("i8_dot_4acc", n), |b| {
+        // Head-to-head vs the pre-change single-accumulator i8 dot. The i8 decode is a
+        // cheap sign-extend (unlike the decode-bound f16 dot), so the kernel is
+        // sum-chain-bound and 4 accumulators win (integer-exact / bit-identical).
+        group.bench_function(BenchmarkId::new("i8_dot_old", n), |b| {
             b.iter(|| {
                 let mut acc = 0_i64;
                 for v in &corpus.stored_i8 {
-                    acc += i64::from(dot_i8_i8_4acc(black_box(v), black_box(qi8)));
+                    acc += i64::from(dot_i8_i8_baseline(black_box(v), black_box(qi8)));
                 }
                 black_box(acc)
             });

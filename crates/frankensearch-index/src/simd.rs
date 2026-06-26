@@ -306,54 +306,12 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 /// scale.
 #[must_use]
 pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
-    let mut sum = i32x8::splat(0);
-
-    let mut stored_chunks = stored.chunks_exact(8);
-    let mut query_chunks = query.chunks_exact(8);
-    for (s, q) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
-        let sv = i16x8::from([
-            i16::from(s[0]),
-            i16::from(s[1]),
-            i16::from(s[2]),
-            i16::from(s[3]),
-            i16::from(s[4]),
-            i16::from(s[5]),
-            i16::from(s[6]),
-            i16::from(s[7]),
-        ]);
-        let qv = i16x8::from([
-            i16::from(q[0]),
-            i16::from(q[1]),
-            i16::from(q[2]),
-            i16::from(q[3]),
-            i16::from(q[4]),
-            i16::from(q[5]),
-            i16::from(q[6]),
-            i16::from(q[7]),
-        ]);
-        sum += sv.mul_widen(qv);
-    }
-
-    let mut result = sum.reduce_add();
-    for (s, q) in stored_chunks
-        .remainder()
-        .iter()
-        .zip(query_chunks.remainder())
-    {
-        result += i32::from(*s) * i32::from(*q);
-    }
-    result
-}
-
-/// **Benchmark probe (4-accumulator i8 dot).** Same i8→i16 widen + `mul_widen` as
-/// [`dot_i8_i8`] but with four independent `i32x8` accumulators to break the single-
-/// accumulator integer-add dependency chain. Unlike the f16 dot (decode-bound, where
-/// extra accumulators regress), the i8 decode is a cheap sign-extend, so this kernel
-/// may be sum-chain-bound. Integer sum is associative, so the result is **bit-identical**
-/// to `dot_i8_i8` — no determinism risk; promote it if the bench shows a win.
-#[doc(hidden)]
-pub fn dot_i8_i8_4acc(stored: &[i8], query: &[i8]) -> i32 {
-    // Bounds-check-free 8-i8 widen from a fixed 32-byte block at a const offset.
+    // Four independent `i32x8` accumulators break the single-accumulator integer-add
+    // dependency chain. The i8→i16 decode is a cheap sign-extend (unlike the
+    // decode-bound f16 dot, where extra accumulators regress — see
+    // docs/NEGATIVE_EVIDENCE.md), so this kernel is sum-chain-bound and the extra ILP
+    // measured ~6% (dim256) to ~16% (dim384) faster. Integer sum is associative, so
+    // the result is bit-identical to the prior single-accumulator kernel.
     #[inline(always)]
     fn w8<const O: usize>(a: &[i8; 32]) -> i16x8 {
         i16x8::from([
@@ -384,7 +342,7 @@ pub fn dot_i8_i8_4acc(stored: &[i8], query: &[i8]) -> i32 {
     }
     let mut sum = (acc0 + acc1) + (acc2 + acc3);
 
-    // Tail: remaining 8-chunks then scalar — mirror dot_i8_i8 exactly.
+    // Tail: remaining full 8-chunks, then a scalar remainder.
     let mut s8 = s32.remainder().chunks_exact(8);
     let mut q8 = q32.remainder().chunks_exact(8);
     for (sc, qc) in s8.by_ref().zip(q8.by_ref()) {
