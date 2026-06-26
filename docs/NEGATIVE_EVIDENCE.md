@@ -356,6 +356,19 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-26 — `ScalarQuantizer::dot_product_quantized` is a SIMD-lever TRAP (test-only, not wired) (BlackThrush)
+
+**Not attempted — flagged to save effort.** `ScalarQuantizer::dot_product_quantized` /
+`cosine_similarity_quantized` (`crates/frankensearch-index/src/quantization.rs`) are scalar,
+single-accumulator per-dim dequant+`mul_add` loops — they *look* exactly like the f16/f32 dot
+kernels that won ~3× from a SIMD-widen rewrite, so a profiling/extreme-optimization pass will be
+tempted to SIMD them. **Don't:** every non-test caller is `#[cfg(test)]`, and `Quantization::Int8` /
+`ScalarQuantizer` is **not** referenced in the production search scans (`search.rs`, `in_memory.rs`).
+The production int8 vector search uses the in-memory **i8 corpus-max-abs slab** two-pass
+(`search_top_k_int8_two_pass`, see `docs/PERF_LEDGER.md`), not this u8/per-dim quantizer. Optimizing
+`dot_product_quantized` would be a zero-impact change (dead in production). If a future index format
+wires `ScalarQuantizer` into search, re-evaluate then.
+
 ### 2026-06-26 — HNSW (ANN) vs flat parallel scan at 10k: a recall/latency trade, not a default win (BlackThrush)
 
 **Lever evaluated (not wired):** the default vector search is a flat O(N) cosine scan
