@@ -357,6 +357,7 @@ impl InMemoryVectorIndex {
                 let start = chunk_index * chunk_size;
                 let end = (start + chunk_size).min(count);
                 let mut heap = BinaryHeap::with_capacity(candidate_count.min(end - start) + 1);
+                let mut cutoff = f32::NEG_INFINITY;
                 for index in start..end {
                     if let Some(f) = filter {
                         let passed = match doc_id_hashes
@@ -372,7 +373,18 @@ impl InMemoryVectorIndex {
                     let offset = index * self.dimension;
                     let stored = &vectors_i8[offset..offset + self.dimension];
                     let score = dot_i8_i8(stored, &query_i8) as f32;
-                    insert_candidate(&mut heap, HeapEntry::new(index, score), candidate_count);
+                    // Skip the insert_candidate call for scores that cannot enter the
+                    // full bounded heap — the same cutoff fast-path scan_range uses,
+                    // which the int8 pass-1 previously lacked. Result is unchanged
+                    // (a sub-cutoff score never makes the bounded heap anyway).
+                    if heap.len() < candidate_count || score_key(score) >= cutoff {
+                        insert_candidate(&mut heap, HeapEntry::new(index, score), candidate_count);
+                        if heap.len() >= candidate_count
+                            && let Some(&worst) = heap.peek()
+                        {
+                            cutoff = score_key(worst.score);
+                        }
+                    }
                 }
                 heap
             })
