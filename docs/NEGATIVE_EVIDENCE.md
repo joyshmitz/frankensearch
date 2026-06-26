@@ -299,6 +299,47 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-26 — moving `LexicalIdHit` into `ScoredResult` is a mixed BOLD result, not a keep (BlackThrush)
+
+**Lever:** the BOLD comparator's private lexical conversion changed from
+`lexical_doc_ids_as_scored(&[LexicalIdHit])` cloning each `doc_id` into a `ScoredResult` to
+consuming `Vec<LexicalIdHit>` and moving the owned `doc_id`. This targets frankensearch-only
+phase-1 overhead that the Tantivy/Lucene/Meilisearch-class incumbent does not pay.
+
+**Measured command (per-crate, warm `frankensearch-cod-a`; `rch exec` fell open to local because
+no workers were admissible: `insufficient_slots=4,hard_preflight=1`):**
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- sh -c 'FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_OUT=.scratch/bold_verify_blackthrush_move_scored \
+  RUST_LOG=error cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1'
+```
+
+Artifact: `frankensearch/.scratch/bold_verify_blackthrush_move_scored/summary.jsonl`
+at git `9650b7fe906af38a075048b3b09d1d7349461575`. Caveat: the harness still emitted
+high-volume span-close logs despite `RUST_LOG=error`, so this is a reject/routing run, not a
+dominance claim.
+
+Key `hash_hybrid_tantivy_vector_rrf` rows vs `tantivy_doc_ids`:
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Decision |
+|----------|-------------|-------------------|-------------------|------------------------|----------|
+| `top10_exact_identifier/10000` | `2e78365a46a7c3b9` | 104 us | 128 us | **1.231x slower** | reject |
+| `top10_natural_language/10000` | `2e78365a46a7c3b9` | 119 us | 213 us | **1.790x slower** | reject |
+| `limit_all/10000` | `2e78365a46a7c3b9` | 6.334 ms | 6.768 ms | **1.069x slower** | reject |
+| `top10_short_keyword/100000` | `13f1b0153f5adec9` | 155 us | 177 us | **1.142x slower** | reject |
+| `top10_high_fanout/100000` | `13f1b0153f5adec9` | 569 us | 547 us | 0.961x | noise / insufficient |
+| `top10_zero_hit/100000` | `13f1b0153f5adec9` | 23 us | 20 us | 0.870x | win row, not enough |
+
+**Decision:** reverted the source hunk. Moving owned `doc_id` strings can help individual rows,
+but it does not survive the BOLD class mix: the shipped hybrid path regresses exact identifiers,
+10k natural-language, `limit_all`, and 100k short-keyword rows. Future work should first fix the
+BOLD logging/artifact harness, then target a deeper id-first fusion path rather than repeating this
+conversion-only lever.
+
 ### 2026-06-25 — branchless f32 sign in `embed_jl` REGRESSES (compiler already selects constants) (BlackThrush)
 
 **Lever:** mirror the SimHash branchless-vote win (`apply_hash_votes`, kept) onto the JL hash
