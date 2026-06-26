@@ -39,5 +39,9 @@ criterion = { workspace = true }
 name = "rrf_fuse"
 harness = false
 
+[[bench]]
+name = "sync_int8_fetch"
+harness = false
+
 [lints]
 workspace = true
