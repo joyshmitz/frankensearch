@@ -52,14 +52,40 @@ fn apply_votes_new(hash: u64, bit_weights: &mut [i32; 64]) {
     }
 }
 
-fn simhash(tokens: &[&str], branchless: bool) -> u64 {
+static VOTE_TABLE: [[i32; 8]; 256] = build_vote_table();
+const fn build_vote_table() -> [[i32; 8]; 256] {
+    let mut table = [[0_i32; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut k = 0;
+        while k < 8 {
+            table[byte][k] = 2 * ((byte >> k) & 1) as i32 - 1;
+            k += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+fn apply_votes_table(hash: u64, bit_weights: &mut [i32; 64]) {
+    for j in 0..8 {
+        let byte = ((hash >> (8 * j)) & 0xFF) as usize;
+        let votes = &VOTE_TABLE[byte];
+        let base = 8 * j;
+        for k in 0..8 {
+            bit_weights[base + k] += votes[k];
+        }
+    }
+}
+
+// mode: 0 = branch, 1 = branchless (current main), 2 = table-driven
+fn simhash(tokens: &[&str], mode: u8) -> u64 {
     let mut bit_weights = [0_i32; 64];
     for window in tokens.windows(SHINGLE_SIZE) {
         let h = hash_token_window(window);
-        if branchless {
-            apply_votes_new(h, &mut bit_weights);
-        } else {
-            apply_votes_old(h, &mut bit_weights);
+        match mode {
+            0 => apply_votes_old(h, &mut bit_weights),
+            1 => apply_votes_new(h, &mut bit_weights),
+            _ => apply_votes_table(h, &mut bit_weights),
         }
     }
     let mut semantic_hash = 0_u64;
@@ -79,15 +105,17 @@ fn bench_fingerprint(c: &mut Criterion) {
         .repeat(15);
     let tokens: Vec<&str> = text.split_whitespace().collect();
 
-    // Sanity: both produce the same SimHash.
-    debug_assert_eq!(simhash(&tokens, false), simhash(&tokens, true));
+    // Sanity: all three modes produce the same SimHash.
+    debug_assert_eq!(simhash(&tokens, 0), simhash(&tokens, 1));
+    debug_assert_eq!(simhash(&tokens, 1), simhash(&tokens, 2));
 
+    // The kept `branchless` (current main) vs the candidate `table` (byte-indexed).
     let mut g = c.benchmark_group("simhash_votes");
-    g.bench_function("old", |b| {
-        b.iter(|| black_box(simhash(black_box(&tokens), false)));
+    g.bench_function("branchless", |b| {
+        b.iter(|| black_box(simhash(black_box(&tokens), 1)));
     });
-    g.bench_function("new", |b| {
-        b.iter(|| black_box(simhash(black_box(&tokens), true)));
+    g.bench_function("table", |b| {
+        b.iter(|| black_box(simhash(black_box(&tokens), 2)));
     });
     g.finish();
 }

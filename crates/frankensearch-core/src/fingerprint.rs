@@ -142,14 +142,38 @@ fn semantic_simhash(tokens: &[&str]) -> u64 {
     semantic_hash
 }
 
+/// Per-byte vote table: `VOTE_TABLE[b][k] = 2*((b>>k)&1) - 1` (the ±1 vote for bit
+/// `k` of byte value `b`). Built at compile time so the hot loop is table lookups
+/// + vectorizable 8-wide adds instead of 64 per-bit shift/mask/mul.
+static VOTE_TABLE: [[i32; 8]; 256] = build_vote_table();
+
+const fn build_vote_table() -> [[i32; 8]; 256] {
+    let mut table = [[0_i32; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut k = 0;
+        while k < 8 {
+            table[byte][k] = 2 * ((byte >> k) & 1) as i32 - 1;
+            k += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
 fn apply_hash_votes(hash: u64, bit_weights: &mut [i32; 64]) {
-    // Branchless vote: the bit value (0/1) maps to a vote of -1/+1 via `2*b - 1`.
-    // The prior `if (bit set) { +1 } else { -1 }` is a data-dependent branch on
-    // effectively-random hash bits (~50% misprediction); the arithmetic form has
-    // no branch. Bit-identical to the conditional (`semantic_simhash` unchanged).
-    for (bit, weight) in bit_weights.iter_mut().enumerate() {
-        let vote = 2 * ((hash >> bit) & 1) as i32 - 1;
-        *weight += vote;
+    // Table-driven vote: process the hash one byte at a time. Each byte's 8 bits
+    // index `VOTE_TABLE` for their 8 ±1 votes, added to the matching 8 counters as
+    // a slice (the compiler vectorizes the 8-wide i32 add). This replaces the 64
+    // per-bit `shift/mask/mul/sub` of the scalar form. Bit-identical: byte `j`'s bit
+    // `k` is hash bit `8j+k`, so the vote landing in `bit_weights[8j+k]` is unchanged.
+    for j in 0..8 {
+        let byte = ((hash >> (8 * j)) & 0xFF) as usize;
+        let votes = &VOTE_TABLE[byte];
+        let base = 8 * j;
+        for k in 0..8 {
+            bit_weights[base + k] += votes[k];
+        }
     }
 }
 
