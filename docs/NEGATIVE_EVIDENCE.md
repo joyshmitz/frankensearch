@@ -247,6 +247,34 @@ zero-hit queries rather than more dot-product work.
 
 ## Reverted experiments
 
+### 2026-06-25 — branchless f32 sign in `embed_jl` REGRESSES (compiler already selects constants) (BlackThrush)
+
+**Lever:** mirror the SimHash branchless-vote win (`apply_hash_votes`, kept) onto the JL hash
+embedder's inner loop. `embed_jl` does `let sign = if (state & 1) == 0 { 1.0 } else { -1.0 }; *dim +=
+sign;` per dimension per token (O(tokens·dim)); the xorshift LSB is effectively random, so the branch
+*looked* like the same ~50%-mispredict target. Replaced with `let sign = 1.0 - 2.0 * (state & 1) as
+f32;`. Bit-identical (43 hash embedder tests green incl. JL determinism/orthogonality).
+
+**Measured command (per-crate):**
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-embed --bench hash_embed jl_sign
+```
+
+In-process A/B (`jl_sign`, ~100-word doc, dim384; identical except the per-dim sign):
+
+| Workload | branch (`if`/`else`) | branchless (`2*b-1` arith) | ratio | verdict |
+|----------|----------------------|----------------------------|-------|---------|
+| `jl_sign` | 97.324 µs | 104.990 µs | **1.079** | regression |
+
+**Why it fails (contrast with the kept SimHash win):** SimHash accumulates into **i32** counters, so
+`2*b - 1` is cheap integer arithmetic and beats the branch (kept, 0.870×). `embed_jl` selects an
+**f32** sign (`+1.0`/`-1.0`); the compiler already lowers the conditional to a branchless **select of
+two f32 constants**, whereas the arithmetic form forces an `int→f32` conversion (`cvtsi2ss`) + a float
+mul + a float sub per element — strictly more work. **Rule:** branchless arithmetic helps integer
+accumulators, not float constant-selection (the compiler handles the latter). Reverted source + bench
+(stashed). Do not re-attempt branchless sign on f32 select paths.
+
 ### 2026-06-25 — `collapse_code_block` slice-join is zero-gain (join allocs dominate) (BlackThrush)
 
 **Lever:** the long-block branch of `collapse_code_block` collected the head/tail lines into
