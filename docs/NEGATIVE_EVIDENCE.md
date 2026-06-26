@@ -71,6 +71,63 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-26 — Reusing `QueryClass` inside BOLD hybrid search is mixed/noise (BlackThrush)
+
+**Lever tested and reverted:** compute `QueryClass::classify(query.text)` once in
+`frankensearch_hash_hybrid_search`, then pass the enum into
+`bold_verify_lexical_prefetch_limit` and `bold_verify_lexical_short_circuit` instead of
+reclassifying the same query twice. This was scoped to the BOLD harness path and did not change
+Tantivy incumbent behavior or product search semantics.
+
+**Requested protocol blocker:** the literal requested command shape still fails before
+measurement on current Cargo:
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench --release -p frankensearch --features lexical \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH selected `hz2`, then Cargo rejected `--release` for `cargo bench` with
+`unexpected argument '--release' found`; use `--profile release` for this bench command.
+
+**Measured command (per-crate, warm target dir; RCH shell-wrapper local fallback for output
+capture):**
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+  --bench search_bench bold_verify_tantivy_class \
+  -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifacts:
+- baseline summary: `frankensearch/.scratch/bold_queryclass_baseline_20260626T0134Z/summary.jsonl`
+- candidate summary: `frankensearch/.scratch/bold_queryclass_candidate_20260626T0144Z/summary.jsonl`
+
+Both summaries completed all 26 BOLD rows at `git_sha=6b70864826f76ac33a964dd561ef451b39fe88d2`.
+The shell wrapper was needed to capture massive tracing output and therefore fell open locally
+(`worker=unknown`); the result is valid as a same-machine reject, not as a remote-worker keep.
+The post-summary Criterion loop was interrupted after summary emission to stop trace-log growth.
+
+**Decision:** rejected and reverted. Median hybrid p50 movement was noise
+(`candidate / baseline = 0.991`), with important short/exact rows regressing beyond the
+3% rejection threshold. Some 100k rows improved, but the mixed profile is not a keep and several
+candidate rows remain slower than the Tantivy/Lucene-class incumbent.
+
+| Workload | Baseline p50 | Candidate p50 | Candidate / baseline | Candidate / Tantivy-class | Decision |
+|----------|--------------|---------------|----------------------|----------------------------|----------|
+| `top10_exact_identifier/10000` | 104 us | 132 us | **1.269x slower** | **1.282x slower** | reverted |
+| `top10_short_keyword/10000` | 41 us | 49 us | **1.195x slower** | **1.065x slower** | reverted |
+| `limit_all/10000` | 5.863 ms | 5.990 ms | 1.022 | **1.139x slower** | zero-gain/reverted |
+| `top10_short_keyword/100000` | 189 us | 200 us | **1.058x slower** | **1.020x slower** | reverted |
+| `top10_zero_hit/100000` | 24 us | 24 us | 1.000 | 0.960 | zero-gain/reverted |
+| `top10_natural_language/10000` | 111 us | 110 us | 0.991 | **1.058x slower** | zero-gain/reverted |
+| `top10_high_fanout/10000` | 69 us | 68 us | 0.986 | 1.000 | noise/reverted |
+| `top10_natural_language/100000` | 798 us | 626 us | 0.784 | 0.817 | isolated/no keep |
+| `top10_quoted_phrase/100000` | 1.194 ms | 965 us | 0.808 | 0.712 | isolated/no keep |
+
 ### 2026-06-26 — Early BOLD short-circuit before `ScoredResult` allocation is not a keep (BlackThrush)
 
 **Lever tested and reverted:** move the BOLD hash-hybrid lexical short-circuit check before
