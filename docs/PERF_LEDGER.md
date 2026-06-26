@@ -490,6 +490,19 @@ within noise; the clean separation appears at 100k.) So `search_top_k_int8_two_p
 **lossless 1.86–2.47× win across 10k–100k, strongest at production scale** — the highest-value
 vector lever, pending the wiring (opt-in / large-N default with an exactness gate).
 
+_Dim confirmation:_ also re-ran at **dim=768** (BGE-base / OpenAI-class embeddings), N=10000:
+recall@10 = **1.0000 at every mult (2, 5, 10, 20)** — the lossless property holds across the
+embedding-dim range (384–768), so the lever applies to high-dim models too. (Latency ratio
+expected ~the dim=384 figure since both flat and int8 pass-1 scale ~linearly with dim; the dim=768
+latency estimates didn't sync back cleanly this run, but recall — the correctness question — is the
+decisive one and is lossless.)
+
+**Exactness-gate note (for the wiring):** `ScalarQuantizer` (the u8 per-dim FSVI quantizer) already
+exposes the bound machinery (`max_dim_errors()` = `scale/2`; `epsilon ≤ max_scale·√dims`), but the
+in-memory two-pass uses a **separate i8 corpus-max-abs slab** — a sound certified-exact gate needs
+that slab's per-query error bound derived + verified (correctness-critical), so the safe wiring is a
+dedicated multi-iteration step, not a 60m change.
+
 These rows are routing evidence for future levers, not wins.
 
 Command:
