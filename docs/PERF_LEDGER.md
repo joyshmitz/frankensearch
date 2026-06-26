@@ -511,6 +511,17 @@ within noise; the clean separation appears at 100k.) So `search_top_k_int8_two_p
 **lossless 1.86–2.47× win across 10k–100k, strongest at production scale** — the highest-value
 vector lever, pending the wiring (opt-in / large-N default with an exactness gate).
 
+_Wiring target (verified 2026-06-26, BlackThrush):_ the validated two-pass is **in-tree but unused
+by callers** — `InMemoryTwoTierIndex::search` (`two_tier.rs:350,353`) and the fusion searcher call
+the **exact** `search_top_k` / `search_top_k_with_params`. The integration point is there: route
+large-N searches to `search_top_k_int8_two_pass(query, k, mult≈10)`. The blocker for a *default*
+(rather than opt-in) switch is the exactness gate — a sound per-query int8-slab error bound (the i8
+corpus-max-abs slab quantizes each component to `q=round(x/σ)`, `σ=max_abs/127`, so by
+Cauchy–Schwarz `|true_dot − int8_dot| ≤ E` with `E ≈ √dim·σ`; if `β + E < θ` where `β` is the
+`k·mult`-th int8 score and `θ` the k-th *exact* rescored score, the result is provably exact).
+Deriving + verifying that bound (and its int8→f32 scaling) is the correctness-critical,
+multi-iteration step that shouldn't be rushed into the default path.
+
 _Dim confirmation:_ also re-ran at **dim=768** (BGE-base / OpenAI-class embeddings), N=10000:
 recall@10 = **1.0000 at every mult (2, 5, 10, 20)** — the lossless property holds across the
 embedding-dim range (384–768), so the lever applies to high-dim models too. (Latency ratio
