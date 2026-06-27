@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::VectorIndex;
 use crate::search::{PARALLEL_CHUNK_SIZE, SearchParams};
-use crate::simd::{dot_i8_i8, dot_packed_4bit, dot_product_f16_f32};
+use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bit_query};
 
 /// Fully-resident in-memory vector index with f16 quantization.
 ///
@@ -507,7 +507,8 @@ impl InMemoryVectorIndex {
         if limit == 0 || count == 0 {
             return Ok(Vec::new());
         }
-        let query_packed = pack_4bit_query(query);
+        // Decode the (loop-invariant) query nibbles once, not per stored vector.
+        let query_prepared = prepare_4bit_query(&pack_4bit_query(query));
         let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
         let bytes_per_vector = self.dimension.div_ceil(2);
         let nibbles = self
@@ -540,7 +541,7 @@ impl InMemoryVectorIndex {
                     }
                     let offset = index * bytes_per_vector;
                     let stored = &nibbles[offset..offset + bytes_per_vector];
-                    let score = dot_packed_4bit(stored, &query_packed) as f32;
+                    let score = dot_4bit_prepared(stored, &query_prepared) as f32;
                     if heap.len() < candidate_count || score_key(score) >= cutoff {
                         insert_candidate(&mut heap, HeapEntry::new(index, score), candidate_count);
                         if heap.len() >= candidate_count

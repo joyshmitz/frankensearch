@@ -369,34 +369,54 @@ fn nibble_hi(b: u8) -> i32 {
     i32::from((((b >> 4) ^ 0x08) as i8) - 8)
 }
 
-/// Dot product of two vectors stored as packed signed 4-bit nibbles: 2 dims per
-/// byte, low nibble = even dim, high nibble = odd dim, each a 4-bit two's
-/// complement in `[-7, 7]`. `stored` and `query` must have equal packed length.
-/// Used by the FSVI 4-bit two-pass pass-1; result is exact (per-dim products ≤ 49).
+/// A query pre-unpacked into per-16-byte-chunk sign-extended low/high nibble lanes
+/// (+ a scalar tail), so the query nibbles are decoded **once** rather than for
+/// every stored vector in a scan. See [`prepare_4bit_query`] / [`dot_4bit_prepared`].
+pub struct PreparedQuery4bit {
+    low: Vec<i16x16>,
+    high: Vec<i16x16>,
+    tail: Vec<(i32, i32)>,
+}
+
+/// Pre-unpack a packed 4-bit query (the loop-invariant operand of a scan). For each
+/// 16-byte chunk, store the sign-extended low/high nibble lanes (`i16x16`); the
+/// remainder bytes go to a scalar `(low, high)` tail.
+pub fn prepare_4bit_query(query: &[u8]) -> PreparedQuery4bit {
+    let mut chunks = query.chunks_exact(16);
+    let mut low = Vec::with_capacity(query.len() / 16);
+    let mut high = Vec::with_capacity(query.len() / 16);
+    for qc in chunks.by_ref() {
+        let qa: [u8; 16] = qc.try_into().expect("chunks_exact(16)");
+        let q = i16x16::from_i8x16(i8x16::from(qa.map(|b| b as i8)));
+        low.push((q << 12_i32) >> 12_i32);
+        high.push((q << 8_i32) >> 12_i32);
+    }
+    let tail = chunks
+        .remainder()
+        .iter()
+        .map(|&b| (nibble_lo(b), nibble_hi(b)))
+        .collect();
+    PreparedQuery4bit { low, high, tail }
+}
+
+/// Dot product of a packed 4-bit `stored` vector against a [`PreparedQuery4bit`].
+/// The stored nibbles are decoded per call; the query was decoded once. Result is
+/// exact (per-dim products ≤ 49). Identical to `dot_packed_4bit(stored, query)`.
 ///
-/// SIMD: load 16 packed bytes → `i16x16` (sign-extended bytes), then extract each
-/// nibble by `(x << 12) >> 12` (low) / `(x << 8) >> 12` (high) using arithmetic
-/// shifts, multiply low·low + high·high, and horizontally accumulate per chunk.
-pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
+/// SIMD: load 16 packed bytes → `i16x16`, extract nibbles via arithmetic
+/// `(x<<12)>>12` / `(x<<8)>>12`, multiply by the prepared query lanes, and
+/// accumulate vertically (flushing before any `i16` lane can overflow).
+pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     let mut sum = 0_i32;
-    // Accumulate products vertically (one `i16x16` accumulator) instead of a
-    // horizontal `reduce_add` per chunk; flush to `sum` before any lane can exceed
-    // `i16`. Per-dim product ≤ 49, per-chunk per-lane ≤ 98, so after 16 chunks a lane
-    // is ≤ 1568 and the 16-lane `reduce_add` is ≤ 25088 < i16::MAX — safe to flush.
     let mut acc = i16x16::splat(0);
     let mut pending = 0_usize;
     let mut s16 = stored.chunks_exact(16);
-    let mut q16 = query.chunks_exact(16);
-    for (sc, qc) in s16.by_ref().zip(q16.by_ref()) {
+    for (i, sc) in s16.by_ref().enumerate() {
         let sa: [u8; 16] = sc.try_into().expect("chunks_exact(16)");
-        let qa: [u8; 16] = qc.try_into().expect("chunks_exact(16)");
         let s = i16x16::from_i8x16(i8x16::from(sa.map(|b| b as i8)));
-        let q = i16x16::from_i8x16(i8x16::from(qa.map(|b| b as i8)));
         let s_low = (s << 12_i32) >> 12_i32;
         let s_high = (s << 8_i32) >> 12_i32;
-        let q_low = (q << 12_i32) >> 12_i32;
-        let q_high = (q << 8_i32) >> 12_i32;
-        acc += s_low * q_low + s_high * q_high;
+        acc += s_low * query.low[i] + s_high * query.high[i];
         pending += 1;
         if pending == 16 {
             sum += i32::from(acc.reduce_add());
@@ -405,10 +425,19 @@ pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
         }
     }
     sum += i32::from(acc.reduce_add());
-    for (sb, qb) in s16.remainder().iter().zip(q16.remainder()) {
-        sum += nibble_lo(*sb) * nibble_lo(*qb) + nibble_hi(*sb) * nibble_hi(*qb);
+    for (sb, &(qlo, qhi)) in s16.remainder().iter().zip(&query.tail) {
+        sum += nibble_lo(*sb) * qlo + nibble_hi(*sb) * qhi;
     }
     sum
+}
+
+/// Dot product of two vectors stored as packed signed 4-bit nibbles: 2 dims per
+/// byte, low nibble = even dim, high nibble = odd dim, each a 4-bit two's
+/// complement in `[-7, 7]`. `stored` and `query` must have equal packed length.
+/// Result is exact (per-dim products ≤ 49). For a scan over many stored vectors,
+/// prefer [`prepare_4bit_query`] + [`dot_4bit_prepared`] to decode the query once.
+pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
+    dot_4bit_prepared(stored, &prepare_4bit_query(query))
 }
 
 fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
