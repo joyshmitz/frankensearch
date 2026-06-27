@@ -12,8 +12,8 @@ use rayon::prelude::*;
 
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
-    Quantization, VectorIndex, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32,
-    dot_product_f32_f32,
+    Quantization, VectorIndex, dot_i8_i8, dot_packed_4bit, dot_product_f16_bytes_f32,
+    dot_product_f32_bytes_f32, dot_product_f32_f32,
 };
 use half::f16;
 
@@ -324,6 +324,127 @@ impl VectorIndex {
             let dim = self.dimension();
             let byte_len = count * dim * 2;
             quantize_f16_bytes_to_i8(&self.data[self.vectors_offset..self.vectors_offset + byte_len])
+        })
+    }
+
+    /// 4-bit (16-level) two-pass exact top-k for standalone large-N vector search.
+    /// A fast parallel pass-1 over a packed signed-4-bit slab (`dim/2` bytes/vector —
+    /// half the int8 slab, so the bandwidth-bound pass-1 is faster) keeps the top
+    /// `k·candidate_multiplier` by approximate score (`dot_packed_4bit`), then an
+    /// exact f16 rescore of just those candidates selects the final top-k. 16 levels
+    /// stay lossless at mult≈5 on realistic clustered data (see `fsvi_4bit_two_pass`
+    /// bench); recall rises with `candidate_multiplier`. Falls back to the exact
+    /// `search_top_k` for WAL/non-F16 indexes. Not wired into the BOLD hybrid.
+    pub fn search_top_k_4bit_two_pass(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let count = self.record_count();
+        if k == 0
+            || count == 0
+            || !self.wal_entries.is_empty()
+            || self.quantization() != Quantization::F16
+        {
+            return self.search_top_k(query, k, None);
+        }
+        if query.len() != self.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension(),
+                found: query.len(),
+            });
+        }
+
+        let dim = self.dimension();
+        let bytes_per_vector = dim.div_ceil(2);
+        let candidate_count = k
+            .saturating_mul(candidate_multiplier.max(1))
+            .min(count)
+            .max(k.min(count));
+        let query_packed = pack_4bit_query(query);
+        let slab = self.nibbles_slab();
+
+        let candidate_heap = if count < PARALLEL_THRESHOLD {
+            self.nibble_scan_range(slab, &query_packed, bytes_per_vector, 0, count, candidate_count)
+        } else {
+            let chunk_count = count.div_ceil(PARALLEL_CHUNK_SIZE);
+            let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_index| {
+                    let start = chunk_index * PARALLEL_CHUNK_SIZE;
+                    let end = (start + PARALLEL_CHUNK_SIZE).min(count);
+                    self.nibble_scan_range(
+                        slab,
+                        &query_packed,
+                        bytes_per_vector,
+                        start,
+                        end,
+                        candidate_count,
+                    )
+                })
+                .collect();
+            merge_partial_heaps(partials, candidate_count)
+        };
+
+        // Pass 2: exact f16 rescore (same bounded-heap selection + tie-break).
+        let stride = dim * 2;
+        let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
+        for candidate in candidate_heap {
+            let vector_offset = self.vectors_offset + candidate.index * stride;
+            let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+            let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
+            insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), k);
+        }
+        self.resolve_hits(heap)
+    }
+
+    /// Bounded-heap 4-bit scan of records `[start, end)` over the packed nibble
+    /// `slab` (index-aligned with the record table), skipping tombstoned records,
+    /// with the same cutoff fast-path as the exact scan.
+    fn nibble_scan_range(
+        &self,
+        slab: &[u8],
+        query_packed: &[u8],
+        bytes_per_vector: usize,
+        start: usize,
+        end: usize,
+        limit: usize,
+    ) -> BinaryHeap<HeapEntry> {
+        let mut heap = BinaryHeap::with_capacity(limit.min(end - start).saturating_add(1));
+        let mut cutoff = f32::NEG_INFINITY;
+        let mut flags_offset = self.records_offset + start * 16 + 14;
+        let mut slab_offset = start * bytes_per_vector;
+
+        for index in start..end {
+            let flags_bytes = &self.data[flags_offset..flags_offset + 2];
+            let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+            if (flags & 0x0001) == 0 {
+                let stored = &slab[slab_offset..slab_offset + bytes_per_vector];
+                let score = dot_packed_4bit(stored, query_packed) as f32;
+                if heap.len() < limit || score_key(score) >= cutoff {
+                    insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                    if heap.len() >= limit
+                        && let Some(&worst) = heap.peek()
+                    {
+                        cutoff = score_key(worst.score);
+                    }
+                }
+            }
+            flags_offset += 16;
+            slab_offset += bytes_per_vector;
+        }
+        heap
+    }
+
+    /// Lazily build (once) the packed signed-4-bit quantization of the contiguous
+    /// F16 main-vector region. Only called after the F16/no-WAL gate.
+    fn nibbles_slab(&self) -> &[u8] {
+        self.vectors_nibbles.get_or_init(|| {
+            let count = self.record_count();
+            let dim = self.dimension();
+            let byte_len = count * dim * 2;
+            pack_4bit_f16_bytes(&self.data[self.vectors_offset..self.vectors_offset + byte_len], dim)
         })
     }
 
@@ -835,6 +956,64 @@ fn quantize_f16_bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
         .collect()
 }
 
+/// Quantize one component to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's
+/// complement in the low 4 bits) given a scale.
+#[inline]
+fn nibble_of(value: f32, scale: f32) -> u8 {
+    let q = (value * scale).round().clamp(-7.0, 7.0) as i8;
+    (q as u8) & 0x0F
+}
+
+/// Pack an f32 query into signed 4-bit nibbles, 2 dims/byte (low = even dim, high =
+/// odd dim), using the query's own max-abs scale (a per-query constant that does not
+/// change the dot-product ranking). Matches `pack_4bit_f16_bytes`.
+fn pack_4bit_query(query: &[f32]) -> Vec<u8> {
+    let max_abs = query.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
+    let mut packed = vec![0_u8; query.len().div_ceil(2)];
+    for (d, &x) in query.iter().enumerate() {
+        let nib = nibble_of(x, scale);
+        if d % 2 == 0 {
+            packed[d / 2] |= nib;
+        } else {
+            packed[d / 2] |= nib << 4;
+        }
+    }
+    packed
+}
+
+/// Pack a contiguous little-endian f16 vector region into signed 4-bit nibbles
+/// (`dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale (a constant
+/// factor, so the dot ranking is preserved).
+fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
+    let mut max_abs = 0.0_f32;
+    for chunk in bytes.chunks_exact(2) {
+        let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32().abs();
+        if value > max_abs {
+            max_abs = value;
+        }
+    }
+    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
+    let count = bytes.len() / (dim * 2);
+    let bytes_per_vector = dim.div_ceil(2);
+    let mut slab = vec![0_u8; count * bytes_per_vector];
+    for v in 0..count {
+        let base = v * dim * 2;
+        let out = v * bytes_per_vector;
+        for d in 0..dim {
+            let value =
+                f16::from_le_bytes([bytes[base + d * 2], bytes[base + d * 2 + 1]]).to_f32();
+            let nib = nibble_of(value, scale);
+            if d % 2 == 0 {
+                slab[out + d / 2] |= nib;
+            } else {
+                slab[out + d / 2] |= nib << 4;
+            }
+        }
+    }
+    slab
+}
+
 pub(crate) const fn score_key(score: f32) -> f32 {
     if score.is_nan() {
         f32::NEG_INFINITY
@@ -1001,6 +1180,52 @@ mod tests {
             assert_eq!(
                 exact_ids, approx_ids,
                 "int8 two-pass (keep-all) must match exact search_top_k for query {qi}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_bit_two_pass_keep_all_matches_exact() {
+        // With a multiplier large enough to retain every record, the exact f16
+        // rescore must reproduce `search_top_k` bit-for-bit — verifying the nibble
+        // pack/unpack offsets, tombstone flag check, rescore, and resolve.
+        let path = temp_index_path("4bit-two-pass-keepall");
+        let dim = 70; // odd-ish, > 64, exercises packing + a partial last byte
+        let count = 300;
+        let vectors: Vec<Vec<f32>> = (0..count)
+            .map(|i| {
+                (0..dim)
+                    .map(|j| {
+                        let mut s = (i as u64)
+                            .wrapping_mul(2_654_435_761)
+                            ^ (j as u64).wrapping_mul(40_503);
+                        s ^= s >> 13;
+                        ((s & 0xffff) as f32 / 65_535.0) - 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        let rows = create_rows(&vectors);
+        let row_refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+            .collect();
+        write_index(&path, &row_refs).expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        for qi in 0..8_usize {
+            let query: Vec<f32> = (0..dim)
+                .map(|j| (((qi * 7 + j * 3) % 11) as f32 / 11.0) - 0.5)
+                .collect();
+            let exact = index.search_top_k(&query, 10, None).expect("exact");
+            let approx = index
+                .search_top_k_4bit_two_pass(&query, 10, 50)
+                .expect("4bit two-pass");
+            let exact_ids: Vec<&str> = exact.iter().map(|h| h.doc_id.as_str()).collect();
+            let approx_ids: Vec<&str> = approx.iter().map(|h| h.doc_id.as_str()).collect();
+            assert_eq!(
+                exact_ids, approx_ids,
+                "4bit two-pass (keep-all) must match exact search_top_k for query {qi}"
             );
         }
     }

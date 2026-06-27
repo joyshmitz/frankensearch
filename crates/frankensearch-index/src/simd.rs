@@ -3,7 +3,7 @@
 
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
-use wide::{f32x8, i16x8, i32x8, u16x8, u32x8};
+use wide::{f32x8, i8x16, i16x8, i16x16, i32x8, u16x8, u32x8};
 
 // ── SIMD load/decode helpers ────────────────────────────────────────────────
 //
@@ -357,6 +357,49 @@ pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
     result
 }
 
+/// Sign-extend the low nibble of a packed byte (4-bit two's complement → i8).
+#[inline(always)]
+fn nibble_lo(b: u8) -> i32 {
+    i32::from((((b & 0x0F) ^ 0x08) as i8) - 8)
+}
+
+/// Sign-extend the high nibble of a packed byte (4-bit two's complement → i8).
+#[inline(always)]
+fn nibble_hi(b: u8) -> i32 {
+    i32::from((((b >> 4) ^ 0x08) as i8) - 8)
+}
+
+/// Dot product of two vectors stored as packed signed 4-bit nibbles: 2 dims per
+/// byte, low nibble = even dim, high nibble = odd dim, each a 4-bit two's
+/// complement in `[-7, 7]`. `stored` and `query` must have equal packed length.
+/// Used by the FSVI 4-bit two-pass pass-1; result is exact (per-dim products ≤ 49).
+///
+/// SIMD: load 16 packed bytes → `i16x16` (sign-extended bytes), then extract each
+/// nibble by `(x << 12) >> 12` (low) / `(x << 8) >> 12` (high) using arithmetic
+/// shifts, multiply low·low + high·high, and horizontally accumulate per chunk.
+pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
+    let mut sum = 0_i32;
+    let mut s16 = stored.chunks_exact(16);
+    let mut q16 = query.chunks_exact(16);
+    for (sc, qc) in s16.by_ref().zip(q16.by_ref()) {
+        let sa: [u8; 16] = sc.try_into().expect("chunks_exact(16)");
+        let qa: [u8; 16] = qc.try_into().expect("chunks_exact(16)");
+        let s = i16x16::from_i8x16(i8x16::from(sa.map(|b| b as i8)));
+        let q = i16x16::from_i8x16(i8x16::from(qa.map(|b| b as i8)));
+        let s_low = (s << 12_i32) >> 12_i32;
+        let s_high = (s << 8_i32) >> 12_i32;
+        let q_low = (q << 12_i32) >> 12_i32;
+        let q_high = (q << 8_i32) >> 12_i32;
+        // Per-dim products ≤ 49; 16 lanes ≤ 1568 → fits i16 reduce_add.
+        let prod = s_low * q_low + s_high * q_high;
+        sum += i32::from(prod.reduce_add());
+    }
+    for (sb, qb) in s16.remainder().iter().zip(q16.remainder()) {
+        sum += nibble_lo(*sb) * nibble_lo(*qb) + nibble_hi(*sb) * nibble_hi(*qb);
+    }
+    sum
+}
+
 fn dot_product_f32_f32_unchecked(a: &[f32], b: &[f32]) -> f32 {
     let mut acc0 = f32x8::splat(0.0);
     let mut acc1 = f32x8::splat(0.0);
@@ -493,6 +536,31 @@ mod tests {
         // Worst-case magnitude: all -128 * -128 over 512 dims must not overflow i32.
         let a = vec![i8::MIN; 512];
         assert_eq!(dot_i8_i8(&a, &a), 512 * 128 * 128);
+    }
+
+    #[test]
+    fn dot_packed_4bit_matches_scalar() {
+        fn lo(b: u8) -> i32 {
+            i32::from((((b & 0x0F) ^ 0x08) as i8) - 8)
+        }
+        fn hi(b: u8) -> i32 {
+            i32::from((((b >> 4) ^ 0x08) as i8) - 8)
+        }
+        fn scalar(s: &[u8], q: &[u8]) -> i32 {
+            s.iter()
+                .zip(q)
+                .map(|(&a, &b)| lo(a) * lo(b) + hi(a) * hi(b))
+                .sum()
+        }
+        // Lengths exercising the 16-wide loop, a partial tail, and extremes.
+        for len in [0_usize, 1, 5, 15, 16, 17, 32, 33, 192, 193] {
+            let s: Vec<u8> = (0..len).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+            let q: Vec<u8> = (0..len).map(|i| ((i * 53 + 7) % 256) as u8).collect();
+            assert_eq!(dot_packed_4bit(&s, &q), scalar(&s, &q), "len={len}");
+        }
+        // All nibbles = -7 (0x99 byte): each dim contributes 49.
+        let a = vec![0x99_u8; 16];
+        assert_eq!(dot_packed_4bit(&a, &a), 32 * 49);
     }
 
     /// End-to-end quality gate for the int8 ADC two-pass (`bd-b5wl`): does an int8

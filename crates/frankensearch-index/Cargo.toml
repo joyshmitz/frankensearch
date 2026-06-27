@@ -55,5 +55,10 @@ harness = false
 name = "fsvi_int8_two_pass"
 harness = false
 
+# FSVI 4-bit (16-level) two-pass vs flat exact + int8 — recall + latency.
+[[bench]]
+name = "fsvi_4bit_two_pass"
+harness = false
+
 [lints]
 workspace = true

@@ -77,8 +77,8 @@ pub use mrl::{MrlConfig, MrlSearchStats};
 pub use quantization::ScalarQuantizer;
 pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{
-    cosine_similarity_f16, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f16_f32,
-    dot_product_f32_bytes_f32, dot_product_f32_f32,
+    cosine_similarity_f16, dot_i8_i8, dot_packed_4bit, dot_product_f16_bytes_f32,
+    dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32,
 };
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
@@ -189,6 +189,12 @@ pub struct VectorIndex {
     /// first two-pass use, so exact-only callers never pay the quantization cost or
     /// its footprint. One corpus-wide max-abs scale (see `quantize_f16_bytes_to_i8`).
     pub(crate) vectors_i8: OnceLock<Vec<i8>>,
+    /// Lazily-built packed signed-4-bit quantization of the (contiguous, F16) main
+    /// vector region — 2 dims/byte, `dim.div_ceil(2)` bytes per vector (half the int8
+    /// slab) — for the optional 4-bit two-pass scan (`search_top_k_4bit_two_pass`).
+    /// 16 levels stay lossless at mult≈5 on realistic data while halving pass-1
+    /// bandwidth vs int8. Built on first 4-bit-two-pass use; other callers never pay.
+    pub(crate) vectors_nibbles: OnceLock<Vec<u8>>,
 }
 
 impl VectorIndex {
@@ -329,6 +335,7 @@ impl VectorIndex {
             wal_entries,
             wal_config: WalConfig::default(),
             vectors_i8: OnceLock::new(),
+            vectors_nibbles: OnceLock::new(),
         })
     }
 
