@@ -80,6 +80,43 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-27 — `SniffFeatures::from_bytes` branchless `u64` counters are not a win — REVERTED (BlackThrush)
+
+**Lever tested and reverted:** `frankensearch-fsfs::SniffFeatures::from_bytes` counts null,
+non-printable, and high-bit bytes with three `u32::saturating_add` guarded increments per byte.
+Retried the route-next from the fsqlite-unblocked entry: widen those counters to `u64`, replace the
+three guarded increments with `u64::from(predicate)` additions, and saturate only once when writing
+`null_bytes`. The goal was to make the per-file sniff histogram easier for LLVM to vectorize.
+
+**Measured command** (per-crate, RCH remote `hz2`, clean worktree
+`/data/projects/frankensearch-blackthrush-fsfs-sniff-20260627`, target dir
+`/data/projects/.rch-targets/frankensearch-cod-a`):
+
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench -p frankensearch-fsfs --profile release \
+    --bench sniff_features sniff_features \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+The bench carried a temporary `old_scalar` arm matching `origin/main` and a `new` arm calling the
+candidate `SniffFeatures::from_bytes`, so the ratio is same-binary old-vs-new. The literal
+`cargo bench --release` protocol remains invalid for this Cargo (`--profile release` is the working
+release-profile equivalent).
+
+| Workload | ORIG p50 | Candidate p50 | Ratio vs ORIG | Decision |
+|----------|----------|----------------|---------------|----------|
+| `sniff_features/8192` | 9.4628 us | 9.8636 us | **1.042x slower** | revert |
+| `sniff_features/65536` | 74.243 us | 75.505 us | **1.017x slower/noise** | revert |
+
+**Decision:** source and `Cargo.toml` changes were reverted. Focused equivalence tests passed while
+the candidate was applied (`file_classification` 14/14), and scoped clippy for the touched lib + bench
+passed with explicit allows for unrelated existing fsfs lint categories. The measured hot loop does
+not benefit from boolean-to-integer `u64` accumulation; keep the current `u32::saturating_add`
+branches. Ratio vs Lucene/Tantivy/Meilisearch-class original is **N/A** for this isolated ingest
+sniff primitive; it does not move the BOLD search comparator.
+
 ### 2026-06-27 — BOLD high-fanout counted collector narrows p50 but still loses vs ORIG — REVERTED (BlackThrush)
 
 **Lever tested and reverted:** for the BOLD `high_fanout` query shape only, keep the
