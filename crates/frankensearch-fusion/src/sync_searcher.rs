@@ -310,7 +310,11 @@ impl SyncTwoTierSearcher {
             // recall=1.0 at mult=10 on validated 10k–100k corpora) instead of the
             // exact scan. Lossless candidate set → identical fused top-k.
             None => {
-                const INT8_FAST_TIER_MULT: usize = 10;
+                // mult=5 keeps the candidate set lossless (recall=1.0 validated at
+                // 100k) while being ~1.38× faster than mult=10 (higher cutoff → fewer
+                // pass-1 inserts + a smaller pass-2 rescore) — `fetch` is already a
+                // candidate over-fetch, so a large extra multiplier is wasteful.
+                const INT8_FAST_TIER_MULT: usize = 5;
                 fast_index.search_top_k_int8_two_pass_filtered(
                     query_vec,
                     fetch,
