@@ -80,6 +80,65 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-27 — BOLD high-fanout counted collector narrows p50 but still loses vs ORIG — REVERTED (BlackThrush)
+
+**Lever tested and reverted:** for the BOLD `high_fanout` query shape only, keep the
+Tantivy/Lucene/Meilisearch-class proxy on `tantivy_doc_ids` / `search_doc_ids`, but route the
+frankensearch candidate's lexical fetch through `search_doc_ids_counted`. This tested the
+query-adaptive collector idea from the count-free top-k evidence: broad, near-universal terms may
+lose with WAND-style count-free `TopDocs`, while the counted collector is ranking-identical for
+`search_doc_ids` rows (`search_doc_ids_matches_counted_baseline` already covers the equivalence).
+
+**Measured command** (RCH local fallback; per-crate; clean worktree
+`/data/projects/frankensearch-blackthrush-bold-dig-fresh-20260627`; target dir
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-fresh`):
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a-bold-fresh \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+  RUST_LOG=error \
+  cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact after the candidate run:
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-fresh/criterion/bold_verify/summary.md`.
+The clean `origin/main` baseline summary was run first in the same clean worktree/target dir and was
+overwritten by the candidate summary; its key emitted rows were captured before overwrite.
+
+**Clean `origin/main` residual before the candidate (candidate / ORIG):**
+
+| Workload | ORIG p50 | frankensearch p50 | Ratio vs ORIG |
+|----------|----------|-------------------|---------------|
+| `top10_high_fanout/100000` hybrid | 668 us | 981 us | **1.469x slower** |
+| `top10_high_fanout/100000` guard | 668 us | 949 us | **1.421x slower** |
+| `limit_all/10000` hybrid | 7.424 ms | 8.987 ms | **1.211x slower** |
+
+**Candidate residual vs ORIG:**
+
+| Workload | ORIG p50 | frankensearch p50 | Ratio vs ORIG | Decision |
+|----------|----------|-------------------|---------------|----------|
+| `top10_high_fanout/100000` hybrid | 620 us | 759 us | **1.224x slower** | reverted |
+| `top10_high_fanout/100000` guard | 620 us | 685 us | **1.105x slower** | reverted |
+| `top10_high_fanout/10000` hybrid | 80 us | 69 us | 0.863 | not causal/too noisy |
+| `top10_high_fanout/10000` guard | 80 us | 68 us | 0.850 | not causal/too noisy |
+
+The 100k p50 residual narrowed, but the target row still lost to ORIG, and the hybrid p95 ratio was
+still bad (`2.087x` slower). The 10k high-fanout rows looked like ORIG wins, but they were not an
+absolute speedup against the clean baseline's frankensearch p50s (`65 us -> 69 us` hybrid,
+`64 us -> 68 us` guard); the ratio improved because the incumbent moved from `64 us` to `80 us`
+between runs. `limit_all/10000` also showed a hybrid p50 win in the candidate run, but the source
+hunk did not route `limit_all`, so that row is run variance, not a causal lever.
+
+**Decision:** source hunk reverted. Do not route BOLD `high_fanout` through the counted collector as
+a frankensearch-only comparator lever; it can reduce p50 noise but does not land a measured ORIG win
+on the biggest residual.
+
 ### 2026-06-27 — Move-only `LexicalIdHit -> ScoredResult` conversion does not fix the BOLD materialization gap (BlackThrush)
 
 **Lever tested and reverted:** add `From<LexicalIdHit> for ScoredResult` and make the BOLD
