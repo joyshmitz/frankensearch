@@ -1504,3 +1504,26 @@ dominated by the extra guard plus noisy tracing-heavy Criterion order. This is n
 end-to-end dominance claim over Lucene, Tantivy, or Meilisearch: the accepted original-comparator
 ratio is **N/A** for this isolated wrapper primitive, while full hybrid BOLD gaps remain governed by
 the existing comparator ledger rows.
+
+### 2026-06-27 — do NOT extend count-free top-k to phrase queries (CopperLark, corroborates BlackThrush)
+
+Independently re-derived the count-free `search_doc_ids` lever before noticing BlackThrush had
+landed the single-plain-token gate (`use_count_free_top_k`, PERF_LEDGER 2026-06-27). The obvious
+next step — broadening the gate to **phrase** queries (phrases use a `PhraseScorer`, so I expected
+dropping `Count` to be strictly safe) — was tested with a dedicated `doc_ids_phrase` A/B on the
+100k BOLD-mirror corpus and is **not** safe. Per-shape `free`/`counted` medians:
+
+| Phrase query | counted | free | ratio | verdict |
+|--------------|---------|------|-------|---------|
+| `"reciprocal rank fusion"` (theme, ~1/6) | 1.151 ms | 1.148 ms | 0.998 | noise |
+| `"approximate nearest neighbor"` (theme, ~1/6) | 1.113 ms | 1.226 ms | 1.101 | regression |
+| `"kubernetes health check"` (theme, ~1/6) | 1.285 ms | 1.085 ms | 0.844 | win |
+| `"common search corpus term"` (universal, all docs) | 8.333 ms | 10.31 ms | 1.237 | regression |
+
+The result is **workload-dependent even within phrases** (one shape wins 0.844, another regresses
+1.24), and the prior cycle's single `quoted_phrase` 0.593 (entry above) did **not** reproduce
+(0.998 here) — it was local-fallback contention noise. So the tempting `0.844` win is a trap: there
+is no safe, corpus-independent way to gate count-free for phrases. BlackThrush's single-plain-token
+boundary is the correct stopping point; do not broaden it to phrase/Boolean shapes without
+per-query corpus statistics. Conformance was green (`cargo test -p frankensearch-lexical --lib`,
+80 passed) and all probe code was reverted — only this entry is kept.
