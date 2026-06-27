@@ -78,6 +78,57 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-27 — Move-only `LexicalIdHit -> ScoredResult` conversion does not fix the BOLD materialization gap (BlackThrush)
+
+**Lever tested and reverted:** add `From<LexicalIdHit> for ScoredResult` and make the BOLD
+`frankensearch_hash_hybrid` / `hash_lexical_guard` paths consume `Vec<LexicalIdHit>` instead of
+cloning every `doc_id` while converting lexical IDs to scored rows. This targeted the biggest
+current materialization-looking miss, `bold_verify/limit_all/10000`, where frankensearch returns
+rich scored rows while the Tantivy/Lucene/Meilisearch-class incumbent stops at IDs.
+
+**Measured command:** the literal requested form still fails in this checkout:
+`cargo bench --release -p frankensearch --features lexical --bench search_bench ...` -> Cargo
+`unexpected argument '--release'`. Actual per-crate release-profile measurement:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- env \
+  FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+  FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+  RUST_LOG=off \
+  cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH worker: `hz2` (artifact retrieved to
+`/data/projects/.rch-targets/frankensearch-cod-a/criterion/bold_verify/summary.jsonl`).
+
+**Observed ratios vs the Tantivy/Lucene/Meilisearch-class proxy (candidate / incumbent):**
+
+| Workload | Candidate | Incumbent p50 | Candidate p50 | Ratio | Decision |
+|----------|-----------|---------------|----------------|-------|----------|
+| `limit_all/10000` | `hash_hybrid_tantivy_vector_rrf` | 5.593 ms | 5.583 ms | **0.998** | zero-gain |
+| `limit_all/10000` | `hash_lexical_guard_tantivy` | 5.593 ms | 5.590 ms | **0.999** | zero-gain |
+| `top10/10000 high_fanout` | hybrid | 75 us | 85 us | **1.133x slower** | regression |
+| `top10/100000 exact_identifier` | guard | 1.056 ms | 1.189 ms | **1.126x slower** | regression |
+| `top10/100000 short_keyword` | hybrid | 507 us | 543 us | **1.071x slower** | regression |
+| `top10/100000 zero_hit` | guard | 59 us | 151 us | **2.559x slower** | regression |
+
+The run also had quoted-phrase win rows, but that shape is already known to be volatile/noisy and
+the source change only removes `String` clones in the scored-row conversion; it does not alter
+Tantivy phrase execution. The target row stayed inside the `[0.97, 1.03]` no-gain band, with
+multiple unrelated regressions in the same comparator sweep.
+
+**Conformance:** before the revert, `AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- cargo test -p frankensearch-lexical --lib`
+fell back locally after queue timeout and passed (`82 passed; 0 failed`). The source patch was then
+reverted; this entry is docs-only.
+
+**Decision:** do not retry move-only `LexicalIdHit` materialization as a BOLD gap lever. The
+remaining `limit_all` gap is in Tantivy collection/doc materialization itself, not this extra clone.
+
 ### 2026-06-27 — Methodology: `rch exec` can serve a STALE bench binary; verify freshness before trusting latency (BlackThrush)
 
 **Finding (tooling, not a perf result):** benching via `rch exec -- cargo bench` does **not** always rebuild the bench binary on the worker — it can run a cached one. Caught red-handed: after renaming the `sync_int8_fetch` bench's default arm `int8_fetch` → `fast_fetch_4bit` (source confirmed) and re-running through `rch`, the worker still emitted the **old** `int8_fetch` arm name, i.e. it ran a stale binary. So **`rch` latency numbers can reflect old code** and silently mislead an A/B of a fresh change. (A clean local `cargo bench` is the cross-check, but the shared `CARGO_TARGET_DIR` here also hits `E0514` "incompatible rustc" when the local toolchain differs from the worker's — so neither path is automatically trustworthy.)
