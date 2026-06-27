@@ -20,7 +20,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -56,6 +56,11 @@ pub struct InMemoryVectorIndex {
     /// does this). Built on first *filtered* search, so unfiltered callers pay
     /// neither the hashing nor the `8·N`-byte footprint.
     doc_id_hashes: OnceLock<Vec<u64>>,
+    /// Lazily-built `doc_id → position` map for O(1) lookup, replacing the O(N)
+    /// linear `doc_ids.iter().position(...)` scan in the per-hit quality-rerank
+    /// path (`quality_scores_for_hits`), which was O(hits·N). Built on first
+    /// doc-id lookup, so search-only callers pay nothing.
+    doc_id_index: OnceLock<HashMap<String, usize>>,
     /// Vector dimensionality.
     dimension: usize,
 }
@@ -141,6 +146,7 @@ impl InMemoryVectorIndex {
             vectors: flat,
             vectors_i8: OnceLock::new(),
             doc_id_hashes: OnceLock::new(),
+            doc_id_index: OnceLock::new(),
             dimension,
         })
     }
@@ -184,6 +190,7 @@ impl InMemoryVectorIndex {
             vectors: flat,
             vectors_i8: OnceLock::new(),
             doc_id_hashes: OnceLock::new(),
+            doc_id_index: OnceLock::new(),
             dimension,
         })
     }
@@ -445,6 +452,24 @@ impl InMemoryVectorIndex {
         })
     }
 
+    /// O(1) `doc_id → position` lookup via a lazily-built map, replacing the O(N)
+    /// `doc_ids.iter().position(...)` linear scan. First-insert-wins, matching
+    /// `position`'s first-match semantics for any (non-canonical) duplicate ids.
+    /// Built once on first lookup (the per-hit quality-rerank path); search-only
+    /// callers never pay the `O(N)` build or its footprint.
+    fn index_of_doc_id(&self, doc_id: &str) -> Option<usize> {
+        self.doc_id_index
+            .get_or_init(|| {
+                let mut map = HashMap::with_capacity(self.doc_ids.len());
+                for (i, id) in self.doc_ids.iter().enumerate() {
+                    map.entry(id.clone()).or_insert(i);
+                }
+                map
+            })
+            .get(doc_id)
+            .copied()
+    }
+
     fn scan_range(
         &self,
         start: usize,
@@ -554,9 +579,7 @@ impl InMemoryVectorIndex {
         for hit in hits {
             // Try to find by doc_id
             let score = self
-                .doc_ids
-                .iter()
-                .position(|id| id == &hit.doc_id)
+                .index_of_doc_id(&hit.doc_id)
                 .map(|idx| {
                     let stored = self.vector_slice(idx);
                     dot_product_f16_f32(stored, query)
@@ -676,9 +699,7 @@ impl InMemoryTwoTierIndex {
         let mut scores = Vec::with_capacity(hits.len());
         for hit in hits {
             let score = quality
-                .doc_ids
-                .iter()
-                .position(|id| id == &hit.doc_id)
+                .index_of_doc_id(&hit.doc_id)
                 .map(|idx| dot_product_f16_f32(quality.vector_slice(idx), query_vec))
                 .transpose()?;
             scores.push(score);
