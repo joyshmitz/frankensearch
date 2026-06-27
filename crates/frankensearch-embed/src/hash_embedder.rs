@@ -136,29 +136,94 @@ impl HashEmbedder {
     /// Each token's contribution is spread across all dimensions using
     /// xorshift64, providing better distance preservation than modular
     /// projection.
+    ///
+    /// This is the compute-bound embedder (O(tokens·dim) xorshift). A single
+    /// token's xorshift chain is **latency-bound**: every step's three
+    /// shift→xor operations depend on the previous step, so one chain cannot
+    /// keep the CPU's shift/ALU ports busy. But each token seeds an
+    /// *independent* chain, so we advance [`JL_LANES`] token chains together
+    /// per dimension to expose instruction-level parallelism that hides that
+    /// latency. The result is **bit-identical** to advancing the chains one at
+    /// a time: the per-dimension accumulator only ever holds an exact
+    /// integer-valued `f32` (a sum of ±1 contributions, `|value| ≤ token count
+    /// ≪ 2^24`), so f32 addition is exact and reordering the lane
+    /// contributions cannot change a single bit of the output.
     fn embed_jl<'a>(&self, tokens: impl Iterator<Item = &'a str>, seed: u64) -> Vec<f32> {
         let mut embedding = vec![0.0_f32; self.dimension];
+
+        // Buffer token chain seeds in lanes; flush a full group through the
+        // interleaved inner loop, then drain the (< JL_LANES) tail one chain
+        // at a time. Token order across the accumulator is preserved.
+        let mut states = [0_u64; JL_LANES];
+        let mut filled = 0_usize;
 
         for token in tokens {
             let hash = fnv1a_hash(token.as_bytes());
             // xorshift64 has a fixed point at zero — if seed ^ hash == 0,
-            // the state stays zero forever, making all signs +1.0.
-            let mut state = (seed ^ hash) | 1;
-
-            for dim in &mut embedding {
-                // Advance xorshift64 state for each dimension
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-
-                let sign = if (state & 1) == 0 { 1.0 } else { -1.0 };
-                *dim += sign;
+            // the state stays zero forever, making all signs +1.0. `| 1`
+            // preserves that exact behaviour while keeping the state live.
+            states[filled] = (seed ^ hash) | 1;
+            filled += 1;
+            if filled == JL_LANES {
+                jl_accumulate_lanes(&mut embedding, &states);
+                filled = 0;
             }
+        }
+        for &state in &states[..filled] {
+            jl_accumulate_one(&mut embedding, state);
         }
 
         // Normalize in place (see `embed_fnv_modular`): one fewer allocation.
         l2_normalize_in_place(&mut embedding);
         embedding
+    }
+}
+
+/// Number of independent xorshift64 token-chains advanced together in the JL
+/// inner loop (instruction-level parallelism over a latency-bound recurrence).
+const JL_LANES: usize = 4;
+
+/// Advance one token's xorshift64 chain over every dimension, adding its ±1
+/// sign per dimension. This is the original single-chain inner loop, used for
+/// the (< [`JL_LANES`]) tail. Kept identical so the tail is trivially the same
+/// as the pre-ILP scalar path.
+#[inline]
+fn jl_accumulate_one(embedding: &mut [f32], mut state: u64) {
+    for dim in embedding.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *dim += if (state & 1) == 0 { 1.0 } else { -1.0 };
+    }
+}
+
+/// Advance [`JL_LANES`] independent token chains together, folding their per-
+/// dimension signs into the accumulator. The four chains are data-independent,
+/// so the CPU can pipeline their shift→xor steps; the `if`-based sign select is
+/// kept (the branchless form regressed — LLVM already emits a conditional move).
+#[inline]
+fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+    let (mut s0, mut s1, mut s2, mut s3) = (states[0], states[1], states[2], states[3]);
+    for dim in embedding.iter_mut() {
+        s0 ^= s0 << 13;
+        s0 ^= s0 >> 7;
+        s0 ^= s0 << 17;
+        s1 ^= s1 << 13;
+        s1 ^= s1 >> 7;
+        s1 ^= s1 << 17;
+        s2 ^= s2 << 13;
+        s2 ^= s2 >> 7;
+        s2 ^= s2 << 17;
+        s3 ^= s3 << 13;
+        s3 ^= s3 >> 7;
+        s3 ^= s3 << 17;
+        let a0 = if (s0 & 1) == 0 { 1.0 } else { -1.0 };
+        let a1 = if (s1 & 1) == 0 { 1.0 } else { -1.0 };
+        let a2 = if (s2 & 1) == 0 { 1.0 } else { -1.0 };
+        let a3 = if (s3 & 1) == 0 { 1.0 } else { -1.0 };
+        // Sum of ±1 lanes is an exact small integer; adding it to the exact
+        // integer accumulator is bit-identical to four sequential `+=`.
+        *dim += a0 + a1 + a2 + a3;
     }
 }
 
@@ -249,6 +314,55 @@ mod tests {
         let a = embedder.embed_sync("hello world");
         let b = embedder.embed_sync("hello world");
         assert_eq!(a, b);
+    }
+
+    /// Reference: the pre-ILP single-chain JL accumulation, used to prove the
+    /// interleaved [`jl_accumulate_lanes`] path is bit-identical.
+    fn embed_jl_scalar_reference(dimension: usize, seed: u64, text: &str) -> Vec<f32> {
+        let mut embedding = vec![0.0_f32; dimension];
+        for token in tokenize(text) {
+            let hash = fnv1a_hash(token.as_bytes());
+            let mut state = (seed ^ hash) | 1;
+            for dim in &mut embedding {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *dim += if (state & 1) == 0 { 1.0 } else { -1.0 };
+            }
+        }
+        l2_normalize_in_place(&mut embedding);
+        embedding
+    }
+
+    #[test]
+    fn jl_ilp_matches_scalar_reference_bit_identical() {
+        // 13 tokens ≥2 chars → exercises three full JL_LANES groups (12) plus a
+        // 1-token tail, covering both the interleaved loop and the drain path.
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa \
+                    lambda mu nu";
+        for &dim in &[256_usize, 384] {
+            for &seed in &[42_u64, 0x9e37_79b9_7f4a_7c15] {
+                let embedder = HashEmbedder::new(dim, HashAlgorithm::JLProjection { seed });
+                let got = embedder.embed_sync(text);
+                let want = embed_jl_scalar_reference(dim, seed, text);
+                assert_eq!(got, want, "ILP JL must be bit-identical (dim={dim}, seed={seed})");
+            }
+        }
+    }
+
+    #[test]
+    fn jl_ilp_matches_scalar_across_token_counts() {
+        // Token counts straddling the JL_LANES boundary (remainders 0..=4+).
+        let embedder = HashEmbedder::jl_384(7);
+        for n in 0..=9 {
+            let text = (0..n)
+                .map(|i| format!("tok{i:02}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let got = embedder.embed_sync(&text);
+            let want = embed_jl_scalar_reference(384, 7, &text);
+            assert_eq!(got, want, "ILP JL mismatch at token count {n}");
+        }
     }
 
     #[test]

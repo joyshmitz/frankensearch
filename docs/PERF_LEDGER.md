@@ -733,3 +733,45 @@ confirmed a fresh `frankensearch-index` rebuild before timing.
 frankensearch FSVI 4-bit path. The original-comparator ratio vs Lucene/Tantivy/Meilisearch is
 **N/A** for this isolated vector pass-1; the comparator caveat is recorded in
 `docs/NEGATIVE_EVIDENCE.md`.
+### 2026-06-27 — JL hash embedder xorshift ILP (interleave 4 token chains) (Cobaltmoth)
+
+**Lever:** `HashEmbedder::embed_jl` (the `jl-*` fast tier) is the compute-bound embedder —
+O(tokens·dim) xorshift64. A single token's chain is **latency-bound**: each step's three
+*dependent* shift→xor ops must retire before the next, so one chain cannot saturate the CPU's
+shift/ALU ports. (This ledger already noted the JL path is "compute-bound xorshift" with alloc
+savings lost in noise; the only prior JL lever — branchless sign — regressed because LLVM already
+cmov's it, see `docs/NEGATIVE_EVIDENCE.md`.) Each token seeds an **independent** chain, so
+`embed_jl` now advances `JL_LANES = 4` token chains together per dimension (`jl_accumulate_lanes`),
+exposing instruction-level parallelism that hides the single-chain latency; the (< 4) tail drains
+one chain at a time via the original loop.
+
+**Bit-identical:** the per-dimension accumulator only ever holds an exact integer-valued `f32`
+(a sum of ±1 contributions, `|value| ≤ token count ≪ 2^24`), so f32 addition is exact and
+reordering the lane contributions cannot change a single output bit. Proven by
+`jl_ilp_matches_scalar_reference_bit_identical` (dims 256/384, two seeds) +
+`jl_ilp_matches_scalar_across_token_counts` (token counts 0..=9 straddling the lane boundary); all
+33 `hash_embedder` tests GREEN.
+
+**Measured command (per-crate, in-process A/B — host-independent ratio):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-embed --bench hash_embed -- hash_embed_jl_ilp
+```
+
+`scalar` = the committed single-chain inner loop (replicated in the bench); `ilp2`/`ilp4` = the
+2-/4-lane interleaved variants. ~100-word doc, dim 384. Medians:
+
+| Workload | scalar | ilp2 | ilp4 | Ratio (ilp4/scalar) | Status |
+|----------|--------|------|------|---------------------|--------|
+| `hash_embed_jl_ilp` (dim384) | 102.88 µs | 69.81 µs | **50.19 µs** | **0.488 (~2.05×)** | KEEP |
+
+CIs do not overlap (`scalar [100.99, 105.49] µs`, `ilp4 [49.70, 50.89] µs`). Independently
+corroborated by a concurrent run on a different worker/target dir (`scalar` 98.0 µs → `ilp4`
+51.2 µs, **~1.92×**). `ilp4` ships; `ilp2` (~1.47×) is the runner-up the bench keeps for the curve.
+
+**Scope:** a local hot-path win on the `jl-*` non-semantic fast tier (the slowest embedder).
+Original-comparator (BOLD vs Tantivy/Lucene/Meilisearch) ratio is **N/A** — this reduces
+frankensearch-internal embedding compute the incumbents do not have; it narrows the end-to-end gap
+on jl-tier searches rather than beating a Tantivy primitive head-to-head.

@@ -1749,3 +1749,22 @@ slower here for unique ids. If store-load is ever the proven bottleneck for big 
 **dedicated minimal id-only stored field** or storing the id in a numeric fast field (dense u64 →
 no dictionary), not the string columnar path. Original-comparator ratio vs Lucene/Tantivy/Meili is
 N/A — this is an internal id-materialization micro-lever on the Tantivy-wrapping crate.
+
+### 2026-06-27 — JL xorshift ILP is a real win, but original-comparator ratio is N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`:** `HashEmbedder::embed_jl` now interleaves `JL_LANES = 4`
+independent token xorshift64 chains per dimension (ILP over a latency-bound recurrence), a
+**bit-identical ~2.05× local win** (`hash_embed_jl_ilp/scalar` 102.88 µs → `ilp4` 50.19 µs;
+CIs disjoint; corroborated ~1.92× on a second worker). This is recorded here only to keep the
+original-comparator honesty bar: the **ratio vs Lucene/Tantivy/Meilisearch is N/A**. The `jl-*`
+tier is a non-semantic hash embedder that frankensearch runs *in addition to* lexical retrieval —
+it is frankensearch-internal compute the incumbents never perform, and the non-semantic fast-tier
+guard already skips it on the BOLD `tantivy_doc_ids` lane. So this narrows the end-to-end gap for
+jl-tier hybrid searches but is **not** a head-to-head win over a Tantivy primitive and must not be
+claimed as one.
+
+**Negative sub-result (kept):** the prior `embed_jl` branchless-sign attempt regressed because LLVM
+already emits a conditional move; the `if (state & 1) == 0 { 1.0 } else { -1.0 }` form is therefore
+retained in each lane. The win here is purely from breaking the single-chain shift→xor dependency,
+not from the sign select. `ilp2` (~1.47×) is left in the bench as the curve point showing the gain
+scales with lanes up to the shift-port limit.

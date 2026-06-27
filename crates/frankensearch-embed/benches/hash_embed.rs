@@ -121,6 +121,88 @@ fn jl_new(text: &str) -> Vec<f32> {
     e
 }
 
+// ── JL projection: scalar single-chain vs interleaved (ILP) inner loops ──────
+// All variants share `jl_old`'s accumulation semantics; the accumulator only
+// ever holds an exact integer-valued f32 (sum of ±1, |v| ≪ 2^24), so lane
+// reordering is bit-identical. This isolates the ILP win on the latency-bound
+// xorshift recurrence (each step's 3 shift→xor ops depend on the prior step).
+fn jl_accumulate_one(e: &mut [f32], mut state: u64) {
+    for dim in e.iter_mut() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        *dim += if (state & 1) == 0 { 1.0 } else { -1.0 };
+    }
+}
+
+fn jl_ilp2(text: &str) -> Vec<f32> {
+    let mut e = vec![0.0_f32; DIM];
+    let mut st = [0_u64; 2];
+    let mut n = 0;
+    for token in tokenize_iter(text) {
+        st[n] = (JL_SEED ^ fnv1a_hash(token.as_bytes())) | 1;
+        n += 1;
+        if n == 2 {
+            let (mut s0, mut s1) = (st[0], st[1]);
+            for dim in e.iter_mut() {
+                s0 ^= s0 << 13;
+                s0 ^= s0 >> 7;
+                s0 ^= s0 << 17;
+                s1 ^= s1 << 13;
+                s1 ^= s1 >> 7;
+                s1 ^= s1 << 17;
+                let a0 = if (s0 & 1) == 0 { 1.0 } else { -1.0 };
+                let a1 = if (s1 & 1) == 0 { 1.0 } else { -1.0 };
+                *dim += a0 + a1;
+            }
+            n = 0;
+        }
+    }
+    for &s in &st[..n] {
+        jl_accumulate_one(&mut e, s);
+    }
+    l2_norm_in_place(&mut e);
+    e
+}
+
+fn jl_ilp4(text: &str) -> Vec<f32> {
+    let mut e = vec![0.0_f32; DIM];
+    let mut st = [0_u64; 4];
+    let mut n = 0;
+    for token in tokenize_iter(text) {
+        st[n] = (JL_SEED ^ fnv1a_hash(token.as_bytes())) | 1;
+        n += 1;
+        if n == 4 {
+            let (mut s0, mut s1, mut s2, mut s3) = (st[0], st[1], st[2], st[3]);
+            for dim in e.iter_mut() {
+                s0 ^= s0 << 13;
+                s0 ^= s0 >> 7;
+                s0 ^= s0 << 17;
+                s1 ^= s1 << 13;
+                s1 ^= s1 >> 7;
+                s1 ^= s1 << 17;
+                s2 ^= s2 << 13;
+                s2 ^= s2 >> 7;
+                s2 ^= s2 << 17;
+                s3 ^= s3 << 13;
+                s3 ^= s3 >> 7;
+                s3 ^= s3 << 17;
+                let a0 = if (s0 & 1) == 0 { 1.0 } else { -1.0 };
+                let a1 = if (s1 & 1) == 0 { 1.0 } else { -1.0 };
+                let a2 = if (s2 & 1) == 0 { 1.0 } else { -1.0 };
+                let a3 = if (s3 & 1) == 0 { 1.0 } else { -1.0 };
+                *dim += a0 + a1 + a2 + a3;
+            }
+            n = 0;
+        }
+    }
+    for &s in &st[..n] {
+        jl_accumulate_one(&mut e, s);
+    }
+    l2_norm_in_place(&mut e);
+    e
+}
+
 fn bench_hash_embed(c: &mut Criterion) {
     // ~100-word document (typical chunk fed to the embedder).
     let doc = "the quick brown fox jumps over the lazy dog while the engineer \
@@ -131,6 +213,9 @@ fn bench_hash_embed(c: &mut Criterion) {
     // Correctness sanity: old and new must be bit-identical.
     debug_assert_eq!(fnv_old(&doc), fnv_new(&doc));
     debug_assert_eq!(jl_old(&doc), jl_new(&doc));
+    // ILP variants must match the scalar JL output exactly.
+    debug_assert_eq!(jl_old(&doc), jl_ilp2(&doc));
+    debug_assert_eq!(jl_old(&doc), jl_ilp4(&doc));
 
     let mut fg = c.benchmark_group("hash_embed_fnv");
     fg.bench_with_input("old", doc.as_str(), |b, t| {
@@ -149,6 +234,19 @@ fn bench_hash_embed(c: &mut Criterion) {
         b.iter(|| black_box(jl_new(black_box(t))));
     });
     jg.finish();
+
+    // ILP A/B on the latency-bound xorshift inner loop.
+    let mut ig = c.benchmark_group("hash_embed_jl_ilp");
+    ig.bench_with_input("scalar", doc.as_str(), |b, t| {
+        b.iter(|| black_box(jl_old(black_box(t))));
+    });
+    ig.bench_with_input("ilp2", doc.as_str(), |b, t| {
+        b.iter(|| black_box(jl_ilp2(black_box(t))));
+    });
+    ig.bench_with_input("ilp4", doc.as_str(), |b, t| {
+        b.iter(|| black_box(jl_ilp4(black_box(t))));
+    });
+    ig.finish();
 }
 
 criterion_group!(benches, bench_hash_embed);
