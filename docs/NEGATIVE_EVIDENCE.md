@@ -1181,3 +1181,49 @@ Compared with the baseline artifact, the hybrid p50 ratio worsened on 9 of 13 ro
 Because the candidate does not produce a durable Lucene/Tantivy-class win, the code was reverted
 and only this ledger entry is kept. A future attempt should attack the remaining Tantivy wrapper
 overhead without disturbing high-fanout and zero-hit tails.
+
+### 2026-06-27 — shared exact-id lexical probe is not a hybrid BOLD win (BlackThrush)
+
+**Lever tested and reverted:** added a real production exact-id probe to
+`frankensearch-lexical` so identifier-shaped queries such as `doc-000001` and `doc 000001`
+searched the Tantivy `id` field before falling back to normal content/title BM25. The probe was
+behaviorally valid (`search_doc_ids_exact_identifier_alias_hits_id_field` and
+`search_doc_ids_exact_identifier_alias_miss_falls_back_to_bm25` passed), but it is a shared
+lexical-backend improvement: the `tantivy_doc_ids` Lucene/Tantivy/Meilisearch-class proxy benefits
+too, while the hash-hybrid challenger still falls through to vector/RRF when the exact lexical hit
+count is below `limit=10`.
+
+Command:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- env CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+    FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+    FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+    cargo bench -p frankensearch --features lexical --profile release \
+      --bench search_bench bold_verify_tantivy_class \
+      -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Worker: `hz2` (`[RCH] remote hz2 (357.9s)`). Parsed log artifact:
+`frankensearch/.scratch/bold_exact_id_prod_teed_20260627T022000Z/stdout_summary.jsonl`.
+Incumbent: `tantivy_doc_ids`.
+
+Hybrid candidate vs Tantivy-class proxy:
+
+| Workload | candidate p50 ratio | candidate p50 us | Tantivy p50 us | verdict |
+|----------|---------------------|------------------|----------------|---------|
+| `top10/10000/exact_identifier` | 28.300 | 1132 | 40 | severe regression |
+| `top10/100000/exact_identifier` | 133.125 | 4260 | 32 | severe regression |
+| `top10/10000/quoted_phrase` | 1.147 | 164 | 143 | miss |
+| `top10/100000/natural_language` | 1.220 | 1935 | 1586 | miss |
+| `top10/100000/high_fanout` | 1.006 | 661 | 657 | miss |
+
+The lexical-guard lane confirmed why this is not enough: `top10/10000/exact_identifier` improved
+to 0.825x (33 us vs 40 us), but `top10/100000/exact_identifier` still lost at 2.875x (92 us vs
+32 us), and the shipped hybrid path regressed dramatically. The exact-id probe was therefore
+reverted. A future lever must either make the hybrid exact-hit path terminate on high-confidence
+identifier hits without changing recall contracts, or move to a separate exact-id lookup structure
+that is not also granted to the Tantivy-class incumbent.
