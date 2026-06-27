@@ -1964,3 +1964,40 @@ parsing) when the query is plain tokens. This **overlaps BlackThrush's plain-que
 path** (`search_doc_ids`, which already detects 1–2 plain terms), so it belongs to that owner: detect
 plain query → skip `parse_query_lenient` → hand the collector a hand-built term query. Original-comparator
 ratio vs Lucene/Tantivy/Meilisearch is **N/A** (internal Tantivy-wrapper parse overhead).
+
+### 2026-06-27 — examined-clean inventory: reachable per-crate compute surface is saturated (Cobaltmoth)
+
+A consolidated map of what I examined this session and found **already-optimal / owned / not-a-lever**,
+so the converging swarm stops re-surveying these. Each was inspected for the usual levers (latency-bound
+reductions, O(n²)/O(n) redundancy, per-iteration allocs, scalar loops missing SIMD, HashMap<String>
+churn) and rejected for the stated structural reason — **no bench needed**:
+
+- `core/cache.rs` — **S3-FIFO** (Yang et al. SOSP 2023); O(1) per access by design (freq-counter, no LRU
+  list manipulation). Already the modern post-LRU algorithm.
+- `core/decision_plane.rs`, `core/collectors.rs` — control-plane / telemetry, **not on the search path**.
+- `core/filter.rs` — per-candidate `matches` is parsed-`Value` field lookups + `HashSet::contains`; no
+  per-call alloc/parse.
+- `fusion/adaptive.rs` — per-query `blend_factor`/`rrf_k` are O(1) `HashMap<QueryClass,_>` reads; updates
+  are O(1) Welford. Optional + already O(1).
+- `fusion/prf.rs::prf_expand` — already auto-vectorized SAXPY (element-wise centroid + interpolate); only
+  the small norm reduction has headroom (f32-reorder caveat).
+- `embed/cached_embedder.rs` — O(1) FIFO (not O(n) LRU); `embed/batch_coalescer.rs` —
+  mutex/condvar request coordination, not a compute loop.
+- `rerank/native.rs` — transformer reranker already SIMD (`f32x8` softmax) + rayon, profiling-driven
+  (BlackThrush beads). Owned.
+- `index`: `simd.rs`/`search.rs`/`mrl.rs`/`two_tier.rs` owned+optimized (BlackThrush); `quantization.rs`
+  test-only (dead, flagged); `hnsw.rs` non-default (flagged); `wal.rs` correctness-critical+flaky
+  (flagged); `vector_at_f32` f16-decode is HNSW-build/API only, not the hot scan (which uses the SIMD
+  f16 dot directly).
+- `lexical`: BM25 `QueryParser` construction is cheap (caching it = ~0-gain, entry above);
+  `search_doc_ids` count-free top-k is BlackThrush's active path.
+- `storage`/`durability`/`fsfs` — **un-buildable** (fsqlite family split, blocker entries above).
+
+**Net state — two real moves remain, both outside a safe solo grab:**
+1. **Unblock fsqlite** (owner/shared-infra) → unlocks the un-mined `storage`/`durability`/`fsfs` graph,
+   which has genuine per-doc indexing compute (e.g. the ready, bit-identical `SniffFeatures::from_bytes`
+   SIMD-histogram win, reverted only because fsfs won't compile).
+2. **Plain-query parse bypass** in `lexical` (~5–15 % of a BOLD lexical query) — owner is the active
+   `search_doc_ids` path; bit-identical *scoring* must be differentially proven vs Tantivy's parser.
+
+Beyond these, the reachable per-crate compute surface for clean bit-identical wins is **saturated**.
