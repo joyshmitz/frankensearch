@@ -1578,3 +1578,46 @@ is no safe, corpus-independent way to gate count-free for phrases. BlackThrush's
 boundary is the correct stopping point; do not broaden it to phrase/Boolean shapes without
 per-query corpus statistics. Conformance was green (`cargo test -p frankensearch-lexical --lib`,
 80 passed) and all probe code was reverted — only this entry is kept.
+
+### 2026-06-27 — 4 independent accumulators REGRESS the 4-bit prepared dot kernel (decode-bound, not sum-chain-bound) (BlackThrush)
+
+**Lever tested and reverted:** apply the proven multi-accumulator ILP pattern to `dot_4bit_prepared`
+(`crates/frankensearch-index/src/simd.rs`) — the pass-1 hot kernel of the current vector frontier,
+`search_top_k_4bit_two_pass` (landed 1.40× vs int8 / 3.09× vs flat). That kernel uses a **single**
+`i16x16` accumulator with a periodic flush, i.e. exactly the single-accumulator add chain that
+`dot_i8_i8`'s own comment says cost 6–16% and was fixed there with 4 independent `i32x8`
+accumulators. Natural hypothesis: the same 4-accumulator split should win on the 4-bit kernel too.
+I rewrote it to 4 independent `i16x16` accumulators processing 4 chunks per iteration (flush every
+256 chunks for overflow safety; integer-exact, so bit-identical — `dot_packed_4bit_matches_scalar`
+still passes).
+
+**Measured (in-process A/B, `dot_product` bench; `fourbit_4acc` = new, `fourbit_1acc` = original
+single-acc, both over the *same* prepared query so the ratio isolates only the accumulator change).
+New arm names doubled as a freshness sentinel — both appeared, so the bench binary was not stale.**
+
+Remote `rch` worker `ovh-a` (`cargo bench -p frankensearch-index --profile release --bench
+dot_product -- fourbit --sample-size 10 --measurement-time 3`) caught a contended window on the
+`fourbit_4acc` arm (CI `[405 µs … 714 µs]`), but its identical sibling `fourbit_prepared_new`
+(same lib fn) measured cleanly at **325.9 µs** vs `fourbit_1acc` **318.3 µs** → **1.024 (slower)**.
+
+Clean local re-measure (`--sample-size 30`), `fourbit_4acc` / `fourbit_1acc` medians:
+
+| dim | 1 acc (old) | 4 acc (new) | ratio | verdict |
+|-----|-------------|-------------|-------|---------|
+| 256 | 304.08 µs | 332.09 µs | **1.092** | regression |
+| 384 | 385.69 µs | 409.96 µs | **1.063** | regression |
+
+**Decision:** rejected and fully reverted (`simd.rs` + the bench A/B arms restored byte-identical to
+`main`; `git diff` empty before this entry). Both runs and both dims agree directionally: the
+4-accumulator split is **6–9 % slower**. Root cause: `dot_4bit_prepared` is **decode-bound**, not
+sum-chain-bound — each 16-byte chunk pays one `i16x16` widen plus **four shifts** to sign-extend the
+low/high nibbles (`(s<<12)>>12`, `(s<<8)>>12`) before the two multiplies, so the single `acc +=` add
+is *not* the binding loop-carried dependency. Extra accumulators only add register pressure /
+scheduling overhead. This is the same regime the `dot_i8_i8` comment already flags for the
+decode-bound f16 dot ("extra accumulators regress"); the int8 win does **not** transfer because the
+i8 decode is a cheap one-op sign-extend while the 4-bit decode is shift-heavy.
+
+**Route next:** the 4-bit pass-1 frontier is gated by **nibble-decode op count**, not accumulator
+ILP. A real win there must *reduce decode work* (fewer shifts per chunk / a cheaper sign-extend), not
+add accumulators. Do not re-attempt multi-accumulator on `dot_4bit_prepared`. Original-comparator
+ratio vs Lucene/Tantivy/Meilisearch is **N/A** for this isolated vector kernel.
