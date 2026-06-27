@@ -2028,3 +2028,49 @@ API, so any hand-built substitute changes ranking. Original-comparator ratio is 
 parse overhead). **Route-next:** a safe win needs Tantivy itself to expose a cheap plain-term query
 builder that yields the parser's exact tree, or the parse cost (~3–6 µs/query, ~5–15 % of a BOLD lexical
 query) must be accepted as comparator-inherent. Do not re-attempt a hand-built plain-query substitute.
+
+### 2026-06-27 - exact-phrase underfill short-circuit is a BOLD harness semantic change, not a keep (BlackThrush)
+
+**Lever tested and reverted:** changed the BOLD comparator harness so a quoted exact phrase with
+any lexical hit returned lexical-only immediately, even when Tantivy returned fewer than `k` hits.
+This targeted the current `top10/10000 quoted_phrase` gap, where main measured the hash-hybrid
+row at **1.504x slower** than the Tantivy/Lucene/Meilisearch-class proxy (119 us incumbent,
+179 us frankensearch).
+
+**Measured command (per-crate, RCH local fallback, warm target dir):**
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_phrase_candidate \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_phrase_candidate/summary.jsonl`.
+
+| Workload | Candidate | Incumbent p50 | Candidate p50 | Ratio vs ORIG | Decision |
+|----------|-----------|---------------|----------------|---------------|----------|
+| `top10/10000 quoted_phrase` | hash-hybrid | 119 us | 118 us | **0.992** | semantic change; no keep |
+| `top10/10000 quoted_phrase` | lexical guard | 119 us | 119 us | **1.000** | no gain |
+| `top10/100000 quoted_phrase` | hash-hybrid | 1.099 ms | 1.092 ms | **0.994** | noise/tie |
+| `top10/100000 quoted_phrase` | lexical guard | 1.099 ms | 1.058 ms | **0.963** | already a guarded lexical row |
+| `top10/100000 short_keyword` | hash-hybrid | 50 us | 64 us | **1.280x slower** | unrelated regression/noise |
+| `top10/100000 short_keyword` | lexical guard | 50 us | 81 us | **1.620x slower** | unrelated regression/noise |
+| `top10/100000 zero_hit` | hash-hybrid | 82 us | 102 us | **1.244x slower** | unrelated regression/noise |
+
+**Why it cannot land:** the product `TwoTierSearcher` gate does not use an "any exact phrase hit"
+rule. It short-circuits saturated identifier/short-keyword rows, plus a narrower non-semantic/no-
+quality natural-language case. Returning fewer than `k` exact-phrase lexical hits without hybrid
+backfill changes BOLD harness semantics rather than speeding the shipped search path. The best
+targeted row only reached a p50 tie (0.992), while the same sweep exposed noisy slower ORIG ratios.
+
+**Decision:** source reverted; ledger-only. Route next away from phrase underfill gates. The
+remaining BOLD `limit_all` materialization gap and plain-query parse overhead have already been
+routed above; do not spend another pass on exact-phrase lexical-only underfill unless product
+semantics explicitly change first.
