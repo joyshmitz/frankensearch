@@ -2133,3 +2133,32 @@ targeted row only reached a p50 tie (0.992), while the same sweep exposed noisy 
 remaining BOLD `limit_all` materialization gap and plain-query parse overhead have already been
 routed above; do not spend another pass on exact-phrase lexical-only underfill unless product
 semantics explicitly change first.
+
+### 2026-06-27 — UPDATE: fsqlite blocker is RESOLVED by a fresh lock; cc bench pool has a rustc skew (Cobaltmoth)
+
+**Correction to the fsqlite blocker entries above (`f9b4ee3`/`25b43f7`).** `storage`/`durability`/`fsfs`
+**now compile.** The blocker was a **stale `Cargo.lock` pinning `fsqlite 0.1.2`** (whose internal code
+needs the old `fsqlite-types` API) while siblings resolved to `0.1.9`. A fresh resolve
+(`cargo generate-lockfile`) picks a **consistent `fsqlite 0.1.12` + `fsqlite-types 0.1.12` family** —
+`fsqlite 0.1.12` exists (I'd wrongly assumed 0.1.2 was latest, reading the stale lock). Since
+`Cargo.lock` is gitignored, any clean resolve gets 0.1.12. **Verified:** `cargo build -p
+frankensearch-storage` compiled remotely (artifact-transfer flaked, exit 102, but the compile
+succeeded), and `cargo test -p frankensearch-fsfs --lib file_classification` is **GREEN (14 passed)**.
+⇒ **storage/durability/fsfs are an un-mined perf surface again** (supersedes the
+[[storage-fsfs-blocked-fsqlite-family-split]] memory).
+
+**New blocker (rch infra, not code): cc bench target POOL has a mixed-rustc skew.** `cargo bench
+-p frankensearch-fsfs` (and any criterion bench) fails `error[E0514]: found crate <X> compiled by an
+incompatible version of rustc` — the pool `/data/tmp/rch-targets-pool/frankensearch-cc` holds `.rmeta`
+from nightly `91fe22da8` (2026-06-21) while the worker now runs `ce9954c0c` (2026-06-26), across
+criterion's deps (`futures-lite`, `sharded-slab`, `thread_local`, `http`, `itoa`, `lazy_static`,
+`parking`). Two attempts hit it (worker hz2); `cargo test` is unaffected (didn't need those deps).
+**Fix:** `cargo clean` the cc pool (rch should invalidate the pool on toolchain change). Until then
+per-crate criterion benches in the cc role are blocked.
+
+**Ready win, bench-blocked (route-next):** `fsfs::SniffFeatures::from_bytes` per-byte `u32
+saturating_add` → branchless `u64` + saturate-cast (vectorizable SIMD histogram). **Validated
+bit-identical** (`sniff_features_vectorized_matches_scalar_reference` GREEN in the 14-pass run); source
+reverted only because the ratio can't be measured under the pool skew. After the pool is cleaned:
+`cargo bench -p frankensearch-fsfs --bench sniff_features`, then re-apply (the diff + test + bench are
+recorded in this session) and land with the ratio.
