@@ -75,6 +75,39 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-27 — 1-bit binary (sign) two-pass for FSVI vector search: recall too low, no speedup (BlackThrush)
+
+**Lever tested and reverted:** follow-up to the landed FSVI int8 two-pass (1.94×, bandwidth-bound).
+Hypothesis: a packed sign-bit slab (`dim/8` bytes — ~8× smaller than the int8 slab, ~16× vs f16)
+scored by XOR+popcount (Hamming) pass-1 + exact f16 rescore of the top `k·mult` would cut the
+dominant bandwidth further. Implemented `VectorIndex::search_top_k_binary_two_pass` mirroring the
+int8 two-pass (lazy `vectors_bits` slab, tombstone-aware parallel Hamming scan + cutoff, F16/no-WAL
+gate); plumbing verified bit-identical to `search_top_k` under keep-all (`binary_two_pass_keep_all_
+matches_exact`).
+
+**Measured (per-crate bench `fsvi_binary_two_pass`, 100k clustered FSVI, dim=384, k=10):**
+
+| mult | recall@10 |  | latency (same fast worker) | vs flat | vs int8 |
+|------|-----------|--|----------------------------|---------|---------|
+| 2    | **0.150** |  | flat (exact) = 2714 µs     | —       | —       |
+| 5    | **0.206** |  | int8 mult=5 = 1014 µs (recall 1.0) | 2.68× | — |
+| 10   | **0.300** |  | binary mult=10 = 1093 µs   | 2.48×   | **0.93× (slower)** |
+| 20   | **0.438** |  | binary mult=20 = 1840 µs   | 1.48×   | 0.55× (slower) |
+| 50   | **0.631** |  |                            |         |         |
+
+**Decision:** rejected and fully reverted (field, method, helpers, test, bench — index crate left
+byte-identical to the FSVI-int8 commit). Two independent failures: (1) **recall is far too low** —
+1-bit sign quantization collapses 384-d clustered embeddings (clusters share sign patterns), so the
+true top-k are not in the candidate set even at mult=50 (0.63); a lossless mult would approach
+keep-all. (2) **No speedup even ignoring recall** — integer Hamming distances (0..dim) produce many
+ties at the heap cutoff, so the bounded-heap fast-path prunes little; binary mult=10 (1093 µs) ≈ int8
+mult=5 (1014 µs, recall=1.0), so the ~8× bandwidth edge is eaten by tie-thrashing + popcount.
+
+**Route next:** sub-int8 quantization is NOT the lever for these embeddings — int8 is the bandwidth
+sweet spot (1.94× lossless, landed). A viable binary path would need rotation/PCA before sign (to
+de-correlate dimensions) + asymmetric (query-full) scoring — a much larger research effort, not a
+clean primitive swap. The FSVI vector-search frontier is int8.
+
 ### 2026-06-27 — BOLD `search_doc_ids` span-removal run is contaminated, not landable (BlackThrush)
 
 **Lever tested and reverted:** remove the two `#[instrument]` spans from the ID-only lexical hot
