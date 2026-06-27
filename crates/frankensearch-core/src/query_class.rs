@@ -54,7 +54,10 @@ impl QueryClass {
             return Self::Identifier;
         }
 
-        let word_count = trimmed.split_whitespace().count();
+        // Only the `<= 3` boundary matters, so stop after the 4th word instead of
+        // counting every word in a long natural-language query (`take(4)` caps the
+        // `split_whitespace` scan at ~4 words). `count() <= 3` ⇔ `take(4).count() <= 3`.
+        let word_count = trimmed.split_whitespace().take(4).count();
         if word_count <= 3 {
             Self::ShortKeyword
         } else {
@@ -81,10 +84,25 @@ impl QueryClass {
             }
 
             // camelCase / PascalCase (mixed case that isn't one capitalized word).
-            let has_lower = s.chars().any(char::is_lowercase);
-            let has_upper = s.chars().any(char::is_uppercase);
-            let first_upper = s.chars().next().is_some_and(char::is_uppercase);
-            let rest_lower = s.chars().skip(1).all(char::is_lowercase);
+            // One char pass collects every case flag the prior code gathered in
+            // three separate `chars()` scans (`any(is_lowercase)`, `any(is_uppercase)`,
+            // `skip(1).all(is_lowercase)`) — each Unicode-aware and thus the costly
+            // part of this check. Flags are order-independent, so the result is identical.
+            let mut has_lower = false;
+            let mut has_upper = false;
+            let mut first_upper = false;
+            let mut rest_lower = true;
+            for (i, c) in s.chars().enumerate() {
+                let is_lower = c.is_lowercase();
+                let is_upper = c.is_uppercase();
+                has_lower |= is_lower;
+                has_upper |= is_upper;
+                if i == 0 {
+                    first_upper = is_upper;
+                } else if !is_lower {
+                    rest_lower = false;
+                }
+            }
             if has_lower && has_upper && !(first_upper && rest_lower) {
                 return true;
             }

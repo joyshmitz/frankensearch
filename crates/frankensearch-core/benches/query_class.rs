@@ -74,6 +74,56 @@ fn classify_old(query: &str) -> u8 {
     }
 }
 
+/// The committed (pre-change) grouped `looks_like_identifier`: one whitespace
+/// check, but still three separate Unicode case scans. A/B baseline for the
+/// single-pass case-flag + `take(4)` word-count change.
+fn looks_like_identifier_current(s: &str) -> bool {
+    if !s.chars().any(char::is_whitespace) {
+        if s.contains('/') || s.contains('\\') || s.contains('.') || s.contains("::") {
+            return true;
+        }
+        if s.contains('_') {
+            return true;
+        }
+        let has_lower = s.chars().any(char::is_lowercase);
+        let has_upper = s.chars().any(char::is_uppercase);
+        let first_upper = s.chars().next().is_some_and(char::is_uppercase);
+        let rest_lower = s.chars().skip(1).all(char::is_lowercase);
+        if has_lower && has_upper && !(first_upper && rest_lower) {
+            return true;
+        }
+        if let Some((prefix, suffix)) = s.rsplit_once('-')
+            && !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit())
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return true;
+        }
+    }
+    if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
+        return true;
+    }
+    false
+}
+
+fn classify_current(query: &str) -> u8 {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    if looks_like_identifier_current(trimmed) {
+        return 1;
+    }
+    if trimmed.split_whitespace().count() <= 3 {
+        2
+    } else {
+        3
+    }
+}
+
 fn bench_query_class(c: &mut Criterion) {
     // Representative query mix: identifiers (no whitespace — the worst case for the
     // prior redundant scans), short keywords, and natural language.
@@ -97,6 +147,16 @@ fn bench_query_class(c: &mut Criterion) {
             let mut acc = 0u32;
             for q in &queries {
                 acc += u32::from(classify_old(black_box(q)));
+            }
+            black_box(acc)
+        });
+    });
+    // A/B baseline: the committed grouped impl (pre single-pass / take(4) change).
+    g.bench_function("current", |b| {
+        b.iter(|| {
+            let mut acc = 0u32;
+            for q in &queries {
+                acc += u32::from(classify_current(black_box(q)));
             }
             black_box(acc)
         });

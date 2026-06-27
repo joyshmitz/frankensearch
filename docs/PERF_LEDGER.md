@@ -650,3 +650,43 @@ RCH executed on `hz2` (`[RCH] remote hz2 (382.8s)`). Artifact:
 **Scope:** this is a local Tantivy-wrapper hot-path win, not an original-comparator BOLD win.
 The required Lucene/Tantivy/Meilisearch-class caveat, N/A original-comparator ratio, and unclaimed
 fallback rows are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
+### 2026-06-27 — single-pass `QueryClass::classify` (fused case scan + `take(4)` word count) (BlackThrush)
+
+**Lever:** `QueryClass::classify` runs on **every** search query (adaptive lexical/semantic budget +
+the lexical short-circuit gate) — pure frankensearch per-query overhead Tantivy never pays, so cutting
+it directly narrows the end-to-end gap vs a Tantivy/Lucene/Meilisearch-class incumbent. Two
+behaviour-identical reductions over the already-grouped baseline:
+1. `looks_like_identifier` collected the camel/Pascal case flags in **three** separate Unicode-aware
+   `chars()` scans (`any(is_lowercase)`, `any(is_uppercase)`, `skip(1).all(is_lowercase)`); fused into
+   **one** char pass (flags are order-independent, so the boolean result is unchanged).
+2. The word count only needs the `<= 3` boundary, so `split_whitespace().take(4).count()` stops after
+   the 4th word instead of scanning every word of a long natural-language query.
+
+All 26 `frankensearch-core::query_class` tests stay green, including `classify_is_trim_invariant`
+(proptest) and every classification case — the change is bit-identical.
+
+**Measured command (per-crate, in-process A/B — host-independent ratio):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=BlackThrush \
+  rch exec -- cargo bench -p frankensearch-core --profile release \
+    --bench query_class -- --measurement-time 5
+```
+
+RCH worker `ovh-a`. `current` = the committed grouped baseline (replicated in the bench); `new` = the
+shipped `classify`. The new arm name `current` doubled as a stale-binary freshness sentinel (it
+appeared in the output).
+
+| Workload (11-query mix) | current (grouped) | new (this change) | Ratio | Status |
+|-------------------------|-------------------|-------------------|-------|--------|
+| `query_class` | 484.88 ns | 424.50 ns | **0.875 (~1.14×)** | KEEP |
+
+CIs do not overlap (`current [468.2, 505.2] ns`, `new [420.0, 429.9] ns`). The same run shows the
+pre-grouping `old` at 805.3 ns (cumulative ~1.9×); the isolated ratio for **this** change is **0.875**.
+
+**Scope:** a local per-query-overhead win on pure frankensearch work (query classification). The
+original-comparator (BOLD vs Tantivy/Lucene/Meilisearch) ratio is **N/A** for this isolated function —
+it reduces overhead the incumbent does not have, narrowing the end-to-end gap rather than beating a
+Tantivy primitive head-to-head.
