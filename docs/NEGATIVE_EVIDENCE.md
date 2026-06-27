@@ -108,6 +108,26 @@ sweet spot (1.94× lossless, landed). A viable binary path would need rotation/P
 de-correlate dimensions) + asymmetric (query-full) scoring — a much larger research effort, not a
 clean primitive swap. The FSVI vector-search frontier is int8.
 
+**UPDATE 2026-06-27 (4-bit probe — the sub-int8 lever DOES exist at 4-bit, not 1-bit):** a quick
+recall probe (16-level quantization, `q = round(x·7/max_abs)` clamped `[-7,7]`, candidate recall of
+the f16 top-10 within the 4-bit top-`k·mult`; N=10k clustered, dim=384) shows **4-bit is recall-
+viable, unlike 1-bit binary**:
+
+| level | mult=2 | mult=5 | mult=10 |
+|-------|--------|--------|---------|
+| 1-bit (binary, rejected above) | 0.150 | 0.206 | 0.300 |
+| **4-bit (16-level)** | **0.981** | **1.000** | **1.000** |
+
+So a 4-bit two-pass would be **lossless at mult=5** (10k; needs a 100k confirm) while reading half
+the int8 slab (`dim/2` vs `dim` bytes) — a plausible ~1.3–1.5× over the landed int8 two-pass. The
+blocker is purely the kernel: unpack-to-buffer writes the full i8 slab (38 MB), negating the 19 MB
+read advantage, so the 4-bit dot must be a **register-fused SIMD nibble dot**. `wide 1.4` supports
+it (`i16x16` Shl/Shr + `from_i8x16`, `i32x8::from_i16x8`): load 16 packed bytes → `i16x16`,
+sign-extend low/high nibbles via `(x<<12)>>12` and `(x<<8)>>12`, multiply (products ≤49), widen-
+accumulate. Scoped as a focused follow-up (intricate SIMD kernel + 100k recall/latency validation +
+a keep-all bit-identical test); **not landed this turn** to avoid shipping an unverified SIMD kernel.
+int8 remains the landed/validated frontier; 4-bit is the next concrete lever.
+
 ### 2026-06-27 — BOLD `search_doc_ids` span-removal run is contaminated, not landable (BlackThrush)
 
 **Lever tested and reverted:** remove the two `#[instrument]` spans from the ID-only lexical hot
