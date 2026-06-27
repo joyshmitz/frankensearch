@@ -379,6 +379,12 @@ fn nibble_hi(b: u8) -> i32 {
 /// shifts, multiply low·low + high·high, and horizontally accumulate per chunk.
 pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
     let mut sum = 0_i32;
+    // Accumulate products vertically (one `i16x16` accumulator) instead of a
+    // horizontal `reduce_add` per chunk; flush to `sum` before any lane can exceed
+    // `i16`. Per-dim product ≤ 49, per-chunk per-lane ≤ 98, so after 16 chunks a lane
+    // is ≤ 1568 and the 16-lane `reduce_add` is ≤ 25088 < i16::MAX — safe to flush.
+    let mut acc = i16x16::splat(0);
+    let mut pending = 0_usize;
     let mut s16 = stored.chunks_exact(16);
     let mut q16 = query.chunks_exact(16);
     for (sc, qc) in s16.by_ref().zip(q16.by_ref()) {
@@ -390,10 +396,15 @@ pub fn dot_packed_4bit(stored: &[u8], query: &[u8]) -> i32 {
         let s_high = (s << 8_i32) >> 12_i32;
         let q_low = (q << 12_i32) >> 12_i32;
         let q_high = (q << 8_i32) >> 12_i32;
-        // Per-dim products ≤ 49; 16 lanes ≤ 1568 → fits i16 reduce_add.
-        let prod = s_low * q_low + s_high * q_high;
-        sum += i32::from(prod.reduce_add());
+        acc += s_low * q_low + s_high * q_high;
+        pending += 1;
+        if pending == 16 {
+            sum += i32::from(acc.reduce_add());
+            acc = i16x16::splat(0);
+            pending = 0;
+        }
     }
+    sum += i32::from(acc.reduce_add());
     for (sb, qb) in s16.remainder().iter().zip(q16.remainder()) {
         sum += nibble_lo(*sb) * nibble_lo(*qb) + nibble_hi(*sb) * nibble_hi(*qb);
     }
