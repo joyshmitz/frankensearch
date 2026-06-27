@@ -690,3 +690,46 @@ pre-grouping `old` at 805.3 ns (cumulative ~1.9×); the isolated ratio for **thi
 original-comparator (BOLD vs Tantivy/Lucene/Meilisearch) ratio is **N/A** for this isolated function —
 it reduces overhead the incumbent does not have, narrowing the end-to-end gap rather than beating a
 Tantivy primitive head-to-head.
+
+### 2026-06-27 — FSVI 4-bit pass-1 uses prepared query lanes (BlackThrush)
+
+**Lever:** `VectorIndex::search_top_k_4bit_two_pass` packed the query once, but the file-backed
+pass-1 still called `dot_packed_4bit` for every stored vector; that wrapper re-prepares the query
+nibble lanes on every dot. The in-memory path already used the prepared-query kernel. This change
+moves the FSVI path to the same loop-invariant query decode: pack once, `prepare_4bit_query` once,
+then call `dot_4bit_prepared` for each stored vector. This is the `/alien-graveyard` vectorized
+execution lever in its smallest form: hoist invariant decode out of a scan morsel while preserving
+the exact same candidate heap, tombstone check, and f16 rescore.
+
+**Measured command:** the literal requested form still fails in this checkout:
+
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench --release -p frankensearch-index \
+    --bench fsvi_4bit_two_pass -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Cargo rejects `cargo bench --release` with `unexpected argument '--release'`; the valid per-crate
+release-profile measurement was:
+
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+    --bench fsvi_4bit_two_pass fourbit_mult5 \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+RCH had no admissible worker for the bench and fell back locally. To avoid the known stale-binary
+pitfall with the shared target dir, the candidate source mtime was bumped and the second run
+confirmed a fresh `frankensearch-index` rebuild before timing.
+
+| Workload | Baseline (`origin/main`) | New | Ratio | Recall | Status |
+|----------|--------------------------|-----|-------|--------|--------|
+| `fsvi_4bit_two_pass/fourbit_mult5` | 3.6991 ms | 1.5660 ms | **0.423 (~2.36x)** | recall@10 = 1.0000 at mult=5 | KEEP |
+
+**Scope:** this is a local file-backed vector-search primitive win against the immediately prior
+frankensearch FSVI 4-bit path. The original-comparator ratio vs Lucene/Tantivy/Meilisearch is
+**N/A** for this isolated vector pass-1; the comparator caveat is recorded in
+`docs/NEGATIVE_EVIDENCE.md`.

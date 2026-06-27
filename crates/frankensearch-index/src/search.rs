@@ -12,8 +12,8 @@ use rayon::prelude::*;
 
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
-    Quantization, VectorIndex, dot_i8_i8, dot_packed_4bit, dot_product_f16_bytes_f32,
-    dot_product_f32_bytes_f32, dot_product_f32_f32,
+    PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8,
+    dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, prepare_4bit_query,
 };
 use half::f16;
 
@@ -332,11 +332,12 @@ impl VectorIndex {
     /// 4-bit (16-level) two-pass exact top-k for standalone large-N vector search.
     /// A fast parallel pass-1 over a packed signed-4-bit slab (`dim/2` bytes/vector —
     /// half the int8 slab, so the bandwidth-bound pass-1 is faster) keeps the top
-    /// `k·candidate_multiplier` by approximate score (`dot_packed_4bit`), then an
-    /// exact f16 rescore of just those candidates selects the final top-k. 16 levels
-    /// stay lossless at mult≈5 on realistic clustered data (see `fsvi_4bit_two_pass`
-    /// bench); recall rises with `candidate_multiplier`. Falls back to the exact
-    /// `search_top_k` for WAL/non-F16 indexes. Not wired into the BOLD hybrid.
+    /// `k·candidate_multiplier` by approximate score (`dot_4bit_prepared`), then
+    /// an exact f16 rescore of just those candidates selects the final top-k. 16
+    /// levels stay lossless at mult≈5 on realistic clustered data (see
+    /// `fsvi_4bit_two_pass` bench); recall rises with `candidate_multiplier`.
+    /// Falls back to the exact `search_top_k` for WAL/non-F16 indexes. Not wired
+    /// into the BOLD hybrid.
     pub fn search_top_k_4bit_two_pass(
         &self,
         query: &[f32],
@@ -365,12 +366,13 @@ impl VectorIndex {
             .min(count)
             .max(k.min(count));
         let query_packed = pack_4bit_query(query);
+        let query_prepared = prepare_4bit_query(&query_packed);
         let slab = self.nibbles_slab();
 
         let candidate_heap = if count < PARALLEL_THRESHOLD {
             self.nibble_scan_range(
                 slab,
-                &query_packed,
+                &query_prepared,
                 bytes_per_vector,
                 0,
                 count,
@@ -385,7 +387,7 @@ impl VectorIndex {
                     let end = (start + PARALLEL_CHUNK_SIZE).min(count);
                     self.nibble_scan_range(
                         slab,
-                        &query_packed,
+                        &query_prepared,
                         bytes_per_vector,
                         start,
                         end,
@@ -414,7 +416,7 @@ impl VectorIndex {
     fn nibble_scan_range(
         &self,
         slab: &[u8],
-        query_packed: &[u8],
+        query_prepared: &PreparedQuery4bit,
         bytes_per_vector: usize,
         start: usize,
         end: usize,
@@ -430,7 +432,7 @@ impl VectorIndex {
             let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
             if (flags & 0x0001) == 0 {
                 let stored = &slab[slab_offset..slab_offset + bytes_per_vector];
-                let score = dot_packed_4bit(stored, query_packed) as f32;
+                let score = dot_4bit_prepared(stored, query_prepared) as f32;
                 if heap.len() < limit || score_key(score) >= cutoff {
                     insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
                     if heap.len() >= limit
