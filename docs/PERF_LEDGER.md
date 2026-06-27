@@ -901,3 +901,40 @@ limit 50, 20 iterations. Medians:
 compute the Tantivy/Lucene/Meilisearch lexical incumbents never perform, and off the default build
 (feature-gated). Original-comparator ratio is **N/A** (recorded in `docs/NEGATIVE_EVIDENCE.md`); it
 makes the graph-rank feature ~12× cheaper when enabled, not a head-to-head comparator win.
+
+### 2026-06-27 — fsfs file-classification byte-sniff: vectorizable u64 histograms (Cobaltmoth)
+
+**Lever:** `SniffFeatures::from_bytes` (`frankensearch-fsfs`) scans a capped content probe of **every
+file** during classification (binary/text detection), counting null / non-printable / high-bit bytes.
+The loop used per-byte `u32::saturating_add` for each of the three counters — a saturating add is *not*
+a plain add, so it **blocks auto-vectorization** of this per-file scan. Switched to branchless `u64`
+accumulators (`count += u64::from(cond)`) saturate-cast to `u32` at the end, letting LLVM emit three
+SIMD histograms.
+
+**Bit-identical:** a `u64` counter cannot overflow for any real `&[u8]` (len ≤ usize ≤ u64), and the
+final `u32::try_from(..).unwrap_or(u32::MAX)` reproduces the exact `u32::MAX` saturation the old
+per-byte `saturating_add` produced. Proven by `sniff_features_vectorized_matches_scalar_reference`
+(empty / all-null / all-high-bit / printable / mixed / 4099-byte / full 0..=255 vs a scalar
+`saturating_add` reference) + all `file_classification` tests GREEN (14 passed).
+
+**Measured command (per-crate, in-process A/B; replicas of old saturating vs new u64):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-fsfs --bench sniff_features
+```
+
+`old` = per-byte `u32::saturating_add`; `new` = branchless `u64` + saturate-cast. Realistic text-ish
+probe (~80% printable ASCII). Medians (gain scales with probe size — vectorization amortizes setup):
+
+| Probe size | old | new | Ratio | Status |
+|------------|-----|-----|-------|--------|
+| `sniff_features/probe_4096` | 3692 ns | 2669 ns | **0.723 (~1.4×)** | KEEP |
+| `sniff_features/probe_16384` | 21114 ns | 10719 ns | **0.508 (~2.0×)** | KEEP |
+| `sniff_features/probe_65536` | 100341 ns | 42559 ns | **0.424 (~2.4×)** | KEEP |
+
+**Scope:** a local indexing-throughput win on the per-file classification scan — pure frankensearch
+file-ingest compute. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (this is the
+file-system scan layer, not a query-time comparator primitive); recorded in `docs/NEGATIVE_EVIDENCE.md`.
+(fsfs is buildable again — the earlier fsqlite blocker was a stale lock; see `4c816a7`.)

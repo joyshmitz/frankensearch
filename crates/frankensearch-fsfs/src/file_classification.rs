@@ -270,21 +270,27 @@ impl SniffFeatures {
             };
         }
 
-        let mut null_bytes = 0_u32;
-        let mut non_printable = 0_u32;
-        let mut high_bit = 0_u32;
+        // Branchless `u64` counters (saturate-cast to `u32` at the end) instead of
+        // per-byte `u32::saturating_add`: a saturating add is not a plain add, so it
+        // blocks auto-vectorization of this per-file content scan. The three
+        // predicates are independent, so `count += u64::from(cond)` lets LLVM emit
+        // three SIMD histograms. Bit-identical: a `u64` counter cannot overflow for
+        // any real `&[u8]` (len ≤ usize ≤ u64), and the final
+        // `u32::try_from(..).unwrap_or(u32::MAX)` reproduces the same `u32::MAX`
+        // saturation the old per-byte `saturating_add` produced.
+        let mut null_bytes = 0_u64;
+        let mut non_printable = 0_u64;
+        let mut high_bit = 0_u64;
 
         for &byte in bytes {
-            if byte == 0 {
-                null_bytes = null_bytes.saturating_add(1);
-            }
-            if is_non_printable(byte) {
-                non_printable = non_printable.saturating_add(1);
-            }
-            if byte >= 0x80 {
-                high_bit = high_bit.saturating_add(1);
-            }
+            null_bytes += u64::from(byte == 0);
+            non_printable += u64::from(is_non_printable(byte));
+            high_bit += u64::from(byte >= 0x80);
         }
+
+        let null_bytes = u32::try_from(null_bytes).unwrap_or(u32::MAX);
+        let non_printable = u32::try_from(non_printable).unwrap_or(u32::MAX);
+        let high_bit = u32::try_from(high_bit).unwrap_or(u32::MAX);
 
         let sample_len = bytes.len() as f64;
         Self {
@@ -1250,6 +1256,53 @@ mod tests {
         FileClassificationDecision, IngestAction, IntegrityState, NormalizationPolicy,
         TruncatedAction,
     };
+
+    use super::{SniffFeatures, is_non_printable};
+
+    fn sniff_reference(bytes: &[u8]) -> (u32, f64, f64) {
+        if bytes.is_empty() {
+            return (0, 0.0, 0.0);
+        }
+        let mut null_bytes = 0_u32;
+        let mut non_printable = 0_u32;
+        let mut high_bit = 0_u32;
+        for &byte in bytes {
+            if byte == 0 {
+                null_bytes = null_bytes.saturating_add(1);
+            }
+            if is_non_printable(byte) {
+                non_printable = non_printable.saturating_add(1);
+            }
+            if byte >= 0x80 {
+                high_bit = high_bit.saturating_add(1);
+            }
+        }
+        let len = bytes.len() as f64;
+        (
+            null_bytes,
+            f64::from(non_printable) / len,
+            f64::from(high_bit) / len,
+        )
+    }
+
+    #[test]
+    fn sniff_features_vectorized_matches_scalar_reference() {
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0u8; 64],
+            vec![0xFFu8; 100],
+            b"hello world\tplain\ntext\r".to_vec(),
+            (0u8..=255).cycle().take(4099).collect(),
+            (0u8..=255).collect(),
+        ];
+        for bytes in &cases {
+            let got = SniffFeatures::from_bytes(bytes);
+            let (rn, rnp, rhb) = sniff_reference(bytes);
+            assert_eq!(got.null_bytes, rn, "null_bytes mismatch (len={})", bytes.len());
+            assert_eq!(got.non_printable_ratio, rnp, "np ratio mismatch (len={})", bytes.len());
+            assert_eq!(got.high_bit_ratio, rhb, "hb ratio mismatch (len={})", bytes.len());
+        }
+    }
 
     #[test]
     fn default_contract_matches_documented_defaults() {

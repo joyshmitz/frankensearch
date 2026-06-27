@@ -2162,3 +2162,11 @@ bit-identical** (`sniff_features_vectorized_matches_scalar_reference` GREEN in t
 reverted only because the ratio can't be measured under the pool skew. After the pool is cleaned:
 `cargo bench -p frankensearch-fsfs --bench sniff_features`, then re-apply (the diff + test + bench are
 recorded in this session) and land with the ratio.
+
+**UPDATE — LANDED.** Cleared the skew with a targeted `rch exec -- cargo clean -p futures-lite
+-p sharded-slab -p thread_local -p http -p itoa -p lazy_static -p parking` (rch warns
+"non-compilation command" but **runs it**; removed 42 files). The bench then compiled and ran
+cleanly: probe_4096 **1.4×**, probe_16384 **2.0×**, probe_65536 **2.4×** — recorded in
+`docs/PERF_LEDGER.md`. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (fsfs
+file-scan layer, not a query comparator). Takeaway for the swarm: a cc-pool rustc skew (E0514) is
+fixable in-band via `rch exec -- cargo clean -p <skewed crates>` — no admin needed.
