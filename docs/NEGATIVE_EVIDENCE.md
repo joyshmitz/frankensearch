@@ -75,6 +75,60 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-27 — BOLD `search_doc_ids` span-removal run is contaminated, not landable (BlackThrush)
+
+**Lever tested and reverted:** remove the two `#[instrument]` spans from the ID-only lexical hot
+path (`execute_query_with_offset` and `TantivyIndex::search_doc_ids`) to avoid per-query tracing
+span close overhead in the BOLD Tantivy/Lucene/Meilisearch-class proxy. The source patch itself was
+only those two attribute removals and passed lexical conformance, but the BOLD measurement cannot be
+claimed for that lever: while the bench was compiling/running, the shared checkout gained unrelated
+uncommitted edits in `frankensearch/benches/search_bench.rs` (exact-ID alias shortcut and
+summary-only switch) and `crates/frankensearch-index/src/in_memory.rs` (lazy `doc_id -> position`
+map). Those edits were not mine, were not staged, and materially affect the measured harness/path.
+
+**Measured command (per-crate, warm target dir; RCH local fallback because no worker was
+admissible: `insufficient_slots=3,hard_preflight=1,active_project_exclusion=1`):**
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/frankensearch/.scratch/bold_no_search_doc_ids_instrument_20260627T0026Z \
+FRANKENSEARCH_BOLD_VERIFY_COMMAND='AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact: `.scratch/bold_no_search_doc_ids_instrument_20260627T0026Z/summary.jsonl`
+(`git_sha=0950df46a5a5b9497a456d2b9a83899729f23c2e`, `worker=unknown`). The literal requested
+`cargo bench --release` form is still rejected by Cargo in this checkout; the equivalent
+per-crate release profile form is `--profile release`.
+
+**Observed ratios vs the Tantivy-class proxy in the contaminated run:**
+
+| Workload | Tantivy-class p50 | Contaminated candidate p50 | Candidate / Tantivy-class | Decision |
+|----------|-------------------|----------------------------|----------------------------|----------|
+| `top10_exact_identifier/10000` | 101 us | 103 us | 1.020 | zero-gain; contaminated |
+| `top10_short_keyword/10000` | 32 us | 33 us | **1.031x slower** | reverted |
+| `top10_quoted_phrase/10000` | 146 us | 138 us | 0.945 | contaminated win row only |
+| `top10_natural_language/10000` | 121 us | 126 us | **1.041x slower** | reverted |
+| `limit_all/10000` | 5.905 ms | 6.764 ms | **1.145x slower** | reverted |
+| `top10_exact_identifier/100000` | 1.296 ms | 1.099 ms | 0.848 | contaminated win row only |
+| `top10_short_keyword/100000` | 177 us | 193 us | **1.090x slower** | reverted |
+| `top10_quoted_phrase/100000` | 981 us | 1.217 ms | **1.241x slower** | reverted |
+| `top10_natural_language/100000` | 824 us | 798 us | 0.968 | noise/contaminated |
+| `top10_high_fanout/100000` | 705 us | 517 us | 0.733 | contaminated win row only |
+
+**Conformance:** `AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a rch exec -- cargo test -p
+frankensearch-lexical --lib` passed locally via RCH fallback (`79 passed; 0 failed`).
+
+**Decision:** reverted the span-removal source patch and landed no code. The run is useful negative
+evidence only: BOLD rows are mixed, and the apparent exact-identifier improvement is not
+attributable because the BOLD harness changed concurrently. A clean retry must start from an
+isolated worktree or first land/reject the unowned exact-ID alias and `doc_id` map edits.
+
 ### 2026-06-26 — BOLD int8 two-pass vector wiring is not a Tantivy-class win (BlackThrush)
 
 **Lever tested and reverted:** route the BOLD hash-hybrid challenger through a resident
