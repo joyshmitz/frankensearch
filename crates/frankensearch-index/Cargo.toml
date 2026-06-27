@@ -50,5 +50,10 @@ harness = false
 name = "int8_two_pass"
 harness = false
 
+# FSVI (file-backed) int8 two-pass vs flat exact — standalone large-N vector search.
+[[bench]]
+name = "fsvi_int8_two_pass"
+harness = false
+
 [lints]
 workspace = true

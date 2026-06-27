@@ -64,6 +64,7 @@ use crc32fast::Hasher as Crc32;
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
 use memmap2::MmapMut;
+use std::sync::OnceLock;
 use tracing::debug;
 
 #[cfg(feature = "ann")]
@@ -183,6 +184,11 @@ pub struct VectorIndex {
     pub(crate) wal_entries: Vec<wal::WalEntry>,
     /// WAL configuration.
     wal_config: WalConfig,
+    /// Lazily-built int8 quantization of the (contiguous, F16) main vector region,
+    /// for the optional int8 two-pass scan (`search_top_k_int8_two_pass`). Built on
+    /// first two-pass use, so exact-only callers never pay the quantization cost or
+    /// its footprint. One corpus-wide max-abs scale (see `quantize_f16_bytes_to_i8`).
+    pub(crate) vectors_i8: OnceLock<Vec<i8>>,
 }
 
 impl VectorIndex {
@@ -322,6 +328,7 @@ impl VectorIndex {
             vectors_offset,
             wal_entries,
             wal_config: WalConfig::default(),
+            vectors_i8: OnceLock::new(),
         })
     }
 

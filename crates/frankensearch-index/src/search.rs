@@ -12,9 +12,10 @@ use rayon::prelude::*;
 
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
-    Quantization, VectorIndex, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32,
+    Quantization, VectorIndex, dot_i8_i8, dot_product_f16_bytes_f32, dot_product_f32_bytes_f32,
     dot_product_f32_f32,
 };
+use half::f16;
 
 /// Record-count threshold where search switches from sequential to Rayon.
 pub const PARALLEL_THRESHOLD: usize = 10_000;
@@ -200,6 +201,130 @@ impl VectorIndex {
         }
 
         self.resolve_hits(heap)
+    }
+
+    /// int8 ADC two-pass exact top-k for **standalone** large-N vector search:
+    /// a fast parallel int8 pass-1 over all main records keeps the top
+    /// `k·candidate_multiplier` by approximate score, then an exact f16 rescore of
+    /// just those candidates selects the final top-k. Lossless (recall=1.0) whenever
+    /// pass-1 retains the true top-k — validated on the in-memory twin; the int8
+    /// dot is monotonic with the true dot under one corpus max-abs scale.
+    ///
+    /// Covers the contiguous F16 main-vector region only; falls back to the exact
+    /// [`VectorIndex::search_top_k`] when a WAL is present or quantization is not F16
+    /// (so results are always correct, never silently degraded). Not wired into the
+    /// BOLD hybrid (that gap is not vector-bound — see docs/NEGATIVE_EVIDENCE.md);
+    /// this targets pure vector-search latency at large N.
+    pub fn search_top_k_int8_two_pass(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let count = self.record_count();
+        // Fall back to the exact scan for anything this fast path does not cover.
+        if k == 0
+            || count == 0
+            || !self.wal_entries.is_empty()
+            || self.quantization() != Quantization::F16
+        {
+            return self.search_top_k(query, k, None);
+        }
+        if query.len() != self.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension(),
+                found: query.len(),
+            });
+        }
+
+        let dim = self.dimension();
+        let candidate_count = k
+            .saturating_mul(candidate_multiplier.max(1))
+            .min(count)
+            .max(k.min(count));
+        let query_i8 = quantize_i8_query(query);
+        let slab = self.int8_slab();
+
+        // Pass 1: bounded-heap int8 scan keeping the top `candidate_count`, parallel
+        // above the same threshold/chunking as the exact scan so it uses all cores.
+        let candidate_heap = if count < PARALLEL_THRESHOLD {
+            self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
+        } else {
+            let chunk_count = count.div_ceil(PARALLEL_CHUNK_SIZE);
+            let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_index| {
+                    let start = chunk_index * PARALLEL_CHUNK_SIZE;
+                    let end = (start + PARALLEL_CHUNK_SIZE).min(count);
+                    self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
+                })
+                .collect();
+            merge_partial_heaps(partials, candidate_count)
+        };
+
+        // Pass 2: exact f16 rescore of the candidates through the SAME bounded-heap
+        // selection + tie-break as `search_top_k`, so the final order is identical
+        // whenever pass-1 retained the true top-k.
+        let stride = dim * 2;
+        let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
+        for candidate in candidate_heap {
+            let vector_offset = self.vectors_offset + candidate.index * stride;
+            let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+            let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
+            insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), k);
+        }
+        self.resolve_hits(heap)
+    }
+
+    /// Bounded-heap int8 scan of records `[start, end)` over the int8 `slab`
+    /// (index-aligned with the record table), skipping tombstoned records via the
+    /// same flag check + cutoff fast-path as the exact `scan_range_chunk`.
+    fn int8_scan_range(
+        &self,
+        slab: &[i8],
+        query_i8: &[i8],
+        start: usize,
+        end: usize,
+        limit: usize,
+    ) -> BinaryHeap<HeapEntry> {
+        let dim = self.dimension();
+        let mut heap = BinaryHeap::with_capacity(limit.min(end - start).saturating_add(1));
+        let mut cutoff = f32::NEG_INFINITY;
+        let mut flags_offset = self.records_offset + start * 16 + 14;
+        let mut slab_offset = start * dim;
+
+        for index in start..end {
+            let flags_bytes = &self.data[flags_offset..flags_offset + 2];
+            let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+            if (flags & 0x0001) == 0 {
+                let stored = &slab[slab_offset..slab_offset + dim];
+                // int8 dots peak well below 2^24 for realistic dims, so `i32 as f32`
+                // is exact and preserves the candidate ranking + index tie-break.
+                let score = dot_i8_i8(stored, query_i8) as f32;
+                if heap.len() < limit || score_key(score) >= cutoff {
+                    insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                    if heap.len() >= limit
+                        && let Some(&worst) = heap.peek()
+                    {
+                        cutoff = score_key(worst.score);
+                    }
+                }
+            }
+            flags_offset += 16;
+            slab_offset += dim;
+        }
+        heap
+    }
+
+    /// Lazily build (once) the int8 quantization of the contiguous F16 main-vector
+    /// region. Only called after the F16/no-WAL gate in `search_top_k_int8_two_pass`.
+    fn int8_slab(&self) -> &[i8] {
+        self.vectors_i8.get_or_init(|| {
+            let count = self.record_count();
+            let dim = self.dimension();
+            let byte_len = count * dim * 2;
+            quantize_f16_bytes_to_i8(&self.data[self.vectors_offset..self.vectors_offset + byte_len])
+        })
     }
 
     fn scan_sequential(
@@ -672,6 +797,44 @@ impl VectorIndex {
     }
 }
 
+/// Quantize an f32 query to int8 using its own max-abs scale (a per-query constant
+/// that does not change the dot-product ranking).
+fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
+    let max_abs = query.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    if max_abs <= 0.0 {
+        return vec![0; query.len()];
+    }
+    let scale = 127.0 / max_abs;
+    query
+        .iter()
+        .map(|&x| (x * scale).round().clamp(-127.0, 127.0) as i8)
+        .collect()
+}
+
+/// Quantize a contiguous little-endian f16 vector region to int8 with one
+/// corpus-wide max-abs scale (a constant factor, so `Σ q_a·q_b` stays monotonic
+/// with the true dot). Reads f16 directly from the mapped bytes.
+fn quantize_f16_bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
+    let mut max_abs = 0.0_f32;
+    for chunk in bytes.chunks_exact(2) {
+        let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32().abs();
+        if value > max_abs {
+            max_abs = value;
+        }
+    }
+    if max_abs <= 0.0 {
+        return vec![0; bytes.len() / 2];
+    }
+    let scale = 127.0 / max_abs;
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
+            (value * scale).round().clamp(-127.0, 127.0) as i8
+        })
+        .collect()
+}
+
 pub(crate) const fn score_key(score: f32) -> f32 {
     if score.is_nan() {
         f32::NEG_INFINITY
@@ -792,6 +955,54 @@ mod tests {
             .enumerate()
             .map(|(idx, vector)| (format!("doc-{idx:03}"), vector.clone()))
             .collect()
+    }
+
+    #[test]
+    fn int8_two_pass_keep_all_matches_exact() {
+        // With a multiplier large enough to retain every record, pass-1 keeps all
+        // main vectors, so the exact f16 rescore must reproduce `search_top_k`
+        // bit-for-bit — verifying the byte offsets, tombstone flag check, rescore,
+        // and resolve are correct, independent of int8 selection quality.
+        let path = temp_index_path("int8-two-pass-keepall");
+        let dim = 8;
+        let count = 300;
+        let vectors: Vec<Vec<f32>> = (0..count)
+            .map(|i| {
+                (0..dim)
+                    .map(|j| {
+                        let mut s = (i as u64)
+                            .wrapping_mul(2_654_435_761)
+                            ^ (j as u64).wrapping_mul(40_503);
+                        s ^= s >> 13;
+                        ((s & 0xffff) as f32 / 65_535.0) - 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        let rows = create_rows(&vectors);
+        let row_refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+            .collect();
+        write_index(&path, &row_refs).expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        for qi in 0..8_usize {
+            let query: Vec<f32> = (0..dim)
+                .map(|j| (((qi * 7 + j * 3) % 11) as f32 / 11.0) - 0.5)
+                .collect();
+            let exact = index.search_top_k(&query, 10, None).expect("exact");
+            // mult=50 → candidate_count clamps to `count` → pass-1 retains all.
+            let approx = index
+                .search_top_k_int8_two_pass(&query, 10, 50)
+                .expect("int8 two-pass");
+            let exact_ids: Vec<&str> = exact.iter().map(|h| h.doc_id.as_str()).collect();
+            let approx_ids: Vec<&str> = approx.iter().map(|h| h.doc_id.as_str()).collect();
+            assert_eq!(
+                exact_ids, approx_ids,
+                "int8 two-pass (keep-all) must match exact search_top_k for query {qi}"
+            );
+        }
     }
 
     proptest! {
