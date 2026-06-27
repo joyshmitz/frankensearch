@@ -19,6 +19,11 @@ rayon = { workspace = true }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "doc_ids_topk"
+harness = false
 
 [lints]
 workspace = true

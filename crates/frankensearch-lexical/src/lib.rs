@@ -248,6 +248,45 @@ pub fn execute_query_with_offset(
     Ok(LexicalSearchResult { hits, total_count })
 }
 
+/// Execute a query for the top-`limit` hits by BM25 score without computing the
+/// total match count.
+///
+/// Unlike [`execute_query_with_offset`], this omits the [`Count`] collector.
+/// `Count` must visit every matching document, while this ID-only path only
+/// needs the ranked page.
+///
+/// # Errors
+///
+/// Returns [`SearchError::SubsystemError`] when Tantivy search fails.
+pub fn execute_top_k(
+    searcher: &Searcher,
+    query: &dyn tantivy::query::Query,
+    limit: usize,
+    offset: usize,
+) -> SearchResult<Vec<LexicalDocHit>> {
+    let top_docs = searcher
+        .search(
+            query,
+            &TopDocs::with_limit(limit)
+                .and_offset(offset)
+                .order_by_score(),
+        )
+        .map_err(|e| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(e),
+        })?;
+
+    Ok(top_docs
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (bm25_score, doc_address))| LexicalDocHit {
+            bm25_score,
+            rank,
+            doc_address,
+        })
+        .collect())
+}
+
 /// Load a stored Tantivy document by address.
 ///
 /// # Errors
@@ -260,6 +299,40 @@ pub fn load_doc(searcher: &Searcher, doc_address: DocAddress) -> SearchResult<Ta
             subsystem: "tantivy",
             source: Box::new(e),
         })
+}
+
+fn use_count_free_top_k(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    !trimmed.bytes().any(|byte| {
+        matches!(
+            byte,
+            b' ' | b'\t'
+                | b'\n'
+                | b'\r'
+                | b'"'
+                | b'\''
+                | b'('
+                | b')'
+                | b':'
+                | b'+'
+                | b'-'
+                | b'!'
+                | b'^'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'*'
+                | b'?'
+                | b'~'
+                | b'\\'
+                | b'/'
+        )
+    })
 }
 
 /// Try to build a snippet generator for a query/content field pair.
@@ -715,11 +788,47 @@ impl TantivyIndex {
 
         let parsed = self.parse_query_lenient(query);
         let searcher = self.reader.searcher();
-        let search_result = execute_query_with_offset(&searcher, &*parsed, limit, 0)?;
+        let hits = if use_count_free_top_k(query) {
+            execute_top_k(&searcher, &*parsed, limit, 0)?
+        } else {
+            execute_query_with_offset(&searcher, &*parsed, limit, 0)?.hits
+        };
+        self.collect_id_hits(&searcher, hits)
+    }
 
-        let mut results = Vec::with_capacity(search_result.hits.len());
-        for hit in search_result.hits {
-            let doc = load_doc(&searcher, hit.doc_address)?;
+    /// Pre-optimization baseline for [`Self::search_doc_ids`] that retains the
+    /// discarded total-count collector. This is used only by the `doc_ids_topk`
+    /// benchmark so the optimized and counted paths can be compared in one
+    /// binary.
+    #[doc(hidden)]
+    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    pub fn search_doc_ids_counted(
+        &self,
+        _cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<LexicalIdHit>> {
+        let query = Self::truncate_query(query);
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parsed = self.parse_query_lenient(query);
+        let searcher = self.reader.searcher();
+        let search_result = execute_query_with_offset(&searcher, &*parsed, limit, 0)?;
+        self.collect_id_hits(&searcher, search_result.hits)
+    }
+
+    /// Materialize ranked Tantivy hits into [`LexicalIdHit`] rows by loading
+    /// each stored document and reading its `id` field.
+    fn collect_id_hits(
+        &self,
+        searcher: &Searcher,
+        hits: Vec<LexicalDocHit>,
+    ) -> SearchResult<Vec<LexicalIdHit>> {
+        let mut results = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let doc = load_doc(searcher, hit.doc_address)?;
             let doc_id = doc
                 .get_first(self.fields.id)
                 .and_then(|v| v.as_str())
@@ -1002,15 +1111,16 @@ mod tests {
             "tantivy.index",
             asupersync::sync::LockError::PolledAfterCompletion,
         );
-        match err {
-            SearchError::SubsystemError { source, .. } => {
-                assert!(
-                    source.to_string().contains(
-                        "writer mutex future reused after completion during tantivy.index"
-                    )
-                );
-            }
-            other => panic!("expected subsystem error, got {other:?}"),
+        assert!(
+            matches!(err, SearchError::SubsystemError { .. }),
+            "expected subsystem error, got {err:?}"
+        );
+        if let SearchError::SubsystemError { source, .. } = err {
+            assert!(
+                source
+                    .to_string()
+                    .contains("writer mutex future reused after completion during tantivy.index")
+            );
         }
     }
 
@@ -1424,6 +1534,45 @@ mod tests {
                 assert!(hit.bm25_score.is_finite());
             }
         });
+    }
+
+    #[test]
+    fn search_doc_ids_matches_counted_baseline() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let docs = sample_docs();
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            for query in ["Rust", "Rust search", "\"Rust programming\""] {
+                let optimized = idx
+                    .search_doc_ids(&cx, query, 10)
+                    .expect("optimized search");
+                let counted = idx
+                    .search_doc_ids_counted(&cx, query, 10)
+                    .expect("counted search");
+                assert_eq!(optimized, counted, "query {query:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn count_free_doc_ids_only_accepts_single_plain_terms() {
+        assert!(use_count_free_top_k("Rust"));
+        assert!(use_count_free_top_k("rust_2026"));
+
+        for query in [
+            "",
+            "Rust search",
+            "\"Rust programming\"",
+            "title:Rust",
+            "Rust*",
+            "+Rust",
+            "doc-000001",
+            "path/to/doc",
+        ] {
+            assert!(!use_count_free_top_k(query), "query {query:?}");
+        }
     }
 
     #[test]

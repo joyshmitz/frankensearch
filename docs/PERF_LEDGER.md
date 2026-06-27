@@ -619,3 +619,34 @@ in `docs/NEGATIVE_EVIDENCE.md`. It is kept because every measured row dramatical
 the existing hash-hybrid path, several rows beat the lexical incumbent, and the behavior is more
 semantically honest for hash-only fast tier searches. Next lever should attack the residual
 `ScoredResult` materialization and high-selectivity lexical overhead rather than vector/RRF.
+
+## Local hot-path wins
+
+### 2026-06-27 — count-free simple `search_doc_ids` top-k (BlackThrush)
+
+**Lever:** `frankensearch-lexical::TantivyIndex::search_doc_ids` now uses a top-k-only Tantivy
+collector for single plain-token queries. The API returns ranked document IDs and BM25 scores, not
+total match counts, so the old `Count` collector was discarded work on this narrow path. Queries
+with Boolean, phrase, field, wildcard, boost, path, quote, or hyphen syntax keep the counted path.
+
+**Measured command:**
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- env RUST_LOG=off \
+    cargo bench -p frankensearch-lexical --profile release \
+      --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH executed locally. Artifact:
+`/data/projects/.rch-targets/frankensearch-cod-a/criterion/doc_ids_topk/high_fanout_{counted,free}/new/estimates.json`.
+
+| Workload | Baseline counted median | New count-free median | Ratio | Status |
+|----------|-------------------------|-----------------------|-------|--------|
+| `doc_ids_topk/high_fanout` | 223.950 us | 204.231 us | **0.912** | KEEP |
+
+**Scope:** this is a local Tantivy-wrapper hot-path win, not an original-comparator BOLD win.
+The required Lucene/Tantivy/Meilisearch-class caveat, N/A original-comparator ratio, and unclaimed
+fallback rows are recorded in `docs/NEGATIVE_EVIDENCE.md`.

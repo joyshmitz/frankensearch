@@ -1457,3 +1457,50 @@ for selective queries (short-keyword / phrase / identifier), counted (full scan)
 natural-language disjunctions that include a corpus-saturating term. Validate on a realistic
 Zipfian corpus *without* a universal term (where `natural_language` may also win) before landing;
 do not re-attempt the unconditional drop.
+
+### 2026-06-27 — count-free simple `search_doc_ids` is a narrow Tantivy-wrapper win, not BOLD dominance (BlackThrush)
+
+**Lever kept with scope limits:** `frankensearch-lexical::TantivyIndex::search_doc_ids` now skips
+Tantivy's discarded `Count` collector only for single plain-token queries. Boolean, phrase, fielded,
+wildcard, boosted, path-like, and hyphenated queries keep the counted execution path so Tantivy query
+semantics and pagination-sensitive collectors stay out of this optimization.
+
+Literal requested command failed because this checkout's Cargo rejects `cargo bench --release`:
+
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- cargo bench --release -p frankensearch-lexical \
+    --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Measured command:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a \
+  rch exec -- env RUST_LOG=off \
+    cargo bench -p frankensearch-lexical --profile release \
+      --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH executed locally (`[RCH] local`; no admissible workers). Criterion artifacts:
+`/data/projects/.rch-targets/frankensearch-cod-a/criterion/doc_ids_topk/*/new/estimates.json`.
+
+Per-crate Tantivy-wrapper ratios:
+
+| Workload | Query shape | counted median | new median | ratio | verdict |
+|----------|-------------|----------------|------------|-------|---------|
+| `high_fanout` | single plain token | 223.950 us | 204.231 us | **0.912** | kept narrow win |
+| `union3` | multi-token boolean fallback | 588.615 us | 652.272 us | 1.108 | not claimed |
+| `natural` | multi-token boolean fallback | 1343.659 us | 1069.351 us | 0.796 | not claimed |
+| `phrase` | phrase fallback | 1869.183 us | 1626.897 us | 0.870 | not claimed |
+
+The ratio above is against the prior counted Tantivy top-k wrapper in frankensearch, used here as
+the local Lucene/Tantivy/Meilisearch-class lexical collector proxy. The non-simple rows are retained
+as negative evidence rather than a claimed win; they stay on the counted path in source, so their
+mixed ratios are treated as Criterion order/cache noise plus guard overhead. This is not a new BOLD
+end-to-end dominance claim over Lucene, Tantivy, or Meilisearch: the accepted original-comparator
+ratio is **N/A** for this isolated wrapper primitive, while full hybrid BOLD gaps remain governed by
+the existing comparator ledger rows.
