@@ -1913,3 +1913,26 @@ unmeasured** because of this — fsfs would not compile to test or bench it.
 `fsqlite-types = "=0.1.2"`, then `cargo update -p fsqlite-types --precise 0.1.2` to rewrite the lock;
 or bump `fsqlite` to a release compatible with `fsqlite-types 0.1.9`. Until then, route perf digs to
 crates outside the `storage`/`fsfs` graph.
+
+**Follow-up (2026-06-27, Cobaltmoth): the naive fix above does NOT work — deeper diagnosis.** Attempted
+the surgical lock fix; it fails because the whole `fsqlite-*` family is split, not just one crate:
+- `cargo update -p fsqlite-types --precise 0.1.2` → **rejected**: `fsqlite-ext-fts5 0.1.9` (storage's
+  optional `fts5`) requires `fsqlite-types ^0.1.9`; and `fsqlite-core 0.1.9` (via
+  `frankensearch-durability`) also requires `^0.1.9`. So **`durability` is in the broken graph too**,
+  not only storage/fsfs.
+- Root cause: the **main `fsqlite` crate's latest is 0.1.2** (old `Text(Arc<…>)` API) while its
+  siblings (`fsqlite-types`, `fsqlite-core`, `fsqlite-ext-fts5`, `fsqlite-vdbe`, `fsqlite-wal`, …)
+  released `0.1.9+` with the breaking `Text(SmallText)` change. There is **no mixed resolution** that
+  compiles: anything pulling a `0.1.9` sibling forces `fsqlite-types 0.1.9`, which `fsqlite 0.1.2`
+  cannot compile against.
+- A **consistent all-`0.1.2` family** IS resolvable —
+  `cargo update fsqlite-types fsqlite-core fsqlite-ext-fts5 fsqlite-ext-rtree fsqlite-ext-icu
+  fsqlite-wal fsqlite-planner fsqlite-pager fsqlite-btree fsqlite-mvcc fsqlite-vdbe --precise 0.1.2` —
+  but it downgrades 12+ crates and **churns transitive deps** (e.g. `json5 1.3.1 → 0.4.1`, removes
+  `iana-time-zone`, adds `pest`/`lru`/`sha1`/`signal-hook`), a wide blast radius that needs a **full
+  workspace build** to validate (per-crate benching can't catch the collateral). Not applied here.
+- **`Cargo.lock` is gitignored** (`.gitignore:5`) → it is regenerated on every clean resolve and a
+  fresh resolve picks the *latest* `fsqlite-types` (already `0.1.12`). So **a committed lock cannot fix
+  this** — the only durable fixes are (a) **Cargo.toml `=` pins** of the entire `fsqlite-*` family to a
+  cohering version (committed, validated workspace-wide), or (b) an upstream **`fsqlite` main-crate
+  0.1.9+ release** matching its siblings. Owner decision; do not lock-surgery this in the shared tree.
