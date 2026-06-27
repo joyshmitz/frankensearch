@@ -623,6 +623,50 @@ semantically honest for hash-only fast tier searches. Next lever should attack t
 
 ## Local hot-path wins
 
+### 2026-06-27 — count-free two-term plain `search_doc_ids` top-k (BlackThrush)
+
+**Lever:** `frankensearch-lexical::TantivyIndex::search_doc_ids` now uses the top-k-only Tantivy
+collector for one or two plain syntax-free terms. The prior single-token gate left the BOLD
+short-keyword shape (`rust ownership`) on the counted collector, even though the API only returns
+ranked IDs and BM25 scores. Fielded, phrase, wildcard, boosted, path-like, hyphenated, and 3+ term
+queries stay on the counted path.
+
+The benchmark harness also avoids `asupersync::test_utils::run_test_with_cx` so the measurement does
+not install trace-level logging while Criterion is timing the hot path.
+
+Literal requested command still fails in this checkout because Cargo rejects `bench --release`:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+RUST_LOG=off \
+  rch exec -- cargo bench --release -p frankensearch-lexical \
+    --bench doc_ids_topk short_keyword_bold -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Measured command (RCH local fallback: `no admissible workers: insufficient_slots=3,hard_preflight=1`):
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+RUST_LOG=error \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+    --bench doc_ids_topk -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Criterion artifacts:
+`/data/projects/.rch-targets/frankensearch-cod-b/criterion/doc_ids_topk/*/new/estimates.json`.
+
+| Workload | Query shape | Counted median | New median | Ratio | Status |
+|----------|-------------|----------------|------------|-------|--------|
+| `doc_ids_topk/short_keyword_bold` | two plain terms, BOLD `rust ownership` mirror | 171.151 us | 30.900 us | **0.181 (~5.54x)** | KEEP |
+
+**Scope:** this attacks the current BOLD short-keyword lexical collector gap but is still a local
+Tantivy-wrapper hot-path win, not a Lucene/Tantivy/Meilisearch original-comparator win. The required
+N/A original-comparator ratio and noisy fallback row are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 ### 2026-06-27 — count-free simple `search_doc_ids` top-k (BlackThrush)
 
 **Lever:** `frankensearch-lexical::TantivyIndex::search_doc_ids` now uses a top-k-only Tantivy

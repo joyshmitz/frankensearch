@@ -301,38 +301,51 @@ pub fn load_doc(searcher: &Searcher, doc_address: DocAddress) -> SearchResult<Ta
         })
 }
 
+fn is_counted_query_syntax(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'"' | b'\''
+            | b'('
+            | b')'
+            | b':'
+            | b'+'
+            | b'-'
+            | b'!'
+            | b'^'
+            | b'['
+            | b']'
+            | b'{'
+            | b'}'
+            | b'*'
+            | b'?'
+            | b'~'
+            | b'\\'
+            | b'/'
+    )
+}
+
 fn use_count_free_top_k(query: &str) -> bool {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return false;
+    let mut term_count = 0usize;
+    let mut in_term = false;
+
+    for byte in query.bytes() {
+        if byte.is_ascii_whitespace() {
+            in_term = false;
+            continue;
+        }
+        if is_counted_query_syntax(byte) {
+            return false;
+        }
+        if !in_term {
+            term_count += 1;
+            if term_count > 2 {
+                return false;
+            }
+            in_term = true;
+        }
     }
 
-    !trimmed.bytes().any(|byte| {
-        matches!(
-            byte,
-            b' ' | b'\t'
-                | b'\n'
-                | b'\r'
-                | b'"'
-                | b'\''
-                | b'('
-                | b')'
-                | b':'
-                | b'+'
-                | b'-'
-                | b'!'
-                | b'^'
-                | b'['
-                | b']'
-                | b'{'
-                | b'}'
-                | b'*'
-                | b'?'
-                | b'~'
-                | b'\\'
-                | b'/'
-        )
-    })
+    term_count > 0
 }
 
 /// Try to build a snippet generator for a query/content field pair.
@@ -1557,13 +1570,15 @@ mod tests {
     }
 
     #[test]
-    fn count_free_doc_ids_only_accepts_single_plain_terms() {
+    fn count_free_doc_ids_only_accepts_one_or_two_plain_terms() {
         assert!(use_count_free_top_k("Rust"));
         assert!(use_count_free_top_k("rust_2026"));
+        assert!(use_count_free_top_k("Rust search"));
+        assert!(use_count_free_top_k("  Rust\tsearch\n"));
 
         for query in [
             "",
-            "Rust search",
+            "Rust search relevance",
             "\"Rust programming\"",
             "title:Rust",
             "Rust*",

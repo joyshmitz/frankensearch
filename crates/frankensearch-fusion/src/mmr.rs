@@ -326,12 +326,16 @@ mod tests {
         let k = k.min(n);
         let lambda = config.clamped_lambda();
         let diversity_weight = 1.0 - lambda;
-        let (mn, mx) = scores[..n].iter().fold(
-            (f64::INFINITY, f64::NEG_INFINITY),
-            |(mn, mx), &s| {
-                if s.is_finite() { (mn.min(s), mx.max(s)) } else { (mn, mx) }
-            },
-        );
+        let (mn, mx) =
+            scores[..n]
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), &s| {
+                    if s.is_finite() {
+                        (mn.min(s), mx.max(s))
+                    } else {
+                        (mn, mx)
+                    }
+                });
         let range = mx - mn;
         let norm_scores: Vec<f64> = scores[..n]
             .iter()
@@ -402,8 +406,7 @@ mod tests {
                 };
                 let embeddings: Vec<Vec<f32>> =
                     (0..n).map(|_| (0..dim).map(|_| next()).collect()).collect();
-                let refs: Vec<&[f32]> =
-                    embeddings.iter().map(std::vec::Vec::as_slice).collect();
+                let refs: Vec<&[f32]> = embeddings.iter().map(std::vec::Vec::as_slice).collect();
                 let scores: Vec<f64> = (0..n).map(|i| (i as f64 * 7.0 % 11.0) / 11.0).collect();
                 for &k in &[1_usize, 5, n] {
                     let got = mmr_rerank(&scores, &refs, k, &config);

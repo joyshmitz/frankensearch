@@ -65,14 +65,21 @@ fn cosine_sim_pre(a: &[f32], b: &[f32], ra: f64, rb: f64) -> f64 {
 }
 
 fn norm_scores(scores: &[f64]) -> Vec<f64> {
-    let (mn, mx) = scores.iter().fold(
-        (f64::INFINITY, f64::NEG_INFINITY),
-        |(mn, mx), &s| (mn.min(s), mx.max(s)),
-    );
+    let (mn, mx) = scores
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(mn, mx), &s| {
+            (mn.min(s), mx.max(s))
+        });
     let range = mx - mn;
     scores
         .iter()
-        .map(|&s| if range < f64::EPSILON { 1.0 } else { (s - mn) / range })
+        .map(|&s| {
+            if range < f64::EPSILON {
+                1.0
+            } else {
+                (s - mn) / range
+            }
+        })
         .collect()
 }
 
@@ -86,7 +93,9 @@ fn mmr_old(scores: &[f64], emb: &[&[f32]], k: usize) -> Vec<usize> {
     let first = ns
         .iter()
         .enumerate()
-        .fold((0, f64::NEG_INFINITY), |(bi, bs), (i, &s)| if s > bs { (i, s) } else { (bi, bs) })
+        .fold((0, f64::NEG_INFINITY), |(bi, bs), (i, &s)| {
+            if s > bs { (i, s) } else { (bi, bs) }
+        })
         .0;
     selected.push(first);
     remaining[first] = false;
@@ -138,7 +147,9 @@ fn mmr_new(scores: &[f64], emb: &[&[f32]], k: usize) -> Vec<usize> {
     let first = ns
         .iter()
         .enumerate()
-        .fold((0, f64::NEG_INFINITY), |(bi, bs), (i, &s)| if s > bs { (i, s) } else { (bi, bs) })
+        .fold((0, f64::NEG_INFINITY), |(bi, bs), (i, &s)| {
+            if s > bs { (i, s) } else { (bi, bs) }
+        })
         .0;
     selected.push(first);
     remaining[first] = false;

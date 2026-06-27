@@ -68,6 +68,9 @@ fn make_doc(i: usize) -> IndexableDocument {
         content.push_str(word);
         content.push(' ');
     }
+    if i % 6 == 0 {
+        content.push_str("rust ownership borrowing lifetimes ");
+    }
     let id = format!("doc-{i:06}");
     content.push_str(&id);
     IndexableDocument {
@@ -82,7 +85,11 @@ fn build_index() -> Arc<TantivyIndex> {
     let index = Arc::new(TantivyIndex::in_memory().expect("create in-memory tantivy index"));
     let docs: Vec<IndexableDocument> = (0..N).map(make_doc).collect();
     let index_to_build = Arc::clone(&index);
-    asupersync::test_utils::run_test_with_cx(move |cx| async move {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build benchmark runtime");
+    runtime.block_on(async move {
+        let cx = asupersync::Cx::for_testing();
         index_to_build
             .index_documents(&cx, &docs)
             .await
@@ -98,6 +105,7 @@ fn bench_doc_ids_topk(c: &mut Criterion) {
 
     let workloads: &[(&str, &str)] = &[
         ("high_fanout", "alpha"),
+        ("short_keyword_bold", "rust ownership"),
         ("union3", "alpha beta gamma"),
         ("natural", "search engine vector ranking relevance"),
         ("phrase", "\"search engine\""),

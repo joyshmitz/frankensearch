@@ -1854,3 +1854,27 @@ scan** in `frankensearch-index/simd.rs` — both actively iterated by BlackThrus
 is absent on the BOLD corpus, so the residual is largely *inherent hybrid overhead*, not a single-primitive
 swap. Route-next for whoever owns `frankensearch-lexical`: a `LexicalSearch` trait method that returns
 id+score **without** materializing the stored doc (the trait only exposes `search()` → full doc today).
+
+### 2026-06-27 — two-term plain count-free top-k is local evidence, not original-comparator dominance (BlackThrush)
+
+**Landed in `docs/PERF_LEDGER.md`:** `search_doc_ids` now extends the count-free top-k collector gate
+from one plain term to one or two plain terms. This targets the current BOLD short-keyword query shape
+(`rust ownership`) without reopening the previously rejected broad count-free path for phrases or
+natural-language disjunctions.
+
+**Measured local Tantivy-wrapper ratio:** `doc_ids_topk/short_keyword_bold` counted median
+171.151 us → count-free median 30.900 us, ratio **0.181** (same-binary A/B, `frankensearch-lexical`,
+RCH local fallback, `--profile release`, `--sample-size 10 --warm-up-time 1 --measurement-time 1`).
+
+**Ratio vs Lucene/Tantivy/Meilisearch original comparator: N/A.** The in-repo BOLD Tantivy-class
+proxy also calls this wrapper's `search_doc_ids`, so this collector choice moves the local proxy and
+frankensearch's lexical candidate source together. It is valid as a local wrapper primitive and as
+gap reduction for frankensearch's own lexical work, but it must not be represented as a standalone
+head-to-head win over Lucene, Tantivy, or Meilisearch.
+
+**Noisy fallback evidence from the same full bench:** fallback rows still execute the counted
+collector for 3+ terms/phrases, but Criterion reported `doc_ids_topk/natural` at 698.216 us counted
+vs 741.499 us through `search_doc_ids` (ratio **1.062**) while `union3` was 0.990 and phrase was
+0.982. Treat the natural row as guard/measurement overhead, not a claimed win; the code deliberately
+keeps 3+ term natural-language queries off the count-free collector because broad disjunctions were
+already rejected in this ledger.

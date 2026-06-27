@@ -318,8 +318,12 @@ mod tests {
             return None;
         }
         let r = GraphRanker::new();
-        let mut ranks: BTreeMap<String, f64> =
-            graph.adjacency().keys().cloned().map(|d| (d, 0.0)).collect();
+        let mut ranks: BTreeMap<String, f64> = graph
+            .adjacency()
+            .keys()
+            .cloned()
+            .map(|d| (d, 0.0))
+            .collect();
         for (d, s) in &personalization {
             ranks.insert(d.clone(), *s);
         }
@@ -338,8 +342,12 @@ mod tests {
         let teleport = r.restart_probability.clamp(0.0, 1.0);
         let walk = 1.0 - teleport;
         for _ in 0..r.max_iterations {
-            let mut next: BTreeMap<String, f64> =
-                graph.adjacency().keys().cloned().map(|d| (d, 0.0)).collect();
+            let mut next: BTreeMap<String, f64> = graph
+                .adjacency()
+                .keys()
+                .cloned()
+                .map(|d| (d, 0.0))
+                .collect();
             for (d, w) in &personalization {
                 *next.entry(d.clone()).or_insert(0.0) += teleport * w;
             }
@@ -402,7 +410,12 @@ mod tests {
                     let j = (next() as usize) % n;
                     if j != i {
                         let w = 0.25 + (next() % 1000) as f32 / 1000.0;
-                        graph.add_edge(format!("d{i:03}"), format!("d{j:03}"), EdgeType::Reference, w);
+                        graph.add_edge(
+                            format!("d{i:03}"),
+                            format!("d{j:03}"),
+                            EdgeType::Reference,
+                            w,
+                        );
                     }
                 }
             }
@@ -421,7 +434,10 @@ mod tests {
 
             let got_ids: Vec<&str> = got.iter().map(|r| r.doc_id.as_str()).collect();
             let want_ids: Vec<&str> = want.iter().map(|r| r.doc_id.as_str()).collect();
-            assert_eq!(got_ids, want_ids, "dense ranking order must match reference");
+            assert_eq!(
+                got_ids, want_ids,
+                "dense ranking order must match reference"
+            );
             for (g, w) in got.iter().zip(want.iter()) {
                 assert!(
                     (f64::from(g.score) - f64::from(w.score)).abs() < 1e-4,
