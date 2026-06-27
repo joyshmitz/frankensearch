@@ -416,6 +416,53 @@ high_fanout/NL gap is bounded by lexical query execution (BM25 over many matches
 none addressable by a single materialization/vector primitive swap; the realistic next probe is the
 RRF/tracing overhead on the mixed stream, or accepting the gap as comparator-inherent.
 
+### 2026-06-27 - removing the outer `rrf_fuse` tracing span is noise (BlackThrush)
+
+**Lever tested and reverted:** the BOLD residual route above pointed at RRF/tracing overhead, and
+`rrf_fuse` had two nested spans: the public `rrf_fuse` wrapper was instrumented, then immediately
+called the already-instrumented `rrf_fuse_with_graph` core. Removing the outer wrapper span should
+have reduced one span enter/exit per hash-hybrid fusion while preserving the core span and all
+ranking behavior. The production hunk was a single `#[instrument]` deletion on `rrf_fuse`.
+
+Current routing context before the probe (`hash_hybrid_tantivy_vector_rrf` vs `tantivy_doc_ids`,
+local BOLD summary `/tmp/frankensearch-bold-current-blackthrush-20260627-2/summary.jsonl`): 10k
+quoted phrase was still 1.459x slower, 100k natural-language 1.151x slower, and `limit_all` 1.140x
+slower against the Lucene/Tantivy/Meilisearch-class proxy.
+
+Literal requested command form remains invalid for this workspace's Cargo:
+
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- cargo bench --release -p frankensearch-fusion \
+    --bench rrf_fuse actual_ -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Measured command:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release \
+    --bench rrf_fuse actual_ -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+The first before/after attempt was not comparable (`before` local fallback, `after` remote `ovh-a`),
+so the bench was tightened temporarily to include an in-binary old-wrapper baseline using the same
+`#[instrument]` shape. That same-binary proof ran locally via RCH fallback and measured:
+
+| Workload | Old outer-span wrapper | New wrapper | new / old | verdict |
+|----------|------------------------|-------------|-----------|---------|
+| `rrf_fuse/actual_old_outer_span_30x30` vs `actual_wrapper_30x30` | 2.2010 us | 2.1935 us | **0.997** | noise / reverted |
+
+`actual_core_30x30` in the same run was 2.1071 us, confirming the core call is a little cheaper,
+but the production wrapper-span deletion itself does not clear the 0.97 keep threshold. Ratio vs
+Lucene/Tantivy/Meilisearch-class original: **none accepted**; this was an isolated challenger RRF
+micro-overhead probe and produced no durable BOLD comparator win. Source and temporary bench arms
+were reverted; only this ledger entry remains.
+
 ### 2026-06-26 — Reusing `QueryClass` inside BOLD hybrid search is mixed/noise (BlackThrush)
 
 **Lever tested and reverted:** compute `QueryClass::classify(query.text)` once in
