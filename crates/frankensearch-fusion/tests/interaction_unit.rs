@@ -175,6 +175,7 @@ fn build_test_index() -> Arc<TwoTierIndex> {
     let mut builder =
         TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create test index");
     builder.set_fast_embedder_id("stub-fast");
+    builder.set_quality_embedder_id("stub-quality");
     // Add 10 documents with varied embeddings.
     for i in 0..10 {
         let mut vec = vec![0.0f32; DIM];
@@ -187,7 +188,7 @@ fn build_test_index() -> Arc<TwoTierIndex> {
             *v /= norm;
         }
         builder
-            .add_fast_record(format!("doc-{i}"), &vec)
+            .add_record(format!("doc-{i}"), &vec, Some(&vec))
             .expect("add record");
     }
     Arc::new(builder.finish().expect("finish test index"))
@@ -445,7 +446,9 @@ fn build_searcher_for_lane(lane: &InteractionLane) -> (TwoTierSearcher, Arc<TwoT
     let index = build_test_index();
     let fast = Arc::new(StubEmbedder::new("fast", DIM));
     let quality = Arc::new(StubEmbedder::new("quality", DIM));
-    let lexical = Arc::new(StubLexical::new(10));
+    // Keep lexical present without letting identifier/short-keyword queries
+    // satisfy k=5 entirely through the intentional lexical short-circuit.
+    let lexical = Arc::new(StubLexical::new(4));
 
     let mut config = TwoTierConfig::default();
 

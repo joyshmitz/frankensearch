@@ -376,11 +376,15 @@ pub fn l2_normalize(vec: &[f32]) -> Vec<f32> {
 pub fn l2_normalize_in_place(vec: &mut [f32]) {
     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
     if !norm_sq.is_finite() || norm_sq < f32::EPSILON {
-        vec.iter_mut().for_each(|x| *x = 0.0);
+        for x in vec.iter_mut() {
+            *x = 0.0;
+        }
         return;
     }
     let inv_norm = 1.0 / norm_sq.sqrt();
-    vec.iter_mut().for_each(|x| *x *= inv_norm);
+    for x in vec.iter_mut() {
+        *x *= inv_norm;
+    }
 }
 
 /// Computes cosine similarity between two vectors.

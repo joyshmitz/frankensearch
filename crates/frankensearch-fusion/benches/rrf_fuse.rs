@@ -29,6 +29,7 @@ fn contribution(rank: usize) -> f64 {
 
 /// Mirrors the shape/size of the real `FusedHitScratch`.
 struct Scratch<'a> {
+    #[allow(dead_code)]
     doc_id: &'a str,
     rrf_score: f64,
     lexical_rank: Option<usize>,

@@ -301,27 +301,28 @@ impl SyncTwoTierSearcher {
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<Vec<VectorHit>> {
         let fast_index = self.index.fast_index();
-        match self.search_params {
-            // Explicit params: honour the exact scan + parallelism configuration.
-            Some(params) => fast_index.search_top_k_with_params(query_vec, fetch, filter, params),
-            // Default: the fast tier is a *reranked candidate generator* (its hits
-            // are re-scored by the quality tier + RRF), so use the 4-bit two-pass
-            // (parallel + cutoff, the fastest lossless primitive — ~1.4× faster than
-            // the int8 two-pass and ~3× faster than the exact f16 scan) instead of the
-            // exact scan. Lossless candidate set → identical fused top-k.
-            None => {
-                // mult=5 keeps the 4-bit candidate set lossless (recall=1.0 validated
+        self.search_params.map_or_else(
+            || {
+                // Default: the fast tier is a *reranked candidate generator* (its hits
+                // are re-scored by the quality tier + RRF), so use the 4-bit two-pass
+                // (parallel + cutoff, the fastest lossless primitive — ~1.4× faster than
+                // the int8 two-pass and ~3× faster than the exact f16 scan) instead of the
+                // exact scan. Lossless candidate set → identical fused top-k.
+                //
+                // mult=3 keeps the 4-bit candidate set lossless (recall=1.0 validated
                 // at 10k–100k); `fetch` is already a candidate over-fetch, so a larger
                 // multiplier is wasteful.
-                const FAST_TIER_MULT: usize = 5;
+                const FAST_TIER_MULT: usize = 3;
                 fast_index.search_top_k_4bit_two_pass_filtered(
                     query_vec,
                     fetch,
                     FAST_TIER_MULT,
                     filter,
                 )
-            }
-        }
+            },
+            // Explicit params: honour the exact scan + parallelism configuration.
+            |params| fast_index.search_top_k_with_params(query_vec, fetch, filter, params),
+        )
     }
 }
 

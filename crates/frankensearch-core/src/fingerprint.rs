@@ -153,7 +153,7 @@ const fn build_vote_table() -> [[i32; 8]; 256] {
     while byte < 256 {
         let mut k = 0;
         while k < 8 {
-            table[byte][k] = 2 * ((byte >> k) & 1) as i32 - 1;
+            table[byte][k] = if ((byte >> k) & 1) == 0 { -1 } else { 1 };
             k += 1;
         }
         byte += 1;

@@ -40,6 +40,73 @@ fn rank_flip_index() -> Arc<InMemoryTwoTierIndex> {
     Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)))
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn deterministic_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed | 1;
+    let mut vector = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        vector.push((state >> 40) as f32 / (1_u64 << 23) as f32 - 1.0);
+    }
+    vector
+}
+
+fn clustered_vector(centroids: &[Vec<f32>], cluster: usize, noise_seed: u64) -> Vec<f32> {
+    const NOISE: f32 = 0.30;
+    let centroid = &centroids[cluster % centroids.len()];
+    let noise = deterministic_vector(centroid.len(), noise_seed);
+    normalize(
+        centroid
+            .iter()
+            .zip(noise)
+            .map(|(base, perturb)| base + NOISE * perturb)
+            .collect(),
+    )
+}
+
+fn clustered_sync_index(
+    doc_count: usize,
+    dim: usize,
+    clusters: usize,
+) -> Arc<InMemoryTwoTierIndex> {
+    let centroids = (0..clusters)
+        .map(|idx| {
+            normalize(deterministic_vector(
+                dim,
+                0xc000_0000 + u64::try_from(idx).expect("cluster index fits u64"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let ids = (0..doc_count)
+        .map(|idx| format!("doc-{idx:06}"))
+        .collect::<Vec<_>>();
+    let fast_vectors = (0..doc_count)
+        .map(|idx| {
+            clustered_vector(
+                &centroids,
+                idx % clusters,
+                u64::try_from(idx).expect("doc index fits u64") + 1,
+            )
+        })
+        .collect::<Vec<_>>();
+    let quality_vectors = (0..doc_count)
+        .map(|idx| {
+            clustered_vector(
+                &centroids,
+                idx % clusters,
+                0xbeef_0000 + u64::try_from(idx).expect("doc index fits u64"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fast =
+        InMemoryVectorIndex::from_vectors(ids.clone(), fast_vectors, dim).expect("fast index");
+    let quality =
+        InMemoryVectorIndex::from_vectors(ids, quality_vectors, dim).expect("quality index");
+    Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)))
+}
+
 #[test]
 fn search_collect_returns_progressive_metrics() {
     let searcher = SyncTwoTierSearcher::new(rank_flip_index(), TwoTierConfig::default());
@@ -63,6 +130,48 @@ fn search_iter_yields_initial_then_refined() {
     assert_eq!(phases.len(), 2);
     assert!(matches!(phases[0], SearchPhase::Initial { .. }));
     assert!(matches!(phases[1], SearchPhase::Refined { .. }));
+}
+
+#[test]
+fn default_fourbit_fetch_matches_explicit_exact_on_clustered_fixture() {
+    const DOCS: usize = 2_048;
+    const DIM: usize = 128;
+    const CLUSTERS: usize = 32;
+    const K: usize = 10;
+
+    let index = clustered_sync_index(DOCS, DIM, CLUSTERS);
+    let centroids = (0..CLUSTERS)
+        .map(|idx| {
+            normalize(deterministic_vector(
+                DIM,
+                0xc000_0000 + u64::try_from(idx).expect("cluster index fits u64"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let approximate = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default());
+    let exact = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+        .with_search_params(SearchParams::default());
+
+    for query_idx in 0..12 {
+        let query = clustered_vector(
+            &centroids,
+            query_idx % CLUSTERS,
+            0xdead_0000 + u64::try_from(query_idx).expect("query index fits u64"),
+        );
+        let (approx_results, _) = approximate
+            .search_collect(&query, K)
+            .expect("approximate search");
+        let (exact_results, _) = exact.search_collect(&query, K).expect("exact search");
+        let approx_ids = approx_results
+            .iter()
+            .map(|result| result.doc_id.as_str())
+            .collect::<Vec<_>>();
+        let exact_ids = exact_results
+            .iter()
+            .map(|result| result.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(approx_ids, exact_ids, "query_idx={query_idx}");
+    }
 }
 
 #[test]
@@ -193,12 +302,13 @@ fn dimension_mismatch_is_reported_by_iterator() {
     let phases = searcher.search_iter(&[], 3).collect::<Vec<_>>();
 
     assert_eq!(phases.len(), 1);
-    match &phases[0] {
-        SearchPhase::RefinementFailed { error, .. } => {
-            assert!(matches!(error, SearchError::DimensionMismatch { .. }));
+    assert!(matches!(
+        &phases[0],
+        SearchPhase::RefinementFailed {
+            error: SearchError::DimensionMismatch { .. },
+            ..
         }
-        other => panic!("expected RefinementFailed, got {other:?}"),
-    }
+    ));
 }
 
 #[test]
