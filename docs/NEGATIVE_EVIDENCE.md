@@ -2170,3 +2170,18 @@ cleanly: probe_4096 **1.4×**, probe_16384 **2.0×**, probe_65536 **2.4×** — 
 `docs/PERF_LEDGER.md`. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (fsfs
 file-scan layer, not a query comparator). Takeaway for the swarm: a cc-pool rustc skew (E0514) is
 fixable in-band via `rch exec -- cargo clean -p <skewed crates>` — no admin needed.
+
+### 2026-06-27 - ParsedQuery NOT-keyword allocation elision is a real local win, but ORIG ratio is N/A (BlackThrush)
+
+**Landed in `docs/PERF_LEDGER.md`:** `ParsedQuery::parse` no longer allocates a three-character
+`String` inside `matches_not_keyword` for each token-boundary check in negation-capable queries.
+The helper now checks the fixed ASCII keyword directly (`N|n`, `O|o`, `T|t`) and preserves the
+same boundary rules. Per-crate A/B through `rch exec` (local fallback, target dir
+`/data/projects/.rch-targets/frankensearch-cod-b`) measured `parsed_query/not_phrase_old` mean
+**746.73 ns** versus `parsed_query/not_phrase_new` mean **668.39 ns**, ratio **0.895 (~1.12x)**.
+
+**Ratio vs Lucene/Tantivy/Meilisearch ORIG: N/A.** This parser is frankensearch-internal query
+preprocessing for `-term` / `NOT "phrase"` exclusions before backend retrieval; the BOLD
+Tantivy/Lucene/Meili-class comparator does not run an equivalent `ParsedQuery` stage. Do not claim
+new ORIG dominance from it. It narrows frankensearch's own negation-query overhead and leaves the
+residual BOLD materialization/parser-routing gaps documented above unchanged.

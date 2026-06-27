@@ -146,6 +146,7 @@ negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-06-25 | frankensearch-core | **`apply_hash_votes` branchless SimHash vote** (`2*b-1` instead of a per-bit `if`/`else` on random hash bits → no ~50% branch mispredict) | `simhash_votes` (~300-token doc) | 18.480 µs | 16.073 µs | **0.870 (~1.15×)** | superseded by table |
 | 2026-06-26 | frankensearch-core | **`apply_hash_votes` table-driven SimHash vote** (8 byte-indexed lookups into a compile-time `[[i32;8];256]` + vectorizable 8-wide slice adds, vs 64 per-bit `shift/mask/mul`) | `simhash_votes` (~300-token doc) | 15.810 µs (branchless) | 10.930 µs | **0.691 (~1.45×) vs branchless, ~0.60× vs original branch** | KEEP (BlackThrush) |
 | 2026-06-26 | frankensearch-core | **`ParsedQuery::parse` no-negation fast path** (queries without `-`/`"`/`\` skip the `Vec<char>` + char-by-char parse; whitespace-normalize via split + `push_str`) | `parsed_query` (plain multi-word query) | 503.4 ns | 109.6 ns | **0.218 (~4.59×)** | KEEP (BlackThrush) |
+| 2026-06-27 | frankensearch-core | **`ParsedQuery::parse` NOT-keyword check: direct ASCII case match instead of allocating a 3-char `String`** on every tested token boundary in the negation-capable parser path. This is the graveyard/data-structure lever in miniature: compile a fixed keyword recognizer to branch checks instead of constructing transient heap data. Behavior is unchanged because the prior `eq_ignore_ascii_case("NOT")` was ASCII-only and only the three-byte keyword is accepted; surrounding whitespace/boundary checks are unchanged. | `parsed_query/not_phrase` (two `NOT "phrase"` exclusions + one `-term`) | 746.73 ns | 668.39 ns | **0.895 (~1.12×)** | KEEP (BlackThrush) |
 | 2026-06-25 | frankensearch-embed | **hash embedder: drop 2 per-embed allocs** (lazy `tokenize` iterator + `l2_normalize_in_place` on the owned accumulator) | `hash_embed_fnv` (~100-word doc, dim384) | 2.318 µs | 1.961 µs | **0.846 (~1.18×)** | KEEP (BlackThrush) |
 | 2026-06-25 | frankensearch-embed | hash embedder alloc elision — JL path (compute-bound, alloc negligible) | `hash_embed_jl` (~100-word doc, dim384) | 100.27 µs | 102.07 µs | 1.018 (neutral) | KEEP (no regression) |
 | 2026-06-27 | frankensearch-embed | **JL projection: interleave 4 independent xorshift token chains** — the JL path was still latency-bound after allocation elision because each token's xorshift recurrence serializes three shift/xor steps per dimension. Buffering four token-chain seeds and advancing them together exposes instruction-level parallelism while preserving the exact scalar output: each dimension accumulator is an exact small integer-valued `f32` sum of +/-1 signs before normalization. Verified by new bit-identical scalar-reference tests across dimensions, seeds, and token-count tails. The requested literal `cargo bench --release` form was tried first and Cargo rejected it; the successful final per-crate run used `--profile release` through `rch exec` with `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a` (local fallback because no RCH worker was admissible). | `hash_embed_jl` (~100-word doc, dim384) | 105.00 µs | 88.945 µs | **0.847 (~1.18×)** | KEEP (BlackThrush) |
@@ -187,6 +188,29 @@ part is just the whitespace-normalized input. The new fast path returns it direc
 (the full parser collects the same whitespace-split words and `join(" ")`s them; 42 parsed_query
 tests green). Measured on a plain multi-word query (`parsed_query`): 503.4 ns → 109.6 ns, **0.218
 (~4.59×)**. Queries that *do* use negation syntax still take the exact char-based path.
+
+**Lever (ParsedQuery NOT-keyword allocation elision):** after the no-negation fast path, queries
+that contain `"` or `-` still use the char parser. Its `matches_not_keyword` helper previously built
+a fresh three-character `String` for every token-boundary check, then called
+`eq_ignore_ascii_case("NOT")`. Replaced that with direct ASCII `N|n`, `O|o`, `T|t` checks while
+leaving the surrounding boundary/whitespace rules unchanged. This preserves behavior exactly for
+the accepted keyword (`eq_ignore_ascii_case` is ASCII-only here) and removes transient allocation
+from negation-capable queries. Measured with the existing per-crate bench extended to include a
+replica of the old helper:
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- cargo bench -p frankensearch-core --profile release \
+    --bench parsed_query -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+The requested literal `cargo bench --release` form was tried first and Cargo rejected it with
+`unexpected argument '--release'`; the successful command used Cargo's release profile spelling
+above. Criterion estimates for `parsed_query/not_phrase`: old mean **746.73 ns**, new mean
+**668.39 ns**, ratio **0.895 (~1.12×)**. Original-comparator ratio is N/A because this is an
+internal query-parser primitive, recorded in `docs/NEGATIVE_EVIDENCE.md`.
 
 ```bash
 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \

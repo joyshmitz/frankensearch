@@ -186,8 +186,10 @@ fn matches_not_keyword(chars: &[char], i: usize) -> bool {
     if i + 3 > len {
         return false;
     }
-    let word: String = chars[i..i + 3].iter().collect();
-    if !word.eq_ignore_ascii_case("NOT") {
+    if !matches!(chars[i], 'N' | 'n')
+        || !matches!(chars[i + 1], 'O' | 'o')
+        || !matches!(chars[i + 2], 'T' | 't')
+    {
         return false;
     }
     // Must be at the start or preceded by whitespace.
