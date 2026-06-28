@@ -2654,3 +2654,50 @@ per-query opportunity — eliminates the `fast_hits`/`quality_hits` doc_id doubl
 Combined with [[bold-comparator-closed]] (comparator closed, limit_all inherent) and the indexing-axis
 clear: **stop re-scanning the query/result-assembly surface — the next real work is the scoped VectorHit
 refactor or a genuinely new subsystem.**
+
+---
+
+## 2026-06-28 — Non-index compute subsystems (MMR cosine, embed L2-normalize, graph_rank) — explored, NOT clean levers (BlackThrush)
+
+After the `frankensearch-index` SIMD vein was capped (all 6 dot kernels + int8/4-bit slab quantizers +
+f16 encode + the file-based FSVI slab write — see PERF_LEDGER, `bce9bc8`→`2a4d333`), I dug the
+**non-index** subsystems the alien-graveyard flagged (`frankensearch-embed` HashEmbedder,
+`frankensearch-fusion` MMR/graph_rank, `frankensearch-rerank`). None yields a clean
+bit-identical, default-path, per-crate lever:
+
+- **MMR `cosine_sim_pre` (`fusion/src/mmr.rs:285`)** — the O(k·n) pairwise-similarity hot kernel. It is
+  ALREADY norm-hoisted (each candidate's L2 norm computed once, not per pair) and running-max optimized
+  (O(k·n) not O(k²·n)) by prior cycles; the residual work is the per-pair dot, which accumulates
+  **sequentially in `f64`** (`dot += f64::from(a[i]) * f64::from(b[i])`). A SIMD/multi-accumulator dot
+  reorders the f64 adds → results differ by ULPs → can **flip the greedy-argmax selection** against the
+  bit-exact reference test (`mmr_rerank_reference`). f64 add is non-associative, so there is no
+  order-preserving SIMD form (unlike the index f16/f32 dots, whose *generic was already a `wide` kernel*
+  I could match lane-for-lane). **AND MMR is opt-in** (`MmrConfig`, not wired into the default/BOLD
+  hybrid). Two strikes: bit-identical-blocked + off-default.
+
+- **`l2_normalize_in_place` (`core/src/traits.rs:376`)** — the 2-pass (Σx² + scale) L2 normalize shared
+  by every embedder, run per embed (index-time docs + each query). The scalar `iter().map(x*x).sum()` IS
+  latency-bound (Rust doesn't fast-math-vectorize f32 reductions → a single serialized accumulator), so a
+  multi-accumulator form is a real ~2-4× **on the kernel**. BUT: (1) `frankensearch-core` has **no SIMD
+  dep** (`wide` absent) — adding SIMD/AVX2-dispatch to the base crate for this is disproportionate; (2)
+  the `l2_normalize_in_place_matches_allocating` test asserts **bit-exact** equality to the allocating
+  variant (small cases pass via the scalar tail, but the contract is bit-exact); (3) reordering Σx²
+  changes embedding values by ULPs that **ripple through f16 quantization + vector scoring** → would need
+  slow **full-workspace** verification (parking risk) to prove no downstream ranking regression — for a
+  modest gain on a kernel the FNV/JL hashing (and, for short queries, the rest of the query) already
+  dominates. Poor risk/reward; left scalar (REVERT-territory per "REVERT ~0-gain").
+
+- **`graph_rank` (`fusion/src/graph_rank.rs`)** — PageRank-style power iteration over a **sparse** HashMap
+  adjacency (`for _ in 0..max_iterations { for src in 0..n { …edges… } }`). Sparse, pointer-chasing,
+  data-dependent — not a SIMD/dense-matrix shape — and opt-in (`GraphRanker`, off-default). No lever.
+
+**Conclusion:** the **clean per-crate compute surface is comprehensively optimized** — index dots +
+quantizers + f16 encode + file-write all AVX2/F16C-dispatched (bit-identical); comparator closed
+([[bold-comparator-closed]]); materialization + async result-assembly mined. The remaining
+float-accumulation kernels are **bit-identical-blocked** (sequential f32/f64, non-associative) and/or
+**off the default path**, so they are not safe 60-min levers. Original-comparator ratio **N/A** for all
+three (own vector/rerank tiers; no Tantivy counterpart). **Next real work is the standing open item:
+re-measure BOLD on a QUIET worker** to confirm the SIMD/build arc's comparator impact (the `frankensearch`
+top-level crate is a cold/slow build — must not re-park it under contention), or accept the current
+(comprehensively optimized) state. Don't re-dig MMR/normalize/graph_rank without lifting the
+bit-identical or off-default constraint first.
