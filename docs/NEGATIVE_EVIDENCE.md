@@ -2466,3 +2466,55 @@ the old in-process converter: `n20` **0.537**, `n60` **0.724**, `n200` **0.406**
 `blend_two_tier` output is already unique). Honesty bar: **ratio vs Lucene/Tantivy/Meilisearch is N/A**
 because this is frankensearch's own pure-vector result-assembly bookkeeping, not a comparator query
 primitive.
+
+### 2026-06-28 — sync `search_collect` phase-clone elision is sub-noise on the end-to-end path (BlackThrush)
+
+**Lever tested and reverted.** `SyncTwoTierSearcher::search_internal` always builds the streaming
+`phases` (`SearchPhase::Initial` + `SearchPhase::Refined`, each cloning the full
+`Vec<ScoredResult>`, plus a `RankChanges` clone into `metrics`), but `search_collect` —
+the hot production/BOLD path (`search_collect → search_collect_with_filter`) — returns only
+`(final_results, metrics)` and **discards `outcome.phases` entirely**. (The async reference
+`searcher.rs` extracts its results *from* the phases via the `on_phase` callback, so it never
+double-builds; the sync path uniquely builds both a phase copy and a separate `final_results`.)
+Hypothesis: thread a `want_phases` flag through `search_internal` so `search_collect` (false) skips
+the discarded phase clones while `search_iter` (true) keeps them. Correctness-neutral: `final_results`
+and `metrics` (incl. `rank_changes`, now *moved* into `metrics` on the collect path instead of cloned)
+are bit-identical; all 6 `sync_searcher` tests GREEN (both the collect and iter paths).
+
+**Measured (same-binary A/B via a `#[doc(hidden)] search_collect_with_phases_baseline` that forces
+`want_phases=true` then discards the phases = old behavior; small two-tier index N=4000/dim=64 so the
+int8 fast-tier scan doesn't swamp the orchestration; per-crate, RCH `hz2`, `--profile release`;
+`baseline` = build+discard phases, `candidate` = skip; medians, two runs):**
+
+| Workload | baseline | candidate | ratio (run 2 / run 1) |
+|----------|----------|-----------|------------------------|
+| `sync_collect_phases/k10`  | 207.03 µs | 193.86 µs | **0.936 / 0.920** |
+| `sync_collect_phases/k64`  | 638.26 µs | 628.86 µs | 0.985 / **1.029 (slower)** |
+| `sync_collect_phases/k256` | 1.1143 ms | 1.1229 ms | **1.008 (slower)** / 1.013 |
+
+Command:
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release \
+  --bench sync_collect_phases -- --sample-size 80 --warm-up-time 2 --measurement-time 4
+```
+
+**Decision: reverted** (source + `Cargo.toml` + bench byte-identical to `main`; only this entry
+remains). The candidate does *strictly less* work (it removes provably-discarded clones), yet the
+k256 arm measured it **slower** (1.008/1.013) and the k64 arm **sign-flipped** between the two runs —
+the saving is below the bench noise floor everywhere except a reproducible-but-CI-overlapping ~6% at
+**k10** (baseline `[194.24, 221.69]` vs candidate `[182.77, 205.18]`). The phase clones are a fixed
+~10–13 µs (≈`2·k` `ScoredResult` clones + one `RankChanges`); end-to-end `search_collect` is dominated
+by the int8 fast-tier scan + quality scoring + `blend_two_tier` + the two *unavoidable* materializers,
+so on a realistic 100k corpus (BOLD top10 ≈645 µs, int8 scan even heavier) that fixed saving is well
+under noise. This mirrors the earlier `doc_id`-cache reject (sync orchestration overhead is a small
+slice at realistic `k`) — the measurable orchestration clones were already captured by the landed
+`rank_map`/`score_map`/`fused_materialize`/`vector_materialize` wins; the residual phase clones don't
+clear the 0.97 keep threshold and the `want_phases` flag + baseline-method complexity isn't justified
+by a measured gain. Original-comparator ratio is **N/A** (internal sync result-assembly).
+
+**Route next:** stop probing the sync result-assembly/orchestration clone-elision vein for end-to-end
+wins — it is mined to the noise floor. Any future attempt here must isolate a *per-function* micro-bench
+(as the landed map/materialize wins did) AND show the function is a non-trivial slice of the real path,
+not just a clean ratio in isolation.
