@@ -121,6 +121,15 @@ faster vector search for free — `wide` then auto-selects its AVX2 paths. This 
 packaging/deploy docs, not the library default. **Do not** add workspace-wide `+avx2` (breaks the
 portable released binary).
 
+> **PARTIALLY OVERTURNED 2026-06-28 (BlackThrush):** the "hand-written runtime-dispatched AVX2 kernel
+> is too large/risky" judgement was wrong for the **integer** dot. `dot_i8_i8` now runtime-dispatches
+> (`is_x86_feature_detected!` + `#[target_feature(enable="avx2")]`, scoped `#[allow(unsafe_code)]`) to a
+> ~25-line hand-written AVX2 kernel, **2.26–2.56×** over the `wide` fallback, **bit-identical** (integer
+> assoc; proven by `avx2_dot_matches_generic`). See `docs/PERF_LEDGER.md` 2026-06-28 "runtime-dispatched
+> AVX2 `dot_i8_i8`". The deploy-flag recommendation still stands as the zero-code option; runtime dispatch
+> is the no-config, safe-on-all-hosts option. **Still open:** 4-bit pass-1 (nibble unpack) and the f16
+> rescore (F16C — but f32 reorder is NOT bit-identical, so it needs a recall gate not exact equality).
+
 ---
 
 ## Residual comparator negatives

@@ -1384,3 +1384,47 @@ Lucene/Tantivy/Meilisearch is **N/A** (MMR diversity rerank has no incumbent cou
 reorder cost per query (scaling with metadata size). Second async-`searcher.rs` clone-elision win in a
 row (after `lexical_metadata_map`), confirming the async hybrid path was materially less mined than the
 sync searcher. Kept bench: `mmr_reorder`.
+
+### 2026-06-28 — runtime-dispatched AVX2 `dot_i8_i8`: 2.26–2.56× over the portable `wide` kernel (BlackThrush)
+
+**Lever (overturns the 2026-06-25 "AVX2 can't be a code lever" finding).** That finding measured a
+global `+avx2` build at ~1.5–2.5× but rejected it as un-landable (a default `+avx2` `SIGILL`s on older
+hosts; `wide` only selects AVX2 via *compile-time* features, so it can't dispatch at runtime) and flagged
+the only code path — a hand-written runtime-dispatched intrinsic kernel — as "large, risky." **That
+route-next is now done.** `dot_i8_i8` (the int8 ADC two-pass **pass-1** kernel — scans every corpus
+vector) now runtime-dispatches via `std::is_x86_feature_detected!("avx2")` to a hand-written AVX2 kernel
+(`#[target_feature(enable = "avx2")]`, 256-bit `vpmaddwd` over sign-extended i16 lanes, two accumulators,
+horizontal sum), falling back to the existing portable `wide` kernel (`dot_i8_i8_generic`) on
+non-x86_64 / pre-AVX2 hosts. `#[allow(unsafe_code)]` scoped to the kernel (crate is `deny(unsafe_code)`;
+mmap already uses the same opt-in).
+
+**Bit-identical:** integer addition is associative, so the 256-bit reduction equals the scalar/`wide`
+sum exactly — new test `simd::tests::avx2_dot_matches_generic` asserts equality across 15 dim shapes
+(0/1/7/8/31/32/33/63/64/65/100/256/384/511/512). Conformance: **364/364** `frankensearch-index` lib
+tests GREEN run serially (incl. all int8 two-pass + recall gates). *(Note: the WAL/compaction tests are
+pre-existing flakes under parallel `cargo test` — shared-tempdir interference, failing set varies
+run-to-run, none SIMD-related; all pass with `--test-threads=1`.)*
+
+**Measured (per-crate, AVX2 worker `hz2`; sum of 10 000 i8 dots; `i8_dot` = runtime dispatch → AVX2,
+`i8_dot_generic` = portable `wide`-SIMD fallback):**
+
+| Workload | i8_dot_generic (`wide`) | i8_dot (AVX2) | Ratio | Status |
+|----------|-------------------------|---------------|-------|--------|
+| `dot/dim256/i8` (10k vectors) | 617.17 µs | 240.91 µs | **0.390 (~2.56×)** | KEEP |
+| `dot/dim384/i8` (10k vectors) | 766.66 µs | 339.42 µs | **0.443 (~2.26×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench dot_product -- "dot/dim(256|384)/i8_dot"
+```
+
+**Scope:** the int8 pass-1 vector scan is frankensearch's own vector tier (no Lucene/Tantivy
+counterpart), so the original-comparator ratio is **N/A** — but this ~2.3–2.6× directly cuts the int8
+two-pass scan cost on every AVX2 host (most modern x86 + the rch workers), with a safe identical-result
+fallback elsewhere. First **explicit-SIMD-intrinsic** win in the tree (prior dot wins were portable
+`wide` + ILP). Route-next: the same runtime-dispatch pattern applies to the 4-bit pass-1
+(`dot_4bit_prepared`, the wired default — harder: nibble unpack) and the f16 pass-2 rescore
+(`dot_product_f16_*` via F16C — but f32 accumulation reorders, so NOT bit-identical there). Kept bench
+arm: `i8_dot_generic`.

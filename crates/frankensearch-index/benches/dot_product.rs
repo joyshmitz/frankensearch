@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    InMemoryVectorIndex, dot_4bit_prepared, dot_i8_i8, dot_product_f16_bytes_f32,
+    InMemoryVectorIndex, dot_4bit_prepared, dot_i8_i8, dot_i8_i8_generic, dot_product_f16_bytes_f32,
     dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, prepare_4bit_query,
 };
 use half::f16;
@@ -389,6 +389,18 @@ fn bench_dot(c: &mut Criterion) {
                 let mut acc = 0_i64;
                 for v in &corpus.stored_i8 {
                     acc += i64::from(dot_i8_i8(black_box(v), black_box(qi8)));
+                }
+                black_box(acc)
+            });
+        });
+        // Runtime-AVX2 dispatch (`i8_dot` above) vs the portable `wide`-SIMD kernel
+        // it falls back to (`dot_i8_i8_generic`). Bit-identical; measures the AVX2
+        // win on AVX2 hosts.
+        group.bench_function(BenchmarkId::new("i8_dot_generic", n), |b| {
+            b.iter(|| {
+                let mut acc = 0_i64;
+                for v in &corpus.stored_i8 {
+                    acc += i64::from(dot_i8_i8_generic(black_box(v), black_box(qi8)));
                 }
                 black_box(acc)
             });

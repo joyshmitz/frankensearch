@@ -304,8 +304,84 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 /// Lengths are assumed equal (caller-guaranteed in the scan); a short tail is
 /// handled scalar. Returns the raw integer dot; the caller applies the dequant
 /// scale.
+///
+/// Dispatches to a hand-written AVX2 kernel at runtime when the CPU supports it:
+/// the portable `wide` path only reaches AVX2 with a global `+avx2` build, which
+/// the published binary can't assume (it would `SIGILL` on older hosts). Because
+/// the dot is integer and integer addition is associative, the 256-bit `madd`
+/// reduction is **bit-identical** to the generic kernel (asserted by
+/// `avx2_dot_matches_generic`).
 #[must_use]
 pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { dot_i8_i8_avx2(stored, query) };
+        }
+    }
+    dot_i8_i8_generic(stored, query)
+}
+
+/// Hand-written AVX2 i8·i8 dot: 256-bit `vpmaddwd` over sign-extended i16 lanes,
+/// two accumulators, horizontal-summed; scalar tail.
+///
+/// # Safety
+/// The caller must ensure the `avx2` target feature is available; the runtime
+/// dispatch in [`dot_i8_i8`] guarantees this.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
+    use core::arch::x86_64::{
+        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
+        _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+    };
+    let n = stored.len().min(query.len());
+    // SAFETY: avx2 is guaranteed by the caller / `dot_i8_i8` dispatch; every load
+    // is `i + 32 <= n`-bounded; the scalar tail covers `n % 32`.
+    unsafe {
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut i = 0_usize;
+        while i + 32 <= n {
+            let s = _mm256_loadu_si256(stored.as_ptr().add(i).cast::<__m256i>());
+            let q = _mm256_loadu_si256(query.as_ptr().add(i).cast::<__m256i>());
+            // Sign-extend low/high 16 i8 lanes to i16, then pairwise multiply-add.
+            let s_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(s));
+            let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q));
+            let s_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(s));
+            let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(q));
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(s_lo, q_lo));
+            acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(s_hi, q_hi));
+            i += 32;
+        }
+        let acc = _mm256_add_epi32(acc0, acc1);
+        // Horizontal sum of the 8 i32 lanes.
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256::<1>(acc),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+        let mut result = _mm_cvtsi128_si32(sum32);
+        while i < n {
+            result += i32::from(stored[i]) * i32::from(query[i]);
+            i += 1;
+        }
+        result
+    }
+}
+
+/// Portable (`wide`-SIMD) i8·i8 dot — the AVX2-dispatch fallback and the path on
+/// non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) so the `dot_product` bench
+/// can A/B it against the AVX2 kernel.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     // Four independent `i32x8` accumulators break the single-accumulator integer-add
     // dependency chain. The i8→i16 decode is a cheap sign-extend (unlike the
     // decode-bound f16 dot, where extra accumulators regress — see
@@ -484,6 +560,36 @@ const fn ensure_same_len(expected: usize, found: usize) -> SearchResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The runtime AVX2 i8·i8 dot must be bit-identical to the portable `wide`
+    /// kernel across every dim shape (full vectors, sub-32 tails, odd lengths) —
+    /// integer addition is associative, so the 256-bit reduction equals the
+    /// scalar/`wide` sum exactly. Skips when the host lacks AVX2 (dispatch falls
+    /// back to the generic kernel there).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_dot_matches_generic() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next_i8 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_possible_truncation)]
+            ((state >> 24) as i8)
+        };
+        for &dim in &[0_usize, 1, 7, 8, 31, 32, 33, 63, 64, 65, 100, 256, 384, 511, 512] {
+            let s: Vec<i8> = (0..dim).map(|_| next_i8()).collect();
+            let q: Vec<i8> = (0..dim).map(|_| next_i8()).collect();
+            let generic = dot_i8_i8_generic(&s, &q);
+            // SAFETY: avx2 verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { dot_i8_i8_avx2(&s, &q) };
+            assert_eq!(generic, avx2, "dim={dim}");
+        }
+    }
 
     /// Exhaustive proof that the SIMD f16->f32 widen matches the scalar reference
     /// (`f16::to_f32`) for **every** one of the 65 536 f16 bit patterns. Finite,
