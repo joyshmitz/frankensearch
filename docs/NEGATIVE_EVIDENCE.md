@@ -2433,3 +2433,13 @@ rank-change telemetry (initial-vs-refined promotion/demotion counts) is a franke
 observability stage with no comparator counterpart; this trims frankensearch's own per-query overhead,
 it is not a head-to-head primitive win. (Counters the earlier "surface is saturated" notes: a genuine
 default-path clone-elision lever remained in the sync result-assembly path.)
+
+### 2026-06-28 — sync vector score-map borrow is a real ~2.4–2.8× local win, original-comparator ratio N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`:** the no-lexical sync branch's per-query `fast_scores`/`quality_scores`
+maps now key on `&str` borrowed from the candidate hits instead of cloned `String` (they were only
+`.get()`-looked-up by `&str`). **~2.37–2.77×** on the two-map build (bit-identical; 6 sync_searcher tests
+GREEN). Honesty bar: **ratio vs Lucene/Tantivy/Meilisearch is N/A** — this is frankensearch's own
+pure-vector result-assembly bookkeeping (no lexical comparator counterpart), and it's the **no-lexical**
+path (the BOLD lexical lane uses `rrf_fuse`, unaffected). Confirms the orchestration/result-assembly
+clone-elision vein is productive (2 wins now: `rank_map` `f8f645e`, this).

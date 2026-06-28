@@ -1070,3 +1070,38 @@ N = result count (initial + refined, partial overlap). Medians:
 **Scope:** a per-query-overhead win on the default sync hybrid path (rank-change telemetry), narrowing
 frankensearch's own per-query cost vs the incumbent. Original-comparator ratio is **N/A** (rank-change
 metrics have no comparator counterpart); caveat in `docs/NEGATIVE_EVIDENCE.md`.
+
+### 2026-06-28 — sync vector path: borrow doc_ids in fast/quality score maps (Cobaltmoth)
+
+**Lever:** the no-lexical branch of `SyncTwoTierSearcher` builds two per-query `HashMap`s
+(`fast_scores`, `quality_scores`) from the fast + quality candidate hits, then passes them to
+`vector_hits_to_scored_results`, which only ever **`.get()`-looks-them-up by `&str`**. The maps were
+keyed on **owned `String`** (`hit.doc_id.clone()` per candidate) for no reason. Now they key on
+`&str` borrowed straight from `fast_hits`/`quality_hits` (which outlive the call), dropping a
+per-candidate `String` clone in both map builds; the dedup `HashSet` in `vector_hits_to_scored_results`
+also gets a `with_capacity` hint.
+
+**Bit-identical:** `HashMap<&str, f32>` with the same entries, looked up by the same
+`hit.doc_id.as_str()` keys → identical `fast_score`/`quality_score` resolution and identical
+`ScoredResult`s. All 6 `sync_searcher` lib tests GREEN.
+
+**Measured command (per-crate, in-process A/B; `clone` = `HashMap<String>`, `borrow` = `HashMap<&str>`):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-fusion --bench score_map
+```
+
+N = fast + quality candidate count. Medians:
+
+| Workload | clone (old) | borrow (new) | Ratio | Status |
+|----------|-------------|--------------|-------|--------|
+| `score_map/n30` | 2883 ns | 1215 ns | **0.422 (~2.37×)** | KEEP |
+| `score_map/n90` | 9572 ns | 3457 ns | **0.361 (~2.77×)** | KEEP |
+| `score_map/n300` | 31859 ns | 11491 ns | **0.361 (~2.77×)** | KEEP |
+
+**Scope:** a per-query-overhead win on the **no-lexical (pure-vector) sync hybrid path** (the lexical
+branch uses `rrf_fuse`, unaffected). Pure frankensearch result-assembly compute; original-comparator
+ratio is **N/A** (caveat in `docs/NEGATIVE_EVIDENCE.md`). Second clone-elision in the sync
+result-assembly vein (after `rank_map`, `f8f645e`).

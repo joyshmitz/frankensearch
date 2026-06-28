@@ -238,14 +238,17 @@ impl SyncTwoTierSearcher {
 
         let refined_results = lexical_hits.as_ref().map_or_else(
             || {
+                // Borrow doc_ids straight from fast_hits/quality_hits (which
+                // outlive this scope) — these maps are only `.get()` looked up by
+                // `&str`, so keying on `&str` drops a per-candidate `String` clone.
                 let fast_scores = fast_hits
                     .iter()
-                    .map(|hit| (hit.doc_id.clone(), hit.score))
-                    .collect::<HashMap<_, _>>();
+                    .map(|hit| (hit.doc_id.as_str(), hit.score))
+                    .collect::<HashMap<&str, f32>>();
                 let quality_scores = quality_hits
                     .iter()
-                    .map(|hit| (hit.doc_id.clone(), hit.score))
-                    .collect::<HashMap<_, _>>();
+                    .map(|hit| (hit.doc_id.as_str(), hit.score))
+                    .collect::<HashMap<&str, f32>>();
                 vector_hits_to_scored_results(
                     &blended,
                     k,
@@ -420,10 +423,10 @@ fn vector_hits_to_scored_results(
     hits: &[VectorHit],
     k: usize,
     source: ScoreSource,
-    fast_scores: Option<&HashMap<String, f32>>,
-    quality_scores: Option<&HashMap<String, f32>>,
+    fast_scores: Option<&HashMap<&str, f32>>,
+    quality_scores: Option<&HashMap<&str, f32>>,
 ) -> Vec<ScoredResult> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(hits.len());
     hits.iter()
         .filter(|hit| seen.insert(hit.doc_id.as_str()))
         .take(k)
