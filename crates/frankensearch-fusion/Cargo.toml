@@ -59,5 +59,9 @@ harness = false
 name = "score_map"
 harness = false
 
+[[bench]]
+name = "fused_materialize"
+harness = false
+
 [lints]
 workspace = true

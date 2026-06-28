@@ -2443,3 +2443,16 @@ GREEN). Honesty bar: **ratio vs Lucene/Tantivy/Meilisearch is N/A** — this is 
 pure-vector result-assembly bookkeeping (no lexical comparator counterpart), and it's the **no-lexical**
 path (the BOLD lexical lane uses `rrf_fuse`, unaffected). Confirms the orchestration/result-assembly
 clone-elision vein is productive (2 wins now: `rank_map` `f8f645e`, this).
+
+### 2026-06-28 — sync lexical fused-materialize move is a real ~7.8–21.5× local win, original-comparator ratio N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`:** `fused_hits_to_scored_results` now takes the `rrf_fuse` result by
+value and **moves** each `doc_id` into the `ScoredResult` instead of cloning it (the `FusedHit`s are a
+fresh temporary). **~7.76–21.55×** on the materialization (bit-identical; 6 sync_searcher tests GREEN) —
+larger than the map wins because it drops both the per-result clone (N allocs) and the temporary's
+string drops (N frees). Honesty bar: **ratio vs Lucene/Tantivy/Meilisearch is N/A** — this is
+frankensearch's own hybrid result-assembly, the absolute time is one small query step, and the headline
+ratio is on that step in isolation (not end-to-end). Third clone-elision win in the sync result-assembly
+vein (`rank_map` `f8f645e`, `score_map` `dc86170`, this). Note the **async `searcher.rs` already** uses
+borrow-keyed score maps + clone-free rank maps — that path was the optimized reference; these three wins
+brought the sync searcher to parity.

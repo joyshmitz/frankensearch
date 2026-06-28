@@ -150,7 +150,7 @@ impl SyncTwoTierSearcher {
             || vector_hits_to_scored_results(&fast_hits, k, ScoreSource::SemanticFast, None, None),
             |lexical| {
                 fused_hits_to_scored_results(
-                    &rrf_fuse(
+                    rrf_fuse(
                         lexical,
                         &fast_hits,
                         k,
@@ -259,7 +259,7 @@ impl SyncTwoTierSearcher {
             },
             |lexical| {
                 fused_hits_to_scored_results(
-                    &rrf_fuse(
+                    rrf_fuse(
                         lexical,
                         &blended,
                         k,
@@ -401,11 +401,14 @@ fn filter_lexical_hits(
         .collect()
 }
 
-fn fused_hits_to_scored_results(hits: &[FusedHit], k: usize) -> Vec<ScoredResult> {
-    hits.iter()
+fn fused_hits_to_scored_results(hits: Vec<FusedHit>, k: usize) -> Vec<ScoredResult> {
+    // Take the `rrf_fuse` result by value and move each `doc_id` into the
+    // `ScoredResult` instead of cloning it; the `FusedHit`s are a fresh
+    // temporary here, so there is no need to keep them alive.
+    hits.into_iter()
         .take(k)
         .map(|hit| ScoredResult {
-            doc_id: hit.doc_id.clone(),
+            doc_id: hit.doc_id,
             score: saturating_f64_to_f32(hit.rrf_score),
             source: ScoreSource::Hybrid,
             index: hit.semantic_index,

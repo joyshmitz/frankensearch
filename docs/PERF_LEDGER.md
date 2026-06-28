@@ -1105,3 +1105,40 @@ N = fast + quality candidate count. Medians:
 branch uses `rrf_fuse`, unaffected). Pure frankensearch result-assembly compute; original-comparator
 ratio is **N/A** (caveat in `docs/NEGATIVE_EVIDENCE.md`). Second clone-elision in the sync
 result-assembly vein (after `rank_map`, `f8f645e`).
+
+### 2026-06-28 — sync lexical path: move doc_ids out of the rrf_fuse result (Cobaltmoth)
+
+**Lever:** the lexical (hybrid/BOLD) branch of `SyncTwoTierSearcher` calls
+`fused_hits_to_scored_results(&rrf_fuse(...), k)` for both the initial and refined phases.
+`fused_hits_to_scored_results` took `&[FusedHit]` and **cloned** each `doc_id` into the `ScoredResult`,
+even though the `rrf_fuse` result is a **fresh temporary** dropped immediately after. Changed it to take
+`Vec<FusedHit>` by value and `into_iter().map(|hit| ScoredResult { doc_id: hit.doc_id, .. })` —
+**moving** each `doc_id` (a pointer copy) instead of cloning. Both call sites now pass the `rrf_fuse(...)`
+result by value.
+
+**Bit-identical:** the moved `String` is the exact value that was previously cloned; every other field is
+copied as before, so the `ScoredResult`s are unchanged. All 6 `sync_searcher` lib tests GREEN.
+
+**Measured command (per-crate; in-process A/B with `iter_batched` so both arms pay the same input-clone
+setup; `clone` = `&[FusedHit]`+clone, `move` = `Vec<FusedHit>`+move):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-fusion --bench fused_materialize
+```
+
+N = fused candidate count (k = N, materialize all). Medians:
+
+| Workload | clone (old) | move (new) | Ratio | Status |
+|----------|-------------|------------|-------|--------|
+| `fused_materialize/n20` | 482 ns | 62 ns | **0.129 (~7.76×)** | KEEP |
+| `fused_materialize/n60` | 1969 ns | 107 ns | **0.054 (~18.41×)** | KEEP |
+| `fused_materialize/n200` | 5970 ns | 277 ns | **0.046 (~21.55×)** | KEEP |
+
+The ratio is large because the move eliminates **both** the per-result `String` clone (N allocs) **and**
+the subsequent drop of the temporary's `doc_id`s (N frees); the new path is allocation-free. Absolute
+times are small — this materialization is one step of the query — but it is bit-identical and on the
+**lexical/BOLD hybrid sync path** (both phases). Original-comparator ratio is **N/A** (frankensearch
+result-assembly); third clone-elision in the sync vein (after `rank_map` `f8f645e`, `score_map`
+`dc86170`).
