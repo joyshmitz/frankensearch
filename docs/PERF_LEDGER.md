@@ -1274,4 +1274,44 @@ document the same way, so this makes frankensearch's `search_doc_ids` **6.32× c
 path the comparator pays** on the materialization-dominated large-limit (`limit_all`) row — directly
 closing that documented gap — while top10 is an unchanged tie. On-disk **reopened** indexes currently
 fall back to docstore until the ord-table is rebuilt on open (correct, just unaccelerated); that rebuild
-is the one remaining follow-up.
+is the one remaining follow-up. **(DONE — see the 2026-06-28 sidecar entry below.)**
+
+### 2026-06-28 — on-`open` ord-table restore (sidecar): reopened on-disk indexes realize the fast path, 2.29× at k1000 (BlackThrush)
+
+**Lever (the "one remaining follow-up" above, now SHIPPED).** A reopened on-disk `TantivyIndex` started
+with an empty `ord_table` and fell back to docstore id-materialization. Now `commit` persists the table
+to an `ord_table.json` sidecar (atomic temp-file + rename, best-effort: write errors are logged and the
+in-memory fast path is unaffected), and `from_index` loads it on `open`. A stale-short sidecar (e.g. a
+persist that failed on the last commit) is repaired with an **O(segments)** guard — `Column::max_value`
+(columnar metadata, no per-doc scan) gives the highest existing ordinal, the table is padded to cover
+it so the next assigned ordinal can't collide, and `collect_id_hits` treats an empty padded slot as a
+miss → docstore fallback (safe even if a real `doc_id` is `""`). Pre-`ord` on-disk indexes have no
+sidecar / no `ord` field → unchanged docstore path.
+
+**Conformance:** 82/82 lexical tests GREEN, incl. a new `reopen_on_disk_restores_fast_id_materialization`
+(create on-disk → index → commit → drop → `open` → asserts the sidecar exists and the reopened index
+returns **byte-identical ranked `doc_id`s**) and the existing `reopen_preserves_documents`. The A/B
+bench also asserts reopened fast == docstore ids at k=1000 before timing.
+
+**Measured (per-crate same-binary A/B, on-disk index N=20k built→committed→dropped→reopened, query
+"document"; `docstore` = forced `searcher.doc`, `fast` = sidecar-restored ord path; medians):**
+
+| Workload | docstore | fast | Ratio | Status |
+|----------|----------|------|-------|--------|
+| `reopen_id_materialize/k10`   | 136.96 µs | 130.37 µs | **0.952** (tie — no regression) | KEEP |
+| `reopen_id_materialize/k1000` | 741.83 µs | 323.24 µs | **0.436 (~2.29×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc RUST_LOG=off \
+  cargo bench -p frankensearch-lexical --profile release \
+  --bench reopen_id_materialize -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+**Scope vs comparator:** the docstore baseline is exactly what a Lucene/Tantivy-class incumbent pays to
+read ids from the stored document, so a **reopened** frankensearch index now materializes ids ~2.29×
+cheaper than that incumbent on the large-fetch row (the in-memory path's 6.32× is higher because that
+bench's 100k high-fanout docstore arm is heavier). The fast path is now reached on **both** fresh and
+reopened on-disk indexes. Sidecar is re-serialized in full per `commit` (fine for batch-commit; a
+delta/binary format is a future optimization for commit-per-doc streaming workloads). Kept bench:
+`reopen_id_materialize`.

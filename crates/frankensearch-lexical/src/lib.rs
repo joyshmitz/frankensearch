@@ -614,15 +614,90 @@ impl TantivyIndex {
         let searcher = reader.searcher();
         let doc_count = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
 
+        // Restore the ordinal→doc_id table for a reopened on-disk index from its
+        // sidecar so id materialization keeps the fast path instead of falling
+        // back to the docstore. The sidecar is best-effort: if it is absent,
+        // corrupt, or stale the table is left short and those ordinals resolve
+        // via the docstore (correct, just unaccelerated).
+        let mut ord_table = match (path.as_deref(), fields.ord) {
+            (Some(dir), Some(_)) => Self::load_ord_table_sidecar(dir).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if fields.ord.is_some() {
+            // Guard against a stale-short sidecar (e.g. a persist that failed on
+            // the last commit): `Column::max_value` is O(1) columnar metadata, so
+            // padding the table to cover the highest existing ordinal keeps the
+            // next assigned ordinal (`ord_table.len()`) collision-free, and the
+            // padded empty slots fall back to the docstore on read.
+            let mut max_ord = 0u64;
+            let mut saw_ord = false;
+            for sr in searcher.segment_readers() {
+                if let Ok(col) = sr.fast_fields().u64("ord")
+                    && col.num_docs() > 0
+                {
+                    max_ord = max_ord.max(col.max_value());
+                    saw_ord = true;
+                }
+            }
+            if saw_ord {
+                let needed = usize::try_from(max_ord).unwrap_or(usize::MAX).saturating_add(1);
+                if ord_table.len() < needed {
+                    ord_table.resize(needed, String::new());
+                }
+            }
+        }
+
         Ok(Self {
             index,
             fields,
             reader,
             writer: Mutex::new(writer),
             doc_count: AtomicUsize::new(doc_count),
-            ord_table: RwLock::new(Vec::new()),
+            ord_table: RwLock::new(ord_table),
             path,
         })
+    }
+
+    /// Load the persisted `ordinal → doc_id` table sidecar (`ord_table.json`)
+    /// from an on-disk index directory. Returns `None` on any error or absence
+    /// so the caller can fall back to docstore materialization.
+    fn load_ord_table_sidecar(dir: &Path) -> Option<Vec<String>> {
+        let file = std::fs::File::open(dir.join("ord_table.json")).ok()?;
+        serde_json::from_reader(std::io::BufReader::new(file)).ok()
+    }
+
+    /// Persist the `ordinal → doc_id` table to the index directory sidecar so a
+    /// later `open` can restore the fast id-materialization path. Best-effort:
+    /// errors are logged and swallowed (the in-memory fast path is unaffected;
+    /// only a future reopen would fall back to the docstore). Written atomically
+    /// via a temp file + rename. No-op for in-memory indexes / pre-`ord` schemas.
+    fn persist_ord_table(&self) {
+        let Some(dir) = self.path.as_ref() else { return };
+        if self.fields.ord.is_none() {
+            return;
+        }
+        let Ok(table) = self.ord_table.read() else {
+            return;
+        };
+        let tmp = dir.join("ord_table.json.tmp");
+        let final_path = dir.join("ord_table.json");
+        let write = std::fs::File::create(&tmp).and_then(|file| {
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer(&mut writer, &*table)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            std::io::Write::flush(&mut writer)
+        });
+        match write {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp, &final_path) {
+                    debug!(error = %e, "ord_table sidecar rename failed; reopen will use docstore");
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "ord_table sidecar write failed; reopen will use docstore");
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
     }
 
     /// Convert an `IndexableDocument` to a Tantivy document.
@@ -965,6 +1040,9 @@ impl TantivyIndex {
                     .and_then(|c| c.first(addr.doc_id))
                     .and_then(|ord| usize::try_from(ord).ok())
                     .and_then(|ord| table.get(ord))
+                    // Empty = a padded/stale slot (sidecar didn't cover this
+                    // ordinal) → fall back to the docstore for the real id.
+                    .filter(|id| !id.is_empty())
                     .cloned()
             }) {
                 Some(id) => id,
@@ -1154,6 +1232,9 @@ impl LexicalSearch for TantivyIndex {
             let actual = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
             self.doc_count.store(actual, Ordering::Relaxed);
 
+            // Persist the ordinal→doc_id table so a reopen keeps the fast path.
+            self.persist_ord_table();
+
             debug!(doc_count = actual, "tantivy commit completed");
             Ok(())
         })
@@ -1236,6 +1317,55 @@ mod tests {
     fn open_nonexistent_returns_error() {
         let result = TantivyIndex::open(Path::new("/nonexistent/tantivy_index_xyz"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reopen_on_disk_restores_fast_id_materialization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let docs: Vec<IndexableDocument> = (0..20)
+                .map(|i| {
+                    IndexableDocument::new(
+                        format!("doc-{i:03}"),
+                        format!("alpha beta document number {i} searchable content"),
+                    )
+                })
+                .collect();
+
+            let ids_before = {
+                let idx = TantivyIndex::create(&path).expect("create");
+                idx.index_documents(&cx, &docs).await.expect("index");
+                idx.commit(&cx).await.expect("commit");
+                idx.search_doc_ids(&cx, "document", 20)
+                    .expect("search")
+                    .into_iter()
+                    .map(|h| h.doc_id)
+                    .collect::<Vec<_>>()
+            }; // original index (and its writer lock) dropped here
+
+            // Commit persisted the ordinal→doc_id sidecar.
+            assert!(
+                path.join("ord_table.json").exists(),
+                "ord_table sidecar should be written on commit"
+            );
+
+            // Reopen: the sidecar restores the fast materialization path, and
+            // results must be byte-identical to the pre-close ranking.
+            let reopened = TantivyIndex::open(&path).expect("open");
+            let ids_after = reopened
+                .search_doc_ids(&cx, "document", 20)
+                .expect("search")
+                .into_iter()
+                .map(|h| h.doc_id)
+                .collect::<Vec<_>>();
+
+            assert!(!ids_after.is_empty(), "reopened index should return hits");
+            assert_eq!(
+                ids_before, ids_after,
+                "reopened index must return identical ranked doc_ids"
+            );
+        });
     }
 
     // ─── Indexing tests ─────────────────────────────────────────────────

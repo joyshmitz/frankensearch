@@ -34,5 +34,9 @@ harness = false
 name = "search_doc_ids_materialize"
 harness = false
 
+[[bench]]
+name = "reopen_id_materialize"
+harness = false
+
 [lints]
 workspace = true
