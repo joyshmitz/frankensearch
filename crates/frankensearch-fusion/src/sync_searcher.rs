@@ -15,7 +15,7 @@ use frankensearch_core::{
 };
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
-use crate::blend::{blend_two_tier, build_borrowed_rank_map, compute_rank_changes_with_maps};
+use crate::blend::{blend_two_tier, compute_rank_changes_with_maps};
 use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -455,30 +455,23 @@ fn compute_rank_changes_for_scored(
     initial: &[ScoredResult],
     refined: &[ScoredResult],
 ) -> RankChanges {
-    let initial_hits = initial
-        .iter()
-        .enumerate()
-        .map(|(idx, hit)| VectorHit {
-            index: hit
-                .index
-                .unwrap_or_else(|| u32::try_from(idx).unwrap_or(u32::MAX)),
-            score: hit.score,
-            doc_id: hit.doc_id.clone(),
-        })
-        .collect::<Vec<_>>();
-    let refined_hits = refined
-        .iter()
-        .enumerate()
-        .map(|(idx, hit)| VectorHit {
-            index: hit
-                .index
-                .unwrap_or_else(|| u32::try_from(idx).unwrap_or(u32::MAX)),
-            score: hit.score,
-            doc_id: hit.doc_id.clone(),
-        })
-        .collect::<Vec<_>>();
-    let initial_map = build_borrowed_rank_map(&initial_hits);
-    let refined_map = build_borrowed_rank_map(&refined_hits);
+    // Build the doc_id → rank maps directly from the `ScoredResult` slices.
+    // `build_borrowed_rank_map` only ever reads `doc_id` (rank = enumerate index;
+    // it ignores `VectorHit::index`/`score`), so the previous code allocated two
+    // throwaway `Vec<VectorHit>` and cloned every `doc_id` into them per query for
+    // nothing. Borrowing `doc_id.as_str()` straight from the input drops those two
+    // Vec allocations + 2·N `String` clones on the sync hybrid path. First-occurrence
+    // wins (`entry().or_insert`), identical to `build_borrowed_rank_map`, so the
+    // resulting maps — and the `RankChanges` — are unchanged.
+    fn rank_map(hits: &[ScoredResult]) -> HashMap<&str, usize> {
+        let mut ranks = HashMap::with_capacity(hits.len());
+        for (rank, hit) in hits.iter().enumerate() {
+            ranks.entry(hit.doc_id.as_str()).or_insert(rank);
+        }
+        ranks
+    }
+    let initial_map = rank_map(initial);
+    let refined_map = rank_map(refined);
     compute_rank_changes_with_maps(&initial_map, &refined_map)
 }
 

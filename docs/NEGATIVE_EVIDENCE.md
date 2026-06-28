@@ -2421,3 +2421,15 @@ path is prepared-statement SQL + serde serialization (inherent). Combined with t
 copy-stub finding (entry above) and the `storage`/`pipeline.rs` scan (orchestration, no byte loops),
 the **fsqlite-reopened storage + durability indexing surface is fully mapped as lever-free** for clean
 per-crate compute wins. Original-comparator ratio is **N/A** (internal indexing/write path).
+
+### 2026-06-28 — sync rank-change clone-elision is a real ~2× local win, original-comparator ratio N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`:** `compute_rank_changes_for_scored` (every sync hybrid query) no
+longer clones every `doc_id` into two throwaway `Vec<VectorHit>` to build its rank maps — it borrows
+`doc_id.as_str()` straight from the `ScoredResult` slices (`build_borrowed_rank_map` only ever read
+`doc_id`). **~1.98–2.26×** on the rank-map build (bit-identical `RankChanges`; 6 sync_searcher tests
+GREEN). Recorded here to hold the honesty bar: the **ratio vs Lucene/Tantivy/Meilisearch is N/A** —
+rank-change telemetry (initial-vs-refined promotion/demotion counts) is a frankensearch-only
+observability stage with no comparator counterpart; this trims frankensearch's own per-query overhead,
+it is not a head-to-head primitive win. (Counters the earlier "surface is saturated" notes: a genuine
+default-path clone-elision lever remained in the sync result-assembly path.)

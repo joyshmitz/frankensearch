@@ -1035,3 +1035,38 @@ path. Realistic code/symbol text. Medians:
 Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** because those incumbents do not
 run frankensearch's fsfs code-structure sidecar tokenizer. The 256-byte row is deliberately recorded
 as a tie in `docs/NEGATIVE_EVIDENCE.md`; do not claim a small-string win from this lever.
+
+### 2026-06-28 — sync rank-change telemetry: drop redundant VectorHit clones (Cobaltmoth)
+
+**Lever:** `compute_rank_changes_for_scored` runs **unconditionally on every sync hybrid query**
+(`SyncTwoTierSearcher`, for `metrics.rank_changes`) — pure frankensearch per-query overhead the
+Tantivy/Lucene/Meilisearch incumbents never pay. It built **two throwaway `Vec<VectorHit>`** by
+**cloning every `doc_id`** out of the initial + refined `ScoredResult` slices, solely to feed
+`build_borrowed_rank_map` — which only reads `doc_id` (rank = enumerate index; it ignores
+`VectorHit::index`/`score`). Now the doc_id→rank maps are built **directly** from the `ScoredResult`
+slices (`entry(hit.doc_id.as_str()).or_insert(rank)`), dropping 2 `Vec` allocations + 2·N `String`
+clones per query.
+
+**Bit-identical:** same first-occurrence-wins `HashMap<&str, usize>` content as `build_borrowed_rank_map`
+(the discarded `index`/`score` never affected the rank map), so `compute_rank_changes_with_maps` returns
+the identical `RankChanges`. All 6 `sync_searcher` lib tests GREEN.
+
+**Measured command (per-crate, in-process A/B; `clone` = build via `Vec<VectorHit>`, `borrow` = direct):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-fusion --bench rank_map
+```
+
+N = result count (initial + refined, partial overlap). Medians:
+
+| Workload | clone (old) | borrow (new) | Ratio | Status |
+|----------|-------------|--------------|-------|--------|
+| `rank_map/n20` | 1543 ns | 778 ns | **0.504 (~1.98×)** | KEEP |
+| `rank_map/n60` | 5233 ns | 2316 ns | **0.443 (~2.26×)** | KEEP |
+| `rank_map/n200` | 17517 ns | 7835 ns | **0.447 (~2.24×)** | KEEP |
+
+**Scope:** a per-query-overhead win on the default sync hybrid path (rank-change telemetry), narrowing
+frankensearch's own per-query cost vs the incumbent. Original-comparator ratio is **N/A** (rank-change
+metrics have no comparator counterpart); caveat in `docs/NEGATIVE_EVIDENCE.md`.

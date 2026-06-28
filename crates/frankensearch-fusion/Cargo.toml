@@ -51,5 +51,9 @@ harness = false
 name = "graph_rank"
 harness = false
 
+[[bench]]
+name = "rank_map"
+harness = false
+
 [lints]
 workspace = true
