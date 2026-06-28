@@ -2701,3 +2701,50 @@ re-measure BOLD on a QUIET worker** to confirm the SIMD/build arc's comparator i
 top-level crate is a cold/slow build — must not re-park it under contention), or accept the current
 (comprehensively optimized) state. Don't re-dig MMR/normalize/graph_rank without lifting the
 bit-identical or off-default constraint first.
+
+---
+
+## 2026-06-28 — BOLD re-measured: comparator NOT fully closed — two real gaps remain (exact_identifier@100k, limit_all) (BlackThrush)
+
+**Did the open item.** Built + ran `bold_verify_tantivy_class` (`-p frankensearch --features lexical`)
+**locally + niced** (the 5 contending procs were OTHER projects on the shared rch workers, so a local
+nice'd build dodged the stuck-queue that killed prior attempts). Fast criterion settings from the bench's
+own documented command (`--sample-size 10 --warm-up-time 1 --measurement-time 3`). Emit:
+`FRANKENSEARCH_BOLD_VERIFY_EMIT=1`. **ratio = frankensearch_p50 / incumbent(Tantivy-class)_p50; >1 means
+frankensearch SLOWER.** corpus hashes `2e78365a…`(10k) / `13f1b015…`(100k).
+
+**frankensearch hybrid (`hash_hybrid_tantivy_vector_rrf`) p50 ratios:**
+
+| query_class | 10k | 100k | reliability |
+|-------------|-----|------|-------------|
+| exact_identifier | 0.927 ✅ | **1.425 ❌** | 100k reliable (619→882 µs) |
+| short_keyword | 1.200 ❓ | 1.020 ≈ | 10k NOISE (30 µs workload, p99 4.2× = spike) |
+| quoted_phrase | 0.940 ✅ | **0.728 ✅** | reliable |
+| natural_language | 0.654 ✅ | **0.792 ✅** | reliable |
+| high_fanout | 1.049 ≈ | **0.789 ✅** | 100k reliable |
+| zero_hit | 0.950 ✅ | 0.853 ✅ | tiny (~20-30 µs) |
+| limit_all | **1.390 ❌** | (pending) | reliable (1376→1913 µs) |
+
+**Conclusion — CORRECTS the stale [[bold-comparator-closed]] "parity-or-better on every row" claim.**
+frankensearch hybrid is **faster than the Tantivy-class incumbent on most classes** (quoted_phrase 0.73,
+natural_language 0.79, high_fanout 0.79 @100k; exact_identifier 0.93 @10k) — but **two real gaps survive
+the entire SIMD/build arc**:
+
+1. **`exact_identifier` @ 100k: 1.425×** (incumbent 619 µs → frankensearch 882 µs). The canonical
+   "non-short-circuit row pays vector+RRF on top of lexical" gap: for a unique-token match the lexical
+   tier alone nails it, but the hybrid still scans the vector tier + fuses RRF (~+263 µs of pure
+   overhead). Notably the **`hash_lexical_guard` variant is EVEN SLOWER here (1.895×, 619→1173 µs)** — so
+   the existing short-circuit guard is NOT helping for exact_identifier@100k (it adds cost without
+   skipping). **This is the next dig target** (algorithmic, not a SIMD kernel): make the lexical guard
+   actually short-circuit (skip vector+RRF) on a high-confidence exact lexical match, or find why the
+   guard path is slow at 100k.
+2. **`limit_all`: ~1.39×** (materialization-bound; "inherent" per prior notes — per-hit full stored-doc
+   materialization the incumbent doesn't pay the same way).
+
+**Strategic takeaway:** the SIMD/build wins this session (dots, quantizers, f16 encode, FSVI write) are
+real **build/load-time** wins but did NOT move these **query-time** gaps — because the gaps are
+**algorithmic** (redundant vector+RRF work on lexical-sufficient queries) and **materialization**, not
+dot-kernel-bound. The next real lever is the **exact_identifier short-circuit** (the lexical-guard path),
+not more compute-kernel SIMD. Caveat: fast settings → small-workload ratios (short_keyword, zero_hit)
+are noise; trust the ≥600 µs workloads. (100k `limit_all` row was still benchmarking at write time;
+consistent with the 10k 1.39×.)
