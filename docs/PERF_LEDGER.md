@@ -1711,3 +1711,39 @@ memory-bandwidth-bound), but it caps the build/load SIMD vein: dot kernels, int8
 and now the f16 encode are all AVX2/F16C-dispatched. The lesson (re-recorded): when a decode/convert
 kernel shows a modest SIMD ratio, check whether per-element `push` is the bottleneck — bulk-store into
 spare capacity. Kept bench: `quantize_slab` (now also covers `encode_f32_to_f16`).
+
+### 2026-06-28 — file-based FSVI slab write: F16C encode + batched write_all = 6.4–7.3× (BOLD build path) (BlackThrush)
+
+**Lever (the FILE-based persist, the build path BOLD itself uses).** `write_vector_slab` (the
+`VectorIndex::finish`/persist encoder, reached by `VectorIndex::create` + `write_record` — i.e. how the
+**BOLD fixture builds its index** and how every on-disk FSVI is written) did per-element
+`writer.write_all(&f16::from_f32(v).to_le_bytes())` — ~38M two-byte `write_all` calls for a 100k×384
+index, each preceded by a software `from_f32`. Now: F16C-encode each record's f32→f16 via
+`simd::encode_f32_to_f16_extend` into a reused scratch `Vec<f16>`, then ONE `write_all` of the whole
+record's bytes (`#[cfg(target_endian="little")]` casts the `repr(transparent)` f16 slab to `&[u8]`; a
+BE fallback keeps the per-element `to_le_bytes`). Kills BOTH the per-element `write_all` overhead AND the
+scalar `from_f32`.
+
+**Bit-identical:** the on-disk slab is byte-for-byte identical (LE f16) — the `write_f16_slab` bench
+asserts the two arms emit equal bytes, and the existing FSVI write→read round-trip tests (which decode
+the slab back) stay GREEN. Conformance: **372/372** index lib tests GREEN serial.
+
+**Measured (per-crate; dim 384 f32 records → LE f16 slab into an in-memory writer; `per_element` = old
+per-value `from_f32`+`write_all`, `batched` = F16C encode + one `write_all`/record):**
+
+| Workload | per_element | batched | Ratio | Status |
+|----------|-------------|---------|-------|--------|
+| `write_f16_slab/10000` (10k×384) | 8.75 ms | 1.20 ms | **0.137 (~7.3×)** | KEEP |
+| `write_f16_slab/50000` (50k×384) | 48.06 ms | 7.52 ms | **0.156 (~6.4×)** | KEEP |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-index --profile release --bench quantize_slab -- write_f16_slab
+```
+
+**Scope:** original-comparator ratio **N/A** (own FSVI storage write). Unlike the in-memory `from_vectors`
+encode (`9f2356a`), this is the **file/persist** build — the path the BOLD comparator fixture itself
+pays, plus every persisted/compacted index. Bigger than the encode-alone ratio because batching also
+removes ~38M→count `write_all` calls. The remaining per-element `f16::from_f32` sites (WAL compaction
+`lib.rs` ~1095, WAL lookup ~1363) are low-traffic compaction/lookup paths — left as-is. Kept bench:
+`quantize_slab` (now also covers `write_f16_slab`).

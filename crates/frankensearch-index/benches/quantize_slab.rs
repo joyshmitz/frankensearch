@@ -14,6 +14,7 @@
 //! ```
 
 use std::hint::black_box;
+use std::io::Write;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
@@ -111,6 +112,64 @@ fn bench(c: &mut Criterion) {
         });
     }
     ge.finish();
+
+    // write_vector_slab F16 arm: per-element `from_f32` + 2-byte `write_all`
+    // (`per_element`) vs the F16C encode + one `write_all` per record (`batched`).
+    let mut gw = c.benchmark_group("write_f16_slab");
+    gw.sample_size(20);
+    for &n in &[10_000_usize, 50_000] {
+        let flat: Vec<f32> = make_slab(n).iter().map(|h| h.to_f32()).collect();
+        // Verify both arms emit identical bytes.
+        let mut old_bytes = Vec::new();
+        for chunk in flat.chunks_exact(DIM) {
+            for &v in chunk {
+                old_bytes.extend_from_slice(&f16::from_f32(v).to_le_bytes());
+            }
+        }
+        let mut new_bytes = Vec::new();
+        let mut scratch: Vec<f16> = Vec::with_capacity(DIM);
+        for chunk in flat.chunks_exact(DIM) {
+            scratch.clear();
+            encode_f32_to_f16_extend(chunk, &mut scratch);
+            for &h in &scratch {
+                new_bytes.extend_from_slice(&h.to_le_bytes());
+            }
+        }
+        assert_eq!(old_bytes, new_bytes, "write arms must emit identical bytes");
+
+        gw.bench_function(BenchmarkId::new("per_element", n), |bn| {
+            let mut out = Vec::with_capacity(flat.len() * 2);
+            bn.iter(|| {
+                out.clear();
+                for chunk in flat.chunks_exact(DIM) {
+                    for &v in chunk {
+                        out.write_all(&f16::from_f32(v).to_le_bytes()).unwrap();
+                    }
+                }
+                black_box(&out);
+            });
+        });
+        gw.bench_function(BenchmarkId::new("batched", n), |bn| {
+            let mut out = Vec::with_capacity(flat.len() * 2);
+            let mut scratch: Vec<f16> = Vec::with_capacity(DIM);
+            bn.iter(|| {
+                out.clear();
+                for chunk in flat.chunks_exact(DIM) {
+                    scratch.clear();
+                    encode_f32_to_f16_extend(chunk, &mut scratch);
+                    // SAFETY: little-endian target; `half::f16` is `repr(transparent)`
+                    // over `u16`, so native bytes equal the LE on-disk encoding.
+                    #[allow(unsafe_code)]
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), scratch.len() * 2)
+                    };
+                    out.write_all(bytes).unwrap();
+                }
+                black_box(&out);
+            });
+        });
+    }
+    gw.finish();
 }
 
 criterion_group!(benches, bench);

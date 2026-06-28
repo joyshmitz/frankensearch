@@ -1993,9 +1993,31 @@ fn write_vector_slab<W: Write>(
 ) -> SearchResult<()> {
     match quantization {
         Quantization::F16 => {
+            // Encode each record's f32 → f16 via the F16C-dispatched kernel and
+            // write the whole record's bytes in one `write_all`, instead of a
+            // per-element `from_f32` + 2-byte `write_all` (which was ~38M tiny
+            // writes for a 100k×384 index). The on-disk format is LE f16.
+            let dim = records.first().map_or(0, |r| r.embedding.len());
+            let mut scratch: Vec<f16> = Vec::with_capacity(dim);
             for record in records {
-                for value in &record.embedding {
-                    writer.write_all(&f16::from_f32(*value).to_le_bytes())?;
+                scratch.clear();
+                crate::simd::encode_f32_to_f16_extend(&record.embedding, &mut scratch);
+                #[cfg(target_endian = "little")]
+                {
+                    // SAFETY: `half::f16` is `repr(transparent)` over `u16`; on a
+                    // little-endian target the native bytes equal `to_le_bytes`, so
+                    // the slab is byte-identical to the per-element path.
+                    #[allow(unsafe_code)]
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), scratch.len() * 2)
+                    };
+                    writer.write_all(bytes)?;
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for &h in &scratch {
+                        writer.write_all(&h.to_le_bytes())?;
+                    }
                 }
             }
         }
