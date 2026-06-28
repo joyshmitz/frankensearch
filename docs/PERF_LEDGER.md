@@ -998,3 +998,38 @@ probe (~80% printable ASCII). Medians (gain scales with probe size — vectoriza
 file-ingest compute. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (this is the
 file-system scan layer, not a query-time comparator primitive); recorded in `docs/NEGATIVE_EVIDENCE.md`.
 (fsfs is buildable again — the earlier fsqlite blocker was a stale lock; see `4c816a7`.)
+
+### 2026-06-27 — fsfs `count_lexical_tokens` ASCII byte fast path (Cobaltmoth)
+
+**Lever:** `count_lexical_tokens` (`frankensearch-fsfs::lexical_pipeline`) runs **per chunk per
+document** at index time (`LexicalChunkPolicy::chunk_text` calls it for every chunk) and is
+allocation-free — so its cost *is* the `for ch in text.chars()` UTF-8-decode loop + per-char
+`is_token_char`. For **ASCII** text (the common case for code/docs) it now takes a byte-loop fast path
+(`for &b in text.as_bytes()` + `is_token_byte`), skipping the `chars()` decoder; non-ASCII text falls
+back to the Unicode `chars()` path unchanged.
+
+**Bit-identical:** for an ASCII byte `b`, `is_token_byte(b) == is_token_char(b as char)`
+(`char::is_alphanumeric` == `u8::is_ascii_alphanumeric` on ASCII; same `_-./:` punctuation set), and the
+token-boundary state machine is unchanged. Proven by `count_lexical_tokens_ascii_fastpath_matches_chars`
+(ASCII + non-ASCII: café/CJK/emoji → fallback, compared to a pure `chars()` reference) +
+`count_lexical_tokens_matches_tokenize_lexical` + all 25 `lexical_pipeline` tests GREEN.
+
+**Measured command (per-crate, in-process A/B; `chars` = decode loop, `bytes` = ASCII fast path):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,AGENT_NAME AGENT_NAME=Cobaltmoth \
+  rch exec -- cargo bench -p frankensearch-fsfs --bench lexical_count
+```
+
+Realistic ASCII code/doc chunk. Medians:
+
+| Chunk size | chars (old) | bytes (new) | Ratio | Status |
+|------------|-------------|-------------|-------|--------|
+| `lexical_count/ascii_1024` | 2675 ns | 1054 ns | **0.394 (~2.54×)** | KEEP |
+| `lexical_count/ascii_4096` | 6235 ns | 3264 ns | **0.524 (~1.91×)** | KEEP |
+| `lexical_count/ascii_16384` | 21386 ns | 11581 ns | **0.542 (~1.85×)** | KEEP |
+
+**Scope:** a local indexing-throughput win on per-chunk token counting (fsfs lexical pipeline) — pure
+frankensearch file-ingest compute. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A**
+(file-system scan layer, not a query comparator); caveat in `docs/NEGATIVE_EVIDENCE.md`.

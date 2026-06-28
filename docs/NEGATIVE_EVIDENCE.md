@@ -2307,3 +2307,12 @@ preprocessing for `-term` / `NOT "phrase"` exclusions before backend retrieval; 
 Tantivy/Lucene/Meili-class comparator does not run an equivalent `ParsedQuery` stage. Do not claim
 new ORIG dominance from it. It narrows frankensearch's own negation-query overhead and leaves the
 residual BOLD materialization/parser-routing gaps documented above unchanged.
+
+### 2026-06-27 — fsfs `count_lexical_tokens` ASCII byte fast path: original-comparator ratio N/A (Cobaltmoth)
+
+**Landed in `docs/PERF_LEDGER.md`** (~1.85–2.54× on per-chunk token counting; bit-identical, 25
+`lexical_pipeline` tests GREEN). Recorded here for the honesty bar: **ratio vs Lucene/Tantivy/Meili is
+N/A** — `count_lexical_tokens` is frankensearch's own fsfs file-ingest/chunking metadata pass (counts
+tokens per chunk at index time); a lexical comparator runs no equivalent stage. It speeds frankensearch
+indexing throughput, not a head-to-head query primitive. Second clean win in the fsfs surface that the
+fsqlite stale-lock unblock reopened (after the `SniffFeatures` SIMD histogram, `08469f5`).

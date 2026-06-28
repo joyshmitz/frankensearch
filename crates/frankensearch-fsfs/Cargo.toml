@@ -76,5 +76,9 @@ criterion = { workspace = true }
 name = "sniff_features"
 harness = false
 
+[[bench]]
+name = "lexical_count"
+harness = false
+
 [lints]
 workspace = true

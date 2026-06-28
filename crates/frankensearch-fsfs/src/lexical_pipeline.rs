@@ -144,8 +144,29 @@ impl LexicalChunkPolicy {
 }
 
 /// Count tokens in text without allocating strings.
+///
+/// ASCII text (the common case for code/docs) takes a byte-loop fast path that
+/// skips `chars()` UTF-8 decoding. Bit-identical to the `chars()` path: for an
+/// ASCII byte `b`, `is_token_byte(b) == is_token_char(b as char)`
+/// (`char::is_alphanumeric` matches `u8::is_ascii_alphanumeric` on ASCII, and the
+/// punctuation set is the same). Non-ASCII text falls back to the Unicode-aware
+/// `chars()` path unchanged.
 #[must_use]
 pub fn count_lexical_tokens(text: &str) -> usize {
+    if text.is_ascii() {
+        let mut count = 0;
+        let mut in_token = false;
+        for &b in text.as_bytes() {
+            if is_token_byte(b) {
+                in_token = true;
+            } else if in_token {
+                in_token = false;
+                count += 1;
+            }
+        }
+        return count + usize::from(in_token);
+    }
+
     let mut count = 0;
     let mut in_token = false;
     for ch in text.chars() {
@@ -207,6 +228,13 @@ pub fn tokenize_lexical(text: &str) -> Vec<LexicalToken> {
 #[must_use]
 fn is_token_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':')
+}
+
+/// ASCII-only `is_token_char` for the `count_lexical_tokens` byte fast path.
+/// Equals `is_token_char(b as char)` for every ASCII byte `b`.
+#[inline]
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':')
 }
 
 fn floor_char_boundary(text: &str, index: usize) -> usize {
@@ -762,6 +790,45 @@ mod tests {
             let count = super::count_lexical_tokens(input);
             let tokens = tokenize_lexical(input);
             assert_eq!(count, tokens.len(), "Mismatch for input: {input:?}");
+        }
+    }
+
+    /// The ASCII byte fast path must match the Unicode `chars()` reference for
+    /// every input — including non-ASCII (which must take the fallback).
+    #[test]
+    fn count_lexical_tokens_ascii_fastpath_matches_chars() {
+        // Reference: the pure chars() state machine (no fast path).
+        fn reference(text: &str) -> usize {
+            let mut count = 0;
+            let mut in_token = false;
+            for ch in text.chars() {
+                if super::is_token_char(ch) {
+                    in_token = true;
+                } else if in_token {
+                    in_token = false;
+                    count += 1;
+                }
+            }
+            count + usize::from(in_token)
+        }
+        let inputs = [
+            "",
+            "a",
+            "hello world",
+            "src/main.rs -> fn run_fast(x: i32) { return x; }",
+            "   !@# $%^ &*() ",
+            "trailing token",
+            "leading.token/sep:colon-dash_underscore",
+            "café résumé naïve",       // non-ASCII letters → fallback
+            "日本語 トークン test123", // mixed CJK + ASCII → fallback
+            "emoji 🚀 then word",
+        ];
+        for input in inputs {
+            assert_eq!(
+                super::count_lexical_tokens(input),
+                reference(input),
+                "fast path diverged from chars() reference for {input:?}"
+            );
         }
     }
 
