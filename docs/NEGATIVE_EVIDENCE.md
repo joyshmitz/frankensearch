@@ -2748,3 +2748,46 @@ dot-kernel-bound. The next real lever is the **exact_identifier short-circuit** 
 not more compute-kernel SIMD. Caveat: fast settings → small-workload ratios (short_keyword, zero_hit)
 are noise; trust the ≥600 µs workloads. (The bench only runs `limit_all` at 10k — there is no 100k
 `limit_all` row. Full run completed; final summary = 26 rows.)
+
+> **⚠️ SELF-CORRECTION (same day, second run — supersedes the `exact_identifier@100k` claim above):
+> that "1.425× gap" was 12-SAMPLE NOISE, not real.** See the next entry.
+
+---
+
+## 2026-06-28 — BOLD re-run #2: the exact_identifier@100k "gap" was NOISE — comparator is top-k PARITY, limit_all the lone gap (BlackThrush)
+
+Immediately suspicious that the `exact_identifier@100k` "gap" (run #1: hybrid 1.425×, **guard 1.895×**)
+was noise — because `hash_lexical_guard` runs the *identical* `fixture.lexical.search_doc_ids(...)` as the
+incumbent, so it CANNOT be 1.9× slower except by measurement variance. The bench's summary uses the custom
+`measure_latency_us` with only **12 samples @100k / 25 @10k** (NOT criterion's `--sample-size`), so per-row
+ratios carry ±40% noise. Code analysis confirms the mechanism: `exact_identifier = "doc 000042"`, and
+"doc" appears in every doc → lexical returns ≥`limit` hits → `bold_verify_lexical_short_circuit` fires
+(class ∈ {Identifier,…}, `lexical_count ≥ limit`) → **the hybrid SHORT-CIRCUITS and skips the vector tier
+entirely** → it should ≈ the incumbent.
+
+**Re-ran the cached binary (run #2, low contention). Result — the gap vanished:**
+
+| query_class | run #1 ratio | run #2 ratio | verdict |
+|-------------|--------------|--------------|---------|
+| exact_identifier @100k (hybrid) | 1.425 | **1.003** | NOISE — parity |
+| exact_identifier @100k (guard) | 1.895 | **1.002** | NOISE — parity |
+| quoted_phrase @100k | 0.728 | 1.004 | NOISE — parity (run#1 "win" was also noise) |
+| natural_language @100k | 0.792 | 1.002 | NOISE — parity |
+| high_fanout @100k | 0.789 | 0.992 | parity |
+| **limit_all @10k** | **1.390** | **1.429** | **REAL — consistent across runs** |
+
+The tell: frankensearch hybrid was *consistent* run-to-run (exact_id@100k 882→884 µs); the **incumbent**
+swung 619→881 µs — i.e. run #1's incumbent measured anomalously LOW, inflating every run-#1 ratio (both
+the apparent gaps AND the apparent wins). **Run #2 shows frankensearch hybrid at PARITY (±6%) on EVERY
+top-10 class at both 10k and 100k**, faster on zero_hit + natural_language@10k. **The only gap consistent
+across both runs is `limit_all` (~1.4×), which is inherent** (returns everything → full vector-tier scan,
+can't prune; RRF full-sort of ~2·N; the incumbent does lexical-only) — no bit-identical removal, per
+[[bold-comparator-closed]].
+
+**Conclusion (re-affirms the ORIGINAL "comparator closed" finding; my own run-#1 "exact_identifier gap"
+was a phantom):** the BOLD comparator is **top-k parity across all classes + corpus sizes**; `limit_all`
+~1.4× is the lone, inherent gap. **There is NO exact_identifier short-circuit lever to dig** (the
+short-circuit already fires and works). **Lesson:** at the fast settings (12/25 samples) a SINGLE run's
+per-row ratios are ±40% noise — never conclude a gap (or a win) from one run; require run-to-run
+consistency, and treat the *incumbent's* variance as the dominant noise source. Don't re-chase
+exact_identifier or the 100k "wins"; `limit_all` remains the only real (inherent) row.
