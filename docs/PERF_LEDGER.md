@@ -1350,3 +1350,37 @@ size and candidate-overfetch (`candidates − k` avoided `Value` clones); it is 
 for metadata-bearing workloads on the production async path. Unlike the sync phase-clone elision
 (2026-06-28, sub-noise — `ScoredResult` struct copies), this elides heap-allocated `serde_json::Value`
 clones, hence the large ratio. Kept bench: `lexical_metadata_map`.
+
+### 2026-06-28 — async MMR rerank reorder moves the pool instead of cloning it twice (25–75× on the reorder step) (BlackThrush)
+
+**Lever.** When MMR diversity reranking is enabled, the async `TwoTierSearcher` reorders the top `pool`
+fused results by the `mmr_rerank` permutation. The old code cloned the pool into a `head` vec, then
+**cloned each element again** while emitting it in MMR order — `2×pool` full `ScoredResult` clones, each
+carrying a `doc_id` `String` + a metadata `Value`. Since `order` is a **distinct permutation of
+`0..pool`** (mmr_rerank never repeats a candidate — guarded by `mmr::tests::no_duplicates_in_output`),
+the head can be reordered by **moving** each element into its MMR slot: `split_off` the tail, collect the
+head into `Vec<Option<ScoredResult>>`, and `Option::take` each index in `order` (the tail is moved
+through untouched). **Zero `ScoredResult` clones.** Bit-identical output (only a permutation; payloads
+unchanged). 817 fusion lib + 32 `mmr` tests GREEN.
+
+**Measured (per-crate isolated A/B, pool=30 + tail=10; `clone_reorder` = old 2×pool clone,
+`move_reorder` = new split_off + `Option::take`; medians):**
+
+| Workload | clone_reorder | move_reorder | Ratio | Status |
+|----------|---------------|--------------|-------|--------|
+| `mmr_reorder/small` (1-field metadata) | 13.842 µs | 542.62 ns | **0.039 (~25.5×)** | KEEP |
+| `mmr_reorder/large` (nested ~10-field)  | 69.682 µs | 925.89 ns | **0.013 (~75.3×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc RUST_LOG=off \
+  cargo bench -p frankensearch-fusion --profile release \
+  --bench mmr_reorder -- --sample-size 60 --warm-up-time 1 --measurement-time 2
+```
+
+**Scope:** frankensearch's own async result-assembly; original-comparator ratio vs
+Lucene/Tantivy/Meilisearch is **N/A** (MMR diversity rerank has no incumbent counterpart, and it is a
+**conditional** path — only runs when `mmr_config.enabled`). When active it saves the full ~14–70 µs
+reorder cost per query (scaling with metadata size). Second async-`searcher.rs` clone-elision win in a
+row (after `lexical_metadata_map`), confirming the async hybrid path was materially less mined than the
+sync searcher. Kept bench: `mmr_reorder`.

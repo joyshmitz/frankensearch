@@ -42,6 +42,10 @@ name = "lexical_metadata_map"
 harness = false
 
 [[bench]]
+name = "mmr_reorder"
+harness = false
+
+[[bench]]
 name = "rrf_fuse"
 harness = false
 

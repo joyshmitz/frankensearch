@@ -1641,14 +1641,22 @@ impl TwoTierSearcher {
                         .collect::<Vec<_>>();
                     let order = mmr_rerank(&scores, &refs, pool, &self.mmr_config);
                     if order.len() == pool {
-                        let head = results.iter().take(pool).cloned().collect::<Vec<_>>();
-                        let mut reranked = Vec::with_capacity(results.len());
+                        // `order` is a distinct permutation of `0..pool` (mmr_rerank
+                        // never repeats a candidate), so reorder the head by MOVING
+                        // each element into its MMR position instead of cloning the
+                        // pool twice (once into `head`, once per `order` index). Take
+                        // each slot at most once; the tail is moved through untouched.
+                        let split = pool.min(results.len());
+                        let tail = results.split_off(split);
+                        let mut slots: Vec<Option<ScoredResult>> =
+                            results.into_iter().map(Some).collect();
+                        let mut reranked = Vec::with_capacity(slots.len() + tail.len());
                         for idx in order {
-                            if let Some(item) = head.get(idx) {
-                                reranked.push(item.clone());
+                            if let Some(item) = slots.get_mut(idx).and_then(Option::take) {
+                                reranked.push(item);
                             }
                         }
-                        reranked.extend(results.into_iter().skip(pool));
+                        reranked.extend(tail);
                         results = reranked;
                     }
                 }
