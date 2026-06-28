@@ -1508,3 +1508,35 @@ non-short-circuit BOLD rows' vector search is now ~3.9× cheaper on AVX2+F16C ho
 frankensearch's hybrid-over-Tantivy overhead), safe-fallback elsewhere. All three integer/f16 dot
 kernels are now AVX2-dispatched; the f16 fear of "not bit-identical" was wrong (reduce-through-`wide`
 fixes it). Kept bench arm: `f16_bytes_generic`.
+
+### 2026-06-28 — runtime-dispatched AVX2+F16C `dot_product_f16_f32` (slice): 3.64–3.81× on the in-memory rescore (BlackThrush)
+
+**Lever (the f16-slice sibling of the bytes win).** `dot_product_f16_f32` (the `&[f16]`-slice kernel) is
+the wired `InMemoryVectorIndex` **pass-2 exact rescore + quality scoring** kernel (`in_memory.rs` 468 /
+562 / 658 / 741 / 859 — every two-pass query rescores its candidates with it). Same F16C dispatch as the
+bytes variant (`7239d58`): `_mm256_cvtph_ps` hardware-decodes 8 f16, same separate-mul+add accumulation,
+final reduce **through `wide::f32x8::reduce_add`**, and — matching this kernel's tail — a separate
+mul+add scalar tail (the bytes variant used `mul_add`; matched per-kernel). **Bit-identical** (f16→f32
+exact; `simd::tests::avx2_f16slicedot_matches_generic` asserts `to_bits` equality across 12 dim shapes).
+Conformance: **367/367** index lib tests GREEN serial.
+
+**Measured (per-crate, AVX2+F16C worker `hz2`; sum of 10 000 f16-slice dots):**
+
+| Workload | generic (`wide`) | AVX2+F16C | Ratio | Status |
+|----------|------------------|-----------|-------|--------|
+| `dot/dim256/f16_slice` (10k vectors) | 1.6404 ms | 430.08 µs | **0.262 (~3.81×)** | KEEP |
+| `dot/dim384/f16_slice` (10k vectors) | 2.3499 ms | 645.05 µs | **0.275 (~3.64×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench dot_product -- "dot/dim(256|384)/f16_slice"
+```
+
+**Scope:** original-comparator ratio **N/A** (frankensearch's own vector tier), but this is the wired
+in-memory two-pass pass-2 rescore kernel, so every two-pass query's rescore is now ~3.7× cheaper on
+AVX2+F16C hosts, safe-fallback elsewhere. With this, **all four hot dot kernels** (int8 2.5×, 4-bit
+1.2×, f16-bytes 3.9×, f16-slice 3.7×) are AVX2-dispatched. The dot-kernel SIMD vein is now essentially
+mined; remaining are the lower-traffic exact-f32 paths (`dot_product_f32_bytes_f32` / `dot_packed_4bit`).
+Kept bench arm: `f16_slice_generic`.

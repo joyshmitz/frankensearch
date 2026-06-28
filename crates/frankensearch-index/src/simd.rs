@@ -143,7 +143,61 @@ pub fn dot_product_f32_f32(a: &[f32], b: &[f32]) -> SearchResult<f32> {
 /// Returns `SearchError::DimensionMismatch` when slice lengths differ.
 pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     ensure_same_len(stored.len(), query.len())?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present; lengths checked equal above.
+            #[allow(unsafe_code)]
+            return Ok(unsafe { dot_product_f16_f32_avx2(stored, query) });
+        }
+    }
+    Ok(dot_product_f16_f32_generic(stored, query))
+}
 
+/// Hand-written AVX2+F16C f16-slice·f32 dot — same `vcvtph2ps` hardware decode +
+/// `reduce`-through-`wide` trick as [`dot_product_f16_bytes_f32`], so it is
+/// **bit-identical** to the portable kernel (the slice tail is separate mul+add,
+/// matched here; proven by `avx2_f16slicedot_matches_generic`).
+///
+/// # Safety
+/// Caller must ensure `avx2` + `f16c` are available (the dispatch in
+/// [`dot_product_f16_f32`] guarantees this) and `stored.len() == query.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_product_f16_f32_avx2(stored: &[f16], query: &[f32]) -> f32 {
+    use core::arch::x86_64::{
+        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps, _mm_loadu_si128,
+    };
+    let n = stored.len().min(query.len());
+    let chunks = n / 8;
+    let mut arr = [0.0_f32; 8];
+    // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded; `&[f16]` is
+    // contiguous little-endian f16 (2 bytes/elem), so a 16-byte load is 8 f16.
+    unsafe {
+        let mut sum = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let f16bits = _mm_loadu_si128(stored.as_ptr().add(c * 8).cast::<__m128i>());
+            let s = _mm256_cvtph_ps(f16bits);
+            let q = _mm256_loadu_ps(query.as_ptr().add(c * 8));
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(s, q));
+        }
+        _mm256_storeu_ps(arr.as_mut_ptr(), sum);
+    }
+    let mut result = f32x8::from(arr).reduce_add();
+    for index in (chunks * 8)..n {
+        result += stored[index].to_f32() * query[index];
+    }
+    result
+}
+
+/// Portable (`wide`-SIMD) f16-slice·f32 dot — the AVX2+F16C-dispatch fallback and
+/// the path on non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_product_f16_f32_generic(stored: &[f16], query: &[f32]) -> f32 {
     let mut sum = f32x8::splat(0.0);
     let mut stored_chunks = stored.chunks_exact(8);
     let mut query_chunks = query.chunks_exact(8);
@@ -166,7 +220,7 @@ pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
     {
         result += s.to_f32() * q;
     }
-    Ok(result)
+    result
 }
 
 /// Cosine similarity helper for f16 stored vectors.
@@ -796,6 +850,33 @@ mod tests {
             // SAFETY: avx2+f16c verified present above.
             #[allow(unsafe_code)]
             let avx2 = unsafe { dot_product_f16_bytes_f32_avx2(&bytes, &q) };
+            assert_eq!(generic.to_bits(), avx2.to_bits(), "dim={dim}");
+        }
+    }
+
+    /// The runtime AVX2+F16C f16-slice dot must be bit-identical to the portable
+    /// `wide` kernel for finite inputs (same exact decode + reduce-through-`wide`).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_f16slicedot_matches_generic() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut state = 0x2468_ace0_1357_9bdf_u64;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            (((state >> 40) as f32 / (1_u64 << 23) as f32) - 1.0)
+        };
+        for &dim in &[1_usize, 7, 8, 9, 16, 17, 31, 64, 100, 256, 384, 512] {
+            let q: Vec<f32> = (0..dim).map(|_| next_f32()).collect();
+            let s: Vec<f16> = (0..dim).map(|_| f16::from_f32(next_f32())).collect();
+            let generic = dot_product_f16_f32_generic(&s, &q);
+            // SAFETY: avx2+f16c verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { dot_product_f16_f32_avx2(&s, &q) };
             assert_eq!(generic.to_bits(), avx2.to_bits(), "dim={dim}");
         }
     }
