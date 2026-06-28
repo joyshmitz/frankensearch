@@ -1540,3 +1540,38 @@ AVX2+F16C hosts, safe-fallback elsewhere. With this, **all four hot dot kernels*
 1.2×, f16-bytes 3.9×, f16-slice 3.7×) are AVX2-dispatched. The dot-kernel SIMD vein is now essentially
 mined; remaining are the lower-traffic exact-f32 paths (`dot_product_f32_bytes_f32` / `dot_packed_4bit`).
 Kept bench arm: `f16_slice_generic`.
+
+### 2026-06-28 — runtime-dispatched AVX2 `dot_product_f32_bytes_f32`: 1.37–1.46× (completes the dot SIMD arc) (BlackThrush)
+
+**Lever (the last dot kernel).** `dot_product_f32_bytes_f32` is the exact f32-quantization scan kernel
+(`Quantization::F32` indexes + MRL rescore — non-default; F16 is the default). Same runtime-AVX2-dispatch
+pattern: a hand-written `#[target_feature(enable="avx2")]` kernel mirroring the `wide` kernel's **4
+accumulators**, `(acc0+acc1)+(acc2+acc3)` reduction, 8-chunk tail (reduced **through `wide::f32x8::reduce_add`**),
+and `mul_add` scalar tail; falls back to `dot_product_f32_bytes_f32_generic` on non-AVX2/non-x86. f32 LE
+bytes are native on x86, so an unaligned `loadu_ps` of the stored bytes gives the same lanes as
+`decode8_f32` → **bit-identical** (`simd::tests::avx2_f32dot_matches_generic`, `to_bits` equality across
+13 dim shapes). Conformance: **368/368** index lib tests GREEN serial.
+
+**Measured (per-crate, AVX2 worker `hz2`; sum of 10 000 f32 dots; `f32_bytes_new` = runtime dispatch →
+AVX2, `f32_bytes_generic` = portable `wide` fallback):**
+
+| Workload | generic (`wide`) | AVX2 | Ratio | Status |
+|----------|------------------|------|-------|--------|
+| `dot/dim256/f32_bytes` (10k vectors) | 415.74 µs | 285.36 µs | **0.686 (~1.46×)** | KEEP |
+| `dot/dim384/f32_bytes` (10k vectors) | 790.82 µs | 575.87 µs | **0.728 (~1.37×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench dot_product -- "dot/dim(256|384)/f32_bytes"
+```
+
+**Scope:** original-comparator ratio **N/A** (frankensearch's own vector tier). The **smallest** of the
+five SIMD-dispatch wins — f32 has no decode win (it's already f32) and the `wide` generic already uses 4
+f32x8 accumulators, so the gain is purely 256-bit width over the SSE2-default 2×128. Non-default path
+(F32-quant / MRL), so low traffic, but a clean bit-identical win that **completes the dot-kernel SIMD
+arc**: int8 (2.5×), 4-bit (1.2×), f16-bytes (3.9×), f16-slice (3.7×), f32-bytes (1.4×) — **all five hot
+dot kernels are now runtime-AVX2-dispatched** with a property test + safe fallback each. Remaining:
+`dot_product_f32_f32` (the `&[f16]`-less f32 slice, MRL — trivial copy of this) and the integer
+`dot_packed_4bit` (non-prepared); both very low traffic. Kept bench arm: `f32_bytes_generic`.

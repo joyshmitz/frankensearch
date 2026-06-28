@@ -360,7 +360,96 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
             found: stored_bytes.len() / 4,
         });
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present; `stored_bytes.len() == dim*4` checked.
+            #[allow(unsafe_code)]
+            return Ok(unsafe { dot_product_f32_bytes_f32_avx2(stored_bytes, query) });
+        }
+    }
+    Ok(dot_product_f32_bytes_f32_generic(stored_bytes, query))
+}
 
+/// Hand-written AVX2 f32-bytes·f32 dot — 256-bit `vmulps`/`vaddps` with the SAME
+/// 4-accumulator grouping, `(acc0+acc1)+(acc2+acc3)` reduction, `wide` 8-chunk
+/// tail (routed through `f32x8::reduce_add`), and `mul_add` scalar tail as the
+/// portable kernel. f32 LE bytes are native on x86, so an unaligned `loadu_ps` of
+/// the stored bytes yields the same lanes as `decode8_f32` → **bit-identical**
+/// (proven by `avx2_f32dot_matches_generic`). f32 has no decode win, so the gain
+/// is purely the 256-bit width over the `wide` SSE2-default path.
+///
+/// # Safety
+/// Caller must ensure `avx2` is available (the dispatch in
+/// [`dot_product_f32_bytes_f32`] guarantees it) and `stored_bytes.len() == query.len()*4`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_product_f32_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
+    use core::arch::x86_64::{
+        _mm256_add_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let dim = query.len();
+    let groups = dim / 32;
+    let chunks = dim / 8;
+    let mut acc_arr = [0.0_f32; 8];
+    // SAFETY: avx2 by contract; `stored_bytes.len() == dim*4`, so a `*const f32`
+    // load of 8 floats at element offset o (o+8 ≤ dim) is in-bounds; `loadu_ps`
+    // is unaligned. Every offset below is group/chunk-bounded by `o+8 ≤ dim`.
+    unsafe {
+        let sptr = stored_bytes.as_ptr().cast::<f32>();
+        let qptr = query.as_ptr();
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+        for g in 0..groups {
+            let o = g * 32;
+            acc0 = _mm256_add_ps(
+                acc0,
+                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o)), _mm256_loadu_ps(qptr.add(o))),
+            );
+            acc1 = _mm256_add_ps(
+                acc1,
+                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o + 8)), _mm256_loadu_ps(qptr.add(o + 8))),
+            );
+            acc2 = _mm256_add_ps(
+                acc2,
+                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o + 16)), _mm256_loadu_ps(qptr.add(o + 16))),
+            );
+            acc3 = _mm256_add_ps(
+                acc3,
+                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o + 24)), _mm256_loadu_ps(qptr.add(o + 24))),
+            );
+        }
+        let mut sum = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+        let mut c = groups * 4;
+        while c < chunks {
+            let o = c * 8;
+            sum = _mm256_add_ps(
+                sum,
+                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o)), _mm256_loadu_ps(qptr.add(o))),
+            );
+            c += 1;
+        }
+        _mm256_storeu_ps(acc_arr.as_mut_ptr(), sum);
+    }
+    let mut result = f32x8::from(acc_arr).reduce_add();
+    for index in (chunks * 8)..dim {
+        let b = &stored_bytes[index * 4..];
+        let val = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        result = val.mul_add(query[index], result);
+    }
+    result
+}
+
+/// Portable (`wide`-SIMD) f32-bytes·f32 dot — the AVX2-dispatch fallback and the
+/// path on non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_product_f32_bytes_f32_generic(stored_bytes: &[u8], query: &[f32]) -> f32 {
+    let dim = query.len();
     let mut acc0 = f32x8::splat(0.0);
     let mut acc1 = f32x8::splat(0.0);
     let mut acc2 = f32x8::splat(0.0);
@@ -406,7 +495,7 @@ pub fn dot_product_f32_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
         result = val.mul_add(query[index], result);
     }
 
-    Ok(result)
+    result
 }
 
 /// Symmetric int8 dot product (both operands int8-quantized) returning the raw
@@ -877,6 +966,37 @@ mod tests {
             // SAFETY: avx2+f16c verified present above.
             #[allow(unsafe_code)]
             let avx2 = unsafe { dot_product_f16_f32_avx2(&s, &q) };
+            assert_eq!(generic.to_bits(), avx2.to_bits(), "dim={dim}");
+        }
+    }
+
+    /// The runtime AVX2 f32-bytes dot must be bit-identical to the portable `wide`
+    /// kernel (same 4-accumulator grouping + reduce-through-`wide` + `mul_add`
+    /// tail; f32 LE bytes are native on x86). Skips without AVX2.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_f32dot_matches_generic() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut state = 0x0f1e_2d3c_4b5a_6978_u64;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            (((state >> 40) as f32 / (1_u64 << 23) as f32) - 1.0)
+        };
+        for &dim in &[1_usize, 7, 8, 9, 16, 31, 32, 33, 64, 100, 256, 384, 512] {
+            let q: Vec<f32> = (0..dim).map(|_| next_f32()).collect();
+            let mut bytes = Vec::with_capacity(dim * 4);
+            for _ in 0..dim {
+                bytes.extend_from_slice(&next_f32().to_le_bytes());
+            }
+            let generic = dot_product_f32_bytes_f32_generic(&bytes, &q);
+            // SAFETY: avx2 verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { dot_product_f32_bytes_f32_avx2(&bytes, &q) };
             assert_eq!(generic.to_bits(), avx2.to_bits(), "dim={dim}");
         }
     }
