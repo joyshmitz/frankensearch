@@ -30,5 +30,9 @@ harness = false
 name = "id_materialize_numeric_ff"
 harness = false
 
+[[bench]]
+name = "search_doc_ids_materialize"
+harness = false
+
 [lints]
 workspace = true

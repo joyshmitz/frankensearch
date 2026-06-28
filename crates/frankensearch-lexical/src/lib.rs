@@ -39,7 +39,9 @@ pub use tantivy::{
     TantivyDocument, Term,
 };
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::Cx;
@@ -49,7 +51,7 @@ use frankensearch_core::traits::{LexicalSearch, SearchFuture};
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
 use tantivy::query::QueryParser;
-use tantivy::schema::{STORED, STRING, TextFieldIndexing, TextOptions};
+use tantivy::schema::{FAST, STORED, STRING, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
 use tracing::{debug, instrument, warn};
 
@@ -394,6 +396,10 @@ struct SchemaFields {
     content: Field,
     title: Field,
     metadata_json: Field,
+    /// Dense per-document insertion ordinal, stored as a `u64` FAST (columnar)
+    /// field. `None` for indexes created before this field existed (resolved by
+    /// name in `from_index`); such indexes materialize ids via the docstore.
+    ord: Option<Field>,
 }
 
 /// Build the frankensearch Tantivy schema.
@@ -426,12 +432,19 @@ fn build_schema() -> (Schema, SchemaFields) {
     // Metadata: stored as JSON string, not indexed.
     let metadata_json = builder.add_text_field("metadata_json", STORED);
 
+    // Dense insertion ordinal: a flat bit-packed `u64` FAST column (no
+    // dictionary) plus an external `ordinal -> doc_id` table lets id
+    // materialization skip the stored-document decompress entirely. STORED too
+    // so the table can be rebuilt from a reopened index if needed.
+    let ord = builder.add_u64_field("ord", FAST | STORED);
+
     let schema = builder.build();
     let fields = SchemaFields {
         id,
         content,
         title,
         metadata_json,
+        ord: Some(ord),
     };
     (schema, fields)
 }
@@ -460,6 +473,12 @@ pub struct TantivyIndex {
     reader: IndexReader,
     writer: Mutex<IndexWriter>,
     doc_count: AtomicUsize,
+    /// Append-only `ordinal -> doc_id` table backing the fast id-materialization
+    /// path. Index `i` holds the `doc_id` of the document assigned ordinal `i`.
+    /// Grows by one per indexed document (including re-upserts); ordinals are
+    /// monotonic and never reused, so it stays correct across deletes/merges
+    /// (a deleted doc's ordinal simply never appears in search results).
+    ord_table: RwLock<Vec<String>>,
     path: Option<PathBuf>,
 }
 
@@ -563,9 +582,14 @@ impl TantivyIndex {
     fn from_index(
         index: Index,
         _schema: Schema,
-        fields: SchemaFields,
+        mut fields: SchemaFields,
         path: Option<PathBuf>,
     ) -> SearchResult<Self> {
+        // Resolve the `ord` fast field against the *actual* index schema so
+        // indexes created before this field existed (no `ord`) cleanly fall back
+        // to docstore materialization instead of using a phantom field handle.
+        fields.ord = index.schema().get_field("ord").ok();
+
         // Register our custom tokenizer.
         let tokenizer_manager = index.tokenizers().clone();
         tokenizer_manager.register(TOKENIZER_NAME, build_tokenizer());
@@ -596,6 +620,7 @@ impl TantivyIndex {
             reader,
             writer: Mutex::new(writer),
             doc_count: AtomicUsize::new(doc_count),
+            ord_table: RwLock::new(Vec::new()),
             path,
         })
     }
@@ -615,6 +640,24 @@ impl TantivyIndex {
         }
 
         tantivy_doc
+    }
+
+    /// Assign the next dense ordinal to `tantivy_doc` and append `doc_id` to the
+    /// `ord_table` so id materialization can skip the docstore decompress.
+    ///
+    /// Must be called while holding the writer lock: that serializes ordinal
+    /// assignment with `add_document`, so ordinal `i` always corresponds to
+    /// `ord_table[i]`. No-op when the schema has no `ord` field (pre-`ord`
+    /// indexes) or when the table lock is poisoned (the doc is left without an
+    /// ordinal and that hit falls back to docstore materialization).
+    fn assign_ord(&self, tantivy_doc: &mut TantivyDocument, doc_id: &str) {
+        if let Some(ord_field) = self.fields.ord
+            && let Ok(mut table) = self.ord_table.write()
+        {
+            let ord = u64::try_from(table.len()).unwrap_or(u64::MAX);
+            table.push(doc_id.to_owned());
+            tantivy_doc.add_u64(ord_field, ord);
+        }
     }
 
     /// Build a `QueryParser` for BM25 search with title boost.
@@ -832,24 +875,101 @@ impl TantivyIndex {
         self.collect_id_hits(&searcher, search_result.hits)
     }
 
-    /// Materialize ranked Tantivy hits into [`LexicalIdHit`] rows by loading
-    /// each stored document and reading its `id` field.
+    /// Pre-optimization baseline for [`Self::search_doc_ids`] that forces the
+    /// docstore id-materialization path (ignoring the `ord` fast field + table).
+    /// Used only by the `search_doc_ids_materialize` benchmark to A/B the fast
+    /// materialization wiring in one binary; not for production use.
+    #[doc(hidden)]
+    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    pub fn search_doc_ids_via_docstore(
+        &self,
+        _cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<LexicalIdHit>> {
+        let query = Self::truncate_query(query);
+        if query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parsed = self.parse_query_lenient(query);
+        let searcher = self.reader.searcher();
+        let hits = if use_count_free_top_k(query) {
+            execute_top_k(&searcher, &*parsed, limit, 0)?
+        } else {
+            execute_query_with_offset(&searcher, &*parsed, limit, 0)?.hits
+        };
+        let mut results = Vec::with_capacity(hits.len());
+        for hit in hits {
+            results.push(LexicalIdHit {
+                doc_id: self.docstore_id(&searcher, hit.doc_address)?,
+                bm25_score: hit.bm25_score,
+                rank: hit.rank,
+            });
+        }
+        Ok(results)
+    }
+
+    /// Read a single hit's `doc_id` from the stored document (the docstore
+    /// fallback path: decompresses the stored block to read the `id` field).
+    fn docstore_id(&self, searcher: &Searcher, addr: DocAddress) -> SearchResult<String> {
+        let doc = load_doc(searcher, addr)?;
+        Ok(doc
+            .get_first(self.fields.id)
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| {
+                debug!("tantivy document missing id field, using empty doc_id");
+                ""
+            })
+            .to_owned())
+    }
+
+    /// Materialize ranked Tantivy hits into [`LexicalIdHit`] rows.
+    ///
+    /// Fast path: read each hit's dense ordinal from the `ord` `u64` FAST column
+    /// (a flat bit-packed read — no stored-document decompress, no dictionary
+    /// seek) and resolve it through the in-memory `ord_table`. Falls back
+    /// per-hit to [`Self::docstore_id`] for any ordinal the table cannot resolve
+    /// (documents written before `ord` existed, a reopened-but-not-rebuilt
+    /// table, or a poisoned lock), so results are identical either way.
     fn collect_id_hits(
         &self,
         searcher: &Searcher,
         hits: Vec<LexicalDocHit>,
     ) -> SearchResult<Vec<LexicalIdHit>> {
         let mut results = Vec::with_capacity(hits.len());
+
+        // Take the table snapshot once; `None` when the field is absent or the
+        // table is empty → pure docstore path. `ord` columns are opened lazily
+        // per *touched* segment (top-k hits cluster in a few segments, so we
+        // avoid paying for segments no hit lands in).
+        let table = self.fields.ord.and_then(|_| {
+            let table = self.ord_table.read().ok()?;
+            if table.is_empty() { None } else { Some(table) }
+        });
+        let mut columns: HashMap<u32, Option<tantivy::columnar::Column<u64>>> = HashMap::new();
+
         for hit in hits {
-            let doc = load_doc(searcher, hit.doc_address)?;
-            let doc_id = doc
-                .get_first(self.fields.id)
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| {
-                    debug!("tantivy document missing id field, using empty doc_id");
-                    ""
-                })
-                .to_owned();
+            let addr = hit.doc_address;
+            let doc_id = match table.as_ref().and_then(|table| {
+                columns
+                    .entry(addr.segment_ord)
+                    .or_insert_with(|| {
+                        searcher
+                            .segment_reader(addr.segment_ord)
+                            .fast_fields()
+                            .u64("ord")
+                            .ok()
+                    })
+                    .as_ref()
+                    .and_then(|c| c.first(addr.doc_id))
+                    .and_then(|ord| usize::try_from(ord).ok())
+                    .and_then(|ord| table.get(ord))
+                    .cloned()
+            }) {
+                Some(id) => id,
+                None => self.docstore_id(searcher, addr)?,
+            };
 
             results.push(LexicalIdHit {
                 doc_id,
@@ -945,7 +1065,7 @@ impl LexicalSearch for TantivyIndex {
         doc: &'a IndexableDocument,
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
-            let tantivy_doc = self.to_tantivy_doc(doc);
+            let mut tantivy_doc = self.to_tantivy_doc(doc);
 
             {
                 let writer = self
@@ -957,6 +1077,7 @@ impl LexicalSearch for TantivyIndex {
                 // Delete any existing document with same ID (upsert semantics).
                 let term = Term::from_field_text(self.fields.id, &doc.id);
                 writer.delete_term(term);
+                self.assign_ord(&mut tantivy_doc, &doc.id);
                 writer
                     .add_document(tantivy_doc)
                     .map_err(|e| SearchError::SubsystemError {
@@ -984,10 +1105,11 @@ impl LexicalSearch for TantivyIndex {
                     .map_err(|e| Self::map_writer_lock_error("tantivy.batch_index", e))?;
 
                 for doc in docs {
-                    let tantivy_doc = self.to_tantivy_doc(doc);
+                    let mut tantivy_doc = self.to_tantivy_doc(doc);
                     // Upsert: delete existing then add.
                     let term = Term::from_field_text(self.fields.id, &doc.id);
                     writer.delete_term(term);
+                    self.assign_ord(&mut tantivy_doc, &doc.id);
                     writer
                         .add_document(tantivy_doc)
                         .map_err(|e| SearchError::SubsystemError {

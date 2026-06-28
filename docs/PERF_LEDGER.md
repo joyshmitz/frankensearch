@@ -1232,3 +1232,46 @@ never reused (a deleted doc's ordinal simply never appears in results; Tantivy c
 through merges), so the append-only table is delete/merge-correct; it grows by one `String` per
 doc-version, rebuilt in O(total docs) on open. That correctness surface needs its own conformance pass,
 hence wiring is deferred to keep this commit GREEN and reversible.
+
+### 2026-06-28 — lexical id materialization WIRED into production: `search_doc_ids` up to 6.32× end-to-end (BlackThrush)
+
+**Lever (the scoped follow-up above, now SHIPPED).** Wired the validated numeric-fast-field
+materialization into `TantivyIndex`: `build_schema` adds `ord: u64 FAST | STORED`; `assign_ord`
+stamps a dense monotonic ordinal on each document under the writer lock and appends its `doc_id` to an
+append-only `RwLock<Vec<String>>` ord-table; `collect_id_hits` reads the `ord` column **lazily per
+touched segment** and resolves `table[ord]`, with a **per-hit docstore fallback** for any ordinal it
+can't resolve (pre-`ord` docs, reopened-but-not-rebuilt tables, poisoned lock). `SchemaFields::ord` is
+resolved by name in `from_index`, so pre-`ord` on-disk indexes are `None` and use docstore unchanged.
+
+**Conformance:** 81/81 lexical tests GREEN — incl. `search_doc_ids_matches_counted_baseline`,
+`search_doc_ids_returns_ranked_identifiers` (ground-truth ids), upsert/delete, multi-segment
+force-merge, and CJK/Korean/Japanese roundtrips. The A/B bench asserts `search_doc_ids` (fast) ==
+`search_doc_ids_via_docstore` (forced docstore) at k=1000 before timing.
+
+**Measured (per-crate same-binary A/B, in-memory Tantivy N=100k, high-fanout query "search"; `docstore`
+= forced `searcher.doc(addr)` decompress, `fast` = wired ord path; medians):**
+
+| Workload | docstore | fast | Ratio | Status |
+|----------|----------|------|-------|--------|
+| `search_doc_ids_materialize/k10`   | 611.35 µs | 602.90 µs | **0.986** (tie — no top10 regression) | KEEP |
+| `search_doc_ids_materialize/k100`  | 633.21 µs | 614.02 µs | **0.970 (~1.03×)** | KEEP |
+| `search_doc_ids_materialize/k1000` | 4407.6 µs | 697.22 µs | **0.158 (~6.32×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+  --bench search_doc_ids_materialize -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+Note: an initial **eager** variant (open every segment's column upfront) was ~1.2× *slower* at k10
+(materialization is a tiny slice of BM25 search there, and top-k hits touch only 1–2 of many segments);
+switching to **lazy per-touched-segment** column loading removed that and left k10 a tie. Kept benches:
+`search_doc_ids_materialize` (end-to-end) + `id_materialize_numeric_ff` (isolated primitive).
+
+**Scope vs comparator:** the incumbent Lucene/Tantivy-class proxy materializes ids out of the stored
+document the same way, so this makes frankensearch's `search_doc_ids` **6.32× cheaper than the docstore
+path the comparator pays** on the materialization-dominated large-limit (`limit_all`) row — directly
+closing that documented gap — while top10 is an unchanged tie. On-disk **reopened** indexes currently
+fall back to docstore until the ord-table is rebuilt on open (correct, just unaccelerated); that rebuild
+is the one remaining follow-up.
