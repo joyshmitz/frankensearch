@@ -367,8 +367,20 @@ impl InMemoryVectorIndex {
         if limit == 0 || count == 0 {
             return Ok(Vec::new());
         }
-        let query_i8 = quantize_i8_query(query);
         let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
+        // Full-recall short-cut: when the candidate budget already covers every
+        // vector (`limit·mult ≥ count`, e.g. `limit_all` or a large limit on a small
+        // corpus), pass-1 prunes NOTHING — the int8 scan, the size-N candidate heap,
+        // the query quantize, and the slab build are all pure overhead, and pass-2
+        // would rescore all N regardless. Delegate to the exact f16 single pass.
+        // **Bit-identical by construction:** the two-pass equals `search_top_k`
+        // whenever pass-1 retains the true top-k (its own doc-contract), and here it
+        // retains *every* candidate. `limit.min(count)` avoids a `usize::MAX`-sized
+        // heap and returns the same `min(limit, count)` hits.
+        if candidate_count >= count {
+            return self.search_top_k(query, limit.min(count), filter);
+        }
+        let query_i8 = quantize_i8_query(query);
         // Build the int8 slab once, on first use — exact-only callers never pay the
         // O(N·d) quantization or its `N·d`-byte footprint at construction time.
         let vectors_i8 = self
@@ -475,9 +487,17 @@ impl InMemoryVectorIndex {
         if limit == 0 || count == 0 {
             return Ok(Vec::new());
         }
+        let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
+        // Full-recall short-cut (see the int8 two-pass for the full rationale): when
+        // `limit·mult ≥ count`, pass-1 prunes nothing, so the 4-bit scan, size-N
+        // heap, query nibble-prep, and slab build are pure overhead — delegate to the
+        // exact f16 pass. Bit-identical by construction (pass-1 retains every
+        // candidate ⇒ two-pass == `search_top_k`).
+        if candidate_count >= count {
+            return self.search_top_k(query, limit.min(count), filter);
+        }
         // Decode the (loop-invariant) query nibbles once, not per stored vector.
         let query_prepared = prepare_4bit_query(&pack_4bit_query(query));
-        let candidate_count = limit.saturating_mul(candidate_multiplier.max(1)).min(count);
         let bytes_per_vector = self.dimension.div_ceil(2);
         let nibbles = self
             .vectors_nibbles

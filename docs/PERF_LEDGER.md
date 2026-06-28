@@ -1747,3 +1747,38 @@ pays, plus every persisted/compacted index. Bigger than the encode-alone ratio b
 removes ~38M→count `write_all` calls. The remaining per-element `f16::from_f32` sites (WAL compaction
 `lib.rs` ~1095, WAL lookup ~1363) are low-traffic compaction/lookup paths — left as-is. Kept bench:
 `quantize_slab` (now also covers `write_f16_slab`).
+
+### 2026-06-28 — InMemory two-pass full-recall short-cut: 1.45–1.49× (skip the pass that prunes nothing) (BlackThrush)
+
+**Lever (the InMemory analog of the file-backed full-recall path).** `VectorIndex` (file-backed) already
+skips the two-pass for full recall (`search.rs:170`: `limit >= total → collect-and-sort single f16 pass`).
+`InMemoryVectorIndex`'s `search_top_k_int8_two_pass_filtered` / `search_top_k_4bit_two_pass_filtered` did
+NOT: when `candidate_count = min(limit·mult, count) >= count` (a `limit_all`-class query, or a large limit
+on a small corpus), pass-1 keeps **every** vector (the size-N bounded heap never evicts) and pass-2
+rescores all N — so the quantized pass-1 scan, the size-N heap, the query quantize/nibble-prep, and the
+lazy slab build (`quantize_i8_slab`/`pack_4bit_slab`) are **pure overhead**. Added a one-branch short-cut:
+when `candidate_count >= count`, delegate to the exact `search_top_k` (f16 single pass).
+
+**Bit-identical by construction:** the two-pass's own doc-contract is "== `search_top_k` whenever pass-1
+retains the true top-k"; full recall retains *every* candidate, so the delegation is exact (not merely
+approximate). `limit.min(count)` avoids a `usize::MAX`-sized heap. The `int8/four_bit_two_pass_keep_all_
+matches_exact` tests + a new bench `assert_eq!(two_pass(N,1) == search_top_k(N))` confirm it. Conformance:
+**372/372** index lib tests GREEN serial.
+
+**Measured (per-crate `int8_two_pass` bench, N=10k×384 clustered, full recall = top-N; fast-path disabled
+to capture the old cost, then restored):**
+
+| Workload | old two-pass | exact (fast-path) | Ratio | Status |
+|----------|--------------|-------------------|-------|--------|
+| `full_recall/4bit` (k=N) | 2.220 ms | 1.491 ms | **0.67 (~1.49×)** | KEEP |
+| `full_recall/int8` (k=N) | 2.162 ms | 1.491 ms | **0.69 (~1.45×)** | KEEP |
+
+(With the fast-path restored, the two-pass arms collapse to ~1.31 ms ≈ the exact arm — the delegation is
+realized.) Plus a **cold-start bonus** not in the steady-state number: full-recall now skips the
+`OnceLock` slab build entirely (the 5–13× slab quantizers don't even run).
+
+**Scope:** original-comparator ratio **N/A** (this is the InMemory sync-hybrid path; BOLD's `limit_all`
+uses the file-backed `VectorIndex`, already single-pass — so this does NOT move the BOLD `limit_all` 1.4×,
+which stays inherent). It closes an *internal* gap: InMemory was doing redundant pass-1 work the
+file-backed path already avoided, on `limit_all`/large-limit queries through the wired two-pass. Kept
+bench: `int8_two_pass` (now has a `full_recall` group).

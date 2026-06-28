@@ -199,6 +199,61 @@ fn bench_int8_two_pass(c: &mut Criterion) {
         });
     });
     g.finish();
+
+    // ── Full-recall (`limit·mult ≥ count`): pass-1 prunes nothing, so the new
+    // fast-path delegates the two-pass to the exact f16 single scan. `exact` is the
+    // fast-path target; the `*_two_pass` arms force the full two-pass at near-full
+    // recall (limit = N-1, mult = 1 ⇒ candidate_count = N-1 < N, no short-cut) and
+    // are what the fast-path replaces. Slabs are already warm from the groups above,
+    // so this isolates the scan cost (the fast-path ALSO skips the slab build cold).
+    // All three arms return the identical top-(N-1) (bit-identical by construction).
+    let full = N;
+    assert_eq!(
+        index
+            .search_top_k(&queries[0], full, None)
+            .unwrap()
+            .iter()
+            .map(|h| h.doc_id.clone())
+            .collect::<Vec<_>>(),
+        index
+            .search_top_k_4bit_two_pass(&queries[0], full, 1)
+            .unwrap()
+            .iter()
+            .map(|h| h.doc_id.clone())
+            .collect::<Vec<_>>(),
+        "full-recall two-pass must equal exact"
+    );
+    let mut gf = c.benchmark_group("full_recall");
+    gf.bench_function("exact", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(index.search_top_k(black_box(q), full, None).expect("exact"))
+        });
+    });
+    gf.bench_function("4bit_two_pass", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(
+                index
+                    .search_top_k_4bit_two_pass(black_box(q), full, 1)
+                    .expect("4bit full"),
+            )
+        });
+    });
+    gf.bench_function("int8_two_pass", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(
+                index
+                    .search_top_k_int8_two_pass(black_box(q), full, 1)
+                    .expect("int8 full"),
+            )
+        });
+    });
+    gf.finish();
 }
 
 criterion_group!(benches, bench_int8_two_pass);
