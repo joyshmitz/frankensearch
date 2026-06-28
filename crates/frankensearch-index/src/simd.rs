@@ -483,6 +483,89 @@ pub fn prepare_4bit_query(query: &[u8]) -> PreparedQuery4bit {
 /// `(x<<12)>>12` / `(x<<8)>>12`, multiply by the prepared query lanes, and
 /// accumulate vertically (flushing before any `i16` lane can overflow).
 pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { dot_4bit_prepared_avx2(stored, query) };
+        }
+    }
+    dot_4bit_prepared_generic(stored, query)
+}
+
+/// Hand-written AVX2 4-bit prepared dot: load 16 packed bytes, sign-extend to
+/// i16, arithmetic-shift out the low/high nibbles, 256-bit `vpmullw` against the
+/// prepared query lanes, accumulate in i16 (flushing every 16 chunks before any
+/// lane can overflow), and reduce via `vpmaddwd`. Bit-identical to the portable
+/// `wide` kernel (integer, in-range — proven by `avx2_dot4bit_matches_generic`).
+///
+/// # Safety
+/// Caller must ensure the `avx2` target feature is available (the runtime
+/// dispatch in [`dot_4bit_prepared`] guarantees this).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
+    use core::arch::x86_64::{
+        __m128i, __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_castsi256_si128,
+        _mm256_cvtepi8_epi16, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_slli_epi16,
+        _mm256_srai_epi16, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
+        _mm_unpackhi_epi64,
+    };
+    let chunks = stored.len() / 16;
+    let n = chunks.min(query.low.len());
+    let mut sum = 0_i32;
+    // SAFETY: avx2 guaranteed by the caller; every load is bounded by `i < n`
+    // (`n ≤ stored.len()/16`); the scalar tail covers the remainder.
+    unsafe {
+        // Reduce 16 i16 lanes → i32 (`vpmaddwd` by ones, then hsum the 8 i32).
+        let hsum16 = |acc: __m256i| -> i32 {
+            let m = _mm256_madd_epi16(acc, _mm256_set1_epi16(1));
+            let p128 =
+                _mm_add_epi32(_mm256_castsi256_si128(m), _mm256_extracti128_si256::<1>(m));
+            let p64 = _mm_add_epi32(p128, _mm_unpackhi_epi64(p128, p128));
+            let p32 = _mm_add_epi32(p64, _mm_shuffle_epi32::<0b01>(p64));
+            _mm_cvtsi128_si32(p32)
+        };
+        let mut acc = _mm256_setzero_si256();
+        let mut pending = 0_usize;
+        for i in 0..n {
+            let sbytes = _mm_loadu_si128(stored.as_ptr().add(i * 16).cast::<__m128i>());
+            let s = _mm256_cvtepi8_epi16(sbytes);
+            let s_low = _mm256_srai_epi16::<12>(_mm256_slli_epi16::<12>(s));
+            let s_high = _mm256_srai_epi16::<12>(_mm256_slli_epi16::<8>(s));
+            // The prepared query lanes are `i16x16` (32 bytes, lane order) — load
+            // their bytes directly as `__m256i`.
+            let q_low = _mm256_loadu_si256(core::ptr::from_ref(&query.low[i]).cast::<__m256i>());
+            let q_high = _mm256_loadu_si256(core::ptr::from_ref(&query.high[i]).cast::<__m256i>());
+            let prod = _mm256_add_epi16(
+                _mm256_mullo_epi16(s_low, q_low),
+                _mm256_mullo_epi16(s_high, q_high),
+            );
+            acc = _mm256_add_epi16(acc, prod);
+            pending += 1;
+            if pending == 16 {
+                sum += hsum16(acc);
+                acc = _mm256_setzero_si256();
+                pending = 0;
+            }
+        }
+        sum += hsum16(acc);
+    }
+    for (sb, &(qlo, qhi)) in stored[chunks * 16..].iter().zip(&query.tail) {
+        sum += nibble_lo(*sb) * qlo + nibble_hi(*sb) * qhi;
+    }
+    sum
+}
+
+/// Portable (`wide`-SIMD) 4-bit prepared dot — the AVX2-dispatch fallback and the
+/// path on non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_4bit_prepared_generic(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     let mut sum = 0_i32;
     let mut acc = i16x16::splat(0);
     let mut pending = 0_usize;
@@ -588,6 +671,36 @@ mod tests {
             #[allow(unsafe_code)]
             let avx2 = unsafe { dot_i8_i8_avx2(&s, &q) };
             assert_eq!(generic, avx2, "dim={dim}");
+        }
+    }
+
+    /// The runtime AVX2 4-bit prepared dot must be bit-identical to the portable
+    /// `wide` kernel across packed-length shapes (full 16-byte chunks, sub-chunk
+    /// tails) — integer/in-range, so the 256-bit accumulation equals the `wide`
+    /// sum exactly. Skips when the host lacks AVX2.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_dot4bit_matches_generic() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut state = 0xdead_beef_cafe_1234_u64;
+        let mut next_u8 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_possible_truncation)]
+            ((state >> 24) as u8)
+        };
+        for &len in &[0_usize, 1, 7, 15, 16, 17, 31, 32, 33, 100, 192, 256] {
+            let q: Vec<u8> = (0..len).map(|_| next_u8()).collect();
+            let s: Vec<u8> = (0..len).map(|_| next_u8()).collect();
+            let prepared = prepare_4bit_query(&q);
+            let generic = dot_4bit_prepared_generic(&s, &prepared);
+            // SAFETY: avx2 verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { dot_4bit_prepared_avx2(&s, &prepared) };
+            assert_eq!(generic, avx2, "len={len}");
         }
     }
 

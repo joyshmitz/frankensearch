@@ -1428,3 +1428,41 @@ fallback elsewhere. First **explicit-SIMD-intrinsic** win in the tree (prior dot
 (`dot_4bit_prepared`, the wired default — harder: nibble unpack) and the f16 pass-2 rescore
 (`dot_product_f16_*` via F16C — but f32 accumulation reorders, so NOT bit-identical there). Kept bench
 arm: `i8_dot_generic`.
+
+### 2026-06-28 — runtime-dispatched AVX2 `dot_4bit_prepared`: 1.19–1.27× on the WIRED-DEFAULT pass-1 kernel (BlackThrush)
+
+**Lever (the int8 route-next, applied to the default path).** `dot_4bit_prepared` is the **wired default**
+sync-hybrid pass-1 kernel (`in_memory.rs` `search_top_k_4bit_two_pass_filtered` → it scans every corpus
+vector). Same runtime-AVX2-dispatch pattern as `dot_i8_i8` (`bce9bc8`): a hand-written
+`#[target_feature(enable="avx2")]` kernel — load 16 packed bytes, `_mm256_cvtepi8_epi16`, arithmetic-shift
+out the low/high nibbles (`slli`/`srai`), 256-bit `_mm256_mullo_epi16` against the prepared query lanes,
+accumulate in i16 (flush every 16 chunks before overflow), reduce via `_mm256_madd_epi16` — falling back
+to the portable `wide` kernel (`dot_4bit_prepared_generic`) on non-AVX2/non-x86 hosts.
+
+**Bit-identical:** integer/in-range (per-dim products ≤ 64, flush keeps lanes < i16::MAX), so the 256-bit
+reduction equals the `wide` sum exactly — new test `simd::tests::avx2_dot4bit_matches_generic` asserts
+equality across 12 packed-length shapes (full 16-byte chunks + sub-chunk tails). Conformance: **365/365**
+index lib tests GREEN serial. *(WAL/compaction tests flake under parallel `cargo test` — pre-existing,
+none SIMD-related; pass with `--test-threads=1`.)*
+
+**Measured (per-crate, AVX2 worker `hz2`; sum of 10 000 4-bit dots; `fourbit_prepared_new` = runtime
+dispatch → AVX2, `fourbit_prepared_generic` = portable `wide` fallback):**
+
+| Workload | generic (`wide`) | AVX2 | Ratio | Status |
+|----------|------------------|------|-------|--------|
+| `dot/dim256/fourbit_prepared` (10k vectors) | 392.30 µs | 329.11 µs | **0.839 (~1.19×)** | KEEP |
+| `dot/dim384/fourbit_prepared` (10k vectors) | 519.74 µs | 410.59 µs | **0.790 (~1.27×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench dot_product -- "dot/dim(256|384)/fourbit_prepared"
+```
+
+**Scope:** original-comparator ratio **N/A** (frankensearch's own vector tier). Smaller than the int8
+2.5× — the 4-bit nibble-unpack (`slli`/`srai`/`mullo` per chunk) is more compute-bound, so the 256-bit
+width helps less than the memory-bound int8 dot — but it's the **default** path, so every AVX2-host
+default vector search now gets a ~1.2× faster pass-1 scan, safe-fallback elsewhere. Both int8 and 4-bit
+pass-1 dots are now AVX2-dispatched. Route-next: only the f16 pass-2 rescore (F16C) remains, and that
+needs a recall gate (f32 reorder is not bit-identical). Kept bench arm: `fourbit_prepared_generic`.
