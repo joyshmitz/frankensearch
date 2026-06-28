@@ -2602,3 +2602,46 @@ index-time overhead is negligible and not lock-bound; there is no clean indexing
 the materialization win is a good trade (6.32× query-time materialization for sub-noise index cost).
 Don't re-attempt index-path micro-opts on the ord-table append. Original-comparator ratio is **N/A**
 (frankensearch's own index-time bookkeeping; raw Tantivy is the floor the wrapper sits above).
+
+### 2026-06-28 — async `searcher.rs` per-query path is now well-mined; remaining clones are structural/invasive or amortized (BlackThrush)
+
+**Full code-level audit, no clean lever found.** After the two async-`searcher.rs` clone-elision wins
+(`cba06d7` lexical-metadata map borrow 3.55–7.20×; `2b7ad34` MMR reorder move 25–75×), I audited the
+rest of the async `TwoTierSearcher` per-query path for the same pattern. Everything else is either
+already optimal or NOT a clean win — these are **code/lifetime facts, not bench-measurable**:
+
+- **Score/rank maps** (`searcher.rs` ~1421–1462): already `AHashMap<&str, &ScoredResult>` / `<&str, f32>`
+  (borrow-keyed, copy values). `build_borrowed_rank_map` is clone-free. **Optimal.**
+- **`kendall_tau_with_refined_rank`** (`blend.rs` 253): already **O(n log n)** (merge-sort inversion
+  counting), documented. One small scratch `Vec` per call (n≈30) — sub-noise. **Optimal.**
+- **`graph_rank`** (`graph_rank.rs` 86–235, conditional): already an **index-based** CSR power iteration
+  (the hot loop uses `usize` indices, not `HashMap` lookups); boundary `doc_id.clone()`s are structural
+  (`HashMap<GraphDocId,…>` owned keys) and it only runs when a `DocumentGraph` is configured. **Optimal.**
+- **`fast_hits` / `quality_hits` doc_id clones** (`searcher.rs` 1358, 1382, every refined query): these
+  clone `doc_id` from `initial_results` → `fast_hits` → `quality_hits`. **Structural**: `VectorHit` owns
+  `doc_id: String`, and `blend_two_tier(&fast_hits, &quality_hits, …)` needs both vecs live
+  simultaneously, so neither can borrow/move from the other or from `initial_results` (which `initial_by_doc`
+  borrows through the final assembly). Eliding requires giving `VectorHit` a borrowed `doc_id` — a
+  **core-type lifetime change with a wide blast radius** across `frankensearch-index` + `-fusion` + the
+  FSVI path. Flagged invasive in [[fusion-sync-result-assembly-clone-elision]] (sync `quality_hits` rebuild).
+- **Phase clones** (`display_hits.clone()` / `refined_results.clone()` into `on_phase(SearchPhase::…)`):
+  **streaming-necessary** — the `on_phase` callback consumes each phase while the search continues
+  mutating `results`, so the phase needs its own owned copy.
+- **`display_hits = initial_hits.iter().take(k).cloned()`** (~516): NOT redundant — `initial_hits` is
+  reused at lines 573/648/819 (phase-2 refinement borrows the full set), so the top-k must be copied out.
+  k≈10, sub-noise regardless (cf. the reverted sync phase-clone elision).
+- **Quantization slab build** (`in_memory.rs` `quantize_i8_slab` / `pack_4bit_slab`): a real scalar
+  compute kernel (`round()` per element may block autovectorization), **but amortized** — built once via
+  `OnceLock` (`get_or_init`, lines 408/516) and cached, so it is a **cold-start / index-build** cost, not
+  a steady-state query gap, and not "vs Lucene/Tantivy" (no incumbent vector tier).
+- **MMR cosine dot** (`mmr.rs` `cosine_sim_pre`): scalar f64; SIMD/f32 would **change rounding**
+  (not bit-identical → could shift MMR selection) and it is a conditional (opt-in) path.
+
+**Conclusion:** the steady-state async per-query paths are **comprehensively optimized**; no clean new
+per-crate lever remains without an **invasive `VectorHit` borrow refactor** (the one real remaining
+per-query opportunity — eliminates the `fast_hits`/`quality_hits` doc_id double-clone, ~60–200 small
+`String` clones/refined query — but needs a dedicated, well-tested change across index+fusion, not a
+60-min dig). Original-comparator ratio **N/A** (async result-assembly the BOLD harness doesn't model).
+Combined with [[bold-comparator-closed]] (comparator closed, limit_all inherent) and the indexing-axis
+clear: **stop re-scanning the query/result-assembly surface — the next real work is the scoped VectorHit
+refactor or a genuinely new subsystem.**
