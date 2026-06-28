@@ -1600,3 +1600,41 @@ win (no f32 decode). Completes the dot-kernel SIMD coverage: **six** kernels now
 (int8, 4-bit-prepared, f16-bytes, f16-slice, f32-bytes, f32-slice), each bit-identical + safe fallback.
 The only dot left is the non-prepared integer `dot_packed_4bit` (lowest traffic). Kept bench arm:
 `f32_slice_generic`.
+
+### 2026-06-28 — runtime-dispatched AVX2+F16C int8 slab QUANTIZE: 5.2–5.9× (a DIFFERENT primitive) (BlackThrush)
+
+**Lever (off the dot vein — the quantizer, not a dot).** `quantize_i8_slab` (the lazy int8 ADC slab
+build) was the next-biggest un-mined **compute** kernel: it decodes the whole f16 slab to f32 **twice**
+(once for the corpus max-abs, once to quantize) with software `f16::to_f32`, plus a per-element
+`f32::round` + clamp — fully decode-bound and scalar. New `simd::quantize_f16_slab_to_i8` runtime-
+dispatches (`is_x86_feature_detected!("avx2") && …("f16c")`) to a hand-written AVX2+F16C kernel:
+`vcvtph2ps` decodes 8 f16/instruction; pass-1 is a vector `max` over `|x|`; pass-2 is `×scale` →
+round-half-away (emulated `trunc(v + copysign(0.5, v))`, exact for `|v| ≤ 127`) → clamp (`min`/`max`) →
+`cvttps_epi32` → `i8`. Falls back to the scalar kernel on non-AVX2+F16C. `in_memory.rs::quantize_i8_slab`
+now delegates to it.
+
+**Bit-identical:** `max` is exact/associative (vector max == scalar fold), the round emulation matches
+`f32::round` exactly, clamp/cast unchanged — `simd::tests::avx2_quantize_i8_matches_generic` asserts the
+`Vec<i8>` is byte-for-byte equal across lengths (incl. sub-8 tails + the zero-vector `max_abs==0` edge).
+Conformance: **370/370** index lib tests GREEN serial.
+
+**Measured (per-crate, AVX2+F16C; dim 384 f16 slab → i8; `generic` = scalar, `dispatch` = AVX2+F16C):**
+
+| Workload | generic | dispatch | Ratio | Status |
+|----------|---------|----------|-------|--------|
+| `quantize_i8_slab/10000` (10k×384) | 25.85 ms | 4.94 ms | **0.191 (~5.2×)** | KEEP |
+| `quantize_i8_slab/50000` (50k×384) | 157.65 ms | 26.61 ms | **0.169 (~5.9×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  cargo bench -p frankensearch-index --profile release --bench quantize_slab
+```
+
+**Scope:** original-comparator ratio **N/A** (frankensearch's own int8 ADC tier; no Tantivy counterpart).
+This is **index-build / cold-start latency** — the slab is `OnceLock`-cached, so amortized for a static
+index but recurs on every rebuild/refresh: a 50k×384 int8 slab build drops **157.65 ms → 26.61 ms**
+(~131 ms/build saved; scales linearly with corpus). The first *non-dot* SIMD win — a genuinely different
+primitive (quantizer), and the largest single ratio besides the f16 dots, because it's pure F16C
+decode-bound. Route-next: `pack_4bit_slab` (the **wired-default** 4-bit slab build, same decode-bound
+shape but with nibble packing) is the natural sibling. Kept bench: `quantize_slab`.

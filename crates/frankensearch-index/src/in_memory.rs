@@ -76,18 +76,8 @@ pub struct InMemoryVectorIndex {
 /// query, so pass-1 ranking is preserved; the exact f16 rescore restores values.
 #[allow(clippy::cast_possible_truncation)] // round()+clamp() bounds the f32->i8 cast
 fn quantize_i8_slab(vectors_f16: &[f16]) -> Vec<i8> {
-    let max_abs = vectors_f16
-        .iter()
-        .map(|x| x.to_f32().abs())
-        .fold(0.0_f32, f32::max);
-    if max_abs <= 0.0 {
-        return vec![0_i8; vectors_f16.len()];
-    }
-    let scale = 127.0 / max_abs;
-    vectors_f16
-        .iter()
-        .map(|x| (x.to_f32() * scale).round().clamp(-127.0, 127.0) as i8)
-        .collect()
+    // Runtime-dispatched (AVX2+F16C when available); see `simd` for the kernel.
+    crate::simd::quantize_f16_slab_to_i8(vectors_f16)
 }
 
 /// Quantize an f32 query to int8 using its own max-abs scale (the scale is a

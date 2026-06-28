@@ -790,11 +790,10 @@ pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
 #[must_use]
 unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_castsi256_si128,
-        _mm256_cvtepi8_epi16, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_slli_epi16,
-        _mm256_srai_epi16, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
-        _mm_unpackhi_epi64,
+        __m128i, __m256i, _mm256_add_epi16, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_slli_epi16, _mm256_srai_epi16,
+        _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32, _mm_unpackhi_epi64,
     };
     let chunks = stored.len() / 16;
     let n = chunks.min(query.low.len());
@@ -923,6 +922,132 @@ const fn ensure_same_len(expected: usize, found: usize) -> SearchResult<()> {
         return Err(SearchError::DimensionMismatch { expected, found });
     }
     Ok(())
+}
+
+/// Quantize an f16 slab to int8 with one corpus-wide max-abs scale (the lazy int8
+/// ADC slab build). Runtime-dispatches to an AVX2+F16C kernel when available: the
+/// build is **decode-bound** (`f16::to_f32` is software, run twice — once for
+/// max-abs, once to quantize) and `round` is a per-element scalar op, both of which
+/// `vcvtph2ps` + vector round crush. Falls back to the portable scalar kernel.
+#[must_use]
+pub fn quantize_f16_slab_to_i8(vectors_f16: &[f16]) -> Vec<i8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { quantize_f16_slab_to_i8_avx2(vectors_f16) };
+        }
+    }
+    quantize_f16_slab_to_i8_generic(vectors_f16)
+}
+
+/// Hand-written AVX2+F16C int8 slab quantizer. Bit-identical to the scalar kernel:
+/// `max` is exact/associative so the vector max-abs equals the scalar fold; the
+/// round is `f32::round` (half-away-from-zero) emulated as `trunc(v + copysign(0.5,
+/// v))` (exact for `|v| ≤ 127`); the clamp + `as i8` cast are unchanged. Proven by
+/// `avx2_quantize_i8_matches_generic`.
+///
+/// # Safety
+/// Caller must ensure `avx2` + `f16c` are available (the dispatch in
+/// [`quantize_f16_slab_to_i8`] guarantees this).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn quantize_f16_slab_to_i8_avx2(vectors_f16: &[f16]) -> Vec<i8> {
+    use core::arch::x86_64::{
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm256_add_ps, _mm256_and_ps, _mm256_cvtph_ps,
+        _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps,
+        _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps, _mm256_storeu_si256,
+        _mm_loadu_si128,
+    };
+    let n = vectors_f16.len();
+    let chunks = n / 8;
+    // `half::f16` is `repr(transparent)` over `u16`, so the slab is `n*2` LE bytes.
+    // SAFETY: `vectors_f16` has `n` f16 = `n*2` bytes, contiguous.
+    #[allow(unsafe_code)]
+    let bytes = unsafe { std::slice::from_raw_parts(vectors_f16.as_ptr().cast::<u8>(), n * 2) };
+
+    // Pass 1: corpus-wide max-abs (F16C decode + clear sign bit + vector max).
+    let mut max_abs = 0.0_f32;
+    // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded.
+    unsafe {
+        let abs_mask = _mm256_set1_ps(f32::from_bits(0x7fff_ffff));
+        let mut vmax = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
+            vmax = _mm256_max_ps(vmax, _mm256_and_ps(x, abs_mask));
+        }
+        let mut arr = [0.0_f32; 8];
+        _mm256_storeu_ps(arr.as_mut_ptr(), vmax);
+        for &v in &arr {
+            max_abs = max_abs.max(v);
+        }
+    }
+    for &x in &vectors_f16[chunks * 8..] {
+        max_abs = max_abs.max(x.to_f32().abs());
+    }
+    if max_abs <= 0.0 {
+        return vec![0_i8; n];
+    }
+    let scale = 127.0 / max_abs;
+
+    // Pass 2: quantize (decode → ×scale → round-half-away → clamp → i8).
+    let mut out = Vec::with_capacity(n);
+    // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded.
+    unsafe {
+        let vscale = _mm256_set1_ps(scale);
+        let vhalf = _mm256_set1_ps(0.5);
+        let vmaxc = _mm256_set1_ps(127.0);
+        let vminc = _mm256_set1_ps(-127.0);
+        let vsign = _mm256_set1_ps(-0.0);
+        let mut tmp = [0_i32; 8];
+        for c in 0..chunks {
+            let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
+            let v = _mm256_mul_ps(x, vscale);
+            // copysign(0.5, v): OR the 0.5 magnitude with v's sign bit.
+            let half_signed = _mm256_or_ps(vhalf, _mm256_and_ps(v, vsign));
+            let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(
+                _mm256_add_ps(v, half_signed),
+            );
+            let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vminc), vmaxc);
+            let i = _mm256_cvttps_epi32(clamped);
+            _mm256_storeu_si256(tmp.as_mut_ptr().cast(), i);
+            for &t in &tmp {
+                #[allow(clippy::cast_possible_truncation)]
+                out.push(t as i8);
+            }
+        }
+    }
+    for &x in &vectors_f16[chunks * 8..] {
+        #[allow(clippy::cast_possible_truncation)]
+        out.push((x.to_f32() * scale).round().clamp(-127.0, 127.0) as i8);
+    }
+    out
+}
+
+/// Portable scalar int8 slab quantizer — the AVX2+F16C-dispatch fallback. Exposed
+/// (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+#[must_use]
+pub fn quantize_f16_slab_to_i8_generic(vectors_f16: &[f16]) -> Vec<i8> {
+    let max_abs = vectors_f16
+        .iter()
+        .map(|x| x.to_f32().abs())
+        .fold(0.0_f32, f32::max);
+    if max_abs <= 0.0 {
+        return vec![0_i8; vectors_f16.len()];
+    }
+    let scale = 127.0 / max_abs;
+    vectors_f16
+        .iter()
+        .map(|x| {
+            #[allow(clippy::cast_possible_truncation)]
+            let q = (x.to_f32() * scale).round().clamp(-127.0, 127.0) as i8;
+            q
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1106,6 +1231,39 @@ mod tests {
             let avx2 = unsafe { dot_product_f32_f32_avx2(&a, &b) };
             assert_eq!(generic.to_bits(), avx2.to_bits(), "dim={dim}");
         }
+    }
+
+    /// The runtime AVX2+F16C int8 slab quantizer must be byte-for-byte identical to
+    /// the scalar kernel for finite inputs (`max` is exact, round-half-away is
+    /// emulated exactly, clamp/cast unchanged). Skips without AVX2+F16C.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_quantize_i8_matches_generic() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut state = 0x51ed_270b_9c4d_a3f8_u64;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            (((state >> 40) as f32 / (1_u64 << 23) as f32) - 1.0)
+        };
+        // Various lengths incl. sub-8 tails + a zero-vector edge (max_abs == 0).
+        for &n in &[0_usize, 1, 7, 8, 9, 16, 31, 100, 384, 769] {
+            let v: Vec<f16> = (0..n).map(|_| f16::from_f32(next_f32() * 3.0)).collect();
+            let generic = quantize_f16_slab_to_i8_generic(&v);
+            // SAFETY: avx2+f16c verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { quantize_f16_slab_to_i8_avx2(&v) };
+            assert_eq!(generic, avx2, "n={n}");
+        }
+        let zeros = vec![f16::from_f32(0.0); 40];
+        // SAFETY: avx2+f16c verified present above.
+        #[allow(unsafe_code)]
+        let avx2_zero = unsafe { quantize_f16_slab_to_i8_avx2(&zeros) };
+        assert_eq!(quantize_f16_slab_to_i8_generic(&zeros), avx2_zero);
     }
 
     /// Exhaustive proof that the SIMD f16->f32 widen matches the scalar reference

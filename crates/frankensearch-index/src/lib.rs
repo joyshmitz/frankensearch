@@ -81,8 +81,8 @@ pub use simd::{
     dot_i8_i8, dot_i8_i8_generic, dot_packed_4bit, dot_product_f16_bytes_f32,
     dot_product_f16_bytes_f32_generic, dot_product_f16_f32, dot_product_f16_f32_generic,
     dot_product_f32_bytes_f32, dot_product_f32_bytes_f32_generic, dot_product_f32_f32,
-    dot_product_f32_f32_generic,
-    prepare_4bit_query,
+    dot_product_f32_f32_generic, prepare_4bit_query, quantize_f16_slab_to_i8,
+    quantize_f16_slab_to_i8_generic,
 };
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
