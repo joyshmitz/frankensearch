@@ -2397,3 +2397,15 @@ at small/medium n, neutral at n500 — the sort is a small fraction of blend (wh
 candidate-count (tens–hundreds) total-order sorts is consistently ~0-gain. Do not re-attempt
 `sort_unstable` micro-opts on fusion candidate sorts. Original-comparator ratio is **N/A** (internal
 fusion finalization).
+
+### 2026-06-28 — durability `codec.rs` is a round-robin COPY stub, not GF erasure coding — no SIMD lever (Cobaltmoth)
+
+**Not attempted — flagged to save the erasure-coding rabbit hole.** `RaptorqCodec::encode`
+(`crates/frankensearch-durability/src/codec.rs`) *looks* like a Reed-Solomon/fountain codec (the
+alien-graveyard "erasure coding → SIMD the GF(256) multiply" lever), but its repair symbols are just
+**round-robin copies of source symbols**: `repair_symbols.push((esi, source_symbols[repair_idx %
+k_source].1.clone()))` — there is **no GF(256) multiply and no XOR parity** to vectorize, only a
+`Vec<u8>` clone per repair symbol (memcpy, allocation-bound, not compute-bound). Optimizing it would be
+a zero-impact change. The rest of `frankensearch-durability` is crc32 (already SIMD via `crc32fast`) +
+file I/O; **no compute lever exists in the durability crate.** If a real erasure codec is wired later
+(actual GF math), re-evaluate then. Original-comparator ratio is **N/A** (internal durability codec).
