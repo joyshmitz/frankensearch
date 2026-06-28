@@ -2375,3 +2375,25 @@ fsfs code-structure sidecar tokenizer, not a comparator query primitive. The sma
 `code_tokenize/ascii_256` measured **5011.625 ns -> 4976.335 ns, ratio 0.993**, which is a noise/tie
 and must not be cited as a win. The lever is kept only for the larger-snippet rows where the measured
 ratio is below the 0.97 keep threshold.
+
+### 2026-06-28 — blend_two_tier `sort_by` → `sort_unstable_by` is ~0-gain — REVERTED (Cobaltmoth)
+
+**Lever tested and reverted.** `blend_two_tier` (the default sync hybrid path, `sync_searcher.rs`)
+finalizes by sorting merged candidates with a strict total-order comparator (score desc, then unique
+`doc_id`), so `sort_by` → `sort_unstable_by` is order-identical (bit-identical) and skips the
+stable-sort scratch alloc. Benched the full blend (bounds + `AHashMap` merge + collect + sort), stable
+vs unstable, at realistic fast+quality candidate counts:
+
+| Workload | stable | unstable | ratio |
+|----------|--------|----------|-------|
+| `blend_sort/n60` | 13553 ns | 13004 ns | **0.959 (~1.04×)** |
+| `blend_sort/n200` | 44925 ns | 43296 ns | **0.964 (~1.04×)** |
+| `blend_sort/n500` | 113990 ns | 115604 ns | **1.014 (~0.99×, slightly slower)** |
+
+**Decision:** **reverted** (`blend.rs` + `Cargo.toml` byte-identical to `main`, bench removed). ~1.04×
+at small/medium n, neutral at n500 — the sort is a small fraction of blend (which is dominated by the
+`AHashMap` build + per-doc `to_owned`), so the unstable-sort saving doesn't move the function. This
+**confirms the earlier federated `sort_unstable` finding**: `sort_by`→`sort_unstable_by` on these
+candidate-count (tens–hundreds) total-order sorts is consistently ~0-gain. Do not re-attempt
+`sort_unstable` micro-opts on fusion candidate sorts. Original-comparator ratio is **N/A** (internal
+fusion finalization).
