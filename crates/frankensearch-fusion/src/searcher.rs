@@ -2403,13 +2403,19 @@ fn fused_hits_to_scored_results(
     fast_embedder_id: &str,
     rrf_k: f64,
 ) -> Vec<ScoredResult> {
-    let lexical_metadata_by_doc: AHashMap<&str, serde_json::Value> = lexical_results
+    // Borrow each candidate's metadata `&Value` into the map instead of cloning
+    // it: only the `fused` (top-k) hits below ever read it, so cloning every
+    // lexical candidate's (often dropped) metadata here is wasted. The `clone` is
+    // deferred to the per-winner lookup, so a deep/large metadata `Value` for a
+    // candidate that misses the top-k is never cloned. `lexical_results` outlives
+    // this function, so the borrows are valid for the whole materialization.
+    let lexical_metadata_by_doc: AHashMap<&str, &serde_json::Value> = lexical_results
         .iter()
         .filter_map(|result| {
             result
                 .metadata
                 .as_ref()
-                .map(|metadata| (result.doc_id.as_str(), metadata.clone()))
+                .map(|metadata| (result.doc_id.as_str(), metadata))
         })
         .collect();
 
@@ -2475,7 +2481,10 @@ fn fused_hits_to_scored_results(
                 lexical_score: fh.lexical_score,
                 rerank_score: None,
                 explanation,
-                metadata: lexical_metadata_by_doc.get(fh.doc_id.as_str()).cloned(),
+                metadata: lexical_metadata_by_doc
+                    .get(fh.doc_id.as_str())
+                    .copied()
+                    .cloned(),
             }
         })
         .collect()

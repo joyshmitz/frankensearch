@@ -1315,3 +1315,38 @@ bench's 100k high-fanout docstore arm is heavier). The fast path is now reached 
 reopened on-disk indexes. Sidecar is re-serialized in full per `commit` (fine for batch-commit; a
 delta/binary format is a future optimization for commit-per-doc streaming workloads). Kept bench:
 `reopen_id_materialize`.
+
+### 2026-06-28 — async hybrid lexical-metadata re-attach borrows `&Value` (3.55–7.20× on the map step) (BlackThrush)
+
+**Lever.** The async `TwoTierSearcher`'s `fused_hits_to_scored_results` (`searcher.rs`) re-attaches
+lexical metadata to the fused results via a `doc_id → metadata` map, but only the `fused` (top-k) hits
+read it. The old map was `AHashMap<&str, serde_json::Value>` and **cloned every lexical candidate's
+metadata** into it — including the many candidates dropped from the top-k. Switched the map to
+`AHashMap<&str, &serde_json::Value>` (borrow) and deferred the `clone` to the per-winner lookup
+(`.get().copied().cloned()`), so a deep/large metadata `Value` for a candidate that misses the top-k is
+**never cloned**. `lexical_results` outlives the function, so the borrows are valid. Bit-identical
+output — the `fused_hits_to_scored_results_preserves_lexical_metadata` guard test and the bench's
+`assert_eq` both confirm identical `Option<Value>` per winner. 817/817 fusion lib tests GREEN.
+
+**Measured (per-crate isolated A/B, N=60 lexical candidates → k=10 winners; `clone_all` = old
+clone-every-candidate map, `borrow` = borrow + clone-only-winners; medians):**
+
+| Workload | clone_all | borrow | Ratio | Status |
+|----------|-----------|--------|-------|--------|
+| `lexical_metadata_map/small` (1-field metadata)  | 9.1124 µs | 2.5641 µs | **0.281 (~3.55×)** | KEEP |
+| `lexical_metadata_map/large` (nested ~10-field)  | 64.788 µs | 8.9993 µs | **0.139 (~7.20×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc RUST_LOG=off \
+  cargo bench -p frankensearch-fusion --profile release \
+  --bench lexical_metadata_map -- --sample-size 60 --warm-up-time 1 --measurement-time 2
+```
+
+**Scope:** this is frankensearch's own async hybrid result-assembly bookkeeping (the metadata
+re-attachment is unique to the real `TwoTierSearcher`, not the simplified BOLD comparator harness), so
+the original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A**. The win scales with metadata
+size and candidate-overfetch (`candidates − k` avoided `Value` clones); it is a real per-query reduction
+for metadata-bearing workloads on the production async path. Unlike the sync phase-clone elision
+(2026-06-28, sub-noise — `ScoredResult` struct copies), this elides heap-allocated `serde_json::Value`
+clones, hence the large ratio. Kept bench: `lexical_metadata_map`.
