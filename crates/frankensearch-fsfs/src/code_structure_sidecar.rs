@@ -486,6 +486,27 @@ fn normalize_signal_value(value: &str) -> String {
 fn tokenize(value: &str) -> BTreeSet<String> {
     let mut tokens = BTreeSet::new();
     let mut current = String::new();
+    // ASCII fast path (the common case for code symbols/queries): a byte loop with
+    // `to_ascii_lowercase` avoids the per-char `chars().flat_map(char::to_lowercase)`
+    // overhead (`char::to_lowercase` builds a `ToLowercase` iterator for every char,
+    // even though only `is_ascii_alphanumeric` chars survive). Bit-identical for
+    // ASCII input: for an ASCII char, `char::to_lowercase` yields exactly its
+    // ASCII lowercase. Non-ASCII falls back to the Unicode path (which still
+    // catches the rare char that *lowercases* to ASCII, e.g. the Kelvin sign).
+    if value.is_ascii() {
+        for &b in value.as_bytes() {
+            let lowered = b.to_ascii_lowercase();
+            if lowered.is_ascii_alphanumeric() {
+                current.push(lowered as char);
+            } else if !current.is_empty() {
+                tokens.insert(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            tokens.insert(current);
+        }
+        return tokens;
+    }
     for ch in value.chars().flat_map(char::to_lowercase) {
         if ch.is_ascii_alphanumeric() {
             current.push(ch);
@@ -514,6 +535,44 @@ mod tests {
     use crate::query_execution::{
         LexicalCandidate, QueryExecutionOrchestrator, RankingPriorTuning, SemanticCandidate,
     };
+
+    /// Reference: the pre-fast-path pure Unicode `tokenize`.
+    fn tokenize_reference(value: &str) -> std::collections::BTreeSet<String> {
+        let mut tokens = std::collections::BTreeSet::new();
+        let mut current = String::new();
+        for ch in value.chars().flat_map(char::to_lowercase) {
+            if ch.is_ascii_alphanumeric() {
+                current.push(ch);
+            } else if !current.is_empty() {
+                tokens.insert(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            tokens.insert(current);
+        }
+        tokens
+    }
+
+    #[test]
+    fn tokenize_ascii_fastpath_matches_unicode_reference() {
+        let inputs = [
+            "",
+            "rank_symbols",
+            "pub fn run_fast(x: i32)",
+            "FooBar BAZ-123 qux.quux",
+            "src/main.rs -> async def rank()",
+            "café Σigma naïve",    // non-ASCII letters: fallback
+            "日本語 token test42", // CJK + ASCII: fallback
+            "\u{212A}elvin sign",  // KELVIN SIGN lowercases to ASCII 'k' (fallback must keep it)
+        ];
+        for input in inputs {
+            assert_eq!(
+                super::tokenize(input),
+                tokenize_reference(input),
+                "tokenize fast path diverged for {input:?}"
+            );
+        }
+    }
 
     fn candidate(doc_id: &str, score: f64) -> FusedCandidate {
         FusedCandidate {

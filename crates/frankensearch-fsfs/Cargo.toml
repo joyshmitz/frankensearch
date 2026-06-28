@@ -80,5 +80,9 @@ harness = false
 name = "lexical_count"
 harness = false
 
+[[bench]]
+name = "code_tokenize"
+harness = false
+
 [lints]
 workspace = true

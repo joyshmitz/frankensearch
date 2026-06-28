@@ -997,3 +997,41 @@ Realistic ASCII code/doc chunk. Medians:
 **Scope:** a local indexing-throughput win on per-chunk token counting (fsfs lexical pipeline) — pure
 frankensearch file-ingest compute. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A**
 (file-system scan layer, not a query comparator); caveat in `docs/NEGATIVE_EVIDENCE.md`.
+
+### 2026-06-27 - fsfs code-structure tokenization ASCII byte fast path (BlackThrush)
+
+**Lever:** `code_structure_sidecar::tokenize` extracts lowercase ASCII alphanumeric tokens for the
+code-structure sidecar. The old path always used
+`value.chars().flat_map(char::to_lowercase)`, which builds a `ToLowercase` iterator for every Unicode
+scalar before discarding non-ASCII separators. For ASCII code and symbol text, the new path uses
+`value.is_ascii()` plus a byte loop with `to_ascii_lowercase`; non-ASCII input keeps the prior Unicode
+path unchanged.
+
+**Bit-identical:** for ASCII input, `char::to_lowercase` yields exactly the ASCII lowercase character,
+and the token-boundary rule is still `is_ascii_alphanumeric`. Non-ASCII input falls back to the old
+Unicode loop, including cases like the Kelvin sign that lowercase to ASCII. Proven by
+`tokenize_ascii_fastpath_matches_unicode_reference` over empty, code-like ASCII, mixed punctuation,
+Latin-1/Greek, CJK, and `\u{212A}` inputs.
+
+**Measured command (per-crate, local fallback through `rch exec`; in-process A/B old vs new):**
+
+```bash
+AGENT_NAME=BlackThrush \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+  rch exec -- cargo bench -p frankensearch-fsfs --profile release \
+    --bench code_tokenize -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+`old` = Unicode `chars().flat_map(char::to_lowercase)` tokenizer replica; `new` = ASCII byte fast
+path. Realistic code/symbol text. Medians:
+
+| Workload | old | new | Ratio | Status |
+|----------|-----|-----|-------|--------|
+| `code_tokenize/ascii_256` | 5011.625 ns | 4976.335 ns | **0.993** | tie/no-claim |
+| `code_tokenize/ascii_1024` | 13.090 us | 8.374 us | **0.640 (~1.56x)** | KEEP |
+| `code_tokenize/ascii_4096` | 95.735 us | 52.135 us | **0.545 (~1.84x)** | KEEP |
+
+**Scope:** a local fsfs indexing/sidecar tokenization win for medium and larger code snippets.
+Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** because those incumbents do not
+run frankensearch's fsfs code-structure sidecar tokenizer. The 256-byte row is deliberately recorded
+as a tie in `docs/NEGATIVE_EVIDENCE.md`; do not claim a small-string win from this lever.

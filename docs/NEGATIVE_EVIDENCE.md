@@ -2360,3 +2360,18 @@ the near-default chunk shape (fsfs `LexicalChunkPolicy::default().max_chars` is 
 1 KiB row) and large chunks, while the 4 KiB row alone is not enough to justify a length-threshold
 policy. Ratio vs Lucene/Tantivy/Meilisearch is **N/A** for this isolated file-ingest token-counting
 primitive; it does not move the BOLD query comparator.
+
+### 2026-06-27 - fsfs `code_structure_sidecar::tokenize` ASCII fast path: ORIG ratio N/A and 256-byte tie (BlackThrush)
+
+**Landed in `docs/PERF_LEDGER.md`** for medium/larger code-structure sidecar tokenization:
+`code_tokenize/ascii_1024` ratio **0.640 (~1.56x)** and `code_tokenize/ascii_4096` ratio
+**0.545 (~1.84x)**, measured per-crate with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b rch exec -- cargo bench
+-p frankensearch-fsfs --profile release --bench code_tokenize -- --sample-size 10 --warm-up-time 1
+--measurement-time 2`.
+
+Honesty notes: **ratio vs Lucene/Tantivy/Meilisearch ORIG is N/A** because this is frankensearch's
+fsfs code-structure sidecar tokenizer, not a comparator query primitive. The small-string row
+`code_tokenize/ascii_256` measured **5011.625 ns -> 4976.335 ns, ratio 0.993**, which is a noise/tie
+and must not be cited as a win. The lever is kept only for the larger-snippet rows where the measured
+ratio is below the 0.97 keep threshold.
