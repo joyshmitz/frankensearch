@@ -1782,3 +1782,41 @@ uses the file-backed `VectorIndex`, already single-pass — so this does NOT mov
 which stays inherent). It closes an *internal* gap: InMemory was doing redundant pass-1 work the
 file-backed path already avoided, on `limit_all`/large-limit queries through the wired two-pass. Kept
 bench: `int8_two_pass` (now has a `full_recall` group).
+
+### 2026-06-28 — AVX2 JL xorshift accumulate: 1.51× (a DIFFERENT primitive — SIMD PRNG) (BlackThrush)
+
+**Lever (off the dot/quantize vein — the embedder's PRNG).** `HashEmbedder::embed_jl` (the
+Johnson-Lindenstrauss projection embedder, the *compute-bound* tier — `O(tokens·dim)` xorshift) folds 4
+independent xorshift64 token-chains per dimension. The hot loop `jl_accumulate_lanes` was scalar-ILP: 4
+chains × 3 shift-xor steps = 24 scalar ops/dim plus 4 sign-selects. The 4 chains are exactly one
+`__m256i` of u64 lanes (`JL_LANES == 4`), so the new `#[target_feature(enable="avx2")]`
+`jl_accumulate_lanes_avx2` does each step as a single vector `slli`/`srli`/`xor_epi64` (6 vector ops vs
+24 scalar), and recovers the per-dim ±1 sum branch-free: shift each lane's low bit into the sign
+position, `_mm256_movemask_pd` the 4 signs, `4 - 2·popcount(mask)` = the exact integer `a0+a1+a2+a3`.
+Runtime-dispatched (`is_x86_feature_detected!("avx2")`); scalar-ILP is the fallback.
+
+**Bit-identical:** the xorshift is per-lane identical, and the per-dim contribution is a sum of ±1 lanes
+— an exact small integer added to an exact-integer accumulator (`|value| ≤ token count ≪ 2²⁴`), so neither
+the SIMD lane grouping nor the `4-2·popcount` reformulation changes a bit. `jl_avx2_matches_scalar`
+asserts `to_bits` equality across 10 dim shapes accumulated over 25 token-groups (+ the all-odd
+zero-state edge). Conformance: **289/289** embed lib tests GREEN.
+
+**Measured (per-crate `hash_embed` bench, dim 384, 2000 4-chain groups ≈ 8k tokens, kernel isolated from
+tokenize/normalize):**
+
+| Workload | scalar-ILP | AVX2 | Ratio | Status |
+|----------|-----------|------|-------|--------|
+| `jl_accumulate` (384×2000) | 2349.7 µs | 1556.0 µs | **0.662 (~1.51×)** | KEEP |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-embed --profile release --bench hash_embed -- jl_accumulate
+```
+
+**Scope:** original-comparator ratio **N/A** (own embedder; no Tantivy counterpart). JL is **non-default**
+(the default `HashEmbedder` is `FnvModular`, whose hash is inherently sequential — not SIMD-able), so this
+helps deployments that pick the JL tier (better distance preservation) — the compute-bound embed path for
+them. A genuinely **different primitive** (SIMD PRNG/xorshift, not a dot/quantize/encode), satisfying the
+"never-safe-Rust-ceiling" steer with AVX2 u64 intrinsics. The smaller-than-the-decode-kernels ratio is
+expected: the scalar-ILP already pipelines the 4 independent chains, so the win is the 4×-fewer
+instructions, not a latency unlock. Kept bench arm: `jl_accumulate/scalar`.

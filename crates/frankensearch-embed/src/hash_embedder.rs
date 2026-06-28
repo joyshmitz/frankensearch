@@ -198,11 +198,34 @@ fn jl_accumulate_one(embedding: &mut [f32], mut state: u64) {
 }
 
 /// Advance [`JL_LANES`] independent token chains together, folding their per-
-/// dimension signs into the accumulator. The four chains are data-independent,
-/// so the CPU can pipeline their shift→xor steps; the `if`-based sign select is
-/// kept (the branchless form regressed — LLVM already emits a conditional move).
+/// dimension signs into the accumulator. Runtime-dispatches to an AVX2 kernel
+/// (the 4 chains are exactly one `__m256i` of u64 lanes — `JL_LANES == 4`); the
+/// scalar-ILP version is the portable fallback. Both are bit-identical: the
+/// per-dimension contribution is a sum of ±1 lanes (an exact small integer added
+/// to an exact-integer accumulator), so neither the SIMD lane grouping nor the
+/// `4 - 2·popcount` reformulation can change a single output bit.
+#[doc(hidden)]
 #[inline]
-fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+pub fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            unsafe {
+                jl_accumulate_lanes_avx2(embedding, states);
+            }
+            return;
+        }
+    }
+    jl_accumulate_lanes_scalar(embedding, states);
+}
+
+/// Portable scalar-ILP JL accumulate (the AVX2-dispatch fallback). 4 independent
+/// xorshift64 chains pipelined; `#[doc(hidden)] pub` for the bench A/B.
+#[doc(hidden)]
+#[inline]
+pub fn jl_accumulate_lanes_scalar(embedding: &mut [f32], states: &[u64; JL_LANES]) {
     let [mut s0, mut s1, mut s2, mut s3] = *states;
     for dim in embedding {
         s0 ^= s0 << 13;
@@ -224,6 +247,43 @@ fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
         // Sum of ±1 lanes is an exact small integer; adding it to the exact
         // integer accumulator is bit-identical to four sequential `+=`.
         *dim += a0 + a1 + a2 + a3;
+    }
+}
+
+/// Hand-written AVX2 JL accumulate: the 4 xorshift64 chains live in one
+/// `__m256i` (u64×4), so each chain step is a single vector `slli`/`srli`/`xor`
+/// (3 steps = 6 vector ops vs 24 scalar). The per-dimension ±1 sum is recovered
+/// branch-free: shift each lane's low bit into the sign position, `movemask_pd`
+/// the 4 sign bits, and `4 - 2·popcount(mask)` is the exact integer
+/// `a0+a1+a2+a3`. **Bit-identical** to the scalar kernel
+/// (`jl_avx2_matches_scalar`); the xorshift is per-lane identical and the sum is
+/// an exact integer either way.
+///
+/// # Safety
+/// Caller must ensure `avx2` is available (the dispatch in [`jl_accumulate_lanes`]
+/// guarantees it).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+fn jl_accumulate_lanes_avx2(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_slli_epi64,
+        _mm256_srli_epi64, _mm256_xor_si256,
+    };
+    // SAFETY: avx2 by contract; the load reads exactly the 4 u64 of `states`.
+    unsafe {
+        let mut s = _mm256_loadu_si256(states.as_ptr().cast::<__m256i>());
+        for dim in embedding {
+            s = _mm256_xor_si256(s, _mm256_slli_epi64::<13>(s));
+            s = _mm256_xor_si256(s, _mm256_srli_epi64::<7>(s));
+            s = _mm256_xor_si256(s, _mm256_slli_epi64::<17>(s));
+            // Move each lane's low bit to its sign bit, then extract the 4 signs.
+            let mask = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(s)));
+            // odd lanes → -1, even → +1; Σ = (4-odd) - odd = 4 - 2·odd.
+            #[allow(clippy::cast_possible_wrap)]
+            let sum = (4 - 2 * (mask as u32).count_ones() as i32) as f32;
+            *dim += sum;
+        }
     }
 }
 
@@ -297,6 +357,45 @@ fn tokenize(text: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AVX2 JL accumulate must be byte-for-byte identical to the scalar-ILP
+    /// kernel across dim shapes + accumulated over many token-groups (exact-integer
+    /// accumulator). Skips without AVX2.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn jl_avx2_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for &dim in &[1_usize, 7, 8, 16, 31, 64, 100, 256, 384, 385] {
+            let mut e_scalar = vec![0.0_f32; dim];
+            let mut e_avx2 = vec![0.0_f32; dim];
+            // Accumulate many independent token-groups (incl. the zero-state edge).
+            for g in 0..25 {
+                let states = if g == 0 {
+                    [1_u64; JL_LANES] // (seed^hash)|1 always odd, never 0
+                } else {
+                    [next() | 1, next() | 1, next() | 1, next() | 1]
+                };
+                jl_accumulate_lanes_scalar(&mut e_scalar, &states);
+                // SAFETY: avx2 verified present above.
+                #[allow(unsafe_code)]
+                unsafe {
+                    jl_accumulate_lanes_avx2(&mut e_avx2, &states);
+                }
+            }
+            let sb: Vec<u32> = e_scalar.iter().map(|x| x.to_bits()).collect();
+            let ab: Vec<u32> = e_avx2.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(sb, ab, "dim={dim}");
+        }
+    }
 
     // ── Determinism ────────────────────────────────────────────────────
 

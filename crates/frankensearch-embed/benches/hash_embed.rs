@@ -244,6 +244,42 @@ fn bench_hash_embed(c: &mut Criterion) {
         });
         ig.finish();
     }
+
+    // Kernel-level A/B of the real JL accumulate (the compute-bound inner loop),
+    // isolated from tokenize/normalize: scalar-ILP vs the AVX2 u64×4 dispatch.
+    {
+        use frankensearch_embed::{jl_accumulate_lanes, jl_accumulate_lanes_scalar};
+        const DIM: usize = 384;
+        const GROUPS: usize = 2000; // ~8000 tokens' worth of 4-chain groups
+        let states: [u64; 4] = [
+            0x1234_5678_9abc_def1,
+            0x9e37_79b9_7f4a_7c15,
+            0xdead_beef_cafe_bac5,
+            0x0123_4567_89ab_cdef,
+        ];
+        let mut ag = c.benchmark_group("jl_accumulate");
+        ag.bench_function("scalar", |b| {
+            let mut e = vec![0.0_f32; DIM];
+            b.iter(|| {
+                e.fill(0.0);
+                for _ in 0..GROUPS {
+                    jl_accumulate_lanes_scalar(black_box(&mut e), black_box(&states));
+                }
+                black_box(&e);
+            });
+        });
+        ag.bench_function("avx2_dispatch", |b| {
+            let mut e = vec![0.0_f32; DIM];
+            b.iter(|| {
+                e.fill(0.0);
+                for _ in 0..GROUPS {
+                    jl_accumulate_lanes(black_box(&mut e), black_box(&states));
+                }
+                black_box(&e);
+            });
+        });
+        ag.finish();
+    }
 }
 
 criterion_group!(benches, bench_hash_embed);

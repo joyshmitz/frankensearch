@@ -93,7 +93,9 @@ pub use model_registry::{
 pub mod hash_embedder;
 
 #[cfg(feature = "hash")]
-pub use hash_embedder::{HashAlgorithm, HashEmbedder};
+pub use hash_embedder::{
+    HashAlgorithm, HashEmbedder, jl_accumulate_lanes, jl_accumulate_lanes_scalar,
+};
 
 #[cfg(feature = "model2vec")]
 pub mod model2vec_embedder;
