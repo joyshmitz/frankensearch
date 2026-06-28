@@ -2574,3 +2574,31 @@ so they miss the 6.32× win the in-memory path already has. Options: (a) one-pas
 `open` (O(N) decompress, simplest-correct, ~0.4 µs/doc ⇒ ~40 ms at 100k), or (b) persist the table to a
 sidecar on `commit` + load on `open` (no scan, but needs a file format + atomicity + corruption
 fallback). This benefits real persisted deployments but does NOT move the in-memory BOLD comparator.
+
+### 2026-06-28 — `index_documents` per-batch ord-table lock hoist is ~0-gain (within noise) (BlackThrush)
+
+**Lever tested and reverted.** The materialization wiring appends each doc's `doc_id` to the ord table
+at index time; `index_documents` did this via `assign_ord` (which re-locks `ord_table.write()` **per
+doc**). Hypothesis: a bulk index should hold the table write lock **once** for the whole batch (and
+`reserve(docs.len())` up front), paying one lock + one growth instead of N — verifying the
+materialization win didn't regress indexing throughput (a real Tantivy/Lucene comparator dimension).
+Correctness-neutral (the ord assignment is identical, just the lock scope differs): 82/82 lexical tests
+GREEN with the batch-lock path.
+
+**Measured (per-crate same-binary A/B, fresh in-memory index per iteration, N=5000 docs, 20 samples;
+`per_doc_lock` = old `assign_ord`-per-doc, `batch_lock` = lock-once + reserve):**
+
+| Workload | per_doc_lock | batch_lock | Ratio |
+|----------|--------------|------------|-------|
+| `batch_index` (index 5000 docs) | 21.547 ms `[19.073, 25.007]` | 20.038 ms `[19.659, 20.458]` | **0.93 (CIs overlap)** |
+
+**Decision: reverted** (source + `Cargo.toml` byte-identical to `main`, baseline method + bench removed).
+The 0.93 median is **noise, not signal**: the `per_doc_lock` arm's CI is very wide `[19.073, 25.007]`
+(allocation/scheduling spikes) and its lower bound sits below the `batch_lock` median, while the true
+lock effect is only ~0.7% (≈`5000 × ~30 ns` uncontended `RwLock` ops over a ~20 ms index). Indexing is
+dominated by Tantivy `add_document` (tokenization + postings + stored doc) plus the **inherent** per-doc
+`doc_id` clone the table requires — neither removable by lock scope. **The materialization win's
+index-time overhead is negligible and not lock-bound; there is no clean indexing lever here.** Confirms
+the materialization win is a good trade (6.32× query-time materialization for sub-noise index cost).
+Don't re-attempt index-path micro-opts on the ord-table append. Original-comparator ratio is **N/A**
+(frankensearch's own index-time bookkeeping; raw Tantivy is the floor the wrapper sits above).
