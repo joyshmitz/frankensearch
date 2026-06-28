@@ -197,7 +197,70 @@ pub fn dot_product_f16_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
             found: stored_bytes.len() / 2,
         });
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above;
+            // `stored_bytes.len() == dim*2` checked above.
+            #[allow(unsafe_code)]
+            return Ok(unsafe { dot_product_f16_bytes_f32_avx2(stored_bytes, query) });
+        }
+    }
+    Ok(dot_product_f16_bytes_f32_generic(stored_bytes, query))
+}
 
+/// Hand-written AVX2+F16C f16·f32 dot. `vcvtph2ps` (`_mm256_cvtph_ps`) decodes 8
+/// f16 in one instruction — the portable `wide` decode (`widen8_f16_bytes`) is
+/// software, and this kernel is decode-bound — then the **same** separate-mul+add
+/// f32 accumulation, the **same** `wide::f32x8::reduce_add` final reduction (the
+/// 256-bit accumulator is round-tripped through `f32x8`), and the **same** scalar
+/// `mul_add` tail as the generic kernel. f16→f32 is exact (f32 has more mantissa
+/// bits), so the products / accumulation / reduction are byte-for-byte the generic
+/// path → **bit-identical** (proven by `avx2_f16dot_matches_generic`).
+///
+/// # Safety
+/// Caller must ensure `avx2` + `f16c` are available (the dispatch in
+/// [`dot_product_f16_bytes_f32`] guarantees this) and `stored_bytes.len() == query.len()*2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
+    use core::arch::x86_64::{
+        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps, _mm_loadu_si128,
+    };
+    let dim = query.len();
+    let chunks = dim / 8;
+    let mut arr = [0.0_f32; 8];
+    // SAFETY: avx2+f16c by contract; every load is `chunk_index < chunks`-bounded.
+    unsafe {
+        let mut sum = _mm256_setzero_ps();
+        for chunk_index in 0..chunks {
+            let f16bits =
+                _mm_loadu_si128(stored_bytes.as_ptr().add(chunk_index * 16).cast::<__m128i>());
+            let stored = _mm256_cvtph_ps(f16bits);
+            let q = _mm256_loadu_ps(query.as_ptr().add(chunk_index * 8));
+            sum = _mm256_add_ps(sum, _mm256_mul_ps(stored, q));
+        }
+        _mm256_storeu_ps(arr.as_mut_ptr(), sum);
+    }
+    // Final reduce + scalar tail are byte-for-byte the generic path.
+    let mut result = f32x8::from(arr).reduce_add();
+    for index in (chunks * 8)..dim {
+        let b = &stored_bytes[index * 2..];
+        let val = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        result = val.mul_add(query[index], result);
+    }
+    result
+}
+
+/// Portable (`wide`-SIMD) f16-bytes·f32 dot — the AVX2+F16C-dispatch fallback and
+/// the path on non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_product_f16_bytes_f32_generic(stored_bytes: &[u8], query: &[f32]) -> f32 {
+    let dim = query.len();
     let chunks = dim / 8;
     let mut sum = f32x8::splat(0.0);
 
@@ -224,7 +287,7 @@ pub fn dot_product_f16_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
         result = val.mul_add(query[index], result);
     }
 
-    Ok(result)
+    result
 }
 
 /// Dot product between f32 bytes and an f32 query vector.
@@ -701,6 +764,39 @@ mod tests {
             #[allow(unsafe_code)]
             let avx2 = unsafe { dot_4bit_prepared_avx2(&s, &prepared) };
             assert_eq!(generic, avx2, "len={len}");
+        }
+    }
+
+    /// The runtime AVX2+F16C f16·f32 dot must be **bit-identical** to the portable
+    /// `wide` kernel for finite inputs (f16→f32 is exact; the accumulation and
+    /// `reduce_add` reductions are byte-for-byte the same). Embeddings are always
+    /// finite, so the test uses finite f16 (NaN payloads are the only legitimate
+    /// divergence and never occur in real vectors). Skips without AVX2+F16C.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_f16dot_matches_generic() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut state = 0x1357_9bdf_2468_ace0_u64;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            (((state >> 40) as f32 / (1_u64 << 23) as f32) - 1.0)
+        };
+        for &dim in &[1_usize, 7, 8, 9, 16, 17, 31, 64, 100, 256, 384, 512] {
+            let q: Vec<f32> = (0..dim).map(|_| next_f32()).collect();
+            let mut bytes = Vec::with_capacity(dim * 2);
+            for _ in 0..dim {
+                bytes.extend_from_slice(&f16::from_f32(next_f32()).to_le_bytes());
+            }
+            let generic = dot_product_f16_bytes_f32_generic(&bytes, &q);
+            // SAFETY: avx2+f16c verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { dot_product_f16_bytes_f32_avx2(&bytes, &q) };
+            assert_eq!(generic.to_bits(), avx2.to_bits(), "dim={dim}");
         }
     }
 

@@ -1466,3 +1466,45 @@ width helps less than the memory-bound int8 dot — but it's the **default** pat
 default vector search now gets a ~1.2× faster pass-1 scan, safe-fallback elsewhere. Both int8 and 4-bit
 pass-1 dots are now AVX2-dispatched. Route-next: only the f16 pass-2 rescore (F16C) remains, and that
 needs a recall gate (f32 reorder is not bit-identical). Kept bench arm: `fourbit_prepared_generic`.
+
+### 2026-06-28 — runtime-dispatched AVX2+F16C `dot_product_f16_bytes_f32`: 3.88–3.99× (BOLD vector-tier kernel) (BlackThrush)
+
+**Lever (the f16 route-next — and it IS bit-identical after all).** `dot_product_f16_bytes_f32` is the
+exact f16 scan kernel — it backs `VectorIndex::search_top_k`, i.e. **the BOLD comparator's vector tier**
+(`frankensearch_hash_hybrid_search` → `fixture.vector.search_top_k`), plus the two-pass f16 rescore. The
+kernel is **decode-bound**: the portable `wide` path decodes each f16→f32 in software. The new
+`#[target_feature(enable="avx2,f16c")]` kernel uses `vcvtph2ps` (`_mm256_cvtph_ps`) to decode 8 f16 in
+one instruction, then runtime-dispatches via `is_x86_feature_detected!("avx2") && …("f16c")`, falling
+back to the `wide` kernel (`dot_product_f16_bytes_f32_generic`) elsewhere.
+
+**Bit-identical (the prior note feared an f32-reorder; avoided it):** f16→f32 is **exact** (f32 has more
+mantissa bits), so F16C yields the same f32 values as `widen8_f16_bytes`; the kernel then keeps the
+**same** separate-mul+add accumulation and routes the final reduction **through `wide::f32x8::reduce_add`**
+(the `__m256` accumulator is stored to `[f32;8]` → `f32x8`), so the reduction order is byte-for-byte the
+generic path. New test `simd::tests::avx2_f16dot_matches_generic` asserts `to_bits` equality across 12
+dim shapes (embeddings are finite; NaN payloads — the only legitimate divergence — never occur).
+Conformance: **366/366** index lib tests GREEN serial. *(WAL tests flake under parallel `cargo test`;
+pass with `--test-threads=1`.)*
+
+**Measured (per-crate, AVX2+F16C worker `ovh-a`; sum of 10 000 f16 dots; `f16_bytes_new` = runtime
+dispatch → AVX2+F16C, `f16_bytes_generic` = portable `wide` software-decode fallback):**
+
+| Workload | generic (`wide`) | AVX2+F16C | Ratio | Status |
+|----------|------------------|-----------|-------|--------|
+| `dot/dim256/f16_bytes` (10k vectors) | 1.0825 ms | 271.48 µs | **0.251 (~3.99×)** | KEEP |
+| `dot/dim384/f16_bytes` (10k vectors) | 1.5735 ms | 405.63 µs | **0.258 (~3.88×)** | KEEP |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench dot_product -- "dot/dim(256|384)/f16_bytes"
+```
+
+**Scope:** the **largest** of the three SIMD-dispatch wins (int8 2.5×, 4-bit 1.2×, f16 3.9×) because the
+f16 dot is decode-bound and F16C is a pure hardware win. Original-comparator ratio vs Lucene/Tantivy is
+**N/A** (vector tier has no incumbent counterpart), but this is the **BOLD vector-tier kernel**, so the
+non-short-circuit BOLD rows' vector search is now ~3.9× cheaper on AVX2+F16C hosts (directly trims
+frankensearch's hybrid-over-Tantivy overhead), safe-fallback elsewhere. All three integer/f16 dot
+kernels are now AVX2-dispatched; the f16 fear of "not bit-identical" was wrong (reduce-through-`wide`
+fixes it). Kept bench arm: `f16_bytes_generic`.

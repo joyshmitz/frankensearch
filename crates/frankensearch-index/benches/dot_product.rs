@@ -25,7 +25,7 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
     InMemoryVectorIndex, dot_4bit_prepared, dot_4bit_prepared_generic, dot_i8_i8, dot_i8_i8_generic,
-    dot_product_f16_bytes_f32,
+    dot_product_f16_bytes_f32, dot_product_f16_bytes_f32_generic,
     dot_product_f16_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, prepare_4bit_query,
 };
 use half::f16;
@@ -465,6 +465,17 @@ fn bench_dot(c: &mut Criterion) {
                 let mut acc = 0.0_f32;
                 for bytes in &corpus.stored_f16_bytes {
                     acc += dot_product_f16_bytes_f32(black_box(bytes), black_box(q)).unwrap();
+                }
+                black_box(acc)
+            });
+        });
+        // Runtime-AVX2+F16C dispatch (`f16_bytes_new` above) vs the portable `wide`
+        // kernel it falls back to. Bit-identical; AVX2+F16C win on capable hosts.
+        group.bench_function(BenchmarkId::new("f16_bytes_generic", n), |b| {
+            b.iter(|| {
+                let mut acc = 0.0_f32;
+                for bytes in &corpus.stored_f16_bytes {
+                    acc += dot_product_f16_bytes_f32_generic(black_box(bytes), black_box(q));
                 }
                 black_box(acc)
             });
