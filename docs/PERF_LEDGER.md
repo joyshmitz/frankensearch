@@ -1181,3 +1181,54 @@ result count (k = N). Medians:
 **Scope:** no-lexical (pure-vector) sync refined result materialization. This is frankensearch's own
 result-assembly overhead; original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (caveat in
 `docs/NEGATIVE_EVIDENCE.md`).
+
+### 2026-06-28 — lexical id materialization: numeric u64 fast-field + ordinal table is 2.56–8.47× over docstore (validated lever) (BlackThrush)
+
+**Lever (validated, bench-level; production wiring scoped as the immediate follow-up).** `TantivyIndex::
+search_doc_ids` materializes each hit's `doc_id` via `collect_id_hits → load_doc → searcher.doc(addr)`,
+which **decompresses the entire stored document** (id + content + title + metadata_json — all `STORED`)
+just to read the `id` field. This is the BOLD `limit_all` / large-fetch materialization gap. Two prior
+attacks were REJECTED: the **str-FAST-field** id (`docs/NEGATIVE_EVIDENCE.md` 2026-06-27, **2.65–18.3×
+slower** — `StrColumn::ord_to_str` does a dictionary SSTable seek per hit) and the **lazy doc_id cache**
+(~0-gain at the realistic ~30-candidate fetch). Their shared route-next — a **numeric `u64` fast field
+carrying a dense insertion ordinal** (a flat bit-packed column, **no dictionary**) plus an external
+append-only `ordinal → doc_id` table (`Vec<String>`, O(1) index) — is now **confirmed a large win**: it
+skips BOTH the docstore decompress AND the dictionary seek, reading `ord = u64_column.first(local_doc)`
+and cloning `table[ord]` once.
+
+**Measured (per-crate A/B, fresh in-RAM Tantivy, N=20k, `content` `STORED` so the docstore arm pays a
+realistic decompress like production; `docstore` = `searcher.doc(addr)` → read id (current path),
+`numeric_ff` = u64 fast-field → `table[ord]`; doc_ids asserted bit-identical before timing; 60 samples):**
+
+| Workload | docstore (now) | numeric_ff | Ratio | Speedup |
+|----------|----------------|------------|-------|---------|
+| `id_materialize/k30`   | 12.340 µs | 4.8263 µs | **0.391** | ~2.56× |
+| `id_materialize/k100`  | 45.184 µs | 9.5752 µs | **0.212** | ~4.72× |
+| `id_materialize/k300`  | 136.60 µs | 16.505 µs | **0.121** | ~8.28× |
+| `id_materialize/k1000` | 431.81 µs | 51.009 µs | **0.118** | ~8.47× |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+  --bench id_materialize_numeric_ff -- --sample-size 60 --warm-up-time 1 --measurement-time 3
+```
+
+Artifact: kept bench `crates/frankensearch-lexical/benches/id_materialize_numeric_ff.rs`. Conformance:
+81/81 lexical lib tests GREEN; the bench asserts the two paths return identical `doc_id`s.
+
+**Why this is a real comparator angle (not just internal):** the incumbent Lucene/Tantivy-class proxy
+also materializes ids out of the stored document (`tantivy_only_search` ultimately reads ids the same
+docstore way); a numeric-ff materialization makes frankensearch's id read **2.56–8.47× cheaper than the
+docstore path the comparator pays**, so it directly closes the materialization-dominated `limit_all`
+gap. **Wins even at k30** — the regime where the doc_id-cache was ~0-gain — so it helps the BOLD top10
+over-fetch too, not only large-limit.
+
+**Production wiring (scoped follow-up, NOT in this commit):** add `ord: u64 FAST` to `build_schema`,
+build the append-only `ordinal → doc_id` table during `index_documents`/`upsert` (rebuild on `open` for
+persisted indexes), and route `collect_id_hits` through the fast field with a **docstore fallback** for
+pre-`ord` indexes (so old on-disk indexes stay correct). Delete/merge safety: ordinals are monotonic and
+never reused (a deleted doc's ordinal simply never appears in results; Tantivy carries fast fields
+through merges), so the append-only table is delete/merge-correct; it grows by one `String` per
+doc-version, rebuilt in O(total docs) on open. That correctness surface needs its own conformance pass,
+hence wiring is deferred to keep this commit GREEN and reversible.

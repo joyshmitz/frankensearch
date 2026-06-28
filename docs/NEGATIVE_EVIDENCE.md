@@ -575,6 +575,15 @@ plausible: a *numeric* fast field carrying a dense doc ordinal + an external ord
 candidates into materialization. Combined with the int8 reject, the BOLD high-fanout gap is bounded
 by docstore materialization + RRF + tracing — none cheaply removable by a single primitive swap.
 
+> **UPDATE 2026-06-28 (BlackThrush): the numeric-fast-field route-next is CONFIRMED a large win.**
+> A per-crate A/B (`id_materialize_numeric_ff`, kept bench) measured the `u64` dense-ordinal fast field +
+> external `ordinal→doc_id` table at **2.56× (k30) → 8.47× (k1000)** faster than the docstore path,
+> bit-identical doc_ids. It wins **even at k30** (where the doc_id-cache below was ~0-gain) because the
+> numeric column has no dictionary (unlike the str-FAST-field above) and skips the stored-doc decompress.
+> See `docs/PERF_LEDGER.md` 2026-06-28 "lexical id materialization: numeric u64 fast-field + ordinal
+> table". Production wiring (schema `ord` field + append-only table + `collect_id_hits` fast path with
+> docstore fallback; delete/merge-safe via monotonic non-reused ordinals) is the scoped follow-up.
+
 ### 2026-06-27 — Lazy doc_id cache for `search_doc_ids` is ~0-gain on the biggest gap (BlackThrush)
 
 **Lever tested and reverted:** the materialization route-next, take 2 — instead of a fast field

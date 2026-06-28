@@ -20,9 +20,14 @@ rayon = { workspace = true }
 asupersync = { workspace = true, features = ["test-internals"] }
 tempfile = "3"
 criterion = { workspace = true }
+tantivy = { workspace = true }
 
 [[bench]]
 name = "doc_ids_topk"
+harness = false
+
+[[bench]]
+name = "id_materialize_numeric_ff"
 harness = false
 
 [lints]
