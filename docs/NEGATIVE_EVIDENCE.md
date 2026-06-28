@@ -44,6 +44,51 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ## Gated levers (measured headroom that can't be landed as library code)
 
+### 2026-06-27 - BOLD hash-hybrid 4-bit vector backfill is mixed and regresses `limit_all` (BlackThrush)
+
+**Lever tested and reverted:** changed the BOLD `hash_hybrid_tantivy_vector_rrf` candidate path to
+use the current FSVI 4-bit two-pass vector primitive (`search_top_k_4bit_two_pass`, mult=5) instead
+of the exact flat vector scan. This was the natural follow-up after the 4-bit vector primitive and
+fusion fast-tier wins, targeting BOLD rows where the hybrid backfill is still slower than ORIG.
+
+**Measured command (per-crate, RCH remote `hz2`, release profile):**
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_4bit_candidate_rerun \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Local transcript artifact: `/tmp/frankensearch-bold-4bit-candidate-rerun.log`; the BOLD summary
+reported `FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_4bit_candidate_rerun`.
+ORIG comparator is `tantivy_doc_ids`.
+
+| Workload | ORIG p50 | Candidate p50 | Ratio vs ORIG | Decision |
+|----------|----------|----------------|---------------|----------|
+| `top10/10000 exact_identifier` | 152 us | 124 us | **0.816** | win, but not enough to offset broader misses |
+| `top10/10000 quoted_phrase` | 151 us | 146 us | **0.967** | borderline/noisy win |
+| `top10/10000 high_fanout` | 82 us | 83 us | **1.012** | tie/noise |
+| `top10/10000 zero_hit` | 41 us | 41 us | **1.000** | no gain |
+| `limit_all/10000` | 5.466 ms | 5.998 ms | **1.097x slower** | reject |
+| `top10/100000 exact_identifier` | 948 us | 974 us | **1.027** | noise/regression |
+| `top10/100000 short_keyword` | 59 us | 64 us | **1.085x slower** | reject |
+| `top10/100000 natural_language` | 2.033 ms | 1.535 ms | **0.755** | real row win, but not isolated |
+| `top10/100000 high_fanout` | 619 us | 620 us | **1.002** | no gain |
+| `top10/100000 zero_hit` | 45 us | 41 us | **0.911** | small win |
+
+**Decision:** source reverted. The 4-bit two-pass primitive remains a valid lower-level win, but
+dropping it into the BOLD hash-hybrid backfill is not a safe end-to-end lever: it worsens the largest
+remaining BOLD materialization gap (`limit_all`) and adds regressions on 100k exact/short rows. Route
+next below the candidate materialization/query parser boundary instead of swapping the vector backfill
+primitive in this harness.
+
 ### 2026-06-25 — AVX2 build is the biggest remaining dot-kernel lever, but it's a build-config knob (BlackThrush)
 
 **Finding:** every SIMD win so far is on an **SSE2-class build** (no AVX2/SSE4.1 — the ~1 ns/elem
