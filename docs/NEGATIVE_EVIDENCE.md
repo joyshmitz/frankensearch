@@ -125,6 +125,46 @@ portable released binary).
 
 ## Residual comparator negatives
 
+### 2026-06-28 — BOLD `limit_all` counted collector is scoped to large-limit only (BlackThrush)
+
+**Lever landed with narrow scope:** the BOLD frankensearch challenger now routes only the
+`limit_all` query shape through `search_doc_ids_counted`; the Tantivy/Lucene/Meilisearch-class
+incumbent (`tantivy_doc_ids`) and all top10 challenger rows stay on the existing adaptive
+`search_doc_ids` path. This targets the large-limit collector/materialization residual without
+reopening the rejected top10 high-fanout counted-collector route below.
+
+**Measured command** (per-crate, RCH local fallback; no admissible workers:
+`insufficient_slots=3,hard_preflight=1`; fresh target dir
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall`):
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+RUST_LOG=error \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact:
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted/summary.jsonl`.
+
+| Workload | Tantivy-class ORIG p50 | frankensearch p50 | Ratio vs ORIG | Decision |
+|----------|------------------------|-------------------|---------------|----------|
+| `bold_verify/limit_all/10000` `hash_hybrid_tantivy_vector_rrf` | 11.046 ms | 9.928 ms | **0.899** | keep |
+| `bold_verify/limit_all/10000` `hash_lexical_guard_tantivy` | 11.046 ms | 10.507 ms | **0.951** | keep |
+
+**Caveat / do not generalize:** this is a large-limit BOLD harness collector-policy win, not a
+general top10 collector rule or product-wide BM25 dominance claim. The same sweep still had
+non-target slow rows: 10k short-keyword hybrid **1.297x**, 10k high-fanout guard **1.040x**, 10k
+zero-hit hybrid **1.152x**, 100k high-fanout hybrid **1.047x**, 100k zero-hit guard **1.537x**, and
+100k quoted-phrase guard **1.479x**. Do not broaden counted collection to top10 high-fanout; that
+route is separately rejected below.
+
 ### 2026-06-27 — `SniffFeatures::from_bytes` branchless `u64` counters are not a win — REVERTED (BlackThrush)
 
 **Lever tested and reverted:** `frankensearch-fsfs::SniffFeatures::from_bytes` counts null,

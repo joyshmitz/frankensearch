@@ -127,6 +127,42 @@ short-circuit rows. It does not establish universal dominance over Tantivy/Lucen
 BM25; the 10k short-keyword/high-fanout/zero-hit rows, 100k quoted phrase, and `limit_all` remain
 negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 
+### 2026-06-28 — BOLD-VERIFY `limit_all` counted collector for frankensearch candidate (BlackThrush)
+
+**Lever:** the BOLD frankensearch challenger now uses the counted `search_doc_ids_counted`
+collector only for the `limit_all` query shape. This keeps the Tantivy/Lucene/Meilisearch-class
+incumbent unchanged, and keeps all top10 challenger rows on the existing adaptive `search_doc_ids`
+path. The scoped rule targets the remaining large-limit materialization/collector residual without
+reopening the already rejected top10 high-fanout counted route.
+
+**Measured command** (RCH local fallback; no admissible workers:
+`insufficient_slots=3,hard_preflight=1`; per-crate, fresh target dir):
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+RUST_LOG=error \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench bold_verify_tantivy_class \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Artifact:
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted/summary.jsonl`.
+
+| Workload | Corpus hash | Tantivy-class p50 | frankensearch p50 | Ratio vs Tantivy-class | Status |
+|----------|-------------|-------------------|-------------------|------------------------|--------|
+| `bold_verify/limit_all/10000` `hash_hybrid_tantivy_vector_rrf` | `2e78365a46a7c3b9` | 11.046 ms | 9.928 ms | **0.899** | KEEP |
+| `bold_verify/limit_all/10000` `hash_lexical_guard_tantivy` | `2e78365a46a7c3b9` | 11.046 ms | 10.507 ms | **0.951** | KEEP |
+
+**Scope:** this is a BOLD harness collector-policy win for the large-limit row, not a general
+BM25 dominance claim. The required residual/regression rows are recorded in
+`docs/NEGATIVE_EVIDENCE.md`; do not generalize this counted collector to top10 high-fanout queries.
+
 | Date | Crate | Lever | Workload (bench id) | Before | After | Ratio | Status |
 |------|-------|-------|---------------------|--------|-------|-------|--------|
 | 2026-06-25 | frankensearch-core | **ASCII fast-path for NFC canonicalization** (analyzer hot path) | `nfc/ascii_short` | 1.207 µs | 26.7 ns | **0.022 (~45×)** | KEEP (`9d7e8d0`) |
