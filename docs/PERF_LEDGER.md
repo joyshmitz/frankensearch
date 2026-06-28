@@ -1675,3 +1675,39 @@ linear in corpus), recurring on rebuild/refresh. Largest non-dot ratio yet. With
 quantizer slab builds are now AVX2-dispatched**; the per-query `quantize_i8_query`/`pack_4bit_query` are
 dim-sized (negligible) and not worth it — the build/quantize SIMD vein is now mined too. Kept bench:
 `quantize_slab`.
+
+### 2026-06-28 — runtime-dispatched F16C f32→f16 ENCODE: 4.1–5.4× (the most-common build kernel) (BlackThrush)
+
+**Lever (the encode, not the decode/quantize — every index build).** `f16::from_f32` is the per-element
+conversion at the heart of EVERY index build — `InMemoryVectorIndex::from_vectors` (both tiers of the
+sync hybrid), FSVI writes. New `simd::encode_f32_to_f16_extend` runtime-dispatches to F16C `vcvtps2ph`
+(8 f32→f16/instruction, round-to-nearest-even) and — critically — **bulk-stores the 8 f16 straight into
+the `Vec`'s spare capacity (`_mm_storeu_si128` + `set_len`)** rather than `push`-ing per element (the
+first cut at ~1.6× was push-bound; bulk store took it to ~5×). `in_memory.rs::from_vectors` now calls it.
+
+**Bit-identical:** `vcvtps2ph` round-to-nearest-even == `half::f16::from_f32` for finite inputs
+(`half::f16` is `repr(transparent)` over `u16`, so the store is layout-safe) —
+`simd::tests::avx2_f16encode_matches_generic` asserts `to_bits` equality across normal/large(near-f16-max)/
+tiny(subnormal) magnitudes + sub-8 tails. Conformance: **372/372** index lib tests GREEN serial (the
+`from_vectors_*` tests exercise the new encode on the build path).
+
+**Measured (per-crate, AVX2+F16C; dim 384 f32→f16; reused output buffer to isolate the encode from
+per-iter allocation — matching the real build which appends to one reserved flat Vec):**
+
+| Workload | generic (`half::from_f32` + push) | F16C (bulk store) | Ratio | Status |
+|----------|-----------------------------------|-------------------|-------|--------|
+| `encode_f32_to_f16/10000` (10k×384) | 5.76 ms | 1.06 ms | **0.184 (~5.4×)** | KEEP |
+| `encode_f32_to_f16/50000` (50k×384) | 31.40 ms | 7.73 ms | **0.246 (~4.1×)** | KEEP |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-index --profile release --bench quantize_slab -- encode_f32_to_f16
+```
+
+**Scope:** original-comparator ratio **N/A** (own storage encoding). Index-build / load latency on the
+**most-common** path (every `from_vectors`, all f16 indexes — the default). Smaller ratio than the
+quantizer slabs (`from_f32` is a cheaper bit-twiddle than `round`/decode, and the bulk store is then
+memory-bandwidth-bound), but it caps the build/load SIMD vein: dot kernels, int8+4-bit slab quantizers,
+and now the f16 encode are all AVX2/F16C-dispatched. The lesson (re-recorded): when a decode/convert
+kernel shows a modest SIMD ratio, check whether per-element `push` is the bottleneck — bulk-store into
+spare capacity. Kept bench: `quantize_slab` (now also covers `encode_f32_to_f16`).

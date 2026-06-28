@@ -167,7 +167,7 @@ impl InMemoryVectorIndex {
                     });
                 }
             }
-            flat.extend(vec.into_iter().map(f16::from_f32));
+            crate::simd::encode_f32_to_f16_extend(&vec, &mut flat);
         }
         Ok(Self {
             doc_ids,

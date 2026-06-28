@@ -1208,6 +1208,70 @@ pub fn pack_f16_slab_to_4bit_generic(vectors_f16: &[f16], dim: usize) -> Vec<u8>
     slab
 }
 
+/// Encode an f32 slice to f16, appending to `dst` — the per-element `f32→f16`
+/// conversion at the heart of every index build (`InMemoryVectorIndex::from_vectors`,
+/// FSVI writes). Runtime-dispatches to F16C `vcvtps2ph` (8 f16/instruction) when
+/// available; the software `half::f16::from_f32` is the fallback.
+pub fn encode_f32_to_f16_extend(src: &[f32], dst: &mut Vec<f16>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            unsafe {
+                encode_f32_to_f16_extend_avx2(src, dst);
+            }
+            return;
+        }
+    }
+    encode_f32_to_f16_extend_generic(src, dst);
+}
+
+/// Hand-written AVX2+F16C f32→f16 encoder (`vcvtps2ph`, round-to-nearest-even).
+/// Bit-identical to `half::f16::from_f32` for finite inputs (both IEEE
+/// round-to-nearest-even); proven by `avx2_f16encode_matches_generic`.
+///
+/// # Safety
+/// Caller must ensure `avx2` + `f16c` are available (the dispatch in
+/// [`encode_f32_to_f16_extend`] guarantees this).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(unsafe_code)]
+unsafe fn encode_f32_to_f16_extend_avx2(src: &[f32], dst: &mut Vec<f16>) {
+    use core::arch::x86_64::{
+        _MM_FROUND_TO_NEAREST_INT, __m128i, _mm256_cvtps_ph, _mm256_loadu_ps, _mm_storeu_si128,
+    };
+    let n = src.len();
+    let chunks = n / 8;
+    dst.reserve(n);
+    let base = dst.len();
+    // `half::f16` is `repr(transparent)` over `u16`, so we write the converted f16
+    // bits straight into the Vec's spare capacity (no per-element push — that was
+    // the bottleneck) and bump the length once.
+    // SAFETY: `reserve(n)` guarantees `n` slots past `base`; `f16` and `u16` share
+    // layout, so the `__m128i` (8 f16) store at `out + c*8` (`c*8+8 ≤ n`) is in
+    // bounds; the scalar tail fills `[chunks*8, n)`; `set_len(base+n)` is then valid.
+    unsafe {
+        let out = dst.as_mut_ptr().add(base).cast::<u16>();
+        for c in 0..chunks {
+            let x = _mm256_loadu_ps(src.as_ptr().add(c * 8));
+            let h = _mm256_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT }>(x);
+            _mm_storeu_si128(out.add(c * 8).cast::<__m128i>(), h);
+        }
+        for i in (chunks * 8)..n {
+            *out.add(i) = f16::from_f32(src[i]).to_bits();
+        }
+        dst.set_len(base + n);
+    }
+}
+
+/// Portable scalar f32→f16 encoder — the F16C-dispatch fallback. Exposed
+/// (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+pub fn encode_f32_to_f16_extend_generic(src: &[f32], dst: &mut Vec<f16>) {
+    dst.extend(src.iter().map(|&v| f16::from_f32(v)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1452,6 +1516,47 @@ mod tests {
                 let avx2 = unsafe { pack_f16_slab_to_4bit_avx2(&v, dim) };
                 assert_eq!(generic, avx2, "dim={dim} count={count}");
             }
+        }
+    }
+
+    /// The runtime F16C f32→f16 encoder must be bit-identical to
+    /// `half::f16::from_f32` for finite inputs (both IEEE round-to-nearest-even),
+    /// across normal, sub-8 tails, tiny/subnormal and near-f16-max magnitudes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_f16encode_matches_generic() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut state = 0x6e3a_91c5_f072_8d4b_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            let u = (state >> 40) as f32 / (1_u64 << 23) as f32;
+            // Mix magnitudes: most in [-1,1] (normalized embeddings) + some large
+            // (near f16 max) + some tiny (f16 subnormal range).
+            match state & 3 {
+                0 => (u - 0.5) * 2.0,
+                1 => (u - 0.5) * 130_000.0,
+                2 => (u - 0.5) * 1e-6,
+                _ => (u - 0.5) * 64.0,
+            }
+        };
+        for &n in &[0_usize, 1, 7, 8, 9, 17, 64, 100, 385] {
+            let src: Vec<f32> = (0..n).map(|_| next()).collect();
+            let mut generic = Vec::new();
+            encode_f32_to_f16_extend_generic(&src, &mut generic);
+            let mut avx2 = Vec::new();
+            // SAFETY: avx2+f16c verified present above.
+            #[allow(unsafe_code)]
+            unsafe {
+                encode_f32_to_f16_extend_avx2(&src, &mut avx2);
+            }
+            let gb: Vec<u16> = generic.iter().map(|h| h.to_bits()).collect();
+            let ab: Vec<u16> = avx2.iter().map(|h| h.to_bits()).collect();
+            assert_eq!(gb, ab, "n={n}");
         }
     }
 

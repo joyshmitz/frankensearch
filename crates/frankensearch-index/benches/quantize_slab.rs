@@ -17,8 +17,8 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    pack_f16_slab_to_4bit, pack_f16_slab_to_4bit_generic, quantize_f16_slab_to_i8,
-    quantize_f16_slab_to_i8_generic,
+    encode_f32_to_f16_extend, encode_f32_to_f16_extend_generic, pack_f16_slab_to_4bit,
+    pack_f16_slab_to_4bit_generic, quantize_f16_slab_to_i8, quantize_f16_slab_to_i8_generic,
 };
 use half::f16;
 
@@ -75,6 +75,42 @@ fn bench(c: &mut Criterion) {
         });
     }
     g4.finish();
+
+    // f32→f16 encode — the per-element conversion in every index build.
+    let mut ge = c.benchmark_group("encode_f32_to_f16");
+    ge.sample_size(20);
+    for &n in &[10_000_usize, 50_000] {
+        let src: Vec<f32> = make_slab(n).iter().map(|h| h.to_f32()).collect();
+        let mut a = Vec::new();
+        encode_f32_to_f16_extend(&src, &mut a);
+        let mut b = Vec::new();
+        encode_f32_to_f16_extend_generic(&src, &mut b);
+        assert_eq!(
+            a.iter().map(|h| h.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|h| h.to_bits()).collect::<Vec<_>>(),
+            "encode dispatch and generic must match"
+        );
+        // Reuse one buffer (clear keeps capacity) so we measure the encode, not a
+        // fresh per-iter allocation's page faults — matching the real build, which
+        // appends to one pre-reserved flat Vec.
+        ge.bench_function(BenchmarkId::new("generic", n), |bn| {
+            let mut out = Vec::with_capacity(src.len());
+            bn.iter(|| {
+                out.clear();
+                encode_f32_to_f16_extend_generic(black_box(&src), &mut out);
+                black_box(&out);
+            });
+        });
+        ge.bench_function(BenchmarkId::new("dispatch", n), |bn| {
+            let mut out = Vec::with_capacity(src.len());
+            bn.iter(|| {
+                out.clear();
+                encode_f32_to_f16_extend(black_box(&src), &mut out);
+                black_box(&out);
+            });
+        });
+    }
+    ge.finish();
 }
 
 criterion_group!(benches, bench);
