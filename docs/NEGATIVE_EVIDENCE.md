@@ -125,23 +125,31 @@ portable released binary).
 
 ## Residual comparator negatives
 
-### 2026-06-28 — BOLD `limit_all` counted collector is scoped to large-limit only (BlackThrush)
+### 2026-06-28 — BOLD `limit_all` counted collector does not reproduce as a keep (BlackThrush)
 
-**Lever landed with narrow scope:** the BOLD frankensearch challenger now routes only the
-`limit_all` query shape through `search_doc_ids_counted`; the Tantivy/Lucene/Meilisearch-class
-incumbent (`tantivy_doc_ids`) and all top10 challenger rows stay on the existing adaptive
-`search_doc_ids` path. This targets the large-limit collector/materialization residual without
-reopening the rejected top10 high-fanout counted-collector route below.
+**Lever tested and reverted:** the BOLD frankensearch challenger routed only the `limit_all`
+query shape through `search_doc_ids_counted`; the Tantivy/Lucene/Meilisearch-class incumbent
+(`tantivy_doc_ids`) and all top10 challenger rows stayed on the existing adaptive
+`search_doc_ids` path. A dirty bench worktree initially looked like a measured large-limit win,
+but the same source port on current `main` did not clear the repo's keep threshold.
 
-**Measured command** (per-crate, RCH local fallback; no admissible workers:
-`insufficient_slots=3,hard_preflight=1`; fresh target dir
-`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall`):
+**Initial bench-worktree result** (local fallback; fresh target dir
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall`; artifact
+`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted/summary.jsonl`):
+
+| Workload | Tantivy-class ORIG p50 | frankensearch p50 | Ratio vs ORIG | Status |
+|----------|------------------------|-------------------|---------------|--------|
+| `bold_verify/limit_all/10000` `hash_hybrid_tantivy_vector_rrf` | 11.046 ms | 9.928 ms | **0.899** | promising but not accepted |
+| `bold_verify/limit_all/10000` `hash_lexical_guard_tantivy` | 11.046 ms | 10.507 ms | **0.951** | promising but not accepted |
+
+**Current-port rerun** (per-crate, RCH remote `hz2`, target dir
+`/data/projects/.rch-targets/frankensearch-cod-b`):
 
 ```bash
 AGENT_NAME=BlackThrush \
 RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_OUT,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall \
-FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-b \
+FRANKENSEARCH_BOLD_VERIFY_OUT=/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_limitall_counted_land \
 FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
 FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
 RUST_LOG=error \
@@ -151,19 +159,20 @@ RUST_LOG=error \
 ```
 
 Artifact:
-`/data/projects/.rch-targets/frankensearch-cod-a-bold-limitall/criterion/bold_verify_limitall_counted/summary.jsonl`.
+`/tmp/frankensearch-bold-limitall-counted-land.log`; the run reported
+`/data/projects/.rch-targets/frankensearch-cod-b/criterion/bold_verify_limitall_counted_land/summary.jsonl`.
 
 | Workload | Tantivy-class ORIG p50 | frankensearch p50 | Ratio vs ORIG | Decision |
 |----------|------------------------|-------------------|---------------|----------|
-| `bold_verify/limit_all/10000` `hash_hybrid_tantivy_vector_rrf` | 11.046 ms | 9.928 ms | **0.899** | keep |
-| `bold_verify/limit_all/10000` `hash_lexical_guard_tantivy` | 11.046 ms | 10.507 ms | **0.951** | keep |
+| `bold_verify/limit_all/10000` `hash_hybrid_tantivy_vector_rrf` | 6.129 ms | 6.082 ms | **0.992** | revert: noise |
+| `bold_verify/limit_all/10000` `hash_lexical_guard_tantivy` | 6.129 ms | 5.976 ms | **0.975** | revert: below keep bar |
 
-**Caveat / do not generalize:** this is a large-limit BOLD harness collector-policy win, not a
-general top10 collector rule or product-wide BM25 dominance claim. The same sweep still had
-non-target slow rows: 10k short-keyword hybrid **1.297x**, 10k high-fanout guard **1.040x**, 10k
-zero-hit hybrid **1.152x**, 100k high-fanout hybrid **1.047x**, 100k zero-hit guard **1.537x**, and
-100k quoted-phrase guard **1.479x**. Do not broaden counted collection to top10 high-fanout; that
-route is separately rejected below.
+**Decision:** source reverted; ledger-only. The fresh current-port run failed to reproduce the
+bench-worktree win and also exposed non-target slow rows (`top10/10000 high_fanout` hybrid
+**1.800x**, guard **2.588x**; `top10/100000 short_keyword` hybrid **1.392x**). Do not broaden
+counted collection to top10 high-fanout, and do not land a `limit_all` counted special case unless
+a future same-source rerun shows a stable `<0.97` ratio on the large-limit rows without opening
+larger top10 regressions.
 
 ### 2026-06-27 — `SniffFeatures::from_bytes` branchless `u64` counters are not a win — REVERTED (BlackThrush)
 

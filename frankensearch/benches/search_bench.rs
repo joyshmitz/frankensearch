@@ -320,26 +320,6 @@ fn tantivy_only_search(fixture: &BoldVerifyFixture, cx: &asupersync::Cx, query: 
 }
 
 #[cfg(feature = "lexical")]
-fn frankensearch_candidate_doc_ids(
-    fixture: &BoldVerifyFixture,
-    cx: &asupersync::Cx,
-    query: &BoldVerifyQuery,
-    limit: usize,
-) -> Vec<frankensearch_lexical::LexicalIdHit> {
-    if query.limit == usize::MAX {
-        fixture
-            .lexical
-            .search_doc_ids_counted(cx, query.text, limit)
-            .expect("hybrid limit-all counted lexical candidate search")
-    } else {
-        fixture
-            .lexical
-            .search_doc_ids(cx, query.text, limit)
-            .expect("hybrid lexical candidate search")
-    }
-}
-
-#[cfg(feature = "lexical")]
 fn frankensearch_hash_hybrid_search(
     fixture: &BoldVerifyFixture,
     cx: &asupersync::Cx,
@@ -348,7 +328,10 @@ fn frankensearch_hash_hybrid_search(
     let limit = query.limit.min(fixture.doc_count);
     let candidate_limit = limit.saturating_mul(3).min(fixture.doc_count).max(limit);
     let lexical_limit = bold_verify_lexical_prefetch_limit(query, limit, candidate_limit);
-    let lexical_hits = frankensearch_candidate_doc_ids(fixture, cx, query, lexical_limit);
+    let lexical_hits = fixture
+        .lexical
+        .search_doc_ids(cx, query.text, lexical_limit)
+        .expect("hybrid lexical candidate search");
     let lexical = lexical_doc_ids_as_scored(&lexical_hits);
     if bold_verify_lexical_short_circuit(query, lexical.len(), limit) {
         black_box(lexical);
@@ -375,7 +358,10 @@ fn frankensearch_hash_lexical_guard_search(
     query: &BoldVerifyQuery,
 ) {
     let limit = query.limit.min(fixture.doc_count);
-    let lexical_hits = frankensearch_candidate_doc_ids(fixture, cx, query, limit);
+    let lexical_hits = fixture
+        .lexical
+        .search_doc_ids(cx, query.text, limit)
+        .expect("lexical-guard candidate search");
     black_box(lexical_doc_ids_as_scored(&lexical_hits));
 }
 
