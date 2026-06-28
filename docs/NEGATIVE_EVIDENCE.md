@@ -2791,3 +2791,40 @@ short-circuit already fires and works). **Lesson:** at the fast settings (12/25 
 per-row ratios are ±40% noise — never conclude a gap (or a win) from one run; require run-to-run
 consistency, and treat the *incumbent's* variance as the dominant noise source. Don't re-chase
 exact_identifier or the 100k "wins"; `limit_all` remains the only real (inherent) row.
+
+---
+
+## 2026-06-28 — Production search orchestration (sync_searcher + fsfs runtime) — verified-mined, no clean lever (BlackThrush)
+
+After the InMemory full-recall short-cut (`84fbfa2`), applied that same "find redundant work" lens to the
+**production** search paths (not the BOLD bench proxy). Both are already optimal; the remaining candidates
+are sub-noise or result-changing:
+
+- **`fusion/sync_searcher.rs` (the wired sync hybrid):** flow is tight — the quality tier
+  `quality_scores_for_hits(query, &fast_hits)` rescores ONLY the fast candidates (no re-scan);
+  `blend_two_tier` keys an `AHashMap<&str, _>` by `doc_id.as_str()` (borrowed, no clone); RRF is mined.
+  The lone remaining per-query alloc is `quality_hits` cloning each `fast_hit.doc_id` (line ~224) just to
+  pair it with the rescored value. It IS elidable bit-identically (a `blend_two_tier_with_quality_scores`
+  variant taking `(&fast_hits, &[Option<f32>])` would merge by the same borrowed `&str` key — `quality_hits`
+  is a doc_id-identical subset of `fast_hits`, so the merged map + `blended` are byte-for-byte the same).
+  BUT it's **provably sub-noise**: `fetch` (≈k·over-fetch ≈ 30–100) small `String` allocs against the
+  `sync_int8_fetch` bench's **100k-vector** scan that dominates end-to-end latency → ~0-gain (REVERT per
+  the directive). Not the same class as the async metadata-map win (`cba06d7`, which elided ~candidate-count
+  `serde_json::Value` clones, far heavier than short doc_id strings). Left as-is.
+
+- **`fsfs/runtime.rs` semantic (6466) + quality (6577) stages — NOT a redundant double-scan:** both call
+  `resources.vector_index.search_top_k(...)`, but the semantic stage embeds with `fast_embedder` and the
+  quality stage with **`quality_embedder`** (a distinct model) → *different query vectors* over the same
+  index = legitimate two-tier reranking, not redundant. (The query embed IS recomputed per stage, but
+  they're different embedders.) The one arguable inefficiency — the quality stage doing a FULL
+  `search_top_k(quality_budget)` rather than rescoring the semantic candidates (as `sync_searcher` does) —
+  is **result-changing** (a full scan can surface docs the semantic stage missed), so it's a design choice,
+  not a bit-identical lever; not a 60-min dig.
+
+**Conclusion:** the production search orchestration is **verified-mined**. Combined with the closed BOLD
+comparator (top-k parity, `limit_all` inherent), the comprehensively-AVX2/F16C-mined index compute, the
+InMemory full-recall short-cut, and the rejected non-index kernels (MMR/normalize/graph_rank), **no clean,
+bit-identical, above-noise per-crate perf lever remains.** The genuine remaining opportunities are either
+**invasive** (a `VectorHit<'a>` lifetime refactor across index+fusion to kill the doc_id clones wholesale)
+or **result-changing** (aggressive exact_identifier short-circuit, fsfs quality-rescore, limit_all tail
+approximation) — none fits the "60-min, bit-identical, conformance-GREEN, measured-ratio" bar.
