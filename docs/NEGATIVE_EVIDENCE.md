@@ -2409,3 +2409,15 @@ k_source].1.clone()))` — there is **no GF(256) multiply and no XOR parity** to
 a zero-impact change. The rest of `frankensearch-durability` is crc32 (already SIMD via `crc32fast`) +
 file I/O; **no compute lever exists in the durability crate.** If a real erasure codec is wired later
 (actual GF math), re-evaluate then. Original-comparator ratio is **N/A** (internal durability codec).
+
+### 2026-06-28 — storage write path already batch-optimal; storage/durability indexing surface mapped lever-free (Cobaltmoth)
+
+**Not attempted — verified already-optimal.** The classic SQLite indexing lever (per-row commits →
+batch into one transaction, often 10–100×) **does not apply**: `DocumentStore::upsert_batch`
+(`crates/frankensearch-storage/src/document.rs`) already wraps the whole batch in a **single**
+`self.transaction(|conn| { for doc in docs { upsert_document_with_outcome(conn, doc) } })`; single-doc
+`upsert` uses one transaction (correct). No per-doc commit/fsync antipattern. The rest of the write
+path is prepared-statement SQL + serde serialization (inherent). Combined with the durability-codec
+copy-stub finding (entry above) and the `storage`/`pipeline.rs` scan (orchestration, no byte loops),
+the **fsqlite-reopened storage + durability indexing surface is fully mapped as lever-free** for clean
+per-crate compute wins. Original-comparator ratio is **N/A** (internal indexing/write path).
