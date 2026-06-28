@@ -16,7 +16,10 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_index::{quantize_f16_slab_to_i8, quantize_f16_slab_to_i8_generic};
+use frankensearch_index::{
+    pack_f16_slab_to_4bit, pack_f16_slab_to_4bit_generic, quantize_f16_slab_to_i8,
+    quantize_f16_slab_to_i8_generic,
+};
 use half::f16;
 
 const DIM: usize = 384;
@@ -53,6 +56,25 @@ fn bench(c: &mut Criterion) {
         });
     }
     g.finish();
+
+    // 4-bit slab pack — the wired-default two-pass pass-1 storage build.
+    let mut g4 = c.benchmark_group("pack_4bit_slab");
+    g4.sample_size(20);
+    for &n in &[10_000_usize, 50_000] {
+        let slab = make_slab(n);
+        assert_eq!(
+            pack_f16_slab_to_4bit(&slab, DIM),
+            pack_f16_slab_to_4bit_generic(&slab, DIM),
+            "4bit dispatch and generic must match"
+        );
+        g4.bench_function(BenchmarkId::new("generic", n), |b| {
+            b.iter(|| black_box(pack_f16_slab_to_4bit_generic(black_box(&slab), DIM)));
+        });
+        g4.bench_function(BenchmarkId::new("dispatch", n), |b| {
+            b.iter(|| black_box(pack_f16_slab_to_4bit(black_box(&slab), DIM)));
+        });
+    }
+    g4.finish();
 }
 
 criterion_group!(benches, bench);

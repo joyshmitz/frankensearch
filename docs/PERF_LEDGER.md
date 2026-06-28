@@ -1638,3 +1638,40 @@ index but recurs on every rebuild/refresh: a 50k×384 int8 slab build drops **15
 primitive (quantizer), and the largest single ratio besides the f16 dots, because it's pure F16C
 decode-bound. Route-next: `pack_4bit_slab` (the **wired-default** 4-bit slab build, same decode-bound
 shape but with nibble packing) is the natural sibling. Kept bench: `quantize_slab`.
+
+### 2026-06-28 — runtime-dispatched AVX2+F16C 4-bit slab PACK: 10.3–13.6× on the WIRED-DEFAULT build (BlackThrush)
+
+**Lever (the int8 quantizer's sibling — and the default path).** `pack_4bit_slab` is the lazy 4-bit ADC
+slab build behind `search_top_k_4bit_two_pass_filtered` — i.e. **the wired-default sync-hybrid pass-1
+storage** (`in_memory.rs::pack_4bit_slab`, `OnceLock`-cached). Same decode-bound shape as the int8 slab
+(software `f16::to_f32` ×2 for max-abs + quantize) PLUS a per-nibble `slab[i] |= nib` read-modify-write.
+New `simd::pack_f16_slab_to_4bit` runtime-dispatches to an AVX2+F16C kernel: `vcvtph2ps` decodes 8
+f16/instruction for both passes; the quantize pass reuses the int8 `×scale` → round-half-away → clamp
+pipeline (clamp `[-7,7]`) → `cvttps_epi32`, then packs the 8 nibbles as **4 fully-determined direct
+byte writes** (no RMW). It beats int8's ratio because it kills BOTH the decode cost AND the per-nibble
+RMW. Falls back to the scalar kernel; `in_memory.rs` delegates (the old scalar slab packer was removed).
+
+**Bit-identical:** same nibble values + byte layout — `simd::tests::avx2_pack_4bit_matches_generic`
+asserts byte-equal `Vec<u8>` across dim shapes (full 8-chunks, sub-8 tails, **odd** dims) × multiple
+vectors. Conformance: **371/371** index lib tests GREEN serial (incl. the 4-bit two-pass recall gates,
+which exercise the slab through the delegated `pack_4bit_slab`).
+
+**Measured (per-crate, AVX2+F16C; dim 384 f16 slab → packed 4-bit; `generic` = scalar, `dispatch` =
+AVX2+F16C):**
+
+| Workload | generic | dispatch | Ratio | Status |
+|----------|---------|----------|-------|--------|
+| `pack_4bit_slab/10000` (10k×384) | 31.38 ms | 2.30 ms | **0.073 (~13.6×)** | KEEP |
+| `pack_4bit_slab/50000` (50k×384) | 150.91 ms | 14.64 ms | **0.097 (~10.3×)** | KEEP |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-index --profile release --bench quantize_slab -- pack_4bit_slab
+```
+
+**Scope:** original-comparator ratio **N/A** (own 4-bit ADC tier). Index-build / cold-start latency on
+the **default** path: a 50k×384 4-bit slab build drops **150.91 ms → 14.64 ms** (~136 ms/build saved,
+linear in corpus), recurring on rebuild/refresh. Largest non-dot ratio yet. With int8 + 4-bit, **both
+quantizer slab builds are now AVX2-dispatched**; the per-query `quantize_i8_query`/`pack_4bit_query` are
+dim-sized (negligible) and not worth it — the build/quantize SIMD vein is now mined too. Kept bench:
+`quantize_slab`.

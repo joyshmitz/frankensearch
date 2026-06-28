@@ -1050,6 +1050,164 @@ pub fn quantize_f16_slab_to_i8_generic(vectors_f16: &[f16]) -> Vec<i8> {
         .collect()
 }
 
+/// Quantize one f32 to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's complement in
+/// the low 4 bits) given a scale — the per-element op inside the 4-bit slab build.
+#[inline(always)]
+fn nibble_of_4bit(value: f32, scale: f32) -> u8 {
+    #[allow(clippy::cast_possible_truncation)]
+    let q = (value * scale).round().clamp(-7.0, 7.0) as i8;
+    (q as u8) & 0x0F
+}
+
+/// Pack a contiguous f16 slab (`count·dim`) into signed 4-bit nibbles (2 dims/byte,
+/// `dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale — the lazy
+/// 4-bit ADC slab build (the **wired-default** two-pass pass-1 storage). Like the
+/// int8 slab, it is decode-bound; runtime-dispatches to AVX2+F16C when available.
+#[must_use]
+pub fn pack_f16_slab_to_4bit(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { pack_f16_slab_to_4bit_avx2(vectors_f16, dim) };
+        }
+    }
+    pack_f16_slab_to_4bit_generic(vectors_f16, dim)
+}
+
+/// Hand-written AVX2+F16C 4-bit slab packer. `vcvtph2ps` decodes 8 f16/instruction
+/// for both the max-abs pass and the quantize pass; the nibble values come from the
+/// SAME `×scale` → round-half-away → clamp(-7,7) → `cvttps_epi32` pipeline as the
+/// int8 kernel, then the (cheap) nibble packing stays scalar. Bit-identical to the
+/// scalar kernel (`avx2_pack_4bit_matches_generic`).
+///
+/// # Safety
+/// Caller must ensure `avx2` + `f16c` are available (the dispatch in
+/// [`pack_f16_slab_to_4bit`] guarantees this).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn pack_f16_slab_to_4bit_avx2(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
+    use core::arch::x86_64::{
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm256_add_ps, _mm256_and_ps, _mm256_cvtph_ps,
+        _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps,
+        _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps, _mm256_storeu_si256,
+        _mm_loadu_si128,
+    };
+    if dim == 0 {
+        return Vec::new();
+    }
+    let n = vectors_f16.len();
+    let total_chunks = n / 8;
+    // SAFETY: `half::f16` is `repr(transparent)` over `u16`; `n` f16 = `n*2` bytes.
+    #[allow(unsafe_code)]
+    let bytes = unsafe { std::slice::from_raw_parts(vectors_f16.as_ptr().cast::<u8>(), n * 2) };
+
+    // Pass 1: corpus-wide max-abs (F16C decode + clear sign + vector max).
+    let mut max_abs = 0.0_f32;
+    // SAFETY: avx2+f16c by contract; loads are `c < total_chunks`-bounded.
+    unsafe {
+        let abs_mask = _mm256_set1_ps(f32::from_bits(0x7fff_ffff));
+        let mut vmax = _mm256_setzero_ps();
+        for c in 0..total_chunks {
+            let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
+            vmax = _mm256_max_ps(vmax, _mm256_and_ps(x, abs_mask));
+        }
+        let mut arr = [0.0_f32; 8];
+        _mm256_storeu_ps(arr.as_mut_ptr(), vmax);
+        for &v in &arr {
+            max_abs = max_abs.max(v);
+        }
+    }
+    for &x in &vectors_f16[total_chunks * 8..] {
+        max_abs = max_abs.max(x.to_f32().abs());
+    }
+    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
+
+    // Pass 2: per-vector quantize → pack 2 dims/byte.
+    let count = n / dim;
+    let bytes_per_vector = dim.div_ceil(2);
+    let mut slab = vec![0_u8; count * bytes_per_vector];
+    // SAFETY: avx2+f16c by contract; within-vector loads are `d+8 ≤ dim`-bounded.
+    unsafe {
+        let vscale = _mm256_set1_ps(scale);
+        let vhalf = _mm256_set1_ps(0.5);
+        let vmaxc = _mm256_set1_ps(7.0);
+        let vminc = _mm256_set1_ps(-7.0);
+        let vsign = _mm256_set1_ps(-0.0);
+        let mut tmp = [0_i32; 8];
+        for v in 0..count {
+            let base = v * dim;
+            let out = v * bytes_per_vector;
+            let mut d = 0;
+            while d + 8 <= dim {
+                let x =
+                    _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add((base + d) * 2).cast()));
+                let vv = _mm256_mul_ps(x, vscale);
+                let half_signed = _mm256_or_ps(vhalf, _mm256_and_ps(vv, vsign));
+                let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(
+                    _mm256_add_ps(vv, half_signed),
+                );
+                let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vminc), vmaxc);
+                _mm256_storeu_si256(tmp.as_mut_ptr().cast(), _mm256_cvttps_epi32(clamped));
+                // 8 dims (d even) → 4 fully-determined bytes: direct write (no RMW).
+                for m in 0..4 {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let lo = (tmp[2 * m] as u8) & 0x0F;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let hi = (tmp[2 * m + 1] as u8) & 0x0F;
+                    slab[out + d / 2 + m] = lo | (hi << 4);
+                }
+                d += 8;
+            }
+            // Scalar tail for the final < 8 dims (handles odd dim / last partial byte).
+            while d < dim {
+                let nib = nibble_of_4bit(vectors_f16[base + d].to_f32(), scale);
+                if d % 2 == 0 {
+                    slab[out + d / 2] |= nib;
+                } else {
+                    slab[out + d / 2] |= nib << 4;
+                }
+                d += 1;
+            }
+        }
+    }
+    slab
+}
+
+/// Portable scalar 4-bit slab packer — the AVX2+F16C-dispatch fallback. Exposed
+/// (doc-hidden) for the bench A/B.
+#[doc(hidden)]
+#[must_use]
+pub fn pack_f16_slab_to_4bit_generic(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let max_abs = vectors_f16
+        .iter()
+        .map(|x| x.to_f32().abs())
+        .fold(0.0_f32, f32::max);
+    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
+    let count = vectors_f16.len() / dim;
+    let bytes_per_vector = dim.div_ceil(2);
+    let mut slab = vec![0_u8; count * bytes_per_vector];
+    for v in 0..count {
+        let base = v * dim;
+        let out = v * bytes_per_vector;
+        for d in 0..dim {
+            let nib = nibble_of_4bit(vectors_f16[base + d].to_f32(), scale);
+            if d % 2 == 0 {
+                slab[out + d / 2] |= nib;
+            } else {
+                slab[out + d / 2] |= nib << 4;
+            }
+        }
+    }
+    slab
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,6 +1422,37 @@ mod tests {
         #[allow(unsafe_code)]
         let avx2_zero = unsafe { quantize_f16_slab_to_i8_avx2(&zeros) };
         assert_eq!(quantize_f16_slab_to_i8_generic(&zeros), avx2_zero);
+    }
+
+    /// The runtime AVX2+F16C 4-bit slab packer must be byte-for-byte identical to
+    /// the scalar kernel across dim shapes (full 8-chunks, sub-8 tails incl. odd
+    /// dim) and multiple vectors. Skips without AVX2+F16C.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_pack_4bit_matches_generic() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut state = 0xa1b2_c3d4_e5f6_0789_u64;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            (((state >> 40) as f32 / (1_u64 << 23) as f32) - 1.0)
+        };
+        for &dim in &[1_usize, 2, 7, 8, 9, 15, 16, 17, 33, 64, 100, 384] {
+            for &count in &[1_usize, 3] {
+                let v: Vec<f16> = (0..dim * count)
+                    .map(|_| f16::from_f32(next_f32() * 2.5))
+                    .collect();
+                let generic = pack_f16_slab_to_4bit_generic(&v, dim);
+                // SAFETY: avx2+f16c verified present above.
+                #[allow(unsafe_code)]
+                let avx2 = unsafe { pack_f16_slab_to_4bit_avx2(&v, dim) };
+                assert_eq!(generic, avx2, "dim={dim} count={count}");
+            }
+        }
     }
 
     /// Exhaustive proof that the SIMD f16->f32 widen matches the scalar reference

@@ -125,30 +125,8 @@ fn pack_4bit_query(query: &[f32]) -> Vec<u8> {
 /// (`dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale (a constant
 /// factor, so the dot ranking is preserved).
 fn pack_4bit_slab(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
-    if dim == 0 {
-        return Vec::new();
-    }
-    let max_abs = vectors_f16
-        .iter()
-        .map(|x| x.to_f32().abs())
-        .fold(0.0_f32, f32::max);
-    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
-    let count = vectors_f16.len() / dim;
-    let bytes_per_vector = dim.div_ceil(2);
-    let mut slab = vec![0_u8; count * bytes_per_vector];
-    for v in 0..count {
-        let base = v * dim;
-        let out = v * bytes_per_vector;
-        for d in 0..dim {
-            let nib = nibble_of(vectors_f16[base + d].to_f32(), scale);
-            if d % 2 == 0 {
-                slab[out + d / 2] |= nib;
-            } else {
-                slab[out + d / 2] |= nib << 4;
-            }
-        }
-    }
-    slab
+    // Runtime-dispatched (AVX2+F16C when available); see `simd` for the kernel.
+    crate::simd::pack_f16_slab_to_4bit(vectors_f16, dim)
 }
 
 impl InMemoryVectorIndex {
