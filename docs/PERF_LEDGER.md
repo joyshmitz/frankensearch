@@ -1575,3 +1575,28 @@ arc**: int8 (2.5×), 4-bit (1.2×), f16-bytes (3.9×), f16-slice (3.7×), f32-by
 dot kernels are now runtime-AVX2-dispatched** with a property test + safe fallback each. Remaining:
 `dot_product_f32_f32` (the `&[f16]`-less f32 slice, MRL — trivial copy of this) and the integer
 `dot_packed_4bit` (non-prepared); both very low traffic. Kept bench arm: `f32_bytes_generic`.
+
+### 2026-06-28 — runtime-dispatched AVX2 `dot_product_f32_f32` (slice): ~1.6× (MRL path) (BlackThrush)
+
+**Lever (the f32-slice sibling of the f32-bytes win — final f32 kernel).** `dot_product_f32_f32` is the
+`&[f32]`·`&[f32]` dot behind the MRL (Matryoshka truncated-embedding) rescore — non-default, low traffic.
+Same runtime-AVX2 dispatch: a `#[target_feature(enable="avx2")]` kernel mirroring the `wide` kernel's 4
+accumulators, `(acc0+acc1)+(acc2+acc3)` reduction (through `wide::f32x8::reduce_add`), 8-chunk tail, and
+**separate-mul+add** scalar tail (matched per-kernel — this one is NOT `mul_add`, unlike f32-bytes);
+falls back to `dot_product_f32_f32_generic` (the former `dot_product_f32_f32_unchecked`) elsewhere.
+**Bit-identical** (`simd::tests::avx2_f32slicedot_matches_generic`, `to_bits` across 13 dim shapes).
+Conformance: **369/369** index lib tests GREEN serial.
+
+**Measured (per-crate, AVX2 worker `hz2`; sum of 10 000 f32-slice dots):**
+
+| Workload | generic (`wide`) | AVX2 | Ratio | Status |
+|----------|------------------|------|-------|--------|
+| `dot/dim256/f32_slice` (10k vectors) | 770.63 µs | 477.82 µs | **0.620 (~1.61×)** | KEEP |
+
+(dim384 same direction, noisier on a contended worker: new ≈ 953 µs.)
+
+**Scope:** original-comparator ratio **N/A**; non-default MRL path, low traffic, modest 256-bit-width-only
+win (no f32 decode). Completes the dot-kernel SIMD coverage: **six** kernels now runtime-AVX2-dispatched
+(int8, 4-bit-prepared, f16-bytes, f16-slice, f32-bytes, f32-slice), each bit-identical + safe fallback.
+The only dot left is the non-prepared integer `dot_packed_4bit` (lowest traffic). Kept bench arm:
+`f32_slice_generic`.
