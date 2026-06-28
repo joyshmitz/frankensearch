@@ -2456,3 +2456,13 @@ ratio is on that step in isolation (not end-to-end). Third clone-elision win in 
 vein (`rank_map` `f8f645e`, `score_map` `dc86170`, this). Note the **async `searcher.rs` already** uses
 borrow-keyed score maps + clone-free rank maps — that path was the optimized reference; these three wins
 brought the sync searcher to parity.
+
+### 2026-06-28 — sync vector refined materialize move is a real ~1.4–2.5× local win, original-comparator ratio N/A (BlackThrush)
+
+**Landed in `docs/PERF_LEDGER.md`:** the no-lexical sync refined branch now consumes the owned
+`blend_two_tier` output and moves each unique `doc_id` into the final `ScoredResult` instead of routing
+through the generic borrowed vector converter (`HashSet` dedup + `String` clone). Measured ratios vs
+the old in-process converter: `n20` **0.537**, `n60` **0.724**, `n200` **0.406** (bit-identical;
+`blend_two_tier` output is already unique). Honesty bar: **ratio vs Lucene/Tantivy/Meilisearch is N/A**
+because this is frankensearch's own pure-vector result-assembly bookkeeping, not a comparator query
+primitive.

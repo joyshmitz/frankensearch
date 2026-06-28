@@ -16,7 +16,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier, compute_rank_changes_with_maps};
-use crate::rrf::{RrfConfig, candidate_count, rrf_fuse};
+use crate::rrf::{candidate_count, rrf_fuse, RrfConfig};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
 pub trait SyncLexicalSearch: Send + Sync {
@@ -236,42 +236,39 @@ impl SyncTwoTierSearcher {
         metrics.quality_search_ms = ms(phase2_started.elapsed());
         metrics.quality_embed_ms = 0.0;
 
-        let refined_results = lexical_hits.as_ref().map_or_else(
-            || {
-                // Borrow doc_ids straight from fast_hits/quality_hits (which
-                // outlive this scope) — these maps are only `.get()` looked up by
-                // `&str`, so keying on `&str` drops a per-candidate `String` clone.
-                let fast_scores = fast_hits
-                    .iter()
-                    .map(|hit| (hit.doc_id.as_str(), hit.score))
-                    .collect::<HashMap<&str, f32>>();
-                let quality_scores = quality_hits
-                    .iter()
-                    .map(|hit| (hit.doc_id.as_str(), hit.score))
-                    .collect::<HashMap<&str, f32>>();
-                vector_hits_to_scored_results(
+        let refined_results = if let Some(lexical) = lexical_hits.as_ref() {
+            fused_hits_to_scored_results(
+                rrf_fuse(
+                    lexical,
                     &blended,
                     k,
-                    ScoreSource::SemanticQuality,
-                    Some(&fast_scores),
-                    Some(&quality_scores),
-                )
-            },
-            |lexical| {
-                fused_hits_to_scored_results(
-                    rrf_fuse(
-                        lexical,
-                        &blended,
-                        k,
-                        0,
-                        &RrfConfig {
-                            k: self.config.rrf_k,
-                        },
-                    ),
-                    k,
-                )
-            },
-        );
+                    0,
+                    &RrfConfig {
+                        k: self.config.rrf_k,
+                    },
+                ),
+                k,
+            )
+        } else {
+            // Borrow doc_ids straight from fast_hits/quality_hits (which
+            // outlive this scope) — these maps are only `.get()` looked up by
+            // `&str`, so keying on `&str` drops a per-candidate `String` clone.
+            let fast_scores = fast_hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .collect::<HashMap<&str, f32>>();
+            let quality_scores = quality_hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .collect::<HashMap<&str, f32>>();
+            unique_vector_hits_to_scored_results_owned(
+                blended,
+                k,
+                ScoreSource::SemanticQuality,
+                Some(&fast_scores),
+                Some(&quality_scores),
+            )
+        };
 
         let rank_changes = compute_rank_changes_for_scored(&initial_results, &refined_results);
         metrics.rank_changes = rank_changes.clone();
@@ -457,6 +454,44 @@ fn vector_hits_to_scored_results(
         .collect()
 }
 
+fn unique_vector_hits_to_scored_results_owned(
+    hits: Vec<VectorHit>,
+    k: usize,
+    source: ScoreSource,
+    fast_scores: Option<&HashMap<&str, f32>>,
+    quality_scores: Option<&HashMap<&str, f32>>,
+) -> Vec<ScoredResult> {
+    // `blend_two_tier` materializes one row per merged doc_id via a HashMap, so
+    // its output is already unique. Consume that owned vector and move each
+    // `doc_id` into the final row instead of cloning it through the generic
+    // borrowed converter, which still handles raw vector hits that may need
+    // first-occurrence deduplication.
+    hits.into_iter()
+        .take(k)
+        .map(|hit| {
+            let fast_score = fast_scores
+                .and_then(|scores| scores.get(hit.doc_id.as_str()))
+                .copied()
+                .or(Some(hit.score));
+            let quality_score = quality_scores
+                .and_then(|scores| scores.get(hit.doc_id.as_str()))
+                .copied();
+            ScoredResult {
+                doc_id: hit.doc_id,
+                score: hit.score,
+                source,
+                index: Some(hit.index),
+                fast_score,
+                quality_score,
+                lexical_score: None,
+                rerank_score: None,
+                explanation: None,
+                metadata: None,
+            }
+        })
+        .collect()
+}
+
 fn compute_rank_changes_for_scored(
     initial: &[ScoredResult],
     refined: &[ScoredResult],
@@ -589,10 +624,8 @@ mod tests {
             SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default()).with_lexical(lexical);
         let (results, _) = searcher.search_collect(&[1.0, 0.0], 3).unwrap();
         assert!(results.iter().any(|result| result.doc_id == "lex-only"));
-        assert!(
-            results
-                .iter()
-                .all(|result| result.source == ScoreSource::Hybrid)
-        );
+        assert!(results
+            .iter()
+            .all(|result| result.source == ScoreSource::Hybrid));
     }
 }

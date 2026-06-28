@@ -1142,3 +1142,42 @@ times are small — this materialization is one step of the query — but it is 
 **lexical/BOLD hybrid sync path** (both phases). Original-comparator ratio is **N/A** (frankensearch
 result-assembly); third clone-elision in the sync vein (after `rank_map` `f8f645e`, `score_map`
 `dc86170`).
+
+### 2026-06-28 — sync vector refined path: move blended doc_ids into final results (BlackThrush)
+
+**Lever:** the no-lexical refined branch of `SyncTwoTierSearcher` receives an owned `blended`
+`Vec<VectorHit>` from `blend_two_tier`, then immediately converted it through the generic borrowed
+`vector_hits_to_scored_results(&blended, ...)` helper. That paid a `HashSet` first-occurrence dedup and
+one `String` clone per final row even though `blend_two_tier` already produces one row per merged doc id
+from a doc-id keyed map. The no-lexical refined branch now consumes that owned vector with
+`unique_vector_hits_to_scored_results_owned`, moves `hit.doc_id` into `ScoredResult`, and leaves the
+generic borrowed helper in place for raw vector-hit inputs that may still need deduplication.
+
+**Bit-identical:** `blend_two_tier` output is unique by construction; the new helper preserves row order
+and every score/source/index field, looking up `fast_score`/`quality_score` by the same `&str` keys before
+moving the `String`. The lexical branch remains on `rrf_fuse` + `fused_hits_to_scored_results`.
+
+**Measured command (per-crate, release profile; `clone_dedup` = old borrowed converter, `move_unique` =
+owned blended converter):**
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a-vector-materialize \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release \
+    --bench vector_materialize -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+RCH had no admissible worker and fell back locally; the run completed with exit 0. N = final blended
+result count (k = N). Medians:
+
+| Workload | clone+dedup (old) | move+unique (new) | Ratio | Status |
+|----------|-------------------|-------------------|-------|--------|
+| `vector_materialize/n20` | 2.7685 us | 1.4859 us | **0.537 (~1.86×)** | KEEP |
+| `vector_materialize/n60` | 8.3990 us | 6.0815 us | **0.724 (~1.38×)** | KEEP |
+| `vector_materialize/n200` | 35.454 us | 14.391 us | **0.406 (~2.46×)** | KEEP |
+
+**Scope:** no-lexical (pure-vector) sync refined result materialization. This is frankensearch's own
+result-assembly overhead; original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (caveat in
+`docs/NEGATIVE_EVIDENCE.md`).
