@@ -2723,7 +2723,7 @@ frankensearch SLOWER.** corpus hashes `2e78365a…`(10k) / `13f1b015…`(100k).
 | natural_language | 0.654 ✅ | **0.792 ✅** | reliable |
 | high_fanout | 1.049 ≈ | **0.789 ✅** | 100k reliable |
 | zero_hit | 0.950 ✅ | 0.853 ✅ | tiny (~20-30 µs) |
-| limit_all | **1.390 ❌** | (pending) | reliable (1376→1913 µs) |
+| limit_all | **1.390 ❌** | (not benched @100k) | reliable (1376→1913 µs) |
 
 **Conclusion — CORRECTS the stale [[bold-comparator-closed]] "parity-or-better on every row" claim.**
 frankensearch hybrid is **faster than the Tantivy-class incumbent on most classes** (quoted_phrase 0.73,
@@ -2746,5 +2746,5 @@ real **build/load-time** wins but did NOT move these **query-time** gaps — bec
 **algorithmic** (redundant vector+RRF work on lexical-sufficient queries) and **materialization**, not
 dot-kernel-bound. The next real lever is the **exact_identifier short-circuit** (the lexical-guard path),
 not more compute-kernel SIMD. Caveat: fast settings → small-workload ratios (short_keyword, zero_hit)
-are noise; trust the ≥600 µs workloads. (100k `limit_all` row was still benchmarking at write time;
-consistent with the 10k 1.39×.)
+are noise; trust the ≥600 µs workloads. (The bench only runs `limit_all` at 10k — there is no 100k
+`limit_all` row. Full run completed; final summary = 26 rows.)
