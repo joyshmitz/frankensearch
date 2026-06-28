@@ -2325,3 +2325,38 @@ N/A** — `count_lexical_tokens` is frankensearch's own fsfs file-ingest/chunkin
 tokens per chunk at index time); a lexical comparator runs no equivalent stage. It speeds frankensearch
 indexing throughput, not a head-to-head query primitive. Second clean win in the fsfs surface that the
 fsqlite stale-lock unblock reopened (after the `SniffFeatures` SIMD histogram, `08469f5`).
+
+### 2026-06-28 — fsfs `count_lexical_tokens` fused ASCII detection is mixed/noisy — REVERTED (BlackThrush)
+
+**Lever tested and reverted:** after the landed ASCII byte fast path, remove the up-front
+`str::is_ascii()` pre-scan and fuse ASCII detection into the token-count loop. The hypothesis was
+single-pass ASCII chunks would beat the current `bytes_prescan` path. This follows the graveyard
+constant-factor rule: eliminate a pass only if the fused branch cost does not erase the memory-pass
+win.
+
+**Measured command** (per-crate; `rch exec` local fallback because no worker was admissible; fresh
+target dir `/data/projects/.rch-targets/frankensearch-cod-a-fsfs-fused`):
+
+```bash
+AGENT_NAME=BlackThrush \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-a-fsfs-fused \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-fsfs --profile release \
+    --bench lexical_count -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+```
+
+Criterion medians from `criterion/lexical_count/*/new/estimates.json`; ORIG is the current landed
+`bytes_prescan` implementation:
+
+| Workload | ORIG `bytes_prescan` | Candidate `bytes_fused` | Ratio vs ORIG | Decision |
+|----------|----------------------|-------------------------|---------------|----------|
+| `lexical_count/ascii_1024` | 1478.54 ns | 2020.15 ns | **1.366x slower** | revert |
+| `lexical_count/ascii_4096` | 6325.66 ns | 4212.20 ns | 0.666 | win row only |
+| `lexical_count/ascii_16384` | 13468.65 ns | 15171.09 ns | **1.126x slower** | revert |
+
+**Decision:** source and bench changes were reverted. The fused loop is not a clean keep: it regresses
+the near-default chunk shape (fsfs `LexicalChunkPolicy::default().max_chars` is 768, closest to the
+1 KiB row) and large chunks, while the 4 KiB row alone is not enough to justify a length-threshold
+policy. Ratio vs Lucene/Tantivy/Meilisearch is **N/A** for this isolated file-ingest token-counting
+primitive; it does not move the BOLD query comparator.
