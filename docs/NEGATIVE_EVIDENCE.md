@@ -2527,3 +2527,50 @@ by a measured gain. Original-comparator ratio is **N/A** (internal sync result-a
 wins — it is mined to the noise floor. Any future attempt here must isolate a *per-function* micro-bench
 (as the landed map/materialize wins did) AND show the function is a non-trivial slice of the real path,
 not just a clean ratio in isolation.
+
+### 2026-06-28 — BOLD comparator is empirically CLOSED; `limit_all` is the lone (inherent) gap (BlackThrush)
+
+**Empirical re-measurement, not a lever.** Ran the live `bold_verify_tantivy_class` comparator
+(`-p frankensearch --features lexical`, 10-sample p50, RCH `hz2`) to find the *current* biggest gap
+vs the Tantivy/Lucene-class proxy rather than trust stale ledger numbers. After the accumulated wins
+(id materialization 6.32×, zero-hit/lexical-saturated short-circuits, int8/4-bit fast tier, RRF
+select_nth, clone-elisions), the comparator is **parity-or-better on every top-k row** — the
+2026-06-27 gaps are gone:
+
+| corpus | query_class | hash_hybrid ratio (fs/incumbent) | was (2026-06-27) |
+|--------|-------------|----------------------------------|------------------|
+| 10k  | short_keyword    | **0.860** | — |
+| 10k  | quoted_phrase    | **0.912** | 1.459× slower |
+| 10k  | natural_language | **0.975** | — |
+| 10k  | exact_identifier | 1.024 (tie) | — |
+| 10k  | high_fanout      | 1.000 (tie) | — |
+| 10k  | zero_hit         | 1.000 (tie) | — |
+| 100k | quoted_phrase    | **0.986** | — |
+| 100k | natural_language | **0.995** | 1.151× slower |
+| 100k | high_fanout      | **0.396** (2.5× FASTER) | — |
+| 100k | zero_hit         | **0.979** | — |
+| 100k | short_keyword    | 1.013 (tie) | — |
+| 100k | exact_identifier | 1.082 (p50; p95 **0.565** faster → noise) | — |
+| 10k  | **limit_all**    | **1.286 (SLOWER)** | 1.140× |
+
+Command: `FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error … rch exec -- cargo bench -p frankensearch
+--features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10
+--warm-up-time 1 --measurement-time 1`; artifact
+`/data/projects/.rch-targets/search-cc/criterion/bold_verify/summary.{md,jsonl}`.
+
+**Decision: no clean new per-crate comparator lever exists.** The only robustly-slower row is
+**`limit_all`** (return *everything*), and its gap is **inherent to hybrid semantics**: the challenger
+must embed the query, scan the *entire* vector tier (candidate_limit = doc_count, so the int8/4-bit
+two-pass can't prune — you need all vectors), and RRF-fuse + full-sort ~2·N candidates, where the
+incumbent does lexical-only. There is no bit-identical way to remove that work without changing
+results (e.g. skipping semantic re-rank for `limit_all` would alter ordering). `exact_identifier/100k`
+(1.082 p50) is sample noise (p95 0.565, the challenger faster). **The perf swarm's comparator mission
+is essentially accomplished — stop hunting comparator-ratio levers.**
+
+**Route next (real-world, NOT comparator-measurable):** the one remaining concrete perf item is the
+**on-`open` ord-table rebuild** for persisted on-disk indexes (PERF_LEDGER 2026-06-28 wiring entry):
+reopened on-disk indexes currently fall back to docstore id-materialization until the table is rebuilt,
+so they miss the 6.32× win the in-memory path already has. Options: (a) one-pass docstore scan at
+`open` (O(N) decompress, simplest-correct, ~0.4 µs/doc ⇒ ~40 ms at 100k), or (b) persist the table to a
+sidecar on `commit` + load on `open` (no scan, but needs a file format + atomicity + corruption
+fallback). This benefits real persisted deployments but does NOT move the in-memory BOLD comparator.
