@@ -2918,3 +2918,33 @@ output lane = f(one input lane), IEEE-exact regardless of width — but **reduct
 accumulators, any `Σ`) are LOCKED, because any reorder changes the result. The element-wise vein is now
 mined (model2vec mean-pool + `l2_normalize` scale shipped); the reduction halves carry a real but
 unspendable ~4× each. Don't re-attempt SIMD/multi-acc on any reduction.
+
+---
+
+## 2026-06-28 — limit_all 1.4× decomposed: every component is optimal or inherent — no lever (BlackThrush)
+
+The only surviving BOLD comparator gap is `limit_all` (~1.4× vs the Tantivy-class incumbent; top-k rows
+are parity). The swarm has `bold-limitall-*` worktrees probing it, so I decomposed it end-to-end and
+confirmed each piece is already optimal or fundamentally inherent — **there is no lever here**:
+
+1. **Lexical (Tantivy):** the incumbent IS Tantivy — can't beat it on its own ground.
+2. **Vector tier (full scan):** `limit_all` sets `candidate_limit = doc_count`, so the file-backed
+   `VectorIndex` takes the full-recall fast path (`search.rs:170`, single f16 collect-and-sort) — the
+   f16 dot is AVX2/F16C (`7239d58`), and the redundant int8/4-bit pass-1 was already short-cut for InMemory
+   (`84fbfa2`). Optimal single pass.
+3. **RRF fuse:** read + benched (`-p frankensearch-fusion --bench rrf_fuse`): **22.3 µs new vs 29.1 µs old**
+   (a prior win already landed). It is comprehensively optimized — `AHashMap<&str, _>` keyed on **borrowed**
+   doc_ids (no `String` clone in the merge), a single `entry()` probe per doc (no get-then-insert),
+   capacity pre-allocated, `select_nth_unstable` for top-k (full sort skipped), and `into_owned` only on the
+   output winners. For `limit_all` the remaining costs are **inherent**: a full `sort_unstable` of the ~N
+   unique fused hits (you must rank *everything*), N `entry` string-hashes (keying on a precomputed u64 would
+   need cross-layer doc_id-hash plumbing through lexical+vector search — invasive, ~3-5% of `limit_all`), and
+   N `into_owned` doc_id clones (the returned `Vec<FusedHit>` must own its doc_ids since the borrowed
+   `lexical`/`semantic` inputs are dropped — only the invasive `VectorHit<'a>` lifetime refactor removes it).
+
+**Conclusion: `limit_all` ~1.4× is structurally inherent — frankensearch does lexical + a full vector scan
++ an RRF full-sort where the incumbent does lexical-only; every part of that extra work is already at its
+floor.** Stop digging `limit_all` for a per-crate lever; the only removals left are invasive
+(`VectorHit<'a>` borrow refactor) or cross-layer (u64 doc_id keys), neither a 60-min win and both
+sub-meaningful against the modest gap. With this, BOTH comparator-gap components (vector scan + RRF) are
+confirmed optimal — the comparator investigation is closed.
