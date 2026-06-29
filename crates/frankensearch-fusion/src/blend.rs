@@ -176,7 +176,13 @@ pub fn blend_two_tier(
         })
         .collect();
 
-    blended.sort_by(|left, right| {
+    // Unstable sort (pdqsort, no scratch alloc) — the comparator is a strict
+    // total order (score `total_cmp`, then a `doc_id` tiebreak), and `blended`
+    // comes from an `AHashMap<&str, _>` so every `doc_id` is unique: no two
+    // elements compare Equal, so the result is identical to a stable sort. The
+    // sibling RRF fuse path already uses `sort_unstable_by`. (~1.3–1.4× on the
+    // sort step, `blend_reorder` bench, realistic mostly-distinct blend scores.)
+    blended.sort_unstable_by(|left, right| {
         sanitize_score(right.score)
             .total_cmp(&sanitize_score(left.score))
             .then_with(|| left.doc_id.cmp(&right.doc_id))

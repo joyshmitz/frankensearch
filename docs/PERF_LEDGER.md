@@ -2303,3 +2303,41 @@ when the total doc set is small; at scale the `BTreeSet`/`String` allocations di
 **Original-comparator ratio: N/A** — federated multi-shard fusion is a frankensearch-only cross-shard path
 (Tantivy/Lucene/Meilisearch have no single-call cross-shard fuse comparator). Internal micro-lever; the
 `federated_fuse` A/B bench is kept for re-validation.
+
+---
+
+## 2026-06-29 — two-tier blend final sort: stable `sort_by` → `sort_unstable_by` is ~1.30–1.40× (BlackThrush)
+
+**Lever LANDED (single-crate, bit-identical).** `blend_two_tier` (the main two-tier quality-phase blend,
+`blend.rs:179`) finished by sorting the deduped `Vec<VectorHit>` with a **stable** `sort_by`, while the
+sibling RRF fuse path (`rrf.rs`) already uses `sort_unstable_by`. Switched it (and the identical
+`federated::into_ranked_hits` sort, `federated.rs:497`) to `sort_unstable_by`. Found via the
+sibling-path-consistency audit (an optimization on one path, not its twin) — same heuristic that landed the
+federated aHash win (`9543ae6`).
+
+**Bit-identical:** the comparator is a **strict total order** — `score.total_cmp` then a `doc_id` tiebreak —
+and `blended` is built from an `AHashMap<&str, _>` so every `doc_id` is unique; no two elements compare
+Equal, so stable and unstable produce identical output. Conformance GREEN (`frankensearch-fusion` lib
+817/817). `federated` is the same argument (`doc_id` is the unique map key).
+
+**Measured** (per-crate `blend_reorder` A/B, isolates the final sort over a realistic blended set —
+unique ids, **mostly-distinct** f32 scores as in a real `alpha*q+(1-alpha)*f` blend, so the `doc_id`
+tiebreak rarely fires):
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-fusion --bench blend_reorder
+```
+
+| Workload | stable `sort_by` (ORIG) | `sort_unstable_by` (landed) | ratio | speedup |
+|----------|-------------------------|-----------------------------|-------|---------|
+| `n200`  (typical top-k blend) | 5.95 µs  | 4.57 µs  | **0.77** | **~1.30×** |
+| `n2000` (limit_all blend)     | 80.07 µs | 57.19 µs | **0.71** | **~1.40×** |
+
+CIs non-overlapping on both. (An initial over-tied bench draft — only `n/8` distinct scores — made the
+tiebreak dominate and showed a false `n2000` regression; the real blend score distribution is
+mostly-distinct, where unstable cleanly wins by dropping the stable-sort O(N) scratch alloc + better
+constant factors. Lesson: model the real key distribution, not a tie-adversarial one.)
+
+**Original-comparator ratio: N/A** — the blend/federated final sort is a frankensearch-only two-tier /
+cross-shard step (no Tantivy/Lucene/Meilisearch single-call equivalent). Internal sort micro-lever; the
+`blend_reorder` A/B bench is kept for re-validation.

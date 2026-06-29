@@ -494,7 +494,12 @@ fn into_ranked_hits(
         })
         .collect();
 
-    output.sort_by(|left, right| {
+    // Unstable sort (no scratch alloc): the comparator is a strict total order
+    // ending in a `doc_id` tiebreak, and `doc_id` is the unique map key, so no two
+    // entries compare Equal — identical output to a stable sort. Same bit-identical
+    // sibling fix as `blend_two_tier` / `rrf_fuse` (this cross-shard path is niche,
+    // not separately benched).
+    output.sort_unstable_by(|left, right| {
         right
             .result
             .score

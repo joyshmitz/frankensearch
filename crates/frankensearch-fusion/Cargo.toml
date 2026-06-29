@@ -54,6 +54,10 @@ name = "federated_fuse"
 harness = false
 
 [[bench]]
+name = "blend_reorder"
+harness = false
+
+[[bench]]
 name = "sync_int8_fetch"
 harness = false
 
