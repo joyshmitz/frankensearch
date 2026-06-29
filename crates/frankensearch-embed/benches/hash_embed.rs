@@ -339,6 +339,38 @@ fn bench_hash_embed(c: &mut Criterion) {
         });
         va.finish();
     }
+
+    // Element-wise in-place scale `vec[d] *= factor` — the scale half of an L2
+    // normalize (the default-path `l2_normalize_in_place`, every embed). Scalar
+    // (SSE2 auto-vec) vs the production `core::simd::scale_f32_in_place` (AVX2).
+    {
+        const SD: usize = 384;
+        const REPS: usize = 64;
+        let base: Vec<f32> = (0..SD).map(|d| (d % 97) as f32 * 0.013 + 0.1).collect();
+        let mut sg = c.benchmark_group("vec_scale");
+        sg.bench_function("scalar", |b| {
+            let mut v = base.clone();
+            b.iter(|| {
+                for _ in 0..REPS {
+                    let f = black_box(1.000_001_f32);
+                    for x in v.iter_mut() {
+                        *x *= f;
+                    }
+                }
+                black_box(&v);
+            });
+        });
+        sg.bench_function("avx2_dispatch", |b| {
+            let mut v = base.clone();
+            b.iter(|| {
+                for _ in 0..REPS {
+                    frankensearch_core::scale_f32_in_place(black_box(&mut v), black_box(1.000_001));
+                }
+                black_box(&v);
+            });
+        });
+        sg.finish();
+    }
 }
 
 criterion_group!(benches, bench_hash_embed);

@@ -30,11 +30,13 @@ pub mod observability_lint;
 pub mod parsed_query;
 pub mod query_class;
 pub mod repair;
+pub mod simd;
 pub mod time_travel;
 pub mod tracing_config;
 pub mod traits;
 pub mod types;
 
+pub use simd::scale_f32_in_place;
 pub use activation::{
     ActiveGeneration, ArtifactVerification, ArtifactVerifier, GenerationController, InvariantCheck,
     check_invariants,

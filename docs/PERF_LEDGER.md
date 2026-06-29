@@ -1890,3 +1890,37 @@ it. **Lesson reinforced (the one that bit me on the f16 dot): MEASURE, don't rea
 loop as "auto-vectorized" but the build's SSE2-only baseline left a clean ~1.5× on the table for a manual
 AVX2 (wider loads).** Element-wise (non-reduction) kernels are the bit-identical-SAFE place to widen SIMD.
 First SIMD in the embed crate's shared path (reusable `accumulate_f32_into`). Kept bench: `vec_accumulate`.
+
+### 2026-06-28 — AVX2 element-wise scale (l2_normalize, DEFAULT path): scale kernel ~1.70× (BlackThrush)
+
+**Lever (the element-wise vein's DEFAULT-path application).** `l2_normalize_in_place`
+(`core/traits.rs`) — called on **every** embed by every embedder (the FNV/JL default tiers, model2vec,
+api) — has two passes: the sum-of-squares (a reduction, bit-identical-LOCKED) and the **scale**
+`vec[d] *= inv_norm` (element-wise, bit-identical-SAFE). New `core::simd::scale_f32_in_place`
+runtime-dispatches the scale to AVX2 (`_mm256_mul_ps` by a broadcast `inv_norm`, 8 f32/instruction);
+the scalar loop (SSE2 auto-vec) is the fallback. **First SIMD in `frankensearch-core`** (std-only —
+`is_x86_feature_detected!` + `core::arch` + opt-in `#[allow(unsafe_code)]`).
+
+**Bit-identical:** each `vec[d] *= inv_norm` is an independent IEEE f32 multiply, identical 1/4/8-wide
+(no cross-lane reduction). `simd::tests::avx2_scale_matches_scalar` asserts `to_bits` equality across 11
+dim shapes; `traits::tests::l2_normalize_in_place_matches_allocating` still GREEN (the AVX2 in-place
+produces the same per-element `x·inv` as the allocating path). Conformance: **core** `l2_normalize` + simd
+tests + **291/291** embed lib tests GREEN.
+
+**Measured (per-crate `hash_embed` bench, dim 384, in-place scale; the production `scale_f32_in_place`):**
+
+| Workload | scalar (SSE2 auto-vec) | AVX2 dispatch | Ratio | Status |
+|----------|------------------------|---------------|-------|--------|
+| `vec_scale` (scale kernel) | 2.015 µs | 1.184 µs | **0.59 (~1.70×)** | KEEP |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-embed --profile release --bench hash_embed -- vec_scale
+```
+
+**Scope:** original-comparator ratio **N/A** (own embedders). ~1.70× on the scale KERNEL; `l2_normalize`
+overall is ~1.3× (the scale is one of its two passes; the sum-of-squares reduction stays scalar — locked).
+This is the **default embed path** (vs the model2vec mean-pool's opt-in tier), so it speeds every embed on
+every embedder — bigger AVX2 ratio than the accumulate (1.4–1.6×) because the scale is more compute-bound
+(one input × broadcast scalar, less memory traffic). The `core::simd` helper is reusable for future
+element-wise core ops. Kept bench: `vec_scale` (in `hash_embed`, importing the core helper).

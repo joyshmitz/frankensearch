@@ -382,9 +382,9 @@ pub fn l2_normalize_in_place(vec: &mut [f32]) {
         return;
     }
     let inv_norm = 1.0 / norm_sq.sqrt();
-    for x in vec.iter_mut() {
-        *x *= inv_norm;
-    }
+    // Element-wise scale — runtime-AVX2 (~1.7× over the SSE2 auto-vec on this
+    // no-global-avx2 build); bit-identical (per-element IEEE multiply).
+    crate::simd::scale_f32_in_place(vec, inv_norm);
 }
 
 /// Computes cosine similarity between two vectors.
