@@ -165,7 +165,7 @@ impl HashEmbedder {
             states[filled] = (seed ^ hash) | 1;
             filled += 1;
             if filled == JL_LANES {
-                jl_accumulate_lanes(&mut embedding, &states);
+                jl_accumulate_lanes8(&mut embedding, &states);
                 filled = 0;
             }
         }
@@ -181,7 +181,7 @@ impl HashEmbedder {
 
 /// Number of independent xorshift64 token-chains advanced together in the JL
 /// inner loop (instruction-level parallelism over a latency-bound recurrence).
-const JL_LANES: usize = 4;
+const JL_LANES: usize = 8;
 
 /// Advance one token's xorshift64 chain over every dimension, adding its ±1
 /// sign per dimension. This is the original single-chain inner loop, used for
@@ -197,16 +197,18 @@ fn jl_accumulate_one(embedding: &mut [f32], mut state: u64) {
     }
 }
 
-/// Advance [`JL_LANES`] independent token chains together, folding their per-
-/// dimension signs into the accumulator. Runtime-dispatches to an AVX2 kernel
-/// (the 4 chains are exactly one `__m256i` of u64 lanes — `JL_LANES == 4`); the
-/// scalar-ILP version is the portable fallback. Both are bit-identical: the
-/// per-dimension contribution is a sum of ±1 lanes (an exact small integer added
-/// to an exact-integer accumulator), so neither the SIMD lane grouping nor the
-/// `4 - 2·popcount` reformulation can change a single output bit.
+/// Advance 4 independent token chains together (one `__m256i` of u64 lanes),
+/// folding their per-dimension signs into the accumulator. **Superseded in
+/// production by the 8-lane [`jl_accumulate_lanes8`]** (2 `__m256i` → 2-way ILP
+/// that hides the xorshift latency, ~1.76× faster); kept as the bench A/B
+/// baseline. Runtime-dispatches to an AVX2 kernel; the scalar-ILP version is the
+/// portable fallback. Both are bit-identical: the per-dimension contribution is a
+/// sum of ±1 lanes (an exact small integer added to an exact-integer accumulator),
+/// so neither the SIMD lane grouping nor the `4 - 2·popcount` reformulation can
+/// change a single output bit.
 #[doc(hidden)]
 #[inline]
-pub fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+pub fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; 4]) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -225,7 +227,7 @@ pub fn jl_accumulate_lanes(embedding: &mut [f32], states: &[u64; JL_LANES]) {
 /// xorshift64 chains pipelined; `#[doc(hidden)] pub` for the bench A/B.
 #[doc(hidden)]
 #[inline]
-pub fn jl_accumulate_lanes_scalar(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+pub fn jl_accumulate_lanes_scalar(embedding: &mut [f32], states: &[u64; 4]) {
     let [mut s0, mut s1, mut s2, mut s3] = *states;
     for dim in embedding {
         s0 ^= s0 << 13;
@@ -265,7 +267,7 @@ pub fn jl_accumulate_lanes_scalar(embedding: &mut [f32], states: &[u64; JL_LANES
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
-fn jl_accumulate_lanes_avx2(embedding: &mut [f32], states: &[u64; JL_LANES]) {
+fn jl_accumulate_lanes_avx2(embedding: &mut [f32], states: &[u64; 4]) {
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_slli_epi64,
         _mm256_srli_epi64, _mm256_xor_si256,
@@ -282,6 +284,85 @@ fn jl_accumulate_lanes_avx2(embedding: &mut [f32], states: &[u64; JL_LANES]) {
             // odd lanes → -1, even → +1; Σ = (4-odd) - odd = 4 - 2·odd.
             #[allow(clippy::cast_possible_wrap)]
             let sum = (4 - 2 * (mask as u32).count_ones() as i32) as f32;
+            *dim += sum;
+        }
+    }
+}
+
+/// 8-chain variant of [`jl_accumulate_lanes`]. The 4-lane AVX2 kernel is one
+/// `__m256i` whose 3-step xorshift is a *dependency chain* → latency-bound; running
+/// TWO independent `__m256i` (8 chains) exposes the 2-way ILP that hides that
+/// latency. Bit-identical to the 4-lane / scalar path for the SAME tokens (the
+/// per-dim contribution is a sum of ±1 — an exact integer independent of lane
+/// grouping). Runtime-dispatched; `#[doc(hidden)] pub` for the bench A/B.
+#[doc(hidden)]
+#[inline]
+pub fn jl_accumulate_lanes8(embedding: &mut [f32], states: &[u64; 8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            unsafe {
+                jl_accumulate_lanes8_avx2(embedding, states);
+            }
+            return;
+        }
+    }
+    jl_accumulate_lanes8_scalar(embedding, states);
+}
+
+/// Portable 8-chain scalar fallback for [`jl_accumulate_lanes8`].
+#[doc(hidden)]
+#[inline]
+pub fn jl_accumulate_lanes8_scalar(embedding: &mut [f32], states: &[u64; 8]) {
+    let mut s = *states;
+    for dim in embedding {
+        let mut odd = 0_i32;
+        for st in &mut s {
+            *st ^= *st << 13;
+            *st ^= *st >> 7;
+            *st ^= *st << 17;
+            odd += i32::from((*st & 1) == 1);
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let sum = (8 - 2 * odd) as f32;
+        *dim += sum;
+    }
+}
+
+/// AVX2 8-chain JL accumulate — TWO `__m256i` (u64×4 each), xorshift steps
+/// interleaved so the CPU pipelines the two independent chains (2-way ILP over the
+/// latency-bound recurrence). Per-dim ±1 sum = `8 - 2·(popcount(maskA)+popcount(maskB))`.
+///
+/// # Safety
+/// Caller must ensure `avx2` is available (the dispatch in [`jl_accumulate_lanes8`]
+/// guarantees it).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+fn jl_accumulate_lanes8_avx2(embedding: &mut [f32], states: &[u64; 8]) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_slli_epi64,
+        _mm256_srli_epi64, _mm256_xor_si256,
+    };
+    // SAFETY: avx2 by contract; the two loads read the 8 u64 of `states` (chains
+    // 0-3 and 4-7); `states` is exactly 8 u64 = 64 bytes.
+    unsafe {
+        let mut a = _mm256_loadu_si256(states.as_ptr().cast::<__m256i>());
+        let mut b = _mm256_loadu_si256(states.as_ptr().add(4).cast::<__m256i>());
+        for dim in embedding {
+            a = _mm256_xor_si256(a, _mm256_slli_epi64::<13>(a));
+            b = _mm256_xor_si256(b, _mm256_slli_epi64::<13>(b));
+            a = _mm256_xor_si256(a, _mm256_srli_epi64::<7>(a));
+            b = _mm256_xor_si256(b, _mm256_srli_epi64::<7>(b));
+            a = _mm256_xor_si256(a, _mm256_slli_epi64::<17>(a));
+            b = _mm256_xor_si256(b, _mm256_slli_epi64::<17>(b));
+            let ma = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(a)));
+            let mb = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(b)));
+            #[allow(clippy::cast_possible_wrap)]
+            let sum =
+                (8 - 2 * ((ma as u32).count_ones() + (mb as u32).count_ones()) as i32) as f32;
             *dim += sum;
         }
     }
@@ -380,7 +461,7 @@ mod tests {
             // Accumulate many independent token-groups (incl. the zero-state edge).
             for g in 0..25 {
                 let states = if g == 0 {
-                    [1_u64; JL_LANES] // (seed^hash)|1 always odd, never 0
+                    [1_u64; 4] // (seed^hash)|1 always odd, never 0
                 } else {
                     [next() | 1, next() | 1, next() | 1, next() | 1]
                 };
@@ -394,6 +475,43 @@ mod tests {
             let sb: Vec<u32> = e_scalar.iter().map(|x| x.to_bits()).collect();
             let ab: Vec<u32> = e_avx2.iter().map(|x| x.to_bits()).collect();
             assert_eq!(sb, ab, "dim={dim}");
+        }
+    }
+
+    /// The 8-chain kernels (AVX2 + scalar) must produce a byte-for-byte identical
+    /// accumulated embedding to the 4-chain path for the SAME tokens — the per-dim
+    /// ±1 sum is an exact integer independent of lane grouping. Skips without AVX2.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn jl_8lane_matches_4lane() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng | 1
+        };
+        for &dim in &[1_usize, 8, 31, 100, 384] {
+            let states: Vec<u64> = (0..48).map(|_| next()).collect(); // 12×4 = 6×8, no tail
+            let mut e4 = vec![0.0_f32; dim];
+            for g in states.chunks_exact(4) {
+                jl_accumulate_lanes_scalar(&mut e4, g.try_into().unwrap());
+            }
+            let mut e8_avx2 = vec![0.0_f32; dim];
+            let mut e8_scalar = vec![0.0_f32; dim];
+            for g in states.chunks_exact(8) {
+                let g8: &[u64; 8] = g.try_into().unwrap();
+                jl_accumulate_lanes8(&mut e8_avx2, g8);
+                jl_accumulate_lanes8_scalar(&mut e8_scalar, g8);
+            }
+            let b4: Vec<u32> = e4.iter().map(|x| x.to_bits()).collect();
+            let ba: Vec<u32> = e8_avx2.iter().map(|x| x.to_bits()).collect();
+            let bs: Vec<u32> = e8_scalar.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(b4, ba, "8-lane avx2 vs 4-lane, dim={dim}");
+            assert_eq!(b4, bs, "8-lane scalar vs 4-lane, dim={dim}");
         }
     }
 

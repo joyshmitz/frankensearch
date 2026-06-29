@@ -248,7 +248,9 @@ fn bench_hash_embed(c: &mut Criterion) {
     // Kernel-level A/B of the real JL accumulate (the compute-bound inner loop),
     // isolated from tokenize/normalize: scalar-ILP vs the AVX2 u64×4 dispatch.
     {
-        use frankensearch_embed::{jl_accumulate_lanes, jl_accumulate_lanes_scalar};
+        use frankensearch_embed::{
+            jl_accumulate_lanes, jl_accumulate_lanes8, jl_accumulate_lanes_scalar,
+        };
         const DIM: usize = 384;
         const GROUPS: usize = 2000; // ~8000 tokens' worth of 4-chain groups
         let states: [u64; 4] = [
@@ -256,6 +258,17 @@ fn bench_hash_embed(c: &mut Criterion) {
             0x9e37_79b9_7f4a_7c15,
             0xdead_beef_cafe_bac5,
             0x0123_4567_89ab_cdef,
+        ];
+        // Same 8000 tokens, packed 8/group → GROUPS/2 calls.
+        let states8: [u64; 8] = [
+            0x1234_5678_9abc_def1,
+            0x9e37_79b9_7f4a_7c15,
+            0xdead_beef_cafe_bac5,
+            0x0123_4567_89ab_cdef,
+            0xfeed_face_dead_c0d5,
+            0xa5a5_5a5a_a5a5_5a5b,
+            0x0f1e_2d3c_4b5a_6979,
+            0xcafe_d00d_8bad_f00d,
         ];
         let mut ag = c.benchmark_group("jl_accumulate");
         ag.bench_function("scalar", |b| {
@@ -268,12 +281,22 @@ fn bench_hash_embed(c: &mut Criterion) {
                 black_box(&e);
             });
         });
-        ag.bench_function("avx2_dispatch", |b| {
+        ag.bench_function("avx2_4lane", |b| {
             let mut e = vec![0.0_f32; DIM];
             b.iter(|| {
                 e.fill(0.0);
                 for _ in 0..GROUPS {
                     jl_accumulate_lanes(black_box(&mut e), black_box(&states));
+                }
+                black_box(&e);
+            });
+        });
+        ag.bench_function("avx2_8lane", |b| {
+            let mut e = vec![0.0_f32; DIM];
+            b.iter(|| {
+                e.fill(0.0);
+                for _ in 0..GROUPS / 2 {
+                    jl_accumulate_lanes8(black_box(&mut e), black_box(&states8));
                 }
                 black_box(&e);
             });

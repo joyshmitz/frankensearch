@@ -1820,3 +1820,35 @@ them. A genuinely **different primitive** (SIMD PRNG/xorshift, not a dot/quantiz
 "never-safe-Rust-ceiling" steer with AVX2 u64 intrinsics. The smaller-than-the-decode-kernels ratio is
 expected: the scalar-ILP already pipelines the 4 independent chains, so the win is the 4×-fewer
 instructions, not a latency unlock. Kept bench arm: `jl_accumulate/scalar`.
+
+### 2026-06-28 — JL accumulate, 4-lane → 8-lane AVX2 (2-way ILP): 1.76× further (2.76× over scalar) (BlackThrush)
+
+**Lever (route-next from the JL win — the 4-lane kernel was latency-bound).** Yesterday's 4-lane AVX2
+`jl_accumulate_lanes` is ONE `__m256i` whose 3-step xorshift (`s ^= s<<13; s ^= s>>7; s ^= s<<17`) is a
+**dependency chain** → latency-bound (each step waits on the previous). Running TWO independent `__m256i`
+(8 chains, `jl_accumulate_lanes8_avx2`) with the xorshift steps **interleaved** exposes the 2-way ILP that
+hides that latency — the CPU pipelines the two chains. Wired as the production JL kernel (`JL_LANES = 8`,
+`embed_jl` groups tokens 8-at-a-time); the 4-lane kernel is kept as the bench A/B baseline.
+
+**Bit-identical:** the per-dim contribution is a sum of ±1 lanes (an exact small integer, `|value| ≤ token
+count ≪ 2²⁴`) — independent of lane grouping AND of the `8 - 2·(popcount(maskA)+popcount(maskB))`
+reformulation. `jl_8lane_matches_4lane` asserts the 8-lane embed (AVX2 **and** scalar) is `to_bits`-equal
+to the 4-lane embed across 5 dim shapes. Conformance: **290/290** embed lib tests GREEN (all JL output
+tests unchanged — the embed is byte-for-byte the same).
+
+**Measured (per-crate `hash_embed` bench, dim 384, 8000 tokens, kernel isolated):**
+
+| Workload | scalar-ILP | AVX2 4-lane | AVX2 8-lane | 8-lane vs 4-lane | 8-lane vs scalar |
+|----------|-----------|-------------|-------------|------------------|------------------|
+| `jl_accumulate` | 2778.9 µs | 1774.7 µs | **1005.8 µs** | **0.567 (~1.76×)** | **0.362 (~2.76×)** |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-embed --profile release --bench hash_embed -- jl_accumulate
+```
+
+**Scope:** original-comparator ratio **N/A** (own JL embedder, non-default). Bigger jump than yesterday's
+4-lane (1.51×) precisely *because* the 4-lane was latency-bound on a single register's dependency chain —
+the second register is a latency unlock, not just more width. **LESSON: a SIMD kernel whose hot recurrence
+is a single-register dependency chain is latency-bound — add a 2nd independent accumulator register (more
+lanes) before assuming the SIMD is saturated.** Kept bench arms: `jl_accumulate/{scalar,avx2_4lane,avx2_8lane}`.
