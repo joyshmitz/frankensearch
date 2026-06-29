@@ -2828,3 +2828,36 @@ bit-identical, above-noise per-crate perf lever remains.** The genuine remaining
 **invasive** (a `VectorHit<'a>` lifetime refactor across index+fusion to kill the doc_id clones wholesale)
 or **result-changing** (aggressive exact_identifier short-circuit, fsfs quality-rescore, limit_all tail
 approximation) — none fits the "60-min, bit-identical, conformance-GREEN, measured-ratio" bar.
+
+---
+
+## 2026-06-28 — f16 dot 4-accumulator latency-unlock: REFUTED (~0-gain — decode-throughput-bound, not add-latency-bound) (BlackThrush)
+
+The JL 8-lane win (`abd4628`) came from a latency unlock — the 4-lane xorshift was a single-register
+dependency chain, so a 2nd accumulator register hid the latency. Its lesson said "re-check the other
+dependency-chain kernels." I did. The **f16-bytes dot** (`dot_product_f16_bytes_f32_avx2`, the DEFAULT
+vector-tier kernel) uses a single `__m256` accumulator — `sum = add_ps(sum, mul_ps(cvtph(..), q))` — and
+`add_ps` has ~4-cycle latency while `cvtph_ps` pipelines at ~1/cycle, so I hypothesised it was
+**add-latency-bound** (a ~4× latent win behind a 4-accumulator rewrite, the biggest default-path kernel).
+
+**MEASURED first (a non-production 4-acc variant + bench arm, since a 4-acc reduction is NOT
+bit-identical):**
+
+| `dot/dim256/f16_bytes` (10k vecs) | 1-acc (prod) | 4-acc | Ratio |
+|-----------------------------------|--------------|-------|-------|
+| | 413.2 µs | 408.5 µs | **~1.0 (within noise)** |
+
+**~0-gain → REVERTED** (the experimental kernel + bench arm backed out via Edit; tree clean). The
+hypothesis was **wrong**: the f16 dot is **decode-throughput-bound** (the `vcvtph2ps` + the two loads cap
+it at ~1 chunk/cycle), so the `add_ps` latency is already fully hidden — a single accumulator is optimal.
+The 4× from the F16C arc (`7239d58`) WAS the bottleneck removal; nothing latency-bound remains.
+
+**Why JL was different (refines the lesson):** JL's xorshift is a **pure-register recurrence with no
+per-element load/decode** — so the dependency chain IS the only thing limiting throughput, and a 2nd
+register is a pure win. The dot kernels all have a per-element **load/decode** (f16 `cvtph`, 4-bit
+`mullo`/unpack, int8 `madd`) whose throughput is the real cap, hiding the accumulator latency. **CORRECTED
+LESSON: the "add a 2nd accumulator register" unlock only applies to kernels whose hot recurrence is
+register-only (PRNG, pure reductions); a kernel with a per-element load or decode is throughput-bound on
+that, NOT accumulator-latency-bound — measure before rewriting (and especially before breaking
+bit-identical for it).** The measure-first cost ~20 min and saved a ~0-gain, bit-identical-breaking,
+default-path-rippling change. Don't re-attempt 4-acc on any of the dot kernels.
