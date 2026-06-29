@@ -3132,3 +3132,36 @@ here**; the controller would be adaptive machinery governing a 5 % slice. Kept t
 baseline as the bd-tjkm trace artifact; recorded no behavior change. Original-comparator ratio **N/A**
 (internal query-path latency). **bd-tjkm perf-lever verdict: marginal — phase-1-dominated and already
 optimized; the controller is not a worthwhile perf win on this path.**
+
+---
+
+## 2026-06-29 — HNSW route-next REFUTED at production scale/dim: recall collapses at 100k × 384 (BlackThrush)
+
+**Lever re-validated and REVERTED — the 2026-06-26 HNSW route-next ("re-validate at larger N; the crossover
+improves for HNSW") does NOT hold at production dimensionality.** The progressive_replay baseline showed the
+fast-tier **flat scan is ~98 % of query latency**, so the only structural lever on it is ANN (HNSW, O(log N)
+vs flat O(N)). HNSW is implemented + wired into the file-backed `TwoTierIndex` (gated by `hnsw_threshold`)
+but was decided "not default" at 10k × 128 (recall/latency trade). Re-ran `hnsw_vs_flat` at **N=100k,
+dim=384** (production dim; clustered vectors; `HnswConfig::default()`):
+
+| ef_search | recall@10 | HNSW latency | vs flat (1.293 ms) |
+|-----------|-----------|--------------|--------------------|
+| 10  | **0.088** | 325.7 µs | 3.97× faster |
+| 20  | **0.181** | 565.0 µs | 2.29× faster |
+| 40  | **0.306** | 955.5 µs | 1.35× faster |
+| 100 | **0.550** | 1.843 ms | **0.70× (slower)** |
+| 200 | **0.625** | (slower)  | — |
+
+**Finding: at 100k × 384 HNSW is non-viable.** Recall **collapses** vs the 10k × 128 baseline (which reached
+0.95 at ef=100) — the dim 128→384 jump (ANN curse of dimensionality) + the `HnswConfig::default()` M /
+ef_construction (under-built for 384-d) crater navigation accuracy. And where recall is even moderate
+(0.55 at ef=100) HNSW is **slower than the parallel flat scan** (1.84 ms vs 1.29 ms). The flat scan
+(rayon-parallel SIMD f16 dot + bounded-heap + cutoff, recall 1.0) **wins decisively** at production scale —
+it's sequential/cache-friendly and bandwidth-bound where HNSW is a serial random-access graph walk that
+degrades with dimension. **The larger-N route-next is the OPPOSITE of what was hoped: higher dim dominates
+the larger-N crossover, so HNSW gets *worse* at production dim, not better.** A heavily-tuned HnswConfig
+(much higher M + ef_construction, → big build-time + memory cost) might lift recall, but that is a separate
+deep investigation and the flat scan is already the strong default. **Decision: keep flat scan as the
+default vector tier; the 2026-06-26 "do not wire HNSW as default" stands and is now confirmed at production
+scale/dim.** Bench reverted to its 10k × 128 form (`git diff` empty); 100k × 384 numbers recorded here.
+Original-comparator ratio **N/A** (internal ANN-vs-flat vector-tier selection).
