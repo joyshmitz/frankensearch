@@ -2092,3 +2092,38 @@ Real win for the diversification feature: ~1.6× wherever MMR runs. Kept bench a
 **Route next:** the f64 widen + `pmullw`/`mulpd` may now bind the loop; an 8-accumulator split or an AVX2
 `dot_product_f32_f32` (the index crate already has one) wired into fusion could push further — but MMR's
 absolute cost is small, so lower priority than the gather's FSVI/lexical plumbing.
+
+### 2026-06-29 — `count_lexical_tokens`: 256-byte LUT + branchless transition → ~1.5–1.8× (BlackThrush)
+
+**Lever (a DIFFERENT primitive — branchless byte-class state machine).** `count_lexical_tokens` (the
+fsfs lexical chunker's per-chunk token counter, run during indexing) had an ASCII byte fast path that, per
+byte, called `is_token_byte` (`is_ascii_alphanumeric()` + a 5-way `matches!`, ~7–10 ops) and then branched
+on a data-dependent `in_token` flag that **mispredicts on every token boundary** (code/path text is
+boundary-dense). Replaced both with (1) a compile-time **256-byte class table** `TOKEN_BYTE` (one L1 load
+per byte) and (2) **branchless transition counting**: a token ends at each token→non-token transition, so
+`count += (prev & !cur)` with no data-dependent branch. The table is built from `is_token_byte` in a
+`const` block, so `TOKEN_BYTE[b] == is_token_byte(b)` for every byte — **bit-identical** token counts.
+
+**Conformance:** `frankensearch-fsfs` lexical tests GREEN; the bench also asserts `count_new == count_lut`
+(identical counts) for every input size before timing.
+
+**Measured (per-crate same-binary A/B, `lexical_count` bench, realistic ASCII code/doc chunk, medians;
+`bytes` = the landed scalar byte path, `lut` = table + branchless):**
+
+| input bytes | chars (UTF-8) | bytes (scalar) | lut (this change) | lut/bytes | speedup |
+|-------------|---------------|----------------|-------------------|-----------|---------|
+| 1 024  | 1.093 µs  | 620.5 ns  | 399.6 ns  | **0.644** | **1.55×** |
+| 4 096  | 3.949 µs  | 2.221 µs  | 1.408 µs  | **0.634** | **1.58×** |
+| 16 384 | 15.64 µs  | 10.17 µs  | 5.582 µs  | **0.549** | **1.82×** |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  cargo bench -p frankensearch-fsfs --profile release \
+  --bench lexical_count -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+**Scope:** original-comparator ratio **N/A** — internal fsfs indexing-path primitive (the token count is
+chunk metadata), so this is a frankensearch before/after, and it speeds **indexing throughput** (a real
+Tantivy/Lucene-class dimension) wherever the lexical chunker runs over ASCII code/docs (the common case).
+The LUT/branchless pattern is reusable for any byte-class state machine. Kept bench arm: `lexical_count/lut`.

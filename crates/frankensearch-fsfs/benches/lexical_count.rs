@@ -36,6 +36,32 @@ fn count_new(text: &str) -> usize {
     }
     count_old(text)
 }
+// LUT candidate: 256-byte class table + branchless transition counting. Each byte
+// is one table load; a token is counted at every token→non-token transition via
+// `prev & !cur` (no data-dependent `in_token` branch). Bit-identical to count_new.
+const TOKEN_BYTE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        t[i] = (b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':')) as u8;
+        i += 1;
+    }
+    t
+};
+fn count_lut(text: &str) -> usize {
+    if text.is_ascii() {
+        let mut count = 0usize;
+        let mut prev = 0u8;
+        for &b in text.as_bytes() {
+            let cur = TOKEN_BYTE[b as usize];
+            count += (prev & !cur) as usize;
+            prev = cur;
+        }
+        return count + prev as usize;
+    }
+    count_old(text)
+}
 // Realistic ASCII code/doc chunk.
 fn make_text(n: usize) -> String {
     let base = "src/main.rs -> fn run_fast(x: i32) { return x + foo.bar.baz(qux); } // http://example.com:8080/path token_count ";
@@ -46,9 +72,11 @@ fn bench_count(c: &mut Criterion) {
     for n in [1024usize, 4096, 16384] {
         let text = make_text(n);
         debug_assert_eq!(count_old(&text), count_new(&text));
+        assert_eq!(count_new(&text), count_lut(&text), "LUT count must match byte path (n{n})");
         let id = format!("ascii_{n}");
         g.bench_with_input(BenchmarkId::new("chars", &id), &(), |b, ()| b.iter(|| black_box(count_old(black_box(&text)))));
         g.bench_with_input(BenchmarkId::new("bytes", &id), &(), |b, ()| b.iter(|| black_box(count_new(black_box(&text)))));
+        g.bench_with_input(BenchmarkId::new("lut", &id), &(), |b, ()| b.iter(|| black_box(count_lut(black_box(&text)))));
     }
     g.finish();
 }

@@ -154,17 +154,19 @@ impl LexicalChunkPolicy {
 #[must_use]
 pub fn count_lexical_tokens(text: &str) -> usize {
     if text.is_ascii() {
-        let mut count = 0;
-        let mut in_token = false;
+        // 256-byte class table (one load per byte) + branchless transition counting:
+        // a token ends at every token→non-token transition (`prev & !cur`), removing
+        // both the multi-op `is_token_byte` and the data-dependent `in_token` branch
+        // that mispredicts on every token boundary. `TOKEN_BYTE[b] == is_token_byte(b)`
+        // by construction, so this is bit-identical to the scalar byte path.
+        let mut count = 0usize;
+        let mut prev = 0u8;
         for &b in text.as_bytes() {
-            if is_token_byte(b) {
-                in_token = true;
-            } else if in_token {
-                in_token = false;
-                count += 1;
-            }
+            let cur = TOKEN_BYTE[b as usize];
+            count += (prev & !cur) as usize;
+            prev = cur;
         }
-        return count + usize::from(in_token);
+        return count + prev as usize;
     }
 
     let mut count = 0;
@@ -233,9 +235,22 @@ fn is_token_char(ch: char) -> bool {
 /// ASCII-only `is_token_char` for the `count_lexical_tokens` byte fast path.
 /// Equals `is_token_char(b as char)` for every ASCII byte `b`.
 #[inline]
-fn is_token_byte(b: u8) -> bool {
+const fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':')
 }
+
+/// Byte→token-class lookup table (`1` = token byte) for the `count_lexical_tokens`
+/// ASCII fast path. Built from [`is_token_byte`] at compile time, so it is exactly
+/// equal to the scalar predicate for every byte (bit-identical token counts).
+const TOKEN_BYTE: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = is_token_byte(i as u8) as u8;
+        i += 1;
+    }
+    t
+};
 
 fn floor_char_boundary(text: &str, index: usize) -> usize {
     let mut idx = index.min(text.len());
