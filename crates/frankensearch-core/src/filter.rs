@@ -265,18 +265,67 @@ impl SearchFilter for DateRangeFilter {
 
 /// Matches documents whose `doc_id` hash is in a pre-computed set.
 ///
+/// Identity `Hasher` for `u64` keys that are ALREADY well-distributed hashes (the
+/// FNV-1a `doc_id` hashes the filter stores). A default `HashSet<u64>` re-runs
+/// SipHash over each key (~25 cyc); since the key is already a uniform hash,
+/// passing it straight through is correct (FNV-1a's high bits feed the SwissTable
+/// control byte) and ~10× cheaper per probe — which dominates the *filtered* vector
+/// scan, where one membership probe runs per candidate before the (cheap, SIMD) dot.
+#[derive(Default, Clone, Copy)]
+pub struct IdentityHasherU64(u64);
+
+impl std::hash::Hasher for IdentityHasherU64 {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    // Defensive fold: only `write_u64` is exercised for `u64` keys; bytes never
+    // arrive in practice, but folding (rather than panicking) keeps the hasher
+    // total if a non-`u64` key is ever inserted.
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8) | u64::from(b);
+        }
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+/// `BuildHasher` for [`IdentityHasherU64`].
+#[derive(Default, Clone, Copy)]
+pub struct BuildIdentityHasherU64;
+
+impl std::hash::BuildHasher for BuildIdentityHasherU64 {
+    type Hasher = IdentityHasherU64;
+    #[inline]
+    fn build_hasher(&self) -> IdentityHasherU64 {
+        IdentityHasherU64(0)
+    }
+}
+
+type DocIdHashSet = HashSet<u64, BuildIdentityHasherU64>;
+
 /// Uses FNV-1a hashing for `O(1)` membership checks. Useful when the set of
 /// allowed documents is known ahead of time and potentially large.
 #[derive(Debug, Clone)]
 pub struct BitsetFilter {
-    hashes: HashSet<u64>,
+    hashes: DocIdHashSet,
 }
 
 impl BitsetFilter {
     /// Create a filter from pre-computed FNV-1a hashes of `doc_id` values.
+    ///
+    /// The keys are re-bucketed into an identity-hashed set ([`IdentityHasherU64`])
+    /// so per-probe membership skips SipHash — paid once at construction, amortized
+    /// over every candidate of a filtered scan.
     #[must_use]
-    pub const fn from_hashes(hashes: HashSet<u64>) -> Self {
-        Self { hashes }
+    pub fn from_hashes(hashes: HashSet<u64>) -> Self {
+        Self {
+            hashes: hashes.into_iter().collect(),
+        }
     }
 
     /// Create a filter by computing FNV-1a hashes from `doc_id` strings.
