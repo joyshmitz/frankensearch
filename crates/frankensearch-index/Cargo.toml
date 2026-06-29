@@ -84,5 +84,9 @@ harness = false
 name = "i8_dot_ilp"
 harness = false
 
+[[bench]]
+name = "max_reduction"
+harness = false
+
 [lints]
 workspace = true
