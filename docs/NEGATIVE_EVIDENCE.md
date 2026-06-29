@@ -3240,3 +3240,40 @@ frankensearch's side is at its floor.** With this, the measured-axis map is comp
 **parity-or-better (won)**, search `limit_all` = inherent (no per-crate lever), vector tier = at floor
 (HNSW refuted, kernels AVX2-capped, reductions bandwidth-bound), indexing = inherent + kernels optimized.
 Original-comparator ratio **N/A**.
+
+---
+
+## 2026-06-29 — hoisting per-call SIMD dispatch (`is_x86_feature_detected!`) out of the scan loop is NOT a lever (BlackThrush)
+
+**Not attempted — flagged to save effort (a highly-visible-looking lever that does not pay).** Every SIMD
+dot wrapper (`dot_i8_i8`, `dot_product_f16_bytes_f32`, `dot_4bit_prepared`, …, `simd.rs`) runs
+`std::is_x86_feature_detected!("avx2")` **per call**, and those calls sit inside the per-vector scan loops
+(e.g. the int8 pass-1 at `in_memory.rs:450`, `dot_i8_i8(stored, &query_i8)` per candidate). To a fresh
+reader this looks like an obvious free win: detect AVX2 **once** before the loop, then call the `_avx2`
+kernel directly. It is not a win, for three compounding reasons:
+
+1. **The mandatory call cannot be removed by hoisting.** `dot_i8_i8_avx2` (and every sibling) carries
+   `#[target_feature(enable = "avx2")]`. A `#[target_feature]` function **can never be inlined into a
+   baseline-compiled caller** (the scan loop is built for baseline `x86-64`, not `+avx2`), so there is
+   **always a real `call` to the kernel per vector** regardless of where the feature check lives. Hoisting
+   the check removes only the cached-atomic-load + (perfectly-predicted) branch around that call — a few
+   cycles — not the call itself.
+
+2. **That residual is hidden — the scan is bandwidth-bound.** The int8/f16 pass-1 reads the `N·d`-byte slab
+   (established bandwidth-bound, this ledger, AVX-512 entry). A relaxed cached-atomic load + always-taken
+   branch per iteration is fully overlapped by the memory stalls of streaming `stored`, so removing it is
+   `~0-gain` on the dominated path — a `REVERT ~0-gain` by the keep threshold.
+
+3. **The version that *would* help is invasive and conflicts with a landed optimization.** The only way to
+   delete the per-vector call (not just the check) is a **batch AVX2 scan kernel** — one `#[target_feature]`
+   fn that loops all `N` vectors internally, keeping the accumulators/registers live across the scan. But the
+   scan body interleaves the **filter predicate** (`f.matches_doc_id_hash`, `in_memory.rs:437`) and the
+   **fused bounded-heap cutoff fast-path** (`heap.len() < candidate_count || score_key(score) >= cutoff`,
+   `in_memory.rs:455` — a deliberate landed win). Pulling the dot into a batch kernel forces scores into a
+   scratch buffer and a **separate** heap pass, regressing that fused cutoff; and the kernel itself stays
+   bandwidth-capped. Net: invasive, conflicts with a kept lever, and bounded above by the same bandwidth wall.
+
+**Conclusion: leave the per-call runtime dispatch as-is — it is the idiomatic, correct shape and its
+overhead is hidden by the bandwidth-bound scan. Do not hoist it or batch-kernel it on this hardware.** This
+closes the last "obvious-looking but dominated" pattern in the vector scan loops. Original-comparator ratio
+**N/A** (internal kernel-dispatch micro-shape).
