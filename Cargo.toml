@@ -103,14 +103,18 @@ fastembed = { version = "5.11.0", default-features = false, features = [
 ] }
 safetensors = "0.7.0"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
-# frankentorch (pure-Rust tensor lib) for the native cross-encoder reranker backend
-# (frankensearch-rerank `native` feature). Referenced as a relative `/dp` sibling
-# (../frankentorch -> /dp/frankentorch), matching the franken-stack layout used by
-# the other unpublished path-deps; frankentorch is unpublished so it cannot use a
-# registry version like asupersync.
-ft-api = { path = "../frankentorch/crates/ft-api" }
-ft-autograd = { path = "../frankentorch/crates/ft-autograd" }
-ft-core = { path = "../frankentorch/crates/ft-core" }
+# frankentorch (pure-Rust tensor lib) backing the frankensearch-rerank `native`
+# feature (cross-encoder reranker + MiniLM embedder). Pinned by GIT REV so downstream
+# consumers (e.g. cass) can pull frankensearch's `native` feature from a git rev
+# without a local frankentorch checkout: a relative `../frankentorch` path dep escapes
+# a git checkout and fails to resolve (`no matching package named ft-api`). frankentorch
+# is unpublishable on crates.io under these names (`ft-api` is taken by an unrelated
+# crate), so a git rev is the consumable pin. For local frankentorch development, add a
+# `[patch."https://github.com/Dicklesworthstone/frankentorch"]` block pointing ft-api /
+# ft-autograd / ft-core at ../frankentorch/crates/* locally (do NOT commit it).
+ft-api = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
+ft-autograd = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
+ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
 
 # Full-text search
 tantivy = "0.26.1"
