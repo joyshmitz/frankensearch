@@ -3518,3 +3518,41 @@ record (e.g. sort a separate `(u128 key, u32 idx)` array, then gather) — but t
 the adjacent idea already refuted structurally (un-radixable String tail + pervasive ties), and gather-by-
 index then needs an unsafe move-out of the `FusedHitScratch` Vec. Not worth it for a ~22%-of-a-noisy-row
 slice. Do not re-attempt fattening `FusedHitScratch` with sort keys.
+
+---
+
+## 2026-06-29 — RRF sort input order: pdqsort is highly adaptive (presorted 4.3-5.8×), but reorder-via-hashmap-remove regresses at large N — NOT wired (BlackThrush)
+
+**Fresh algorithmic lever (not a kernel micro-op).** The RRF final sort consumes `hits.into_values()`
+(random hashmap order) then `sort_unstable_by(cmp_for_ranking)` — a full O(N log N). pdqsort is *adaptive*,
+and for `limit_all` the semantic list is already in fused order for the vector-only majority (their fused
+score is `1/(60+sem_rank)`, monotonic), so feeding the sort a **semantic-ordered** input is bit-identical
+(the comparator is a total order → same output for any input permutation) yet should sort in ~O(N).
+
+**Probe 1 — does input order matter? (sort only, identical output):**
+
+| N | random | presorted | nearsorted (20% displaced) |
+|---|--------|-----------|----------------------------|
+| 10000 | 1.326 ms | **305 µs (4.3×)** | 936 µs (1.42×) |
+| 50000 | 8.43 ms | **1.46 ms (5.8×)** | — |
+
+Huge — pdqsort exploits the near-sortedness. **Probe 2 — honest full path** (both arms clone the same
+prebuilt `AHashMap` in the timed region; `current` = `into_values`+sort, `reorder` = drain in semantic
+order via `remove`+sort, charging the N hashmap removes `into_values` never pays):
+
+| N | current | reorder | ratio |
+|---|---------|---------|-------|
+| 10000 | 1.9146 ms | 1.4042 ms | **0.73 (1.36× faster)** |
+| 50000 | 16.208 ms | 17.791 ms | **1.10 (SLOWER)** |
+
+**Decision: NOT wired (corpus-size-dependent, regresses at scale).** The reorder wins at 10k but **loses at
+50k**: the semantic-order `remove` loop does N random accesses into the hashmap, which is cache-miss-bound
+once the map exceeds LLC (~100 ns/remove at 50k) — exceeding the sort savings. A gate (reorder only below
+~16 k, like `PAR_SORT_THRESHOLD`) would bank only the small-corpus win, which lands on the noise-dominated
+`limit_all/10k` BOLD row — not worth the branch. **Route next (the clean capture):** a *merge-structured*
+RRF that never builds the N-entry hashmap — keep a small `L`-entry lexical/graph contribution map (cache-
+resident), then iterate the already-sorted semantic list **once in order**, emitting `FusedHitScratch`
+directly (semantic-ordered, near fused order) and applying the lexical boost via the small map. That gets the
+near-sorted sort input AND avoids both the N-entry hashmap build and the N cache-missing removes — but it is
+a structural rewrite of `rrf_fuse_with_graph` with dedup/graph/lexical-only edge cases to keep bit-identical,
+so it is a scoped follow-up, not a one-commit lever. Do not re-attempt the simple reorder-via-remove.
