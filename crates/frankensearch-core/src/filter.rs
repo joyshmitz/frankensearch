@@ -37,6 +37,20 @@ pub trait SearchFilter: Send + Sync {
         None
     }
 
+    /// Optional allow-set for selective hash-addressable filters.
+    ///
+    /// Returns `Some(set)` when this filter is an explicit FNV-1a allow-list (a
+    /// document passes **iff** its `doc_id_hash` is in the set), letting a scan
+    /// that knows the corpus iterate the (small) allow-set and gather only those
+    /// positions — `O(|allow-set|)` instead of one membership probe per corpus
+    /// document. Returns `None` for predicate/metadata/composite filters that
+    /// cannot be enumerated. The result of a gather must equal the per-document
+    /// scan, so this is only sound for filters whose `matches_doc_id_hash` is
+    /// exactly `Some(set.contains(hash))`.
+    fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        None
+    }
+
     /// A short, descriptive name for diagnostics and tracing.
     fn name(&self) -> &str;
 }
@@ -306,7 +320,10 @@ impl std::hash::BuildHasher for BuildIdentityHasherU64 {
     }
 }
 
-type DocIdHashSet = HashSet<u64, BuildIdentityHasherU64>;
+/// Identity-hashed `u64` set used as a [`BitsetFilter`]'s allow-list and exposed
+/// via [`SearchFilter::candidate_hashes`] so a selective filtered scan can iterate
+/// the allow-set directly instead of probing it per corpus document.
+pub type DocIdHashSet = HashSet<u64, BuildIdentityHasherU64>;
 
 /// Uses FNV-1a hashing for `O(1)` membership checks. Useful when the set of
 /// allowed documents is known ahead of time and potentially large.
@@ -352,6 +369,10 @@ impl SearchFilter for BitsetFilter {
         _metadata: Option<&serde_json::Value>,
     ) -> Option<bool> {
         Some(self.hashes.contains(&doc_id_hash))
+    }
+
+    fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+        Some(&self.hashes)
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
