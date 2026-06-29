@@ -50,6 +50,10 @@ name = "rrf_fuse"
 harness = false
 
 [[bench]]
+name = "federated_fuse"
+harness = false
+
+[[bench]]
 name = "sync_int8_fetch"
 harness = false
 

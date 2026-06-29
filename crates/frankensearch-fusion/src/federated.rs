@@ -3,7 +3,7 @@
 //! A single query fans out to multiple indices, then gathered results are fused
 //! into one ranked list.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
+use ahash::AHashMap;
 use asupersync::Cx;
 use asupersync::time::{timeout, wall_now};
 use frankensearch_core::{ScoreSource, ScoredResult, SearchError, SearchResult};
@@ -351,7 +352,12 @@ impl FederatedSearcher {
 
 fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
     let k = sanitize_rrf_k(k);
-    let mut docs: HashMap<String, AggregateDoc> = HashMap::new();
+    // aHash (not SipHash): the cross-shard merge keys on owned `doc_id` strings;
+    // the DoS-resistant default hasher is the bottleneck here, and the sibling
+    // single-node `rrf_fuse_with_graph` already uses `AHashMap`. Output is
+    // unchanged — `into_ranked_hits` sorts by a strict total order (the final
+    // `doc_id` tiebreak), so map drain order never reaches the result.
+    let mut docs: AHashMap<String, AggregateDoc> = AHashMap::new();
     for shard in shards {
         // NaN.max(0.0) propagates NaN — guard explicitly.
         if !shard.weight.is_finite() || shard.weight <= 0.0 {
@@ -380,7 +386,7 @@ fn fuse_weighted(
     normalization: NormalizationMethod,
     apply_comb_mnz: bool,
 ) -> Vec<FederatedHit> {
-    let mut docs: HashMap<String, AggregateDoc> = HashMap::new();
+    let mut docs: AHashMap<String, AggregateDoc> = AHashMap::new();
 
     for shard in shards {
         // NaN.max(0.0) propagates NaN — guard explicitly.
@@ -424,7 +430,7 @@ fn rank_contribution(k: f64, rank: usize) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn accumulate_doc(
-    docs: &mut HashMap<String, AggregateDoc>,
+    docs: &mut AHashMap<String, AggregateDoc>,
     hit: &ScoredResult,
     shard_name: &str,
     rank: usize,
@@ -465,7 +471,7 @@ fn accumulate_doc(
 
 #[allow(clippy::cast_precision_loss)]
 fn into_ranked_hits(
-    mut docs: HashMap<String, AggregateDoc>,
+    mut docs: AHashMap<String, AggregateDoc>,
     apply_comb_mnz: bool,
 ) -> Vec<FederatedHit> {
     let mut output: Vec<FederatedHit> = docs

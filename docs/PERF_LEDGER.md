@@ -2267,3 +2267,39 @@ not the 23 % from `dcde68f`** — that earlier run was on a contended worker (lo
 number. **So the limit_all doc_id clone is ~10 %, allocator-bound, un-elidable per-crate (move/Arc/inline all
 multi-crate), and un-parallelizable (allocator contention). Fully closed; `materialize_clone` bench kept,
 par arm reverted.**
+
+---
+
+## 2026-06-29 — federated cross-shard fuse: SipHash → aHash on the merge map is ~1.09–1.22× (BlackThrush)
+
+**Lever LANDED (single-crate, bit-identical).** `federated::{fuse_rrf, fuse_weighted}` accumulate per-doc
+aggregates in `std::collections::HashMap<String, AggregateDoc>` — the DoS-resistant **SipHash** default
+hasher — keyed on owned `doc_id` strings, while the sibling single-node `rrf_fuse_with_graph` already uses
+`ahash::AHashMap`. Swapped the four federated map sites to `AHashMap` (aHash). This is **separate from the
+Cobaltmoth clone-elim lever** (NEGATIVE_EVIDENCE 2026-06-27, ~1.05×, reverted): that attacked the key
+*clone*; this attacks the key *hash*. The per-hit allocations (`doc_id.clone()`, `appeared_in.to_owned()`)
+are unchanged, so this is a clean, orthogonal hasher win.
+
+**Bit-identical:** `into_ranked_hits` sorts by a **strict total order** — `score.total_cmp` → `appeared_in`
+count → `source_rank` → **`doc_id` tiebreak** (`federated.rs:491`). Since `doc_id` is the unique map key,
+no two output entries compare Equal, so the transient map's (hasher-dependent) drain order never reaches the
+result. Output is identical for every input.
+
+**Measured** (per-crate A/B, isolates only the hasher — identical alloc profile in both arms;
+`federated_fuse` bench, real merge shape: `String` key clone + `BTreeSet<String>` appeared-in + template clone):
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  rch exec -- cargo bench -p frankensearch-fusion --bench federated_fuse
+```
+
+| Workload (shards × hits, universe) | SipHash (prod) | aHash (landed) | ratio | speedup |
+|------------------------------------|----------------|----------------|-------|---------|
+| `s5_h200_u600`   (5 × 200, ~50% overlap)  | 173.4 µs | 142.6 µs | **0.82** | **~1.22×** |
+| `s10_h500_u2500` (10 × 500, ~50% overlap) | 805.4 µs | 742.0 µs | **0.92** | **~1.09×** |
+
+CIs non-overlapping on both. The smaller workload shows the larger ratio (hash-compute is a bigger fraction
+when the total doc set is small; at scale the `BTreeSet`/`String` allocations dilute it toward ~1.09×).
+
+**Original-comparator ratio: N/A** — federated multi-shard fusion is a frankensearch-only cross-shard path
+(Tantivy/Lucene/Meilisearch have no single-call cross-shard fuse comparator). Internal micro-lever; the
+`federated_fuse` A/B bench is kept for re-validation.
