@@ -2250,3 +2250,20 @@ cross-cutting type/lifetime change** — the String-everywhere result API + the 
 make N owned allocations unavoidable per-crate. **The limit_all doc_id clone lever is conclusively closed
 for single-crate work; the deep `Arc<str>`-or-lifetime refactor is the only path and is a deliberate
 multi-crate decision, not a 60-min lever.**
+
+**UPDATE 2 — parallelizing the clone (rayon) is also REJECTED (allocator-bound), and the clone is ~10% not
+23% on a clean worker.** Since the clone can't be elided per-crate, the next idea was to keep it but
+parallelize it (`into_par_iter().map(into_owned)`) — bit-identical (order preserved), single-crate,
+non-invasive. Measured (`materialize_clone`, clean worker, owned serial vs `owned_clone_par` rayon):
+
+| N | serial clone | rayon par clone | borrowed (lower bound) |
+|---|--------------|-----------------|------------------------|
+| 10 000 | **190.6 µs** | **228.3 µs (SLOWER)** | 2.90 µs |
+
+The parallel clone is **~1.2× SLOWER** than serial: the N small `String` allocations **contend on the global
+allocator**, so the clone is allocator-bound, not CPU-bound — rayon adds spawn overhead with no parallelism
+to exploit. Rejected (not wired). Also note the serial clone is **190 µs here (~10 % of limit_all's 1869 µs),
+not the 23 % from `dcde68f`** — that earlier run was on a contended worker (load ~13); 190 µs is the clean
+number. **So the limit_all doc_id clone is ~10 %, allocator-bound, un-elidable per-crate (move/Arc/inline all
+multi-crate), and un-parallelizable (allocator contention). Fully closed; `materialize_clone` bench kept,
+par arm reverted.**
