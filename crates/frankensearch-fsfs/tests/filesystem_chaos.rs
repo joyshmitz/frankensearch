@@ -284,6 +284,18 @@ fn assert_binary_chaos_result(
 ) {
     let result = run_binary_filesystem_chaos_scenario(scenario_id);
 
+    // Privileged-host guard for the permission-denied scenario. Its fixture makes a
+    // `0o000` file that only an UNPRIVILEGED process is blocked from reading. On
+    // root / `CAP_DAC_OVERRIDE` (several CI and rch remote workers run as root) the
+    // binary reads and indexes that file, so it is never skipped and no
+    // permission-denied event fires — the scenario cannot be exercised. Detect that
+    // from the binary's own result (nothing skipped ⇒ the "blocked" file was read,
+    // which a non-root host physically cannot do) and skip, rather than assert a
+    // denial that is impossible on this host (the source of host-dependent flakiness).
+    if scenario_id == "cli-chaos-permission-denied" && result.sentinel.skipped == 0 {
+        return;
+    }
+
     assert!(
         !result.output.stdout.is_empty() || !result.output.stderr.is_empty(),
         "binary run should produce observable output"
