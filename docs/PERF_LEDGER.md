@@ -2435,3 +2435,43 @@ together ~1.16× (top-k) → ~4.1× (50k winners, stable→par) on the biggest m
 
 **Original-comparator relevance:** shrinks the frankensearch side of the `limit_all` BOLD gap vs the
 Tantivy/Lucene/Meilisearch-class incumbent. Internal sort lever; `winners_sort` bench (now with `par` arm) kept.
+
+---
+
+## 2026-06-29 — BOLD re-measure post sort-wins: top10 at parity, limit_all 1.59× p50 (inherent) (BlackThrush)
+
+**Surface (measured, no new single-crate lever).** Re-ran the BOLD Tantivy-class comparator
+(`bold_verify_tantivy_class`, 10k corpus, hash hybrid + lexical-guard) after this session's sort wins to
+locate the current biggest gap without ceiling-framing.
+
+| query_class | frankensearch p50 µs | tantivy p50 µs | ratio | note |
+|-------------|----------------------|----------------|-------|------|
+| exact_identifier | 112  | 115  | **0.97** | at/under parity |
+| short_keyword    | 30   | 28   | 1.07  | parity |
+| quoted_phrase    | 144  | 142  | 1.01  | parity |
+| natural_language | 153  | 154  | **0.99** | at/under parity |
+| high_fanout      | 85   | 78   | 1.09  | parity |
+| zero_hit         | 46   | 47   | 0.98  | at/under parity |
+| **limit_all**    | **2151** | **1351** | **1.59** | the lone gap |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  env FRANKENSEARCH_BOLD_VERIFY_EMIT=1 RUST_LOG=error cargo bench -p frankensearch --features lexical \
+  --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 3
+```
+
+**Reading it:** all six top10 classes are **parity-or-better** (0.97–1.09; the >1.0 cases are within the
+sample-10 noise band). `limit_all` is the **only** gap at **1.59× p50** — and at 10k corpus the parallel
+winners sort (`PAR_SORT_THRESHOLD = 16384`) does **not** trigger, so this is the inherent hybrid cost (vector
+scan + RRF + materialize) the lexical-only incumbent never pays. (The high p95/p99 ratios, 2.15×/3.42×, are
+unreliable at `--sample-size 10` — essentially the max of 10 samples — not a systematic tail.)
+
+**Where the 800 µs limit_all gap lives (single-crate sub-levers, all addressed or locked):** the vector scan
+is bandwidth-bound + AVX2-capped; the winners sort is `sort_unstable_by` (+ gated parallel at ≥16384,
+`7c53d3f`); the doc_id materialization is the numeric-ord fast field (`14e87e4`, up to 6.32×); the **RRF full
+sort is the largest remaining slice (~472 µs at 10k ≈ 22% of limit_all, `rrf_sort` measurement this session)**
+but its `cmp_for_ranking` `doc_id`-String tiebreak is **bit-identity-locked** — a cheaper deterministic key
+would reorder tied docs — and `par_sort` regresses it (this ledger, RRF-par-sort entry). The residual
+materialization `String` clones are allocator-bound + multi-crate-blocked. **Conclusion: limit_all is at its
+single-crate floor; top10 is won. No per-crate lever remains on the measured gap.** Original-comparator
+ratios are the table above (this IS the head-to-head vs the Tantivy/Lucene/Meilisearch-class incumbent).
