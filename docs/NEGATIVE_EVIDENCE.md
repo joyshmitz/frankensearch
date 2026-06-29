@@ -3102,3 +3102,33 @@ gate to exact is warranted** — always taking the two-pass above the existing f
 answered: the crossover is benign (two-pass ≥ exact everywhere); the current behavior needs no change.** No
 code lever → the measurement bench was reverted byte-identical (`git diff` empty), numbers recorded here.
 Original-comparator ratio **N/A** (internal two-pass-vs-exact selection).
+
+---
+
+## 2026-06-29 — bd-tjkm: expected-loss controller has marginal headroom — phase-1 scan is ~98% of query latency (BlackThrush)
+
+**Measurement (bd-tjkm AC#1 baseline, KEPT as `progressive_replay` bench), rejecting the controller lever.**
+bd-tjkm proposes an expected-loss candidate-budget controller (adapt `candidate_multiplier` /
+`quality_timeout` / `fast_only` from measured latency-vs-quality loss). Built the mandated measurement-first
+baseline: a Zipf query-replay over `SyncTwoTierSearcher::search_collect` (in-memory two-tier, N=20k, dim
+384, k=10, 4000-access Zipf trace) emitting end-to-end percentiles + the phase split.
+
+**Measured (`progressive_replay` bench):**
+
+| metric | value |
+|--------|-------|
+| p50 / p95 / p99 | 508.1 µs / 701.4 µs / 864.1 µs |
+| phase-1 (fast-tier scan) mean | **0.498 ms (~98 %)** |
+| phase-2 (quality rescore) mean | **0.024 ms (~5 %)** |
+
+**Finding: the expected-loss controller's levers have little to act on.** (1) A `fast_only` / skip-phase-2
+gate can save at most the phase-2 cost — **~24 µs / ~5 %** — and it is *result-altering* (the quality tier
+re-ranks the fused top-k), so it trades a real recall/ordering risk for a sub-5 % latency sliver: not worth
+it. (2) The candidate budget is already at its validated lossless point (`mult=3`; lower loses 4-bit recall,
+bd-t8tv / int8_two_pass bench). (3) The S3-FIFO cache half of bd-tjkm is already landed (`b83b25d`). The
+**~98 % is phase-1** — the fast-tier 4-bit two-pass scan, already AVX2 + parallel + cutoff-gated and
+confirmed at its floor (bd-t8tv). So there is **no expected-loss perf lever worth the complexity + risk
+here**; the controller would be adaptive machinery governing a 5 % slice. Kept the `progressive_replay`
+baseline as the bd-tjkm trace artifact; recorded no behavior change. Original-comparator ratio **N/A**
+(internal query-path latency). **bd-tjkm perf-lever verdict: marginal — phase-1-dominated and already
+optimized; the controller is not a worthwhile perf win on this path.**

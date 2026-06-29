@@ -79,3 +79,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "progressive_replay"
+harness = false
