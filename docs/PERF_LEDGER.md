@@ -2225,3 +2225,17 @@ than the multi-crate `VectorHit<'a>` lifetime refactor. (Negligible for top-k �
 is a `limit_all`/large-fetch win specifically.) Next: implement `rrf_fuse` move-not-clone (owned inputs),
 wire the sync hot callers, A/B vs the clone path. Kept bench: `materialize_clone`. Original-comparator: this
 directly attacks the `limit_all` row (the biggest measured gap).
+
+**UPDATE — move-not-clone is BLOCKED; the elision is invasive-multi-crate after all (traced the actual
+caller).** The "fusion-crate-only move" route fails: `rrf_fuse` cannot move doc_ids out of its inputs
+because the inputs' doc_ids are **reused by value all through phase-2 and result assembly, after the fuse**.
+Concretely in the sync path (`sync_searcher.rs`): after `rrf_fuse(lexical, &fast_hits, …)`, phase-2
+`quality_scores_for_hits(query_vec, &fast_hits)` looks up `find_index_by_doc_id(&hit.doc_id)` + the WAL by
+`hit.doc_id` (`two_tier.rs:35,44,58`), and the score-maps + blend re-read `fast_hits`/`lexical_hits` doc_ids
+(`sync_searcher.rs:~42-48`, and `lexical_hits.as_ref()` at ~215). So both inputs must stay intact (doc_ids
+included) long after the fuse — `std::mem::take` would corrupt phase-2. Eliding the clone therefore needs a
+**deep multi-crate pipeline lifetime refactor** (borrow doc_ids through fuse → phase-2 → blend, materialize
+once at final `ScoredResult` assembly), which is exactly the invasive `VectorHit<'a>`-class change the
+2026-06-28 decomposition flagged — and it's forbidden by the per-crate constraint. **Net: the clone is big
+(~23%, the ledger's 3-5% was wrong) but its elision is invasive-multi-crate-blocked, not a clean lever. The
+`materialize_clone` bench is kept as the lever-sizing evidence; no per-crate win is available on it.**
