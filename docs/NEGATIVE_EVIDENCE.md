@@ -2986,3 +2986,35 @@ is NOT parallelizing the `HashSet` walk — it would be a *cheaper representatio
 positions directly), so no per-query collect+sort is needed at all. Lower priority than the FSVI/lexical
 plumbing — moderately-selective (>10 %) filters are the uncommon case, and the serial setup already serves
 the common <10 % region well. Original-comparator ratio **N/A** (internal filtered-path micro-lever).
+
+---
+
+## 2026-06-29 — hash-embedder `tokenize` ASCII fast path is NOT a lever — JL projection dominates (BlackThrush)
+
+**Not attempted — flagged to save effort (the LUT/byte-fast-path pattern does NOT transfer here).** After
+landing the byte-class LUT on `count_lexical_tokens` (`d7c8477`, ~1.6×), the obvious next target looked like
+`hash_embedder::tokenize` (`hash_embedder.rs:431`): it splits on Unicode `!c.is_alphanumeric()` per char with
+**no ASCII fast path**, and it runs on *every* embed (query + each document at index time) — superficially a
+broad hot-path win.
+
+**But the embed cost is dominated by the JL projection, not tokenization.** `embed_jl` (the production
+default) does, **per token**, `jl_accumulate` over **all `dimension` (384) dims** (SIMD, `4a75fd7`), i.e.
+`O(tokens · 384)` — whereas `tokenize` is `O(text length)` and `fnv1a_hash` is `O(token length)`. For an
+average token (~6 chars) the JL inner loop does ~384 dim-ops vs ~6 char-classifications in tokenize, so
+**tokenize is well under ~2 % of `embed_jl`**. An ASCII byte/LUT tokenizer (≈1.5× on that 2 % slice) moves
+end-to-end embed by **<1 %** — below the bench noise floor, so it would be a `REVERT ~0-gain` per the keep
+threshold. (`embed_fnv_modular` is `O(tokens)` so tokenize is a larger fraction there, but JL is the
+quality-default; and the `hash_embed` bench already mined the embed allocations — `tokenize_vec`→lazy iter,
+L2 in-place.) Original-comparator ratio **N/A**.
+
+**Consequence — the per-crate micro-lever frontier is empirically exhausted this session.** Probed with
+evidence and ruled out: embedding (JL/mean-pool/l2 SIMD'd; tokenize dominated, above), tokenizers
+(`count_lexical_tokens` LUT landed, `code_structure::tokenize` already byte-fast-pathed, `tokenize_lexical`
+allocation-bound), core scanners (`canonicalize` nfc/filter/md fast paths, `parsed_query` no-op fast path +
+alloc elision — both already landed), search-time reductions (MMR cosine 4-acc **landed** `efbfe33`;
+`graph_rank` is scatter-add, `native_rerank` is ONNX), and the filtered vector path (gather **landed**
+`ec76859`+`383ee53`, live in the production sync fast-tier). The remaining real wins are **substantial /
+invasive**, not 60-min micro-levers: (a) a BOLD **selective-filter comparator row** (head-to-head dominance
+number for the gather — needs a fair Tantivy filter-then-search incumbent), (b) the **FSVI raw-mmap gather**
+(mutation-safe generation-keyed cache invalidation over tombstones+WAL), (c) the `VectorHit<'a>` /
+u64-doc-id-key refactors for the last `limit_all` clones. Pick one as a deliberate fresh cycle.
