@@ -371,6 +371,48 @@ fn bench_hash_embed(c: &mut Criterion) {
         });
         sg.finish();
     }
+
+    // Sum-of-squares reduction (`l2_normalize`'s OTHER half) — 1-accumulator
+    // (current, LLVM won't auto-vec the strict-IEEE f32 reduction) vs a 4-acc
+    // reorder (auto-vec-friendly). Measures the speed *locked* by the bit-identical
+    // / cross-host requirement (a reorder changes the embedding → not shippable).
+    {
+        const SD: usize = 384;
+        const REPS: usize = 128;
+        let v: Vec<f32> = (0..SD).map(|d| (d % 97) as f32 * 0.01 + 0.1).collect();
+        let mut g = c.benchmark_group("sum_of_squares");
+        g.bench_function("acc1_current", |b| {
+            b.iter(|| {
+                let mut total = 0.0_f32;
+                for _ in 0..REPS {
+                    total += black_box(&v).iter().map(|x| x * x).sum::<f32>();
+                }
+                black_box(total)
+            });
+        });
+        g.bench_function("acc4_reorder", |b| {
+            b.iter(|| {
+                let mut total = 0.0_f32;
+                for _ in 0..REPS {
+                    let mut a = [0.0_f32; 4];
+                    let mut ch = black_box(&v).chunks_exact(4);
+                    for c in ch.by_ref() {
+                        a[0] += c[0] * c[0];
+                        a[1] += c[1] * c[1];
+                        a[2] += c[2] * c[2];
+                        a[3] += c[3] * c[3];
+                    }
+                    let mut s = a[0] + a[1] + a[2] + a[3];
+                    for r in ch.remainder() {
+                        s += r * r;
+                    }
+                    total += s;
+                }
+                black_box(total)
+            });
+        });
+        g.finish();
+    }
 }
 
 criterion_group!(benches, bench_hash_embed);

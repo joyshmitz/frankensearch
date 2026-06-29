@@ -2883,3 +2883,38 @@ the 2nd register (4→8 lanes) is the latency unlock; the 3rd/4th (8→16) hit t
 **General: the ILP unlock is a ONE-STEP transition (latency-bound → throughput-bound), not a ladder —
 once 2 independent accumulators fill the recurrence latency, more lanes only add work. Stop at 2× the
 in-flight registers needed to cover the dependency depth.** Don't push JL past 8 lanes.
+
+---
+
+## 2026-06-28 — l2_normalize sum-of-squares: a real ~4.3× LOCKED behind embedding stability (not shippable) (BlackThrush)
+
+After landing the bit-identical scale half of `l2_normalize` (`41b16bc`, ~1.70× on the scale kernel), I
+dug its OTHER half — the sum-of-squares `vec.iter().map(|x| x*x).sum()`. It's a **1-accumulator strict-IEEE
+f32 reduction**, which LLVM will NOT auto-vectorize (reordering changes the sum), so it runs sequential +
+latency-bound. **Measured the speed locked there** (`sum_of_squares` bench, dim 384):
+
+| Workload | acc1 (current, sequential) | acc4 (reorder, auto-vec) | Ratio |
+|----------|----------------------------|--------------------------|-------|
+| `sum_of_squares` | 35.31 µs | 8.21 µs | **0.23 (~4.3×)** |
+
+So a 4-accumulator reformulation is **~4.3× faster** — and notably it needs NO AVX2/unsafe at all (4
+independent scalar accumulators → LLVM auto-vec to SSE2), so it's even **cross-host-consistent** (same
+binary everywhere). If unlocked, `l2_normalize` would go from ~1.3× (scale-only) to ~2× overall.
+
+**But it is LOCKED — `REVERTed` the idea, kept only the bench as evidence.** A 4-acc reduction reorders
+the f32 sum → `norm_sq` differs by ULPs → `inv_norm` differs → **every embedding shifts by ULPs**. That
+is an **embedding-stability break**: a persisted index built before the change no longer matches a query
+embedded after it (the stored f16 mostly absorbs the ULP, but the query f32 does not), and results would
+silently drift on a library upgrade. This is exactly what the **bit-identical discipline protects** — and
+it's why the SCALE half (`x *= inv_norm`, element-wise, IEEE-exact 1/4/8-wide, identical on every host and
+every version) WAS shippable while the sum-of-squares is not. The absolute value is also modest (the embed
+is a small fraction of a query; `l2_normalize` a fraction of the embed), so the embedding churn is not
+worth it even if conformance happened to stay GREEN.
+
+**CLARIFIED INVARIANT (the deep reason every SIMD win this session had to be bit-identical):** a search
+library's embeddings/scores must be **reproducible across hosts AND library versions**. Therefore
+**element-wise** ops (scale, accumulate, decode, encode, round/clamp, quantize-pack) are widenable — each
+output lane = f(one input lane), IEEE-exact regardless of width — but **reductions** (sum-of-squares, dot
+accumulators, any `Σ`) are LOCKED, because any reorder changes the result. The element-wise vein is now
+mined (model2vec mean-pool + `l2_normalize` scale shipped); the reduction halves carry a real but
+unspendable ~4× each. Don't re-attempt SIMD/multi-acc on any reduction.
