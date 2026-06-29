@@ -3045,3 +3045,33 @@ the deployment moves to Zen4+/AVX-512 hardware AND a compute-bound (not bandwidt
 proven bottleneck. Original-comparator ratio **N/A**. With this, the radical-lever search space — software
 micro-levers (≈15 veins, all mined/landed), wider SIMD (hardware-unavailable), and the head-to-head
 filtered comparator (structurally N/A) — is comprehensively closed for the current code + hardware.
+
+---
+
+## 2026-06-29 — bd-lhck: f16 dot 4-accumulator re-measured now decode is F16C — REFUTED (bandwidth-bound) (BlackThrush)
+
+**Lever tested and REVERTED — closes the open bead `bd-lhck`** ("Re-measure multi-accumulator on f16 dot
+kernels NOW that decode is SIMD (was decode-bound)"). The current production f16 vector dot
+(`dot_product_f16_bytes_f32_avx2`, simd.rs) is **single-accumulator** (one `_mm256_add_ps` loop-carried
+chain). The prior 4-acc refutation (`359863d`) was on the *software-decode* generic path (decode-bound);
+bd-lhck's premise — that F16C hardware decode (`_mm256_cvtph_ps`, `7239d58`) removed the decode wall so the
+add-chain latency would now bind — is **correct in premise but wrong in conclusion**: the kernel is
+**bandwidth-bound**, not latency-bound. Added a bench-only 4-accumulator AVX2+F16C variant
+(`f16_bytes_4acc`) and A/B'd it vs the single-acc library kernel.
+
+**Measured (`dot_product` bench, 10k×dim f16 slab, host under load ~13 → 10 samples, CIs OVERLAP):**
+
+| dim | `f16_bytes_new` (1-acc) | `f16_bytes_4acc` | median ratio | CIs |
+|-----|-------------------------|------------------|--------------|-----|
+| 256 | 3.646 ms | 3.492 ms | 0.958 | [3.56,3.78] vs [3.16,4.05] — overlap |
+| 384 | 5.022 ms | 4.772 ms | 0.950 | [4.62,5.58] vs [4.46,5.33] — overlap |
+
+**Root cause / decision:** the dot iterates a **5–7.7 MB f16 slab** (10k×256–384×2B), far out of L1/L2, so a
+single accumulator already saturates **memory bandwidth** — extra accumulators have nothing to unlock
+(the add-chain isn't the binding resource). The ~0.95 median is within the (overlapping, contended,
+10-sample) noise, and is directionally a non-result: the **real `limit_all`/full-scan path reads an even
+larger slab → even more bandwidth-bound**, so any cache-resident micro-advantage would shrink further. Not
+worth landing regardless — it would also break the **default** f16 path's cross-host bit-identity
+(`avx2_f16dot_matches_generic`) for a ≤5% kernel gain that doesn't transfer. Bench reverted byte-identical
+(`git diff` empty). Original-comparator ratio **N/A**. **bd-lhck answered: no — the f16 dot is
+bandwidth-bound; multi-accumulator does not help regardless of decode width.**
