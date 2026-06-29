@@ -3075,3 +3075,30 @@ worth landing regardless — it would also break the **default** f16 path's cros
 (`avx2_f16dot_matches_generic`) for a ≤5% kernel gain that doesn't transfer. Bench reverted byte-identical
 (`git diff` empty). Original-comparator ratio **N/A**. **bd-lhck answered: no — the f16 dot is
 bandwidth-bound; multi-accumulator does not help regardless of decode width.**
+
+---
+
+## 2026-06-29 — bd-t8tv: int8 two-pass crossover vs parallel-exact — NO adverse crossover, no gate needed (BlackThrush)
+
+**Measurement, closes the open bead `bd-t8tv`** ("int8 two-pass: bounded-heap parallel pass-1 + find the
+crossover scale vs parallel exact"). Part 1 (parallel bounded-heap pass-1) is already shipped
+(`in_memory.rs`: pass-1 is `(0..chunk_count).into_par_iter()` with per-chunk bounded heaps + `merge`). Part
+2 — the crossover scale — measured here: `search_top_k_int8_two_pass(k=10, mult=5)` vs the parallel exact
+`search_top_k` across corpus size N (clustered embeddings, dim 384, `int8_crossover` bench arm, 20 samples).
+
+| N | flat (parallel exact) | int8 two-pass mult=5 | int8/flat | recall@10 | verdict |
+|---|-----------------------|----------------------|-----------|-----------|---------|
+| 500    | 19.63 µs  | 15.89 µs  | **0.81**  | 1.0000 | int8 **1.24×** faster |
+| 2 000  | 71.37 µs  | 71.01 µs  | 0.995     | 1.0000 | tie |
+| 10 000 | 245.4 µs  | 246.7 µs  | 1.005     | 1.0000 | tie |
+| 50 000 | 718.4 µs  | 456.5 µs  | **0.636** | 1.0000 | int8 **1.57×** faster |
+
+**Finding: there is NO adverse crossover.** int8 two-pass is **tie-or-faster than parallel-exact at every
+scale** with recall **1.0** — it wins at small N (1.24×, cheap int8 dots dominate the few-element scan),
+ties in a 2k–10k "overhead valley" (the larger candidate heap + f16 rescore balance the cheaper pass-1),
+and wins again at large N (1.57×, the 3×-cheaper int8 dots amortize the fixed overhead). So **no small-N
+gate to exact is warranted** — always taking the two-pass above the existing full-recall short-cut
+(`candidate_count ≥ count` → exact, `84fbfa2`) is already optimal; the two-pass never regresses. **bd-t8tv
+answered: the crossover is benign (two-pass ≥ exact everywhere); the current behavior needs no change.** No
+code lever → the measurement bench was reverted byte-identical (`git diff` empty), numbers recorded here.
+Original-comparator ratio **N/A** (internal two-pass-vs-exact selection).
