@@ -655,13 +655,32 @@ impl InMemoryVectorIndex {
     }
 
     /// Exact f16 top-k over an explicit list of candidate positions (the
-    /// selective-filter gather fast-path). Identical bounded-heap + cutoff logic to
-    /// [`Self::scan_range`], but iterates only the gathered `positions` instead of
-    /// the whole corpus and skips the per-document filter probe (membership is
-    /// already decided by the gather). The `(score, index)` total order makes the
-    /// result independent of `positions` ordering, so it is bit-identical to the
-    /// full filtered scan over the same passing set.
+    /// selective-filter gather fast-path). Parallel above `PARALLEL_CHUNK_SIZE`
+    /// positions, serial below (tiny allow-sets don't amortize rayon overhead). The
+    /// parallel path scans disjoint position chunks into per-chunk bounded heaps and
+    /// merges by the `(score, index)` total order — order-independent, exactly like
+    /// [`Self::scan_parallel`] — so it is bit-identical to the serial gather, to the
+    /// per-document scan, and across thread counts.
     fn scan_gather(
+        &self,
+        positions: &[usize],
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        if positions.len() > PARALLEL_CHUNK_SIZE {
+            let partials: SearchResult<Vec<BinaryHeap<HeapEntry>>> = positions
+                .par_chunks(PARALLEL_CHUNK_SIZE)
+                .map(|chunk| self.gather_range(chunk, query, limit))
+                .collect();
+            return Ok(merge_partial_heaps(partials?, limit));
+        }
+        self.gather_range(positions, query, limit)
+    }
+
+    /// Bounded-heap exact f16 scan over one slice of candidate positions. Mirrors
+    /// [`Self::scan_range`]'s cutoff fast-path, minus the per-document filter probe
+    /// (membership was already decided when the positions were gathered).
+    fn gather_range(
         &self,
         positions: &[usize],
         query: &[f32],
@@ -1057,14 +1076,15 @@ impl InMemoryTwoTierIndex {
 
 /// Selectivity threshold for the gather fast-path: take it only when the filter's
 /// allow-set is smaller than `corpus / GATHER_SELECTIVITY_DIVISOR`. Below this the
-/// serial gather (exact f16 dot per allowed vector) beats the parallel
-/// per-document scan; above it the parallel scan wins. The `filtered_gather`
-/// selectivity-sweep bench (N=50k, dim 384) measured the crossover at ~10% of the
-/// corpus (gather/scan ≈ 0.97 there: 50× at 0.1%, 6.9× at 1%, 1.7× at 5%, and a
-/// loss by 25%). Gate at **N/16 (≈6.25%)** — comfortably inside the winning region
-/// (~1.5× at the boundary), with margin so the crossover can shift on machines with
-/// a different core count without risking a regression.
-const GATHER_SELECTIVITY_DIVISOR: usize = 16;
+/// gather (exact f16 dots over the allow-set, parallel above `PARALLEL_CHUNK_SIZE`)
+/// beats the parallel per-document scan; above it the scan wins because the gather's
+/// serial setup (allow-set collect + position sort) grows with the allow-set. The
+/// `filtered_gather` selectivity-sweep bench (N=50k, dim 384) measured, with the
+/// parallel gather: 14× at 0.5%, 8.6× at 1%, 2.1× at 5%, 1.3× at 10%, then a loss by
+/// 25% (crossover ~13%). Gate at **N/10 (10%)** — inside the winning region
+/// (≥1.3× at the boundary) with margin for a machine whose core count shifts the
+/// crossover. (Tiny allow-sets stay serial and still hit 6.9–50× — see the ledger.)
+const GATHER_SELECTIVITY_DIVISOR: usize = 10;
 
 // ─── Heap helpers (mirrors search.rs internals) ─────────────────────────────
 
@@ -1514,6 +1534,29 @@ mod tests {
             assert_eq!(public, scan, "search_top_k gather != scan (qseed={qseed})");
             assert_eq!(int8, scan, "int8 two-pass gather != exact scan (qseed={qseed})");
             assert_eq!(fourbit, scan, "4bit two-pass gather != exact scan (qseed={qseed})");
+        }
+    }
+
+    #[test]
+    fn parallel_gather_matches_scan() {
+        // Allow-set larger than PARALLEL_CHUNK_SIZE → the gather runs its parallel
+        // per-chunk-heap + merge path, which must stay bit-identical to the scan.
+        use frankensearch_core::filter::BitsetFilter;
+        let dim = 16;
+        let n = 3000; // > PARALLEL_CHUNK_SIZE allow-set below forces the parallel path
+        let doc_ids: Vec<String> = (0..n).map(|i| format!("doc-{i:05}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..n).map(|i| make_normalized_vec(dim, i as f32)).collect();
+        // ~half the corpus (1500 > 1024 chunk size) → parallel gather.
+        let allowed: Vec<String> = doc_ids.iter().step_by(2).cloned().collect();
+        assert!(allowed.len() > PARALLEL_CHUNK_SIZE, "must exceed chunk size");
+        let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id).collect() };
+        for qseed in [2.0_f32, 99.0, 1234.0] {
+            let query = make_normalized_vec(dim, qseed);
+            let scan = ids(index.bench_scan_filtered(&query, 25, Some(&filter)).unwrap());
+            let gather = ids(index.bench_gather_filtered(&query, 25, &filter).unwrap());
+            assert_eq!(gather, scan, "parallel gather != scan (qseed={qseed})");
         }
     }
 

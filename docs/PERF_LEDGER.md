@@ -2028,3 +2028,30 @@ order-independent pattern) to push the crossover well above 10 % and reclaim the
 gate could widen toward N/2. (2) Plumb `candidate_hashes` into the **FSVI file-backed** scan
 (`search.rs`) and the **lexical** filtered path so the inversion covers every tier, not just in-memory.
 (3) Add a selective-filter row to the BOLD comparator to convert this into a head-to-head dominance number.
+
+### 2026-06-29 — gather follow-up: PARALLELIZE the gather → 10% flips tie→1.3× win, gate widened to N/10 (BlackThrush)
+
+**Lever (route-next #1 above, now done).** The serial gather lost above ~10% only because it ran one core
+against the parallel scan. Split `scan_gather` into a per-slice `gather_range` + a dispatcher that
+`par_chunks(PARALLEL_CHUNK_SIZE)` above the chunk size and merges per-chunk bounded heaps by the
+`(score, index)` total order — the exact `scan_parallel` pattern, so still **bit-identical** (new test
+`parallel_gather_matches_scan` at a >chunk-size allow-set; full `frankensearch-index` lib **374/374** GREEN;
+the earlier one-off `soft_delete_*` red was a fixed-temp-path flake colliding with a concurrent test run —
+green on isolated re-run). Tiny allow-sets (< `PARALLEL_CHUNK_SIZE`) stay serial, so the 6.9–50× small-M
+wins are unchanged.
+
+**Measured (same `filtered_gather` A/B, N=50k clustered dim 384 k10, gather/scan median; parallel gather):**
+
+| selectivity | scan | gather | ratio | vs serial gather |
+|-------------|------|--------|-------|------------------|
+| 5 %  | 273.5 µs | 128.3 µs | **0.469 (2.1×)** | was 0.578 (1.7×) |
+| 10 % | 288.4 µs | 217.7 µs | **0.755 (1.3×)** | was 0.968 (tie) — **flipped to a win** |
+| 25 % | 421.8 µs | 726.1 µs | 1.72 (loss) | was 2.95 — better but still loses |
+| 50 % | 808.7 µs | 1169.5 µs | 1.45 (loss) | was 6.01 |
+
+Crossover moved from ~10% to **~13%** — capped not by the (now parallel) dots but by the gather's
+**serial** setup (allow-set `collect` + position `sort_unstable`), which grows with the allow-set. Gate
+widened `GATHER_SELECTIVITY_DIVISOR` 16 → **10 (N/10)**: ≥1.3× at the boundary, scan path unchanged above
+it (no regression — 25/50% rows never reach the gather). **Route next (unchanged):** parallelize the gather
+*setup* (`par_sort_unstable` + parallel allow-set materialization) to push the crossover past 25%; then
+FSVI/lexical plumbing; then a BOLD selective-filter comparator row.
