@@ -3419,3 +3419,37 @@ Do not re-probe batched/loop-interchange query execution for the f16 scan, and d
 scratch kernel. The "bandwidth-bound" characterization in the PERF_LEDGER should be read as "AVX2-FMA-bound";
 sublinear candidate reduction (ANN/IVF — already present behind the `ann` feature) remains the only way to
 cut the f16 scan's wall-clock, since the per-vector dot itself is at its compute floor.
+
+---
+
+## 2026-06-29 — int8 dot 2→4 accumulators is ~0 (throughput-bound, NOT latency-bound like f16) — bench kept, no prod change (BlackThrush)
+
+**Route-next from the f16-dot ILP win (`82e151f`) tested and rejected for integer kernels.** That win came
+from breaking the exact f16 dot's single-`vaddps` dependency chain (latency-bound) with 4 accumulators
+(1.45×). The surfaced route-next asked whether `dot_i8_i8_avx2` (shipped with **2** accumulators) and the
+4-bit kernel share the same latency-bound shape. Built `i8_dot_ilp` (commit prior) with faithful 2-acc and a
+4-acc copy (integer adds associate ⇒ bit-identical, asserted).
+
+**Measured (per-crate, in-process A/B, dim=384, 4096-vector i8 scan):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-index --bench i8_dot_ilp
+```
+
+| kernel | time (4096×384 i8 dots) | ratio |
+|--------|-------------------------|-------|
+| `acc2` (shipped) | 104.99 µs `[95.81, 115.83]` | 1.00 |
+| `acc4` | 105.77 µs `[96.55, 117.19]` | 1.007 (~0, CIs overlap) |
+
+**Decision: no prod change (kernel left at 2 accumulators); bench kept as evidence.** The int8 kernel is
+**throughput-bound on `vpmovsxbw` (4×/iter, port 5) + `vpmaddwd` (port 0)**, not latency-bound on the
+`vpaddd` accumulator chain — so additional accumulators have nothing to unblock. This is the structural
+difference from the f16 dot: there the per-element decode (`vcvtph2ps`) is cheap and pipelines freely, so the
+lone f32-add chain was the bottleneck; here the per-element widen+multiply already saturate their ports.
+
+**Route next:** the 4-bit pass-1 kernel (`dot_4bit_prepared_avx2`) uses a **single** i16 accumulator but
+flushes to i32 every 16 chunks and is dominated by `vpmullw` (2×/iter) + `vpsllw`/`vpsraw` (4×/iter) +
+`vpmovsxbw` — the same port-throughput regime as int8, and the flush already segments the i16 add chain. By
+that structural read it is **not** an accumulator-latency lever either; do not expect the f16 win to repeat
+on the integer/quantized kernels. The f16 ILP win was specific to the cheap-decode + lone-add-chain shape.
