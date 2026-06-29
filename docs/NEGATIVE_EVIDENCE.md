@@ -3277,3 +3277,39 @@ kernel directly. It is not a win, for three compounding reasons:
 overhead is hidden by the bandwidth-bound scan. Do not hoist it or batch-kernel it on this hardware.** This
 closes the last "obvious-looking but dominated" pattern in the vector scan loops. Original-comparator ratio
 **N/A** (internal kernel-dispatch micro-shape).
+
+---
+
+## 2026-06-29 — vector winners radix sort: bit-identical & radixable but SLOWER than pdqsort — REVERTED (BlackThrush)
+
+**Lever tested and reverted — a NEW result distinct from the RRF radix refutation.** The exact-search final
+winners sort (`search.rs` / `in_memory.rs` / `mrl.rs`, now `sort_unstable_by(compare_best_first)`) is the
+single-crate sub-lever on the `limit_all` gap. The earlier RRF radix refutation (this ledger, 2026-06-29)
+was **structural** — RRF has pervasive discrete-score ties and an un-radixable **String** doc_id tiebreak.
+The vector winners sort does **not** share that structure: cosine scores are **continuous f32** (ties rare)
+and the tiebreak is an **integer `index`**, so a composite `u64` key — `score` mapped HIGHER→smaller (desc)
+in the high 32 bits, `index` asc in the low 32 — encodes `compare_best_first` **exactly** and is fully
+radixable. So radix was *viable* here where it wasn't for RRF; the question was purely speed.
+
+**Measured** (per-crate, `winners_sort` bench, radix arm A/B'd vs the shipped `sort_unstable_by`; full-order
+`assert_eq` confirmed the radix output is bit-identical to the stable sort at every N):
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --bench winners_sort
+```
+
+| Winners | `sort_unstable_by` (shipped) | composite-`u64` radix | ratio (radix/unstable) | verdict |
+|---------|------------------------------|-----------------------|------------------------|---------|
+| `n100`   | 1.142 µs   | 2.733 µs   | **2.39× SLOWER** | regression |
+| `n10000` | 190.1 µs   | 213.5 µs   | **1.12× SLOWER** | regression |
+| `n50000` | 1.285 ms   | 1.736 ms   | **1.35× SLOWER** | regression |
+
+**Why it loses:** an 8-pass LSD radix carries `(u64 key, HeapEntry)` = 24-byte pairs through 8 read/scatter
+passes (~`8·N` random-ish writes + ping-pong buffers = ~2× the working set), which is **memory-movement-bound**
+and blows the L2 working set at 50k. `sort_unstable_by` (pdqsort) is cache-efficient, branch-predicts well on
+the mostly-distinct continuous keys, and at these N its `~N·log N` cheap `u64`-ish comparisons beat the radix's
+`8·N` memory passes. Radix only wins when keys are short, N is huge, and the payload is a small index — not a
+24-byte record at N≤50k. **Reverted** (bench restored byte-identical to HEAD; production winners sorts stay
+`sort_unstable_by`). The comparison sort is the right primitive for the vector winners sort; the
+`sort_by → sort_unstable_by` win already shipped (`afb646b`, ~1.16–1.47×) is the floor for this sub-lever.
+Original-comparator ratio **N/A** (internal sort-primitive micro-lever on the `limit_all` gap).
