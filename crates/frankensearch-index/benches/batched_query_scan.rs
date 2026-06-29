@@ -26,10 +26,47 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_index::dot_product_f16_bytes_f32;
+use frankensearch_index::{dot_product_f16_bytes_f32, dot_product_f32_f32};
 use half::f16;
 
 const DIM: usize = 384;
+
+/// AVX2+F16C decode of `dst.len()` packed little-endian f16 values to f32.
+/// `vcvtph2ps` is the exact same hardware decode the f16 dot kernel uses, so the
+/// widened f32 values are bit-identical; we just do it **once** per corpus vector
+/// instead of once per (corpus vector, query) pair. `DIM` is a multiple of 8, so
+/// the scalar tail never runs in this bench.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "f16c"))]
+#[inline]
+fn decode_f16_bytes_to_f32(src: &[u8], dst: &mut [f32]) {
+    use std::arch::x86_64::{
+        __m128i, _mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128,
+    };
+    let n = dst.len();
+    let mut i = 0;
+    // SAFETY: cfg-gated to avx2+f16c; reads 16 B and writes 8 f32 per step within
+    // bounds (i + 8 <= n); pointers are from valid slices.
+    unsafe {
+        while i + 8 <= n {
+            let bits = _mm_loadu_si128(src.as_ptr().add(i * 2).cast::<__m128i>());
+            let f = _mm256_cvtph_ps(bits);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), f);
+            i += 8;
+        }
+    }
+    while i < n {
+        dst[i] = f16::from_le_bytes([src[i * 2], src[i * 2 + 1]]).to_f32();
+        i += 1;
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "f16c")))]
+#[inline]
+fn decode_f16_bytes_to_f32(src: &[u8], dst: &mut [f32]) {
+    for (i, d) in dst.iter_mut().enumerate() {
+        *d = f16::from_le_bytes([src[i * 2], src[i * 2 + 1]]).to_f32();
+    }
+}
 
 fn xorshift(s: &mut u64) -> f32 {
     *s ^= *s << 13;
@@ -97,6 +134,32 @@ fn scan_batched(corpus: &[u8], n: usize, stride: usize, queries: &[Vec<f32>]) ->
     maxes
 }
 
+/// Decode-once batched kernel: decode each f16 corpus vector to f32 **once**,
+/// then score it against all `B` queries from the hot f32 scratch (in L1). This
+/// amortizes both the RAM fetch AND the `vcvtph2ps` decode across the batch —
+/// `N` decodes total instead of the sequential path's `B·N`.
+#[inline(never)]
+fn scan_batched_decode_once(
+    corpus: &[u8],
+    n: usize,
+    stride: usize,
+    queries: &[Vec<f32>],
+) -> Vec<f32> {
+    let mut maxes = vec![f32::NEG_INFINITY; queries.len()];
+    let mut scratch = vec![0.0_f32; DIM];
+    for c in 0..n {
+        let v = &corpus[c * stride..c * stride + stride];
+        decode_f16_bytes_to_f32(v, &mut scratch);
+        for (qi, q) in queries.iter().enumerate() {
+            let d = dot_product_f32_f32(&scratch, q).unwrap();
+            if d > maxes[qi] {
+                maxes[qi] = d;
+            }
+        }
+    }
+    maxes
+}
+
 fn bench(c: &mut Criterion) {
     let stride = DIM * 2;
     let mut group = c.benchmark_group("batched_query_scan");
@@ -111,10 +174,20 @@ fn bench(c: &mut Criterion) {
         for &b in &[4_usize, 16, 64] {
             let queries = build_queries(b, DIM, 0xABCD);
 
-            // Equivalence guard: identical results regardless of loop order.
+            // Equivalence guards. Loop interchange is bit-identical (same kernel);
+            // decode-once routes through dot_product_f32_f32 on the (exactly)
+            // widened f16 values — equal up to f32 accumulator lane-grouping, so
+            // checked within a tight relative epsilon.
             let seq = scan_sequential(&corpus, n, stride, &queries);
             let bat = scan_batched(&corpus, n, stride, &queries);
             assert_eq!(seq, bat, "batched scan must equal sequential scan");
+            let dec = scan_batched_decode_once(&corpus, n, stride, &queries);
+            for (a, d) in seq.iter().zip(&dec) {
+                assert!(
+                    (a - d).abs() <= 1e-3 * a.abs().max(1.0),
+                    "decode-once result {d} diverged from sequential {a}"
+                );
+            }
 
             group.bench_with_input(
                 BenchmarkId::new("sequential", format!("n{n}_b{b}")),
@@ -128,6 +201,20 @@ fn bench(c: &mut Criterion) {
                 &b,
                 |bch, _| {
                     bch.iter(|| black_box(scan_batched(&corpus, n, stride, black_box(&queries))));
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("batched_decode_once", format!("n{n}_b{b}")),
+                &b,
+                |bch, _| {
+                    bch.iter(|| {
+                        black_box(scan_batched_decode_once(
+                            &corpus,
+                            n,
+                            stride,
+                            black_box(&queries),
+                        ))
+                    });
                 },
             );
         }
