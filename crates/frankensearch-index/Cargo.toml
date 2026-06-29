@@ -41,6 +41,10 @@ name = "quantize_slab"
 harness = false
 
 [[bench]]
+name = "winners_sort"
+harness = false
+
+[[bench]]
 name = "dot_product"
 harness = false
 

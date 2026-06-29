@@ -854,7 +854,7 @@ impl InMemoryVectorIndex {
             return Ok(Vec::new());
         }
         let mut winners = heap.into_vec();
-        winners.sort_by(compare_best_first);
+        winners.sort_unstable_by(compare_best_first);
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
             let index_u32 =

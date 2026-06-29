@@ -2341,3 +2341,39 @@ constant factors. Lesson: model the real key distribution, not a tie-adversarial
 **Original-comparator ratio: N/A** — the blend/federated final sort is a frankensearch-only two-tier /
 cross-shard step (no Tantivy/Lucene/Meilisearch single-call equivalent). Internal sort micro-lever; the
 `blend_reorder` A/B bench is kept for re-validation.
+
+---
+
+## 2026-06-29 — exact-search final winners sort: stable `sort_by` → `sort_unstable_by` (~1.16–1.47×, biggest on limit_all) (BlackThrush)
+
+**Lever LANDED (single-crate, bit-identical) — lands on the biggest gap vs ORIG (`limit_all`).** The exact
+vector search ordered its collected `Vec<HeapEntry>` best-first with a **stable** `sort_by(compare_best_first)`
+at three sites: `search.rs:183` (the **`limit_all` scan-all path**, `scan_wal_collect_all`, where `winners`
+holds *every* match), `search.rs:821` (bounded top-k, `heap.into_vec()`), and `in_memory.rs:857`
+(`resolve_heap`). Switched all three to `sort_unstable_by`. Found via the sibling-path-consistency audit
+(`rrf.rs`/`blend.rs` already use `sort_unstable_by`).
+
+**Bit-identical:** `compare_best_first` is a **strict total order** — `score_key.total_cmp` then a
+unique-`index` tiebreak (`index` is the vector position, unique per entry) — so no two entries compare Equal
+and the unstable sort yields output identical to the stable sort. Conformance GREEN (`frankensearch-index`
+lib 374/374).
+
+**Measured** (per-crate `winners_sort` A/B, isolates the final sort over realistic winners sets — unique
+indices, mostly-distinct cosine-like f32 scores):
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --bench winners_sort
+```
+
+| Winners (path) | stable `sort_by` (ORIG) | `sort_unstable_by` (landed) | ratio | speedup |
+|----------------|-------------------------|-----------------------------|-------|---------|
+| `n100`   (bounded top-k)        | 1.302 µs   | 1.121 µs   | **0.86** | **~1.16×** |
+| `n10000` (`limit_all`)          | 247.6 µs   | 188.2 µs   | **0.76** | **~1.32×** |
+| `n50000` (`limit_all`)          | 1858.2 µs  | 1263.7 µs  | **0.68** | **~1.47×** |
+
+CIs non-overlapping on all. The win **grows with N** (the exact `limit_all` profile): unstable drops the
+stable-sort O(N) scratch allocation + has better constant factors, saving ~595 µs/query at 50k winners.
+
+**Original-comparator relevance:** this is the frankensearch-side final ordering of the **`limit_all`**
+path — the documented biggest gap vs the Tantivy/Lucene/Meilisearch-class incumbent (BOLD `limit_all` row).
+It shrinks the frankensearch side of that inherent gap. Internal sort lever; `winners_sort` bench kept.
