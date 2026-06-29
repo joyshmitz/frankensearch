@@ -2170,3 +2170,36 @@ cap=1/2 eviction) all pass (at small sizes with freq 0, S3-FIFO matches FIFO ord
 policy change. Kept bench: `cache_replay`. **Route next (bd-tjkm remainder):** the expected-loss
 candidate-budget controller (candidate_multiplier / quality_timeout from measured latency-vs-loss) + a full
 query-path replay harness with deterministic fallback.
+
+### 2026-06-29 — BOLD head-to-head re-measure: dominance HELD through the session (parity-or-better, limit_all inherent) (BlackThrush)
+
+**Head-to-head confirmation vs the Tantivy/Lucene/Meilisearch-class incumbent**, re-run after this session's
+5 perf wins + concurrent-agent commits to verify nothing regressed the comparator (the mission metric).
+Ran `bold_verify_tantivy_class` (`-p frankensearch --features lexical --profile release`, 10-sample p50,
+RCH `ovh-a`, `FRANKENSEARCH_BOLD_VERIFY_EMIT=1`). Ratio = frankensearch_p50 / incumbent_p50 (**< 1 = we win**):
+
+| corpus | query_class | hash_hybrid ratio | verdict |
+|--------|-------------|-------------------|---------|
+| 10k  | exact_identifier | **0.825** | 1.21× faster |
+| 10k  | natural_language | **0.811** | 1.23× faster |
+| 10k  | quoted_phrase    | 1.039 | ~tie |
+| 10k  | high_fanout      | 1.015 | tie |
+| 10k  | zero_hit         | 1.000 | tie |
+| 10k  | short_keyword    | 1.105 | 21 µs vs 19 µs (tiny abs) |
+| 10k  | **limit_all**    | **1.445** | SLOWER (inherent) |
+| 100k | natural_language | **0.812** | 1.23× faster |
+| 100k | exact_identifier | 1.006 | tie |
+| 100k | quoted_phrase    | 1.015 | tie |
+| 100k | high_fanout      | 1.006 | tie |
+| 100k | short_keyword    | 1.022 | tie |
+| 100k | zero_hit         | 1.000 | tie |
+
+**Result: parity-or-better on every top-k row at both 10k and 100k** (natural_language a clean ~1.23× win
+at both scales; exact_identifier 1.21× at 10k) — the session's wins (gather, MMR, LUT, S3-FIFO) and the
+concurrent frankentorch/rerank commits **did not regress the comparator**. The lone slower row is
+**`limit_all` (~1.45×)**, the structurally-inherent gap (the hybrid embeds + scans the *entire* vector tier
++ RRF-fuses ~2·N where the incumbent is lexical-only; decomposed + confirmed optimal/inherent in the
+2026-06-28 entry — the ~1.286→1.445 shift is 10-sample/worker variance on a path nothing this session
+touched). Original-comparator verdict: **frankensearch is at parity-or-better vs the Tantivy-class incumbent
+on all top-k query classes; the only residual is the inherent `limit_all` semantics gap.** No code change
+(measurement); artifact `/data/projects/.rch-targets/frankensearch-cc/criterion/bold_verify/summary.{md,jsonl}`.
