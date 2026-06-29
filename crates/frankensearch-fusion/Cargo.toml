@@ -99,3 +99,7 @@ harness = false
 [[bench]]
 name = "rrf_sort_key"
 harness = false
+
+[[bench]]
+name = "rrf_sort_order"
+harness = false
