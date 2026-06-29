@@ -3187,3 +3187,31 @@ and degrades with dimension. HNSW only wins at *low recall* or at *N large enoug
 beats the parallelism* (≫100k) — neither applies at frankensearch's 10k–100k target with a recall-1.0
 requirement. **HNSW is conclusively closed: not a default-vector-tier lever at any tested config/scale;
 the parallel flat scan is the floor. Do not re-probe HNSW tuning.**
+
+---
+
+## 2026-06-29 — limit_all RRF radix-sort: refuted by structure (un-radixable String tie-break + pervasive ties) (BlackThrush)
+
+**Not attempted — flagged to save effort.** Today's BOLD re-measure (`2c8e73b`) confirms `limit_all` (~1.45×)
+is the lone slower row vs the incumbent — the biggest measured gap. Its components are inherent (full vector
+scan + RRF + materialize vs the incumbent's lexical-only); the one *single-crate* sub-lever is the RRF
+**full sort** (`rrf.rs:341` `sort_unstable_by(cmp_for_ranking)` when `k = N`), O(N log N). A radix/counting
+sort (O(N), a DIFFERENT primitive) looked tempting, but it is **structurally refuted**:
+
+1. **Pervasive ties.** RRF score = `1/(k+lex_rank) + 1/(k+vec_rank)`. For limit_all, most docs appear in only
+   one tier, so a lexical-only doc at rank `r` and a vector-only doc at rank `r` BOTH score `1/(k+r)` —
+   every rank value collides across the two single-tier populations. Ties are not rare; they are the common
+   case at limit_all scale.
+2. **Un-radixable tie-break key.** `cmp_for_ranking` breaks ties by the **doc_id String** (ascending).
+   Radix needs the minor key radixable; a variable-length UTF-8 String is not cheaply radix-sortable, and
+   with ties pervasive the radix would have to comparison-sort large tie-groups by String anyway — which is
+   exactly what `sort_unstable_by` already does. No clean win; likely a regression (radix passes + tie-group
+   sorts on top of the unavoidable comparisons).
+
+So **the only per-crate sort primitive available is the comparison sort already in use**; the radix lever is
+not viable. The remaining limit_all removals are the **invasive, multi-crate** ones already flagged
+(u64-keyed RRF merge needing cross-layer doc_id-hash plumbing ~3-5%; the `VectorHit<'a>` lifetime refactor
+to drop the N materialization clones ~3-5%) — both forbidden by the per-crate constraint and sub-meaningful
+against an inherent gap. **`limit_all` is conclusively at its floor for single-crate work; no per-crate
+lever remains on the biggest measured gap.** Original-comparator ratio **N/A** (the gap itself is the
+2026-06-28-decomposed inherent hybrid-vs-lexical-only cost).
