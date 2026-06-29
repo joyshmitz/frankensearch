@@ -854,7 +854,17 @@ impl InMemoryVectorIndex {
             return Ok(Vec::new());
         }
         let mut winners = heap.into_vec();
-        winners.sort_unstable_by(compare_best_first);
+        // In-memory limit_all (`limit >= count`) builds a count-sized heap, so
+        // `winners` can hold every record. Above a threshold the final sort
+        // dominates and a parallel sort pays (~2.81× at 50k, `winners_sort` bench);
+        // below it the rayon overhead is not worth it. Bit-identical — the same
+        // gated lever as `search.rs:183` (`compare_best_first` is a strict total
+        // order, so the parallel sort yields the same unique order).
+        if winners.len() >= PAR_SORT_THRESHOLD {
+            winners.par_sort_unstable_by(compare_best_first);
+        } else {
+            winners.sort_unstable_by(compare_best_first);
+        }
         let mut hits = Vec::with_capacity(winners.len());
         for winner in winners {
             let index_u32 =
@@ -1132,6 +1142,11 @@ const fn score_key(score: f32) -> f32 {
         score
     }
 }
+
+/// Winners-count threshold above which the limit_all final sort uses a parallel
+/// `par_sort_unstable_by` (mirrors `search::PAR_SORT_THRESHOLD`). Below it, rayon's
+/// spawn/merge overhead is not amortized for the cheap `compare_best_first`.
+const PAR_SORT_THRESHOLD: usize = 16_384;
 
 fn compare_best_first(left: &HeapEntry, right: &HeapEntry) -> Ordering {
     match score_key(right.score).total_cmp(&score_key(left.score)) {

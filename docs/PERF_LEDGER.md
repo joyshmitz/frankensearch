@@ -2475,3 +2475,29 @@ would reorder tied docs — and `par_sort` regresses it (this ledger, RRF-par-so
 materialization `String` clones are allocator-bound + multi-crate-blocked. **Conclusion: limit_all is at its
 single-crate floor; top10 is won. No per-crate lever remains on the measured gap.** Original-comparator
 ratios are the table above (this IS the head-to-head vs the Tantivy/Lucene/Meilisearch-class incumbent).
+
+---
+
+## 2026-06-29 — in-memory limit_all winners sort: gated parallel sort (extends 7c53d3f to the fast tier) (BlackThrush)
+
+**Lever LANDED (single-crate, bit-identical) — extends the proven parallel sort to the in-memory index.**
+`d4bc73c`/`7c53d3f` gated `par_sort_unstable_by` on the file-backed exact-search limit_all sort (`search.rs:183`).
+The **in-memory** index (`InMemoryVectorIndex::resolve_heap`, `in_memory.rs:857`) — the two-tier **fast tier** —
+serves limit_all the same way: `search_top_k` with `limit >= count` builds a `count`-sized heap, so
+`winners = heap.into_vec()` holds **every record** and was sorted serially. Applied the same gated
+`par_sort_unstable_by` above `PAR_SORT_THRESHOLD = 16_384`.
+
+**Bit-identical & measured-by-coverage:** `in_memory.rs`'s `compare_best_first` is the **identical** strict
+total order as `search.rs`'s (`score_key.total_cmp` then unique `index` tiebreak), and the data (POD
+`HeapEntry`) is identical, so the **`winners_sort` bench directly covers this site** — no new bench needed:
+
+| Winners | serial `sort_unstable_by` | `par_sort_unstable_by` | ratio | verdict |
+|---------|---------------------------|------------------------|-------|---------|
+| `n10000` | 196.0 µs  | 184.7 µs  | ~1.06× (kept serial, <threshold) | serial |
+| `n50000` | 1284.3 µs | 457.6 µs  | **0.36 (~2.81×)** | **parallel (≥16384)** |
+
+Conformance: `frankensearch-index` lib **373/374** — the lone failure is the **pre-existing flaky**
+`soft_delete_wal_restores_state_on_rewrite_failure` (a WAL-restoration test, intermittent, unrelated to this
+gated sort: tiny test corpora never reach the 16384 parallel branch, and the serial `else` path is
+byte-identical to before). Original-comparator relevance: shrinks the in-memory fast-tier side of the
+limit_all gap. The `winners_sort` bench covers it.
