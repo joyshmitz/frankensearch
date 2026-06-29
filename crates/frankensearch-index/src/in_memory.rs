@@ -24,7 +24,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use frankensearch_core::filter::{SearchFilter, fnv1a_hash};
+use frankensearch_core::filter::{BuildIdentityHasherU64, SearchFilter, fnv1a_hash};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use half::f16;
 use rayon::prelude::*;
@@ -65,6 +65,15 @@ pub struct InMemoryVectorIndex {
     /// path (`quality_scores_for_hits`), which was O(hits·N). Built on first
     /// doc-id lookup, so search-only callers pay nothing.
     doc_id_index: OnceLock<HashMap<String, usize>>,
+    /// Lazily-built `doc_id_hash → position` map (identity-hashed, same FNV-1a key
+    /// space as `BitsetFilter`). Lets a *selective* filtered search gather the
+    /// allow-set's positions directly — `O(|allow-set|)` exact dots instead of one
+    /// filter probe per corpus document (`scan_gather` vs `scan_range`). Stored as
+    /// `Option`: `None` means two doc_ids collide to the same hash, so the map is
+    /// not a bijection and the gather fast-path is disabled (the per-document scan
+    /// stays correct). Built on first selective-filter search; other callers pay
+    /// neither the build nor its footprint.
+    hash_to_pos: OnceLock<Option<HashMap<u64, usize, BuildIdentityHasherU64>>>,
     /// Vector dimensionality.
     dimension: usize,
 }
@@ -176,6 +185,7 @@ impl InMemoryVectorIndex {
             vectors_nibbles: OnceLock::new(),
             doc_id_hashes: OnceLock::new(),
             doc_id_index: OnceLock::new(),
+            hash_to_pos: OnceLock::new(),
             dimension,
         })
     }
@@ -221,6 +231,7 @@ impl InMemoryVectorIndex {
             vectors_nibbles: OnceLock::new(),
             doc_id_hashes: OnceLock::new(),
             doc_id_index: OnceLock::new(),
+            hash_to_pos: OnceLock::new(),
             dimension,
         })
     }
@@ -302,6 +313,13 @@ impl InMemoryVectorIndex {
             return Ok(Vec::new());
         }
 
+        // Selective hash-addressable filter → gather the allow-set and exact-scan
+        // only those positions (work ∝ |allow-set|, not corpus N). Bit-identical to
+        // the per-document scan below.
+        if let Some(hits) = self.try_gather_filtered(query, limit, filter, count)? {
+            return Ok(hits);
+        }
+
         let use_parallel = params.parallel_enabled && count >= params.parallel_threshold;
         let chunk_size = params.parallel_chunk_size.max(1);
 
@@ -379,6 +397,14 @@ impl InMemoryVectorIndex {
         // heap and returns the same `min(limit, count)` hits.
         if candidate_count >= count {
             return self.search_top_k(query, limit.min(count), filter);
+        }
+        // Selective hash-addressable filter → exact gather of the allow-set. The
+        // gather scans only `|allow-set|` vectors (vs all N for the int8 pass-1) and
+        // is *exact* f16, so it is strictly more accurate than this approximate
+        // two-pass while doing far less work. Falls through when the filter is not a
+        // selective allow-list.
+        if let Some(hits) = self.try_gather_filtered(query, limit, filter, count)? {
+            return Ok(hits);
         }
         let query_i8 = quantize_i8_query(query);
         // Build the int8 slab once, on first use — exact-only callers never pay the
@@ -496,6 +522,13 @@ impl InMemoryVectorIndex {
         if candidate_count >= count {
             return self.search_top_k(query, limit.min(count), filter);
         }
+        // Selective hash-addressable filter → exact gather of the allow-set (see the
+        // int8 two-pass for the rationale): scans only `|allow-set|` vectors and is
+        // exact f16, so it is strictly more accurate than this approximate 4-bit
+        // two-pass while doing far less work.
+        if let Some(hits) = self.try_gather_filtered(query, limit, filter, count)? {
+            return Ok(hits);
+        }
         // Decode the (loop-invariant) query nibbles once, not per stored vector.
         let query_prepared = prepare_4bit_query(&pack_4bit_query(query));
         let bytes_per_vector = self.dimension.div_ceil(2);
@@ -594,6 +627,147 @@ impl InMemoryVectorIndex {
                 .map(|id| fnv1a_hash(id.as_bytes()))
                 .collect()
         })
+    }
+
+    /// Lazily-built `doc_id_hash → position` map for the selective-filter gather
+    /// fast-path. Returns `None` when two doc_ids hash to the same value (the map
+    /// would not be a bijection, so a gather could miss a colliding position the
+    /// per-document scan would visit) — callers then fall back to the full scan,
+    /// preserving exact results. Built once on first selective-filter search.
+    fn hash_to_pos(&self) -> Option<&HashMap<u64, usize, BuildIdentityHasherU64>> {
+        self.hash_to_pos
+            .get_or_init(|| {
+                let hashes = self.doc_id_hashes();
+                let mut map = HashMap::with_capacity_and_hasher(
+                    hashes.len(),
+                    BuildIdentityHasherU64,
+                );
+                for (pos, &h) in hashes.iter().enumerate() {
+                    if map.insert(h, pos).is_some() {
+                        // Hash collision (or duplicate doc_id): the map can hold
+                        // only one position per hash, so disable the fast path.
+                        return None;
+                    }
+                }
+                Some(map)
+            })
+            .as_ref()
+    }
+
+    /// Exact f16 top-k over an explicit list of candidate positions (the
+    /// selective-filter gather fast-path). Identical bounded-heap + cutoff logic to
+    /// [`Self::scan_range`], but iterates only the gathered `positions` instead of
+    /// the whole corpus and skips the per-document filter probe (membership is
+    /// already decided by the gather). The `(score, index)` total order makes the
+    /// result independent of `positions` ordering, so it is bit-identical to the
+    /// full filtered scan over the same passing set.
+    fn scan_gather(
+        &self,
+        positions: &[usize],
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        let mut heap = BinaryHeap::with_capacity(limit.min(positions.len()).saturating_add(1));
+        let mut cutoff = f32::NEG_INFINITY;
+        for &index in positions {
+            let stored = self.vector_slice(index);
+            let score = dot_product_f16_f32(stored, query)?;
+            if heap.len() < limit || score_key(score) >= cutoff {
+                insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                if heap.len() >= limit
+                    && let Some(&worst) = heap.peek()
+                {
+                    cutoff = score_key(worst.score);
+                }
+            }
+        }
+        Ok(heap)
+    }
+
+    /// Try the selective-filter gather fast-path: when `filter` is a
+    /// hash-addressable allow-list whose size is below
+    /// `count / GATHER_SELECTIVITY_DIVISOR`, gather the allowed positions and exact
+    /// f16-scan only those. Returns `Some(hits)` when the fast-path applied,
+    /// `None` to fall through to the per-document scan. Bit-identical: the gathered
+    /// passing set equals `{ pos : doc_id_hash[pos] ∈ allow-set }`, the same set the
+    /// scan keeps, and both rank by the `(score, index)` total order.
+    fn try_gather_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+        count: usize,
+    ) -> SearchResult<Option<Vec<VectorHit>>> {
+        let Some(f) = filter else {
+            return Ok(None);
+        };
+        let Some(allowed) = f.candidate_hashes() else {
+            return Ok(None);
+        };
+        // Selectivity gate: gather pays a map lookup + sort per allowed hash, so it
+        // only wins when the allow-set is a small fraction of the corpus. Above the
+        // crossover the per-document scan (which skips the gather's setup) is faster.
+        if allowed
+            .len()
+            .saturating_mul(GATHER_SELECTIVITY_DIVISOR)
+            >= count
+        {
+            return Ok(None);
+        }
+        let Some(map) = self.hash_to_pos() else {
+            return Ok(None);
+        };
+        let mut positions: Vec<usize> = allowed.iter().filter_map(|h| map.get(h).copied()).collect();
+        // Ascending position order → sequential slab access (cache-friendly); not
+        // required for correctness (the heap's total order is position-independent).
+        positions.sort_unstable();
+        let heap = self.scan_gather(&positions, query, limit)?;
+        Ok(Some(self.resolve_heap(heap)?))
+    }
+
+    /// Bench-only: forced per-document filtered scan (the gather-fast-path baseline).
+    /// Bypasses [`Self::try_gather_filtered`] so the A/B measures the old behavior.
+    #[doc(hidden)]
+    pub fn bench_scan_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let count = self.record_count();
+        if limit == 0 || count == 0 {
+            return Ok(Vec::new());
+        }
+        let params = SearchParams::default();
+        let use_parallel = params.parallel_enabled && count >= params.parallel_threshold;
+        let heap = if use_parallel {
+            self.scan_parallel(query, limit, filter, params.parallel_chunk_size.max(1))?
+        } else {
+            self.scan_sequential(query, limit, filter)?
+        };
+        self.resolve_heap(heap)
+    }
+
+    /// Bench-only: forced gather over a hash-addressable allow-set, ignoring the
+    /// selectivity gate (so the crossover can be measured directly).
+    #[doc(hidden)]
+    pub fn bench_gather_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: &dyn SearchFilter,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let allowed = filter
+            .candidate_hashes()
+            .expect("bench_gather_filtered requires a hash-addressable allow-set");
+        let map = self
+            .hash_to_pos()
+            .expect("bench_gather_filtered requires a bijective hash→pos map");
+        let mut positions: Vec<usize> =
+            allowed.iter().filter_map(|h| map.get(h).copied()).collect();
+        positions.sort_unstable();
+        let heap = self.scan_gather(&positions, query, limit)?;
+        self.resolve_heap(heap)
     }
 
     /// O(1) `doc_id → position` lookup via a lazily-built map, replacing the O(N)
@@ -880,6 +1054,17 @@ impl InMemoryTwoTierIndex {
         self.quality_index.as_ref()
     }
 }
+
+/// Selectivity threshold for the gather fast-path: take it only when the filter's
+/// allow-set is smaller than `corpus / GATHER_SELECTIVITY_DIVISOR`. Below this the
+/// serial gather (exact f16 dot per allowed vector) beats the parallel
+/// per-document scan; above it the parallel scan wins. The `filtered_gather`
+/// selectivity-sweep bench (N=50k, dim 384) measured the crossover at ~10% of the
+/// corpus (gather/scan ≈ 0.97 there: 50× at 0.1%, 6.9× at 1%, 1.7× at 5%, and a
+/// loss by 25%). Gate at **N/16 (≈6.25%)** — comfortably inside the winning region
+/// (~1.5× at the boundary), with margin so the crossover can shift on machines with
+/// a different core count without risking a regression.
+const GATHER_SELECTIVITY_DIVISOR: usize = 16;
 
 // ─── Heap helpers (mirrors search.rs internals) ─────────────────────────────
 
@@ -1297,6 +1482,38 @@ mod tests {
                 two_pass, exact,
                 "filtered two-pass != exact (qseed={qseed})"
             );
+        }
+    }
+
+    #[test]
+    fn selective_filter_gather_matches_scan() {
+        // A selective hash-addressable filter takes the gather fast-path through
+        // `search_top_k`/the two-pass filtered fns; it must be bit-identical to the
+        // forced per-document filtered scan (same passing set, `(score,index)` order).
+        use frankensearch_core::filter::BitsetFilter;
+        let dim = 16;
+        let doc_ids: Vec<String> = (0..500).map(|i| format!("doc-{i:04}")).collect();
+        let vectors: Vec<Vec<f32>> = (0..500).map(|i| make_normalized_vec(dim, i as f32)).collect();
+        // ~5% allow-set (well under the selectivity gate) → gather path is taken.
+        let allowed: Vec<String> = doc_ids.iter().step_by(20).cloned().collect();
+        let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
+        let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
+
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id).collect() };
+        for qseed in [1.0_f32, 42.0, 313.0] {
+            let query = make_normalized_vec(dim, qseed);
+            let scan = ids(index.bench_scan_filtered(&query, 10, Some(&filter)).unwrap());
+            let gather = ids(index.bench_gather_filtered(&query, 10, &filter).unwrap());
+            let public = ids(index.search_top_k(&query, 10, Some(&filter)).unwrap());
+            let int8 = ids(index.search_top_k_int8_two_pass_filtered(&query, 10, 3, Some(&filter)).unwrap());
+            let fourbit = ids(index.search_top_k_4bit_two_pass_filtered(&query, 10, 3, Some(&filter)).unwrap());
+            for id in &gather {
+                assert!(allowed.contains(id), "gather returned filtered-out {id}");
+            }
+            assert_eq!(gather, scan, "gather != scan (qseed={qseed})");
+            assert_eq!(public, scan, "search_top_k gather != scan (qseed={qseed})");
+            assert_eq!(int8, scan, "int8 two-pass gather != exact scan (qseed={qseed})");
+            assert_eq!(fourbit, scan, "4bit two-pass gather != exact scan (qseed={qseed})");
         }
     }
 

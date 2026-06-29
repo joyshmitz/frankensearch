@@ -1960,3 +1960,71 @@ regression). Still a real, bit-identical fix of a genuine inefficiency (SipHash 
 hash) on the common filtered-search path. This is a SAFE-Rust data-structure lever (not a SIMD intrinsic),
 but a different *kind* of primitive from the compute kernels. `IdentityHasherU64` is reusable for any
 already-hashed-u64 set. Kept the existing `int8_two_pass` filtered bench arms.
+
+### 2026-06-29 — selective-filter GATHER fast-path: invert the loop, 6.9–50× on filtered vector search (BlackThrush)
+
+**Lever (a DIFFERENT primitive — loop-order inversion, not a kernel).** A filtered vector search with a
+hash-addressable allow-list (`BitsetFilter` — "search within these K docs") previously scanned the
+**whole corpus** and ran one membership probe per document (the identity-hasher commit `f7d613b` made that
+probe cheap, but it still runs `N` times). When the allow-set is a small fraction of the corpus — the
+common real-world case (per-tenant / per-folder / per-ACL scoping) — almost all of that work is wasted.
+The gather fast-path **inverts the loop**: iterate the (small) allow-set, map each hash → position via a
+lazily-built bijective `hash → pos` table, and exact f16-scan **only** those positions. Work becomes
+`O(|allow-set|)` instead of `O(corpus)`.
+
+- New trait method `SearchFilter::candidate_hashes() -> Option<&DocIdHashSet>` (default `None`;
+  `BitsetFilter` returns its allow-set). `None` ⇒ predicate/metadata/composite filters keep the scan.
+- New lazy `InMemoryVectorIndex::hash_to_pos` map (identity-hashed, same FNV-1a key space). Returns
+  `None` when two doc_ids collide to one hash (not a bijection) ⇒ disables the fast path, so results stay
+  exact. Built once on first selective-filter search (other callers pay nothing).
+- Wired into `search_top_k`, `search_top_k_int8_two_pass_filtered`, and
+  `search_top_k_4bit_two_pass_filtered` (the production sync fast-tier). For the two-pass paths the gather
+  is *exact* f16, so it is **strictly more accurate** than the approximate int8/4-bit pass-1 it replaces
+  *and* far cheaper when selective.
+
+**Bit-identical:** the gathered passing set `{pos : doc_id_hash[pos] ∈ allow-set}` is exactly the set the
+per-document scan keeps, and both rank by the `(score, index)` total order, so order is independent of the
+gather sequence. **Conformance: GREEN** — `frankensearch-core` filter 39/39, `frankensearch-index` lib
+**373/373** (372 + a new `selective_filter_gather_matches_scan` asserting gather == forced scan == exact
+on the public, int8, and 4-bit filtered paths). The bench also asserts parity at all 8 selectivities × 32
+queries before timing.
+
+**Measured (per-crate same-binary A/B, in-memory N=50k clustered, dim 384, k=10, 32 queries; `scan` =
+forced per-document parallel filtered scan, `gather` = allow-set gather; medians; ratio = gather/scan):**
+
+| selectivity | allow-set | scan | gather | ratio | speedup |
+|-------------|-----------|------|--------|-------|---------|
+| 0.1 % | 50    | 165.9 µs | 3.31 µs  | **0.020** | **50.1×** |
+| 0.5 % | 250   | 194.8 µs | 16.06 µs | **0.082** | **12.1×** |
+| 1 %   | 500   | 219.4 µs | 31.96 µs | **0.146** | **6.9×**  |
+| 2 %   | 1 000 | 197.9 µs | 63.45 µs | **0.321** | **3.1×**  |
+| 5 %   | 2 500 | 267.8 µs | 154.7 µs | **0.578** | **1.7×**  |
+| 10 %  | 5 000 | 449.0 µs | 434.6 µs | 0.968 | ~tie (crossover) |
+| 25 %  | 12 500 | 853 µs  | 2 517 µs | 2.95  | 0.34× (loss) |
+| 50 %  | 25 000 | 852 µs  | 5 117 µs | 6.01  | 0.17× (loss) |
+
+The serial gather crosses over the parallel scan at ~10 %; the selectivity gate is set to **N/16 (≈6.25 %)**
+(`GATHER_SELECTIVITY_DIVISOR`) — comfortably inside the winning region (~1.5× at the boundary) with margin
+for machines whose core count shifts the crossover. Above the gate the scan path is taken unchanged (no
+regression; the existing `int8_two_pass/flat_filtered` 50 % arm is unaffected — `50%·16 ≥ 100%` ⇒ no
+gather).
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  cargo bench -p frankensearch-index --profile release \
+  --bench filtered_gather -- --sample-size 30 --warm-up-time 1 --measurement-time 2
+```
+
+**Scope vs comparator:** filtered search is exactly where a Lucene/Tantivy/Meilisearch-class engine applies
+the filter *first* and searches only the surviving subset; frankensearch previously paid a full-corpus
+vector scan regardless. This closes that structural disadvantage for selective filters and makes the
+production sync fast-tier (`search_top_k_4bit_two_pass_filtered`) both faster and *exact* on selective
+queries. Original-comparator ratio is not re-measured here (the BOLD harness has no selective-filter row
+yet), so this is a frankensearch before/after on the filtered path, not a new head-to-head dominance claim.
+
+**Route next:** (1) **parallelize the gather** (rayon chunks + `merge_*_partials`, the established
+order-independent pattern) to push the crossover well above 10 % and reclaim the 6–25 % band; with that the
+gate could widen toward N/2. (2) Plumb `candidate_hashes` into the **FSVI file-backed** scan
+(`search.rs`) and the **lexical** filtered path so the inversion covers every tier, not just in-memory.
+(3) Add a selective-filter row to the BOLD comparator to convert this into a head-to-head dominance number.

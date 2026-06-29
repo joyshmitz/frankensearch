@@ -64,5 +64,9 @@ harness = false
 name = "fsvi_4bit_two_pass"
 harness = false
 
+[[bench]]
+name = "filtered_gather"
+harness = false
+
 [lints]
 workspace = true
