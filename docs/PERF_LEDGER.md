@@ -1924,3 +1924,39 @@ This is the **default embed path** (vs the model2vec mean-pool's opt-in tier), s
 every embedder — bigger AVX2 ratio than the accumulate (1.4–1.6×) because the scale is more compute-bound
 (one input × broadcast scalar, less memory traffic). The `core::simd` helper is reusable for future
 element-wise core ops. Kept bench: `vec_scale` (in `hash_embed`, importing the core helper).
+
+### 2026-06-28 — BitsetFilter: identity hasher for already-hashed u64 keys: ~8–11% on the filtered scan (BlackThrush)
+
+**Lever (a data-structure inefficiency, not a compute kernel).** `core::filter::BitsetFilter` stored its
+allow-set as a default `HashSet<u64>` — i.e. it ran **SipHash over each key on every membership probe**.
+But the keys are ALREADY FNV-1a `doc_id` hashes (uniform), so SipHash is pure redundant work. Added an
+`IdentityHasherU64` (`write_u64` passes the key straight through; FNV-1a's high bits feed the SwissTable
+control byte) + `BuildIdentityHasherU64`, and switched `BitsetFilter` to `HashSet<u64,
+BuildIdentityHasherU64>` (re-bucketed once at construction). On a **filtered vector scan** the probe runs
+per candidate (all N, before the cheap SIMD dot), so dropping SipHash speeds the hot loop.
+
+**Bit-identical:** identity hashing preserves set membership exactly (a `u64` is present iff inserted) —
+results are unchanged. Conformance: **core** filter tests 39/39 + **index** lib tests **372/372** GREEN
+(filtered-search tests exercise `BitsetFilter`).
+
+**Measured (per-crate `int8_two_pass` bench, N=10k clustered, dim 384, ~50%-pass filter; SipHash baseline
+vs identity hasher):**
+
+| Workload | SipHash | identity | Ratio | Status |
+|----------|---------|----------|-------|--------|
+| `flat_filtered` (exact f16 filtered scan) | ~205 µs | ~189 µs | **~1.08–1.11×** (criterion "improved", −8.6…−13%) | KEEP |
+| `int8_filtered_mult5` (two-pass filtered) | ~204 µs | ~208 µs | within noise | — |
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-index --profile release --bench int8_two_pass -- flat_filtered
+```
+
+**Scope:** original-comparator ratio **N/A** (filtered search — not the unfiltered BOLD path). The
+hypothesis that SipHash *dominated* the filtered scan was wrong — measured it's ~8% of the exact-scan
+cost (the dot + heap + memory dominate), so the win is modest, and the int8/4-bit two-pass filtered path
+is within noise (the probe is a smaller relative fraction there; the identity probe is strictly faster, no
+regression). Still a real, bit-identical fix of a genuine inefficiency (SipHash over an already-uniform
+hash) on the common filtered-search path. This is a SAFE-Rust data-structure lever (not a SIMD intrinsic),
+but a different *kind* of primitive from the compute kernels. `IdentityHasherU64` is reusable for any
+already-hashed-u64 set. Kept the existing `int8_two_pass` filtered bench arms.
