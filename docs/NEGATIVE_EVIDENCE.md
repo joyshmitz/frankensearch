@@ -2948,3 +2948,41 @@ floor.** Stop digging `limit_all` for a per-crate lever; the only removals left 
 (`VectorHit<'a>` borrow refactor) or cross-layer (u64 doc_id keys), neither a 60-min win and both
 sub-meaningful against the modest gap. With this, BOTH comparator-gap components (vector scan + RRF) are
 confirmed optimal — the comparator investigation is closed.
+
+---
+
+## 2026-06-29 — parallelizing the gather SETUP (rayon `&HashSet::par_iter` + `par_sort`) is a ~10× REGRESSION (BlackThrush)
+
+**Lever tested and REVERTED.** Follow-up to the landed gather fast-path (`ec76859` serial, `383ee53`
+parallel-dots). The gather's crossover (~13%) is capped not by its dots (already `par_chunks`) but by its
+**serial setup** — `allowed.iter().filter_map(|h| map.get(h)).collect()` + `positions.sort_unstable()`.
+Hypothesis: parallelize the setup above `PARALLEL_CHUNK_SIZE` (`allowed.par_iter()…collect()` +
+`par_sort_unstable()`) to flip the 25–50 % band to wins and widen the gate toward N/2. Compiled clean,
+conformance GREEN (index lib 374/374, incl. the parity tests), so it was correct — just **far slower**.
+
+**Measured** (`filtered_gather`, N=50k clustered dim 384 k10, gather median; parallel branch is M>1024):
+
+| selectivity | serial setup (`383ee53`) | parallel setup | scan | verdict |
+|-------------|--------------------------|----------------|------|---------|
+| 5 %  (2 500)  | 128.3 µs | **1 297 µs** | 180.8 µs | **10.1× slower → now a LOSS** |
+| 10 % (5 000)  | 217.7 µs | **2 035 µs** | 194.6 µs | 9.4× slower → LOSS |
+| 25 % (12 500) | 726 µs   | **4 052 µs** | 357 µs   | 5.6× slower |
+| 50 % (25 000) | 1 170 µs | **6 205 µs** | 794 µs   | 5.3× slower |
+
+(Sub-1024 allow-sets stay on the serial branch and were unchanged — `0.5%`=15 µs, `1%`=30 µs, `2%`=58 µs.)
+
+**Root cause:** `rayon`'s **`&HashSet` parallel iterator partitions a hash table extremely poorly** — a
+`RawTable` has no cheap midpoint split, so `par_iter` degrades to high-overhead bucket walking with bad load
+balancing, an order of magnitude slower than the plain serial `iter().filter_map().collect()` (a linear
+probe-friendly walk). `par_sort_unstable` adds its own spawn overhead at these sizes. The setup is **memory-
+/probe-bound serial work that rayon cannot accelerate here**; the win came entirely from parallelizing the
+**dots** (already shipped in `383ee53`).
+
+**Decision: fully reverted** (`in_memory.rs` byte-identical to `383ee53` — `git diff` empty before this
+entry; reverted via Edit, not `git checkout`, which `dcg` blocks). The serial-setup + parallel-dots gather
+(`383ee53`, gate N/10) stands as the kept state. **Route next:** to extend the gather past ~13 % the lever
+is NOT parallelizing the `HashSet` walk — it would be a *cheaper representation* of the gathered positions
+(e.g. having `candidate_hashes` hand back an already-sorted `&[u64]` slab, or storing the allow-set
+positions directly), so no per-query collect+sort is needed at all. Lower priority than the FSVI/lexical
+plumbing — moderately-selective (>10 %) filters are the uncommon case, and the serial setup already serves
+the common <10 % region well. Original-comparator ratio **N/A** (internal filtered-path micro-lever).
