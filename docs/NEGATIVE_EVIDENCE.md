@@ -3165,3 +3165,25 @@ deep investigation and the flat scan is already the strong default. **Decision: 
 default vector tier; the 2026-06-26 "do not wire HNSW as default" stands and is now confirmed at production
 scale/dim.** Bench reverted to its 10k × 128 form (`git diff` empty); 100k × 384 numbers recorded here.
 Original-comparator ratio **N/A** (internal ANN-vs-flat vector-tier selection).
+
+**FOLLOW-UP — tuning the config does NOT fix it (the trade is fundamental).** The default `m=16` looked
+under-built for 384-d, so re-ran `hnsw_vs_flat` with a **tuned `HnswConfig { m: 32, ef_construction: 400 }`**
+at N=30k × 384 (clustered):
+
+| ef_search | recall@10 | HNSW latency | vs flat (531.8 µs) |
+|-----------|-----------|--------------|--------------------|
+| 10  | 0.350 | 402.8 µs | 1.32× faster |
+| 20  | 0.469 | 654.7 µs | 0.81× (slower) |
+| 40  | 0.606 | 1.057 ms | 0.50× (2× slower) |
+| 100 | 0.819 | 2.338 ms | **0.23× (4.4× slower)** |
+| 200 | 0.906 | (slower)  | — |
+
+m=32 *did* lift recall (ef=200: 0.625→**0.906**), but HNSW is faster than flat **only at ef=10 (recall
+0.35, useless)**; to reach even ~0.82 recall it is **4.4× slower** than the flat scan, and it never reaches
+the ~1.0 a default vector tier needs. **Root cause is structural, not config:** the flat scan is
+**rayon-parallel + SIMD f16 dot + cache-friendly sequential**, so on a 32-core host it finishes 30k–100k in
+0.5–1.3 ms; HNSW is an inherently **serial graph walk with random memory access** that can't use the cores
+and degrades with dimension. HNSW only wins at *low recall* or at *N large enough that flat's O(N) finally
+beats the parallelism* (≫100k) — neither applies at frankensearch's 10k–100k target with a recall-1.0
+requirement. **HNSW is conclusively closed: not a default-vector-tier lever at any tested config/scale;
+the parallel flat scan is the floor. Do not re-probe HNSW tuning.**
