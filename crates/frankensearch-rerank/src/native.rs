@@ -39,7 +39,7 @@ const NH: usize = 12;
 const HD: usize = H / NH; // 32
 const INTER: usize = 4 * H; // 1536 — FFN intermediate width
 const EPS: f64 = 1e-12;
-const DEFAULT_MAX_LENGTH: usize = 512;
+pub(crate) const DEFAULT_MAX_LENGTH: usize = 512;
 /// Token budget per batched forward. Documents are reranked in chunks whose total
 /// token count stays under this cap so the chunk's attention intermediates (which
 /// co-exist on the tape until the per-chunk truncate) stay memory-bounded, while
@@ -56,9 +56,9 @@ const MAX_BATCH_TOKENS: usize = 2048;
 /// bmm — obsolete since the raw attention became a gemm.)
 const FUSED_ATTN_MAX_SEQ: usize = DEFAULT_MAX_LENGTH;
 const MODEL_NAME: &str = "ms-marco-minilm-l-6-v2";
-const SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
-const SAFETENSORS_FALLBACK: &str = "model.safetensors";
-const TOKENIZER_JSON: &str = "tokenizer.json";
+pub(crate) const SAFETENSORS_PRIMARY: &str = "model_f32.safetensors";
+pub(crate) const SAFETENSORS_FALLBACK: &str = "model.safetensors";
+pub(crate) const TOKENIZER_JSON: &str = "tokenizer.json";
 
 fn rerank_err(ctx: &str, e: impl std::fmt::Display) -> SearchError {
     SearchError::RerankFailed {
@@ -417,7 +417,7 @@ struct QLinear {
 
 /// Owns the frankentorch session and the loaded weight tensors. Mutated during the
 /// forward pass, so it lives behind a `Mutex` in `NativeReranker`.
-struct Model {
+pub(crate) struct Model {
     s: FrankenTorchSession,
     /// f32 leaf nodes for the non-Linear parameters (word/position/token_type
     /// embeddings and every LayerNorm weight/bias) — these stay in f32.
@@ -1036,6 +1036,112 @@ impl Model {
         }
         Ok(vals)
     }
+
+    /// Sentence-embedding forward (the embedder head). Runs the SAME shared BERT
+    /// encoder as the reranker over each input's tokens — identical embeddings build
+    /// and `encoder_layer_raw` (same int8/SIMD kernels) — then replaces the reranker's
+    /// `[CLS]` pooler + classifier with **mean-pooling over every token + L2-normalize**
+    /// (the `sentence-transformers/all-MiniLM-L6-v2` head). Token-type ids are all 0
+    /// (a single text, no query/doc split). Returns one `[H]` unit vector per input.
+    ///
+    /// Every input is ≤ `DEFAULT_MAX_LENGTH` (callers truncate at tokenization), so the
+    /// whole batch goes through the tape-free raw path; there is no CLS-only shortcut
+    /// because mean-pooling needs every token's final hidden state.
+    pub(crate) fn embed_forward(&mut self, batch: &[Vec<i64>]) -> SearchResult<Vec<Vec<f32>>> {
+        let n_docs = batch.len();
+        let lens: Vec<usize> = batch.iter().map(Vec::len).collect();
+        let total: usize = lens.iter().sum();
+        if total == 0 {
+            return Ok(vec![vec![0.0; H]; n_docs]);
+        }
+        let mut offsets = Vec::with_capacity(n_docs);
+        {
+            let mut o = 0usize;
+            for &l in &lens {
+                offsets.push(o);
+                o += l;
+            }
+        }
+        // Flat token / position / type ids over the concatenated inputs. Positions
+        // restart at 0 per input; token-type is always 0 (single text).
+        let mut ids_flat = Vec::with_capacity(total);
+        let mut pos_flat = Vec::with_capacity(total);
+        let mut typ_flat = Vec::with_capacity(total);
+        for ids in batch {
+            for (i, &id) in ids.iter().enumerate() {
+                ids_flat.push(id);
+                pos_flat.push(i as i64);
+                typ_flat.push(0i64);
+            }
+        }
+        // Embeddings → [total, H]: word + position + token_type, then LayerNorm.
+        let id_t = self.idx(&ids_flat)?;
+        let pos_t = self.idx(&pos_flat)?;
+        let typ_t = self.idx(&typ_flat)?;
+        let we = self.g("bert.embeddings.word_embeddings.weight")?;
+        let pe = self.g("bert.embeddings.position_embeddings.weight")?;
+        let te = self.g("bert.embeddings.token_type_embeddings.weight")?;
+        let e_word = self
+            .s
+            .tensor_index_select(we, 0, id_t)
+            .map_err(|e| rerank_err("embed.word", e))?;
+        let e_pos = self
+            .s
+            .tensor_index_select(pe, 0, pos_t)
+            .map_err(|e| rerank_err("embed.pos", e))?;
+        let e_typ = self
+            .s
+            .tensor_index_select(te, 0, typ_t)
+            .map_err(|e| rerank_err("embed.type", e))?;
+        let emb_wp = self
+            .s
+            .tensor_add(e_word, e_pos)
+            .map_err(|e| rerank_err("embed.add", e))?;
+        let emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
+
+        // Encoder: ALL L layers on raw f32 buffers (mean-pooling needs every token's
+        // final hidden state, so no CLS-only last layer). Same kernels as the reranker.
+        let scale_f = (1.0 / (HD as f64).sqrt()) as f32;
+        let mut scratch = AttnScratch::default();
+        let mut emb_vals = self
+            .s
+            .tensor_values_f32(emb)
+            .map_err(|e| rerank_err("embed.extract", e))?;
+        for i in 0..L {
+            let p = format!("bert.encoder.layer.{i}");
+            emb_vals =
+                self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f, &mut scratch)?;
+        }
+        self.s.truncate_autograd_graph(self.weights_boundary);
+
+        // Mean-pool each input's token rows → [H], then L2-normalize to a unit vector.
+        let mut out = Vec::with_capacity(n_docs);
+        for (&off, &len) in offsets.iter().zip(&lens) {
+            let mut acc = vec![0.0f32; H];
+            if len > 0 {
+                let doc = &emb_vals[off * H..(off + len) * H];
+                for t in 0..len {
+                    let row = &doc[t * H..t * H + H];
+                    for (a, &r) in acc.iter_mut().zip(row) {
+                        *a += r;
+                    }
+                }
+                let inv = 1.0 / len as f32;
+                for a in &mut acc {
+                    *a *= inv;
+                }
+            }
+            let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                for a in &mut acc {
+                    *a *= inv;
+                }
+            }
+            out.push(acc);
+        }
+        Ok(out)
+    }
 }
 
 /// Pure-Rust frankentorch cross-encoder reranker.
@@ -1150,7 +1256,7 @@ fn is_linear_weight(name: &str) -> bool {
 /// Parsed, immutable weight data: int8 Linear weights keyed by layer prefix, plus
 /// the f32 embedding/LayerNorm parameter values. Parsed and quantized once, then
 /// cloned (cheaply, via `Arc`) into each session by [`build_model`].
-struct SharedWeights {
+pub(crate) struct SharedWeights {
     qw: HashMap<String, QLinear>,
     f32_params: HashMap<String, (Arc<Vec<f32>>, Vec<usize>)>,
 }
@@ -1158,7 +1264,7 @@ struct SharedWeights {
 /// Parse a safetensors file: int8-quantize the Linear weights (per output channel)
 /// and keep the embeddings + LayerNorm parameters as f32. Non-F32 tensors (e.g. the
 /// I64 `position_ids` buffer) are skipped — those indices are regenerated at forward.
-fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
+pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
     let bytes = fs::read(path).map_err(|e| SearchError::ModelLoadFailed {
         path: path.to_path_buf(),
         source: format!("read safetensors: {e}").into(),
@@ -1238,7 +1344,18 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        raw.insert(name.clone(), (vals, shape));
+        // Normalize HuggingFace BERT key conventions to the `bert.`-prefixed scheme
+        // the shared encoder/`build_model` use. sentence-transformers all-MiniLM-L6-v2
+        // ships bare `embeddings.*` / `encoder.*` keys; cross-encoder/ms-marco ships
+        // `bert.`-prefixed ones — so this is a strict no-op there (those keys start with
+        // `bert.embeddings`/`bert.encoder`, not bare `embeddings.`/`encoder.`). Backbone
+        // keys only; `pooler`/`classifier` are left untouched.
+        let key = if name.starts_with("embeddings.") || name.starts_with("encoder.") {
+            format!("bert.{name}")
+        } else {
+            name.clone()
+        };
+        raw.insert(key, (vals, shape));
     }
     if raw.is_empty() {
         return Err(SearchError::ModelLoadFailed {
@@ -1368,7 +1485,7 @@ fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
 
 /// Build a fresh session from shared weights: create an f32 leaf for every
 /// embedding/LayerNorm parameter and clone the (Arc-shared) int8 Linear weights.
-fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
+pub(crate) fn build_model(shared: &SharedWeights) -> SearchResult<Model> {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
     session.no_grad_enter();
     let mut w = HashMap::with_capacity(shared.f32_params.len());

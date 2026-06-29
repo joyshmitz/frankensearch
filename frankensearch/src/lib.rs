@@ -312,6 +312,9 @@ pub use frankensearch_rerank::rerank_step;
 #[cfg(feature = "native")]
 pub use frankensearch_rerank::NativeReranker;
 
+#[cfg(feature = "native")]
+pub use frankensearch_rerank::NativeEmbedder;
+
 #[cfg(feature = "fastembed-reranker")]
 pub use frankensearch_rerank::FastEmbedReranker;
 

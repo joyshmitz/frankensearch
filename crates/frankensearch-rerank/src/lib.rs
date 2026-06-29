@@ -24,7 +24,13 @@ pub use fastembed_reranker::FastEmbedReranker;
 pub mod native;
 
 #[cfg(feature = "native")]
+pub mod native_embedder;
+
+#[cfg(feature = "native")]
 pub use native::NativeReranker;
+
+#[cfg(feature = "native")]
+pub use native_embedder::NativeEmbedder;
 
 /// Default model directory name for the cross-encoder reranker.
 pub const DEFAULT_MODEL_NAME: &str = "rerank-default-v1";
