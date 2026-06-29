@@ -3351,3 +3351,26 @@ parallel comparison sort pays when elements are small/POD and the comparator is 
 when elements carry heap payloads and the comparator hits pervasive variable-size tie-groups (RRF). Measure
 each site — do not assume a sort primitive transfers across comparators. Original-comparator ratio **N/A**
 (internal sort-primitive micro-lever on the limit_all gap).
+
+---
+
+## 2026-06-29 — shrinking `FusedHitScratch` ranks (usize→u32) NOT pursued — anomalous A/B, sort is comparison-bound (BlackThrush)
+
+**Lever investigated, NOT landed (anomalous measurement + sound first-principles reason).** `FusedHitScratch`
+(the RRF sort element) carries three `Option<usize>` rank fields (lexical/semantic/graph) that are **not** in
+`cmp_for_ranking` — pure payload. Ranks are result-list positions (< u32::MAX), so `Option<u32>` would be
+bit-identical and shrink the struct 120→96 B (`size_of` confirmed), cutting per-element sort data movement
+~20%. The hypothesis: a smaller sorted element speeds the limit_all RRF full sort (~22% of limit_all).
+
+**The isolated A/B (`rrf_struct_size` bench, wide-120B vs narrow-96B, identical data + `cmp_for_ranking` +
+`sort_unstable_by`) returned an anomalous, non-physical result:** the *smaller* struct sorted **~2× SLOWER**
+at both sizes (n10000: 245 µs vs 490 µs; n50000: 1.45 ms vs 2.86 ms). A 24-byte size reduction cannot make
+an identical sort 2× slower — this is a bench/layout/load artifact I could not pin down (the per-iteration
+10k-`String` allocation in `iter_batched` setup plausibly confounds the timing), so the number is untrusted
+and no production change was made on it.
+
+**The deeper reason the lever is unpromising anyway:** the limit_all RRF sort is **comparison-bound, not
+movement-bound** — `cmp_for_ranking`'s `doc_id`-String tiebreak fires on the pervasive `1/(k+rank)` ties, so
+the cost is in the comparisons (bit-identity-locked), not the per-element move that a smaller struct would
+reduce. This is the same root cause that made `par_sort` fail here (this ledger, RRF-par-sort entry). Bench
+removed, `Cargo.toml` reverted to HEAD; `FusedHitScratch` unchanged. Original-comparator ratio **N/A**.
