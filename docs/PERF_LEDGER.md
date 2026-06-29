@@ -2203,3 +2203,25 @@ concurrent frankentorch/rerank commits **did not regress the comparator**. The l
 touched). Original-comparator verdict: **frankensearch is at parity-or-better vs the Tantivy-class incumbent
 on all top-k query classes; the only residual is the inherent `limit_all` semantics gap.** No code change
 (measurement); artifact `/data/projects/.rch-targets/frankensearch-cc/criterion/bold_verify/summary.{md,jsonl}`.
+
+### 2026-06-29 — limit_all doc_id materialization clone is ~23% (NOT the ledger's "3-5%") — reopens the move-not-clone lever (BlackThrush)
+
+**Lever-sizing measurement that corrects a wrong prior estimate.** The 2026-06-28 `limit_all` decomposition
+estimated the RRF `into_owned` doc_id clone-elision (the `VectorHit<'a>` lever) at "~3-5% of limit_all" —
+but that was never measured. `rrf_fuse` returns `Vec<FusedHit>` whose `doc_id: String` are `to_owned()`
+clones of the borrowed inputs (`rrf.rs:348`, `FusedHitScratch::into_owned`); for `limit_all` (k=N) that is
+N short-String allocations. Isolated it (`materialize_clone` bench, N doc_ids, owned-clone vs borrowed):
+
+| N | owned clone (`Vec<String>`) | borrowed (`Vec<&str>`) | clone overhead |
+|---|------------------------------|------------------------|----------------|
+| 10 000  | **429.8 µs** | 3.94 µs | **~426 µs (109×)** |
+| 100 000 | **4.856 ms**  | (~40 µs) | ~4.8 ms |
+
+**At 10k the clone is ~426 µs = ~23 % of the measured `limit_all` p50 (1869 µs)** — not 3-5 %. Eliding it
+would move `limit_all` from **1.445× → ~1.12×** vs the incumbent, closing most of the lone remaining gap.
+**Route: the elision is bit-identical and likely fusion-crate-only** — have `rrf_fuse` take *owned* inputs
+and **move** each winner's doc_id `String` out of the input (`std::mem::take`) instead of cloning, rather
+than the multi-crate `VectorHit<'a>` lifetime refactor. (Negligible for top-k — k=10 clones are ~0 — so this
+is a `limit_all`/large-fetch win specifically.) Next: implement `rrf_fuse` move-not-clone (owned inputs),
+wire the sync hot callers, A/B vs the clone path. Kept bench: `materialize_clone`. Original-comparator: this
+directly attacks the `limit_all` row (the biggest measured gap).

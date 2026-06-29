@@ -83,3 +83,7 @@ workspace = true
 [[bench]]
 name = "progressive_replay"
 harness = false
+
+[[bench]]
+name = "materialize_clone"
+harness = false
