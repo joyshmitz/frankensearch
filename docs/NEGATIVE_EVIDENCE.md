@@ -3453,3 +3453,35 @@ flushes to i32 every 16 chunks and is dominated by `vpmullw` (2×/iter) + `vpsll
 `vpmovsxbw` — the same port-throughput regime as int8, and the flush already segments the i16 add chain. By
 that structural read it is **not** an accumulator-latency lever either; do not expect the f16 win to repeat
 on the integer/quantized kernels. The f16 ILP win was specific to the cheap-decode + lone-add-chain shape.
+
+---
+
+## 2026-06-29 — scalar→SIMD f32 max-reduction wins 1.35× in isolation but has no measurable hot-path home (BlackThrush)
+
+**Probed the f16-dot ILP pattern (`82e151f`) in non-dot reductions.** A scalar `f32::max` reduction
+(`for &x in row { m = m.max(x) }`) is the shape of the native reranker's attention-softmax max pass
+(`softmax_row_fused`, native.rs:79); `f32::max`'s NaN semantics block LLVM from auto-vectorizing it, so it
+runs as one serial `maxss` chain. Built `max_reduction` (commit prior): scalar vs f32x8 lanewise-max +
+horizontal reduce (bit-identical for finite/-inf; asserted).
+
+**Measured (per-crate, `-p frankensearch-index`):**
+
+| n | scalar | simd | ratio |
+|---|--------|------|-------|
+| 128 | 28.33 ns | 21.50 ns | 0.76 (1.32× faster) |
+| 512 | 116.46 ns | 84.27 ns | 0.72 (1.38× faster) |
+| 2048 | 469.55 ns | ~335 ns | ~0.71 (~1.4× faster) |
+
+**Decision: NOT wired (no measurable impactful home) — bench kept as evidence.** Unlike the f16 dot (called
+`N`× per query → the kernel IS the path, so 1.45× kernel ⇒ 1.45× path), the only hot caller of a scalar
+f32-max reduction is the softmax **max pass**, which is a small fraction of the forward — the vectorized
+`exp` pass (a transcendental polynomial, far more work/elem) dominates softmax, and softmax is ~24% of the
+per-doc forward. So even a 1.4× max-pass is a low-single-digit-% softmax change ⇒ ~0 end-to-end. Worse, it is
+**unmeasurable here**: `native_rerank` (the only end-to-end reranker bench) requires a staged model at
+`/private/tmp/ee-reranker-port/model` that is absent on the rch workers, so it SKIPs — there is no way to
+confirm a real forward-latency delta. The other scalar f32 reduction in `native.rs` (the L2-norm
+sum-of-squares at line 1134) is **per-doc mean-pooling** over `H=768` once per document (cold), not a
+per-token hot loop. **Route next:** the max-reduction SIMD kernel is real and reusable, but the f16-win
+pattern only pays where the reduced loop is a *large fraction* of a measured hot path; no such home exists in
+the core/index/fusion crates today (fusion `min_max_normalize`/`z_score_normalize` are off the RRF rank path).
+Do not wire the softmax max without a way to measure the native reranker forward end-to-end.
