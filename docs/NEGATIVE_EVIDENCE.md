@@ -3374,3 +3374,48 @@ movement-bound** — `cmp_for_ranking`'s `doc_id`-String tiebreak fires on the p
 the cost is in the comparisons (bit-identity-locked), not the per-element move that a smaller struct would
 reduce. This is the same root cause that made `par_sort` fail here (this ledger, RRF-par-sort entry). Bench
 removed, `Cargo.toml` reverted to HEAD; `FusedHitScratch` unchanged. Original-comparator ratio **N/A**.
+
+---
+
+## 2026-06-29 — batched (GEMM-style) multi-query vector scan: only 1.03–1.14×, decode-once REGRESSES — the f16 scan is compute-bound, not bandwidth-bound (BlackThrush)
+
+**Fundamentally-different execution model probed (not a micro-lever on the existing single-query path).**
+The PERF_LEDGER repeatedly calls the brute-force vector scan "bandwidth-bound + AVX2-capped." If true, a
+high-QPS server scoring a *batch* of `B` query vectors against the full f16 corpus should win big by
+**streaming the corpus from RAM once** and reusing each loaded vector across all `B` queries (loop
+interchange / GEMM-style), instead of the production path's `B` independent full-corpus scans. Lucene/
+Tantivy/Meili execute queries independently, so this would be a structural throughput edge. Built the
+smallest per-crate harness, `frankensearch-index/benches/batched_query_scan.rs` (committed `8c6c51a`,
+`e7d3452`): N=100k f16 vectors (73 MB slab ≫ L3), `B∈{4,16,64}`, identical `B·N` dots, results asserted
+equal. Three arms — `sequential` (production per-query), `batched` (loop-interchange, bit-identical),
+`batched_decode_once` (decode each f16 vector to f32 *once* via `vcvtph2ps`, then `B` f32 dots from L1).
+
+**Measured (per-crate, `CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- cargo bench -p
+frankensearch-index --bench batched_query_scan`, criterion p50, head-to-head in one process):**
+
+| B  | sequential (ORIG) | batched | ratio | batched_decode_once | ratio |
+|----|-------------------|---------|-------|---------------------|-------|
+| 4  | 15.014 ms | 13.224 ms | **0.881 (1.14× faster)** | 66.13 ms | **4.40× SLOWER** |
+| 16 | 60.947 ms | 55.951 ms | **0.918 (1.09× faster)** | 100.54 ms | **1.65× SLOWER** |
+| 64 | 228.40 ms | 220.98 ms | **0.967 (1.03× faster)** | 221.65 ms | 0.97 (parity) |
+
+**Decision: no domination here; decode-once REJECTED, batched kept as bench-only evidence.** Two findings,
+both correcting the "bandwidth-bound" premise:
+
+1. **Loop-interchange `batched` is only 1.03–1.14×, and the win SHRINKS as `B` grows.** If the scan were
+   bandwidth-bound, amortizing corpus RAM traffic over more queries would help *more* at larger `B` — the
+   opposite happened. The hardware prefetcher already hides almost all of the corpus re-streaming, so
+   reading it once buys very little. The scan is **compute-bound** (FMA throughput on the per-element dot),
+   not memory-bound.
+
+2. **`batched_decode_once` is a hard regression (4.40×/1.65× slower at B≤16).** `vcvtph2ps` is fused into
+   the load in the production `dot_product_f16_bytes_f32` kernel — decoding f16→f32 is essentially free.
+   Materializing a decoded f32 scratch buffer and re-reading it adds a store+load round-trip per corpus
+   vector that the free hardware decode never paid, so "decode once" loses to "decode B times for free."
+
+**Route next:** the vector scan's floor is FMA compute, not memory bandwidth — so a batched/GEMM query API
+would net at most ~1.1× and only at tiny batch sizes, not worth the multi-query-plumbing it would require.
+Do not re-probe batched/loop-interchange query execution for the f16 scan, and do not build a decode-to-
+scratch kernel. The "bandwidth-bound" characterization in the PERF_LEDGER should be read as "AVX2-FMA-bound";
+sublinear candidate reduction (ANN/IVF — already present behind the `ann` feature) remains the only way to
+cut the f16 scan's wall-clock, since the per-vector dot itself is at its compute floor.
