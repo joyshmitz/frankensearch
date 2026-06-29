@@ -2861,3 +2861,25 @@ register-only (PRNG, pure reductions); a kernel with a per-element load or decod
 that, NOT accumulator-latency-bound — measure before rewriting (and especially before breaking
 bit-identical for it).** The measure-first cost ~20 min and saved a ~0-gain, bit-identical-breaking,
 default-path-rippling change. Don't re-attempt 4-acc on any of the dot kernels.
+
+---
+
+## 2026-06-28 — JL accumulate is SATURATED at 8-lane: 16-lane (4-way ILP) = ~1.02× (throughput wall) (BlackThrush)
+
+The JL register-only recurrence DID respond to the 2nd-accumulator unlock: scalar → 4-lane (1.51×) →
+8-lane (1.76× more, `abd4628`). Natural question: does **16-lane (4 `__m256i`, 4-way ILP)** give a 3rd
+jump? Op-count model said no — the 8-lane already moved the xorshift from latency-bound (1 register, ~6-cyc
+dependency chain) to ~throughput-bound (2 registers fill the ~6-cyc latency), so a 3rd/4th register just
+piles on `slli`/`xor`/`movemask` ops against a fixed ~3 vector-ALU-ports/cycle. **MEASURED (non-prod
+16-lane variant, 4 registers, interleaved):**
+
+| `jl_accumulate` (dim 384, 8k tokens) | 8-lane | 16-lane | Ratio |
+|--------------------------------------|--------|---------|-------|
+| | 949.8 µs | 930.2 µs | **~1.02× (noise)** |
+
+**~0-gain → REVERTED** (experimental kernel + bench arm backed out via Edit; tree clean). **JL is
+saturated at 8-lane** — the 8-lane was the right stopping point (`abd4628`). Confirms the refined model:
+the 2nd register (4→8 lanes) is the latency unlock; the 3rd/4th (8→16) hit the vector-ALU-throughput wall.
+**General: the ILP unlock is a ONE-STEP transition (latency-bound → throughput-bound), not a ladder —
+once 2 independent accumulators fill the recurrence latency, more lanes only add work. Stop at 2× the
+in-flight registers needed to cover the dependency depth.** Don't push JL past 8 lanes.
