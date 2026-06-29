@@ -186,10 +186,7 @@ impl VectorIndex {
             // rayon overhead is not worth it, so stay serial. Bit-identical either
             // way — `compare_best_first` is a strict total order.
             if winners.len() >= PAR_SORT_THRESHOLD {
-                rayon::slice::ParallelSliceMut::par_sort_unstable_by(
-                    &mut winners,
-                    compare_best_first,
-                );
+                winners.par_sort_unstable_by(compare_best_first);
             } else {
                 winners.sort_unstable_by(compare_best_first);
             }
