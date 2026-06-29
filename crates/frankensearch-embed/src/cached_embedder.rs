@@ -12,7 +12,7 @@
 //! The lock is held only for the brief `HashMap` lookup/insert — never across an
 //! async `.await` boundary.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
@@ -34,10 +34,35 @@ pub struct CacheStats {
     pub capacity: usize,
 }
 
+struct CacheEntry {
+    value: Vec<f32>,
+    /// Access frequency, saturating at [`FREQ_CAP`]. Drives S3-FIFO promotion
+    /// (Small→Main) and the Main second-chance.
+    freq: u8,
+}
+
+const FREQ_CAP: u8 = 3;
+
+/// S3-FIFO query-embedding cache (Yang et al., SOSP 2023), entry-count form.
+///
+/// Three queues over a single entry map: **Small** (new/one-hit-wonder admissions,
+/// ~10% of capacity), **Main** (proven-reused, ~90%), and **Ghost** (keys recently
+/// evicted from Small, metadata-only). Unlike the previous plain FIFO, a key
+/// re-requested while resident is promoted to Main and survives the scan churn that
+/// evicts cold one-hit-wonders from Small — measurably fewer embed misses on skewed
+/// / scan-heavy query streams (see the `cache_replay` bench + PERF_LEDGER 2026-06-29).
+/// Lookups borrow `&str` (no per-get allocation); the external `CacheState` API
+/// (`get`/`insert`/`stats`/`clear`, entry-count `capacity`, hit/miss counters) is
+/// unchanged, so `CachedEmbedder` and `CacheStats` are untouched.
 struct CacheState {
-    map: HashMap<String, Vec<f32>>,
-    order: VecDeque<String>,
+    entries: HashMap<String, CacheEntry>,
+    small: VecDeque<String>,
+    main: VecDeque<String>,
+    ghost: VecDeque<String>,
+    ghost_set: HashSet<String>,
     capacity: usize,
+    small_cap: usize,
+    ghost_cap: usize,
     hits: u64,
     misses: u64,
 }
@@ -45,18 +70,25 @@ struct CacheState {
 impl CacheState {
     fn new(capacity: usize) -> Self {
         Self {
-            map: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
+            entries: HashMap::with_capacity(capacity),
+            small: VecDeque::new(),
+            main: VecDeque::new(),
+            ghost: VecDeque::new(),
+            ghost_set: HashSet::new(),
             capacity,
+            // Small queue ~10% of capacity (≥1 when caching is enabled).
+            small_cap: (capacity / 10).max(1),
+            ghost_cap: capacity,
             hits: 0,
             misses: 0,
         }
     }
 
     fn get(&mut self, key: &str) -> Option<Vec<f32>> {
-        if let Some(vec) = self.map.get(key) {
+        if let Some(entry) = self.entries.get_mut(key) {
             self.hits += 1;
-            Some(vec.clone())
+            entry.freq = entry.freq.saturating_add(1).min(FREQ_CAP);
+            Some(entry.value.clone())
         } else {
             self.misses += 1;
             None
@@ -65,30 +97,91 @@ impl CacheState {
 
     fn insert(&mut self, key: String, value: Vec<f32>) {
         // capacity == 0 means caching is disabled.
-        if self.capacity == 0 || self.map.contains_key(&key) {
+        if self.capacity == 0 || self.entries.contains_key(&key) {
             return;
         }
-        if self.order.len() >= self.capacity
-            && let Some(evicted) = self.order.pop_front()
-        {
-            self.map.remove(&evicted);
+        // A key seen recently (in Ghost) re-enters straight into Main; a fresh key
+        // starts in Small so a scan of one-hit-wonders can't displace the hot set.
+        if self.ghost_set.remove(&key) {
+            self.main.push_back(key.clone());
+        } else {
+            self.small.push_back(key.clone());
         }
-        self.order.push_back(key.clone());
-        self.map.insert(key, value);
+        self.entries.insert(key, CacheEntry { value, freq: 0 });
+        while self.entries.len() > self.capacity {
+            self.evict_one();
+        }
+    }
+
+    /// Free exactly one slot: evict from Small when it's over its target (promoting
+    /// reused keys to Main, demoting cold ones to Ghost), otherwise give Main keys a
+    /// frequency-decremented second chance until one with `freq == 0` is dropped.
+    fn evict_one(&mut self) {
+        loop {
+            // Evict from Small whenever it is at-or-over its target (`>=`): a fresh
+            // key on probation survives only if re-accessed (freq>0 → promoted to
+            // Main) before the next eviction; cold one-hit-wonders are dropped. Using
+            // `>=` (not `>`) keeps this correct at the degenerate `small_cap ==
+            // capacity` size (e.g. capacity 1), where `>` would evict a just-promoted
+            // Main entry instead of the cold Small one.
+            if !self.small.is_empty() && self.small.len() >= self.small_cap {
+                let Some(k) = self.small.pop_front() else {
+                    continue;
+                };
+                if self.entries.get(&k).is_some_and(|e| e.freq > 0) {
+                    if let Some(e) = self.entries.get_mut(&k) {
+                        e.freq = 0;
+                    }
+                    self.main.push_back(k); // promote — no slot freed, keep going
+                } else {
+                    self.entries.remove(&k);
+                    self.push_ghost(k);
+                    return;
+                }
+            } else if let Some(k) = self.main.pop_front() {
+                if self.entries.get(&k).is_some_and(|e| e.freq > 0) {
+                    if let Some(e) = self.entries.get_mut(&k) {
+                        e.freq -= 1;
+                    }
+                    self.main.push_back(k); // second chance — keep going
+                } else {
+                    self.entries.remove(&k);
+                    return;
+                }
+            } else {
+                return; // defensive: both queues drained
+            }
+        }
+    }
+
+    fn push_ghost(&mut self, key: String) {
+        if self.ghost_cap == 0 {
+            return;
+        }
+        self.ghost.push_back(key.clone());
+        self.ghost_set.insert(key);
+        while self.ghost.len() > self.ghost_cap {
+            if let Some(old) = self.ghost.pop_front() {
+                self.ghost_set.remove(&old);
+            }
+        }
     }
 
     fn stats(&self) -> CacheStats {
         CacheStats {
             hits: self.hits,
             misses: self.misses,
-            entries: self.map.len(),
+            entries: self.entries.len(),
             capacity: self.capacity,
         }
     }
 
     fn clear(&mut self) {
-        self.map.clear();
-        self.order.clear();
+        self.entries.clear();
+        self.small.clear();
+        self.main.clear();
+        self.ghost.clear();
+        self.ghost_set.clear();
         self.hits = 0;
         self.misses = 0;
     }
@@ -333,23 +426,51 @@ mod tests {
     }
 
     #[test]
-    fn fifo_eviction_at_capacity() {
+    fn eviction_at_capacity() {
         let (cached, inner) = make_cached(2);
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             cached.embed(&cx, "first").await.unwrap();
             cached.embed(&cx, "second").await.unwrap();
-            // Cache is full (2 entries). Inserting a third evicts "first".
+            // Cache full (2 entries), all freq 0 → S3-FIFO evicts the oldest Small
+            // entry ("first") on the third insert.
             cached.embed(&cx, "third").await.unwrap();
             assert_eq!(inner.call_count(), 3);
 
-            // "first" was evicted, so this is a miss.
+            // "first" was evicted → miss; re-inserting it evicts "second".
             cached.embed(&cx, "first").await.unwrap();
             assert_eq!(inner.call_count(), 4);
 
-            // "second" was evicted when "first" was re-inserted.
-            // "third" should still be cached.
+            // "third" is still cached → hit (no inner call).
             cached.embed(&cx, "third").await.unwrap();
             assert_eq!(inner.call_count(), 4);
+        });
+    }
+
+    #[test]
+    fn s3fifo_keeps_reused_key_through_scan() {
+        // The S3-FIFO win over plain FIFO: a key re-requested while resident is
+        // promoted to Main and survives a scan of cold one-hit-wonders that overflows
+        // the cache — a FIFO would have evicted it by insertion order.
+        let (cached, inner) = make_cached(4);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            cached.embed(&cx, "hot").await.unwrap(); // miss → Small
+            cached.embed(&cx, "hot").await.unwrap(); // hit → freq++ (promotable)
+            assert_eq!(inner.call_count(), 1);
+            let after_hot = inner.call_count();
+
+            // Scan: 6 unique cold keys through a capacity-4 cache.
+            for i in 0..6 {
+                cached.embed(&cx, &format!("cold-{i}")).await.unwrap();
+            }
+            assert_eq!(inner.call_count(), after_hot + 6); // all cold = misses
+
+            // "hot" survived the scan (promoted to Main) → still a hit.
+            cached.embed(&cx, "hot").await.unwrap();
+            assert_eq!(
+                inner.call_count(),
+                after_hot + 6,
+                "S3-FIFO must keep the reused 'hot' key through the cold scan"
+            );
         });
     }
 

@@ -50,6 +50,10 @@ criterion = { workspace = true }
 name = "hash_embed"
 harness = false
 
+[[bench]]
+name = "cache_replay"
+harness = false
+
 [build-dependencies]
 sha2 = { workspace = true }
 

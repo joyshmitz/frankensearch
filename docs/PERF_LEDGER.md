@@ -2127,3 +2127,46 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
 chunk metadata), so this is a frankensearch before/after, and it speeds **indexing throughput** (a real
 Tantivy/Lucene-class dimension) wherever the lexical chunker runs over ASCII code/docs (the common case).
 The LUT/branchless pattern is reusable for any byte-class state machine. Kept bench arm: `lexical_count/lut`.
+
+### 2026-06-29 — S3-FIFO query-embedding cache: 4–14% fewer embed misses on skewed/scan streams (BlackThrush)
+
+**Lever (bd-tjkm S3-FIFO admission — a DIFFERENT primitive: cache eviction policy, /alien-graveyard §15.1).**
+The hot-path query-embedding cache (`CachedEmbedder` → `CacheState`) used plain **FIFO** eviction (evict
+oldest by insertion order; `get` never reorders), so a scan of one-hit-wonder queries evicts the hot/reused
+set and a re-requested query becomes a miss = a recomputed embedding. Replaced `CacheState`'s eviction with
+**S3-FIFO** (Yang et al., SOSP 2023): three entry-count queues over one map — **Small** (probation, ~10%),
+**Main** (promoted on reuse), **Ghost** (recently-evicted keys → re-admit straight to Main). A key
+re-requested while resident is promoted to Main and survives scan churn; cold singletons are dropped from
+Small. `&str` lookups (no per-get alloc); the `CachedEmbedder`/`CacheStats`/embed API is unchanged (only
+`CacheState` internals changed — the codebase's existing `core::S3FifoCache` is byte-budgeted and would
+force a per-get `String` alloc, so an entry-count S3-FIFO is the right fit here).
+
+**Measured (`cache_replay` bench, 100k accesses, cap=128 = `DEFAULT_CAPACITY`; a miss = one embed):**
+
+| trace | FIFO hit | S3-FIFO hit | FIFO miss | S3-FIFO miss | miss_ratio (s3/fifo) |
+|-------|----------|-------------|-----------|--------------|----------------------|
+| zipf s=2 (U=2000)       | 0.120 | 0.154 | 87 985 | 84 577 | **0.961** |
+| zipf s=3 (U=5000)       | 0.145 | 0.211 | 85 536 | 78 892 | **0.922** |
+| scan-polluted (hot 256) | 0.072 | **0.201** | 92 796 | 79 915 | **0.861** |
+
+S3-FIFO has a **strictly higher hit rate on every trace** — 4 % fewer embeds on mild Zipf, **14 % fewer** on
+scan-polluted streams (where FIFO admits one-hit-wonders and evicts the hot set; S3-FIFO's Small queue
+absorbs them). Per cache op S3-FIFO is ~2× the FIFO time (≈52 ns→110 ns), but that is **ns-scale vs the embed
+it avoids** (µs for the hash embedder, ~0.5 ms for model2vec/Native), so the net is positive end-to-end and
+**scales with embedder cost** — timely as the pure-Rust Native/model embedders land (`a18943d`).
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  cargo bench -p frankensearch-embed --profile release --bench cache_replay
+```
+
+**Conformance:** `frankensearch-embed` lib **292/292** GREEN — the existing cache tests (hit/miss, stats,
+cap=1/2 eviction) all pass (at small sizes with freq 0, S3-FIFO matches FIFO order) plus a new
+`s3fifo_keeps_reused_key_through_scan` proving a reused key survives a cold scan that overflows the cache.
+
+**Scope:** original-comparator ratio **N/A** (internal cache policy). This is the S3-FIFO admission half of
+**bd-tjkm**; the `cache_replay` bench is the replay-trace churn-identification the bead requires before the
+policy change. Kept bench: `cache_replay`. **Route next (bd-tjkm remainder):** the expected-loss
+candidate-budget controller (candidate_multiplier / quality_timeout from measured latency-vs-loss) + a full
+query-path replay harness with deterministic fallback.
