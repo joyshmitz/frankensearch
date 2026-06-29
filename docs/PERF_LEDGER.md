@@ -2377,3 +2377,30 @@ stable-sort O(N) scratch allocation + has better constant factors, saving ~595 �
 **Original-comparator relevance:** this is the frankensearch-side final ordering of the **`limit_all`**
 path — the documented biggest gap vs the Tantivy/Lucene/Meilisearch-class incumbent (BOLD `limit_all` row).
 It shrinks the frankensearch side of that inherent gap. Internal sort lever; `winners_sort` bench kept.
+
+---
+
+## 2026-06-29 — MRL rescore final sort: stable `sort_by` → `sort_unstable_by` (~1.16–1.47×, same lever) (BlackThrush)
+
+**Lever LANDED (single-crate, bit-identical) — extends the winners-sort sweep.** `mrl_search_with_stats`
+(`mrl.rs:325`, the Matryoshka truncated-dims rescore search path) ordered its `rescored` candidates with a
+stable `sort_by` before `truncate(limit)`. The comparator is the **identical strict total order** as the
+exact-search winners sort — `nan_safe(score).total_cmp` then a **unique `index` tiebreak** (vector position,
+distinct per rescored entry) — so `sort_unstable_by` is bit-identical and drops the mergesort scratch alloc.
+Directly covered by the `winners_sort` bench (same crate, same `score`+`index` comparator):
+
+| Winners (path) | stable `sort_by` | `sort_unstable_by` | ratio | speedup |
+|----------------|------------------|--------------------|-------|---------|
+| `n100`   | 1.302 µs  | 1.121 µs  | 0.86 | ~1.16× |
+| `n10000` | 247.6 µs  | 188.2 µs  | 0.76 | ~1.32× |
+| `n50000` | 1858.2 µs | 1263.7 µs | 0.68 | ~1.47× |
+
+**Negative result on the same sweep — `IndexWriter::finish` records sort MUST stay stable (REVERTED).** The
+`finish()` full-corpus records sort (`lib.rs:1624`, `doc_id_hash` then `doc_id`) looked like the same lever,
+but `self.records` can contain **duplicate `doc_id`s** (soft-delete then rewrite), so the comparator is NOT
+a strict total order and the **stable** sort is load-bearing for last-write-wins among dupes. Switching to
+`sort_unstable_by` broke `soft_delete_wal_restores_state_on_rewrite_failure`. Reverted to `sort_by` and added
+a guard comment. Lesson: the stable→unstable lever requires a **truly unique** tiebreak key — verify the data
+can't carry duplicate keys (here, updated/rewritten docs), not just that the comparator *names* a unique field.
+
+**Original-comparator ratio: N/A** (internal sort lever; MRL is a frankensearch-only truncated-dims search path).

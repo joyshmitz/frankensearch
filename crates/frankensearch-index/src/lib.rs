@@ -1621,6 +1621,11 @@ impl VectorIndexWriter {
     /// `SearchError::Io` for filesystem write/sync failures.
     #[allow(clippy::too_many_lines)]
     pub fn finish(mut self) -> SearchResult<()> {
+        // STABLE sort is load-bearing here: `self.records` can contain duplicate
+        // `doc_id`s (soft-delete then rewrite), so the comparator is NOT a strict
+        // total order, and stable ordering preserves last-write-wins among dupes
+        // (verified by `soft_delete_wal_restores_state_on_rewrite_failure`). Do not
+        // switch to `sort_unstable_by`.
         self.records.sort_by(|left, right| {
             left.doc_id_hash
                 .cmp(&right.doc_id_hash)

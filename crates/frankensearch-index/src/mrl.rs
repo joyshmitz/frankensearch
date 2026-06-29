@@ -321,8 +321,12 @@ impl VectorIndex {
             });
         }
 
-        // Select top `limit` from rescored candidates.
-        rescored.sort_by(|a, b| {
+        // Select top `limit` from rescored candidates. Strict total order (score
+        // `total_cmp`, then unique `index` tiebreak) → `sort_unstable_by` is
+        // bit-identical to a stable sort and drops the mergesort scratch alloc.
+        // Same lever as the exact-search winners sort (`winners_sort` bench,
+        // ~1.16–1.47×; identical `score`+`index` comparator).
+        rescored.sort_unstable_by(|a, b| {
             nan_safe(b.score)
                 .total_cmp(&nan_safe(a.score))
                 .then_with(|| a.index.cmp(&b.index))
