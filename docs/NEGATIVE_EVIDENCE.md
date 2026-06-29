@@ -3485,3 +3485,36 @@ per-token hot loop. **Route next:** the max-reduction SIMD kernel is real and re
 pattern only pays where the reduced loop is a *large fraction* of a measured hot path; no such home exists in
 the core/index/fusion crates today (fusion `min_max_normalize`/`z_score_normalize` are off the RRF rank path).
 Do not wire the softmax max without a way to measure the native reranker forward end-to-end.
+
+---
+
+## 2026-06-29 — RRF precomputed-key comparator (int keys + doc_id-prefix u64) is ~0/slight-regression once struct growth is charged (BlackThrush)
+
+**Lever tested and rejected — distinct from the radix refutation (which rejected replacing the sort
+algorithm).** The `limit_all` RRF final sort (`rrf.rs:341`, ~22% of limit_all) is comparison-bound:
+`cmp_for_ranking` runs `f64::total_cmp` + `f32::total_cmp` + byte-by-byte `str::cmp` per comparison,
+O(N log N)×. Hypothesis: precompute, O(N)×, a `total_cmp`-equivalent i64/i32 key per score level + a
+big-endian u64 doc_id prefix (full `str::cmp` fallback only on prefix-tie, so **bit-identical order** —
+asserted), turning each comparison into cheap integer compares. Built `rrf_sort_key` (committed), realistic
+limit_all-shaped input (N docs, `1/(60+rank)` with wrap → pervasive ties, ~20% in-both).
+
+**Measured (per-crate, `-p frankensearch-fusion`, honest A/B: `current` = production-shape struct + total_cmp
+comparator; `fast` = struct + **3 added key fields** + the O(N) precompute pass + int-key comparator):**
+
+| N | current (small struct) | fast (keyed struct + precompute) | ratio |
+|---|------------------------|----------------------------------|-------|
+| 10000 | 873.06 µs `[850,898]` | 892.01 µs `[883,905]` | 1.02 (CIs overlap → tie) |
+| 50000 | 4.8652 ms `[4.75,5.00]` | 5.0687 ms `[4.95,5.20]` | 1.04 (slightly SLOWER) |
+
+**Decision: rejected, no production change (bench-only).** A first pass that left the 3 key fields on the
+struct for *both* arms showed a misleading 1.07–1.14× "win" — but that only proved the comparator is cheaper
+*at a fixed (bigger) struct size*. Charged honestly, the lever **loses on two fronts that cancel the
+comparator savings**: (1) the O(N) precompute pass (key_f64 + key_f32 + doc_prefix per element), and (2) the
+~18% `FusedHitScratch` size growth (3 added fields → 8/4/8 B), which makes every pdqsort swap copy more
+bytes — and the sort, while comparison-*bound*, still moves the records. Net ~0 to 4% slower. The cheaper
+per-comparison work is real but the per-element precompute + per-swap movement of a fatter struct give it
+back. **Route next:** a comparator-key win here would need the keys carried *without* growing the sorted
+record (e.g. sort a separate `(u128 key, u32 idx)` array, then gather) — but the radix-on-indices variant is
+the adjacent idea already refuted structurally (un-radixable String tail + pervasive ties), and gather-by-
+index then needs an unsafe move-out of the `FusedHitScratch` Vec. Not worth it for a ~22%-of-a-noisy-row
+slice. Do not re-attempt fattening `FusedHitScratch` with sort keys.
