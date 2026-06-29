@@ -3215,3 +3215,28 @@ to drop the N materialization clones ~3-5%) — both forbidden by the per-crate 
 against an inherent gap. **`limit_all` is conclusively at its floor for single-crate work; no per-crate
 lever remains on the biggest measured gap.** Original-comparator ratio **N/A** (the gap itself is the
 2026-06-28-decomposed inherent hybrid-vs-lexical-only cost).
+
+---
+
+## 2026-06-29 — indexing-throughput axis is inherent + frankensearch kernels already optimized (no comparator-beatable gap) (BlackThrush)
+
+**Frontier-map completion — flagged to save a future agent a slow indexing-comparator build.** The BOLD
+comparator is search-only; indexing throughput is the one realistic "vs original" axis it doesn't cover.
+Probed the untouched crates (`durability`, `storage`) — they are file-integrity / persistence (xxh3_64
+verify, protect/repair), **not the search or index hot path**, and already examined (28 NEGATIVE_EVIDENCE
+entries). And **no indexing-throughput-vs-Tantivy comparator exists**. Building one is not worth it because
+the axis is **structurally the same inherent hybrid-vs-lexical-only shape as `limit_all`**: frankensearch
+indexes lexical (Tantivy, the incumbent's own ground) **plus** a vector index (embed → FSVI slab write →
+quantize) that Tantivy does not build at all, so frankensearch indexing is *necessarily* slower than
+lexical-only by exactly the vector-build cost — an inherent gap, not a beatable lever.
+
+**And the frankensearch-specific indexing kernels are already measured-optimized** (so the inherent overhead
+is already minimized): FSVI slab write **6.4–7.3×** (`2a4d333`), int8 quantize **5.2–5.9×** (`76338bd`),
+4-bit pack **10.3–13.6×** (`dc60d61`), F16C f32→f16 encode **4.1–5.4×** (`9f2356a`), JL embed accumulate
+**2.76×** (`abd4628`), `count_lexical_tokens` LUT **1.5–1.8×** (`d7c8477`). Every per-doc index-build step
+frankensearch owns has a landed SIMD/branchless win; the residual is the irreducible vector-embedding cost.
+**Conclusion: do not build an indexing comparator expecting a winnable gap — the axis is inherent and
+frankensearch's side is at its floor.** With this, the measured-axis map is complete: search top-k =
+**parity-or-better (won)**, search `limit_all` = inherent (no per-crate lever), vector tier = at floor
+(HNSW refuted, kernels AVX2-capped, reductions bandwidth-bound), indexing = inherent + kernels optimized.
+Original-comparator ratio **N/A**.
