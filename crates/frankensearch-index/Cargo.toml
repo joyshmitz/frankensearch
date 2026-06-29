@@ -76,5 +76,9 @@ harness = false
 name = "batched_query_scan"
 harness = false
 
+[[bench]]
+name = "f16_dot_ilp"
+harness = false
+
 [lints]
 workspace = true
