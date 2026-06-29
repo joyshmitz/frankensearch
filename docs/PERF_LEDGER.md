@@ -2239,3 +2239,14 @@ once at final `ScoredResult` assembly), which is exactly the invasive `VectorHit
 2026-06-28 decomposition flagged — and it's forbidden by the per-crate constraint. **Net: the clone is big
 (~23%, the ledger's 3-5% was wrong) but its elision is invasive-multi-crate-blocked, not a clean lever. The
 `materialize_clone` bench is kept as the lever-sizing evidence; no per-crate win is available on it.**
+
+**The alternative elision primitives are ALSO multi-crate-invasive (don't chase them either):** (1)
+**`Arc<str>` doc_ids** would make the clone a refcount bump (~8× cheaper, ~20% off limit_all) — but it
+requires changing the doc_id type on `ScoredResult` + `VectorHit` + `FusedHit` + every construction site +
+the public result API (huge cross-crate blast radius). (2) **inline small-string** (`SmolStr` etc.) doesn't
+help: the public `ScoredResult.doc_id: String` at the end of the pipeline forces the heap allocation
+regardless of an inline type in the middle. So **every approach (move, `Arc<str>`, inline) needs a deep
+cross-cutting type/lifetime change** — the String-everywhere result API + the input-doc_id reuse in phase-2
+make N owned allocations unavoidable per-crate. **The limit_all doc_id clone lever is conclusively closed
+for single-crate work; the deep `Arc<str>`-or-lifetime refactor is the only path and is a deliberate
+multi-crate decision, not a 60-min lever.**
