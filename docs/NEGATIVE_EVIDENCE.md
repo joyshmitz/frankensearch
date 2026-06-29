@@ -3313,3 +3313,41 @@ the mostly-distinct continuous keys, and at these N its `~N·log N` cheap `u64`-
 `sort_unstable_by`). The comparison sort is the right primitive for the vector winners sort; the
 `sort_by → sort_unstable_by` win already shipped (`afb646b`, ~1.16–1.47×) is the floor for this sub-lever.
 Original-comparator ratio **N/A** (internal sort-primitive micro-lever on the `limit_all` gap).
+
+---
+
+## 2026-06-29 — parallel sort does NOT transfer from vector winners to the RRF limit_all sort — REVERTED (BlackThrush)
+
+**Lever tested and reverted.** The gated `par_sort_unstable_by` that won **~2.81× at 50k** on the exact-search
+vector winners sort (`d4bc73c`/`7c53d3f`, `winners_sort` bench) looked like it should transfer directly to
+the *sibling* large-N serial sort on the same `limit_all` path: `rrf_fuse_with_graph`'s full
+`sort_unstable_by(cmp_for_ranking)` (`rrf.rs:341`, runs when `window >= len`). `cmp_for_ranking` is a strict
+total order (`doc_id` tiebreak on the unique map key → bit-identical under a parallel sort), and the
+comparator is *more expensive* than the winners' `compare_best_first`, so the naive expectation was that
+parallelism would amortize even better.
+
+**The opposite happened — measured** (per-crate `rrf_sort` bench, serial vs `par_sort_unstable_by`,
+limit_all-shaped fused set: discrete `1/(k+rank)` scores → **pervasive ties** → the `doc_id` String tiebreak
+fires constantly; bit-identity asserted):
+
+| Fused hits | serial `sort_unstable_by` | `par_sort_unstable_by` | ratio (par/serial) | verdict |
+|------------|---------------------------|------------------------|--------------------|---------|
+| `n10000` | 472.7 µs  | 653.6 µs | **1.38× SLOWER** | regression |
+| `n50000` | 2738 µs   | 2149 µs  | 0.79 (~1.27× faster) | marginal |
+
+**Why it does NOT transfer (the counterintuitive part):** an *expensive* comparator makes the parallel sort
+**worse**, not better, here. (1) The pervasive RRF ties produce large `doc_id`-String tie-groups of uneven
+size → poor parallel load balancing (rayon splits don't align with tie-group boundaries). (2) The element is
+a 40-byte `FusedHitScratch` carrying a `String` (24-byte ptr/len/cap) vs the winners' 16-byte POD
+`HeapEntry`, so the merge/partition data movement is ~2.5× heavier per element and dominates. The serial
+`sort_unstable_by` (pdqsort) handles the tie-groups and the larger elements with better cache locality.
+Net: a regression below ~50k and only a modest 1.27× at 50k — far from the winners' 2.81×, with an uncertain
+crossover and a real regression zone over the common limit_all sizes.
+
+**Decision: reverted** (bench removed, `Cargo.toml` registration reverted; `rrf.rs` untouched — the serial
+`sort_unstable_by` stays). The parallel-sort primitive is **kept only on the cheap-comparator vector winners
+sort** (`7c53d3f`), where it cleanly wins; it is **not** a blanket lever for every large-N sort. Lesson: a
+parallel comparison sort pays when elements are small/POD and the comparator is cheap (winners), and loses
+when elements carry heap payloads and the comparator hits pervasive variable-size tie-groups (RRF). Measure
+each site — do not assume a sort primitive transfers across comparators. Original-comparator ratio **N/A**
+(internal sort-primitive micro-lever on the limit_all gap).
