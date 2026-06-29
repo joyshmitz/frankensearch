@@ -3018,3 +3018,30 @@ invasive**, not 60-min micro-levers: (a) a BOLD **selective-filter comparator ro
 number for the gather — needs a fair Tantivy filter-then-search incumbent), (b) the **FSVI raw-mmap gather**
 (mutation-safe generation-keyed cache invalidation over tombstones+WAL), (c) the `VectorHit<'a>` /
 u64-doc-id-key refactors for the last `limit_all` clones. Pick one as a deliberate fresh cycle.
+
+---
+
+## 2026-06-29 — wider-SIMD (AVX-512 / VNNI) is HARDWARE-UNAVAILABLE — AVX2 is the ceiling here (BlackThrush)
+
+**Not attempted — hardware blocker, flagged to save effort.** After the per-crate micro-lever frontier was
+exhausted, the last "radical primitive" angle was a **wider SIMD** dot kernel above the landed AVX2 ones:
+AVX-512 (16-wide f32 / 32-wide i8) or, best of all, **AVX-512-VNNI `vpdpbusd`** (4 int8 mul-accumulates per
+lane in one instruction) for the int8 two-pass pass-1. Crucially, an int8 VNNI dot would be **bit-identical**
+to the AVX2 int8 dot (integer accumulation — no float reorder), so it would dodge the usual cross-host
+ULP concern.
+
+**But the deployment/bench CPU has no AVX-512.** `rch exec` reports the host as an **AMD Ryzen Threadripper
+PRO 5975WX (Zen3, 32-core)** with CPU flags `avx2 f16c fma` and **no `avx512*` / `vnni`** (Zen3 predates
+AMD AVX-512, which arrives in Zen4). So: (1) a VNNI/AVX-512 kernel can't run or be measured on this host;
+(2) it wouldn't benefit this deployment at all; and (3) even on a hypothetical AVX-512 host, signed×signed
+int8 (`i8·i8`) isn't a single VNNI op — `vpdpbusd` is **u8·i8**, so it needs an offset-by-128 + correction
+(extra work), and a clean single-instruction signed path needs **AVX-VNNI-INT8 `vpdpbssd`** (Sapphire
+Rapids / Zen5+ only). And the int8 two-pass pass-1 is **bandwidth-bound** (reading the `N·d`-byte slab), so
+a wider *compute* kernel would likely be ~0-gain on the scan even where AVX-512 exists.
+
+**Conclusion: the AVX2 runtime-dispatch kernels (`dot_i8_i8`, `dot_product_f16_bytes_f32`, the 4-bit and
+f32 dots) are the SIMD ceiling for the target hardware (Zen3).** Do not attempt AVX-512/VNNI kernels unless
+the deployment moves to Zen4+/AVX-512 hardware AND a compute-bound (not bandwidth-bound) kernel is the
+proven bottleneck. Original-comparator ratio **N/A**. With this, the radical-lever search space — software
+micro-levers (≈15 veins, all mined/landed), wider SIMD (hardware-unavailable), and the head-to-head
+filtered comparator (structurally N/A) — is comprehensively closed for the current code + hardware.
