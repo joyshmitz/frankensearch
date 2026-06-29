@@ -2404,3 +2404,34 @@ a guard comment. Lesson: the stable→unstable lever requires a **truly unique**
 can't carry duplicate keys (here, updated/rewritten docs), not just that the comparator *names* a unique field.
 
 **Original-comparator ratio: N/A** (internal sort lever; MRL is a frankensearch-only truncated-dims search path).
+
+---
+
+## 2026-06-29 — limit_all winners sort: gated PARALLEL sort (`par_sort_unstable_by`) ~2.81× at 50k (BlackThrush)
+
+**Lever LANDED (single-crate, bit-identical) — a NEW primitive on the biggest gap (`limit_all`).** The
+exact-search `limit_all` scan-all final sort (`search.rs:183`, `winners` holds *every* match) was a serial
+`sort_unstable_by`. The earlier ledger rejected parallelizing the materialization *clone* (allocator-bound),
+but the **sort** is CPU-bound (comparison sort) and parallelizes cleanly. Gated `par_sort_unstable_by`
+(rayon) above `PAR_SORT_THRESHOLD = 16_384` winners; below it the serial sort stays (rayon spawn/merge
+overhead is not amortized for the cheap `compare_best_first` comparison). Bit-identical — `compare_best_first`
+is a strict total order, so the parallel sort yields the same unique order. Conformance GREEN (index lib 374/374).
+
+**Measured** (per-crate `winners_sort` bench, `par` arm vs serial `sort_unstable_by`):
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --bench winners_sort
+```
+
+| Winners | serial `sort_unstable_by` | `par_sort_unstable_by` | ratio | verdict |
+|---------|---------------------------|------------------------|-------|---------|
+| `n100`   | 1.76 µs   | 1.14 µs   | (noise; rayon serial-fallback) | serial (below threshold) |
+| `n10000` | 196.0 µs  | 184.7 µs  | ~1.06× (marginal/noisy)        | serial (below threshold) |
+| `n50000` | 1284.3 µs | 457.6 µs  | **0.36 (~2.81×)**              | **parallel (≥16384)** |
+
+Threshold 16384 keeps the marginal/noisy n10000 zone serial and only parallelizes where the win is clear and
+large — the `limit_all` case. Stacks on the earlier serial `sort_by → sort_unstable_by` win (`afb646b`):
+together ~1.16× (top-k) → ~4.1× (50k winners, stable→par) on the biggest measured gap.
+
+**Original-comparator relevance:** shrinks the frankensearch side of the `limit_all` BOLD gap vs the
+Tantivy/Lucene/Meilisearch-class incumbent. Internal sort lever; `winners_sort` bench (now with `par` arm) kept.

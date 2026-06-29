@@ -21,6 +21,7 @@ use std::cmp::Ordering;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use rayon::slice::ParallelSliceMut;
 
 #[derive(Clone, Copy)]
 struct HeapEntry {
@@ -69,6 +70,11 @@ fn sort_unstable(mut v: Vec<HeapEntry>) -> usize {
     v[0].index
 }
 
+fn sort_par(mut v: Vec<HeapEntry>) -> usize {
+    v.par_sort_unstable_by(compare_best_first);
+    v[0].index
+}
+
 fn bench_winners_sort(c: &mut Criterion) {
     let mut g = c.benchmark_group("winners_sort");
     // n100 = bounded top-k; n10000/n50000 = limit_all scan-all winners.
@@ -87,6 +93,13 @@ fn bench_winners_sort(c: &mut Criterion) {
             b.iter_batched(
                 || v.clone(),
                 |v| black_box(sort_unstable(v)),
+                criterion::BatchSize::LargeInput,
+            );
+        });
+        g.bench_with_input(BenchmarkId::new("par", &id), &base, |b, v| {
+            b.iter_batched(
+                || v.clone(),
+                |v| black_box(sort_par(v)),
                 criterion::BatchSize::LargeInput,
             );
         });
