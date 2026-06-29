@@ -1852,3 +1852,41 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
 the second register is a latency unlock, not just more width. **LESSON: a SIMD kernel whose hot recurrence
 is a single-register dependency chain is latency-bound — add a 2nd independent accumulator register (more
 lanes) before assuming the SIMD is saturated.** Kept bench arms: `jl_accumulate/{scalar,avx2_4lane,avx2_8lane}`.
+
+### 2026-06-28 — AVX2 element-wise vector accumulate (model2vec mean-pool): ~1.4–1.6× (BlackThrush)
+
+**Lever (the one candidate I'd dismissed by REASONING, not measuring).** `Model2VecEmbedder::embed_sync`
+mean-pools by accumulating each in-vocab token's embedding row into a sum (`sum[d] += row[d]`, T tokens ×
+`dim`). I'd assumed LLVM auto-vectorizes it away — true, but only to the **SSE2 baseline** (this workspace
+builds with no global `+avx2`). New `simd::accumulate_f32_into` runtime-dispatches to a hand-written AVX2
+kernel (`_mm256_loadu_ps`/`_mm256_add_ps`/`_mm256_storeu_ps`, 8 f32/instruction = 32-byte loads), which
+roughly doubles the per-cycle load bandwidth on this memory-bound loop. `model2vec_embedder.rs`'s mean-pool
+now calls it.
+
+**Bit-identical:** each `sum[d] += row[d]` is an independent element-wise add (NOT a cross-lane reduction),
+so SIMD only changes how many dims are added per instruction, never the per-dim arithmetic — unlike the
+dot/JL reductions, this needs no reorder. `simd::tests::avx2_accumulate_matches_scalar` asserts `to_bits`
+equality across 11 dim shapes accumulated over 5 rows. Conformance: **291/291** default embed lib tests +
+**27/27** `--features model2vec` tests (the mean-pool feeds `embed_output_is_l2_normalized`,
+`embed_deterministic`, etc.) GREEN.
+
+**Measured (per-crate `hash_embed` bench, dim 384, 64-row mean-pool; the production `accumulate_f32_into`):**
+
+| Workload | scalar (SSE2 auto-vec) | AVX2 dispatch | Ratio | Status |
+|----------|------------------------|---------------|-------|--------|
+| `vec_accumulate` run 1 | 2.194 µs | 1.530 µs | **0.70 (~1.43×)** | KEEP |
+| `vec_accumulate` run 2 | 2.735 µs | 1.680 µs | **0.61 (~1.63×)** | KEEP |
+
+(AVX2 is consistent ~1.5–1.7 µs; the scalar arm is the noisier one, so ~1.4–1.6× is the honest range.)
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+  cargo bench -p frankensearch-embed --profile release --bench hash_embed -- vec_accumulate
+```
+
+**Scope:** original-comparator ratio **N/A** (own embedder). `Model2Vec` is the **opt-in** quality tier
+(`model2vec` feature, potion-128M static embedder), so this speeds the mean-pool for deployments that pick
+it. **Lesson reinforced (the one that bit me on the f16 dot): MEASURE, don't reason — I'd written off this
+loop as "auto-vectorized" but the build's SSE2-only baseline left a clean ~1.5× on the table for a manual
+AVX2 (wider loads).** Element-wise (non-reduction) kernels are the bit-identical-SAFE place to widen SIMD.
+First SIMD in the embed crate's shared path (reusable `accumulate_f32_into`). Kept bench: `vec_accumulate`.

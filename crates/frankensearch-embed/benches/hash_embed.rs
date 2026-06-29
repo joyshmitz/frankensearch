@@ -303,6 +303,42 @@ fn bench_hash_embed(c: &mut Criterion) {
         });
         ag.finish();
     }
+
+    // Element-wise vector accumulate `sum[d] += row[d]` — the model2vec mean-pool
+    // inner loop. Bit-identical under SIMD (no reduction reorder). Scalar (LLVM
+    // auto-vec, SSE2 on this build) vs a manual AVX2 (32-byte loads). Measures
+    // whether wider loads beat the auto-vectorized path before adopting it.
+    {
+        const VD: usize = 384;
+        const TOKENS: usize = 64;
+        let rows: Vec<Vec<f32>> = (0..TOKENS)
+            .map(|t| (0..VD).map(|d| ((t * 31 + d) % 97) as f32 * 0.01).collect())
+            .collect();
+        let mut va = c.benchmark_group("vec_accumulate");
+        va.bench_function("scalar", |b| {
+            let mut sum = vec![0.0_f32; VD];
+            b.iter(|| {
+                sum.fill(0.0);
+                for row in &rows {
+                    for (s, r) in sum.iter_mut().zip(row.iter()) {
+                        *s += *r;
+                    }
+                }
+                black_box(&sum);
+            });
+        });
+        va.bench_function("avx2_dispatch", |b| {
+            let mut sum = vec![0.0_f32; VD];
+            b.iter(|| {
+                sum.fill(0.0);
+                for row in &rows {
+                    frankensearch_embed::accumulate_f32_into(black_box(&mut sum), black_box(row));
+                }
+                black_box(&sum);
+            });
+        });
+        va.finish();
+    }
 }
 
 criterion_group!(benches, bench_hash_embed);

@@ -16,6 +16,8 @@ pub mod cached_embedder;
 pub mod model_cache;
 pub mod model_manifest;
 pub mod model_registry;
+pub mod simd;
+pub use simd::accumulate_f32_into;
 pub use auto_detect::{
     DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus, TwoTierAvailability,
 };
