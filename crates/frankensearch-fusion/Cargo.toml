@@ -95,3 +95,7 @@ harness = false
 [[bench]]
 name = "materialize_clone"
 harness = false
+
+[[bench]]
+name = "rrf_sort_key"
+harness = false
