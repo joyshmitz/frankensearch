@@ -251,14 +251,36 @@ unsafe fn dot_product_f16_f32_avx2(stored: &[f16], query: &[f32]) -> f32 {
     let mut arr = [0.0_f32; 8];
     // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded; `&[f16]` is
     // contiguous little-endian f16 (2 bytes/elem), so a 16-byte load is 8 f16.
-    unsafe {
-        let mut sum = _mm256_setzero_ps();
-        for c in 0..chunks {
-            let f16bits = _mm_loadu_si128(stored.as_ptr().add(c * 8).cast::<__m128i>());
+    // Four independent accumulators break the per-iteration `vaddps` dependency
+    // chain (the kernel is ~4-cycle-add-latency-bound, not decode-throughput-bound
+    // at one accumulator); the `(s0+s1)+(s2+s3)` tree + grouped chunk→lane mapping
+    // is matched bit-for-bit in `dot_product_f16_f32_generic`.
+    macro_rules! mul_chunk {
+        ($c:expr) => {{
+            let f16bits = _mm_loadu_si128(stored.as_ptr().add($c * 8).cast::<__m128i>());
             let s = _mm256_cvtph_ps(f16bits);
-            let q = _mm256_loadu_ps(query.as_ptr().add(c * 8));
-            sum = _mm256_add_ps(sum, _mm256_mul_ps(s, q));
+            let q = _mm256_loadu_ps(query.as_ptr().add($c * 8));
+            _mm256_mul_ps(s, q)
+        }};
+    }
+    unsafe {
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut s3 = _mm256_setzero_ps();
+        let mut c = 0;
+        while c + 4 <= chunks {
+            s0 = _mm256_add_ps(s0, mul_chunk!(c));
+            s1 = _mm256_add_ps(s1, mul_chunk!(c + 1));
+            s2 = _mm256_add_ps(s2, mul_chunk!(c + 2));
+            s3 = _mm256_add_ps(s3, mul_chunk!(c + 3));
+            c += 4;
         }
+        while c < chunks {
+            s0 = _mm256_add_ps(s0, mul_chunk!(c));
+            c += 1;
+        }
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
         _mm256_storeu_ps(arr.as_mut_ptr(), sum);
     }
     let mut result = f32x8::from(arr).reduce_add();
@@ -273,27 +295,34 @@ unsafe fn dot_product_f16_f32_avx2(stored: &[f16], query: &[f32]) -> f32 {
 #[doc(hidden)]
 #[must_use]
 pub fn dot_product_f16_f32_generic(stored: &[f16], query: &[f32]) -> f32 {
-    let mut sum = f32x8::splat(0.0);
-    let mut stored_chunks = stored.chunks_exact(8);
-    let mut query_chunks = query.chunks_exact(8);
-
-    for (stored_chunk, query_chunk) in stored_chunks.by_ref().zip(query_chunks.by_ref()) {
-        let s: &[f16; 8] = stored_chunk
-            .try_into()
-            .expect("chunks_exact(8) yields 8 elements");
-        let q: &[f32; 8] = query_chunk
-            .try_into()
-            .expect("chunks_exact(8) yields 8 elements");
-        sum += widen8_f16_slice(s) * f32x8::from(*q);
+    let n = stored.len().min(query.len());
+    let chunks = n / 8;
+    // Four independent accumulators with the `(s0+s1)+(s2+s3)` tree — bit-for-bit
+    // the grouped chunk→lane mapping of `dot_product_f16_f32_avx2`.
+    let prod = |c: usize| -> f32x8 {
+        let s: &[f16; 8] = stored[c * 8..c * 8 + 8].try_into().expect("8 f16");
+        let q: &[f32; 8] = query[c * 8..c * 8 + 8].try_into().expect("8 f32");
+        widen8_f16_slice(s) * f32x8::from(*q)
+    };
+    let mut s0 = f32x8::splat(0.0);
+    let mut s1 = f32x8::splat(0.0);
+    let mut s2 = f32x8::splat(0.0);
+    let mut s3 = f32x8::splat(0.0);
+    let mut c = 0;
+    while c + 4 <= chunks {
+        s0 += prod(c);
+        s1 += prod(c + 1);
+        s2 += prod(c + 2);
+        s3 += prod(c + 3);
+        c += 4;
     }
-
-    let mut result = sum.reduce_add();
-    for (s, q) in stored_chunks
-        .remainder()
-        .iter()
-        .zip(query_chunks.remainder())
-    {
-        result += s.to_f32() * q;
+    while c < chunks {
+        s0 += prod(c);
+        c += 1;
+    }
+    let mut result = ((s0 + s1) + (s2 + s3)).reduce_add();
+    for index in (chunks * 8)..n {
+        result += stored[index].to_f32() * query[index];
     }
     result
 }
@@ -362,16 +391,37 @@ unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> 
     let dim = query.len();
     let chunks = dim / 8;
     let mut arr = [0.0_f32; 8];
+    // Four independent accumulators break the single-`vaddps` dependency chain
+    // (latency-bound at one accumulator); grouped chunk→lane mapping + `(s0+s1)+
+    // (s2+s3)` tree matched bit-for-bit in `dot_product_f16_bytes_f32_generic`.
+    macro_rules! mul_chunk {
+        ($c:expr) => {{
+            let f16bits =
+                _mm_loadu_si128(stored_bytes.as_ptr().add($c * 16).cast::<__m128i>());
+            let stored = _mm256_cvtph_ps(f16bits);
+            let q = _mm256_loadu_ps(query.as_ptr().add($c * 8));
+            _mm256_mul_ps(stored, q)
+        }};
+    }
     // SAFETY: avx2+f16c by contract; every load is `chunk_index < chunks`-bounded.
     unsafe {
-        let mut sum = _mm256_setzero_ps();
-        for chunk_index in 0..chunks {
-            let f16bits =
-                _mm_loadu_si128(stored_bytes.as_ptr().add(chunk_index * 16).cast::<__m128i>());
-            let stored = _mm256_cvtph_ps(f16bits);
-            let q = _mm256_loadu_ps(query.as_ptr().add(chunk_index * 8));
-            sum = _mm256_add_ps(sum, _mm256_mul_ps(stored, q));
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut s3 = _mm256_setzero_ps();
+        let mut c = 0;
+        while c + 4 <= chunks {
+            s0 = _mm256_add_ps(s0, mul_chunk!(c));
+            s1 = _mm256_add_ps(s1, mul_chunk!(c + 1));
+            s2 = _mm256_add_ps(s2, mul_chunk!(c + 2));
+            s3 = _mm256_add_ps(s3, mul_chunk!(c + 3));
+            c += 4;
         }
+        while c < chunks {
+            s0 = _mm256_add_ps(s0, mul_chunk!(c));
+            c += 1;
+        }
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
         _mm256_storeu_ps(arr.as_mut_ptr(), sum);
     }
     // Final reduce + scalar tail are byte-for-byte the generic path.
@@ -391,25 +441,35 @@ unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> 
 pub fn dot_product_f16_bytes_f32_generic(stored_bytes: &[u8], query: &[f32]) -> f32 {
     let dim = query.len();
     let chunks = dim / 8;
-    let mut sum = f32x8::splat(0.0);
-
-    for chunk_index in 0..chunks {
-        let byte_offset = chunk_index * 16;
-        let query_offset = chunk_index * 8;
-
-        let block: &[u8; 16] = stored_bytes[byte_offset..byte_offset + 16]
+    // Four independent accumulators with the `(s0+s1)+(s2+s3)` tree — bit-for-bit
+    // the grouped chunk→lane mapping of `dot_product_f16_bytes_f32_avx2`.
+    let prod = |c: usize| -> f32x8 {
+        let block: &[u8; 16] = stored_bytes[c * 16..c * 16 + 16]
             .try_into()
             .expect("16-byte f16 block");
-        let stored_chunk = widen8_f16_bytes(block);
-
-        let q: &[f32; 8] = query[query_offset..query_offset + 8]
+        let q: &[f32; 8] = query[c * 8..c * 8 + 8]
             .try_into()
             .expect("8-element query block");
-
-        sum += stored_chunk * f32x8::from(*q);
+        widen8_f16_bytes(block) * f32x8::from(*q)
+    };
+    let mut s0 = f32x8::splat(0.0);
+    let mut s1 = f32x8::splat(0.0);
+    let mut s2 = f32x8::splat(0.0);
+    let mut s3 = f32x8::splat(0.0);
+    let mut c = 0;
+    while c + 4 <= chunks {
+        s0 += prod(c);
+        s1 += prod(c + 1);
+        s2 += prod(c + 2);
+        s3 += prod(c + 3);
+        c += 4;
+    }
+    while c < chunks {
+        s0 += prod(c);
+        c += 1;
     }
 
-    let mut result = sum.reduce_add();
+    let mut result = ((s0 + s1) + (s2 + s3)).reduce_add();
     for index in (chunks * 8)..dim {
         let b = &stored_bytes[index * 2..];
         let val = f16::from_le_bytes([b[0], b[1]]).to_f32();

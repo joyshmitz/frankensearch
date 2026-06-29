@@ -2501,3 +2501,42 @@ Conformance: `frankensearch-index` lib **373/374** — the lone failure is the *
 gated sort: tiny test corpora never reach the 16384 parallel branch, and the serial `else` path is
 byte-identical to before). Original-comparator relevance: shrinks the in-memory fast-tier side of the
 limit_all gap. The `winners_sort` bench covers it.
+
+---
+
+## 2026-06-29 — exact f16·f32 dot kernel: single→4 accumulators = 1.45× (gather + pass-2 + small-N hot path) (BlackThrush)
+
+**Lever LANDED (per-crate, conformance GREEN).** The shipped exact f16 dot kernels accumulated into a
+**single** `__m256`/`f32x8` (`sum = add(sum, mul(decode(f16), q))`), so each iteration's `vaddps` waited on
+the previous one — the loop was **latency-bound on the ~4-cycle f32-add chain** (~48 chunks at dim=384),
+while the hardware can retire `vcvtph2ps`/`vmulps` 3–4× faster. Split into **four independent accumulators**
+(`(s0+s1)+(s2+s3)` tree, grouped chunk→lane mapping) to make the loop decode-throughput-bound. Applied
+identically to all four variants — `dot_product_f16_f32_avx2`, `dot_product_f16_f32_generic`,
+`dot_product_f16_bytes_f32_avx2`, `dot_product_f16_bytes_f32_generic` — so the AVX2≡generic bit-identity
+tests stay GREEN by construction.
+
+**Measured (per-crate, in-process A/B, dim=384, 4096-vector f16 scan; `f16_dot_ilp` bench, commit prior):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-index --bench f16_dot_ilp
+```
+
+| kernel | time (4096×384 f16 dots) | ratio |
+|--------|--------------------------|-------|
+| `acc1` (shipped single-accumulator) | 110.16 µs | 1.00 |
+| `acc4` (4 independent accumulators) | **75.81 µs** | **0.688 (1.45× faster)** |
+
+**Conformance:** `frankensearch-index` lib **355/356** — the lone failure is the **pre-existing flaky**
+`soft_delete_wal_restores_state_on_rewrite_failure` (a WAL-restoration test on root workers, intermittent,
+unrelated: it exercises tombstone/WAL recovery, never the dot kernels). Both `avx2_f16dot_matches_generic`
+and `avx2_f16slicedot_matches_generic` **passed** (the 4-acc reassociation is matched bit-for-bit between
+AVX2 and generic). A real `Compiling frankensearch-index` rebuild was confirmed (not stale cache).
+
+**Quality:** the 4-acc partial-sum order shifts each f32 dot by ULPs vs the old single-acc — a
+reassociation in the class the project already accepts (MMR cosine 4-acc, softmax/GELU). No ranking or
+dot-value test regressed (355/356, the one being the unrelated WAL flake), so it is quality-neutral in
+practice. **Original-comparator relevance:** the exact f16 dot is the per-vector kernel of the selective-
+filter **gather** (`gather_range`), the two-pass **pass-2 refine**, and the small-N exact scan — so this
+speeds frankensearch's filtered/exact vector paths vs a Tantivy/Lucene/Meilisearch-class incumbent. The
+`f16_dot_ilp` bench covers it.
