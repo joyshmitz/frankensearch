@@ -288,8 +288,24 @@ fn cosine_sim_pre(a: &[f32], b: &[f32], root_a: f64, root_b: f64) -> f64 {
         return 0.0;
     }
 
-    let mut dot = 0.0_f64;
-    for i in 0..len {
+    // Four independent f64 accumulators break the single-accumulator loop-carried
+    // dependency (latency-bound at ~1 add/4-5 cyc), letting LLVM auto-vectorize the
+    // f32→f64 widen + multiply-add to SSE2/AVX — ~1.6× on `mmr_rerank` end-to-end
+    // (the pairwise dot dominates MMR at realistic n·k). Search-time reranking score
+    // (not a persisted embedding), so the f64 reassociation is the same accepted ULP
+    // trade as the vector-search dot kernels; selection stays identical (verified by
+    // the `mmr_rerank` bench's `assert_eq` and the `mmr::` tests).
+    let mut acc = [0.0_f64; 4];
+    let chunks = len / 4;
+    for c in 0..chunks {
+        let i = c * 4;
+        acc[0] += f64::from(a[i]) * f64::from(b[i]);
+        acc[1] += f64::from(a[i + 1]) * f64::from(b[i + 1]);
+        acc[2] += f64::from(a[i + 2]) * f64::from(b[i + 2]);
+        acc[3] += f64::from(a[i + 3]) * f64::from(b[i + 3]);
+    }
+    let mut dot = acc[0] + acc[1] + acc[2] + acc[3];
+    for i in (chunks * 4)..len {
         dot += f64::from(a[i]) * f64::from(b[i]);
     }
 

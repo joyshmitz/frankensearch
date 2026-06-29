@@ -2055,3 +2055,40 @@ widened `GATHER_SELECTIVITY_DIVISOR` 16 → **10 (N/10)**: ≥1.3× at the bound
 it (no regression — 25/50% rows never reach the gather). **Route next (unchanged):** parallelize the gather
 *setup* (`par_sort_unstable` + parallel allow-set materialization) to push the crossover past 25%; then
 FSVI/lexical plumbing; then a BOLD selective-filter comparator row.
+
+### 2026-06-29 — MMR cosine: 4-accumulator f64 dot → ~1.6× on `mmr_rerank` end-to-end (BlackThrush)
+
+**Lever (a DIFFERENT primitive — multi-accumulator ILP, the proven pattern).** MMR diversity reranking is
+dominated by `cosine_sim_pre`'s inter-doc dot — `O(k·n)` evaluations of a dim-d vector per rerank. That dot
+was a **single-accumulator f64 reduction** (`dot += f64::from(a[i]) * f64::from(b[i])`), latency-bound on
+the loop-carried `dot` and not auto-vectorized (strict f64 order). Reformulated as **4 independent f64
+accumulators** so LLVM auto-vectorizes the f32→f64 widen + multiply-add to SSE2/AVX. No `unsafe`, no SIMD
+intrinsics — pure reassociation.
+
+**Bit-identical selection:** MMR is a **search-time** reranking score (not a persisted embedding), so the
+f64 reassociation is the same accepted ULP trade as the landed vector-search dot kernels. The ULP-level
+score shift does not change the selection at realistic `n·k` — the `mmr_rerank` bench asserts
+`mmr_new == mmr_new_4acc` (identical selected index list) for both shapes, and all `frankensearch-fusion`
+`mmr::` tests pass unchanged.
+
+**Measured (per-crate same-binary A/B, `mmr_rerank` bench, dim 384, medians; `new` = single-acc running-max
+MMR, `new_4acc` = same with the 4-acc dot):**
+
+| shape (pool n, results k) | new (1-acc) | new_4acc | ratio | speedup |
+|---------------------------|-------------|----------|-------|---------|
+| n=100, k=20  | 622.7 µs  | 384.7 µs  | **0.618** | **1.62×** |
+| n=200, k=50  | 3 063.7 µs | 1 896.8 µs | **0.619** | **1.62×** |
+
+```bash
+AGENT_NAME=BlackThrush RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc RUST_LOG=off \
+  cargo bench -p frankensearch-fusion --profile release \
+  --bench mmr_rerank -- --sample-size 30 --warm-up-time 1 --measurement-time 2
+```
+
+**Scope:** original-comparator ratio **N/A** — MMR is an opt-in diversification reranker, not on the default
+BOLD hybrid path, so this is a frankensearch before/after on that path (not a head-to-head dominance claim).
+Real win for the diversification feature: ~1.6× wherever MMR runs. Kept bench arm: `mmr_rerank/new_4acc`.
+**Route next:** the f64 widen + `pmullw`/`mulpd` may now bind the loop; an 8-accumulator split or an AVX2
+`dot_product_f32_f32` (the index crate already has one) wired into fusion could push further — but MMR's
+absolute cost is small, so lower priority than the gather's FSVI/lexical plumbing.

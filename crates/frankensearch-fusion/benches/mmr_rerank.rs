@@ -64,6 +64,34 @@ fn cosine_sim_pre(a: &[f32], b: &[f32], ra: f64, rb: f64) -> f64 {
     dot / denom
 }
 
+// Candidate: 4 independent f64 accumulators break the single-accumulator
+// loop-carried dependency (latency-bound), letting LLVM auto-vectorize the
+// f32→f64 widen + FMA to SSE2/AVX.
+fn cosine_sim_pre_4acc(a: &[f32], b: &[f32], ra: f64, rb: f64) -> f64 {
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let mut acc = [0.0_f64; 4];
+    let chunks = len / 4;
+    for c in 0..chunks {
+        let i = c * 4;
+        acc[0] += f64::from(a[i]) * f64::from(b[i]);
+        acc[1] += f64::from(a[i + 1]) * f64::from(b[i + 1]);
+        acc[2] += f64::from(a[i + 2]) * f64::from(b[i + 2]);
+        acc[3] += f64::from(a[i + 3]) * f64::from(b[i + 3]);
+    }
+    let mut dot = acc[0] + acc[1] + acc[2] + acc[3];
+    for i in (chunks * 4)..len {
+        dot += f64::from(a[i]) * f64::from(b[i]);
+    }
+    let denom = ra * rb;
+    if denom < f64::EPSILON {
+        return 0.0;
+    }
+    dot / denom
+}
+
 fn norm_scores(scores: &[f64]) -> Vec<f64> {
     let (mn, mx) = scores
         .iter()
@@ -189,6 +217,72 @@ fn mmr_new(scores: &[f64], emb: &[&[f32]], k: usize) -> Vec<usize> {
     selected
 }
 
+// Candidate: identical to `mmr_new` but the inter-doc similarity uses the
+// 4-accumulator dot. Same selection (search-time reassociation only shifts the
+// f64 sum by ULPs), so this isolates the kernel speedup end-to-end.
+fn mmr_new_4acc(scores: &[f64], emb: &[&[f32]], k: usize) -> Vec<usize> {
+    let n = scores.len();
+    let ns = norm_scores(scores);
+    let dw = 1.0 - LAMBDA;
+    let roots: Vec<f64> = emb
+        .iter()
+        .map(|e| {
+            let mut s = 0.0_f64;
+            for &x in *e {
+                let x = f64::from(x);
+                s += x * x;
+            }
+            s.sqrt()
+        })
+        .collect();
+    let sim = |i: usize, j: usize| cosine_sim_pre_4acc(emb[i], emb[j], roots[i], roots[j]);
+    let mut selected = Vec::with_capacity(k);
+    let mut remaining = vec![true; n];
+    let first = ns
+        .iter()
+        .enumerate()
+        .fold((0, f64::NEG_INFINITY), |(bi, bs), (i, &s)| {
+            if s > bs { (i, s) } else { (bi, bs) }
+        })
+        .0;
+    selected.push(first);
+    remaining[first] = false;
+    let mut max_sim = vec![f64::NEG_INFINITY; n];
+    for i in 0..n {
+        if remaining[i] {
+            max_sim[i] = sim(i, first);
+        }
+    }
+    for _ in 1..k {
+        let mut best_idx = usize::MAX;
+        let mut best = f64::NEG_INFINITY;
+        for i in 0..n {
+            if !remaining[i] {
+                continue;
+            }
+            let mmr = LAMBDA.mul_add(ns[i], -(dw * max_sim[i]));
+            if mmr > best {
+                best = mmr;
+                best_idx = i;
+            }
+        }
+        if best_idx == usize::MAX {
+            break;
+        }
+        selected.push(best_idx);
+        remaining[best_idx] = false;
+        for i in 0..n {
+            if remaining[i] {
+                let s = sim(i, best_idx);
+                if s > max_sim[i] {
+                    max_sim[i] = s;
+                }
+            }
+        }
+    }
+    selected
+}
+
 fn make_inputs(n: usize, dim: usize) -> (Vec<f64>, Vec<Vec<f32>>) {
     let mut state = 0x2545_f491_4f6c_dd1d_u64 ^ (dim as u64).wrapping_mul(n as u64 + 1);
     let mut next = || {
@@ -211,8 +305,13 @@ fn bench_mmr(c: &mut Criterion) {
     for (n, k) in cases {
         let (scores, emb) = make_inputs(n, dim);
         let refs: Vec<&[f32]> = emb.iter().map(Vec::as_slice).collect();
-        // Correctness: identical selection.
+        // Correctness: identical selection (incl. the 4-acc dot variant).
         debug_assert_eq!(mmr_old(&scores, &refs, k), mmr_new(&scores, &refs, k));
+        assert_eq!(
+            mmr_new(&scores, &refs, k),
+            mmr_new_4acc(&scores, &refs, k),
+            "4-acc cosine must yield identical MMR selection (n{n} k{k})"
+        );
 
         let id = format!("n{n}_k{k}_d{dim}");
         g.bench_with_input(BenchmarkId::new("old", &id), &(), |b, ()| {
@@ -220,6 +319,9 @@ fn bench_mmr(c: &mut Criterion) {
         });
         g.bench_with_input(BenchmarkId::new("new", &id), &(), |b, ()| {
             b.iter(|| black_box(mmr_new(black_box(&scores), black_box(&refs), k)));
+        });
+        g.bench_with_input(BenchmarkId::new("new_4acc", &id), &(), |b, ()| {
+            b.iter(|| black_box(mmr_new_4acc(black_box(&scores), black_box(&refs), k)));
         });
     }
     g.finish();
