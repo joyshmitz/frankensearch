@@ -165,7 +165,11 @@ pub fn rrf_fuse(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
-    rrf_fuse_with_graph(lexical, semantic, &[], 0.0, limit, offset, config)
+    // Merge-structured fusion: byte-identical to `rrf_fuse_with_graph`
+    // (proven by `merge_matches_map_fusion`) but feeds the final sort a
+    // near-sorted (semantic-ordered) input — 1.31-1.46× faster on the limit_all
+    // shape, growing with N (`rrf_merge_fuse` bench).
+    rrf_fuse_with_graph_merge(lexical, semantic, &[], 0.0, limit, offset, config)
 }
 
 /// Fuse lexical, semantic, and optional graph-ranked results with weighted RRF.

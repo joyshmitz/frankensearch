@@ -2540,3 +2540,40 @@ practice. **Original-comparator relevance:** the exact f16 dot is the per-vector
 filter **gather** (`gather_range`), the two-pass **pass-2 refine**, and the small-N exact scan — so this
 speeds frankensearch's filtered/exact vector paths vs a Tantivy/Lucene/Meilisearch-class incumbent. The
 `f16_dot_ilp` bench covers it.
+
+---
+
+## 2026-06-29 — merge-structured RRF fusion: 1.31-1.46× (growing with N) on the limit_all shape (BlackThrush)
+
+**Lever LANDED (single-crate, byte-identical, conformance GREEN).** The RRF fuse built every doc into one
+`N`-entry value `AHashMap`, then `into_values()` (random order) → from-scratch `sort_unstable_by`. The final
+sort is the largest frankensearch-owned slice of `limit_all`, and pdqsort is **adaptive** — a near-sorted
+input sorts in ~O(N) (probe: presorted **4.3-5.8× faster** than random; `rrf_sort_order` bench,
+NEGATIVE_EVIDENCE 2026-06-29). A naive reorder-via-`remove` regressed at large N (cache-miss removes), so
+this restructures the fuse instead: keep small `&str→(rank,score)` lexical/graph contribution maps
+(cache-resident), walk the already-score-sorted `semantic` slice **once in order**, emitting each
+`FusedHitScratch` directly → `results` lands in fused order for the vector-only majority, so the sort runs
+near-O(N). Also drops the `N`-entry value map (replaced by a small `&str` dedup set + sequential `Vec` push).
+
+**Byte-identical:** `rrf_score` is a commutative sum of per-source contributions, so emitting
+`semantic+lexical+graph` instead of `lexical+semantic+graph` is bit-for-bit equal; all fields + the
+`in_both_sources` (lexical ∧ semantic) rule are reproduced exactly. Proven by `merge_matches_map_fusion`
+(40 randomized overlap/graph/dedup/pagination trials, `rrf_score.to_bits()` equality) — GREEN.
+
+**Measured (per-crate, `-p frankensearch-fusion`, `rrf_merge_fuse` bench, limit_all shape: all-N semantic in
+score order + 20% lexical overlap, `limit=N`, head-to-head in one process):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-fusion --bench rrf_merge_fuse
+```
+
+| N | map (`rrf_fuse_with_graph`) | merge | ratio |
+|---|------------------------------|-------|-------|
+| 10000 | 1.3255 ms | 1.0103 ms | **0.76 (1.31× faster)** |
+| 50000 | 9.785 ms  | 6.7137 ms | **0.69 (1.46× faster)** |
+
+The win **grows with N** (opposite of the rejected reorder-via-remove). Wired: `rrf_fuse` (the hot path —
+`limit_all`, sync/async searchers) now calls `rrf_fuse_with_graph_merge`; the map version is kept as the
+differential-test + bench reference. Original-comparator relevance: shrinks the frankensearch-owned RRF slice
+of the `limit_all` gap vs the Tantivy/Lucene/Meilisearch-class incumbent (the `rrf_merge_fuse` bench covers it).
