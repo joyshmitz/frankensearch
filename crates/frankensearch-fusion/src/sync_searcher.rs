@@ -16,7 +16,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier, compute_rank_changes_with_maps};
-use crate::rrf::{candidate_count, rrf_fuse, RrfConfig};
+use crate::rrf::{candidate_count, rrf_fuse, rrf_fuse_with_graph_merge_unique, RrfConfig};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
 pub trait SyncLexicalSearch: Send + Sync {
@@ -150,9 +150,11 @@ impl SyncTwoTierSearcher {
             || vector_hits_to_scored_results(&fast_hits, k, ScoreSource::SemanticFast, None, None),
             |lexical| {
                 fused_hits_to_scored_results(
-                    rrf_fuse(
+                    rrf_fuse_with_graph_merge_unique(
                         lexical,
                         &fast_hits,
+                        &[],
+                        0.0,
                         k,
                         0,
                         &RrfConfig {

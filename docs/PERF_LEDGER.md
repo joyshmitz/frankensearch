@@ -2577,3 +2577,32 @@ The win **grows with N** (opposite of the rejected reorder-via-remove). Wired: `
 `limit_all`, sync/async searchers) now calls `rrf_fuse_with_graph_merge`; the map version is kept as the
 differential-test + bench reference. Original-comparator relevance: shrinks the frankensearch-owned RRF slice
 of the `limit_all` gap vs the Tantivy/Lucene/Meilisearch-class incumbent (the `rrf_merge_fuse` bench covers it).
+
+---
+
+## 2026-06-29 — RRF merge: skip the seen_semantic dedup for unique inputs = 1.10× more (BlackThrush)
+
+**Lever LANDED (single-crate, conformance GREEN).** The merge-structured RRF (`4aeb66b`) dedups the
+`semantic` slice with an O(N) `seen_semantic` `&str` set (mirroring the map's first-occurrence-wins). But a
+vector-index `search_top_k` result has **unique doc_ids by construction** (doc_id is the index key; one live
+record per doc), so that dedup never fires on the production hot path. Added `rrf_fuse_with_graph_merge_unique`
+(shares `rrf_fuse_merge_inner(dedup_semantic: bool)`) which skips the set, and wired the searchers'
+vector-hit fuse calls to it (`sync_searcher` initial fuse, `searcher` graph/non-graph fast-tier fuses). The
+public `rrf_fuse` keeps the defensive dedup for arbitrary callers; `sync_searcher`'s `&blended` refine fuse
+also stays on the dedup path (uniqueness not guaranteed).
+
+**Measured (per-crate, `rrf_merge_fuse` bench, limit_all shape, head-to-head):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-fusion --bench rrf_merge_fuse
+```
+
+| N | merge (dedup) | merge_unique | ratio |
+|---|---------------|--------------|-------|
+| 10000 | 921.51 µs `[915,928]` | 837.36 µs `[824,853]` | **0.909 (1.10× faster)** |
+
+CIs non-overlapping → real (~84 µs = the N hash-inserts). Identical output whenever `semantic` is unique
+(asserted in the bench); `merge_matches_map_fusion` continues to cover the dedup variant. Conformance:
+fusion lib **818/818 GREEN**, `--features graph` builds clean. Stacks on top of the merge win (`4aeb66b`) —
+the production searcher's RRF is now `~1.1×` faster again on the limit_all path.
