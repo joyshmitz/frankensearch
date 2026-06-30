@@ -3556,3 +3556,38 @@ directly (semantic-ordered, near fused order) and applying the lexical boost via
 near-sorted sort input AND avoids both the N-entry hashmap build and the N cache-missing removes — but it is
 a structural rewrite of `rrf_fuse_with_graph` with dedup/graph/lexical-only edge cases to keep bit-identical,
 so it is a scoped follow-up, not a one-commit lever. Do not re-attempt the simple reorder-via-remove.
+
+---
+
+## 2026-06-29 — limit_all materialize doc_id clone MEASURED at ~23% of limit_all (not the estimated 3-5%) but structurally un-elidable per-crate (BlackThrush)
+
+**Measured a previously-estimated-only cost.** The PERF_LEDGER guessed the `limit_all` RRF `into_owned`
+doc_id clones at "~3-5% of limit_all (never measured)". Ran the existing `materialize_clone` bench
+(`-p frankensearch-fusion`): N short-String clones vs borrow.
+
+| N | `owned_clone` (current) | `borrowed` (refactor target) | ratio |
+|---|--------------------------|------------------------------|-------|
+| 10000  | **432.61 µs** | 3.88 µs | ~110× |
+| 100000 | ~4.3 ms (linear) | ~39 µs | ~110× |
+
+**432 µs at 10k is ~23% of `limit_all`/10k (~1869 µs)** — **5-7× the ledger's estimate.** Each `doc-NNNNNN`
+clone is ~43 ns of malloc+memcpy; at N=10k that is a major, real slice.
+
+**But it is structurally un-elidable as a single-crate lever (verified, not assumed):** the only ways to
+avoid the clone both fail —
+1. **Move the input** (owned-input fuse): blocked — `sync_searcher.rs` **reuses `fast_hits` after the fuse**:
+   the quality tier re-scores it (`quality_scores_for_hits(query_vec, &fast_hits)`) AND clones its doc_ids
+   again into `quality_hits` (`doc_id: fast.doc_id.clone()`). So `fast_hits` can't be consumed by the fuse;
+   its doc_ids are needed by ≥2 downstream consumers.
+2. **Borrow** (`FusedHit<'a>`): the clone just moves downstream — the final `ScoredResult`/`quality_hits` own
+   `doc_id: String` (they outlive `fast_hits`), so a `String` must materialize somewhere; borrowing relocates
+   the N clones, it doesn't remove them.
+
+**The only real fix is cross-crate:** make `doc_id` an `Arc<str>` on `VectorHit`/`ScoredResult`/`FusedHit`
+(frankensearch-core types used everywhere), turning the per-consumer clones into ~5 ns refcount bumps (1
+alloc + N bumps vs N allocs). That touches every doc_id constructor/consumer across core/index/fusion —
+**not a per-crate lever**, and high regression surface. **Decision:** no per-crate change; the clone is the
+single biggest remaining frankensearch-owned slice of `limit_all` after the f16-dot (`82e151f`) and merge-RRF
+(`4aeb66b`) wins, but capturing it is an `Arc<str>` doc_id refactor scoped at the workspace level. Recorded so
+the magnitude (~23%, not 3-5%) is on the books and the `Arc<str>` refactor can be prioritized as the next
+*big* lever rather than re-estimated.
