@@ -15,7 +15,7 @@ use frankensearch_core::{
 };
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
-use crate::blend::{blend_two_tier, compute_rank_changes_with_maps};
+use crate::blend::{blend_two_tier_aligned, compute_rank_changes_with_maps};
 use crate::rrf::{candidate_count, rrf_fuse, rrf_fuse_with_graph_merge_unique, RrfConfig};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -217,21 +217,15 @@ impl SyncTwoTierSearcher {
         };
 
         let blend_started = Instant::now();
-        let quality_hits = fast_hits
-            .iter()
-            .zip(quality_scores.iter())
-            .filter_map(|(fast, score)| {
-                score.map(|s| VectorHit {
-                    index: fast.index,
-                    doc_id: fast.doc_id.clone(),
-                    score: s,
-                })
-            })
-            .collect::<Vec<_>>();
-        metrics.phase2_vectors_searched = quality_hits.len();
-        let blended = blend_two_tier(
+        // The quality tier is a re-scored subset of `fast_hits` (same doc_ids).
+        // Blend straight from the aligned `quality_scores` so we never clone one
+        // `String` doc_id per quality hit into an intermediate `Vec<VectorHit>`
+        // whose doc_ids are only ever read as `&str` (bit-identical output).
+        let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
+        metrics.phase2_vectors_searched = quality_count;
+        let blended = blend_two_tier_aligned(
             &fast_hits,
-            &quality_hits,
+            &quality_scores,
             saturating_f64_to_f32(self.config.quality_weight),
         );
         metrics.blend_ms = ms(blend_started.elapsed());
@@ -252,16 +246,19 @@ impl SyncTwoTierSearcher {
                 k,
             )
         } else {
-            // Borrow doc_ids straight from fast_hits/quality_hits (which
-            // outlive this scope) — these maps are only `.get()` looked up by
-            // `&str`, so keying on `&str` drops a per-candidate `String` clone.
+            // Borrow doc_ids straight from fast_hits (which outlives this scope)
+            // — these maps are only `.get()` looked up by `&str`, so keying on
+            // `&str` drops a per-candidate `String` clone. The quality map pairs
+            // each fast doc_id with its aligned quality score (the same entries
+            // the materialized `quality_hits` carried).
             let fast_scores = fast_hits
                 .iter()
                 .map(|hit| (hit.doc_id.as_str(), hit.score))
                 .collect::<HashMap<&str, f32>>();
-            let quality_scores = quality_hits
+            let quality_scores = fast_hits
                 .iter()
-                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .zip(quality_scores.iter())
+                .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
                 .collect::<HashMap<&str, f32>>();
             unique_vector_hits_to_scored_results_owned(
                 blended,
@@ -282,7 +279,7 @@ impl SyncTwoTierSearcher {
             latency: phase2_started.elapsed(),
             metrics: PhaseMetrics {
                 embedder_id: "sync-quality-query".to_owned(),
-                vectors_searched: quality_hits.len(),
+                vectors_searched: quality_count,
                 lexical_candidates: metrics.lexical_candidates,
                 fused_count: refined_results.len(),
             },

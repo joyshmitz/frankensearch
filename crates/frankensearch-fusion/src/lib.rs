@@ -40,8 +40,8 @@ pub use adaptive::{
     SignalSource,
 };
 pub use blend::{
-    blend_two_tier, build_borrowed_rank_map, compute_rank_changes, compute_rank_changes_with_maps,
-    kendall_tau, kendall_tau_with_refined_rank,
+    blend_two_tier, blend_two_tier_aligned, build_borrowed_rank_map, compute_rank_changes,
+    compute_rank_changes_with_maps, kendall_tau, kendall_tau_with_refined_rank,
 };
 pub use cache::{
     IndexCache, IndexSentinel, IndexStaleness, SENTINEL_FILENAME, SENTINEL_VERSION,

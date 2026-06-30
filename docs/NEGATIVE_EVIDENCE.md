@@ -3591,3 +3591,18 @@ single biggest remaining frankensearch-owned slice of `limit_all` after the f16-
 (`4aeb66b`) wins, but capturing it is an `Arc<str>` doc_id refactor scoped at the workspace level. Recorded so
 the magnitude (~23%, not 3-5%) is on the books and the `Arc<str>` refactor can be prioritized as the next
 *big* lever rather than re-estimated.
+
+**FOLLOW-UP 2026-06-30 (BlackThrush) — the *separate* `quality_hits` doc_id clone WAS per-crate elidable
+(now LANDED, see PERF_LEDGER 2026-06-30).** The argument above cited `quality_hits` (`sync_searcher.rs`
+`doc_id: fast.doc_id.clone()`) only as *evidence* `fast_hits` can't be moved into the fuse — it never
+analyzed that clone for elision. It turns out the `quality_hits` `Vec<VectorHit>` is a re-scored subset of
+`fast_hits` (same doc_ids/index), built purely to hand a `&[VectorHit]` to `blend_two_tier`, and **both** of
+its consumers — the blend (reads `hit.doc_id.as_str()`) and the downstream `quality_scores` borrow-map (also
+`as_str()`) — only ever read the doc_id as `&str`. So a new `blend_two_tier_aligned(fast_hits, &[Option<f32>])`
+blends straight from the aligned `quality_scores_for_hits` output, borrowing each doc_id from `fast_hits` and
+eliding those N clones with **bit-identical** output (single-pass merge guarded by `is_none()`; permanent
+equivalence test + bench guard). Measured **1.38× at 10k / 1.08× at 100k** on the blend region (`blend_aligned`
+bench). This does NOT touch the RRF `into_owned` clone analyzed above — that one remains un-elidable per-crate
+and still needs the workspace `Arc<str>` refactor. Lesson: when a clone is cited as a *blocker* for some other
+elision, separately check whether that clone is itself dead weight — `quality_hits`' doc_ids were never owned
+downstream, only borrowed.

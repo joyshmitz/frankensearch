@@ -198,6 +198,101 @@ pub fn blend_two_tier(
     blended
 }
 
+/// Blend the fast and quality tiers **without materializing the quality side**.
+///
+/// `quality_scores[i]` is the optional quality-tier score for `fast_hits[i]` —
+/// i.e. the aligned output of `quality_scores_for_hits`. The quality tier is a
+/// *re-scored subset of the fast tier* (it shares every `doc_id`/`index`), so
+/// the caller would otherwise build an intermediate `Vec<VectorHit>` cloning one
+/// `String` doc_id per quality hit purely to hand a `&[VectorHit]` to
+/// [`blend_two_tier`] — yet that slice's doc_ids are only ever read as `&str`.
+///
+/// This function borrows each doc_id straight from `fast_hits` (one alloc-free
+/// `&str` per hit) and is **bit-identical** to
+/// `blend_two_tier(fast_hits, &quality_subset, blend_factor)` where
+/// `quality_subset` is the `Some`-filtered `VectorHit` projection of `fast_hits`:
+/// same normalization bounds (fast over all `fast_hits`, quality over the `Some`
+/// scores), same per-doc `ScorePair` (`index`/`fast`/`quality` all sourced from
+/// the first occurrence in fast order), and the same total-order sort over a set
+/// of unique doc_ids. The two-loop→single-pass merge is safe because the `fast`
+/// and `quality` slots are each guarded by `is_none()` (first-in-fast-order
+/// wins, exactly as the original fast-loop-then-quality-loop did).
+#[must_use]
+pub fn blend_two_tier_aligned(
+    fast_hits: &[VectorHit],
+    quality_scores: &[Option<f32>],
+    blend_factor: f32,
+) -> Vec<VectorHit> {
+    let alpha = sanitize_blend_factor(blend_factor);
+
+    // fast bounds over all fast scores; quality bounds over the present (`Some`)
+    // quality scores — the exact two sets the materialized path normalized over.
+    let fast_bounds = NormBounds::from_scores(fast_hits.iter().map(|h| &h.score));
+    let quality_bounds = NormBounds::from_scores(quality_scores.iter().filter_map(Option::as_ref));
+
+    // Quality docs are a subset of fast docs, so the merged set never exceeds
+    // `fast_hits.len()` keys (matches the original `max(fast, quality)` cap).
+    let capacity = fast_hits.len() * 13 / 10 + 1;
+    let mut merged: AHashMap<&str, ScorePair> = AHashMap::with_capacity(capacity);
+
+    for (i, hit) in fast_hits.iter().enumerate() {
+        let normalized = fast_bounds.apply(hit.score);
+        let entry = merged
+            .entry(hit.doc_id.as_str())
+            .or_insert_with(|| ScorePair {
+                index: hit.index,
+                ..ScorePair::default()
+            });
+        // fast_hits are sorted best-first. Keep the first (best) score + index.
+        if entry.fast.is_none() {
+            entry.fast = Some(normalized);
+            entry.index = hit.index;
+        }
+        // The quality slot for this same doc (aligned by position). `is_none()`
+        // keeps the first-in-fast-order value, matching the original quality
+        // loop (which walked the `Some` subset in fast order).
+        if let Some(score) = quality_scores.get(i).copied().flatten() {
+            if entry.quality.is_none() {
+                entry.quality = Some(quality_bounds.apply(score));
+            }
+        }
+    }
+
+    let mut blended: Vec<VectorHit> = merged
+        .into_iter()
+        .map(|(doc_id, pair)| {
+            let score = match (pair.fast, pair.quality) {
+                (Some(f), Some(q)) => alpha.mul_add(q, (1.0 - alpha) * f),
+                (Some(f), None) => f,
+                (None, Some(q)) => q,
+                (None, None) => 0.0,
+            };
+            VectorHit {
+                index: pair.index,
+                score: sanitize_score(score),
+                doc_id: doc_id.to_owned(),
+            }
+        })
+        .collect();
+
+    // Identical strict-total-order sort as `blend_two_tier` (unique doc_ids ⇒
+    // unstable == stable).
+    blended.sort_unstable_by(|left, right| {
+        sanitize_score(right.score)
+            .total_cmp(&sanitize_score(left.score))
+            .then_with(|| left.doc_id.cmp(&right.doc_id))
+    });
+
+    debug!(
+        target: "frankensearch.blend",
+        blended_count = blended.len(),
+        effective_alpha = %alpha,
+        "blending complete (aligned)"
+    );
+
+    blended
+}
+
 /// Compute promoted/demoted/stable rank-change counts between two rankings.
 ///
 /// - `promoted`: rank improved (smaller index), or new docs appearing in refined
@@ -387,7 +482,7 @@ pub fn build_borrowed_rank_map(hits: &[VectorHit]) -> HashMap<&str, usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blend_two_tier, compute_rank_changes, kendall_tau};
+    use super::{blend_two_tier, blend_two_tier_aligned, compute_rank_changes, kendall_tau};
     use frankensearch_core::VectorHit;
 
     const EPSILON: f32 = 1e-6;
@@ -405,6 +500,82 @@ mod tests {
             .find(|hit| hit.doc_id == doc_id)
             .map(|hit| hit.score)
             .expect("missing doc")
+    }
+
+    /// `blend_two_tier_aligned(fast, scores)` must be byte-for-byte identical to
+    /// `blend_two_tier(fast, &quality_subset)` where `quality_subset` is the
+    /// `Some`-filtered `VectorHit` projection of `fast` — the materialized path
+    /// the sync searcher used before. Covers the cases that drive the proof:
+    /// docs with/without quality scores, distinct fast vs quality rankings, and
+    /// a duplicate doc_id (where the two-loop→single-pass merge could diverge).
+    #[test]
+    fn aligned_blend_is_bit_identical_to_materialized() {
+        let fast = vec![
+            hit("a", 0.90, 0),
+            hit("b", 0.70, 1),
+            hit("c", 0.50, 2),
+            hit("d", 0.30, 3),
+            hit("a", 0.20, 9), // duplicate doc_id, worse fast score (later)
+            hit("e", 0.10, 4),
+        ];
+        // Aligned to `fast` by position; `None` = no quality vector for that hit.
+        let scores = vec![
+            Some(0.10f32),
+            None,
+            Some(0.95),
+            Some(0.40),
+            Some(0.99), // quality for the duplicate "a" — must be ignored (first wins)
+            None,
+        ];
+
+        for &alpha in &[0.0f32, 0.3, 0.7, 1.0, f32::NAN] {
+            let subset: Vec<VectorHit> = fast
+                .iter()
+                .zip(scores.iter())
+                .filter_map(|(f, s)| {
+                    s.map(|v| VectorHit {
+                        index: f.index,
+                        doc_id: f.doc_id.clone(),
+                        score: v,
+                    })
+                })
+                .collect();
+            let materialized = blend_two_tier(&fast, &subset, alpha);
+            let aligned = blend_two_tier_aligned(&fast, &scores, alpha);
+
+            assert_eq!(
+                materialized.len(),
+                aligned.len(),
+                "length mismatch at alpha={alpha}"
+            );
+            for (m, a) in materialized.iter().zip(aligned.iter()) {
+                assert_eq!(m.doc_id, a.doc_id, "doc_id order mismatch at alpha={alpha}");
+                assert_eq!(m.index, a.index, "index mismatch at alpha={alpha}");
+                assert_eq!(
+                    m.score.to_bits(),
+                    a.score.to_bits(),
+                    "score bits mismatch at alpha={alpha} for {}",
+                    m.doc_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aligned_blend_handles_empty_and_all_none() {
+        // No quality scores at all → fast-only, identical to the materialized
+        // empty-quality path.
+        let fast = vec![hit("a", 0.9, 0), hit("b", 0.1, 1)];
+        let none_scores = vec![None, None];
+        let materialized = blend_two_tier(&fast, &[], 0.7);
+        let aligned = blend_two_tier_aligned(&fast, &none_scores, 0.7);
+        assert_eq!(materialized.len(), aligned.len());
+        for (m, a) in materialized.iter().zip(aligned.iter()) {
+            assert_eq!(m.doc_id, a.doc_id);
+            assert_eq!(m.score.to_bits(), a.score.to_bits());
+        }
+        // Fully empty inputs.
+        assert!(blend_two_tier_aligned(&[], &[], 0.7).is_empty());
     }
 
     #[test]

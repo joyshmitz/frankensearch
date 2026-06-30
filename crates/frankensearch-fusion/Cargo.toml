@@ -107,3 +107,7 @@ harness = false
 [[bench]]
 name = "rrf_merge_fuse"
 harness = false
+
+[[bench]]
+name = "blend_aligned"
+harness = false
