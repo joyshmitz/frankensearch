@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};
-use frankensearch_fusion::rrf::{RrfConfig, rrf_fuse_with_graph, rrf_fuse_with_graph_merge};
+use frankensearch_fusion::rrf::{
+    RrfConfig, rrf_fuse_with_graph, rrf_fuse_with_graph_merge, rrf_fuse_with_graph_merge_unique,
+};
 
 fn lexical(doc_id: String, score: f32) -> ScoredResult {
     ScoredResult {
@@ -90,6 +92,23 @@ fn bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("merge", n), &n, |bch, _| {
             bch.iter(|| {
                 black_box(rrf_fuse_with_graph_merge(
+                    black_box(&lex),
+                    black_box(&sem),
+                    &[],
+                    0.0,
+                    n,
+                    0,
+                    &cfg,
+                ));
+            });
+        });
+        // Unique-semantic fast path (skips the seen_semantic dedup set).
+        let u = rrf_fuse_with_graph_merge_unique(&lex, &sem, &[], 0.0, n, 0, &cfg);
+        assert_eq!(u.len(), b.len());
+        assert_eq!(u[0].doc_id, b[0].doc_id);
+        group.bench_with_input(BenchmarkId::new("merge_unique", n), &n, |bch, _| {
+            bch.iter(|| {
+                black_box(rrf_fuse_with_graph_merge_unique(
                     black_box(&lex),
                     black_box(&sem),
                     &[],

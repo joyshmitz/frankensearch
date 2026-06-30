@@ -392,6 +392,39 @@ pub fn rrf_fuse_with_graph_merge(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
+    rrf_fuse_merge_inner(lexical, semantic, graph, graph_weight, limit, offset, config, true)
+}
+
+/// Like [`rrf_fuse_with_graph_merge`] but **assumes the `semantic` slice has no
+/// duplicate `doc_id`s** (true for any vector-index `search_top_k` result), so it
+/// skips the O(N) `seen_semantic` dedup set — saving N hash-inserts on the hot
+/// `limit_all` path. Identical output to the dedup version whenever `semantic` is
+/// in fact unique; only diverges on (never-produced) duplicate semantic hits.
+#[must_use]
+pub fn rrf_fuse_with_graph_merge_unique(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+) -> Vec<FusedHit> {
+    rrf_fuse_merge_inner(lexical, semantic, graph, graph_weight, limit, offset, config, false)
+}
+
+#[must_use]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn rrf_fuse_merge_inner(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+    dedup_semantic: bool,
+) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
     let graph_weight = sanitize_graph_weight(graph_weight);
     let graph_active = graph_weight > 0.0;
@@ -414,12 +447,16 @@ pub fn rrf_fuse_with_graph_merge(
     let mut results: Vec<FusedHitScratch<'_>> = Vec::with_capacity(capacity);
     // Defensive dedup of the semantic slice (keep first occurrence), mirroring the
     // map's `semantic_rank.is_some() … continue`. A `&str` set is far smaller than
-    // the old value map, so it stays cache-friendlier.
-    let mut seen_semantic: ahash::AHashSet<&str> = ahash::AHashSet::with_capacity(semantic.len());
+    // the old value map, so it stays cache-friendlier. Skipped (`None`) when the
+    // caller guarantees unique semantic doc_ids (the vector-index hot path).
+    let mut seen_semantic: Option<ahash::AHashSet<&str>> =
+        dedup_semantic.then(|| ahash::AHashSet::with_capacity(semantic.len()));
 
     for (rank, hit) in semantic.iter().enumerate() {
         let doc_id = hit.doc_id.as_str();
-        if !seen_semantic.insert(doc_id) {
+        if let Some(seen) = seen_semantic.as_mut()
+            && !seen.insert(doc_id)
+        {
             continue;
         }
         let lex = lex_map.remove(doc_id);
