@@ -361,6 +361,169 @@ pub fn rrf_fuse_with_graph(
     output
 }
 
+/// Merge-structured RRF: identical result to [`rrf_fuse_with_graph`], built so the
+/// final sort receives a **near-sorted** (semantic-ordered) input.
+///
+/// Instead of accumulating every doc into one `N`-entry value map (random
+/// iteration order → a from-scratch O(N log N) sort), this keeps only small
+/// `&str → (rank, score)` contribution maps for the lexical and graph sources
+/// (cache-resident), then walks the already-score-sorted `semantic` slice **once
+/// in order**, emitting each fused hit directly into `results`. Vector-only docs
+/// land in fused order (their score is the monotone `1/(k+sem_rank+1)`), so the
+/// sort runs near-O(N) (pdqsort is adaptive).
+///
+/// **Bit-identical** to the map version: the `rrf_score` is a sum of the same
+/// per-source contributions, and f64 addition is commutative, so emitting
+/// `semantic + lexical + graph` instead of `lexical + semantic + graph` yields the
+/// byte-identical score; all other fields and the `in_both_sources` rule
+/// (lexical ∧ semantic) are reproduced exactly. Verified by
+/// `merge_matches_map_fusion`.
+#[must_use]
+pub fn rrf_fuse_with_graph_merge(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+) -> Vec<FusedHit> {
+    let k = sanitize_rrf_k(config.k);
+    let graph_weight = sanitize_graph_weight(graph_weight);
+    let graph_active = graph_weight > 0.0;
+    let graph_len = if graph_active { graph.len() } else { 0 };
+
+    // Small, cache-resident contribution maps (first occurrence wins, matching the
+    // map version's `Entry::Occupied … continue`).
+    let mut lex_map: AHashMap<&str, (usize, f32)> = AHashMap::with_capacity(lexical.len());
+    for (rank, result) in lexical.iter().enumerate() {
+        lex_map.entry(result.doc_id.as_str()).or_insert((rank, result.score));
+    }
+    let mut graph_map: AHashMap<&str, (usize, f32)> = AHashMap::with_capacity(graph_len);
+    if graph_active {
+        for (rank, result) in graph.iter().enumerate() {
+            graph_map.entry(result.doc_id.as_str()).or_insert((rank, result.score));
+        }
+    }
+
+    let capacity = (lexical.len() + semantic.len() + graph_len) * 3 / 4 + 1;
+    let mut results: Vec<FusedHitScratch<'_>> = Vec::with_capacity(capacity);
+    // Defensive dedup of the semantic slice (keep first occurrence), mirroring the
+    // map's `semantic_rank.is_some() … continue`. A `&str` set is far smaller than
+    // the old value map, so it stays cache-friendlier.
+    let mut seen_semantic: ahash::AHashSet<&str> = ahash::AHashSet::with_capacity(semantic.len());
+
+    for (rank, hit) in semantic.iter().enumerate() {
+        let doc_id = hit.doc_id.as_str();
+        if !seen_semantic.insert(doc_id) {
+            continue;
+        }
+        let lex = lex_map.remove(doc_id);
+        let gr = if graph_active { graph_map.remove(doc_id) } else { None };
+        let mut rrf_score = rank_contribution(k, rank);
+        if let Some((lex_rank, _)) = lex {
+            rrf_score += rank_contribution(k, lex_rank);
+        }
+        if let Some((graph_rank, _)) = gr {
+            rrf_score += rank_contribution(k, graph_rank) * graph_weight;
+        }
+        results.push(FusedHitScratch {
+            doc_id,
+            rrf_score,
+            lexical_rank: lex.map(|(r, _)| r),
+            semantic_rank: Some(rank),
+            semantic_index: Some(hit.index),
+            graph_rank: gr.map(|(r, _)| r),
+            lexical_score: lex.map(|(_, s)| s),
+            semantic_score: Some(hit.score),
+            graph_score: gr.map(|(_, s)| s),
+            in_both_sources: lex.is_some(),
+        });
+    }
+
+    // Lexical-only docs (never seen in semantic).
+    for (doc_id, (lex_rank, lex_score)) in lex_map.drain() {
+        let gr = if graph_active { graph_map.remove(doc_id) } else { None };
+        let mut rrf_score = rank_contribution(k, lex_rank);
+        if let Some((graph_rank, _)) = gr {
+            rrf_score += rank_contribution(k, graph_rank) * graph_weight;
+        }
+        results.push(FusedHitScratch {
+            doc_id,
+            rrf_score,
+            lexical_rank: Some(lex_rank),
+            semantic_rank: None,
+            semantic_index: None,
+            graph_rank: gr.map(|(r, _)| r),
+            lexical_score: Some(lex_score),
+            semantic_score: None,
+            graph_score: gr.map(|(_, s)| s),
+            in_both_sources: false,
+        });
+    }
+
+    // Graph-only docs (never seen in semantic or lexical).
+    if graph_active {
+        for (doc_id, (graph_rank, graph_score)) in graph_map.drain() {
+            results.push(FusedHitScratch {
+                doc_id,
+                rrf_score: rank_contribution(k, graph_rank) * graph_weight,
+                lexical_rank: None,
+                semantic_rank: None,
+                semantic_index: None,
+                graph_rank: Some(graph_rank),
+                lexical_score: None,
+                semantic_score: None,
+                graph_score: Some(graph_score),
+                in_both_sources: false,
+            });
+        }
+    }
+
+    let overlap_count = tracing::enabled!(target: "frankensearch.rrf", Level::DEBUG)
+        .then(|| results.iter().filter(|h| h.in_both_sources).count());
+    let fused_count = results.len();
+
+    let window = limit.saturating_add(offset);
+    if window == 0 {
+        if let Some(overlap_count) = overlap_count {
+            debug!(
+                target: "frankensearch.rrf",
+                fused_count,
+                overlap_count,
+                output_count = 0,
+                "rrf fusion complete"
+            );
+        }
+        return Vec::new();
+    }
+    if window < results.len() {
+        let nth_index = window.saturating_sub(1);
+        results.select_nth_unstable_by(nth_index, FusedHitScratch::cmp_for_ranking);
+        results.truncate(window);
+    }
+    results.sort_unstable_by(FusedHitScratch::cmp_for_ranking);
+
+    let output: Vec<FusedHit> = results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(FusedHitScratch::into_owned)
+        .collect();
+
+    if let Some(overlap_count) = overlap_count {
+        debug!(
+            target: "frankensearch.rrf",
+            fused_count,
+            overlap_count,
+            output_count = output.len(),
+            "rrf fusion complete"
+        );
+    }
+
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -404,6 +567,76 @@ mod tests {
             rerank_score: None,
             explanation: None,
             metadata: None,
+        }
+    }
+
+    // ─── Merge fusion bit-identity ──────────────────────────────────────
+
+    #[test]
+    fn merge_matches_map_fusion() {
+        // Deterministic xorshift to drive varied overlap/graph/dedup scenarios.
+        let mut st = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let cfg = RrfConfig::default();
+        for trial in 0..40 {
+            let n_lex = (next() % 30) as usize;
+            let n_sem = (next() % 40) as usize;
+            let n_graph = (next() % 20) as usize;
+            // Shared id pool so sources overlap; small pool forces dedup dupes.
+            let pool = 1 + (next() % 25) as usize;
+            let id = |x: u64| format!("doc-{:04}", x % pool as u64);
+
+            let lexical: Vec<ScoredResult> = (0..n_lex)
+                .map(|_| lexical_hit(&id(next()), (next() % 1000) as f32 * 0.01))
+                .collect();
+            let semantic: Vec<VectorHit> = (0..n_sem)
+                .map(|_| VectorHit {
+                    index: (next() % 10_000) as u32,
+                    score: (next() % 1000) as f32 * 0.001,
+                    doc_id: id(next()).into(),
+                })
+                .collect();
+            let graph: Vec<ScoredResult> = (0..n_graph)
+                .map(|_| graph_hit(&id(next()), (next() % 1000) as f32 * 0.01))
+                .collect();
+            let gw = if trial % 3 == 0 { 0.0 } else { 0.5 };
+            let limit = 1 + (next() % 50) as usize;
+            let offset = (next() % 5) as usize;
+
+            let a = rrf_fuse_with_graph(&lexical, &semantic, &graph, gw, limit, offset, &cfg);
+            let b =
+                rrf_fuse_with_graph_merge(&lexical, &semantic, &graph, gw, limit, offset, &cfg);
+
+            assert_eq!(a.len(), b.len(), "trial {trial}: length differs");
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.doc_id, y.doc_id, "trial {trial} row {i}: doc_id");
+                assert_eq!(
+                    x.rrf_score.to_bits(),
+                    y.rrf_score.to_bits(),
+                    "trial {trial} row {i}: rrf_score not byte-identical ({} vs {})",
+                    x.rrf_score,
+                    y.rrf_score
+                );
+                assert_eq!(x.lexical_rank, y.lexical_rank, "trial {trial} row {i}: lexical_rank");
+                assert_eq!(x.semantic_rank, y.semantic_rank, "trial {trial} row {i}: semantic_rank");
+                assert_eq!(x.semantic_index, y.semantic_index, "trial {trial} row {i}: semantic_index");
+                assert_eq!(x.in_both_sources, y.in_both_sources, "trial {trial} row {i}: in_both");
+                assert_eq!(
+                    x.lexical_score.map(f32::to_bits),
+                    y.lexical_score.map(f32::to_bits),
+                    "trial {trial} row {i}: lexical_score"
+                );
+                assert_eq!(
+                    x.semantic_score.map(f32::to_bits),
+                    y.semantic_score.map(f32::to_bits),
+                    "trial {trial} row {i}: semantic_score"
+                );
+            }
         }
     }
 
