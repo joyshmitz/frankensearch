@@ -3,7 +3,6 @@
 //! A single query fans out to multiple indices, then gathered results are fused
 //! into one ranked list.
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::future::poll_fn;
 use std::pin::Pin;
@@ -112,7 +111,13 @@ struct AggregateDoc {
     primary_rank: usize,
     primary_contribution: f32,
     fused_score: f32,
-    appeared_in: BTreeSet<String>,
+    /// Interned shard ids (rank in the sorted distinct-shard-name list) this doc
+    /// appeared in. Was a `BTreeSet<String>` cloning a shard-name `String` on every
+    /// `accumulate_doc` call (thousands per fuse); interning to integer ids and
+    /// deduping once at output (`into_ranked_hits`) drops that per-call churn.
+    /// Ids are the sorted-name rank, so sorting them ascending == sorting the names
+    /// lexicographically (the `BTreeSet<String>` iteration order the output kept).
+    appeared_in: Vec<u32>,
 }
 
 /// A fused hit returned by federated search.
@@ -350,6 +355,24 @@ impl FederatedSearcher {
     }
 }
 
+/// Intern the distinct shard names to their **sorted rank**. Returns the sorted
+/// distinct names (indexable by id) and a `name → id` lookup. Because ids are the
+/// sorted-name rank, sorting a doc's `appeared_in` ids ascending reproduces the
+/// lexicographic name order the old `BTreeSet<String>` iteration gave — so the
+/// public `FederatedHit::appeared_in` order is unchanged.
+#[allow(clippy::cast_possible_truncation)]
+fn intern_shard_names(shards: &[ShardResult]) -> (Vec<&str>, AHashMap<&str, u32>) {
+    let mut names: Vec<&str> = shards.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let name_to_id: AHashMap<&str, u32> = names
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i as u32))
+        .collect();
+    (names, name_to_id)
+}
+
 fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
     let k = sanitize_rrf_k(k);
     // aHash (not SipHash): the cross-shard merge keys on owned `doc_id` strings;
@@ -357,6 +380,7 @@ fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
     // single-node `rrf_fuse_with_graph` already uses `AHashMap`. Output is
     // unchanged — `into_ranked_hits` sorts by a strict total order (the final
     // `doc_id` tiebreak), so map drain order never reaches the result.
+    let (names, name_to_id) = intern_shard_names(shards);
     let mut docs: AHashMap<String, AggregateDoc> = AHashMap::new();
     for shard in shards {
         // NaN.max(0.0) propagates NaN — guard explicitly.
@@ -364,6 +388,7 @@ fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
             continue;
         }
         let weight = shard.weight;
+        let shard_id = name_to_id[shard.name.as_str()];
 
         for (rank, hit) in shard.hits.iter().enumerate() {
             let contribution = weight * rank_contribution(k, rank);
@@ -371,6 +396,7 @@ fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
                 &mut docs,
                 hit,
                 &shard.name,
+                shard_id,
                 rank,
                 contribution,
                 contribution,
@@ -378,7 +404,7 @@ fn fuse_rrf(shards: &[ShardResult], k: f64) -> Vec<FederatedHit> {
         }
     }
 
-    into_ranked_hits(docs, false)
+    into_ranked_hits(docs, &names, false)
 }
 
 fn fuse_weighted(
@@ -386,6 +412,7 @@ fn fuse_weighted(
     normalization: NormalizationMethod,
     apply_comb_mnz: bool,
 ) -> Vec<FederatedHit> {
+    let (names, name_to_id) = intern_shard_names(shards);
     let mut docs: AHashMap<String, AggregateDoc> = AHashMap::new();
 
     for shard in shards {
@@ -394,6 +421,7 @@ fn fuse_weighted(
             continue;
         }
         let weight = shard.weight;
+        let shard_id = name_to_id[shard.name.as_str()];
 
         let raw_scores: Vec<f32> = shard.hits.iter().map(|hit| hit.score).collect();
         let normalized = normalize_scores_with_method(&raw_scores, normalization);
@@ -403,6 +431,7 @@ fn fuse_weighted(
                 &mut docs,
                 hit,
                 &shard.name,
+                shard_id,
                 rank,
                 contribution,
                 contribution,
@@ -410,7 +439,7 @@ fn fuse_weighted(
         }
     }
 
-    into_ranked_hits(docs, apply_comb_mnz)
+    into_ranked_hits(docs, &names, apply_comb_mnz)
 }
 
 #[inline]
@@ -433,6 +462,7 @@ fn accumulate_doc(
     docs: &mut AHashMap<String, AggregateDoc>,
     hit: &ScoredResult,
     shard_name: &str,
+    shard_id: u32,
     rank: usize,
     contribution: f32,
     primary_signal: f32,
@@ -446,12 +476,15 @@ fn accumulate_doc(
             primary_rank: rank,
             primary_contribution: primary_signal,
             fused_score: 0.0,
-            appeared_in: BTreeSet::new(),
+            appeared_in: Vec::new(),
         }
     });
 
     entry.fused_score += contribution;
-    entry.appeared_in.insert(shard_name.to_owned());
+    // Push the interned id (deduped once at output). A shard contributes a given
+    // doc at most once, so duplicates only arise from a shard with a repeated
+    // doc_id — `into_ranked_hits` sort+dedups, matching the old `BTreeSet` semantics.
+    entry.appeared_in.push(shard_id);
 
     let update_primary = match primary_signal.total_cmp(&entry.primary_contribution) {
         std::cmp::Ordering::Greater => true,
@@ -472,11 +505,17 @@ fn accumulate_doc(
 #[allow(clippy::cast_precision_loss)]
 fn into_ranked_hits(
     mut docs: AHashMap<String, AggregateDoc>,
+    names: &[&str],
     apply_comb_mnz: bool,
 ) -> Vec<FederatedHit> {
     let mut output: Vec<FederatedHit> = docs
         .drain()
         .map(|(_, mut aggregate)| {
+            // Dedup the interned ids once here (the old `BTreeSet` deduped on
+            // insert). Ascending id order == lexicographic name order, so the
+            // materialized `appeared_in` names are sorted, as before.
+            aggregate.appeared_in.sort_unstable();
+            aggregate.appeared_in.dedup();
             let appearance_count = aggregate.appeared_in.len();
             if apply_comb_mnz {
                 aggregate.fused_score *= appearance_count as f32;
@@ -485,11 +524,16 @@ fn into_ranked_hits(
             if appearance_count > 1 {
                 aggregate.template.source = ScoreSource::Hybrid;
             }
+            let appeared_in: Vec<String> = aggregate
+                .appeared_in
+                .iter()
+                .map(|&id| names[id as usize].to_owned())
+                .collect();
             FederatedHit {
                 result: aggregate.template,
                 source_index: aggregate.primary_index,
                 source_rank: aggregate.primary_rank,
-                appeared_in: aggregate.appeared_in.into_iter().collect(),
+                appeared_in,
             }
         })
         .collect();

@@ -115,3 +115,7 @@ harness = false
 [[bench]]
 name = "collect_limit_all"
 harness = false
+
+[[bench]]
+name = "federated_appeared_in"
+harness = false

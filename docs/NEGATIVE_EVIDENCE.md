@@ -2030,6 +2030,14 @@ dominate, so removing just the key clone moves ~5%. A real federated-fuse win wo
 key clone. Original-comparator ratio vs Lucene/Tantivy/Meilisearch is **N/A** (federated cross-shard
 fusion has no lexical-comparator counterpart). Do not re-attempt the key-clone/sort micro-opt alone.
 
+**ROUTE-NEXT CAPTURED 2026-07-01 (BlackThrush) — LANDED, see PERF_LEDGER.** The predicted lever was
+right: interning shard names to integer ids and moving `appeared_in` from `BTreeSet<String>` to a
+`Vec<u32>` (sort+dedup once at output, ids = sorted-name rank so the output name order is unchanged)
+won **~1.44× (s5) / ~1.22× (s10)** on the `federated_appeared_in` bench — vs the ~1.05× the key clone
+alone moved. Bit-identical (`FederatedHit::appeared_in` byte-identical; federated tests + bench full-output
+assert). The per-`accumulate_doc` `String` alloc + BTree node churn (thousands/fuse) was indeed the real
+cost. `Vec<u32>` chosen over a `u64` bitset (1.6×/1.36×) to keep no shard-count cap.
+
 ### 2026-06-27 — reachable unowned compute surface is mined out; route-next handoff (Cobaltmoth)
 
 Surveyed for a NEW clean lever after landing JL-ILP (`87892cd`), MMR running-max (`5f8b59c`), and
