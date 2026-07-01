@@ -51,7 +51,7 @@ use frankensearch_index::{SearchParams, TwoTierIndex};
 
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
-    blend_two_tier, build_borrowed_rank_map, compute_rank_changes_with_maps,
+    blend_two_tier_aligned, build_borrowed_rank_map, compute_rank_changes_with_maps,
     kendall_tau_with_refined_rank,
 };
 use crate::calibration::CalibratorConfig;
@@ -1386,27 +1386,26 @@ impl TwoTierSearcher {
             .quality_scores_for_hits(&quality_vec, &fast_hits)?;
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Build quality VectorHits for blending. Only include docs that have
-        // quality-tier vectors — docs with None are left out so the blend
-        // function uses their fast-only score without penalty.
-        let mut quality_hits = Vec::with_capacity(fast_hits.len());
-        for (hit, score) in fast_hits.iter().zip(quality_scores.iter()) {
-            if let Some(s) = score {
-                quality_hits.push(VectorHit {
-                    index: hit.index,
-                    score: *s,
-                    doc_id: hit.doc_id.clone(),
-                });
-            }
-        }
-        metrics.incomplete_embeddings = fast_hits.len() - quality_hits.len();
-        metrics.phase2_vectors_searched = quality_hits.len();
-        self.apply_score_calibration_to_hits(&mut quality_hits);
+        // Calibrate the quality scores in aligned form. The quality tier is a
+        // re-scored subset of `fast_hits` (same doc_ids/index) and calibration is
+        // a pure per-element score transform, so we calibrate the aligned
+        // `Vec<Option<f32>>` directly instead of materializing a `Vec<VectorHit>`
+        // that clones one `String` doc_id per quality hit — those doc_ids are only
+        // ever read as `&str` (by the blend and the `quality_scores_by_doc` map).
+        // Docs with `None` are left out so the blend uses their fast-only score
+        // without penalty. Bit-identical to the old materialized+calibrated path.
+        let quality_scores: Vec<Option<f32>> = quality_scores
+            .iter()
+            .map(|s| s.map(|v| self.calibrate_score(v)))
+            .collect();
+        let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
+        metrics.incomplete_embeddings = fast_hits.len() - quality_count;
+        metrics.phase2_vectors_searched = quality_count;
 
         // Blend fast + quality scores.
         let blend_start = Instant::now();
         let blend_factor = self.effective_blend_factor(query_class);
-        let blended = blend_two_tier(&fast_hits, &quality_hits, blend_factor);
+        let blended = blend_two_tier_aligned(&fast_hits, &quality_scores, blend_factor);
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
         // Compute rank changes (initial vs refined).
@@ -1436,9 +1435,10 @@ impl TwoTierSearcher {
             .iter()
             .map(|hit| (hit.doc_id.as_str(), hit.score))
             .collect();
-        let quality_scores_by_doc: AHashMap<&str, f32> = quality_hits
+        let quality_scores_by_doc: AHashMap<&str, f32> = fast_hits
             .iter()
-            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .zip(quality_scores.iter())
+            .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
             .collect();
 
         // Convert blended to scored results.
@@ -1860,16 +1860,28 @@ impl TwoTierSearcher {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn apply_score_calibration_to_hits(&self, hits: &mut [VectorHit]) {
+    /// Apply the configured score calibrator to a single score (identity if no
+    /// calibrator is set). Non-finite calibrated values collapse to `0.0`, matching
+    /// [`Self::apply_score_calibration_to_hits`].
+    #[allow(clippy::cast_possible_truncation)]
+    fn calibrate_score(&self, score: f32) -> f32 {
         let Some(calibrator) = self.score_calibrator.as_ref() else {
-            return;
+            return score;
         };
+        let calibrated = calibrator.calibrate(f64::from(score)) as f32;
+        if calibrated.is_finite() {
+            calibrated
+        } else {
+            0.0
+        }
+    }
+
+    fn apply_score_calibration_to_hits(&self, hits: &mut [VectorHit]) {
+        if self.score_calibrator.is_none() {
+            return;
+        }
         for hit in hits {
-            let calibrated = calibrator.calibrate(f64::from(hit.score));
-            hit.score = calibrated as f32;
-            if !hit.score.is_finite() {
-                hit.score = 0.0;
-            }
+            hit.score = self.calibrate_score(hit.score);
         }
     }
 
