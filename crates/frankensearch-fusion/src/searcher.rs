@@ -402,31 +402,14 @@ impl TwoTierSearcher {
     /// Returns `SearchError::EmbeddingFailed` if fast embedding fails and no
     /// lexical backend is available as fallback.
     #[instrument(skip_all, fields(query_len = query.len(), k))]
+    #[allow(clippy::too_many_lines)]
     pub async fn search(
         &self,
         cx: &Cx,
         query: &str,
         k: usize,
         text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
-        on_phase: impl FnMut(SearchPhase) + Send,
-    ) -> SearchResult<TwoTierMetrics> {
-        // Streaming callers consume every progressive phase — emit them all.
-        self.search_inner(cx, query, k, text_fn, on_phase, true)
-            .await
-    }
-
-    /// Shared search body. `emit_intermediate` = whether to fire the `Initial`
-    /// (and other pre-terminal) phases; `search_collect_with_text` passes `false`
-    /// to skip the wasted Initial-phase clone (it keeps only the terminal phase).
-    #[allow(clippy::too_many_lines)]
-    async fn search_inner(
-        &self,
-        cx: &Cx,
-        query: &str,
-        k: usize,
-        text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
         mut on_phase: impl FnMut(SearchPhase) + Send,
-        emit_intermediate: bool,
     ) -> SearchResult<TwoTierMetrics> {
         let mut metrics = TwoTierMetrics::default();
 
@@ -556,12 +539,23 @@ impl TwoTierSearcher {
             );
         }
 
-        // Quality-tier gate, hoisted above the Initial emit (no data dependency on
-        // the emit or the telemetry between them): knowing whether a
-        // Refined/RefinementFailed phase will follow lets us skip the Initial
-        // phase's full `Vec<ScoredResult>` clone when the caller only wants the
-        // final result (search_collect_with_text). Skipped when fast embedding
-        // failed entirely (phase1_vectors_searched == 0) — the pipeline is degraded.
+        on_phase(SearchPhase::Initial {
+            results: display_hits.clone(),
+            latency: initial_latency,
+            metrics: PhaseMetrics {
+                embedder_id: self.fast_embedder.id().to_owned(),
+                vectors_searched: metrics.phase1_vectors_searched,
+                lexical_candidates: metrics.lexical_candidates,
+                fused_count: display_hits.len(),
+            },
+        });
+        self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
+
+        // Phase 2: Quality refinement (optional).
+        // Runs even if Phase 1 was lexical-only (fast_score is None), effectively
+        // performing a "lexical -> quality rerank" flow.  Skipped when fast
+        // embedding failed entirely (phase1_vectors_searched == 0) because the
+        // embedding pipeline is degraded and quality refinement would be unreliable.
         let quality_circuit_open = if self.should_run_quality()
             && let Some(circuit_breaker) = self.circuit_breaker.as_ref()
         {
@@ -572,34 +566,13 @@ impl TwoTierSearcher {
         };
         let quality_phase_gate_skip =
             self.should_run_quality() && self.phase_gate_should_skip_quality();
-        let quality_will_run = self.should_run_quality()
+
+        if self.should_run_quality()
             && !quality_circuit_open
             && !quality_phase_gate_skip
             && !initial_hits.is_empty()
-            && metrics.phase1_vectors_searched > 0;
-
-        // Emit the Initial phase (cloning `display_hits`) only when a streaming
-        // caller consumes intermediate phases, OR when Initial IS the terminal
-        // result (no quality tier will run). For `search_collect_with_text` with a
-        // quality tier, the Initial results are immediately overwritten by
-        // Refined/RefinementFailed, so cloning them here is pure waste.
-        if emit_intermediate || !quality_will_run {
-            on_phase(SearchPhase::Initial {
-                results: display_hits.clone(),
-                latency: initial_latency,
-                metrics: PhaseMetrics {
-                    embedder_id: self.fast_embedder.id().to_owned(),
-                    vectors_searched: metrics.phase1_vectors_searched,
-                    lexical_candidates: metrics.lexical_candidates,
-                    fused_count: display_hits.len(),
-                },
-            });
-        }
-        self.export_search_metrics(query_class, &metrics, display_hits.len(), false);
-
-        // Phase 2: Quality refinement (optional). Runs even if Phase 1 was
-        // lexical-only (fast_score is None) — a "lexical -> quality rerank" flow.
-        if quality_will_run {
+            && metrics.phase1_vectors_searched > 0
+        {
             let phase2_start = Instant::now();
             metrics.quality_embedder_id = self.quality_embedder.as_ref().map(|e| e.id().to_owned());
 
@@ -913,29 +886,17 @@ impl TwoTierSearcher {
         text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
         let mut best_results = Vec::new();
-        // `emit_intermediate = false`: skip the Initial-phase clone (it would be
-        // overwritten by Refined here anyway). When quality refinement fails, the
-        // Initial results arrive via `RefinementFailed.initial_results` instead.
         let metrics = self
-            .search_inner(
-                cx,
-                query,
-                k,
-                text_fn,
-                |phase| match phase {
-                    SearchPhase::Initial { results, .. }
-                    | SearchPhase::Refined { results, .. }
-                    | SearchPhase::Reranked { results, .. } => {
-                        best_results = results;
-                    }
-                    SearchPhase::RefinementFailed {
-                        initial_results, ..
-                    } => {
-                        best_results = initial_results;
-                    }
-                },
-                false,
-            )
+            .search(cx, query, k, text_fn, |phase| match phase {
+                SearchPhase::Initial { results, .. }
+                | SearchPhase::Refined { results, .. }
+                | SearchPhase::Reranked { results, .. } => {
+                    best_results = results;
+                }
+                SearchPhase::RefinementFailed { .. } => {
+                    // Keep the initial results already stored in best_results.
+                }
+            })
             .await?;
         Ok((best_results, metrics))
     }

@@ -3661,17 +3661,29 @@ measuring end-to-end needs a bench that stands up a runtime + `Cx` + stub embedd
 `#[cfg(test)]` module). Bit-identity is conformance-checkable now; the ratio needs that harness. High EV
 (production + federated path, proven pattern) — top of the next-session queue.
 
-**LANDED 2026-07-01 (see PERF_LEDGER same date).** Implemented exactly as sketched: `search_inner(emit_intermediate)`,
-Initial emit guarded by `emit_intermediate || !quality_will_run` (the quality gate hoisted above the emit),
-`search_collect_with_text` passes `false` and captures `RefinementFailed.initial_results`. **Bit-identical,
-conformance 820 GREEN, 0 failed** (quality-success/timeout/error/streaming/collect paths). The direct async
-A/B bench (`async_collect_phase`) is NOT landed: the async `Cx`/runtime harness worked (`Cx::for_testing()` +
-`RuntimeBuilder::current_thread()` are reachable via the fusion dev-dep's `test-internals`), but `HashEmbedder`
-sits behind frankensearch-embed's `hash` feature, which is OFF in fusion's deps (workspace `default-features =
-false`) — the bench needs `frankensearch-embed = { workspace = true, features = ["hash"] }` in fusion
-`[dev-dependencies]` (next-session follow-up to get the direct ratio). Magnitude is cited from
-`collect_limit_all` (the identical `Vec<ScoredResult>` clone on the sync sibling): one clone ≈ 3.1 ms at
-N=10k, ~1.1× on the async collect path.
+**TESTED + REVERTED 2026-07-01 (BlackThrush) — measured ~0/noise, NOT the ~1.1× extrapolated.** Implemented
+it (`82eb351`, bit-identical, conformance 820 GREEN) AND built the direct async bench harness — which works:
+a fusion bench CAN stand up `Cx::for_testing()` + `asupersync::runtime::RuntimeBuilder::current_thread()`
+(via the dev-dep's `test-internals`) and `rt.block_on` per iter; `HashEmbedder` needs
+`frankensearch-embed = { workspace=true, features=["hash"] }` in fusion `[dev-dependencies]` (its `hash`
+feature is off in the lib graph). The A/B — `stream` (pub `search()` + latest-capturing callback = old, Initial
+cloned) vs `collect` (`search_collect_with_text` = new, Initial skipped), same searcher, bit-identical output
+asserted — measured on `search-cc` (worker hz2), N=10k/dim=384/k=N:
+
+| arm | time | ratio |
+|-----|------|-------|
+| `stream` (old) | 19.340 ms `[18.822, 19.910]` | 1.00 |
+| `collect` (new) | 19.052 ms `[18.502, 19.670]` | **1.015× — CIs overlap = tie** |
+
+**Why the extrapolation was wrong:** `collect_limit_all` (sync) measured **2** phase clones = 6.29 ms (≈3.1 ms
+each) on a 21 ms path, but that delta also bundled phase-struct/iterator overhead, and — decisively — the async
+Initial `display_hits` clone is only ~0.29 ms (~1.5 %) of the 19 ms async collect path: the async fast tier's
+Initial result set is a far smaller fraction than the sync 2-clone limit_all case, so eliminating it is within
+noise. **Reverted per "revert near-zero gains"** (the change was bit-identical, so no regression either way, but
+the `search_inner`/`emit_intermediate` complexity isn't justified by a ~0 gain). Lesson: do NOT extrapolate a
+clone's ratio across searcher paths — the same `Vec<ScoredResult>` clone is 30 % of the sync collect path but
+<2 % of the async one; measure the actual path. The `hash`-dev-dep async-bench recipe above is the reusable
+takeaway if a future async lever needs measuring.
 
 **Assessed marginal, do not re-tread alone:** the federated `accumulate_doc` template `hit.clone()`
 (insert + primary-update) and the per-call `docs.entry(hit.doc_id.clone())` key clone are each ~5 % after the
