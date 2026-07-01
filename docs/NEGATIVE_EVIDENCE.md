@@ -3661,6 +3661,18 @@ measuring end-to-end needs a bench that stands up a runtime + `Cx` + stub embedd
 `#[cfg(test)]` module). Bit-identity is conformance-checkable now; the ratio needs that harness. High EV
 (production + federated path, proven pattern) — top of the next-session queue.
 
+**LANDED 2026-07-01 (see PERF_LEDGER same date).** Implemented exactly as sketched: `search_inner(emit_intermediate)`,
+Initial emit guarded by `emit_intermediate || !quality_will_run` (the quality gate hoisted above the emit),
+`search_collect_with_text` passes `false` and captures `RefinementFailed.initial_results`. **Bit-identical,
+conformance 820 GREEN, 0 failed** (quality-success/timeout/error/streaming/collect paths). The direct async
+A/B bench (`async_collect_phase`) is NOT landed: the async `Cx`/runtime harness worked (`Cx::for_testing()` +
+`RuntimeBuilder::current_thread()` are reachable via the fusion dev-dep's `test-internals`), but `HashEmbedder`
+sits behind frankensearch-embed's `hash` feature, which is OFF in fusion's deps (workspace `default-features =
+false`) — the bench needs `frankensearch-embed = { workspace = true, features = ["hash"] }` in fusion
+`[dev-dependencies]` (next-session follow-up to get the direct ratio). Magnitude is cited from
+`collect_limit_all` (the identical `Vec<ScoredResult>` clone on the sync sibling): one clone ≈ 3.1 ms at
+N=10k, ~1.1× on the async collect path.
+
 **Assessed marginal, do not re-tread alone:** the federated `accumulate_doc` template `hit.clone()`
 (insert + primary-update) and the per-call `docs.entry(hit.doc_id.clone())` key clone are each ~5 % after the
 `appeared_in` win (the key clone was already reverted at ~1.05×, 2026-06-27); the insert/template clone
