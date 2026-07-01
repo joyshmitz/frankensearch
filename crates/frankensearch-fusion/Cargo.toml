@@ -111,3 +111,7 @@ harness = false
 [[bench]]
 name = "blend_aligned"
 harness = false
+
+[[bench]]
+name = "collect_limit_all"
+harness = false

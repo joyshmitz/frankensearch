@@ -91,7 +91,10 @@ impl SyncTwoTierSearcher {
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
-        let outcome = self.search_internal(query_vec, k, filter)?;
+        // `search_collect` discards `outcome.phases`, so skip building them — that
+        // avoids cloning the full `Vec<ScoredResult>` (N owned doc_ids each) once
+        // per phase (Initial + Refined), pure waste at large `k` (limit_all).
+        let outcome = self.search_internal(query_vec, k, filter, false)?;
         Ok((outcome.final_results, outcome.metrics))
     }
 
@@ -113,7 +116,8 @@ impl SyncTwoTierSearcher {
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SyncSearchIterator {
-        match self.search_internal(query_vec, k, filter) {
+        // The iterator streams the progressive phases, so build them.
+        match self.search_internal(query_vec, k, filter, true) {
             Ok(outcome) => SyncSearchIterator::new(outcome.phases),
             Err(error) => SyncSearchIterator::from_error(error),
         }
@@ -125,9 +129,17 @@ impl SyncTwoTierSearcher {
         query_vec: &[f32],
         k: usize,
         filter: Option<&dyn SearchFilter>,
+        want_phases: bool,
     ) -> SearchResult<SyncSearchOutcome> {
         let mut metrics = TwoTierMetrics::default();
-        let mut phases = Vec::with_capacity(2);
+        // Only the streaming iterator path consumes `phases`; `search_collect`
+        // discards them. When they are not wanted, skip the allocation and the
+        // per-phase `Vec<ScoredResult>` clones entirely (see the guarded pushes).
+        let mut phases = if want_phases {
+            Vec::with_capacity(2)
+        } else {
+            Vec::new()
+        };
         let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
 
         let phase1_started = Instant::now();
@@ -172,16 +184,18 @@ impl SyncTwoTierSearcher {
         metrics.phase1_total_ms = ms(phase1_latency);
         metrics.fast_embed_ms = 0.0;
 
-        phases.push(SearchPhase::Initial {
-            results: initial_results.clone(),
-            latency: phase1_latency,
-            metrics: PhaseMetrics {
-                embedder_id: "sync-fast-query".to_owned(),
-                vectors_searched: fast_hits.len(),
-                lexical_candidates: metrics.lexical_candidates,
-                fused_count: initial_results.len(),
-            },
-        });
+        if want_phases {
+            phases.push(SearchPhase::Initial {
+                results: initial_results.clone(),
+                latency: phase1_latency,
+                metrics: PhaseMetrics {
+                    embedder_id: "sync-fast-query".to_owned(),
+                    vectors_searched: fast_hits.len(),
+                    lexical_candidates: metrics.lexical_candidates,
+                    fused_count: initial_results.len(),
+                },
+            });
+        }
 
         if self.config.fast_only || !self.index.has_quality_index() {
             metrics.skip_reason = Some(if self.config.fast_only {
@@ -203,11 +217,13 @@ impl SyncTwoTierSearcher {
                 let latency = phase2_started.elapsed();
                 metrics.phase2_total_ms = ms(latency);
                 metrics.skip_reason = Some(error.to_string());
-                phases.push(SearchPhase::RefinementFailed {
-                    initial_results: initial_results.clone(),
-                    error,
-                    latency,
-                });
+                if want_phases {
+                    phases.push(SearchPhase::RefinementFailed {
+                        initial_results: initial_results.clone(),
+                        error,
+                        latency,
+                    });
+                }
                 return Ok(SyncSearchOutcome {
                     phases,
                     final_results: initial_results,
@@ -274,17 +290,19 @@ impl SyncTwoTierSearcher {
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
         metrics.kendall_tau = None;
 
-        phases.push(SearchPhase::Refined {
-            results: refined_results.clone(),
-            latency: phase2_started.elapsed(),
-            metrics: PhaseMetrics {
-                embedder_id: "sync-quality-query".to_owned(),
-                vectors_searched: quality_count,
-                lexical_candidates: metrics.lexical_candidates,
-                fused_count: refined_results.len(),
-            },
-            rank_changes,
-        });
+        if want_phases {
+            phases.push(SearchPhase::Refined {
+                results: refined_results.clone(),
+                latency: phase2_started.elapsed(),
+                metrics: PhaseMetrics {
+                    embedder_id: "sync-quality-query".to_owned(),
+                    vectors_searched: quality_count,
+                    lexical_candidates: metrics.lexical_candidates,
+                    fused_count: refined_results.len(),
+                },
+                rank_changes,
+            });
+        }
 
         Ok(SyncSearchOutcome {
             phases,
