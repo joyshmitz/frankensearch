@@ -3614,3 +3614,54 @@ bench). This does NOT touch the RRF `into_owned` clone analyzed above — that o
 and still needs the workspace `Arc<str>` refactor. Lesson: when a clone is cited as a *blocker* for some other
 elision, separately check whether that clone is itself dead weight — `quality_hits`' doc_ids were never owned
 downstream, only borrowed.
+
+---
+
+## 2026-07-01 — main comparator confirmed at floor; two remaining levers are both multi-cycle (BlackThrush)
+
+**Surfaced blocker, not a tested-and-rejected lever.** After landing four fusion wins this arc
+(`blend_two_tier_aligned` sync+async `41beaff`/`5bc9d58`, `want_phases` `5100734`, federated `appeared_in`
+interning `8ec3108`), swept for a NEW clean per-crate lever on the biggest gap vs ORIG and found none that is
+safely landable-GREEN in a single ~60 m window. Recording the frontier state + the two real remaining levers
+with exact scope so the next session executes instead of re-exploring.
+
+**Main BOLD-VERIFY comparator (`frankensearch/benches/search_bench.rs`) is at floor.** Its challenger,
+`frankensearch_hash_hybrid_search`, is hand-rolled: `lexical.search_doc_ids` → `lexical_doc_ids_as_scored`
+(bench glue) → `vector.search_top_k` → `rrf_fuse`. Every component is individually mined (RRF fuse/merge, dot
+kernels, id materialization, prescreen). It does **not** call `SyncTwoTierSearcher::search_collect` /
+`blend_two_tier` / `search_internal`, so the recent two-tier wins don't move this row. The production
+`SyncLexicalSearch` impl is integrator-provided (only the test `StaticLexical` exists in-tree), so there is no
+fixed lexical→`ScoredResult` conversion clone to attack here. The only robustly-slower comparator row remains
+`limit_all` (~1.286× @10k, inherent hybrid semantics — see 2026-06-27 comparator entry).
+
+**Lever 1 (biggest gap vs ORIG) — `Arc<str>` doc_ids. Multi-cycle.** Closing the `limit_all` gap needs the
+RRF `into_owned` + resolve_heap source materialization (~20 % of limit_all, ~432 µs/10k measured) turned into
+refcount bumps. Scope counted this session: **182 `doc_id:` construction sites** in non-test src (fusion 106,
+core 46, index 28, lexical 2) + serde **`rc`** feature + a public-API break on `VectorHit`/`FusedHit`/
+`ScoredResult`/core `traits.rs` across **5 crates** (also storage/fsfs downstream). Most *read* sites survive
+via `Arc<str>: Deref<Target=str>`; the real edit surface is the 182 constructors (`x` → `x.into()`) + serde.
+This is a dedicated multi-cycle refactor with high regression surface (820+ tests), NOT a 60 m ship. Execution
+order: core types → serde rc → index source (`self.doc_ids: Vec<String>` → `Vec<Arc<str>>`, `resolve_heap`) →
+fusion/lexical constructors → per-crate `cargo test` after each.
+
+**Lever 2 (NEW, found this session) — async `search_collect_with_text` wastes the Initial-phase clone.**
+Same proven pattern as the sync `want_phases` win (`5100734`, 1.29×), on the async production collect path used
+by `TwoTierSearcher::search_collect` **and by federated** (per-shard `collect_shard_results`). `search()`
+(searcher.rs) streams phases via `on_phase`, cloning results into **every** phase (Initial `display_hits.clone()`
+@543, Refined @683, Reranked @736). `search_collect_with_text` (@881) drives it with a callback that just does
+`best_results = results` — keeping only the **latest** phase. So when a Refined/Reranked phase follows, the
+**Initial phase clone is pure waste** (built, stored, overwritten, dropped) — N `ScoredResult` clones per
+collect call at limit_all. Fix sketch: private `search_inner(..., emit_intermediate: bool)` (pub `search`
+passes `true`, `search_collect_with_text` passes `false`); guard the Initial emit @542 to fire only when
+`emit_intermediate || !should_run_quality()` (Initial is terminal only when no quality runs); update the
+collect callback to capture `RefinementFailed { initial_results, .. }` (@636/@805) so the failure path still
+delivers results when the Initial emit was skipped. **Blocker:** no async bench harness exists (all fusion
+benches are sync; `Cx` currently only from `asupersync::test_utils::run_test_with_cx`, test-internals-gated);
+measuring end-to-end needs a bench that stands up a runtime + `Cx` + stub embedders (replicated from the
+`#[cfg(test)]` module). Bit-identity is conformance-checkable now; the ratio needs that harness. High EV
+(production + federated path, proven pattern) — top of the next-session queue.
+
+**Assessed marginal, do not re-tread alone:** the federated `accumulate_doc` template `hit.clone()`
+(insert + primary-update) and the per-call `docs.entry(hit.doc_id.clone())` key clone are each ~5 % after the
+`appeared_in` win (the key clone was already reverted at ~1.05×, 2026-06-27); the insert/template clone
+relocates to output (1↔1) so only the O(log M)/doc update clones are elidable — sub-1.1× on a niche path.
