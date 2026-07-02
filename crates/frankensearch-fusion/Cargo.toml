@@ -97,6 +97,10 @@ name = "filter_match_ab"
 harness = false
 
 [[bench]]
+name = "tokenize_ascii_ab"
+harness = false
+
+[[bench]]
 name = "fused_materialize"
 harness = false
 

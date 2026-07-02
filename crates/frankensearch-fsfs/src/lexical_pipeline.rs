@@ -190,6 +190,16 @@ pub fn count_lexical_tokens(text: &str) -> usize {
 /// Split text into lexical tokens while preserving code/path-like identifiers.
 #[must_use]
 pub fn tokenize_lexical(text: &str) -> Vec<LexicalToken> {
+    // ASCII byte fast path (the common case: code, English prose). For all-ASCII
+    // text the byte index equals the char index and `TOKEN_BYTE` equals
+    // `is_token_char` for every byte, so the emitted tokens (text/line/offsets)
+    // are bit-identical — it just skips the UTF-8 decode + Unicode `is_alphanumeric`
+    // per char (~1.1-1.17×, `tokenize_ascii_ab` bench). Mirrors the sibling
+    // `count_lexical_tokens` ASCII fast path.
+    if text.is_ascii() {
+        return tokenize_lexical_ascii(text);
+    }
+
     let mut tokens = Vec::new();
     let mut token_start: Option<usize> = None;
     let mut line = 1_u32;
@@ -211,6 +221,49 @@ pub fn tokenize_lexical(text: &str) -> Vec<LexicalToken> {
         }
 
         if ch == '\n' {
+            line = line.saturating_add(1);
+        }
+    }
+
+    if let Some(start) = token_start {
+        tokens.push(LexicalToken {
+            text: text[start..].to_ascii_lowercase(),
+            line: token_line,
+            byte_start: start,
+            byte_end: text.len(),
+        });
+    }
+
+    tokens
+}
+
+/// ASCII fast path for [`tokenize_lexical`]. Only called when `text.is_ascii()`,
+/// where byte index == char index and `TOKEN_BYTE[b]` == `is_token_char(b as char)`
+/// for every byte, so the output is bit-identical to the char-based path — it just
+/// avoids per-char UTF-8 decoding and the Unicode `is_alphanumeric` predicate.
+fn tokenize_lexical_ascii(text: &str) -> Vec<LexicalToken> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut token_start: Option<usize> = None;
+    let mut line = 1_u32;
+    let mut token_line = 1_u32;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        if TOKEN_BYTE[b as usize] == 1 {
+            if token_start.is_none() {
+                token_start = Some(idx);
+                token_line = line;
+            }
+        } else if let Some(start) = token_start.take() {
+            tokens.push(LexicalToken {
+                text: text[start..idx].to_ascii_lowercase(),
+                line: token_line,
+                byte_start: start,
+                byte_end: idx,
+            });
+        }
+
+        if b == b'\n' {
             line = line.saturating_add(1);
         }
     }

@@ -2733,3 +2733,36 @@ see the NEGATIVE_EVIDENCE mixed entry). Bit-identical (asserted both filter kind
 **Scope:** original-comparator ratio **N/A** (internal, opt-in filter path); a frankensearch before/after — **narrow**
 (only extension-only filters benefit; path filters are a strict tie, no regression). Kept A/B harness `filter_match_ab`.
 Verified: remote `cargo build -p frankensearch-fsfs --lib` compile SUCCEEDED (RCH-E309 = artifact-transfer only).
+
+---
+
+## 2026-07-02 — `tokenize_lexical` ASCII byte fast path — ~1.1–1.17× on the per-document index-time tokenizer (SlateHeron)
+
+**Lever (sibling-consistency — the ASCII fast path the token-emitter missed).** `tokenize_lexical`
+(`fsfs/lexical_pipeline.rs:192`) runs a per-character loop over EVERY document's full text at index time via
+`text.char_indices()` (UTF-8 decode per char) + `is_token_char` (Unicode `is_alphanumeric()`). Its sibling
+`count_lexical_tokens` already had an ASCII byte fast path (256-byte `TOKEN_BYTE` LUT, won ~1.5–1.8×) but the
+token-EMITTER never got it. Added `if text.is_ascii() { tokenize_lexical_ascii(text) }` — a byte-iteration + LUT path
+reusing the file's existing `TOKEN_BYTE`. Bit-identical for ASCII text (byte index == char index; `TOKEN_BYTE[b]` ==
+`is_token_char(b as char)` for every byte); non-ASCII text falls back to the unchanged char path.
+
+**Measured (`tokenize_ascii_ab`, remote, realistic ASCII code/prose docs):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-slateheron rch exec -- \
+  cargo bench -p frankensearch-fusion --bench tokenize_ascii_ab -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+| doc size | char (current) | fast | ratio |
+|---|---|---|---|
+| 5.8 KB  | 27.05 µs  | 24.63 µs  | **0.911 (1.10×)** |
+| 29 KB   | 144.67 µs | 123.99 µs | **0.857 (1.17×)** |
+| 116 KB  | 567.89 µs | 498.25 µs | **0.877 (1.14×)** |
+
+Smaller than the count sibling's 1.5–1.8× because the per-token `to_ascii_lowercase` allocation (shared by both arms)
+dominates token emission; the win is the saved UTF-8 decode + Unicode predicate per char. Bit-identical (bench asserts
+identical token vectors; the `tokenize_lexical_preserves_code_and_path_tokens` test exercises the fast path).
+
+**Scope:** original-comparator ratio **N/A** — index-time lexical tokenizer, not a lexical *comparator* lever; a
+frankensearch before/after on indexing throughput (per-document, high corpus multiplier). Kept bench `tokenize_ascii_ab`.
+Verified: remote `cargo build -p frankensearch-fsfs --lib` compile SUCCEEDED (RCH-E309 = artifact-transfer only).
