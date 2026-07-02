@@ -58,7 +58,7 @@ impl GraphRanker {
             .map(|(doc_id, score)| {
                 let score_f32 = score as f32;
                 ScoredResult {
-                    doc_id,
+                    doc_id: doc_id.into(),
                     score: score_f32,
                     source: ScoreSource::SemanticFast,
                     index: None,

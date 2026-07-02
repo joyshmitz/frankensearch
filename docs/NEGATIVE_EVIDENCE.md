@@ -3953,3 +3953,23 @@ win at the measured scales** — it stays decision-gated (would need a 100k+ rec
 budget before wiring). The bench is validation-only; nothing ANN is wired into the product search path. **Route next:**
 ANN-in-BOLD needs a 100k-scale recall sweep, not a 10k one, before it's worth pursuing — deferred pending that data + a
 recall-budget decision.
+
+---
+
+## 2026-07-02 — LANDED FIX #2: the `graph` feature was ALSO broken by 8529084 (same cfg blind spot) (BlackThrush)
+
+**Applied the [[cfg-gated-feature-migration-blindspot]] lesson from the `ann` fix and found a second casualty.** Ran
+`cargo check -p frankensearch-fusion --all-features --all-targets` (and the top-level `full` lane) to hunt for *other*
+cfg-gated code the `DocId=CompactString` refactor (`8529084`) missed — and it did: `graph_rank.rs:61` built
+`ScoredResult { doc_id, .. }` (shorthand) from a `String`-keyed rank map, `E0308 expected CompactString, found String`.
+The `graph` feature (like `ann`) is absent from the default `--workspace --lib` conformance, so it broke silently. **Fixed
+(`<sha>`)** `doc_id: doc_id.into()` (owned `String`→`CompactString`, `From<String>` reuses the heap buffer for >24 B ids).
+Verified: `cargo check -p frankensearch-fusion --all-features --all-targets` GREEN (lib+tests+benches).
+
+**Tally:** the CompactString migration silently broke **two** feature configs — `ann` (`index`, fixed `d462e00`) and
+`graph` (`fusion`, this fix). Both are in the top-level `full` feature (`full = [.., "ann", .., "graph", ..]`), so a
+single `cargo check -p frankensearch --no-default-features --features full` (or `--all-features`) would have caught both
+— it just isn't in the swarm's default `--workspace --lib` conformance. **Process fix (do this after every workspace-wide
+type change):** run the `full`/`--all-features` lane, not only `--workspace --lib`. `graph_rank.rs` tests already used
+`.into()`; only the one production `map` closure was missed. (The top-level `full` lane re-check with both fixes was
+launched to confirm no third casualty hides behind `durable`/`api`.)
