@@ -3689,3 +3689,33 @@ takeaway if a future async lever needs measuring.
 (insert + primary-update) and the per-call `docs.entry(hit.doc_id.clone())` key clone are each ~5 % after the
 `appeared_in` win (the key clone was already reverted at ~1.05×, 2026-06-27); the insert/template clone
 relocates to output (1↔1) so only the O(log M)/doc update clones are elidable — sub-1.1× on a niche path.
+
+---
+
+## 2026-07-01 — RRF indirect index-sort is SLOWER (cache-miss-bound), not the win the flawed dismissal implied (BlackThrush)
+
+**Untested route-next tested (its prior rejection rested on a false premise) — REJECTED for a different, real
+reason.** The 2026-06-29 sort-key entry dismissed "sort a separate `(key, idx)` array then gather" because
+"gather-by-index needs an unsafe move-out of the `FusedHitScratch` Vec." That premise is **false**:
+`FusedHitScratch.doc_id` is `&'a str` (borrowed), so gather-by-index reads Copy fields + `into_owned`s the
+borrowed `&str` (a clone, no move, no unsafe). So the indirect index-sort (sort a `Vec<u32>` of **4-byte**
+indices instead of the ~112-byte 10-field struct, then gather by index) is safe and worth measuring — 4-byte
+swaps vs ~112-byte swaps on the ~22%-of-limit_all RRF sort.
+
+**Measured (per-crate, `-p frankensearch-fusion`, `rrf_index_sort` bench, `iter_batched` so the base clone is
+untimed; realistic limit_all shape, faithful `&str` doc_id; bit-identical output asserted — 0 reorders):**
+
+| N | `struct_sort` (production: sort fat structs in place) | `index_sort` (sort u32 idx + gather) | ratio |
+|---|------------------------------------------------------|--------------------------------------|-------|
+| 10000 | **686.22 µs** `[669,710]` | 715.82 µs `[711,723]` | **1.04× SLOWER** |
+| 50000 | **3.7289 ms** `[3.69,3.78]` | 4.2800 ms `[4.20,4.39]` | **1.15× SLOWER (worsens with N)** |
+
+**Decision: rejected, no production change (bench kept as evidence).** The indirect sort **loses**, and worse
+at scale: pdqsort over the fat struct array touches near-adjacent elements (cache-friendly), and even ~112-byte
+swaps are cheaper than the **scattered cache-miss reads** the indirect comparator (`scratch[a]` vs `scratch[b]`
+for random `a,b`) and the scattered gather (`scratch[idx]`) incur once the `N`-struct array (1.1 MB @10k,
+5.6 MB @50k) exceeds cache. So the prior dismissal reached the right conclusion (don't do it) for the wrong
+reason (it isn't an unsafe-safety issue, it's a cache-locality issue). **The RRF final sort is at its floor**:
+the sort algorithm (radix), the comparator (precomputed keys / key-fattening), the sorted-record size (indirect
+index sort) have all now been probed and rejected. Route next: the only remaining limit_all lever is the
+`Arc<str>` doc_id materialization (workspace refactor), not the sort.

@@ -119,3 +119,7 @@ harness = false
 [[bench]]
 name = "federated_appeared_in"
 harness = false
+
+[[bench]]
+name = "rrf_index_sort"
+harness = false
