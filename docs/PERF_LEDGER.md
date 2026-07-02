@@ -2894,3 +2894,26 @@ recall ≥ 0.95** rather than an uncertified 3.4× at 0.9875 average with an unc
 Verified: bench compiles + runs clean under `--features ann` (exit 0). Ratio vs Tantivy N/A directly (vector tier; flat
 exact is the internal baseline). This closes the recall-certificate arc: a caller now obtains a **certified, measured**
 ANN speedup from one `certify_ef_search(..)` call.
+
+---
+
+## 2026-07-02 — MEASURED: two-mode certified ANN ef selection @100k — tail 1.76× vs Bernstein-mean 3.70× vs flat (SlateHeron)
+
+Completes the Bernstein mean-mode (`7f8de36`) with **live ANN data**. `hnsw_vs_flat_100k` now certifies the ANN `ef` under
+BOTH guarantee modes on shared calibration (1000 queries; exact top-k measured ONCE per candidate `ef`), each reporting
+the chosen `ef` + out-of-sample recall on 300 fresh held-out queries.
+
+**Measured (remote `--features ann`, N=100k, dim=128, NOISE=0.15, m=32, k=10, target recall 0.95):**
+
+| mode | guarantee | certified ef | latency | vs flat | certified LB | holdout recall |
+|---|---|---|---|---|---|---|
+| flat | exact | — | 1062.5 µs | 1.00× | — | 1.000 |
+| **TAIL** (conformal, α=0.1) | per-query recall ≥ 0.95 w.p. ≥ 0.9 | 100 | 605.1 µs | **1.76×** | 1.0000 | 0.9927 |
+| **MEAN** (Bernstein, δ=0.05) | E[recall] ≥ 0.95 w.p. ≥ 0.95 | **40** | 286.9 µs | **3.70×** | 0.9665 | 0.9760 |
+
+The Bernstein **mean** mode certifies the cheaper `ef=40` → **3.70×** (2.1× more speedup than the tail mode's `ef=100` →
+1.76×) by accepting the weaker **average**-recall guarantee; both meet the 0.95 target with high held-out recall
+(0.976 / 0.993). This validates the `7f8de36` unit-test demonstration on live ANN, and gives the ANN-in-BOLD product
+decision a **certified** speedup at each guarantee level: pick the tail mode for a per-query SLA, the mean mode for an
+average-recall budget. Verified: bench compiles + runs clean under `--features ann` (exit 0). Ratio vs Tantivy N/A
+directly (vector tier; flat exact is the internal baseline).

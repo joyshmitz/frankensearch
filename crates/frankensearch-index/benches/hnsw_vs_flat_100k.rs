@@ -20,6 +20,7 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
 
     use frankensearch_index::{
         HNSW_DEFAULT_EF_SEARCH, HnswConfig, HnswIndex, Quantization, VectorIndex,
+        certified_min_ef, certified_min_ef_mean,
     };
 
     const N: usize = 100_000;
@@ -115,44 +116,85 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
         })
         .collect();
 
-    // ── Certificate-driven ef selection (the operational payoff of the conformal
-    //    recall certificate): auto-pick the CHEAPEST ef whose certified recall lower
-    //    bound meets a target, then verify the choice OUT-OF-SAMPLE on fresh queries
-    //    the certificate never saw. This is the number the ANN-in-BOLD recall-budget
-    //    decision needs — a certified ef with a finite-sample guarantee, no guess.
-    const CAL_QUERIES: usize = 200;
+    // ── Certificate-driven ef selection, TWO guarantee modes on shared calibration:
+    //    (1) PER-QUERY TAIL (split-conformal): a fresh query's recall >= target w.p.
+    //        >= 1-alpha — the strong guarantee. (2) AVERAGE recall (empirical-Bernstein
+    //        mean LCB): E[recall] >= target w.p. >= 1-delta — a weaker budget that
+    //        certifies a CHEAPER ef. Recall is measured ONCE per candidate ef on the
+    //        calibration set (exact top-k is ef-independent), then each mode selects.
+    const CAL_QUERIES: usize = 1000;
+    const HOLDOUT_QUERIES: usize = 300;
     const TARGET_RECALL: f64 = 0.95;
-    const ALPHA: f64 = 0.1;
+    const ALPHA: f64 = 0.1; // per-query tail confidence
+    const DELTA: f64 = 0.05; // mean-mode confidence
     const CANDIDATE_EFS: [usize; 5] = [10, 20, 40, 100, 200];
+
     let calibration: Vec<Vec<f32>> = (0..CAL_QUERIES)
         .map(|q| make_vector(&centroids, q % CLUSTERS, 0xca11_0000 + q as u64))
         .collect();
-    let holdout: Vec<Vec<f32>> = (0..CAL_QUERIES)
+    // Exact top-k ids per calibration query, computed ONCE (ef-independent).
+    let cal_exact: Vec<Vec<String>> = calibration
+        .iter()
+        .map(|q| {
+            index
+                .search_top_k(q, K, None)
+                .expect("flat")
+                .into_iter()
+                .map(|h| h.doc_id.to_string())
+                .collect()
+        })
+        .collect();
+    // Per-ef recall sample over the calibration set.
+    let cal_samples: Vec<(usize, Vec<f64>)> = CANDIDATE_EFS
+        .iter()
+        .map(|&ef| {
+            let recalls: Vec<f64> = calibration
+                .iter()
+                .zip(&cal_exact)
+                .map(|(q, exact)| {
+                    let ann: Vec<String> = hnsw
+                        .knn_search(q, K, ef)
+                        .expect("ann")
+                        .into_iter()
+                        .map(|h| h.doc_id.to_string())
+                        .collect();
+                    recall_at_k(exact, &ann)
+                })
+                .collect();
+            (ef, recalls)
+        })
+        .collect();
+    let tail = certified_min_ef(&cal_samples, TARGET_RECALL, ALPHA).expect("tail");
+    let mean = certified_min_ef_mean(&cal_samples, TARGET_RECALL, DELTA).expect("mean");
+    let (tail_ef, mean_ef) = (tail.ef_search, mean.ef_search);
+
+    // Out-of-sample recall for each chosen ef on fresh held-out queries.
+    let holdout: Vec<Vec<f32>> = (0..HOLDOUT_QUERIES)
         .map(|q| make_vector(&centroids, q % CLUSTERS, 0x401d_0000 + q as u64))
         .collect();
-    let certified = hnsw
-        .certify_ef_search(&index, &calibration, &CANDIDATE_EFS, K, TARGET_RECALL, ALPHA)
-        .expect("certify")
-        .expect("some candidate");
-    let certified_ef = certified.chosen.ef_search;
-    // Out-of-sample recall of the chosen ef on fresh held-out queries.
-    let mut holdout_total = 0.0_f64;
-    for q in &holdout {
-        let exact: Vec<String> = index
-            .search_top_k(q, K, None)
-            .expect("flat")
-            .into_iter()
-            .map(|h| h.doc_id.to_string())
-            .collect();
-        let ann: Vec<String> = hnsw
-            .knn_search(q, K, certified_ef)
-            .expect("ann")
-            .into_iter()
-            .map(|h| h.doc_id.to_string())
-            .collect();
-        holdout_total += recall_at_k(&exact, &ann);
-    }
-    let holdout_recall = holdout_total / CAL_QUERIES as f64;
+    let holdout_recall_at = |ef: usize| -> f64 {
+        let sum: f64 = holdout
+            .iter()
+            .map(|q| {
+                let exact: Vec<String> = index
+                    .search_top_k(q, K, None)
+                    .expect("flat")
+                    .into_iter()
+                    .map(|h| h.doc_id.to_string())
+                    .collect();
+                let ann: Vec<String> = hnsw
+                    .knn_search(q, K, ef)
+                    .expect("ann")
+                    .into_iter()
+                    .map(|h| h.doc_id.to_string())
+                    .collect();
+                recall_at_k(&exact, &ann)
+            })
+            .sum();
+        sum / HOLDOUT_QUERIES as f64
+    };
+    let tail_holdout = holdout_recall_at(tail_ef);
+    let mean_holdout = holdout_recall_at(mean_ef);
 
     let mut qi = 0usize;
     let mut g = c.benchmark_group("hnsw_vs_flat_100k");
@@ -172,13 +214,20 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
             });
         });
     }
-    // The certificate's auto-selected ef — its latency vs `flat` above is the
-    // certified ANN-in-BOLD speedup.
-    g.bench_function(format!("hnsw_certified_ef{certified_ef}"), |b| {
+    // The two certified efs — each one's latency vs `flat` above is the certified
+    // ANN-in-BOLD speedup under that guarantee mode.
+    g.bench_function(format!("hnsw_tail_certified_ef{tail_ef}"), |b| {
         b.iter(|| {
             let q = &queries[qi % QUERIES];
             qi += 1;
-            black_box(hnsw.knn_search(black_box(q), K, certified_ef).expect("ann"))
+            black_box(hnsw.knn_search(black_box(q), K, tail_ef).expect("ann"))
+        });
+    });
+    g.bench_function(format!("hnsw_mean_certified_ef{mean_ef}"), |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(hnsw.knn_search(black_box(q), K, mean_ef).expect("ann"))
         });
     });
     g.finish();
@@ -205,10 +254,12 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
     }
 
     println!(
-        "CERTIFIED_RESULT target={TARGET_RECALL} alpha={ALPHA} n_cal={CAL_QUERIES} \
-         certified_ef={certified_ef} certified_lower_bound={:.4} meets_target={} \
-         holdout_recall@{K}={:.4} (compare hnsw_certified_ef{certified_ef} vs flat for the certified speedup)",
-        certified.chosen.certified_recall, certified.chosen.meets_target, holdout_recall
+        "CERTIFIED_RESULT target={TARGET_RECALL} n_cal={CAL_QUERIES} | \
+         TAIL(per-query, alpha={ALPHA}): ef={tail_ef} lower_bound={:.4} meets={} holdout@{K}={:.4} | \
+         MEAN(average, Bernstein, delta={DELTA}): ef={mean_ef} lower_bound={:.4} meets={} holdout@{K}={:.4} \
+         (compare hnsw_tail_certified_ef{tail_ef} and hnsw_mean_certified_ef{mean_ef} vs flat for the two certified speedups)",
+        tail.certified_recall, tail.meets_target, tail_holdout,
+        mean.certified_recall, mean.meets_target, mean_holdout
     );
 
     let _ = std::fs::remove_file(&path);
