@@ -2867,3 +2867,30 @@ _Frontier note (this turn): re-confirmed the competitive vs-Tantivy path stays c
 RRF top-k / WAND / block-max / threshold-pruning family is closed (BlackThrush explored it extensively), and query
 preprocessing is heavily mined. The remaining landable levers are ratio-N/A caller-less contract modules (this win) or the
 product-gated ANN-in-BOLD._
+
+---
+
+## 2026-07-02 — MEASURED: certificate-driven ANN ef selection vs flat @100k — certified 1.65× at recall≥0.95 (SlateHeron)
+
+The operational payoff of the recall-certificate arc (`915c902` certificate → `e77e3fe` driver → `c30004c` live glue).
+`hnsw_vs_flat_100k` now **auto-selects the ANN `ef`** via `HnswIndex::certify_ef_search` (target recall 0.95, alpha 0.1,
+200 calibration queries), then reports the certified `ef`'s latency vs flat exact + its **out-of-sample** recall on 200
+fresh held-out queries.
+
+**Measured (remote `--features ann`, N=100k, dim=128, tight clusters NOISE=0.15, m=32, k=10):**
+
+| path | latency (median) | vs flat | recall@10 |
+|---|---|---|---|
+| flat (exact, rayon) | 932.84 µs | 1.00× | 1.000 (baseline) |
+| hnsw ef=40 | 275.00 µs | 3.39× | 0.9875 avg — **tail NOT certified ≥0.95** |
+| **hnsw certified ef=100** | **566.79 µs** | **1.65×** | certified LB 1.0000, holdout 0.9890, meets 0.95 ✓ |
+
+The certificate auto-selected **ef=100** and correctly **rejected the cheaper ef=40**: ef=40's 0.9875 *average* clears
+0.95, but its split-conformal *lower bound* (≈10th percentile over 200 calibration recalls) does **not**, so it cannot
+*guarantee* 0.95. This is the guarantee-vs-average distinction the whole arc exists to make safe — a **certified 1.65× at
+recall ≥ 0.95** rather than an uncertified 3.4× at 0.9875 average with an uncontrolled tail. (At dim=384 the flat scan is
+~3× costlier per vector, so the certified speedup is larger there — see [[ann-in-bold-viable]]'s 2.6–5× at dim 384.)
+
+Verified: bench compiles + runs clean under `--features ann` (exit 0). Ratio vs Tantivy N/A directly (vector tier; flat
+exact is the internal baseline). This closes the recall-certificate arc: a caller now obtains a **certified, measured**
+ANN speedup from one `certify_ef_search(..)` call.
