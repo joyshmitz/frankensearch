@@ -4494,3 +4494,33 @@ it removes N−1 redundant model invocations per cache-cold batch on the indexin
 improvement (fewer inner calls, same outputs, all contracts preserved), verified by test rather than by a bench ratio.
 **LESSON:** an "uncommitted measured win" in a shared tree may be an *incomplete draft* — re-run the crate's own contract
 tests before landing; this one silently dropped a documented dedup invariant.
+
+---
+
+## 2026-07-02 — MEASUREMENT BLOCKER: sync_searcher per-query maps/sets are std-SipHash where siblings use aHash (SlateHeron)
+
+**Lever identified (high prior, unmeasured — NOT landed):** `sync_searcher.rs` builds, per query on the default sync
+hybrid path, two `HashMap<&str, f32>` score maps (`fast_scores`/`quality_scores`, `sync_searcher.rs:270-278`, one
+entry per candidate) + a `seen` dedup `HashSet<&str>` (`:446`) + a `ranks` `HashMap<&str,usize>` (`:525`), then probes
+every candidate doc_id in both maps — **all std `std::collections` (SipHash), imported at `sync_searcher.rs:7`.** The
+sibling fusion paths already moved off SipHash: `rrf.rs:17` and `blend.rs:236` use `ahash::AHashMap`, `search.rs:7`
+uses `AHashSet` (the `search.rs:1285`/`rrf.rs:1111` std-HashMap hits are in `mod tests`, imports at 1125/570). SipHash
+is a crypto hash; for short non-adversarial `&str` doc_ids `ahash` is materially faster on insert+lookup. This is the
+same sibling-path-consistency lever that LANDED **1.1–1.22×** on the federated aHash-vs-SipHash swap (`9543ae6`,
+see [[sibling-path-consistency-audit]]), applied to the one hot searcher map cluster it missed.
+
+**Blocker (the ONE thing):** wrote the faithful A/B bench (`sync_hash` group: `sip` vs `ahash`, build both score maps
++ seen set then one fast+one quality `.get()` per candidate, n∈{30,100,300}, bit-identical asserted) but got **no
+ratio** — the first rch run failed because the untracked bench file was not transferred to the remote worker
+(`couldn't read benches/sync_hash_ab.rs`), and the staged re-run was interrupted before measurement. Per the honest
+protocol I did **not** land the production hasher swap unmeasured, and did **not** commit the unverified bench
+(cargo autobench discovery would compile it into `--all-targets`; ahash `AHashSet::with_capacity` / `FromIterator`
+compile-safety unconfirmed without a build). Bench body preserved in the session scratchpad (`sync_hash_ab.rs`).
+
+**Route-next (one A/B, then a 4-line swap):** copy `sync_hash_ab.rs` back to `crates/frankensearch-fusion/benches/`,
+add its `[[bench]]` (harness=false) to `Cargo.toml`, **`git add` it first** (rch only transfers tracked/staged files —
+this was the trap), then `CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- cargo bench -p
+frankensearch-fusion --bench sync_hash_ab`. If `ahash` ratio < 0.97: switch `sync_searcher.rs:7` to `use
+ahash::{AHashMap, AHashSet}` and the four constructors at :270/:274/:446/:525 (all local, private fns, keys are
+`&str` doc_ids — bit-identical, no caller ripple). LESSON: `git add` new bench/source files BEFORE any `rch exec` or
+the remote build reads a stale tree.
