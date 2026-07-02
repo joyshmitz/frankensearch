@@ -4628,3 +4628,32 @@ convert the two `let mut seen* = HashSet::with_capacity(...)` at `runtime.rs:612
 `ahash::AHashSet::with_capacity(...)` (fsfs already deps `ahash` since `401c3e3`; inferred `&str` element type; same
 proven swap as `sync_searcher`/`fuse_expanded`). Verify `cargo build -p frankensearch-fsfs --lib` (RCH-E309 exit-102 =
 compile-succeeded), then land. Refused to push the unverified fsfs edit to the shared tree.
+
+---
+
+## 2026-07-02 — MIXED: filter `matches_doc_id` per-candidate `to_ascii_lowercase` — naive alloc-free contains REJECTED; conditional-skip is a narrow ~1.7× (ext-only), queued (SlateHeron)
+
+**Lever probed:** `SearchFilterExpr::matches_doc_id` (`fsfs/runtime.rs:305`) is evaluated PER CANDIDATE in
+`apply_search_filter` (`:5890`, filters the fused head at `:6533`/`:6607`) and both merge loops (`:6134`/`:6147`). It
+unconditionally allocates `let lowered = doc_id.to_ascii_lowercase();` every call — even for `Extension`-only filters
+(`type:`/`ext:`/`lang:`) that never read `lowered`. Two candidate fixes benched (`filter_match_ab`, remote, over
+realistic path candidate sets, PathContains vs Extension filter):
+
+**(1) REJECTED — replace the alloc + `lowered.contains(needle)` with a naive alloc-free byte-wise
+case-insensitive `contains`.** For PathContains filters this is a **regression / wash**: old 4.47µs/22.49µs (n200/n1000)
+→ naive 4.65µs/22.73µs = **1.04×/1.01×**. The single `to_ascii_lowercase` allocation feeds `str::contains`, which is
+SIMD/`memchr`-optimized and beats a naive O((H−N)·N) byte scan — the alloc is NOT the bottleneck for path filters.
+Do not replace `str::contains` with a hand-rolled scan.
+
+**(2) Narrow WIN (queued, prod edit UNVERIFIED under no-build) — allocate `lowered` ONLY when a PathContains clause
+exists.** For Extension-only filters (which never read `lowered`) the alloc is pure waste: old 8.19µs/40.50µs
+(n200/n1000) → no-alloc 4.87µs/23.83µs = **0.595/0.588 (~1.7×)**. Path filters keep the identical `to_ascii_lowercase`
++ SIMD `contains` (tie by construction, no regression). Bit-identical (asserted both filter kinds).
+
+**Route-next (verified-safe scope):** add a `has_path_contains: bool` field to `SearchFilterExpr` set once in
+`parse` (`:249`), then `let lowered = self.has_path_contains.then(|| doc_id.to_ascii_lowercase());` and
+`PathContains(needle) => lowered.as_deref().is_some_and(|l| l.contains(needle))`. Bench (`filter_match_ab`, conditional
+variant) preserved in session scratchpad; register + `git add` + `rch bench`, then wire + `cargo build -p
+frankensearch-fsfs --lib`. Ratio vs Tantivy N/A (internal, opt-in filter path). NOTE: narrow — only ext-only filters
+benefit; low priority vs a broader lever. LESSON: an "eliminate the alloc" instinct can LOSE when the alloc feeds a
+SIMD stdlib routine (`str::contains`); measure before replacing stdlib string ops with hand-rolled scans.
