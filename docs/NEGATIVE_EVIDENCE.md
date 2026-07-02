@@ -4816,3 +4816,41 @@ caller now chooses per-query-tail vs average-recall guarantees, each with the *c
 **Verified: remote `cargo test -p frankensearch-index --lib recall_certificate` PASSED 14/14**, incl. the Bernstein
 coverage-validity Monte-Carlo (miss ≤ δ), `bernstein_is_tighter_than_hoeffding_on_low_variance_recall`, and
 `mean_mode_certifies_a_cheaper_ef_than_the_per_query_tail_mode`.
+
+---
+
+## 2026-07-02 — FRONTIER EXHAUSTED (definitive synthesis): remaining levers are research-grade or measurement-blocked (SlateHeron)
+
+After a multi-turn sweep, the **clean-and-landable measured-perf frontier** vs the internal baselines (Tantivy lexical /
+flat exact vector) is definitively exhausted. This turn's fresh probes all closed on inspection:
+- **1-bit binary quantization + Hamming** — the natural bandwidth-reduction idea for the memory-bound flat scan (1062 µs
+  @100k F32 is bandwidth-bound). Already probed and **REJECTED** (§ "1-bit binary (sign) two-pass", BlackThrush): 1-bit
+  sign quant collapses clustered embeddings (clusters share sign patterns → recall too low) AND no speedup (integer
+  Hamming ties thrash + popcount eats the ~8× bandwidth edge). The sub-int8 lever that DOES work is **4-bit**, already
+  shipped (`dot_packed_4bit`). `simd.rs::binary_quant_recall_at_10` remains only as a `#[cfg(test)]` recall probe.
+- **Streaming quantile sketch** (t-digest, graveyard Tier-S) — already the production metrics path (`metrics.rs`: paired
+  t-digests + Huber `MedianMAD`).
+- **`ScalarQuantizer::fit` min/max reduction** — caller-less public API (production uses `Quantization::F16` + the SIMD
+  slab kernels).
+
+**Session contribution (the last substantive frontier, now closed with a measured result):** the ANN recall-CERTIFICATE
+arc — conformal per-query bound + empirical-Bernstein mean bound, the lazy `calibrate_certified_ef` driver, the live
+`HnswIndex::certify_ef_search` glue, and a two-mode @100k measurement (**tail 1.76× / Bernstein-mean 3.70× vs flat**, both
+certified ≥ 0.95). This retired the sole open competitive lever's (ANN-in-BOLD) recall-budget sign-off end-to-end.
+
+**Remaining levers — all research-grade or measurement-blocked; NOT ship-fast commits. Prioritized for a future
+dedicated effort:**
+1. **Real-embedding validation harness** (highest value, MEASUREMENT-BLOCKED): every ANN/certificate number is on
+   *synthetic* clustered corpora. A real 384-d embedded 100k recall/latency sweep needs a semantic model, absent on rch
+   workers. Unblock = stage a model on the workers, or run locally.
+2. **Adaptive / stratified-ef ANN** (Mondrian conformal): route queries by difficulty stratum to per-stratum certified
+   `ef`s to recover the tail-mode speedup on heterogeneous corpora. Needs a reliable cheap difficulty signal + a
+   heterogeneous-corpus model to even *demonstrate* — the homogeneous synthetic corpus can't show it.
+3. **Anisotropic / ScaNN-style quantization**: better recall-per-byte than scalar quant for MIPS. Recall-affecting; needs
+   a recall/latency Pareto sweep.
+4. **AVX-512 dot kernels**: ~2× wider than the shipped AVX2 tier, *iff* the target CPUs expose AVX-512. Needs runtime
+   dispatch + hardware confirmation + a non-trivial bit-identity story (wider lanes reassociate float sums).
+
+**Route for the next session:** do NOT re-walk quantization / hasher / clone / top-k / fusion / filter / tokenizer /
+binary-quant / t-digest — all closed with measurement. Either unblock #1 (real embeddings) or take on one of #2–4 as a
+dedicated multi-turn design, not a single-turn perf commit.
