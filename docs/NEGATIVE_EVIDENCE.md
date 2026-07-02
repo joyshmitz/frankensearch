@@ -3890,3 +3890,33 @@ niche-safety (sentinels re-admit "is this `u32::MAX` a real rank or absent?" bug
 run — that was hz1, this is ovh-a; the SAME-worker packed/compact ratio is the valid comparison, re-confirming
 cross-worker absolutes are noise.) `docid_materialize_ab` packed arm kept as evidence. **Route next: the two remaining
 levers are now (a) ANN-in-BOLD (recall tradeoff, decision-gated) only — struct-shrink (b) is closed by data.**
+
+---
+
+## 2026-07-02 — LANDED: `DocId=CompactString` extended to the lexical id-materialization (sibling-path consistency)
+
+**A real win, not a rejection — the `8529084` CompactString refactor stopped at the core/fusion/index boundary; the
+`frankensearch-lexical` crate was the last hot holdout still on `String`.** ([[sibling-path-consistency-audit]] pattern:
+grep for an optimization applied to one path but not its twin.) The lexical fast id-materialization (`collect_id_hits`,
+the `ord` u64 FAST-column → `ord_table` lookup that skips the docstore decompress) stored `ord_table: RwLock<Vec<String>>`
+and returned `LexicalIdHit { doc_id: String }`, so on **every lexical query** (the exact `exact_identifier` /
+`quoted_phrase` classes where frankensearch historically trailed tantivy) each hit's id was a `String` heap clone
+(`ord_table[ord].clone()`, rrf-lexical.rs:1046) **and then re-converted** `String→CompactString` at the fusion boundary
+(`ScoredResult.doc_id` is already `DocId`).
+
+**Change (`<sha>`):** `ord_table` → `Vec<DocId>`, `LexicalIdHit.doc_id` → `DocId`, `docstore_id()` → `DocId`,
+`assign_ord` push → `DocId::from`, sidecar load/persist → `Vec<DocId>` (CompactString serializes as a JSON string, so
+existing `ord_table.json` sidecars stay byte-compatible — no reindex). `DocId` re-exported from `frankensearch_core`.
+Net: the per-hit lexical id clone becomes an **SSO inline memcpy** (the measured 29.8× bare-clone / 2.2× full-materialize
+primitive from [[limit-all-materialize-clone-arc-str]] / `docid_materialize_ab`, now applied on the lexical hot path)
+AND the `String→CompactString` boundary re-conversion is **eliminated** (the id moves straight into `ScoredResult`).
+Strictly cheaper-or-equal: same 24 B footprint, same >24 B heap-fallback behavior, so no regression.
+
+**Conformance:** `cargo test -p frankensearch-lexical -p frankensearch-fusion -p frankensearch-core --lib --features
+lexical` GREEN (exit 0) on a **forced-fresh core rebuild** (`cargo clean -p frankensearch-core` first). METHODOLOGY
+[[rch-stale-cache-false-green]]: a first run *falsely failed* `unresolved import frankensearch_core::types::DocId` on a
+worker whose cached core `.rlib` predated the `DocId` alias, while a lexical-only check *falsely passed* on a
+fresh-core worker — always force a clean core rebuild when a cross-crate type alias won't resolve. `search_doc_ids_materialize`
+per-crate bench launched on search-cc for a current-state datapoint (fleet-slow; the win magnitude is the already-measured
+CompactString primitive, so it does not gate the landing). **Route next:** the CompactString arc is now complete across
+every hot crate (core/index/fusion/lexical); the sole remaining perf lever is (a) ANN-in-BOLD (recall-gated).

@@ -48,7 +48,7 @@ use asupersync::Cx;
 use asupersync::sync::Mutex;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{LexicalSearch, SearchFuture};
-use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
+use frankensearch_core::types::{DocId, IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, STORED, STRING, TextFieldIndexing, TextOptions};
@@ -198,8 +198,11 @@ pub struct LexicalSearchResult {
 /// Lightweight lexical hit used by hot paths that only need `doc_id` + score.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LexicalIdHit {
-    /// Unique document identifier.
-    pub doc_id: String,
+    /// Unique document identifier. `DocId` (`CompactString`, SSO) so the
+    /// per-hit id-materialization clone (`ord_table` lookup / docstore) is an
+    /// inline memcpy for short ids and needs no `String→CompactString`
+    /// re-conversion when it flows into `ScoredResult` at the fusion boundary.
+    pub doc_id: DocId,
     /// BM25 relevance score.
     pub bm25_score: f32,
     /// 0-based rank in the returned page.
@@ -478,7 +481,7 @@ pub struct TantivyIndex {
     /// Grows by one per indexed document (including re-upserts); ordinals are
     /// monotonic and never reused, so it stays correct across deletes/merges
     /// (a deleted doc's ordinal simply never appears in search results).
-    ord_table: RwLock<Vec<String>>,
+    ord_table: RwLock<Vec<DocId>>,
     path: Option<PathBuf>,
 }
 
@@ -642,7 +645,7 @@ impl TantivyIndex {
             if saw_ord {
                 let needed = usize::try_from(max_ord).unwrap_or(usize::MAX).saturating_add(1);
                 if ord_table.len() < needed {
-                    ord_table.resize(needed, String::new());
+                    ord_table.resize(needed, DocId::default());
                 }
             }
         }
@@ -661,7 +664,7 @@ impl TantivyIndex {
     /// Load the persisted `ordinal → doc_id` table sidecar (`ord_table.json`)
     /// from an on-disk index directory. Returns `None` on any error or absence
     /// so the caller can fall back to docstore materialization.
-    fn load_ord_table_sidecar(dir: &Path) -> Option<Vec<String>> {
+    fn load_ord_table_sidecar(dir: &Path) -> Option<Vec<DocId>> {
         let file = std::fs::File::open(dir.join("ord_table.json")).ok()?;
         serde_json::from_reader(std::io::BufReader::new(file)).ok()
     }
@@ -730,7 +733,7 @@ impl TantivyIndex {
             && let Ok(mut table) = self.ord_table.write()
         {
             let ord = u64::try_from(table.len()).unwrap_or(u64::MAX);
-            table.push(doc_id.to_owned());
+            table.push(DocId::from(doc_id));
             tantivy_doc.add_u64(ord_field, ord);
         }
     }
@@ -987,16 +990,16 @@ impl TantivyIndex {
 
     /// Read a single hit's `doc_id` from the stored document (the docstore
     /// fallback path: decompresses the stored block to read the `id` field).
-    fn docstore_id(&self, searcher: &Searcher, addr: DocAddress) -> SearchResult<String> {
+    fn docstore_id(&self, searcher: &Searcher, addr: DocAddress) -> SearchResult<DocId> {
         let doc = load_doc(searcher, addr)?;
-        Ok(doc
-            .get_first(self.fields.id)
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                debug!("tantivy document missing id field, using empty doc_id");
-                ""
-            })
-            .to_owned())
+        Ok(DocId::from(
+            doc.get_first(self.fields.id)
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| {
+                    debug!("tantivy document missing id field, using empty doc_id");
+                    ""
+                }),
+        ))
     }
 
     /// Materialize ranked Tantivy hits into [`LexicalIdHit`] rows.
