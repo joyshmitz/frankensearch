@@ -550,7 +550,7 @@ mod tests {
 
     fn lexical_result(doc_id: &str, score: f32) -> ScoredResult {
         ScoredResult {
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
             score,
             source: ScoreSource::Lexical,
             index: None,

@@ -111,7 +111,7 @@ fn bench_hnsw_vs_flat(c: &mut Criterion) {
                 .search_top_k(q, K, None)
                 .expect("flat")
                 .into_iter()
-                .map(|h| h.doc_id)
+                .map(|h| h.doc_id.to_string())
                 .collect()
         })
         .collect();
@@ -125,7 +125,7 @@ fn bench_hnsw_vs_flat(c: &mut Criterion) {
                 .knn_search(query, K, ef)
                 .expect("ann")
                 .into_iter()
-                .map(|h| h.doc_id)
+                .map(|h| h.doc_id.to_string())
                 .collect();
             total += recall_at_k(&flat_topk[qi], &ann);
         }

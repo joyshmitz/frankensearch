@@ -2981,7 +2981,7 @@ mod tests {
             Box::pin(async move {
                 Ok((0..limit.min(3))
                     .map(|i| ScoredResult {
-                        doc_id: format!("lex-doc-{i}"),
+                        doc_id: format!("lex-doc-{i}").into(),
                         score: (3 - i) as f32,
                         source: ScoreSource::Lexical,
                         index: None,
@@ -4453,7 +4453,7 @@ mod tests {
     fn fused_hits_to_scored_results_preserves_lexical_metadata() {
         let fused = vec![
             frankensearch_core::types::FusedHit {
-                doc_id: "lex-doc-1".to_owned(),
+                doc_id: "lex-doc-1".into(),
                 rrf_score: 1.5,
                 lexical_rank: Some(0),
                 semantic_rank: None,
@@ -4463,7 +4463,7 @@ mod tests {
                 in_both_sources: false,
             },
             frankensearch_core::types::FusedHit {
-                doc_id: "sem-doc-1".to_owned(),
+                doc_id: "sem-doc-1".into(),
                 rrf_score: 1.0,
                 lexical_rank: None,
                 semantic_rank: Some(0),
@@ -4474,7 +4474,7 @@ mod tests {
             },
         ];
         let lexical_results = vec![ScoredResult {
-            doc_id: "lex-doc-1".to_owned(),
+            doc_id: "lex-doc-1".into(),
             score: 3.0,
             source: ScoreSource::Lexical,
             index: None,
@@ -5219,7 +5219,7 @@ mod tests {
             .map(|idx| VectorHit {
                 index: u32::try_from(idx).expect("idx fits in u32 for test fixture"),
                 score: idx as f32 * 0.001_f32,
-                doc_id: format!("doc-{idx}"),
+                doc_id: format!("doc-{idx}").into(),
             })
             .collect();
         let quality_hits: Vec<VectorHit> = (0..doc_count)
@@ -5227,13 +5227,13 @@ mod tests {
             .map(|idx| VectorHit {
                 index: u32::try_from(idx).expect("idx fits in u32 for test fixture"),
                 score: idx as f32 * 0.002_f32,
-                doc_id: format!("doc-{idx}"),
+                doc_id: format!("doc-{idx}").into(),
             })
             .collect();
         let blended: Vec<VectorHit> = (0..doc_count)
             .map(|idx| VectorHit {
                 index: u32::try_from(idx).expect("idx fits in u32 for test fixture"),
-                doc_id: format!("doc-{idx}"),
+                doc_id: format!("doc-{idx}").into(),
                 score: idx as f32 * 0.0005_f32,
             })
             .collect();
@@ -5462,7 +5462,7 @@ mod tests {
             .map(|i| VectorHit {
                 index: i,
                 score: (10 - i) as f32,
-                doc_id: format!("doc-{i}"),
+                doc_id: format!("doc-{i}").into(),
             })
             .collect();
         let config = TwoTierConfig::default();
@@ -5484,7 +5484,7 @@ mod tests {
         let hits = vec![VectorHit {
             index: 0,
             score: 0.95,
-            doc_id: "my-doc".to_owned(),
+            doc_id: "my-doc".into(),
         }];
         let config = TwoTierConfig::default();
         let results = vector_hits_to_scored_results(&hits, 10, &config, "test-fast");
@@ -5506,7 +5506,7 @@ mod tests {
     #[test]
     fn fused_hits_hybrid_source_classification() {
         let fused = vec![frankensearch_core::types::FusedHit {
-            doc_id: "hybrid-doc".to_owned(),
+            doc_id: "hybrid-doc".into(),
             rrf_score: 2.0,
             lexical_rank: Some(0),
             semantic_rank: Some(1),
@@ -5524,7 +5524,7 @@ mod tests {
     #[test]
     fn fused_hits_semantic_only_source() {
         let fused = vec![frankensearch_core::types::FusedHit {
-            doc_id: "sem-only".to_owned(),
+            doc_id: "sem-only".into(),
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: Some(0),
@@ -5540,7 +5540,7 @@ mod tests {
     #[test]
     fn fused_hits_lexical_only_source() {
         let fused = vec![frankensearch_core::types::FusedHit {
-            doc_id: "lex-only".to_owned(),
+            doc_id: "lex-only".into(),
             rrf_score: 1.0,
             lexical_rank: Some(0),
             semantic_rank: None,
@@ -5556,7 +5556,7 @@ mod tests {
     #[test]
     fn fused_hits_graph_only_source_defaults_to_hybrid() {
         let fused = vec![frankensearch_core::types::FusedHit {
-            doc_id: "graph-only".to_owned(),
+            doc_id: "graph-only".into(),
             rrf_score: 1.0,
             lexical_rank: None,
             semantic_rank: None,
@@ -5572,7 +5572,7 @@ mod tests {
     #[test]
     fn fused_hits_include_explanation_when_enabled() {
         let fused = vec![frankensearch_core::types::FusedHit {
-            doc_id: "explained".to_owned(),
+            doc_id: "explained".into(),
             rrf_score: 1.25,
             lexical_rank: Some(1),
             semantic_rank: Some(3),

@@ -19,7 +19,7 @@ mod tests {
 
     fn make_entry(doc_id: &str, base: f32, dim: usize) -> WalEntry {
         WalEntry {
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
             doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),
             embedding: vec![base; dim],
         }

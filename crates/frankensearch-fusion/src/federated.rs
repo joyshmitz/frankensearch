@@ -467,7 +467,7 @@ fn accumulate_doc(
     contribution: f32,
     primary_signal: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggregateDoc {

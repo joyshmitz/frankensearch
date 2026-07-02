@@ -108,7 +108,7 @@ fn main() {
         let n = 500;
         let lexical: Vec<_> = (0..n)
             .map(|i| frankensearch_core::types::ScoredResult {
-                doc_id: format!("doc-{i:06}"),
+                doc_id: format!("doc-{i:06}").into(),
                 score: (n - i) as f32,
                 source: frankensearch_core::types::ScoreSource::Lexical,
                 index: None,
@@ -125,7 +125,7 @@ fn main() {
             .map(|i| VectorHit {
                 index: i as u32,
                 score: 1.0 - (i as f32 / n as f32),
-                doc_id: format!("sem-{i:06}"),
+                doc_id: format!("sem-{i:06}").into(),
             })
             .collect();
         let config = RrfConfig::default();

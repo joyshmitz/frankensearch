@@ -830,7 +830,7 @@ fn build_results(
         let rank_u32 = u32::try_from(rank).unwrap_or(u32::MAX);
         let rank_score = 100_u32.saturating_sub(rank_u32.saturating_mul(7));
         results.push(ScoredResult {
-            doc_id: format!("{instance_id}:doc:{tick_index}:{event_index}:{rank}"),
+            doc_id: format!("{instance_id}:doc:{tick_index}:{event_index}:{rank}").into(),
             score: f32::from(u16::try_from(rank_score).unwrap_or(u16::MAX)) / 100.0,
             source,
             index: None,
@@ -1668,7 +1668,7 @@ mod tests {
         let phase = SearchPhase::Initial {
             results: vec![
                 ScoredResult {
-                    doc_id: "a".to_owned(),
+                    doc_id: "a".into(),
                     score: 1.0,
                     source: ScoreSource::SemanticFast,
                     index: None,
@@ -1680,7 +1680,7 @@ mod tests {
                     metadata: None,
                 },
                 ScoredResult {
-                    doc_id: "b".to_owned(),
+                    doc_id: "b".into(),
                     score: 0.5,
                     source: ScoreSource::SemanticFast,
                     index: None,

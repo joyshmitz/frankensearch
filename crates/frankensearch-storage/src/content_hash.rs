@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(
             decision,
             DeduplicationDecision::Skip {
-                doc_id: "doc-1".to_owned(),
+                doc_id: "doc-1".into(),
                 reason: "unchanged_content_already_embedded",
             }
         );
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(
             decision,
             DeduplicationDecision::Skip {
-                doc_id: "doc-pending".to_owned(),
+                doc_id: "doc-pending".into(),
                 reason: "unchanged_content_already_pending",
             }
         );
@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(
             decision,
             DeduplicationDecision::Skip {
-                doc_id: "doc-skipped".to_owned(),
+                doc_id: "doc-skipped".into(),
                 reason: "unchanged_content_previously_skipped",
             }
         );
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(
             decision,
             DeduplicationDecision::Changed {
-                doc_id: "doc-3".to_owned(),
+                doc_id: "doc-3".into(),
                 old_hash: doc.content_hash,
                 new_hash,
             }
@@ -674,14 +674,14 @@ mod tests {
         assert_eq!(
             decisions[1],
             DeduplicationDecision::Skip {
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
                 reason: "unchanged_content_already_embedded",
             }
         );
         assert_eq!(
             decisions[2],
             DeduplicationDecision::Changed {
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
                 old_hash: doc_b.content_hash,
                 new_hash: hash_with(7),
             }

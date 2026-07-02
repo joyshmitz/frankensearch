@@ -24,7 +24,7 @@ use frankensearch_fusion::rrf::{
 
 fn lexical(doc_id: String, score: f32) -> ScoredResult {
     ScoredResult {
-        doc_id,
+        doc_id: doc_id.into(),
         score,
         source: ScoreSource::Lexical,
         index: None,
@@ -45,7 +45,7 @@ fn build(n: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
             index: i as u32,
             #[allow(clippy::cast_precision_loss)]
             score: 1.0 - (i as f32) / (n as f32), // strictly descending
-            doc_id: format!("doc-{i:06}"),
+            doc_id: format!("doc-{i:06}").into(),
         })
         .collect();
     // Lexical: every 5th doc (20%), with its own ranking order.

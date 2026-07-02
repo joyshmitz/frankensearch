@@ -876,7 +876,7 @@ impl InMemoryVectorIndex {
             hits.push(VectorHit {
                 index: index_u32,
                 score: winner.score,
-                doc_id: self.doc_ids[winner.index].clone(),
+                doc_id: self.doc_ids[winner.index].as_str().into(),
             });
         }
         Ok(hits)
@@ -1471,7 +1471,7 @@ mod tests {
         assert!(!hits.is_empty());
         for hit in &hits {
             assert!(
-                allowed.contains(&hit.doc_id),
+                allowed.iter().any(|a| a.as_str() == hit.doc_id.as_str()),
                 "bitset filter must only return allowed doc-ids; got {}",
                 hit.doc_id
             );
@@ -1501,13 +1501,13 @@ mod tests {
                 .search_top_k(&query, 10, Some(&filter))
                 .unwrap()
                 .into_iter()
-                .map(|h| h.doc_id)
+                .map(|h| h.doc_id.to_string())
                 .collect();
             let two_pass: Vec<String> = index
                 .search_top_k_int8_two_pass_filtered(&query, 10, 10, Some(&filter))
                 .unwrap()
                 .into_iter()
-                .map(|h| h.doc_id)
+                .map(|h| h.doc_id.to_string())
                 .collect();
             // Only allowed docs, and identical to the exact filtered top-k.
             for id in &two_pass {
@@ -1534,7 +1534,7 @@ mod tests {
         let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
         let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
 
-        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id).collect() };
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id.to_string()).collect() };
         for qseed in [1.0_f32, 42.0, 313.0] {
             let query = make_normalized_vec(dim, qseed);
             let scan = ids(index.bench_scan_filtered(&query, 10, Some(&filter)).unwrap());
@@ -1566,7 +1566,7 @@ mod tests {
         assert!(allowed.len() > PARALLEL_CHUNK_SIZE, "must exceed chunk size");
         let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
         let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
-        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id).collect() };
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id.to_string()).collect() };
         for qseed in [2.0_f32, 99.0, 1234.0] {
             let query = make_normalized_vec(dim, qseed);
             let scan = ids(index.bench_scan_filtered(&query, 25, Some(&filter)).unwrap());

@@ -96,7 +96,7 @@ fn bench_collect_limit_all(c: &mut Criterion) {
         .expect("collect")
         .0
         .iter()
-        .map(|r| r.doc_id.clone())
+        .map(|r| r.doc_id.to_string())
         .collect();
     let iter_final = searcher
         .search_iter(&queries[0], N)
@@ -110,7 +110,7 @@ fn bench_collect_limit_all(c: &mut Criterion) {
             initial_results, ..
         } => initial_results,
     };
-    let iter_ids: Vec<String> = iter_results.iter().map(|r| r.doc_id.clone()).collect();
+    let iter_ids: Vec<String> = iter_results.iter().map(|r| r.doc_id.to_string()).collect();
     assert_eq!(collect_ids, iter_ids, "collect vs iter final ranking differs");
 
     let mut qi = 0usize;

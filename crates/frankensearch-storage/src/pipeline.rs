@@ -2504,7 +2504,7 @@ mod tests {
     #[test]
     fn ingest_request_serde_roundtrip() {
         let req = IngestRequest {
-            doc_id: "d1".to_owned(),
+            doc_id: "d1".into(),
             text: "hello".to_owned(),
             source_path: Some("/tmp/f.rs".to_owned()),
             metadata: Some(Value::Bool(true)),
@@ -2805,7 +2805,7 @@ mod tests {
     #[test]
     fn persisted_embedding_clone_and_eq() {
         let e = PersistedEmbedding {
-            doc_id: "d".to_owned(),
+            doc_id: "d".into(),
             embedder_id: "e".to_owned(),
             embedding: vec![1.0, 2.0],
         };
@@ -2816,7 +2816,7 @@ mod tests {
     #[test]
     fn ingest_result_clone_and_serde() {
         let r = IngestResult {
-            doc_id: "d".to_owned(),
+            doc_id: "d".into(),
             action: IngestAction::New,
             fast_job_enqueued: true,
             quality_job_enqueued: false,

@@ -766,7 +766,7 @@ mod tests {
     fn submit(queue: &EmbeddingQueue, doc_id: &str, text: &str) {
         queue
             .submit(EmbeddingRequest {
-                doc_id: doc_id.to_owned(),
+                doc_id: doc_id.into(),
                 text: text.to_owned(),
                 metadata: None,
                 submitted_at: Instant::now(),
@@ -894,7 +894,7 @@ mod tests {
             // Submitting the same text again should be deduped.
             let outcome = queue
                 .submit(EmbeddingRequest {
-                    doc_id: "doc-1".to_owned(),
+                    doc_id: "doc-1".into(),
                     text: "First document text".to_owned(),
                     metadata: None,
                     submitted_at: Instant::now(),
@@ -1312,7 +1312,7 @@ mod tests {
             // Force a new submission by changing text.
             queue
                 .submit(EmbeddingRequest {
-                    doc_id: "doc-1".to_owned(),
+                    doc_id: "doc-1".into(),
                     text: "Second version completely different".to_owned(),
                     metadata: None,
                     submitted_at: Instant::now(),

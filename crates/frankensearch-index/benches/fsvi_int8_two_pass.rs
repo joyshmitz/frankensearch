@@ -94,7 +94,7 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
                 .search_top_k(q, K, None)
                 .expect("flat")
                 .into_iter()
-                .map(|h| h.doc_id)
+                .map(|h| h.doc_id.to_string())
                 .collect()
         })
         .collect();
@@ -107,7 +107,7 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
                 .search_top_k_int8_two_pass(query, K, mult)
                 .expect("int8")
                 .into_iter()
-                .map(|h| h.doc_id)
+                .map(|h| h.doc_id.to_string())
                 .collect();
             total += recall_at_k(&exact[qi], &approx);
         }

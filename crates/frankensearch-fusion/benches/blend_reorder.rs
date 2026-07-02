@@ -35,7 +35,7 @@ fn make_blended(n: usize) -> Vec<VectorHit> {
             VectorHit {
                 index: i as u32,
                 score: scrambled as f32 * 0.5 + tie,
-                doc_id: format!("doc_{i:08}"),
+                doc_id: format!("doc_{i:08}").into(),
             }
         })
         .collect()

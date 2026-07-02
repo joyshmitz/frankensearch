@@ -236,7 +236,7 @@ fn write_index(dir: &Path, corpus: &[(String, Vec<f32>)], dim: usize) {
 fn make_lexical_hits(n: usize) -> Vec<ScoredResult> {
     (0..n)
         .map(|i| ScoredResult {
-            doc_id: format!("doc-{i:06}"),
+            doc_id: format!("doc-{i:06}").into(),
             score: (n - i) as f32,
             source: ScoreSource::Lexical,
             index: None,
@@ -256,7 +256,7 @@ fn make_semantic_hits(n: usize) -> Vec<VectorHit> {
         .map(|i| VectorHit {
             index: u32::try_from(i).unwrap_or(u32::MAX),
             score: 1.0 - (i as f32 / n as f32),
-            doc_id: format!("sem-{i:06}"),
+            doc_id: format!("sem-{i:06}").into(),
         })
         .collect()
 }

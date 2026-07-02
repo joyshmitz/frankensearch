@@ -60,7 +60,7 @@ fn consume_scored(rows: &[Scored]) -> usize {
 fn make(n: usize) -> Vec<Fused> {
     (0..n)
         .map(|i| Fused {
-            doc_id: format!("doc-{:06}", i),
+            doc_id: format!("doc-{:06}", i).into(),
             rrf_score: 1.0 / (i as f64 + 1.0),
             semantic_index: Some(i as u32),
             semantic_score: Some(0.5),

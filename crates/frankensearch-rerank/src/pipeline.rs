@@ -84,7 +84,7 @@ pub async fn rerank_step(
     for (i, candidate) in candidates.iter().take(rerank_count).enumerate() {
         if let Some(text) = text_fn(&candidate.doc_id) {
             rerank_docs.push(RerankDocument {
-                doc_id: candidate.doc_id.clone(),
+                doc_id: candidate.doc_id.to_string(),
                 text,
             });
             included_indices.push(i);
@@ -319,7 +319,7 @@ mod tests {
     fn make_candidates(n: usize) -> Vec<ScoredResult> {
         (0..n)
             .map(|i| ScoredResult {
-                doc_id: format!("doc-{i}"),
+                doc_id: format!("doc-{i}").into(),
                 score: (i as f32).mul_add(-0.1, 1.0),
                 source: ScoreSource::Hybrid,
                 index: None,
@@ -425,7 +425,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let reranker = FailingReranker;
             let mut candidates = make_candidates(10);
-            let original_ids: Vec<String> = candidates.iter().map(|c| c.doc_id.clone()).collect();
+            let original_ids: Vec<String> = candidates.iter().map(|c| c.doc_id.to_string()).collect();
 
             // Should NOT return an error
             rerank_step(
@@ -441,7 +441,7 @@ mod tests {
             .unwrap();
 
             // Candidates should be unchanged
-            let current_ids: Vec<String> = candidates.iter().map(|c| c.doc_id.clone()).collect();
+            let current_ids: Vec<String> = candidates.iter().map(|c| c.doc_id.to_string()).collect();
             assert_eq!(original_ids, current_ids);
             assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
         });
@@ -810,7 +810,7 @@ mod tests {
             let reranker = StubReranker;
             let mut candidates = make_candidates(15);
             let original_tail: Vec<String> =
-                candidates[10..].iter().map(|c| c.doc_id.clone()).collect();
+                candidates[10..].iter().map(|c| c.doc_id.to_string()).collect();
 
             rerank_step(
                 &cx,
@@ -826,7 +826,7 @@ mod tests {
 
             // Candidates beyond top_k_rerank should be unchanged.
             let current_tail: Vec<String> =
-                candidates[10..].iter().map(|c| c.doc_id.clone()).collect();
+                candidates[10..].iter().map(|c| c.doc_id.to_string()).collect();
             assert_eq!(original_tail, current_tail);
             assert!(candidates[10..].iter().all(|c| c.rerank_score.is_none()));
         });
@@ -1068,7 +1068,7 @@ mod tests {
             let mut candidates = make_candidates(6);
             // Attach metadata to each candidate
             for c in &mut candidates {
-                c.metadata = Some(serde_json::Value::String(c.doc_id.clone()));
+                c.metadata = Some(serde_json::Value::String(c.doc_id.to_string()));
             }
 
             rerank_step(
@@ -1193,7 +1193,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, _doc)| RerankScore {
-                        doc_id: format!("wrong-{i}"),
+                        doc_id: format!("wrong-{i}").into(),
                         score: 0.5,
                         original_rank: i,
                         raw_logit: None,

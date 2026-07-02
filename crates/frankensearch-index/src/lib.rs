@@ -1599,7 +1599,7 @@ impl VectorIndexWriter {
             reason: "doc_id byte length must fit in u16".to_owned(),
         })?;
         self.records.push(PendingRecord {
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
             doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
             flags: 0,
             embedding: embedding.to_vec(),
@@ -2433,7 +2433,7 @@ mod tests {
             .search_top_k(&query, 64, None)
             .expect("final search");
         let deleted_ids: HashSet<String> = (0..32).map(|i| format!("doc-{i:03}")).collect();
-        assert!(hits.iter().all(|hit| !deleted_ids.contains(&hit.doc_id)));
+        assert!(hits.iter().all(|hit| !deleted_ids.contains(hit.doc_id.as_str())));
 
         std::fs::remove_file(&path).ok();
     }
@@ -2550,7 +2550,7 @@ mod tests {
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 150, None)
             .expect("search");
         assert_eq!(hits.len(), 100);
-        let ids: HashSet<String> = hits.iter().map(|hit| hit.doc_id.clone()).collect();
+        let ids: HashSet<String> = hits.iter().map(|hit| hit.doc_id.to_string()).collect();
 
         for i in 0..50 {
             assert!(

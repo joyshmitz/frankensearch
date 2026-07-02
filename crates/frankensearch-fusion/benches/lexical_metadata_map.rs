@@ -45,7 +45,7 @@ fn large_metadata(i: usize) -> Value {
 fn make_candidates(meta: impl Fn(usize) -> Value) -> Vec<ScoredResult> {
     (0..N)
         .map(|i| ScoredResult {
-            doc_id: format!("doc-{i:06}"),
+            doc_id: format!("doc-{i:06}").into(),
             score: 1.0,
             source: ScoreSource::Lexical,
             index: None,

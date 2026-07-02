@@ -93,7 +93,7 @@ impl GraphRanker {
             if !score.is_finite() || score <= 0.0 {
                 continue;
             }
-            let entry = seed_weights.entry(hit.doc_id.clone()).or_insert(0.0);
+            let entry = seed_weights.entry(hit.doc_id.to_string()).or_insert(0.0);
             if score > *entry {
                 *entry = score;
             }
@@ -253,7 +253,7 @@ mod tests {
             let seed_hits = vec![VectorHit {
                 index: 0,
                 score: 1.0,
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
             }];
             let results = GraphRanker::new().rank_phase1(&cx, "query", &graph, &seed_hits, 5);
             assert!(results.is_none());
@@ -268,7 +268,7 @@ mod tests {
             let seed_hits = vec![VectorHit {
                 index: 0,
                 score: 1.0,
-                doc_id: "outside-graph".to_owned(),
+                doc_id: "outside-graph".into(),
             }];
             let results = GraphRanker::new().rank_phase1(&cx, "query", &graph, &seed_hits, 5);
             assert!(results.is_none());
@@ -284,7 +284,7 @@ mod tests {
             let seed_hits = vec![VectorHit {
                 index: 0,
                 score: 1.0,
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
             }];
 
             let results = GraphRanker::new()
@@ -423,7 +423,7 @@ mod tests {
                 .map(|s| VectorHit {
                     index: s as u32,
                     score: 0.5 + (s as f32) * 0.1,
-                    doc_id: format!("d{:03}", (s * 7) % n),
+                    doc_id: format!("d{:03}", (s * 7) % n).into(),
                 })
                 .collect();
 

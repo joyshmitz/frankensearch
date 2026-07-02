@@ -951,12 +951,12 @@ fn test_index_freshness_audit_report_conformance() {
             deleted_at_ms: None,
         }],
         vector_index: vec![IndexMembershipEntry {
-            doc_id: "vector:src/lib.rs:3".to_owned(),
+            doc_id: "vector:src/lib.rs:3".into(),
             file_key: "src/lib.rs".to_owned(),
             revision: 3,
         }],
         lexical_index: vec![IndexMembershipEntry {
-            doc_id: "lexical:src/lib.rs:3".to_owned(),
+            doc_id: "lexical:src/lib.rs:3".into(),
             file_key: "src/lib.rs".to_owned(),
             revision: 3,
         }],

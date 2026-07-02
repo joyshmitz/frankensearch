@@ -36,7 +36,7 @@ fn fast_hits(n: usize) -> Vec<VectorHit> {
         .map(|i| VectorHit {
             index: i as u32,
             score: 1.0 - (i as f32) / (n as f32),
-            doc_id: format!("doc-{i:06}"),
+            doc_id: format!("doc-{i:06}").into(),
         })
         .collect()
 }

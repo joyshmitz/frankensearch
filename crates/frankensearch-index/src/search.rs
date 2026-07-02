@@ -880,7 +880,7 @@ impl VectorIndex {
                 hits.push(VectorHit {
                     index: index_u32,
                     score: winner.score,
-                    doc_id,
+                    doc_id: doc_id.into(),
                 });
             }
         }
@@ -925,7 +925,7 @@ impl VectorIndex {
         Ok(VectorHit {
             index: index_u32,
             score: winner.score,
-            doc_id: entry.doc_id.clone(),
+            doc_id: entry.doc_id.as_str().into(),
         })
     }
 

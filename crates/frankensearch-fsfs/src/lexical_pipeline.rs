@@ -941,7 +941,7 @@ mod tests {
     fn plan_action_none_text_treated_as_empty() {
         let pipeline = LexicalPipeline::new(InMemoryLexicalBackend::default());
         let mutation = LexicalMutation {
-            doc_id: "doc-none".to_owned(),
+            doc_id: "doc-none".into(),
             revision: 1,
             ingestion_class: IngestionClass::FullSemanticLexical,
             change: super::LexicalMutationKind::Upsert,

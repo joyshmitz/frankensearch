@@ -591,7 +591,7 @@ impl VectorIndex {
                 hits.push(VectorHit {
                     index: index_u32,
                     score: entry.score,
-                    doc_id: wal_entry.doc_id.clone(),
+                    doc_id: wal_entry.doc_id.as_str().into(),
                 });
             } else {
                 if self.is_deleted(entry.index) {
@@ -603,11 +603,11 @@ impl VectorIndex {
                         value: entry.index.to_string(),
                         reason: "index exceeds u32 range".into(),
                     })?;
-                let doc_id = self.doc_id_at(entry.index)?.to_owned();
+                let doc_id = self.doc_id_at(entry.index)?;
                 hits.push(VectorHit {
                     index: index_u32,
                     score: entry.score,
-                    doc_id,
+                    doc_id: doc_id.into(),
                 });
             }
         }
@@ -749,13 +749,13 @@ mod tests {
             .mrl_search(&query, 10, &config, None)
             .expect("mrl")
             .into_iter()
-            .map(|h| h.doc_id)
+            .map(|h| h.doc_id.to_string())
             .collect();
         let exact: Vec<String> = index
             .search_top_k(&query, 10, None)
             .expect("exact")
             .into_iter()
-            .map(|h| h.doc_id)
+            .map(|h| h.doc_id.to_string())
             .collect();
         assert_eq!(
             mrl, exact,

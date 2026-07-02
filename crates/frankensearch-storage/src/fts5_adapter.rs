@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn fts5_hit_serde_roundtrip() {
         let hit = Fts5Hit {
-            doc_id: "doc1".to_owned(),
+            doc_id: "doc1".into(),
             bm25_score: 1.5,
             rank: 0,
             snippet: Some("hello <b>world</b>".to_owned()),

@@ -500,7 +500,7 @@ mod tests {
 
     fn make_entry(doc_id: &str, base: f32, dim: usize) -> WalEntry {
         WalEntry {
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
             doc_id_hash: crate::fnv1a_hash(doc_id.as_bytes()),
             embedding: vec![base; dim],
         }
@@ -1047,7 +1047,7 @@ mod tests {
         let path = temp_wal_path("f16-precision");
         let dim = 2;
         let entries = vec![WalEntry {
-            doc_id: "precise".to_owned(),
+            doc_id: "precise".into(),
             doc_id_hash: crate::fnv1a_hash(b"precise"),
             embedding: vec![0.123_456, -0.987_654],
         }];
@@ -1067,7 +1067,7 @@ mod tests {
         let dim = 3;
         let val = std::f32::consts::PI;
         let entries = vec![WalEntry {
-            doc_id: "pi-doc".to_owned(),
+            doc_id: "pi-doc".into(),
             doc_id_hash: crate::fnv1a_hash(b"pi-doc"),
             embedding: vec![val, -val, 0.0],
         }];
@@ -1093,7 +1093,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
         let entries = vec![WalEntry {
-            doc_id: "doc-0".to_owned(),
+            doc_id: "doc-0".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-0"),
             embedding: vec![1.0, 2.0, 3.0],
         }];

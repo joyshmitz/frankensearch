@@ -67,7 +67,7 @@ fn accumulate_set(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDocSet {
@@ -124,7 +124,7 @@ fn accumulate_bits(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDocBits {
@@ -210,7 +210,7 @@ fn accumulate_vec(
     rank: usize,
     contribution: f32,
 ) {
-    let entry = docs.entry(hit.doc_id.clone()).or_insert_with(|| {
+    let entry = docs.entry(hit.doc_id.to_string()).or_insert_with(|| {
         let mut template = hit.clone();
         template.score = 0.0;
         AggDocVec {
@@ -281,7 +281,7 @@ fn make_shards(shards: usize, per_shard: usize, universe: usize) -> Vec<Shard> {
                 .map(|i| {
                     let id = (s * (per_shard / 2) + i) % universe;
                     Hit {
-                        doc_id: format!("doc_{id:07}"),
+                        doc_id: format!("doc_{id:07}").into(),
                         score: 1.0 - (i as f32) / (per_shard as f32),
                     }
                 })

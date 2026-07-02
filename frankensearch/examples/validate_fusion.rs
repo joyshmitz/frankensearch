@@ -375,7 +375,7 @@ fn make_lexical(ids: &[&str], scores: &[f32]) -> Vec<ScoredResult> {
     ids.iter()
         .zip(scores.iter())
         .map(|(id, &score)| ScoredResult {
-            doc_id: id.to_string(),
+            doc_id: id.to_string().into(),
             score,
             source: ScoreSource::Lexical,
             index: None,
@@ -397,7 +397,7 @@ fn make_semantic(ids: &[&str], scores: &[f32]) -> Vec<VectorHit> {
         .map(|(i, (id, &score))| VectorHit {
             index: i as u32,
             score,
-            doc_id: id.to_string(),
+            doc_id: id.to_string().into(),
         })
         .collect()
 }

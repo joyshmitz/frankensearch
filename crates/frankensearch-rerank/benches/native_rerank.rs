@@ -97,7 +97,7 @@ fn bench_native_rerank(c: &mut Criterion) {
     let mut per_doc_ms: Vec<(&str, f64)> = Vec::new();
     for (label, nw) in SEQ_CONFIGS {
         let docs = vec![RerankDocument {
-            doc_id: "d0".to_owned(),
+            doc_id: "d0".into(),
             text: filler_doc(*nw),
         }];
         let _ = reranker.rerank_sync(QUERY, &docs); // warm caches
@@ -124,7 +124,7 @@ fn bench_native_rerank(c: &mut Criterion) {
     g.measurement_time(Duration::from_secs(8));
     for (label, nw) in SEQ_CONFIGS {
         let docs = vec![RerankDocument {
-            doc_id: "d0".to_owned(),
+            doc_id: "d0".into(),
             text: filler_doc(*nw),
         }];
         g.bench_with_input(BenchmarkId::from_parameter(label), &docs, |b, docs| {
@@ -141,7 +141,7 @@ fn bench_native_rerank(c: &mut Criterion) {
     g2.measurement_time(Duration::from_secs(12));
     let docs10: Vec<RerankDocument> = (0..10)
         .map(|i| RerankDocument {
-            doc_id: format!("d{i}"),
+            doc_id: format!("d{i}").into(),
             text: filler_doc(215),
         })
         .collect();

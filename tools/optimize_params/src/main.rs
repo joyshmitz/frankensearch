@@ -347,7 +347,7 @@ impl EvalContext {
                 .take(candidate_count)
                 .filter(|(_, s)| *s > 0.0)
                 .map(|(i, s)| ScoredResult {
-                    doc_id: self.doc_ids[*i].clone(),
+                    doc_id: self.doc_ids[*i].clone().into(),
                     score: *s as f32,
                     source: ScoreSource::Lexical,
                     index: None,
@@ -379,7 +379,7 @@ impl EvalContext {
                 .map(|(i, s)| VectorHit {
                     index: *i as u32,
                     score: *s,
-                    doc_id: self.doc_ids[*i].clone(),
+                    doc_id: self.doc_ids[*i].clone().into(),
                 })
                 .collect();
 
@@ -963,17 +963,17 @@ mod tests {
     fn sample_eval_context() -> EvalContext {
         let docs = vec![
             Document {
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
                 title: "Rust ownership".to_owned(),
                 content: "Ownership and borrowing in rust".to_owned(),
             },
             Document {
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
                 title: "Python threading".to_owned(),
                 content: "GIL and threading model".to_owned(),
             },
             Document {
-                doc_id: "doc-c".to_owned(),
+                doc_id: "doc-c".into(),
                 title: "Distributed systems".to_owned(),
                 content: "Consensus and replication".to_owned(),
             },

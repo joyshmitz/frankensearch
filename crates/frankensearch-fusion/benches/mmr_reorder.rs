@@ -44,7 +44,7 @@ fn large_metadata(i: usize) -> Value {
 fn make_results(meta: impl Fn(usize) -> Value) -> Vec<ScoredResult> {
     (0..POOL + TAIL)
         .map(|i| ScoredResult {
-            doc_id: format!("doc-{i:06}"),
+            doc_id: format!("doc-{i:06}").into(),
             score: (POOL + TAIL - i) as f32,
             source: ScoreSource::Hybrid,
             index: None,

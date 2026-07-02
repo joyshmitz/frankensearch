@@ -1,7 +1,15 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
+
+/// Document identifier type. `CompactString` (SSO) stores ids ≤24 bytes inline, so
+/// the per-query `limit_all` doc_id clones (RRF/blend/resolve materialization) are
+/// a stack memcpy instead of a heap alloc — 29.8× cheaper for short ids
+/// (`doc_id_clone_sso` bench). Drop-in for `String` at read sites (`Deref<str>`,
+/// `as_str`, `From`, `PartialEq`, `Hash`, `Ord`, serde).
+pub type DocId = CompactString;
 
 use crate::SearchError;
 use crate::explanation::HitExplanation;
@@ -72,7 +80,7 @@ pub struct VectorHit {
     /// Raw cosine similarity score.
     pub score: f32,
     /// Document identifier resolved from the index.
-    pub doc_id: String,
+    pub doc_id: DocId,
 }
 
 impl VectorHit {
@@ -103,7 +111,7 @@ impl VectorHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusedHit {
     /// Document identifier.
-    pub doc_id: String,
+    pub doc_id: DocId,
     /// RRF-fused score (f64 for precision during fusion).
     pub rrf_score: f64,
     /// Rank in the lexical (BM25) source, if present.
@@ -168,7 +176,7 @@ pub enum ScoreSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredResult {
     /// Unique document identifier.
-    pub doc_id: String,
+    pub doc_id: DocId,
     /// Primary relevance score (RRF or blended, truncated to f32).
     pub score: f32,
     /// Which search backend produced this result.

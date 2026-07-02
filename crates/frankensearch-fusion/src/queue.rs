@@ -652,7 +652,7 @@ mod tests {
 
     fn request(doc_id: &str, text: &str) -> EmbeddingRequest {
         EmbeddingRequest {
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
             text: text.to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -878,7 +878,7 @@ mod tests {
             .unwrap();
 
         let job = EmbeddingJob {
-            doc_id: "doc-retry".to_owned(),
+            doc_id: "doc-retry".into(),
             canonical_text: "retry text".to_owned(),
             content_hash: "hash".to_owned(),
             metadata: None,

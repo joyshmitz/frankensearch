@@ -83,7 +83,7 @@ fn allow_filter(count: usize) -> BitsetFilter {
 }
 
 fn ids(hits: &[frankensearch_core::VectorHit]) -> Vec<String> {
-    hits.iter().map(|h| h.doc_id.clone()).collect()
+    hits.iter().map(|h| h.doc_id.to_string()).collect()
 }
 
 fn bench_filtered_gather(c: &mut Criterion) {

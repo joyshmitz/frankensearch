@@ -130,7 +130,7 @@ impl LexicalSearch for StubLexical {
                 .map(|i| {
                     let doc_idx = (hash as usize + i) % 10;
                     ScoredResult {
-                        doc_id: format!("doc-{doc_idx}"),
+                        doc_id: format!("doc-{doc_idx}").into(),
                         score: (count - i) as f32 / count as f32,
                         source: ScoreSource::Lexical,
                         index: None,

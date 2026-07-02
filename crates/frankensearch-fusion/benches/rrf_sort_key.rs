@@ -123,7 +123,7 @@ fn build(n: usize) -> Vec<Scratch> {
                 None
             };
             Scratch {
-                doc_id: format!("doc-{i:06}"),
+                doc_id: format!("doc-{i:06}").into(),
                 rrf_score,
                 lexical_rank: in_both.then_some(i),
                 semantic_rank: Some(rank),

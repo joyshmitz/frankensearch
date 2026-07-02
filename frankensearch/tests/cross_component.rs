@@ -85,13 +85,13 @@ fn hit(doc_id: &str, score: f32, index: u32) -> VectorHit {
     VectorHit {
         index,
         score,
-        doc_id: doc_id.to_owned(),
+        doc_id: doc_id.into(),
     }
 }
 
 fn scored(doc_id: &str, score: f32) -> ScoredResult {
     ScoredResult {
-        doc_id: doc_id.to_owned(),
+        doc_id: doc_id.into(),
         score,
         source: ScoreSource::Hybrid,
         index: None,
@@ -362,7 +362,7 @@ fn queue_canonicalization_produces_consistent_hashes() {
     // NFC-decomposed: e + combining acute accent
     queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             text: "caf\u{0065}\u{0301}".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -372,7 +372,7 @@ fn queue_canonicalization_produces_consistent_hashes() {
     // NFC-precomposed: é
     queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-2".to_owned(),
+            doc_id: "doc-2".into(),
             text: "caf\u{00e9}".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -399,7 +399,7 @@ fn queue_canonicalization_produces_consistent_hashes() {
 
     queue2
         .submit(EmbeddingRequest {
-            doc_id: "doc-3".to_owned(),
+            doc_id: "doc-3".into(),
             text: "completely different".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -428,7 +428,7 @@ fn queue_dedup_survives_drain_rebuild_cycle() {
     // First submission
     queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             text: "Important document content".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -444,7 +444,7 @@ fn queue_dedup_survives_drain_rebuild_cycle() {
     // Re-submit identical content → should skip
     let outcome = queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             text: "Important document content".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -455,7 +455,7 @@ fn queue_dedup_survives_drain_rebuild_cycle() {
     // Re-submit modified content → should enqueue
     let outcome = queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             text: "Modified document content".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -479,7 +479,7 @@ fn queue_backpressure_does_not_corrupt_dedup_state() {
     // Fill queue
     queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             text: "First".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -487,7 +487,7 @@ fn queue_backpressure_does_not_corrupt_dedup_state() {
         .unwrap();
     queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-2".to_owned(),
+            doc_id: "doc-2".into(),
             text: "Second".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -497,7 +497,7 @@ fn queue_backpressure_does_not_corrupt_dedup_state() {
     // Queue full → backpressure
     let err = queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-3".to_owned(),
+            doc_id: "doc-3".into(),
             text: "Third".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -514,7 +514,7 @@ fn queue_backpressure_does_not_corrupt_dedup_state() {
     // Now doc-3 should work, and doc-1/doc-2 should be skipped
     let outcome = queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             text: "First".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),
@@ -524,7 +524,7 @@ fn queue_backpressure_does_not_corrupt_dedup_state() {
 
     let outcome = queue
         .submit(EmbeddingRequest {
-            doc_id: "doc-3".to_owned(),
+            doc_id: "doc-3".into(),
             text: "Third".to_owned(),
             metadata: None,
             submitted_at: Instant::now(),

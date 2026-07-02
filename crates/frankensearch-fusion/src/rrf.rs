@@ -112,7 +112,7 @@ impl FusedHitScratch<'_> {
 
     fn into_owned(self) -> FusedHit {
         FusedHit {
-            doc_id: self.doc_id.to_owned(),
+            doc_id: self.doc_id.into(),
             rrf_score: self.rrf_score,
             lexical_rank: self.lexical_rank,
             semantic_rank: self.semantic_rank,
@@ -1120,7 +1120,7 @@ mod tests {
 
             let rrf_contribution = rank_contribution(k, rank);
 
-            hits.entry(result.doc_id.clone())
+            hits.entry(result.doc_id.to_string())
                 .and_modify(|hit| {
                     hit.rrf_score += rrf_contribution;
                     hit.lexical_rank = Some(rank);
@@ -1148,7 +1148,7 @@ mod tests {
 
             let rrf_contribution = rank_contribution(k, rank);
 
-            hits.entry(hit.doc_id.clone())
+            hits.entry(hit.doc_id.to_string())
                 .and_modify(|fh| {
                     fh.rrf_score += rrf_contribution;
                     fh.semantic_rank = Some(rank);

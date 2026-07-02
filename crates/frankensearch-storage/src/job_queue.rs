@@ -2421,7 +2421,7 @@ mod tests {
     fn claimed_job_serde_roundtrip() {
         let job = ClaimedJob {
             job_id: 42,
-            doc_id: "doc-1".to_owned(),
+            doc_id: "doc-1".into(),
             embedder_id: "emb-1".to_owned(),
             priority: 5,
             retry_count: 1,
@@ -2438,7 +2438,7 @@ mod tests {
     fn claimed_job_without_content_hash() {
         let job = ClaimedJob {
             job_id: 1,
-            doc_id: "d".to_owned(),
+            doc_id: "d".into(),
             embedder_id: "e".to_owned(),
             priority: 0,
             retry_count: 0,

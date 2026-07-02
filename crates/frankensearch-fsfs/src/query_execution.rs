@@ -804,7 +804,7 @@ impl QueryExecutionOrchestrator {
             let contribution = rrf_contribution(k, rank);
             let lexical_score = sanitize_score(candidate.score);
             merged
-                .entry(candidate.doc_id.clone())
+                .entry(candidate.doc_id.to_string())
                 .and_modify(|hit| {
                     hit.fused_score += contribution;
                     hit.lexical_rank = Some(rank);
@@ -840,7 +840,7 @@ impl QueryExecutionOrchestrator {
             let contribution = rrf_contribution(k, rank);
             let semantic_score = sanitize_score(candidate.score);
             merged
-                .entry(candidate.doc_id.clone())
+                .entry(candidate.doc_id.to_string())
                 .and_modify(|hit| {
                     hit.fused_score += contribution;
                     hit.semantic_rank = Some(rank);
@@ -1334,7 +1334,7 @@ mod tests {
         let orchestrator = QueryExecutionOrchestrator::default();
         let fused = vec![
             super::FusedCandidate {
-                doc_id: "src/auth.rs".to_owned(),
+                doc_id: "src/auth.rs".into(),
                 fused_score: 0.923,
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
@@ -1344,7 +1344,7 @@ mod tests {
                 in_both_sources: true,
             },
             super::FusedCandidate {
-                doc_id: "docs/auth.md".to_owned(),
+                doc_id: "docs/auth.md".into(),
                 fused_score: f64::NAN,
                 prior_boost: 0.0,
                 lexical_rank: Some(3),
@@ -2197,7 +2197,7 @@ mod tests {
     #[test]
     fn fused_cmp_score_descending() {
         let a = super::FusedCandidate {
-            doc_id: "a".to_owned(),
+            doc_id: "a".into(),
             fused_score: 0.9,
             prior_boost: 0.0,
             lexical_rank: None,
@@ -2207,7 +2207,7 @@ mod tests {
             in_both_sources: false,
         };
         let b = super::FusedCandidate {
-            doc_id: "b".to_owned(),
+            doc_id: "b".into(),
             fused_score: 0.8,
             prior_boost: 0.0,
             lexical_rank: None,
@@ -2222,7 +2222,7 @@ mod tests {
     #[test]
     fn fused_cmp_in_both_tiebreak() {
         let a = super::FusedCandidate {
-            doc_id: "a".to_owned(),
+            doc_id: "a".into(),
             fused_score: 0.5,
             prior_boost: 0.0,
             lexical_rank: None,
@@ -2232,7 +2232,7 @@ mod tests {
             in_both_sources: true,
         };
         let b = super::FusedCandidate {
-            doc_id: "b".to_owned(),
+            doc_id: "b".into(),
             fused_score: 0.5,
             prior_boost: 0.0,
             lexical_rank: None,
@@ -2248,7 +2248,7 @@ mod tests {
     #[test]
     fn fused_cmp_doc_id_tiebreak() {
         let a = super::FusedCandidate {
-            doc_id: "alpha".to_owned(),
+            doc_id: "alpha".into(),
             fused_score: 0.5,
             prior_boost: 0.0,
             lexical_rank: None,
@@ -2258,7 +2258,7 @@ mod tests {
             in_both_sources: false,
         };
         let b = super::FusedCandidate {
-            doc_id: "beta".to_owned(),
+            doc_id: "beta".into(),
             fused_score: 0.5,
             prior_boost: 0.0,
             lexical_rank: None,

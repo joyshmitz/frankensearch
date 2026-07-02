@@ -171,7 +171,7 @@ pub fn blend_two_tier(
             VectorHit {
                 index: pair.index,
                 score: sanitize_score(score),
-                doc_id: doc_id.to_owned(),
+                doc_id: doc_id.into(),
             }
         })
         .collect();
@@ -270,7 +270,7 @@ pub fn blend_two_tier_aligned(
             VectorHit {
                 index: pair.index,
                 score: sanitize_score(score),
-                doc_id: doc_id.to_owned(),
+                doc_id: doc_id.into(),
             }
         })
         .collect();
@@ -491,7 +491,7 @@ mod tests {
         VectorHit {
             index,
             score,
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
         }
     }
 

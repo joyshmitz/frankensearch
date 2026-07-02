@@ -7,7 +7,7 @@ mod tests {
         VectorHit {
             index: 0,
             score,
-            doc_id: doc_id.to_owned(),
+            doc_id: doc_id.into(),
         }
     }
 

@@ -2464,7 +2464,7 @@ mod tests {
         assert_eq!(
             open,
             Some(SearchInteractionEvent::OpenSelected {
-                doc_id: "doc-2".to_owned(),
+                doc_id: "doc-2".into(),
                 source_path: "src/b.rs".to_owned(),
             })
         );
@@ -2473,7 +2473,7 @@ mod tests {
         assert_eq!(
             jump,
             Some(SearchInteractionEvent::JumpToSource {
-                doc_id: "doc-2".to_owned(),
+                doc_id: "doc-2".into(),
                 source_path: "src/b.rs".to_owned(),
             })
         );

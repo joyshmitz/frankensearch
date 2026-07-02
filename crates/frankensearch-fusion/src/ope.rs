@@ -361,7 +361,7 @@ mod tests {
         (0..n)
             .map(|i| LoggedObservation {
                 query: format!("query-{i}"),
-                doc_id: format!("doc-{i}"),
+                doc_id: format!("doc-{i}").into(),
                 rank: i,
                 reward: if i % 2 == 0 { 1.0 } else { 0.0 },
                 logging_propensity: 0.5,
@@ -449,7 +449,7 @@ mod tests {
         let obs: Vec<LoggedObservation> = (0..100)
             .map(|i| LoggedObservation {
                 query: format!("q-{i}"),
-                doc_id: format!("d-{i}"),
+                doc_id: format!("d-{i}").into(),
                 rank: i,
                 reward: if i % 3 == 0 { 1.0 } else { 0.0 },
                 #[allow(clippy::cast_precision_loss)]
@@ -587,7 +587,7 @@ mod tests {
         let obs: Vec<LoggedObservation> = (0..10)
             .map(|i| LoggedObservation {
                 query: format!("q-{i}"),
-                doc_id: format!("d-{i}"),
+                doc_id: format!("d-{i}").into(),
                 rank: i,
                 reward: 0.0,
                 logging_propensity: 0.5,
@@ -604,7 +604,7 @@ mod tests {
         let obs: Vec<LoggedObservation> = (0..10)
             .map(|i| LoggedObservation {
                 query: format!("q-{i}"),
-                doc_id: format!("d-{i}"),
+                doc_id: format!("d-{i}").into(),
                 rank: i,
                 reward: 1.0,
                 logging_propensity: 0.5,

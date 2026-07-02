@@ -286,7 +286,7 @@ fn quality_scores_for_unknown_doc_id_returns_zero() {
     let hits = vec![VectorHit {
         index: 0,
         score: 1.0,
-        doc_id: "missing".to_owned(),
+        doc_id: "missing".into(),
     }];
     let scores = index
         .scores_for_hits(&normalize(vec![1.0, 0.0]), &hits)

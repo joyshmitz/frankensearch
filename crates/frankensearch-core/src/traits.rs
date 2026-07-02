@@ -703,19 +703,19 @@ mod tests {
         ) -> SearchResult<Vec<RerankScore>> {
             Ok(vec![
                 RerankScore {
-                    doc_id: "doc-a".to_owned(),
+                    doc_id: "doc-a".into(),
                     score: 0.8,
                     original_rank: 2,
                     raw_logit: None,
                 },
                 RerankScore {
-                    doc_id: "doc-b".to_owned(),
+                    doc_id: "doc-b".into(),
                     score: 0.8,
                     original_rank: 1,
                     raw_logit: None,
                 },
                 RerankScore {
-                    doc_id: "doc-c".to_owned(),
+                    doc_id: "doc-c".into(),
                     score: 0.3,
                     original_rank: 0,
                     raw_logit: None,
@@ -851,15 +851,15 @@ mod tests {
             let adapter = SyncRerankerAdapter(UnsortedSyncReranker);
             let docs = vec![
                 RerankDocument {
-                    doc_id: "doc-a".to_owned(),
+                    doc_id: "doc-a".into(),
                     text: "alpha".to_owned(),
                 },
                 RerankDocument {
-                    doc_id: "doc-b".to_owned(),
+                    doc_id: "doc-b".into(),
                     text: "beta".to_owned(),
                 },
                 RerankDocument {
-                    doc_id: "doc-c".to_owned(),
+                    doc_id: "doc-c".into(),
                     text: "gamma".to_owned(),
                 },
             ];

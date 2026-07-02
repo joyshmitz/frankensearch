@@ -16002,7 +16002,7 @@ mod tests {
     fn merge_with_lexical_tail_preserves_head_order_and_appends_tail() {
         let fused_head = vec![
             FusedCandidate {
-                doc_id: "src/b.rs".to_owned(),
+                doc_id: "src/b.rs".into(),
                 fused_score: 0.016,
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
@@ -16012,7 +16012,7 @@ mod tests {
                 in_both_sources: false,
             },
             FusedCandidate {
-                doc_id: "src/a.rs".to_owned(),
+                doc_id: "src/a.rs".into(),
                 fused_score: 0.015,
                 prior_boost: 0.0,
                 lexical_rank: Some(1),
@@ -16045,7 +16045,7 @@ mod tests {
     #[test]
     fn merge_with_lexical_tail_applies_filter_to_head_and_tail() {
         let fused_head = vec![FusedCandidate {
-            doc_id: "src/head.rs".to_owned(),
+            doc_id: "src/head.rs".into(),
             fused_score: 0.016,
             prior_boost: 0.0,
             lexical_rank: Some(0),
@@ -16076,7 +16076,7 @@ mod tests {
     fn merge_with_fallback_tail_preserves_refined_head_and_appends_remaining_tail() {
         let refined_head = vec![
             FusedCandidate {
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
                 fused_score: 0.95,
                 prior_boost: 0.0,
                 lexical_rank: None,
@@ -16086,7 +16086,7 @@ mod tests {
                 in_both_sources: false,
             },
             FusedCandidate {
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
                 fused_score: 0.90,
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
@@ -16098,7 +16098,7 @@ mod tests {
         ];
         let fallback = vec![
             FusedCandidate {
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
                 fused_score: 0.90,
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
@@ -16108,7 +16108,7 @@ mod tests {
                 in_both_sources: true,
             },
             FusedCandidate {
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
                 fused_score: 0.85,
                 prior_boost: 0.0,
                 lexical_rank: None,
@@ -16118,7 +16118,7 @@ mod tests {
                 in_both_sources: false,
             },
             FusedCandidate {
-                doc_id: "doc-c".to_owned(),
+                doc_id: "doc-c".into(),
                 fused_score: 0.10,
                 prior_boost: 0.0,
                 lexical_rank: None,
@@ -16128,7 +16128,7 @@ mod tests {
                 in_both_sources: false,
             },
             FusedCandidate {
-                doc_id: "doc-d".to_owned(),
+                doc_id: "doc-d".into(),
                 fused_score: 0.05,
                 prior_boost: 0.0,
                 lexical_rank: None,
@@ -16151,7 +16151,7 @@ mod tests {
     fn merge_with_fallback_tail_respects_output_limit() {
         let refined_head = vec![
             FusedCandidate {
-                doc_id: "doc-1".to_owned(),
+                doc_id: "doc-1".into(),
                 fused_score: 1.0,
                 prior_boost: 0.0,
                 lexical_rank: Some(0),
@@ -16161,7 +16161,7 @@ mod tests {
                 in_both_sources: true,
             },
             FusedCandidate {
-                doc_id: "doc-2".to_owned(),
+                doc_id: "doc-2".into(),
                 fused_score: 0.9,
                 prior_boost: 0.0,
                 lexical_rank: Some(1),
@@ -16175,7 +16175,7 @@ mod tests {
             refined_head[0].clone(),
             refined_head[1].clone(),
             FusedCandidate {
-                doc_id: "doc-3".to_owned(),
+                doc_id: "doc-3".into(),
                 fused_score: 0.1,
                 prior_boost: 0.0,
                 lexical_rank: None,

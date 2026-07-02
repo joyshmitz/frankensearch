@@ -78,7 +78,7 @@ fn make_hits(n: usize, offset: usize) -> Vec<VHit> {
         .map(|i| VHit {
             index: offset + i,
             score: 1.0 / (i as f32 + 1.0),
-            doc_id: format!("doc-{:06}", offset + i),
+            doc_id: format!("doc-{:06}", offset + i).into(),
         })
         .collect()
 }

@@ -1029,17 +1029,17 @@ mod tests {
             VectorHit {
                 index: 0,
                 score: 0.0,
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
             },
             VectorHit {
                 index: 1,
                 score: 0.0,
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
             },
             VectorHit {
                 index: 2,
                 score: 0.0,
-                doc_id: "doc-c".to_owned(),
+                doc_id: "doc-c".into(),
             },
         ];
         let scores = index
@@ -1070,17 +1070,17 @@ mod tests {
             VectorHit {
                 index: 0,
                 score: 0.0,
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
             },
             VectorHit {
                 index: 1,
                 score: 0.0,
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
             },
             VectorHit {
                 index: 99,
                 score: 0.0,
-                doc_id: "doc-missing".to_owned(),
+                doc_id: "doc-missing".into(),
             },
         ];
         let scores = index
@@ -1218,7 +1218,7 @@ mod tests {
         let hits = vec![VectorHit {
             index: 0,
             score: 0.0,
-            doc_id: "doc-a".to_owned(),
+            doc_id: "doc-a".into(),
         }];
         let error = index
             .quality_scores_for_hits(&[1.0, 0.0, 0.0, 0.0], &hits)
@@ -1594,14 +1594,14 @@ mod tests {
         // Inject a WAL entry with NaN in the embedding. dot_product with NaN
         // produces NaN, which should be filtered out by the is_finite() guard.
         index.fast_index.wal_entries.push(WalEntry {
-            doc_id: "doc-nan".to_owned(),
+            doc_id: "doc-nan".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-nan"),
             embedding: vec![f32::NAN, 0.0, 0.0, 0.0],
         });
 
         // Also inject a valid WAL entry to confirm it's still returned.
         index.fast_index.wal_entries.push(WalEntry {
-            doc_id: "doc-wal-ok".to_owned(),
+            doc_id: "doc-wal-ok".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-wal-ok"),
             embedding: vec![0.0, 1.0, 0.0, 0.0],
         });
@@ -1781,12 +1781,12 @@ mod tests {
             VectorHit {
                 index: 0,
                 score: 0.0,
-                doc_id: "doc-a".to_owned(),
+                doc_id: "doc-a".into(),
             },
             VectorHit {
                 index: 1,
                 score: 0.0,
-                doc_id: "doc-b".to_owned(),
+                doc_id: "doc-b".into(),
             },
         ];
         let scores = index
@@ -1927,7 +1927,7 @@ mod tests {
         let hits = vec![VectorHit {
             index: 0,
             score: 0.0,
-            doc_id: "doc-a".to_owned(),
+            doc_id: "doc-a".into(),
         }];
         let scores = index
             .quality_scores_for_hits(&[1.0, 2.0, 3.0, 4.0, 5.0], &hits)
