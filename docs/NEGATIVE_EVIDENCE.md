@@ -4117,3 +4117,29 @@ lesson: a big *ratio* is necessary but not sufficient — a per-item clone lever
 populated* AND the realistic access pattern has *large N*. Metadata (common, all-N) qualified; explanation (opt-in,
 top-k) does not. The `ScoredResult` clone arc is optimized for every common-path field; `explanation` stays deep-clone
 by choice, cheap because it's usually `None`.
+
+---
+
+## 2026-07-02 — dig (algorithmic/alien-graveyard): MMR lazy-greedy is N/A — the O(k²n)→O(kn) incremental win is already landed; indexing content path borrow-optimized (BlackThrush)
+
+**Two fresh checks, both already-optimal — recorded so they aren't re-hypothesized.**
+
+- **MMR / diversity reranking (`mmr.rs:103`).** Hypothesis: naive greedy (recompute `max sim(i, selected)` each round,
+  O(k²·n)) → Minoux lazy-greedy. **Already preempted:** production maintains a running `max_sim_to_selected[i]` folded
+  incrementally (`:205/:243`), so it's **O(k·n)**, bit-identical to the naive `mmr_rerank_reference` oracle (`:332`) via
+  `f64::max` associativity — the in-code comment (`:200-204`) documents exactly this. Lazy-greedy can't improve it: the
+  residual cost is the inherent **n·k cosine similarities** (each `O(d)`, and you MUST evaluate `sim(new, i)` to update
+  the diversity penalty) — not the argmax a priority queue would replace. The cosine kernel is already 4-accumulator SIMD
+  ([[search-time-reductions-still-widenable]], efbfe33). Floored.
+- **Indexing content path.** `IndexableDocument.content` (full text, always populated, large-N when indexing) is
+  **borrowed** into tantivy (`lexical/lib.rs:710` `add_text(&doc.content)`) and the embedder takes `&str` — no clone on
+  the main path. The only content clones are `fts5` (`fts5_adapter.rs:232`, **forced**: `SqliteValue::Text` needs owned
+  `String` + the doc is shared across lexical/vector/storage consumers) and the cass-compat layer — both narrow/feature-
+  gated/forced, not oversights.
+
+**Conclusion — the measurable, broadly-applicable frontier is comprehensively exhausted (verified this session across
+result-materialization, indexing, MMR, vector/index top-k, and the closed comparator).** Every hot clone/materialization
+is optimized (`doc_id` SSO, `metadata` Arc, `content` borrowed) or correctly left alone (`explanation` opt-in,
+`fts5` content forced). The remaining levers are **decision-gated** (ANN-in-BOLD w/ recall budget) or need a **workload
+the BOLD proxy doesn't model** (heavy-metadata corpus end-to-end, reranker-in-loop, indexing-throughput) — not a
+per-crate mechanical swap. Re-measure before assuming any new lever exists.
