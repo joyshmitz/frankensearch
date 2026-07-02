@@ -4184,8 +4184,25 @@ NOT need a recall-budget sign-off after all, because there is no favorable budge
 speedup, or give up the speedup for still-imperfect recall. (Caveat: `HnswConfig::default()` M/ef_construction + synthetic
 256-cluster/dim-128/noise-0.30 data; a higher-M index or real 384-dim embeddings *might* shift recall, but the default
 out-of-box config — what BOLD would use — is decisively unfavorable, and the flat scan is already sub-ms at 100k.)
-`hnsw_vs_flat_100k` kept as evidence. **This closes the LAST remaining lever: even the one decision-gated option is now
-measured-and-rejected. The frontier is comprehensively closed — top-k comparator parity, limit_all inherent, all clone/
+`hnsw_vs_flat_100k` kept as evidence.
+
+**M-swept re-check (M is HNSW's primary recall knob; default 16 → tested 32): rejection HOLDS.** Higher M lifts recall
+at every `ef` but not enough to create a favorable frontier point vs the exact flat scan (recall / latency, within-run;
+flat varies 517–769 µs across runs from worker variance, so compare relative within each run):
+
+| ef | recall@10 M=16 | recall@10 M=32 | M=32 latency vs flat |
+|----|----------------|----------------|----------------------|
+| 10 | 0.49 | 0.63 | 5.4× faster |
+| 20 | 0.61 | 0.74 | 2.9× faster |
+| 40 | 0.78 | 0.85 | 1.36× faster |
+| 100 | 0.88 | 0.95 | slower |
+| 200 | 0.93 | 0.98 | slower |
+
+At M=32 the best "fast" point is ef40 (**1.36× faster, but only 0.85 recall — loses 15% of the true top-10**); 0.95
+recall needs ef100, which is SLOWER than the exact scan. Doubling M again would keep eroding the memory/build advantage
+for diminishing recall gains. **The exact rayon+SIMD flat scan — sub-ms at 100k, 1.0 recall, already the shipped vector
+tier — dominates the speed/recall frontier for the default `ef_construction`.** This closes the LAST remaining lever
+across two M settings: even the one decision-gated option is now measured-and-rejected. The frontier is comprehensively closed — top-k comparator parity, limit_all inherent, all clone/
 materialization paths optimized, vector top-k floored (flat exact beats ANN on the recall/latency frontier through 100k),
 MMR incremental, indexing borrow-optimized.** Route next is a different workload (heavy-metadata E2E, reranker-in-loop)
 or a higher-M ANN re-measure with real embeddings — not a per-crate lever on the current surface.

@@ -86,8 +86,14 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
         writer.finish().expect("finish");
     }
     let index = VectorIndex::open(&path).expect("open index");
-    let hnsw =
-        HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("build hnsw");
+    // M is HNSW's primary recall knob (default 16). Bump to 32 (standard high-recall
+    // setting) to test whether the default-M recall rejection is config-dependent or
+    // fundamental. ef_construction kept at the 200 default.
+    let hnsw_config = HnswConfig {
+        m: 32,
+        ..HnswConfig::default()
+    };
+    let hnsw = HnswIndex::build_from_vector_index(&index, hnsw_config).expect("build hnsw");
 
     let queries: Vec<Vec<f32>> = (0..QUERIES)
         .map(|q| make_vector(&centroids, q % CLUSTERS, 0xdead_0000 + q as u64))
