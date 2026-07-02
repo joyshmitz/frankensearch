@@ -243,6 +243,10 @@ enum SearchFilterClause {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SearchFilterExpr {
     clauses: Vec<SearchFilterClause>,
+    /// True iff any clause is `PathContains` — precomputed so `matches_doc_id`
+    /// only pays the per-candidate `to_ascii_lowercase` alloc when a path clause
+    /// actually reads it (extension-only filters skip it entirely).
+    has_path_contains: bool,
 }
 
 impl SearchFilterExpr {
@@ -299,13 +303,27 @@ impl SearchFilterExpr {
             return Ok(None);
         }
 
-        Ok(Some(Self { clauses }))
+        let has_path_contains = clauses
+            .iter()
+            .any(|c| matches!(c, SearchFilterClause::PathContains(_)));
+        Ok(Some(Self {
+            clauses,
+            has_path_contains,
+        }))
     }
 
     fn matches_doc_id(&self, doc_id: &str) -> bool {
-        let lowered = doc_id.to_ascii_lowercase();
+        // Only pay the lowercase allocation when a PathContains clause reads it;
+        // extension-only filters test `doc_id` directly and allocate nothing
+        // (~1.7× on ext-only filters, `filter_match_ab` bench). PathContains keeps
+        // the SIMD `str::contains` (a naive alloc-free scan measured slower).
+        let lowered = self
+            .has_path_contains
+            .then(|| doc_id.to_ascii_lowercase());
         self.clauses.iter().all(|clause| match clause {
-            SearchFilterClause::PathContains(needle) => lowered.contains(needle),
+            SearchFilterClause::PathContains(needle) => {
+                lowered.as_deref().is_some_and(|l| l.contains(needle))
+            }
             SearchFilterClause::Extension(expected) => Path::new(doc_id)
                 .extension()
                 .and_then(|ext| ext.to_str())

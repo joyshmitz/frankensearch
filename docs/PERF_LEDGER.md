@@ -2708,3 +2708,28 @@ Bit-identical (merged doc_id order asserted across arms).
 **Scope:** original-comparator ratio **N/A** (internal hasher on the fsfs merge, not a lexical comparator lever); a
 frankensearch before/after on the default result path. Kept A/B harness `merge_dedup_ab`. Verified: remote
 `cargo build -p frankensearch-fsfs --lib` compile SUCCEEDED (RCH-E309 exit-102 = artifact-transfer only).
+
+---
+
+## 2026-07-02 — filter `matches_doc_id`: conditional lowercase — skip the per-candidate alloc for extension-only filters (~1.6×) (SlateHeron)
+
+**Lever (conditional allocation).** `SearchFilterExpr::matches_doc_id` (`fsfs/runtime.rs`) runs per candidate in
+`apply_search_filter` (filters the fused head) + both merge loops, and it unconditionally allocated
+`doc_id.to_ascii_lowercase()` every call — dead work for `Extension`-only filters (`type:`/`ext:`/`lang:`), which read
+`doc_id` directly. Precomputed a `has_path_contains: bool` on the expr at `parse` time; `matches_doc_id` now allocates
+`lowered` only when a PathContains clause will read it (`self.has_path_contains.then(|| doc_id.to_ascii_lowercase())`).
+Path filters keep the identical `to_ascii_lowercase` + SIMD `str::contains` (a naive alloc-free scan measured SLOWER,
+see the NEGATIVE_EVIDENCE mixed entry). Bit-identical (asserted both filter kinds).
+
+**Measured (`filter_match_ab`, remote, per-candidate filter over path candidate sets):**
+
+| filter | shape | old | new | ratio |
+|---|---|---|---|---|
+| PathContains | n200/1000/4000 | 4.59/22.57/86.77 µs | 4.37/22.21/89.03 µs | **~1.0 (tie, identical code)** |
+| Extension    | n200 | 6.99 µs  | 4.57 µs  | **0.654 (1.53×)** |
+| Extension    | n1000 | 36.39 µs | 22.34 µs | **0.614 (1.63×)** |
+| Extension    | n4000 | 139.54 µs | 88.18 µs | **0.632 (1.58×)** |
+
+**Scope:** original-comparator ratio **N/A** (internal, opt-in filter path); a frankensearch before/after — **narrow**
+(only extension-only filters benefit; path filters are a strict tie, no regression). Kept A/B harness `filter_match_ab`.
+Verified: remote `cargo build -p frankensearch-fsfs --lib` compile SUCCEEDED (RCH-E309 = artifact-transfer only).

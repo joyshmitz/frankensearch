@@ -93,6 +93,10 @@ name = "merge_dedup_ab"
 harness = false
 
 [[bench]]
+name = "filter_match_ab"
+harness = false
+
+[[bench]]
 name = "fused_materialize"
 harness = false
 
