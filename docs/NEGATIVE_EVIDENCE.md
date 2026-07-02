@@ -4524,3 +4524,41 @@ frankensearch-fusion --bench sync_hash_ab`. If `ahash` ratio < 0.97: switch `syn
 ahash::{AHashMap, AHashSet}` and the four constructors at :270/:274/:446/:525 (all local, private fns, keys are
 `&str` doc_ids — bit-identical, no caller ripple). LESSON: `git add` new bench/source files BEFORE any `rch exec` or
 the remote build reads a stale tree.
+
+---
+
+## 2026-07-02 — MEASURED (bench landed, prod swap scoped): sync_searcher per-query maps → aHash is ~2× SipHash (SlateHeron)
+
+**Resolves the prior blocker entry.** `git add`-ed the A/B bench before `rch exec` (the earlier trap) and got a clean
+same-binary measurement on remote `hz2`. The `sync_hash` bench models the real per-query shape of
+`vector_hits_to_scored_results` (`sync_searcher.rs`): build the `fast`+`quality` `HashMap<&str,f32>` score maps + the
+`seen` dedup set, then one fast + one quality `.get()` per candidate.
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-fusion --bench sync_hash_ab -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+| n (candidates) | sip (std SipHash) | ahash | ratio |
+|---|---|---|---|
+| 30  | 2.626 µs  | 1.329 µs  | **0.506 (1.98×)** |
+| 100 | 9.092 µs  | 4.343 µs  | **0.478 (2.09×)** |
+| 300 | 28.347 µs | 12.451 µs | **0.439 (2.28×)** |
+
+**aHash is ~2× SipHash** on this build+probe over short `doc-{:06}` keys — well past the 0.97 keep gate. Bit-identical:
+the maps/sets are only `.get()`/`.insert()`/`.entry()`-probed, never iterated for output (`debug_assert_eq!` on the
+accumulated f32 bits passes across arms). Bench + `[[bench]]` registration LANDED (`sync_hash_ab`).
+
+**Ratio vs Lucene/Tantivy/Meilisearch-class: N/A** — internal hasher microbench on the sync hybrid materialization,
+not a lexical comparator lever; kept as evidence + a wired A/B harness. The sibling paths (`rrf.rs:17`, `blend.rs`,
+`search.rs:7`) already use aHash, so this closes the last SipHash hot-map island in fusion once wired.
+
+**Prod swap — SCOPED (one compile constraint found, not yet wired):** aliasing the whole file to
+`use ahash::{AHashMap as HashMap, AHashSet as HashSet}` does NOT compile — `rank_map` (`sync_searcher.rs:524`) feeds
+`blend::compute_rank_changes_with_maps` (`blend.rs:315`) which takes `&std::collections::HashMap<&str,usize>` (E0308 at
+`sync_searcher.rs:540`). **Route-next (verified-safe scope):** alias only the score-map/`seen` sites — convert the two
+`.collect::<HashMap<&str,f32>>()` (`:273,:278`), the `Option<&HashMap<&str,f32>>` params (`:443,:444,:478,:479`), and
+`seen` (`:446`) to the aHash types, but leave `rank_map` (`:524,:525`) as explicit `std::collections::HashMap` (it
+crosses the blend boundary). All score-map/`seen` sites are local, private, `&str`-keyed, probe-only ⇒ bit-identical.
+Build `-p frankensearch-fusion --lib --tests` to confirm, then land as the ~2× sync-path win. (Not wired this turn:
+HEAD-frozen / no-build directive — refused to push an unverified compile to the shared tree.)
