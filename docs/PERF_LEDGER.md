@@ -2917,3 +2917,30 @@ The Bernstein **mean** mode certifies the cheaper `ef=40` → **3.70×** (2.1× 
 decision a **certified** speedup at each guarantee level: pick the tail mode for a per-query SLA, the mean mode for an
 average-recall budget. Verified: bench compiles + runs clean under `--features ann` (exit 0). Ratio vs Tantivy N/A
 directly (vector tier; flat exact is the internal baseline).
+
+---
+
+## 2026-07-02 — MEASURED: stratified (Mondrian-conformal) certified-ef ANN — 1.22–1.31× at 100k (the regime the 40k probe predicted) (SlateHeron)
+
+Follow-through on the 40k stratified-ef probe (`6098cb5`), which found no speedup at 40k but predicted one at larger N
+(steeper `ef`→latency curve). Made the bench's corpus size env-overridable (`FS_STRAT_N`, default 40k) and re-ran at 100k.
+
+**Measured (remote `--features ann`, N=100k, dim=128, m=32, k=10, target 0.90, α 0.1; heterogeneous corpus: half tight
+NOISE=0.08 / half diffuse NOISE=0.35):**
+
+| policy | guarantee | ef | latency (median, 95% CI) | holdout recall@10 |
+|---|---|---|---|---|
+| global **population** | population 90th-pct ≥ 0.90 | 160 | 1.590 ms [1.41–1.80] | 0.982 |
+| global **per-group** | every stratum ≥ 0.90 | 160 | 1.712 ms [1.55–1.93] | 0.982 |
+| **stratified routed** | every stratum ≥ 0.90 | 40/160 | **1.305 ms** [1.23–1.39] | 0.964 |
+
+At 100k the population-conformal `ef` **jumps to 160** (== per-group): recall at low `ef` is worse at scale, so the
+population bound can no longer dilute the tail with easy queries. Both global policies therefore need `ef`=160, and
+stratified routing (tight→`ef`40, diffuse→`ef`160) is the only remaining lever: **1.22× vs population-global, 1.31× vs
+per-group-global**, at recall 0.964 ≥ target (CIs nearly/clearly separated). This **confirms the 40k probe's prediction
+and flips backlog #2 positive**: stratified/Mondrian-conformal `ef` IS a speed lever once the `ef`→latency curve is steep
+enough that the population bound can't cheat (at 40k it lost because population `ef`=80 dominated; at 100k
+pop==pergroup==160, so stratification wins). Verified: bench compiles + runs clean under `--features ann` (exit 0).
+
+**Also recorded this turn:** backlog #4 (AVX-512 dot kernels) is **measurement-blocked** — the rch workers are AMD
+Threadripper PRO 5975WX (**Zen 3**: `avx2`/`fma` only, no `avx512`/`vnni`), so no AVX-512 win can be measured here.

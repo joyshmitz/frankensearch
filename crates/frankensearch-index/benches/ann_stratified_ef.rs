@@ -23,7 +23,12 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
     };
 
     const DIM: usize = 128;
-    const N: usize = 40_000;
+    // Corpus size (env-overridable so the same bench can probe the steeper
+    // ef->latency regime at larger N, where stratified routing should pay off).
+    let n: usize = std::env::var("FS_STRAT_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40_000);
     const K: usize = 10;
     const CLUSTERS: usize = 128; // first half tight, second half diffuse
     const TIGHT_NOISE: f32 = 0.08;
@@ -67,7 +72,7 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
     {
         let mut w = VectorIndex::create_with_revision(&path, "hash", "bench", DIM, Quantization::F32)
             .expect("create writer");
-        for i in 0..N {
+        for i in 0..n {
             let v = make(i % CLUSTERS, i as u64 + 1);
             w.write_record(&format!("doc-{i:06}"), &v).expect("write");
         }
