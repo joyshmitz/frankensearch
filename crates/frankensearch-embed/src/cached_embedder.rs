@@ -95,6 +95,13 @@ impl CacheState {
         }
     }
 
+    /// Record a hit that was served without a fresh lookup — used for an in-batch
+    /// duplicate query that folds onto another slot's just-computed embedding, so
+    /// batch stats match the old per-text loop (dup = hit, not a second miss).
+    fn record_hit(&mut self) {
+        self.hits += 1;
+    }
+
     fn insert(&mut self, key: String, value: Vec<f32>) {
         // capacity == 0 means caching is disabled.
         if self.capacity == 0 || self.entries.contains_key(&key) {
@@ -285,11 +292,62 @@ impl Embedder for CachedEmbedder {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
-            let mut out = Vec::with_capacity(texts.len());
-            for text in texts {
-                out.push(self.embed(cx, text).await?);
+            // Pass 1 (single lock scope, released BEFORE the await so the batched
+            // inner call holds no lock): resolve cache hits and collect the *distinct*
+            // misses. A miss text repeated within the batch folds onto one inner
+            // embedding and counts as a hit — the in-batch dedup the old per-text loop
+            // got for free — so a batch of repeated queries embeds each text at most once.
+            let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
+            let mut miss_texts: Vec<&str> = Vec::new();
+            // Output slot -> index into `miss_texts` (None once the slot is resolved).
+            let mut slot_miss: Vec<Option<usize>> = Vec::with_capacity(texts.len());
+            // Dedup map: distinct miss text -> its index in `miss_texts`.
+            let mut miss_index: HashMap<&str, usize> = HashMap::new();
+            {
+                let mut cache = self.state_lock();
+                for &text in texts {
+                    if let Some(&idx) = miss_index.get(text) {
+                        // Repeat of a text already queued this batch: fold onto the
+                        // same inner result, no second inner call, record a hit.
+                        cache.record_hit();
+                        out.push(None);
+                        slot_miss.push(Some(idx));
+                        continue;
+                    }
+                    match cache.get(text) {
+                        Some(vec) => {
+                            out.push(Some(vec));
+                            slot_miss.push(None);
+                        }
+                        None => {
+                            let idx = miss_texts.len();
+                            miss_texts.push(text);
+                            miss_index.insert(text, idx);
+                            out.push(None);
+                            slot_miss.push(Some(idx));
+                        }
+                    }
+                }
             }
-            Ok(out)
+            // ONE batched inner call for all distinct misses — vs the old per-text loop
+            // that called `inner.embed` N times, defeating a batching inner (e.g.
+            // fastembed embeds the whole batch in a single model invocation). N → 1.
+            if !miss_texts.is_empty() {
+                let embedded = self.inner.embed_batch(cx, &miss_texts).await?;
+                {
+                    let mut cache = self.state_lock();
+                    for (idx, vec) in embedded.iter().enumerate() {
+                        cache.insert(miss_texts[idx].to_owned(), vec.clone());
+                    }
+                }
+                // Fan the distinct embeddings back out to every slot that needed them.
+                for (slot, maybe_idx) in slot_miss.iter().enumerate() {
+                    if let Some(idx) = *maybe_idx {
+                        out[slot] = Some(embedded[idx].clone());
+                    }
+                }
+            }
+            Ok(out.into_iter().map(|v| v.expect("every slot filled")).collect())
         })
     }
 
@@ -382,6 +440,90 @@ mod tests {
         fn category(&self) -> ModelCategory {
             ModelCategory::HashEmbedder
         }
+    }
+
+    /// Counts `embed` vs `embed_batch` inner calls separately, so a test can prove
+    /// `CachedEmbedder::embed_batch` funnels misses through ONE `inner.embed_batch`
+    /// (not N `inner.embed`), which is the whole point when the inner batches.
+    struct BatchCountingEmbedder {
+        dim: usize,
+        embed_calls: AtomicUsize,
+        batch_calls: AtomicUsize,
+    }
+
+    impl BatchCountingEmbedder {
+        fn deterministic(dim: usize, text: &str) -> Vec<f32> {
+            let mut vec = vec![0.0_f32; dim];
+            for (i, b) in text.bytes().enumerate() {
+                vec[i % dim] += f32::from(b);
+            }
+            l2_normalize(&vec)
+        }
+    }
+
+    impl Embedder for BatchCountingEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.embed_calls.fetch_add(1, Ordering::Relaxed);
+            let v = Self::deterministic(self.dim, text);
+            Box::pin(async move { Ok(v) })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            let out: Vec<Vec<f32>> =
+                texts.iter().map(|t| Self::deterministic(self.dim, t)).collect();
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+        fn id(&self) -> &'static str {
+            "batch-counting-test"
+        }
+        fn model_name(&self) -> &'static str {
+            "Batch Counting Test Embedder"
+        }
+        fn is_semantic(&self) -> bool {
+            false
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    #[test]
+    fn embed_batch_funnels_misses_through_one_inner_embed_batch() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let inner = Arc::new(BatchCountingEmbedder {
+                dim: 64,
+                embed_calls: AtomicUsize::new(0),
+                batch_calls: AtomicUsize::new(0),
+            });
+            let cached = CachedEmbedder::new(inner.clone(), 128);
+            let texts = ["a", "bb", "ccc", "dddd", "eeeee"];
+            let refs: Vec<&str> = texts.iter().copied().collect();
+
+            let out = cached.embed_batch(&cx, &refs).await.expect("embed_batch");
+
+            // The win: all misses go through ONE inner.embed_batch, zero inner.embed.
+            assert_eq!(inner.batch_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(inner.embed_calls.load(Ordering::Relaxed), 0);
+            // Correctness: same vectors the direct (uncached) embed_batch produces.
+            for (i, t) in texts.iter().enumerate() {
+                assert_eq!(out[i], BatchCountingEmbedder::deterministic(64, t));
+            }
+
+            // A second call is fully cache-served: no further inner work.
+            let out2 = cached.embed_batch(&cx, &refs).await.expect("embed_batch 2");
+            assert_eq!(inner.batch_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(inner.embed_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(out, out2);
+        });
     }
 
     fn make_cached(capacity: usize) -> (CachedEmbedder, Arc<CountingEmbedder>) {

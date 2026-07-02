@@ -4466,3 +4466,31 @@ hot clone/materialization optimized (metadata-Arc 278×, explanation-Box 1.14×,
 E2E), struct layout at floor, vector tier AVX2/two-pass/ANN-shipped-default, MMR incremental, RRF score+sort probed,
 phase-gate an e-process, comparator parity-or-faster, `limit_all` two-pass inherent, workspace `--all-targets` GREEN.
 No un-landed lever remains on the current code; the productive next step is a workload the BOLD proxy doesn't model.
+---
+
+## 2026-07-02 — LANDED: `CachedEmbedder::embed_batch` funnels distinct misses through ONE `inner.embed_batch` (SlateHeron)
+
+**Lever (uncommitted-in-tree, now completed + landed):** the `CachedEmbedder` wrapper's `embed_batch` override was a
+per-text loop calling `self.embed(cx, text)` N times, so each cache MISS did a separate `inner.embed` call. That defeats
+a *batching* inner embedder — fastembed/ONNX pay high fixed per-invocation overhead but low marginal cost per extra input
+(`traits.rs:140` documents exactly this), so N miss-calls where 1 batched call would do is pure waste on the cache-cold
+refresh/indexing path (`fusion/refresh.rs:415,447`; `fsfs/runtime.rs:8487,8860,8914`). New impl: pass 1 takes one lock
+scope, resolves hits, and collects the **distinct** misses (dedup map), releasing the lock before the await; then **one**
+`inner.embed_batch(cx, &distinct_misses)` for all of them; then fans results back to every slot. **Inner call-count
+reduction: N distinct misses → 1 batched call** (test-proven, `embed_batch_funnels_misses_through_one_inner_embed_batch`
+asserts `batch_calls==1, embed_calls==0` for 5 unique misses).
+
+**Correctness — the uncommitted draft had a real bug I fixed before landing:** it lost the in-batch dedup the old
+sequential loop got for free, so a batch with a repeated query (`["hello","hello","world"]`) embedded `hello` twice and
+mis-counted stats — it FAILED the existing `embed_batch_deduplicates_within_batch` contract (bd-1ocg): got 3 inner calls
++ (0 hits,3 misses) vs the required 2 inner calls + (1 hit,2 misses). The landed version dedups distinct misses and folds
+an in-batch repeat onto the same result, counting it as a hit (`CacheState::record_hit`). **All 25 `cached_embedder`
+tests GREEN incl. dedup + stats + per-item-cache + funnel.** Bit-identical output vectors to the old path.
+
+**Ratio vs Lucene/Tantivy/Meilisearch-class: N/A** — this is an embed/refresh-path call-count win, not a lexical
+comparator lever; there is no criterion wall-clock bench for `CachedEmbedder::embed_batch` (the win only materializes
+under a *real batching* inner like fastembed, absent from the test doubles). So it does not move a BOLD comparator row;
+it removes N−1 redundant model invocations per cache-cold batch on the indexing/refresh path. Kept because it is a strict
+improvement (fewer inner calls, same outputs, all contracts preserved), verified by test rather than by a bench ratio.
+**LESSON:** an "uncommitted measured win" in a shared tree may be an *incomplete draft* — re-run the crate's own contract
+tests before landing; this one silently dropped a documented dedup invariant.
