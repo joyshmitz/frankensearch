@@ -4070,3 +4070,18 @@ lesson applied: verified `--features full` before pushing). Reads are unchanged 
 metadata construction is almost all `None` or `.clone()` (auto `Arc::clone`), so only 4 test-construction sites needed
 `Arc::new`. This is the largest measured win of the session — 200–278× on the rich-metadata `limit_all` materialization,
 a real production path the BOLD proxy structurally hides.
+
+**Bonus impact (recorded, no extra change):** the metadata-Arc landing also makes the async **progressive-phase
+emission clones cheap for rich metadata**. `display_hits.clone()` / `refined_results.clone()`
+(`searcher.rs:543/637/683/806`) copy `Vec<ScoredResult>` per phase; *previously* each carried `metadata: Value`, so a
+rich-metadata `limit_all` deep-cloned N Values **per phase** (2N/query). The async phase-clone had been measured "~0"
+([[discarded-output-clone-lever]]) — but ONLY because that test used tiny metadata; the struct-copy itself was already
+cheap, the hidden cost was the metadata deep-clone. Now `metadata: Arc<Value>` → those phase clones are `Arc::clone`.
+So one field-type change fixed BOTH the materialization AND the phase-emission clone for rich-metadata workloads.
+
+**ScoredResult clone arc now comprehensively optimized:** `doc_id` (`CompactString` SSO), `metadata` (`Arc<Value>`),
+`explanation` (built winner-only, gated on `explain`), all other fields `Copy`. No heap-heavy per-result clone remains
+on the common path. The `explanation` deep-clone under `explain=true`+`limit_all`+phases is the only residual (an
+`Arc<HitExplanation>` would fix it by the same pattern) — niche (`explain` is opt-in debug/UI), low-EV, deferred. The
+"rich-metadata real-path the BOLD proxy hides" vein — productive for two landings ([[metadata-arc-value-landed]] +
+cba06d7) — is now itself optimized.
