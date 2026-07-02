@@ -4592,3 +4592,39 @@ expand_fuse_ab`. If `borrow_ahash` < 0.97 vs `clone_sip`: in `fuse_expanded_payl
 and `.to_owned()` the path only in the final `take(limit)` output build. Verify with `cargo build -p frankensearch-fsfs
 --lib` (budget ~10-15min — fsfs is the heavy crate). LESSON: bench self-contained algorithmic levers in the LIGHTEST
 crate that has the deps (fusion), never in fsfs — its openssl/TUI/pdf graph makes every bench cycle a 10-min compile.
+
+---
+
+## 2026-07-02 — MEASURED (bench landed, prod swap ready): fsfs default-path merge dedup — aHash ~1.3× on the full merge (SlateHeron)
+
+**Lever (hasher-only; keys already borrow `&str`).** `merge_with_lexical_tail` (`fsfs/runtime.rs:6127`) and
+`merge_with_fallback_tail` (`:6184`) — on the DEFAULT (non-expansion) result-assembly path — dedup the fused head's
+doc_ids in a std `HashSet<&str>` (SipHash) probed **once per lexical/fallback-tail candidate** (O(tail); the tail is
+the full lexical result set, large on big corpora). Siblings use `ahash`. Unlike the `fuse_expanded` win there is no
+clone to elide here (keys already `&str`), and each kept candidate is `FusedCandidate::clone()`d (a `String` alloc) in
+BOTH arms — so I benched the REAL merge shape (build head set + O(tail) contains-probes + per-keep clone) to see whether
+the hasher swap survives the clone dilution end-to-end, rather than measuring the isolated set op.
+
+**Measured (`merge_dedup_ab`, remote `hz2`, `frankensearch-fusion` benches — fsfs is a >10-min compile so its
+self-contained levers are benched in the light crate):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-slateheron rch exec -- \
+  cargo bench -p frankensearch-fusion --bench merge_dedup_ab -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+| shape (head, tail) | sip | ahash | ratio |
+|---|---|---|---|
+| h50_t200  | 10.16 µs | 7.57 µs  | **0.745 (1.34×)** |
+| h50_t1000 | 47.68 µs | 35.37 µs | **0.742 (1.35×)** |
+| h100_t2000| 95.59 µs | 75.60 µs | **0.791 (1.26×)** |
+
+aHash survives the clone dilution: **~1.3× on the full merge** (the raw set-op win is ~2× but clones are hasher-
+independent). Well past the 0.97 gate. Bit-identical (same merged doc_id order asserted across arms).
+
+**Scope:** original-comparator ratio **N/A** (internal hasher on the fsfs merge, not a lexical comparator lever); kept
+A/B harness `merge_dedup_ab` (in fusion benches). **Prod swap READY, not wired this turn (HEAD-frozen/no-build):**
+convert the two `let mut seen* = HashSet::with_capacity(...)` at `runtime.rs:6127` and `:6184` to
+`ahash::AHashSet::with_capacity(...)` (fsfs already deps `ahash` since `401c3e3`; inferred `&str` element type; same
+proven swap as `sync_searcher`/`fuse_expanded`). Verify `cargo build -p frankensearch-fsfs --lib` (RCH-E309 exit-102 =
+compile-succeeded), then land. Refused to push the unverified fsfs edit to the shared tree.
