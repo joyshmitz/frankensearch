@@ -3863,3 +3863,30 @@ latency — breaks the bit-identical/parity invariant the BOLD comparison holds,
 decision), or (b) shrink the public `FusedHit`/`ScoredResult` (an API break). Both need owner direction; neither is a
 per-crate perf lever. **Route next: stop re-auditing the owned hot paths — re-measure the live BOLD ratios first, and
 only pursue (a)/(b) with an explicit go-ahead.**
+
+---
+
+## 2026-07-02 — REJECTED (measured): shrinking `FusedHit` ~96 B→56 B buys only ~1.04× on limit_all materialize (BlackThrush)
+
+**Negative evidence — the struct-shrink lever (b) from the prior entry, benched instead of assumed. No production
+change; the ~40 % smaller struct does NOT justify the public-API break.** Added a `packed` arm to `docid_materialize_ab`:
+`FusedHitPacked` replaces the `Option<usize>`/`Option<u32>` ranks with `u32` (`u32::MAX` sentinel) and `Option<f32>`
+scores with `f32` (`NaN` sentinel) — ~96 B → ~56 B, same `CompactString` doc_id — and materializes it the same way over
+N `limit_all` winners. All three arms (`string`/`compact`/`packed`) run in ONE binary on ONE worker (ovh-a here), so the
+packed-vs-compact ratio is same-worker-clean.
+
+| N | `string` (96 B, pre-CompactString) | `compact` (96 B, landed) | `packed` (56 B) | packed/compact |
+|---|---|---|---|---|
+| 10,000 | 181.1 µs | 88.5 µs | 85.4 µs | **1.036× (3.5 % faster)** |
+| 100,000 | 2014 µs | 905.6 µs | 862.4 µs | **1.050× (4.8 % faster)** |
+
+**Why so small:** the materialize is dominated by the `CompactString` clone (a 24 B SSO inline memcpy, **identical in both
+arms**) plus per-element `Vec` push/alloc — NOT the `Copy`-field footprint the packing shrinks. Cutting 40 B of `Copy`
+fields off each record moves the full materialize by only ~4 %. **Decision: rejected — do NOT pack/shrink the public
+`FusedHit`/`ScoredResult`.** A ~1.04× on one sub-step of `limit_all` (which is already at/under tantivy parity) cannot
+justify (i) breaking every consumer that reads `.lexical_rank: Option<usize>` etc. and (ii) losing the `Option`
+niche-safety (sentinels re-admit "is this `u32::MAX` a real rank or absent?" bugs). The `limit_all` struct-build floor is
+**real and inherent** — confirmed by measurement, not just asserted. (NB: absolute times differ from the 2.2× entry's
+run — that was hz1, this is ovh-a; the SAME-worker packed/compact ratio is the valid comparison, re-confirming
+cross-worker absolutes are noise.) `docid_materialize_ab` packed arm kept as evidence. **Route next: the two remaining
+levers are now (a) ANN-in-BOLD (recall tradeoff, decision-gated) only — struct-shrink (b) is closed by data.**

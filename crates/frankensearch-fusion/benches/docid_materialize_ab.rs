@@ -46,7 +46,7 @@ struct FusedHitString {
     in_both_sources: bool,
 }
 
-/// `FusedHit` with a `CompactString` doc_id — the landed production type.
+/// `FusedHit` with a `CompactString` doc_id — the landed production type (~96 B).
 struct FusedHitCompact {
     doc_id: CompactString,
     rrf_score: f64,
@@ -55,6 +55,22 @@ struct FusedHitCompact {
     semantic_index: Option<u32>,
     lexical_score: Option<f32>,
     semantic_score: Option<f32>,
+    in_both_sources: bool,
+}
+
+/// Hypothetical packed `FusedHit` (~56 B): the `Option<usize>`/`Option<u32>` rank
+/// fields become `u32` with a `u32::MAX` sentinel, `Option<f32>` scores become
+/// `f32` with a `NaN` sentinel. Same doc_id (CompactString). Tests whether the
+/// ~40 % struct-size cut speeds the `limit_all` materialize (smaller memcpy +
+/// smaller Vec alloc) enough to justify the public-API break it would require.
+struct FusedHitPacked {
+    doc_id: CompactString,
+    rrf_score: f64,
+    lexical_rank: u32,
+    semantic_rank: u32,
+    semantic_index: u32,
+    lexical_score: f32,
+    semantic_score: f32,
     in_both_sources: bool,
 }
 
@@ -102,6 +118,20 @@ fn to_compact(w: &Winner<'_>) -> FusedHitCompact {
     }
 }
 
+#[inline]
+fn to_packed(w: &Winner<'_>) -> FusedHitPacked {
+    FusedHitPacked {
+        doc_id: w.doc_id.into(),
+        rrf_score: w.rrf_score,
+        lexical_rank: w.lexical_rank.map_or(u32::MAX, |r| r as u32),
+        semantic_rank: w.semantic_rank.map_or(u32::MAX, |r| r as u32),
+        semantic_index: w.semantic_index.unwrap_or(u32::MAX),
+        lexical_score: w.lexical_score.unwrap_or(f32::NAN),
+        semantic_score: w.semantic_score.unwrap_or(f32::NAN),
+        in_both_sources: w.in_both_sources,
+    }
+}
+
 fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("docid_materialize_ab");
     for n in [10_000usize, 100_000] {
@@ -120,6 +150,13 @@ fn bench(c: &mut Criterion) {
             b.iter(|| {
                 let out: Vec<FusedHitCompact> =
                     black_box(ws).iter().map(to_compact).collect();
+                black_box(out)
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("packed", n), &ws, |b, ws| {
+            b.iter(|| {
+                let out: Vec<FusedHitPacked> =
+                    black_box(ws).iter().map(to_packed).collect();
                 black_box(out)
             });
         });
