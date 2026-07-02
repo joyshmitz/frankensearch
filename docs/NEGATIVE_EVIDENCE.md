@@ -4256,3 +4256,27 @@ sensitive to cluster tightness; sweep the noise/separation before concluding.
 already implemented.** The ONE open perf lever remains **ANN-in-BOLD** ([[ann-in-bold-viable]]) — a measured 2.6–5×
 vector-tier win at ≥0.975 recall for realistically-clustered corpora — which is NOT decision-free (it trades exact recall
 for ~0.99) and so is blocked on a recall-budget sign-off + real-embedding validation, not on finding a lever.
+
+---
+
+## 2026-07-02 — RESOLVED: ANN-in-BOLD is ALREADY the shipped default at scale (`hnsw_threshold: 50_000`); my session validated the default config (BlackThrush)
+
+**The ANN thread is closed — there was nothing to "land" because it's already default-on.** Checked the wiring end to
+end: `TwoTierConfig` exposes `hnsw_threshold` (default **50_000**), `hnsw_ef_search` (100), `hnsw_m` (16),
+`hnsw_ef_construction` (200). `maybe_load_or_build_ann` **auto-builds** the HNSW sidecar when the corpus exceeds the
+threshold, and `two_tier.rs:285` uses `ann.knn_search` whenever the sidecar is present. So **for any corpus ≥50k built
+with the `ann` feature, frankensearch ALREADY uses HNSW ANN by default** at ef_search=100 / m=16. (BOLD's proxy uses the
+flat scan only because its bench doesn't enable the `ann` feature / build the sidecar — not because ANN is unwired.)
+
+**My session's ANN measurement (`hnsw_vs_flat_100k`) therefore validates the shipped defaults rather than proposing a
+new lever:** at the default-ish ef_search=100 on realistically-tight clusters, recall@10 = **0.994** (m=32) / ~0.98–0.99
+(m=16) at **2.6× faster** than exact flat — so the defaults (threshold 50k, ef 100, m 16) are a sensible exact-vs-ANN
+crossover for large corpora with real semantic structure. The `NOISE=0.30` "rejection" was the synthetic-diffuseness
+artifact; the shipped default targets the realistic (tight) regime and is well-chosen.
+
+**Conclusion: there is NO un-landed perf lever.** The one measured big win (ANN, 2.6–5×) is already the default at scale;
+every other surface is optimized or inherent (metadata-Arc 278× landed, doc_id SSO, MMR incremental, flat scan AVX2-
+ceiling on Zen 3, phase gate an e-process, top-k comparator parity, limit_all inherent). The only remaining actions are
+NON-mechanical: (a) validate the ANN default's recall on a REAL embedded corpus (needs a semantic model, absent on the
+rch workers), or (b) a different workload than the BOLD proxy models. The measurable, per-crate frontier is
+comprehensively closed and, for ANN, already shipped.
