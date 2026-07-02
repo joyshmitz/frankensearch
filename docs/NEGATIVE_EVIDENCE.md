@@ -3724,8 +3724,7 @@ index sort) have all now been probed and rejected. Route next: the only remainin
 
 ## 2026-07-02 — limit_all doc_id clone: CompactString (SSO) is 29.8× cheaper for short ids, beating Arc<str> — the materialization lever's optimal type (BlackThrush)
 
-**Positive finding, not a rejection — no production change yet (the refactor is cross-crate/multi-session);
-recorded to re-scope the biggest remaining `limit_all` lever with data.** The doc_id materialization clone
+**Positive finding — now LANDED (see 2026-07-02 landing note below).** The doc_id materialization clone
 (RRF `into_owned` + resolve_heap + blend, ~23% of limit_all, ~432 µs/10k) was slated for an `Arc<str>`
 refactor. Benched the actual N-clone cost of the candidate types (`doc_id_clone_sso`, N=10k):
 
@@ -3746,3 +3745,31 @@ where `Arc<str>` stays a universal win — so for a library with unknown consume
 bigger refactor). **Recommendation for the dedicated materialization session:** `doc_id: CompactString` on the
 frankensearch-core types (`VectorHit`/`FusedHit`/`ScoredResult`) + index doc_ids table — near-drop-in, ~22%
 off limit_all for the common short-id case. `doc_id_clone_sso` bench kept as evidence.
+
+---
+
+## 2026-07-02 — LANDED: `DocId = CompactString` on the hot materialization structs (`8529084`, BlackThrush)
+
+**The recommendation above shipped.** `pub type DocId = CompactString` added to `frankensearch-core::types`;
+`VectorHit`/`FusedHit`/`ScoredResult` `doc_id` fields + their RRF/blend/resolve clone sites swapped `String → DocId`
+across the workspace (60 files, +199/−190). The hot `limit_all` path benefits: `FusedHitScratch.doc_id` stays
+`&'a str` (borrowed) and `into_owned` (rrf.rs:113, called via `.map(FusedHitScratch::into_owned)` at rrf.rs:352/552)
+now does `self.doc_id.into()` = `<CompactString as From<&str>>::from` = **SSO inline memcpy** for ids ≤24 B instead
+of a heap `String` alloc. Non-hot structs (traits.rs `LexicalHit`, commit_replay events, ope/queue records) keep
+`String` intentionally. `compact_str 0.9.1` already pinned in `Cargo.lock`.
+
+**Measured basis (already on main, `62f06f5`):** `doc_id_clone_sso` — short-id N-clone `String` 438 µs → `CompactString`
+14.73 µs = **29.8× cheaper**; this is the isolated cost of exactly the `into_owned` clone the landing removes from the
+`limit_all` output materialization (~23% of the fusion `limit_all` collect path). Ratio vs incumbents on the
+`limit_all` BOLD row (recorded pre-landing baseline, `bold_verify/limit_all/10000`): frankensearch **0.933–0.966×
+tantivy** (already at/under parity); this landing removes the largest remaining per-query heap-alloc term from that
+path in the common short-id case.
+
+**Conformance:** the landed source (tracked crates/tools/docs) is **byte-identical** to `blackthrush-compactstr-docid`,
+whose commits recorded **lib + tests GREEN / bit-identical** for this exact change. A fresh cold `cargo test --workspace
+--lib --features lexical` was launched on the rch fleet as independent re-verification; the fleet is **degraded (4/12
+workers healthy, ovh-a >15 min cold build of the asupersync+frankensqlite siblings)** and did not return inside the
+ship window — surfaced here as the only open item. **End-to-end `collect_limit_all` A/B** (saved String-era baseline
+`collect_limit_all/collect` = 21,372 µs in `search-cc/criterion`; rebuild at HEAD into the same target auto-reports the
+% delta) is the clean follow-up measurement, also fleet-gated. Neither gate blocks the landing: the win is
+correctness-verified on identical source and rests on an already-committed micro-measurement.
