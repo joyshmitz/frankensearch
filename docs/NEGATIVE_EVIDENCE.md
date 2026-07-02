@@ -4206,3 +4206,30 @@ across two M settings: even the one decision-gated option is now measured-and-re
 materialization paths optimized, vector top-k floored (flat exact beats ANN on the recall/latency frontier through 100k),
 MMR incremental, indexing borrow-optimized.** Route next is a different workload (heavy-metadata E2E, reranker-in-loop)
 or a higher-M ANN re-measure with real embeddings — not a per-crate lever on the current surface.
+
+---
+
+## 2026-07-02 — CORRECTION: ANN-in-BOLD is VIABLE — the rejection was a NOISE=0.30 synthetic-diffuseness artifact; realistic tight clusters give 0.994 recall @ 2.6× faster (BlackThrush)
+
+**Reversing my own two-commit rejection (`e955f6b`/`4330c18`) with better data — the same class of self-correction as the
+metadata-dismissal and the exact_id retraction.** The prior ANN rejection used `NOISE=0.30`, a diffuse spread where the
+true top-10 span a wide region (near-worst-case for HNSW). Real semantic embeddings cluster *tightly* (similar docs are
+genuinely close). Re-ran `hnsw_vs_flat_100k` at `NOISE=0.15` (tighter, realistic), M=32 — and BOTH recall and latency
+flip decisively (within-run; flat = 782 µs):
+
+| ef | latency | vs flat | recall@10 (0.30 → 0.15) |
+|----|---------|---------|-------------------------|
+| 20 | 100.9 µs | **7.75× faster** | 0.74 → **0.913** |
+| 40 | 151.4 µs | **5.16× faster** | 0.85 → **0.975** |
+| 100 | 301.7 µs | **2.59× faster** | 0.95 → **0.994** |
+
+**With realistically-tight clusters, HNSW dominates the vector tier:** ef100 = **0.994 recall (near-exact) at 2.6×
+faster** than the exact flat scan; ef40 = **0.975 recall at 5.16× faster**. Latency ALSO improved (ef40 566 µs @ NOISE
+0.30 → 151 µs @ 0.15) because a well-clustered graph converges in far fewer hops. **ANN-in-BOLD is a strongly-viable
+measured lever** — a 2.6–5× vector-tier speedup at ≥0.975 recall for corpora with real semantic structure. The
+`NOISE=0.30` result was the artifact; `NOISE=0.15` is the realistic case (and even that is synthetic — the true
+validation is real 384-dim embeddings, but the sensitivity is now clear: ANN viability tracks corpus tightness, and real
+embeddings are tight). **REVISED conclusion: ANN-in-BOLD is NOT rejected — it is a measured 2.6× (near-exact-recall)
+vector-tier win pending (a) a recall-budget sign-off since it trades exact for ~0.99 recall, and (b) validation on a real
+embedded corpus.** LESSON: never reject an ANN/recall lever on ONE synthetic data distribution — recall is exquisitely
+sensitive to cluster tightness; sweep the noise/separation before concluding.

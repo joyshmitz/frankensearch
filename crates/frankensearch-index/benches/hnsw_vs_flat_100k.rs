@@ -28,7 +28,11 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
     const QUERIES: usize = 32;
 
     const CLUSTERS: usize = 256;
-    const NOISE: f32 = 0.30;
+    // Tighter clusters (0.15 vs the prior 0.30): real semantic embeddings put
+    // similar docs genuinely close, unlike the diffuse 0.30 spread that is
+    // near-worst-case for HNSW navigation. Tests whether the M-swept rejection is
+    // a synthetic-diffuseness artifact or robust to realistic cluster tightness.
+    const NOISE: f32 = 0.15;
 
     fn raw_vector(seed: u64) -> Vec<f32> {
         let mut state = seed | 1;
