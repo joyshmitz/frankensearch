@@ -3976,32 +3976,32 @@ launched to confirm no third casualty hides behind `durable`/`api`.)
 
 ---
 
-## 2026-07-02 — RE-MEASURED BOLD ratios: comparator CONFIRMED closed; exact_identifier@100k now 2.5× FASTER; only >1.1× gap is inherent limit_all (BlackThrush)
+## 2026-07-02 — RE-MEASURED BOLD ratios: comparator CONFIRMED closed (top-k parity, limit_all ~1.4× inherent); exact_id@100k "2.5×" is single-run incumbent noise, NOT a claimed win (BlackThrush)
 
-**Fresh `bold_verify_tantivy_class` run (`search_bench`, `--features lexical`, 10k+100k, hz2) — measured, not
-memory.** Re-ran the frankensearch-hybrid-vs-tantivy-class-incumbent comparison after all recent landings (CompactString
-core/fusion/index + lexical, feature fixes) to find where frankensearch *currently* trails. `ratio = fs_p50 /
-incumbent_p50` (<1 = frankensearch faster). **Parity-or-better on every top-k row; the historical loss is now a 2.5×
-win:**
+**Fresh `bold_verify_tantivy_class` run (`search_bench`, `--features lexical`, 10k+100k, hz2, `--sample-size 10`).**
+`ratio = fs_p50 / incumbent_p50` (<1 = frankensearch faster). **CAVEAT (per [[bold-comparator-closed]]): at these fast
+sample settings a SINGLE run's per-row ratio is ±40% noise dominated by the INCUMBENT's variance — do not conclude a
+per-row win/gap from one run.**
 
-| query_class | docs | ratio (hybrid) | ratio (lexical-guard) | note |
+| query_class | docs | ratio (hybrid) | ratio (guard) | note |
 |---|---|---|---|---|
-| **exact_identifier** | **100k** | **0.405** | **0.403** | **~2.5× FASTER** (was 1.2–1.3× *slower* in the pre-comparator baseline: fs 923 µs vs incumbent 2277 µs) |
-| exact_identifier | 10k | 0.992 | 0.857 | parity/faster |
-| quoted_phrase | 100k | 1.060 | 0.995 | was ~1.25× slower → now parity |
+| exact_identifier | 100k | 0.405 | 0.403 | **NOISE, not a win** — incumbent measured 2277 µs here vs its ~881 µs historical true value ([[bold-comparator-closed]] run #2); at 881 µs the real ratio is ~1.05 (parity). Needs a confirming re-run before any claim. |
+| exact_identifier | 10k | 0.992 | 0.857 | parity |
+| quoted_phrase | 100k | 1.060 | 0.995 | parity (was ~1.25× slower in the old pre-comparator baseline) |
 | quoted_phrase | 10k | 1.008 | 1.000 | parity |
 | short_keyword | 100k | 1.000 | 1.000 | parity |
 | high_fanout | 100k | 0.997 | 1.000 | parity |
 | natural_language | 100k | 1.026 | 1.034 | ~1.03× (noise-band) |
-| zero_hit | 100k | 1.067 | 1.022 | p50 marginal; p95/p99 **faster** (0.879 / 0.605) |
-| **limit_all** | **10k** | **1.392** | **1.517** | the sole >1.1× gap — **inherent** (fs 1964 µs vs incumbent 1411 µs) |
+| zero_hit | 100k | 1.067 | 1.022 | p50 marginal; p95/p99 0.879 / 0.605 |
+| **limit_all** | **10k** | **1.392** | **1.517** | the one gap that is **run-to-run consistent** (matches memory's ~1.4×) — **inherent** (fs 1964 µs vs incumbent 1411 µs) |
 
-**Conclusion — the comparator is CLOSED, verified by fresh data:** every top-k class is at/under parity, and the class
-frankensearch historically lost (`exact_identifier`@100k) is now a **2.5× win**. The only material gap is `limit_all`
-(1.39–1.52×), which is **inherent and already probed to its floor**: frankensearch materializes full `ScoredResult`
-rows (doc_id + scores + source) for *all* N results while the incumbent returns bare doc_ids — the doc_id term is
-already SSO (CompactString), and the residual `Copy`-field struct build was measured only ~1.04× shrinkable (packed-struct
-rejection) and isn't shrinkable without a public API break. **No new mechanical lever exists on the measured surface.**
-Route next: the productive frontier is off the BOLD-comparator axis entirely — either the decision-gated ANN-in-BOLD
-(needs a 100k recall sweep) or non-comparator real-world work; the top-k comparator itself is done. Re-measure before
-assuming any regression — this table is the current (2026-07-02) reference.
+**Honest conclusion (only the run-to-run-consistent claims):** frankensearch is **at parity on every top-k class** and
+the sole reliable gap is **`limit_all` ~1.4×, which is inherent** (full `ScoredResult` materialization for all N vs bare
+doc_ids; doc_id already SSO; `Copy`-field struct build only ~1.04× shrinkable → packed-struct rejection; not shrinkable
+without an API break). **The exact_identifier@100k 0.405 is almost certainly incumbent variance** (2277 µs is ~2.6× its
+historically-measured ~881 µs) — I initially reported it as a "2.5× win" and am **retracting that** per the documented
+lesson: never claim a per-row BOLD win/gap from a single fast-sample run. **METHODOLOGY (self-correction):** check a
+surprising per-row ratio against the incumbent's *known* absolute p50 before believing it; the incumbent's variance, not
+frankensearch, usually moves it. No new mechanical lever exists; the comparator is closed. (A confirming re-run of the
+exact_identifier row is the only way to settle whether it's real — deferred, low-value since it would at best show
+parity.)
