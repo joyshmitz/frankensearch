@@ -4387,9 +4387,11 @@ is heap-allocated only when `explain=true` (rare, and the explanation is already
 the metadata-Arc landing. Landing now with a full `cargo test --workspace` verification (per the [[cfg-gated-feature-migration-blindspot]]
 `cfg(test)` lesson). `scoredresult_box_ab` kept as evidence.
 
-**✅ LANDED (`a5b3f86`) + VERIFIED:** `cargo check -p frankensearch-fusion --all-targets` = **Finished, no errors** (only
-dead_code warnings on unused bench struct fields) — the Box change + the two bench fixes compile clean across lib +
-tests + all benches, resolving the open verification item. `ScoredResult.explanation: Option<HitExplanation>` →
+**✅ LANDED (`a5b3f86`) + FULLY VERIFIED:** `cargo check --workspace --all-targets --features lexical` = **Finished in
+5m28s, 0 errors** (fresh compile, no stale-cache, no unresolved imports) — the Box change AND all this session's type
+migrations (CompactString `DocId`, metadata `Arc<Value>`) compile clean across **every crate and every target** (lib +
+tests + benches). No cfg(test)/bench blind spot remains anywhere in the workspace — the comprehensive certification that
+the per-crate lib tests + compile-only feature lane could not give. `ScoredResult.explanation: Option<HitExplanation>` →
 `Option<Box<HitExplanation>>` (core
 `types.rs`) + the 3 production constructions wrapped in `Box::new` (searcher.rs:2497/1567/2577). `Box` needs NO serde
 feature (unlike Arc's `rc`); the two mutation sites (`searcher.rs:1678` rank-movement update, `rerank/pipeline.rs:158`
