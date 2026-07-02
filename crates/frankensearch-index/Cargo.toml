@@ -94,3 +94,7 @@ workspace = true
 [[bench]]
 name = "hnsw_vs_flat_100k"
 harness = false
+
+[[bench]]
+name = "ann_stratified_ef"
+harness = false
