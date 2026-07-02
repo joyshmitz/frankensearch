@@ -4058,3 +4058,15 @@ vein [[bold-comparator-closed]] flagged ("profile rich-metadata workloads; BOLD 
 sites (`.get()`, `.as_object()`, filters) mostly compile unchanged; construction wraps in `Arc::new`; **serde `rc`
 feature needed for `Deserialize<Arc<T>>`.** Landing it (carefully — with `--all-features`/`full` lane checks per
 [[cfg-gated-feature-migration-blindspot]]) is the next step. `metadata_clone_ab` bench kept as evidence.
+
+**✅ LANDED `f5e9c9d` (2026-07-02, pushed main+master).** `ScoredResult.metadata: Option<serde_json::Value>` →
+`Option<Arc<serde_json::Value>>`. The async searcher's `lexical_metadata_by_doc` map now holds `&Arc<Value>` so the
+per-winner `.copied().cloned()` at `searcher.rs:2514` is an `Arc::clone` (the win); `filter.matches` sites use
+`.as_deref()` (trait unchanged, `Arc` derefs to `Value`); serde `rc` feature added to core for `Deserialize<Arc>`.
+**Verified GREEN:** core+fusion+lexical tests **820+ passed / 0 failed** (incl. the `types.rs:910` Serialize→Deserialize
+`Arc` roundtrip exercising the `rc` feature, and the fused-conversion metadata-preservation test), AND the full-feature
+lane (`--features full` = ann+graph+rerank+durable+api) compiles clean — no cfg-gated casualty this time ([[cfg-gated-feature-migration-blindspot]]
+lesson applied: verified `--features full` before pushing). Reads are unchanged (`Arc<Value>` derefs); production
+metadata construction is almost all `None` or `.clone()` (auto `Arc::clone`), so only 4 test-construction sites needed
+`Arc::new`. This is the largest measured win of the session — 200–278× on the rich-metadata `limit_all` materialization,
+a real production path the BOLD proxy structurally hides.
