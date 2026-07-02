@@ -2829,5 +2829,5 @@ for every signal) — bench exit 0.**
 (`CodeStructureSidecar::score_query`; no internal frankensearch runtime caller — benefits integrators using the
 code-structure prior), previously un-benched. A frankensearch before/after on the per-(query,document) signal loop. Added
 bench `code_signal_probe_ab` + unit test `smallest_matching_token_matches_intersection_reference` (asserts parity vs the
-old tokenize+intersection). Bench-verified (~1.8×, parity, exit 0); remote `cargo test -p frankensearch-fsfs --lib
-code_structure_sidecar` confirming the wired change in the background — fix-forward if red.
+old tokenize+intersection). Bench-verified (~1.8×, parity, exit 0). **Wired change verified: remote `cargo test -p
+frankensearch-fsfs --lib code_structure_sidecar` PASSED (7/7 green, incl. the new parity test); exit 0.**
