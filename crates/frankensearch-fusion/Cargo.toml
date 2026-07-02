@@ -105,6 +105,10 @@ name = "code_signal_probe_ab"
 harness = false
 
 [[bench]]
+name = "normalize_signal_ab"
+harness = false
+
+[[bench]]
 name = "fused_materialize"
 harness = false
 

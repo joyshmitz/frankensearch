@@ -2831,3 +2831,39 @@ code-structure prior), previously un-benched. A frankensearch before/after on th
 bench `code_signal_probe_ab` + unit test `smallest_matching_token_matches_intersection_reference` (asserts parity vs the
 old tokenize+intersection). Bench-verified (~1.8×, parity, exit 0). **Wired change verified: remote `cargo test -p
 frankensearch-fsfs --lib code_structure_sidecar` PASSED (7/7 green, incl. the new parity test); exit 0.**
+
+---
+
+## 2026-07-02 — `normalize_signal_value` single-pass, single-alloc — ~1.12× (SlateHeron)
+
+**Lever (fuse a multi-pass, multi-alloc string normalisation into one pass — NOT the clone/hasher/SSO families).**
+`normalize_signal_value` (`code_structure_sidecar.rs`) made THREE allocations —
+`split_whitespace().collect::<Vec<_>>().join(" ").trim().to_ascii_lowercase()` (a `Vec<&str>`, the joined `String`, the
+lowercased `String`) — to do one thing: collapse `char::is_whitespace` runs to single ASCII spaces, strip leading/trailing
+whitespace, ASCII-lowercase. It runs per extracted declaration at index time (via `push_signal`, per
+`fn`/`struct`/`import`/heading across every line of every file) AND once per (query, document) at search time. Replaced
+with a single pass into one pre-reserved `String`. Byte-identical: `split_whitespace` and `char::is_whitespace` share the
+Unicode White_Space definition (token boundaries match), and output bytes <= input bytes so the reserve never reallocs.
+
+**Measured (`normalize_signal_ab`, remote, realistic signal values):**
+
+| batch | old (3 allocs) | new (1 pass) | ratio |
+|---|---|---|---|
+| 192  | 15.93 µs  | 14.23 µs  | **0.893 (1.12×)** |
+| 1536 | 142.85 µs | 127.95 µs | **0.896 (1.12×)** |
+
+Modest (the alloc reduction 3→1 is the win; the char copy is shared by both arms) but consistent across sizes and above
+the ±3% gate. Parity asserted per-value in the bench (exit 0, no divergence).
+
+**Scope:** original-comparator ratio **N/A** — code-structure signal normalisation, a public-API pipeline contract (no
+internal frankensearch runtime caller; benefits integrators building `CodeStructureDocument`s). Added bench
+`normalize_signal_ab` + unit test `normalize_signal_value_matches_three_alloc_reference` (asserts byte-identity vs the old
+3-alloc form, incl. non-ASCII + vertical-tab whitespace). Bench-verified (~1.12×, parity, exit 0); the wired change is a
+pure function-body swap (no new types/deps/signature), remote `cargo test -p frankensearch-fsfs --lib
+code_structure_sidecar` confirming in the background — fix-forward if red.
+
+_Frontier note (this turn): re-confirmed the competitive vs-Tantivy path stays closed — `BitsetFilter` is already optimal
+(identity-hasher `HashSet<u64>` over precomputed FNV hashes + prescreen, `filter_prescreen` 2.08× already landed), the
+RRF top-k / WAND / block-max / threshold-pruning family is closed (BlackThrush explored it extensively), and query
+preprocessing is heavily mined. The remaining landable levers are ratio-N/A caller-less contract modules (this win) or the
+product-gated ANN-in-BOLD._
