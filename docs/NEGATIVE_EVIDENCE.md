@@ -3834,3 +3834,32 @@ The biggest gap vs the incumbents (`limit_all` wall-clock) is bounded by the act
 changing the **public** `FusedHit`/`ScoredResult` types (an API break, out of scope). Route next is off the fusion
 result-assembly vein entirely — the productive frontier is now the vector-scan and index tiers (already heavily mined) or
 a corpus/algorithmic change (approximate top-k, block-max), not a clone-elision.
+
+---
+
+## 2026-07-02 — dig: vector-scan + index top-k tier audited, no mechanical lever left; remaining wins are decision-gated (BlackThrush)
+
+**Negative evidence — followed the previous entry's own route-next onto the vector/index tier; source-audited the hot
+top-k path, all optimal. No production change.** After the fusion arc floored, audited `frankensearch-index/src/search.rs`:
+
+- **Bounded-heap top-k** (`int8_scan_range` :291-326, and the f16/4-bit twins): already the textbook O(N·log k) shape —
+  `BinaryHeap` capped at k, per-element cutoff early-skip (`heap.len() < limit || score_key(score) >= cutoff`),
+  incremental record/slab offset advance (no recompute), tombstone flag gate. `insert_candidate` peek-compare-pop.
+- **Two-pass quantization** already in place: parallel 4-bit (`dot_4bit_prepared`) or int8 (`dot_i8_i8`) approximate
+  pass-1 keeps `k·mult` candidates → exact f16 rescore. AVX2 runtime-dispatch kernels ([[avx2-runtime-dispatch]]).
+- **ANN / HNSW** IS wired into the two-tier search (`two_tier.rs:285` — `ann.knn_search` when the sidecar is present,
+  brute-force fallback otherwise); not a missing lever.
+- **`score_key`-in-int8 micro-lever considered + rejected without a bench:** `score_key` is a `const fn` `is_nan()→NEG_INF`
+  passthrough; int8 dots (`dot_i8_i8 as f32`) are always finite, so it's ~1 branch/elem of dead work — but the int8 scan
+  is **dot-throughput-bound** (measured, [[batched-query-scan-compute-bound]] / int8 route-next ~0), so removing a
+  single inlined branch on a memory/FMA-bound loop is a predicted ~0. Not worth ~8 min of degraded-fleet build time.
+
+**Conclusion — the mechanical per-crate frontier is exhausted.** Across this session all three frankensearch-owned hot
+tiers were confirmed at floor: fusion result-assembly (moves everywhere sound), vector top-k (heap+cutoff+two-pass+ANN),
+index materialization (reopen ord-table shipped 2.29×). The residual gaps vs Tantivy are **inherent** (the Copy-field
+`FusedHit`/`ScoredResult` struct build; tantivy-internal BM25) — not removable by a single-primitive swap. **The next
+real lever is decision-gated, not mechanical:** (a) use ANN in the BOLD hybrid at large N (trades exact recall for
+latency — breaks the bit-identical/parity invariant the BOLD comparison holds, needs an explicit recall-budget
+decision), or (b) shrink the public `FusedHit`/`ScoredResult` (an API break). Both need owner direction; neither is a
+per-crate perf lever. **Route next: stop re-auditing the owned hot paths — re-measure the live BOLD ratios first, and
+only pursue (a)/(b) with an explicit go-ahead.**
