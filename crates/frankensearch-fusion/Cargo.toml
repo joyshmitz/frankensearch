@@ -130,3 +130,7 @@ harness = false
 [[bench]]
 name = "rrf_index_sort"
 harness = false
+
+[[bench]]
+name = "docid_materialize_ab"
+harness = false

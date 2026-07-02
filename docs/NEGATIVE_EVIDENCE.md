@@ -3765,11 +3765,43 @@ of a heap `String` alloc. Non-hot structs (traits.rs `LexicalHit`, commit_replay
 tantivy** (already at/under parity); this landing removes the largest remaining per-query heap-alloc term from that
 path in the common short-id case.
 
-**Conformance:** the landed source (tracked crates/tools/docs) is **byte-identical** to `blackthrush-compactstr-docid`,
-whose commits recorded **lib + tests GREEN / bit-identical** for this exact change. A fresh cold `cargo test --workspace
---lib --features lexical` was launched on the rch fleet as independent re-verification; the fleet is **degraded (4/12
-workers healthy, ovh-a >15 min cold build of the asupersync+frankensqlite siblings)** and did not return inside the
-ship window — surfaced here as the only open item. **End-to-end `collect_limit_all` A/B** (saved String-era baseline
-`collect_limit_all/collect` = 21,372 µs in `search-cc/criterion`; rebuild at HEAD into the same target auto-reports the
-% delta) is the clean follow-up measurement, also fleet-gated. Neither gate blocks the landing: the win is
-correctness-verified on identical source and rests on an already-committed micro-measurement.
+**Conformance (re-verified at HEAD):** targeted `cargo test -p frankensearch-core -p frankensearch-fusion
+-p frankensearch-index --lib --features lexical` (the three crates carrying the doc_id change; no network deps) →
+**819 passed, 1 failed**. The single failure was `searcher::tests::exclusion_overhead_is_sub_millisecond_for_typical_query`
+— a pure **wall-clock timing assertion** (`overhead_ms < 1.0`, observed 1.066 ms) that CompactString cannot affect
+(it isn't on the exclusion-negation path, and cheaper clones only *reduce* overhead); it tripped on the degraded/loaded
+ovh-a worker and **passed clean on re-run** on hz2 (`exclusion_overhead ... ok`). Net **820/820 GREEN**, consistent with
+`blackthrush-compactstr-docid`'s recorded "lib + tests GREEN / bit-identical" (the landed tracked source is
+byte-identical to that branch). The full-workspace lib test also compiled+ran GREEN before hanging on the network-bound
+`model_download` HuggingFace tests (a pre-existing fleet-network issue, unrelated).
+
+**End-to-end note:** the earlier plan to diff against the saved `collect_limit_all/collect` baseline (21,372 µs) is
+**invalid — cross-worker**: HEAD ran on hz2 at 7.31 ms `[6.99, 7.67]`, but the 21 ms base was a *different* worker, so
+the absolute delta is hardware noise, not the CompactString effect. The clean same-worker measurement is the
+`docid_materialize_ab` bench (both String and CompactString arms in one binary on one worker) — see the next entry.
+
+---
+
+## 2026-07-02 — same-worker A/B: `DocId=CompactString` FusedHit materialization is 2.2–2.3× faster (BlackThrush)
+
+**Measured, not extrapolated — the clean end-to-end-ish number for the landed `8529084`.** `doc_id_clone_sso`
+measured the *bare* doc_id clone at 29.8× (String 438 µs → CompactString 14.73 µs / 10k). To answer "how much of that
+survives when folded into the real `FusedHitScratch::into_owned` — building the whole 10-field `FusedHit` (9 `Copy`
+fields + `doc_id.into()`) over N `limit_all` winners," the `docid_materialize_ab` bench runs BOTH arms (`String` vs
+`CompactString` doc_id, identical `Copy` fields) in **one binary on one worker** — no cross-worker noise.
+
+| N | `string` (pre-landing) | `compact` (landed) | speedup |
+|---|------------------------|--------------------|---------|
+| 10,000 | 294.15 µs | **133.31 µs** | **2.21×** |
+| 100,000 | 3242.39 µs `[3.24 ms]` | **1425.59 µs `[1.39, 1.43 ms]`** | **2.27×** |
+
+**Interpretation:** the 29.8× bare-clone win dilutes to **~2.2×** once the fixed `Copy`-field struct-build cost is
+charged to both arms (that cost is identical either way, so it caps the achievable ratio) — the *doc_id term itself*
+still collapses from a heap alloc to an SSO inline memcpy, halving the full per-winner materialization. This is the
+per-query cost of the RRF `into_owned` at `limit_all` (called once per output hit, `rrf.rs:352/552`), so the searcher's
+`limit_all` collect shrinks its largest per-hit heap term by ~2.2× for the common short-id (≤24 B) case. **Ratio vs
+incumbent context:** frankensearch was already at/under tantivy parity on the `limit_all` BOLD row (0.933–0.966×
+pre-landing); this removes the dominant remaining allocation from that path. Bench `docid_materialize_ab` kept as
+evidence. **Route next:** the RRF sort, comparator, struct size, and now the doc_id materialization type are all probed
+— the fusion `limit_all` collect path is at its floor for short ids; the only residual is the >24 B id tail (~1.2×
+clone regression, absent on measured corpora).
