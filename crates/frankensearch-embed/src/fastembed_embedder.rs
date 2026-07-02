@@ -612,7 +612,7 @@ mod tests {
                 assert!(
                     source
                         .to_string()
-                        .contains("future reused after completion")
+                        .contains("future polled after completion")
                 );
             }
             other => panic!("expected EmbeddingFailed variant, got {other:?}"),
