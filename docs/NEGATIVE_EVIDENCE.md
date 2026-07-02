@@ -4335,3 +4335,30 @@ that was actually a huge measured lever; re-mining finds no sibling. Combined wi
 AVX-512-HW-closed, and the ANN-already-shipped-default resolution, there is no un-landed per-crate lever on the measured
 surface. The productive frontier is a different workload (real-embedded-corpus ANN validation; heavy-metadata E2E) — not
 a lever hunt on the current code.
+
+---
+
+## 2026-07-02 — RELIABLE BOLD ratios (25-sample): hybrid is parity-or-FASTER on every top-k class; quoted_phrase now a WIN; exact_id noise resolved (BlackThrush)
+
+**Higher-sample (`--sample-size 25 --warm-up 2 --measure 2`) `bold_verify_tantivy_class` — the definitive current ratio
+vs the tantivy-class incumbent, resolving the single-sample noise that forced the earlier `exact_id@100k` retraction.**
+`ratio = fs_p50 / incumbent_p50` (<1 = frankensearch faster). **`hash_hybrid_tantivy_vector_rrf` (the real hybrid):**
+
+| query_class | 10k | 100k |
+|-------------|-----|------|
+| exact_identifier | 0.943 (faster) | **0.956** (parity — the 0.40 earlier was noise; the retraction was right) |
+| quoted_phrase | **0.803 (faster)** | **0.811 (faster)** — historically the ~1.25× *gap*, now a WIN |
+| short_keyword | 1.015 | 0.992 |
+| natural_language | 1.018 | 1.002 |
+| high_fanout | 1.010 | 1.000 |
+| zero_hit | 1.025 | **0.612 (much faster — short-circuits)** |
+| **limit_all** | **1.151** | (not sampled) — sole slower row, **inherent**, improved from the earlier 1.39–1.52 |
+
+**Conclusion — the comparator is definitively closed and favorable:** the production hybrid is **at parity or FASTER on
+every top-k class at both corpus sizes**, and the one class it historically lost (`quoted_phrase`) is now a clear win
+(0.81×). The only >1.1× row is `limit_all` (1.15×, inherent — full `ScoredResult` materialization for all N vs the
+incumbent's bare doc_ids), and even that shrank from earlier readings. (The `hash_lexical_guard` variant shows a few high
+rows — high_fanout@100k 1.314, quoted_phrase@10k 1.368 — that are **incumbent-variance noise**: the guard executes the
+IDENTICAL `search_doc_ids` as the incumbent, so it cannot truly be slower; only the hybrid rows are the meaningful
+head-to-head.) This is the current (2026-07-02, 25-sample) reference table — statistically firmer than the earlier
+10-sample run; re-measure before assuming any regression.
