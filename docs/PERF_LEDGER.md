@@ -2858,9 +2858,9 @@ the ±3% gate. Parity asserted per-value in the bench (exit 0, no divergence).
 **Scope:** original-comparator ratio **N/A** — code-structure signal normalisation, a public-API pipeline contract (no
 internal frankensearch runtime caller; benefits integrators building `CodeStructureDocument`s). Added bench
 `normalize_signal_ab` + unit test `normalize_signal_value_matches_three_alloc_reference` (asserts byte-identity vs the old
-3-alloc form, incl. non-ASCII + vertical-tab whitespace). Bench-verified (~1.12×, parity, exit 0); the wired change is a
-pure function-body swap (no new types/deps/signature), remote `cargo test -p frankensearch-fsfs --lib
-code_structure_sidecar` confirming in the background — fix-forward if red.
+3-alloc form, incl. non-ASCII + vertical-tab whitespace). Bench-verified (~1.12×, parity, exit 0). **Wired change
+verified: remote `cargo test -p frankensearch-fsfs --lib code_structure_sidecar` PASSED (8/8 green, incl. the new
+`normalize_signal_value_matches_three_alloc_reference` parity test); exit 0.**
 
 _Frontier note (this turn): re-confirmed the competitive vs-Tantivy path stays closed — `BitsetFilter` is already optimal
 (identity-hasher `HashSet<u64>` over precomputed FNV hashes + prescreen, `filter_prescreen` 2.08× already landed), the
