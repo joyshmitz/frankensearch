@@ -4562,3 +4562,33 @@ not a lexical comparator lever; kept as evidence + a wired A/B harness. The sibl
 crosses the blend boundary). All score-map/`seen` sites are local, private, `&str`-keyed, probe-only ⇒ bit-identical.
 Build `-p frankensearch-fusion --lib --tests` to confirm, then land as the ~2× sync-path win. (Not wired this turn:
 HEAD-frozen / no-build directive — refused to push an unverified compile to the shared tree.)
+
+---
+
+## 2026-07-02 — BLOCKER: `fuse_expanded_payloads` clones String path key into 5 maps/hit — bench blocked by fsfs compile weight (SlateHeron)
+
+**Lever identified (clone-elision + hasher, unmeasured — NOT landed):** `RealtimeRuntime::fuse_expanded_payloads`
+(`fsfs/runtime.rs:5648-5710`), the cross-query RRF fusion over query-expansion variants, builds FIVE `HashMap<String,_>`
+(`scores`/`snippets`/`best_lexical_rank`/`best_semantic_rank`/`appeared_in_count`) and calls `.entry(hit.path.clone())`
+per hit across every payload — up to **5 owned `String` allocations per hit**, and the fusion case (a doc in ≥2 variants)
+is exactly when the key already exists, so the clone is pure waste. All five maps are keyed by path and only
+`.entry()`/`.get()`-probed; the output sort/build reads paths and materializes owned strings only for the top-`limit`
+hits. So borrowing `&str` keys (payloads outlive the fusion) is **bit-identical** and drops ~5·N String allocs/query;
+stacking `ahash` (default here is SipHash, unlike sibling `rrf.rs`/`blend.rs`) adds the ~2× hash win on top.
+
+**Blocker (the ONE thing): `frankensearch-fsfs` is too heavy to bench in-crate.** Wrote a 3-arm A/B
+(`expand_fuse_ab`: `clone_sip` → `borrow_sip` → `borrow_ahash`, identical ranked output asserted) but the fsfs bench
+build **timed out >10min** on the rch worker — fsfs pulls vendored `openssl` + the whole TUI stack + `pdf-extract`, so
+even a self-contained bench must compile the entire crate graph. The bench has **no fsfs types** (pure local structs), so
+I relocated it to the lightweight `frankensearch-fusion` benches to measure — but that run was interrupted before it
+executed (HEAD-frozen / no-build). No ratio → not landing the prod edit unmeasured; not committing the unverified bench
+(cargo autobench would compile it into `--all-targets`). Bench preserved in the session scratchpad (`expand_fuse_ab.rs`).
+
+**Route-next (one fast A/B, then a scoped fsfs edit):** copy `expand_fuse_ab.rs` into
+`crates/frankensearch-fusion/benches/`, add its `[[bench]]`, **`git add` first**, then
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- cargo bench -p frankensearch-fusion --bench
+expand_fuse_ab`. If `borrow_ahash` < 0.97 vs `clone_sip`: in `fuse_expanded_payloads` switch the five maps to
+`ahash::AHashMap<&str,_>` keyed on `hit.path.as_str()` (add `ahash = { workspace = true }` to fsfs `[dependencies]`),
+and `.to_owned()` the path only in the final `take(limit)` output build. Verify with `cargo build -p frankensearch-fsfs
+--lib` (budget ~10-15min — fsfs is the heavy crate). LESSON: bench self-contained algorithmic levers in the LIGHTEST
+crate that has the deps (fusion), never in fsfs — its openssl/TUI/pdf graph makes every bench cycle a 10-min compile.
