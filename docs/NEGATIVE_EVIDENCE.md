@@ -4403,3 +4403,24 @@ tests or the compile-only feature lane, so they'd been broken since f5e9c9d ([[c
 the `cfg(test)`/bench blind spot again — run `--all-targets`). Result: `ScoredResult` is now 88 B (was 168), exact
 1.14× materialize + faster phase clones + half the result-set memory, the last measured improvement on the `limit_all`
 path.
+
+---
+
+## 2026-07-02 — dig: the fat-inline-`Option` boxing pattern is exhausted for hot structs (BlackThrush)
+
+**Generalized the explanation-Box win (box/Arc a usually-`None` `Option<BigInline>` to pay 8 B not `size_of::<Big>` on
+the common path) and swept the workspace for siblings — none remain on a hot per-result path.** `grep`ed hot-crate
+structs for `Option<Vec/String/HashMap/BigStruct>` fields:
+
+- **`ScoredResult`** (the only per-result hot struct, materialized at large N): already fully optimized — `doc_id`
+  `CompactString` SSO, `metadata` `Arc<Value>` (278×), `explanation` `Box<HitExplanation>` (168→88 B). No fat field left.
+- **`FusedHit`** (RRF intermediate): its `Option`s are small primitives (`Option<usize/u32/f32>`, ≤16 B) — no fat
+  inline variant; struct-packing was already REJECTED at 1.04× (the packed-struct entry).
+- **All other `Option<String>` matches** are in COLD structs — `config`/telemetry/`e2e_artifact`/`traits` (constructed
+  once per query or per config, NOT per-result at large N) or `IndexableDocument.title` (index-time). `Option<String>`
+  is only 24 B inline; boxing saves 16 B on structs that aren't in a large-N materialization loop = not worth it.
+
+**Conclusion: the struct-size / fat-Option lever is exhausted.** `ScoredResult` is at its floor (88 B, every heavy
+field boxed/Arc'd/SSO'd); no other hot struct carries a large inline `Option`. Combined with the workspace `--all-targets`
+GREEN certification, the per-crate memory-layout frontier is closed. Route next remains a different workload
+(real-embedded-corpus ANN validation, heavy-metadata E2E) — not a struct/field lever on the current code.
