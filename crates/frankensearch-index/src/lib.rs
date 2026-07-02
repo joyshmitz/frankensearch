@@ -47,6 +47,7 @@ pub mod hnsw;
 pub mod in_memory;
 pub mod mrl;
 pub mod quantization;
+pub mod recall_certificate;
 mod repro_soft_delete_rollback;
 mod repro_wal_truncation;
 pub mod search;
@@ -75,6 +76,9 @@ pub use hnsw::{
 pub use in_memory::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 pub use mrl::{MrlConfig, MrlSearchStats};
 pub use quantization::ScalarQuantizer;
+pub use recall_certificate::{
+    CertifiedEf, certified_min_ef, conformal_recall_lower_bound, mean_recall_lower_bound,
+};
 pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{
     PreparedQuery4bit, cosine_similarity_f16, dot_4bit_prepared, dot_4bit_prepared_generic,

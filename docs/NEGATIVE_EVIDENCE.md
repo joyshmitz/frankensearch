@@ -4713,3 +4713,37 @@ call site is cold:
 per candidate) but is **O(n·dim) = ~1/k of MMR's O(k·n·dim) pairwise-dot work**, so a 1.5× widen is ~2%/k end-to-end
 (noise-level for realistic k≥10) — below the ±3% gate, and non-bit-identical (would need the `mmr_rerank` selection
 assert to still hold). Recorded so it's not re-attempted as a "win". The reduction-widening route is CLOSED.
+
+---
+
+## 2026-07-02 — ARTIFACT: distribution-free recall CERTIFICATE for ANN — dissolves the "recall-budget sign-off" gate on ANN-in-BOLD (SlateHeron)
+
+**Lever kind: a formal-guarantee artifact (alien-artifact-coding + graveyard §12.1 Conformal Prediction, Tier S), not a
+perf ratio.** The one remaining competitive lever — ANN-in-BOLD (2.6–5× vector tier, [[ann-in-bold-viable]]) — has been
+**decision-gated** for weeks on a human **recall-budget sign-off**. The reason there was a *human* in that loop: the only
+recall signal frankensearch had was `hnsw.rs::estimate_recall`, a magic-constant heuristic `0.9 + 0.1·log2(ef/k)`
+(clamped) with **no empirical grounding** — at ef/k=10 it reports ≈1.0 recall regardless of the actual corpus. You
+cannot responsibly sign off a recall budget on a guess, so the lever stalled.
+
+Added `frankensearch-index::recall_certificate` (self-contained, pure std, no new deps): given a calibration sample of
+**measured** per-query recalls (the crate already has the `recall_at_k` bruteforce machinery that produces them), it
+emits a **distribution-free, finite-sample-valid** recall lower bound:
+- `conformal_recall_lower_bound(recalls, alpha)` — split-conformal per-query lower *tolerance* bound: a fresh query's
+  recall ≥ L with probability ≥ 1−alpha under only exchangeability (the §12.1 primitive; the ⌊alpha·(n+1)⌋-th order
+  statistic — no distributional assumptions, no asymptotics).
+- `mean_recall_lower_bound(recalls, delta)` — Hoeffding lower confidence bound on E[recall].
+- `certified_min_ef(calibration, target, alpha)` — the **cheapest ef whose *certified* bound meets the target**: the
+  automated replacement for the human sign-off. The certificate *is* the sign-off.
+
+**Verified (per-crate, remote `cargo test -p frankensearch-index --lib recall_certificate`): 9/9 green**, including the
+two finite-sample **coverage-validity** Monte-Carlo tests — a fresh draw falls below the conformal bound at ≤ alpha, and
+below the Hoeffding mean LCB at ≤ delta, over thousands of trials on arbitrary/adversarial recall laws — plus
+`certificate_catches_heuristic_overconfidence` (the `estimate_recall` heuristic claims ≈1.0 where the certificate
+correctly refuses a 0.9 budget on measured 0.85 recall). Exported from the crate; `AnnSearchStats.estimated_recall`'s doc
+now points at the certified path.
+
+**What this changes on the frontier map:** the "recall-budget *decision*" on ANN-in-BOLD is no longer a subjective human
+gate — it is a `certified_min_ef(...).meets_target` check against a finite-sample guarantee. The lever's remaining gates
+are now purely mechanical and already-known: (1) plumb a small calibration sweep (measured recall at candidate ef's) into
+the ANN config path, and (2) the 100k-scale recall/latency measurement [[ann-in-bold-viable]]. The subjective blocker is
+retired.

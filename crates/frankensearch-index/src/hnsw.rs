@@ -99,7 +99,13 @@ pub struct AnnSearchStats {
     pub search_time_us: u64,
     /// Whether this path is approximate ANN.
     pub is_approximate: bool,
-    /// Estimated recall@k from ef/k ratio.
+    /// Estimated recall@k from the ef/k ratio (see [`estimate_recall`]).
+    ///
+    /// This is a heuristic point estimate with NO guarantee. For a certified,
+    /// distribution-free recall bound (the automated replacement for a human
+    /// recall-budget sign-off), use
+    /// [`crate::recall_certificate::conformal_recall_lower_bound`] over a measured
+    /// calibration sample instead.
     pub estimated_recall: f64,
 }
 
