@@ -4446,3 +4446,23 @@ session's materialization wins collapsed it: cloning `Vec<ScoredResult>` per pha
 the **end-to-end payoff** of the isolated micro-wins (doc_id SSO, metadata-Arc, explanation-Box) on the real searcher's
 `limit_all` path, and a clean regression check that the type migrations did NOT slow it (collect path healthy).
 (Absolute ms is cross-worker noise vs earlier runs; the same-run `iter/collect` ratio is the valid measure.)
+
+---
+
+## 2026-07-02 — dig: the `limit_all` two vector passes are INHERENT (blend uses fast_score) — not a skippable redundant scan (BlackThrush)
+
+**Checked the last open question about the one row behind Tantivy (`limit_all` 1.15×): is either of its two vector
+passes (fast approximate scan + quality exact rescore) redundant/elidable at `limit_all`?** Answer: **no.** The two-tier
+blends `alpha·quality + (1-alpha)·fast` with `alpha = blend_factor` defaulting to **0.7** (`blend.rs:104`, config
+`quality_weight: 0.7`), so the FAST-tier scores carry weight 0.3 in the final blended score — the fast scan is NOT a
+prune-only pass whose output can be discarded at `limit_all`; its scores are part of the result. Skipping it (using exact
+scores for both tiers) would change the blend by the quantization error = not bit-identical. So both passes are inherent
+to the two-tier blend semantics, and the `limit_all` gap vs the lexical-only incumbent (which does neither) is inherent
+hybrid cost — confirming (not a new lever) the row is at its floor. (The only elision is the narrow `quality_weight=1.0`
+config where fast_score has weight 0 → the fast tier could enumerate-without-scoring; not the default, not worth it.)
+
+**This closes the last structural question. The measurable per-crate frontier is exhaustively verified closed:** every
+hot clone/materialization optimized (metadata-Arc 278×, explanation-Box 1.14×, doc_id SSO — phase clones now ~free
+E2E), struct layout at floor, vector tier AVX2/two-pass/ANN-shipped-default, MMR incremental, RRF score+sort probed,
+phase-gate an e-process, comparator parity-or-faster, `limit_all` two-pass inherent, workspace `--all-targets` GREEN.
+No un-landed lever remains on the current code; the productive next step is a workload the BOLD proxy doesn't model.
