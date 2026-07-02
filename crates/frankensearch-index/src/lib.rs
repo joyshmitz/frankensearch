@@ -77,8 +77,8 @@ pub use in_memory::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 pub use mrl::{MrlConfig, MrlSearchStats};
 pub use quantization::ScalarQuantizer;
 pub use recall_certificate::{
-    CertifiedEf, EfCalibration, calibrate_certified_ef, certified_min_ef,
-    conformal_recall_lower_bound, mean_recall_lower_bound,
+    CertifiedEf, EfCalibration, calibrate_certified_ef, certified_min_ef, certified_min_ef_mean,
+    conformal_recall_lower_bound, mean_recall_lower_bound, mean_recall_lower_bound_bernstein,
 };
 pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{

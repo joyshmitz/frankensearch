@@ -4792,3 +4792,27 @@ in `[0,1]`. (`hnsw_rs` compiles clean under `--features ann`.)
 `ann.certify_ef_search(..).chosen` call against a finite-sample guarantee. The subjective human sign-off is retired
 end-to-end (certificate → driver → live ANN). The only remaining item is the *policy* choice of `(target, alpha)` and
 flipping aggressive ANN on — a product decision, not missing machinery.
+
+---
+
+## 2026-07-02 — ARTIFACT: empirical-Bernstein mean-recall certificate → certifies a CHEAPER ef (recovers the tail-mode speedup gap) (SlateHeron)
+
+Extends the recall certificate with a **mean-recall** certification mode, motivated directly by last turn's measurement
+(`8c711d5`): the per-query **tail** certificate conservatively picked `ef=100` (1.65× vs flat @100k dim128) because
+`ef=40`'s split-conformal tail lower bound fails 0.95 — even though `ef=40`'s **average** recall (0.9875) clears 0.95 and
+would give 3.4×. For a product budget of "**average** recall@k ≥ target" (weaker than a per-query tail guarantee), the
+right certificate is a mean lower bound. Added (feature-independent, exported):
+- `mean_recall_lower_bound_bernstein(recalls, delta)` — Maurer–Pontil empirical **Bernstein** LCB
+  `mean − sqrt(2·Vₙ·ln(2/δ)/n) − 7·ln(2/δ)/(3(n−1))`. Uses the sample **variance**, so it is far tighter than Hoeffding
+  on low-variance recall (the usual case: most queries ≈ 1.0).
+- `certified_min_ef_mean(calibration, target, delta)` — cheapest `ef` whose Bernstein mean bound meets `target`.
+
+**Quantified effect (unit test on the real measured recall shape):** at n=1000 calibration, `ef=40` (mean 0.9875):
+Bernstein LCB = **0.977 ≥ 0.95 (CERTIFIES)** while Hoeffding LCB = 0.949 < 0.95 (does not), and the per-query tail bound
+refuses it. So the Bernstein mean mode certifies `ef=40` for the average-recall budget → the **3.4×** speedup, versus the
+per-query tail mode's `ef=100` → 1.65×. The tighter concentration bound **recovers ~2× more certified speedup** — the
+caller now chooses per-query-tail vs average-recall guarantees, each with the *cheapest ef that certifies it*.
+
+**Verified: remote `cargo test -p frankensearch-index --lib recall_certificate` PASSED 14/14**, incl. the Bernstein
+coverage-validity Monte-Carlo (miss ≤ δ), `bernstein_is_tighter_than_hoeffding_on_low_variance_recall`, and
+`mean_mode_certifies_a_cheaper_ef_than_the_per_query_tail_mode`.

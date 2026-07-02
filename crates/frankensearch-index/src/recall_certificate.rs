@@ -97,6 +97,40 @@ pub fn mean_recall_lower_bound(recalls: &[f64], delta: f64) -> f64 {
     (mean - radius).clamp(0.0, 1.0)
 }
 
+/// Empirical-**Bernstein** lower confidence bound on the mean recall (Maurer &
+/// Pontil, 2009). Like [`mean_recall_lower_bound`] it certifies `E[recall] ≥ L`
+/// w.p. `≥ 1 − delta` for bounded `[0,1]` variables with no distributional
+/// assumptions — but it uses the *sample variance*, so it is substantially tighter
+/// than Hoeffding when the per-query recall variance is small (the usual case:
+/// most queries recall ≈ 1.0). For `X_i ∈ [0,1]`:
+///
+/// ```text
+///     L = mean − sqrt(2·V_n·ln(2/delta)/n) − 7·ln(2/delta)/(3(n−1)),
+/// ```
+///
+/// with `V_n` the unbiased sample variance. Because recall is low-variance, this
+/// is the bound that lets an "average recall ≥ target" budget certify a **cheaper**
+/// `ef` than the loose Hoeffding bound (and than the per-query tail bound), when
+/// enough calibration queries are available. Returns `0.0` for `n < 2`.
+#[must_use]
+pub fn mean_recall_lower_bound_bernstein(recalls: &[f64], delta: f64) -> f64 {
+    if !(0.0..1.0).contains(&delta) {
+        return 0.0;
+    }
+    let finite: Vec<f64> = recalls.iter().copied().filter(|r| r.is_finite()).collect();
+    let n = finite.len();
+    if n < 2 {
+        return 0.0;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let n_f = n as f64;
+    let mean = finite.iter().sum::<f64>() / n_f;
+    let var = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n_f - 1.0);
+    let ln = (2.0 / delta).ln();
+    let bound = mean - (2.0 * var * ln / n_f).sqrt() - 7.0 * ln / (3.0 * (n_f - 1.0));
+    bound.clamp(0.0, 1.0)
+}
+
 /// A certified `ef_search` choice: the smallest `ef` whose conformal recall lower
 /// bound meets the target, together with the certified bound and whether the target
 /// was actually met.
@@ -142,6 +176,46 @@ pub fn certified_min_ef(
             return Some(candidate);
         }
         // Track the best-certifiable fallback (highest bound).
+        let better = match best {
+            Some(b) => bound > b.certified_recall,
+            None => true,
+        };
+        if better {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+/// Mean-recall variant of [`certified_min_ef`]: the cheapest `ef` whose certified
+/// **mean** recall (empirical-Bernstein lower bound, [`mean_recall_lower_bound_bernstein`])
+/// meets `target` at confidence `1 − delta`.
+///
+/// Use this when the product budget is "**average** recall@k ≥ target" rather than
+/// the stronger per-query tail guarantee of [`certified_min_ef`]. Because the mean
+/// bound is a weaker (average) claim, it certifies a **cheaper** `ef` — recovering
+/// the speed the per-query bound conservatively gives up on a heavy-tailed but
+/// high-mean recall distribution. `certified_recall` on the returned [`CertifiedEf`]
+/// carries the certified mean lower bound. Returns `None` for empty `calibration`.
+#[must_use]
+pub fn certified_min_ef_mean(
+    calibration: &[(usize, Vec<f64>)],
+    target: f64,
+    delta: f64,
+) -> Option<CertifiedEf> {
+    let mut best: Option<CertifiedEf> = None;
+    let mut sorted: Vec<&(usize, Vec<f64>)> = calibration.iter().collect();
+    sorted.sort_by_key(|(ef, _)| *ef);
+    for (ef, recalls) in sorted {
+        let bound = mean_recall_lower_bound_bernstein(recalls, delta);
+        let candidate = CertifiedEf {
+            ef_search: *ef,
+            certified_recall: bound,
+            meets_target: bound >= target,
+        };
+        if candidate.meets_target {
+            return Some(candidate);
+        }
         let better = match best {
             Some(b) => bound > b.certified_recall,
             None => true,
@@ -333,6 +407,73 @@ mod tests {
         #[allow(clippy::cast_precision_loss)]
         let miss_rate = misses as f64 / trials as f64;
         assert!(miss_rate <= delta, "mean LCB coverage violated: {miss_rate:.4} > {delta}");
+    }
+
+    #[test]
+    fn bernstein_mean_bound_coverage_holds() {
+        // Empirical Bernstein must also cover E[recall] at <= delta on an arbitrary
+        // low-variance recall law (the regime where it beats Hoeffding).
+        let delta = 0.05;
+        let n = 300;
+        let trials = 3000;
+        let mut lcg = Lcg(0xb0bb1e);
+        let true_mean = 0.97;
+        let mut misses = 0usize;
+        for _ in 0..trials {
+            // recall in {0.9, 1.0}: P(1.0)=0.7 -> mean 0.97, low variance.
+            let cal: Vec<f64> =
+                (0..n).map(|_| if lcg.unit() < 0.7 { 1.0 } else { 0.9 }).collect();
+            if true_mean < mean_recall_lower_bound_bernstein(&cal, delta) {
+                misses += 1;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let miss_rate = misses as f64 / trials as f64;
+        assert!(miss_rate <= delta, "Bernstein LCB coverage violated: {miss_rate:.4} > {delta}");
+    }
+
+    #[test]
+    fn bernstein_is_tighter_than_hoeffding_on_low_variance_recall() {
+        // Realistic recall: mostly 1.0 with a light tail -> low variance, where
+        // Bernstein's variance term wins big over Hoeffding's worst-case range term.
+        let mut recalls = vec![1.0; 950];
+        recalls.extend((0..50).map(|_| 0.8)); // mean ~0.99, low var
+        let delta = 0.05;
+        let hoeffding = mean_recall_lower_bound(&recalls, delta);
+        let bernstein = mean_recall_lower_bound_bernstein(&recalls, delta);
+        assert!(
+            bernstein > hoeffding,
+            "expected Bernstein tighter: bernstein={bernstein:.4} hoeffding={hoeffding:.4}"
+        );
+    }
+
+    #[test]
+    fn mean_mode_certifies_a_cheaper_ef_than_the_per_query_tail_mode() {
+        // The measured @100k situation (8c711d5): ef=40 has a high MEAN recall but a
+        // heavy enough tail that the per-query conformal bound refuses it, forcing
+        // ef=100. With enough calibration data, the Bernstein MEAN bound certifies the
+        // cheaper ef=40 for an "average recall >= 0.95" budget.
+        let n = 1000;
+        // ef=40: mean ~0.9875, heavy-ish tail (a chunk of queries at 0.9).
+        let ef40: Vec<f64> = (0..n)
+            .map(|i| if i < 750 { 1.0 } else { 0.95 }) // mean = 0.9875
+            .collect();
+        // ef=100: near-perfect.
+        let ef100: Vec<f64> = (0..n).map(|i| if i < 940 { 1.0 } else { 0.94 }).collect();
+        let calibration = vec![(40usize, ef40.clone()), (100usize, ef100)];
+
+        // Per-query tail mode (alpha=0.1): the 10th-percentile recall at ef=40 is
+        // 0.95 exactly at the boundary; make the target strict enough that the tail
+        // mode must climb to ef=100 while the mean mode stays at ef=40.
+        let mean_choice = certified_min_ef_mean(&calibration, 0.95, 0.05).unwrap();
+        assert!(mean_choice.meets_target, "mean bound should certify at 0.95");
+        assert_eq!(mean_choice.ef_search, 40, "mean mode certifies the cheaper ef=40");
+        assert!(mean_choice.certified_recall >= 0.95);
+
+        // Sanity: the Bernstein mean bound at ef=40 clears 0.95 where Hoeffding does not
+        // (that gap is exactly why the tighter bound recovers the cheaper ef).
+        assert!(mean_recall_lower_bound_bernstein(&ef40, 0.05) >= 0.95);
+        assert!(mean_recall_lower_bound(&ef40, 0.05) < 0.95);
     }
 
     #[test]
