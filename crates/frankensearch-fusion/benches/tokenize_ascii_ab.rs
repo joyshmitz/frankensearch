@@ -10,11 +10,25 @@
 //! Identical token output asserted.
 use std::hint::black_box;
 
+use compact_str::CompactString;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 #[derive(PartialEq, Eq, Debug)]
 struct Token {
     text: String,
+    line: u32,
+    byte_start: usize,
+    byte_end: usize,
+}
+
+/// SSO-token variant: identical to `Token` but the lowercased text is a
+/// `CompactString`. Lexical tokens (code identifiers, prose words) are almost
+/// always <=24 bytes, so they live inline with ZERO heap allocation — the
+/// per-token `to_ascii_lowercase` heap alloc that the ledger flagged as the
+/// dominant remaining emission cost simply disappears for the common case.
+#[derive(PartialEq, Eq, Debug)]
+struct CompactToken {
+    text: CompactString,
     line: u32,
     byte_start: usize,
     byte_end: usize,
@@ -113,6 +127,64 @@ fn tokenize_fast(text: &str) -> Vec<Token> {
     tokens
 }
 
+/// Proposed SSO variant: same ASCII byte fast path as `tokenize_fast`, but each
+/// token's lowercased text is built directly into a `CompactString` via
+/// `CompactString::new(slice)` + in-place `make_ascii_lowercase()`. For ASCII
+/// input this is byte-identical to `slice.to_ascii_lowercase()` (ASCII-only
+/// lowercasing), and short tokens (<=24 bytes) never touch the heap.
+fn tokenize_compact(text: &str) -> Vec<CompactToken> {
+    fn lower(slice: &str) -> CompactString {
+        let mut cs = CompactString::new(slice);
+        cs.as_mut_str().make_ascii_lowercase();
+        cs
+    }
+    if !text.is_ascii() {
+        // Match the char-path lowercasing (ASCII-only) for parity with the other arms.
+        let string = tokenize_char(text);
+        return string
+            .into_iter()
+            .map(|t| CompactToken {
+                text: CompactString::new(&t.text),
+                line: t.line,
+                byte_start: t.byte_start,
+                byte_end: t.byte_end,
+            })
+            .collect();
+    }
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut token_start: Option<usize> = None;
+    let mut line = 1_u32;
+    let mut token_line = 1_u32;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if TOKEN_BYTE[b as usize] == 1 {
+            if token_start.is_none() {
+                token_start = Some(idx);
+                token_line = line;
+            }
+        } else if let Some(start) = token_start.take() {
+            tokens.push(CompactToken {
+                text: lower(&text[start..idx]),
+                line: token_line,
+                byte_start: start,
+                byte_end: idx,
+            });
+        }
+        if b == b'\n' {
+            line = line.saturating_add(1);
+        }
+    }
+    if let Some(start) = token_start {
+        tokens.push(CompactToken {
+            text: lower(&text[start..]),
+            line: token_line,
+            byte_start: start,
+            byte_end: text.len(),
+        });
+    }
+    tokens
+}
+
 /// Realistic ASCII document text (code + prose + paths), repeated to `reps`.
 fn doc(reps: usize) -> String {
     let unit = "fn compute_search_score(query: &str, doc_id: usize) -> f64 {\n    \
@@ -127,12 +199,25 @@ fn bench(c: &mut Criterion) {
     for &reps in &[20usize, 100, 400] {
         let text = doc(reps);
         assert_eq!(tokenize_char(&text), tokenize_fast(&text)); // bit-identical
+        // The CompactString arm must emit the same token texts/offsets/lines.
+        let string_tokens = tokenize_fast(&text);
+        let compact_tokens = tokenize_compact(&text);
+        assert_eq!(string_tokens.len(), compact_tokens.len());
+        for (s, c) in string_tokens.iter().zip(compact_tokens.iter()) {
+            assert_eq!(s.text, c.text.as_str());
+            assert_eq!(s.line, c.line);
+            assert_eq!(s.byte_start, c.byte_start);
+            assert_eq!(s.byte_end, c.byte_end);
+        }
         let id = format!("bytes{}", text.len());
         g.bench_with_input(BenchmarkId::new("char", &id), &(), |b, ()| {
             b.iter(|| black_box(tokenize_char(black_box(&text))));
         });
         g.bench_with_input(BenchmarkId::new("fast", &id), &(), |b, ()| {
             b.iter(|| black_box(tokenize_fast(black_box(&text))));
+        });
+        g.bench_with_input(BenchmarkId::new("compact", &id), &(), |b, ()| {
+            b.iter(|| black_box(tokenize_compact(black_box(&text))));
         });
     }
     g.finish();

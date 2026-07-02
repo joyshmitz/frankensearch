@@ -2766,3 +2766,34 @@ identical token vectors; the `tokenize_lexical_preserves_code_and_path_tokens` t
 **Scope:** original-comparator ratio **N/A** — index-time lexical tokenizer, not a lexical *comparator* lever; a
 frankensearch before/after on indexing throughput (per-document, high corpus multiplier). Kept bench `tokenize_ascii_ab`.
 Verified: remote `cargo build -p frankensearch-fsfs --lib` compile SUCCEEDED (RCH-E309 = artifact-transfer only).
+
+---
+
+## 2026-07-02 — `LexicalToken.text` `String`→`CompactString` SSO — ~1.07× MORE on the index-time tokenizer (SlateHeron)
+
+**Lever (small-string optimization — a DIFFERENT kind than the closed clone/hasher/borrow family).** With the ASCII
+decode fast path landed (`3280baf`), the dominant remaining `tokenize_lexical` emission cost is the per-token
+`to_ascii_lowercase()` **heap allocation** (one per token). Lexical tokens (code identifiers, prose words, short paths)
+are almost always <=24 bytes, so switching `LexicalToken.text` from `String` to `CompactString` makes them live inline —
+**zero heap allocation** for the common case. Built via `CompactString::new(slice)` + in-place `make_ascii_lowercase()`,
+which is byte-identical to `slice.to_ascii_lowercase()` for ANY input (`make_ascii_lowercase` touches only `0x41..=0x5A`,
+so UTF-8 multi-byte sequences are untouched — the non-ASCII fallback keeps its ASCII-only lowering). This is SSO, NOT
+clone-elision/aHash — a new technique on the index-time surface the search-time BOLD proxy cannot model.
+
+**Measured (`tokenize_ascii_ab`, char/fast/compact arms, same remote run):**
+
+| doc size | char (orig) | fast (String, shipped) | compact (SSO) | compact vs fast | compact vs char (cumulative) |
+|---|---|---|---|---|---|
+| 29 KB  | 144.67 µs | 118.91 µs | 110.23 µs | **0.927 (1.08×)** | 1.31× |
+| 116 KB | 643.19 µs | 478.81 µs | 448.93 µs | **0.938 (1.07×)** | 1.43× |
+
+Headline is the apples-to-apples **compact-vs-fast marginal** (~7%, both arms same run, CIs cleanly separated: fast
+116–120 µs vs compact 110.0–110.5 µs @ 29 KB). The `vs char` column is cumulative with the decode fast path. The ~7% is
+the eliminated per-token heap alloc for short tokens; residual cost is the byte scan + `Vec` growth (shared by both arms).
+
+**Scope:** original-comparator ratio **N/A** — index-time lexical tokenizer; a public-API pipeline contract for external
+consumers (no internal frankensearch caller). Public-API field type change (`LexicalToken.text: String → CompactString`)
+with tiny blast radius — `CompactString` is a drop-in `&str` (`Deref`/`as_str`/`PartialEq<&str>` all work); the only
+break is `let s: String = token.text` (rare). Follows the `DocId=CompactString` precedent. **Verified: remote
+`cargo test -p frankensearch-fsfs --lib lexical_pipeline` PASSED (25/25 green, incl.
+`tokenize_lexical_preserves_code_and_path_tokens` / `tokenize_lowercases_output`); exit 0 (artifacts transferred).**

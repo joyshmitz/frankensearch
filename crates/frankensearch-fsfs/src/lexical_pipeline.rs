@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use compact_str::CompactString;
 use frankensearch_core::{SearchError, SearchResult};
 use tracing::debug;
 
@@ -81,12 +82,29 @@ pub struct LexicalChunk {
 }
 
 /// Token span produced by deterministic lexical tokenization.
+///
+/// `text` is a [`CompactString`]: lexical tokens (code identifiers, prose words,
+/// short paths) are almost always <=24 bytes, so they live inline with zero heap
+/// allocation. The per-token lowercase heap alloc was the dominant emission cost
+/// (see the `tokenize_ascii_ab` bench); SSO removes it for the common case while
+/// `CompactString` remains a drop-in `&str` (`Deref`/`as_str`/`PartialEq<&str>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexicalToken {
-    pub text: String,
+    pub text: CompactString,
     pub line: u32,
     pub byte_start: usize,
     pub byte_end: usize,
+}
+
+/// Build a lowercased token text directly into a [`CompactString`], preserving the
+/// exact ASCII-only lowercasing of `str::to_ascii_lowercase` (`make_ascii_lowercase`
+/// touches only bytes `0x41..=0x5A`, so UTF-8 multi-byte sequences are untouched and
+/// the result is byte-identical for any input). Short tokens never touch the heap.
+#[inline]
+fn lower_token_text(slice: &str) -> CompactString {
+    let mut text = CompactString::new(slice);
+    text.as_mut_str().make_ascii_lowercase();
+    text
 }
 
 impl LexicalChunkPolicy {
@@ -213,7 +231,7 @@ pub fn tokenize_lexical(text: &str) -> Vec<LexicalToken> {
             }
         } else if let Some(start) = token_start.take() {
             tokens.push(LexicalToken {
-                text: text[start..idx].to_ascii_lowercase(),
+                text: lower_token_text(&text[start..idx]),
                 line: token_line,
                 byte_start: start,
                 byte_end: idx,
@@ -227,7 +245,7 @@ pub fn tokenize_lexical(text: &str) -> Vec<LexicalToken> {
 
     if let Some(start) = token_start {
         tokens.push(LexicalToken {
-            text: text[start..].to_ascii_lowercase(),
+            text: lower_token_text(&text[start..]),
             line: token_line,
             byte_start: start,
             byte_end: text.len(),
@@ -256,7 +274,7 @@ fn tokenize_lexical_ascii(text: &str) -> Vec<LexicalToken> {
             }
         } else if let Some(start) = token_start.take() {
             tokens.push(LexicalToken {
-                text: text[start..idx].to_ascii_lowercase(),
+                text: lower_token_text(&text[start..idx]),
                 line: token_line,
                 byte_start: start,
                 byte_end: idx,
@@ -270,7 +288,7 @@ fn tokenize_lexical_ascii(text: &str) -> Vec<LexicalToken> {
 
     if let Some(start) = token_start {
         tokens.push(LexicalToken {
-            text: text[start..].to_ascii_lowercase(),
+            text: lower_token_text(&text[start..]),
             line: token_line,
             byte_start: start,
             byte_end: text.len(),

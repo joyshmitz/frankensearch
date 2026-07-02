@@ -46,6 +46,10 @@ ftui-extras = { workspace = true, features = ["markdown"] }
 # runtime-attached Cx) per the asupersync capability model, then drop this.
 asupersync = { workspace = true, features = ["test-internals"] }
 ahash = { workspace = true }
+# compact_str: SSO short-string type (inline <=24 bytes, zero heap alloc) for
+# lexical token text — the per-token to_ascii_lowercase heap alloc dominated
+# tokenize_lexical emission. Already resolved in the workspace lock (fusion dep).
+compact_str = "0.9"
 fsqlite = "0.1.2"
 fsqlite-types = "0.1.2"
 serde = { workspace = true }
