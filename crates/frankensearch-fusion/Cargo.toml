@@ -142,3 +142,7 @@ harness = false
 [[bench]]
 name = "explanation_clone_ab"
 harness = false
+
+[[bench]]
+name = "rrf_recip_ab"
+harness = false

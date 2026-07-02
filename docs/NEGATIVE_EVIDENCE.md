@@ -4280,3 +4280,32 @@ ceiling on Zen 3, phase gate an e-process, top-k comparator parity, limit_all in
 NON-mechanical: (a) validate the ANN default's recall on a REAL embedded corpus (needs a semantic model, absent on the
 rch workers), or (b) a different workload than the BOLD proxy models. The measurable, per-crate frontier is
 comprehensively closed and, for ANN, already shipped.
+
+---
+
+## 2026-07-02 — REJECTED: RRF reciprocal-LUT — 1.45× isolated ceiling doesn't survive the real fuse (OoO-hidden divides + cache-hostile LUT) (BlackThrush)
+
+**A genuinely new exact/bit-identical lever, measured and rejected on realistic-scenario grounds.** `rank_contribution =
+1.0/(k+rank+1.0)` is a float DIVIDE per candidate per source in the fuse loop (rrf.rs:464/488); at `limit_all` that's
+~2·N divides/query. A precomputed reciprocal LUT (indexed by rank, bit-identical) replaces the ~10–20-cycle divide with
+a lookup. Ceiling measured (`rrf_recip_ab`, isolated divide vs LUT):
+
+| N | divide | LUT | speedup |
+|---|--------|-----|---------|
+| 10,000 | 19.3 µs | 13.1 µs | 1.47× |
+| 100,000 | 195.8 µs | 135.3 µs | 1.45× (~60 µs saved) |
+
+**Rejected — the isolated ceiling doesn't transfer to the real fuse:**
+1. **Divides are out-of-order-hidden** in the fuse loop — they overlap with the merge/store/compare *memory* work
+   ([[rrf-sort-adaptivity-merge-routenext]] made the merge a sequential sorted walk, but it still touches N scratch
+   records), so the realized win is ≤60 µs/100k and likely far less.
+2. **Cache-hostile at `limit_all`:** the LUT must be sized to max rank = N → **800 KB at 100k**, competing with the
+   ~MB `FusedHitScratch` array for L2 → lookups turn into cache misses. The micro-bench's LUT was cache-resident (no
+   competing data); the real fuse is not, so the real LUT could REGRESS.
+3. **No favorable scenario:** `limit_all` has the divides but a huge cache-hostile LUT (building it per-query = N divides,
+   no saving; reuse needs a searcher-held table sized to unknown N); top-k has a tiny LUT but too few candidates for the
+   divides to matter. Neither end wins.
+
+**Decision: no production change; `rrf_recip_ab` kept as evidence.** METHODOLOGY (again): a big *isolated* ratio (1.45×)
+is necessary but not sufficient — charge it to the realistic loop (OoO overlap + cache competition), same as the
+packed-struct (1.04×) and explanation (65× but opt-in) rejections. The RRF score computation is at its floor.
