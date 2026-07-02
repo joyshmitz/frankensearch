@@ -4362,3 +4362,27 @@ rows — high_fanout@100k 1.314, quoted_phrase@10k 1.368 — that are **incumben
 IDENTICAL `search_doc_ids` as the incumbent, so it cannot truly be slower; only the hybrid rows are the meaningful
 head-to-head.) This is the current (2026-07-02, 25-sample) reference table — statistically firmer than the earlier
 10-sample run; re-measure before assuming any regression.
+
+---
+
+## 2026-07-02 — LEVER FOUND (measured, landing): box `ScoredResult.explanation` — halves the struct (168→88 B), 1.14× materialize + phase-clone + memory (BlackThrush)
+
+**A real EXACT lever, cleaner + higher-ratio than the rejected packed-struct (1.04×) — the one remaining improvement on
+the `limit_all` path.** `ScoredResult.explanation: Option<HitExplanation>` stores `HitExplanation` (88 B: `Vec` + `f64` +
+`Option<RankMovement>{String}`) **inline**, so every `ScoredResult` reserves 88 B for it **even when None** (the common
+`explain=false` case). Measured (`scoredresult_box_ab`, `size_of` + materialize A/B):
+
+| metric | inline (`Option<HitExplanation>`) | boxed (`Option<Box<HitExplanation>>`) |
+|--------|-----------------------------------|---------------------------------------|
+| `size_of::<ScoredResult-shape>` | **168 B** | **88 B** (48 % smaller) |
+| materialize N (10k) | 96.1 µs | 89.1 µs (**1.08×**) |
+| materialize N (100k) | 1023 µs | 896 µs (**1.14×**) |
+
+**Why land it (vs the packed-struct reject):** (1) **exact/bit-identical** — `Box<HitExplanation>` derefs to
+`HitExplanation`, no sentinel/niche-safety loss (packed-struct changed `Option<usize>` ranks that consumers READ; this
+changes an opt-in, rarely-read field); (2) the 1.14× understates it — halving the struct also speeds the async
+progressive-phase clones (`display_hits.clone()` copies `Vec<ScoredResult>` up to 2N/query) and **halves result-set
+memory footprint**; (3) **no downside** for the common path — a boxed `None` is an 8 B null ptr (no allocation); the Box
+is heap-allocated only when `explain=true` (rare, and the explanation is already heap-heavy then). Same proven pattern as
+the metadata-Arc landing. Landing now with a full `cargo test --workspace` verification (per the [[cfg-gated-feature-migration-blindspot]]
+`cfg(test)` lesson). `scoredresult_box_ab` kept as evidence.
