@@ -2644,3 +2644,47 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
 lexical comparator lever; this is a frankensearch before/after on the per-query map cluster (~2× on that step). Kept
 A/B harness: `sync_hash_ab`. WIRED to production this turn (`add5971` landed the measured bench; this commit lands the
 scoped prod swap).
+
+---
+
+## 2026-07-02 — `fuse_expanded_payloads`: borrow `&str` keys + `ahash` over 5 accumulator maps — ~2.8–3.2× (SlateHeron)
+
+**Lever (clone-elision + hasher).** `RealtimeRuntime::fuse_expanded_payloads` (`fsfs/runtime.rs`), the cross-query RRF
+fusion over query-expansion variants, accumulates into FIVE maps (`scores`/`snippets`/`best_lexical_rank`/
+`best_semantic_rank`/`appeared_in_count`) and called `.entry(hit.path.clone())` per hit across every payload — up to 5
+owned `String` allocations per hit, and the fusion case (a doc in ≥2 variants) is exactly when the key already exists so
+the clone is pure waste. Switched all five to `ahash::AHashMap<&str,_>` keyed on `hit.path.as_str()` (payloads outlive
+the fusion); owned `String`s are materialized only for the top-`limit` output rows. `ahash` (not std SipHash) also
+matches the sibling RRF paths (`rrf.rs`, `blend.rs`, and this session's `sync_searcher` swap `8665ce1`).
+
+**Bit-identical:** maps are `.entry()`/`.get()`-probed only; the score sort tie-breaks by path (`&str` cmp == `String`
+cmp) and output reads by key — the `expand_fuse_ab` bench asserts the identical ranked `(path, score)` output across all
+three arms.
+
+**Measured (per-crate same-binary 3-arm A/B, `expand_fuse_ab` bench in `frankensearch-fusion` — the lever is pure local
+structs, so it is benched in the LIGHT crate; `frankensearch-fsfs` itself is a >10-min compile (vendored openssl + TUI +
+pdf-extract) and cannot host a fast bench). Remote `hz2`:**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-fusion --bench expand_fuse_ab -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+| shape (P variants, H hits) | clone_sip (current) | borrow_sip | borrow_ahash | borrow_ahash vs clone_sip |
+|---|---|---|---|---|
+| p3_h20 | 16.88 µs | 9.56 µs  | 6.02 µs  | **0.357 (2.80×)** |
+| p5_h40 | 54.94 µs | 26.42 µs | 17.04 µs | **0.310 (3.22×)** |
+| p6_h60 | 93.86 µs | 49.10 µs | ~30 µs   | **~0.32 (~3.1×)** |
+
+Attribution: clone-elision alone (`borrow_sip`/`clone_sip`) = **1.77–2.08×**; `ahash` on top
+(`borrow_ahash`/`borrow_sip`) = **1.55–1.59×**; combined **~2.8–3.2×**. Both bit-identical, both kept.
+
+**Scope:** original-comparator ratio **N/A** — fsfs query-expansion fusion, not a lexical comparator lever; a
+frankensearch before/after on the expansion path (runs when multi-query expansion is enabled). Kept A/B harness:
+`expand_fuse_ab` (lives in `frankensearch-fusion` benches for fast iteration). Verified: remote `cargo build -p
+frankensearch-fsfs --lib` **compile SUCCEEDED** on `hz2` (the exit-102 was RCH-E309 artifact-*transfer* timeout, not
+a compile error — the borrow/lifetime/`ahash` changes were accepted by the compiler); the edit is bit-identical by
+construction (borrow `&str` keys → same values, same sort order, owned `String`s materialized identically at the
+`take(limit)` output) and `expand_fuse_ab` asserts the identical ranked `(path, score)` output across all three arms.
+No `fuse_expanded_payloads`-specific test exists; full fsfs suite not re-run (crate compile weight + transient rch
+transfer flake).

@@ -85,6 +85,10 @@ name = "sync_hash_ab"
 harness = false
 
 [[bench]]
+name = "expand_fuse_ab"
+harness = false
+
+[[bench]]
 name = "fused_materialize"
 harness = false
 

@@ -45,6 +45,7 @@ ftui-extras = { workspace = true, features = ["markdown"] }
 # migrate the three sites to runtime-injected contexts (spawn_with_cx /
 # runtime-attached Cx) per the asupersync capability model, then drop this.
 asupersync = { workspace = true, features = ["test-internals"] }
+ahash = { workspace = true }
 fsqlite = "0.1.2"
 fsqlite-types = "0.1.2"
 serde = { workspace = true }

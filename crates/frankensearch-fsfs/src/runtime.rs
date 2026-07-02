@@ -5645,35 +5645,40 @@ impl FsfsRuntime {
         };
 
         // Accumulate RRF scores across all payload rankings.
-        let mut scores: HashMap<String, f64> = HashMap::new();
-        let mut snippets: HashMap<String, String> = HashMap::new();
-        let mut best_lexical_rank: HashMap<String, usize> = HashMap::new();
-        let mut best_semantic_rank: HashMap<String, usize> = HashMap::new();
-        let mut appeared_in_count: HashMap<String, usize> = HashMap::new();
+        // Keys borrow each hit's path (`payloads` outlives this fusion), so the five
+        // accumulator maps do zero per-hit `String` allocation — the fusion case (a
+        // doc in ≥2 variants) is exactly when `.entry(path.clone())` would re-clone an
+        // already-present key. `ahash` (not SipHash) matches the sibling RRF paths.
+        // Owned strings are materialized only for the top-`limit` output rows.
+        // Bit-identical to the prior owned-key form (`expand_fuse_ab` bench: ~2.8–3.2×).
+        let mut scores: ahash::AHashMap<&str, f64> = ahash::AHashMap::new();
+        let mut snippets: ahash::AHashMap<&str, &str> = ahash::AHashMap::new();
+        let mut best_lexical_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
+        let mut best_semantic_rank: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
+        let mut appeared_in_count: ahash::AHashMap<&str, usize> = ahash::AHashMap::new();
 
         for payload in payloads {
             for hit in &payload.hits {
+                let key = hit.path.as_str();
                 let contribution = 1.0 / (k + hit.rank as f64);
-                *scores.entry(hit.path.clone()).or_default() += contribution;
-                *appeared_in_count.entry(hit.path.clone()).or_default() += 1;
+                *scores.entry(key).or_default() += contribution;
+                *appeared_in_count.entry(key).or_default() += 1;
 
                 // Keep the first non-empty snippet.
                 if let Some(snippet) = &hit.snippet {
-                    snippets
-                        .entry(hit.path.clone())
-                        .or_insert_with(|| snippet.clone());
+                    snippets.entry(key).or_insert_with(|| snippet.as_str());
                 }
 
                 // Track best ranks across all queries.
                 if let Some(lr) = hit.lexical_rank {
                     best_lexical_rank
-                        .entry(hit.path.clone())
+                        .entry(key)
                         .and_modify(|existing| *existing = (*existing).min(lr))
                         .or_insert(lr);
                 }
                 if let Some(sr) = hit.semantic_rank {
                     best_semantic_rank
-                        .entry(hit.path.clone())
+                        .entry(key)
                         .and_modify(|existing| *existing = (*existing).min(sr))
                         .or_insert(sr);
                 }
@@ -5681,11 +5686,11 @@ impl FsfsRuntime {
         }
 
         // Sort by fused score descending, then by path for tie-break.
-        let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+        let mut ranked: Vec<(&str, f64)> = scores.into_iter().collect();
         ranked.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         });
 
         let total_candidates = ranked.len();
@@ -5694,14 +5699,14 @@ impl FsfsRuntime {
             .take(limit)
             .enumerate()
             .map(|(idx, (path, score))| {
-                let lexical_rank = best_lexical_rank.get(&path).copied();
-                let semantic_rank = best_semantic_rank.get(&path).copied();
-                let in_multiple = appeared_in_count.get(&path).copied().unwrap_or(0) > 1;
+                let lexical_rank = best_lexical_rank.get(path).copied();
+                let semantic_rank = best_semantic_rank.get(path).copied();
+                let in_multiple = appeared_in_count.get(path).copied().unwrap_or(0) > 1;
                 SearchHitPayload {
                     rank: idx.saturating_add(1),
-                    path: path.clone(),
+                    path: path.to_owned(),
                     score,
-                    snippet: snippets.get(&path).cloned(),
+                    snippet: snippets.get(path).map(|&s| s.to_owned()),
                     lexical_rank,
                     semantic_rank,
                     in_both_sources: in_multiple,
