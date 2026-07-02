@@ -4657,3 +4657,29 @@ variant) preserved in session scratchpad; register + `git add` + `rch bench`, th
 frankensearch-fsfs --lib`. Ratio vs Tantivy N/A (internal, opt-in filter path). NOTE: narrow — only ext-only filters
 benefit; low priority vs a broader lever. LESSON: an "eliminate the alloc" instinct can LOSE when the alloc feeds a
 SIMD stdlib routine (`str::contains`); measure before replacing stdlib string ops with hand-rolled scans.
+
+---
+
+## 2026-07-02 — FRONTIER UPDATE: the clone/hasher/alloc/top-k family is now mined out too (SlateHeron)
+
+The prior [[frontier-closed-2026-07-02]] map declared the per-crate perf frontier closed, but this session found a
+whole UN-mined family the BOLD proxy could not model — per-query `String`-clone / std-SipHash-map / per-item-alloc
+churn on the sync + fsfs result-assembly paths — and landed **5 measured wins** from it:
+- `dc5b2c5` embed: `CachedEmbedder::embed_batch` funnels N misses → 1 inner batch (+ preserves in-batch dedup).
+- `8665ce1` fusion: `sync_searcher` score-maps/`seen` SipHash→aHash — **~2×** (0.44–0.51).
+- `401c3e3` fsfs: `fuse_expanded_payloads` 5 maps clone-String→borrow-`&str` + aHash — **~2.8–3.2×**.
+- `3746d9c` fsfs: default-path merge dedup SipHash→aHash — **~1.3×** (survives clone dilution).
+- `77124b9` fsfs: filter `matches_doc_id` conditional lowercase — **~1.6×** on ext-only filters (path = strict tie).
+
+**This family is now exhausted too (surveyed this turn):** `frankensearch-lexical` is a thin Tantivy wrapper (ranking
+delegated to fusion `rrf_fuse`, already `select_nth_unstable` for top-k); `fuse_expanded_payloads`' full-sort is on a
+small deduped-variant set (N~40–240, select_nth ≈ noise there); the remaining fsfs std-SipHash maps are bounded/cold —
+`snippets_by_doc` is capped at `FSFS_SEARCH_SNIPPET_HEAD_LIMIT=200` and dominated by snippet *extraction* I/O (map
+hasher is a noise-level fraction), `hot_cache` is a per-query single lookup, `dedupe` is small. The naive alloc-free
+`str::contains` was measured SLOWER than the stdlib SIMD path (`9b170cf`). No remaining site clears the ±3% gate.
+
+**Route-next (unchanged from the prior close):** the ONE measured-big open lever is **ANN-in-BOLD** (2.6–5× vector
+tier, [[ann-in-bold-viable]]) — blocked on a recall-budget product sign-off + real-embedding validation, not landable
+as unilateral perf code. Otherwise the productive next step is a genuinely NEW workload the BOLD proxy can't model
+(heavy-metadata E2E, reranker-in-loop, or a filtered/faceted query mix that stresses paths the micro-benches don't).
+Do not re-walk the clone/hasher/alloc/top-k family — every hot site is landed or measured-marginal.
