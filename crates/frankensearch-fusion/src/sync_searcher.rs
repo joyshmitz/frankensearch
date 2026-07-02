@@ -4,7 +4,14 @@
 //! [`crate::searcher::TwoTierSearcher`] but operates on precomputed query
 //! embeddings and fully in-memory indices.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+
+// The per-query `&str`-keyed score maps + `seen` dedup set are `.get()`/`.insert()`
+// probed only (never iterated for output), so `ahash` is bit-identical to std and
+// ~2× faster than SipHash on short doc_ids (`sync_hash_ab` bench: 0.44–0.51 across
+// n=30..300), matching the sibling fusion paths (`rrf.rs`, `blend.rs`). `rank_map`
+// below stays std `HashMap` — it feeds `blend::compute_rank_changes_with_maps`.
+use ahash::{AHashMap, AHashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -270,12 +277,12 @@ impl SyncTwoTierSearcher {
             let fast_scores = fast_hits
                 .iter()
                 .map(|hit| (hit.doc_id.as_str(), hit.score))
-                .collect::<HashMap<&str, f32>>();
+                .collect::<AHashMap<&str, f32>>();
             let quality_scores = fast_hits
                 .iter()
                 .zip(quality_scores.iter())
                 .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
-                .collect::<HashMap<&str, f32>>();
+                .collect::<AHashMap<&str, f32>>();
             unique_vector_hits_to_scored_results_owned(
                 blended,
                 k,
@@ -440,10 +447,10 @@ fn vector_hits_to_scored_results(
     hits: &[VectorHit],
     k: usize,
     source: ScoreSource,
-    fast_scores: Option<&HashMap<&str, f32>>,
-    quality_scores: Option<&HashMap<&str, f32>>,
+    fast_scores: Option<&AHashMap<&str, f32>>,
+    quality_scores: Option<&AHashMap<&str, f32>>,
 ) -> Vec<ScoredResult> {
-    let mut seen = HashSet::with_capacity(hits.len());
+    let mut seen = AHashSet::with_capacity(hits.len());
     hits.iter()
         .filter(|hit| seen.insert(hit.doc_id.as_str()))
         .take(k)
@@ -475,8 +482,8 @@ fn unique_vector_hits_to_scored_results_owned(
     hits: Vec<VectorHit>,
     k: usize,
     source: ScoreSource,
-    fast_scores: Option<&HashMap<&str, f32>>,
-    quality_scores: Option<&HashMap<&str, f32>>,
+    fast_scores: Option<&AHashMap<&str, f32>>,
+    quality_scores: Option<&AHashMap<&str, f32>>,
 ) -> Vec<ScoredResult> {
     // `blend_two_tier` materializes one row per merged doc_id via a HashMap, so
     // its output is already unique. Consume that owned vector and move each

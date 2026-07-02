@@ -2610,3 +2610,37 @@ CIs non-overlapping → real (~84 µs = the N hash-inserts). Identical output wh
 (asserted in the bench); `merge_matches_map_fusion` continues to cover the dedup variant. Conformance:
 fusion lib **818/818 GREEN**, `--features graph` builds clean. Stacks on top of the merge win (`4aeb66b`) —
 the production searcher's RRF is now `~1.1×` faster again on the limit_all path.
+
+---
+
+## 2026-07-02 — sync_searcher per-query score maps + `seen` dedup: std SipHash → `ahash` (~2×) (SlateHeron)
+
+**Lever (sibling-path consistency — the last SipHash hot-map island in fusion).** On the default sync hybrid path,
+`RealtimeSyncSearcher` builds two per-query `HashMap<&str,f32>` score maps (`fast`/`quality`, `sync_searcher.rs:273,278`)
+and a `seen` dedup `HashSet<&str>` (`:446`), then probes every candidate doc_id in both maps. Those were std
+`std::collections` (SipHash, a crypto hash) while the sibling fusion paths `rrf.rs`/`blend.rs` and `search.rs` already
+use `ahash`. Swapped the score-map/`seen` sites to `ahash::{AHashMap, AHashSet}`; `rank_map` (`:524`) stays std because
+it feeds `blend::compute_rank_changes_with_maps` (`&std::HashMap`). Same lever family as the federated aHash swap
+(`9543ae6`, [[sibling-path-consistency-audit]]).
+
+**Bit-identical:** the maps/sets are only `.get()`/`.insert()`/`.entry()`-probed, never iterated for output, so the
+hasher never changes results — the `sync_hash_ab` bench `debug_assert_eq!`s identical accumulated f32 bits across arms,
+and fusion lib is **820/820 GREEN**, clippy-clean (no new `sync_searcher.rs` lints).
+
+**Measured (per-crate same-binary A/B, `sync_hash_ab` bench, remote `hz2`):**
+
+```bash
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- \
+  cargo bench -p frankensearch-fusion --bench sync_hash_ab -- --sample-size 40 --warm-up-time 1 --measurement-time 2
+```
+
+| n (candidates) | sip (std) | ahash | ratio |
+|---|---|---|---|
+| 30  | 2.626 µs  | 1.329 µs  | **0.506 (1.98×)** |
+| 100 | 9.092 µs  | 4.343 µs  | **0.478 (2.09×)** |
+| 300 | 28.347 µs | 12.451 µs | **0.439 (2.28×)** |
+
+**Scope:** original-comparator ratio **N/A** — an internal hasher microbench on the sync hybrid materialization, not a
+lexical comparator lever; this is a frankensearch before/after on the per-query map cluster (~2× on that step). Kept
+A/B harness: `sync_hash_ab`. WIRED to production this turn (`add5971` landed the measured bench; this commit lands the
+scoped prod swap).
