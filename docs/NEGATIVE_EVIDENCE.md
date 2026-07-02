@@ -4233,3 +4233,26 @@ embeddings are tight). **REVISED conclusion: ANN-in-BOLD is NOT rejected — it 
 vector-tier win pending (a) a recall-budget sign-off since it trades exact for ~0.99 recall, and (b) validation on a real
 embedded corpus.** LESSON: never reject an ANN/recall lever on ONE synthetic data distribution — recall is exquisitely
 sensitive to cluster tightness; sweep the noise/separation before concluding.
+
+---
+
+## 2026-07-02 — dig (exact/decision-free + alien-artifact): AVX-512 avenue closed (dev HW is Zen 3); the phase gate is already an e-process (BlackThrush)
+
+**Two fresh checks for a LANDABLE exact win (no recall tradeoff, unlike ANN) — both come back closed/already-absorbed.**
+
+- **AVX-512 on the flat scan (the exact vector-tier workhorse that beats ANN when recall matters).** The dot kernels are
+  AVX2-dispatched ([[avx2-runtime-dispatch-dot-kernels]]); AVX-512 (512-bit lanes) could be a ~1.5–2× *exact* win. But
+  the **dev/verify machine is an AMD Ryzen Threadripper PRO 5975WX (Zen 3): avx2 + f16c + fma, NO avx512** (Zen 3
+  predates AMD AVX-512, which lands in Zen 4). So the flat scan cannot be AVX-512-accelerated on this hardware — can't be
+  written, run, or verified here — and AVX2 is the practical exact ceiling. Closed.
+- **Certified early-exit for the quality (phase-2) tier (the `/alien-artifact-coding` angle).** Hypothesis: provably skip
+  phase 2 when it cannot change the top-k. Already absorbed at a *higher* level: `phase_gate.rs` is a **sequential-testing
+  e-process** (anytime-valid via Ville's inequality; refs Ramdas 2020, Grünwald 2019) that decides `SkipQuality` when the
+  fast tier is statistically sufficient over the workload. A per-query provable-stability gate would be marginal beside a
+  workload-adaptive e-process and risks changing results; not worth it. The codebase has already ingested the
+  advanced-math breakthroughs (e-processes, fsfs expected-loss contracts) as well as the systems ones.
+
+**Net: the exact/decision-free perf frontier is closed on this hardware, and the alien-artifact statistical levers are
+already implemented.** The ONE open perf lever remains **ANN-in-BOLD** ([[ann-in-bold-viable]]) — a measured 2.6–5×
+vector-tier win at ≥0.975 recall for realistically-clustered corpora — which is NOT decision-free (it trades exact recall
+for ~0.99) and so is blocked on a recall-budget sign-off + real-embedding validation, not on finding a lever.
