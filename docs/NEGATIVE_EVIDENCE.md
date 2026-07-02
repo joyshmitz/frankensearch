@@ -4683,3 +4683,11 @@ tier, [[ann-in-bold-viable]]) — blocked on a recall-budget product sign-off + 
 as unilateral perf code. Otherwise the productive next step is a genuinely NEW workload the BOLD proxy can't model
 (heavy-metadata E2E, reranker-in-loop, or a filtered/faceted query mix that stresses paths the micro-benches don't).
 Do not re-walk the clone/hasher/alloc/top-k family — every hot site is landed or measured-marginal.
+
+**Vector-tier addendum (this turn's confirmation):** the ANN path IS wired (`two_tier.rs:289` `ann.knn_search`,
+gated by `hnsw_threshold`); its graph traversal + visited-set is delegated to an **external HNSW dependency**
+(`self.hnsw.search`, `hnsw.rs:378`) — NOT frankensearch code, so the classic hnswlib visited-array lever is out of
+scope (would require forking the dep). The frankensearch-side wrapper only builds ≤k `VectorHit`s + a bounded
+`hits.sort_by` (both small). Production vector top-k is `BinaryHeap`-based (`mrl.rs`), already optimal; every
+`sort_unstable` in `simd.rs` is a `#[test]` recall probe, not a hot path. So the vector tier is closed AND partly
+external — do not dig HNSW internals or the vector top-k selection.
