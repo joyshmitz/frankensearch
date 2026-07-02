@@ -4005,3 +4005,29 @@ surprising per-row ratio against the incumbent's *known* absolute p50 before bel
 frankensearch, usually moves it. No new mechanical lever exists; the comparator is closed. (A confirming re-run of the
 exact_identifier row is the only way to settle whether it's real — deferred, low-value since it would at best show
 parity.)
+
+---
+
+## 2026-07-02 — dig: async `TwoTierSearcher` materialization audited (the vein BOLD hides) — both paths winner-only, floored (BlackThrush)
+
+**Followed [[bold-comparator-closed]]'s own route-next ("profile the production async searcher / rich-metadata paths the
+BOLD proxy doesn't model") and source-audited both async materializations. No lever left.** BOLD uses tiny metadata, so
+it hides per-candidate clone costs — the cba06d7 win (3.55–7.20×) came from exactly this vein. Checked for a *sibling*:
+
+- **Initial fused→scored** (`searcher.rs:2429`): metadata is borrowed as `&serde_json::Value` into an `AHashMap` and
+  cloned **only for the top-k winners** (the cba06d7 win); `explanation` is gated on `explain` AND built only over the
+  already-top-k `fused` slice; `doc_id` is SSO `CompactString`. Optimal.
+- **Refined/quality** (`searcher.rs:1465`): `blended.iter().enumerate().take(k).map(..)` — materializes **winner-only**
+  (`.take(k)` before the map); fast/quality/initial scores are `.get().copied()` from **borrowed** maps keyed on `&str`
+  (no per-candidate clone); blend runs via `blend_two_tier_aligned` (the 41beaff/5bc9d58 borrow win); explanation gated.
+  Optimal.
+
+**Conclusion:** the async searcher's per-candidate work is already winner-only everywhere; even a heavy-metadata workload
+can't expose a candidate-wide clone here (there isn't one). Combined with the sync path ([[fusion-result-assembly-floored-2026-07-02]]),
+vector top-k, index materialization, lexical, and the confirmed-closed comparator, **the mechanical perf frontier is
+comprehensively exhausted and re-verified this session.** The one *untested* residual is `ScoredResult.metadata:
+Option<Value>` → `Option<Arc<Value>>` (refcount-bump clone instead of deep-clone), which only matters at
+`limit_all`+rich-metadata (uncommon) and is a **public API break** — same class as the packed-`FusedHit` rejection
+(measured 1.04×), so low-EV and decision-gated, not a mechanical swap. **Blocker surfaced:** no new mechanical lever
+exists on the measured surface; remaining options are decision-gated (ANN-in-BOLD w/ 100k recall budget; metadata-Arc w/
+API break) or a different workload than the codebase currently exercises.
