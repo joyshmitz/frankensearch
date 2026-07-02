@@ -399,7 +399,7 @@ impl HnswIndex {
             hits.push(VectorHit {
                 index,
                 score: 1.0 - neighbor.distance,
-                doc_id: doc_id.clone(),
+                doc_id: doc_id.as_str().into(),
             });
         }
         hits.sort_by(|left, right| {

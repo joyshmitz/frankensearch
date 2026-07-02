@@ -3920,3 +3920,36 @@ fresh-core worker — always force a clean core rebuild when a cross-crate type 
 per-crate bench launched on search-cc for a current-state datapoint (fleet-slow; the win magnitude is the already-measured
 CompactString primitive, so it does not gate the landing). **Route next:** the CompactString arc is now complete across
 every hot crate (core/index/fusion/lexical); the sole remaining perf lever is (a) ANN-in-BOLD (recall-gated).
+
+---
+
+## 2026-07-02 — LANDED FIX: `ann` feature broke on main since 8529084 (CompactString missed `cfg(ann)` code) + ANN-vs-flat data (BlackThrush)
+
+**A real landable fix surfaced by trying to *measure* the last lever.** Running the `hnsw_vs_flat` bench
+(`--features ann`) to quantify ANN-in-BOLD failed to compile: 2× `E0308 expected CompactString, found String` at
+`hnsw.rs:402` (`VectorHit { doc_id: doc_id.clone() }`) and `two_tier.rs:322` (`doc_id: entry.doc_id.clone()`). The
+`8529084` `DocId=CompactString` refactor changed `VectorHit.doc_id` String→CompactString but **missed these two
+`#[cfg(feature = "ann")]`-gated sites** — the `ann` feature is not in the default `cargo test`/CI lanes, so the break
+went unnoticed on main. **Fixed (`<sha>`)** with the SSO-optimal form `doc_id.as_str().into()` (builds `CompactString`
+straight from the `&str`, skipping the intermediate `String` heap clone) at both sites. Verified: `cargo bench
+--features ann --bench hnsw_vs_flat` now compiles + runs GREEN. **METHODOLOGY:** a `cfg`-gated feature is a blind spot
+for a workspace-wide type migration — after a `DocId`-style refactor, grep `cfg(feature` for the changed type or build
+`--all-features`. (Follow-up worth doing: add `ann` to the feature-smoke lane so this can't regress silently.)
+
+**ANN-vs-flat measurement (`hnsw_vs_flat`, N=10k, DIM=128, K=10, hz2):**
+
+| arm | latency | vs flat |
+|-----|---------|---------|
+| `flat` (exact, rayon-parallel `search_top_k`) | 175.5 µs | 1.00× |
+| `hnsw_ef10` | **73.7 µs** | **2.38× faster** |
+| `hnsw_ef20` | 119.7 µs | 1.47× faster |
+| `hnsw_ef40` | 205.2 µs | 0.86× (slower) |
+| `hnsw_ef100` | 471.3 µs | 0.37× (2.7× slower) |
+
+**Read:** at BOLD's smaller scale (10k) the rayon-parallel *exact* flat scan is already ~175 µs, so HNSW only wins at
+**low `ef`** (ef10/ef20) — precisely where recall is worst — and *loses* at ef≥40. ANN's O(log N) edge only dominates at
+much larger N; at ≤10k it's a recall-for-latency trade with a *shrinking* latency payoff. So **ANN-in-BOLD is not a clear
+win at the measured scales** — it stays decision-gated (would need a 100k+ recall/latency sweep + an explicit recall
+budget before wiring). The bench is validation-only; nothing ANN is wired into the product search path. **Route next:**
+ANN-in-BOLD needs a 100k-scale recall sweep, not a 10k one, before it's worth pursuing — deferred pending that data + a
+recall-budget decision.

@@ -319,7 +319,7 @@ impl TwoTierIndex {
                     hits.push(VectorHit {
                         index,
                         score,
-                        doc_id: entry.doc_id.clone(),
+                        doc_id: entry.doc_id.as_str().into(),
                     });
                 }
                 // Re-sort and truncate after merging
