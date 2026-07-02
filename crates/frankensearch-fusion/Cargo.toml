@@ -138,3 +138,7 @@ harness = false
 [[bench]]
 name = "metadata_clone_ab"
 harness = false
+
+[[bench]]
+name = "explanation_clone_ab"
+harness = false

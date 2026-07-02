@@ -4085,3 +4085,35 @@ on the common path. The `explanation` deep-clone under `explain=true`+`limit_all
 `Arc<HitExplanation>` would fix it by the same pattern) — niche (`explain` is opt-in debug/UI), low-EV, deferred. The
 "rich-metadata real-path the BOLD proxy hides" vein — productive for two landings ([[metadata-arc-value-landed]] +
 cba06d7) — is now itself optimized.
+
+---
+
+## 2026-07-02 — REJECTED: `explanation` → `Arc<HitExplanation>` measures 65× but the realistic scenario doesn't justify the cross-crate change (BlackThrush)
+
+**Measured the residual (didn't dismiss it — the metadata lesson), found a big ratio, but rejected on scenario/risk —
+the mirror of the metadata *acceptance*.** The last heavy `ScoredResult` field is `explanation: Option<HitExplanation>`
+(nested `Vec<ScoreComponent>` + `Vec<String>` matched-terms + `String`s). Under `explain=true` the async
+phase-emission clones deep-clone it per phase. Same-worker A/B (`explanation_clone_ab`, realistic 2-component hybrid
+explanation w/ rank-movement):
+
+| N | `value_deep_clone` | `arc_clone` | speedup |
+|---|---|---|---|
+| 10,000 | 4,534 µs | 69.5 µs | **65×** |
+| 100,000 | 52,746 µs | 808 µs | **65×** |
+
+**Why REJECTED (unlike metadata's 278× which shipped):**
+1. **Opt-in.** `explanation` is `Some` only when `config.explain=true` (debug/UI) — `None` (cheap) for the vast
+   majority of queries. Metadata is populated whenever a consumer attaches document metadata (common).
+2. **Narrow scenario.** The 65× is on N clones; it only bites at `explain`+`limit_all`, but realistic `explain` use is
+   **top-k** (you explain the k results shown, not all N) — so realistic N is small and the *absolute* saving is
+   sub-millisecond. (METHODOLOGY: charge the ratio to the realistic scenario, per [[rrf-sort-key-fattening-rejected]].)
+3. **Cross-crate mutation friction.** `rerank/pipeline.rs:158` **mutates** the explanation in place (pushes a `Rerank`
+   `ScoreComponent`). `Arc<HitExplanation>` forces `Arc::make_mut` there — correct and cheap *only because* the Arc is
+   uniquely held pre-phase-emission, i.e. a subtle shared-ownership invariant to preserve — plus it widens the change
+   (and its `--all-features`/`full`-lane verification) to core+fusion+rerank, all for an opt-in, top-k-small win.
+
+**Decision: no production change; `explanation_clone_ab` bench kept as evidence.** The distinction from metadata is the
+lesson: a big *ratio* is necessary but not sufficient — a per-item clone lever pays only if the field is *commonly
+populated* AND the realistic access pattern has *large N*. Metadata (common, all-N) qualified; explanation (opt-in,
+top-k) does not. The `ScoredResult` clone arc is optimized for every common-path field; `explanation` stays deep-clone
+by choice, cheap because it's usually `None`.

@@ -1,0 +1,97 @@
+//! Same-worker A/B for the `ScoredResult.explanation` clone (the residual after
+//! the metadata→Arc landing).
+//!
+//! When `explain=true`, each winner carries a `HitExplanation` (nested
+//! `Vec<ScoreComponent>` with `Vec<String>` matched-terms / embedder `String`, +
+//! `RankMovement.reason: String`). The async progressive-phase emission clones
+//! `Vec<ScoredResult>` per phase (`searcher.rs:543/637/683/806`), deep-cloning
+//! every explanation — N per phase, 2 phases per query. This measures whether an
+//! `Arc<HitExplanation>` (refcount bump) is materially cheaper than the deep clone,
+//! to decide if the metadata-Arc pattern is worth repeating for the `explain` path.
+//!
+//! Run with:
+//! ```bash
+//! CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+//!   rch exec -- cargo bench -p frankensearch-fusion --bench explanation_clone_ab
+//! ```
+
+use std::hint::black_box;
+use std::sync::Arc;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_core::explanation::{
+    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
+};
+
+/// A representative populated `HitExplanation` (a hybrid hit: lexical + semantic
+/// components with a few matched terms, plus a rank movement) — the shape the
+/// async searcher builds when `explain=true`.
+fn realistic_explanation(i: usize) -> HitExplanation {
+    HitExplanation {
+        final_score: 0.87,
+        components: vec![
+            ScoreComponent {
+                source: ExplainedSource::LexicalBm25 {
+                    matched_terms: vec![
+                        format!("term{}", i % 7),
+                        "rust".to_owned(),
+                        "hybrid".to_owned(),
+                        "search".to_owned(),
+                    ],
+                    tf: 3.0,
+                    idf: 2.1,
+                },
+                raw_score: 12.5,
+                normalized_score: 0.8,
+                rrf_contribution: 1.0 / 61.0,
+                weight: 0.3,
+            },
+            ScoreComponent {
+                source: ExplainedSource::SemanticFast {
+                    embedder: "potion-base-8M".to_owned(),
+                    cosine_sim: 0.72,
+                },
+                raw_score: 0.72,
+                normalized_score: 0.72,
+                rrf_contribution: 1.0 / 62.0,
+                weight: 0.7,
+            },
+        ],
+        phase: ExplanationPhase::Refined,
+        rank_movement: Some(RankMovement {
+            initial_rank: i % 50,
+            refined_rank: (i % 50).saturating_sub(3),
+            delta: -3,
+            reason: "promoted by quality-tier cosine rescore".to_owned(),
+        }),
+    }
+}
+
+fn bench(c: &mut Criterion) {
+    let mut g = c.benchmark_group("explanation_clone_ab");
+    for n in [10_000usize, 100_000] {
+        let values: Vec<HitExplanation> = (0..n).map(realistic_explanation).collect();
+        let arcs: Vec<Arc<HitExplanation>> = values.iter().cloned().map(Arc::new).collect();
+
+        // Current: N deep clones of Option<HitExplanation> (per-phase emission).
+        g.bench_with_input(BenchmarkId::new("value_deep_clone", n), &values, |b, vs| {
+            b.iter(|| {
+                let out: Vec<Option<HitExplanation>> =
+                    black_box(vs).iter().map(|v| Some(v.clone())).collect();
+                black_box(out)
+            });
+        });
+        // Candidate: N Arc refcount bumps of Option<Arc<HitExplanation>>.
+        g.bench_with_input(BenchmarkId::new("arc_clone", n), &arcs, |b, as_| {
+            b.iter(|| {
+                let out: Vec<Option<Arc<HitExplanation>>> =
+                    black_box(as_).iter().map(|a| Some(Arc::clone(a))).collect();
+                black_box(out)
+            });
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench);
+criterion_main!(benches);
