@@ -4854,3 +4854,35 @@ dedicated effort:**
 **Route for the next session:** do NOT re-walk quantization / hasher / clone / top-k / fusion / filter / tokenizer /
 binary-quant / t-digest — all closed with measurement. Either unblock #1 (real embeddings) or take on one of #2–4 as a
 dedicated multi-turn design, not a single-turn perf commit.
+
+---
+
+## 2026-07-02 — TESTED (mixed/negative): stratified (Mondrian-conformal) ef selection — per-group guarantee works, but NO measurable speedup at N=40k (SlateHeron)
+
+Tackled backlog item #2 from the frontier-exhausted synthesis (`31eea29`): does per-stratum certified `ef` (route easy
+queries to a cheap `ef`, hard queries to a costly one) recover the speed a single global `ef` gives up? **Ran** the
+`ann_stratified_ef` bench (landed `bea92bd`, added tooling-only/"no measurement" by a sibling agent — shared-tree
+convergence on the same lever) — a HETEROGENEOUS 40k corpus (half tight clusters NOISE=0.08, half diffuse NOISE=0.35),
+calibrating a conformal `ef` per stratum (target 0.90, α 0.1) and routing held-out queries by nearest-centroid.
+
+**Measured (remote `--features ann`, N=40k, dim=128, m=32, k=10):**
+
+| policy | guarantee | ef | latency (median, 95% CI) | held-out recall@10 |
+|---|---|---|---|---|
+| global **population** | population 90th-pct ≥ 0.90 | 80 | **817 µs** [795–834] | 0.9890 |
+| global **per-group** | every stratum ≥ 0.90 | 160 | 1179 µs [1134–1221] | 0.9910 |
+| **stratified routed** | every stratum ≥ 0.90 | 40/160 | 1118 µs [1033–1213] | 0.9850 |
+
+**Findings (honest):** (1) The router **works** — per-group guarantees hold out-of-sample (stratified recall 0.985 ≥
+target; tight stratum certifies `ef`=40, diffuse `ef`=160). (2) But stratified (1118 µs) vs the fair per-group baseline
+(1179 µs) is only **1.05× with OVERLAPPING CIs** — no statistically-established speedup at 40k, because the HNSW
+`ef`→latency curve is too flat here (`ef`=40 isn't much cheaper than `ef`=160). (3) The **cheapest** option is the simple
+**population** conformal `ef`=80 (817 µs), which already delivers 0.989 avg recall out-of-sample — so on this corpus the
+population certificate ([[ann-in-bold-viable]]) practically dominates; stratification only adds guarantee-*semantics*
+(per-group fairness), not speed.
+
+**Conclusion:** stratified/Mondrian-conformal `ef` is a guarantee-FAIRNESS lever, not a speed lever at moderate N. A
+measurable speedup needs BOTH (a) a steeper `ef`→latency curve (larger N — at 100k `ef`=40 is ~2× cheaper than `ef`=100,
+`acfb33b`) AND (b) a hard per-group SLA that forbids the population bound's tail dilution. Backlog #2 refined: viable, but
+its payoff is conditional and modest — not the "recover the tail-mode speedup" hoped for. Kept the bench for the
+steeper-curve regime. Verified: compiles + runs clean under `--features ann` (exit 0).
