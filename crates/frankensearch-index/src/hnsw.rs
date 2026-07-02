@@ -19,6 +19,7 @@ use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo};
 use serde::{Deserialize, Serialize};
 
 use crate::VectorIndex;
+use crate::recall_certificate::{EfCalibration, calibrate_certified_ef};
 
 /// Default HNSW `M` (max connections per node).
 pub const HNSW_DEFAULT_M: usize = 16;
@@ -441,6 +442,59 @@ impl HnswIndex {
             .map(|(hits, _)| hits)
     }
 
+    /// Certify the cheapest `ef_search` whose recall meets `target` — the automated
+    /// replacement for the human "recall-budget sign-off" that gated ANN-in-BOLD.
+    ///
+    /// Measures this ANN index's recall@`k` against exact bruteforce
+    /// ([`VectorIndex::search_top_k`]) over `calibration_queries`, and returns the
+    /// smallest `ef` in `candidate_efs` whose split-conformal recall **lower bound**
+    /// is `≥ target` at confidence `1 − alpha` (distribution-free, finite-sample
+    /// valid; see [`crate::recall_certificate`]). If none qualifies, returns the
+    /// best-certifiable `ef` with `meets_target = false`.
+    ///
+    /// The exact top-k for each query is independent of `ef`, so it is computed
+    /// **once per query** (not per `ef`); only the ANN search re-runs per candidate,
+    /// and the sweep short-circuits at the first certified `ef`, so no ANN search is
+    /// run at an `ef` larger than the chosen one.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from the exact [`VectorIndex::search_top_k`] pass. A
+    /// failed ANN search for a single (query, ef) is treated as recall `0.0` for that
+    /// query — the conservative direction, which can only *lower* a certified bound
+    /// (never over-certify).
+    pub fn certify_ef_search(
+        &self,
+        exact_index: &VectorIndex,
+        calibration_queries: &[Vec<f32>],
+        candidate_efs: &[usize],
+        k: usize,
+        target: f64,
+        alpha: f64,
+    ) -> SearchResult<Option<EfCalibration>> {
+        // Exact top-k is ef-independent: compute it once per calibration query.
+        let exact: Vec<Vec<VectorHit>> = calibration_queries
+            .iter()
+            .map(|q| exact_index.search_top_k(q, k, None))
+            .collect::<SearchResult<_>>()?;
+
+        Ok(calibrate_certified_ef(
+            candidate_efs,
+            |ef| {
+                calibration_queries
+                    .iter()
+                    .zip(&exact)
+                    .map(|(q, exact_hits)| {
+                        let approx = self.knn_search(q, k, ef).unwrap_or_default();
+                        recall_at_k_of(&approx, exact_hits)
+                    })
+                    .collect()
+            },
+            target,
+            alpha,
+        ))
+    }
+
     /// Returns true when this ANN index matches row order and shape of a `VectorIndex`.
     ///
     /// Since `HnswIndex` no longer stores vectors, this only checks:
@@ -822,6 +876,23 @@ fn estimate_recall(ef_search: usize, k: usize) -> f64 {
     0.1_f64.mul_add(ratio.log2(), 0.9_f64).clamp(0.0, 1.0)
 }
 
+/// Recall@k of `approx` against exact `exact`: the fraction of exact `doc_id`s that
+/// also appear in `approx`. Used by [`HnswIndex::certify_ef_search`] to build the
+/// measured calibration sample fed to the conformal certificate. `k` is tiny (top-k),
+/// so the nested membership scan is trivial.
+fn recall_at_k_of(approx: &[VectorHit], exact: &[VectorHit]) -> f64 {
+    if exact.is_empty() {
+        return 1.0;
+    }
+    let overlap = exact
+        .iter()
+        .filter(|e| approx.iter().any(|a| a.doc_id == e.doc_id))
+        .count();
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = overlap as f64 / exact.len() as f64;
+    ratio
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -966,6 +1037,47 @@ mod tests {
         assert!(
             avg_recall >= 0.95,
             "expected avg recall >= 0.95, got {avg_recall:.4}"
+        );
+    }
+
+    #[test]
+    fn certify_ef_search_wires_conformal_certificate_end_to_end() {
+        // Real ANN index + real bruteforce feeding the conformal certificate.
+        let fsvi_path = temp_path("certify", "fsvi");
+        let vectors: Vec<Vec<f32>> = (0..800).map(|i| normalized_vector(i, 384)).collect();
+        let index = write_index(&fsvi_path, &vectors).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        // Calibration queries disjoint from... they're near corpus points, fine for wiring.
+        let calibration: Vec<Vec<f32>> =
+            (5..1_600).step_by(64).map(|s| normalized_vector(s, 384)).collect();
+        let candidate_efs = [10usize, 40, 100, 200];
+
+        // target=0.0 is always certified => cheapest ef, and the sweep must
+        // short-circuit immediately (only the smallest ef is ever ANN-searched).
+        let trivial = ann
+            .certify_ef_search(&index, &calibration, &candidate_efs, 10, 0.0, 0.1)
+            .expect("certify")
+            .expect("some");
+        assert!(trivial.chosen.meets_target);
+        assert_eq!(trivial.chosen.ef_search, 10, "cheapest ef for a trivial target");
+        assert_eq!(trivial.sweep.len(), 1, "short-circuits at the first certified ef");
+
+        // An unreachable target => no ef meets it, fall back to the best-certifiable
+        // (largest ef here, since recall is non-decreasing in ef), full sweep measured,
+        // and the certified bound is a real recall in [0, 1].
+        let strict = ann
+            .certify_ef_search(&index, &calibration, &candidate_efs, 10, 2.0, 0.1)
+            .expect("certify")
+            .expect("some");
+        assert!(!strict.chosen.meets_target);
+        assert_eq!(strict.sweep.len(), candidate_efs.len(), "measures all when none certifies");
+        assert!((0.0..=1.0).contains(&strict.chosen.certified_recall));
+        // The best-certifiable fallback should be a high ef with a strong bound on
+        // this tight synthetic corpus (sanity: ANN recovers most exact neighbours).
+        assert!(
+            strict.chosen.certified_recall > 0.3,
+            "expected a meaningful certified recall, got {}",
+            strict.chosen.certified_recall
         );
     }
 

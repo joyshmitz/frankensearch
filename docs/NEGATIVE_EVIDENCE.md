@@ -4768,3 +4768,27 @@ test asserting only `{20,40}` of `{20,40,100,200}` are measured when `ef=40` cer
 Remaining ANN-in-BOLD gate: the small `#[cfg(feature="ann")]` glue building the `measure_recall` closure from an
 `HnswIndex` + bruteforce (deferred only because `--features ann` pulls the heavier `hnsw_rs` compile; not a design gap).
 The subjective recall-budget sign-off is fully retired — it is now `calibrate_certified_ef(..).chosen.meets_target`.
+
+---
+
+## 2026-07-02 — ARTIFACT COMPLETE: live ANN recall certification (HnswIndex::certify_ef_search) (SlateHeron)
+
+Closes the recall-certificate thread end-to-end (`915c902` certificate → `e77e3fe` driver → this glue).
+`HnswIndex::certify_ef_search(exact_index, calibration_queries, candidate_efs, k, target, alpha)` runs THIS ANN index's
+recall@k against exact bruteforce (`VectorIndex::search_top_k`) over the calibration queries and returns the CHEAPEST `ef`
+whose split-conformal recall lower bound `≥ target` at confidence `1−alpha` (via `calibrate_certified_ef`).
+
+Two efficiencies baked in: the exact top-k is **`ef`-independent so it is computed ONCE per query** (not per `ef`), and
+the ascending sweep **short-circuits at the first certified `ef`** — no ANN search runs at an `ef` larger than the chosen
+one. Failure direction is conservative: exact-pass errors propagate; a failed ANN `(query, ef)` counts as recall `0.0`,
+which can only *lower* a certified bound (never over-certify).
+
+**Verified: remote `cargo test -p frankensearch-index --features ann --lib certify_ef_search_...` PASSED** — end-to-end on
+a real HNSW index (800×384) + real bruteforce: `target=0.0` certifies at the cheapest `ef` with a 1-element short-circuit
+sweep; an unreachable target measures the full sweep and falls back to the best-certifiable `ef` with a real recall bound
+in `[0,1]`. (`hnsw_rs` compiles clean under `--features ann`.)
+
+**ANN-in-BOLD's recall-budget gate is now fully operational code:** a caller obtains the certified `ef` via one
+`ann.certify_ef_search(..).chosen` call against a finite-sample guarantee. The subjective human sign-off is retired
+end-to-end (certificate → driver → live ANN). The only remaining item is the *policy* choice of `(target, alpha)` and
+flipping aggressive ANN on — a product decision, not missing machinery.
