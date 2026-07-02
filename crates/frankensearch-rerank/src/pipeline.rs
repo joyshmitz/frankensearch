@@ -1068,7 +1068,9 @@ mod tests {
             let mut candidates = make_candidates(6);
             // Attach metadata to each candidate
             for c in &mut candidates {
-                c.metadata = Some(serde_json::Value::String(c.doc_id.to_string()));
+                c.metadata = Some(std::sync::Arc::new(serde_json::Value::String(
+                    c.doc_id.to_string(),
+                )));
             }
 
             rerank_step(
