@@ -2688,3 +2688,23 @@ construction (borrow `&str` keys → same values, same sort order, owned `String
 `take(limit)` output) and `expand_fuse_ab` asserts the identical ranked `(path, score)` output across all three arms.
 No `fuse_expanded_payloads`-specific test exists; full fsfs suite not re-run (crate compile weight + transient rch
 transfer flake).
+
+---
+
+## 2026-07-02 — fsfs default-path merge dedup wired to `ahash` — ~1.3× on the full merge (SlateHeron)
+
+**Lever (wires the measured `merge_dedup_ab` result into production).** `merge_with_lexical_tail`
+(`fsfs/runtime.rs:6127`) and `merge_with_fallback_tail` (`:6184`) — the DEFAULT (non-expansion) result-assembly
+merge — dedup the fused head's doc_ids in a `HashSet<&str>` probed once per lexical/fallback-tail candidate
+(O(tail); tail = full lexical result set). Swapped both from std SipHash to `ahash::AHashSet` (fsfs already deps `ahash`
+since `401c3e3`). `&str` keys, bit-identical. Matches the sibling RRF/fusion paths and this session's `sync_searcher`
+(`8665ce1`) + `fuse_expanded` (`401c3e3`) swaps.
+
+**Measured `~1.3×` on the FULL merge shape** (`merge_dedup_ab`, remote `hz2`; benched in the light `frankensearch-fusion`
+crate since fsfs is a >10-min compile): h50_t200 **0.745**, h50_t1000 **0.742**, h100_t2000 **0.791** (`sip`→`ahash`).
+The set-op win is ~2× but the per-keep `FusedCandidate` clone (hasher-independent) dilutes it to ~1.3× end-to-end.
+Bit-identical (merged doc_id order asserted across arms).
+
+**Scope:** original-comparator ratio **N/A** (internal hasher on the fsfs merge, not a lexical comparator lever); a
+frankensearch before/after on the default result path. Kept A/B harness `merge_dedup_ab`. Verified: remote
+`cargo build -p frankensearch-fsfs --lib` compile SUCCEEDED (RCH-E309 exit-102 = artifact-transfer only).

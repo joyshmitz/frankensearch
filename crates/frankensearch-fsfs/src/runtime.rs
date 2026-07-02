@@ -6124,7 +6124,10 @@ impl FsfsRuntime {
         // Lexical candidates are produced from Tantivy doc addresses and are expected
         // to be unique under normal upsert/index invariants. Growing a full-set for the
         // entire lexical tail is unnecessary and expensive on large corpora.
-        let mut seen_head_ids = HashSet::with_capacity(fused_head.len());
+        // `ahash` (not SipHash) for the doc_id dedup probed once per lexical-tail
+        // candidate (O(tail)); ~1.3× on the full merge (`merge_dedup_ab` bench),
+        // matching the sibling RRF/fusion paths. Keys already borrow `&str`.
+        let mut seen_head_ids = ahash::AHashSet::with_capacity(fused_head.len());
 
         for candidate in fused_head {
             if let Some(expr) = filter_expr
@@ -6181,7 +6184,9 @@ impl FsfsRuntime {
 
         let mut merged =
             Vec::with_capacity(refined_head.len().saturating_add(fallback_ordered.len()));
-        let mut seen = HashSet::with_capacity(refined_head.len());
+        // aHash dedup probed once per fallback-tail candidate (sibling to the
+        // lexical-tail merge above); `&str` keys, bit-identical.
+        let mut seen = ahash::AHashSet::with_capacity(refined_head.len());
         for candidate in refined_head {
             seen.insert(candidate.doc_id.as_str());
             merged.push(candidate.clone());
