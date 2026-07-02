@@ -4424,3 +4424,25 @@ structs for `Option<Vec/String/HashMap/BigStruct>` fields:
 field boxed/Arc'd/SSO'd); no other hot struct carries a large inline `Option`. Combined with the workspace `--all-targets`
 GREEN certification, the per-crate memory-layout frontier is closed. Route next remains a different workload
 (real-embedded-corpus ANN validation, heavy-metadata E2E) — not a struct/field lever on the current code.
+
+---
+
+## 2026-07-02 — E2E CONFIRMATION: the session's materialization wins made the `limit_all` phase-clone nearly FREE (BlackThrush)
+
+**Ran the real-searcher `collect_limit_all` bench (SyncTwoTierSearcher.search_collect, in-memory, N=10k) — a same-worker
+`iter` (builds progressive phase clones) vs `collect` (want_phases=false, no phase clones) A/B — to confirm the session's
+materialization arc end-to-end and regression-check the real path.** Result (hz1, CIs overlap):
+
+| arm | time | note |
+|-----|------|------|
+| `collect` (no phase clones) | 8.50 ms `[8.27, 8.76]` | |
+| `iter` (builds 2 phase clones of `Vec<ScoredResult>`) | 8.59 ms `[8.35, 8.85]` | **iter/collect = 1.01× — within noise** |
+
+**Finding: the progressive-phase clone at `limit_all` is now statistically FREE (~1%).** Historically that same phase
+clone was a **1.29× (≈29%)** cost — the `want_phases` elision win ([[discarded-output-clone-lever]], `5100734`). The
+session's materialization wins collapsed it: cloning `Vec<ScoredResult>` per phase is now cheap because each
+`ScoredResult` is **88 B** (was 168) with an **SSO `CompactString` doc_id** (was a heap `String` clone) and a **boxed
+`explanation`** — so the 2N per-query struct copies + doc_id clones that dominated the phase-clone cost are gone. This is
+the **end-to-end payoff** of the isolated micro-wins (doc_id SSO, metadata-Arc, explanation-Box) on the real searcher's
+`limit_all` path, and a clean regression check that the type migrations did NOT slow it (collect path healthy).
+(Absolute ms is cross-worker noise vs earlier runs; the same-run `iter/collect` ratio is the valid measure.)
