@@ -31,6 +31,9 @@ time = { workspace = true }
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
+# compact_str: SSO-string clone-cost probe for the limit_all doc_id materialization
+# lever (dev-only; already a transitive workspace dep). See doc_id_clone_sso bench.
+compact_str = "0.9"
 tempfile = "3"
 tracing-test = "0.2"
 criterion = { workspace = true }
@@ -118,6 +121,10 @@ harness = false
 
 [[bench]]
 name = "federated_appeared_in"
+harness = false
+
+[[bench]]
+name = "doc_id_clone_sso"
 harness = false
 
 [[bench]]

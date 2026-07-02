@@ -3719,3 +3719,30 @@ reason (it isn't an unsafe-safety issue, it's a cache-locality issue). **The RRF
 the sort algorithm (radix), the comparator (precomputed keys / key-fattening), the sorted-record size (indirect
 index sort) have all now been probed and rejected. Route next: the only remaining limit_all lever is the
 `Arc<str>` doc_id materialization (workspace refactor), not the sort.
+
+---
+
+## 2026-07-02 — limit_all doc_id clone: CompactString (SSO) is 29.8× cheaper for short ids, beating Arc<str> — the materialization lever's optimal type (BlackThrush)
+
+**Positive finding, not a rejection — no production change yet (the refactor is cross-crate/multi-session);
+recorded to re-scope the biggest remaining `limit_all` lever with data.** The doc_id materialization clone
+(RRF `into_owned` + resolve_heap + blend, ~23% of limit_all, ~432 µs/10k) was slated for an `Arc<str>`
+refactor. Benched the actual N-clone cost of the candidate types (`doc_id_clone_sso`, N=10k):
+
+| type | short id (`doc-000042`, 10 B) | long id (36 B uuid-like) |
+|------|-------------------------------|--------------------------|
+| `String` (current) | 438.58 µs `[431,448]` (confirms `materialize_clone` 432 µs) | 248.99 µs |
+| **`CompactString`** (SSO, ≤24 B inline) | **14.73 µs — 29.8× cheaper** | 295.47 µs (~1.2× slower, heap fallback) |
+| `Arc<str>` (refcount bump) | 66.58 µs — 6.6× cheaper | 72.18 µs — 3.5× cheaper |
+
+**`CompactString` is the better target than `Arc<str>` for typical (short) doc_ids:** 29.8× vs 6.6× (inline
+memcpy beats an atomic refcount bump), AND far more drop-in — it has `.as_str()`, `Deref<str>`, `From<String>`
+/`From<&str>`, `PartialEq`/`Hash`/`Ord`, and serde built in, so most call sites (`hit.doc_id.as_str()`, `==`,
+`clone`, `format!`) compile **unchanged**; only the struct field types + constructors (`.into()`) change, and
+**no serde `rc` feature** is needed. `Arc<str>` lacks `.as_str()` (breaks every `.as_str()` site) and needs
+serde `rc`. **Tradeoff:** `CompactString` degrades to ~1.2× *slower* clone for ids >24 B (UUIDs/long URLs),
+where `Arc<str>` stays a universal win — so for a library with unknown consumer id lengths, the choice is
+`CompactString` (bet on short ids, huge win, small tail regression) vs `Arc<str>` (universal, no regression,
+bigger refactor). **Recommendation for the dedicated materialization session:** `doc_id: CompactString` on the
+frankensearch-core types (`VectorHit`/`FusedHit`/`ScoredResult`) + index doc_ids table — near-drop-in, ~22%
+off limit_all for the common short-id case. `doc_id_clone_sso` bench kept as evidence.
