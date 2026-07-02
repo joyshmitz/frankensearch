@@ -90,3 +90,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "hnsw_vs_flat_100k"
+harness = false

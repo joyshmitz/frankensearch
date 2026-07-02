@@ -4143,3 +4143,29 @@ is optimized (`doc_id` SSO, `metadata` Arc, `content` borrowed) or correctly lef
 `fts5` content forced). The remaining levers are **decision-gated** (ANN-in-BOLD w/ recall budget) or need a **workload
 the BOLD proxy doesn't model** (heavy-metadata corpus end-to-end, reranker-in-loop, indexing-throughput) — not a
 per-crate mechanical swap. Re-measure before assuming any new lever exists.
+
+---
+
+## 2026-07-02 — dig: ANN-vs-flat AT 100k — HNSW's edge scales with N (up to 4.7×); recall pending (BlackThrush)
+
+**Autonomous measurement of the one remaining lever (ANN-in-BOLD), at the scale where it matters.** My earlier
+`hnsw_vs_flat` used N=10k, where the rayon flat scan (~175 µs) already beats HNSW except at ef10. Built `hnsw_vs_flat_100k`
+(N=100k, DIM=128, K=10, 256 clusters, `--features ann`) — the BOLD corpus scale. **Latency (search-cc, ovh-a/hz2):**
+
+| arm | 100k latency | vs flat | (10k for contrast) |
+|-----|-------------|---------|--------------------|
+| `flat` (exact, rayon) | 517.9 µs | 1.00× | 175 µs |
+| `hnsw_ef10` | **109.2 µs** | **4.7× faster** | 2.38× |
+| `hnsw_ef20` | 216 µs | 2.4× | 1.47× |
+| `hnsw_ef40` | 341 µs | 1.5× | 0.86× (slower) |
+| `hnsw_ef100` | 797 µs | 0.65× (slower) | 0.37× |
+
+**Finding: HNSW's advantage GROWS with N** — at 10k it only won at ef10 (2.38×) and lost by ef40; at 100k it wins through
+ef40 (up to 4.7× at ef10, 2.4× at ef20), as O(log N) vs O(N) predicts. So **ANN-in-BOLD becomes materially attractive at
+larger corpora** (unlike the 10k picture). **Gating factor = recall (PENDING):** the recall@10 sweep over `ef` was
+printed at setup via `eprintln` and truncated by rch's tail-only capture; re-run moves it to a post-criterion `println`
+(in flight, ~6 min on the degraded fleet). HNSW is a real win only where recall is high at a fast `ef` (the ef20 2.4×
+row is the likely sweet spot — clustered data typically gives ~0.95+ recall@10 by ef20, but that must be MEASURED not
+assumed). `hnsw_vs_flat_100k` bench committed as the harness. **Route next:** get the recall numbers, then if ef20-40
+holds >0.95 recall, ANN-in-BOLD is a measured win pending only a recall-budget sign-off — the first non-floored lever in
+many cycles.
