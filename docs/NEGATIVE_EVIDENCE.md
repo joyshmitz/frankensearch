@@ -3973,3 +3973,35 @@ single `cargo check -p frankensearch --no-default-features --features full` (or 
 type change):** run the `full`/`--all-features` lane, not only `--workspace --lib`. `graph_rank.rs` tests already used
 `.into()`; only the one production `map` closure was missed. (The top-level `full` lane re-check with both fixes was
 launched to confirm no third casualty hides behind `durable`/`api`.)
+
+---
+
+## 2026-07-02 — RE-MEASURED BOLD ratios: comparator CONFIRMED closed; exact_identifier@100k now 2.5× FASTER; only >1.1× gap is inherent limit_all (BlackThrush)
+
+**Fresh `bold_verify_tantivy_class` run (`search_bench`, `--features lexical`, 10k+100k, hz2) — measured, not
+memory.** Re-ran the frankensearch-hybrid-vs-tantivy-class-incumbent comparison after all recent landings (CompactString
+core/fusion/index + lexical, feature fixes) to find where frankensearch *currently* trails. `ratio = fs_p50 /
+incumbent_p50` (<1 = frankensearch faster). **Parity-or-better on every top-k row; the historical loss is now a 2.5×
+win:**
+
+| query_class | docs | ratio (hybrid) | ratio (lexical-guard) | note |
+|---|---|---|---|---|
+| **exact_identifier** | **100k** | **0.405** | **0.403** | **~2.5× FASTER** (was 1.2–1.3× *slower* in the pre-comparator baseline: fs 923 µs vs incumbent 2277 µs) |
+| exact_identifier | 10k | 0.992 | 0.857 | parity/faster |
+| quoted_phrase | 100k | 1.060 | 0.995 | was ~1.25× slower → now parity |
+| quoted_phrase | 10k | 1.008 | 1.000 | parity |
+| short_keyword | 100k | 1.000 | 1.000 | parity |
+| high_fanout | 100k | 0.997 | 1.000 | parity |
+| natural_language | 100k | 1.026 | 1.034 | ~1.03× (noise-band) |
+| zero_hit | 100k | 1.067 | 1.022 | p50 marginal; p95/p99 **faster** (0.879 / 0.605) |
+| **limit_all** | **10k** | **1.392** | **1.517** | the sole >1.1× gap — **inherent** (fs 1964 µs vs incumbent 1411 µs) |
+
+**Conclusion — the comparator is CLOSED, verified by fresh data:** every top-k class is at/under parity, and the class
+frankensearch historically lost (`exact_identifier`@100k) is now a **2.5× win**. The only material gap is `limit_all`
+(1.39–1.52×), which is **inherent and already probed to its floor**: frankensearch materializes full `ScoredResult`
+rows (doc_id + scores + source) for *all* N results while the incumbent returns bare doc_ids — the doc_id term is
+already SSO (CompactString), and the residual `Copy`-field struct build was measured only ~1.04× shrinkable (packed-struct
+rejection) and isn't shrinkable without a public API break. **No new mechanical lever exists on the measured surface.**
+Route next: the productive frontier is off the BOLD-comparator axis entirely — either the decision-gated ANN-in-BOLD
+(needs a 100k recall sweep) or non-comparator real-world work; the top-k comparator itself is done. Re-measure before
+assuming any regression — this table is the current (2026-07-02) reference.
