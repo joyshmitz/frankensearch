@@ -4691,3 +4691,25 @@ scope (would require forking the dep). The frankensearch-side wrapper only build
 `hits.sort_by` (both small). Production vector top-k is `BinaryHeap`-based (`mrl.rs`), already optimal; every
 `sort_unstable` in `simd.rs` is a `#[test]` recall probe, not a hot path. So the vector tier is closed AND partly
 external — do not dig HNSW internals or the vector top-k selection.
+
+---
+
+## 2026-07-02 — ROUTE CLOSED: the "widen search-time reductions" family has no remaining HOT single-acc target (SlateHeron)
+
+Followed [[search-time-reductions-still-widenable]]'s own route ("grep dot+=/sum+= on rerank paths") — the pattern that
+won MMR cosine 4-acc 1.6× (efbfe33). Every scalar reduction on a per-candidate hot path is already optimized or the
+call site is cold:
+- **MMR cosine** (`mmr.rs`): the hot path uses `cosine_sim_pre` (4-acc dot + hoisted norms, the landed win). The slow
+  single-acc `cosine_sim` survives ONLY in a cold non-uniform-dim fallback (`:179`, "essentially never") and the
+  `#[cfg(test)] mmr_rerank_reference` bruteforce (`:388`). Not hot — no lever.
+- **HNSW ANN** (`hnsw.rs`): traversal + the per-comparison distance (`DistDot`) are `hnsw_rs` (external crate,
+  `hnsw.rs:18,108`); `normalize_for_dist_dot` (`:774`) is frankensearch but cold — 1×/query (`:375`) and bulk-at-build
+  (`:539`), and SIMD-reassociating it would perturb ANN normalization rounding (recall-adjacent). Skip.
+- **prf.rs / ope.rs** norms/weights: pseudo-relevance-feedback + OPE calibration, opt-in and computed once/query, not
+  per-candidate. **mrl.rs `normalize`** (`:665`) is a `#[cfg(test)]` helper.
+
+**One remaining single-acc SIBLING (known-marginal, not pursued):** the MMR norm-precompute loop (`mmr.rs:163-175`,
+`norm += x*x`) is still single-accumulator while the dot it feeds (`cosine_sim_pre`) is 4-acc. It runs n times (once
+per candidate) but is **O(n·dim) = ~1/k of MMR's O(k·n·dim) pairwise-dot work**, so a 1.5× widen is ~2%/k end-to-end
+(noise-level for realistic k≥10) — below the ±3% gate, and non-bit-identical (would need the `mmr_rerank` selection
+assert to still hold). Recorded so it's not re-attempted as a "win". The reduction-widening route is CLOSED.
