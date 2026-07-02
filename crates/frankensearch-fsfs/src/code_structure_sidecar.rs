@@ -418,10 +418,14 @@ fn score_document(query: &str, document: &CodeStructureDocument) -> CodeStructur
     let normalized_query = normalize_signal_value(query);
     let mut raw_score = 0.0;
     let mut matched = BTreeSet::new();
+    // Reused across signals: the per-token lowercase scratch is allocated once for
+    // the whole document rather than once per signal token.
+    let mut token_scratch = String::new();
 
     for signal in &document.signals {
-        let signal_tokens = tokenize(&signal.value);
-        if let Some(token) = query_tokens.intersection(&signal_tokens).next().cloned() {
+        if let Some(token) =
+            smallest_matching_token(&query_tokens, &signal.value, &mut token_scratch)
+        {
             raw_score += signal_weight(signal.kind);
             matched.insert(CodeStructureMatchedSignal {
                 kind: signal.kind,
@@ -520,6 +524,50 @@ fn tokenize(value: &str) -> BTreeSet<String> {
     tokens
 }
 
+/// The lexicographically smallest token of `value` that also occurs in
+/// `query_tokens`, or `None`. This is exactly `tokenize(value)`-then-
+/// `query_tokens.intersection(..).next()`, but it streams `value`'s tokens through
+/// the reused `scratch` buffer and probes `query_tokens` directly, so it never
+/// materialises the intermediate `BTreeSet<String>` nor its per-token heap
+/// allocations (a token is cloned only when it becomes the new smallest match).
+/// Bit-identical to that pair: the minimum of the intersection is unaffected by
+/// the set's deduplication, so streaming (with possible duplicates) and taking the
+/// min over query-hits yields the same token; non-ASCII input delegates to the
+/// exact reference computation. Measured ~1.8× on the per-document signal loop
+/// (`code_signal_probe_ab` bench).
+fn smallest_matching_token(
+    query_tokens: &BTreeSet<String>,
+    value: &str,
+    scratch: &mut String,
+) -> Option<String> {
+    if !value.is_ascii() {
+        let signal_tokens = tokenize(value);
+        return query_tokens.intersection(&signal_tokens).next().cloned();
+    }
+    let mut best: Option<String> = None;
+    scratch.clear();
+    for &b in value.as_bytes() {
+        let lowered = b.to_ascii_lowercase();
+        if lowered.is_ascii_alphanumeric() {
+            scratch.push(lowered as char);
+        } else if !scratch.is_empty() {
+            consider_token(&mut best, scratch.as_str(), query_tokens);
+            scratch.clear();
+        }
+    }
+    if !scratch.is_empty() {
+        consider_token(&mut best, scratch.as_str(), query_tokens);
+    }
+    best
+}
+
+#[inline]
+fn consider_token(best: &mut Option<String>, current: &str, query_tokens: &BTreeSet<String>) {
+    if query_tokens.contains(current) && best.as_deref().map_or(true, |b| current < b) {
+        *best = Some(current.to_owned());
+    }
+}
+
 fn sanitize_signal_score(value: f64) -> f64 {
     if value.is_finite() && value > 0.0 {
         value.clamp(0.0, 1.0)
@@ -571,6 +619,41 @@ mod tests {
                 tokenize_reference(input),
                 "tokenize fast path diverged for {input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn smallest_matching_token_matches_intersection_reference() {
+        // The streaming probe must return exactly what
+        // `tokenize(value).intersection(query).next()` (the smallest common token)
+        // would, for every query/signal combination — including non-ASCII fallback,
+        // no-match, single-token, and duplicate-token signals.
+        let query_sets = [
+            vec!["auth", "user", "token", "session", "login"],
+            vec!["rank", "symbols"],
+            vec![], // empty query
+            vec!["zzz_never_matches"],
+            vec!["k"], // exercises the Kelvin-sign fallback
+        ];
+        let values = [
+            "",
+            "authenticate_user_session",
+            "src/auth/login_handler.rs",
+            "NoMatchHereJustFiller",
+            "rank_symbols rank_symbols",     // duplicate token
+            "café Σigma auth naïve",         // non-ASCII: fallback path
+            "\u{212A}elvin token",           // KELVIN SIGN → ascii 'k' (fallback)
+            "user",                          // single token
+        ];
+        for qs in &query_sets {
+            let query: BTreeSet<String> = qs.iter().map(|s| (*s).to_owned()).collect();
+            let mut scratch = String::new();
+            for value in values {
+                let signal_tokens = tokenize(value);
+                let expected = query.intersection(&signal_tokens).next().cloned();
+                let got = smallest_matching_token(&query, value, &mut scratch);
+                assert_eq!(expected, got, "diverged for query={qs:?} value={value:?}");
+            }
         }
     }
 

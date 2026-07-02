@@ -101,6 +101,10 @@ name = "tokenize_ascii_ab"
 harness = false
 
 [[bench]]
+name = "code_signal_probe_ab"
+harness = false
+
+[[bench]]
 name = "fused_materialize"
 harness = false
 

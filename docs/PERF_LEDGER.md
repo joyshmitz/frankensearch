@@ -2797,3 +2797,37 @@ with tiny blast radius — `CompactString` is a drop-in `&str` (`Deref`/`as_str`
 break is `let s: String = token.text` (rare). Follows the `DocId=CompactString` precedent. **Verified: remote
 `cargo test -p frankensearch-fsfs --lib lexical_pipeline` PASSED (25/25 green, incl.
 `tokenize_lexical_preserves_code_and_path_tokens` / `tokenize_lowercases_output`); exit 0 (artifacts transferred).**
+
+---
+
+## 2026-07-02 — `code_structure_sidecar` signal matching: drop the per-signal `BTreeSet` for a streaming min-probe — ~1.8× (SlateHeron)
+
+**Lever (skip materialising an intermediate deduped collection when you only need a filtered-min probe — NOT the
+clone/hasher/SSO families).** `score_document` (`code_structure_sidecar.rs`) tokenised EACH code-structure signal into a
+full `BTreeSet<String>` (`tokenize(&signal.value)`) purely to compute
+`query_tokens.intersection(&signal_tokens).next()` — the lexicographically smallest query token appearing in the signal.
+It needs only that one token, but first allocates a `BTreeSet` + one heap `String` per signal token. Replaced with
+`smallest_matching_token`: stream the signal's tokens through a single scratch buffer **hoisted across all signals of the
+document** and probe `query_tokens` directly, cloning a token only when it becomes the new smallest match (0–1 heap
+allocs/signal instead of one per token, and zero intermediate `BTreeSet`s). Bit-identical: `min(query ∩ signal_set)`
+== `min` over signal token occurrences in `query` (set dedup cannot change the minimum); non-ASCII signals delegate to
+the exact reference computation.
+
+**Measured (`code_signal_probe_ab`, remote, realistic per-document signal sets):**
+
+| signals/doc | old (`BTreeSet` + intersection) | new (stream + probe) | ratio |
+|---|---|---|---|
+| 128  | 21.41 µs  | 11.95 µs  | **1.79×** |
+| 640  | 112.67 µs | 59.96 µs  | **1.88×** |
+| 2560 | 426.75 µs | 238.97 µs | **1.79×** |
+
+The bench allocates the scratch buffer per-call; the shipped `score_document` hoists it across the whole document, so the
+production win is a strict lower bound of the above. **Parity asserted per-signal in the bench (`assert_eq!(old, new)`
+for every signal) — bench exit 0.**
+
+**Scope:** original-comparator ratio **N/A** — code-structure prior signal matching, a public-API pipeline contract
+(`CodeStructureSidecar::score_query`; no internal frankensearch runtime caller — benefits integrators using the
+code-structure prior), previously un-benched. A frankensearch before/after on the per-(query,document) signal loop. Added
+bench `code_signal_probe_ab` + unit test `smallest_matching_token_matches_intersection_reference` (asserts parity vs the
+old tokenize+intersection). Bench-verified (~1.8×, parity, exit 0); remote `cargo test -p frankensearch-fsfs --lib
+code_structure_sidecar` confirming the wired change in the background — fix-forward if red.
