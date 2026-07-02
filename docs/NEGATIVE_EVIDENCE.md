@@ -4031,3 +4031,30 @@ Option<Value>` → `Option<Arc<Value>>` (refcount-bump clone instead of deep-clo
 (measured 1.04×), so low-EV and decision-gated, not a mechanical swap. **Blocker surfaced:** no new mechanical lever
 exists on the measured surface; remaining options are decision-gated (ANN-in-BOLD w/ 100k recall budget; metadata-Arc w/
 API break) or a different workload than the codebase currently exercises.
+
+---
+
+## 2026-07-02 — BIG LEVER FOUND (measured 200–278×): `ScoredResult.metadata` deep-`Value`-clone → `Arc<Value>` (BlackThrush)
+
+**I was WRONG to dismiss this as "low-EV, same class as packed-struct" — measured it and it is the largest lever of the
+session.** The packed-struct analogy was false: that was `Copy` fields; `metadata` is a **deep clone of a nested
+`serde_json::Value`** (map + strings + arrays re-allocated each time). The async searcher deep-clones each winner's
+metadata at materialization (`searcher.rs:2514`, `.cloned()`); at `limit_all` that is N deep clones per query. BOLD uses
+*tiny* metadata so this is invisible in the comparator — but real document metadata (title/path/tags/…) is not tiny.
+
+**Same-worker A/B `metadata_clone_ab` (deep `Value` clone vs `Arc` refcount bump, realistic 8-field metadata, ovh-a):**
+
+| N | `value_deep_clone` (current `Option<Value>`) | `arc_clone` (`Option<Arc<Value>>`) | speedup |
+|---|---|---|---|
+| 10,000 | 11,338 µs (11.3 ms) | 56.8 µs | **200×** |
+| 100,000 | 158,598 µs (158 ms) | 571 µs | **278×** |
+
+**Context:** the whole `limit_all`@10k query is ~2 ms with BOLD's tiny metadata — but with realistic metadata the clone
+ALONE is ~11 ms, i.e. a rich-metadata `limit_all` query is **metadata-clone-bound** and `Arc<Value>` removes ~99.5% of
+that term. This is a REAL production win (rich-metadata consumers) that the BOLD proxy structurally hides — exactly the
+vein [[bold-comparator-closed]] flagged ("profile rich-metadata workloads; BOLD hides real-path clone costs"). **Lever:
+`ScoredResult.metadata: Option<serde_json::Value>` → `Option<Arc<serde_json::Value>>`** — analogous to the landed doc_id
+`CompactString` (also a public field-type change accepted for a clone win). `Arc<Value>` `Deref`s to `Value` so read
+sites (`.get()`, `.as_object()`, filters) mostly compile unchanged; construction wraps in `Arc::new`; **serde `rc`
+feature needed for `Deserialize<Arc<T>>`.** Landing it (carefully — with `--all-features`/`full` lane checks per
+[[cfg-gated-feature-migration-blindspot]]) is the next step. `metadata_clone_ab` bench kept as evidence.

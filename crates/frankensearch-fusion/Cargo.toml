@@ -134,3 +134,7 @@ harness = false
 [[bench]]
 name = "docid_materialize_ab"
 harness = false
+
+[[bench]]
+name = "metadata_clone_ab"
+harness = false
