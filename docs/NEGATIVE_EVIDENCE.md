@@ -3805,3 +3805,32 @@ pre-landing); this removes the dominant remaining allocation from that path. Ben
 evidence. **Route next:** the RRF sort, comparator, struct size, and now the doc_id materialization type are all probed
 — the fusion `limit_all` collect path is at its floor for short ids; the only residual is the >24 B id tail (~1.2×
 clone regression, absent on measured corpora).
+
+---
+
+## 2026-07-02 — dig: post-CompactString, the fusion result-assembly arc has no remaining clone/move lever (BlackThrush)
+
+**Negative evidence from a full route-next sweep + fresh source audit — no production change, records the frontier so it
+isn't re-walked.** After landing `DocId=CompactString` (`8529084`), swept every open "Route next" in this doc and
+re-audited the sync searcher's result-assembly by source, all confirmed floored:
+
+- **Reopen id-materialization** (route-next @ the 2026-06-27 "numeric fast field" entry): already **SHIPPED** — PERF_LEDGER
+  `reopen_id_materialize/k1000` = **0.436 (~2.29×) KEEP** via the persisted ord/sidecar table; reopened on-disk indexes no
+  longer fall back to docstore materialization. Closed.
+- **`fused_hits_to_scored_results`** (`sync_searcher.rs:418`, the hot hybrid `limit_all` path): already **moves** each
+  `doc_id` out of the owned `Vec<FusedHit>` via `into_iter` (no second clone). Optimal.
+- **Refined semantic path** (`:251-284`): already uses `unique_vector_hits_to_scored_results_owned(blended, …)` — **moves**
+  from the owned `blended` vec; the `fast_scores`/`quality_scores` maps key on `&str` (no clone). Optimal.
+- **Initial fast-phase** (`vector_hits_to_scored_results(&fast_hits, …)`, `:162`): the one residual `doc_id.clone()`. It is
+  **necessary, not a lever** — `fast_hits` is reused downstream at `:193` (len), `:214` (`quality_scores_for_hits`), `:243`
+  (`blend_two_tier_aligned`), `:270-277` (score maps), so it cannot be consumed here; and the clone is already **~2.2×
+  cheaper** post-CompactString (SSO). Moving it would require duplicating `fast_hits`, a net loss.
+- **RRF indirect index-sort** (route-next @ 2026-07-01): rejected, cache-miss-bound (kept as evidence).
+
+**Conclusion:** the fusion result-assembly arc (RRF fuse → materialize → ScoredResult) is move-optimized everywhere a
+move is sound, with the sole necessary clone reduced to an SSO memcpy. No single-primitive lever remains on this path.
+The biggest gap vs the incumbents (`limit_all` wall-clock) is bounded by the actual per-hit struct build (the `Copy`-field
+`FusedHit`/`ScoredResult` writes + Vec alloc, identical for any doc_id type) — not a clone, and not shrinkable without
+changing the **public** `FusedHit`/`ScoredResult` types (an API break, out of scope). Route next is off the fusion
+result-assembly vein entirely — the productive frontier is now the vector-scan and index tiers (already heavily mined) or
+a corpus/algorithmic change (approximate top-k, block-max), not a clone-elision.
