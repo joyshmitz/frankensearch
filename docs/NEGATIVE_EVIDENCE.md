@@ -4164,8 +4164,28 @@ per-crate mechanical swap. Re-measure before assuming any new lever exists.
 ef40 (up to 4.7× at ef10, 2.4× at ef20), as O(log N) vs O(N) predicts. So **ANN-in-BOLD becomes materially attractive at
 larger corpora** (unlike the 10k picture). **Gating factor = recall (PENDING):** the recall@10 sweep over `ef` was
 printed at setup via `eprintln` and truncated by rch's tail-only capture; re-run moves it to a post-criterion `println`
-(in flight, ~6 min on the degraded fleet). HNSW is a real win only where recall is high at a fast `ef` (the ef20 2.4×
-row is the likely sweet spot — clustered data typically gives ~0.95+ recall@10 by ef20, but that must be MEASURED not
-assumed). `hnsw_vs_flat_100k` bench committed as the harness. **Route next:** get the recall numbers, then if ef20-40
-holds >0.95 recall, ANN-in-BOLD is a measured win pending only a recall-budget sign-off — the first non-floored lever in
-many cycles.
+(in flight, ~6 min on the degraded fleet). HNSW is a real win only where recall is high at a fast `ef`.
+
+**✅ RECALL MEASURED → ANN-in-BOLD REJECTED (my "~0.95 by ef20" assumption was WRONG — good I measured):**
+
+| ef | recall@10 | latency vs flat |
+|----|-----------|-----------------|
+| 10 | **0.4875** | 4.7× faster |
+| 20 | **0.6125** | 2.4× faster |
+| 40 | **0.7813** | 1.5× faster |
+| 100 | 0.8750 | 0.65× (slower) |
+| 200 | 0.9313 | slower |
+
+**There is NO operating point where HNSW is both faster than the exact flat scan AND has acceptable recall.** Where it's
+fast (ef≤40) recall is 0.49–0.78 (loses a quarter to half of the true top-10); to reach even 0.93 recall needs ef200,
+which is SLOWER than the exact 517 µs flat scan (which is 1.0 recall). The exact rayon flat scan **dominates the
+speed/recall frontier** at 100k for every ef that matters. **Decision: ANN-in-BOLD REJECTED by measurement** — it does
+NOT need a recall-budget sign-off after all, because there is no favorable budget: you'd trade 22–51% recall for the
+speedup, or give up the speedup for still-imperfect recall. (Caveat: `HnswConfig::default()` M/ef_construction + synthetic
+256-cluster/dim-128/noise-0.30 data; a higher-M index or real 384-dim embeddings *might* shift recall, but the default
+out-of-box config — what BOLD would use — is decisively unfavorable, and the flat scan is already sub-ms at 100k.)
+`hnsw_vs_flat_100k` kept as evidence. **This closes the LAST remaining lever: even the one decision-gated option is now
+measured-and-rejected. The frontier is comprehensively closed — top-k comparator parity, limit_all inherent, all clone/
+materialization paths optimized, vector top-k floored (flat exact beats ANN on the recall/latency frontier through 100k),
+MMR incremental, indexing borrow-optimized.** Route next is a different workload (heavy-metadata E2E, reranker-in-loop)
+or a higher-M ANN re-measure with real embeddings — not a per-crate lever on the current surface.
