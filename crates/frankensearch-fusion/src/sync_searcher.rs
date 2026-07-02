@@ -411,7 +411,7 @@ fn filter_lexical_hits(
         return hits;
     };
     hits.into_iter()
-        .filter(|hit| filter.matches(&hit.doc_id, hit.metadata.as_ref()))
+        .filter(|hit| filter.matches(&hit.doc_id, hit.metadata.as_deref()))
         .collect()
 }
 

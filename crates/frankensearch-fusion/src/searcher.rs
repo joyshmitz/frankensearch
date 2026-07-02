@@ -2439,7 +2439,7 @@ fn fused_hits_to_scored_results(
     // deferred to the per-winner lookup, so a deep/large metadata `Value` for a
     // candidate that misses the top-k is never cloned. `lexical_results` outlives
     // this function, so the borrows are valid for the whole materialization.
-    let lexical_metadata_by_doc: AHashMap<&str, &serde_json::Value> = lexical_results
+    let lexical_metadata_by_doc: AHashMap<&str, &Arc<serde_json::Value>> = lexical_results
         .iter()
         .filter_map(|result| {
             result
@@ -4483,10 +4483,10 @@ mod tests {
             lexical_score: Some(3.0),
             rerank_score: None,
             explanation: None,
-            metadata: Some(serde_json::json!({
+            metadata: Some(Arc::new(serde_json::json!({
                 "title": "Lexical doc",
                 "section": "api",
-            })),
+            }))),
         }];
 
         let scored =
@@ -4497,10 +4497,10 @@ mod tests {
             .expect("lexical fused result must exist");
         assert_eq!(
             lexical.metadata,
-            Some(serde_json::json!({
+            Some(Arc::new(serde_json::json!({
                 "title": "Lexical doc",
                 "section": "api",
-            })),
+            }))),
             "lexical metadata should be preserved through fused conversion"
         );
 

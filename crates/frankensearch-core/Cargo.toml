@@ -10,7 +10,7 @@ repository.workspace = true
 asupersync = { workspace = true }
 thiserror = { workspace = true }
 compact_str = { version = "0.9", features = ["serde"] }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }

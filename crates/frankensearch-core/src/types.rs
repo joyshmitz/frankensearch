@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use compact_str::CompactString;
@@ -193,8 +194,13 @@ pub struct ScoredResult {
     pub rerank_score: Option<f32>,
     /// Detailed explanation of scoring (if enabled).
     pub explanation: Option<HitExplanation>,
-    /// Arbitrary document metadata (from index stored fields).
-    pub metadata: Option<serde_json::Value>,
+    /// Arbitrary document metadata (from index stored fields). `Arc`-wrapped so
+    /// the per-winner metadata materialization at `limit_all` is a refcount bump,
+    /// not a deep `Value` clone (map + strings + arrays re-allocated) — measured
+    /// 200–278× cheaper for realistic metadata (`metadata_clone_ab` bench).
+    /// `Arc<Value>` derefs to `Value`, so reads (`.get`, `.as_object`, filters via
+    /// `.as_deref()`) are unchanged.
+    pub metadata: Option<Arc<serde_json::Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +526,7 @@ mod tests {
             lexical_score: Some(12.5),
             rerank_score: None,
             explanation: None,
-            metadata: Some(serde_json::json!({"tags": ["rust", "search"]})),
+            metadata: Some(std::sync::Arc::new(serde_json::json!({"tags": ["rust", "search"]}))),
         };
         let json = serde_json::to_string(&result).expect("serialize");
         let roundtripped: ScoredResult = serde_json::from_str(&json).expect("deserialize");
@@ -899,7 +905,7 @@ mod tests {
             lexical_score: Some(15.0),
             rerank_score: Some(0.95),
             explanation: None,
-            metadata: Some(serde_json::json!({"key": "value"})),
+            metadata: Some(std::sync::Arc::new(serde_json::json!({"key": "value"}))),
         };
         let json = serde_json::to_string(&result).unwrap();
         let decoded: ScoredResult = serde_json::from_str(&json).unwrap();
