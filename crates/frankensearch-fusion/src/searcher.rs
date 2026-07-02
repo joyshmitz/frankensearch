@@ -1564,12 +1564,12 @@ impl TwoTierSearcher {
                         }
                     });
 
-                    Some(HitExplanation {
+                    Some(Box::new(HitExplanation {
                         final_score: f64::from(hit.score),
                         components,
                         phase: ExplanationPhase::Refined,
                         rank_movement,
-                    })
+                    }))
                 } else {
                     None
                 };
@@ -2494,12 +2494,12 @@ fn fused_hits_to_scored_results(
                     });
                 }
 
-                HitExplanation {
+                Box::new(HitExplanation {
                     final_score: f64::from(score),
                     components,
                     phase: ExplanationPhase::Initial,
                     rank_movement: None,
-                }
+                })
             });
             ScoredResult {
                 doc_id: fh.doc_id.clone(),
@@ -2574,7 +2574,7 @@ fn vector_hits_to_scored_results(
         .take(k)
         .map(|h| {
             let explanation = if config.explain {
-                Some(HitExplanation {
+                Some(Box::new(HitExplanation {
                     final_score: f64::from(h.score),
                     components: vec![ScoreComponent {
                         source: ExplainedSource::SemanticFast {
@@ -2588,7 +2588,7 @@ fn vector_hits_to_scored_results(
                     }],
                     phase: ExplanationPhase::Initial,
                     rank_movement: None,
-                })
+                }))
             } else {
                 None
             };

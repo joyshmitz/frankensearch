@@ -53,7 +53,7 @@ fn make_results(meta: impl Fn(usize) -> Value) -> Vec<ScoredResult> {
             lexical_score: Some(1.0),
             rerank_score: None,
             explanation: None,
-            metadata: Some(meta(i)),
+            metadata: Some(std::sync::Arc::new(meta(i))),
         })
         .collect()
 }

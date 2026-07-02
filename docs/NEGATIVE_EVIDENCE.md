@@ -4386,3 +4386,15 @@ memory footprint**; (3) **no downside** for the common path — a boxed `None` i
 is heap-allocated only when `explain=true` (rare, and the explanation is already heap-heavy then). Same proven pattern as
 the metadata-Arc landing. Landing now with a full `cargo test --workspace` verification (per the [[cfg-gated-feature-migration-blindspot]]
 `cfg(test)` lesson). `scoredresult_box_ab` kept as evidence.
+
+**✅ LANDED (`<sha>`):** `ScoredResult.explanation: Option<HitExplanation>` → `Option<Box<HitExplanation>>` (core
+`types.rs`) + the 3 production constructions wrapped in `Box::new` (searcher.rs:2497/1567/2577). `Box` needs NO serde
+feature (unlike Arc's `rc`); the two mutation sites (`searcher.rs:1678` rank-movement update, `rerank/pipeline.rs:158`
+push Rerank component) work UNCHANGED via `Box`'s `DerefMut` — **this is why `Box` beats `Arc` for a mutated field** (Arc
+would have forced `Arc::make_mut`). Lib + tests compile clean. **This surfaced (and this cycle also fixed) pre-existing
+metadata-Arc BENCH breaks** the f5e9c9d landing left — `mmr_reorder.rs`, `lexical_metadata_map.rs` constructed
+`metadata: Some(Value)` (need `Arc::new`); benches are compiled only by `--all-targets`/`cargo bench`, never by the lib
+tests or the compile-only feature lane, so they'd been broken since f5e9c9d ([[cfg-gated-feature-migration-blindspot]]:
+the `cfg(test)`/bench blind spot again — run `--all-targets`). Result: `ScoredResult` is now 88 B (was 168), exact
+1.14× materialize + faster phase clones + half the result-set memory, the last measured improvement on the `limit_all`
+path.

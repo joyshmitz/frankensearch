@@ -192,8 +192,13 @@ pub struct ScoredResult {
     pub lexical_score: Option<f32>,
     /// Cross-encoder score from reranking, if applicable.
     pub rerank_score: Option<f32>,
-    /// Detailed explanation of scoring (if enabled).
-    pub explanation: Option<HitExplanation>,
+    /// Detailed explanation of scoring (if enabled). `Box`ed so the (usually
+    /// `None`, `explain=false`) common case doesn't carry ~88 B of inline
+    /// `HitExplanation` in every `ScoredResult` — halves the struct (168→88 B),
+    /// speeding `limit_all` materialization + phase clones and halving result-set
+    /// memory (`scoredresult_box_ab` bench). `Box<HitExplanation>` derefs to
+    /// `HitExplanation`; the heap alloc happens only when `explain=true`.
+    pub explanation: Option<Box<HitExplanation>>,
     /// Arbitrary document metadata (from index stored fields). `Arc`-wrapped so
     /// the per-winner metadata materialization at `limit_all` is a refcount bump,
     /// not a deep `Value` clone (map + strings + arrays re-allocated) — measured

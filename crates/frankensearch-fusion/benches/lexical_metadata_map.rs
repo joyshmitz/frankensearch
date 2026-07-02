@@ -17,6 +17,7 @@
 //! ```
 
 use std::hint::black_box;
+use std::sync::Arc;
 
 use ahash::AHashMap;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -54,7 +55,7 @@ fn make_candidates(meta: impl Fn(usize) -> Value) -> Vec<ScoredResult> {
             lexical_score: Some(1.0),
             rerank_score: None,
             explanation: None,
-            metadata: Some(meta(i)),
+            metadata: Some(std::sync::Arc::new(meta(i))),
         })
         .collect()
 }
@@ -64,8 +65,8 @@ fn winners() -> Vec<String> {
 }
 
 /// Old path: clone every candidate's metadata into the map, lookup+clone winners.
-fn clone_all(lexical: &[ScoredResult], fused: &[String]) -> Vec<Option<Value>> {
-    let map: AHashMap<&str, Value> = lexical
+fn clone_all(lexical: &[ScoredResult], fused: &[String]) -> Vec<Option<Arc<Value>>> {
+    let map: AHashMap<&str, Arc<Value>> = lexical
         .iter()
         .filter_map(|r| r.metadata.as_ref().map(|m| (r.doc_id.as_str(), m.clone())))
         .collect();
@@ -76,8 +77,8 @@ fn clone_all(lexical: &[ScoredResult], fused: &[String]) -> Vec<Option<Value>> {
 }
 
 /// New path: borrow metadata into the map, clone only the winners.
-fn borrow(lexical: &[ScoredResult], fused: &[String]) -> Vec<Option<Value>> {
-    let map: AHashMap<&str, &Value> = lexical
+fn borrow(lexical: &[ScoredResult], fused: &[String]) -> Vec<Option<Arc<Value>>> {
+    let map: AHashMap<&str, &Arc<Value>> = lexical
         .iter()
         .filter_map(|r| r.metadata.as_ref().map(|m| (r.doc_id.as_str(), m)))
         .collect();
