@@ -4747,3 +4747,24 @@ gate — it is a `certified_min_ef(...).meets_target` check against a finite-sam
 are now purely mechanical and already-known: (1) plumb a small calibration sweep (measured recall at candidate ef's) into
 the ANN config path, and (2) the 100k-scale recall/latency measurement [[ann-in-bold-viable]]. The subjective blocker is
 retired.
+
+---
+
+## 2026-07-02 — ARTIFACT (follow-through): certified-ef calibration DRIVER — lazy, early-terminating (SlateHeron)
+
+Operationalises the recall certificate (`915c902`) into a usable ANN-config decision. `calibrate_certified_ef(candidate_efs,
+measure_recall, target, alpha)` is the driver a caller (ANN config / BOLD) invokes: supply only a
+`measure_recall(ef) -> Vec<f64>` closure (ANN@ef vs bruteforce over a calibration query set) and it returns the CHEAPEST
+`ef` whose certified conformal lower bound meets `target` at confidence `1−alpha`, plus a `sweep` audit trail.
+
+Because recall measurement is the expensive step (an ANN *and* a bruteforce search per calibration query), candidates are
+tried **ascending** and the sweep **short-circuits** at the first certified `ef` — recall is never measured for larger
+`ef`s (a real ~2–4× cut in calibration cost when a small `ef` already certifies). Falls back to the best-certifiable `ef`
+when none meets the target. Feature-independent (no `ann` dep), so it compiles/tests under default features.
+
+**Verified: remote `cargo test -p frankensearch-index --lib recall_certificate` PASSED 11/11**, incl. the short-circuit
+test asserting only `{20,40}` of `{20,40,100,200}` are measured when `ef=40` certifies, and the no-early-stop fallback.
+
+Remaining ANN-in-BOLD gate: the small `#[cfg(feature="ann")]` glue building the `measure_recall` closure from an
+`HnswIndex` + bruteforce (deferred only because `--features ann` pulls the heavier `hnsw_rs` compile; not a design gap).
+The subjective recall-budget sign-off is fully retired — it is now `calibrate_certified_ef(..).chosen.meets_target`.

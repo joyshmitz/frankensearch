@@ -153,6 +153,68 @@ pub fn certified_min_ef(
     best
 }
 
+/// Result of a lazy certified-`ef` calibration sweep.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EfCalibration {
+    /// The certified choice: the smallest `ef` meeting the target, or, if none
+    /// does, the best-certifiable `ef` (with `meets_target = false`).
+    pub chosen: CertifiedEf,
+    /// The certified bound for every `ef` actually measured, ascending. Stops at
+    /// the first `ef` that meets the target (later candidates are never measured),
+    /// so this doubles as an audit trail of the calibration.
+    pub sweep: Vec<CertifiedEf>,
+}
+
+/// Drive a certified `ef_search` selection while **measuring recall lazily,
+/// cheapest `ef` first, and stopping at the first `ef` that certifies the target**.
+///
+/// This is the operational entry point that turns [`conformal_recall_lower_bound`]
+/// into an ANN configuration decision (retiring the human "recall-budget sign-off"):
+/// the caller supplies only `measure_recall(ef)`, which returns the per-query recall
+/// sample at that `ef` (e.g. ANN@ef vs bruteforce ground truth over a calibration
+/// query set), and this returns the cheapest `ef` whose certified lower bound meets
+/// `target` at confidence `1 − alpha`.
+///
+/// Because recall measurement is the expensive step (an ANN search *and* a bruteforce
+/// search per calibration query), candidates are tried in **ascending `ef`** and the
+/// sweep **short-circuits** the moment one certifies — so recall is never measured for
+/// `ef`s larger than the chosen one. `candidate_efs` is de-duplicated and sorted
+/// internally. Returns `None` only for an empty `candidate_efs`.
+pub fn calibrate_certified_ef(
+    candidate_efs: &[usize],
+    mut measure_recall: impl FnMut(usize) -> Vec<f64>,
+    target: f64,
+    alpha: f64,
+) -> Option<EfCalibration> {
+    let mut efs: Vec<usize> = candidate_efs.to_vec();
+    efs.sort_unstable();
+    efs.dedup();
+    let mut sweep: Vec<CertifiedEf> = Vec::with_capacity(efs.len());
+    let mut best: Option<CertifiedEf> = None;
+    for ef in efs {
+        let recalls = measure_recall(ef);
+        let bound = conformal_recall_lower_bound(&recalls, alpha);
+        let candidate = CertifiedEf {
+            ef_search: ef,
+            certified_recall: bound,
+            meets_target: bound >= target,
+        };
+        sweep.push(candidate);
+        if candidate.meets_target {
+            // Cheapest certified ef found — do NOT measure any larger candidate.
+            return Some(EfCalibration { chosen: candidate, sweep });
+        }
+        let better = match best {
+            Some(b) => bound > b.certified_recall,
+            None => true,
+        };
+        if better {
+            best = Some(candidate);
+        }
+    }
+    best.map(|chosen| EfCalibration { chosen, sweep })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +356,61 @@ mod tests {
         assert!(!choice.meets_target);
         assert_eq!(choice.ef_search, 100); // higher certified bound
         assert!(certified_min_ef(&[], 0.9, 0.05).is_none());
+    }
+
+    #[test]
+    fn calibrate_short_circuits_at_the_cheapest_certified_ef() {
+        // Recall rises with ef; the target is first certified at ef=40. The driver
+        // must NOT measure ef=100 or ef=200 once ef=40 certifies (the expensive step).
+        let mut measured: Vec<usize> = Vec::new();
+        let recalls_for = |ef: usize| -> Vec<f64> {
+            let r = match ef {
+                20 => 0.80,
+                40 => 0.99,
+                _ => 0.999,
+            };
+            vec![r; 300]
+        };
+        // Deliberately pass the candidates unsorted + duplicated to exercise the
+        // internal sort/dedup.
+        let cal = calibrate_certified_ef(
+            &[200, 40, 20, 100, 40],
+            |ef| {
+                measured.push(ef);
+                recalls_for(ef)
+            },
+            0.95,
+            0.05,
+        )
+        .unwrap();
+        assert!(cal.chosen.meets_target);
+        assert_eq!(cal.chosen.ef_search, 40, "cheapest certified ef");
+        assert_eq!(measured, vec![20, 40], "must stop measuring once ef=40 certifies");
+        assert_eq!(cal.sweep.len(), 2);
+    }
+
+    #[test]
+    fn calibrate_falls_back_and_measures_all_when_none_certifies() {
+        let mut count = 0usize;
+        let cal = calibrate_certified_ef(
+            &[20, 40, 100],
+            |ef| {
+                count += 1;
+                let r = if ef >= 100 { 0.90 } else { 0.80 };
+                vec![r; 300]
+            },
+            0.99, // unreachable target
+            0.05,
+        )
+        .unwrap();
+        assert!(!cal.chosen.meets_target);
+        assert_eq!(cal.chosen.ef_search, 100, "best-certifiable fallback");
+        assert_eq!(count, 3, "no early stop when nothing certifies");
+        assert_eq!(cal.sweep.len(), 3);
+        // Empty candidate set -> None, and the closure is never called.
+        let mut never = 0usize;
+        assert!(calibrate_certified_ef(&[], |_| { never += 1; vec![1.0] }, 0.9, 0.05).is_none());
+        assert_eq!(never, 0);
     }
 
     /// The heuristic `estimate_recall` can be *over-optimistic* on a distribution
