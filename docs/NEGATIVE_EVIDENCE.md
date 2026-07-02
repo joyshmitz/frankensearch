@@ -4309,3 +4309,29 @@ a lookup. Ceiling measured (`rrf_recip_ab`, isolated divide vs LUT):
 **Decision: no production change; `rrf_recip_ab` kept as evidence.** METHODOLOGY (again): a big *isolated* ratio (1.45×)
 is necessary but not sufficient — charge it to the realistic loop (OoO overlap + cache competition), same as the
 packed-struct (1.04×) and explanation (65× but opt-in) rejections. The RRF score computation is at its floor.
+
+---
+
+## 2026-07-02 — dig: mined the ledger's unmeasured/asserted claims (the metadata-278× strategy) — all remaining are sound rejections (BlackThrush)
+
+**Re-ran [[mine-rejected-lever-route-nexts]] — the strategy that surfaced the metadata-Arc 278× win (an assertion
+dismissed by analogy, never benched). This pass every remaining un-benched claim is a genuine structural rejection, not
+a missed measurement:**
+
+- `core::l2_normalize` multi-accumulator — non-bit-identical (f32 reorder) on a core primitive w/ 6 callers, and
+  **embedding-time (LOCKED, [[search-time-reductions-still-widenable]])**; ~0.35 µs of a 50 µs embed. Sound reject.
+- `core::cosine_similarity` ILP — test-only, not on any hot path. No-op.
+- `prf::prf_expand` — already auto-vectorized SAXPY. `storage::content_hash` — SHA-256 semantics (dedup table). Sound.
+- **Lexical ids-only routing (the biggest-looking residual):** the async hybrid uses `LexicalSearch::search()` (full
+  `searcher.doc()` store-read per hit) rather than the fast `search_doc_ids`/`collect_id_hits` (no docstore). BUT: (1)
+  the store-read is **shared with the tantivy incumbent** (ledger line ~2069) so it does NOT move the vs-Tantivy ratio;
+  (2) the metadata it fetches IS consumed by filters + output (the `lexical_metadata_by_doc` re-attach — now Arc-shared,
+  metadata-Arc 278×), so it can only be skipped conditionally (no-filter + caller-wants-no-metadata); (3) it's a
+  trait-surface change. Marginal, conditional, non-ratio-improving → correctly deprioritized. (The `SyncLexicalSearch`
+  path is test-only — `StaticLexical` is the sole impl; production lexical is the async trait.)
+
+**Conclusion: the unmeasured-claims vein is now dry too.** The metadata-Arc win was the one assertion-dismissed-by-analogy
+that was actually a huge measured lever; re-mining finds no sibling. Combined with the RRF-recip-LUT reject (`1b6e5d6`),
+AVX-512-HW-closed, and the ANN-already-shipped-default resolution, there is no un-landed per-crate lever on the measured
+surface. The productive frontier is a different workload (real-embedded-corpus ANN validation; heavy-metadata E2E) — not
+a lever hunt on the current code.
