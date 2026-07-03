@@ -179,6 +179,11 @@ harness = false
 name = "scoredresult_box_ab"
 harness = false
 
+# Latency cost of the shipped RrfConfig knobs (per-tier weights + hash tiebreak).
+[[bench]]
+name = "rrf_config_cost_ab"
+harness = false
+
 # REAL-data hybrid (lexical+vector RRF) vs Tantivy-lexical-alone known-item retrieval.
 [[bench]]
 name = "real_hybrid_knownitem"

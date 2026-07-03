@@ -6562,3 +6562,29 @@ dense vector tier is immune to). Each stage still contributes monotonically (0.2
 +10% to +20% recall across three BEIR datasets, in one consistent end-to-end harness, with the biggest margin where
 Tantivy's BM25 is weakest.** All using shipped, default-preserving APIs. Verified: `model2vec` retrieval-32M +
 `fastembed` cross-encoders + `rank_bm25` on BEIR qrels (no cargo, no torch).
+
+---
+
+### MEASURED (not assumed): the shipped RrfConfig knobs are latency-free — per-crate bench (IronPetrel, 2026-07-03)
+
+I'd repeatedly *asserted* the shipped fusion knobs (per-tier weights `7ccda28`, hash tiebreak `05472cd`) are negligible-cost
+— the project's ethos is measure-don't-assume, so here's the per-crate criterion bench (`benches/rrf_config_cost_ab.rs`,
+real public `rrf_fuse`, n=2000 lexical+semantic, median):
+
+| rrf_fuse config | latency | vs default |
+|---|---|---|
+| **realistic** (few ties) — default | 149 µs | — |
+| realistic — tier-weighted (`semantic_weight=1.3`) | 152 µs | +1.9% (CIs overlap → noise) |
+| realistic — hash tiebreak | 139 µs | ~equal (noise) |
+| **tie-heavy** (n exact ties, adversarial) — lexical tiebreak (default) | 375 µs | — |
+| tie-heavy — hash tiebreak | 405 µs | **+7.9%** |
+
+**Finding — the shipped config knobs cost nothing in practice; using the tuned config is latency-free.** The per-tier
+weight is a single f64 multiply per candidate — unmeasurable (+1.9%, within noise). The hash tiebreak only computes the
+FNV hash on *exact rrf_score ties* (rare in real corpora → ~free realistically), and even in a **pathological workload
+where every doc ties** (disjoint lexical/semantic sets with parallel ranks) it adds only **+7.9%** (375→405 µs). Note the
+tie-heavy case is ~2.5× slower than realistic for *both* tiebreaks (149→375 µs) — that's the sort doing full comparator
+work on ties, independent of the tiebreak choice. **Perf conclusion for the fusion-default question: flipping to the
+tuned config (weights + hash tiebreak) has zero practical latency cost** — the earlier "negligible" claim is now measured,
+and this is a regression guard for the shipped hot-path changes. Bench: `cargo bench -p frankensearch-fusion --bench
+rrf_config_cost_ab`.
