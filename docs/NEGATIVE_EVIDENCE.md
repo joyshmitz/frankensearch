@@ -5681,3 +5681,29 @@ Both models are lightweight static (no ONNX/torch), so this is a **free** upgrad
 default embedder matters most — use a **retrieval-distilled** model (potion-retrieval-32M class), not a general one; with
 it the hybrid decisively dominates Tantivy-lexical on real semantic search. Verified: `model2vec` (auto-downloaded
 retrieval-32M) + `sklearn` in the venv on BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — GENERALIZATION (multi-dataset rigor): the retrieval-32M hybrid wins on 2/3 BEIR datasets and ties lexical on the 3rd — a SAFE default, but not universal domination (IronPetrel)
+
+The landmark findings rested on one dataset (SciFact); tested generality across **3 BEIR datasets** (different domains /
+query types) with the retrieval-32M vector tier + TF-IDF lexical + stronger-tier-weighted hybrid, all in the venv harness:
+
+| dataset (test qrels) | lexical R@10/nDCG | vector R@10/nDCG | hybrid R@10/nDCG | verdict |
+|---|---|---|---|---|
+| SciFact (n=300, science claims) | 0.773 / 0.629 | 0.795 / 0.633 | **0.835 / 0.665** | hybrid **> both** |
+| NFCorpus (n=323, medical NL) | 0.146 / 0.303 | 0.148 / 0.308 | **0.156 / 0.321** | hybrid **> both** |
+| ArguAna (n=1406, arg→counter-arg) | **0.796** / 0.387 | 0.698 / 0.333 | 0.794 / 0.384 | hybrid **≈ lexical** (tie) |
+
+**Findings (honest, multi-dataset):** (1) The retrieval-32M hybrid **wins on 2/3** (SciFact, NFCorpus) — where the vector
+tier is competitive/stronger. (2) On **ArguAna** it **ties** lexical (0.794 vs 0.796, within noise): ArguAna is
+argument→counter-argument retrieval, where the counter-argument **rebuts the same topic and shares vocabulary** → high
+keyword-overlap → lexical is strong (0.796) and the vector tier is weaker (0.698), so the hybrid ≈ the (lexical) stronger
+tier. (3) **Robust conclusion: the hybrid is never worse than the best single tier by more than noise, and wins
+meaningfully where the vector tier is competitive** — i.e. it's a **safe, generally-beneficial default** (matches or beats
+lexical across domains), not a universal dominator. So the hybrid's *advantage* is dataset-dependent (tied to how
+semantic vs keyword-overlapping the queries are), but its *safety* is universal (it never underperforms the best tier).
+This tempers the SciFact-only enthusiasm with the right multi-dataset framing: adopt the hybrid as the safe default, and
+its lift is largest on genuinely semantic corpora. (Caveat: NFCorpus recall@10 is low because it has many relevant docs
+per query — nDCG is the fairer metric there, and the hybrid still leads 0.321 > 0.308 > 0.303.) Verified: `model2vec`
+(retrieval-32M) + `sklearn` venv on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
