@@ -6722,3 +6722,30 @@ title+body concatenation (frankensearch's current approach); do NOT implement BM
 — it's at best neutral and easily net-negative.** Note this is a lexical-config lever that would help Tantivy-alone and
 the hybrid's lexical tier equally, so it does not shift the hybrid-vs-Tantivy delta regardless. Verified: `rank_bm25`
 (BM25Okapi) on BEIR SciFact/NFCorpus with separated title/body fields (no cargo).
+
+---
+
+### Lexical tier: RM3 pseudo-relevance feedback is a recall/nDCG tradeoff, redundant with the vector tier (IronPetrel, 2026-07-03)
+
+Companion to the BM25F test — the *other* classic BM25 improvement, and distinct from the (negative) embedding-space PRF
+(`433f758`): **RM3 lexical PRF** expands the BM25 query with high-value terms from the top-retrieved docs (relevance-model
+weights, IDF-scaled, top-10 feedback docs), then re-retrieves. Swept expansion-term count M:
+
+| config | SciFact recall/nDCG@10 | NFCorpus recall/nDCG@10 |
+|---|---|---|
+| BM25 (no RM3) | 0.7757 / **0.6523** | 0.1522 / **0.3062** |
+| RM3 +5 terms | 0.7857 / 0.6256 | 0.1549 / 0.2985 |
+| RM3 +10 terms | **0.7932** / 0.5950 | 0.1520 / 0.2841 |
+| RM3 +20 terms | 0.7826 / 0.5591 | 0.1544 / 0.2875 |
+| RM3 +30 terms | 0.7693 / 0.5380 | **0.1558** / 0.2932 |
+
+**Finding — RM3 is a recall↑ / nDCG↓ tradeoff, not a clear win; and it's redundant in the hybrid.** Classic query-
+expansion behavior: it retrieves more relevant docs (SciFact recall +1.8 pt @M=10; NFCorpus +0.4 pt @M=30) but dilutes
+the top ranking with expansion noise (SciFact nDCG −8.8%, NFCorpus −2.5%) — by nDCG, no-RM3 wins on both. **Two reasons
+it's not worth it for frankensearch's hybrid:** (1) the recall gain is **redundant** — the vector tier already supplies
+recall (hybrid recall@100 ≈ 0.96, `ad4487e`), so RM3's lexical recall bump adds little the vector tier doesn't already
+cover; (2) the nDCG hit would **propagate** into the fusion. So the lexical tier should stay plain BM25 over concatenated
+title+body. **This closes lexical-tier tuning:** both classic BM25 improvements — BM25F title-boosting (`b10e243`) and
+RM3 — are net-neutral-to-negative for the hybrid, and both PRF variants (embedding-space `433f758` and lexical RM3) fail
+to cleanly help. The vector tier is the right way to improve recall, not lexical expansion. Verified: `rank_bm25`
+(BM25Okapi + its IDF weights) on BEIR SciFact/NFCorpus qrels (no cargo).
