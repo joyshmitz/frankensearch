@@ -5075,3 +5075,12 @@ Net: the session's two headline conclusions (int8 lossless/7.1×; 4-bit rotation
 real embedding distributions (potion PCA-static and MiniLM raw-transformer), and both turn out near-Gaussian — the
 synthetic-corpus worry about real anisotropy breaking int8 does not materialize. Verified: `--features fastembed` example
 + `real_embed_quant` bench run clean locally (exit 0).
+
+**Follow-up (closes the potion/MiniLM asymmetry for the ANN arc): `real_embed_ann` on MiniLM (N=28 336, dim=384, M=32).**
+The quant conclusions were validated on both distributions above; the ANN conclusions had rested only on potion. MiniLM
+ANN recall@10 = 0.980/0.994/0.995 at ef=40/100/200 (plateau 0.995), and the per-query tail certificate (0.95, α 0.1)
+**`meets=true` at ef=100 with lower bound 1.0000**. So the ANN cert arc replicates on the 384-d raw-transformer
+distribution — and is in fact **easier** than potion (potion needed ef=200 @ M=32 to certify at N=40k; MiniLM certifies at
+the cheaper ef=100, and its recall is higher at every ef: ef40 0.980 vs potion 0.956). Higher-dim near-isotropic
+embeddings give HNSW cleaner neighborhoods. Both real distributions now confirm both the quant AND the ANN conclusions.
+Verified: `--features ann` bench runs clean locally (exit 0).
