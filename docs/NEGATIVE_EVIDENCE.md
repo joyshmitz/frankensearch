@@ -5707,3 +5707,28 @@ This tempers the SciFact-only enthusiasm with the right multi-dataset framing: a
 its lift is largest on genuinely semantic corpora. (Caveat: NFCorpus recall@10 is low because it has many relevant docs
 per query — nDCG is the fairer metric there, and the hybrid still leads 0.321 > 0.308 > 0.303.) Verified: `model2vec`
 (retrieval-32M) + `sklearn` venv on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — ACTIONABLE (the default is the worst): frankensearch's stock embedder `potion-multilingual-128M` is the WORST of 4 model2vec models for English retrieval — retrieval-32M is +33% better (IronPetrel)
+
+Directly evaluated **frankensearch's current default embedder** (`DEFAULT_MODEL_NAME = "potion-multilingual-128M"`,
+`model2vec_embedder.rs:35`) against alternatives on the BEIR harness (vector-tier recall@10 / nDCG@10):
+
+| model2vec model | SciFact | NFCorpus | note |
+|---|---|---|---|
+| potion-base-8M (general, small) | 0.662 / 0.506 | 0.108 / 0.244 | |
+| potion-base-32M (general) | 0.702 / 0.562 | 0.132 / 0.273 | |
+| **potion-retrieval-32M (retrieval-distilled)** | **0.795 / 0.633** | **0.148 / 0.308** | best |
+| **potion-multilingual-128M (frankensearch DEFAULT)** | **0.598 / 0.451** | **0.085 / 0.174** | **worst** |
+
+**Finding:** frankensearch's stock default — the **largest** model (128M) — is the **worst of the four on English
+retrieval**: SciFact recall **0.598 vs retrieval-32M's 0.795 (+0.197, +33% relative)**, and it even trails the tiny
+general potion-base-8M (0.662). The multilingual model trades English-retrieval quality for language coverage (a
+reasonable choice *iff* the deployment is multilingual, but a poor English default). **Direct, high-value product action:
+change the default English embedder from `potion-multilingual-128M` to a retrieval-distilled model
+(`potion-retrieval-32M` class) — a ~33% vector-recall upgrade for free (still a lightweight static model, no ONNX/torch,
+and 32M < 128M so it's smaller and faster too).** This is the single highest-leverage, lowest-cost change surfaced this
+session: the embedder default, not any algorithm. (Keep a multilingual option for non-English corpora; the recommendation
+is the *default*.) Verified: `model2vec` (all four auto-downloaded) + `sklearn` venv on BEIR SciFact + NFCorpus qrels (no
+cargo, no torch).
