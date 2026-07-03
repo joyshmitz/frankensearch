@@ -6049,3 +6049,36 @@ gate reranking behind a per-corpus eval. Cost caveat unchanged: `bge-reranker-ba
 `ms-marco-L6` on CPU — the quality/latency trade is real, so reranking stays a **conditional** premium, but when you DO
 rerank, the model choice is decisive. Verified: `fastembed` TextCrossEncoder (both ONNX cross-encoders) + `model2vec`
 retrieval-32M + `rank_bm25` in the venv on BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+### Reranker CROSS-DATASET: no safe default reranker — "stronger" (bge) is NOT safer; it can catastrophically hurt (IronPetrel, 2026-07-03)
+
+The prior entry recommended "ship `bge-reranker-base`, not ms-marco" — but that was measured on **one** dataset
+(SciFact). Held to the same 3-BEIR-dataset bar as the embedder recommendation, **it fails.** Same hybrid candidates
+(retrieval-32M + real BM25, top-30), 60-query subsets, both cross-encoders vs the no-rerank baseline:
+
+| dataset (query style) | hybrid baseline nDCG@10 | `ms-marco-MiniLM-L-6-v2` Δ | `bge-reranker-base` Δ |
+|---|---|---|---|
+| SciFact (scientific *claims*) | 0.7572 | −0.0162 (−2.1%) | **+0.0335 (+4.4%)** |
+| NFCorpus (natural-language health *questions*) | 0.2924 | **+0.0687 (+23.5%)** | −0.0003 (~0) |
+| ArguAna (argument → *counter*-argument) | 0.3134 | **+0.0221 (+7.0%)** | **−0.0732 (−23.4%)** |
+
+**Finding — the "best" reranker flips completely by corpus; there is no safe default, and stronger ≠ safer.**
+- **`bge-reranker-base`** wins *only* on SciFact (+4.4%), is **inert on NFCorpus** (~0), and **catastrophically hurts
+  ArguAna (−23.4%)**. The ArguAna collapse is the sharp lesson: ArguAna's relevant doc *argues against* the query, but a
+  strong similarity reranker ranks same-stance (semantically-nearest) docs highest → it **actively demotes the correct
+  counter-arguments.** When the task's notion of relevance (counter-argument) diverges from the reranker's training
+  objective (semantic similarity), a *stronger* reranker does *more* damage.
+- **`ms-marco-MiniLM-L-6-v2`** is the better **generalist** — net-positive on 2/3 (huge +23.5% on NFCorpus's
+  web-question-style queries, which match its MS-MARCO training; +7.0% ArguAna), only mildly negative on SciFact.
+
+**This RETRACTS the prior entry's "ship bge-reranker-base as the reranking default."** Corrected takeaway: **the
+reranker model is not universally rankable — you MUST evaluate the reranker per-corpus.** Neither model is a safe
+default: ms-marco is the safer *generalist* but can be net-neutral/negative on claim-style corpora; bge peaks higher on
+some but can lose 23% on adversarial-relevance tasks. The only robust rule is **reranking is conditional, and the
+reranker choice is a per-corpus eval decision** (or skip reranking — the hybrid alone is never catastrophic, whereas a
+mismatched reranker can be). This also strengthens the earlier "reranker is a conditional polish" verdict: the
+*downside risk* of the wrong reranker (−23%) exceeds the upside of the right one on most corpora. Verified: `fastembed`
+TextCrossEncoder (both ONNX cross-encoders) + `model2vec` retrieval-32M + `rank_bm25` on BEIR NFCorpus/ArguAna qrels
+(no cargo, no torch).

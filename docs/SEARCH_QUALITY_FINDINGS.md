@@ -50,19 +50,26 @@ measurably the worst option for English retrieval.
   **96% of relevant docs** (SciFact recall@100 = 0.960), and the vector tier's edge over BM25
   *grows* with depth (exactly what a reranker exploits).
 
-### 4. Reranker is a CONDITIONAL polish — and the MODEL choice is decisive (measured head-to-head).
-- frankensearch's default reranker (`ms-marco-MiniLM-L-6-v2`) is a **poor default for non-web corpora**:
-  on SciFact it hovers around **zero and its sign flips with the query sample** (+1.5% on 300 queries,
-  **−2.1% on an 80-query subset — it *loses* quality**). It's trained on MS-MARCO **web passages** and
-  transfers weakly to out-of-domain (scientific) text.
-- **A strong general reranker fixes it: `bge-reranker-base` scored +4.4% nDCG on the same candidates**
-  (0.757→0.791) — a **+0.050 nDCG (+6.7%) gap** over ms-marco, swinging the tier **from net-negative to
-  net-positive.** The small lift in the first measurement was the **MODEL's fault, not the task's**;
-  the reranker tier carries real headroom with a reranker that generalizes.
-- **Recommendation:** ship `bge-reranker-base` (or a domain-matched reranker) as the reranking default,
-  or gate reranking behind a per-corpus eval. Cost trade is real (`bge-reranker-base` ~278M ≈ 3× slower
-  per pair than `ms-marco-L6` on CPU), so reranking stays conditional — but when you DO rerank, **don't
-  use the ms-marco default off-web-domain.** Or **skip reranking** if the hybrid already ranks well.
+### 4. Reranker is a CONDITIONAL polish — there is NO safe default reranker (measured across 3 datasets).
+The "best" reranker **flips completely by corpus**, and *stronger is not safer.* Same hybrid candidates,
+both cross-encoders vs no-rerank, on all 3 BEIR datasets:
+
+| dataset (query style) | `ms-marco-L6` (default) | `bge-reranker-base` (strong) |
+|---|---|---|
+| SciFact (scientific *claims*) | −2.1% | **+4.4%** |
+| NFCorpus (health *questions*) | **+23.5%** | ~0 |
+| ArguAna (arg → *counter*-arg) | **+7.0%** | **−23.4%** |
+
+- **`bge-reranker-base` is NOT a safe default** (retracts an earlier single-dataset call): it wins only on
+  SciFact, is inert on NFCorpus, and **loses 23% on ArguAna** — a strong *similarity* reranker demotes the
+  *counter*-arguments ArguAna wants. When the task's relevance notion diverges from the reranker's training
+  objective, a stronger reranker does *more* damage.
+- **`ms-marco-L6` is the better generalist** (net-positive 2/3, +23.5% on web-question-style NFCorpus) but is
+  mildly negative on claim-style SciFact.
+- **Recommendation:** treat the reranker as a **per-corpus eval decision, not a default** — the downside of a
+  mismatched reranker (−23%) exceeds the upside of the right one on most corpora. **The hybrid alone is never
+  catastrophic; a mismatched reranker can be.** Cost adds to the case: `bge-reranker-base` (~278M) is ≈3× slower
+  per pair than `ms-marco-L6` on CPU. When in doubt, **skip reranking** — or A/B a candidate reranker per corpus.
 
 ### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
 - On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both
