@@ -6506,3 +6506,29 @@ Added `rrf_weights_flow_through_searcher_to_fusion`: with a lexical source favor
 favoring another, **extreme opposite tier weights flip the fused top result** — proving the builder values reach
 `rrf_fuse` end-to-end (also exercises `with_rrf_tiebreak(Hash)` on the searcher path). `cargo test -p frankensearch-fusion
 --lib` → **823 passed, 0 failed**. Closes the coverage gap between the shipped builders and the low-level fusion units.
+
+---
+
+### CAPSTONE: full recommended pipeline vs Tantivy, end-to-end in one harness — +12-13% nDCG (IronPetrel, 2026-07-03)
+
+The definitive "ratio vs Tantivy" for the **whole** recommended stack, composed and run end-to-end in a single consistent
+harness (same query set, same candidate depths) — not stitched from prior per-experiment subsets. Pipeline:
+retrieval-32M vector + BM25 → **tuned RRF** (stronger-tier weight ~1.3, small k=10) → **RRF-combine reranker**
+(corpus-appropriate cross-encoder). Baseline = Tantivy BM25-alone (`rank_bm25`).
+
+| stage | SciFact recall@10 / nDCG@10 | NFCorpus recall@10 / nDCG@10 |
+|---|---|---|
+| **Tantivy BM25-alone** (baseline) | 0.7757 / 0.6523 | 0.1522 / 0.3062 |
+| + hybrid (retrieval-32M + tuned RRF) | 0.8159 / 0.6837 | 0.1585 / 0.3268 |
+| + RRF-combine rerank (bge / ms-marco) | **0.8724 / 0.7309** | **0.1667 / 0.3460** |
+| **FULL STACK vs Tantivy** | **+12% / +12%** | **+10% / +13%** |
+
+**Finding — the full recommended frankensearch pipeline beats Tantivy BM25-alone by +12-13% nDCG and +10-12% recall,
+consistently across both datasets, with every stage contributing monotonically.** SciFact nDCG 0.652 → 0.684 (hybrid) →
+0.731 (+rerank); NFCorpus 0.306 → 0.327 → 0.346. This composes all measured recommendations into one number: the
+retrieval-distilled embedder (#1), two-tier hybrid (#2), tuned RRF (#3, using the shipped `RrfConfig` weights), and the
+RRF-combine reranker (#4, the shipped `RerankCombine::RrfCombine`). It is the headline result the whole investigation
+builds toward — and note the reranker uses the **shipped, default-preserving `RrfCombine` mode**, so this exact pipeline
+is expressible today via the `TwoTierSearcher` builders (`with_rrf_weights` + `with_rerank_combine`) plus a
+retrieval-distilled embedder; only the *defaults* remain product-gated. Verified: `model2vec` retrieval-32M +
+`fastembed` cross-encoders + `rank_bm25` on BEIR SciFact/NFCorpus qrels (no cargo, no torch).

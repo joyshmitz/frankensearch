@@ -118,6 +118,16 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
 | NFCorpus | 0.141 / 0.268 | **0.156 / 0.321** | +1.5 / +5.3 |
 | ArguAna | 0.778 / 0.373 | **0.794 / 0.384** | +1.6 / +1.1 |
 
+## Capstone: FULL pipeline (1+3+4) vs Tantivy BM25-alone (one end-to-end run)
+The whole recommended stack — retrieval-32M + tuned RRF hybrid **+ RRF-combine reranker** — vs Tantivy BM25-alone,
+each stage's contribution shown (recall@10 / nDCG@10). This is the headline number, using the *shipped*
+`RerankCombine::RrfCombine` + `RrfConfig` weights (so it's expressible today; only defaults are product-gated):
+
+| BEIR | Tantivy BM25 | + hybrid | + RRF-combine rerank | full vs Tantivy |
+|---|---|---|---|---|
+| SciFact | 0.776 / 0.652 | 0.816 / 0.684 | **0.872 / 0.731** | **+12% / +12%** |
+| NFCorpus | 0.152 / 0.306 | 0.159 / 0.327 | **0.167 / 0.346** | **+10% / +13%** |
+
 ## Gotchas ruled out (measured)
 - **Query prefixes** (`query:`/`passage:`): do NOT add them — potion-retrieval-32M is a no-prefix
   (symmetric) model; prefixes cost 2-3 recall pts.
