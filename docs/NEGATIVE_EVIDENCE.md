@@ -5992,3 +5992,31 @@ ceiling measured this session — **SciFact 0.865 recall / 0.724 nDCG**, well ab
 default's hybrid (0.785/0.591). This is the strongest end-to-end evidence that frankensearch's hybrid + a good embedder
 beats Tantivy-lexical, and that the hybrid earns its keep even when you can afford the best vector model. Verified:
 `fastembed` (bge-small) + `rank_bm25` in the venv on BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — MEASURED (the last tier — reranker): frankensearch's DEFAULT reranker (ms-marco-MiniLM-L-6-v2) adds only +1.5% nDCG on out-of-domain SciFact — the reranker choice matters like the embedder (IronPetrel)
+
+Completed the full-pipeline validation by measuring the **reranker** tier (frankensearch's final stage; the default is
+`ms-marco-MiniLM-L-6-v2` per `model_cache.rs`). Reranked the hybrid's top-50 candidates with the *exact* default reranker
+(`Xenova/ms-marco-MiniLM-L-6-v2` via `fastembed` cross-encoder, ONNX, no torch) on SciFact:
+
+| SciFact (n=300) | recall@10 | nDCG@10 |
+|---|---|---|
+| hybrid (retrieval-32M + BM25), no rerank | 0.8341 | 0.6890 |
+| hybrid **+ rerank (ms-marco-MiniLM-L-6-v2)** | 0.8382 | **0.6991** |
+| rerank Δ | +0.004 | **+0.0102 (+1.5%)** |
+
+**Finding:** frankensearch's **default reranker gives only a modest +0.010 nDCG (+1.5%)** lift on SciFact — far below the
+big gains cross-encoder rerankers typically show. Two honest reasons: (1) **domain mismatch** — `ms-marco-MiniLM` is
+trained on MS-MARCO **web passages**, and it transfers weakly to SciFact's **scientific-claim** domain; (2) the hybrid
+candidates are already well-ranked (retrieval-32M nDCG 0.633), leaving less headroom. So the reranker is **not free
+quality** on out-of-domain corpora — **the reranker model choice matters as much as the embedder**: a domain-matched or
+stronger reranker (`BAAI/bge-reranker-base`, jina-reranker-v2) would likely help more, but the *default* ms-marco reranker
+under-delivers off-web-domain. **Product takeaway:** don't assume the default reranker is a big win everywhere — its value
+is domain-dependent; for non-web-search corpora, evaluate a domain-appropriate reranker (or skip reranking if the hybrid
+already ranks well, saving the cross-encoder's per-candidate forward-pass cost — reranking 50 candidates × 300 queries
+took minutes of CPU here). This completes the full pipeline picture (fast-tier int8 → hybrid fusion → rerank): the big,
+free levers are **the embedder** (+33% free) and **the hybrid** (always ≥ best single tier); the reranker is a
+**conditional, model-and-domain-dependent** final polish, not a guaranteed win. Verified: `fastembed` cross-encoder
+(ms-marco-MiniLM-L-6-v2, ONNX) + `model2vec` + `rank_bm25` in the venv on BEIR SciFact qrels (no cargo, no torch).
