@@ -5037,3 +5037,41 @@ M=32 graph memory + slower build), certified at ef=200 (≈1.4× vs flat 6.17 ms
 certifiable much cheaper (ef=100, recall 0.988, ≈2.5× vs flat). The synthetic-era cert numbers were optimistic on the
 *tail at large N with default M*, but the guarantee is recoverable — it is an **M-budget** decision, not a wall.
 Verified: `--features ann` runs clean locally (exit 0).
+
+---
+
+## 2026-07-02 — MEASURED (CONFIRMS on the hard distribution): RAW transformer (MiniLM-L6-v2) embeddings — int8 still LOSSLESS, 4-bit rotation still moot, and mean-pooled sentence embeddings are near-ISOTROPIC (IronPetrel)
+
+The potion (Model2Vec) results carried a caveat: potion PCA-smooths its embeddings to near-Gaussian, so they might not
+stress per-dimension int8 quant the way raw transformer "outlier dimensions" would. Closed that gap: built
+`minilm_embed_corpus.rs` (`--features fastembed`, self-contained ort-download onnxruntime) and embedded the 30k corpus
+with the on-disk **all-MiniLM-L6-v2 ONNX** (384-d, mean-pooled + normalized), then re-ran `real_embed_quant`.
+
+**Anisotropy (MiniLM, dim=384):** per-dim variance share `top1=0.4% top5=2.0% top10=3.8%`, excess-kurtosis `−0.02`.
+For reference a *fully isotropic* 384-d has top1=1/384=0.26%, so MiniLM's top dim is only ~1.5× isotropic — **even MORE
+isotropic than potion-256** (top10 was 12%). The documented transformer "outlier/massive-activation dimension"
+phenomenon (which lives in raw per-token activations of larger models) **does NOT survive mean-pooling + L2-normalization**
+into these sentence embeddings.
+
+**Recall@10 (MiniLM, N=29 700, k=10, 300 queries):**
+
+| mult | int8 | int8+rot | 4bit | 4bit+rot |
+|---|---|---|---|---|
+| 2  | 1.0000 | 1.0000 | 0.9927 | 0.9913 |
+| 3  | 1.0000 | 1.0000 | 0.9997 | 0.9980 |
+| 5  | 1.0000 | 1.0000 | 1.0000 | 0.9997 |
+| 10 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+
+**Findings — both core conclusions CONFIRMED on the harder distribution:**
+1. **int8 two-pass is LOSSLESS on raw-transformer embeddings too** (recall 1.0 at mult=2). The headline `int8 7.1× vs
+   flat @ recall 1.0` (`0b9800e`) is **distribution-robust** — its losslessness rests on the quantizer's *per-dimension
+   adaptive* range, which handles any per-dim scale, so it survives the switch from potion to MiniLM.
+2. **The 4-bit rotation lever is confirmed MOOT — and MiniLM makes it moot for a second, independent reason.** 4-bit is
+   *already* near-lossless here (0.993 @mult2, vs potion's 0.898) because MiniLM is 384-d and near-isotropic, so there is
+   nothing for a variance-equalizing rotation to fix — and it in fact **slightly hurts** (0.9913 < 0.9927 @mult2). So
+   across *both* real distributions the verdict holds: ship int8; 4-bit rotation buys nothing at the system level.
+
+Net: the session's two headline conclusions (int8 lossless/7.1×; 4-bit rotation system-moot) are validated on **two**
+real embedding distributions (potion PCA-static and MiniLM raw-transformer), and both turn out near-Gaussian — the
+synthetic-corpus worry about real anisotropy breaking int8 does not materialize. Verified: `--features fastembed` example
++ `real_embed_quant` bench run clean locally (exit 0).
