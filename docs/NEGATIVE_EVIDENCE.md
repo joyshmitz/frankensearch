@@ -5443,3 +5443,29 @@ the query-length spectrum**, always ≥ the better single tier and always > Tant
 product argument for the hybrid tier: it removes the query-length risk of committing to lexical-only (weak on long/semantic
 queries) or vector-only (weak on short/keyword queries). Verified: `--features lexical` bench, async Tantivy index of 130k
 docs, ran clean (exit 0) once the shared-target lock cleared (see [[isolated-target-sidesteps-lock-contention]]).
+
+---
+
+## 2026-07-03 — ROOT CAUSE (mechanistic, no rebuild): the short-query vector collapse is QUERY-EMBEDDING DRIFT — the query vector moves away from its source doc as the query shortens (IronPetrel)
+
+Explains *why* the vector tier collapses on short queries (0.99/0.79/0.45 recall@10 at 10/5/3 words). Pure-Python analysis
+of the existing embedding slabs (no cargo build — dodges the shared-target lock): for each known-item query, the cosine
+similarity between the **query embedding** and its **source doc's embedding** (both L2-normalized potion-256; 130k corpus,
+321 queries):
+
+| query length | cos(query, source-doc) mean | median | p10 | frac < 0.5 | → measured recall@10 |
+|---|---|---|---|---|---|
+| 10-word | 0.846 | 0.873 | 0.693 | 0.00 | 0.99 |
+| 5-word | 0.656 | 0.674 | 0.460 | 0.15 | 0.79 |
+| 3-word | **0.517** | 0.527 | 0.277 | **0.39** | 0.45 |
+
+**Finding:** the collapse is **query-embedding drift**, not a retrieval/index defect — as the query shrinks from 10→3
+words its embedding moves from cos **0.85 → 0.52** away from the very doc it came from, and at 3 words **39% of queries are
+< 0.5 cosine to their own source doc**. In a 130k corpus, a query vector only 0.52-similar to its target has thousands of
+docs nearer, so the true doc falls out of the top-10 (recall 0.45). The cos-drift curve (0.85/0.66/0.52) tracks the recall
+curve (0.99/0.79/0.45) tightly. **Consequences:** (1) this is a property of the *query*, so no ANN/quant/index tuning can
+fix it — only a better *query representation* (more context) or the lexical tier (which matches the literal keywords)
+helps; it's precisely why lexical carries the hybrid on short queries and why the hybrid's advantage over Tantivy shrinks
+there. (2) Open question (MiniLM contextual-vs-static test building): does a contextual model drift *less* on short spans,
+or is 3-word underspecification fundamental? — the cos-drift metric is the clean way to answer it (compare MiniLM's
+cos(query,source) curve to potion's). Verified: computed directly from the committed slabs; recall figures from `6bf4b25`.
