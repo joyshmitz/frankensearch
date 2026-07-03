@@ -6495,3 +6495,14 @@ expose the full fusion-tuning recipe (`with_rrf_weights` + `with_rrf_tiebreak`),
 async path — every measured fusion/rerank capability is reachable from **both** primary entry points. Only the *default*
 values remain product-gated. Recurring lesson: when a capability seems blocked by a widely-constructed config struct,
 check whether the entry-point struct has its own builder — it usually does, and that's the ripple-free home.
+
+---
+
+### Test: end-to-end coverage for the searcher fusion-tuning builders (IronPetrel, 2026-07-03)
+
+The fusion-weight / tiebreak knobs (`7ccda28`/`05472cd`) had unit coverage in `rrf.rs` but nothing validated that the
+`SyncTwoTierSearcher::with_rrf_weights` / `with_rrf_tiebreak` builders actually *thread through* to the fusion `RrfConfig`.
+Added `rrf_weights_flow_through_searcher_to_fusion`: with a lexical source favoring one doc and the quality/semantic tier
+favoring another, **extreme opposite tier weights flip the fused top result** — proving the builder values reach
+`rrf_fuse` end-to-end (also exercises `with_rrf_tiebreak(Hash)` on the searcher path). `cargo test -p frankensearch-fusion
+--lib` → **823 passed, 0 failed**. Closes the coverage gap between the shipped builders and the low-level fusion units.

@@ -647,6 +647,35 @@ mod tests {
     }
 
     #[test]
+    fn rrf_weights_flow_through_searcher_to_fusion() {
+        // Lexical favors "c" (then "b"); the quality/semantic tier favors a different doc
+        // for query [1,0]. Extreme opposite tier weights must therefore flip the top result,
+        // proving `with_rrf_weights` / `with_rrf_tiebreak` reach the fusion `RrfConfig`.
+        let make_lex = || {
+            Arc::new(StaticLexical {
+                hits: vec![lexical_result("c", 10.0), lexical_result("b", 5.0)],
+            })
+        };
+        let q = [1.0_f32, 0.0];
+
+        let sem_heavy = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_lexical(make_lex())
+            .with_rrf_weights(0.01, 100.0)
+            .with_rrf_tiebreak(crate::rrf::RrfTiebreak::Hash);
+        let lex_heavy = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_lexical(make_lex())
+            .with_rrf_weights(100.0, 0.01);
+
+        let (sem_res, _) = sem_heavy.search_collect(&q, 3).unwrap();
+        let (lex_res, _) = lex_heavy.search_collect(&q, 3).unwrap();
+        assert!(!sem_res.is_empty() && !lex_res.is_empty());
+        assert_ne!(
+            sem_res[0].doc_id, lex_res[0].doc_id,
+            "opposite tier weights must change the fused top result (weights reach fusion)"
+        );
+    }
+
+    #[test]
     fn search_iter_yields_initial_then_refined() {
         let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
         let phases = searcher.search_iter(&[1.0, 0.0], 2).collect::<Vec<_>>();
