@@ -5760,3 +5760,27 @@ model. (This also reconciles the MRL machinery in `mrl.rs`: its "2–6× faster"
 with a Matryoshka-trained embedder, which the stock `potion-multilingual-128M`/`potion-base-8M` defaults are not; another
 reason to switch the default to a retrieval-distilled model.) Verified: `model2vec` retrieval-32M + numpy in the venv on
 BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — SYNTHESIS (the total uplift): the RECOMMENDED stack beats frankensearch's CURRENT stack on all 3 BEIR datasets, with a smaller+faster embedder (IronPetrel)
+
+End-to-end comparison of the full **hybrid** under two configs — **CURRENT** (stock default `potion-multilingual-128M`
+vector + equal-weight RRF k=60) vs **RECOMMENDED** (`potion-retrieval-32M` vector + stronger-tier-weighted RRF, k=10) —
+across all 3 BEIR datasets (recall@10 / nDCG@10):
+
+| dataset | CURRENT (multilingual-128M + equal RRF) | RECOMMENDED (retrieval-32M + tuned RRF) | Δrecall / ΔnDCG |
+|---|---|---|---|
+| SciFact | 0.785 / 0.591 | **0.835 / 0.665** | **+0.050 / +0.074** |
+| NFCorpus | 0.141 / 0.268 | **0.156 / 0.321** | +0.015 / +0.053 |
+| ArguAna | 0.778 / 0.373 | **0.794 / 0.384** | +0.016 / +0.011 |
+
+**Finding — the session's recommendations, combined, are a consistent measured win:** the recommended stack **beats the
+current stack on every dataset** (+1.5 to +5.0 recall pts, +1.1 to +7.4 nDCG pts), with the **nDCG gains larger than
+recall** (the retrieval-tuned model ranks relevant docs higher) — and it does so with a **smaller (32M < 128M), faster**
+embedder. (Note the current hybrid isn't terrible — 0.785 SciFact — because the strong lexical/BM25 tier masks the weak
+multilingual vector tier 0.598; but the recommended stack lifts it further, especially in ranking.) **Net: two changes —
+(1) default embedder → retrieval-distilled, (2) RRF → stronger-tier weight + smaller k + neutral tiebreak — deliver a
+consistent +1.5–5.0 recall / +1.1–7.4 nDCG improvement across BEIR at lower embedder cost.** This is the quantified,
+multi-dataset business case for the roadmap. Verified: `model2vec` (both stacks auto-downloaded) + `sklearn` venv on BEIR
+SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
