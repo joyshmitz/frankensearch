@@ -6475,3 +6475,23 @@ sync-searcher path (`sync_searcher.rs`, sourcing `k` from `TwoTierConfig`) still
 weights there needs the `TwoTierConfig` field addition (~35 construction sites), deferred. All four fusion/rerank
 capabilities (int8, RRF-combine reranker, per-tier weights, hash tiebreak) are now reachable from the primary searcher
 API; only the *default* values remain product-gated.
+
+---
+
+### SHIPPED: sync-searcher fusion tuning too — the "deferred sync gap" was not actually blocked (IronPetrel, 2026-07-03)
+
+The prior entry deferred the sync path, claiming it needed the `TwoTierConfig` 35-site ripple. That was wrong (same
+class of error as the earlier searcher-exposure dismissal): `SyncTwoTierSearcher` is its **own struct with a builder**,
+so the weights/tiebreak go on *it*, not `TwoTierConfig` — no ripple.
+
+- Three fields on `SyncTwoTierSearcher` (`rrf_lexical_weight`/`rrf_semantic_weight`/`rrf_tiebreak`, default
+  `1.0`/`1.0`/`LexicalThenId`) + `const fn` builders `with_rrf_weights` / `with_rrf_tiebreak`, threaded into **both**
+  of its per-query `RrfConfig` constructions (`sync_searcher.rs:180`, `:267`). Added the 3 fields to its manual `Debug`
+  impl (fixing the `missing_fields_in_debug` lint).
+
+**Verification:** `cargo test -p frankensearch-fusion --lib` → **822 passed, 0 failed**; `cargo clippy` clean.
+Default-preserving. Both the async (`TwoTierSearcher`, `e3bbc7b`) and sync (`SyncTwoTierSearcher`) searcher APIs now
+expose the full fusion-tuning recipe (`with_rrf_weights` + `with_rrf_tiebreak`), and the reranker combine mode on the
+async path — every measured fusion/rerank capability is reachable from **both** primary entry points. Only the *default*
+values remain product-gated. Recurring lesson: when a capability seems blocked by a widely-constructed config struct,
+check whether the entry-point struct has its own builder — it usually does, and that's the ripple-free home.

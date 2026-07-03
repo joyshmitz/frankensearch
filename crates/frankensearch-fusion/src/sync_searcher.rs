@@ -23,7 +23,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier_aligned, compute_rank_changes_with_maps};
-use crate::rrf::{candidate_count, rrf_fuse, rrf_fuse_with_graph_merge_unique, RrfConfig};
+use crate::rrf::{candidate_count, rrf_fuse, rrf_fuse_with_graph_merge_unique, RrfConfig, RrfTiebreak};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
 pub trait SyncLexicalSearch: Send + Sync {
@@ -44,6 +44,9 @@ pub struct SyncTwoTierSearcher {
     lexical: Option<Arc<dyn SyncLexicalSearch>>,
     search_params: Option<SearchParams>,
     config: TwoTierConfig,
+    rrf_lexical_weight: f64,
+    rrf_semantic_weight: f64,
+    rrf_tiebreak: RrfTiebreak,
 }
 
 impl SyncTwoTierSearcher {
@@ -55,6 +58,9 @@ impl SyncTwoTierSearcher {
             lexical: None,
             search_params: None,
             config,
+            rrf_lexical_weight: 1.0,
+            rrf_semantic_weight: 1.0,
+            rrf_tiebreak: RrfTiebreak::LexicalThenId,
         }
     }
 
@@ -69,6 +75,28 @@ impl SyncTwoTierSearcher {
     #[must_use]
     pub const fn with_search_params(mut self, params: SearchParams) -> Self {
         self.search_params = Some(params);
+        self
+    }
+
+    /// Set per-tier RRF fusion weights (default `1.0` / `1.0` = neutral).
+    ///
+    /// Up-weighting the *stronger* tier for the workload (~1.3×) makes the hybrid strictly
+    /// dominate the best single tier (see `docs/NEGATIVE_EVIDENCE.md`). Non-finite or `≤ 0`
+    /// values fall back to `1.0`.
+    #[must_use]
+    pub const fn with_rrf_weights(mut self, lexical_weight: f64, semantic_weight: f64) -> Self {
+        self.rrf_lexical_weight = lexical_weight;
+        self.rrf_semantic_weight = semantic_weight;
+        self
+    }
+
+    /// Set the RRF tie-break strategy (default [`RrfTiebreak::LexicalThenId`]).
+    ///
+    /// [`RrfTiebreak::Hash`] breaks score ties by an unbiased hash of `doc_id` rather than
+    /// favoring the lexical tier (see `docs/NEGATIVE_EVIDENCE.md`).
+    #[must_use]
+    pub const fn with_rrf_tiebreak(mut self, tiebreak: RrfTiebreak) -> Self {
+        self.rrf_tiebreak = tiebreak;
         self
     }
 
@@ -178,7 +206,9 @@ impl SyncTwoTierSearcher {
                         0,
                         &RrfConfig {
                             k: self.config.rrf_k,
-                            ..Default::default()
+                            lexical_weight: self.rrf_lexical_weight,
+                            semantic_weight: self.rrf_semantic_weight,
+                            tiebreak: self.rrf_tiebreak,
                         },
                     ),
                     k,
@@ -265,7 +295,9 @@ impl SyncTwoTierSearcher {
                     0,
                     &RrfConfig {
                         k: self.config.rrf_k,
-                        ..Default::default()
+                        lexical_weight: self.rrf_lexical_weight,
+                        semantic_weight: self.rrf_semantic_weight,
+                        tiebreak: self.rrf_tiebreak,
                     },
                 ),
                 k,
@@ -366,6 +398,9 @@ impl std::fmt::Debug for SyncTwoTierSearcher {
             .field("search_params", &self.search_params)
             .field("has_quality_index", &self.index.has_quality_index())
             .field("config", &self.config)
+            .field("rrf_lexical_weight", &self.rrf_lexical_weight)
+            .field("rrf_semantic_weight", &self.rrf_semantic_weight)
+            .field("rrf_tiebreak", &self.rrf_tiebreak)
             .finish()
     }
 }
