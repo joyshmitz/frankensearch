@@ -4983,3 +4983,35 @@ system verdict.
    20→5 matters). Absent those, **int8 two-pass is the recall-per-byte AND latency winner at large N; ship int8, not
    4-bit.** Backlog #3 refined from "first positive" to "positive-in-isolation, dominated-in-system"; the real shippable
    result is the measured **int8 7.1× vs flat on real data**. Verified: runs clean locally (exit 0, 0 panics).
+
+---
+
+## 2026-07-02 — MEASURED (mixed/validation): HNSW ANN cert arc on REAL embeddings — mean-recall speedups HOLD (2.5× @0.98), but the per-query TAIL 0.95 certificate is NOT achievable on real data (IronPetrel)
+
+The entire ANN recall-CERTIFICATE arc (`certify_ef_search`; ledger tail 1.76×/mean 3.70× vs flat; "ANN-in-BOLD viable")
+was measured only on SYNTHETIC tight-cluster corpora (NOISE=0.15). New bench `real_embed_ann.rs` re-runs it on genuine
+potion-256 embeddings (N=100 336, M=32, k=10) via `HnswIndex::certify_ef_search`.
+
+| ef | recall@10 (real) | HNSW latency | vs flat (6.17 ms) |
+|---|---|---|---|
+| 40  | 0.938 | 1.21 ms | **5.1×** |
+| 100 | 0.978 | 2.49 ms | **2.5×** |
+| 200 | 0.992 | 4.33 ms | 1.4× |
+
+Certificate (tail, target 0.95, α 0.1): **`meets=false` — the best-certifiable ef is 100 with a conformal lower bound of
+only 0.90; 0.95 is NOT met even at ef=200** (whose *mean* recall is 0.992).
+
+**Findings (honest):**
+1. **The mean-recall speedups broadly HOLD on real data**: HNSW is **2.5× faster than flat at 0.978 mean recall** (ef100)
+   and 5.1× at 0.938 (ef40). ANN-in-BOLD's *latency-vs-mean-recall* case survives the jump from synthetic to real
+   embeddings — the ~2.5–5× band is real, not a synthetic artifact.
+2. **But the strong per-query TAIL guarantee does NOT transfer.** On real embeddings the split-conformal 0.95 tail
+   certificate is unachievable at ef≤200 — real potion embeddings have a **heavy low-recall tail** (a minority of queries
+   whose true neighbors HNSW misses regardless of ef), which pins the conformal lower bound at ~0.90 even while mean
+   recall is 0.99. The synthetic tight clusters hid this (uniform easy queries → tail≈mean). So the certified-ef arc's
+   *tail-mode* numbers were optimistic; on real data only the **mean-recall (Bernstein) mode** is viable, and only down
+   to a ~0.90 per-query floor.
+3. **Consequence:** if BOLD needs a per-query 0.95 tail guarantee, HNSW-at-ef≤200 on real embeddings can't provide it —
+   use the mean-recall budget (2.5× @0.98 mean) or a higher ef / M / exact fallback for the tail. Route-next: sweep M=48/64
+   and ef>200 to see whether the tail floor lifts, and re-confirm on the on-disk MiniLM-L6-v2 (raw transformer, harder
+   distribution). Verified: `--features ann` bench compiles + runs locally (exit 0); recall/cert/latency captured.

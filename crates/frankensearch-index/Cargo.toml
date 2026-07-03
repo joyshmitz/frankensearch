@@ -63,6 +63,11 @@ harness = false
 name = "real_embed_quant"
 harness = false
 
+# REAL-embedding validation of the HNSW ANN recall-certificate arc (--features ann).
+[[bench]]
+name = "real_embed_ann"
+harness = false
+
 # FSVI (file-backed) int8 two-pass vs flat exact — standalone large-N vector search.
 [[bench]]
 name = "fsvi_int8_two_pass"
