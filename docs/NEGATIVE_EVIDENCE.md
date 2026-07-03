@@ -5544,3 +5544,25 @@ on a free-to-compute signal (top-1 − top-2). Net arc (query-difficulty): drift
 (fundamental) → but it's *predictable* per-query (margin AUC 0.77) → so **query-adaptive fusion / selective routing** is
 the answer, directly attacking the one measured hybrid weakness. Route-next (cargo-gated): wire the margin gate into the
 fusion path and measure end-to-end hybrid uplift. Verified: numpy on the committed potion slab (no cargo build).
+
+**Follow-up (SIMULATED end-to-end — tempers the adaptive lever + surfaces a task-design bias): margin-gated routing gives only a marginal bump, and strong lexical beats the equal-weight hybrid on keyword-overlap known-item.** Ran the full pipeline in Python (no cargo): a **TF-IDF** lexical tier (sklearn, BM25 proxy) over the 130k corpus + the potion vector tier, fused per-query; 963 queries, found@10 / MRR@10:
+
+| method | found@10 | MRR@10 |
+|---|---|---|
+| vector-alone | 0.7445 | 0.6077 |
+| TF-IDF lexical-alone | **0.8681** | 0.7196 |
+| static hybrid (equal RRF) | 0.8515 | 0.6963 |
+| margin-gated adaptive hybrid (margin<0.06 → lexical-heavy, else vector-heavy) | 0.8505 | 0.7085 |
+
+**Findings (honest):** (1) **On this known-item task, strong lexical (0.868) BEATS the equal-weight hybrid (0.852)** — the
+vector tier *dilutes* a strong lexical ranking. (2) **Margin-gated adaptive routing gave only +0.012 MRR and ~0 recall**
+over static hybrid — NOT the clear win the AUC-0.77 confidence signal implied. **Why (task-design bias, important):** the
+"first-N-words of the doc" query is **keyword-overlapping** — the query words are literally in the source doc, which is
+the *best case for lexical / worst case for the vector tier's marginal value*. (This also reconciles with the Tantivy run
+where hybrid *beat* lexical: TF-IDF here is a stronger lexical tier than that Tantivy config, so the vector tier had less
+to add.) The adaptive-fusion / vector tier's value is **understated by keyword-overlap known-item retrieval** and would
+need **semantic / paraphrase queries** (where the query and doc share meaning but not words) to demonstrate — which this
+prefix-query harness cannot generate without a paraphrase model. **Net (corrects the prior enthusiasm):** the margin
+*signal* is real (AUC 0.77) but a simple margin *gate* is not an end-to-end win on keyword-overlap tasks; validating
+adaptive fusion needs a semantic-query benchmark, and the honest current bottom line is that for exact-keyword known-item
+search, lexical-alone is hard to beat. Verified: numpy + sklearn TF-IDF on the committed slabs + corpus texts (no cargo).
