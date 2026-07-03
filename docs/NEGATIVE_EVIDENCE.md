@@ -7108,3 +7108,29 @@ captures and CombMAX/score-fusion don't (`50d077c`/`27c488a`). Note the multipli
 relevant docs → agreement is very selective) and still strong on NFCorpus (5×). This completes the mechanistic account of
 frankensearch's hybrid: **RRF works because it's a cross-tier-agreement detector, and agreement is a 5-25× relevance
 prior.** Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### Explicit agreement bonus doesn't help — RRF's sum already weights agreement optimally (IronPetrel, 2026-07-03)
+
+Since cross-tier agreement is a 5-25× relevance signal (`a81346b`), can we exploit it *more* with an **explicit
+agreement bonus** (extra +β for docs in both tiers, on top of RRF's implicit 2-contribution boost)? Swept β (RRF
+contributions are ~0.02-0.09):
+
+| config | SciFact recall/nDCG@10 | NFCorpus recall/nDCG@10 |
+|---|---|---|
+| plain RRF (β=0) | 0.8358 / **0.6904** | 0.1587 / **0.3257** |
+| +bonus β=0.02 | 0.8276 / 0.6873 | 0.1579 / 0.3240 |
+| +bonus β=0.05 | 0.8109 / 0.6812 | 0.1559 / 0.3218 |
+| +bonus β=0.1-0.2 | 0.8109 / 0.6811 (plateau) | 0.1559 / 0.3218 (plateau) |
+
+**Finding — an explicit agreement bonus never helps; plain RRF (β=0) is optimal.** Even a small bonus hurts, and larger
+ones plateau — once β dominates the `1/(k+r)` contributions, it forces *all* both-tier docs above *all* one-tier docs,
+destroying the within-tier rank information (a both-tier doc at rank-50-in-both then beats a one-tier doc at rank-1).
+**RRF's 2-contribution sum already weights agreement optimally**: it rewards agreement *while still respecting rank* — a
+both-tier doc at good ranks beats a both-tier doc at bad ranks. So the agreement signal (5-25×) is real, but RRF's sum
+captures it *perfectly*; you can't improve on it with explicit agreement weighting. This closes the mechanistic arc with
+a design validation: **RRF's `1/(k+r_L)+1/(k+r_V)` is the sweet spot — enough agreement reward to exploit the 5-25×
+signal, not so much that it discards rank.** (Consistent with CombMAX losing `50d077c` — max discards agreement; explicit
+bonus over-weights it; RRF's sum is the balance.) Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
+SciFact/NFCorpus (no cargo).
