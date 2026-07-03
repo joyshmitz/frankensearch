@@ -6401,3 +6401,28 @@ Users enable the measured-safe integration with
 unchanged). **Default output is byte-identical** (still `PureReorder` — provably the same code path). The reranker arc is
 now end-to-end: measurement → recommendation → landed opt-in primitive → reachable via the searcher builder. Flipping the
 default from `PureReorder` to `RrfCombine` remains the one product-gated line (changes user-visible ordering + snapshots).
+
+---
+
+### SHIPPED: per-tier RRF weighting in `RrfConfig` (implements the top fusion lever), default-preserving (IronPetrel, 2026-07-03)
+
+Implemented the biggest fusion-tuning lever from the measurements — **up-weight the stronger tier** (finding `fa592b9`:
+a modest stronger-tier weight ~1.3× makes the hybrid *strictly dominate* the best single tier on both recall and nDCG,
+e.g. SciFact 0.835/0.665). Until now `RrfConfig` had only `k`; the tier weights were **unexpressible in the API**.
+
+- **`RrfConfig`** (`frankensearch-fusion/src/rrf.rs`) gains `lexical_weight` and `semantic_weight` (both default `1.0`),
+  applied as a multiplier on each tier's per-rank RRF contribution in **both** the map and merge fusion paths (2 + 3
+  contribution sites). `sanitize_tier_weight` degrades non-finite/`≤0` to the neutral `1.0`.
+- The 9 in-workspace `RrfConfig { k }` literal sites now use `..Default::default()` (mechanical, behavior-unchanged).
+- New test `tier_weight_reorders_by_upweighted_source`: up-weighting the semantic tier 2× promotes the semantic-only doc
+  to #1 with exactly 2× the rank-0 contribution; up-weighting lexical flips the winner; a NaN/negative weight degrades
+  to standard RRF.
+
+**Verification:** `cargo test -p frankensearch-fusion --lib` → **821 passed, 0 failed**, including the exact-value
+formula tests (`rrf_score_formula_k60/k1/k0`) and the map-vs-merge **byte-identity** test (`merge_matches_map_fusion`).
+This is the key safety property: **default weight `1.0` is an exact f64 identity** (`x * 1.0 == x`), so every existing
+score is bit-for-bit unchanged and both fusion paths stay identical; the feature is purely additive. `cargo clippy`
+clean on the added code. Users now express the measured "hybrid strictly dominates" config via
+`RrfConfig { semantic_weight: 1.3, ..Default::default() }` (or `lexical_weight` when lexical is the stronger tier —
+per the *up-weight-the-stronger-tier* rule). Flipping the *default* weight away from 1.0 stays product-gated (it changes
+ranking output), but the capability — and the measured recipe — is now in the code.

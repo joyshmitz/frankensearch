@@ -951,6 +951,7 @@ impl TwoTierSearcher {
 
         let rrf_config = RrfConfig {
             k: self.effective_rrf_k(query_class),
+            ..Default::default()
         };
 
         if lexical_short_circuit && let Some(lex) = self.lexical.as_ref() {

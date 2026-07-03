@@ -33,11 +33,35 @@ const DEFAULT_RRF_K: f64 = 60.0;
 pub struct RrfConfig {
     /// RRF constant K. Default: 60.0.
     pub k: f64,
+    /// Multiplier applied to every lexical (BM25) tier RRF contribution. Default `1.0`
+    /// (neutral). Up-weighting the *stronger* tier for the workload makes the hybrid
+    /// strictly dominate the best single tier on both recall and nDCG
+    /// (see `docs/NEGATIVE_EVIDENCE.md`). Non-finite or `≤ 0` values are treated as `1.0`.
+    pub lexical_weight: f64,
+    /// Multiplier applied to every semantic (vector) tier RRF contribution. Default `1.0`.
+    /// See [`RrfConfig::lexical_weight`].
+    pub semantic_weight: f64,
 }
 
 impl Default for RrfConfig {
     fn default() -> Self {
-        Self { k: DEFAULT_RRF_K }
+        Self {
+            k: DEFAULT_RRF_K,
+            lexical_weight: 1.0,
+            semantic_weight: 1.0,
+        }
+    }
+}
+
+/// Sanitize a tier weight: non-finite or non-positive values fall back to the neutral
+/// `1.0`, so a bad config degrades to standard (unweighted) RRF rather than corrupting
+/// scores.
+#[inline]
+fn sanitize_tier_weight(weight: f64) -> f64 {
+    if weight.is_finite() && weight > 0.0 {
+        weight
+    } else {
+        1.0
     }
 }
 
@@ -198,6 +222,8 @@ pub fn rrf_fuse_with_graph(
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
+    let lexical_weight = sanitize_tier_weight(config.lexical_weight);
+    let semantic_weight = sanitize_tier_weight(config.semantic_weight);
     let graph_weight = sanitize_graph_weight(graph_weight);
     // Adjusted for typical ~50% overlap to reduce over-allocation.
     let graph_len = if graph_weight > 0.0 { graph.len() } else { 0 };
@@ -206,7 +232,7 @@ pub fn rrf_fuse_with_graph(
 
     // Score lexical results.
     for (rank, result) in lexical.iter().enumerate() {
-        let rrf_contribution = rank_contribution(k, rank);
+        let rrf_contribution = rank_contribution(k, rank) * lexical_weight;
 
         // Single hash lookup via `entry` instead of `get` (dedup probe) + `entry`
         // (update). We iterate in rank order (0, 1, ...), so the first occurrence
@@ -244,7 +270,7 @@ pub fn rrf_fuse_with_graph(
 
     // Score semantic results.
     for (rank, hit) in semantic.iter().enumerate() {
-        let rrf_contribution = rank_contribution(k, rank);
+        let rrf_contribution = rank_contribution(k, rank) * semantic_weight;
 
         // Single hash lookup (see lexical loop): skip if already seen in semantic.
         match hits.entry(hit.doc_id.as_str()) {
@@ -426,6 +452,8 @@ fn rrf_fuse_merge_inner(
     dedup_semantic: bool,
 ) -> Vec<FusedHit> {
     let k = sanitize_rrf_k(config.k);
+    let lexical_weight = sanitize_tier_weight(config.lexical_weight);
+    let semantic_weight = sanitize_tier_weight(config.semantic_weight);
     let graph_weight = sanitize_graph_weight(graph_weight);
     let graph_active = graph_weight > 0.0;
     let graph_len = if graph_active { graph.len() } else { 0 };
@@ -461,9 +489,9 @@ fn rrf_fuse_merge_inner(
         }
         let lex = lex_map.remove(doc_id);
         let gr = if graph_active { graph_map.remove(doc_id) } else { None };
-        let mut rrf_score = rank_contribution(k, rank);
+        let mut rrf_score = rank_contribution(k, rank) * semantic_weight;
         if let Some((lex_rank, _)) = lex {
-            rrf_score += rank_contribution(k, lex_rank);
+            rrf_score += rank_contribution(k, lex_rank) * lexical_weight;
         }
         if let Some((graph_rank, _)) = gr {
             rrf_score += rank_contribution(k, graph_rank) * graph_weight;
@@ -485,7 +513,7 @@ fn rrf_fuse_merge_inner(
     // Lexical-only docs (never seen in semantic).
     for (doc_id, (lex_rank, lex_score)) in lex_map.drain() {
         let gr = if graph_active { graph_map.remove(doc_id) } else { None };
-        let mut rrf_score = rank_contribution(k, lex_rank);
+        let mut rrf_score = rank_contribution(k, lex_rank) * lexical_weight;
         if let Some((graph_rank, _)) = gr {
             rrf_score += rank_contribution(k, graph_rank) * graph_weight;
         }
@@ -702,7 +730,10 @@ mod tests {
 
     #[test]
     fn rrf_score_formula_k1() {
-        let config = RrfConfig { k: 1.0 };
+        let config = RrfConfig {
+            k: 1.0,
+            ..Default::default()
+        };
         let semantic = vec![semantic_hit("first", 0.9), semantic_hit("second", 0.8)];
 
         let results = rrf_fuse(&[], &semantic, 10, 0, &config);
@@ -716,7 +747,10 @@ mod tests {
 
     #[test]
     fn rrf_score_formula_k0_is_valid() {
-        let config = RrfConfig { k: 0.0 };
+        let config = RrfConfig {
+            k: 0.0,
+            ..Default::default()
+        };
         let lexical = vec![lexical_hit("doc-a", 10.0)];
 
         let results = rrf_fuse(&lexical, &[], 10, 0, &config);
@@ -731,7 +765,10 @@ mod tests {
         let expected = 1.0 / (DEFAULT_RRF_K + 1.0);
 
         for invalid_k in [f64::NAN, f64::INFINITY, -1.0, -100.0] {
-            let config = RrfConfig { k: invalid_k };
+            let config = RrfConfig {
+                k: invalid_k,
+                ..Default::default()
+            };
             let results = rrf_fuse(&lexical, &[], 10, 0, &config);
             assert_eq!(results.len(), 1);
             assert!(
@@ -838,6 +875,52 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].doc_id, "x");
         assert_eq!(results[1].doc_id, "y");
+    }
+
+    #[test]
+    fn tier_weight_reorders_by_upweighted_source() {
+        let lexical = vec![lexical_hit("lex", 1.0)];
+        let semantic = vec![semantic_hit("sem", 0.9)];
+        let k = RrfConfig::default().k;
+
+        // Up-weight the semantic tier 2× → the semantic-only doc ranks first with
+        // exactly 2× the unweighted rank-0 contribution.
+        let sem_cfg = RrfConfig {
+            semantic_weight: 2.0,
+            ..Default::default()
+        };
+        let sem_first = rrf_fuse(&lexical, &semantic, 10, 0, &sem_cfg);
+        assert_eq!(sem_first[0].doc_id, "sem");
+        let expected = 2.0 / (k + 1.0);
+        assert!(
+            (sem_first[0].rrf_score - expected).abs() < 1e-12,
+            "expected {expected}, got {}",
+            sem_first[0].rrf_score
+        );
+
+        // Symmetrically, up-weighting lexical flips the winner to the lexical-only doc.
+        let lex_cfg = RrfConfig {
+            lexical_weight: 2.0,
+            ..Default::default()
+        };
+        let lex_first = rrf_fuse(&lexical, &semantic, 10, 0, &lex_cfg);
+        assert_eq!(lex_first[0].doc_id, "lex");
+
+        // A non-finite / non-positive weight degrades to neutral 1.0 (standard RRF),
+        // never corrupts scores.
+        let bad_cfg = RrfConfig {
+            semantic_weight: f64::NAN,
+            lexical_weight: -1.0,
+            ..Default::default()
+        };
+        let neutral = rrf_fuse(&lexical, &semantic, 10, 0, &bad_cfg);
+        assert_eq!(neutral.len(), 2);
+        assert!(
+            neutral
+                .iter()
+                .all(|h| (h.rrf_score - 1.0 / (k + 1.0)).abs() < 1e-12),
+            "bad weights should degrade to unweighted RRF"
+        );
     }
 
     // ─── Empty input ────────────────────────────────────────────────────
@@ -1296,7 +1379,10 @@ mod tests {
 
     #[test]
     fn rrf_config_debug_format() {
-        let config = RrfConfig { k: 42.0 };
+        let config = RrfConfig {
+            k: 42.0,
+            ..Default::default()
+        };
         let debug = format!("{config:?}");
         assert!(debug.contains("42"));
         assert!(debug.contains("RrfConfig"));

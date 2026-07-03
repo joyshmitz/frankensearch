@@ -162,7 +162,10 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     // ── RRF-k sweep: does a sharper (lower-k) fusion keep hybrid's recall win AND
     //    recover the rank-1 MRR that the default k=60 blend dilutes below vector-alone? ──
     for k in [5.0f64, 10.0, 20.0, 30.0, 60.0, 100.0] {
-        let cfg = RrfConfig { k };
+        let cfg = RrfConfig {
+            k,
+            ..Default::default()
+        };
         let (mut rh, mut mh) = (0.0f64, 0.0f64);
         for qi in 0..q {
             let fused = rrf_fuse(&lex_all[qi], &vec_all[qi], K, 0, &cfg);

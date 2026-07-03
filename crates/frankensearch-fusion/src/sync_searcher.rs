@@ -178,6 +178,7 @@ impl SyncTwoTierSearcher {
                         0,
                         &RrfConfig {
                             k: self.config.rrf_k,
+                            ..Default::default()
                         },
                     ),
                     k,
@@ -264,6 +265,7 @@ impl SyncTwoTierSearcher {
                     0,
                     &RrfConfig {
                         k: self.config.rrf_k,
+                        ..Default::default()
                     },
                 ),
                 k,
