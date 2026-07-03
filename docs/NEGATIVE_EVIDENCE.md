@@ -5784,3 +5784,28 @@ multilingual vector tier 0.598; but the recommended stack lifts it further, espe
 consistent +1.5–5.0 recall / +1.1–7.4 nDCG improvement across BEIR at lower embedder cost.** This is the quantified,
 multi-dataset business case for the roadmap. Verified: `model2vec` (both stacks auto-downloaded) + `sklearn` venv on BEIR
 SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — MEASURED (small config win): fusing DEEPER candidate lists (top-50–100 per tier, not top-10) modestly improves the hybrid — cheap, actionable fetch-depth tuning (IronPetrel)
+
+Tested the fusion **candidate depth** `D` — retrieve top-`D` per tier before RRF-fusing, then take the top-10 (the config
+knob is `candidate_multiplier` in `frankensearch-core`, default 3 ⇒ fetch ≈ 3·k). retrieval-32M + TF-IDF, stronger-tier
+weight, k=10:
+
+| D (per-tier candidates fused) | SciFact recall/nDCG | NFCorpus recall/nDCG |
+|---|---|---|
+| 10 | 0.8349 / 0.6655 | 0.1557 / 0.3213 |
+| 20 | 0.8383 / 0.6667 | **0.1595 / 0.3297** |
+| 50 | 0.8413 / 0.6689 | 0.1553 / 0.3251 |
+| 100 | **0.8446 / 0.6703** | 0.1549 / 0.3251 |
+
+**Finding:** deeper candidate fusion helps **modestly and cheaply** — SciFact improves ~monotonically (+1.0 recall / +0.5
+nDCG from D=10→100), NFCorpus peaks around D=20 then plateaus. Mechanism: with only top-10 lists, a doc that's rank 5 in
+one tier but rank 40 in the other is scored by *one* tier; deeper lists let RRF give it *both* tiers' rank-contributions,
+promoting docs both tiers moderately agree on. **Actionable:** set the fusion **fetch depth to ~50–100 per tier**
+(candidate_multiplier ≈ 5–10 at k=10), not the tight top-K — a small quality gain (~1 recall pt on semantic data) at
+negligible cost (RRF over 100 vs 10 items is microseconds; the fast-tier scan already produces a deep candidate list —
+this just fuses more of it). A *minor* knob vs the embedder-default (+33%) and stronger-tier-weight levers, but free.
+(Diminishing past D≈50–100.) Verified: `model2vec` retrieval-32M + `sklearn` venv on BEIR SciFact + NFCorpus qrels (no
+cargo, no torch).
