@@ -38,6 +38,14 @@ measurably the worst option for English retrieval.
   (SciFact hybrid 0.834 vs BM25 0.776), ties on keyword-overlap ones. **Never worse than the best
   single tier by more than noise.** The vector tier alone beats real BM25 on all 3 datasets
   (including ArguAna, where BM25's long-doc length-penalty hurts it — a weakness embeddings lack).
+- **Exactly two tiers — one strong embedder + BM25. Do NOT ensemble multiple embedders.** Adding a
+  second static embedder never helps and usually *hurts* (SciFact ret32+base32 0.769 < ret32 alone
+  0.795; the triple 2-embedders+BM25 is worse than the pair on both datasets). The model2vec embedders
+  are too correlated (a 2nd finds a doc the 1st misses in only ~3% of queries vs ~7% for BM25) *and*
+  weaker, so RRF just dilutes. **The hybrid's power is MODALITY diversity (exact-term vs semantic →
+  decorrelated errors), not signal count** — and the partner must be *comparably strong* (high
+  unique-% alone doesn't help if the partner is weak; see NEGATIVE_EVIDENCE). To strengthen the vector
+  tier, use a *better* single embedder (rec #1), not *more* embedders.
 
 ### 3. Tune RRF fusion: up-weight the STRONGER tier, small k, deep candidate feed.
 - **Up-weight the stronger tier ~1.3×** (not always vector) + smaller RRF `k` (~10, not 60 —

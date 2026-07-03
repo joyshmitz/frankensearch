@@ -6193,3 +6193,41 @@ pure-reorder or score-blend. It's the empirically-best *and* simplest *and* arch
 risky imperfect-reranker regime, safe everywhere, no tuning, reuses existing `rrf_fuse`. This closes the "how to combine
 the reranker" question with the frankensearch-native answer. Verified: `fastembed` TextCrossEncoder (both ONNX
 cross-encoders) + `model2vec` retrieval-32M + `rank_bm25` on BEIR NFCorpus/SciFact qrels (no cargo, no torch).
+
+---
+
+### Multi-embedder ensembling is net-destructive — the hybrid's power is MODALITY diversity, not signal count (IronPetrel, 2026-07-03)
+
+Every hybrid finding so far fused *one* vector model + BM25. Static embedders are cheap (~free to run a second), and
+frankensearch's RRF is a general ensemble mechanism — so does fusing **two static embedders** add recall the way
+lexical+vector does? Tested retrieval-32M RRF-fused with each other model2vec embedder, ± BM25, on 2 BEIR datasets
+(recall@10 / nDCG@10):
+
+| stack | SciFact | NFCorpus |
+|---|---|---|
+| BM25 alone | 0.776 / 0.652 | 0.152 / 0.306 |
+| retrieval-32M alone (best single vector) | 0.795 / 0.633 | 0.148 / 0.309 |
+| **retrieval-32M + BM25 (current hybrid)** | **0.836 / 0.690** | **0.159 / 0.326** |
+| retrieval-32M + potion-base-32M (2 embedders) | 0.769 / 0.617 | 0.148 / 0.301 |
+| retrieval-32M + multilingual-128M (2 embedders) | 0.771 / 0.577 | 0.130 / 0.269 |
+| retrieval-32M + multilingual-128M + BM25 (triple) | 0.814 / 0.661 | 0.150 / 0.308 |
+
+**Finding — adding a second static embedder never helps and usually HURTS; the triple is worse than the pair.**
+- On SciFact a 2nd static embedder **drops recall below retrieval-32M alone** (0.769 vs 0.795): the model2vec embedders
+  are **highly correlated** (same token-lookup+mean-pool family, same errors — the 2nd finds a relevant doc ret32 misses
+  in only **2.7-3.3%** of queries, vs **~7%** for BM25) *and* weaker, so RRF just **dilutes** ret32's better ranking
+  with the weaker model's worse one.
+- The **triple (2 embedders + BM25) is worse than the pair (1 embedder + BM25)** on both datasets (SciFact 0.814<0.836,
+  NFCorpus 0.150<0.159) — the redundant weak embedder dilutes the good hybrid.
+- **Subtle NFCorpus lesson — unique-contribution % is NOT sufficient for ensemble value.** There the 2nd embedder finds
+  a doc ret32 misses in **26.9%** of queries (NFCorpus has many relevant docs/query), yet the ensemble still doesn't
+  gain (0.148 ≈ ret32) — because the 2nd embedder is *weaker*, its dilution cancels its unique finds. **The partner must
+  be both diverse AND comparably strong.**
+
+**Product takeaway — do NOT build a multi-embedder ensemble; one strong retrieval-distilled embedder + BM25 is the
+right stack.** This closes the ensemble question with a clean negative, and it *explains why the hybrid works*: BM25 is
+the uniquely-valuable partner because it's a **different modality** (exact-term vs semantic → decorrelated errors) *and*
+comparably strong — not because RRF benefits from "more signals." Same-modality same-strength ensembling is redundant.
+Corollary: the way to strengthen the vector tier is a **better** single embedder (retrieval-distilled → contextual, per
+rec #1), not *more* embedders. Verified: 4 `model2vec` static embedders + `rank_bm25` on BEIR SciFact/NFCorpus qrels
+(no cargo, no torch).
