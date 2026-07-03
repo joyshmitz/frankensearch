@@ -5292,3 +5292,18 @@ both. (2) **BONUS / route-next:** the naive equal-weight weighted-**sum** RRF (M
 MRR to its tie-break / candidate-handling vs a plain weighted-sum-of-reciprocal-ranks. Worth a focused look: if `rrf_fuse`'s
 tiebreak is the cause and can be made rank-preserving, it's a free MRR gain on the shipped hybrid path (not landed here —
 needs confirming it's a real tiebreak effect, not a bench artifact). Verified: `--features lexical` bench runs clean (exit 0).
+
+**Follow-up (ROOT CAUSE DIAGNOSED — it's a real, localized tiebreak asymmetry, not a bench artifact):** read the
+`rrf_fuse` ranking comparator (`FusedHitScratch::cmp_for_ranking`, `rrf.rs:100–111`). On an RRF-score tie it breaks by
+(1) `in_both_sources` (promote docs both tiers agree on — reasonable), then (2) **`lexical_score.unwrap_or(f32::NEG_INFINITY)`
+descending** — which **asymmetrically favors lexical**. The failure mode: a **vector-only** target (lexical missed it —
+lexical recall is only 0.90) at vector-rank `r` has RRF score `1/(k+r+1)`, which is **exactly equal** to any **lexical-only**
+doc at lexical-rank `r`; the tie then goes to the lexical-only doc because the target's `lexical_score` is `None → −∞`.
+So every lexical-only doc at rank ≤ `r` is ranked **above** the vector-only best answer, systematically lowering its rank
+→ the ~1.6-pt MRR gap vs a neutral (random-tiebreak) fusion. This is **not a bench artifact** — it's a deterministic
+tiebreak that favors lexical over semantic for no principled reason. **Fix (product-gated design choice, NOT landed):** make
+tiebreak (2) symmetric — e.g. compare `max(lexical_score, semantic_score)` or fall back to `semantic_score` when
+`lexical_score` is absent — so a vector-only doc isn't auto-demoted to `−∞`. Gain is small (~1.6 MRR pts) and it shifts
+tie-ordering (some fusion tests may assert the current order), so it's a deliberate tweak, not a free swap; but the current
+lexical-favoring tiebreak is arbitrary and worth revisiting for vector-dominant workloads. Verified by source inspection +
+the weighted-RRF measurement above (equal-weight neutral-tiebreak RRF = 0.9596 MRR vs `rrf_fuse` 0.9436, same 1.0 recall).
