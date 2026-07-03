@@ -7158,3 +7158,30 @@ valuable precisely because the deep both-tier (consensus) set is 25-30× enriche
 reranker reorders — whereas RRF already surfaces the shallow both-tier docs into the non-reranked top-10. So the practical
 rule: **a deep candidate pool + consensus filtering (RRF) + reranking compound** — agreement enriches the deep pool, RRF
 ranks by it, the reranker refines it. Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### Embedder quality works through agreement VOLUME, not precision (connecting the biggest lever to the mechanism) (IronPetrel, 2026-07-03)
+
+Connecting the two biggest findings — embedder choice (biggest lever) and cross-tier agreement (the mechanism). Does a
+better embedder produce a *cleaner* (higher-precision) or *bigger* consensus set with BM25? Measured across 3 embedders:
+
+| dataset · embedder | vec recall@10 | both-tier precision | both-tier count/q | rel-consensus/q | hybrid nDCG@10 |
+|---|---|---|---|---|---|
+| SciFact · multi-128M (stock) | 0.598 | 6.5% | 12.0 | 0.78 | 0.6135 |
+| SciFact · base-8M | 0.662 | 6.6% | 12.6 | 0.83 | 0.6225 |
+| SciFact · **retrieval-32M** | 0.795 | 5.8% | **16.0** | **0.93** | **0.6904** |
+| NFCorpus · multi-128M | 0.085 | 26.1% | 8.6 | 2.24 | 0.2743 |
+| NFCorpus · base-8M | 0.108 | 26.1% | 10.9 | 2.85 | 0.3062 |
+| NFCorpus · **retrieval-32M** | 0.148 | 24.5% | **13.6** | **3.33** | **0.3257** |
+
+**Finding — a better embedder does NOT raise consensus-set *precision* (~flat at 6% / 25%); it raises consensus-set
+*volume*.** retrieval-32M overlaps BM25's top-50 on 16 docs/query (SciFact) vs base-8M's 12.6 — it ranks the right docs
+high enough to **co-occur** with BM25 more often — so it captures more relevant docs in the consensus set (0.93 vs 0.78
+rel-consensus/query) at similar precision. My precision hypothesis was wrong: **embedder quality feeds the agreement
+mechanism through VOLUME** (a larger relevance-rich both-tier overlap), not through a cleaner overlap. This unifies the
+two headline findings into one causal chain: **better embedder → higher recall → more agreement with BM25 → a larger
+relevant-consensus set → higher hybrid nDCG** (both-tier count and hybrid nDCG track vec recall monotonically across all 3
+embedders on both datasets). So the "biggest lever" and the "why" are the same story: the embedder's job in the hybrid is
+to **agree with BM25 on more of the right documents.** Verified: 3 `model2vec` embedders + `rank_bm25` on BEIR
+SciFact/NFCorpus (no cargo).
