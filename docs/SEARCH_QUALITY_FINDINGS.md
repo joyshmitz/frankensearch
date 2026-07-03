@@ -57,6 +57,12 @@ measurably the worst option for English retrieval.
   pt, ~free. frankensearch reranks, so the first-stage metric is **recall@100** — the hybrid feeds
   **96% of relevant docs** (SciFact recall@100 = 0.960), and the vector tier's edge over BM25
   *grows* with depth (exactly what a reranker exploits).
+- **Keep RRF (rank fusion) — don't switch to score-fusion.** Measured RRF vs score-fusion (normalize
+  BM25+cosine, weighted sum) across all 3 datasets: they're **tied on quality** (RRF wins recall on 2/3;
+  score-fusion wins nDCG by a hair, only NFCorpus's +0.014 above noise), but RRF is **scale-free** — no
+  per-query normalizer to choose (z-norm vs min-max disagree and are brittle to BM25's unbounded vs
+  cosine's bounded distributions). RRF's simplicity + recall edge win. This validates `rrf_fuse` as the
+  fusion primitive across the whole stack (base hybrid *and* reranker-combine).
 
 ### 4. Reranker is a CONDITIONAL polish — there is NO safe default reranker (measured across 3 datasets).
 The "best" reranker **flips completely by corpus**, and *stronger is not safer.* Same hybrid candidates,

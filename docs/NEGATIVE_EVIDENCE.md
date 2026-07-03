@@ -6231,3 +6231,35 @@ comparably strong — not because RRF benefits from "more signals." Same-modalit
 Corollary: the way to strengthen the vector tier is a **better** single embedder (retrieval-distilled → contextual, per
 rec #1), not *more* embedders. Verified: 4 `model2vec` static embedders + `rank_bm25` on BEIR SciFact/NFCorpus qrels
 (no cargo, no torch).
+
+---
+
+### RRF vs score-fusion for the base hybrid: RRF is the correct default (tied quality, less fragile) (IronPetrel, 2026-07-03)
+
+Every hybrid finding assumed RRF (rank-based fusion), which discards score magnitudes. The main alternative is
+**score-fusion**: normalize BM25 and cosine per query (z-score or min-max) and take a weighted sum. Does keeping the
+magnitudes beat RRF? Swept the vector weight for each method (RRF k=10; score-fusion with z-norm and min-max),
+candidate union of each tier's top-100, on all 3 BEIR datasets (best-nDCG config shown):
+
+| dataset | RRF (rank) recall/nDCG@10 | score-fusion z-norm | score-fusion min-max |
+|---|---|---|---|
+| SciFact  | **0.8374** / 0.6905 | 0.8218 / 0.6911 | 0.8126 / **0.6931** |
+| NFCorpus | 0.1597 / 0.3253 | 0.1655 / 0.3393 | **0.1665 / 0.3386** |
+| ArguAna  | **0.7148** / 0.3363 | 0.7084 / 0.3375 | 0.7098 / **0.3378** |
+
+**Finding — RRF and score-fusion are tied on quality; RRF wins on simplicity/robustness, so it's the correct default.**
+- **RRF wins RECALL on 2/3** (SciFact +0.025, ArguAna +0.005 over the best score-fusion) and loses only NFCorpus
+  (−0.007). **Score-fusion wins nDCG by a hair on all 3**, but the margin is within noise except **NFCorpus (+0.014)** —
+  so score-fusion has exactly one real quality edge across three datasets.
+- **The tiebreaker is fragility.** Score-fusion needs a per-query score normalizer, and the choice *matters* (z-norm and
+  min-max disagree, and each is sensitive to per-query score-distribution quirks — BM25 is unbounded/long-tailed, cosine
+  is bounded), *and* it still needs the same weight tuning as RRF. RRF is **rank-based → scale-free**: no normalizer to
+  pick, no BM25-vs-cosine scale mismatch to manage, and it's robust to the score-distribution differences that make
+  score-fusion brittle across heterogeneous corpora.
+
+**Product takeaway — keep RRF as the fusion primitive (frankensearch's `rrf_fuse` choice is validated).** Score-fusion's
+single real edge (NFCorpus nDCG +0.014) doesn't justify the added per-query-normalization fragility, and RRF is
+marginally *better* on recall — the first-stage metric that matters when a reranker follows. This is consistent with the
+reranker-integration finding (`b114e39`): **RRF is the robust, scale-free, tuning-light fusion primitive throughout the
+stack** (lexical+vector *and* reranker-combine). Don't switch the base hybrid to score-fusion. Verified: `model2vec`
+retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
