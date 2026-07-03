@@ -128,6 +128,22 @@ each stage's contribution shown (recall@10 / nDCG@10). This is the headline numb
 | SciFact | 0.776 / 0.652 | 0.816 / 0.684 | **0.872 / 0.731** | **+12% / +12%** |
 | NFCorpus | 0.152 / 0.306 | 0.159 / 0.327 | **0.167 / 0.346** | **+10% / +13%** |
 
+### How to configure this pipeline today (shipped, default-preserving APIs)
+The capstone stack is expressible now — no default changes, all opt-in builders landed this session:
+```rust
+use frankensearch_rerank::{RerankCombine, DEFAULT_RRF_COMBINE_K};
+// #1 embedder: load a retrieval-distilled static model (potion-retrieval-32M) as the fast/quality embedder.
+let searcher = TwoTierSearcher::new(index, retrieval_distilled_embedder, config) // config.rrf_k = 10.0  (#3 small k)
+    .with_lexical(tantivy_bm25)                                     // #2 two-tier hybrid
+    .with_rrf_weights(1.0, 1.3)                                     // #3 up-weight the STRONGER tier (~1.3×)
+    .with_rrf_tiebreak(RrfTiebreak::Hash)                          // #3 neutral tiebreak
+    .with_reranker(cross_encoder)                                   // #4 corpus-appropriate cross-encoder
+    .with_rerank_combine(RerankCombine::RrfCombine { k: DEFAULT_RRF_COMBINE_K }); // #4 RRF-combine (never pure-reorder)
+```
+`SyncTwoTierSearcher` exposes the same `with_rrf_weights` / `with_rrf_tiebreak`. int8 fast-tier (#5) is already the
+default. The only thing not yet default is the *choice* of these values — flipping the shipped defaults to match is the
+remaining product-gated step.
+
 ## Gotchas ruled out (measured)
 - **Query prefixes** (`query:`/`passage:`): do NOT add them — potion-retrieval-32M is a no-prefix
   (symmetric) model; prefixes cost 2-3 recall pts.
