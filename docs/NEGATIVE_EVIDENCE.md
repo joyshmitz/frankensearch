@@ -6990,3 +6990,25 @@ embedder + weighting only mattered at k=60 to overcome its flatness — with k=1
 directly. **Net fusion recommendation, maximally simplified: retrieval-distilled embedder + BM25 + RRF with k≈10. That's
 it** (add the optional reranker via RRF-combine on top). Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
 SciFact/NFCorpus (no cargo).
+
+---
+
+### BM25 k1/b tuning is marginal and corpus-specific — defaults are near-optimal (IronPetrel, 2026-07-03)
+
+The last untuned lexical knobs: BM25's **k1** (term-frequency saturation) and **b** (length normalization). Tantivy
+exposes both; the BM25Okapi defaults are k1=1.5, b=0.75. Swept k1∈{0.9,1.2,1.5,2.0} × b∈{0.3,0.5,0.75,0.9}:
+
+| dataset | default (k1=1.5, b=0.75) recall/nDCG@10 | best-tuned | Δ nDCG |
+|---|---|---|---|
+| SciFact | 0.7757 / 0.6523 | 0.7723 / 0.6612 (k1=0.9, b=0.9) | +1.4% |
+| NFCorpus | 0.1522 / 0.3062 | 0.1495 / 0.3068 (k1=2.0, b=0.5) | +0.2% (noise) |
+
+**Finding — BM25 k1/b tuning gives at most +1.4% nDCG, it's corpus-specific, and it costs recall.** The optimal params
+flip direction by corpus: SciFact wants **low k1 (0.9) + high b (0.9)** (early TF saturation + strong length norm — fits
+short scientific abstracts), NFCorpus wants the **opposite** (high k1=2.0 + low b=0.5). And both nDCG-optimal settings
+*lose* recall (SciFact 0.776→0.772, NFCorpus 0.152→0.150) — so tuning for nDCG hurts the reranker-feed metric. **The
+standard defaults (k1=1.5, b=0.75) are near-optimal; per-corpus BM25 tuning isn't worth it** (marginal, corpus-specific,
+recall-costing — and no universal better setting exists). This completes the lexical-tier exploration: **BM25F
+title-boost (`b10e243`), RM3 (`d02581c`), and now k1/b — all minor/negative; the lexical tier is best left as plain
+BM25(k1=1.5, b=0.75) over concatenated title+body.** Verified: `rank_bm25` (BM25Okapi with swept k1/b) on BEIR
+SciFact/NFCorpus qrels (no cargo).
