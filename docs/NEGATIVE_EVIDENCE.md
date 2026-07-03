@@ -6892,3 +6892,26 @@ no new model). ArguAna's uplift is smaller (~+1-4%) — there the vector tier is
 length penalty, so the embedder swap adds less. **Bottom line: the retrieval-side recommendations alone (before the
 optional reranker) lift the semantic-search hybrid +15-21% nDCG at zero inference cost**, all via shipped config knobs +
 a retrieval-distilled embedder. Verified: `model2vec` multilingual-128M & retrieval-32M + `rank_bm25` on BEIR (no cargo).
+
+---
+
+### Tier-weighting subsumes the tiebreak: it eliminates 95-97% of RRF ties (recommendations interact) (IronPetrel, 2026-07-03)
+
+I ship + recommend both the neutral **hash tiebreak** and **tier-weighting** — but they interact, and measuring how
+self-simplifies the recommendation. Counted exact RRF-score ties in the fused top-10 (the only place the tiebreak
+fires), stock vs recommended config:
+
+| config | SciFact: % queries with a tie (tie-collisions) | NFCorpus |
+|---|---|---|
+| equal-weight, k=60 (stock) | **27.0%** (105) | **47.7%** (369) |
+| weighted 1.3, k=10 (recommended) | **1.0%** (3) | **1.2%** (4) |
+
+**Finding — tier-weighting eliminates ~95-97% of RRF-score ties, making the hash-tiebreak nearly moot once you weight.**
+With *equal* weights the tiebreak matters enormously: 27-48% of queries have a top-10 tie, so the legacy lexical-favoring
+tiebreak biases a huge fraction of results (this is why the tiebreak diagnosis `339d22b`/`05472cd` mattered — for the
+*stock* config). But distinct tier weights (`1.0` vs `1.3/(k+r)`) make the per-doc contributions distinct, and small `k`
+spreads scores, so the recommended config has almost **no** ties (~1%) — the tiebreak choice becomes irrelevant.
+**Practical simplification: if you adopt tier-weighting (rec #3), the hash-tiebreak is redundant (skip it); if you run
+equal weights, the hash-tiebreak is important (it de-biases ~1/3-1/2 of queries).** The two knobs are not independent —
+weighting is the more fundamental fix (it removes the ties rather than resolving them fairly). Verified: `model2vec`
+retrieval-32M + `rank_bm25`, exact-float tie detection in the fused top-10 on BEIR SciFact/NFCorpus (no cargo).
