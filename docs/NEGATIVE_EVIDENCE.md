@@ -6668,3 +6668,30 @@ ones already measured: **rerank a shallow depth** (`97eb1e0`), **gate the whole 
 margin-gated *fusion* result (`8130208`, ~+0.012 only): the top-1/top-2 margin is a real but weak signal that doesn't
 convert into a strong adaptive lever. Verified: `model2vec` retrieval-32M + `fastembed` ms-marco cross-encoder +
 `rank_bm25` on BEIR NFCorpus qrels (no cargo).
+
+---
+
+### DEFINITIVE: no cheap pre-rerank signal predicts rerank benefit — selective reranking is buried (IronPetrel, 2026-07-03)
+
+The prior entry found the top1-top2 *margin* doesn't predict which queries benefit from reranking (corr −0.055) but left
+open "maybe a better signal does." Tested **five** candidate pre-rerank signals in one rerank pass (NFCorpus, ms-marco
+RRF-combine, full gain +0.0192), correlating each per-query signal with the per-query rerank benefit:
+
+| signal (all computable BEFORE reranking) | corr with rerank benefit |
+|---|---|
+| `margin` (top-1 − top-2 RRF gap) | −0.055 |
+| `tier_overlap` (\|lexical top-k ∩ vector top-k\|) | +0.011 |
+| `top1` (top RRF score) | +0.019 |
+| `spread` (std of top-k RRF scores) | +0.057 |
+| `vec_lex_gap` (per-tier nDCG gap — **oracle, uses labels**) | +0.195 |
+
+**Finding — no deployable pre-rerank signal predicts rerank benefit; selective (confidence-gated) reranking is not
+viable.** Every real signal is ≤ 0.057 (essentially zero), including the principled *tier-disagreement* one
+(`tier_overlap`, +0.011) — reranking does NOT preferentially help queries where the two tiers disagree. Even the
+oracle-ish `vec_lex_gap` (which cheats by using relevance labels) only reaches +0.195. So the reranker's per-query value
+is essentially **unpredictable from cheap query-time features** — you cannot cheaply decide *which* queries to rerank.
+This comprehensively closes the selective-reranking cost lever (5 signals tested, all weak): the robust reranker cost
+levers remain **corpus-level gating** (`657df16`), **shallow depth** (`97eb1e0`), and **RRF-combine safety**
+(`b114e39`) — not per-query gating. Combined with the earlier weak margin-gated *fusion* (`8130208`), the broader lesson
+is settled: **cheap retrieval-confidence signals do not convert into strong adaptive levers** in this stack. Verified:
+`model2vec` retrieval-32M + `fastembed` ms-marco cross-encoder + `rank_bm25` on BEIR NFCorpus qrels (no cargo).
