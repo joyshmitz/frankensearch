@@ -7185,3 +7185,30 @@ relevant-consensus set → higher hybrid nDCG** (both-tier count and hybrid nDCG
 embedders on both datasets). So the "biggest lever" and the "why" are the same story: the embedder's job in the hybrid is
 to **agree with BM25 on more of the right documents.** Verified: 3 `model2vec` embedders + `rank_bm25` on BEIR
 SciFact/NFCorpus (no cargo).
+
+---
+
+### Reranker CEILING is +38-106% (oracle), but real rerankers capture only ~10-25% of it (IronPetrel, 2026-07-03)
+
+Characterized the reranker tier's *potential* without slow reranking: the **oracle reranker** perfectly reorders the
+hybrid's candidate pool (all relevant candidates first) — the maximum any reranker could achieve. The gap to the hybrid
+is the reranker headroom:
+
+| dataset · feed | hybrid nDCG@10 | oracle-rerank nDCG@10 | reranker headroom |
+|---|---|---|---|
+| SciFact · 50 | 0.6904 | 0.9545 | **+38%** |
+| SciFact · 100 | 0.6920 | 0.9645 | +39% |
+| NFCorpus · 50 | 0.3257 | 0.6138 | **+88%** |
+| NFCorpus · 100 | 0.3242 | 0.6671 | **+106%** |
+
+**Finding — the reranker tier has enormous headroom (+38% to +106% nDCG), but real rerankers capture only ~10-25% of it.**
+The relevant docs *are* in the candidate pool (recall@50-100 is high, `6efd9d9`) — the hybrid just ranks them poorly in
+the top-10, so a perfect reranker would nearly *double* NFCorpus nDCG (0.32→0.61-0.67) and push SciFact to 0.95+. Yet the
+measured rerankers captured a small slice: ms-marco RRF-combine got +23% on NFCorpus (of the +88-106% ceiling → ~25%),
+bge +4% on SciFact (of +38% → ~10%). Two implications: (1) **the reranker is the highest-leverage *remaining* tier** —
+far more upside than any fusion/embedder knob (which are ≤+33%), but (2) **current cross-encoders are weak relative to the
+ceiling**, which is why the reranker was the "treacherous" tier (model/depth/combine all mattered) — they're operating
+far from optimal. The headroom **grows with feed depth on NFCorpus** (+88%→+106%), consistent with agreement-at-depth
+(`8451e77`) — deeper pools hold more promotable relevant docs. **So: the fusion/embedder story is nearly maxed
+(recommendations ≈ oracle-fusion), but the reranker is wide open** — a better reranker (or better use of it) is the one
+place large gains remain. Verified: `model2vec` retrieval-32M + `rank_bm25`, oracle reorder on BEIR SciFact/NFCorpus.
