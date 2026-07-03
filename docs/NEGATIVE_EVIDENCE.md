@@ -7134,3 +7134,27 @@ a design validation: **RRF's `1/(k+r_L)+1/(k+r_V)` is the sweet spot — enough 
 signal, not so much that it discards rank.** (Consistent with CombMAX losing `50d077c` — max discards agreement; explicit
 bonus over-weights it; RRF's sum is the balance.) Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
 SciFact/NFCorpus (no cargo).
+
+---
+
+### Cross-tier agreement STRENGTHENS with depth (11-30×) — why deep pools help the reranker (IronPetrel, 2026-07-03)
+
+Extending the agreement-signal foundation (`a81346b`): does the 5-25× multiplier hold at other pool depths? Measured the
+both-tier-vs-one-tier precision multiplier at depths 10/20/50/100 per tier:
+
+| depth/tier | SciFact: both-tier / one-tier % rel (multiplier) | NFCorpus (multiplier) |
+|---|---|---|
+| 10 | 20.5% / 1.81% (**11×**) | 43.6% / 11.5% (**4×**) |
+| 20 | 12.1% / 0.75% (16×) | 35.1% / 8.1% (4×) |
+| 50 | 5.8% / 0.23% (25×) | 24.5% / 4.9% (5×) |
+| 100 | 3.1% / 0.10% (**30×**) | 17.2% / 3.1% (**6×**) |
+
+**Finding — the agreement multiplier GROWS with pool depth (SciFact 11×→30×, NFCorpus 4×→6×).** Both-tier precision falls
+with depth (more marginal agreed docs), but one-tier precision falls *faster* — a one-tier doc at depth-100 is near-pure
+noise (0.10% relevant on SciFact). So a doc both tiers rank *deep* is an even stronger relevance signal than one they rank
+*shallow*: cross-tier agreement is a **depth-robust, depth-strengthening** relevance prior. This **explains the deep-feed
+result** (`b311ac3`, deep feed helps the reranker but not the non-reranked top-10): feeding a deep pool to the reranker is
+valuable precisely because the deep both-tier (consensus) set is 25-30× enriched for relevance — a clean signal the
+reranker reorders — whereas RRF already surfaces the shallow both-tier docs into the non-reranked top-10. So the practical
+rule: **a deep candidate pool + consensus filtering (RRF) + reranking compound** — agreement enriches the deep pool, RRF
+ranks by it, the reranker refines it. Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
