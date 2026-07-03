@@ -6941,3 +6941,29 @@ top-10 is set by the top ~20. **Refined recommendation for `candidate_multiplier
 reranking; use a deep feed (~100/tier) only when reranking** (the reranker is what turns deep recall into final-ranking
 quality). Reconciles the two depth findings: recall@100 grows with feed depth, but non-reranked nDCG@10 doesn't. Verified:
 `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### Small-k substitutes for the tier-weight: with k=10, equal weight ≈ 1.3× (over-weighting hurts) (IronPetrel, 2026-07-03)
+
+The "up-weight the stronger tier ~1.3×" recommendation (`fa592b9`) was found with the *old* k=60. Re-swept the
+vector-tier weight **with the recommended small k=10** (vector is the stronger tier on both), nDCG@10:
+
+| vec_w (k=10) | SciFact recall/nDCG@10 | NFCorpus recall/nDCG@10 |
+|---|---|---|
+| 1.0 (equal) | 0.8358 / **0.6904** | 0.1587 / 0.3257 |
+| 1.3 | 0.8341 / 0.6890 | 0.1585 / **0.3268** |
+| 1.7 | 0.8366 / 0.6835 | 0.1608 / 0.3257 |
+| 2.5 | 0.8280 / 0.6758 | 0.1574 / 0.3229 |
+| 4.0 | 0.8113 / 0.6594 | 0.1528 / 0.3174 |
+
+**Finding — with small k=10 the tier-weight barely matters: equal weight (1.0) ≈ 1.3× (within ±0.3% noise), and
+over-weighting (≥1.7) HURTS monotonically.** This softens the earlier "up-weight 1.3×" claim: that mattered with k=60,
+where the flat `1/(k+r)` over the top-10 needed a weight to shift ranking (and >1 then "collapsed to that tier",
+`7bb8da5`). With small k=10 the contribution curve is already sharp enough to separate the top ranks, so **small-k
+substitutes for the weight** — the two knobs are partial substitutes, not additive. So the k=10 uplift (`4cc3b47`, +2.6%)
+is mostly the *small-k*, not the weight. **Simplified recommendation: the key fusion knob is small `k` (≈10); a light
+tier-weight (1.0-1.3) is fine but NOT critical, and never over-weight (≥1.7 degrades).** This is the third fusion-knob
+interaction (after tiebreak⊂weighting `396e2c6` and deep-feed⊂reranking `b311ac3`): **the fusion config is far simpler
+than the knob count suggests — small-k does most of the work; weight and tiebreak are largely redundant with it.**
+Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
