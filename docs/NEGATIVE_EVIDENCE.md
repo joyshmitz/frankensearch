@@ -7212,3 +7212,29 @@ far from optimal. The headroom **grows with feed depth on NFCorpus** (+88%→+10
 (`8451e77`) — deeper pools hold more promotable relevant docs. **So: the fusion/embedder story is nearly maxed
 (recommendations ≈ oracle-fusion), but the reranker is wide open** — a better reranker (or better use of it) is the one
 place large gains remain. Verified: `model2vec` retrieval-32M + `rank_bm25`, oracle reorder on BEIR SciFact/NFCorpus.
+
+---
+
+### RRF ↔ reranker complementarity: RRF surfaces consensus, the reranker recovers RRF-diluted one-tier docs (IronPetrel, 2026-07-03)
+
+Connecting the reranker headroom (`2779703`) to the dilution mechanism (`4c9530c`): what's the *composition* of the
+reranker's headroom — the relevant docs in the candidate pool the hybrid ranks poorly (>10)? Are they the one-tier
+relevant docs RRF diluted?
+
+| dataset | hybrid top-10 relevant docs | reranker headroom (relevant, ranked >10) |
+|---|---|---|
+| SciFact | 278 (**95% both-tier**) | 48 (**56% one-tier**, 44% both) |
+| NFCorpus | 764 (**92% both-tier**) | 2135 (**66% one-tier**, 34% both) |
+
+**Finding — RRF and the reranker are mechanistically complementary.** (1) The hybrid's **top-10 is 92-95% consensus
+(both-tier) docs** — RRF surfaces exactly the cross-tier-agreement set (the 5-25× relevance signal, `a81346b`). (2) The
+**reranker's headroom is majority one-tier (56-66%)** — the relevant docs the hybrid ranks poorly are disproportionately
+the one-tier docs RRF *diluted* (+16-32 positions, `4c9530c`). So the reranker's job is largely to **recover the one-tier
+relevant docs that consensus-filtering demoted** — which it *can* do because, by reading query-doc content, it
+distinguishes the one-tier *relevant* docs from the one-tier *false positives* that RRF (rank-only) necessarily diluted
+*together*. This is the mechanistic reason **RRF + reranking compound**: RRF cheaply ranks the consensus set (rank-based,
+false-positive-filtered), and the reranker expensively recovers the complementary one-tier relevant docs (content-based).
+It also explains NFCorpus's huge reranker ceiling (+106%): it has 2135 headroom relevant docs, 66% one-tier — a mountain
+of RRF-diluted relevant docs a content-aware reranker could recover. **The two tiers aren't redundant: RRF's blind spot
+(one-tier relevant docs, indistinguishable from FPs by rank) is exactly the reranker's strength (content).** Verified:
+`model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
