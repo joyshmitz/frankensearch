@@ -50,7 +50,15 @@ measurably the worst option for English retrieval.
   **96% of relevant docs** (SciFact recall@100 = 0.960), and the vector tier's edge over BM25
   *grows* with depth (exactly what a reranker exploits).
 
-### 4. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
+### 4. Reranker is a CONDITIONAL polish, not a guaranteed win — pick it per domain.
+- frankensearch's default reranker (`ms-marco-MiniLM-L-6-v2`) gave only **+1.5% nDCG** reranking the
+  hybrid's top-50 on SciFact — it's trained on MS-MARCO **web passages** and transfers weakly to
+  out-of-domain (scientific) corpora, and the hybrid candidates are already well-ranked.
+- **The reranker MODEL choice matters as much as the embedder.** For non-web-search domains, evaluate a
+  domain-matched / stronger reranker (`bge-reranker-base`, `jina-reranker-v2`) — or **skip reranking**
+  if the hybrid already ranks well, saving the cross-encoder's per-candidate forward-pass cost.
+
+### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
 - On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both
   faster *and* exactly lossless vs 4-bit (the AVX2 `dot_i8_i8` kernel beats the 4-bit nibble-unpack).
   Already swapped in `sync_searcher.rs` (820/820 fusion tests green).
