@@ -112,11 +112,19 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   Already swapped in `sync_searcher.rs` (820/820 fusion tests green).
 
 ## Total measured uplift (recommendations 1+3, end-to-end hybrid)
-| BEIR dataset | current stack (multilingual-128M + equal RRF) | recommended (retrieval-32M + tuned RRF) | Δrecall / ΔnDCG |
+Refreshed with **all** validated retrieval-side knobs — retrieval-32M **@ dim-256** (`06fdef9`) + tier-weight 1.3 +
+**RRF k=10** (`4cc3b47`) — vs stock (multilingual-128M + equal-weight k=60), both at dim-256 (equal scan cost, no
+reranker). recall@10 / nDCG@10:
+
+| BEIR dataset | stock (multilingual-128M + equal RRF k=60) | recommended (retrieval-32M@256 + w-1.3 + k=10) | Δrecall / ΔnDCG |
 |---|---|---|---|
-| SciFact | 0.785 / 0.591 | **0.835 / 0.665** | +5.0 / +7.4 |
-| NFCorpus | 0.141 / 0.268 | **0.156 / 0.321** | +1.5 / +5.3 |
-| ArguAna | 0.778 / 0.373 | **0.794 / 0.384** | +1.6 / +1.1 |
+| SciFact | 0.756 / 0.590 | **0.842 / 0.676** | **+11% / +15%** |
+| NFCorpus | 0.133 / 0.269 | **0.160 / 0.325** | **+20% / +21%** |
+| ArguAna | vector already strong vs BM25's long-doc penalty | (embedder swap adds least) | ~+1-4% |
+
+The compounding free/cheap changes (retrieval-distilled embedder + stronger-tier weight + small k, all at dim-256) lift
+the semantic-search hybrid **+15-21% nDCG at zero inference cost** — ~3× the earlier estimate, which omitted the
+validated small-k and full tuning. (Add the optional reranker on top for the capstone's further gains.)
 
 ## Capstone: FULL pipeline (1+3+4) vs Tantivy BM25-alone (one end-to-end run)
 The whole recommended stack — retrieval-32M + tuned RRF hybrid **+ RRF-combine reranker** — vs Tantivy BM25-alone,
