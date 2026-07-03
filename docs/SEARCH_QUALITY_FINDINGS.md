@@ -26,6 +26,12 @@ measurably the worst option for English retrieval.
   +27%** at identical cost. 32M < 128M, so it's smaller on disk too.
 - **Caveat:** keep a multilingual option for non-English corpora; the recommendation is the
   *English default*. (This is the one genuine product decision — multilingual vs English-first.)
+- **Premium tier (contextual):** frankensearch also ships a contextual ONNX path (`fastembed`).
+  A contextual model (`BAAI/bge-small-en-v1.5`) scores **0.845/0.720** on SciFact — **+14% nDCG**
+  over the best static — but embeds **~650× slower** (transformer forward pass vs static lookup)
+  and needs the onnxruntime. Since embed cost is a one-time *index-build* cost (not per-query),
+  contextual is the right premium for quality-sensitive, rarely-reindexed corpora. Tiered guidance:
+  **static `retrieval-32M` = fast default; contextual BGE = quality premium.**
 
 ### 2. Ship the hybrid as the default (it's the safe choice across domains).
 - Hybrid ≥ the better single tier on all 3 BEIR datasets; wins meaningfully on semantic corpora
