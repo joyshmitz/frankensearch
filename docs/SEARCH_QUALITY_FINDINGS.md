@@ -55,8 +55,10 @@ measurably the worst option for English retrieval.
 - **Up-weight the stronger tier ~1.3×** (not always vector) + smaller RRF `k` (~10, not 60 —
   `k=60` is too flat over the top-10, so any weight >1 degenerates to that tier alone) → the hybrid
   strictly dominates the best single tier on **both** recall and nDCG (SciFact 0.835/0.665).
-- **Neutral (hash) tiebreak**, not the current lexical-favoring one in `rrf.rs:100-111`
-  (never fall through to `doc_id` — that's worse); small nDCG lift.
+- **Neutral (hash) tiebreak** — but *only if you run equal weights*. Tier-weighting **subsumes** it: with weights the
+  fused contributions are distinct, eliminating ~95-97% of RRF ties (stock equal-weight has ties in 27-48% of queries;
+  weighted has ~1%). So the lexical-favoring tiebreak biases 1/3-1/2 of *stock* results, but is nearly moot once you
+  weight — **adopt tier-weighting and you can skip the tiebreak knob** (`396e2c6`).
 - **Deep candidate feed** (`candidate_multiplier` ⇒ fetch ~50-100/tier, not tight top-K): +~1 recall
   pt, ~free. frankensearch reranks, so the first-stage metric is **recall@100** — the hybrid feeds
   **96% of relevant docs** (SciFact recall@100 = 0.960), and the vector tier's edge over BM25
