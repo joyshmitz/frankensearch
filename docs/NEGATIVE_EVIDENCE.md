@@ -5567,6 +5567,37 @@ prefix-query harness cannot generate without a paraphrase model. **Net (corrects
 adaptive fusion needs a semantic-query benchmark, and the honest current bottom line is that for exact-keyword known-item
 search, lexical-alone is hard to beat. Verified: numpy + sklearn TF-IDF on the committed slabs + corpus texts (no cargo).
 
+---
+
+## 2026-07-03 — LANDMARK (the definitive semantic answer): on a REAL labeled semantic benchmark (BEIR SciFact), the HYBRID beats lexical by +4.8 recall pts and the vector tier's unique value is 5× higher than on keyword-overlap (IronPetrel)
+
+Settled the open question (the keyword-overlap known-item task couldn't test the vector tier's real value). Downloaded
+**BEIR SciFact** (5183 scientific abstracts; 300 test queries that are scientific **claims** — keyword-*divergent*, they
+paraphrase the evidence; real qrels), embedded corpus+queries with **potion** (via `model2vec` in a venv — no torch, no
+cargo), TF-IDF as the BM25-proxy lexical tier, and evaluated against the qrels:
+
+| method | recall@10 | nDCG@10 |
+|---|---|---|
+| TF-IDF lexical (BM25 proxy ≈ Tantivy tier) | 0.7735 | 0.6286 |
+| vector (potion) | 0.6618 | 0.5064 |
+| **hybrid (equal RRF)** | **0.8216** | 0.6102 |
+
+Complementarity on semantic queries: **vector-ONLY (relevant docs lexical missed) = 7.0%**, lexical-ONLY = 18.3%, both =
+61.0%.
+
+**Findings — the payoff of the whole session's real-embedding arc:** (1) **On real semantic queries the hybrid BEATS the
+best single tier by +4.8 recall pts** (0.822 vs lexical 0.774, +6.2% relative) — the exact *opposite* of the
+keyword-overlap known-item task (where the hybrid was *below* lexical, `8130208`). (2) **The vector tier's unique
+contribution is 7.0% here vs 1.35% on keyword-overlap — 5× higher** — confirming the precise prediction from the
+complementarity entry (`46b230c`): the hybrid is justified iff, on semantic queries, vector-ONLY ≫ 1.35%. It is. (3) So
+frankensearch's hybrid design is **validated where it matters** — semantic/keyword-divergent queries — and the earlier
+"lexical-alone is hard to beat" bottom line was an artifact of the keyword-overlap test harness, now corrected on a real
+benchmark. (Honest caveats: nDCG@10 hybrid 0.610 is a hair below lexical 0.629 — the same RRF rank-dilution/tiebreak effect
+from `a721e39`; equal-weight RRF maximizes *recall* but slightly dilutes rank-1, so the source-weighted + neutral-tiebreak
+fixes would lift nDCG too. potion is a lightweight static model; a stronger contextual model would raise vector/hybrid
+further. TF-IDF ≈ BM25 but not Tantivy's exact scorer.) Strongest real-benchmark evidence that the hybrid > lexical(Tantivy)
+on semantic search. Verified: `model2vec`+`sklearn` in a venv on BEIR SciFact qrels (no cargo, no torch).
+
 **Follow-up (COMPLEMENTARITY decomposition — quantifies *why*, and what a semantic benchmark must show): on keyword-overlap
 known-item, the vector tier adds only 1.35% UNIQUE, so the fusion ceiling is barely above lexical-alone.** Decomposed where
 each tier finds the source doc (963 queries, potion vector + TF-IDF lexical):
