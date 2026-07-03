@@ -6801,3 +6801,26 @@ definitively: **no cheap per-query signal (margin, length) converts into a stron
 aggregate ≠ per-query predictability.** Fixed fusion weighting (up-weight the stronger tier globally, `fa592b9`) is the
 right approach; per-query adaptivity does not pay. Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
 SciFact/NFCorpus qrels (no cargo).
+
+---
+
+### MRL dim-256 truncation validated across 3 datasets: 95-98% of full nDCG at 2× smaller (IronPetrel, 2026-07-03)
+
+The "free upgrade" recommendation stores retrieval-32M MRL-truncated to **dim-256** (half of its 512), claiming ~95% of
+full quality — but that rested mostly on SciFact. Validated the MRL dim ladder (first-d dims, re-normalized) across all 3
+BEIR datasets:
+
+| dataset | dim 512 (full) nDCG@10 | MRL-256 | MRL-128 | MRL-64 |
+|---|---|---|---|---|
+| SciFact | 0.6331 | 0.5993 (**95%**) | 0.5682 (90%) | 0.4869 (77%) |
+| NFCorpus | 0.3085 | 0.3032 (**98%**) | 0.2899 (94%) | 0.2553 (83%) |
+| ArguAna | 0.3328 | 0.3275 (**98%**) | 0.3088 (93%) | 0.2710 (81%) |
+
+**Finding — MRL-256 retains 95-98% of full nDCG on every dataset** (SciFact 95%, NFCorpus 98%, ArguAna 98%) at 2× less
+storage and scan cost — the dim-256 free-upgrade recommendation holds beyond SciFact, confirmed to the 3-dataset bar.
+**dim-128** (4× smaller) is a viable *storage-constrained* option (90-94% of full, weakest on SciFact); **dim-64** is
+too aggressive (77-83%). The graceful degradation is a property of the retrieval-distilled (Matryoshka-trained) model —
+recall the general multilingual default degrades catastrophically under MRL (`01bec23`), so this only applies with a
+retrieval-distilled embedder (rec #1). Net: **default to retrieval-32M @ dim-256 (95-98% quality, 2× cheaper); drop to
+dim-128 only if storage-bound.** Verified: `model2vec` retrieval-32M, first-d MRL truncation on BEIR
+SciFact/NFCorpus/ArguAna qrels (no cargo).
