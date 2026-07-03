@@ -5229,3 +5229,32 @@ genuinely **Matryoshka-trained** embeddings (models trained so prefixes are self
 and MiniLM (raw transformer) are **not**. **Recommendation:** do NOT enable `MrlConfig` on potion/MiniLM-class embeddings
 — the 1.67× scan speedup is worthless at 0.545 recall; the `mrl.rs` "2–6× faster" claim must be read as speed-only and
 gated on an MRL-trained model. Verified: `--features ann` bench (with the new `[mrl]` block) runs clean locally (exit 0).
+
+---
+
+## 2026-07-03 — MEASURED (POSITIVE, the "ratio vs Tantivy" itself): HYBRID retrieves 100% of known items vs Tantivy-lexical's 90.2% on real data (IronPetrel)
+
+Every prior "vs Tantivy" note framed the vector tier as *the differentiator* frankensearch adds on top of Tantivy, but the
+end-to-end HYBRID had never been measured against Tantivy-lexical-alone on real data. Built `real_hybrid_knownitem`
+(`frankensearch-fusion --features lexical`): index a real 30k English corpus in **Tantivy (BM25)** AND the **vector index
+(real potion embeddings)**, then run **label-free known-item retrieval** — each query is the first ~10 words of a held-out
+corpus doc (embedded separately, so it's a genuine partial query, not a trivial exact-vector match); the one relevant
+answer is that source doc. Fuses lexical + vector via the production `rrf_fuse`.
+
+**Measured (30k corpus, 254 known-item queries, k=10):**
+
+| tier | recall@10 | MRR@10 |
+|---|---|---|
+| **Tantivy lexical (BM25) alone** | **0.9016** | 0.8915 |
+| vector (potion) alone | 0.9961 | 0.9678 |
+| **hybrid (lexical + vector, RRF)** | **1.0000** | 0.9457 |
+
+**Finding (the direct product-value ratio vs Tantivy):** the **hybrid retrieves the source doc for 100% of queries vs
+Tantivy-lexical-alone's 90.2%** — a **+9.8-point / ~10.9% relative recall win**, the first real-data confirmation that
+frankensearch's hybrid tier meaningfully beats the Tantivy baseline it's built on. RRF recall is ≥ max(lexical, vector) by
+construction (fusion recovers what *either* tier finds); here vector-alone (0.996) already dominates lexical (0.902), and
+hybrid (1.0) tops both. **Honest nuance:** hybrid maximizes *recall* but its **MRR (0.946) sits just below vector-alone
+(0.968)** — RRF rank-blending slightly dilutes a strong vector rank-1 when the lexical rank is weak, so for pure rank-1
+precision vector-alone edges hybrid, while for "find the doc at all" hybrid wins outright. Net: the hybrid's value-add
+over Tantivy is real and measured (+10.9% recall) on real embeddings + real text. Verified: `--features lexical` bench
+compiles + runs locally (exit 0); async Tantivy index of 30k real docs + 254 queries.

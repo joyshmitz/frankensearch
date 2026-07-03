@@ -178,3 +178,9 @@ harness = false
 [[bench]]
 name = "scoredresult_box_ab"
 harness = false
+
+# REAL-data hybrid (lexical+vector RRF) vs Tantivy-lexical-alone known-item retrieval.
+[[bench]]
+name = "real_hybrid_knownitem"
+harness = false
+required-features = ["lexical"]
