@@ -93,13 +93,19 @@ fn bench_real_embed_ann(c: &mut Criterion) {
     }
     let index = VectorIndex::open(&path).expect("open index");
 
-    // M=32 (high-recall setting, matching hnsw_vs_flat_100k).
+    // M controls HNSW graph density (recall knob); env-overridable to test whether
+    // a denser graph restores the per-query tail certificate at large N.
+    let m: usize = std::env::var("FS_REAL_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
     let hnsw_config = HnswConfig {
-        m: 32,
+        m,
         ..HnswConfig::default()
     };
     let hnsw = HnswIndex::build_from_vector_index(&index, hnsw_config).expect("build hnsw");
-    eprintln!("[real_embed_ann] N={n} dim={dim} k={K} — HNSW M=32 built");
+    eprintln!("[real_embed_ann] HNSW M={m}");
+    eprintln!("[real_embed_ann] N={n} dim={dim} k={K} — HNSW M={m} built");
 
     // ── Recall@ef sweep vs exact flat (real data). ──
     let holdout_exact: Vec<Vec<String>> = holdout

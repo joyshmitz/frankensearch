@@ -5025,3 +5025,15 @@ as the corpus grows** (a heavier low-recall tail emerges when the graph gets rel
 takeaway: finding #2's "0.95 tail unachievable on real data" is **N-specific (100k @ M=32)**, not fundamental — at
 BOLD-scale N the fix is **higher M** (denser graph), not just higher ef (recall plateaus at 0.992 by ef=400, so ef alone
 can't close the tail). Verified: runs clean locally (exit 0).
+
+**Follow-up 2 (CONFIRMS the M-hypothesis, closes the ANN-in-BOLD tail question): M=64 RESTORES the 0.95 tail cert at
+N=100k.** Re-ran `real_embed_ann` at **N=100 336, M=64** (`FS_REAL_M=64`, same real potion embeddings): recall@10 =
+0.956/0.988/0.994/0.998/0.998 at ef=40/100/200/400/800, and the per-query tail certificate (target 0.95, α 0.1) is now
+**`meets=true` at ef=200 with lower bound 1.0000** — vs **M=32 @100k which failed** (ef=200 bound 0.90, `meets=false`).
+So the large-N tail-cert degradation (Follow-up 1) is **not fundamental — doubling M (32→64) closes it**: the denser graph
+lifts the low-recall tail so ≥90% of calibration queries hit recall@10=1.0 at ef=200 even at 100k. **Net ANN-in-BOLD
+verdict on REAL embeddings:** the strong per-query 0.95 tail guarantee IS deliverable at BOLD scale with **M=64** (≈2× the
+M=32 graph memory + slower build), certified at ef=200 (≈1.4× vs flat 6.17 ms); the weaker mean-recall budget is
+certifiable much cheaper (ef=100, recall 0.988, ≈2.5× vs flat). The synthetic-era cert numbers were optimistic on the
+*tail at large N with default M*, but the guarantee is recoverable — it is an **M-budget** decision, not a wall.
+Verified: `--features ann` runs clean locally (exit 0).
