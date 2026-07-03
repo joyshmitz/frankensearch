@@ -6292,3 +6292,32 @@ right remedy for weak/short queries remains the **lexical (BM25) tier** (per the
 vector-space feedback. Caveat: this is measured for *static* (model2vec) embeddings — contextual embeddings have more
 semantically-precise doc vectors and *might* tolerate PRF, but that's the premium path, not the fast default. Verified:
 `model2vec` retrieval-32M on BEIR SciFact/NFCorpus qrels (no cargo, no torch).
+
+---
+
+### Contextual embedder premium GENERALIZES (+10-29% nDCG) — largest where static is weakest (IronPetrel, 2026-07-03)
+
+Rec #1's *premium tier* (contextual `BAAI/bge-small-en-v1.5` > static `retrieval-32M`) rested on **one** dataset
+(SciFact +14% nDCG). Held to the same 3-BEIR-dataset bar as the static-embedder recommendation, it's now validated —
+vector-tier recall@10 / nDCG@10, static vs contextual:
+
+| dataset | static retrieval-32M | contextual bge-small-en-v1.5 | ΔnDCG |
+|---|---|---|---|
+| SciFact  | 0.795 / 0.633 | 0.845 / 0.720 | **+14%** |
+| NFCorpus | 0.148 / 0.3085 | 0.1615 / 0.3382 | **+9.6%** |
+| ArguAna  | 0.698 / 0.3328 | **0.841 / 0.4287** | **+28.8%** (recall +0.143!) |
+
+**Finding — the contextual premium is real and generalizes (+10% to +29% nDCG on every dataset), and it's LARGEST
+exactly where static embeddings are weakest.** On ArguAna the contextual model lifts nDCG **+28.8%** and recall from
+0.698 → **0.841** — because ArguAna is argument→*counter*-argument retrieval, which needs deep semantic understanding of
+argumentative structure and negation that a static mean-pooled token-lookup embedding fundamentally cannot capture, but
+a contextual transformer can. The static tier's biggest weakness (semantic/argumentative queries) is precisely the
+contextual tier's biggest win.
+
+**This CONFIRMS and STRENGTHENS rec #1's premium tier** (contrast the reranker cross-dataset result `657df16`, where the
+same 3-dataset validation *retracted* the "ship bge-reranker" call — same rigor, opposite outcome, which is the point of
+validating across datasets). Product takeaway unchanged but now multi-dataset-backed: **static `retrieval-32M` = fast
+default; contextual `bge-small` = quality premium worth +10-29% nDCG for quality-sensitive, rarely-reindexed corpora**
+(the ~650× embed-slowdown is a one-time index-build cost, not per-query). The premium is most compelling on semantically
+hard corpora (argumentative, negation-heavy) where static embeddings structurally underperform. Verified: `model2vec`
+retrieval-32M + `fastembed` bge-small-en-v1.5 (ONNX) on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).

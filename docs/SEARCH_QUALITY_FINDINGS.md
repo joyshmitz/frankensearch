@@ -27,11 +27,15 @@ measurably the worst option for English retrieval.
 - **Caveat:** keep a multilingual option for non-English corpora; the recommendation is the
   *English default*. (This is the one genuine product decision — multilingual vs English-first.)
 - **Premium tier (contextual):** frankensearch also ships a contextual ONNX path (`fastembed`).
-  A contextual model (`BAAI/bge-small-en-v1.5`) scores **0.845/0.720** on SciFact — **+14% nDCG**
-  over the best static — but embeds **~650× slower** (transformer forward pass vs static lookup)
-  and needs the onnxruntime. Since embed cost is a one-time *index-build* cost (not per-query),
-  contextual is the right premium for quality-sensitive, rarely-reindexed corpora. Tiered guidance:
-  **static `retrieval-32M` = fast default; contextual BGE = quality premium.**
+  A contextual model (`BAAI/bge-small-en-v1.5`) beats the best static on **all 3 BEIR datasets** —
+  **+14% nDCG SciFact, +9.6% NFCorpus, +28.8% ArguAna** (ArguAna recall 0.698→0.841) — but embeds
+  **~650× slower** (transformer forward pass vs static lookup) and needs the onnxruntime. Since embed
+  cost is a one-time *index-build* cost (not per-query), contextual is the right premium for
+  quality-sensitive, rarely-reindexed corpora. **The premium is largest exactly where static embeddings
+  are weakest** (ArguAna's argument→counter-argument task, which needs contextual understanding of
+  argumentative structure/negation that static mean-pooling can't capture). Tiered guidance:
+  **static `retrieval-32M` = fast default; contextual BGE = quality premium (+10-29% nDCG, multi-dataset
+  validated), most compelling on semantically hard / argumentative corpora.**
 
 ### 2. Ship the hybrid as the default (it's the safe choice across domains).
 - Hybrid ≥ the better single tier on all 3 BEIR datasets; wins meaningfully on semantic corpora
