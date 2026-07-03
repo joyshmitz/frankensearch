@@ -5913,3 +5913,25 @@ recall for 2× scan cost — a separate speed/quality knob via MRL, per the earl
 default embedder = retrieval-distilled, stored at dim=256 (MRL-truncated) → matches the current stock's cost profile while
 delivering +27% vector recall.** This removes the last objection (latency) to the session's #1 recommendation. Verified:
 `model2vec` (4 models) + numpy timing/MRL in the venv on BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — RULED OUT (config gotcha): `query:`/`passage:` prefixes HURT potion-retrieval-32M — it's a no-prefix model, my numbers already use the optimal convention (IronPetrel)
+
+Checked a common retrieval gotcha: many models (E5, BGE, Nomic) require asymmetric `query:`/`passage:` (or
+`search_query:`/`search_document:`) prefixes for best performance. Tested whether potion-retrieval-32M does, on SciFact +
+NFCorpus (vector recall@10 / nDCG@10):
+
+| prefix convention | SciFact | NFCorpus |
+|---|---|---|
+| **none** (what I've used) | **0.795 / 0.633** | **0.148 / 0.309** |
+| `query:` / `passage:` | 0.772 / 0.622 | 0.140 / 0.294 |
+| `Query:` / (none) | 0.772 / 0.621 | 0.141 / 0.294 |
+| `search_query:` / `search_document:` | 0.775 / 0.613 | 0.133 / 0.278 |
+
+**Finding:** prefixes **hurt** potion-retrieval-32M (−2 to −3 recall pts) on both datasets — it's a **no-prefix (symmetric)
+retrieval model**, not E5/BGE-style. So (1) all this session's retrieval-32M numbers already use the **optimal** convention
+(no quality was left on the table), and (2) it rules out a real production gotcha: **do NOT wrap queries/docs in
+`query:`/`passage:` prefixes with this model** (the prefix tokens dilute the mean-pooled static embedding). A small,
+config-hygiene confirmation — but the kind of gotcha that silently costs 2–3 recall pts if assumed. Verified: `model2vec`
+retrieval-32M + numpy venv on BEIR SciFact + NFCorpus qrels (no cargo, no torch).
