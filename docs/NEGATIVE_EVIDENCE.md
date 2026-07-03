@@ -5654,3 +5654,30 @@ the up-weighted tier's docs *all* outrank the other tier → collapse to that ti
 takeaway:** frankensearch's hybrid, tuned with a modest stronger-tier weight (~1.3×) + a smaller RRF k + neutral tiebreak,
 **strictly beats Tantivy-lexical on both recall and nDCG on real semantic queries** — the definitive, actionable
 validation. Verified: `model2vec`+`sklearn` venv on BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — LANDMARK (the biggest lever): a RETRIEVAL-TUNED static embedding model makes the vector tier ALONE beat lexical on SciFact — the model choice dominates the fusion tuning (IronPetrel)
+
+The prior SciFact runs used **potion-base-8M**, a *general-purpose* static model, where the vector tier was *weaker* than
+lexical (0.66 vs 0.77 recall). Swapped in **`minishlab/potion-retrieval-32M`** — a **retrieval-distilled** static model
+(still `model2vec`, lightweight, **no torch**) — via the venv harness on BEIR SciFact:
+
+| method (SciFact, 300 test queries) | recall@10 | nDCG@10 |
+|---|---|---|
+| lexical (TF-IDF ≈ BM25 ≈ Tantivy tier) | 0.7735 | 0.6286 |
+| vector — potion-base-8M (general) | 0.6618 | 0.5064 |
+| **vector — potion-retrieval-32M (retrieval-tuned)** | **0.7948** | **0.6331** |
+| hybrid — 8M, `lex_w=1.3` (up-weight stronger=lexical) | 0.8063 | 0.6293 |
+| **hybrid — retrieval-32M, `vec_w=1.3` (up-weight stronger=vector)** | **0.8349** | **0.6655** |
+
+**Findings:** (1) **The retrieval-tuned model makes the VECTOR tier alone beat lexical on semantic queries** — recall
+0.7948 > 0.7735, nDCG 0.6331 > 0.6286 — flipping which tier is stronger (and, per the stronger-tier-weighting rule, which
+tier to up-weight: now vector). (2) **The retrieval-32M hybrid reaches 0.835 recall / 0.666 nDCG — beating Tantivy-lexical
+by +6.1 recall / +3.7 nDCG pts**, and the general-8M hybrid (0.806 / 0.629) by a wide margin. (3) **The embedding-model
+choice is a BIGGER lever than any fusion tuning:** swapping general→retrieval static model moved vector recall +13 pts
+(0.66→0.79) and the hybrid +2.9 pts (0.806→0.835) — far more than the fusion-weight/tiebreak knobs (fractions of a point).
+Both models are lightweight static (no ONNX/torch), so this is a **free** upgrade. **Product takeaway:** frankensearch's
+default embedder matters most — use a **retrieval-distilled** model (potion-retrieval-32M class), not a general one; with
+it the hybrid decisively dominates Tantivy-lexical on real semantic search. Verified: `model2vec` (auto-downloaded
+retrieval-32M) + `sklearn` in the venv on BEIR SciFact qrels (no cargo, no torch).
