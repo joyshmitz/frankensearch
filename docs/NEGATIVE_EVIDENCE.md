@@ -6915,3 +6915,29 @@ spreads scores, so the recommended config has almost **no** ties (~1%) — the t
 equal weights, the hash-tiebreak is important (it de-biases ~1/3-1/2 of queries).** The two knobs are not independent —
 weighting is the more fundamental fix (it removes the ties rather than resolving them fairly). Verified: `model2vec`
 retrieval-32M + `rank_bm25`, exact-float tie detection in the fused top-10 on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### Deep candidate feed is a RERANKER-only lever: the non-reranked top-10 plateaus at feed=20 (IronPetrel, 2026-07-03)
+
+I recommend a "deep candidate feed (~50-100/tier)" — but that was justified by recall@100 (`ad4487e`, `6efd9d9`), the
+*reranker*-feed metric. Does deeper feed help the **non-reranked hybrid's final top-10**? Swept the fusion feed depth
+(candidates per tier fed to RRF), weighted hybrid, final recall/nDCG@10:
+
+| feed/tier | SciFact nDCG@10 | NFCorpus nDCG@10 |
+|---|---|---|
+| 10 | 0.6834 | 0.3219 |
+| 20 | 0.6896 | 0.3251 |
+| 50 | 0.6890 | 0.3268 |
+| 100 | 0.6888 | 0.3255 |
+| 200 | 0.6899 | 0.3248 |
+
+**Finding — for the non-reranked hybrid, feed=20-50 is sufficient; deeper feed (100-200) adds nothing** (nDCG flat from
+feed=20 onward, ±0.1% = noise). The reason is structural: a candidate at feed-rank ~80 contributes only `1/(k+80)` ≈
+negligible to its RRF score, so it cannot crack the fused top-10 unless it *also* ranks near the top of the other tier
+(rare) — deep feed simply can't move the non-reranked top-10. **So "deep candidate feed" is a RERANKER-only lever:** it
+enriches the deep candidate pool the cross-encoder reorders (recall@100 grows with depth, `6efd9d9`), but the raw hybrid
+top-10 is set by the top ~20. **Refined recommendation for `candidate_multiplier`: use a modest feed (~20-50/tier) if NOT
+reranking; use a deep feed (~100/tier) only when reranking** (the reranker is what turns deep recall into final-ranking
+quality). Reconciles the two depth findings: recall@100 grows with feed depth, but non-reranked nDCG@10 doesn't. Verified:
+`model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
