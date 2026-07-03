@@ -6020,3 +6020,32 @@ took minutes of CPU here). This completes the full pipeline picture (fast-tier i
 free levers are **the embedder** (+33% free) and **the hybrid** (always ≥ best single tier); the reranker is a
 **conditional, model-and-domain-dependent** final polish, not a guaranteed win. Verified: `fastembed` cross-encoder
 (ms-marco-MiniLM-L-6-v2, ONNX) + `model2vec` + `rank_bm25` in the venv on BEIR SciFact qrels (no cargo, no torch).
+
+---
+
+### Reranker MODEL head-to-head: the default HURTS, a strong reranker helps +4.4% (IronPetrel, 2026-07-03)
+
+The prior entry conjectured a stronger reranker "would likely help more." **Measured it** — same hybrid candidates
+(retrieval-32M + real BM25, RRF stronger-tier-weighted, top-30 fed to the reranker), SciFact 80-query subset,
+two cross-encoders head-to-head:
+
+| SciFact (80q, hybrid top-30 candidates) | nDCG@10 | Δ vs no-rerank |
+|---|---|---|
+| hybrid baseline (no rerank) | 0.7572 | — |
+| **+ `ms-marco-MiniLM-L-6-v2`** (frankensearch's DEFAULT) | 0.7410 | **−0.0162 (−2.1%, HURTS)** |
+| **+ `BAAI/bge-reranker-base`** (strong general reranker) | **0.7907** | **+0.0335 (+4.4%)** |
+
+**Finding — the reranker MODEL is the whole story, confirmed.** On out-of-domain (scientific) text the default
+`ms-marco-MiniLM-L-6-v2` reranker **actively hurts** (−2.1% here; it was a marginal +1.5% on the full 300-query set —
+i.e. it hovers around zero and its sign flips with the query sample). A strong general reranker, `bge-reranker-base`,
+gives a solid **+4.4%**. The gap between the two rerankers is **+0.050 nDCG (0.741 → 0.791, +6.7%)** — the model choice
+alone swings the reranker tier **from net-negative to net-positive**. This retires the ambiguity in the earlier reranker
+entry: the small/negative lift was the **MODEL's fault (web-domain ms-marco), not the task's** — the reranker tier *does*
+carry real headroom on this corpus, but only with a reranker that generalizes off-web-domain.
+
+**Product takeaway (sharpened):** the default reranker (`ms-marco-MiniLM-L-6-v2`) is a **poor default for non-web
+corpora — it can lose quality.** Ship `bge-reranker-base` (or a domain-matched reranker) as the reranking default, or
+gate reranking behind a per-corpus eval. Cost caveat unchanged: `bge-reranker-base` (~278M) is ~3× slower per pair than
+`ms-marco-L6` on CPU — the quality/latency trade is real, so reranking stays a **conditional** premium, but when you DO
+rerank, the model choice is decisive. Verified: `fastembed` TextCrossEncoder (both ONNX cross-encoders) + `model2vec`
+retrieval-32M + `rank_bm25` in the venv on BEIR SciFact qrels (no cargo, no torch).

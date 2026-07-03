@@ -50,13 +50,19 @@ measurably the worst option for English retrieval.
   **96% of relevant docs** (SciFact recall@100 = 0.960), and the vector tier's edge over BM25
   *grows* with depth (exactly what a reranker exploits).
 
-### 4. Reranker is a CONDITIONAL polish, not a guaranteed win — pick it per domain.
-- frankensearch's default reranker (`ms-marco-MiniLM-L-6-v2`) gave only **+1.5% nDCG** reranking the
-  hybrid's top-50 on SciFact — it's trained on MS-MARCO **web passages** and transfers weakly to
-  out-of-domain (scientific) corpora, and the hybrid candidates are already well-ranked.
-- **The reranker MODEL choice matters as much as the embedder.** For non-web-search domains, evaluate a
-  domain-matched / stronger reranker (`bge-reranker-base`, `jina-reranker-v2`) — or **skip reranking**
-  if the hybrid already ranks well, saving the cross-encoder's per-candidate forward-pass cost.
+### 4. Reranker is a CONDITIONAL polish — and the MODEL choice is decisive (measured head-to-head).
+- frankensearch's default reranker (`ms-marco-MiniLM-L-6-v2`) is a **poor default for non-web corpora**:
+  on SciFact it hovers around **zero and its sign flips with the query sample** (+1.5% on 300 queries,
+  **−2.1% on an 80-query subset — it *loses* quality**). It's trained on MS-MARCO **web passages** and
+  transfers weakly to out-of-domain (scientific) text.
+- **A strong general reranker fixes it: `bge-reranker-base` scored +4.4% nDCG on the same candidates**
+  (0.757→0.791) — a **+0.050 nDCG (+6.7%) gap** over ms-marco, swinging the tier **from net-negative to
+  net-positive.** The small lift in the first measurement was the **MODEL's fault, not the task's**;
+  the reranker tier carries real headroom with a reranker that generalizes.
+- **Recommendation:** ship `bge-reranker-base` (or a domain-matched reranker) as the reranking default,
+  or gate reranking behind a per-corpus eval. Cost trade is real (`bge-reranker-base` ~278M ≈ 3× slower
+  per pair than `ms-marco-L6` on CPU), so reranking stays conditional — but when you DO rerank, **don't
+  use the ms-marco default off-web-domain.** Or **skip reranking** if the hybrid already ranks well.
 
 ### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
 - On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both
