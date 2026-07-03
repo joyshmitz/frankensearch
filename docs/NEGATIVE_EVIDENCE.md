@@ -5523,3 +5523,24 @@ useful but not sharp, and it's weakest exactly where it's most needed (uniformly
 separates found 0.693 vs missed 0.683) — so margin-routing helps the *mixed* query stream more than the all-short tail.
 Route-next: wire a margin-thresholded per-query fusion weight and measure the hybrid recall/MRR uplift (needs the
 lexical-fusion bench). Verified: numpy brute-force on the committed potion slab (no cargo build).
+
+**Follow-up (selective retrieval — the margin gives a usable coverage/accuracy dial): risk-coverage curve.** Serving only
+the top-X% most-confident queries by margin (potion-256, 130k, 963 queries):
+
+| coverage (top-X% by margin) | found@10 on the served set |
+|---|---|
+| 25% | **0.983** |
+| 50% | 0.915 |
+| 75% | 0.812 |
+| 90% | 0.766 |
+| 100% (baseline) | 0.745 |
+
+And the **flagged bottom-25%-margin queries have found@10 = 0.544** — the vector tier is nearly a coin-flip there. So the
+margin is a genuinely actionable confidence dial: **serve the confident half of the stream at 0.92 found@10** (vs 0.745
+undifferentiated) and **route the uncertain quarter (0.54) to lexical BM25** (which, per the query-length entries, carries
+exactly those short/ambiguous queries). This is the concrete selective-prediction / adaptive-routing operating point that
+the AUC-0.77 margin signal enables — a real product lever: instead of one global fusion weight, a per-query decision gated
+on a free-to-compute signal (top-1 − top-2). Net arc (query-difficulty): drift is the root cause → it's model-invariant
+(fundamental) → but it's *predictable* per-query (margin AUC 0.77) → so **query-adaptive fusion / selective routing** is
+the answer, directly attacking the one measured hybrid weakness. Route-next (cargo-gated): wire the margin gate into the
+fusion path and measure end-to-end hybrid uplift. Verified: numpy on the committed potion slab (no cargo build).
