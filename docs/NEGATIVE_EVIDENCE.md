@@ -6380,3 +6380,24 @@ ONNX/`fastembed`/`native` needed — so the safe integration is available to eve
 byte-identical to before** (still `PureReorder`); flipping the default to `RrfCombine` is the remaining one-line,
 product-gated decision (it changes user-visible ordering + rerank snapshots) — now de-risked to a single enum value.
 This converts the reranker arc from measurement → recommendation → **landed, tested opt-in code**.
+
+---
+
+### SHIPPED: RrfCombine reachable end-to-end via `TwoTierSearcher::with_rerank_combine` (IronPetrel, 2026-07-03)
+
+Wired the opt-in `RerankCombine` (previous commit) through the fusion searcher so it's reachable from the public API
+without a code fork — additive, default-preserving:
+
+- **`TwoTierSearcher`** (`frankensearch-fusion/src/searcher.rs`) gains a `#[cfg(feature = "rerank")] rerank_combine`
+  field defaulting to `RerankCombine::PureReorder`, plus a builder **`with_rerank_combine(...)`**, following the exact
+  `#[cfg(feature = "graph")]` field pattern already in the struct.
+- **`run_phase3`** now calls `rerank_step_with_combine(..., self.rerank_combine)` instead of `rerank_step(...)`.
+
+Users enable the measured-safe integration with
+`searcher.with_rerank_combine(RerankCombine::RrfCombine { k: DEFAULT_RRF_COMBINE_K })` — one builder call, no fork.
+
+**Verification:** `cargo build -p frankensearch-fusion --features rerank` → clean (EXIT_0);
+`cargo test -p frankensearch-fusion --features rerank --lib rerank` → **2 passed, 0 failed** (822 unrelated tests
+unchanged). **Default output is byte-identical** (still `PureReorder` — provably the same code path). The reranker arc is
+now end-to-end: measurement → recommendation → landed opt-in primitive → reachable via the searcher builder. Flipping the
+default from `PureReorder` to `RrfCombine` remains the one product-gated line (changes user-visible ordering + snapshots).

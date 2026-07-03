@@ -127,6 +127,8 @@ pub struct TwoTierSearcher {
     quality_embedder: Option<Arc<dyn Embedder>>,
     lexical: Option<Arc<dyn LexicalSearch>>,
     reranker: Option<Arc<dyn Reranker>>,
+    #[cfg(feature = "rerank")]
+    rerank_combine: frankensearch_rerank::RerankCombine,
     host_adapter: Option<Arc<dyn HostAdapter>>,
     runtime_metrics_collector: Arc<RuntimeMetricsCollector>,
     live_search_stream_emitter: Arc<LiveSearchStreamEmitter>,
@@ -169,6 +171,8 @@ impl TwoTierSearcher {
             quality_embedder: None,
             lexical: None,
             reranker: None,
+            #[cfg(feature = "rerank")]
+            rerank_combine: frankensearch_rerank::RerankCombine::PureReorder,
             host_adapter: None,
             runtime_metrics_collector: Arc::new(RuntimeMetricsCollector::default()),
             live_search_stream_emitter: Arc::new(LiveSearchStreamEmitter::default()),
@@ -215,6 +219,19 @@ impl TwoTierSearcher {
     #[must_use]
     pub fn with_reranker(mut self, reranker: Arc<dyn Reranker>) -> Self {
         self.reranker = Some(reranker);
+        self
+    }
+
+    /// Choose how the cross-encoder's rerank scores combine with the retrieval order.
+    ///
+    /// Defaults to [`frankensearch_rerank::RerankCombine::PureReorder`] (legacy behavior).
+    /// [`frankensearch_rerank::RerankCombine::RrfCombine`] is the measured-safe integration
+    /// that rank-fuses the pre-rerank order with the rerank order so retrieval vetoes deep
+    /// false positives the reranker would promote (see `docs/NEGATIVE_EVIDENCE.md`).
+    #[cfg(feature = "rerank")]
+    #[must_use]
+    pub fn with_rerank_combine(mut self, combine: frankensearch_rerank::RerankCombine) -> Self {
+        self.rerank_combine = combine;
         self
     }
 
@@ -1611,7 +1628,7 @@ impl TwoTierSearcher {
             let rerank_start = Instant::now();
             let rerank_budget = k.min(results.len());
             if rerank_budget > 0 {
-                frankensearch_rerank::pipeline::rerank_step(
+                frankensearch_rerank::pipeline::rerank_step_with_combine(
                     cx,
                     reranker.as_ref(),
                     query,
@@ -1619,6 +1636,7 @@ impl TwoTierSearcher {
                     text_fn,
                     rerank_budget,
                     5,
+                    self.rerank_combine,
                 )
                 .await?;
             }
