@@ -5832,3 +5832,33 @@ retroactively strengthens every prior BEIR entry (the lexical baseline was, if a
 and BM25 being slightly stronger it is expected to tie or marginally favor lexical, consistent with "hybrid = safe default,
 lift largest on semantic corpora".) Verified: `rank_bm25` + `model2vec` retrieval-32M in the venv on BEIR SciFact + NFCorpus
 qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — MEASURED (architecturally-relevant metric): at reranker-feed depth (recall@100), the hybrid feeds 96% of relevant docs, and the VECTOR tier's edge over BM25 GROWS with depth (IronPetrel)
+
+frankensearch is a **rerank pipeline** (fast + quality tiers → optional cross-encoder rerank), so the metric that actually
+matters for its *first stage* is **recall@100** (the candidate feed to the reranker), not recall@10. Measured recall at
+increasing depth (retrieval-32M vector + TF-IDF lexical + stronger-tier-weight RRF):
+
+| SciFact (n=300) | BM25/tfidf | vector | hybrid | hybrid − best single |
+|---|---|---|---|---|
+| recall@10 | 0.774 | 0.795 | 0.844 | +0.049 |
+| recall@50 | 0.876 | 0.907 | 0.940 | +0.033 |
+| recall@100 | 0.892 | 0.934 | **0.960** | +0.026 |
+
+| NFCorpus (n=323) | BM25/tfidf | vector | hybrid | hybrid − best single |
+|---|---|---|---|---|
+| recall@10 | 0.146 | 0.148 | 0.157 | +0.009 |
+| recall@100 | 0.240 | 0.288 | 0.301 | +0.013 |
+
+**Findings:** (1) **At reranker-feed depth the hybrid feeds 96% of relevant docs (SciFact recall@100 = 0.960)** — a strong
+candidate set for the rerank tier to reorder. (2) The hybrid's *absolute* margin over the best single tier **shrinks with
+depth** (SciFact +0.049@10 → +0.026@100) because both tiers catch more relevant docs as the window widens — but it stays
+positive. (3) **The vector tier's edge over BM25 GROWS with depth** (SciFact @10 vector +2.1 over BM25 → @100 +4.2; NFCorpus
++0.2 → +4.8): the vector tier's *unique* relevant finds sit deeper in its ranking, precisely the docs a reranker promotes.
+**Takeaway:** for frankensearch's rerank architecture the hybrid is the right first stage — it maximizes candidate-feed
+recall (0.96 on semantic data), and the deeper the feed the more the vector tier contributes uniquely; so the fast-tier
+should fetch a **deep candidate list** (≥100) and let the reranker exploit the vector tier's deep unique finds (reinforces
+the fusion-depth entry above). Verified: `model2vec` retrieval-32M + `sklearn` venv on BEIR SciFact + NFCorpus qrels (no
+cargo, no torch).
