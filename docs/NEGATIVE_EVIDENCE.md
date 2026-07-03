@@ -5566,3 +5566,32 @@ prefix-query harness cannot generate without a paraphrase model. **Net (corrects
 *signal* is real (AUC 0.77) but a simple margin *gate* is not an end-to-end win on keyword-overlap tasks; validating
 adaptive fusion needs a semantic-query benchmark, and the honest current bottom line is that for exact-keyword known-item
 search, lexical-alone is hard to beat. Verified: numpy + sklearn TF-IDF on the committed slabs + corpus texts (no cargo).
+
+**Follow-up (COMPLEMENTARITY decomposition — quantifies *why*, and what a semantic benchmark must show): on keyword-overlap
+known-item, the vector tier adds only 1.35% UNIQUE, so the fusion ceiling is barely above lexical-alone.** Decomposed where
+each tier finds the source doc (963 queries, potion vector + TF-IDF lexical):
+
+| outcome | fraction |
+|---|---|
+| vector-alone found@10 | 0.7445 |
+| TF-IDF lexical-alone found@10 | 0.8681 |
+| **ORACLE (either tier finds it)** | **0.8816** ← the ceiling any fusion could reach |
+| both tiers find | 0.7310 |
+| **vector-ONLY (lexical missed)** | **0.0135** ← the vector tier's *unique* contribution |
+| lexical-ONLY (vector missed) | 0.1371 |
+| neither | 0.1184 |
+
+**Findings:** (1) The two tiers are **highly redundant** on keyword-overlap queries — 73% found by *both*, and the vector
+tier finds only **1.35% that lexical misses**. So the **fusion ceiling (0.882) is only ~1.4 pts above lexical-alone
+(0.868)** — there is almost nothing for fusion to gain. (2) Static RRF (0.852, prior entry) is actually **below** the best
+single tier (TF-IDF 0.868) — it doesn't even reach the ceiling; it goes *backward*, diluting the strong lexical ranking
+with the redundant weaker vector tier. So on this task **fusion is net-destructive**, not because RRF is bad but because
+the vector tier has **~0 unique value** to contribute. (3) This is the precise, quantified reason the hybrid "didn't help":
+it's a **redundancy** problem, not a fusion-algorithm problem. **What a proper (semantic) benchmark must show:** for the
+hybrid to be justified, **vector-ONLY must be ≫ 1.35%** — i.e. the vector tier must retrieve relevant docs that share
+*meaning but not keywords* with the query, which only keyword-*divergent* queries (paraphrases / real IR qrels) exercise.
+The known-item-prefix harness structurally cannot produce those (query ⊂ doc). **This is the cleanest statement of the
+open question:** frankensearch's hybrid is worth its complexity iff, on semantic queries, the vector tier's unique-find
+rate is large — unmeasured here (needs a labeled semantic dataset + an embedding path, both currently absent in this
+Python env: no `tokenizers`/`sentence-transformers`, embed binaries cleaned). Verified: numpy + sklearn on committed
+slabs + corpus texts (no cargo).
