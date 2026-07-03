@@ -58,6 +58,11 @@ harness = false
 name = "int8_two_pass"
 harness = false
 
+# REAL-embedding (potion/model2vec) validation of int8/4-bit quant + rotation lever.
+[[bench]]
+name = "real_embed_quant"
+harness = false
+
 # FSVI (file-backed) int8 two-pass vs flat exact — standalone large-N vector search.
 [[bench]]
 name = "fsvi_int8_two_pass"

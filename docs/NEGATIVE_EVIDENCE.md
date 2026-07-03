@@ -4886,3 +4886,58 @@ measurable speedup needs BOTH (a) a steeper `ef`→latency curve (larger N — a
 `acfb33b`) AND (b) a hard per-group SLA that forbids the population bound's tail dilution. Backlog #2 refined: viable, but
 its payoff is conditional and modest — not the "recover the tail-mode speedup" hoped for. Kept the bench for the
 steeper-curve regime. Verified: compiles + runs clean under `--features ann` (exit 0).
+
+---
+
+## 2026-07-02 — ARTIFACT + WIN: #1 real-embedding harness UNBLOCKED locally → int8 quant validated on REAL data; ROTATION lever (#3) wins for 4-bit (IronPetrel)
+
+Two backlog items advanced in one dig. Backlog **#1 (real-embedding validation harness)** was recorded as
+MEASUREMENT-BLOCKED ("needs a semantic model, absent on rch workers"). That block is **rch-worker-specific, not
+absolute**: on this machine a real **Model2Vec/potion** model (`minishlab/potion-base-8M`, 256-d, PCA-projected static
+embeddings) runs in **pure Rust** (`safetensors` + `tokenizers`, no ONNX runtime) and embeds **30 000 real English docs
+in ~1 s**. Every prior ANN/quant recall number in this repo rests on a *synthetic* clustered-Gaussian corpus; this is the
+**first real-embedding measurement**. New tooling (own files):
+- `frankensearch-embed/examples/potion_embed_corpus.rs` — embeds a text corpus → flat f32 slab (smoke check:
+  cos(related)=0.543 vs cos(unrelated)=0.014).
+- `frankensearch-index/benches/real_embed_quant.rs` — loads the real slab, reports per-dim anisotropy, and measures
+  int8/4-bit two-pass recall@10 vs exact, plain vs an orthonormal random-rotation preprocessing (lever #3).
+
+**Corpus (real potion embeddings of 29 700 local-doc English lines, held-out 300 queries, dim=256, k=10):**
+
+| mult | int8 | int8+rot | 4bit | **4bit+rot** |
+|---|---|---|---|---|
+| 2  | 1.0000 | 1.0000 | 0.8980 | **0.9700** |
+| 3  | 1.0000 | 1.0000 | 0.9530 | **0.9897** |
+| 5  | 1.0000 | 1.0000 | 0.9833 | **0.9987** |
+| 10 | 1.0000 | 1.0000 | 0.9983 | **1.0000** |
+| 20 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+
+Anisotropy (per-dim variance share of total): real `top1=1.8% top5=7.1% top10=12.0% excess-kurtosis=0.05`; after
+rotation `top1=0.5% top5=2.5% top10=4.9% kurt=-0.02`. So potion-256 is only **mildly** anisotropic (near-Gaussian) — not
+the heavy outlier-dim structure of raw transformer outputs (PCA + Zipf smooth it).
+
+**Findings (honest, measured):**
+1. **int8 two-pass is LOSSLESS on real embeddings — recall 1.0000 at every mult, down to mult=2.** This validates the
+   shipped int8 ADC path (`search_top_k_int8_two_pass`) on real data. The synthetic-era worry ("clustered embeddings may
+   need a higher mult to stay lossless", `int8_two_pass.rs`) **does not materialize** on real potion embeddings — int8's
+   256 levels comfortably preserve the exact top-10 with a mult=2 candidate set.
+2. **Rotation (lever #3) WINS for the 4-bit path.** An inner-product-preserving orthonormal rotation (`<Rx,Rq>=<x,q>`
+   exactly; only the quantizer grid changes) lifts 4-bit two-pass recall so it reaches **near-lossless 0.999 at mult=5,
+   where plain 4-bit needs mult=20 to hit 1.0 → a ~4× smaller exact-rescore candidate set** for the same recall (+7.2
+   recall points at mult=2: 0.898→0.970). Even *mild* per-dim variance concentration wastes 4-bit's coarse 16-level grid;
+   equalizing it via rotation recovers the resolution. int8 (256 levels) is already saturated, so rotation is a no-op
+   there — the lever is **4-bit-specific**. 4-bit is 2× smaller than int8, so rotation makes the **2× recall-per-byte**
+   tier viable at high recall.
+
+**Honest latency caveat (why this is banked as recall-per-byte, not an end-to-end speedup HERE):** at N≈30k dim=256 the
+two-pass is *slower* than the flat f16 scan (flat **394 µs** vs int8_mult5 498 µs, 4bit_mult5 464 µs, int8_mult10 545 µs,
+4bit_mult10 597 µs) — pass-1 + rescore overhead exceeds the flat-scan saving at modest N. The rotation-4bit win is a
+recall / rescore-count win at this N; it converts to wall-clock only in the **large-N regime** where the flat scan
+dominates and two-pass already beats flat (the ~1.4–1.5× the `int8_two_pass` ledger records). The rotation itself is
+near-free at runtime (a one-time `d×d` matrix; O(d²)/query ≪ the scan).
+
+**Route-next:** (a) re-run `real_embed_quant` at N=100k+ (embed a larger corpus) to convert the 4× mult reduction into a
+measured latency ratio in the regime where two-pass wins; (b) wire the rotation into the 4-bit index path
+(store one `d×d` orthonormal matrix, rotate at insert + query) — product-gated on choosing the 4-bit tier. Backlog #1 is
+no longer measurement-blocked *locally*; #3 (anisotropic-quant) has its first measured positive. **Verified:** bench
+compiles clean on rch (`--no-run`, exit 0) and runs locally (exit 0); example builds + runs (`--features model2vec`).
