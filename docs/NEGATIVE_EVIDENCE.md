@@ -5167,3 +5167,20 @@ The practical impact is softened downstream (the fast tier's misses are masked b
 build. `M=64` is the setting if a certified per-query 0.95 tail is required (`68d213e`). Left as a documented
 recommendation rather than a code change because the graph-memory cost is a real deployment decision (unlike the
 fast-tier int8 slab, whose absolute size was negligible). Verified: `--features ann` bench runs clean locally (exit 0).
+
+**Follow-up (rules out the tempting memory-FREE fix): raising `ef_construction` does NOT fix the M=16 gap — it is
+M-bound.** `ef_construction` (build-time beam, default 200) improves graph quality at the SAME M with no query-memory
+cost (only build time), so it looked like a free way to lift the M=16 recall. Swept it at M=16, N=100k real potion
+(recall@10 at the default **ef_search=100**):
+
+| ef_construction @ M=16 | recall@10 (ef=100) |
+|---|---|
+| 200 (default) | 0.947 |
+| 400 | 0.933 |
+| 800 | 0.927 |
+
+The values are **flat-to-noisy at ~0.92–0.95 (HNSW build is non-deterministic), none reaching 0.95** — raising the build
+beam 4× does NOT lift recall (if anything the baseline run was the luckiest). So the M=16 recall gap is genuinely
+**M-bound (graph node degree / connectivity), not build-beam-bound**: there is no free lunch, the only fix is more `M`
+(with its ~2× graph-memory cost). This closes the "cheaper alternative" question and confirms the `M=16→32`
+recommendation is the real lever. Verified: `--features ann` bench runs clean locally (exit 0).

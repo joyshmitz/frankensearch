@@ -99,13 +99,20 @@ fn bench_real_embed_ann(c: &mut Criterion) {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+    // ef_construction (build-time beam) improves graph quality at the SAME M — so it
+    // can lift recall WITHOUT the ~2× graph-memory cost of raising M (only build time).
+    let efc: usize = std::env::var("FS_REAL_EFC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(HnswConfig::default().ef_construction);
     let hnsw_config = HnswConfig {
         m,
+        ef_construction: efc,
         ..HnswConfig::default()
     };
     let hnsw = HnswIndex::build_from_vector_index(&index, hnsw_config).expect("build hnsw");
-    eprintln!("[real_embed_ann] HNSW M={m}");
-    eprintln!("[real_embed_ann] N={n} dim={dim} k={K} — HNSW M={m} built");
+    eprintln!("[real_embed_ann] HNSW M={m} ef_construction={efc}");
+    eprintln!("[real_embed_ann] N={n} dim={dim} k={K} — HNSW M={m} efc={efc} built");
 
     // ── Recall@ef sweep vs exact flat (real data). ──
     let holdout_exact: Vec<Vec<String>> = holdout
