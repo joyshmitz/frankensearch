@@ -6869,3 +6869,26 @@ small-k recommendation to the 3-dataset bar and quantifies the `RrfConfig.k` def
 ~+2.6% nDCG when paired with the tuned tier weight, free at inference.** Recommend `k ≈ 10` as a safe default (k=5 is
 marginally better but sharper); `RrfConfig.k` is already a shipped config field, so this is a one-value change. Verified:
 `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo).
+
+---
+
+### Refreshed total uplift: recommended vs stock defaults = +15-21% nDCG (all validated knobs) (IronPetrel, 2026-07-03)
+
+The `SEARCH_QUALITY_FINDINGS.md` "Total measured uplift" table (+5-7% nDCG) predated the k=10 (`4cc3b47`) and dim-256
+(`06fdef9`) validations. Refreshed the definitive stock-vs-recommended hybrid comparison with **all** now-validated
+retrieval-side knobs, both at dim-256 (= equal scan cost, no reranker), recall@10 / nDCG@10:
+
+| dataset | STOCK (multilingual-128M + equal RRF k=60) | RECOMMENDED (retrieval-32M@256 + weight-1.3 + k=10) | Δrecall / ΔnDCG |
+|---|---|---|---|
+| SciFact | 0.7564 / 0.5904 | **0.8424 / 0.6761** | **+11% / +15%** |
+| NFCorpus | 0.1325 / 0.2694 | **0.1595 / 0.3253** | **+20% / +21%** |
+| ArguAna | (embedder change matters least here; prior recs-1+3 ≈ +1% nDCG — vector already strong vs BM25's long-doc weakness) | | ~+1-4% |
+
+**Finding — adopting the recommended retrieval-side defaults buys +11-20% recall / +15-21% nDCG over the current stock
+defaults on the semantic corpora** (SciFact, NFCorpus), roughly **3× the stale table's +5-7%** — because the earlier
+number omitted the small-k (+2.6%) and only-partially-applied the tuning. The stack of free/cheap changes compounds:
+retrieval-distilled embedder (biggest), + stronger-tier weight, + small RRF k, all at dim-256 (equal cost, no reranker,
+no new model). ArguAna's uplift is smaller (~+1-4%) — there the vector tier is *already* strong versus BM25's long-doc
+length penalty, so the embedder swap adds less. **Bottom line: the retrieval-side recommendations alone (before the
+optional reranker) lift the semantic-search hybrid +15-21% nDCG at zero inference cost**, all via shipped config knobs +
+a retrieval-distilled embedder. Verified: `model2vec` multilingual-128M & retrieval-32M + `rank_bm25` on BEIR (no cargo).
