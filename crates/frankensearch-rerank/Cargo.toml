@@ -43,5 +43,10 @@ name = "native_rerank"
 harness = false
 required-features = ["native"]
 
+# Reranker combine-step reorder cost: PureReorder (one sort) vs RrfCombine (fuse+sort).
+[[bench]]
+name = "combine_reorder_cost_ab"
+harness = false
+
 [lints]
 workspace = true

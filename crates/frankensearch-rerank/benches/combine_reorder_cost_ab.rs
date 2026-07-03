@@ -1,0 +1,100 @@
+//! Latency of the shipped reranker combine step: `RerankCombine::PureReorder` (one sort)
+//! vs `RerankCombine::RrfCombine` (rank-fuse the pre-rerank order with the rerank order —
+//! an argsort + fused sort + permute). Landed default-preserving (`235fb46`); this MEASURES
+//! (rather than assumes) that the RRF-combine reorder is negligible vs a cross-encoder's
+//! per-candidate forward pass — the perf side of the reranker-default question.
+//!
+//! The reorder logic mirrors `pipeline.rs::apply_rrf_combine` / `compare_by_rerank_score`
+//! (both private), replicated here over real `ScoredResult`s so the clone/permute cost is
+//! faithful.
+//!
+//! Run with:
+//! ```bash
+//! CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
+//!   rch exec -- cargo bench -p frankensearch-rerank --bench combine_reorder_cost_ab
+//! ```
+
+use std::cmp::Ordering;
+use std::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_core::types::{ScoreSource, ScoredResult};
+
+const K: f64 = 60.0;
+
+fn candidate(i: usize, rerank_score: f32) -> ScoredResult {
+    ScoredResult {
+        doc_id: format!("doc-{i:06}").into(),
+        score: 1.0 - (i as f32) * 0.001,
+        source: ScoreSource::Reranked,
+        index: None,
+        fast_score: None,
+        quality_score: None,
+        lexical_score: None,
+        rerank_score: Some(rerank_score),
+        explanation: None,
+        metadata: None,
+    }
+}
+
+/// A reranked window in pre-rerank (fused) order — index i == pre-rerank rank — with an
+/// interleaved rerank score so the two orders genuinely differ.
+fn window(n: usize) -> Vec<ScoredResult> {
+    (0..n)
+        .map(|i| {
+            // rerank score roughly reverses the pre-order, with jitter, to force a real reorder.
+            let rs = ((n - i) as f32) + ((i * 7 % 13) as f32) * 0.1;
+            candidate(i, rs)
+        })
+        .collect()
+}
+
+fn finite(c: &ScoredResult) -> f32 {
+    c.rerank_score.filter(|s| s.is_finite()).unwrap_or(f32::NEG_INFINITY)
+}
+
+fn cmp_rerank(a: &ScoredResult, b: &ScoredResult) -> Ordering {
+    finite(b).total_cmp(&finite(a)).then_with(|| a.doc_id.cmp(&b.doc_id))
+}
+
+/// PureReorder: one sort by rerank score descending.
+fn pure_reorder(win: &[ScoredResult]) -> Vec<ScoredResult> {
+    let mut v = win.to_vec();
+    v.sort_by(cmp_rerank);
+    v
+}
+
+/// RrfCombine: argsort for rerank rank, fuse with pre-rank, sort by fused, permute.
+#[allow(clippy::cast_precision_loss)]
+fn rrf_combine(win: &[ScoredResult]) -> Vec<ScoredResult> {
+    let n = win.len();
+    let mut by_rerank: Vec<usize> = (0..n).collect();
+    by_rerank.sort_by(|&a, &b| cmp_rerank(&win[a], &win[b]));
+    let mut rerank_rank = vec![0usize; n];
+    for (rank, &pos) in by_rerank.iter().enumerate() {
+        rerank_rank[pos] = rank;
+    }
+    let key: Vec<f64> = (0..n)
+        .map(|i| 1.0 / (K + i as f64) + 1.0 / (K + rerank_rank[i] as f64))
+        .collect();
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by(|&a, &b| key[b].total_cmp(&key[a]).then_with(|| win[a].doc_id.cmp(&win[b].doc_id)));
+    perm.into_iter().map(|i| win[i].clone()).collect()
+}
+
+fn bench(c: &mut Criterion) {
+    let mut g = c.benchmark_group("rerank_combine_reorder");
+    for &n in &[20_usize, 50, 100, 200] {
+        let win = window(n);
+        g.bench_with_input(BenchmarkId::new("pure_reorder", n), &win, |b, w| {
+            b.iter(|| black_box(pure_reorder(black_box(w))));
+        });
+        g.bench_with_input(BenchmarkId::new("rrf_combine", n), &win, |b, w| {
+            b.iter(|| black_box(rrf_combine(black_box(w))));
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench);
+criterion_main!(benches);

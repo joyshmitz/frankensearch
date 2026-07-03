@@ -6588,3 +6588,29 @@ work on ties, independent of the tiebreak choice. **Perf conclusion for the fusi
 tuned config (weights + hash tiebreak) has zero practical latency cost** — the earlier "negligible" claim is now measured,
 and this is a regression guard for the shipped hot-path changes. Bench: `cargo bench -p frankensearch-fusion --bench
 rrf_config_cost_ab`.
+
+---
+
+### MEASURED: RrfCombine reranker reorder is negligible vs the cross-encoder — per-crate bench (IronPetrel, 2026-07-03)
+
+Completing the "measure the cost of everything shipped" pass (fusion knobs done in `979ea3c`; reranker combine here).
+I'd asserted the RRF-combine reorder (`235fb46`) is negligible vs a cross-encoder forward pass — measured it
+(`frankensearch-rerank/benches/combine_reorder_cost_ab.rs`, faithful replica of `apply_rrf_combine` over real
+`ScoredResult`s, median):
+
+| rerank window N | `PureReorder` (1 sort) | `RrfCombine` (argsort+fuse+permute) | Δ |
+|---|---|---|---|
+| 20 | 0.40 µs | 0.57 µs | +41% |
+| 50 | 1.02 µs | 1.26 µs | +24% |
+| 100 | 1.98 µs | 2.43 µs | +23% |
+| 200 | 3.81 µs | 4.83 µs | +27% |
+
+**Finding — RrfCombine's reorder costs +23-41% over pure-reorder, but that's single-digit MICROseconds; the reranker's
+cross-encoder inference is MILLIseconds *per candidate*, so the reorder is ~4-5 orders of magnitude smaller than the
+inference it follows — negligible.** For a typical N=100 window, RrfCombine adds **~0.45 µs** of reorder over
+PureReorder, against **~100 ms-1 s** of cross-encoder forward passes for those 100 candidates. The relative overhead
+(the extra argsort for the rerank rank + the fused sort + the clone-permute) is real but irrelevant at the system level.
+**Perf conclusion for the reranker-default question: switching the default to `RrfCombine` is latency-free** — its only
+cost is a sub-microsecond reorder, dwarfed by the inference. Combined with the quality finding (RrfCombine removes the
+−11/−23% pure-reorder downside), the reranker-default flip is free on both axes. Bench: `cargo bench -p
+frankensearch-rerank --bench combine_reorder_cost_ab` (default features, no ONNX).
