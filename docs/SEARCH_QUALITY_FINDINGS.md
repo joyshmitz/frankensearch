@@ -127,6 +127,11 @@ each stage's contribution shown (recall@10 / nDCG@10). This is the headline numb
 |---|---|---|---|---|
 | SciFact | 0.776 / 0.652 | 0.816 / 0.684 | **0.872 / 0.731** | **+12% / +12%** |
 | NFCorpus | 0.152 / 0.306 | 0.159 / 0.327 | **0.167 / 0.346** | **+10% / +13%** |
+| ArguAna (200q) | 0.565 / 0.259 | 0.620 / 0.294 | **0.680 / 0.316** | **+20% / +22%** |
+
+The full-stack win is **largest on ArguAna (+22% nDCG)** — precisely because BM25 is structurally weakest there (its
+long-doc length penalty), a weakness the dense vector tier is immune to. Headline across 3 datasets: **+12% to +22%
+nDCG / +10% to +20% recall vs Tantivy BM25-alone.**
 
 ### How to configure this pipeline today (shipped, default-preserving APIs)
 The capstone stack is expressible now — no default changes, all opt-in builders landed this session:
