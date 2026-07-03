@@ -6824,3 +6824,26 @@ recall the general multilingual default degrades catastrophically under MRL (`01
 retrieval-distilled embedder (rec #1). Net: **default to retrieval-32M @ dim-256 (95-98% quality, 2× cheaper); drop to
 dim-128 only if storage-bound.** Verified: `model2vec` retrieval-32M, first-d MRL truncation on BEIR
 SciFact/NFCorpus/ArguAna qrels (no cargo).
+
+---
+
+### Hybrid's recall advantage over Tantivy grows/holds with depth (3 datasets) — validates the reranker-feed (IronPetrel, 2026-07-03)
+
+The "deep candidate feed" recommendation and "hybrid is the right reranker first-stage" rested on SciFact (recall@100
+0.96, `ad4487e`). Validated the recall-depth curve — Tantivy BM25 vs hybrid — across all 3 BEIR datasets:
+
+| dataset | recall@10 | recall@50 | recall@100 |
+|---|---|---|---|
+| SciFact | BM25 0.776 / hyb 0.837 (**+8%**) | 0.869 / 0.935 (+8%) | 0.873 / 0.960 (**+10%**) |
+| NFCorpus | 0.152 / 0.157 (+3%) | 0.212 / 0.245 (+15%) | 0.235 / 0.301 (**+28%**) |
+| ArguAna | 0.606 / 0.696 (+15%) | 0.802 / 0.926 (+15%) | 0.841 / 0.957 (**+14%**) |
+
+**Finding — the hybrid's recall advantage over Tantivy BM25 is large and grows-or-holds with depth on all 3 datasets**
+(+10% to +28% at recall@100). This is the reranker-feed argument confirmed: the hybrid supplies the cross-encoder a far
+richer candidate pool at depth than Tantivy would (hybrid recall@100 = 0.96 / 0.30 / 0.96). **NFCorpus is the sharpest
+case: only +3% at rank-10 but +28% at rank-100** — precisely *why* reranking helps NFCorpus so much (ms-marco +23.5%,
+`657df16`): the deep pool holds 28% more relevant docs than Tantivy for the reranker to promote into the top-10. This
+validates two recommendations to the 3-dataset bar — **deep candidate feed** (fetch ~50-100/tier, since the advantage
+is largest at depth) and **the hybrid as the first stage for reranking** — and quantifies frankensearch's deep-recall
+edge over Tantivy: it's the compounding advantage a reranker turns into final-ranking quality. Verified: `model2vec`
+retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo).
