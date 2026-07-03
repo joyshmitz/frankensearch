@@ -70,6 +70,12 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   mismatched reranker (−23%) exceeds the upside of the right one on most corpora. **The hybrid alone is never
   catastrophic; a mismatched reranker can be.** Cost adds to the case: `bge-reranker-base` (~278M) is ≈3× slower
   per pair than `ms-marco-L6` on CPU. When in doubt, **skip reranking** — or A/B a candidate reranker per corpus.
+- **Rerank DEPTH is a second corpus-dependent knob — bias shallow.** How many candidates to feed the cross-encoder
+  has opposite-signed optima: on NFCorpus/ms-marco reranking is monotonic-increasing (knee at D≈20-30 — captures 90%
+  of the lift at top-20, never pay for >30); on SciFact/bge it's monotonic-**decreasing** past D=5 (deep reranking
+  promotes false positives, flipping +0.019→−0.011). So **default to a shallow rerank depth (~top-10)** and only go
+  deeper if a per-corpus eval shows the reranker is well-matched *and* relevant docs sit deep. Deeper reranking is
+  neither free (linear cross-encoder cost) nor safe (an imperfect reranker injects false positives at depth).
 
 ### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
 - On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both

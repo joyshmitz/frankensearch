@@ -6082,3 +6082,38 @@ mismatched reranker can be). This also strengthens the earlier "reranker is a co
 *downside risk* of the wrong reranker (−23%) exceeds the upside of the right one on most corpora. Verified: `fastembed`
 TextCrossEncoder (both ONNX cross-encoders) + `model2vec` retrieval-32M + `rank_bm25` on BEIR NFCorpus/ArguAna qrels
 (no cargo, no torch).
+
+---
+
+### Reranker DEPTH: opposite-signed optima — deeper is NOT free, and can flip a helpful reranker harmful (IronPetrel, 2026-07-03)
+
+Having measured *which* reranker (cross-dataset), the remaining reranker knob is *how deep* to rerank — the cost axis
+(reranking is O(candidates) cross-encoder forward passes, the expensive part). Swept rerank-depth D on each dataset's
+**winning** reranker (one rerank-top-50 pass per query, reused across depths; hybrid retrieval-32M + real BM25, 60q):
+
+| rerank depth D | NFCorpus (ms-marco-L6) ΔnDCG@10 | SciFact (bge-reranker-base) ΔnDCG@10 |
+|---|---|---|
+| 5  | +0.0152 | **+0.0191 (best)** |
+| 10 | +0.0265 | +0.0103 |
+| 20 | +0.0563 (90% of max) | +0.0058 |
+| 30 | +0.0613 (99%) | −0.0049 |
+| 50 | +0.0622 (max) | −0.0114 |
+
+**Finding — rerank depth is a real config knob with OPPOSITE-signed optima across (reranker, corpus); deeper is not
+free and not always better.**
+- **NFCorpus / ms-marco: monotonic increasing, knee at D≈20-30.** Reranking top-20 captures **90%** of the full-top-50
+  lift at 2.5× fewer forward passes; top-30 = 99%. The big jump is D 10→20 (+0.027→+0.056) — relevant docs sit at
+  hybrid ranks 10-20 and the well-matched reranker promotes them into the top-10, so you **must** rerank ≥20 (top-10 is
+  too shallow). Beyond 30, ~0 gain — deeper is wasted cost.
+- **SciFact / bge: monotonic DECREASING beyond D=5 — shallow is best, deep HURTS.** The base ranking is already strong
+  (0.796) and every extra candidate the reranker reaches into is another chance to **promote a false positive**; depth
+  swings the reranker from **+0.0191 (D=5) to −0.0114 (D=50)** — a 3-point flip from helpful to harmful.
+
+**Product takeaway — rerank depth must be tuned per (reranker, corpus), and the safe bias is SHALLOW.** When the
+reranker is well-matched and relevant docs sit deep, rerank ~20-30 (and never pay for >30). When the base ranking is
+already strong or the reranker is imperfect, rerank only the top ~5-10 — deep reranking lets an imperfect reranker
+inject false positives and can turn a net-positive reranker net-negative. Combined with the cross-dataset model finding,
+the reranker tier is the most treacherous stage: **both the model AND the depth are corpus-dependent and both carry real
+downside risk** — reinforcing "reranking is a conditional, must-eval polish," and that when reranking, **default to a
+shallow depth.** Verified: `fastembed` TextCrossEncoder (both ONNX cross-encoders) + `model2vec` retrieval-32M +
+`rank_bm25` on BEIR NFCorpus/SciFact qrels (no cargo, no torch).
