@@ -4941,3 +4941,45 @@ measured latency ratio in the regime where two-pass wins; (b) wire the rotation 
 (store one `d×d` orthonormal matrix, rotate at insert + query) — product-gated on choosing the 4-bit tier. Backlog #1 is
 no longer measurement-blocked *locally*; #3 (anisotropic-quant) has its first measured positive. **Verified:** bench
 compiles clean on rch (`--no-run`, exit 0) and runs locally (exit 0); example builds + runs (`--features model2vec`).
+
+---
+
+## 2026-07-02 — MEASURED (follow-through, decisive): large-N real embeddings — int8 two-pass 7.1× vs flat @ recall 1.0; the 4-bit rotation win is real-but-SYSTEM-MOOT (int8 dominates 4-bit) (IronPetrel)
+
+Resolves the route-next from `3833955` ("re-run at N=100k+ for a latency ratio"). Re-embedded **130 000** real English
+docs (potion-256) and re-ran `real_embed_quant` at N=129 850. This converts the earlier 30k recall-only result into a
+system verdict.
+
+**Latency (criterion median, N=129 850 dim=256 k=10, 150 queries):**
+
+| config | time | vs flat |
+|---|---|---|
+| flat exact (f16) | 4.74 ms | 1.0× |
+| **int8 two-pass mult5** | **665 µs** | **7.1×** |
+| 4-bit two-pass mult5 | 716 µs | 6.6× |
+| int8 two-pass mult10 | 1.28 ms | 3.7× |
+| 4-bit two-pass mult10 | 1.07 ms | 4.4× |
+
+**Recall (same run):** int8 **1.0000 at every mult (incl. mult=2)**; 4-bit needs **mult=20** for 1.0
+(0.873/0.975/0.997/1.000 at mult 2/5/10/20); 4-bit+rot 0.963/0.995/0.997/0.998; int8+rot **0.998** (rotation slightly
+*hurts* int8).
+
+**Decisive findings (honest):**
+1. **HEADLINE — validated on real data: `search_top_k_int8_two_pass` is 7.1× faster than flat exact vector search at
+   recall 1.0** on real 130k embeddings (int8 is lossless from mult=2, so the lossless int8 config is ≤ 665 µs). The
+   shipped int8 ADC path's prior ratio (~1.4–1.5× on small uniform-random, `int8_two_pass.rs`) understated it — at real
+   large N it is **7×**. int8 losslessness is robust 30k→130k.
+2. **The 4-bit rotation lever (`3833955`) is real but SYSTEM-MOOT at large N: int8 strictly dominates 4-bit here.** int8
+   is lossless at mult=2 AND *faster* than 4-bit at equal mult (int8_mult5 665 µs < 4bit_mult5 716 µs) — the AVX2
+   `dot_i8_i8` kernel is fast enough that 4-bit's 2× *bandwidth* edge is eaten by nibble-unpack *compute* overhead, so
+   4-bit is not actually cheaper. Since 4-bit is worse than int8 in BOTH recall (needs mult=20 vs 2) and latency,
+   improving 4-bit with rotation (+9 recall pts @mult2) does not yield a system win — you would just use int8. Rotation's
+   **only** residual value is the **memory-capacity niche** (4-bit = ½ int8's RAM ⇒ 2× more vectors resident); there
+   rotation buys ~0.96 vs 0.87 recall@mult2. It is **not a speed lever** on this kernel/scale, and it slightly *hurts*
+   int8 (never rotate int8).
+3. **Corrected route-next:** the pre-condition for a 4-bit/rotation speed win is a 4-bit pass-1 genuinely faster than int8
+   pass-1 — which needs a faster nibble kernel (VNNI `vpdpbusd` on int4-packed, or AVX-512, both measurement-blocked on
+   the Zen 3 workers) OR a rescore-dominated regime (disk-backed FSVI two-pass / cross-encoder pass-2, where cutting mult
+   20→5 matters). Absent those, **int8 two-pass is the recall-per-byte AND latency winner at large N; ship int8, not
+   4-bit.** Backlog #3 refined from "first positive" to "positive-in-isolation, dominated-in-system"; the real shippable
+   result is the measured **int8 7.1× vs flat on real data**. Verified: runs clean locally (exit 0, 0 panics).
