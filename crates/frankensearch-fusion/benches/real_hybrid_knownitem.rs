@@ -198,6 +198,44 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
         eprintln!("[knownitem] weighted-RRF vec_w={wv:>4} lex_w=1: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
     }
 
+    // ── Deterministic-tiebreak variants (equal weight): is a tiebreak-only fix (no
+    //    source-weighting API) enough to recover the dominance the random tiebreak got?
+    //    Compares vs production rrf_fuse (lexical-favoring tiebreak). "hash" = unbiased
+    //    deterministic (FNV of doc_id); "doc_id" = ascending (deterministic, may be
+    //    biased if ids correlate with relevance — they do in this bench by construction). ──
+    fn fnv(s: &str) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for b in s.bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+    for tb in ["hash", "doc_id"] {
+        let (mut rh, mut mh) = (0.0f64, 0.0f64);
+        for qi in 0..q {
+            let mut score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+            for (r, h) in vec_all[qi].iter().enumerate() {
+                *score.entry(h.doc_id.to_string()).or_insert(0.0) += 1.0 / (60.0 + r as f64 + 1.0);
+            }
+            for (r, h) in lex_all[qi].iter().enumerate() {
+                *score.entry(h.doc_id.to_string()).or_insert(0.0) += 1.0 / (60.0 + r as f64 + 1.0);
+            }
+            let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
+            ranked.sort_by(|a, b| {
+                b.1.total_cmp(&a.1).then_with(|| match tb {
+                    "hash" => fnv(&a.0).cmp(&fnv(&b.0)),
+                    _ => a.0.cmp(&b.0),
+                })
+            });
+            let ids: Vec<String> = ranked.iter().take(K).map(|(d, _)| d.clone()).collect();
+            let (a, b) = recall_mrr(&ids, &targets[qi]);
+            rh += a;
+            mh += b;
+        }
+        eprintln!("[knownitem] equal-RRF tiebreak={tb:>6}: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
+    }
+
     // ── Latency: lexical vs vector vs hybrid per query. ──
     let mut qi = 0usize;
     let mut g = c.benchmark_group("real_hybrid_knownitem");

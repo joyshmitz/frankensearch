@@ -5371,3 +5371,24 @@ lexical-favoring tiebreak; fixing both (a source-weighted `rrf_fuse` variant + a
 hybrid **strictly dominate vector-alone** on both recall and MRR — the strongest argument yet for the hybrid tier. Two
 concrete product route-nexts, both now measurement-justified. Verified: `--features lexical` + `--features fastembed`
 (MiniLM embed) run clean locally (exit 0).
+
+**Follow-up (which fix, and how — a subtle implementation trap): deterministic-tiebreak sweep** (equal-weight RRF, MiniLM
+130k), to see if a *tiebreak-only* fix (no source-weighting API) recovers the dominance:
+
+| tiebreak (equal weight) | recall@10 | MRR@10 |
+|---|---|---|
+| `doc_id` ascending | 1.0000 | **0.9307** (worst) |
+| production `rrf_fuse` (lexical-favoring) | 1.0000 | 0.9338 |
+| **hash (unbiased, FNV of doc_id)** | 1.0000 | **0.9426** |
+| random (unbiased) | 1.0000 | 0.9461 |
+| *vs vector-alone* | 0.9938 | *0.9509* |
+
+**Findings:** (1) An **unbiased deterministic tiebreak (hash) beats production by +0.9 MRR pts** (0.9338 → 0.9426) — a
+realizable, ~1-line cheap fix. (2) But hash **still trails vector-alone** (0.9509) — a tiebreak-only fix does NOT achieve
+the dominance; **only source-weighting (`vec_w=2`, MRR 0.958) dominates vector-alone.** (3) **Implementation TRAP:**
+`doc_id` ascending is the **worst** (0.9307) — so the "obvious" fix of *removing* the lexical-favoring tiebreak (which
+would fall through to the `doc_id` final tiebreak, `rrf.rs:110`) would make MRR **worse**, not better; the lexical tiebreak
+is accidentally *better* than `doc_id` here. The correct tiebreak fix is to **insert an unbiased (hash) comparator**, not
+delete the lexical one. **Net recommendation:** the dominant fix is a **source-weighted `rrf_fuse`** (`vec_w≈2`), which is a
+config/API addition; a cheaper hash-tiebreak tweak recovers ~0.9 MRR pts but not full dominance and must be an *added*
+unbiased comparator (never fall to `doc_id`). Verified: `--features lexical` bench runs clean locally (exit 0).
