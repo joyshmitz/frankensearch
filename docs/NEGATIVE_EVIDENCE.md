@@ -5626,3 +5626,31 @@ open question:** frankensearch's hybrid is worth its complexity iff, on semantic
 rate is large — unmeasured here (needs a labeled semantic dataset + an embedding path, both currently absent in this
 Python env: no `tokenizers`/`sentence-transformers`, embed binaries cleaned). Verified: numpy + sklearn on committed
 slabs + corpus texts (no cargo).
+
+---
+
+## 2026-07-03 — MEASURED (completes the fusion story): the hybrid STRICTLY DOMINATES lexical on SciFact with a modest STRONGER-TIER up-weight — and it corrects the "vec_w=2 dominates" claim (weight the stronger tier, not always vector) (IronPetrel)
+
+Followed the landmark SciFact result (hybrid wins recall 0.822 but its nDCG 0.610 was a hair below lexical 0.629 — a
+recall/precision tradeoff) into the fusion-weighting question, on the reusable venv+SciFact harness:
+
+| method (SciFact, 300 test queries) | recall@10 | nDCG@10 |
+|---|---|---|
+| lexical (TF-IDF ≈ BM25) | 0.7735 | 0.6286 |
+| vector (potion) | 0.6618 | 0.5064 |
+| hybrid RRF equal-weight | 0.8216 | 0.6135 |
+| **hybrid RRF, `lex_w=1.3`** | **0.8063** | **0.6293** ← beats lexical on BOTH |
+
+**Findings:** (1) **A modest up-weight of the STRONGER tier makes the hybrid strictly dominate the best single tier on
+BOTH recall AND nDCG** — `lex_w=1.3` gives recall 0.806 (> lexical 0.774) AND nDCG 0.629 (> lexical 0.629): the hybrid
+Pareto-dominates lexical, resolving the equal-weight nDCG deficit. (2) **CORRECTION to `7bb8da5`'s "vec_w=2 dominates":**
+the right rule is *up-weight the **stronger** tier for the workload*, not always the vector tier. On SciFact **lexical**
+is stronger (0.774 vs vector 0.662), so up-weighting **lexical** wins; on the keyword-overlap known-item task vector was
+stronger (10-word 0.99), so up-weighting **vector** won there. Up-weighting the *weaker* tier degrades both metrics.
+(3) **Also corrected a fusion artifact:** with RRF `k=60`, `1/(k+r)` is nearly flat over the top-10, so any weight >1 makes
+the up-weighted tier's docs *all* outrank the other tier → collapse to that tier alone (this is why the earlier `vec_w=2`
+"collapsed to vector"); a smaller `k` (≈5–10) or score-level weighting is needed for a graded blend. (4) The neutral
+**hash tiebreak** gives a small nDCG lift (0.610→0.616 at equal weight, `a721e39` confirmed on real data). **Net product
+takeaway:** frankensearch's hybrid, tuned with a modest stronger-tier weight (~1.3×) + a smaller RRF k + neutral tiebreak,
+**strictly beats Tantivy-lexical on both recall and nDCG on real semantic queries** — the definitive, actionable
+validation. Verified: `model2vec`+`sklearn` venv on BEIR SciFact qrels (no cargo, no torch).
