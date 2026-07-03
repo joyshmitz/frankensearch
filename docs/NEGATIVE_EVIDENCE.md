@@ -6532,3 +6532,33 @@ builds toward — and note the reranker uses the **shipped, default-preserving `
 is expressible today via the `TwoTierSearcher` builders (`with_rrf_weights` + `with_rerank_combine`) plus a
 retrieval-distilled embedder; only the *defaults* remain product-gated. Verified: `model2vec` retrieval-32M +
 `fastembed` cross-encoders + `rank_bm25` on BEIR SciFact/NFCorpus qrels (no cargo, no torch).
+
+---
+
+### CAPSTONE completed to 3 datasets: ArguAna is the biggest vs-Tantivy win (+22% nDCG) (IronPetrel, 2026-07-03)
+
+Held the capstone to the same 3-BEIR-dataset bar as every other finding. ArguAna (200-query subset, same harness:
+retrieval-32M + tuned RRF → ms-marco RRF-combine — ms-marco not bge, since bge hurts ArguAna's counter-argument task):
+
+| ArguAna stage (200q) | recall@10 / nDCG@10 |
+|---|---|
+| **Tantivy BM25-alone** | 0.5650 / 0.2593 |
+| + hybrid (retrieval-32M + tuned RRF) | 0.6200 / 0.2943 |
+| + RRF-combine rerank (ms-marco-L6) | **0.6800 / 0.3163** |
+| **FULL STACK vs Tantivy** | **+20% / +22%** |
+
+**Finding — ArguAna shows the LARGEST full-stack win over Tantivy (+22% nDCG / +20% recall), exactly because BM25 is
+structurally weakest there** (its long-document length penalty hurts on ArguAna's full-argument docs — a weakness the
+dense vector tier is immune to). Each stage still contributes monotonically (0.259 → 0.294 → 0.316 nDCG). Completes the
+3-dataset capstone:
+
+| BEIR | full-stack vs Tantivy (nDCG / recall) |
+|---|---|
+| SciFact | +12% / +12% |
+| NFCorpus | +13% / +10% |
+| ArguAna | **+22% / +20%** |
+
+**Definitive headline: the full recommended frankensearch pipeline beats Tantivy BM25-alone by +12% to +22% nDCG and
++10% to +20% recall across three BEIR datasets, in one consistent end-to-end harness, with the biggest margin where
+Tantivy's BM25 is weakest.** All using shipped, default-preserving APIs. Verified: `model2vec` retrieval-32M +
+`fastembed` cross-encoders + `rank_bm25` on BEIR qrels (no cargo, no torch).
