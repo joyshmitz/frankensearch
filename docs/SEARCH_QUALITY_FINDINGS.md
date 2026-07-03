@@ -133,6 +133,12 @@ The full-stack win is **largest on ArguAna (+22% nDCG)** — precisely because B
 long-doc length penalty), a weakness the dense vector tier is immune to. Headline across 3 datasets: **+12% to +22%
 nDCG / +10% to +20% recall vs Tantivy BM25-alone.**
 
+**Cost side (measured per-crate):** the hybrid's added latency over Tantivy-lexical-alone is just *vector search + RRF
+fusion* (the BM25 tier is shared) = **~250-290 µs (int8 vector, 10k×384) + ~149 µs (fusion) ≈ < 1 ms/query** — near-free
+for the recall/nDCG win. The **reranker** is the only expensive stage (~ms/candidate cross-encoder inference →
+100 ms-1 s for a top-100 window; its RRF-combine reorder is itself µs), so it's a quality-vs-latency-gated polish, not a
+default cost. Net vs Tantivy: **large quality win, sub-ms hybrid latency, expensive-but-optional rerank.**
+
 ### How to configure this pipeline today (shipped, default-preserving APIs)
 The capstone stack is expressible now — no default changes, all opt-in builders landed this session:
 ```rust
