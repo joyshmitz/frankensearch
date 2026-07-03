@@ -7035,3 +7035,28 @@ on hard/few-relevant queries (its most valuable robustness case), but on many-re
 cancels the rescue benefit for the complete-miss metric** — though aggregate recall/nDCG still improve (+13-21%,
 `6efd9d9`). The dilution is the flip side of RRF's averaging: it helps most queries but can demote a lone relevant doc
 when the other tier is pure noise. Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### RRF mechanism: it ranks by CONSENSUS (dilutes one-tier docs), not by boosting agreed docs (IronPetrel, 2026-07-03)
+
+Mechanistic follow-up to the dilution/robustness finding (`c206a60`). Hypothesis: RRF *boosts* docs both tiers rank
+high (two `1/(k+r)` contributions). Measured the actual rank change of relevant docs vs their **best single-tier** rank:
+
+| dataset | both-tier rel docs: Δ(hybrid rank − best-tier rank) | one-tier rel docs: Δ(hybrid rank − its-tier rank) |
+|---|---|---|
+| SciFact | +0.5 (only **9%** ranked *higher* than best tier) | **+15.9 (100% diluted)** |
+| NFCorpus | +2.0 (18% higher) | **+32.3 (100% diluted)** |
+
+**Finding — RRF does NOT boost consensus docs above their best-tier rank; it works by DILUTING one-tier docs.**
+Both-tier relevant docs barely move (they stay ~at their best single-tier rank, +0.5-2.0 — the sum is dominated by the
+best contribution, and *other* both-tier docs compete). But **one-tier relevant docs are 100% diluted, pushed down 16-32
+positions**, because they carry a single `1/(k+r)` contribution while both-tier docs carry two. So RRF is a **consensus
+mechanism: it rewards agreement by *sinking* the docs only one tier finds**, not by lifting the agreed ones. This
+mechanistically explains the earlier findings: (1) the **complete-miss caveat** — NFCorpus has ~51% one-tier relevant
+docs (n=1477 vs 1422 both-tier), all diluted +32 → many fall out of the top-10, so its miss rate doesn't improve; SciFact
+is 87% both-tier (n=284 vs 42) so dilution barely bites. (2) why **up-weighting a tier helps** — it counteracts the
+dilution of that tier's one-tier docs. (3) why the **multi-embedder/third-modality ensembles hurt** — adding a
+weak-but-decorrelated tier creates *more* one-tier docs to dilute. **Takeaway: RRF's value is proportional to the
+fraction of relevant docs found by BOTH tiers; it's weakest exactly where the tiers are complementary (many one-tier
+relevant docs) — the opposite of intuition.** Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus.
