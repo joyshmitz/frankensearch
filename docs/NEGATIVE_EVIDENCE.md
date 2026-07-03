@@ -5340,3 +5340,34 @@ scale-amplified — a real result to temper any "hybrid wins more at scale" intu
 recall 0.9969 / MRR 0.9448; higher `vec_w` → recall drops to vector-alone's 0.9907), and the neutral-tiebreak vs `rrf_fuse`
 MRR gap persists (0.9448 vs 0.9339). Verified: `--features lexical` bench, async Tantivy index of 130k real docs + 321
 queries, runs clean locally (exit 0).
+
+---
+
+## 2026-07-03 — MEASURED (elevates the tiebreak finding): the hybrid value-add SURVIVES a stronger embedding model (MiniLM), and neutral-tiebreak weighted-RRF *dominates* vector-alone on BOTH recall AND MRR (IronPetrel)
+
+Re-ran `real_hybrid_knownitem` on the 130k corpus with the **raw-transformer MiniLM-384** vector tier (vs the earlier
+potion-256), to test whether a *stronger* vector model makes the lexical/hybrid tier redundant. (The bench's
+`vector(potion)` label is hardcoded — the vectors here are MiniLM.)
+
+| MiniLM @130k, 321 queries | recall@10 | MRR@10 |
+|---|---|---|
+| Tantivy lexical (BM25) | 0.9128 | 0.8918 |
+| vector (MiniLM) alone | 0.9938 | 0.9509 |
+| production `rrf_fuse` | 1.0000 | 0.9333 |
+| **weighted-RRF `vec_w=1`** (neutral tiebreak) | **1.0000** | 0.9453 |
+| **weighted-RRF `vec_w=2`** | 0.9938 | **0.9580** |
+| weighted-RRF `vec_w=4/8/16` | 0.9938 | 0.956 / 0.954 / 0.952 |
+
+**Two findings:** (1) **The hybrid value-add over Tantivy survives a stronger embedding model** — even with MiniLM (a
+better retriever than potion: 0.994 vs 0.991 recall), the hybrid still beats Tantivy by **+8.7 pts recall**, and hybrid
+recall (1.0) still **tops MiniLM-vector-alone (0.994)** — so the lexical tier is *not* made redundant by better embeddings.
+(2) **Neutral-tiebreak weighted-RRF DOMINATES vector-alone on BOTH metrics:** `vec_w=2` gives recall 0.9938 (= vector-alone)
+AND **MRR 0.9580 > vector-alone's 0.9509** (+0.7 pts), and `vec_w=1` gives higher recall (1.0 vs 0.994) at MRR 0.9453. So
+the hybrid, with proper source-weighting + a neutral tiebreak, is **strictly better than vector-alone** — there IS a fusion
+that wins on both axes (contra the earlier potion "Pareto tradeoff" framing, which was measured only vs `rrf_fuse`'s
+*lexical-biased* tiebreak). **This elevates the earlier tiebreak diagnosis from "minor" to meaningful:** production
+`rrf_fuse` trails vector-alone on MRR (0.9333 < 0.9509) *only* because of (a) no per-source weighting + (b) the
+lexical-favoring tiebreak; fixing both (a source-weighted `rrf_fuse` variant + a neutral tiebreak) would make the shipped
+hybrid **strictly dominate vector-alone** on both recall and MRR — the strongest argument yet for the hybrid tier. Two
+concrete product route-nexts, both now measurement-justified. Verified: `--features lexical` + `--features fastembed`
+(MiniLM embed) run clean locally (exit 0).
