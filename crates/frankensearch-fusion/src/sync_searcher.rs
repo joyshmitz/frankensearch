@@ -329,13 +329,19 @@ impl SyncTwoTierSearcher {
             || {
                 // Default: the fast tier is a *reranked candidate generator* (its hits
                 // are re-scored by the quality tier + RRF), so use the 4-bit two-pass
-                // (parallel + cutoff, the fastest lossless primitive — ~1.4× faster than
-                // the int8 two-pass and ~3× faster than the exact f16 scan) instead of the
-                // exact scan. Lossless candidate set → identical fused top-k.
+                // (parallel + cutoff, ~3× faster than the exact f16 scan) instead of the
+                // exact scan.
                 //
-                // mult=3 keeps the 4-bit candidate set lossless (recall=1.0 validated
-                // at 10k–100k); `fetch` is already a candidate over-fetch, so a larger
-                // multiplier is wasteful.
+                // mult=3 keeps the 4-bit candidate set EFFECTIVELY lossless. On SYNTHETIC
+                // corpora candidate-recall@10=1.0 (10k–100k). On REAL embeddings measured
+                // 2026-07-02 (potion-256, 30k, fetch=K·3 regime) it is 0.9973 — NOT exactly
+                // 1.0; the int8 two-pass twin is exactly 1.0000 in the same regime (see
+                // docs/NEGATIVE_EVIDENCE.md). The ~0.3% fast-tier miss is further masked by
+                // the lexical tier + RRF, so the fused top-k impact is negligible. Switch to
+                // `search_top_k_int8_two_pass_filtered` (mult=2) if a hard exact-candidate
+                // guarantee is required — int8 is lossless at low mult on real data at
+                // comparable latency, for ~2× the fast-tier slab bytes. `fetch` is already
+                // a candidate over-fetch, so a larger 4-bit multiplier is wasteful.
                 const FAST_TIER_MULT: usize = 3;
                 fast_index.search_top_k_4bit_two_pass_filtered(
                     query_vec,

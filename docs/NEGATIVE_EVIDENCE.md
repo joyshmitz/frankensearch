@@ -5084,3 +5084,33 @@ distribution — and is in fact **easier** than potion (potion needed ef=200 @ M
 the cheaper ef=100, and its recall is higher at every ef: ef40 0.980 vs potion 0.956). Higher-dim near-isotropic
 embeddings give HNSW cleaner neighborhoods. Both real distributions now confirm both the quant AND the ANN conclusions.
 Verified: `--features ann` bench runs clean locally (exit 0).
+
+---
+
+## 2026-07-02 — FINDING (real data corrects a production claim): the fast tier's "4-bit @mult3 lossless (recall=1.0)" is 0.9973 on REAL embeddings, not 1.0; int8 is exactly 1.0 (IronPetrel)
+
+`sync_searcher::search_fast_hits` (the PRODUCTION vector fast tier) returns the top-`fetch` candidates
+(`fetch = K·candidate_multiplier`, default 3) from `search_top_k_4bit_two_pass_filtered(query, fetch, FAST_TIER_MULT=3)`,
+and the code comment asserted the candidate set is **lossless (recall=1.0), validated at 10k–100k** — i.e. *"Lossless
+candidate set → identical fused top-k."* That validation was on SYNTHETIC corpora. Added the exact production regime
+(`fetch=K·3=30`, `FAST_TIER_MULT=3`) to `real_embed_quant` and measured **candidate recall** (fraction of the exact
+top-K present in the returned `fetch` set) on REAL potion-256 embeddings (30k, 300 queries):
+
+| fast-tier primitive (production regime, fetch=30, mult=3) | candidate-recall@10 (REAL) |
+|---|---|
+| **4-bit two-pass (current production default)** | **0.9973** |
+| int8 two-pass (the low-mult-lossless twin) | **1.0000** |
+
+**Finding:** the "recall=1.0 lossless" claim is **marginally false on real embeddings** — 4-bit@mult3 misses ~0.27% of
+the true top-K candidates (the earlier `[recall]` table shows why: at the tighter top-K-from-K·mult regime 4-bit is only
+0.953 @mult3 on potion; the production over-fetch to top-30 masks most of it, but not all). **int8 two-pass is exactly
+lossless (1.0000) in the same regime** — consistent with int8 being lossless at mult=2 across both real distributions
+(potion + MiniLM) and comparable-latency to 4-bit (`0b9800e`). The ~0.3% fast-tier miss is *further* masked downstream by
+the lexical tier + RRF, so the fused-top-k impact is negligible in practice — hence "effectively lossless," not "exactly
+lossless." Corrected the overstated comment in `sync_searcher.rs` to state the measured real-embedding numbers and to
+point at the int8 remedy (exact-candidate guarantee for ~2× the fast-tier slab bytes). **Route-next (product-gated):**
+if a hard exact-candidate guarantee is wanted, swap the fast tier to `search_top_k_int8_two_pass_filtered(.., mult=2)` —
+pending a fusion-crate latency A/B to confirm int8 doesn't regress the hot path (real 130k quant bench shows int8 ≈ 4-bit,
+but the comment's legacy "4-bit ~1.4× faster than int8" claim should be re-measured in this exact fast-tier regime first).
+Verified: `real_embed_quant` (with the new `[fast-tier-regime]` block) runs clean locally (exit 0); comment-only change to
+`sync_searcher.rs`.

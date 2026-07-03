@@ -273,6 +273,44 @@ fn bench_real_embed_quant(c: &mut Criterion) {
         );
     }
 
+    // ── PRODUCTION fast-tier regime (sync_searcher::search_fast_hits): the fast tier
+    //    returns the top-`fetch` (= K·candidate_multiplier, default 3) candidates from a
+    //    4-bit two-pass with FAST_TIER_MULT=3, and the fused top-k depends on the true
+    //    top-K surviving in that returned set. The code comment CLAIMS this is lossless
+    //    ("recall=1.0 validated at 10k–100k") — but on SYNTHETIC data. Check it on REAL
+    //    embeddings (candidate recall = fraction of exact top-K present in the returned
+    //    top-`fetch`), 4-bit (production) vs int8 (the strictly-lossless-@low-mult twin).
+    {
+        const CAND_MULT: usize = 3;
+        const FAST_TIER_MULT: usize = 3;
+        let fetch = (K * CAND_MULT).max(K);
+        let mut c4 = 0.0;
+        let mut ci8 = 0.0;
+        for (qi, qv) in queries.iter().enumerate() {
+            let to_ids = |hits: Vec<frankensearch_core::types::VectorHit>| -> Vec<String> {
+                hits.into_iter().map(|h| h.doc_id.to_string()).collect()
+            };
+            let cand4 = to_ids(
+                index
+                    .search_top_k_4bit_two_pass(qv, fetch, FAST_TIER_MULT)
+                    .expect("4b-cand"),
+            );
+            let cand8 = to_ids(
+                index
+                    .search_top_k_int8_two_pass(qv, fetch, FAST_TIER_MULT)
+                    .expect("i8-cand"),
+            );
+            c4 += recall_at_k(&exact[qi], &cand4);
+            ci8 += recall_at_k(&exact[qi], &cand8);
+        }
+        let nq = n_queries as f64;
+        eprintln!(
+            "[fast-tier-regime] fetch={fetch} FAST_TIER_MULT={FAST_TIER_MULT} (production sync_searcher): 4bit-candidate-recall@{K}={:.4} int8-candidate-recall@{K}={:.4}",
+            c4 / nq,
+            ci8 / nq
+        );
+    }
+
     // ── Latency: flat exact vs int8/4bit two-pass (plain) at a representative mult. ──
     let mut qi = 0usize;
     let mut g = c.benchmark_group("real_embed_quant");
