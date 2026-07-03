@@ -5184,3 +5184,22 @@ beam 4× does NOT lift recall (if anything the baseline run was the luckiest). S
 **M-bound (graph node degree / connectivity), not build-beam-bound**: there is no free lunch, the only fix is more `M`
 (with its ~2× graph-memory cost). This closes the "cheaper alternative" question and confirms the `M=16→32`
 recommendation is the real lever. Verified: `--features ann` bench runs clean locally (exit 0).
+
+**Follow-up (QUALIFIES the M=16 recommendation — it is distribution-dependent for the mean budget, universal for the
+tail): re-ran M=16 @100k on RAW MiniLM-384.** Embedded 130k real docs with all-MiniLM-L6-v2 and ran `real_embed_ann`
+FS_REAL_M=16, N=100 336, dim=384:
+
+| distribution @ M=16, N=100k | recall@10 ef=100 (default) | tail-0.95 cert |
+|---|---|---|
+| potion-256 (PCA-static) | 0.947 (**< 0.95**) | ✗ (bound 0.90) |
+| **MiniLM-384 (raw transformer)** | **0.964 (≥ 0.95)** | ✗ (bound 0.90) |
+
+So the stock-M=16 gap is **NOT universal**: on the HNSW-friendlier raw-transformer distribution (384-d, near-isotropic,
+which gives HNSW cleaner neighborhoods — see `22a2f52`) M=16 already clears a 0.95 **mean** budget (0.964), whereas the
+lower-dim PCA-compressed potion-256 does not (0.947). **Corrected takeaway:** the `M=16→32` bump is warranted for
+lower-dim / PCA-reduced embeddings (potion-class), but higher-dim raw-transformer embeddings (MiniLM-class) meet a 0.95
+mean target at stock M=16 — the recommendation is embedding-distribution-dependent, not blanket. **However, the per-query
+0.95 TAIL certificate fails at M=16 on BOTH distributions** (bound 0.90) — the strong per-query guarantee needs higher M
+(M=64 on potion, `68d213e`) *regardless* of distribution. So: mean-recall adequacy of the default is distribution-
+dependent; the tail guarantee's M-requirement is universal. Verified: `--features fastembed` MiniLM embed + `--features
+ann` bench run clean locally (exit 0).
