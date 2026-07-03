@@ -174,6 +174,30 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
         eprintln!("[knownitem] hybrid RRF k={k:>5}: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
     }
 
+    // ── Source-weighted RRF (manual; the knob rrf_fuse doesn't expose): up-weight the
+    //    more-reliable vector tier. RRF-k is inert above, so this tests whether
+    //    weighting recovers MRR ABOVE vector-alone (0.968) while keeping recall high. ──
+    let k = 60.0f64;
+    for wv in [1.0f64, 2.0, 4.0, 8.0, 16.0] {
+        let (mut rh, mut mh) = (0.0f64, 0.0f64);
+        for qi in 0..q {
+            let mut score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+            for (r, h) in vec_all[qi].iter().enumerate() {
+                *score.entry(h.doc_id.to_string()).or_insert(0.0) += wv / (k + r as f64 + 1.0);
+            }
+            for (r, h) in lex_all[qi].iter().enumerate() {
+                *score.entry(h.doc_id.to_string()).or_insert(0.0) += 1.0 / (k + r as f64 + 1.0);
+            }
+            let mut ranked: Vec<(String, f64)> = score.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let ids: Vec<String> = ranked.iter().take(K).map(|(d, _)| d.clone()).collect();
+            let (a, b) = recall_mrr(&ids, &targets[qi]);
+            rh += a;
+            mh += b;
+        }
+        eprintln!("[knownitem] weighted-RRF vec_w={wv:>4} lex_w=1: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
+    }
+
     // ── Latency: lexical vs vector vs hybrid per query. ──
     let mut qi = 0usize;
     let mut g = c.benchmark_group("real_hybrid_knownitem");

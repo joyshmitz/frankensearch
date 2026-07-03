@@ -5270,3 +5270,25 @@ the basic `rrf_fuse`/`RrfConfig` (only `k`) does not expose. **Takeaways:** (1) 
 tradeoff — it's inert; (2) the hybrid **recall** win over Tantivy (1.0 vs 0.902) is robust and `k`-invariant; (3) if
 rank-1 MRR matters more than recall, either use vector-alone or add a source-weighted fusion (a real route-next: a
 weighted-RRF variant or pre-scaling the semantic ranks). Verified: `--features lexical` bench runs clean locally (exit 0).
+
+**Follow-up (source-weighting IS a real knob — but a Pareto tradeoff, and it surfaces a possible `rrf_fuse` MRR gap):
+manual weighted-RRF sweep** (up-weight the vector tier: `score = w_vec/(k+r_vec+1) + w_lex/(k+r_lex+1)`, since `rrf_fuse`
+exposes no tier weight — FederatedSearch's `weight` is a *shard* weight, not a lexical-vs-vector one):
+
+| fusion (k=60) | recall@10 | MRR@10 |
+|---|---|---|
+| vector-alone | 0.9961 | 0.9678 |
+| production `rrf_fuse` | 1.0000 | 0.9436 |
+| weighted-RRF `vec_w=1` (equal) | 1.0000 | **0.9596** |
+| weighted-RRF `vec_w=2` | 0.9961 | **0.9647** |
+| weighted-RRF `vec_w=4/8/16` | 0.9961 | 0.959 / 0.958 / 0.962 |
+
+**Two findings:** (1) **Unlike RRF-`k` (inert), per-source weighting IS a real knob** — up-weighting vector lifts MRR
+(0.9596 → 0.9647 at `vec_w=2`) but recall drops **1.0 → 0.9961** as it approaches vector-alone. So it is a genuine
+**Pareto tradeoff: no weight achieves BOTH recall 1.0 AND MRR ≥ vector-alone (0.968)** — the +recall over vector comes
+*precisely* from including lexical's hits, which is also what dilutes MRR; you can trade along the frontier but not beat
+both. (2) **BONUS / route-next:** the naive equal-weight weighted-**sum** RRF (MRR **0.9596**) beats the production
+`rrf_fuse` (MRR **0.9436**) by ~1.6 pts at the *same* recall (1.0) — the merge-structured `rrf_fuse` appears to lose some
+MRR to its tie-break / candidate-handling vs a plain weighted-sum-of-reciprocal-ranks. Worth a focused look: if `rrf_fuse`'s
+tiebreak is the cause and can be made rank-preserving, it's a free MRR gain on the shipped hybrid path (not landed here —
+needs confirming it's a real tiebreak effect, not a bench artifact). Verified: `--features lexical` bench runs clean (exit 0).
