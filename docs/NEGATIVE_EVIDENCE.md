@@ -6639,3 +6639,32 @@ a separate, expensive, quality-vs-latency-gated polish (and its RRF-combine reor
 reranker's cost is 100% cross-encoder inference, nothing frankensearch adds around it). This completes the vs-Tantivy
 picture: large quality win, negligible hybrid latency cost, expensive-but-optional rerank. Measured via per-crate
 criterion benches (no cargo-for-quality; the index + fusion crates), int8 kernels are the shipped AVX2 path.
+
+---
+
+### Selective (confidence-gated) reranking is a WEAK cost lever — reranker benefit is ~unpredictable from hybrid confidence (IronPetrel, 2026-07-03)
+
+The reranker is the only expensive stage (100 ms-1 s, per the cost analysis). Natural cost lever: **skip the cross-encoder
+for high-confidence queries** (large hybrid top-1/top-2 RRF margin — where reranking is unlikely to change the top-k) and
+rerank only the uncertain ones. Tested on NFCorpus (ms-marco RRF-combine, where full reranking helps +0.0192 nDCG),
+reranking only the least-confident fraction by margin, the rest keeping hybrid order:
+
+| rerank budget | nDCG@10 (margin-selective) | % of full-rerank gain | random-budget baseline |
+|---|---|---|---|
+| 0% (hybrid) | 0.3268 | 0% | 0.3268 |
+| 25% | 0.3352 | **44%** | 0.3316 (~25%) |
+| 50% | 0.3393 | **65%** | 0.3364 (~50%) |
+| 75% | 0.3422 | 80% | 0.3412 |
+| 100% | 0.3460 | 100% | 0.3460 |
+
+**Finding — margin-gated selective reranking is a WEAK lever; reranker benefit is largely unpredictable from pre-rerank
+confidence.** The correlation between the hybrid top-1/top-2 margin and the per-query rerank benefit is **−0.055**
+(essentially zero). Consequently margin-selective reranking beats *random* budget allocation only modestly (44% vs ~25%
+of the gain at a 25% budget; 65% vs ~50% at 50%). So you *can* rerank the least-confident half and keep ~65% of the
+quality bump at half the cross-encoder cost — a mild efficiency — but this is far short of the hoped-for "rerank 25%, keep
+90%." **The reranker's per-query value doesn't track hybrid confidence**, so the robust reranker cost levers remain the
+ones already measured: **rerank a shallow depth** (`97eb1e0`), **gate the whole reranker by corpus** (`657df16`), and
+**RRF-combine so it's never catastrophic** (`b114e39`) — not per-query confidence gating. This also echoes the earlier
+margin-gated *fusion* result (`8130208`, ~+0.012 only): the top-1/top-2 margin is a real but weak signal that doesn't
+convert into a strong adaptive lever. Verified: `model2vec` retrieval-32M + `fastembed` ms-marco cross-encoder +
+`rank_bm25` on BEIR NFCorpus qrels (no cargo).
