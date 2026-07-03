@@ -52,9 +52,11 @@ measurably the worst option for English retrieval.
   tier, use a *better* single embedder (rec #1), not *more* embedders.
 
 ### 3. Tune RRF fusion: up-weight the STRONGER tier, small k, deep candidate feed.
-- **Up-weight the stronger tier ~1.3×** (not always vector) + smaller RRF `k` (~10, not 60 —
-  `k=60` is too flat over the top-10, so any weight >1 degenerates to that tier alone) → the hybrid
-  strictly dominates the best single tier on **both** recall and nDCG (SciFact 0.835/0.665).
+- **Small RRF `k` (~10, not 60) is the key fusion knob.** k=60 is too flat over the top-10; k≈10 sharpens
+  `1/(k+r)` so the top ranks separate (+2.6% nDCG vs k=60, `4cc3b47`). Given small-k, the **tier-weight is
+  largely redundant**: equal weight ≈ 1.3× within noise, and over-weighting (≥1.7) *hurts* (`44566fd`) — small-k
+  substitutes for the weight. So: **small k≈10 + a light weight (1.0-1.3, never more)**; the earlier "1.3×"
+  mattered mainly at the old k=60. Up-weight the *stronger* tier for the workload if you weight at all.
 - **Neutral (hash) tiebreak** — but *only if you run equal weights*. Tier-weighting **subsumes** it: with weights the
   fused contributions are distinct, eliminating ~95-97% of RRF ties (stock equal-weight has ties in 27-48% of queries;
   weighted has ~1%). So the lexical-favoring tiebreak biases 1/3-1/2 of *stock* results, but is nearly moot once you
