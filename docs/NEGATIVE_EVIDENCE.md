@@ -5490,3 +5490,36 @@ exactly why the hybrid beats both single tiers across the query-length spectrum 
 the right call. This closes the query-length/embedding-model arc. (Efficiency note: the cos-drift metric answered the
 contextual-vs-static question directly, so the heavier MiniLM retrieval bench was **not needed**.) Verified: pure-Python on
 the committed potion + MiniLM slabs (no cargo build).
+
+---
+
+## 2026-07-03 — MEASURED (NEW LEVER, alien-graveyard-tier): a cheap per-query CONFIDENCE signal (top-1/top-2 score margin) predicts vector-retrieval success (AUC 0.77) → query-ADAPTIVE fusion is viable (IronPetrel)
+
+The short-query weakness is a *query* property (see the drift entries), so instead of a fixed lexical/vector fusion weight,
+a system could detect *per-query* whether the vector tier is trustworthy and lean on lexical when it isn't. Tested whether
+a **cheap, at-query-time** confidence signal predicts vector success. numpy brute-force retrieval over the potion-256 130k
+corpus, 963 known-item queries (3/5/10-word mixed); for each query take the vector top-k scores and ask whether the
+score-shape predicts finding the source doc:
+
+| confidence signal | AUC (predict found@10) |
+|---|---|
+| raw top-1 score | 0.722 |
+| **score margin (top-1 − top-2)** | **0.771** |
+
+| | found@10 | mean top-1 | mean margin |
+|---|---|---|---|
+| source **found** | — | 0.775 | **0.126** |
+| source **missed** | — | 0.683 | **0.035** |
+
+**Finding:** the **margin (top-1 − top-2) predicts retrieval success with AUC 0.771** — a genuinely usable signal, and
+cheaper/better than the raw top-1 score (0.722). A confident retrieval has one doc standing out (margin 0.126); an
+ambiguous/underspecified query has flat top-k scores (margin 0.035, **3.6× smaller**). This is computable **for free** at
+query time (the top-2 scores are already retrieved). **New product lever — query-adaptive fusion:** route/re-weight
+per-query by the vector margin — when it's small (uncertain), down-weight the vector tier and lean on lexical BM25 (which,
+per the query-length entries, is exactly the tier that carries short/ambiguous queries); when it's large (confident),
+up-weight vector. This is the adaptive version of the static source-weighting lever (which already dominates vector-alone,
+`7bb8da5`), and it directly attacks the one measured hybrid weakness (short/underspecified queries). Caveat: AUC 0.77 is
+useful but not sharp, and it's weakest exactly where it's most needed (uniformly-hard 3-word queries: top-1 barely
+separates found 0.693 vs missed 0.683) — so margin-routing helps the *mixed* query stream more than the all-short tail.
+Route-next: wire a margin-thresholded per-query fusion weight and measure the hybrid recall/MRR uplift (needs the
+lexical-fusion bench). Verified: numpy brute-force on the committed potion slab (no cargo build).
