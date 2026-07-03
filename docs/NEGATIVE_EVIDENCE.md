@@ -5258,3 +5258,15 @@ hybrid (1.0) tops both. **Honest nuance:** hybrid maximizes *recall* but its **M
 precision vector-alone edges hybrid, while for "find the doc at all" hybrid wins outright. Net: the hybrid's value-add
 over Tantivy is real and measured (+10.9% recall) on real embeddings + real text. Verified: `--features lexical` bench
 compiles + runs locally (exit 0); async Tantivy index of 30k real docs + 254 queries.
+
+**Follow-up (RRF-k is a NO-OP for the recall/MRR tradeoff — the MRR gap is structural): swept RRF `k` ∈ {5,10,20,30,60,100}
+on the known-item eval.** Hybrid is **flat at recall@10=1.0000, MRR@10=0.9406 across ALL k** — sharpening the fusion (low
+k, which weights rank-1 more) does NOT recover the rank-1 MRR that sits below vector-alone (0.9678). Reason: RRF weights
+lexical and vector **equally**, and `k` scales both sources' rank contributions the same way, so a competitor with a
+strong *lexical* rank-1 keeps outranking the target's strong *vector* rank-1 regardless of `k`. The hybrid's MRR being
+below vector-alone is therefore **inherent to equal-weight RRF, not a tuning artifact** — the only knob that would fix it
+is **per-source weighting** (up-weight the vector tier, which is the more reliable retriever here: 0.996 vs 0.902), which
+the basic `rrf_fuse`/`RrfConfig` (only `k`) does not expose. **Takeaways:** (1) don't bother tuning RRF `k` for this
+tradeoff — it's inert; (2) the hybrid **recall** win over Tantivy (1.0 vs 0.902) is robust and `k`-invariant; (3) if
+rank-1 MRR matters more than recall, either use vector-alone or add a source-weighted fusion (a real route-next: a
+weighted-RRF variant or pre-scaling the semantic ranks). Verified: `--features lexical` bench runs clean locally (exit 0).

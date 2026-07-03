@@ -108,20 +108,25 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     });
 
     let cx = asupersync::Cx::for_testing();
-    let rrf = RrfConfig::default();
-
-    // ── Known-item eval: recall@K + MRR for lexical / vector / hybrid. ──
-    let (mut rl, mut rv, mut rh) = (0.0f64, 0.0f64, 0.0f64);
-    let (mut ml, mut mv, mut mh) = (0.0f64, 0.0f64, 0.0f64);
     let rank_of = |ids: &[String], target: &str| -> Option<usize> {
         ids.iter().position(|d| d == target)
     };
+    let recall_mrr = |ids: &[String], target: &str| -> (f64, f64) {
+        match rank_of(ids, target) {
+            Some(rank) => (1.0, 1.0 / (rank as f64 + 1.0)),
+            None => (0.0, 0.0),
+        }
+    };
+
+    // Precompute per-query lexical + vector rankings (k-independent); the hybrid is
+    // re-fused per RRF-k below.
+    let mut lex_all: Vec<Vec<ScoredResult>> = Vec::with_capacity(q);
+    let mut vec_all: Vec<Vec<frankensearch_core::types::VectorHit>> = Vec::with_capacity(q);
+    let mut targets: Vec<String> = Vec::with_capacity(q);
+    let (mut rl, mut rv, mut ml, mut mv) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for qi in 0..q {
         let target = format!("doc-{:06}", query_src[qi]);
-        // Lexical (Tantivy BM25).
-        let lex_hits = tantivy
-            .search_doc_ids(&cx, &query_texts[qi], K)
-            .expect("lex");
+        let lex_hits = tantivy.search_doc_ids(&cx, &query_texts[qi], K).expect("lex");
         let lex_ids: Vec<String> = lex_hits.iter().map(|h| h.doc_id.to_string()).collect();
         let lex_scored: Vec<ScoredResult> = lex_hits
             .iter()
@@ -138,27 +143,36 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
                 metadata: None,
             })
             .collect();
-        // Vector.
         let vec_hits = vindex.search_top_k(&query_vecs[qi], K, None).expect("vec");
         let vec_ids: Vec<String> = vec_hits.iter().map(|h| h.doc_id.to_string()).collect();
-        // Hybrid (RRF).
-        let fused = rrf_fuse(&lex_scored, &vec_hits, K, 0, &rrf);
-        let hyb_ids: Vec<String> = fused.iter().map(|h| h.doc_id.to_string()).collect();
-
-        for (ids, rc, mc) in [
-            (&lex_ids, &mut rl, &mut ml),
-            (&vec_ids, &mut rv, &mut mv),
-            (&hyb_ids, &mut rh, &mut mh),
-        ] {
-            if let Some(rank) = rank_of(ids, &target) {
-                *rc += 1.0;
-                *mc += 1.0 / (rank as f64 + 1.0);
-            }
-        }
+        let (a, b) = recall_mrr(&lex_ids, &target);
+        rl += a;
+        ml += b;
+        let (a, b) = recall_mrr(&vec_ids, &target);
+        rv += a;
+        mv += b;
+        lex_all.push(lex_scored);
+        vec_all.push(vec_hits);
+        targets.push(target);
     }
     let qf = q as f64;
-    eprintln!("[knownitem] recall@{K}:  lexical={:.4}  vector={:.4}  hybrid={:.4}", rl / qf, rv / qf, rh / qf);
-    eprintln!("[knownitem] MRR@{K}:     lexical={:.4}  vector={:.4}  hybrid={:.4}", ml / qf, mv / qf, mh / qf);
+    eprintln!("[knownitem] lexical(Tantivy): recall@{K}={:.4} MRR@{K}={:.4}", rl / qf, ml / qf);
+    eprintln!("[knownitem] vector(potion):   recall@{K}={:.4} MRR@{K}={:.4}", rv / qf, mv / qf);
+
+    // ── RRF-k sweep: does a sharper (lower-k) fusion keep hybrid's recall win AND
+    //    recover the rank-1 MRR that the default k=60 blend dilutes below vector-alone? ──
+    for k in [5.0f64, 10.0, 20.0, 30.0, 60.0, 100.0] {
+        let cfg = RrfConfig { k };
+        let (mut rh, mut mh) = (0.0f64, 0.0f64);
+        for qi in 0..q {
+            let fused = rrf_fuse(&lex_all[qi], &vec_all[qi], K, 0, &cfg);
+            let hyb_ids: Vec<String> = fused.iter().map(|h| h.doc_id.to_string()).collect();
+            let (a, b) = recall_mrr(&hyb_ids, &targets[qi]);
+            rh += a;
+            mh += b;
+        }
+        eprintln!("[knownitem] hybrid RRF k={k:>5}: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
+    }
 
     // ── Latency: lexical vs vector vs hybrid per query. ──
     let mut qi = 0usize;
