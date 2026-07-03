@@ -5935,3 +5935,31 @@ retrieval model**, not E5/BGE-style. So (1) all this session's retrieval-32M num
 `query:`/`passage:` prefixes with this model** (the prefix tokens dilute the mean-pooled static embedding). A small,
 config-hygiene confirmation — but the kind of gotcha that silently costs 2–3 recall pts if assumed. Verified: `model2vec`
 retrieval-32M + numpy venv on BEIR SciFact + NFCorpus qrels (no cargo, no torch).
+
+---
+
+## 2026-07-03 — MEASURED (the quality ceiling — static vs contextual): a contextual model (BGE-small) beats the best static one by +14% nDCG on SciFact, but embeds ~650× slower — the tradeoff frankensearch's dual embedder path exists for (IronPetrel)
+
+All prior results used **static** `model2vec` embedders (fast, no ONNX/torch). frankensearch *also* ships a **contextual
+ONNX path** (`fastembed`/`FastEmbedEmbedder`), so the real question is the **quality ceiling**: how much does a contextual
+transformer buy over the best static model, and at what cost? Measured on SciFact (via `fastembed`, onnxruntime, no torch):
+
+| embedder (SciFact, n=300) | tier | dim | recall@10 | nDCG@10 | embed throughput |
+|---|---|---|---|---|---|
+| potion-multilingual-128M (stock default) | static | 256 | 0.598 | 0.451 | ~9200 doc/s |
+| potion-retrieval-32M (recommended static) | static | 512 | 0.795 | 0.633 | ~7800 doc/s |
+| **BAAI/bge-small-en-v1.5** | **contextual** | 384 | **0.845** | **0.720** | **~12 doc/s** |
+
+**Findings:** (1) **The contextual model (BGE-small) is meaningfully better than the best static one** — recall 0.845 vs
+0.795 (+5.0 pts) and nDCG **0.720 vs 0.633 (+8.7 pts, +14%)** — the nDCG (ranking) gain is largest, i.e. the contextual
+model *orders* relevant docs much better. (2) **But it embeds ~650× slower** (12 doc/s vs 7800 — a real transformer
+forward pass vs a static token-lookup + mean-pool) and requires the **onnxruntime**. (3) So the two embedder tiers are a
+clean **quality/cost Pareto**, exactly what frankensearch's dual path (model2vec static + fastembed ONNX) is built for:
+**static `retrieval-32M` for the fast default** (7800 doc/s, no ONNX, 0.795), **contextual BGE-small for the
+quality-premium** (+14% nDCG at ~650× embed cost + ONNX runtime). **Product framing:** the embedder is a *tiered* choice —
+(a) *fix the bad default*: multilingual-128M → retrieval-32M is a **free +33%** static-to-static win (no cost change); (b)
+*offer the premium*: contextual BGE for deployments that can afford the index-build cost / ONNX dep, +14% nDCG on top.
+(Note the embed cost is a one-time *index-build* cost, not per-query — so for a static corpus, contextual's 650× embed
+penalty is paid once; that reframes the tradeoff toward contextual for quality-sensitive, rarely-reindexed corpora.)
+Verified: `fastembed` (bge-small onnxruntime) + `model2vec` in the venv on BEIR SciFact qrels (no cargo, no torch; a light
+`snowflake-arctic-embed-xs` point was still embedding at cutoff — contextual ONNX is slow on CPU).
