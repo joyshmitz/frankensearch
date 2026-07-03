@@ -108,3 +108,8 @@ harness = false
 [[bench]]
 name = "ann_stratified_ef"
 harness = false
+
+# Vector-tier known-item recall vs query length on real embeddings (index-only, light).
+[[bench]]
+name = "real_qlen_vector"
+harness = false

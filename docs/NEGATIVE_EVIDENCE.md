@@ -5392,3 +5392,29 @@ is accidentally *better* than `doc_id` here. The correct tiebreak fix is to **in
 delete the lexical one. **Net recommendation:** the dominant fix is a **source-weighted `rrf_fuse`** (`vec_w≈2`), which is a
 config/API addition; a cheaper hash-tiebreak tweak recovers ~0.9 MRR pts but not full dominance and must be an *added*
 unbiased comparator (never fall to `doc_id`). Verified: `--features lexical` bench runs clean locally (exit 0).
+
+---
+
+## 2026-07-03 — MEASURED (inverts a common intuition): the VECTOR tier degrades ~2.2× in recall for SHORT queries — semantic search does NOT rescue vague queries (for static embeddings) (IronPetrel)
+
+Tested how the vector tier holds up as queries get **short/vague** (the regime where BM25 keyword-matching is supposed to
+struggle and semantic search is supposed to shine). Light index-only bench `real_qlen_vector` (built on an **isolated
+`CARGO_TARGET_DIR`** to dodge the shared-target lock contention that blocked the heavier fusion bench): known-item
+recall@10 where the query is the first W words of a held-out doc (potion-256, 130k corpus, 321 queries):
+
+| query length | vector recall@10 | MRR@10 |
+|---|---|---|
+| 10-word | 0.9907 | 0.9391 |
+| 5-word | 0.7944 | 0.6291 |
+| **3-word** | **0.4486** | 0.2551 |
+
+**Finding:** the vector tier **collapses for short queries** — recall@10 falls from 0.99 (10-word) to 0.79 (5-word) to
+**0.45 (3-word)**, a ~2.2× drop. This **inverts the common "semantic search rescues vague/short queries" intuition**: a
+3-word span produces a noisy, underspecified **static** (Model2Vec) embedding, and nearest-neighbor retrieval on that
+noisy query vector misses the source doc more than half the time. **Implication for the hybrid vs Tantivy story:** for
+short queries the vector tier is *weak* (0.45), so the **lexical BM25 tier likely carries the hybrid** there — meaning the
+vector/hybrid advantage over Tantivy that we measured on 10-word queries (+8–10 pts) probably **shrinks or reverses for
+very short queries**, where exact keyword matching beats a vague embedding. (Caveat: this is a *static* Model2Vec
+embedding; a contextual model may degrade less on short spans — a route-next once the fusion bench is unblocked, to get
+the full hybrid-vs-Tantivy-by-query-length curve.) Verified: `--features` none (index-only) bench runs clean on an
+isolated target (exit 0).
