@@ -6749,3 +6749,30 @@ title+body. **This closes lexical-tier tuning:** both classic BM25 improvements 
 RM3 — are net-neutral-to-negative for the hybrid, and both PRF variants (embedding-space `433f758` and lexical RM3) fail
 to cleanly help. The vector tier is the right way to improve recall, not lexical expansion. Verified: `rank_bm25`
 (BM25Okapi + its IDF weights) on BEIR SciFact/NFCorpus qrels (no cargo).
+
+---
+
+### No valuable THIRD modality: char-3gram / word-bigram don't help — two strong tiers is the sweet spot (IronPetrel, 2026-07-03)
+
+The modality-diversity finding (`339d22b`) showed the hybrid works via *decorrelated modalities* (BM25 exact-term vs
+vector semantic), and multi-*embedder* ensembling was redundant (same modality). Open question: is there a valuable
+**third, genuinely-different lexical modality**? Tested char-3gram (typo/morphology) and word-bigram (phrase) TF-IDF as a
+third RRF tier on top of vector + token-BM25:
+
+| stack | SciFact recall/nDCG@10 | NFCorpus recall/nDCG@10 |
+|---|---|---|
+| hybrid (vector + token-BM25) | **0.8358 / 0.6904** | **0.1587 / 0.3257** |
+| + char-3gram (3rd tier) | 0.8323 / 0.6923 (noise) | 0.1590 / 0.3239 (noise) |
+| + word-bigram (3rd tier) | 0.8164 / 0.6589 (**−4.6%**) | 0.1430 / 0.2925 (**−10%**) |
+
+**Finding — no third modality adds value; two comparably-strong decorrelated tiers is the sweet spot.** char-3gram is
+**neutral** (redundant with token-BM25 on clean, well-spelled BEIR text — its finer granularity captures the same lexical
+signal); word-bigram **hurts** (bigram matching is too sparse/noisy and dilutes the fusion). Critically, on NFCorpus
+char-3gram **finds a relevant doc the vec+BM25 top-10 miss in 17.3% of queries — yet the ensemble does not gain** (0.3239
+≈ 0.3257): the exact "unique-% is not sufficient" mechanism from the multi-embedder finding — the third modality is
+*weaker*, so its dilution cancels its unique finds. **Combined verdict on ensembling (embedder + modality): the hybrid is
+optimally exactly two tiers — one strong embedder + BM25.** More tiers (a second embedder `339d22b`, a third lexical
+modality here) are redundant-to-harmful; the partner must be both *decorrelated* AND *comparably strong*, and only the
+BM25↔vector pair satisfies both. Caveat: char n-grams' value is typo/OOV-robustness, which clean BEIR doesn't exercise —
+they may help noisier real-world corpora, but not the retrieval-quality axis. Verified: `model2vec` retrieval-32M +
+`rank_bm25` + `sklearn` char/word n-gram TF-IDF on BEIR SciFact/NFCorpus qrels (no cargo).
