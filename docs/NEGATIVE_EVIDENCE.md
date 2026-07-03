@@ -6156,3 +6156,40 @@ from the model/depth entries. Combined verdict for the reranker tier: **blend (d
 still eval the model per corpus — but blending is the safety net that makes the tier usable by default.** Verified:
 `fastembed` TextCrossEncoder (both ONNX cross-encoders) + `model2vec` retrieval-32M + `rank_bm25` on BEIR
 NFCorpus/SciFact qrels (no cargo, no torch).
+
+---
+
+### Reranker integration: RRF-COMBINE (as a 3rd RRF source) beats score-blend AND is α-free/native (IronPetrel, 2026-07-03)
+
+Last entry recommended score-blending (`α·reranker + (1-α)·retrieval`) to tame the reranker's downside — but that needs
+an α *and* per-query min-max normalization of incomparable scales. frankensearch is an **RRF-native** system, so the
+architecturally-clean integration is to feed the reranker as a **third RRF source** (rank-fusion of the retrieval-order
+and the reranker-order) — rank-based, so scale-free and α-free. Head-to-head, same top-50 candidates (retrieval-32M +
+real BM25), 60q, each dataset's winning reranker:
+
+| combine method | NFCorpus (ms-marco-L6) | SciFact (bge-reranker-base) |
+|---|---|---|
+| pure-hybrid (no rerank) | 0.2966 | 0.7962 |
+| pure-reorder (reranker only, α=1) | **0.3588 (+0.0622)** | 0.7848 (−0.0114, HURTS) |
+| score-blend α=0.25 | 0.3210 | 0.8216 (+0.0254) |
+| score-blend α=0.5 | 0.3397 (+0.0431) | 0.8209 (+0.0247) |
+| **RRF-combine k=10** | 0.3439 (+0.0473) | 0.8331 (+0.0369) |
+| **RRF-combine k=60** | 0.3439 (+0.0474) | **0.8358 (+0.0396, BEST non-reorder)** |
+
+**Finding — RRF-combine is the best default way to apply a reranker in an RRF pipeline.**
+- **On the imperfect-reranker case (SciFact/bge), RRF-combine BEATS score-blend** (+0.0396 vs +0.0254, a further +0.014
+  nDCG) and comfortably clears pure-reorder's −0.0114 loss — the rank fusion caps how far a deep false positive can
+  climb (it must be highly ranked by *both* retrieval and the reranker).
+- **It's parameter-free and robust:** no α, no score normalization (rank-based), and **k-insensitive** (k=10 vs 60
+  differ by 0.003) — nothing to tune per corpus, unlike score-blend's α or the RRF-`k`.
+- **It only trails pure-reorder when the reranker is strongly matched** (NFCorpus: pure-reorder +0.062 > RRF +0.047),
+  trading a little peak upside for robustness, safety (never catastrophic), and zero tuning — the correct trade for a
+  *default*, since you don't know a priori whether your reranker matches the corpus.
+- **Zero new machinery for frankensearch:** it already ships `rrf_fuse`; the reranker becomes another ranked source
+  fed into the same fusion (optionally tier-weighted, per the fusion-tuning entry) — no min-max normalizer, no α config.
+
+**Product takeaway (supersedes the score-blend rec):** integrate the reranker as a **third RRF source**, not by
+pure-reorder or score-blend. It's the empirically-best *and* simplest *and* architecturally-native option — best on the
+risky imperfect-reranker regime, safe everywhere, no tuning, reuses existing `rrf_fuse`. This closes the "how to combine
+the reranker" question with the frankensearch-native answer. Verified: `fastembed` TextCrossEncoder (both ONNX
+cross-encoders) + `model2vec` retrieval-32M + `rank_bm25` on BEIR NFCorpus/SciFact qrels (no cargo, no torch).

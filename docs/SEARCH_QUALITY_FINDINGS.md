@@ -76,14 +76,17 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   promotes false positives, flipping +0.019→−0.011). So **default to a shallow rerank depth (~top-10)** and only go
   deeper if a per-corpus eval shows the reranker is well-matched *and* relevant docs sit deep. Deeper reranking is
   neither free (linear cross-encoder cost) nor safe (an imperfect reranker injects false positives at depth).
-- **BLEND the reranker score — don't let it fully reorder (this is the safety net).** Rank by
-  `α·reranker + (1-α)·retrieval` (per-query min-max normalized), **not** by the reranker alone. This resolves the
-  downside risk above: on SciFact/bge pure-reorder *hurts* (−0.011) but a light blend (α=0.25) gives **+0.025** — a
-  +0.037 swing — because the retrieval score vetoes the deep false positives. When the reranker is strong (NFCorpus)
-  blending costs nothing (peaks α=0.75, marginally over pure-reorder). **A fixed α≈0.4-0.5 is net-positive on every
-  dataset tested** and degrades gracefully on a mismatched reranker (leans on retrieval) — so blending is what makes the
-  reranker tier usable *by default* and shrinks the per-corpus-eval burden. Net reranker verdict: **blend (never
-  pure-reorder), bias shallow, still sanity-check the model per corpus.**
+- **Integrate the reranker as a THIRD RRF SOURCE — don't pure-reorder, don't even score-blend (this is the safety net,
+  and it's native).** Rank by RRF-fusing the retrieval-order and the reranker-order, **not** by the reranker score
+  alone. This resolves the downside risk above and beats the alternatives: on SciFact/bge pure-reorder *hurts* (−0.011),
+  score-blend recovers it (+0.025), but **RRF-combine does best (+0.040)** — the rank fusion caps how far a deep false
+  positive can climb (it must rank high by *both* retrieval and the reranker). It's **parameter-free** (no α, no score
+  normalization, and k-insensitive: k=10≈k=60), so nothing to tune per corpus. It only trails pure-reorder when the
+  reranker is strongly matched (NFCorpus +0.062 vs RRF +0.047) — the right trade for a default, since you can't know a
+  priori if the reranker fits. **Zero new machinery: frankensearch already ships `rrf_fuse`** — feed the reranker as
+  another ranked source (optionally tier-weighted). Net reranker verdict: **RRF-combine (never pure-reorder), bias
+  shallow depth, still sanity-check the model per corpus — but RRF-combine makes the tier safe and tuning-free by
+  default.** (Score-blend `α·reranker+(1-α)·retrieval`, α≈0.5, is the fallback if a non-RRF stage is combining.)
 
 ### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
 - On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both
