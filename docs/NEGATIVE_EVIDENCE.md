@@ -5132,3 +5132,9 @@ is a **pure win at large N**: faster + exact candidate recall (1.0 vs 0.993), fo
 (int8 `dim` bytes/vec vs 4-bit `dim/2`). The only regime where 4-bit may edge int8 is very small N (bandwidth matters more,
 compute less — 30k earlier showed 4bit_mult5 464µs < int8_mult5 498µs), a ~7% wash where int8 is still exactly lossless.
 **The prior entry's product-gate is now measurement-cleared; wiring the swap is justified.**
+
+**LANDED (`sync_searcher.rs`): the fast tier now uses `search_top_k_int8_two_pass_filtered` (mult=3).** A production win,
+not just evidence: strictly-lossless candidate set (candidate-recall@10 = 1.0 on real potion + MiniLM) restores the
+"identical fused top-k" guarantee the comment depends on, AND it's 1.09× faster at N≈130k, for ~12.8 MB extra slab @100k.
+Verified: `cargo test -p frankensearch-fusion --lib` **820 passed / 0 failed** (via rch) — no test asserted 4-bit-specific
+output, so the swap is behavior-compatible (more-correct candidate set, unchanged passing fused results).

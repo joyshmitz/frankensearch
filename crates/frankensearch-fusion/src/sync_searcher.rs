@@ -328,22 +328,23 @@ impl SyncTwoTierSearcher {
         self.search_params.map_or_else(
             || {
                 // Default: the fast tier is a *reranked candidate generator* (its hits
-                // are re-scored by the quality tier + RRF), so use the 4-bit two-pass
-                // (parallel + cutoff, ~3× faster than the exact f16 scan) instead of the
-                // exact scan.
+                // are re-scored by the quality tier + RRF), so use the int8 two-pass
+                // (parallel + cutoff) instead of the exact f16 scan.
                 //
-                // mult=3 keeps the 4-bit candidate set EFFECTIVELY lossless. On SYNTHETIC
-                // corpora candidate-recall@10=1.0 (10k–100k). On REAL embeddings measured
-                // 2026-07-02 (potion-256, 30k, fetch=K·3 regime) it is 0.9973 — NOT exactly
-                // 1.0; the int8 two-pass twin is exactly 1.0000 in the same regime (see
-                // docs/NEGATIVE_EVIDENCE.md). The ~0.3% fast-tier miss is further masked by
-                // the lexical tier + RRF, so the fused top-k impact is negligible. Switch to
-                // `search_top_k_int8_two_pass_filtered` (mult=2) if a hard exact-candidate
-                // guarantee is required — int8 is lossless at low mult on real data at
-                // comparable latency, for ~2× the fast-tier slab bytes. `fetch` is already
-                // a candidate over-fetch, so a larger 4-bit multiplier is wasteful.
+                // int8 (was 4-bit): on REAL embeddings the int8 candidate set is EXACTLY
+                // lossless (candidate-recall@10 = 1.0000 in this fetch=K·3, mult=3 regime,
+                // potion-256 + MiniLM-384), whereas 4-bit was only 0.9930–0.9973 (its
+                // "recall=1.0" was a synthetic-corpus artifact). And int8 is also FASTER at
+                // scale: 0.985 ms vs 4-bit 1.070 ms @ N≈130k (1.09×, separated CIs) — the
+                // AVX2 `dot_i8_i8` kernel beats the 4-bit nibble-unpack, so 4-bit's
+                // ½-bandwidth edge does not pay when pass-1 is compute-bound (see
+                // docs/NEGATIVE_EVIDENCE.md 2026-07-02). Net: strictly-lossless candidate
+                // set → identical fused top-k, faster, for ~2× the fast-tier slab bytes
+                // (int8 `dim` vs 4-bit `dim/2`; ~12.8 MB extra @100k dim256 — negligible).
+                // mult=3 keeps ample margin (int8 is lossless from mult=2); `fetch` is
+                // already a candidate over-fetch, so a larger multiplier is wasteful.
                 const FAST_TIER_MULT: usize = 3;
-                fast_index.search_top_k_4bit_two_pass_filtered(
+                fast_index.search_top_k_int8_two_pass_filtered(
                     query_vec,
                     fetch,
                     FAST_TIER_MULT,
