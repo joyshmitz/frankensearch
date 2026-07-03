@@ -6263,3 +6263,32 @@ marginally *better* on recall — the first-stage metric that matters when a rer
 reranker-integration finding (`b114e39`): **RRF is the robust, scale-free, tuning-light fusion primitive throughout the
 stack** (lexical+vector *and* reranker-combine). Don't switch the base hybrid to score-fusion. Verified: `model2vec`
 retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
+
+---
+
+### Query-side: embedding-space pseudo-relevance feedback (PRF/Rocchio) is net-harmful for static embedders (IronPetrel, 2026-07-03)
+
+Every lever so far was corpus/fusion/rerank-side; the query side was untouched except the short-query-drift finding.
+Tested the classic query-side technique — **embedding-space pseudo-relevance feedback** (Rocchio in vector space):
+retrieve top-k with the raw query, then `q' = normalize(q + α·mean(top-k doc vectors))` and re-retrieve. Swept
+k∈{3,5,10}, α∈{0.5,1,2}, retrieval-32M, nDCG@10 vs the raw-query baseline:
+
+| dataset | baseline nDCG@10 | best PRF | worst PRF |
+|---|---|---|---|
+| SciFact  | 0.6331 | 0.6134 (k=3,α=0.5, **−0.020**) | 0.4886 (k=10,α=2, **−0.145**) |
+| NFCorpus | 0.3085 | 0.3086 (k=3,α=0.5, +0.0001 ≈ noise) | 0.2868 (k=10,α=2, −0.022) |
+
+**Finding — embedding PRF is uniformly net-harmful (or at best neutral); do NOT add it for the static embedder.**
+On SciFact *every* PRF configuration loses quality, and the loss grows **monotonically** with both k (more docs) and α
+(more feedback weight) — the signature of **query drift**, not a tuning miss. The mechanism is specific to static
+embedders: (1) the top-k always contains false positives (precision@3-10 < 1), so averaging their vectors pulls the
+query toward off-topic regions; (2) mean-pooled static doc embeddings don't *refine* the query intent, they **blur** it
+toward the corpus centroid (regression to the mean). More feedback → more blur → worse. NFCorpus is nearly flat (its
+many-relevant-docs structure tolerates a tiny α=0.5 nudge) but still never *gains*.
+
+**Product takeaway — no embedding-space query expansion/PRF for the static vector tier.** It's a classic technique
+someone would plausibly add, and it *degrades* quality here (up to −0.14 nDCG aggressive, at-best-neutral gentle). The
+right remedy for weak/short queries remains the **lexical (BM25) tier** (per the short-query-drift finding), not
+vector-space feedback. Caveat: this is measured for *static* (model2vec) embeddings — contextual embeddings have more
+semantically-precise doc vectors and *might* tolerate PRF, but that's the premium path, not the fast default. Verified:
+`model2vec` retrieval-32M on BEIR SciFact/NFCorpus qrels (no cargo, no torch).

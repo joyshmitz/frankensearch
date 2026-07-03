@@ -122,6 +122,10 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   a Matryoshka-trained embedder — another reason for recommendation #1.
 - **Short queries:** the vector tier collapses on ≤3-word queries (recall 0.45) — a *fundamental*
   query-underspecification (query-embedding drift), model-invariant; lexical BM25 carries them.
+- **Embedding-space PRF / query expansion (Rocchio):** do NOT add it for the static vector tier — it's
+  net-harmful (SciFact: every config loses, up to −0.14 nDCG; harm grows monotonically with feedback =
+  query drift). Static mean-pooled doc vectors averaged into the query blur it toward the corpus centroid;
+  top-k false positives poison the centroid. Lexical BM25, not vector PRF, is the weak-query remedy.
 
 ## What's NOT yet done (implementation, product-gated)
 The above are measured recommendations, not code changes (except #4, landed). Wiring #1 (default
