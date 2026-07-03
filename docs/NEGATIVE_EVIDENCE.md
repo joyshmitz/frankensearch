@@ -7060,3 +7060,28 @@ dilution of that tier's one-tier docs. (3) why the **multi-embedder/third-modali
 weak-but-decorrelated tier creates *more* one-tier docs to dilute. **Takeaway: RRF's value is proportional to the
 fraction of relevant docs found by BOTH tiers; it's weakest exactly where the tiers are complementary (many one-tier
 relevant docs) — the opposite of intuition.** Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus.
+
+---
+
+### CombMAX loses to RRF: consensus dilution FILTERS single-tier false positives (a feature, not a bug) (IronPetrel, 2026-07-03)
+
+The consensus/dilution mechanism (`4c9530c`) predicted **CombMAX** (score = *max* of the two reciprocal-rank
+contributions = rank by best-tier position, which *preserves* one-tier docs) should beat RRF (CombSUM) on complementary
+corpora. Tested it — the prediction **failed**, informatively:
+
+| dataset | CombSUM (RRF) recall/nDCG@10 | CombMAX |
+|---|---|---|
+| SciFact | 0.8358 / **0.6904** | 0.8541 / 0.6731 (recall +2.2%, **nDCG −2.5%**) |
+| NFCorpus | 0.1587 / **0.3257** | 0.1558 / 0.3204 (**both −**) |
+
+**Finding — CombMAX is worse than RRF on both corpora; RRF's consensus dilution is a FEATURE (single-tier
+false-positive filtering), not a bug.** CombMAX ranks by best-tier position, so a *non-relevant* doc that's rank-1 in one
+tier outranks a *relevant* doc that's rank-5 in both — it promotes single-tier **false positives**. RRF's `1/(k+r_L) +
+1/(k+r_V)` sum instead rewards agreement, correctly *demoting* one-tier docs. The key insight refining `4c9530c`: **most
+one-tier docs are false positives**, so RRF's dilution of one-tier docs is *net-beneficial* — the downside (the occasional
+one-tier *relevant* doc lost, e.g. NFCorpus complete-misses) is outweighed by the upside (filtering the many one-tier
+false positives). On SciFact CombMAX buys recall (+2.2% — it recovers some one-tier relevant docs) but *at the cost of*
+nDCG (−2.5% — the promoted false positives pollute the top ranks); on NFCorpus even recall drops. **So RRF/CombSUM is
+validated over CombMAX; the consensus mechanism's false-positive filtering is why `rrf_fuse`'s sum is right** (and why
+score-fusion `27c488a` and CombMAX both lose to it). Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
+SciFact/NFCorpus (no cargo).
