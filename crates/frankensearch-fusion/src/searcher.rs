@@ -64,7 +64,7 @@ use crate::mmr::MmrConfig;
 use crate::mmr::mmr_rerank;
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
-use crate::rrf::{RrfConfig, candidate_count, rrf_fuse_with_graph_merge_unique};
+use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, rrf_fuse_with_graph_merge_unique};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -136,6 +136,11 @@ pub struct TwoTierSearcher {
     config: TwoTierConfig,
     prf_config: PrfConfig,
     mmr_config: MmrConfig,
+    /// Per-tier RRF weights + tiebreak applied to hybrid fusion (default: neutral 1.0 /
+    /// legacy tiebreak). See [`RrfConfig::lexical_weight`] / [`RrfTiebreak`].
+    rrf_lexical_weight: f64,
+    rrf_semantic_weight: f64,
+    rrf_tiebreak: RrfTiebreak,
     adaptive_fusion: Option<Arc<AdaptiveFusion>>,
     score_calibrator: Option<CalibratorConfig>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
@@ -180,6 +185,9 @@ impl TwoTierSearcher {
             config,
             prf_config: PrfConfig::default(),
             mmr_config: MmrConfig::default(),
+            rrf_lexical_weight: 1.0,
+            rrf_semantic_weight: 1.0,
+            rrf_tiebreak: RrfTiebreak::LexicalThenId,
             adaptive_fusion: None,
             score_calibrator: None,
             circuit_breaker: None,
@@ -212,6 +220,29 @@ impl TwoTierSearcher {
     #[must_use]
     pub fn with_lexical(mut self, lexical: Arc<dyn LexicalSearch>) -> Self {
         self.lexical = Some(lexical);
+        self
+    }
+
+    /// Set per-tier RRF fusion weights (default `1.0` / `1.0` = neutral).
+    ///
+    /// Up-weighting the *stronger* tier for the workload (~1.3×) makes the hybrid strictly
+    /// dominate the best single tier on both recall and nDCG (see `docs/NEGATIVE_EVIDENCE.md`).
+    /// Non-finite or `≤ 0` values fall back to `1.0`.
+    #[must_use]
+    pub fn with_rrf_weights(mut self, lexical_weight: f64, semantic_weight: f64) -> Self {
+        self.rrf_lexical_weight = lexical_weight;
+        self.rrf_semantic_weight = semantic_weight;
+        self
+    }
+
+    /// Set the RRF tie-break strategy (default [`RrfTiebreak::LexicalThenId`]).
+    ///
+    /// [`RrfTiebreak::Hash`] breaks score ties by an unbiased hash of `doc_id` instead of
+    /// favoring the lexical tier — it stops the legacy tiebreak from systematically
+    /// demoting vector-only best-answers (see `docs/NEGATIVE_EVIDENCE.md`).
+    #[must_use]
+    pub fn with_rrf_tiebreak(mut self, tiebreak: RrfTiebreak) -> Self {
+        self.rrf_tiebreak = tiebreak;
         self
     }
 
@@ -951,7 +982,9 @@ impl TwoTierSearcher {
 
         let rrf_config = RrfConfig {
             k: self.effective_rrf_k(query_class),
-            ..Default::default()
+            lexical_weight: self.rrf_lexical_weight,
+            semantic_weight: self.rrf_semantic_weight,
+            tiebreak: self.rrf_tiebreak,
         };
 
         if lexical_short_circuit && let Some(lex) = self.lexical.as_ref() {

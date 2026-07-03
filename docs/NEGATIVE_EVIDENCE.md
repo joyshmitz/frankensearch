@@ -6451,3 +6451,27 @@ tiebreak with `RrfConfig { tiebreak: RrfTiebreak::Hash, ..Default::default() }`.
 
 **Fusion-config recipe now fully expressible in the API:** RRF `k`, per-tier weights (`7ccda28`), and tiebreak — every
 measured fusion lever is a config knob, each defaulting to legacy behavior. Flipping any *default* stays product-gated.
+
+---
+
+### SHIPPED: per-tier RRF weights + tiebreak reachable via `TwoTierSearcher` builder (IronPetrel, 2026-07-03)
+
+Closed the plumbing gap noted in the prior roadmap entry: the shipped `RrfConfig` fusion knobs (`7ccda28` weights,
+`05472cd` tiebreak) were only reachable via a direct `rrf_fuse` call, not through the primary async searcher API. Wired
+them onto the **`TwoTierSearcher` builder** (one struct, the same pattern as `with_rerank_combine`), avoiding the
+`TwoTierConfig` 35-site field ripple:
+
+- Three non-gated fields on `TwoTierSearcher` (`rrf_lexical_weight`, `rrf_semantic_weight`, `rrf_tiebreak`) defaulting to
+  `1.0` / `1.0` / `LexicalThenId`, plus builders **`with_rrf_weights(lex, sem)`** and **`with_rrf_tiebreak(t)`**.
+- The per-query `RrfConfig` construction (`searcher.rs:952`) now threads these fields instead of `..Default::default()`.
+
+Users tune fusion from the main API:
+`TwoTierSearcher::new(..).with_lexical(..).with_rrf_weights(1.0, 1.3).with_rrf_tiebreak(RrfTiebreak::Hash)`.
+
+**Verification:** `cargo test -p frankensearch-fusion --lib` → **822 passed, 0 failed**; `cargo clippy` clean on the added
+code. Default-preserving: the defaults make the `RrfConfig` at `searcher.rs:952` byte-identical to the prior
+`..Default::default()`. **Scope note (honest):** this covers the async `TwoTierSearcher` path only; the separate
+sync-searcher path (`sync_searcher.rs`, sourcing `k` from `TwoTierConfig`) still uses neutral fusion weights — exposing
+weights there needs the `TwoTierConfig` field addition (~35 construction sites), deferred. All four fusion/rerank
+capabilities (int8, RRF-combine reranker, per-tier weights, hash tiebreak) are now reachable from the primary searcher
+API; only the *default* values remain product-gated.
