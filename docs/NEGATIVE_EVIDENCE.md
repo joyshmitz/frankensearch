@@ -5307,3 +5307,13 @@ tiebreak (2) symmetric — e.g. compare `max(lexical_score, semantic_score)` or 
 tie-ordering (some fusion tests may assert the current order), so it's a deliberate tweak, not a free swap; but the current
 lexical-favoring tiebreak is arbitrary and worth revisiting for vector-dominant workloads. Verified by source inspection +
 the weighted-RRF measurement above (equal-weight neutral-tiebreak RRF = 0.9596 MRR vs `rrf_fuse` 0.9436, same 1.0 recall).
+
+**Correction (integrity — my fix proposal above was flawed):** `max(lexical_score, semantic_score)` does NOT work as a
+tiebreak — BM25 scores (~0–20+) and cosine/dot scores (~0–1) are on **incomparable scales**, so the max would just always
+be the BM25 value → still lexical-biased. There is no *score-based* neutral tiebreak because the two sources' scores aren't
+commensurable. The **sound, scale-free** replacement is **rank-based**: on an RRF-score tie, prefer the doc with the better
+(lower) **min rank** across sources (or simply drop score-tiebreak (2) and go straight to `doc_id`, removing the lexical
+favoritism at the cost of an arbitrary-but-unbiased order). Note also that the manual "0.9596" used a *random* tiebreak, so
+it reflects "unbiased ≥ lexical-biased for vector-only targets," not a guaranteed 1.6-pt gain — the realizable gain from a
+deterministic neutral tiebreak is workload-dependent. Net: the diagnosis (lexical-favoring tiebreak demotes vector-only
+best-answers) stands; the *clean* fix is a min-rank tiebreak, and its payoff is modest + workload-dependent.
