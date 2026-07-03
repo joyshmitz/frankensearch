@@ -5317,3 +5317,26 @@ favoritism at the cost of an arbitrary-but-unbiased order). Note also that the m
 it reflects "unbiased ≥ lexical-biased for vector-only targets," not a guaranteed 1.6-pt gain — the realizable gain from a
 deterministic neutral tiebreak is workload-dependent. Net: the diagnosis (lexical-favoring tiebreak demotes vector-only
 best-answers) stands; the *clean* fix is a min-rank tiebreak, and its payoff is modest + workload-dependent.
+
+---
+
+## 2026-07-03 — MEASURED (hypothesis REJECTED, robustness confirmed): the hybrid-vs-Tantivy advantage is ~stable across scale (30k→130k), it does NOT grow (IronPetrel)
+
+Tested whether frankensearch's hybrid advantage over Tantivy-lexical **grows at scale** (hypothesis: BM25 lexical recall
+degrades faster than vector recall as the corpus grows, widening the gap). Re-ran `real_hybrid_knownitem` on the **130k**
+real corpus (321 known-item queries):
+
+| corpus | lexical (Tantivy) recall@10 | vector recall@10 | hybrid recall@10 | **hybrid − lexical** |
+|---|---|---|---|---|
+| 30k | 0.9016 | 0.9961 | 1.0000 | **+9.84 pts** |
+| 130k | 0.9128 | 0.9907 | 0.9969 | **+8.41 pts** |
+
+**Hypothesis REJECTED:** the advantage does not grow — it is roughly stable and if anything *shrinks* slightly at 130k
+(+9.8 → +8.4 pts). What actually moved: **vector** recall dips a little at scale (0.9961 → 0.9907 — more near-neighbor
+confusion in a bigger corpus), while **lexical** recall is flat-to-up (0.9016 → 0.9128); the hybrid tracks vector's slight
+decline. So the hybrid value-add over Tantivy is **robust (~+8–10 pts / ~9–11% relative) but scale-invariant**, not
+scale-amplified — a real result to temper any "hybrid wins more at scale" intuition. The RRF-tuning findings **replicate at
+130k**: RRF-`k` inert (hybrid flat MRR 0.9339 across `k`), per-source weighting a Pareto tradeoff (`vec_w=1` best:
+recall 0.9969 / MRR 0.9448; higher `vec_w` → recall drops to vector-alone's 0.9907), and the neutral-tiebreak vs `rrf_fuse`
+MRR gap persists (0.9448 vs 0.9339). Verified: `--features lexical` bench, async Tantivy index of 130k real docs + 321
+queries, runs clean locally (exit 0).
