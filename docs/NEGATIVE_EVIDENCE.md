@@ -7012,3 +7012,26 @@ recall-costing — and no universal better setting exists). This completes the l
 title-boost (`b10e243`), RM3 (`d02581c`), and now k1/b — all minor/negative; the lexical tier is best left as plain
 BM25(k1=1.5, b=0.75) over concatenated title+body.** Verified: `rank_bm25` (BM25Okapi with swept k1/b) on BEIR
 SciFact/NFCorpus qrels (no cargo).
+
+---
+
+### Hybrid robustness: fewer complete failures on few-relevant corpora, neutral on many-relevant (dilution) (IronPetrel, 2026-07-03)
+
+Beyond aggregate recall, a different robustness question: on how many queries does a tier return **zero** relevant docs
+in the top-10 (a *complete* miss)? Does the hybrid have fewer complete failures than either tier?
+
+| dataset | Tantivy BM25 miss | vector miss | **hybrid miss** | both-tiers-fail floor | hybrid rescues (≥1 tier fails, hybrid hits) |
+|---|---|---|---|---|---|
+| SciFact (1-2 rel/query) | 20.3% | 18.7% | **14.3%** | 10.3% | 14.7% |
+| NFCorpus (many rel/query) | 30.3% | 31.6% | **30.3%** | 24.8% | 7.4% |
+
+**Finding — the hybrid's complete-failure robustness is corpus-dependent: strong on few-relevant corpora, neutral on
+many-relevant.** On **SciFact** (few relevant docs/query, so a miss is a genuine failure) the hybrid cuts complete misses
+~30% (20% → 14%, approaching the 10.3% both-fail floor) and **rescues 14.7%** of queries one tier misses — clear
+robustness. On **NFCorpus** (many relevant docs/query) the hybrid miss rate equals BM25's (30.3%) and sits well above the
+24.8% both-fail floor: **RRF dilution** (a failing tier's noise demotes the succeeding tier's relevant doc out of the
+top-10) offsets the 7.4% rescues. So the "hybrid is robust" claim needs a caveat: **it reliably reduces complete failures
+on hard/few-relevant queries (its most valuable robustness case), but on many-relevant corpora the fusion's dilution
+cancels the rescue benefit for the complete-miss metric** — though aggregate recall/nDCG still improve (+13-21%,
+`6efd9d9`). The dilution is the flip side of RRF's averaging: it helps most queries but can demote a lone relevant doc
+when the other tier is pure noise. Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
