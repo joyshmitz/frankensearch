@@ -5138,3 +5138,32 @@ not just evidence: strictly-lossless candidate set (candidate-recall@10 = 1.0 on
 "identical fused top-k" guarantee the comment depends on, AND it's 1.09× faster at N≈130k, for ~12.8 MB extra slab @100k.
 Verified: `cargo test -p frankensearch-fusion --lib` **820 passed / 0 failed** (via rch) — no test asserted 4-bit-specific
 output, so the swap is behavior-compatible (more-correct candidate set, unchanged passing fused results).
+
+---
+
+## 2026-07-02 — FINDING (real data flags a stock-config gap): the production default HNSW `M=16` gives sub-0.95 recall@10 on real 100k embeddings; `M=32` fixes it (IronPetrel)
+
+The async ANN fast tier (`TwoTierIndex::search_fast_with_params` → `knn_search`) uses `HnswConfig::default()` — `M=16`,
+`ef_construction=200`, `ef_search=100` (`hnsw.rs:25–29`). Every prior ANN-quality number was at `M=32`/`M=64`; the STOCK
+default `M=16` was never measured on real embeddings. Ran `real_embed_ann` at `FS_REAL_M=16`, N=100 336, real potion-256:
+
+**recall@10 by ef, real 100k, across M (default `ef_search`=100 is the middle column):**
+
+| M | ef40 | **ef100 (default)** | ef200 | ef400 | ef800 | tail-0.95 cert |
+|---|---|---|---|---|---|---|
+| **16 (stock default)** | 0.858 | **0.947** | 0.967 | 0.975 | 0.984 | ✗ (bound 0.90) |
+| 32 | 0.938 | **0.978** | 0.992 | — | — | ✗ (bound 0.90) |
+| 64 | 0.956 | **0.988** | 0.994 | 0.998 | 0.998 | ✓ (ef200, bound 1.0) |
+
+**Finding:** at the **stock defaults (M=16, ef_search=100)** the ANN fast tier gets **recall@10 = 0.947** on real 100k
+embeddings — **below a 0.95 quality target**, and it cannot certify the 0.95 tail even at ef=800. Bumping **M=16→32 lifts
+the default operating point to 0.978** (comfortably above 0.95); **M=64 → 0.988 + a certifiable per-query 0.95 tail**. The
+synthetic `hnsw_vs_flat_100k` bench (tight NOISE=0.15 clusters) never surfaced this because synthetic recall runs higher.
+The practical impact is softened downstream (the fast tier's misses are masked by the lexical tier + RRF, as with the
+4-bit finding), but the *default* ANN recall is meaningfully under-provisioned for real 100k+ corpora.
+
+**Recommendation (product-gated — memory/build tradeoff, not a unilateral flip): raise `HNSW_DEFAULT_M` 16→32** for real
+100k+ corpora — a clean +0.031 recall@0.95-target at the default ef, for ~2× graph memory (`M·N` adjacency) and a longer
+build. `M=64` is the setting if a certified per-query 0.95 tail is required (`68d213e`). Left as a documented
+recommendation rather than a code change because the graph-memory cost is a real deployment decision (unlike the
+fast-tier int8 slab, whose absolute size was negligible). Verified: `--features ann` bench runs clean locally (exit 0).
