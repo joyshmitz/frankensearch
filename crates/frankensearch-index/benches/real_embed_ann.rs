@@ -114,7 +114,7 @@ fn bench_real_embed_ann(c: &mut Criterion) {
         })
         .collect();
 
-    for ef in [10usize, 20, 40, 100, 200] {
+    for ef in [40usize, 100, 200, 400, 800] {
         let mut total = 0.0;
         for (qi, q) in holdout.iter().enumerate() {
             let ann: Vec<String> = hnsw
@@ -132,7 +132,7 @@ fn bench_real_embed_ann(c: &mut Criterion) {
     }
 
     // ── Conformal certificate on REAL calibration data (tail mode). ──
-    const CANDIDATE_EFS: [usize; 5] = [10, 20, 40, 100, 200];
+    const CANDIDATE_EFS: [usize; 5] = [100, 200, 400, 800, 1600];
     let cert = hnsw
         .certify_ef_search(&index, &calibration, &CANDIDATE_EFS, K, 0.95, 0.1)
         .expect("certify");

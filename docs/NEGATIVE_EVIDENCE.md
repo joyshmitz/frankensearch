@@ -5015,3 +5015,13 @@ only 0.90; 0.95 is NOT met even at ef=200** (whose *mean* recall is 0.992).
    use the mean-recall budget (2.5× @0.98 mean) or a higher ef / M / exact fallback for the tail. Route-next: sweep M=48/64
    and ef>200 to see whether the tail floor lifts, and re-confirm on the on-disk MiniLM-L6-v2 (raw transformer, harder
    distribution). Verified: `--features ann` bench compiles + runs locally (exit 0); recall/cert/latency captured.
+
+**Follow-up (same session, refines finding #2): the tail-cert floor is N-DEPENDENT, not a fixed real-data wall.**
+Re-ran `real_embed_ann` at **N=40 000** (same potion embeddings, M=32): recall@10 = 0.956/0.983/0.989/0.992/0.992 at
+ef=40/100/200/400/800, and the tail certificate (target 0.95, α 0.1) now **`meets=true` at ef=200 with lower bound
+1.0000** (≥90% of calibration queries hit recall@10=1.0). Contrast the same ef=200 at N=100 336: bound **0.90,
+`meets=false`**. So the per-query 0.95 tail guarantee IS achievable on real embeddings at **moderate N**; it **degrades
+as the corpus grows** (a heavier low-recall tail emerges when the graph gets relatively sparser for fixed M). Corrected
+takeaway: finding #2's "0.95 tail unachievable on real data" is **N-specific (100k @ M=32)**, not fundamental — at
+BOLD-scale N the fix is **higher M** (denser graph), not just higher ef (recall plateaus at 0.992 by ef=400, so ef alone
+can't close the tail). Verified: runs clean locally (exit 0).
