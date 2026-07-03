@@ -6117,3 +6117,42 @@ the reranker tier is the most treacherous stage: **both the model AND the depth 
 downside risk** — reinforcing "reranking is a conditional, must-eval polish," and that when reranking, **default to a
 shallow depth.** Verified: `fastembed` TextCrossEncoder (both ONNX cross-encoders) + `model2vec` retrieval-32M +
 `rank_bm25` on BEIR NFCorpus/SciFact qrels (no cargo, no torch).
+
+---
+
+### Reranker SCORE-BLENDING resolves the downside risk: blend, don't reorder (IronPetrel, 2026-07-03)
+
+The prior two entries documented the reranker tier's danger — the wrong model or too-deep reranking can *lose* 11-23%
+because the cross-encoder **promotes deep false positives** (docs it scores high but retrieval scored low). This entry
+is the **resolution**: don't let the reranker *fully reorder* the candidates — **blend** its score with the retrieval
+(hybrid) score, so a deep false positive with a high reranker score but a low retrieval score is vetoed. Per query,
+min-max-normalize both scores to [0,1] and rank by `α·reranker + (1-α)·hybrid`; α=0 is pure hybrid, α=1 is pure reorder
+(what the earlier entries measured). Same candidates (retrieval-32M + real BM25, top-50), 60q, each dataset's winning
+reranker:
+
+| α (reranker weight) | NFCorpus (ms-marco-L6) nDCG@10 | SciFact (bge-reranker-base) nDCG@10 |
+|---|---|---|
+| 0.00 (pure hybrid) | 0.2966 | 0.7962 |
+| 0.25 | 0.3210 | **0.8216 (+0.0254, BEST)** |
+| 0.50 | 0.3397 | 0.8209 (+0.0247) |
+| 0.75 | **0.3597 (BEST)** | 0.8098 (+0.0136) |
+| 1.00 (pure reorder) | 0.3588 | 0.7848 (**−0.0114, HURTS**) |
+
+**Finding — score-blending is the robust way to apply a reranker; it turns the net-negative pure-reorder case
+net-positive.**
+- **SciFact / bge: pure reorder HURTS (−0.0114) but a light blend (α=0.25) gives +0.0254 (+3.2%)** — a **+0.037 nDCG
+  swing** from the blend. The retrieval score acts as a veto on the deep false positives the reranker would otherwise
+  promote, exactly the failure mode from the depth entry.
+- **NFCorpus / ms-marco: the reranker is strong, so α peaks at 0.75 (0.3597), marginally above pure reorder** — blending
+  costs nothing when the reranker is good.
+- **A fixed α≈0.5 is net-positive on BOTH** (NFCorpus +0.0431, SciFact +0.0247) — capturing most of the upside with
+  none of the pure-reorder downside.
+
+**Product takeaway — apply the reranker as a SIGNAL, not a replacement: rank by `α·reranker + (1-α)·retrieval` with a
+safe default α≈0.4-0.5, never pure-reorder (α=1).** This is the single most actionable reranker finding: it removes the
+catastrophic-downside risk (the −11% to −23% pure-reorder losses) while keeping ~all of the upside, and it degrades
+gracefully when the reranker is mismatched (blend leans on retrieval) — so it also *reduces* the per-corpus-eval burden
+from the model/depth entries. Combined verdict for the reranker tier: **blend (don't reorder), bias shallow, and
+still eval the model per corpus — but blending is the safety net that makes the tier usable by default.** Verified:
+`fastembed` TextCrossEncoder (both ONNX cross-encoders) + `model2vec` retrieval-32M + `rank_bm25` on BEIR
+NFCorpus/SciFact qrels (no cargo, no torch).

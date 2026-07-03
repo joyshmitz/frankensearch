@@ -76,6 +76,14 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   promotes false positives, flipping +0.019→−0.011). So **default to a shallow rerank depth (~top-10)** and only go
   deeper if a per-corpus eval shows the reranker is well-matched *and* relevant docs sit deep. Deeper reranking is
   neither free (linear cross-encoder cost) nor safe (an imperfect reranker injects false positives at depth).
+- **BLEND the reranker score — don't let it fully reorder (this is the safety net).** Rank by
+  `α·reranker + (1-α)·retrieval` (per-query min-max normalized), **not** by the reranker alone. This resolves the
+  downside risk above: on SciFact/bge pure-reorder *hurts* (−0.011) but a light blend (α=0.25) gives **+0.025** — a
+  +0.037 swing — because the retrieval score vetoes the deep false positives. When the reranker is strong (NFCorpus)
+  blending costs nothing (peaks α=0.75, marginally over pure-reorder). **A fixed α≈0.4-0.5 is net-positive on every
+  dataset tested** and degrades gracefully on a mismatched reranker (leans on retrieval) — so blending is what makes the
+  reranker tier usable *by default* and shrinks the per-corpus-eval burden. Net reranker verdict: **blend (never
+  pure-reorder), bias shallow, still sanity-check the model per corpus.**
 
 ### 5. int8 two-pass as the fast-tier primitive. [DONE — landed `39dd9be`]
 - On real embeddings int8 two-pass is **7.1× faster than flat exact @ recall 1.0**, and it's both
