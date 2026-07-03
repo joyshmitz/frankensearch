@@ -345,6 +345,33 @@ fn bench_real_embed_quant(c: &mut Criterion) {
             });
         });
     }
+    // ── Fast-tier-regime A/B (the swap decision): production `search_fast_hits` uses
+    //    4-bit two-pass at (limit=fetch=K·3, mult=3). Measure int8 vs 4-bit latency in
+    //    EXACTLY that regime — int8 gives exact candidate recall (1.0 vs 4-bit's 0.9973
+    //    on real data); this A/B is the "does int8 regress the hot path?" gate. ──
+    let fetch = (K * 3).max(K);
+    g.bench_function("fasttier_4bit_limit30_mult3", |b| {
+        b.iter(|| {
+            let q = &queries[qi % n_queries];
+            qi += 1;
+            black_box(
+                index
+                    .search_top_k_4bit_two_pass(black_box(q), fetch, 3)
+                    .expect("4b-ft"),
+            )
+        });
+    });
+    g.bench_function("fasttier_int8_limit30_mult3", |b| {
+        b.iter(|| {
+            let q = &queries[qi % n_queries];
+            qi += 1;
+            black_box(
+                index
+                    .search_top_k_int8_two_pass(black_box(q), fetch, 3)
+                    .expect("i8-ft"),
+            )
+        });
+    });
     g.finish();
 }
 

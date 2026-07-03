@@ -5114,3 +5114,21 @@ pending a fusion-crate latency A/B to confirm int8 doesn't regress the hot path 
 but the comment's legacy "4-bit ~1.4× faster than int8" claim should be re-measured in this exact fast-tier regime first).
 Verified: `real_embed_quant` (with the new `[fast-tier-regime]` block) runs clean locally (exit 0); comment-only change to
 `sync_searcher.rs`.
+
+**Follow-up (the A/B — gate PASSED, swap is a pure win): int8 is FASTER *and* exactly lossless in the fast-tier regime.**
+Added `fasttier_int8`/`fasttier_4bit` latency arms (exact production regime: limit=fetch=30, mult=3) to `real_embed_quant`
+and ran at **N≈130k** (real potion, dim 256):
+
+| fast-tier primitive (limit=30, mult=3, N≈130k) | latency (median, 95% CI) | candidate-recall@10 (real) |
+|---|---|---|
+| 4-bit two-pass (current production) | 1.070 ms [1.015–1.142] | 0.9930 |
+| **int8 two-pass** | **0.985 ms [0.965–1.003]** | **1.0000** |
+
+**int8 is 1.09× FASTER (separated CIs) AND exactly lossless**, refuting the code's legacy *"4-bit ~1.4× faster than int8"*
+claim in the exact fast-tier regime at scale: the AVX2 `dot_i8_i8` kernel beats the 4-bit nibble-unpack, so 4-bit's
+½-bandwidth edge does not pay (pass-1 is compute-bound, not bandwidth-bound, at N≈130k dim=256 — consistent with
+`0b9800e`). So swapping the production fast tier `search_top_k_4bit_two_pass_filtered` → `search_top_k_int8_two_pass_filtered`
+is a **pure win at large N**: faster + exact candidate recall (1.0 vs 0.993), for ~12.8 MB extra fast-tier slab at 100k
+(int8 `dim` bytes/vec vs 4-bit `dim/2`). The only regime where 4-bit may edge int8 is very small N (bandwidth matters more,
+compute less — 30k earlier showed 4bit_mult5 464µs < int8_mult5 498µs), a ~7% wash where int8 is still exactly lossless.
+**The prior entry's product-gate is now measurement-cleared; wiring the swap is justified.**
