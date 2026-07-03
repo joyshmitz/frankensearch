@@ -5862,3 +5862,27 @@ recall (0.96 on semantic data), and the deeper the feed the more the vector tier
 should fetch a **deep candidate list** (≥100) and let the reranker exploit the vector tier's deep unique finds (reinforces
 the fusion-depth entry above). Verified: `model2vec` retrieval-32M + `sklearn` venv on BEIR SciFact + NFCorpus qrels (no
 cargo, no torch).
+
+---
+
+## 2026-07-03 — CORRECTION (real BM25 flips ArguAna): the "ArguAna: lexical wins" tie was a TF-IDF artifact — with Tantivy's real BM25 the VECTOR tier beats lexical on ALL 3 datasets (IronPetrel)
+
+Completed the 3-dataset real-BM25 run (ArguAna's pure-Python BM25 finally finished). ArguAna, real BM25 vs my earlier
+TF-IDF proxy:
+
+| ArguAna (n=1406) | lexical R@10 | vector R@10 | hybrid R@10 |
+|---|---|---|---|
+| **TF-IDF proxy** (earlier entries) | **0.796** | 0.698 | 0.794 | ← lexical "wins", hybrid≈lexical |
+| **real BM25** (Tantivy scorer) | **0.606** | **0.698** | 0.697 | ← **vector wins**, hybrid≈vector |
+
+**Finding — an important correction:** real **BM25 on ArguAna is much weaker (0.606) than my TF-IDF proxy (0.796)** because
+**BM25's document-length normalization (the `b` term) penalizes ArguAna's long argument documents**, which my TF-IDF config
+(no length norm) did not. So the earlier "ArguAna is keyword-overlap → lexical beats vector → hybrid only ties" conclusion
+was a **TF-IDF artifact**: with Tantivy's *actual* BM25, the retrieval-32M **vector tier beats lexical on ArguAna too**
+(0.698 > 0.606), and thus **the vector/hybrid tier beats real BM25 on ALL 3 BEIR datasets** (SciFact 0.795>0.776, NFCorpus
+0.148≈0.152, ArguAna 0.698>0.606). **Net: the hybrid-vs-Tantivy story is *stronger* with the real scorer than with the
+TF-IDF proxy** — and it exposes a real BM25 weakness (long-document penalty) that the vector tier is immune to (embeddings
+have no length bias), a *complementarity* argument for the hybrid beyond keyword-vs-semantic. (The hybrid ties rather than
+strictly beats vector on ArguAna only because BM25 is now the *weaker* tier there, adding little; per the stronger-tier
+rule, one would up-weight vector.) Verified: `rank_bm25` BM25Okapi + `model2vec` retrieval-32M venv on BEIR ArguAna qrels
+(no cargo, no torch).
