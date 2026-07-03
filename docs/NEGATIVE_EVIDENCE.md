@@ -7085,3 +7085,26 @@ nDCG (−2.5% — the promoted false positives pollute the top ranks); on NFCorp
 validated over CombMAX; the consensus mechanism's false-positive filtering is why `rrf_fuse`'s sum is right** (and why
 score-fusion `27c488a` and CombMAX both lose to it). Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
 SciFact/NFCorpus (no cargo).
+
+---
+
+### The foundation: cross-tier AGREEMENT is a 5-25× relevance signal (why RRF works) (IronPetrel, 2026-07-03)
+
+Direct measurement of the assumption underlying the whole RRF-consensus arc (`4c9530c`/`50d077c`): I claimed one-tier
+docs are "mostly false positives." Measured the **precision** of both-tier vs one-tier candidates (per query, top-50/tier):
+
+| dataset | both-tier docs (in both tiers' top-50) | one-tier docs (in exactly one) | agreement multiplier |
+|---|---|---|---|
+| SciFact | **5.8%** relevant (276/4786) | 0.2% relevant (47/20428) | **25.1×** |
+| NFCorpus | **24.5%** relevant (1073/4384) | 4.9% relevant (1142/23532) | **5.0×** |
+
+**Finding — a candidate found by BOTH tiers is 5-25× more likely to be relevant than one found by only one tier.** This is
+the empirical bedrock of why the hybrid works: **cross-tier agreement is a 5-25× relevance signal**, so one-tier docs are
+overwhelmingly false positives (95% non-relevant on NFCorpus, 99.8% on SciFact). RRF's consensus mechanism — rewarding
+docs both tiers rank high, diluting one-tier docs (`4c9530c`) — is therefore *exactly* the right design: it up-ranks the
+5-25× denser relevant set and demotes the false-positive-heavy one-tier set. **The hybrid's power is not "two tiers" but
+that tier *agreement* is highly predictive of relevance** — an emergent signal neither tier has alone, which RRF's sum
+captures and CombMAX/score-fusion don't (`50d077c`/`27c488a`). Note the multiplier is largest on SciFact (25×, few
+relevant docs → agreement is very selective) and still strong on NFCorpus (5×). This completes the mechanistic account of
+frankensearch's hybrid: **RRF works because it's a cross-tier-agreement detector, and agreement is a 5-25× relevance
+prior.** Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
