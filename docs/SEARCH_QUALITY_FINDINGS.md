@@ -59,10 +59,11 @@ measurably the worst option for English retrieval.
   fused contributions are distinct, eliminating ~95-97% of RRF ties (stock equal-weight has ties in 27-48% of queries;
   weighted has ~1%). So the lexical-favoring tiebreak biases 1/3-1/2 of *stock* results, but is nearly moot once you
   weight — **adopt tier-weighting and you can skip the tiebreak knob** (`396e2c6`).
-- **Deep candidate feed** (`candidate_multiplier` ⇒ fetch ~50-100/tier, not tight top-K): +~1 recall
-  pt, ~free. frankensearch reranks, so the first-stage metric is **recall@100** — the hybrid feeds
-  **96% of relevant docs** (SciFact recall@100 = 0.960), and the vector tier's edge over BM25
-  *grows* with depth (exactly what a reranker exploits).
+- **Deep candidate feed is a RERANKER-only lever** (`candidate_multiplier`). Deeper feed grows recall@100
+  (the reranker-feed metric — hybrid feeds 96% of relevant docs, SciFact recall@100=0.960, and the vector
+  edge over BM25 grows with depth), but the **non-reranked hybrid top-10 plateaus at feed≈20** — a candidate
+  at feed-rank 80 contributes ~`1/(k+80)`≈0, so it can't crack the fused top-10 (`b311ac3`). So: **~20-50/tier
+  if NOT reranking; ~100/tier only when reranking** (the reranker is what turns deep recall into final quality).
 - **Keep RRF (rank fusion) — don't switch to score-fusion.** Measured RRF vs score-fusion (normalize
   BM25+cosine, weighted sum) across all 3 datasets: they're **tied on quality** (RRF wins recall on 2/3;
   score-fusion wins nDCG by a hair, only NFCorpus's +0.014 above noise), but RRF is **scale-free** — no
