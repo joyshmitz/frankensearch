@@ -132,6 +132,14 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   top-k false positives poison the centroid. Lexical BM25, not vector PRF, is the weak-query remedy.
 
 ## What's NOT yet done (implementation, product-gated)
-The above are measured recommendations, not code changes (except #4, landed). Wiring #1 (default
-embedder + dim-256), #3 (RRF weight/k/tiebreak/depth) into the Rust config are product decisions.
-The full measurement trail, with self-corrections, is in `NEGATIVE_EVIDENCE.md`.
+The above are measured recommendations, not code changes (except #5's int8, landed). Wiring #1 (default
+embedder + dim-256), #3 (RRF weight/k/tiebreak/depth), and #4 (RRF-combine reranker) into the Rust config
+are product decisions. The full measurement trail, with self-corrections, is in `NEGATIVE_EVIDENCE.md`.
+
+**Highest-value ready-to-implement code change — reranker integration (`frankensearch-rerank/src/pipeline.rs`).**
+The shipped `rerank_step` currently **pure-reorders** by rerank score (`pipeline.rs:184`,
+`candidates[..rerank_count].sort_by(compare_by_rerank_score)`) — the measurably *worst* integration (can lose
+11-23%). Candidates arrive pre-sorted by fused score, so each candidate's arrival index *is* its pre-rerank rank;
+replace the final sort with RRF-fusion of the pre-rerank rank and the rerank-score rank (`1/(k+pre)+1/(k+rr)`,
+k≈10-60). Converts the tier from "can lose 11-23%" to "safe +4-6%, tuning-free," reusing existing fusion machinery.
+Product-gated only because it changes user-visible ordering (updates reranker test snapshots). See NEGATIVE_EVIDENCE.

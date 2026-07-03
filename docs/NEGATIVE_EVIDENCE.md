@@ -6321,3 +6321,38 @@ default; contextual `bge-small` = quality premium worth +10-29% nDCG for quality
 (the ~650× embed-slowdown is a one-time index-build cost, not per-query). The premium is most compelling on semantically
 hard corpora (argumentative, negation-heavy) where static embeddings structurally underperform. Verified: `model2vec`
 retrieval-32M + `fastembed` bge-small-en-v1.5 (ONNX) on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo, no torch).
+
+---
+
+### Code-grounded: the shipped reranker pure-reorders (pipeline.rs:184) — the measurably-worst integration (IronPetrel, 2026-07-03)
+
+Bridged the reranker measurements to the actual Rust code. `frankensearch-rerank/src/pipeline.rs::rerank_step` currently
+applies the cross-encoder by **pure-reorder**: it overwrites `rerank_score` on each candidate and then
+
+```rust
+// pipeline.rs:184
+candidates[..rerank_count].sort_by(compare_by_rerank_score);  // descending rerank_score, discards the fused order
+```
+
+This is exactly the integration the reranker-combine measurement (`b114e39`) identified as the **worst** option:
+pure-reorder *hurts* on SciFact/bge (−0.0114 nDCG) and loses up to −23% when the reranker is domain-mismatched
+(`657df16`), because it lets the cross-encoder promote deep false positives with **no veto from the retrieval score**.
+The measured-best alternative, **RRF-combine** (fuse the pre-rerank order with the rerank order), scored **+0.0396** on
+the same case — safe (never catastrophic), parameter-free, and native to frankensearch's `rrf_fuse`.
+
+**The fix is cleanly implementable at this exact site with zero new dependencies.** Candidates arrive at `rerank_step`
+already sorted by their fused RRF score, so **each candidate's arrival index `i` IS its pre-rerank rank** — no extra
+bookkeeping needed. Replace the final pure-reorder sort with a rank-fusion:
+
+- record each reranked candidate's pre-rerank rank = its index `i` in `candidates[..rerank_count]`;
+- compute its rerank rank from `rerank_score` (descending);
+- sort by `1/(k + pre_rank) + 1/(k + rerank_rank)` (k≈10-60, k-insensitive per `b114e39`).
+
+This is the single highest-value reranker code change: it converts the tier from "can lose 11-23%" to "safe +4-6% with
+no tuning," and the machinery (reciprocal-rank fusion) already exists in the fusion crate. **It is product-gated only
+because it changes user-visible result ordering** (and would update reranker test snapshots) — an outward-facing
+default-behavior change, so it's surfaced here as ready-to-implement rather than flipped unilaterally. The
+`explanation.rrf_contribution` field on the rerank `ScoreComponent` (currently hardcoded `0.0` at pipeline.rs:170) even
+anticipates this — it's the natural place to record the reranker's RRF contribution. Verified by reading the shipped
+code (`crates/frankensearch-rerank/src/pipeline.rs`) against the measured findings; the measurement harness is the
+Python venv (`fastembed` cross-encoders + `model2vec` + `rank_bm25`), no cargo.
