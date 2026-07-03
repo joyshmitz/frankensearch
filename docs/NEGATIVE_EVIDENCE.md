@@ -6967,3 +6967,26 @@ tier-weight (1.0-1.3) is fine but NOT critical, and never over-weight (≥1.7 de
 interaction (after tiebreak⊂weighting `396e2c6` and deep-feed⊂reranking `b311ac3`): **the fusion config is far simpler
 than the knob count suggests — small-k does most of the work; weight and tiebreak are largely redundant with it.**
 Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### Fusion-knob decomposition: the k=60→10 flip alone captures the ENTIRE tuning gain (IronPetrel, 2026-07-03)
+
+Capstone of the three knob-interaction findings (tiebreak⊂weight, deep-feed⊂reranker, weight⊂small-k): decomposed the
+fusion tuning into its single-knob contributions on the retrieval-32M hybrid (nDCG@10):
+
+| config | SciFact recall/nDCG@10 | NFCorpus recall/nDCG@10 |
+|---|---|---|
+| (1) equal-weight, k=60 (RRF library default) | 0.8051 / 0.6741 | 0.1560 / 0.3224 |
+| (2) equal-weight, **k=10** (k-flip *only*) | 0.8358 / **0.6904** (+2.4%) | 0.1587 / **0.3257** (+1.0%) |
+| (3) weighted 1.3, k=10 (full tuning) | 0.8341 / 0.6890 (+2.2%) | 0.1585 / 0.3268 (+1.3%) |
+
+**Finding — the single-value k-flip (k=60→10) captures essentially the ENTIRE fusion-tuning gain; the tier-weight adds
+~0** (SciFact: weight *subtracts* 0.2%; NFCorpus: +0.3%). So the minimal, optimal fusion config is just **`RrfConfig.k`
+= 10 with equal weights and no tiebreak change** — the weight and tiebreak knobs are redundant with small-k (per
+`44566fd`/`396e2c6`). This **simplifies the product-gated fusion flip to a single line** (`RrfConfig` default k 60→10),
+worth +1.0-2.4% nDCG on the semantic corpora, free at inference. Note the k-flip's benefit is largest with a good
+embedder + weighting only mattered at k=60 to overcome its flatness — with k=10 the sharper `1/(k+r)` does the work
+directly. **Net fusion recommendation, maximally simplified: retrieval-distilled embedder + BM25 + RRF with k≈10. That's
+it** (add the optional reranker via RRF-combine on top). Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
+SciFact/NFCorpus (no cargo).
