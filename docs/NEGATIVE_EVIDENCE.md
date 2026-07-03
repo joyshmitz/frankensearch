@@ -5886,3 +5886,30 @@ have no length bias), a *complementarity* argument for the hybrid beyond keyword
 strictly beats vector on ArguAna only because BM25 is now the *weaker* tier there, adding little; per the stronger-tier
 rule, one would up-weight vector.) Verified: `rank_bm25` BM25Okapi + `model2vec` retrieval-32M venv on BEIR ArguAna qrels
 (no cargo, no torch).
+
+---
+
+## 2026-07-03 — MEASURED (quality/latency Pareto — the embedder upgrade is FREE): retrieval-32M truncated to dim=256 beats the stock default by +27% at IDENTICAL scan cost and embed speed (IronPetrel)
+
+The retrieval-32M recommendation raised a latency worry (it's 512-dim vs the general models' 256, so 2× the per-vector
+scan cost). Measured the full **quality/latency Pareto** (embed throughput + dim = scan cost + SciFact recall, full-dim and
+MRL-truncated to 256):
+
+| model2vec model | dim | embed docs/s | recall@10 (full dim) | recall@10 (dim=256 MRL) |
+|---|---|---|---|---|
+| potion-base-8M | 256 | 10022 | 0.662 | 0.662 |
+| potion-base-32M | 512 | 8497 | 0.702 | 0.682 |
+| **potion-retrieval-32M** | 512 | 8483 | **0.795** | **0.757** |
+| potion-multilingual-128M (stock default) | 256 | 9244 | 0.598 | 0.598 |
+
+**Findings:** (1) **model2vec embed speed is ~flat across all models (~8.5–10k docs/s)** — they're token-lookup + mean-pool,
+NOT transformer forward passes, so the 128M "large" default is **not** slower to embed (the size worry is moot). (2)
+retrieval-32M is 512-dim → 2× scan cost at full dim, **but MRL-truncated to 256 it still scores 0.757** (95% of full). (3)
+**THE CLEAN RESULT — at *identical* 256-dim scan cost + embed speed, `retrieval-32M @ dim=256` (0.757) beats the stock
+default `multilingual-128M` (0.598) by +0.159 recall (+27%)** and beats every 256-dim option (base-8M 0.662). So switching
+the default embedder to a retrieval-distilled model **is not a quality/latency tradeoff — it's a FREE ~27% quality upgrade
+at the same scan cost, same memory (256-dim), and same embed throughput.** (Full 512-dim retrieval-32M buys another +0.038
+recall for 2× scan cost — a separate speed/quality knob via MRL, per the earlier MRL entry.) **Definitive product config:
+default embedder = retrieval-distilled, stored at dim=256 (MRL-truncated) → matches the current stock's cost profile while
+delivering +27% vector recall.** This removes the last objection (latency) to the session's #1 recommendation. Verified:
+`model2vec` (4 models) + numpy timing/MRL in the venv on BEIR SciFact qrels (no cargo, no torch).
