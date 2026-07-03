@@ -144,6 +144,39 @@ fn bench_real_embed_ann(c: &mut Criterion) {
         );
     }
 
+    // ── MRL (Matryoshka prefix-truncation) on REAL embeddings. potion is PCA-projected
+    //    (dims ordered by decreasing variance), so a first-`search_dims` scan should
+    //    keep the top candidates and a full-dim rescore restores exact order. Measures
+    //    recall@K (vs exact) + latency of the truncated scan, for a range of search_dims.
+    //    mrl.rs claims "2–6× faster than a full-dim scan"; the open question is recall. ──
+    {
+        use frankensearch_index::MrlConfig;
+        for sd in [32usize, 64, 128] {
+            if sd >= dim {
+                continue;
+            }
+            let cfg = MrlConfig {
+                search_dims: sd,
+                rescore_dims: 0,
+                rescore_top_k: 0,
+            };
+            let mut r = 0.0;
+            for (qi, q) in holdout.iter().enumerate() {
+                let hits: Vec<String> = index
+                    .mrl_search(q, K, &cfg, None)
+                    .expect("mrl")
+                    .into_iter()
+                    .map(|h| h.doc_id.to_string())
+                    .collect();
+                r += recall_at_k(&holdout_exact[qi], &hits);
+            }
+            eprintln!(
+                "[mrl] search_dims={sd}/{dim} rescore=3K recall@{K}={:.4}",
+                r / holdout.len() as f64
+            );
+        }
+    }
+
     // ── Conformal certificate on REAL calibration data (tail mode). ──
     const CANDIDATE_EFS: [usize; 5] = [100, 200, 400, 800, 1600];
     let cert = hnsw
@@ -184,6 +217,28 @@ fn bench_real_embed_ann(c: &mut Criterion) {
                 black_box(hnsw.knn_search(black_box(q), K, ef).expect("ann"))
             });
         });
+    }
+    // MRL truncated-scan latency (flat's competitor when ANN isn't wired): first
+    // `search_dims` scan + full-dim rescore of 3K candidates.
+    {
+        use frankensearch_index::MrlConfig;
+        for sd in [64usize, 128] {
+            if sd >= dim {
+                continue;
+            }
+            g.bench_function(format!("mrl_dims{sd}"), |b| {
+                b.iter(|| {
+                    let q = &holdout[qi % BENCH_Q];
+                    qi += 1;
+                    let cfg = MrlConfig {
+                        search_dims: sd,
+                        rescore_dims: 0,
+                        rescore_top_k: 0,
+                    };
+                    black_box(index.mrl_search(black_box(q), K, &cfg, None).expect("mrl"))
+                });
+            });
+        }
     }
     g.finish();
 

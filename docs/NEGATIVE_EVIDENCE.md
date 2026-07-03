@@ -5203,3 +5203,29 @@ mean target at stock M=16 — the recommendation is embedding-distribution-depen
 (M=64 on potion, `68d213e`) *regardless* of distribution. So: mean-recall adequacy of the default is distribution-
 dependent; the tail guarantee's M-requirement is universal. Verified: `--features fastembed` MiniLM embed + `--features
 ann` bench run clean locally (exit 0).
+
+---
+
+## 2026-07-02 — TESTED (negative): MRL (Matryoshka prefix-truncation) DESTROYS recall on real (non-MRL-trained) embeddings — PCA variance-ordering ≠ Matryoshka nesting (IronPetrel)
+
+`VectorIndex::mrl_search` (`mrl.rs`) does a coarse phase-1 scan over the first `search_dims` dimensions (default 64) then
+rescores the top 3·k candidates at full dim; the doc claims **"2–6× faster than a full-dimension scan."** The recall of
+that truncation on real embeddings was never measured. It *looked* promising for potion because potion is PCA-projected
+(`apply_pca:256` — dims ordered by decreasing variance, so a prefix keeps the most variance ⇒ "Matryoshka-like"). Added an
+MRL recall+latency block to `real_embed_ann` and ran on real potion-256 (N=40k):
+
+| MRL `search_dims` / 256 | recall@10 (vs exact) | latency | vs flat (1.524 ms) |
+|---|---|---|---|
+| 32 | **0.242** | — | — |
+| 64 (default) | **0.545** | 0.912 ms | 1.67× faster |
+| 128 | **0.886** | 1.219 ms | 1.25× faster |
+
+**Finding:** MRL delivers its documented speedup (1.25–1.67×) but at a **catastrophic recall cost** — recall **0.545 at
+the default `search_dims=64`**, and still only 0.886 at half the dims (128). **The "PCA variance-ordering ≈ Matryoshka
+nesting" intuition is FALSE for ranking:** PCA concentrates *variance* in early dims, but nearest-neighbor
+*discrimination* is spread across the full geometry, so the truncated phase-1 drops the true top-k out of the top-3·k
+candidate set *before* the full-dim rescore can recover them (the rescore only reorders what phase-1 kept). MRL requires
+genuinely **Matryoshka-trained** embeddings (models trained so prefixes are self-sufficient), which potion (PCA-static)
+and MiniLM (raw transformer) are **not**. **Recommendation:** do NOT enable `MrlConfig` on potion/MiniLM-class embeddings
+— the 1.67× scan speedup is worthless at 0.545 recall; the `mrl.rs` "2–6× faster" claim must be read as speed-only and
+gated on an MRL-trained model. Verified: `--features ann` bench (with the new `[mrl]` block) runs clean locally (exit 0).
