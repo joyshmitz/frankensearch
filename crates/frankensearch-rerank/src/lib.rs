@@ -15,7 +15,10 @@ pub mod pipeline;
 #[cfg(feature = "fastembed-reranker")]
 pub mod fastembed_reranker;
 
-pub use pipeline::{DEFAULT_MIN_CANDIDATES, DEFAULT_TOP_K_RERANK, rerank_step};
+pub use pipeline::{
+    DEFAULT_MIN_CANDIDATES, DEFAULT_RRF_COMBINE_K, DEFAULT_TOP_K_RERANK, RerankCombine, rerank_step,
+    rerank_step_with_combine,
+};
 
 #[cfg(feature = "fastembed-reranker")]
 pub use fastembed_reranker::FastEmbedReranker;

@@ -6356,3 +6356,27 @@ default-behavior change, so it's surfaced here as ready-to-implement rather than
 anticipates this — it's the natural place to record the reranker's RRF contribution. Verified by reading the shipped
 code (`crates/frankensearch-rerank/src/pipeline.rs`) against the measured findings; the measurement harness is the
 Python venv (`fastembed` cross-encoders + `model2vec` + `rank_bm25`), no cargo.
+
+---
+
+### SHIPPED: RRF-combine reranker as an opt-in (frankensearch-rerank), default behavior preserved (IronPetrel, 2026-07-03)
+
+Implemented the measured-safe reranker integration from `b114e39`/`9e945d3` as **additive, tested Rust code** — no
+behavior change to any existing caller:
+
+- **`RerankCombine`** enum in `frankensearch-rerank/src/pipeline.rs`: `PureReorder` (the legacy default) and
+  `RrfCombine { k }` (rank-fuse the pre-rerank order with the rerank order, `1/(k+pre)+1/(k+rerank_rank)`).
+- **`rerank_step_with_combine(...)`** takes the strategy; **`rerank_step(...)`** is unchanged as the stable wrapper that
+  passes `PureReorder`. `DEFAULT_RRF_COMBINE_K = 60` (k-insensitive per the measurements → no tuning). All exported from
+  `lib.rs`.
+- **Unit test `rrf_combine_vetoes_deep_false_positive`**: a stub reranker that over-promotes the deepest (retrieval-worst)
+  candidate makes `PureReorder` put that false positive at rank #1, while `RrfCombine` keeps retrieval's best at #1 and
+  vetoes the false positive — the exact failure mode the measurements identified (SciFact/bge pure-reorder −0.011 →
+  RRF-combine +0.040).
+
+**Verification:** `cargo test -p frankensearch-rerank --lib` → **32 passed, 0 failed** (31 pre-existing + the new test);
+`cargo clippy` clean on the added code. The pipeline compiles under the crate's default (empty) feature set — no
+ONNX/`fastembed`/`native` needed — so the safe integration is available to every reranker backend. **Default output is
+byte-identical to before** (still `PureReorder`); flipping the default to `RrfCombine` is the remaining one-line,
+product-gated decision (it changes user-visible ordering + rerank snapshots) — now de-risked to a single enum value.
+This converts the reranker arc from measurement → recommendation → **landed, tested opt-in code**.

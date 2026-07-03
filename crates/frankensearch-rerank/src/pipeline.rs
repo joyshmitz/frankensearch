@@ -20,6 +20,38 @@ pub const DEFAULT_TOP_K_RERANK: usize = 100;
 /// Default minimum number of candidates required to trigger reranking.
 pub const DEFAULT_MIN_CANDIDATES: usize = 5;
 
+/// Default RRF constant for [`RerankCombine::RrfCombine`].
+///
+/// Reciprocal-rank fusion is nearly insensitive to this over the reranked window
+/// (measured `k`=10 ≈ `k`=60), so a single fixed value needs no per-corpus tuning.
+pub const DEFAULT_RRF_COMBINE_K: f32 = 60.0;
+
+/// How the cross-encoder's rerank scores are combined with the pre-rerank (fused) order.
+///
+/// The reranked window arrives already sorted by the fused retrieval score, so each
+/// candidate's position in that window *is* its pre-rerank rank.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RerankCombine {
+    /// Sort the reranked window purely by descending rerank score (legacy default).
+    ///
+    /// This lets the cross-encoder fully reorder the window — including promoting deep
+    /// candidates the retrieval stage ranked low. Simple, but a mismatched/imperfect
+    /// reranker can inject false positives; measured net-harmful on some corpora
+    /// (`docs/NEGATIVE_EVIDENCE.md`).
+    #[default]
+    PureReorder,
+    /// Rank-fuse the pre-rerank order with the rerank order via reciprocal-rank fusion.
+    ///
+    /// Ordering key is `1/(k+pre_rank) + 1/(k+rerank_rank)`. A deep false positive must
+    /// rank high by **both** retrieval and the reranker to climb, so the retrieval score
+    /// vetoes the reranker's mistakes. Measured the safe, best-default integration — never
+    /// catastrophic, parameter-light (see `docs/NEGATIVE_EVIDENCE.md`).
+    RrfCombine {
+        /// RRF constant; see [`DEFAULT_RRF_COMBINE_K`].
+        k: f32,
+    },
+}
+
 /// Rerank the top candidates in-place using a cross-encoder model.
 ///
 /// This function converts `ScoredResult` candidates into `RerankDocument` pairs,
@@ -50,12 +82,6 @@ pub const DEFAULT_MIN_CANDIDATES: usize = 5;
 ///
 /// Returns `SearchError::Cancelled` if the operation was cancelled via `cx`.
 /// All other reranker errors are caught and logged, returning `Ok(())`.
-#[instrument(skip_all, fields(
-    query_len = query.len(),
-    num_candidates = candidates.len(),
-    top_k = top_k_rerank,
-))]
-#[allow(clippy::too_many_lines)]
 pub async fn rerank_step(
     cx: &Cx,
     reranker: &dyn Reranker,
@@ -64,6 +90,47 @@ pub async fn rerank_step(
     text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
     top_k_rerank: usize,
     min_candidates: usize,
+) -> SearchResult<()> {
+    rerank_step_with_combine(
+        cx,
+        reranker,
+        query,
+        candidates,
+        text_fn,
+        top_k_rerank,
+        min_candidates,
+        RerankCombine::PureReorder,
+    )
+    .await
+}
+
+/// Rerank the top candidates in-place, choosing how the cross-encoder scores combine
+/// with the pre-rerank (fused) order via [`RerankCombine`].
+///
+/// [`RerankCombine::RrfCombine`] is the measured-safe integration: it rank-fuses the
+/// pre-rerank order with the rerank order, so the reranker cannot promote a deep false
+/// positive the retrieval stage ranked low. [`rerank_step`] is the stable convenience
+/// wrapper that uses [`RerankCombine::PureReorder`] (unchanged legacy behavior).
+///
+/// # Errors
+///
+/// Returns `SearchError::Cancelled` if the operation was cancelled via `cx`.
+/// All other reranker errors are caught and logged, returning `Ok(())`.
+#[instrument(skip_all, fields(
+    query_len = query.len(),
+    num_candidates = candidates.len(),
+    top_k = top_k_rerank,
+))]
+#[allow(clippy::too_many_lines)]
+pub async fn rerank_step_with_combine(
+    cx: &Cx,
+    reranker: &dyn Reranker,
+    query: &str,
+    candidates: &mut [ScoredResult],
+    text_fn: impl Fn(&str) -> Option<String> + Send + Sync,
+    top_k_rerank: usize,
+    min_candidates: usize,
+    combine: RerankCombine,
 ) -> SearchResult<()> {
     if candidates.len() < min_candidates {
         tracing::debug!(
@@ -177,9 +244,19 @@ pub async fn rerank_step(
         }
     }
 
-    // Re-sort the reranked portion by rerank_score descending (NaN-safe).
-    // Non-reranked candidates (beyond top_k_rerank) keep their original order.
-    candidates[..rerank_count].sort_by(compare_by_rerank_score);
+    // Re-order the reranked portion per the chosen combine strategy. Non-reranked
+    // candidates (beyond top_k_rerank) keep their original order in both cases.
+    match combine {
+        // Pure reorder: sort by rerank_score descending (NaN-safe). Legacy default.
+        RerankCombine::PureReorder => {
+            candidates[..rerank_count].sort_by(compare_by_rerank_score);
+        }
+        // RRF-combine: rank-fuse the pre-rerank order with the rerank order so the
+        // retrieval score vetoes deep false positives the reranker would promote.
+        RerankCombine::RrfCombine { k } => {
+            apply_rrf_combine(&mut candidates[..rerank_count], k);
+        }
+    }
 
     tracing::debug!(
         reranked = included_indices.len(),
@@ -210,6 +287,47 @@ fn compare_by_rerank_score(a: &ScoredResult, b: &ScoredResult) -> Ordering {
     score_b
         .total_cmp(&score_a)
         .then_with(|| a.doc_id.cmp(&b.doc_id))
+}
+
+/// Reorder `window` (the reranked candidates, arriving in pre-rerank/fused order — so
+/// index `i` is the pre-rerank rank) by reciprocal-rank fusion of the pre-rerank rank
+/// and the rerank-score rank: `1/(k+pre_rank) + 1/(k+rerank_rank)`, descending. Ties
+/// break on `doc_id` for determinism. Candidates without a finite rerank score sort to
+/// the worst rerank rank (they keep their pre-rerank contribution but earn none from the
+/// reranker), matching the graceful-skip semantics of the pure-reorder path.
+#[allow(clippy::cast_precision_loss)]
+fn apply_rrf_combine(window: &mut [ScoredResult], k: f32) {
+    let n = window.len();
+    if n < 2 {
+        return;
+    }
+    let kf = f64::from(k.max(1.0));
+
+    // rerank rank per position: sort indices by rerank score (same comparator as
+    // pure-reorder), then invert the permutation to get each position's rerank rank.
+    let mut by_rerank: Vec<usize> = (0..n).collect();
+    by_rerank.sort_by(|&a, &b| compare_by_rerank_score(&window[a], &window[b]));
+    let mut rerank_rank = vec![0usize; n];
+    for (rank, &pos) in by_rerank.iter().enumerate() {
+        rerank_rank[pos] = rank;
+    }
+
+    // Fused RRF key: pre_rank == position index i.
+    let key: Vec<f64> = (0..n)
+        .map(|i| 1.0 / (kf + i as f64) + 1.0 / (kf + rerank_rank[i] as f64))
+        .collect();
+
+    // Permutation sorting positions by fused key descending, doc_id tiebreak.
+    let mut perm: Vec<usize> = (0..n).collect();
+    perm.sort_by(|&a, &b| {
+        key[b]
+            .total_cmp(&key[a])
+            .then_with(|| window[a].doc_id.cmp(&window[b].doc_id))
+    });
+
+    // Apply the permutation in place (window is small: the reranked top-k).
+    let reordered: Vec<ScoredResult> = perm.into_iter().map(|i| window[i].clone()).collect();
+    window.clone_from_slice(&reordered);
 }
 
 #[cfg(test)]
@@ -315,6 +433,51 @@ mod tests {
         }
     }
 
+    /// Reranker that over-promotes the DEEPEST candidate (the one retrieval ranked last)
+    /// to the highest score — a "false positive" the cross-encoder loves. Used to show
+    /// that `PureReorder` lets it win the top slot while `RrfCombine` vetoes it.
+    struct FalsePositiveReranker;
+
+    impl Reranker for FalsePositiveReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                let n = documents.len();
+                Ok(documents
+                    .iter()
+                    .enumerate()
+                    .map(|(i, doc)| {
+                        // Deepest doc gets the top score; the rest stay near retrieval order.
+                        #[allow(clippy::cast_precision_loss)]
+                        let score = if i + 1 == n {
+                            1.0
+                        } else {
+                            (i as f32).mul_add(-0.01, 0.9)
+                        };
+                        RerankScore {
+                            doc_id: doc.doc_id.clone(),
+                            score,
+                            original_rank: i,
+                            raw_logit: None,
+                        }
+                    })
+                    .collect())
+            })
+        }
+
+        fn id(&self) -> &str {
+            "false-positive-reranker"
+        }
+
+        fn model_name(&self) -> &str {
+            "false-positive-reranker"
+        }
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn make_candidates(n: usize) -> Vec<ScoredResult> {
         (0..n)
@@ -346,6 +509,54 @@ mod tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn rrf_combine_vetoes_deep_false_positive() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            // Pure-reorder (default): the reranker's false positive — the deepest
+            // candidate, which retrieval ranked last — wins the top slot.
+            let mut pure = make_candidates(5);
+            rerank_step(&cx, &FalsePositiveReranker, "q", &mut pure, text_for_doc, 100, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                pure[0].doc_id.to_string(),
+                "doc-4",
+                "pure-reorder lets the reranker promote the deep false positive to #1"
+            );
+
+            // RRF-combine: retrieval's best doc is retained at #1 and the deep false
+            // positive is vetoed out of the top slot — it ranked last by retrieval, so
+            // fusing the two ranks caps how far the reranker alone can lift it.
+            let mut rrf = make_candidates(5);
+            rerank_step_with_combine(
+                &cx,
+                &FalsePositiveReranker,
+                "q",
+                &mut rrf,
+                text_for_doc,
+                100,
+                2,
+                RerankCombine::RrfCombine {
+                    k: DEFAULT_RRF_COMBINE_K,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                rrf[0].doc_id.to_string(),
+                "doc-0",
+                "RRF-combine keeps retrieval's best on top"
+            );
+            assert_ne!(
+                rrf[0].doc_id.to_string(),
+                "doc-4",
+                "RRF-combine vetoes the deep false positive"
+            );
+            // The reranked window still carries fresh rerank scores in both modes.
+            assert!(rrf.iter().all(|c| c.rerank_score.is_some()));
+        });
     }
 
     #[test]
