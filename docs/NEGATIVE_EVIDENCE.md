@@ -6776,3 +6776,28 @@ modality here) are redundant-to-harmful; the partner must be both *decorrelated*
 BM25↔vector pair satisfies both. Caveat: char n-grams' value is typo/OOV-robustness, which clean BEIR doesn't exercise —
 they may help noisier real-world corpora, but not the retrieval-quality axis. Verified: `model2vec` retrieval-32M +
 `rank_bm25` + `sklearn` char/word n-gram TF-IDF on BEIR SciFact/NFCorpus qrels (no cargo).
+
+---
+
+### Length-adaptive fusion doesn't help — query length is a weak per-query tier predictor (IronPetrel, 2026-07-03)
+
+The short-query vector-collapse is a real *aggregate* effect (vector recall 0.99→0.45 as queries shrink 10→3 words,
+`db0cca4`), and length is a **cheap, reliable** signal — unlike the weak top-1/top-2 margin. So length-gated fusion
+weighting (short queries → up-weight lexical, long → up-weight vector) was the one adaptive lever that *should* work.
+Tested vs a fixed `vec_w=1.3` (recall/nDCG@10, threshold = word count):
+
+| dataset (median qlen) | fixed | length-adaptive (best) | corr(qlen, vector-advantage) |
+|---|---|---|---|
+| SciFact (12 words) | 0.8341 / **0.6890** | 0.8326 / 0.6914 (thr=8, +0.3% = noise) | +0.078 |
+| NFCorpus (2 words) | 0.1585 / **0.3268** | 0.1556 / 0.3187 (all worse) | +0.113 |
+
+**Finding — length-adaptive fusion is neutral (SciFact, noise) to harmful (NFCorpus); query length is a WEAK per-query
+predictor of which tier wins** (corr with per-query vector-vs-lexical advantage = only +0.078 / +0.113). The crucial
+distinction: the short-query collapse is real in *aggregate*, but on natural BEIR queries length does NOT *per-query*
+predict the better tier well enough to gate on — even NFCorpus (median 2-word queries) is *hurt* by short→lexical gating,
+because plenty of short queries retrieve fine with the vector tier. **This is the third adaptive signal proven weak**
+(after margin×fusion `8130208` and margin×reranking `4017650`), and the most principled one — so it settles the direction
+definitively: **no cheap per-query signal (margin, length) converts into a strong adaptive lever in this stack; the
+aggregate ≠ per-query predictability.** Fixed fusion weighting (up-weight the stronger tier globally, `fa592b9`) is the
+right approach; per-query adaptivity does not pay. Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR
+SciFact/NFCorpus qrels (no cargo).
