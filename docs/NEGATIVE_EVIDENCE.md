@@ -6426,3 +6426,28 @@ clean on the added code. Users now express the measured "hybrid strictly dominat
 `RrfConfig { semantic_weight: 1.3, ..Default::default() }` (or `lexical_weight` when lexical is the stronger tier —
 per the *up-weight-the-stronger-tier* rule). Flipping the *default* weight away from 1.0 stays product-gated (it changes
 ranking output), but the capability — and the measured recipe — is now in the code.
+
+---
+
+### SHIPPED: neutral (hash) RRF tiebreak option — completes the fusion-config recipe, default-preserving (IronPetrel, 2026-07-03)
+
+Implemented the last un-shipped fusion knob: the **neutral tiebreak**. The RRF tie comparator broke exact score ties by
+`lexical_score.unwrap_or(-inf)` — **asymmetric**: vector-only docs (no lexical score) always lose the tie, systematically
+demoting semantic-only best-answers (diagnosed earlier; a neutral hash tiebreak measured a small nDCG / +0.9 MRR gain on
+the known-item task). Note the trap: the fix is *not* falling through to raw `doc_id` (alphabetical bias is worse) — it's
+an unbiased hash.
+
+- **`RrfTiebreak`** enum in `rrf.rs`: `LexicalThenId` (legacy default) and `Hash` (unbiased FNV-1a of `doc_id`, then
+  `doc_id` for determinism). Added `tiebreak` field to `RrfConfig` (default `LexicalThenId`) — no literal-site churn,
+  since all `RrfConfig` construction already uses `..Default::default()` from the prior commit.
+- `cmp_for_ranking` now branches on the mode; the 4 production sort/select sites pass `config.tiebreak`.
+- New test `hash_tiebreak_is_symmetric_across_tiers`: two docs tying on rrf_score (a lexical-only and a semantic-only)
+  are ordered by the lexical bias under the default, but tier-agnostically by `doc_id` hash under `Hash`.
+
+**Verification:** `cargo test -p frankensearch-fusion --lib` → **822 passed, 0 failed**, including the map-vs-merge
+**byte-identity** test (`merge_matches_map_fusion`) — default `LexicalThenId` keeps the comparator (and both fusion
+paths) bit-for-bit identical, so the change is purely additive. `cargo clippy` clean on the added code. Enable the fairer
+tiebreak with `RrfConfig { tiebreak: RrfTiebreak::Hash, ..Default::default() }`.
+
+**Fusion-config recipe now fully expressible in the API:** RRF `k`, per-tier weights (`7ccda28`), and tiebreak — every
+measured fusion lever is a config knob, each defaulting to legacy behavior. Flipping any *default* stays product-gated.

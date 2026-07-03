@@ -41,6 +41,35 @@ pub struct RrfConfig {
     /// Multiplier applied to every semantic (vector) tier RRF contribution. Default `1.0`.
     /// See [`RrfConfig::lexical_weight`].
     pub semantic_weight: f64,
+    /// How to break exact RRF-score ties. Default [`RrfTiebreak::LexicalThenId`] (legacy).
+    pub tiebreak: RrfTiebreak,
+}
+
+/// Tiebreak strategy for documents with an identical RRF score *and* the same
+/// both-sources status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RrfTiebreak {
+    /// Legacy: prefer the higher lexical score, then `doc_id`. This is **asymmetric** —
+    /// vector-only docs (no lexical score) always lose the tie, systematically demoting
+    /// semantic-only best-answers (diagnosed in `docs/NEGATIVE_EVIDENCE.md`).
+    #[default]
+    LexicalThenId,
+    /// Neutral: break ties by an unbiased hash of `doc_id` (then `doc_id` for
+    /// determinism), so neither tier is favored. Measured a small nDCG / MRR gain over
+    /// the lexical-favoring default. Note: never fall through to raw `doc_id` alone —
+    /// that alphabetical bias is *worse* (see `docs/NEGATIVE_EVIDENCE.md`).
+    Hash,
+}
+
+/// Deterministic, dependency-free FNV-1a hash of a `doc_id`, for the neutral tiebreak.
+#[inline]
+fn doc_id_tiebreak_hash(doc_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in doc_id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 impl Default for RrfConfig {
@@ -49,6 +78,7 @@ impl Default for RrfConfig {
             k: DEFAULT_RRF_K,
             lexical_weight: 1.0,
             semantic_weight: 1.0,
+            tiebreak: RrfTiebreak::LexicalThenId,
         }
     }
 }
@@ -121,17 +151,25 @@ struct FusedHitScratch<'a> {
 }
 
 impl FusedHitScratch<'_> {
-    fn cmp_for_ranking(&self, other: &Self) -> std::cmp::Ordering {
-        other
+    fn cmp_for_ranking(&self, other: &Self, tiebreak: RrfTiebreak) -> std::cmp::Ordering {
+        let base = other
             .rrf_score
             .total_cmp(&self.rrf_score)
-            .then(other.in_both_sources.cmp(&self.in_both_sources))
-            .then_with(|| {
-                let a = self.lexical_score.unwrap_or(f32::NEG_INFINITY);
-                let b = other.lexical_score.unwrap_or(f32::NEG_INFINITY);
-                b.total_cmp(&a)
-            })
-            .then_with(|| self.doc_id.cmp(other.doc_id))
+            .then(other.in_both_sources.cmp(&self.in_both_sources));
+        match tiebreak {
+            RrfTiebreak::LexicalThenId => base
+                .then_with(|| {
+                    let a = self.lexical_score.unwrap_or(f32::NEG_INFINITY);
+                    let b = other.lexical_score.unwrap_or(f32::NEG_INFINITY);
+                    b.total_cmp(&a)
+                })
+                .then_with(|| self.doc_id.cmp(other.doc_id)),
+            RrfTiebreak::Hash => base
+                .then_with(|| {
+                    doc_id_tiebreak_hash(self.doc_id).cmp(&doc_id_tiebreak_hash(other.doc_id))
+                })
+                .then_with(|| self.doc_id.cmp(other.doc_id)),
+        }
     }
 
     fn into_owned(self) -> FusedHit {
@@ -225,6 +263,7 @@ pub fn rrf_fuse_with_graph(
     let lexical_weight = sanitize_tier_weight(config.lexical_weight);
     let semantic_weight = sanitize_tier_weight(config.semantic_weight);
     let graph_weight = sanitize_graph_weight(graph_weight);
+    let tiebreak = config.tiebreak;
     // Adjusted for typical ~50% overlap to reduce over-allocation.
     let graph_len = if graph_weight > 0.0 { graph.len() } else { 0 };
     let capacity = (lexical.len() + semantic.len() + graph_len) * 3 / 4 + 1;
@@ -362,13 +401,13 @@ pub fn rrf_fuse_with_graph(
     }
     if window < results.len() {
         let nth_index = window.saturating_sub(1);
-        results.select_nth_unstable_by(nth_index, FusedHitScratch::cmp_for_ranking);
+        results.select_nth_unstable_by(nth_index, |a, b| a.cmp_for_ranking(b, tiebreak));
         results.truncate(window);
     }
 
     // Deterministic comparator gives a total order, so unstable sort is safe
     // and avoids stable-sort overhead on large candidate sets.
-    results.sort_unstable_by(FusedHitScratch::cmp_for_ranking);
+    results.sort_unstable_by(|a, b| a.cmp_for_ranking(b, tiebreak));
 
     // Apply offset and limit.
     let output: Vec<FusedHit> = results
@@ -455,6 +494,7 @@ fn rrf_fuse_merge_inner(
     let lexical_weight = sanitize_tier_weight(config.lexical_weight);
     let semantic_weight = sanitize_tier_weight(config.semantic_weight);
     let graph_weight = sanitize_graph_weight(graph_weight);
+    let tiebreak = config.tiebreak;
     let graph_active = graph_weight > 0.0;
     let graph_len = if graph_active { graph.len() } else { 0 };
 
@@ -568,10 +608,10 @@ fn rrf_fuse_merge_inner(
     }
     if window < results.len() {
         let nth_index = window.saturating_sub(1);
-        results.select_nth_unstable_by(nth_index, FusedHitScratch::cmp_for_ranking);
+        results.select_nth_unstable_by(nth_index, |a, b| a.cmp_for_ranking(b, tiebreak));
         results.truncate(window);
     }
-    results.sort_unstable_by(FusedHitScratch::cmp_for_ranking);
+    results.sort_unstable_by(|a, b| a.cmp_for_ranking(b, tiebreak));
 
     let output: Vec<FusedHit> = results
         .into_iter()
@@ -920,6 +960,39 @@ mod tests {
                 .iter()
                 .all(|h| (h.rrf_score - 1.0 / (k + 1.0)).abs() < 1e-12),
             "bad weights should degrade to unweighted RRF"
+        );
+    }
+
+    #[test]
+    fn hash_tiebreak_is_symmetric_across_tiers() {
+        // Two docs that tie on rrf_score (each rank 0 in its own tier) and both have
+        // in_both_sources == false, so only the tiebreak decides their order.
+        let lexical = vec![lexical_hit("alpha", 5.0)];
+        let semantic = vec![semantic_hit("beta", 0.9)];
+
+        // Default (lexical-favoring): the lexical-only doc always wins the tie.
+        let d = rrf_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
+        assert_eq!(d[0].doc_id, "alpha", "default tiebreak favors the lexical-only doc");
+
+        // Hash tiebreak: order decided by an unbiased hash of doc_id, not the tier.
+        let hash_cfg = RrfConfig {
+            tiebreak: RrfTiebreak::Hash,
+            ..Default::default()
+        };
+        let h = rrf_fuse(&lexical, &semantic, 10, 0, &hash_cfg);
+        assert_eq!(h.len(), 2);
+        assert!(
+            (h[0].rrf_score - h[1].rrf_score).abs() < 1e-12,
+            "the two docs genuinely tie on rrf_score"
+        );
+        let expected_first = if doc_id_tiebreak_hash("alpha") <= doc_id_tiebreak_hash("beta") {
+            "alpha"
+        } else {
+            "beta"
+        };
+        assert_eq!(
+            h[0].doc_id, expected_first,
+            "hash tiebreak orders by doc_id hash, tier-agnostic"
         );
     }
 
