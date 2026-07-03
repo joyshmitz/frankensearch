@@ -7238,3 +7238,28 @@ It also explains NFCorpus's huge reranker ceiling (+106%): it has 2135 headroom 
 of RRF-diluted relevant docs a content-aware reranker could recover. **The two tiers aren't redundant: RRF's blind spot
 (one-tier relevant docs, indistinguishable from FPs by rank) is exactly the reranker's strength (content).** Verified:
 `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### Why the reranker is corpus-dependent: rank separates one-tier relevant-vs-FP on SciFact but not NFCorpus (IronPetrel, 2026-07-03)
+
+Final link in the RRF↔reranker chain: RRF dilutes one-tier relevant docs *together with* one-tier false positives
+(`7b3cfd7`) — but *why* can't RRF's rank distinguish them? Measured the within-tier rank of one-tier relevant vs one-tier
+false-positive docs:
+
+| dataset | one-tier RELEVANT: mean/median within-tier rank | one-tier FALSE-POS: mean/median | rank<10: rel% vs FP% |
+|---|---|---|---|
+| SciFact | 14.1 / **6** | 55.6 / 57 | **60%** vs 4% |
+| NFCorpus | 44.5 / **41** | 54.6 / 56 | 12% vs 5% |
+
+**Finding — rank separates one-tier relevant from false-positive docs well on SciFact but poorly on NFCorpus, which
+explains the reranker's corpus-dependent value.** On **SciFact** the one-tier relevant docs sit at *good* within-tier
+ranks (median 6 vs 57 for FPs; 60% at rank<10 vs 4%) — so **rank is informative**, RRF's rank fusion partially surfaces
+them, and the reranker headroom is modest (+38%). On **NFCorpus** the one-tier relevant docs are *buried deep* (median 41
+vs 56 for FPs; only 12% at rank<10 vs 5%) — **rank is nearly uninformative**, RRF cannot distinguish them from the deep
+FPs, so *only a content-aware reranker* can recover them → the +106% reranker ceiling. This closes the full mechanistic
+chain: **the reranker's value is exactly proportional to how many relevant docs are (a) one-tier and (b) buried at ranks
+where content, not rank, is needed to find them.** It's the deepest "when does reranking matter" answer: **rerank when
+your relevant docs are ranked deep by a single tier** (NFCorpus-like: question-answering over long medical docs where the
+right passage is lexically-or-semantically-but-not-both-ranked-high); skip it when they surface shallowly (SciFact-like).
+Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
