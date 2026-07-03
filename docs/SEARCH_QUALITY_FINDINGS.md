@@ -131,15 +131,30 @@ both cross-encoders vs no-rerank, on all 3 BEIR datasets:
   query drift). Static mean-pooled doc vectors averaged into the query blur it toward the corpus centroid;
   top-k false positives poison the centroid. Lexical BM25, not vector PRF, is the weak-query remedy.
 
-## What's NOT yet done (implementation, product-gated)
-The above are measured recommendations, not code changes (except #5's int8, landed). Wiring #1 (default
-embedder + dim-256), #3 (RRF weight/k/tiebreak/depth), and #4 (RRF-combine reranker) into the Rust config
-are product decisions. The full measurement trail, with self-corrections, is in `NEGATIVE_EVIDENCE.md`.
+## Implementation status
 
-**Highest-value ready-to-implement code change — reranker integration (`frankensearch-rerank/src/pipeline.rs`).**
-The shipped `rerank_step` currently **pure-reorders** by rerank score (`pipeline.rs:184`,
-`candidates[..rerank_count].sort_by(compare_by_rerank_score)`) — the measurably *worst* integration (can lose
-11-23%). Candidates arrive pre-sorted by fused score, so each candidate's arrival index *is* its pre-rerank rank;
-replace the final sort with RRF-fusion of the pre-rerank rank and the rerank-score rank (`1/(k+pre)+1/(k+rr)`,
-k≈10-60). Converts the tier from "can lose 11-23%" to "safe +4-6%, tuning-free," reusing existing fusion machinery.
-Product-gated only because it changes user-visible ordering (updates reranker test snapshots). See NEGATIVE_EVIDENCE.
+The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
+byte-for-byte unchanged), so the recipe is expressible in code with **no** product decision required:
+
+| Lever | Status | Enable via |
+|---|---|---|
+| int8 fast-tier (#5) | **LIVE (default)** `39dd9be` | (default in `sync_searcher.rs`) |
+| RRF-combine reranker (#4) | **Shipped, opt-in + wired** `235fb46`/`7ca8877` | `TwoTierSearcher::with_rerank_combine(RerankCombine::RrfCombine { k })` |
+| Per-tier RRF weight (#3) | **Shipped, opt-in** `7ccda28` | `RrfConfig { semantic_weight: 1.3, .. }` (up-weight the *stronger* tier) |
+| Neutral hash RRF tiebreak (#3) | **Shipped, opt-in** `05472cd` | `RrfConfig { tiebreak: RrfTiebreak::Hash, .. }` |
+| RRF `k` (#3) | already configurable | `RrfConfig { k: 10.0, .. }` / `TwoTierConfig.rrf_k` |
+| Deep candidate feed (#3) | already configurable | `candidate_multiplier` |
+
+**Remaining work is outward-facing DEFAULT flips (product-gated).** Turning the recipe on *by default* changes
+user-visible ranking output and updates test snapshots, so each needs a product sign-off — each is de-risked to a
+one-to-few-line change:
+- **#1 Embedder default → `potion-retrieval-32M` @ dim-256** (`model2vec_embedder.rs:35`): +33% English recall at
+  equal cost; keep multilingual as an option. The single biggest lever — but a multilingual→English product call.
+- **#4 Reranker default → `RrfCombine`**: removes the −11%/−23% pure-reorder downside (updates 1 rerank test).
+- **#3 Fusion defaults → stronger-tier weight ~1.3, `k`≈10, `Hash` tiebreak**: makes the hybrid strictly dominate.
+
+**Known plumbing gap:** the per-tier weights / tiebreak are reachable via `RrfConfig` (a direct `rrf_fuse` call) but
+not yet through the high-level `TwoTierSearcher` builder — exposing them there is blocked on `TwoTierConfig`'s ~35
+construction sites (a large field-addition ripple), so it's deferred rather than forced through churn.
+
+The full measurement trail, with self-corrections, is in `NEGATIVE_EVIDENCE.md`.
