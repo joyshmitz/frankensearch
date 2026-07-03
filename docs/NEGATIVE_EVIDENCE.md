@@ -5418,3 +5418,28 @@ very short queries**, where exact keyword matching beats a vague embedding. (Cav
 embedding; a contextual model may degrade less on short spans — a route-next once the fusion bench is unblocked, to get
 the full hybrid-vs-Tantivy-by-query-length curve.) Verified: `--features` none (index-only) bench runs clean on an
 isolated target (exit 0).
+
+---
+
+## 2026-07-03 — MEASURED (completes the curve): the full HYBRID-vs-Tantivy-by-query-length — hybrid ALWAYS beats Tantivy, and is ROBUST where each single tier is weak (IronPetrel)
+
+Completes the query-length arc (the detached `real_hybrid_knownitem` sweep finished once the shared-target lock freed).
+Full known-item retrieval by query length (potion-256, 130k corpus, 321 queries):
+
+| query length | Tantivy lexical (BM25) | vector (potion) | hybrid (RRF) | **hybrid − Tantivy** |
+|---|---|---|---|---|
+| 3-word | 0.6854 | **0.4486** | 0.7259 | **+4.05 pts** |
+| 5-word | 0.8692 | 0.7944 | 0.9408 | **+7.16 pts** |
+| 10-word | 0.9128 | 0.9907 | 0.9969 | **+8.41 pts** |
+
+**Findings:** (1) For **short queries, lexical BEATS vector** (0.685 vs 0.449 @3-word) — confirming last entry's prediction:
+a vague short query makes a poor static embedding, so BM25 keyword-matching wins. The vector tier only **overtakes**
+lexical for longer queries (crossover between 5- and 10-word: 0.794<0.869 @5w, 0.991>0.913 @10w). (2) **The hybrid beats
+Tantivy at EVERY query length** — the advantage *shrinks* for short queries (+4.05 @3w vs +8.41 @10w, since vector
+contributes less) but **never reverses**. (3) The real value: **the hybrid is ROBUST where each single tier is weak** — at
+3-word it rescues a strong 0.726 (> lexical's 0.685) out of a *terrible* vector (0.449) + decent lexical (0.685), because
+RRF recovers whatever *either* tier finds. So the hybrid isn't just "better on average" — it's the **safe choice across
+the query-length spectrum**, always ≥ the better single tier and always > Tantivy-alone. This is the strongest
+product argument for the hybrid tier: it removes the query-length risk of committing to lexical-only (weak on long/semantic
+queries) or vector-only (weak on short/keyword queries). Verified: `--features lexical` bench, async Tantivy index of 130k
+docs, ran clean (exit 0) once the shared-target lock cleared (see [[isolated-target-sidesteps-lock-contention]]).
