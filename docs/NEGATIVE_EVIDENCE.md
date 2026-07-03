@@ -6847,3 +6847,25 @@ validates two recommendations to the 3-dataset bar — **deep candidate feed** (
 is largest at depth) and **the hybrid as the first stage for reranking** — and quantifies frankensearch's deep-recall
 edge over Tantivy: it's the compounding advantage a reranker turns into final-ranking quality. Verified: `model2vec`
 retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo).
+
+---
+
+### RRF k=10 beats the default k=60 by +2.5-2.9% nDCG on all 3 datasets (with tuned weight) (IronPetrel, 2026-07-03)
+
+The fusion-tuning recommendation includes a **small RRF `k` (~10, not the default 60)**, found on SciFact. Validated the
+k-sweep with the stronger-tier weight (`vec_w=1.3`) across all 3 BEIR datasets (nDCG@10):
+
+| dataset | k=5 | k=10 | k=20 | k=40 | k=60 (default) | k=10 vs k=60 |
+|---|---|---|---|---|---|---|
+| SciFact | **0.6907** | 0.6890 | 0.6814 | 0.6746 | 0.6698 | +2.9% |
+| NFCorpus | **0.3268** | 0.3268 | 0.3243 | 0.3208 | 0.3187 | +2.5% |
+| ArguAna | **0.3330** | 0.3300 | 0.3253 | 0.3220 | 0.3216 | +2.6% |
+
+**Finding — smaller `k` is better on every dataset; nDCG decreases monotonically from k=5 to k=60, and k=10 beats the
+default k=60 by +2.5-2.9%** (k=5 marginally best). The mechanism (confirmed): with a stronger-tier weight, a small `k`
+keeps `1/(k+r)` **top-heavy** so the weight actually shifts ranking, whereas `k=60` flattens the contribution curve over
+the top-10 and the weight barely bites — the two knobs (small `k` + tier weight) work together. This validates the
+small-k recommendation to the 3-dataset bar and quantifies the `RrfConfig.k` default flip (60 → ~10, or 5): **worth
+~+2.6% nDCG when paired with the tuned tier weight, free at inference.** Recommend `k ≈ 10` as a safe default (k=5 is
+marginally better but sharper); `RrfConfig.k` is already a shipped config field, so this is a one-value change. Verified:
+`model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus/ArguAna qrels (no cargo).
