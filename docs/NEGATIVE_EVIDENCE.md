@@ -6695,3 +6695,30 @@ levers remain **corpus-level gating** (`657df16`), **shallow depth** (`97eb1e0`)
 (`b114e39`) — not per-query gating. Combined with the earlier weak margin-gated *fusion* (`8130208`), the broader lesson
 is settled: **cheap retrieval-confidence signals do not convert into strong adaptive levers** in this stack. Verified:
 `model2vec` retrieval-32M + `fastembed` ms-marco cross-encoder + `rank_bm25` on BEIR NFCorpus qrels (no cargo).
+
+---
+
+### Lexical tier: BM25F title-boosting does NOT help — plain title+body concatenation is optimal (IronPetrel, 2026-07-03)
+
+The one tier never tuned this session was the **lexical** one (frankensearch delegates it to Tantivy, which supports
+fielded/BM25F scoring). Tested whether **title-boosting** beats the current plain `title + " " + text` concatenation:
+built separate `BM25(title)` + `BM25(body)` and scored `tw·BM25(title) + BM25(body)` over a title-weight sweep (both
+BEIR datasets are 100% titled):
+
+| config | SciFact recall/nDCG@10 | NFCorpus recall/nDCG@10 |
+|---|---|---|
+| **concat** `BM25(title+body)` (current) | **0.7757 / 0.6523** | 0.1522 / 0.3062 |
+| body-only (`tw=0`) | 0.7590 / 0.6367 | 0.1474 / 0.3013 |
+| fielded `tw=0.5` | 0.7757 / 0.6466 | 0.1503 / **0.3074** (+0.4%) |
+| fielded `tw=1.0` | 0.7523 / 0.6248 | 0.1487 / 0.3036 |
+| fielded `tw=2.0` | 0.6973 / 0.5784 | 0.1418 / 0.2902 |
+
+**Finding — plain concatenation is optimal; explicit BM25F title-boosting doesn't help and HURTS when over-applied.**
+The title *does* carry signal (body-only is worse than concat on both), but concatenation already captures it — the title
+terms naturally raise the doc's term frequencies. Explicitly up-weighting the title (`tw ≥ 1`) DEGRADES quality (SciFact
+`tw=2` → **−11% nDCG**), because BM25's length normalization is distorted by over-emphasizing the short title field. The
+only positive is a noise-level +0.4% on NFCorpus at `tw=0.5`. **Product takeaway: keep the lexical tier as plain
+title+body concatenation (frankensearch's current approach); do NOT implement BM25F/fielded title-boosting for the hybrid
+— it's at best neutral and easily net-negative.** Note this is a lexical-config lever that would help Tantivy-alone and
+the hybrid's lexical tier equally, so it does not shift the hybrid-vs-Tantivy delta regardless. Verified: `rank_bm25`
+(BM25Okapi) on BEIR SciFact/NFCorpus with separated title/body fields (no cargo).
