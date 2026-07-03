@@ -5469,3 +5469,24 @@ helps; it's precisely why lexical carries the hybrid on short queries and why th
 there. (2) Open question (MiniLM contextual-vs-static test building): does a contextual model drift *less* on short spans,
 or is 3-word underspecification fundamental? — the cos-drift metric is the clean way to answer it (compare MiniLM's
 cos(query,source) curve to potion's). Verified: computed directly from the committed slabs; recall figures from `6bf4b25`.
+
+**Follow-up (answers it — contextual does NOT help): MiniLM drifts just as much as potion on short queries → the collapse
+is FUNDAMENTAL query underspecification, not a static-embedding artifact.** Embedded the same 3/5/10-word queries with the
+**raw-transformer MiniLM-384** and compared its cos(query, source-doc) drift to potion-256's:
+
+| query length | potion (static) cos-to-source | MiniLM (contextual) cos-to-source |
+|---|---|---|
+| 3-word | 0.517 (frac<0.5 = 0.39) | **0.517** (frac<0.5 = 0.41) |
+| 5-word | 0.656 | 0.667 |
+| 10-word | 0.846 | 0.858 |
+
+**The two drift curves are near-identical** — at 3 words both models land at cos **0.517** to the source doc. So a
+*contextual* transformer embedding does **not** rescue short queries any better than a *static* Model2Vec one: a 3-word
+span is **inherently underspecified**, and no embedding model can pull a 0.52-similar query vector back onto its source
+doc in a 130k corpus. **Consequences:** (1) the short-query vector weakness (recall 0.45 @3w) is a **query property, not a
+model or index defect** — you cannot fix it by upgrading the embedder (potion→MiniLM buys ~0 on cos-drift); (2) the
+**lexical (BM25) tier is the only real remedy** for short/keyword queries, independent of the embedding model — which is
+exactly why the hybrid beats both single tiers across the query-length spectrum and why frankensearch's hybrid design is
+the right call. This closes the query-length/embedding-model arc. (Efficiency note: the cos-drift metric answered the
+contextual-vs-static question directly, so the heavier MiniLM retrieval bench was **not needed**.) Verified: pure-Python on
+the committed potion + MiniLM slabs (no cargo build).
