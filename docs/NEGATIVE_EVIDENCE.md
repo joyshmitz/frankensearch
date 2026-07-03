@@ -5732,3 +5732,31 @@ and 32M < 128M so it's smaller and faster too).** This is the single highest-lev
 session: the embedder default, not any algorithm. (Keep a multilingual option for non-English corpora; the recommendation
 is the *default*.) Verified: `model2vec` (all four auto-downloaded) + `sklearn` venv on BEIR SciFact + NFCorpus qrels (no
 cargo, no torch).
+
+---
+
+## 2026-07-03 — REFINEMENT (MRL viability is MODEL-DEPENDENT): dim-truncation degrades GRACEFULLY on the retrieval-tuned model — a real speed/memory knob, unlike the catastrophic collapse on the general model (IronPetrel)
+
+Earlier (`dfdaf3a`) MRL prefix-truncation *collapsed* recall on `potion-base-8M` (a general, PCA-smoothed static model:
+recall 0.545 at 25% dims) — concluded "MRL is a recall trap." Re-tested on the **retrieval-tuned** `potion-retrieval-32M`
+(full dim = 512) on SciFact:
+
+| dim | recall@10 | nDCG@10 | size/speed | % of full recall |
+|---|---|---|---|---|
+| 512 (full) | 0.7948 | 0.6331 | 1× | 100% |
+| 256 | 0.7573 | 0.5993 | **2× smaller** | **95%** |
+| 128 | 0.7279 | 0.5682 | 4× smaller | 92% |
+| 64 | 0.6471 | 0.4869 | 8× smaller | 81% |
+| 32 | 0.4611 | 0.3393 | 16× smaller | 58% |
+
+**Finding — MRL viability is model-dependent:** on the retrieval-distilled model, prefix-truncation degrades **gracefully**
+(dim=256 keeps **95% recall at 2× smaller/faster**; dim=128 keeps 92% at 4×), a genuine **speed/memory Pareto knob** — the
+*opposite* of the catastrophic collapse on general `potion-base-8M` (0.545 at 25% dims). So the earlier "MRL is a recall
+trap" conclusion is **corrected/qualified: it's a trap on *general* static models, but a usable Matryoshka knob on
+*retrieval-distilled* models** (which are trained with nested/Matryoshka structure). **Practical:** a memory- or
+latency-constrained deployment can run retrieval-32M at **dim=256 (half the slab bytes, ~2× faster scan) for a ~4-pt recall
+cost** — still a strong vector tier (0.757). Not "free" (it is a tradeoff), but a *usable* one, unlike on the general
+model. (This also reconciles the MRL machinery in `mrl.rs`: its "2–6× faster" claim is real *and recall-safe* — but only
+with a Matryoshka-trained embedder, which the stock `potion-multilingual-128M`/`potion-base-8M` defaults are not; another
+reason to switch the default to a retrieval-distilled model.) Verified: `model2vec` retrieval-32M + numpy in the venv on
+BEIR SciFact qrels (no cargo, no torch).
