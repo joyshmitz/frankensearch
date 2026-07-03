@@ -6614,3 +6614,28 @@ PureReorder, against **~100 ms-1 s** of cross-encoder forward passes for those 1
 cost is a sub-microsecond reorder, dwarfed by the inference. Combined with the quality finding (RrfCombine removes the
 −11/−23% pure-reorder downside), the reranker-default flip is free on both axes. Bench: `cargo bench -p
 frankensearch-rerank --bench combine_reorder_cost_ab` (default features, no ONNX).
+
+---
+
+### The COST side of the capstone: the hybrid's quality win costs <1ms vs Tantivy (measured) (IronPetrel, 2026-07-03)
+
+The capstone measured the hybrid's *quality* win (+12-22% nDCG vs Tantivy BM25); this is its *latency* cost — the missing
+half of the vs-Tantivy story. Key insight: frankensearch's hybrid = Tantivy BM25 (identical to the baseline) + a vector
+tier + RRF fusion, so the **added** latency over Tantivy-lexical-alone is exactly *vector search + fusion* — both
+fast-benchable per-crate, no Tantivy chain needed. Measured:
+
+| added stage | latency / query | source |
+|---|---|---|
+| vector search (int8 two-pass, 10k×384-dim) | **~250-290 µs** | `frankensearch-index --bench int8_two_pass` (this turn) |
+| RRF fusion (2000 candidates) | **~149 µs** | `frankensearch-fusion --bench rrf_config_cost_ab` (`979ea3c`) |
+| **hybrid total added vs Tantivy (no rerank)** | **< 1 ms** | sum |
+| optional reranker (cross-encoder) | **~ms per candidate → 100 ms-1 s** for a top-100 window | forward-pass, established |
+
+**Finding — the hybrid's recall/nDCG win over Tantivy is near-free (< 1 ms added/query); the reranker is the only
+expensive stage and should be gated.** At the capstone's BEIR corpus scale (3.6k-5k docs, 256-dim — *smaller* than the
+10k×384 bench) vector search is even faster, so the < 1 ms bound holds comfortably. So the cost/benefit vs Tantivy is
+lopsided in frankensearch's favor: **+12-22% nDCG for sub-millisecond added latency** on the hybrid, with the reranker as
+a separate, expensive, quality-vs-latency-gated polish (and its RRF-combine reorder is itself µs — `368e291` — so the
+reranker's cost is 100% cross-encoder inference, nothing frankensearch adds around it). This completes the vs-Tantivy
+picture: large quality win, negligible hybrid latency cost, expensive-but-optional rerank. Measured via per-crate
+criterion benches (no cargo-for-quality; the index + fusion crates), int8 kernels are the shipped AVX2 path.
