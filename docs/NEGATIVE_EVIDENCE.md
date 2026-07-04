@@ -7752,3 +7752,43 @@ nDCG by ~+2-4% (short) to +14% (long-prose); the **relative** fusion-mechanics c
 tier weight, per-tier `k`) are analyzer-robust and stand — they concern how ranks combine, not how tokens are cut. Verified: `model2vec`
 retrieval-32M + `rank_bm25` with `snowballstemmer` (Snowball English) + sklearn English stopwords, BM25-alone & RRF-hybrid &
 lex-uniq-rel decorrelation probe, full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
+
+---
+
+### Lexical RM3 query expansion has NO safe default in the hybrid — optimal aggressiveness FLIPS by corpus (catastrophic on precise SciFact −0.055, +18% on argumentative ArguAna) (CopperKestrel, 2026-07-03)
+
+The prior arc rejected **embedding-space PRF/Rocchio** for the static vector tier (`657df16`/query drift → centroid blur). It never
+tested the *lexical* twin: **RM3 pseudo-relevance-feedback query expansion on the BM25 tier** — a classic, strong IR technique that is
+a *different* mechanism (add corpus terms from top-feedback docs to the query, re-score). A prior scratch run measured RM3 on BM25-alone
+(naive tokenizer) — raised recall, hurt nDCG — but **never measured the HYBRID**, where the lexical tier only contributes RANKS to the
+fusion pool and the vector tier supplies precision, so RM3's recall might pay differently. Measured it on the properly-analyzed
+(stem+stop) lexical tier, RM3 as normalized score-interpolation (`α·orig + (1−α)·expansion`, 10 feedback docs, E expansion terms),
+both BM25-alone and the tuned RRF hybrid. **HYBRID nDCG@10 Δ vs no-expansion:**
+
+| RM3 setting | SciFact | NFCorpus | ArguAna | mean | (BM25-alone Δ, SciFact/NFC/Arg) |
+|---|---:|---:|---:|---:|---|
+| `α.7 E10` (gentle) | −0.0085 | **+0.0057** | −0.0051 | −0.0026 | −0.034 / +0.003 / −0.035 |
+| `α.5 E10` | −0.0290 | +0.0013 | −0.0003 | −0.0093 | −0.183 / −0.013 / −0.033 |
+| `α.5 E20` | −0.0276 | +0.0039 | +0.0218 | −0.0006 | −0.156 / −0.009 / +0.008 |
+| `α.3 E20` (aggressive) | **−0.0547** | −0.0007 | **+0.0625 (+18%)** | +0.0024 | −0.289 / −0.033 / +0.022 |
+
+**Finding — lexical RM3 has NO safe default in the hybrid; its optimal aggressiveness is corpus-conditional and the corpora DISAGREE,
+so no single setting is net-positive on all three.** The signs are pinned to the task's *notion of relevance*: (1) **SciFact** (precise
+scientific *claims*, relevance = exact term match) — RM3 is pure harm at every setting, worsening with aggressiveness (−0.0085 →
+−0.0547): expansion is *drift* away from the precise claim. (2) **ArguAna** (argument → *counter*-argument, relevance = topical/
+argumentative overlap) — **aggressive** RM3 is a *large win* (+0.0625, +18% hybrid nDCG; recall 0.743→0.770): expanding toward the
+pseudo-relevant docs' topic cloud surfaces counter-arguments that share the topic but not the query's framing, exactly what BM25's
+exact match and the (weak here, 0.319) vector tier both miss — this is also where BM25 is structurally weakest and the reranker helps
+most. (3) **NFCorpus** (medical vocab-mismatch) sits between — only *gentle* RM3 (α.7 E10) bridges vocabulary for a small +0.0057; more
+drifts. **The best mean setting (α.3 E20, +0.0024) is catastrophic on SciFact (−0.0547); the most balanced (α.7 E10) is net-negative
+mean and loses on 2/3.** No setting generalizes.
+
+**This refines the PRF picture across BOTH tiers into one rule.** Vector-space PRF is *uniformly* harmful (`657df16`) because the static
+doc-vector centroid always blurs the query; **lexical** PRF is *conditionally* useful — it genuinely helps where relevance is topical
+and both base tiers are weak (argumentative corpora), because there the expansion adds signal the hybrid otherwise lacks. But like the
+reranker (`657df16`), **it is a per-CORPUS decision, not a default**: enabling it globally is dominated by its SciFact-class downside
+(−0.055, precise-match corpora punish drift). **Practical rule: do NOT enable query expansion by default; offer aggressive lexical RM3
+as an opt-in for topical/argumentative corpora where the dense tier is weak (the same profile that wants the reranker), and A/B it —
+the same corpus signal (is relevance exact-match or topical?) predicts reranker fit, RM3 fit, and RM3 aggressiveness together.** Verified:
+`model2vec` retrieval-32M + `rank_bm25` (stem+stop) + score-interpolation RM3 (10 fb docs, E∈{10,20}, α∈{.7,.5,.3}), BM25-alone & RRF
+hybrid, full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
