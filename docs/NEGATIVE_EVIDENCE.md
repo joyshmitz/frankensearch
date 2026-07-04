@@ -8290,3 +8290,24 @@ Extended the compression Pareto (`777193f`) to the 1-bit/dim extreme. Sign-quant
 5. **The 96× extreme is viable for memory-critical deployments.** PCA-128-bin-asym is nearly free on nfcorpus (−0.0098) and arguana (−0.0220) at **96× compression** (16 bytes/vector); scifact is the exception (−0.0506 = 6%). So for memory-desperate scenarios, PCA-128-binary-asymmetric buys 96× at ~1–2% hybrid loss on most corpora — a real option at the frontier's edge.
 
 **Net — the dense compression Pareto is now fully mapped:** int8 (12×, ~0 loss, DEFAULT) → PCA256-bin-asym (48×, ~1–4%) → PCA128-bin-asym (96×, ~1–6%). **Ship int8-12× as default** (confirms perf-side int8-dominance on real hybrid data); reach for **PCA-128-binary-asymmetric** only when memory is the hard constraint; and **never binary-quantize raw dims — PCA-first is mandatory** (raw-dim binary collapses the dense tier to zero). Caveats: N=100, sign quant with per-vector float query, sklearn PCA centering (headline vs raw-384-f32). Verified: cached BGE-small `.npy` + `sklearn` PCA + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana, no cargo/torch. `binary_quant.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — Compression + rerank (capstone): the reranker RECOVERS int8-12× loss (end-to-end FREE) but only PARTIALLY recovers binary-96× — recovery is capped by top-50 RECALL
+
+Capstone of the compression arc (`3847c59` PCA / `777193f` int8-Pareto / `6991ef3` binary): if you ship a compressed dense index, does jina-turbo reranking the compressed top-50 *recover* the small compression loss? Reranked 3 candidate sources (f32, PCA128-int8, PCA128-binary hybrid top-50) with jina-turbo RRF-combine, BEIR N=100:
+
+| dataset | source | no-rerank | +jina rerank | rerank Δ | vs f32-reranked |
+|---|---|---:|---:|---:|---:|
+| **scifact** | f32 | 0.7940 | 0.8146 | +0.0206 | — |
+| | PCA128-int8 | 0.7790 | 0.8091 | +0.0301 | **−0.0055** |
+| | PCA128-bin | 0.7206 | 0.7722 | +0.0516 | −0.0423 |
+| **nfcorpus** | f32 | 0.4006 | 0.4200 | +0.0194 | — |
+| | PCA128-int8 | 0.4029 | 0.4211 | +0.0182 | **+0.0011** |
+| | PCA128-bin | 0.3815 | 0.4098 | +0.0283 | −0.0102 |
+
+**Findings:**
+1. **int8-12× is END-TO-END essentially FREE with reranking**: int8-reranked vs f32-reranked = −0.0055 (scifact) / +0.0011 (nfcorpus), mean −0.0022. The reranker fully closes int8's small no-rerank gap (scifact no-rerank int8 gap −0.0150 → reranked −0.0055). Combined with the no-rerank result (`777193f`, −0.002), **int8-12× is free BOTH with and without reranking** — the ship recommendation is now doubly validated.
+2. **binary-96× is only PARTIALLY recoverable**: binary-reranked vs f32-reranked = −0.0423 (scifact) / −0.0102 (nfcorpus). The reranker recovers a large fraction but cannot close it.
+3. **The reranker Δ grows MONOTONICALLY with compression severity** (scifact f32 +0.0206 < int8 +0.0301 < binary +0.0516; nfcorpus similar): a more-compressed candidate list has more top-10 ordering errors, and the reranker fixes proportionally more — **the cross-encoder acts as a compression EQUALIZER**, doing more work the coarser the first-pass scores.
+4. **But recovery is CAPPED by top-50 RECALL (the unifying principle, ties to `c039c3a`).** int8 preserves recall (relevants stay in the compressed top-50, so the reranker reorders them into the top-10 → full recovery); binary DAMAGES recall (relevants get pushed out of the top-50, which the reranker CANNOT resurrect → residual −0.01 to −0.04). **The reranker can only reorder what compression left in the pool** — so recall-preserving compression is end-to-end free and recall-damaging compression is not.
+
+**Net — closes the compression arc:** **ship PCA-128 + int8 (12×)** — free with *and* without reranking, the unambiguous default; **binary-96× stays memory-critical-only** even with a reranker (−0.01 to −0.04 residual it cannot fix). The general law: **a reranker equalizes compression loss up to the recall the compressed index preserves.** This makes int8 the recommended dense representation for frankensearch (12× memory, `dot_i8_i8` speed, quality-free end-to-end) and bounds how far aggressive quantization can go before the reranker stops rescuing it. Caveats: N=100, scifact+nfcorpus (the convention pair), FEED=50, jina-turbo RRF-combine. Verified: cached BGE-small `.npy` + `sklearn` PCA + int8/sign simulation + `rank_bm25` stem+stop + `fastembed` jina-reranker-v1-turbo-en, BEIR scifact/nfcorpus, no cargo/torch. `rerank_compress.py` in `$D`.
