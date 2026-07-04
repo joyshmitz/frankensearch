@@ -289,6 +289,12 @@ fn compare_by_rerank_score(a: &ScoredResult, b: &ScoredResult) -> Ordering {
         .then_with(|| a.doc_id.cmp(&b.doc_id))
 }
 
+#[derive(Clone, Copy)]
+struct RrfOrder {
+    position: usize,
+    fused_key: f64,
+}
+
 /// Reorder `window` (the reranked candidates, arriving in pre-rerank/fused order — so
 /// index `i` is the pre-rerank rank) by reciprocal-rank fusion of the pre-rerank rank
 /// and the rerank-score rank: `1/(k+pre_rank) + 1/(k+rerank_rank)`, descending. Ties
@@ -303,30 +309,31 @@ fn apply_rrf_combine(window: &mut [ScoredResult], k: f32) {
     }
     let kf = f64::from(k.max(1.0));
 
-    // rerank rank per position: sort indices by rerank score (same comparator as
-    // pure-reorder), then invert the permutation to get each position's rerank rank.
-    let mut by_rerank: Vec<usize> = (0..n).collect();
-    by_rerank.sort_by(|&a, &b| compare_by_rerank_score(&window[a], &window[b]));
-    let mut rerank_rank = vec![0usize; n];
-    for (rank, &pos) in by_rerank.iter().enumerate() {
-        rerank_rank[pos] = rank;
-    }
-
-    // Fused RRF key: pre_rank == position index i.
-    let key: Vec<f64> = (0..n)
-        .map(|i| 1.0 / (kf + i as f64) + 1.0 / (kf + rerank_rank[i] as f64))
+    // One order vector carries both stages: first sort it by rerank score to
+    // assign rerank ranks, then overwrite each entry with its fused key and sort
+    // by that final key. This preserves the previous rank-fusion semantics while
+    // avoiding separate `by_rerank`, `rerank_rank`, `key`, and `perm` vectors.
+    let mut order: Vec<RrfOrder> = (0..n)
+        .map(|position| RrfOrder {
+            position,
+            fused_key: 0.0,
+        })
         .collect();
-
-    // Permutation sorting positions by fused key descending, doc_id tiebreak.
-    let mut perm: Vec<usize> = (0..n).collect();
-    perm.sort_by(|&a, &b| {
-        key[b]
-            .total_cmp(&key[a])
-            .then_with(|| window[a].doc_id.cmp(&window[b].doc_id))
+    order.sort_by(|a, b| compare_by_rerank_score(&window[a.position], &window[b.position]));
+    for (rerank_rank, entry) in order.iter_mut().enumerate() {
+        entry.fused_key = 1.0 / (kf + entry.position as f64) + 1.0 / (kf + rerank_rank as f64);
+    }
+    order.sort_by(|a, b| {
+        b.fused_key
+            .total_cmp(&a.fused_key)
+            .then_with(|| window[a.position].doc_id.cmp(&window[b.position].doc_id))
     });
 
     // Apply the permutation in place (window is small: the reranked top-k).
-    let reordered: Vec<ScoredResult> = perm.into_iter().map(|i| window[i].clone()).collect();
+    let reordered: Vec<ScoredResult> = order
+        .into_iter()
+        .map(|entry| window[entry.position].clone())
+        .collect();
     window.clone_from_slice(&reordered);
 }
 
@@ -511,15 +518,79 @@ mod tests {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn apply_rrf_combine_reference(window: &mut [ScoredResult], k: f32) {
+        let n = window.len();
+        if n < 2 {
+            return;
+        }
+        let kf = f64::from(k.max(1.0));
+
+        let mut by_rerank: Vec<usize> = (0..n).collect();
+        by_rerank.sort_by(|&a, &b| compare_by_rerank_score(&window[a], &window[b]));
+        let mut rerank_rank = vec![0usize; n];
+        for (rank, &pos) in by_rerank.iter().enumerate() {
+            rerank_rank[pos] = rank;
+        }
+
+        let key: Vec<f64> = (0..n)
+            .map(|i| 1.0 / (kf + i as f64) + 1.0 / (kf + rerank_rank[i] as f64))
+            .collect();
+        let mut perm: Vec<usize> = (0..n).collect();
+        perm.sort_by(|&a, &b| {
+            key[b]
+                .total_cmp(&key[a])
+                .then_with(|| window[a].doc_id.cmp(&window[b].doc_id))
+        });
+
+        let reordered: Vec<ScoredResult> = perm.into_iter().map(|i| window[i].clone()).collect();
+        window.clone_from_slice(&reordered);
+    }
+
+    #[test]
+    fn rrf_combine_order_vector_matches_reference_permutation() {
+        let mut reference = make_candidates(16);
+        let mut candidate = reference.clone();
+        for (i, item) in reference.iter_mut().enumerate() {
+            let score = ((i * 13 + 7) % 17) as f32 * 0.1;
+            item.rerank_score = if i % 7 == 0 { None } else { Some(score) };
+        }
+        candidate.clone_from_slice(&reference);
+
+        apply_rrf_combine_reference(&mut reference, DEFAULT_RRF_COMBINE_K);
+        apply_rrf_combine(&mut candidate, DEFAULT_RRF_COMBINE_K);
+
+        let reference_ids = reference
+            .iter()
+            .map(|item| item.doc_id.as_str())
+            .collect::<Vec<_>>();
+        let candidate_ids = candidate
+            .iter()
+            .map(|item| item.doc_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_ids, reference_ids);
+        for (candidate, reference) in candidate.iter().zip(reference.iter()) {
+            assert_eq!(candidate.rerank_score, reference.rerank_score);
+        }
+    }
+
     #[test]
     fn rrf_combine_vetoes_deep_false_positive() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             // Pure-reorder (default): the reranker's false positive — the deepest
             // candidate, which retrieval ranked last — wins the top slot.
             let mut pure = make_candidates(5);
-            rerank_step(&cx, &FalsePositiveReranker, "q", &mut pure, text_for_doc, 100, 2)
-                .await
-                .unwrap();
+            rerank_step(
+                &cx,
+                &FalsePositiveReranker,
+                "q",
+                &mut pure,
+                text_for_doc,
+                100,
+                2,
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 pure[0].doc_id.to_string(),
                 "doc-4",
@@ -636,7 +707,8 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let reranker = FailingReranker;
             let mut candidates = make_candidates(10);
-            let original_ids: Vec<String> = candidates.iter().map(|c| c.doc_id.to_string()).collect();
+            let original_ids: Vec<String> =
+                candidates.iter().map(|c| c.doc_id.to_string()).collect();
 
             // Should NOT return an error
             rerank_step(
@@ -652,7 +724,8 @@ mod tests {
             .unwrap();
 
             // Candidates should be unchanged
-            let current_ids: Vec<String> = candidates.iter().map(|c| c.doc_id.to_string()).collect();
+            let current_ids: Vec<String> =
+                candidates.iter().map(|c| c.doc_id.to_string()).collect();
             assert_eq!(original_ids, current_ids);
             assert!(candidates.iter().all(|c| c.rerank_score.is_none()));
         });
@@ -1020,8 +1093,10 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let reranker = StubReranker;
             let mut candidates = make_candidates(15);
-            let original_tail: Vec<String> =
-                candidates[10..].iter().map(|c| c.doc_id.to_string()).collect();
+            let original_tail: Vec<String> = candidates[10..]
+                .iter()
+                .map(|c| c.doc_id.to_string())
+                .collect();
 
             rerank_step(
                 &cx,
@@ -1036,8 +1111,10 @@ mod tests {
             .unwrap();
 
             // Candidates beyond top_k_rerank should be unchanged.
-            let current_tail: Vec<String> =
-                candidates[10..].iter().map(|c| c.doc_id.to_string()).collect();
+            let current_tail: Vec<String> = candidates[10..]
+                .iter()
+                .map(|c| c.doc_id.to_string())
+                .collect();
             assert_eq!(original_tail, current_tail);
             assert!(candidates[10..].iter().all(|c| c.rerank_score.is_none()));
         });

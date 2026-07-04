@@ -1,8 +1,7 @@
 //! Latency of the shipped reranker combine step: `RerankCombine::PureReorder` (one sort)
-//! vs `RerankCombine::RrfCombine` (rank-fuse the pre-rerank order with the rerank order —
-//! an argsort + fused sort + permute). Landed default-preserving (`235fb46`); this MEASURES
-//! (rather than assumes) that the RRF-combine reorder is negligible vs a cross-encoder's
-//! per-candidate forward pass — the perf side of the reranker-default question.
+//! vs `RerankCombine::RrfCombine` (rank-fuse the pre-rerank order with the rerank order).
+//! The RRF-combine arms compare the original five-vector bookkeeping against the compact
+//! order-vector implementation used by `pipeline.rs`.
 //!
 //! The reorder logic mirrors `pipeline.rs::apply_rrf_combine` / `compare_by_rerank_score`
 //! (both private), replicated here over real `ScoredResult`s so the clone/permute cost is
@@ -50,23 +49,33 @@ fn window(n: usize) -> Vec<ScoredResult> {
 }
 
 fn finite(c: &ScoredResult) -> f32 {
-    c.rerank_score.filter(|s| s.is_finite()).unwrap_or(f32::NEG_INFINITY)
+    c.rerank_score
+        .filter(|s| s.is_finite())
+        .unwrap_or(f32::NEG_INFINITY)
 }
 
 fn cmp_rerank(a: &ScoredResult, b: &ScoredResult) -> Ordering {
-    finite(b).total_cmp(&finite(a)).then_with(|| a.doc_id.cmp(&b.doc_id))
+    finite(b)
+        .total_cmp(&finite(a))
+        .then_with(|| a.doc_id.cmp(&b.doc_id))
 }
 
-/// PureReorder: one sort by rerank score descending.
+/// `PureReorder`: one sort by rerank score descending.
 fn pure_reorder(win: &[ScoredResult]) -> Vec<ScoredResult> {
     let mut v = win.to_vec();
     v.sort_by(cmp_rerank);
     v
 }
 
-/// RrfCombine: argsort for rerank rank, fuse with pre-rank, sort by fused, permute.
+#[derive(Clone, Copy)]
+struct RrfOrder {
+    position: usize,
+    fused_key: f64,
+}
+
+/// Original `RrfCombine`: argsort, inverted rank map, key vector, permutation, copy.
 #[allow(clippy::cast_precision_loss)]
-fn rrf_combine(win: &[ScoredResult]) -> Vec<ScoredResult> {
+fn rrf_combine_current(win: &[ScoredResult]) -> Vec<ScoredResult> {
     let n = win.len();
     let mut by_rerank: Vec<usize> = (0..n).collect();
     by_rerank.sort_by(|&a, &b| cmp_rerank(&win[a], &win[b]));
@@ -78,20 +87,66 @@ fn rrf_combine(win: &[ScoredResult]) -> Vec<ScoredResult> {
         .map(|i| 1.0 / (K + i as f64) + 1.0 / (K + rerank_rank[i] as f64))
         .collect();
     let mut perm: Vec<usize> = (0..n).collect();
-    perm.sort_by(|&a, &b| key[b].total_cmp(&key[a]).then_with(|| win[a].doc_id.cmp(&win[b].doc_id)));
+    perm.sort_by(|&a, &b| {
+        key[b]
+            .total_cmp(&key[a])
+            .then_with(|| win[a].doc_id.cmp(&win[b].doc_id))
+    });
     perm.into_iter().map(|i| win[i].clone()).collect()
+}
+
+/// New `RrfCombine`: one order vector carries the rerank-rank and fused-key stages.
+#[allow(clippy::cast_precision_loss)]
+fn rrf_combine_order_vec(win: &[ScoredResult]) -> Vec<ScoredResult> {
+    let n = win.len();
+    let mut order: Vec<RrfOrder> = (0..n)
+        .map(|position| RrfOrder {
+            position,
+            fused_key: 0.0,
+        })
+        .collect();
+    order.sort_by(|a, b| cmp_rerank(&win[a.position], &win[b.position]));
+    for (rerank_rank, entry) in order.iter_mut().enumerate() {
+        entry.fused_key = 1.0 / (K + entry.position as f64) + 1.0 / (K + rerank_rank as f64);
+    }
+    order.sort_by(|a, b| {
+        b.fused_key
+            .total_cmp(&a.fused_key)
+            .then_with(|| win[a.position].doc_id.cmp(&win[b.position].doc_id))
+    });
+    order
+        .into_iter()
+        .map(|entry| win[entry.position].clone())
+        .collect()
+}
+
+fn comparable_order(win: &[ScoredResult]) -> Vec<(&str, Option<f32>)> {
+    win.iter()
+        .map(|item| (item.doc_id.as_ref(), item.rerank_score))
+        .collect()
 }
 
 fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("rerank_combine_reorder");
     for &n in &[20_usize, 50, 100, 200] {
         let win = window(n);
+        let current = rrf_combine_current(&win);
+        let order_vec = rrf_combine_order_vec(&win);
+        assert_eq!(comparable_order(&current), comparable_order(&order_vec));
+
         g.bench_with_input(BenchmarkId::new("pure_reorder", n), &win, |b, w| {
             b.iter(|| black_box(pure_reorder(black_box(w))));
         });
-        g.bench_with_input(BenchmarkId::new("rrf_combine", n), &win, |b, w| {
-            b.iter(|| black_box(rrf_combine(black_box(w))));
+        g.bench_with_input(BenchmarkId::new("rrf_combine_current", n), &win, |b, w| {
+            b.iter(|| black_box(rrf_combine_current(black_box(w))));
         });
+        g.bench_with_input(
+            BenchmarkId::new("rrf_combine_order_vec", n),
+            &win,
+            |b, w| {
+                b.iter(|| black_box(rrf_combine_order_vec(black_box(w))));
+            },
+        );
     }
     g.finish();
 }

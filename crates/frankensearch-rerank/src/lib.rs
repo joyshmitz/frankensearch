@@ -3,7 +3,7 @@
 //! The pure-Rust [`NativeReranker`] (feature `native`) runs a BERT
 //! cross-encoder forward pass on frankentorch tensors — no ONNX / `ort` /
 //! native C++ dependency — producing `sigmoid(logit)` relevance scores in
-//! `[0, 1]`. An optional FastEmbed backend is available behind
+//! `[0, 1]`. An optional `FastEmbed` backend is available behind
 //! `fastembed-reranker`.
 //!
 //! ```text
@@ -16,8 +16,8 @@ pub mod pipeline;
 pub mod fastembed_reranker;
 
 pub use pipeline::{
-    DEFAULT_MIN_CANDIDATES, DEFAULT_RRF_COMBINE_K, DEFAULT_TOP_K_RERANK, RerankCombine, rerank_step,
-    rerank_step_with_combine,
+    DEFAULT_MIN_CANDIDATES, DEFAULT_RRF_COMBINE_K, DEFAULT_TOP_K_RERANK, RerankCombine,
+    rerank_step, rerank_step_with_combine,
 };
 
 #[cfg(feature = "fastembed-reranker")]

@@ -19,6 +19,45 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-04 - rerank RRF-combine order-vector bookkeeping is a kept internal win; external original-comparator ratio is N/A (Codex)
+
+**Ledger entry for the land:** replaced `frankensearch-rerank`'s `apply_rrf_combine`
+bookkeeping from the original five transient vectors (`by_rerank`, `rerank_rank`, `key`,
+`perm`, and `reordered`) to one compact `RrfOrder` vector plus the final reordered output.
+The new path sorts the order vector by rerank score to assign rerank ranks, writes the fused
+RRF key into the same entries, then sorts by the fused key and applies the same doc-id
+tiebreaker. A unit test compares the new implementation against a local copy of the old
+permutation logic.
+
+**Measured command (per-crate, same benchmark binary):**
+
+```bash
+AGENT_NAME=Codex \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo bench -p frankensearch-rerank --profile release \
+    --bench combine_reorder_cost_ab -- \
+    rrf_combine --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3
+```
+
+`rch exec -- cargo bench -p frankensearch-rerank --profile release --bench
+combine_reorder_cost_ab ...` was tried first on `vmi1293453` and produced no samples in the
+bounded window; the local exact release-profile run also stalled in dependency LTO. The
+successful fallback kept release `opt-level=3` but disabled LTO and raised codegen units for
+this measurement binary only.
+
+| Workload | ORIG five-vector RRF bookkeeping | Candidate order-vector bookkeeping | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `rerank_combine_reorder/rrf_combine_current -> rrf_combine_order_vec` (N=20) | 549.26 ns | 479.86 ns | **0.874 (~1.14x faster)** | keep |
+| `rerank_combine_reorder/rrf_combine_current -> rrf_combine_order_vec` (N=50) | 1.2107 us | 1.0628 us | **0.878 (~1.14x faster)** | keep |
+| `rerank_combine_reorder/rrf_combine_current -> rrf_combine_order_vec` (N=100) | 2.1862 us | 2.0193 us | **0.924 (~1.08x faster)** | keep |
+| `rerank_combine_reorder/rrf_combine_current -> rrf_combine_order_vec` (N=200) | 4.4715 us | 3.9125 us | **0.875 (~1.14x faster)** | keep |
+
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an
+internal reranker reorder primitive, not a standalone search-quality comparator. The ratio
+above is against the pre-change in-repo ORIG implementation for this callsite.
+
 ### 2026-07-04 - sync refined vector score lookup is a kept internal win; external original-comparator ratio is N/A (Codex)
 
 **Ledger entry for the land:** replaced the vector-only refined result assembly in
