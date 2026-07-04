@@ -19,6 +19,43 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-04 - lexical `ord` column cache array is no gain and regresses the large materialization row (CobaltRidge)
+
+**Lever tested and reverted:** replaced `TantivyIndex::collect_id_hits`'s lazy
+`HashMap<segment_ord, ord-column>` cache with a prebuilt segment-indexed `Vec<Option<Column<u64>>>`.
+This was the natural "Swiss-table/cache-friendly array" follow-up to the kept numeric-ordinal
+materialization path: skip one hash-table probe per hit while preserving the same `ord` fast-field
+lookup and docstore fallback behavior.
+
+**Measured command (per-crate, RCH remote `vmi1149989`, release profile, same worker before/after):**
+
+```bash
+AGENT_NAME=CobaltRidge \
+RCH_WORKER=vmi1149989 \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cobaltridge \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+    --bench search_doc_ids_materialize -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+`cargo bench --release` was not used because this workspace's established bench protocol is
+`--profile release`; Cargo rejects `--release` for `cargo bench` (documented above).
+
+| Workload | current fast baseline | candidate fast | ratio vs current | docstore original in candidate run | candidate ratio vs docstore original | Decision |
+|---|---:|---:|---:|---:|---:|---|
+| `search_doc_ids_materialize/fast/k10` | 600.44 us | 608.58 us | **1.014** | 568.90 us | **1.070** | no gain |
+| `search_doc_ids_materialize/fast/k100` | 619.32 us | 607.30 us | **0.981** | 658.45 us | **0.922** | noise; Criterion: no change |
+| `search_doc_ids_materialize/fast/k1000` | 791.08 us | 861.06 us | **1.088** | 4.9285 ms | **0.175** | regression vs current |
+
+**Decision:** reject and revert. The only apparent improvement was the mid-size `k100` row, but
+Criterion classified it as "No change in performance detected"; the largest materialization row
+regressed by 8.8% against current main and weakens the ratio against the docstore original
+(current fast was 791.08 us / 4.9049 ms = **0.161**, candidate was 861.06 us / 4.9285 ms =
+**0.175**). Do not retry prebuilding every segment's `ord` column for `collect_id_hits`; if this
+surface is revisited, it needs a different lazy array/last-segment design and must beat the current
+lazy `HashMap` path on the large row without moving top-k rows.
+
+---
+
 ## Measurement blockers
 
 | Date | Owner | Workload | Evidence | Status |
