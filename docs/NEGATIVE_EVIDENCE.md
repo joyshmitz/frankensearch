@@ -7792,3 +7792,35 @@ as an opt-in for topical/argumentative corpora where the dense tier is weak (the
 the same corpus signal (is relevance exact-match or topical?) predicts reranker fit, RM3 fit, and RM3 aggressiveness together.** Verified:
 `model2vec` retrieval-32M + `rank_bm25` (stem+stop) + score-interpolation RM3 (10 fb docs, E∈{10,20}, α∈{.7,.5,.3}), BM25-alone & RRF
 hybrid, full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
+
+---
+
+### 4th-dataset validation: every core recommendation holds on SciDocs (citation relevance) — including a NEW lexical-dominant regime where BM25 beats the vector tier yet the hybrid still wins (CopperKestrel, 2026-07-03)
+
+The entire recommendation stack was tuned on 3 BEIR datasets (SciFact/NFCorpus/ArguAna). Downloaded a **4th, out-of-sample**
+dataset — **SciDocs** (25,657 docs, 500 queries, avg 4.9 rel/q, **citation-prediction relevance**: given a paper, retrieve the papers
+it cites — a *distinct* relevance notion not represented in the prior three) — and re-ran the core levers in one pass. Every
+recommendation replicates:
+
+| lever (recommendation) | SciDocs measurement | verdict |
+|---|---|---|
+| **Hybrid ≥ best single tier** (`ship hybrid as default`) | HYBRID **0.1545** > BM25 0.1505 > vector 0.1309 (nDCG@10) | ✓ holds |
+| **Lexical analysis** (stem+stop, `24c0f4a`) | BM25 naive 0.1423 → stem+stop **0.1505** (+0.0082, **+5.8%**; recall +0.012) | ✓ holds |
+| **Small-`k` / sharp RRF** (`4cc3b47`,`561e8a5`) | RRF k=60 0.1533 < k=10 0.1545 < **k=1 0.1558** (monotone sharper-better) | ✓ holds |
+| **Up-weight the STRONGER tier** (`44566fd`) | BM25 is stronger here → auto-weighted lexical 1.3× (correct direction) | ✓ holds |
+| **RM3: no safe default, aggressive only for argumentative** (`b8a027c`) | gentle +0.0023 / aggressive **−0.0040** hybrid (wants gentle-or-off, like SciFact/NFCorpus — NOT ArguAna) | ✓ holds |
+
+**Finding — the recommendations generalize to a 4th relevance notion, and SciDocs reveals a NEW regime that strengthens the
+headline "ship the hybrid" call: the LEXICAL tier can be the STRONGER one, and the hybrid still wins.** SciDocs is the first
+dataset measured where **BM25 beats the dense tier** (0.1423 vs 0.1309) — citation relevance rewards exact overlap of coined technical
+terms and title tokens, which BM25 captures and static mean-pooled embeddings dilute. All three prior datasets had vector ≥ lexical, so
+"the vector tier is the strong partner" was an unstated assumption in the arc. SciDocs breaks it — and yet the hybrid (0.1545) still
+beats *both* the stronger lexical tier (0.1505) and the weaker dense tier (0.1309), because the weaker vector tier still contributes
+**decorrelated** recall. This is the strongest possible support for the hybrid-as-default recommendation: **it does not depend on which
+modality is stronger — the modality-diversity argument (decorrelated errors) is symmetric, so the hybrid dominates whether the vector or
+the lexical tier leads.** The RM3 result also confirms the corpus-conditional rule from the other direction: SciDocs' citation relevance
+is shared-term/mildly-topical (not argumentative), so — exactly as predicted — it wants *gentle-or-no* expansion (+0.0023 gentle) and is
+hurt by aggressive expansion (−0.0040), placing it with SciFact/NFCorpus and away from ArguAna's aggressive-RM3 win. **Net: no
+recommendation is overfit to the original three datasets; the one surprise (lexical-dominant corpus) makes the core call stronger, not
+weaker.** Verified: `model2vec` retrieval-32M + `rank_bm25` (naive & stem+stop) + RRF hybrid (k-sweep, tuned weights) + score-interp RM3,
+BEIR **SciDocs** (500q, downloaded fresh; no cargo, no torch).
