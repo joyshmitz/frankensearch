@@ -7867,3 +7867,41 @@ favor the vector tier on some corpora — this claim is specifically nDCG@10, th
 call — the hybrid still beats both tiers on all 4 (`84f362b`) — it corrects which tier is the *lead partner* and reinforces that the
 stronger-tier decision is label-dependent. Verified: `model2vec` retrieval-32M + `rank_bm25` (stem+stop) tier scores, 4 QPP signals vs
 nDCG@10, BEIR SciFact/NFCorpus/ArguAna/SciDocs (no cargo, no torch).
+
+---
+
+### HEADLINE CORRECTION — the vector tier adds only +0.6–3.0% nDCG over a properly-analyzed Tantivy BM25, NOT the capstone's +12–22%: most of that gain was the stemming Tantivy already does but the naive-tokenizer baseline omitted (CopperKestrel, 2026-07-04)
+
+The stemming finding (`24c0f4a`) forces a re-audit of the arc's **headline number**. The capstone (`SEARCH_QUALITY_FINDINGS.md`) claims
+the hybrid beats "Tantivy BM25-alone" by **+12–22% nDCG** — but that "Tantivy baseline" is the pure-Python harness's **naive-tokenizer**
+`rank_bm25` (no stemming, no stopwords), while frankensearch's actual lexical tier is **Tantivy's default analyzer, which stems +
+removes stopwords**. So the capstone credited the *whole* hybrid−BM25 gap to the vector tier, when part of it is standard IR analysis the
+real baseline already performs. Recomputed the retrieval-side comparison with the lexical tier held at **stem+stop for BOTH the Tantivy
+baseline and the hybrid's lexical arm** (the honest apples-to-apples), all 4 BEIR corpora, tuned RRF hybrid, nDCG@10 / recall@10:
+
+| corpus | Tantivy naive | Tantivy **stem** (faithful) | naive-hybrid | stem-hybrid | capstone-style Δ (naive-hyb vs naive-Tan) | **FAITHFUL Δ (vector-tier value)** | stem-Tantivy-ALONE vs naive-hybrid |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SciFact  | 0.652 | 0.684 | 0.684 | 0.705 | +4.8% | **+3.0% nDCG / +2.8% rec** | +0.1% (ties) |
+| NFCorpus | 0.306 | 0.329 | 0.326 | 0.339 | +6.3% | **+3.0% / +5.3%** | +1.2% (**beats**) |
+| ArguAna  | 0.259 | 0.346 | 0.305 | 0.348 | +17.9% | **+0.6% / +0.5%** | **+13.3% (beats)** |
+| SciDocs  | 0.142 | 0.151 | 0.150 | 0.155 | +5.4% | **+2.6% / +4.5%** | +0.3% (ties) |
+
+**Finding — the honest marginal value of the dense tier over a properly-analyzed Tantivy is +0.6–3.0% nDCG@10 (mean ~+2.3%) and
++0.5–5.3% recall@10 — real, near-free, but ~½ to ~1/30 of the headlined +12–22%.** The mechanism is direct and shown in the last two
+columns: **stemmed-Tantivy-alone matches or beats the entire *naive* hybrid on all 4 corpora** (SciFact +0.1%, NFCorpus +1.2%, SciDocs
++0.3%, and **ArguAna +13.3%**). In other words, *just giving BM25 the analyzer it already has in production captures most of what the
+capstone attributed to adding embeddings.* ArguAna is the extreme case — capstone-style +17.9% collapses to a **+0.6%** faithful vector
+contribution — because ArguAna's naive BM25 was crippled by stopword saturation (`24c0f4a`: stop-removal alone was +0.087 BM25 there);
+once stopwords are removed (which Tantivy does), BM25 is strong and the dense tier is nearly redundant on that corpus.
+
+**This does NOT retract "ship the hybrid" — it corrects its magnitude and reattributes the credit.** The dense tier is still net-positive
+on all 4 corpora (never negative), adds more in **recall** (+0.5–5.3%, the reranker-feed metric) than in top-precision, and costs sub-ms —
+so a near-free +2–3% nDCG / +3–5% recall is still worth shipping, and the reranker adds further on top (its absolute gains stand; only the
+"% vs Tantivy" denominator was understated). **But the practical priority order flips: the single biggest lexical-side quality lever is
+using a proper stem+stop analyzer (Tantivy's default — ensure any custom field keeps it), and the dense tier is a modest complement on top,
+not the dominant source of the hybrid's edge.** The correct headline is: *frankensearch's hybrid ≈ a well-analyzed BM25 + a ~+2-3% nDCG /
+~+3-5% recall dense-tier complement (near-free) + an optional corpus-dependent reranker* — not "+12–22% from the hybrid." `SEARCH_QUALITY_
+FINDINGS.md`'s capstone table should be read as vs a *naive* BM25 baseline; the vs-**production-Tantivy** number is the faithful column here.
+Caveat: this is the no-reranker retrieval comparison and specifically nDCG@10/recall@10; the recall edge (which feeds the reranker) is the
+dense tier's most durable contribution. Verified: `model2vec` retrieval-32M + `rank_bm25` with naive vs `snowballstemmer`+sklearn-stopword
+analysis, identical tuned RRF hybrid, full BEIR SciFact/NFCorpus/ArguAna/SciDocs (no cargo, no torch).

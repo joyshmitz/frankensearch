@@ -132,6 +132,15 @@ the semantic-search hybrid **+15-21% nDCG at zero inference cost** — ~3× the 
 validated small-k and full tuning. (Add the optional reranker on top for the capstone's further gains.)
 
 ## Capstone: FULL pipeline (1+3+4) vs Tantivy BM25-alone (one end-to-end run)
+
+> **⚠️ BASELINE CORRECTION (see `NEGATIVE_EVIDENCE.md`, "HEADLINE CORRECTION", 2026-07-04):** the "Tantivy BM25" baseline in
+> this table is the harness's **naive-tokenizer** `rank_bm25` (no stemming/stopwords), while production Tantivy's default analyzer
+> **stems + removes stopwords**. Against a *faithful* (stem+stop) BM25 baseline the dense tier's marginal value is only **+0.6–3.0%
+> nDCG / +0.5–5.3% recall** (mean ~+2.3%), not the +12–22% below — because stemmed-Tantivy-alone matches or *beats* the naive hybrid
+> on all 4 corpora (ArguAna: +13.3%). The hybrid still helps (near-free) and the reranker's absolute gains stand, but the headline
+> "% vs Tantivy" is inflated by an understated baseline. Priority order: a proper stem+stop analyzer first, dense tier as a modest
+> complement. Read the numbers below as **vs naive BM25**; the vs-production-Tantivy number is in the correction.
+
 The whole recommended stack — retrieval-32M + tuned RRF hybrid **+ RRF-combine reranker** — vs Tantivy BM25-alone,
 each stage's contribution shown (recall@10 / nDCG@10). This is the headline number, using the *shipped*
 `RerankCombine::RrfCombine` + `RrfConfig` weights (so it's expressible today; only defaults are product-gated):
