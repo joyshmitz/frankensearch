@@ -8621,3 +8621,24 @@ materialized ORIG at 10k (2.2917 ms vs 2.6086 ms, ratio 0.878), current main alr
 and the unique path is not better at 10k. Production is therefore thresholded: keep `blend_two_tier_aligned` below
 100k hits and use `blend_two_tier_aligned_unique` only for the measured 100k `limit_all` case. Do not re-test the 10k
 unique-blend variant unless a new measurement changes the threshold.
+
+### 2026-07-04 — CopperKestrel — Abstention/confidence is corpus-specific, NOT universal: the cross-encoder top score is the best "is there a good answer" signal on CLEAN-relevance corpora (AUROC ~0.78) but COLLAPSES on argumentative retrieval, and NO signal (CE or retrieval) supports a corpus-agnostic global threshold
+
+Novel angle (no prior finding touches calibration/abstention): can the system tell when it has NO good answer? Cross-encoder scores are ABSOLUTE relevance judgments (unlike BM25/cosine, only relative within a query), so the top CE score SHOULD be a corpus-agnostic confidence signal where retrieval scores fail. Tested: per query, predict hit@10 (any relevant in top-10) from the top jina-turbo CE score vs retrieval signals (top fused score, fused score-gap, tier top-10 agreement, max BM25, max cosine). AUROC, full-N:
+
+| signal | scifact (hit 0.87) | nfcorpus (0.73) | arguana (0.79) | **POOLED (global threshold)** |
+|---|---:|---:|---:|---:|
+| **top1_ce** | **0.789** | **0.774** | 0.582 | 0.640 |
+| top1_fused | 0.753 | 0.721 | 0.449 | 0.621 |
+| gap_fused | 0.748 | 0.690 | 0.433 | 0.645 |
+| agree (BM25∩BGE top10) | 0.657 | 0.765 | 0.594 | **0.666** |
+| max_bm25 | 0.729 | 0.741 | 0.395 | 0.599 |
+| max_cos | 0.731 | 0.722 | 0.581 | 0.614 |
+
+**Findings:**
+1. **Within a CLEAN-relevance corpus, the CE top score is the best abstention signal** — scifact (factual claims) 0.789 and nfcorpus (medical) 0.774, beating every retrieval signal. So the cross-encoder's absolute score IS a usable per-query "is there a relevant doc in the results" confidence signal for factual/topical retrieval, and PER-CORPUS abstention thresholding is viable there.
+2. **It COLLAPSES on argumentative retrieval** (arguana 0.582, barely above chance) — and there ALL signals fail, with the retrieval scores going WORSE than random (top1_fused 0.449, max_bm25 0.395, i.e. high retrieval confidence ANTI-predicts a good answer). Mechanism: arguana relevance = "correct COUNTER-argument stance," which is invisible to both retrieval similarity and the CE's topical-relevance score — a confident high score is often a topically-similar WRONG-STANCE doc (the argument being countered). Confidence signals fail on stance/argument tasks.
+3. **POOLED (a single corpus-agnostic threshold), NO signal supports reliable abstention** — all AUROC 0.60–0.67, barely above chance, and the CE score (0.640) is NOT better than cheap tier-agreement (0.666) or the fused-score gap (0.645). The CE's theoretical advantage (absolute, cross-query-comparable scores) does NOT yield a corpus-agnostic threshold: jina-turbo's calibration is corpus-specific (its arguana failure drags the pool down). My hypothesis "CE scores are absolute → universal confidence signal" is empirically REJECTED.
+4. **Degree-of-quality wants a different signal than binary abstention**: for continuous Spearman-with-nDCG the fused-score GAP is the best pooled predictor (0.295) while the CE score is weak pooled (0.131) — the CE score separates has-answer/no-answer within clean corpora but doesn't rank quality across them.
+
+**Net:** abstention is achievable but CORPUS-SPECIFIC — use the CE top score with a PER-CORPUS threshold for factual/topical retrieval (AUROC ~0.78, better than any retrieval signal); expect it to fail on argumentative/stance corpora, and expect NO global threshold to generalize (all signals ~0.64 pooled). The intuition that cross-encoder absolute scores give a universal confidence gauge does not hold across corpus types; calibration must be fit per domain. Ties to `b0a409a` (arguana is the hardest corpus for rerankers) and the recall/difficulty structure. Caveats: full-N, hit@10 binary target, jina-turbo (a small distilled reranker — a larger CE might calibrate better across corpora), single global threshold via pooled AUROC. Verified: `fastembed` BGE-small + `rank_bm25` stem+stop + `jina-reranker-v1-turbo-en`, BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `abstain.py` in `$D`.
