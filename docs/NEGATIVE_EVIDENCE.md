@@ -54,6 +54,47 @@ regressed by 8.8% against current main and weakens the ratio against the docstor
 surface is revisited, it needs a different lazy array/last-segment design and must beat the current
 lazy `HashMap` path on the large row without moving top-k rows.
 
+### 2026-07-04 - lexical last-segment `ord` column cache is noise and regresses k100 (Codex)
+
+**Lever tested and reverted:** added a last-segment fast path to `TantivyIndex::collect_id_hits`
+so consecutive hits from the same Tantivy segment reuse the already-open `ord` fast-field column
+without probing the lazy `HashMap<segment_ord, ord-column>` cache. This was the cache-locality
+follow-up explicitly left open by the prebuilt segment-array rejection above: keep lazy column
+opening, but exploit temporal locality in score-ordered hit streams.
+
+**Measured command (per-crate, release profile, same binary):**
+
+```bash
+AGENT_NAME=Codex \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-lexical --profile release \
+    --bench search_doc_ids_materialize -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+`rch exec` fell open locally because no worker was admissible
+(`critical_pressure=1,insufficient_slots=10,active_project_exclusion=1`). The literal requested
+`cargo bench --release -p frankensearch-lexical --bench search_doc_ids_materialize ...` form was
+also tried first and Cargo rejected it with `unexpected argument '--release'`; this workspace's
+working release-profile form remains `--profile release`.
+
+The bench temporarily carried three same-binary arms: `docstore` (legacy original id
+materialization), `hash` (current lazy HashMap segment-column cache), and `fast` (candidate
+last-segment cache). All arms asserted identical ranked ids at k1000 before timing.
+
+| Workload | docstore ORIG | current hash | candidate | candidate/current | candidate/ORIG | Decision |
+|---|---:|---:|---:|---:|---:|---|
+| `search_doc_ids_materialize/k10` | 571.68 us | 576.32 us | 558.14 us | **0.968** | **0.976** | borderline/noise |
+| `search_doc_ids_materialize/k100` | 602.99 us | 580.91 us | 631.26 us | **1.087** | **1.047** | regression |
+| `search_doc_ids_materialize/k1000` | 4.4248 ms | 739.56 us | 734.49 us | **0.993** | **0.166** | no gain vs current |
+
+**Decision:** source and bench A/B scaffolding reverted. The large-row ratio vs the legacy
+docstore original remains excellent only because of the already-landed ordinal-table materialization
+win; this last-segment cache adds no material improvement and worsens the mid-size row. Do not retry
+the simple "last segment" cache in `collect_id_hits`; any future revisit needs a different hit-order
+model or segment-batched collection proof.
+
 ---
 
 ## Measurement blockers
@@ -8466,3 +8507,21 @@ Ties the robustness thread (typos `782f398`, synonyms `c3932f4`) to the static-v
 4. **Closes the `9355feb` open question with a refinement**: making the 3rd tier STRONG (comparable-strength MiniLM) flips the marginal from *inconsistent-sign* (weak potion: best +0.0050, worst −0.0163) to *consistently weakly-positive* (+0.002…+0.011) — so 3-tier viability **is gated on 3rd-tier strength** (confirms `9355feb`'s "decorrelation strength floor"). BUT a whole second neural embedder (2× embedding + 2× index cost) buys **≤+0.01 nDCG best-case, sweep-inflated, no stable weight** — *less than the single lexical tier already contributes for free* — and it must be ADDED to, never substituted for, the lexical anchor (finding 2).
 
 **Net:** the hybrid's power is decorrelation **across MODALITIES** (dense vs lexical), not across models within the dense modality — two dense embedders are largely redundant (Jaccard 0.28–0.48 mutual overlap), and BM25 is the cheaper, more-decorrelated, load-bearing complement. A 2nd neural embedder as a 3rd tier is a poor use of compute; spend it on ONE good embedder + the lexical tier + a reranker (`683a3d4`/`db2a5ff`/`6911260` — the reranker's marginal nDCG dwarfs this). Two-tier BM25+dense is the right architecture; don't stack embedders. Caveats: full-N; one different-lineage 2nd embedder (MiniLM-L6, weaker single-tier than BGE on scifact but comparable on nf/arguana); 3-tier number is best-over-sweep (fixed-weight gain is smaller). Verified: `fastembed` BGE-small + MiniLM-L6 + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `twodense.py` + `{ds}_miniC/Q.npy` caches in `$D`.
+
+### 2026-07-04 — CopperKestrel — Document LENGTH is NOT a decorrelation axis: both tiers are length-neutral (|ρ|≤0.04), the weak length-tilt flips sign by corpus — rules out doc-length-adaptive fusion (doc-side analog of the rejected query-length weighting `e837e15`)
+
+Having established the hybrid's complementarity is vocabulary/semantic (top-10 Jaccard, `c26651f`), tested a plausible SECOND axis: do BM25 and the dense tier specialize by document LENGTH (BM25 favoring short, dense favoring long, or vice-versa)? If so, a doc-length-adaptive fusion weight would be a lever. Cached BGE + stem/stop BM25, full-N:
+
+| dataset (median doc len) | mean len of relevants caught **only-dense / only-BM25 / both** | score-vs-length **Spearman** BM25 / dense | recall@100 **short / long** half BM25 / dense |
+|---|---|---|---|
+| **scifact** (204w) | 239 / 210 / 230 (n=19/9/306) | **+0.011 / +0.023** | 0.922/0.933 · 0.960/0.950 |
+| **nfcorpus** (237w) | 245 / 231 / 239 (n=968/623/1534) | **+0.007 / −0.010** | 0.255/0.236 · 0.285/0.312 |
+| **arguana** (150w) | 97 / — / 133 (n=8/0/288) | **−0.041 / +0.031** | 0.949/1.000 · 0.986/1.000 |
+
+**Findings:**
+1. **Score-vs-length Spearman is ≈0 for BOTH tiers on ALL 3 corpora** (|ρ| ≤ 0.041; within each query's top-200 candidates). Neither default-`b` BM25 nor the unit-normalized dense cosine tier has a meaningful within-pool length preference. This is the robust headline.
+2. **Relevants caught only-by-dense vs only-by-BM25 differ in length only marginally and INCONSISTENTLY** — dense-only slightly LONGER on scifact (+29w) and nfcorpus (+14w) but SHORTER on arguana (arguana BM25-only n=0, undefined; both tiers already catch the single relevant). No consistent length specialization.
+3. **Length-stratified recall@100 shows NO stable crossover**: the weak short/long tilt flips SIGN by corpus — on the informative many-relevant nfcorpus dense is better on the long half (0.285→0.312) and BM25 on the short half (0.255→0.236), but on scifact it's the OPPOSITE (dense better short, BM25 better long). A sign-inconsistent, sub-0.03 effect = no exploitable rule.
+4. **Rules out doc-length-adaptive fusion weighting** — the document-side analog of the already-rejected query-length-adaptive weighting (`e837e15`). BOTH length-adaptive fusion variants (query-length and doc-length) are now measured-rejected: length carries no differential tier signal to exploit. Also CONFIRMS default-`b`=0.75 BM25 is already length-neutral (ρ≈0, validating the `43be67e` finding that `b` controls length-norm — at default `b` the residual length correlation is gone) and BGE cosine is length-neutral in the 100–250w range these corpora span.
+
+**Net:** document length is NOT a source of tier decorrelation — the hybrid's complementarity is vocabulary/semantic (`c26651f`), and both tiers are effectively length-blind after their respective normalizations (BM25's `b`, dense unit-norm). A measured negative that closes the doc-length-adaptive-fusion lever and sharpens the "why hybrid" mechanism to purely lexical-vs-semantic. Caveats: full-N; corpora span 150–237w medians (a corpus with extreme length variance or docs exceeding the embedder's 512-token window could differ — that is the separate truncation/chunking question, untested here); arguana length-analysis is uninformative (1-rel/q, recall-saturated). Verified: `fastembed` BGE-small + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `length_bias.py` in `$D`.
