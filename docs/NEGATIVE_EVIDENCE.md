@@ -7943,3 +7943,38 @@ earns its keep mainly in the *no-reranker* path (where it adds the +2–3%) and 
 Caveats: N=40 subsample (per-dataset deltas are within noise; the robust claim is "small and inconsistent," not the precise values), single
 reranker (ms-marco-L6); a different/stronger reranker or deeper feed could shift it. Verified: `model2vec` retrieval-32M + `rank_bm25`
 (stem+stop) candidate generation + `fastembed` ms-marco-L6 RRF-combine rerank of the union, BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
+
+---
+
+### The dense tier's "modest" value is EMBEDDER-GATED: a contextual embedder ~triples it (over a FAITHFUL Tantivy the hybrid goes from +3% static to +8–9% nDCG) — the headline correction was partly a weak-static-embedder artifact (CopperKestrel, 2026-07-04)
+
+The headline correction (`de979c7`) and reranker-feed finding (`3eca5d5`) concluded the dense tier is a modest complement — but **every one of
+those measurements used the weak STATIC embedder** (`model2vec` retrieval-32M). Recommendation #1 itself notes a *contextual* embedder
+(`fastembed` BGE) beats the static one +10–29% — so the honest question is whether "the dense tier is modest" is a property of the *hybrid*
+or an artifact of a *weak embedder*. Re-ran the faithful capstone (hybrid vs **stem+stop** Tantivy, apples-to-apples) with the contextual
+**BGE-small-en-v1.5** replacing the static tier (BGE corpus embeddings cached to `.npy`; queries use the BGE retrieval instruction prefix):
+
+| corpus | faithful Tantivy (stem) | vector-only STATIC | vector-only **BGE** | hybrid STATIC Δ vs Tantivy | **hybrid BGE Δ vs Tantivy** |
+|---|---:|---:|---:|---:|---:|
+| SciFact  | 0.6842 | 0.6331 (< BM25) | **0.7203 (> BM25)** | +3.0% nDCG / +2.8% rec | **+7.9% nDCG / +6.4% rec** |
+| NFCorpus | 0.3294 | 0.3085 (< BM25) | **0.3382 (> BM25)** | +3.0% / +5.3% | **+9.1% / +9.6%** |
+
+**Finding — the dense tier's marginal value over a properly-analyzed Tantivy is embedder-gated, and the contextual embedder roughly
+TRIPLES it (+3.0% → +7.9–9.1% nDCG; recall +2.8–5.3% → +6.4–9.6%).** The mechanism is visible in the vector-only column: the **static**
+tier is *weaker* than stemmed BM25 on both corpora (0.633 < 0.684, 0.309 < 0.329), so it can only nudge the fused result; the **contextual**
+tier is *stronger* than stemmed BM25 (0.720 > 0.684, 0.338 > 0.329), so it leads the fusion and the hybrid clears the faithful baseline by a
+real margin. So the earlier "dense tier is modest / largely redundant" conclusion is **correct for the static default but must be qualified:
+it was partly a weak-embedder artifact.** Corrected, unified deployment guidance:
+- **Static embedder (current default):** hybrid ≈ faithful BM25 **+3%** — a near-free nudge; the lexical analyzer is the dominant quality
+  source (`de979c7`), and a BM25-only → reranker pipeline is competitive (`3eca5d5`). The dense tier is optional polish.
+- **Contextual embedder (BGE premium):** hybrid beats faithful BM25 by **+8–9% nDCG / +6–10% recall** — a substantial, worth-it gain; here
+  the dense tier *leads*, and the vector index clearly earns its keep. The premium's ~650× embed cost (`SEARCH_QUALITY_FINDINGS` #1) is an
+  index-build one-time cost, so this is the configuration for quality-sensitive corpora.
+
+This does not overturn the headline correction — the old **+12–22%** was still inflated (naive baseline + reranker); the honest contextual
+number vs a *faithful* Tantivy is **+8–9%** (retrieval-only, no reranker) — but it materially sharpens it: **the dense tier is a modest
+complement with the static default and a substantial one with a contextual embedder; the embedder choice is what decides whether the vector
+index is optional or essential.** This also re-frames recommendation #1 — the contextual "premium" isn't just "more embedder quality," it is
+*the* thing that turns the hybrid from a +3% nudge into a +8–9% win over a well-analyzed BM25. Verified: `model2vec` retrieval-32M vs
+`fastembed` BGE-small-en-v1.5 (query-prefixed, `.npy`-cached) + `rank_bm25` stem+stop, tuned RRF hybrid, BEIR SciFact/NFCorpus (no cargo, no
+torch). [ArguAna BGE run in progress — 2-dataset finding, convention-consistent.]
