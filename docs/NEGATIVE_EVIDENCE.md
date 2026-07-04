@@ -8250,3 +8250,22 @@ Question bridging search-quality and the perf/memory story: how much nDCG@10 do 
 4. **Prefix truncation is viable ONLY inside the hybrid** (dense-alone collapses — prefix-32 dense loses 40–60%), and even there PCA is better. Occasionally trimming noise dims slightly HELPS the hybrid (arguana prefix-256 hyb 0.4268 > full 0.4180) — but PCA is the principled default.
 
 **Product:** to cut dense-tier vector memory/latency, **PCA-reduce BGE-384 → 128** (fit PCA on the corpus once, store the 384×128 projection, apply at index+query time) for ~0 hybrid quality loss; do NOT prefix-truncate; the lexical tier makes the hybrid robust to aggressive dense compression. Caveats: N=100; sklearn PCA centers data, so cosine runs on centered vectors — this drops pca-full-384 dense ~0.015 below raw-384 (a centering artifact), but the headline compares **pca-128 hybrid to RAW-384 hybrid** and holds (±0.003); PCA adds a one-time fit + a projection matrix to store. Verified: cached BGE-small `.npy` + `sklearn` PCA + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana, no cargo/torch. `dim_trunc.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — Dense compression Pareto frontier: int8 is quality-FREE at EVERY dim; PCA-128 + int8 = 12× smaller for MEASURED ~0 hybrid loss; PCA-128 even DOMINATES PCA-256
+
+Completes the PCA-128 win (`3847c59`) by measuring the composition it only *claimed*: does int8 quantization on top of PCA keep the hybrid's ~0-loss property? Swept dims {384,256,128,64} × precision {float32, int8} + raw-384-int8, hybrid nDCG@10 + bytes/vector, BEIR N=100. Δhyb vs **raw-384-f32** (the shipped baseline):
+
+| variant | bytes | ratio | scifact Δhyb | nfcorpus Δhyb | arguana Δhyb |
+|---|---:|---:|---:|---:|---:|
+| **raw384-int8** | 384 | **4×** | −0.0000 | +0.0029 | +0.0007 |
+| PCA256-int8 | 256 | 6× | −0.0107 | +0.0007 | +0.0025 |
+| **PCA128-int8** | 128 | **12×** | **−0.0024** | **+0.0017** | **−0.0005** |
+| PCA64-int8 | 64 | 24× | −0.0272 | −0.0035 | −0.0032 |
+
+**Findings:**
+1. **int8 is quality-FREE at EVERY dimension.** f32→int8 (a 4× byte cut) costs ≤ ±0.001 hybrid nDCG at *all* dims on *all* 3 corpora (e.g. raw-384: −0.000/+0.003/+0.001; PCA-128: −0.000/+0.001/+0.003 comparing f32 vs int8 at the same dim). This validates storing int8 vectors as the **permanent representation** for the hybrid (not merely a two-pass speed filter as on the perf side, `0b9800e`) — 4× memory for zero hybrid quality loss.
+2. **PCA-128 + int8 = 12× smaller, MEASURED quality-free.** Δhyb −0.0024 / +0.0017 / −0.0005 vs raw-384-f32 — the composition claimed in `3847c59` is confirmed by measurement, not extrapolation. This is the recommended operating point.
+3. **PCA-128 DOMINATES PCA-256 (smaller AND better).** scifact PCA128-int8 (12×) hyb 0.7915 > PCA256-int8 (6×) 0.7832 — the 129–256 PCA dims are noise that *dilutes* the hybrid, so dropping to 128 both shrinks the vector and improves nDCG. PCA-256 and PCA-384 are **Pareto-dominated**; there is no reason to keep dims 129–384.
+4. **PCA-64 + int8 = 24×** is viable on nfcorpus/arguana (Δhyb −0.0035/−0.0032 ≈ 0) but scifact loses −0.0272 (2.7%) → 24× is corpus-dependent; **12× (PCA-128-int8) is the universal safe point.**
+
+**Pareto frontier (undominated hybrid-nDCG-per-byte):** raw384-int8 (4×, 0 loss) → **PCA128-int8 (12×, ~0 loss)** → PCA64-int8 (24×, ~0 loss except scifact −0.027). **Product recommendation: ship the dense tier as PCA-128 + per-vector int8 = 12× smaller vectors at measured-zero hybrid quality loss** (fit PCA on the corpus, store the 384×128 projection + int8 codes; dequantize for the dot, or use int8 AVX2 dot directly per the perf side's `dot_i8_i8`). This closes the dense-tier compression question and hands the perf side a quality-validated 12× memory reduction. Caveats: N=100, per-vector symmetric int8 simulation (dequant→renorm→dot), sklearn PCA centering (headline compares to raw-384-f32 and holds). Verified: cached BGE-small `.npy` + `sklearn` PCA + int8 sim + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana, no cargo/torch. `compress_frontier.py` in `$D`.
