@@ -7660,3 +7660,45 @@ the shipped `rrf_fuse` (which is a reciprocal, k-parameterized) — squaring it 
 (sharp).** ISR-k10 is logged as the marginal frontier of the sharpness axis should a future eval want the last ~1%. Verified:
 `model2vec` retrieval-32M + `rank_bm25`, single-variable kernel sweep at fixed tuned hybrid config, full BEIR SciFact/NFCorpus/ArguAna
 test sets (no cargo, no torch).
+
+---
+
+### PER-TIER rank-decay sharpness is a NON-lever — the fused optimum lies on the symmetric diagonal (both tiers want the same `k`); asymmetry re-encodes a worse tier-weight (CopperKestrel, 2026-07-03)
+
+The kernel finding above (`561e8a5`) established that fusion sharpness matters but used **one shared `k`** for both tiers. The obvious
+next degree of freedom: BM25's exact-match top ranks and the vector tier's semantic top ranks have *different reliability profiles*,
+so maybe they want **different sharpness** — a sharper kernel on the tier whose top ranks are more trustworthy. Swept the full
+`k_vector × k_lexical` grid (each ∈ {1,5,10,20,60}, reciprocal kernel, tuned weights, FEED=100), full BEIR test sets. nDCG@10 grid
+(rows = `k_vec`, cols = `k_lex`), SciFact shown as representative:
+
+```
+ kv\kl     1       5      10      20      60
+     1  0.6942  0.6634  0.6514  0.6396  0.6329
+     5  0.6717  0.6935  0.6861  0.6622  0.6374
+    10  0.6623  0.6798  0.6835  0.6764  0.6479
+    60  0.6533  0.6556  0.6598  0.6731  0.6768
+```
+
+The best cell sits **on (or one step off) the diagonal `k_vec≈k_lex`** on every dataset; the **corners** (extreme asymmetry, e.g.
+`kv=1,kl=60` = 0.6329 vs diagonal 0.6942) are the *worst* cells. Cross-dataset mean Δ vs symmetric `k=10`, best settings:
+
+| setting | mean Δ | SciFact | NFCorpus | ArguAna |
+|---|---:|---:|---:|---:|
+| **`kv=1, kl=1`** (symmetric, sharp) | **+0.0052** | +0.0106 | +0.0010 | +0.0039 |
+| `kv=5, kl=5` (symmetric) | +0.0046 | +0.0100 | +0.0012 | +0.0027 |
+| `kv=5, kl=10` (best off-diagonal) | +0.0025 | +0.0026 | **−0.0020** | +0.0070 |
+| `kv=10, kl=10` (shipped) | 0 | 0 | 0 | 0 |
+| `kv=20, kl=10` / corners | ≤ −0.002 | −0.005…−0.007 | — | — |
+
+**Finding — per-tier sharpness asymmetry buys nothing robust; the fused optimum is on the SYMMETRIC diagonal.** The single best
+cross-dataset setting is **symmetric `k=1`** (+0.0052 mean, positive on all 3). The *only* off-diagonal winner is ArguAna's `kv=5,kl=10`
+(+0.0031 over its best diagonal) — and it **fails to generalize**: the same setting is −0.0020 on NFCorpus. No asymmetric setting is
+both cross-dataset-positive *and* better than the best symmetric one. Mechanism: **RRF fuses RANKS, which are already scale-normalized
+across modalities** — each tier's rank-1 is equally "that tier's best guess" regardless of whether it came from exact-match or cosine,
+so there is no principled reason to discount one tier's rank ladder faster than the other's. An asymmetric kernel just makes the
+sharper tier *dominate the top of the fused list* — i.e. it re-encodes a **tier IMBALANCE**, which is a strictly worse, entangled
+version of the already-tuned tier-*weight* knob (hence the bad corners). **The fusion has exactly one effective sharpness knob (a
+shared, small `k`) plus a light tier weight — per-tier `k` collapses to the diagonal.** This closes the per-tier-sharpness degree of
+freedom and re-confirms the prior result from a second direction (the modest available gain is purely from a smaller *shared* `k`≈1-5,
+not from decoupling the tiers). Verified: `model2vec` retrieval-32M + `rank_bm25`, 5×5 per-tier `k` grid at fixed tuned hybrid config,
+full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
