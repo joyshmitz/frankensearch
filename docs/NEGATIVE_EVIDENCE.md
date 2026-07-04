@@ -8016,3 +8016,39 @@ too, and a BM25-only feed leaves +0.01–0.04 nDCG on the table** (most on SciFa
 N=40 subsample (per-dataset deltas directional), single reranker (ms-marco-L6). Verified: `model2vec` retrieval-32M & `fastembed` BGE-small-en
 (`.npy`-cached) hybrid candidate generation + `rank_bm25` stem+stop + `fastembed` ms-marco-L6 RRF-combine rerank of the union, BEIR SciFact/
 NFCorpus/ArguAna (no cargo, no torch).
+
+---
+
+### Reranker shootout on the strong contextual hybrid: jina-reranker-v1-turbo is a STRICTLY better generalist than ms-marco-L6; bigger (ms-marco-L12) is WORSE; a strong base retrieval cannibalizes weak rerankers (CopperKestrel, 2026-07-04)
+
+The one tier with big oracle headroom is the reranker, and the standing recommendation was **ms-marco-L6 = better generalist** (`657df16`,
+tested vs bge). But only 2 rerankers were ever measured, and never on the *strong* contextual-hybrid candidate pool (`a414d92`). Shootout: 3
+rerankers — **ms-marco-L6** (current default), **ms-marco-L12** (bigger, same family), **jina-reranker-v1-turbo-en** (different lineage) —
+RRF-combined onto the **contextual (BGE) hybrid** top-50, Δ nDCG@10 vs no-rerank, BEIR N=40/corpus:
+
+| reranker | SciFact | NFCorpus | ArguAna | **mean** | **worst** |
+|---|---:|---:|---:|---:|---:|
+| ms-marco-L6 (default) | −0.0316 | +0.0153 | −0.0004 | −0.0056 | −0.0316 |
+| ms-marco-L12 (bigger) | −0.0428 | +0.0131 | −0.0062 | −0.0120 | −0.0428 |
+| **jina-turbo-en** | **−0.0039** | **+0.0281** | **+0.0213** | **+0.0152** | **−0.0039** |
+
+**Three findings:**
+1. **`jina-reranker-v1-turbo-en` is a strictly better generalist than ms-marco-L6** — it wins on **all 3** corpora (least-harmful where
+   reranking hurts: −0.004 vs −0.032 SciFact; most-helpful where it helps: +0.028 vs +0.015 NFCorpus; +0.021 vs −0.0004 ArguAna), with the
+   best **mean** (+0.0152 vs −0.0056) *and* the best **worst-case** (−0.004 vs −0.032). It is the only reranker here that is net-positive on
+   average and effectively never-harmful. This answers the arc's open route-next ("a genuinely better single reranker") with a **YES**:
+   **change the default cross-encoder from ms-marco-L6 to jina-turbo.** (Jina is also fast — "turbo" — so it's not a cost regression.)
+2. **Bigger is NOT better — ms-marco-L12 is worse than L6 on all 3** (mean −0.0120 vs −0.0056, worst −0.0428). Scaling up the *same family*
+   backfires: the deeper model over-commits and injects more false positives into the top-10. This closes the tempting "just use a bigger
+   ms-marco" lever with a measured NO — reranker *lineage/training* matters, not depth.
+3. **A strong base retrieval CANNIBALIZES weak rerankers.** On the contextual hybrid (no-rerank nDCG SciFact **0.870**, already excellent) the
+   ms-marco family is net-*negative* (L6 mean −0.0056, L12 −0.0120) — the reranker mostly has nothing left to fix and only adds false
+   positives, worst exactly where the hybrid is strongest (SciFact −0.032/−0.043). This is the reranker-side mirror of the embedder-gating
+   arc: as the retriever improves (static→contextual), the reranker's marginal value *shrinks and can go negative* — so the better your
+   embedder, the more the reranker choice matters, and a mediocre reranker (ms-marco) becomes a net *liability*. Only jina-turbo still clears
+   the bar. **Net: on a contextual hybrid, default to jina-turbo (net-positive, safe); do NOT reach for a bigger ms-marco; and treat the
+   reranker as increasingly optional as the embedder improves.** This refines "ms-marco-L6 is the better generalist" (`657df16`, true vs bge
+   on weaker pools) to: **jina-turbo is the better generalist on a strong contextual pool.** Caveats: N=40 subsample (per-dataset deltas
+   directional, but jina-turbo *sweeps all 3* — robust to noise), single candidate pool (contextual hybrid), RRF-combine integration; still
+   A/B per corpus per the standing rule. Verified: `fastembed` ms-marco-L6 / ms-marco-L12 / jina-reranker-v1-turbo-en, RRF-combine on the
+   BGE contextual hybrid (`.npy`-cached) + `rank_bm25` stem+stop, BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
