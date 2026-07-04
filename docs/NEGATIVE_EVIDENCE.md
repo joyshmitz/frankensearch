@@ -8133,3 +8133,21 @@ Every arc finding concatenated `title+text` at equal weight, untested. Tested up
 4. **Theme, mirroring the BM25-`b` finding (`43be67e`)**: lexical micro-optimizations that help standalone BM25 (b-tuning, title-boost) are largely **ABSORBED by the contextual vector tier in the hybrid**. The hybrid's value is cross-tier **decorrelation**, not stacking lexical precision tricks — a strong embedder makes them redundant, and where the embedder is strongest they turn net-negative.
 
 **Practical:** a **lexical-only** system should boost the title ~3× (+0.011–0.014, but only for substantive titles — skip corpora with trivial ones); the **HYBRID (the product) should NOT add a title-boost default** — it is redundant with the contextual vector tier, marginal-to-negative, and worst where the embedder is strongest. Keep simple equal concat. Caveats: term-repetition boost approximates but is not exact BM25F; N=100; dense tier fixed on the cached title+text BGE `.npy` (only the lexical field-weighting varies). Verified: `rank_bm25` stem+stop (snowball) + cached BGE-small `.npy`, BEIR scifact/nfcorpus/arguana, no cargo/torch. `title_boost.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — BGE query-instruction prefix: fastembed `query_embed()`==`embed()` (arc caches are CORRECT, no silent bug), and MANUALLY adding the instruction is NOT a safe default — corpus-dependent (nfcorpus +0.019 hybrid, scifact −0.010, arguana ~0)
+
+Tested two things about the dense tier's query encoding: (1) did the arc's cached BGE query embeddings silently MISS the asymmetric query instruction that BGE models are documented to want? (2) does adding it lift the dense tier?
+
+**(1) NO silent bug — the caches are correct.** fastembed's `query_embed()` returns embeddings **bit-identical** to plain `embed()` for `BAAI/bge-small-en-v1.5` (per-row cosine **1.0000** on all 3 datasets; dense nDCG identical to 4 dp). fastembed applies **no** query instruction for this model, and the arc's `_bgeQ.npy` caches (built with `embed()`) are exactly what `query_embed()` would produce. So every contextual-hybrid finding in the arc used the standard, correct BGE encoding — **not** an under-instructed dense tier. This closes the "did we miss the BGE instruction" worry with a measured NO.
+
+**(2) Manually prepending the classic BGE instruction** (`"Represent this sentence for searching relevant passages:"`) **is corpus-dependent, NOT a safe default** (Δ nDCG@10 vs plain):
+
+| dataset | Δ dense | Δ hybrid |
+|---|---:|---:|
+| **nfcorpus** (short medical topics) | +0.0138 | **+0.0189** |
+| **scifact** (declarative claims) | −0.0111 | −0.0096 |
+| **arguana** (full-paragraph arguments) | −0.0040 | −0.0000 |
+
+**Mechanism:** the instruction helps when queries are **short and keyword-like** (nfcorpus — the "for searching relevant passages" framing reshapes an under-specified topic into search intent) and **hurts when queries are already articulate / passage-shaped** (scifact declarative claims — the prefix injects off-target instruction tokens that pull the embedding off the claim; arguana full-paragraph arguments — a short prefix is diluted → neutral). This is the **same profile as lexical RM3** (`b8a027c`): a query-reformulation lever that pays only on short, under-specified queries and backfires on well-formed ones → **per-corpus opt-in, never a default**.
+
+**Net:** no free dense-tier win from the instruction prefix (mean hybrid Δ ≈ +0.003, entirely nfcorpus), but two useful results: (a) the arc's dense caches are verified-correct (fastembed BGE is symmetric — `query_embed`==`embed`), and (b) nfcorpus is a legit +0.019-hybrid opt-in for the instruction. Reinforces that query-side reformulation (RM3 lexical, BGE-instruction dense) is uniformly a **short-under-specified-query** lever, harmful on articulate queries — a corpus-shape decision, never global. Caveats: `BAAI/bge-small-en-v1.5` via fastembed, one instruction string, N=100. Verified: fastembed `embed`/`query_embed` (re-embedded queries live) + cached BGE docs `.npy` + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana, no cargo/torch. `bge_qinstruct.py` in `$D`.
