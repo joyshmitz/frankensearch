@@ -14,6 +14,12 @@
 //!   rch exec -- cargo bench -p frankensearch-embed --bench hash_embed
 //! ```
 
+#![allow(
+    clippy::chunks_exact_to_as_chunks,
+    clippy::explicit_iter_loop,
+    clippy::many_single_char_names
+)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

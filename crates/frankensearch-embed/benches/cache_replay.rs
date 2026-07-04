@@ -20,6 +20,12 @@
 //!   rch exec -- cargo bench -p frankensearch-embed --bench cache_replay
 //! ```
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::zero_sized_map_values
+)]
+
 use std::collections::{HashMap, VecDeque};
 use std::hint::black_box;
 
@@ -40,7 +46,11 @@ struct Fifo {
 }
 impl Fifo {
     fn new(cap: usize) -> Self {
-        Self { set: HashMap::with_capacity(cap), order: VecDeque::with_capacity(cap), cap }
+        Self {
+            set: HashMap::with_capacity(cap),
+            order: VecDeque::with_capacity(cap),
+            cap,
+        }
     }
     fn get(&self, k: u64) -> bool {
         self.set.contains_key(&k)
@@ -137,7 +147,10 @@ fn bench_cache_replay(c: &mut Criterion) {
     let traces: [(&str, Vec<u64>); 3] = [
         ("zipf_s2_u2000", zipf_stream(ACCESSES, 2000, 2.0, 0xa11ce)),
         ("zipf_s3_u5000", zipf_stream(ACCESSES, 5000, 3.0, 0xb0b)),
-        ("scan_polluted_hot256", scan_polluted_stream(ACCESSES, 256, 0xcafe)),
+        (
+            "scan_polluted_hot256",
+            scan_polluted_stream(ACCESSES, 256, 0xcafe),
+        ),
     ];
 
     for (name, stream) in &traces {

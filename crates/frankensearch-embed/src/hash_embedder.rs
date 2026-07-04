@@ -267,6 +267,7 @@ pub fn jl_accumulate_lanes_scalar(embedding: &mut [f32], states: &[u64; 4]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
+#[allow(clippy::cast_ptr_alignment)]
 fn jl_accumulate_lanes_avx2(embedding: &mut [f32], states: &[u64; 4]) {
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_slli_epi64,
@@ -283,7 +284,7 @@ fn jl_accumulate_lanes_avx2(embedding: &mut [f32], states: &[u64; 4]) {
             let mask = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(s)));
             // odd lanes → -1, even → +1; Σ = (4-odd) - odd = 4 - 2·odd.
             #[allow(clippy::cast_possible_wrap)]
-            let sum = (4 - 2 * (mask as u32).count_ones() as i32) as f32;
+            let sum = (4 - 2 * mask.cast_unsigned().count_ones() as i32) as f32;
             *dim += sum;
         }
     }
@@ -341,6 +342,7 @@ pub fn jl_accumulate_lanes8_scalar(embedding: &mut [f32], states: &[u64; 8]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
+#[allow(clippy::cast_ptr_alignment)]
 fn jl_accumulate_lanes8_avx2(embedding: &mut [f32], states: &[u64; 8]) {
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_pd, _mm256_loadu_si256, _mm256_movemask_pd, _mm256_slli_epi64,
@@ -361,7 +363,9 @@ fn jl_accumulate_lanes8_avx2(embedding: &mut [f32], states: &[u64; 8]) {
             let ma = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(a)));
             let mb = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(b)));
             #[allow(clippy::cast_possible_wrap)]
-            let sum = (8 - 2 * ((ma as u32).count_ones() + (mb as u32).count_ones()) as i32) as f32;
+            let sum = (8 - 2
+                * (ma.cast_unsigned().count_ones() + mb.cast_unsigned().count_ones()) as i32)
+                as f32;
             *dim += sum;
         }
     }
@@ -596,15 +600,18 @@ mod tests {
         for &dim in &[1_usize, 8, 31, 100, 384] {
             let states: Vec<u64> = (0..48).map(|_| next()).collect(); // 12×4 = 6×8, no tail
             let mut e4 = vec![0.0_f32; dim];
-            for g in states.chunks_exact(4) {
-                jl_accumulate_lanes_scalar(&mut e4, g.try_into().unwrap());
+            let (chunks4, tail4) = states.as_chunks::<4>();
+            assert!(tail4.is_empty());
+            for g in chunks4 {
+                jl_accumulate_lanes_scalar(&mut e4, g);
             }
             let mut e8_avx2 = vec![0.0_f32; dim];
             let mut e8_scalar = vec![0.0_f32; dim];
-            for g in states.chunks_exact(8) {
-                let g8: &[u64; 8] = g.try_into().unwrap();
-                jl_accumulate_lanes8(&mut e8_avx2, g8);
-                jl_accumulate_lanes8_scalar(&mut e8_scalar, g8);
+            let (chunks8, tail8) = states.as_chunks::<8>();
+            assert!(tail8.is_empty());
+            for g in chunks8 {
+                jl_accumulate_lanes8(&mut e8_avx2, g);
+                jl_accumulate_lanes8_scalar(&mut e8_scalar, g);
             }
             let b4: Vec<u32> = e4.iter().map(|x| x.to_bits()).collect();
             let ba: Vec<u32> = e8_avx2.iter().map(|x| x.to_bits()).collect();

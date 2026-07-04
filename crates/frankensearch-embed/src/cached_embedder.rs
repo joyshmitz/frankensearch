@@ -50,7 +50,7 @@ const FREQ_CAP: u8 = 3;
 /// evicted from Small, metadata-only). Unlike the previous plain FIFO, a key
 /// re-requested while resident is promoted to Main and survives the scan churn that
 /// evicts cold one-hit-wonders from Small — measurably fewer embed misses on skewed
-/// / scan-heavy query streams (see the `cache_replay` bench + PERF_LEDGER 2026-06-29).
+/// / scan-heavy query streams (see the `cache_replay` bench + `PERF_LEDGER` 2026-06-29).
 /// Lookups borrow `&str` (no per-get allocation); the external `CacheState` API
 /// (`get`/`insert`/`stats`/`clear`, entry-count `capacity`, hit/miss counters) is
 /// unchanged, so `CachedEmbedder` and `CacheStats` are untouched.
@@ -347,7 +347,10 @@ impl Embedder for CachedEmbedder {
                     }
                 }
             }
-            Ok(out.into_iter().map(|v| v.expect("every slot filled")).collect())
+            Ok(out
+                .into_iter()
+                .map(|v| v.expect("every slot filled"))
+                .collect())
         })
     }
 
@@ -474,8 +477,10 @@ mod tests {
             texts: &'a [&'a str],
         ) -> SearchFuture<'a, Vec<Vec<f32>>> {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
-            let out: Vec<Vec<f32>> =
-                texts.iter().map(|t| Self::deterministic(self.dim, t)).collect();
+            let out: Vec<Vec<f32>> = texts
+                .iter()
+                .map(|t| Self::deterministic(self.dim, t))
+                .collect();
             Box::pin(async move { Ok(out) })
         }
 
@@ -506,7 +511,7 @@ mod tests {
             });
             let cached = CachedEmbedder::new(inner.clone(), 128);
             let texts = ["a", "bb", "ccc", "dddd", "eeeee"];
-            let refs: Vec<&str> = texts.iter().copied().collect();
+            let refs: Vec<&str> = texts.to_vec();
 
             let out = cached.embed_batch(&cx, &refs).await.expect("embed_batch");
 
