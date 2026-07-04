@@ -8269,3 +8269,24 @@ Completes the PCA-128 win (`3847c59`) by measuring the composition it only *clai
 4. **PCA-64 + int8 = 24×** is viable on nfcorpus/arguana (Δhyb −0.0035/−0.0032 ≈ 0) but scifact loses −0.0272 (2.7%) → 24× is corpus-dependent; **12× (PCA-128-int8) is the universal safe point.**
 
 **Pareto frontier (undominated hybrid-nDCG-per-byte):** raw384-int8 (4×, 0 loss) → **PCA128-int8 (12×, ~0 loss)** → PCA64-int8 (24×, ~0 loss except scifact −0.027). **Product recommendation: ship the dense tier as PCA-128 + per-vector int8 = 12× smaller vectors at measured-zero hybrid quality loss** (fit PCA on the corpus, store the 384×128 projection + int8 codes; dequantize for the dot, or use int8 AVX2 dot directly per the perf side's `dot_i8_i8`). This closes the dense-tier compression question and hands the perf side a quality-validated 12× memory reduction. Caveats: N=100, per-vector symmetric int8 simulation (dequant→renorm→dot), sklearn PCA centering (headline compares to raw-384-f32 and holds). Verified: cached BGE-small `.npy` + `sklearn` PCA + int8 sim + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana, no cargo/torch. `compress_frontier.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — Binary quantization: raw-dim binary COLLAPSES the dense tier (→0); PCA-first + asymmetric is viable at 96× but loses to int8 — confirms "int8 dominates" on REAL hybrid data
+
+Extended the compression Pareto (`777193f`) to the 1-bit/dim extreme. Sign-quantize the dense tier — symmetric (both sign) vs asymmetric (float query · sign doc), raw-dim vs PCA-first — BEIR N=100, Δhyb vs raw-384-f32:
+
+| variant | bytes | ratio | scifact Δhyb | nfcorpus Δhyb | arguana Δhyb | (dense nDCG scifact) |
+|---|---:|---:|---:|---:|---:|---:|
+| raw384-bin-sym | 48 | 32× | −0.0846 | −0.0709 | −0.0985 | **0.0000** |
+| raw384-bin-asym | 48 | 32× | −0.0870 | −0.0704 | −0.0899 | 0.0000 |
+| PCA128-bin-sym | 16 | 96× | −0.0771 | −0.0238 | −0.0451 | 0.5339 |
+| **PCA128-bin-asym** | 16 | **96×** | **−0.0506** | **−0.0098** | **−0.0220** | 0.6527 |
+| PCA256-bin-asym | 32 | 48× | −0.0476 | −0.0137 | −0.0222 | 0.6663 |
+
+**Findings:**
+1. **Binary on RAW BGE dims CATASTROPHICALLY collapses the dense tier** — dense nDCG → **0.00–0.04** on all 3 (scifact 0.7532→0.0000). BGE-small's raw dimensions are not sign-informative (magnitude/distribution carries the signal, not the sign), so 1-bit sign destroys almost everything. The hybrid *appears* to survive (0.71/0.33/0.32) ONLY because the lexical tier carries it — the binarized dense tier contributes ~nothing. This is why the perf-side binary-quant rejection holds — but that was on raw dims.
+2. **Binary REQUIRES PCA first (new insight).** PCA-128-binary dense recovers to 0.65/0.31/0.35 (vs ~0 raw) — the top PCA components are variance-ordered and decorrelated, so their SIGN carries real signal where raw-dim signs do not. PCA-first is the difference between binary being *useless* (raw) and *viable* (PCA); the perf-side rejection didn't test PCA-first binary.
+3. **Asymmetric (float query · sign doc) > symmetric everywhere** (PCA-128 scifact 0.7433 vs 0.7169, arguana 0.3960 vs 0.3730) — keeping query precision recovers meaningful quality at *zero* doc-storage cost. Always use asymmetric.
+4. **Binary still loses meaningfully to int8 in the hybrid — confirms "int8 dominates" on REAL data.** PCA128-int8 (12×) is free (Δhyb −0.002/+0.002/−0.001, `777193f`) whereas PCA128-bin-asym (96×) costs −0.051/−0.010/−0.022. int8 is the practical FLOOR: strictly better quality-per-utility than binary unless memory is the hard binding constraint. This validates the perf-side "int8 dominates 4-bit/binary" conclusion on real hybrid data (not just synthetic/BOLD) — with the PCA-first caveat.
+5. **The 96× extreme is viable for memory-critical deployments.** PCA-128-bin-asym is nearly free on nfcorpus (−0.0098) and arguana (−0.0220) at **96× compression** (16 bytes/vector); scifact is the exception (−0.0506 = 6%). So for memory-desperate scenarios, PCA-128-binary-asymmetric buys 96× at ~1–2% hybrid loss on most corpora — a real option at the frontier's edge.
+
+**Net — the dense compression Pareto is now fully mapped:** int8 (12×, ~0 loss, DEFAULT) → PCA256-bin-asym (48×, ~1–4%) → PCA128-bin-asym (96×, ~1–6%). **Ship int8-12× as default** (confirms perf-side int8-dominance on real hybrid data); reach for **PCA-128-binary-asymmetric** only when memory is the hard constraint; and **never binary-quantize raw dims — PCA-first is mandatory** (raw-dim binary collapses the dense tier to zero). Caveats: N=100, sign quant with per-vector float query, sklearn PCA centering (headline vs raw-384-f32). Verified: cached BGE-small `.npy` + `sklearn` PCA + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana, no cargo/torch. `binary_quant.py` in `$D`.
