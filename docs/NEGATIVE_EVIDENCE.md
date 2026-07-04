@@ -7318,6 +7318,72 @@ score, on BEIR SciFact / NFCorpus (no cargo).
 
 ---
 
+### BOLD legacy-original remeasure at `6f89b5e`: top-10 is parity/noisy, limit-all and 100k exact-id reject another mechanical lever (Codex, 2026-07-03)
+
+Agent coordination note: `AGENT_NAME=Codex`; Agent Mail registration and reservations were blocked by the shared
+`am` SQLite database corruption (`database disk image is malformed`). `am doctor fix --dry-run` said it would
+reconstruct the database from the archive, but no repair was run from this checkout.
+
+Per-crate RCH comparator run against the legacy-original Tantivy incumbent (`tantivy_doc_ids`):
+
+```bash
+AGENT_NAME=Codex \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,FRANKENSEARCH_BOLD_VERIFY_EMIT,FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY,FRANKENSEARCH_BOLD_VERIFY_COMMAND,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-codex-20260703-rerun \
+FRANKENSEARCH_BOLD_VERIFY_EMIT=1 \
+FRANKENSEARCH_BOLD_VERIFY_SUMMARY_ONLY=1 \
+FRANKENSEARCH_BOLD_VERIFY_COMMAND='AGENT_NAME=Codex CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-codex-20260703-rerun rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1' \
+RUST_LOG=off \
+rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH completed on `ovh-a` in 372.7s. The bench rows reported `git_sha=unknown` because the RCH bench process did not see
+Git metadata, but the local checkout was `6f89b5e` immediately before the run. Ratio is
+`frankensearch_p50_us / incumbent_p50_us`; lower is faster.
+
+| workload | docs | class | challenger | incumbent p50 us | frankensearch p50 us | ratio | p95 ratio | p99 ratio |
+|---|---:|---|---|---:|---:|---:|---:|---:|
+| top10 | 10000 | exact_identifier | hybrid_rrf | 95 | 94 | 0.989 | 0.990 | 1.010 |
+| top10 | 10000 | exact_identifier | lexical_guard | 95 | 94 | 0.989 | 1.000 | 1.019 |
+| top10 | 10000 | short_keyword | hybrid_rrf | 31 | 31 | 1.000 | 1.000 | 1.051 |
+| top10 | 10000 | short_keyword | lexical_guard | 31 | 31 | 1.000 | 1.000 | 0.949 |
+| top10 | 10000 | quoted_phrase | hybrid_rrf | 117 | 118 | 1.009 | 0.869 | 0.844 |
+| top10 | 10000 | quoted_phrase | lexical_guard | 117 | 119 | 1.017 | 0.862 | 0.831 |
+| top10 | 10000 | natural_language | hybrid_rrf | 113 | 113 | 1.000 | 1.008 | 0.969 |
+| top10 | 10000 | natural_language | lexical_guard | 113 | 100 | 0.885 | 0.943 | 1.124 |
+| top10 | 10000 | high_fanout | hybrid_rrf | 58 | 58 | 1.000 | 1.000 | 1.000 |
+| top10 | 10000 | high_fanout | lexical_guard | 58 | 58 | 1.000 | 1.085 | 1.000 |
+| top10 | 10000 | zero_hit | hybrid_rrf | 16 | 16 | 1.000 | 1.000 | 1.000 |
+| top10 | 10000 | zero_hit | lexical_guard | 16 | 16 | 1.000 | 1.000 | 1.235 |
+| limit_all | 10000 | limit_all | hybrid_rrf | 637 | 729 | 1.144 | 1.126 | 1.116 |
+| limit_all | 10000 | limit_all | lexical_guard | 637 | 728 | 1.143 | 1.152 | 1.233 |
+| top10 | 100000 | exact_identifier | hybrid_rrf | 557 | 919 | 1.650 | 2.012 | 2.012 |
+| top10 | 100000 | exact_identifier | lexical_guard | 557 | 925 | 1.661 | 1.657 | 1.657 |
+| top10 | 100000 | short_keyword | hybrid_rrf | 44 | 45 | 1.023 | 1.056 | 1.056 |
+| top10 | 100000 | short_keyword | lexical_guard | 44 | 44 | 1.000 | 0.963 | 0.963 |
+| top10 | 100000 | quoted_phrase | hybrid_rrf | 840 | 844 | 1.005 | 0.984 | 0.984 |
+| top10 | 100000 | quoted_phrase | lexical_guard | 840 | 845 | 1.006 | 1.000 | 1.000 |
+| top10 | 100000 | natural_language | hybrid_rrf | 591 | 594 | 1.005 | 1.002 | 1.002 |
+| top10 | 100000 | natural_language | lexical_guard | 591 | 590 | 0.998 | 1.277 | 1.277 |
+| top10 | 100000 | high_fanout | hybrid_rrf | 475 | 484 | 1.019 | 1.521 | 1.521 |
+| top10 | 100000 | high_fanout | lexical_guard | 475 | 478 | 1.006 | 1.000 | 1.000 |
+| top10 | 100000 | zero_hit | hybrid_rrf | 19 | 19 | 1.000 | 1.333 | 1.333 |
+| top10 | 100000 | zero_hit | lexical_guard | 19 | 19 | 1.000 | 0.875 | 0.875 |
+
+**Finding - no shippable BOLD mechanical perf lever remains in this comparator surface.** The top-10 rows are mostly
+parity/noise against the legacy-original Tantivy path. The only apparent p50 win large enough to pass the raw ratio gate
+is `10k natural_language` with `lexical_guard` (0.885x), but it carries a p99 regression (1.124x), so it fails the
+"no regressions >1.03" rule. The stable-looking negative rows are worse: `limit_all/10000` is ~1.14x slower for both
+challengers, and `top10/100000 exact_identifier` is ~1.65x slower in this run. That combination rejects another
+source-level change: there is no measured win to land without either overfitting noisy top-10 rows or hurting tail/large
+identifier cases.
+
+**Decision - surface, do not ship code.** This run supports closing the current BOLD/vector-scan lane as evidence-only:
+record the legacy-original ratios, leave code unchanged, and route future work to a deeper quality or indexing primitive
+rather than another wrapper-level comparator tweak.
+
+---
+
 ### Per-query rerank GATING from cheap signals is NOT viable — where gating pays the signal is absent, where a signal exists gating doesn't pay (SlateHarrier, 2026-07-03)
 
 The reranker is the one open tier (`2779703`) but its sole downside is COST (~ms/candidate cross-encoder → 100 ms–1 s
