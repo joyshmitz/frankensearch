@@ -205,17 +205,17 @@ pub fn blend_two_tier(
 /// i.e. the aligned output of `quality_scores_for_hits`. The quality tier is a
 /// *re-scored subset of the fast tier* (it shares every `doc_id`/`index`), so
 /// the caller would otherwise build an intermediate `Vec<VectorHit>` cloning one
-/// `String` doc_id per quality hit purely to hand a `&[VectorHit]` to
-/// [`blend_two_tier`] — yet that slice's doc_ids are only ever read as `&str`.
+/// `String` `doc_id` per quality hit purely to hand a `&[VectorHit]` to
+/// [`blend_two_tier`] — yet that slice's `doc_ids` are only ever read as `&str`.
 ///
-/// This function borrows each doc_id straight from `fast_hits` (one alloc-free
+/// This function borrows each `doc_id` straight from `fast_hits` (one alloc-free
 /// `&str` per hit) and is **bit-identical** to
 /// `blend_two_tier(fast_hits, &quality_subset, blend_factor)` where
 /// `quality_subset` is the `Some`-filtered `VectorHit` projection of `fast_hits`:
 /// same normalization bounds (fast over all `fast_hits`, quality over the `Some`
 /// scores), same per-doc `ScorePair` (`index`/`fast`/`quality` all sourced from
 /// the first occurrence in fast order), and the same total-order sort over a set
-/// of unique doc_ids. The two-loop→single-pass merge is safe because the `fast`
+/// of unique `doc_ids`. The two-loop→single-pass merge is safe because the `fast`
 /// and `quality` slots are each guarded by `is_none()` (first-in-fast-order
 /// wins, exactly as the original fast-loop-then-quality-loop did).
 #[must_use]
@@ -294,7 +294,7 @@ pub fn blend_two_tier_aligned(
     blended
 }
 
-/// Blend aligned fast/quality tiers when `fast_hits` is already unique by doc_id.
+/// Blend aligned fast/quality tiers when `fast_hits` is already unique by `doc_id`.
 ///
 /// This is the vector-index hot-path sibling of [`blend_two_tier_aligned`]. It
 /// preserves that function's output when `fast_hits` contains no duplicate
@@ -315,13 +315,14 @@ pub fn blend_two_tier_aligned_unique(
     let mut blended = Vec::with_capacity(fast_hits.len());
     for (i, hit) in fast_hits.iter().enumerate() {
         let fast_score = fast_bounds.apply(hit.score);
-        let score = match quality_scores.get(i).copied().flatten() {
-            Some(quality_score) => {
+        let score = quality_scores
+            .get(i)
+            .copied()
+            .flatten()
+            .map_or(fast_score, |quality_score| {
                 let quality_score = quality_bounds.apply(quality_score);
                 alpha.mul_add(quality_score, (1.0 - alpha) * fast_score)
-            }
-            None => fast_score,
-        };
+            });
         blended.push(VectorHit {
             index: hit.index,
             score: sanitize_score(score),
@@ -347,7 +348,7 @@ pub fn blend_two_tier_aligned_unique(
 
 /// Blend aligned vector-index hits using the measured large-N specialization.
 ///
-/// `fast_hits` from the vector index are unique by doc_id, but the unique
+/// `fast_hits` from the vector index are unique by `doc_id`, but the unique
 /// specialization only pays off at the large `limit_all` shape measured in the
 /// `blend_aligned` bench. Smaller queries keep the defensive map path because
 /// it is neutral/slightly faster at 10k.

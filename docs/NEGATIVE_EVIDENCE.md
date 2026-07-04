@@ -19,6 +19,40 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-04 - sync refined vector score lookup is a kept internal win; external original-comparator ratio is N/A (Codex)
+
+**Ledger entry for the land:** replaced the vector-only refined result assembly in
+`SyncTwoTierSearcher` from two doc-id-keyed `AHashMap<&str, f32>` score maps plus two doc-id
+lookups per output row with an aligned numeric lookup keyed by `VectorHit.index`. This callsite
+already has the aligned `fast_hits` and `quality_scores_for_hits` vectors, and the blended vector
+results preserve the original vector index, so the doc-id maps were only recovering data that was
+still available by position/index.
+
+**Measured command (per-crate, same benchmark binary):**
+
+```bash
+AGENT_NAME=Codex \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release \
+    --bench score_map lookup -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+`rch exec` fell open locally because no worker was admissible
+(`critical_pressure=3,insufficient_slots=8`). The literal requested `cargo bench --release` form is
+not accepted by Cargo for this workspace's bench command; the working release-profile form is
+`--profile release`.
+
+| Workload | ORIG doc-id score maps | Candidate aligned numeric lookup | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `score_map/lookup_current -> lookup_aligned` (N=10k) | 1.0584 ms | 37.104 us | **0.035 (~28.5x faster)** | keep |
+| `score_map/lookup_current -> lookup_aligned` (N=100k) | 19.845 ms | 379.92 us | **0.019 (~52.2x faster)** | keep |
+
+The bench asserts the old doc-id-map lookup path and the new aligned numeric lookup produce
+bit-identical accumulated fast+quality scores before timing. External Tantivy/Lucene/Meilisearch
+original-comparator ratio is **N/A** because this is an internal result-assembly primitive, not a
+standalone search-quality comparator. The ratio above is against the pre-change in-repo ORIG for
+this callsite.
+
 ### 2026-07-04 - sync refined lexical RRF unique path is a kept internal win; external original-comparator ratio is N/A (CobaltRidge)
 
 **Ledger entry for the land:** wired `SyncTwoTierSearcher`'s refined lexical fusion call from the

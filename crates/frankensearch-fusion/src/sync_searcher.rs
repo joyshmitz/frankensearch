@@ -305,26 +305,12 @@ impl SyncTwoTierSearcher {
                 k,
             )
         } else {
-            // Borrow doc_ids straight from fast_hits (which outlives this scope)
-            // — these maps are only `.get()` looked up by `&str`, so keying on
-            // `&str` drops a per-candidate `String` clone. The quality map pairs
-            // each fast doc_id with its aligned quality score (the same entries
-            // the materialized `quality_hits` carried).
-            let fast_scores = fast_hits
-                .iter()
-                .map(|hit| (hit.doc_id.as_str(), hit.score))
-                .collect::<AHashMap<&str, f32>>();
-            let quality_scores = fast_hits
-                .iter()
-                .zip(quality_scores.iter())
-                .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
-                .collect::<AHashMap<&str, f32>>();
-            unique_vector_hits_to_scored_results_owned(
+            unique_vector_hits_to_scored_results_aligned_owned(
                 blended,
                 k,
                 ScoreSource::SemanticQuality,
-                Some(&fast_scores),
-                Some(&quality_scores),
+                &fast_hits,
+                &quality_scores,
             )
         };
 
@@ -524,34 +510,94 @@ fn vector_hits_to_scored_results(
         .collect()
 }
 
-fn unique_vector_hits_to_scored_results_owned(
+type AlignedScores = (f32, Option<f32>);
+
+enum AlignedScoreLookup {
+    Dense {
+        base: u32,
+        scores: Vec<Option<AlignedScores>>,
+    },
+    Hash(AHashMap<u32, AlignedScores>),
+    Empty,
+}
+
+impl AlignedScoreLookup {
+    fn new(fast_hits: &[VectorHit], quality_scores: &[Option<f32>]) -> Self {
+        let Some(first) = fast_hits.first() else {
+            return Self::Empty;
+        };
+        let (mut min_index, mut max_index) = (first.index, first.index);
+        for hit in &fast_hits[1..] {
+            min_index = min_index.min(hit.index);
+            max_index = max_index.max(hit.index);
+        }
+
+        let span = max_index.saturating_sub(min_index).saturating_add(1);
+        let dense_limit = u32::try_from(fast_hits.len().saturating_mul(4).saturating_add(1024))
+            .unwrap_or(u32::MAX);
+
+        if span <= dense_limit {
+            let span = usize::try_from(span).expect("dense score lookup span fits usize");
+            let mut scores = vec![None; span];
+            for (position, hit) in fast_hits.iter().enumerate() {
+                let slot = usize::try_from(hit.index.saturating_sub(min_index))
+                    .expect("dense score lookup offset fits usize");
+                scores[slot] = Some((hit.score, quality_scores.get(position).copied().flatten()));
+            }
+            Self::Dense {
+                base: min_index,
+                scores,
+            }
+        } else {
+            let mut scores = AHashMap::with_capacity(fast_hits.len());
+            for (position, hit) in fast_hits.iter().enumerate() {
+                scores.insert(
+                    hit.index,
+                    (hit.score, quality_scores.get(position).copied().flatten()),
+                );
+            }
+            Self::Hash(scores)
+        }
+    }
+
+    fn get(&self, index: u32) -> Option<AlignedScores> {
+        match self {
+            Self::Dense { base, scores } => index
+                .checked_sub(*base)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|offset| scores.get(offset))
+                .copied()
+                .flatten(),
+            Self::Hash(scores) => scores.get(&index).copied(),
+            Self::Empty => None,
+        }
+    }
+}
+
+fn unique_vector_hits_to_scored_results_aligned_owned(
     hits: Vec<VectorHit>,
     k: usize,
     source: ScoreSource,
-    fast_scores: Option<&AHashMap<&str, f32>>,
-    quality_scores: Option<&AHashMap<&str, f32>>,
+    fast_hits: &[VectorHit],
+    quality_scores: &[Option<f32>],
 ) -> Vec<ScoredResult> {
-    // `blend_two_tier` materializes one row per merged doc_id via a HashMap, so
-    // its output is already unique. Consume that owned vector and move each
-    // `doc_id` into the final row instead of cloning it through the generic
-    // borrowed converter, which still handles raw vector hits that may need
-    // first-occurrence deduplication.
+    // `blend_two_tier_aligned_vector_index` is only used with vector-index hits,
+    // whose `(index, doc_id)` pairs are unique. The blended output preserves the
+    // original vector index, so we can recover fast/quality scores through a
+    // numeric aligned lookup instead of building two `doc_id`-hashed maps and
+    // probing both for every output row.
+    let score_lookup = AlignedScoreLookup::new(fast_hits, quality_scores);
     hits.into_iter()
         .take(k)
         .map(|hit| {
-            let fast_score = fast_scores
-                .and_then(|scores| scores.get(hit.doc_id.as_str()))
-                .copied()
-                .or(Some(hit.score));
-            let quality_score = quality_scores
-                .and_then(|scores| scores.get(hit.doc_id.as_str()))
-                .copied();
+            let (fast_score, quality_score) =
+                score_lookup.get(hit.index).unwrap_or((hit.score, None));
             ScoredResult {
                 doc_id: hit.doc_id,
                 score: hit.score,
                 source,
                 index: Some(hit.index),
-                fast_score,
+                fast_score: Some(fast_score),
                 quality_score,
                 lexical_score: None,
                 rerank_score: None,
@@ -636,6 +682,76 @@ mod tests {
         fn name(&self) -> &'static str {
             "exclude-b"
         }
+    }
+
+    fn vector_hit(doc_id: &str, index: u32, score: f32) -> VectorHit {
+        VectorHit {
+            doc_id: doc_id.into(),
+            index,
+            score,
+        }
+    }
+
+    fn assert_aligned_result_scores(indices: [u32; 3]) {
+        let fast_hits = vec![
+            vector_hit("a", indices[0], 0.9),
+            vector_hit("b", indices[1], 0.7),
+            vector_hit("c", indices[2], 0.5),
+        ];
+        let quality_scores = vec![Some(0.2), None, Some(0.95)];
+        let blended = vec![
+            vector_hit("c", indices[2], 0.91),
+            vector_hit("a", indices[0], 0.88),
+            vector_hit("b", indices[1], 0.77),
+        ];
+
+        let fast_by_doc = fast_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect::<AHashMap<&str, f32>>();
+        let quality_by_doc = fast_hits
+            .iter()
+            .zip(quality_scores.iter())
+            .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
+            .collect::<AHashMap<&str, f32>>();
+        let expected_scores = blended
+            .iter()
+            .map(|hit| {
+                (
+                    hit.doc_id.clone(),
+                    hit.score,
+                    fast_by_doc
+                        .get(hit.doc_id.as_str())
+                        .copied()
+                        .or(Some(hit.score)),
+                    quality_by_doc.get(hit.doc_id.as_str()).copied(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let actual = unique_vector_hits_to_scored_results_aligned_owned(
+            blended,
+            3,
+            ScoreSource::SemanticQuality,
+            &fast_hits,
+            &quality_scores,
+        );
+        assert_eq!(actual.len(), expected_scores.len());
+        for (actual, (doc_id, score, fast_score, quality_score)) in
+            actual.iter().zip(expected_scores)
+        {
+            assert_eq!(actual.doc_id, doc_id);
+            assert_eq!(actual.score.to_bits(), score.to_bits());
+            assert_eq!(actual.fast_score, fast_score);
+            assert_eq!(actual.quality_score, quality_score);
+            assert_eq!(actual.source, ScoreSource::SemanticQuality);
+        }
+    }
+
+    #[test]
+    fn aligned_numeric_score_lookup_matches_doc_id_maps() {
+        assert_aligned_result_scores([10, 11, 12]);
+        assert_aligned_result_scores([7, 50_000, 90_000]);
     }
 
     #[test]

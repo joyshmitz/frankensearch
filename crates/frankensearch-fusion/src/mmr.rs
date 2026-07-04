@@ -174,10 +174,10 @@ pub fn mmr_rerank(
             .collect()
     });
     let sim = |i: usize, j: usize| -> f64 {
-        match &root_norms {
-            Some(rn) => cosine_sim_pre(embeddings[i], embeddings[j], rn[i], rn[j]),
-            None => cosine_sim(embeddings[i], embeddings[j]),
-        }
+        root_norms.as_ref().map_or_else(
+            || cosine_sim(embeddings[i], embeddings[j]),
+            |rn| cosine_sim_pre(embeddings[i], embeddings[j], rn[i], rn[j]),
+        )
     };
 
     // Select first document: pure relevance (highest score).

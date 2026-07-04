@@ -457,14 +457,25 @@ pub fn rrf_fuse_with_graph_merge(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
-    rrf_fuse_merge_inner(lexical, semantic, graph, graph_weight, limit, offset, config, true)
+    rrf_fuse_merge_inner(
+        lexical,
+        semantic,
+        graph,
+        graph_weight,
+        limit,
+        offset,
+        config,
+        true,
+    )
 }
 
 /// Like [`rrf_fuse_with_graph_merge`] but **assumes the `semantic` slice has no
-/// duplicate `doc_id`s** (true for any vector-index `search_top_k` result), so it
-/// skips the O(N) `seen_semantic` dedup set — saving N hash-inserts on the hot
-/// `limit_all` path. Identical output to the dedup version whenever `semantic` is
-/// in fact unique; only diverges on (never-produced) duplicate semantic hits.
+/// duplicate `doc_id`s**.
+///
+/// That is true for any vector-index `search_top_k` result, so this skips the
+/// O(N) `seen_semantic` dedup set — saving N hash-inserts on the hot `limit_all`
+/// path. Output is identical to the dedup version whenever `semantic` is in fact
+/// unique; it only diverges on never-produced duplicate semantic hits.
 #[must_use]
 pub fn rrf_fuse_with_graph_merge_unique(
     lexical: &[ScoredResult],
@@ -475,7 +486,16 @@ pub fn rrf_fuse_with_graph_merge_unique(
     offset: usize,
     config: &RrfConfig,
 ) -> Vec<FusedHit> {
-    rrf_fuse_merge_inner(lexical, semantic, graph, graph_weight, limit, offset, config, false)
+    rrf_fuse_merge_inner(
+        lexical,
+        semantic,
+        graph,
+        graph_weight,
+        limit,
+        offset,
+        config,
+        false,
+    )
 }
 
 #[must_use]
@@ -502,12 +522,16 @@ fn rrf_fuse_merge_inner(
     // map version's `Entry::Occupied … continue`).
     let mut lex_map: AHashMap<&str, (usize, f32)> = AHashMap::with_capacity(lexical.len());
     for (rank, result) in lexical.iter().enumerate() {
-        lex_map.entry(result.doc_id.as_str()).or_insert((rank, result.score));
+        lex_map
+            .entry(result.doc_id.as_str())
+            .or_insert((rank, result.score));
     }
     let mut graph_map: AHashMap<&str, (usize, f32)> = AHashMap::with_capacity(graph_len);
     if graph_active {
         for (rank, result) in graph.iter().enumerate() {
-            graph_map.entry(result.doc_id.as_str()).or_insert((rank, result.score));
+            graph_map
+                .entry(result.doc_id.as_str())
+                .or_insert((rank, result.score));
         }
     }
 
@@ -528,7 +552,11 @@ fn rrf_fuse_merge_inner(
             continue;
         }
         let lex = lex_map.remove(doc_id);
-        let gr = if graph_active { graph_map.remove(doc_id) } else { None };
+        let gr = if graph_active {
+            graph_map.remove(doc_id)
+        } else {
+            None
+        };
         let mut rrf_score = rank_contribution(k, rank) * semantic_weight;
         if let Some((lex_rank, _)) = lex {
             rrf_score += rank_contribution(k, lex_rank) * lexical_weight;
@@ -552,7 +580,11 @@ fn rrf_fuse_merge_inner(
 
     // Lexical-only docs (never seen in semantic).
     for (doc_id, (lex_rank, lex_score)) in lex_map.drain() {
-        let gr = if graph_active { graph_map.remove(doc_id) } else { None };
+        let gr = if graph_active {
+            graph_map.remove(doc_id)
+        } else {
+            None
+        };
         let mut rrf_score = rank_contribution(k, lex_rank) * lexical_weight;
         if let Some((graph_rank, _)) = gr {
             rrf_score += rank_contribution(k, graph_rank) * graph_weight;
@@ -718,8 +750,7 @@ mod tests {
             let offset = (next() % 5) as usize;
 
             let a = rrf_fuse_with_graph(&lexical, &semantic, &graph, gw, limit, offset, &cfg);
-            let b =
-                rrf_fuse_with_graph_merge(&lexical, &semantic, &graph, gw, limit, offset, &cfg);
+            let b = rrf_fuse_with_graph_merge(&lexical, &semantic, &graph, gw, limit, offset, &cfg);
 
             assert_eq!(a.len(), b.len(), "trial {trial}: length differs");
             for (i, (x, y)) in a.iter().zip(&b).enumerate() {
@@ -731,10 +762,22 @@ mod tests {
                     x.rrf_score,
                     y.rrf_score
                 );
-                assert_eq!(x.lexical_rank, y.lexical_rank, "trial {trial} row {i}: lexical_rank");
-                assert_eq!(x.semantic_rank, y.semantic_rank, "trial {trial} row {i}: semantic_rank");
-                assert_eq!(x.semantic_index, y.semantic_index, "trial {trial} row {i}: semantic_index");
-                assert_eq!(x.in_both_sources, y.in_both_sources, "trial {trial} row {i}: in_both");
+                assert_eq!(
+                    x.lexical_rank, y.lexical_rank,
+                    "trial {trial} row {i}: lexical_rank"
+                );
+                assert_eq!(
+                    x.semantic_rank, y.semantic_rank,
+                    "trial {trial} row {i}: semantic_rank"
+                );
+                assert_eq!(
+                    x.semantic_index, y.semantic_index,
+                    "trial {trial} row {i}: semantic_index"
+                );
+                assert_eq!(
+                    x.in_both_sources, y.in_both_sources,
+                    "trial {trial} row {i}: in_both"
+                );
                 assert_eq!(
                     x.lexical_score.map(f32::to_bits),
                     y.lexical_score.map(f32::to_bits),
@@ -972,7 +1015,10 @@ mod tests {
 
         // Default (lexical-favoring): the lexical-only doc always wins the tie.
         let d = rrf_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
-        assert_eq!(d[0].doc_id, "alpha", "default tiebreak favors the lexical-only doc");
+        assert_eq!(
+            d[0].doc_id, "alpha",
+            "default tiebreak favors the lexical-only doc"
+        );
 
         // Hash tiebreak: order decided by an unbiased hash of doc_id, not the tier.
         let hash_cfg = RrfConfig {
