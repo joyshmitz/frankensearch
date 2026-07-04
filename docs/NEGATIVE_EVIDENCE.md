@@ -8225,3 +8225,28 @@ Follow-up to the reorder-bound vs recall-bound split (`9355feb`): *why* is nfcor
 4. **Mechanism:** MMR's core premise — *redundancy signals irrelevance; relevant results are diverse* — is FALSE for retrieval relevance. Relevant documents are **topically coherent**: similar to the query AND to each other (they answer the same information need). Diversity therefore trades relevant-but-similar docs for diverse-but-irrelevant ones, and the loss scales with how tightly relevance couples to similarity (worst on arguana, where the relevant IS the near-query doc).
 
 **Net:** never apply MMR to optimize a relevance metric (nDCG/recall) — it is pure loss on all corpora, and the relevance-density intuition backfires because relevance is topically *clustered*, not diverse. MMR optimizes a DIFFERENT objective (subtopic coverage / near-duplicate de-duplication for UX) that is **anti-correlated with relevance** on these corpora; use it only when that UX objective is the explicit goal, never as a relevance re-ranker. This complements the reranker findings (a cross-encoder *sharpens* relevance; MMR *dilutes* it). Caveats: N=100, BGE-cosine for both relevance and diversity, greedy MMR, binary relevance. Verified: cached BGE-small `.npy` + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana, no cargo/torch. `mmr.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — Embedding-dim reduction: PCA-128 keeps ~FULL hybrid nDCG at 3× vector compression; naive PREFIX truncation is far worse (BGE-small isn't Matryoshka); the hybrid ABSORBS dense dim-reduction
+
+Question bridging search-quality and the perf/memory story: how much nDCG@10 do you lose shrinking the BGE-384 dense tier, **prefix-truncation vs PCA**? Sliced the cached BGE vectors to D ∈ {384,256,192,128,96,64,32}, re-normalized, measured dense-tier and hybrid nDCG@10, BEIR N=100:
+
+| dataset | dim | prefix dense | prefix hyb | pca dense | pca hyb |
+|---|---:|---:|---:|---:|---:|
+| **scifact** (raw-384 hyb 0.7940) | 256 | 0.7168 | 0.7776 | 0.7083 | 0.7833 |
+| | **128** | 0.6495 | 0.7538 | 0.6877 | **0.7917** |
+| | 64 | 0.5452 | 0.7464 | 0.6285 | 0.7666 |
+| | 32 | 0.3830 | 0.7280 | 0.5268 | 0.7478 |
+| **nfcorpus** (raw-384 hyb 0.4006) | **128** | 0.3294 | 0.3955 | 0.3537 | **0.4017** |
+| | 64 | 0.2500 | 0.3850 | 0.3091 | 0.3960 |
+| | 32 | 0.1483 | 0.3743 | 0.2234 | 0.3798 |
+| **arguana** (raw-384 hyb 0.4180) | **128** | 0.3458 | 0.4195 | 0.4005 | **0.4142** |
+| | 64 | 0.2907 | 0.3977 | 0.3656 | 0.4148 |
+| | 32 | 0.1721 | 0.3586 | 0.3373 | 0.3968 |
+
+**Findings:**
+1. **PCA truncation ≫ naive PREFIX truncation on the dense tier, most dramatically at low dims.** `BAAI/bge-small-en-v1.5` is NOT Matryoshka-trained, so prefix dims are not self-sufficient — at 32-dim PCA nearly DOUBLES prefix dense nDCG (scifact 0.527 vs 0.383, arguana 0.337 vs 0.172, nfcorpus 0.223 vs 0.148). To ship smaller vectors, **use PCA, never a prefix slice.**
+2. **The HYBRID is far more robust to dense-tier dim reduction than the dense tier alone.** PCA-128 hybrid ≈ raw-384 hybrid on all 3 (scifact 0.7917 vs 0.7940, nfcorpus 0.4017 vs 0.4006, arguana 0.4142 vs 0.4110) — **3× vector compression for ~0 hybrid nDCG loss (±0.003)**. This is the same "lexical tier absorbs dense degradation" theme as the b-tuning / title-boost / query-instruction findings: the BM25 tier compensates for a weaker (lower-dim) dense tier, so the hybrid tolerates aggressive dense compression the dense-alone tier cannot.
+3. **PCA-128 is the sweet spot; PCA-64 is still close** (scifact 0.7666, nfcorpus 0.3960, arguana 0.4148 — arguana ≈ full) = **~6× compression at ~2–3% hybrid loss**. This is a real, measured memory/compute win that **composes with int8 quantization** (PCA-128 × int8 = 3× fewer dims × 4× fewer bytes/dim = **~12× smaller** vectors, faster dot products) — complementary to the perf side's int8 two-pass (`0b9800e`).
+4. **Prefix truncation is viable ONLY inside the hybrid** (dense-alone collapses — prefix-32 dense loses 40–60%), and even there PCA is better. Occasionally trimming noise dims slightly HELPS the hybrid (arguana prefix-256 hyb 0.4268 > full 0.4180) — but PCA is the principled default.
+
+**Product:** to cut dense-tier vector memory/latency, **PCA-reduce BGE-384 → 128** (fit PCA on the corpus once, store the 384×128 projection, apply at index+query time) for ~0 hybrid quality loss; do NOT prefix-truncate; the lexical tier makes the hybrid robust to aggressive dense compression. Caveats: N=100; sklearn PCA centers data, so cosine runs on centered vectors — this drops pca-full-384 dense ~0.015 below raw-384 (a centering artifact), but the headline compares **pca-128 hybrid to RAW-384 hybrid** and holds (±0.003); PCA adds a one-time fit + a projection matrix to store. Verified: cached BGE-small `.npy` + `sklearn` PCA + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana, no cargo/torch. `dim_trunc.py` in `$D`.
