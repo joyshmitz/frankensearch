@@ -8112,3 +8112,24 @@ b-profile @k1=1.5 (hybrid, b=[0,.25,.5,.75,1]): scifact **flat** 0.801/0.800/0.7
 4. **Hybrid-optimal b ≥ standalone-optimal b on all 3** (scifact 0.75>0.25, nfcorpus 1.0>0.5, arguana 1.0=1.0): confirms the **complement hypothesis** — with the vector tier supplying recall, the lexical tier can lean harder on length-normalization (precision) without losing coverage. The hybrid *wants* a more length-aggressive BM25 than you'd tune standalone.
 
 **Practical:** leave **k1 at default** (inert); set **b by corpus doc-length** — 0.75 is fine for short/medium corpora in the hybrid, but for **LONG-doc corpora raise b toward 1.0** (+0.016 nDCG in the hybrid, +0.046 standalone). A length-adaptive b (scale b up with avg doc length) is the one cheap, safe BM25 default improvement; it does NOT require labels (avg doc length is a corpus statistic). This does NOT retract "stemming/analysis is the biggest lexical lever" (`657df16`) — b-tuning is second-order to the analyzer — but it is the next lexical knob after the analyzer, and unlike RM3 (`b8a027c`) it has a *label-free* corpus-statistic rule. Caveats: N=100; benign `rank_bm25` divide-warning at b=0 (empty-after-tokenization docs → NaN in a few doc scores; doesn't move aggregates — optima are all at b≥0.25); grid resolution 0.25 in b. Verified: `rank_bm25` stem+stop (snowball) + cached BGE-small `.npy`, BEIR scifact/nfcorpus/arguana, no cargo/torch. `bm25_params.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — TITLE/FIELD BOOST helps STANDALONE BM25 (~+0.011–0.014 @3× on substantive titles) but is REDUNDANT-to-HARMFUL in the hybrid — the contextual vector tier already absorbs title semantics; NO title-boost default for the hybrid
+
+Every arc finding concatenated `title+text` at equal weight, untested. Tested up-weighting the title via term-repetition field boost (boost = 0=body-only, 1=equal concat [arc baseline], 2/3/5 = title repeated N× + body), STANDALONE BM25 vs contextual-BGE HYBRID, BEIR N=100, nDCG@10. Title richness (avg stemmed title length): scifact 10.0, nfcorpus 9.4, **arguana 2.7** tokens (arguana "titles" are near-empty — argument text has no real title). Δ vs the concat baseline:
+
+| dataset (avg_tlen, vec-alone) | boost | BM25-alone Δ | hybrid Δ |
+|---|---|---:|---:|
+| **scifact** (10.0, vec 0.753) | body-only | −0.0014 | **+0.0038** |
+| | title×3 | **+0.0143** | −0.0010 |
+| **nfcorpus** (9.4, vec 0.387) | body-only | −0.0145 | −0.0083 |
+| | title×3 | **+0.0113** | **+0.0063** |
+| **arguana** (2.7, vec 0.411) | body-only | −0.0235 | −0.0138 |
+| | title×2 | −0.0059 | **+0.0025** |
+
+**Findings:**
+1. **The title field carries real signal** — dropping it (body-only) is the WORST config for standalone on all 3 (−0.0014/−0.0145/−0.0235) and worst hybrid on 2/3. The one exception is telling: **scifact HYBRID body-only is BEST** (+0.0038, and every title-boost is net-negative there).
+2. **Title-BOOSTING (>1×) reliably helps STANDALONE where titles are substantive** — scifact +0.0143, nfcorpus +0.0113 at title×3 — but HURTS where titles are trivial (arguana, all boosts negative; its 2.7-token titles have little to boost and over-weighting dilutes). Optimal ~**3×**; ×5 over-weights and regresses everywhere.
+3. **In the HYBRID, title-boost is marginal-to-negative with NO safe default**: scifact *any* boost is negative (body-only wins), nfcorpus +0.0063 @×3, arguana +0.0025 @×2. The contextual vector tier (embedded on title+text) already absorbs title semantics, so a lexical title-boost is **redundant** — and most harmful exactly on the corpus the embedder captures best (**scifact**, highest vec-alone 0.753 → the only corpus where the hybrid prefers dropping the title from the lexical tier entirely).
+4. **Theme, mirroring the BM25-`b` finding (`43be67e`)**: lexical micro-optimizations that help standalone BM25 (b-tuning, title-boost) are largely **ABSORBED by the contextual vector tier in the hybrid**. The hybrid's value is cross-tier **decorrelation**, not stacking lexical precision tricks — a strong embedder makes them redundant, and where the embedder is strongest they turn net-negative.
+
+**Practical:** a **lexical-only** system should boost the title ~3× (+0.011–0.014, but only for substantive titles — skip corpora with trivial ones); the **HYBRID (the product) should NOT add a title-boost default** — it is redundant with the contextual vector tier, marginal-to-negative, and worst where the embedder is strongest. Keep simple equal concat. Caveats: term-repetition boost approximates but is not exact BM25F; N=100; dense tier fixed on the cached title+text BGE `.npy` (only the lexical field-weighting varies). Verified: `rank_bm25` stem+stop (snowball) + cached BGE-small `.npy`, BEIR scifact/nfcorpus/arguana, no cargo/torch. `title_boost.py` in `$D`.
