@@ -7485,3 +7485,47 @@ the very short (1–2 token) NFCorpus queries where the vector tier is weakest, 
 a **single static stronger-tier weight** (`4cc3b47`/`44566fd`) and closes query-adaptive tier weighting as a lever.
 Verified: `model2vec` retrieval-32M + `rank_bm25`, per-query-length-tertile recall + qlen-adaptive RRF weight sweep, BEIR
 SciFact / NFCorpus (no cargo).
+
+---
+
+### BOLD lexical `LexicalIdHit` doc_id move is NOT a landable win on current main (Codex, 2026-07-04)
+
+**Scratch/worktree scan:** no unpublished measured positive worktree commit was found. The only unlanded scratch-style
+candidate still relevant to the remaining BOLD legacy-original ratio was the benchmark-side conversion of
+`Vec<LexicalIdHit>` into `Vec<ScoredResult>` by moving `hit.doc_id` instead of cloning it. That targets the current
+`limit_all` residual, where the hash-hybrid BOLD path short-circuits to lexical results and pays full `ScoredResult`
+materialization while the Tantivy-class original returns bare doc ids.
+
+**Alien dig:** `/alien-graveyard` and `/alien-artifact-coding` mapped the remaining measured gap to query-processing
+constants, vectorized execution, Swiss-table/hash-map shape, sort-key materialization, and "constants kill you" evidence
+discipline. Those families are already covered on main for this comparator lane: RRF merge/unique, unstable and parallel
+sorts, CompactString doc ids, boxed explanations, Arc metadata, reciprocal LUT rejection, ANN rejection, two-vector-pass
+inherence, and result-assembly move paths. The remaining candidate here was intentionally narrow and only kept if the
+current per-crate BOLD ratio supported it.
+
+**Measured command:** `AGENT_NAME=Codex CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-codex-move-scored
+rch exec -- cargo bench -p frankensearch --features lexical --profile release --bench search_bench
+bold_verify_tantivy_class -- --sample-size 10 --warm-up-time 1 --measurement-time 1`.
+Cargo's `bench` subcommand in this workspace supports `--profile release`; it does not expose a `--release` flag.
+RCH queue build `29914252970033618`, worker `ovh-a`; candidate worktree head `2064e55` plus the uncommitted move hunk.
+Source hunk dropped after measurement.
+
+| workload | docs | query | engine | original p50 us | candidate p50 us | ratio vs original | decision |
+|---|---:|---|---|---:|---:|---:|---|
+| `bold_verify/top10` | 10k | exact_identifier | hash_hybrid | 106 | 106 | 1.000 | no win |
+| `bold_verify/top10` | 10k | exact_identifier | lexical_guard | 106 | 131 | 1.236 | reject |
+| `bold_verify/top10` | 10k | short_keyword | hash_hybrid | 50 | 45 | 0.900 | isolated win |
+| `bold_verify/top10` | 10k | short_keyword | lexical_guard | 50 | 36 | 0.720 | isolated win |
+| `bold_verify/top10` | 10k | quoted_phrase | hash_hybrid | 125 | 127 | 1.016 | no win |
+| `bold_verify/top10` | 10k | high_fanout | hash_hybrid | 71 | 72 | 1.014 | no win |
+| `bold_verify/limit_all` | 10k | limit_all | hash_hybrid | 629 | 708 | 1.126 | still slower |
+| `bold_verify/limit_all` | 10k | limit_all | lexical_guard | 629 | 894 | 1.421 | reject |
+| `bold_verify/top10` | 100k | exact_identifier | hash_hybrid | 565 | 572 | 1.012 | no win |
+| `bold_verify/top10` | 100k | exact_identifier | lexical_guard | 565 | 758 | 1.342 | reject |
+| `bold_verify/top10` | 100k | zero_hit | hash_hybrid | 54 | 51 | 0.944 | isolated win |
+
+**Decision:** reject and leave code unchanged. The move hunk does not produce a clean measured win versus the legacy
+original; the only attractive rows are isolated top-10/no-hit noise while the exact-id and `limit_all` lexical-guard rows
+regress well beyond the 1.03 stop line. This closes the obvious scratch candidate without re-opening already covered
+RRF/sort/hash/ANN/LUT work. The durable blocker remains the same: BOLD `limit_all` asks frankensearch to materialize full
+typed `ScoredResult`s for every document, while the legacy original returns bare Tantivy doc ids.

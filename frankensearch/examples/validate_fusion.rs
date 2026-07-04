@@ -190,8 +190,14 @@ fn main() {
     // ── Step 4: RRF K parameter sensitivity ───────────────────────────────
     log_info("RRF", "Testing K parameter sensitivity...");
 
-    let low_k = RrfConfig { k: 1.0 };
-    let high_k = RrfConfig { k: 1000.0 };
+    let low_k = RrfConfig {
+        k: 1.0,
+        ..RrfConfig::default()
+    };
+    let high_k = RrfConfig {
+        k: 1000.0,
+        ..RrfConfig::default()
+    };
 
     let fused_low = rrf_fuse(&lexical, &semantic, 10, 0, &low_k);
     let fused_high = rrf_fuse(&lexical, &semantic, 10, 0, &high_k);

@@ -289,7 +289,10 @@ fn rrf_output_feeds_blend_correctly() {
         hit("doc-4", 0.70, 2),
     ];
 
-    let rrf_config = RrfConfig { k: 60.0 };
+    let rrf_config = RrfConfig {
+        k: 60.0,
+        ..RrfConfig::default()
+    };
     let fused = rrf_fuse(&lexical, &semantic, 10, 0, &rrf_config);
 
     // doc-1 and doc-2 appear in both → higher RRF scores
@@ -809,7 +812,10 @@ fn rrf_with_all_zero_scores_still_ranks_by_position() {
     let lexical = vec![scored("a", 0.0), scored("b", 0.0), scored("c", 0.0)];
     let semantic = vec![hit("b", 0.0, 0), hit("c", 0.0, 1), hit("a", 0.0, 2)];
 
-    let config = RrfConfig { k: 60.0 };
+    let config = RrfConfig {
+        k: 60.0,
+        ..RrfConfig::default()
+    };
     let fused = rrf_fuse(&lexical, &semantic, 10, 0, &config);
 
     // All docs should be present with valid (non-NaN) scores
@@ -943,7 +949,10 @@ fn rrf_deterministic_ordering_with_ties() {
     let lexical = vec![scored("a", 5.0), scored("b", 5.0), scored("c", 5.0)];
     let semantic = vec![hit("a", 0.9, 0), hit("b", 0.9, 1), hit("c", 0.9, 2)];
 
-    let config = RrfConfig { k: 60.0 };
+    let config = RrfConfig {
+        k: 60.0,
+        ..RrfConfig::default()
+    };
 
     // Run twice → same output
     let fused1 = rrf_fuse(&lexical, &semantic, 10, 0, &config);
@@ -958,7 +967,10 @@ fn rrf_deterministic_ordering_with_ties() {
 
 #[test]
 fn rrf_lexical_only_and_semantic_only() {
-    let config = RrfConfig { k: 60.0 };
+    let config = RrfConfig {
+        k: 60.0,
+        ..RrfConfig::default()
+    };
 
     // Lexical-only
     let lexical = vec![scored("a", 10.0), scored("b", 5.0)];
@@ -977,7 +989,10 @@ fn rrf_lexical_only_and_semantic_only() {
 
 #[test]
 fn rrf_offset_and_limit_pagination() {
-    let config = RrfConfig { k: 60.0 };
+    let config = RrfConfig {
+        k: 60.0,
+        ..RrfConfig::default()
+    };
     let lexical: Vec<ScoredResult> = (0..10)
         .map(|i| {
             scored(
@@ -1019,7 +1034,16 @@ fn score_calibration_maps_rrf_scores_to_probabilities() {
         hit("d", 0.40, 3),
     ];
 
-    let fused = rrf_fuse(&lexical, &semantic, 10, 0, &RrfConfig { k: 60.0 });
+    let fused = rrf_fuse(
+        &lexical,
+        &semantic,
+        10,
+        0,
+        &RrfConfig {
+            k: 60.0,
+            ..RrfConfig::default()
+        },
+    );
     let raw_scores: Vec<f64> = fused.iter().map(|h| h.rrf_score).collect();
     let labels = vec![1.0, 1.0, 0.0, 0.0];
 
