@@ -19,6 +19,41 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-04 - sync refined lexical RRF unique path is a kept internal win; external original-comparator ratio is N/A (CobaltRidge)
+
+**Ledger entry for the land:** wired `SyncTwoTierSearcher`'s refined lexical fusion call from the
+legacy semantic-dedup RRF merge to `rrf_fuse_with_graph_merge_unique`. The semantic input at this
+callsite is `blended = blend_two_tier_aligned(&fast_hits, &quality_scores, ...)`; it is one row per
+`fast_hits` entry and therefore inherits the vector-index result's unique doc ids. The skipped
+`seen_semantic` set cannot change output for this path.
+
+**Measured command (per-crate, strict RCH remote `ovh-a`, same benchmark binary):**
+
+```bash
+AGENT_NAME=CobaltRidge \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 RUST_LOG=off \
+  rch --no-self-healing exec -- cargo bench -p frankensearch-fusion --profile release \
+    --bench collect_limit_all refined_rrf_callsite \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+`cargo bench --release` was tried first in this turn and Cargo rejected it with
+`unexpected argument '--release'`; the working per-crate release profile form is `--profile release`.
+
+| Workload | ORIG legacy dedup | Candidate unique | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `refined_rrf_callsite/dedup -> unique` (N=10k) | 770.14 us | 661.37 us | **0.859 (~1.164x faster)** | keep |
+
+The bench constructs the exact refined-callsite shape (`blend_two_tier_aligned` output plus lexical
+hits), asserts full `FusedHit` equality before timing, then benchmarks old and new arms in one run.
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an internal
+fusion primitive deployment, not a standalone search-quality comparator. An attempted end-to-end
+`collect_limit_all/lexical_collect` baseline on `hz2` measured 8.4706 ms before the source patch, but
+`rch` worker placement would not reliably pin the post-patch run to `hz2`; do not use cross-worker
+end-to-end timings for this lever.
+
 ### 2026-07-04 - lexical `ord` column cache array is no gain and regresses the large materialization row (CobaltRidge)
 
 **Lever tested and reverted:** replaced `TantivyIndex::collect_id_hits`'s lazy

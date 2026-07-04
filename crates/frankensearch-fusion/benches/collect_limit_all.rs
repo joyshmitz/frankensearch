@@ -26,8 +26,13 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use frankensearch_core::{SearchPhase, TwoTierConfig};
-use frankensearch_fusion::SyncTwoTierSearcher;
+use frankensearch_core::{
+    ScoreSource, ScoredResult, SearchPhase, SearchResult, TwoTierConfig, VectorHit,
+};
+use frankensearch_fusion::rrf::{
+    RrfConfig, RrfTiebreak, rrf_fuse, rrf_fuse_with_graph_merge_unique,
+};
+use frankensearch_fusion::{SyncLexicalSearch, SyncTwoTierSearcher, blend_two_tier_aligned};
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 
 const N: usize = 10_000;
@@ -70,11 +75,60 @@ fn make_vector(centroids: &[Vec<f32>], c: usize, noise_seed: u64) -> Vec<f32> {
     )
 }
 
+fn lexical_result(doc_id: &str, score: f32) -> ScoredResult {
+    ScoredResult {
+        doc_id: doc_id.into(),
+        score,
+        source: ScoreSource::Lexical,
+        index: None,
+        fast_score: None,
+        quality_score: None,
+        lexical_score: Some(score),
+        rerank_score: None,
+        explanation: None,
+        metadata: None,
+    }
+}
+
+fn make_lexical_hits(ids: &[String]) -> Vec<ScoredResult> {
+    ids.iter()
+        .step_by(5)
+        .enumerate()
+        .map(|(rank, id)| lexical_result(id, (N - rank) as f32))
+        .collect()
+}
+
+fn make_ranked_vector_hits(ids: &[String]) -> Vec<VectorHit> {
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| VectorHit {
+            index: u32::try_from(i).expect("bench N fits in u32"),
+            score: 1.0 - (i as f32 / N as f32),
+            doc_id: id.clone().into(),
+        })
+        .collect()
+}
+
+fn make_quality_scores() -> Vec<Option<f32>> {
+    (0..N).map(|i| Some(1.0 - (i as f32 / N as f32))).collect()
+}
+
+struct StaticLexical {
+    hits: Vec<ScoredResult>,
+}
+
+impl SyncLexicalSearch for StaticLexical {
+    fn search_sync(&self, _query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>> {
+        Ok(self.hits.iter().take(limit).cloned().collect())
+    }
+}
+
 fn bench_collect_limit_all(c: &mut Criterion) {
     let centroids: Vec<Vec<f32>> = (0..CLUSTERS)
         .map(|i| normalize(raw_vector(0xc000_0000 + i as u64)))
         .collect();
     let ids: Vec<String> = (0..N).map(|i| format!("doc-{i:06}")).collect();
+    let lexical_hits = make_lexical_hits(&ids);
     let fast_vecs: Vec<Vec<f32>> = (0..N)
         .map(|i| make_vector(&centroids, i % CLUSTERS, i as u64 + 1))
         .collect();
@@ -84,7 +138,9 @@ fn bench_collect_limit_all(c: &mut Criterion) {
     let fast = InMemoryVectorIndex::from_vectors(ids.clone(), fast_vecs, DIM).expect("fast");
     let quality = InMemoryVectorIndex::from_vectors(ids, quality_vecs, DIM).expect("quality");
     let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
-    let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+    let searcher = SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default());
+    let lexical_searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default())
+        .with_lexical(Arc::new(StaticLexical { hits: lexical_hits }));
 
     let queries: Vec<Vec<f32>> = (0..QUERIES)
         .map(|q| make_vector(&centroids, q % CLUSTERS, 0xdead_0000 + q as u64))
@@ -111,7 +167,14 @@ fn bench_collect_limit_all(c: &mut Criterion) {
         } => initial_results,
     };
     let iter_ids: Vec<String> = iter_results.iter().map(|r| r.doc_id.to_string()).collect();
-    assert_eq!(collect_ids, iter_ids, "collect vs iter final ranking differs");
+    assert_eq!(
+        collect_ids, iter_ids,
+        "collect vs iter final ranking differs"
+    );
+    let (lexical_results, _) = lexical_searcher
+        .search_collect(&queries[0], N)
+        .expect("lexical collect");
+    assert_eq!(lexical_results.len(), N, "lexical collect should return k");
 
     let mut qi = 0usize;
     let mut g = c.benchmark_group("collect_limit_all");
@@ -131,8 +194,78 @@ fn bench_collect_limit_all(c: &mut Criterion) {
             black_box(searcher.search_iter(black_box(q), N).count())
         });
     });
+    g.bench_function("lexical_collect", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(
+                lexical_searcher
+                    .search_collect(black_box(q), N)
+                    .expect("lexical collect"),
+            )
+        });
+    });
     g.finish();
 }
 
-criterion_group!(benches, bench_collect_limit_all);
+fn bench_refined_rrf_callsite(c: &mut Criterion) {
+    let ids: Vec<String> = (0..N).map(|i| format!("doc-{i:06}")).collect();
+    let lexical_hits = make_lexical_hits(&ids);
+    let fast_hits = make_ranked_vector_hits(&ids);
+    let quality_scores = make_quality_scores();
+    let blended = blend_two_tier_aligned(&fast_hits, &quality_scores, 0.7);
+    let config = RrfConfig {
+        k: TwoTierConfig::default().rrf_k,
+        lexical_weight: 1.0,
+        semantic_weight: 1.0,
+        tiebreak: RrfTiebreak::LexicalThenId,
+    };
+
+    let legacy = rrf_fuse(&lexical_hits, &blended, N, 0, &config);
+    let unique = rrf_fuse_with_graph_merge_unique(&lexical_hits, &blended, &[], 0.0, N, 0, &config);
+    assert_eq!(
+        legacy.len(),
+        unique.len(),
+        "legacy and unique fused lengths"
+    );
+    for (legacy_hit, unique_hit) in legacy.iter().zip(&unique) {
+        assert_eq!(legacy_hit.doc_id, unique_hit.doc_id);
+        assert_eq!(legacy_hit.rrf_score, unique_hit.rrf_score);
+        assert_eq!(legacy_hit.lexical_rank, unique_hit.lexical_rank);
+        assert_eq!(legacy_hit.semantic_rank, unique_hit.semantic_rank);
+        assert_eq!(legacy_hit.semantic_index, unique_hit.semantic_index);
+        assert_eq!(legacy_hit.lexical_score, unique_hit.lexical_score);
+        assert_eq!(legacy_hit.semantic_score, unique_hit.semantic_score);
+        assert_eq!(legacy_hit.in_both_sources, unique_hit.in_both_sources);
+    }
+
+    let mut g = c.benchmark_group("refined_rrf_callsite");
+    g.bench_function("dedup", |b| {
+        b.iter(|| {
+            black_box(rrf_fuse(
+                black_box(&lexical_hits),
+                black_box(&blended),
+                N,
+                0,
+                black_box(&config),
+            ))
+        });
+    });
+    g.bench_function("unique", |b| {
+        b.iter(|| {
+            black_box(rrf_fuse_with_graph_merge_unique(
+                black_box(&lexical_hits),
+                black_box(&blended),
+                black_box(&[]),
+                black_box(0.0),
+                N,
+                0,
+                black_box(&config),
+            ))
+        });
+    });
+    g.finish();
+}
+
+criterion_group!(benches, bench_collect_limit_all, bench_refined_rrf_callsite);
 criterion_main!(benches);
