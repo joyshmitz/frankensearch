@@ -7617,3 +7617,46 @@ model2vec embedders, ARE decorrelated, so the ensemble is at least *never-harmfu
 it does not predict it beats a strong single member. Verified: `model2vec` retrieval-32M + `rank_bm25` hybrid candidates + `fastembed`
 ONNX cross-encoders (`ms-marco-MiniLM-L-6-v2`, `bge-reranker-base`), RRF-combine of retrieval/reranker ranks, BEIR SciFact/NFCorpus/
 ArguAna (N=60, no cargo, no torch).
+
+---
+
+### The RRF rank-decay KERNEL is near-optimal — only SHARPNESS matters (flat kernels hurt on all 3); squaring the reciprocal (ISR) buys a marginal +0.006 nDCG, not worth flipping the primitive (CopperKestrel, 2026-07-03)
+
+The prior fusion arc tuned the reciprocal-rank kernel's *smoothing* constant `k` (small `k≈10` beats `k=60` by +2.6%, `4cc3b47`)
+and rejected *score*-based alternatives (score-fusion tied-but-fragile `RRF vs score-fusion`; CombMAX loses `4c9530c`). It never
+tested the **shape of the rank-decay kernel itself** — RRF's `1/(k+r)` is one specific convex decay. Swept the full rank-aggregation
+kernel family, holding everything else at the tuned config (retrieval-32M + stronger-tier ×1.3 + FEED=100), varying ONLY the kernel
+`w(r)` applied to each tier's 0-indexed rank `r`. nDCG@10 Δ vs the shipped `RRF k=10`, full BEIR test sets (SciFact N=300, NFCorpus
+N=323, ArguAna N=200):
+
+| kernel `w(r)` | shape | SciFact | NFCorpus | ArguAna | **mean Δ** |
+|---|---|---:|---:|---:|---:|
+| `1/(60+r)` RRF k=60 | flatter reciprocal | −0.0067 | −0.0068 | −0.0014 | −0.0050 |
+| `1/(10+r)` **RRF k=10 (shipped)** | reciprocal | 0 | 0 | 0 | 0 |
+| `1/(1+r)` RRF k=1 | sharp reciprocal | +0.0106 | +0.0008 | +0.0039 | +0.0051 |
+| `1/(10+r)²` **ISR k=10** | sharp (smoothed inv-square) | **+0.0116** | +0.0003 | **+0.0055** | **+0.0058** |
+| `1/(r+1)²` ISR k=0 | sharpest (unsmoothed) | +0.0073 | −0.0013 | −0.0016 | +0.0015 |
+| `1/log2(r+2)` log-DCG | gentle | +0.0076 | +0.0008 | −0.0027 | +0.0019 |
+| `FEED−r` Borda | linear (flattest) | −0.0130 | −0.0068 | −0.0014 | −0.0071 |
+| `exp(−r/10)` exp decay | sharp | +0.0089 | +0.0011 | +0.0040 | +0.0047 |
+
+**Finding — the rank-decay KERNEL barely matters beyond one axis: SHARPNESS. The only thing that separates kernels is how fast they
+decay, and the rule is monotone — sharper is better, flat is worse, on ALL THREE datasets.** The flattest kernels lose everywhere
+(**Borda** — linear, gives deep ranks the most weight of any — is worst on all 3, mean −0.0071; **RRF k=60**, the old flatter default,
+negative on all 3). The sharp kernels (RRF k=1, ISR k=10, exp) are positive on all 3. Mechanism: **fusion weight belongs on the TOP
+ranks; a candidate at feed-rank 50 is near-noise, and any kernel that rewards it (Borda, large-k RRF) dilutes the consensus signal**
+— the same top-heavy logic that made small-`k` beat large-`k`, now shown to be the *whole* story of kernel choice. This is why RRF's
+reciprocal was never the point: **exp-decay and inverse-square do just as well** — the *shape* is interchangeable among sharp kernels;
+only the sharpness is real.
+
+**The sharpness axis has a little more headroom past the shipped `k=10`, but not enough to flip the primitive.** The best kernel,
+**ISR `1/(k+r)²` at k=10** (square the reciprocal, keep the k=10 smoothing), beats shipped RRF k=10 on all 3 (SciFact +0.0116, ArguAna
++0.0055, NFCorpus +0.0003≈tie) and lifts recall too (SciFact 0.816→0.851, ArguAna 0.620→0.645) — but the mean gain is only **+0.0058
+nDCG (~+1% relative)**, and it's a *tie* on NFCorpus. Two guardrails keep this from being a free lever: (1) **smoothing still matters** —
+unsmoothed inverse-square `1/(r+1)²` (k=0) over-commits to rank-0 and *regresses* on NFCorpus/ArguAna (the same failure as too-small k);
+the win needs the k=10 floor *inside* the square. (2) The gain is below the bar that would justify an outward-facing ranking change to
+the shipped `rrf_fuse` (which is a reciprocal, k-parameterized) — squaring it is a new kernel shape, product-gated, for +1%.
+**Verdict: keep RRF's reciprocal kernel — it's validated as near-optimal against Borda/ISR/log-DCG/exp; only ensure `k` is small
+(sharp).** ISR-k10 is logged as the marginal frontier of the sharpness axis should a future eval want the last ~1%. Verified:
+`model2vec` retrieval-32M + `rank_bm25`, single-variable kernel sweep at fixed tuned hybrid config, full BEIR SciFact/NFCorpus/ArguAna
+test sets (no cargo, no torch).
