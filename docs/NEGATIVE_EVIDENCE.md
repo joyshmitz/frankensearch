@@ -8642,3 +8642,27 @@ Novel angle (no prior finding touches calibration/abstention): can the system te
 4. **Degree-of-quality wants a different signal than binary abstention**: for continuous Spearman-with-nDCG the fused-score GAP is the best pooled predictor (0.295) while the CE score is weak pooled (0.131) — the CE score separates has-answer/no-answer within clean corpora but doesn't rank quality across them.
 
 **Net:** abstention is achievable but CORPUS-SPECIFIC — use the CE top score with a PER-CORPUS threshold for factual/topical retrieval (AUROC ~0.78, better than any retrieval signal); expect it to fail on argumentative/stance corpora, and expect NO global threshold to generalize (all signals ~0.64 pooled). The intuition that cross-encoder absolute scores give a universal confidence gauge does not hold across corpus types; calibration must be fit per domain. Ties to `b0a409a` (arguana is the hardest corpus for rerankers) and the recall/difficulty structure. Caveats: full-N, hit@10 binary target, jina-turbo (a small distilled reranker — a larger CE might calibrate better across corpora), single global threshold via pooled AUROC. Verified: `fastembed` BGE-small + `rank_bm25` stem+stop + `jina-reranker-v1-turbo-en`, BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `abstain.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — The hybrid's margin over the best single tier is corpus-size-INVARIANT (does NOT grow with distractors): fusion degrades in lockstep with single tiers, it is not a distractor-protection mechanism at scale — so the arc's hybrid-advantage findings EXTRAPOLATE
+
+The whole arc is measured on tiny 3.6–8.7k-doc corpora; real corpora are far larger. Hypothesis: because the two tiers make DECORRELATED mistakes, fusion should filter distractors better as they multiply → the hybrid's margin should GROW with corpus size (meaning the arc UNDERSTATES production value). Tested by keeping all relevants and subsampling non-relevant distractors to hit target sizes; refit BM25, sliced cached BGE. nDCG@10:
+
+| corpus | size (small→full) | BM25 | BGE | hybrid | best-single | **margin (hybrid − best)** |
+|---|---|---|---|---|---|---|
+| **scifact** (0.9 rel/q) | 518 | 0.844 | 0.874 | 0.888 | 0.874 | +0.0144 |
+| | 1296 | 0.804 | 0.814 | 0.838 | 0.814 | +0.0241 |
+| | 2592 | 0.765 | 0.772 | 0.792 | 0.772 | +0.0197 |
+| | 5183 | 0.684 | 0.720 | 0.738 | 0.720 | +0.0180 |
+| **arguana** (1.0 rel/q) | 867 | 0.698 | 0.758 | 0.759 | 0.758 | +0.0016 |
+| | 2168 | 0.623 | 0.683 | 0.696 | 0.683 | +0.0124 |
+| | 4337 | 0.487 | 0.574 | 0.574 | 0.574 | +0.0003 |
+| | 8674 | 0.346 | 0.413 | 0.420 | 0.413 | +0.0067 |
+
+**Findings:**
+1. **All tiers degrade sharply as distractors multiply** — over ~10× more docs, scifact BGE 0.874→0.720, BM25 0.844→0.684; arguana BGE 0.758→0.413, BM25 0.698→0.346. The experiment bites (distractors genuinely make retrieval harder), and arguana's difficulty is heavily DISTRACTOR-driven (biggest collapse — long argumentative docs are highly confusable).
+2. **The hybrid's MARGIN over the best single tier is size-INVARIANT — it does NOT grow with corpus size.** scifact holds ~+0.018–0.024 across a 10× range; arguana is small and noisy (~+0.005 avg). The hybrid degrades in LOCKSTEP with the single tiers → **fusion is NOT a distractor-protection mechanism at scale**; its advantage is a fixed relative lift (~+2–3% relative on scifact, ~+1% arguana), not a growing one. HYPOTHESIS REJECTED.
+3. **Weak floor effect at tiny corpus sizes**: at the smallest size the margin is lowest (scifact +0.0144 @518, arguana +0.0016 @867) because the single tiers are near-ceiling (nDCG 0.76–0.87) and fusion is redundant; the margin rises to its plateau once the task is hard enough that single tiers make mistakes, then stays flat.
+4. **Extrapolation-validity payoff**: because the margin is size-invariant across 10×, the arc's hybrid-advantage findings EXTRAPOLATE — the ~+0.02 margin is a stable property of tier DECORRELATION, neither understated nor overstated by the small BEIR corpora. (Caveat: only a 10× range is testable here; ≥100× is unmeasured.)
+5. **Methodological caveat**: **nfcorpus is UNUSABLE for distractor-scaling** — 86% of its docs (3128/3633) are relevant to some query, so you cannot subsample below the relevant set (all sub-full fractions collapse to the same 3128-doc subset). Anyone doing corpus-scaling on BEIR should skip nfcorpus.
+
+**Net:** fusion buys a size-INVARIANT ~+0.02 nDCG margin, not a scale-amplified one — the two tiers' decorrelated errors give a constant relative edge that neither compounds nor washes out as distractors grow (10× tested). Good news for extrapolation (the arc's findings hold at larger scale), bad news for anyone hoping fusion is a distractor-robustness lever (it isn't; all tiers sink together). Caveats: 10× size range only, seeded distractor subsample, best-single = per-corpus max(BM25,BGE) which is always BGE here. Verified: `fastembed` BGE-small + `rank_bm25` stem+stop (snowball), BEIR scifact/arguana (nfcorpus excluded — too dense), full test sets, no cargo/torch. `corpus_scale.py` in `$D`.
