@@ -7263,3 +7263,55 @@ where content, not rank, is needed to find them.** It's the deepest "when does r
 your relevant docs are ranked deep by a single tier** (NFCorpus-like: question-answering over long medical docs where the
 right passage is lexically-or-semantically-but-not-both-ranked-high); skip it when they surface shallowly (SciFact-like).
 Verified: `model2vec` retrieval-32M + `rank_bm25` on BEIR SciFact/NFCorpus (no cargo).
+
+---
+
+### The reranker headroom is real but CHEAP-UNEXPLOITABLE: within-tier score beats rank at separating one-tier rel-from-FP, yet gating on it breaks the consensus prior (SlateHarrier, 2026-07-03)
+
+Direct follow-up to the last finding (`f81edd6`): on NFCorpus, *rank* barely separates one-tier relevant docs from
+one-tier false-positives (median within-tier rank 41 vs 56), so "only a content-aware reranker can recover them." The
+tempting cheap shortcut: RRF's `1/(k+r)` fuses on **rank alone**, discarding the raw within-tier **score magnitude**. A
+doc at rank-41 sitting just below its query's score ceiling is very different from one at rank-41 in a flat tail — a gap
+**rank throws away but a per-query min-max-normalized score preserves**. Can that free signal rescue the one-tier reranker
+headroom (`2779703`) without paying for a cross-encoder?
+
+**(1) The signal is real.** AUROC separating one-tier *relevant* from one-tier *false-positive* docs, `-rank` (what RRF
+uses) vs per-query-per-tier `min-max` score, over all one-tier docs pooled (FEED=100/tier):
+
+| dataset | overall −rank | overall minmax | vector tier −rank→minmax | lexical tier −rank→minmax |
+|---|---|---|---|---|
+| SciFact | 0.899 | **0.922** | 0.902 → 0.923 | 0.889 → 0.910 |
+| NFCorpus | 0.604 | **0.720** | 0.606 → 0.624 | **0.600 → 0.809** |
+
+Min-max score separates one-tier rel-from-FP **strictly better than rank on every dataset and tier**, and the jump is
+largest exactly where the reranker was said to be needed — **NFCorpus's lexical tier, AUROC 0.600 → 0.809** (rank
+near-uninformative there, score-magnitude highly informative). Score preserves the gap; rank (a positional count) can't.
+
+**(2) But you cannot exploit it by gating the boost to one-tier docs.** End-to-end recall@10 / nDCG@10, plain RRF vs
+adding `β·minmax` (a) to *every* tier-appearance ("all-doc blend") vs (b) *only* to one-tier docs ("one-tier gate"),
+FEED=100/tier, k=10:
+
+| dataset | plain RRF nDCG | one-tier gate β=0.05 / 0.1 / 0.2 | all-doc blend β=0.1 / 0.2 |
+|---|---|---|---|
+| SciFact | 0.6920 | 0.6900 / 0.6608 / **0.5374 (−22%)** | 0.6974 / 0.6970 (+0.8%) |
+| NFCorpus | 0.3242 | 0.3265 / 0.3197 / **0.2719 (−16%)** | 0.3335 / 0.3345 (+3.2%) |
+
+**Finding — the one-tier headroom signal is real but cheap-unexploitable; gating a boost on it is CATASTROPHIC.** The
+one-tier gate collapses (−16% on NFCorpus, −22% on SciFact by β=0.2, and to −41%/−57% at β=0.4) because it promotes
+one-tier docs — where min-max AUROC is only 0.72–0.81, i.e. **still mostly false positives** — *over* the both-tier
+consensus docs, which carry the **5–25× relevance prior** (`a81346b`). It is the CombMAX failure mode again (`50d077c`):
+elevating single-tier docs above consensus docs pollutes the top ranks. The score signal only helps as an **all-doc
+blend** (score added to consensus docs too, so their ordering is preserved) — which is mild (+0.8% / +3.2% nDCG) and
+merely re-derives the already-known "score-fusion beats RRF by a hair on NFCorpus" (`27c488a`); it is *not* a new lever,
+and it does *not* recover the one-tier headroom (the boost lifts consensus docs in lockstep, so the diluted one-tier
+relevant docs stay diluted).
+
+**Mechanistic conclusion — a measured NO to skipping the reranker, with the reason.** A within-tier score threshold
+(AUROC ≤0.81) **cannot** out-rank the consensus prior, so it cannot cheaply recover the +38–106% one-tier reranker
+headroom (`2779703`). The reranker's irreplaceable edge is that it reads **content**, distinguishing one-tier *relevant*
+from one-tier *FP* with fidelity *above* any score-magnitude a single tier exposes — which is exactly why the expensive
+cross-encoder captures headroom a free score-rescue cannot. **The reranker is not a luxury polish over RRF; it is the only
+tier with enough one-tier rel-vs-FP fidelity to safely promote a one-tier doc over the consensus set** — the mechanistic
+reason it delivers the capstone's final +10–22% nDCG over Tantivy BM25 (`SEARCH_QUALITY_FINDINGS.md`) that no rank- or
+score-fusion knob can reach. Verified: `model2vec` retrieval-32M + `rank_bm25`, per-query-per-tier min-max within-tier
+score, on BEIR SciFact / NFCorpus (no cargo).
