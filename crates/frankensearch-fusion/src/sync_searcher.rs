@@ -23,7 +23,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier_aligned, compute_rank_changes_with_maps};
-use crate::rrf::{candidate_count, rrf_fuse, rrf_fuse_with_graph_merge_unique, RrfConfig, RrfTiebreak};
+use crate::rrf::{candidate_count, rrf_fuse_with_graph_merge_unique, RrfConfig, RrfTiebreak};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
 pub trait SyncLexicalSearch: Send + Sync {
@@ -288,9 +288,11 @@ impl SyncTwoTierSearcher {
 
         let refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             fused_hits_to_scored_results(
-                rrf_fuse(
+                rrf_fuse_with_graph_merge_unique(
                     lexical,
                     &blended,
+                    &[],
+                    0.0,
                     k,
                     0,
                     &RrfConfig {

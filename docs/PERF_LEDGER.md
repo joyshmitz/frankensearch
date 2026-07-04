@@ -2614,6 +2614,38 @@ the production searcher's RRF is now `~1.1×` faster again on the limit_all path
 
 ---
 
+## 2026-07-04 — sync refined RRF: wire the unique-semantic merge path (CobaltRidge)
+
+**Lever LANDED (single-crate).** The 2026-06-29 unique-semantic RRF fast path was wired to the
+initial sync fuse and async searcher, but `SyncTwoTierSearcher`'s **refined lexical** fuse still
+called the public `rrf_fuse` wrapper, which preserves the defensive semantic-dedup set. That old
+note left the refined `&blended` path on dedup because uniqueness was assumed uncertain. Current
+`blend_two_tier_aligned` proves the opposite: it emits from an `AHashMap<&str, ScorePair>` and then
+sorts the unique keys, so the refined semantic slice is unique even if the fast input ever contains
+duplicates. Switched that call site to `rrf_fuse_with_graph_merge_unique`, preserving public
+`rrf_fuse` semantics for arbitrary callers while removing N unused hash inserts from the refined
+`limit_all` path.
+
+**Measured (per-crate, RCH worker `vmi1293453`, target dir
+`/data/projects/.rch-targets/frankensearch-cod`, `cargo bench -p frankensearch-fusion --profile
+release --bench rrf_merge_fuse`).** `merge` is the legacy refined-call-site behavior (dedup);
+`merge_unique` is the landed path. Same binary, same worker.
+
+| N | legacy dedup `merge` | landed `merge_unique` | ratio vs legacy original |
+|---|----------------------|------------------------|--------------------------|
+| 10000 | 690.09 µs `[674.57,703.80]` | 611.85 µs `[583.82,640.24]` | **0.887 (~1.13× faster)** |
+| 50000 | 6.2551 ms `[6.0261,6.4687]` | 4.0401 ms `[3.8927,4.2061]` | **0.646 (~1.55× faster)** |
+| 100000 | 16.657 ms `[16.000,17.295]` | 11.885 ms `[11.408,12.442]` | **0.714 (~1.40× faster)** |
+
+Correctness: the refined semantic list is the output of `blend_two_tier_aligned`, which deduplicates
+by doc_id before sorting; the unique RRF path is bit-identical to the dedup path for unique semantic
+input. Conformance: `rch exec -- cargo test -p frankensearch-fusion --lib sync_searcher --profile
+release` passed `7/7` focused sync-searcher tests. `cargo fmt -p frankensearch-fusion --check`
+remains blocked by pre-existing rustfmt drift in unrelated committed bench files, so this commit
+does not mass-format them.
+
+---
+
 ## 2026-07-02 — sync_searcher per-query score maps + `seen` dedup: std SipHash → `ahash` (~2×) (SlateHeron)
 
 **Lever (sibling-path consistency — the last SipHash hot-map island in fusion).** On the default sync hybrid path,
