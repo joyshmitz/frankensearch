@@ -330,6 +330,36 @@ reverted; this entry is docs-only.
 **Decision:** do not retry move-only `LexicalIdHit` materialization as a BOLD gap lever. The
 remaining `limit_all` gap is in Tantivy collection/doc materialization itself, not this extra clone.
 
+**Repeat confirmation (2026-07-03, CobaltRidge):** retried the narrowest version of the same
+move-only idea in `frankensearch/benches/search_bench.rs` only: make the BOLD challenger consume
+`Vec<LexicalIdHit>` into `ScoredResult` instead of cloning each `doc_id`, then revert the source
+hunk after measurement. First baseline attempt
+(`AGENT_NAME=CobaltRidge`, target dir `/data/projects/.rch-targets/frankensearch-cobaltridge`) was
+cancelled because RCH build `29914252970033518` on `vmi1152480` stayed progress-stale. The
+successful per-crate release-profile run completed remotely on `hz2`:
+
+```bash
+AGENT_NAME=CobaltRidge \
+RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cobaltridge \
+RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch --features lexical --profile release \
+    --bench search_bench limit_all/limit_all/10000 \
+    -- --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Criterion artifacts:
+`/data/projects/.rch-targets/frankensearch-cobaltridge/criterion/bold_verify_tantivy_class/*_limit_all_limit_all/10000/new/estimates.json`.
+
+| Workload | Incumbent mean | Candidate mean | Ratio vs ORIG | Median ratio | Slope ratio | Decision |
+|----------|----------------|----------------|---------------|--------------|-------------|----------|
+| `limit_all/10000` `hash_hybrid_tantivy_vector_rrf` | 899.47 us | 929.03 us | **1.033x slower/noise** | 1.019 | 0.998 | reverted |
+| `limit_all/10000` `hash_lexical_guard_tantivy` | 899.47 us | 1.040 ms | **1.156x slower** | 1.133 | 1.075 | reverted |
+
+This confirms the prior route-stop on current `main`: removing only the extra `DocId` clone does
+not produce a legacy-original win, and the guard arm regresses. The console transcript was too
+noisy to preserve because tracing emitted ~749k tokens; use the Criterion artifacts above.
+
 ### 2026-06-27 — Methodology: `rch exec` can serve a STALE bench binary; verify freshness before trusting latency (BlackThrush)
 
 **Finding (tooling, not a perf result):** benching via `rch exec -- cargo bench` does **not** always rebuild the bench binary on the worker — it can run a cached one. Caught red-handed: after renaming the `sync_int8_fetch` bench's default arm `int8_fetch` → `fast_fetch_4bit` (source confirmed) and re-running through `rch`, the worker still emitted the **old** `int8_fetch` arm name, i.e. it ran a stale binary. So **`rch` latency numbers can reflect old code** and silently mislead an A/B of a fresh change. (A clean local `cargo bench` is the cross-check, but the shared `CARGO_TARGET_DIR` here also hits `E0514` "incompatible rustc" when the local toolchain differs from the worker's — so neither path is automatically trustworthy.)
