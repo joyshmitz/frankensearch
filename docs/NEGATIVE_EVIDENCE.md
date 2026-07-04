@@ -7984,3 +7984,35 @@ index is optional or essential — most decisively on semantic corpora.** This a
 isn't just "more embedder quality," it is *the* thing that turns the hybrid from a +0.6–3% nudge into a +8–21% win over a well-analyzed BM25.
 Verified: `model2vec` retrieval-32M vs `fastembed` BGE-small-en-v1.5 (query-prefixed, `.npy`-cached) + `rank_bm25` stem+stop, tuned RRF
 hybrid, full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
+
+---
+
+### The reranker-feed conclusion is ALSO embedder-gated: BM25-only reranking is competitive with the STATIC hybrid but LOSES to the CONTEXTUAL hybrid on all 3 — the "distractor injection" was a weak-static-embedder artifact (CopperKestrel, 2026-07-04)
+
+Two prior findings need joining: (a) the reranker-feed result (`3eca5d5`) — reranking BM25-alone is competitive with (on NFCorpus *better*
+than) reranking the hybrid — used the **static** embedder; (b) the embedder-gating result (`a414d92`) — a contextual embedder makes the dense
+tier *lead* retrieval. So: does a contextual embedder make the hybrid a materially better **reranker candidate feeder**, flipping (a)?
+Reranked the *same* `ms-marco-L6` (RRF-combine) over three candidate sources — **BM25-alone (stem+stop)**, the **static** hybrid, and the
+**contextual (BGE)** hybrid — using the cached BGE embeddings, BEIR N=40/corpus:
+
+| corpus | reranked BM25-alone | reranked STATIC-hyb (Δ vs BM25) | **reranked CONTEXTUAL-hyb (Δ vs BM25)** | feed recall@50 (BM25 / static / **ctx**) |
+|---|---:|---:|---:|---:|
+| SciFact  | 0.7938 | 0.8059 (+0.0121) | **0.8379 (+0.0441)** | 0.920 / 0.945 / **1.000** |
+| NFCorpus | 0.4142 | 0.4068 (**−0.0074**) | **0.4237 (+0.0095)** | 0.235 / 0.249 / **0.271** |
+| ArguAna  | 0.3664 | 0.3819 (+0.0155) | **0.4041 (+0.0378)** | 1.000 / 0.975 / **1.000** |
+
+**Finding — the "BM25-only reranking is competitive" conclusion is embedder-gated: it holds for the STATIC hybrid (mixed, ±, `3eca5d5`) but
+FAILS for the CONTEXTUAL hybrid, which beats BM25-alone reranking on all 3 corpora (+0.0095 to +0.0441).** The decisive reversal is
+**NFCorpus**: the *static* hybrid feed was −0.0074 *worse* than BM25-alone (the anomaly that motivated `3eca5d5`), but the *contextual* hybrid
+feed is +0.0095 *better* — **the sign flips.** This confirms the mechanism I proposed for the static anomaly ("**distractor injection**": the
+dense tier's extra candidates are topical-but-irrelevant docs a strong reranker promotes) is a property of the **weak static** embedder, not
+of the hybrid: the **contextual** tier's extra recall is *genuinely relevant* (feed recall@50 rises on all 3 — SciFact to a perfect 1.000 — and
+now that recall *converts* to reranked gain, restoring the positive recall→reranked coupling that was decoupled in the static case). **Unified
+result — the dense tier's value is embedder-gated in BOTH regimes:** with a static embedder it is a marginal retrieval nudge (+0.6–3%,
+`a414d92`) *and* a ~0/redundant reranker feeder (`3eca5d5`); with a contextual embedder it is a substantial retrieval lead (+8–21%, `a414d92`)
+*and* a clearly-positive reranker feeder (+0.010–0.044 here). **Deployment corollary: "if you rerank, a BM25-only candidate generator is a legit
+cheaper choice" is true ONLY with a weak/static embedder — with a contextual embedder the vector index earns its keep as the reranker's feeder
+too, and a BM25-only feed leaves +0.01–0.04 nDCG on the table** (most on SciFact, where the contextual feed reaches perfect recall). Caveats:
+N=40 subsample (per-dataset deltas directional), single reranker (ms-marco-L6). Verified: `model2vec` retrieval-32M & `fastembed` BGE-small-en
+(`.npy`-cached) hybrid candidate generation + `rank_bm25` stem+stop + `fastembed` ms-marco-L6 RRF-combine rerank of the union, BEIR SciFact/
+NFCorpus/ArguAna (no cargo, no torch).
