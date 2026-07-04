@@ -51,7 +51,7 @@ use frankensearch_index::{SearchParams, TwoTierIndex};
 
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
-    blend_two_tier_aligned, build_borrowed_rank_map, compute_rank_changes_with_maps,
+    blend_two_tier_aligned_vector_index, build_borrowed_rank_map, compute_rank_changes_with_maps,
     kendall_tau_with_refined_rank,
 };
 use crate::calibration::CalibratorConfig;
@@ -1456,7 +1456,8 @@ impl TwoTierSearcher {
         // Blend fast + quality scores.
         let blend_start = Instant::now();
         let blend_factor = self.effective_blend_factor(query_class);
-        let blended = blend_two_tier_aligned(&fast_hits, &quality_scores, blend_factor);
+        let blended =
+            blend_two_tier_aligned_vector_index(&fast_hits, &quality_scores, blend_factor);
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
         // Compute rank changes (initial vs refined).

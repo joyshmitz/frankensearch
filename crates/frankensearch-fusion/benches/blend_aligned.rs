@@ -26,7 +26,7 @@ use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::VectorHit;
-use frankensearch_fusion::{blend_two_tier, blend_two_tier_aligned};
+use frankensearch_fusion::{blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique};
 
 const BLEND_FACTOR: f32 = 0.7;
 
@@ -90,6 +90,18 @@ fn aligned(fast: &[VectorHit], qscores: &[Option<f32>]) -> (Vec<VectorHit>, usiz
     (blended, qmap.len())
 }
 
+/// Unique aligned path: same production precondition as vector-index search
+/// results, which already have at most one hit per doc_id.
+fn aligned_unique(fast: &[VectorHit], qscores: &[Option<f32>]) -> (Vec<VectorHit>, usize) {
+    let blended = blend_two_tier_aligned_unique(fast, qscores, BLEND_FACTOR);
+    let qmap = fast
+        .iter()
+        .zip(qscores.iter())
+        .filter_map(|(h, s)| s.map(|v| (h.doc_id.as_str(), v)))
+        .collect::<HashMap<&str, f32>>();
+    (blended, qmap.len())
+}
+
 fn bench_blend_aligned(c: &mut Criterion) {
     let mut g = c.benchmark_group("blend_aligned");
     for n in [10_000usize, 100_000] {
@@ -100,6 +112,7 @@ fn bench_blend_aligned(c: &mut Criterion) {
         // quality-map size, otherwise the A/B is meaningless.
         let (b_cur, m_cur) = current(&fast, &qscores);
         let (b_ali, m_ali) = aligned(&fast, &qscores);
+        let (b_uni, m_uni) = aligned_unique(&fast, &qscores);
         assert_eq!(b_cur.len(), b_ali.len(), "blended length mismatch (n={n})");
         assert_eq!(m_cur, m_ali, "quality-map size mismatch (n={n})");
         for (x, y) in b_cur.iter().zip(b_ali.iter()) {
@@ -111,13 +124,39 @@ fn bench_blend_aligned(c: &mut Criterion) {
             );
             assert_eq!(x.index, y.index, "blended index mismatch (n={n})");
         }
+        assert_eq!(b_ali.len(), b_uni.len(), "unique length mismatch (n={n})");
+        assert_eq!(m_ali, m_uni, "unique quality-map size mismatch (n={n})");
+        for (x, y) in b_ali.iter().zip(b_uni.iter()) {
+            assert_eq!(x.doc_id, y.doc_id, "unique doc_id order mismatch (n={n})");
+            assert_eq!(
+                x.score.to_bits(),
+                y.score.to_bits(),
+                "unique score mismatch (n={n})"
+            );
+            assert_eq!(x.index, y.index, "unique index mismatch (n={n})");
+        }
 
-        g.bench_with_input(BenchmarkId::new("current", n), &(&fast, &qscores), |b, _| {
-            b.iter(|| black_box(current(black_box(&fast), black_box(&qscores))));
-        });
-        g.bench_with_input(BenchmarkId::new("aligned", n), &(&fast, &qscores), |b, _| {
-            b.iter(|| black_box(aligned(black_box(&fast), black_box(&qscores))));
-        });
+        g.bench_with_input(
+            BenchmarkId::new("current", n),
+            &(&fast, &qscores),
+            |b, _| {
+                b.iter(|| black_box(current(black_box(&fast), black_box(&qscores))));
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("aligned", n),
+            &(&fast, &qscores),
+            |b, _| {
+                b.iter(|| black_box(aligned(black_box(&fast), black_box(&qscores))));
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("aligned_unique", n),
+            &(&fast, &qscores),
+            |b, _| {
+                b.iter(|| black_box(aligned_unique(black_box(&fast), black_box(&qscores))));
+            },
+        );
     }
     g.finish();
 }

@@ -2977,3 +2977,36 @@ pop==pergroup==160, so stratification wins). Verified: bench compiles + runs cle
 
 **Also recorded this turn:** backlog #4 (AVX-512 dot kernels) is **measurement-blocked** — the rch workers are AMD
 Threadripper PRO 5975WX (**Zen 3**: `avx2`/`fma` only, no `avx512`/`vnni`), so no AVX-512 win can be measured here.
+
+---
+
+## 2026-07-04 — aligned vector-index blend: skip the defensive merge only at 100k `limit_all` (CobaltRidge)
+
+**Lever LANDED (single-crate, thresholded).** `blend_two_tier_aligned` still preserves arbitrary-caller duplicate
+semantics by merging `fast_hits` through an `AHashMap<&str, ScorePair>`. The production vector-index callers
+(`TwoTierSearcher` and `SyncTwoTierSearcher`) receive unique doc ids from the vector index, so the large `limit_all`
+case can stream normalized scores directly into the output vector and sort it, skipping the defensive hash-merge.
+
+The 10k subcase is not a current-main win, so it is **not wired** there: `blend_two_tier_aligned_vector_index` keeps the
+existing map-preserving aligned path below 100k hits and switches to the unique path only for the measured 100k shape.
+This drops the ~0-gain/regression variant while keeping the large-N win.
+
+**Measured (per-crate, local fallback after RCH worker `vmi1167313` exceeded the 10-minute bench cutoff; target dir
+`/data/projects/.rch-targets/frankensearch-cod`):**
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod \
+  cargo bench -p frankensearch-fusion --profile release --bench blend_aligned -- \
+  blend_aligned --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+| N | legacy materialized ORIG `current` | current main `aligned` | `aligned_unique` | ratio vs current main | ratio vs ORIG |
+|---:|---:|---:|---:|---:|---:|
+| 10000 | 2.6086 ms `[1.9682,3.0989]` | 2.2163 ms `[1.8569,2.7936]` | 2.2917 ms `[1.9936,2.5115]` | **1.034** (not wired) | 0.878 |
+| 100000 | 75.669 ms `[65.607,86.836]` | 67.779 ms `[52.004,83.726]` | 34.245 ms `[30.626,37.913]` | **0.505 (~1.98× faster)** | **0.452 (~2.21× faster)** |
+
+Correctness: `aligned_unique_matches_aligned_for_unique_fast_hits` proves bit-identical output for unique fast hits
+across alpha `{0, 0.3, 0.7, 1, NaN}`; the bench also asserts bit-identical output and quality-map size before timing.
+Conformance: `cargo test -p frankensearch-fusion --lib blend::tests` passed (42 passed, 1 ignored perf harness);
+`cargo check -p frankensearch-fusion --all-targets` passed (existing bench dead-code warnings only); exact touched-file
+`rustfmt --edition 2024 --check` passed.

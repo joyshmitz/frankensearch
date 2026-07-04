@@ -8604,3 +8604,20 @@ Direct extension of the oracle-routing finding (`6cc008e`: fusion LOSES to the b
 4. **Redirects the `2a90c06` "spend on recall" takeaway**: to close the reranked-vs-oracle-single residual you need a BETTER CROSS-ENCODER (or to accept it), NOT a smarter/deeper feed — the feed already contains the answers. Deeper/union feeding only helps the deep-recall ceiling on many-relevant corpora, a distinct objective (r@100+, `c039c3a`).
 
 **Net:** the intuitive "feed the reranker pre-fusion candidates so it can undo the demotion" lever is a measured dead end — fusion never actually removes the demoted relevants from the top-50, it just under-ranks them, and the reranker already sees them. The remaining fusion-loss residual is bounded by cross-encoder ranking quality, not candidate availability. This tightens the mechanism from `2a90c06` and closes the feed-source question. Caveats: full-N; "demoted" defined via best-single top-10 vs hybrid top-10; union = BM25-top-50 ∪ BGE-top-50. No reranker run needed — the precondition (relevants-in-feed) is decisive. Verified: `fastembed` BGE-small + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `feed_recall.py` in `$D`.
+
+### 2026-07-04 — CobaltRidge — `blend_two_tier_aligned_unique` is NOT a 10k current-main win; only wire it for the measured 100k `limit_all` shape
+
+Tested the tempting follow-up to `blend_two_tier_aligned`: since vector-index fast hits are unique by doc id, skip the
+aligned blend's defensive `AHashMap<&str, ScorePair>` merge and stream directly into the output vector. Same-binary
+`blend_aligned` bench, local fallback after RCH worker `vmi1167313` exceeded the 10-minute bench cutoff:
+
+| N | current main `aligned` | `aligned_unique` | ratio |
+|---:|---:|---:|---:|
+| 10000 | 2.2163 ms `[1.8569,2.7936]` | 2.2917 ms `[1.9936,2.5115]` | **1.034** |
+| 100000 | 67.779 ms `[52.004,83.726]` | 34.245 ms `[30.626,37.913]` | **0.505** |
+
+**Decision:** reject the 10k specialization as a standalone lever. Although it is still faster than the older
+materialized ORIG at 10k (2.2917 ms vs 2.6086 ms, ratio 0.878), current main already has the aligned clone-elision win,
+and the unique path is not better at 10k. Production is therefore thresholded: keep `blend_two_tier_aligned` below
+100k hits and use `blend_two_tier_aligned_unique` only for the measured 100k `limit_all` case. Do not re-test the 10k
+unique-blend variant unless a new measurement changes the threshold.

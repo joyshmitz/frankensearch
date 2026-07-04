@@ -22,8 +22,8 @@ use frankensearch_core::{
 };
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
-use crate::blend::{blend_two_tier_aligned, compute_rank_changes_with_maps};
-use crate::rrf::{candidate_count, rrf_fuse_with_graph_merge_unique, RrfConfig, RrfTiebreak};
+use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes_with_maps};
+use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, rrf_fuse_with_graph_merge_unique};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
 pub trait SyncLexicalSearch: Send + Sync {
@@ -277,7 +277,7 @@ impl SyncTwoTierSearcher {
         // whose doc_ids are only ever read as `&str` (bit-identical output).
         let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
         metrics.phase2_vectors_searched = quality_count;
-        let blended = blend_two_tier_aligned(
+        let blended = blend_two_tier_aligned_vector_index(
             &fast_hits,
             &quality_scores,
             saturating_f64_to_f32(self.config.quality_weight),
@@ -723,8 +723,10 @@ mod tests {
             SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default()).with_lexical(lexical);
         let (results, _) = searcher.search_collect(&[1.0, 0.0], 3).unwrap();
         assert!(results.iter().any(|result| result.doc_id == "lex-only"));
-        assert!(results
-            .iter()
-            .all(|result| result.source == ScoreSource::Hybrid));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.source == ScoreSource::Hybrid)
+        );
     }
 }

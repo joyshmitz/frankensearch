@@ -23,6 +23,7 @@ use tracing::{debug, instrument};
 
 const DEFAULT_BLEND_FACTOR: f32 = 0.7;
 const NON_FINITE_SCORE_FALLBACK: f32 = 0.0;
+const ALIGNED_UNIQUE_BLEND_MIN_HITS: usize = 100_000;
 
 /// Pre-computed normalization bounds for a score set.
 ///
@@ -293,6 +294,76 @@ pub fn blend_two_tier_aligned(
     blended
 }
 
+/// Blend aligned fast/quality tiers when `fast_hits` is already unique by doc_id.
+///
+/// This is the vector-index hot-path sibling of [`blend_two_tier_aligned`]. It
+/// preserves that function's output when `fast_hits` contains no duplicate
+/// `doc_id`s, but skips the defensive `AHashMap` merge because there is no
+/// second occurrence to collapse. Public callers that need duplicate handling
+/// should keep using [`blend_two_tier_aligned`].
+#[must_use]
+pub fn blend_two_tier_aligned_unique(
+    fast_hits: &[VectorHit],
+    quality_scores: &[Option<f32>],
+    blend_factor: f32,
+) -> Vec<VectorHit> {
+    let alpha = sanitize_blend_factor(blend_factor);
+
+    let fast_bounds = NormBounds::from_scores(fast_hits.iter().map(|h| &h.score));
+    let quality_bounds = NormBounds::from_scores(quality_scores.iter().filter_map(Option::as_ref));
+
+    let mut blended = Vec::with_capacity(fast_hits.len());
+    for (i, hit) in fast_hits.iter().enumerate() {
+        let fast_score = fast_bounds.apply(hit.score);
+        let score = match quality_scores.get(i).copied().flatten() {
+            Some(quality_score) => {
+                let quality_score = quality_bounds.apply(quality_score);
+                alpha.mul_add(quality_score, (1.0 - alpha) * fast_score)
+            }
+            None => fast_score,
+        };
+        blended.push(VectorHit {
+            index: hit.index,
+            score: sanitize_score(score),
+            doc_id: hit.doc_id.clone(),
+        });
+    }
+
+    blended.sort_unstable_by(|left, right| {
+        sanitize_score(right.score)
+            .total_cmp(&sanitize_score(left.score))
+            .then_with(|| left.doc_id.cmp(&right.doc_id))
+    });
+
+    debug!(
+        target: "frankensearch.blend",
+        blended_count = blended.len(),
+        effective_alpha = %alpha,
+        "blending complete (aligned unique)"
+    );
+
+    blended
+}
+
+/// Blend aligned vector-index hits using the measured large-N specialization.
+///
+/// `fast_hits` from the vector index are unique by doc_id, but the unique
+/// specialization only pays off at the large `limit_all` shape measured in the
+/// `blend_aligned` bench. Smaller queries keep the defensive map path because
+/// it is neutral/slightly faster at 10k.
+#[must_use]
+pub(crate) fn blend_two_tier_aligned_vector_index(
+    fast_hits: &[VectorHit],
+    quality_scores: &[Option<f32>],
+    blend_factor: f32,
+) -> Vec<VectorHit> {
+    if fast_hits.len() >= ALIGNED_UNIQUE_BLEND_MIN_HITS {
+        blend_two_tier_aligned_unique(fast_hits, quality_scores, blend_factor)
+    } else {
+        blend_two_tier_aligned(fast_hits, quality_scores, blend_factor)
+    }
+}
+
 /// Compute promoted/demoted/stable rank-change counts between two rankings.
 ///
 /// - `promoted`: rank improved (smaller index), or new docs appearing in refined
@@ -482,7 +553,10 @@ pub fn build_borrowed_rank_map(hits: &[VectorHit]) -> HashMap<&str, usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{blend_two_tier, blend_two_tier_aligned, compute_rank_changes, kendall_tau};
+    use super::{
+        blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique,
+        blend_two_tier_aligned_vector_index, compute_rank_changes, kendall_tau,
+    };
     use frankensearch_core::VectorHit;
 
     const EPSILON: f32 = 1e-6;
@@ -576,6 +650,66 @@ mod tests {
         }
         // Fully empty inputs.
         assert!(blend_two_tier_aligned(&[], &[], 0.7).is_empty());
+    }
+
+    #[test]
+    fn aligned_unique_matches_aligned_for_unique_fast_hits() {
+        let fast = vec![
+            hit("a", 0.90, 0),
+            hit("b", 0.70, 1),
+            hit("c", 0.50, 2),
+            hit("d", 0.30, 3),
+            hit("e", 0.10, 4),
+        ];
+        let scores = vec![Some(0.10f32), None, Some(0.95), Some(0.40), None];
+
+        for &alpha in &[0.0f32, 0.3, 0.7, 1.0, f32::NAN] {
+            let aligned = blend_two_tier_aligned(&fast, &scores, alpha);
+            let unique = blend_two_tier_aligned_unique(&fast, &scores, alpha);
+
+            assert_eq!(
+                aligned.len(),
+                unique.len(),
+                "length mismatch at alpha={alpha}"
+            );
+            for (aligned_hit, unique_hit) in aligned.iter().zip(unique.iter()) {
+                assert_eq!(
+                    aligned_hit.doc_id, unique_hit.doc_id,
+                    "doc_id order mismatch at alpha={alpha}"
+                );
+                assert_eq!(
+                    aligned_hit.index, unique_hit.index,
+                    "index mismatch at alpha={alpha}"
+                );
+                assert_eq!(
+                    aligned_hit.score.to_bits(),
+                    unique_hit.score.to_bits(),
+                    "score bits mismatch at alpha={alpha} for {}",
+                    aligned_hit.doc_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vector_index_blend_keeps_aligned_path_below_threshold() {
+        let fast = vec![
+            hit("a", 0.90, 0),
+            hit("b", 0.70, 1),
+            hit("c", 0.50, 2),
+            hit("d", 0.30, 3),
+            hit("e", 0.10, 4),
+        ];
+        let scores = vec![Some(0.10f32), None, Some(0.95), Some(0.40), None];
+
+        let aligned = blend_two_tier_aligned(&fast, &scores, 0.7);
+        let vector_index = blend_two_tier_aligned_vector_index(&fast, &scores, 0.7);
+        assert_eq!(aligned.len(), vector_index.len());
+        for (aligned_hit, vector_hit) in aligned.iter().zip(vector_index.iter()) {
+            assert_eq!(aligned_hit.doc_id, vector_hit.doc_id);
+            assert_eq!(aligned_hit.index, vector_hit.index);
+            assert_eq!(aligned_hit.score.to_bits(), vector_hit.score.to_bits());
+        }
     }
 
     #[test]
