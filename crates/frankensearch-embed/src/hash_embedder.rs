@@ -361,8 +361,7 @@ fn jl_accumulate_lanes8_avx2(embedding: &mut [f32], states: &[u64; 8]) {
             let ma = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(a)));
             let mb = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_slli_epi64::<63>(b)));
             #[allow(clippy::cast_possible_wrap)]
-            let sum =
-                (8 - 2 * ((ma as u32).count_ones() + (mb as u32).count_ones()) as i32) as f32;
+            let sum = (8 - 2 * ((ma as u32).count_ones() + (mb as u32).count_ones()) as i32) as f32;
             *dim += sum;
         }
     }
@@ -428,16 +427,116 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
 ///
 /// Splits on non-alphanumeric characters and filters
 /// tokens shorter than `MIN_TOKEN_LEN`. Case is intentionally preserved.
-fn tokenize(text: &str) -> impl Iterator<Item = &str> {
-    // Lazy: the embedders iterate tokens exactly once, so there is no need to
-    // materialize an intermediate `Vec<&str>`.
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|token| token.len() >= MIN_TOKEN_LEN)
+fn tokenize(text: &str) -> Tokens<'_> {
+    Tokens {
+        text,
+        offset: 0,
+        unicode: false,
+    }
+}
+
+struct Tokens<'a> {
+    text: &'a str,
+    offset: usize,
+    unicode: bool,
+}
+
+impl<'a> Iterator for Tokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.unicode {
+            return self.next_unicode();
+        }
+        self.next_ascii_or_promote()
+    }
+}
+
+impl<'a> Tokens<'a> {
+    fn next_ascii_or_promote(&mut self) -> Option<&'a str> {
+        let bytes = self.text.as_bytes();
+        while self.offset < bytes.len() {
+            while self.offset < bytes.len() {
+                let byte = bytes[self.offset];
+                if byte >= 0x80 {
+                    self.unicode = true;
+                    return self.next_unicode();
+                }
+                if byte.is_ascii_alphanumeric() {
+                    break;
+                }
+                self.offset += 1;
+            }
+            let start = self.offset;
+            while self.offset < bytes.len() {
+                let byte = bytes[self.offset];
+                if byte >= 0x80 {
+                    self.unicode = true;
+                    self.offset = start;
+                    return self.next_unicode();
+                }
+                if !byte.is_ascii_alphanumeric() {
+                    break;
+                }
+                self.offset += 1;
+            }
+            if self.offset.saturating_sub(start) >= MIN_TOKEN_LEN {
+                return Some(&self.text[start..self.offset]);
+            }
+        }
+        None
+    }
+
+    fn next_unicode(&mut self) -> Option<&'a str> {
+        while self.offset < self.text.len() {
+            let Some((start_rel, _)) = self.text[self.offset..]
+                .char_indices()
+                .find(|(_, c)| c.is_alphanumeric())
+            else {
+                self.offset = self.text.len();
+                return None;
+            };
+            let start = self.offset + start_rel;
+            let mut end = self.text.len();
+            for (idx, c) in self.text[start..].char_indices() {
+                if !c.is_alphanumeric() {
+                    end = start + idx;
+                    break;
+                }
+            }
+            self.offset = end;
+            if end.saturating_sub(start) >= MIN_TOKEN_LEN {
+                return Some(&self.text[start..end]);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_tokens(text: &str) -> Vec<&str> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|token| token.len() >= MIN_TOKEN_LEN)
+            .collect()
+    }
+
+    #[test]
+    fn tokenizer_matches_unicode_split_reference() {
+        let cases = [
+            "",
+            "a an ant, fox_42 jumps-over C3PO",
+            "snake_case HTTP/2 path/to/file.rs",
+            "cafe\u{0301} café naïve 日本語 x",
+            "a.b::c -- Δelta42",
+        ];
+        for case in cases {
+            let actual: Vec<_> = tokenize(case).collect();
+            assert_eq!(actual, reference_tokens(case), "input={case:?}");
+        }
+    }
 
     /// The AVX2 JL accumulate must be byte-for-byte identical to the scalar-ILP
     /// kernel across dim shapes + accumulated over many token-groups (exact-integer

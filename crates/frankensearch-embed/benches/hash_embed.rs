@@ -43,6 +43,36 @@ fn tokenize_iter(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| t.len() >= MIN_TOKEN_LEN)
 }
+fn tokenize_ascii_iter(text: &str) -> AsciiTokens<'_> {
+    debug_assert!(text.is_ascii());
+    AsciiTokens { text, offset: 0 }
+}
+
+struct AsciiTokens<'a> {
+    text: &'a str,
+    offset: usize,
+}
+
+impl<'a> Iterator for AsciiTokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.text.as_bytes();
+        while self.offset < bytes.len() {
+            while self.offset < bytes.len() && !bytes[self.offset].is_ascii_alphanumeric() {
+                self.offset += 1;
+            }
+            let start = self.offset;
+            while self.offset < bytes.len() && bytes[self.offset].is_ascii_alphanumeric() {
+                self.offset += 1;
+            }
+            if self.offset.saturating_sub(start) >= MIN_TOKEN_LEN {
+                return Some(&self.text[start..self.offset]);
+            }
+        }
+        None
+    }
+}
 
 // ── L2 normalize: old (allocating collect) vs new (in place) ─────────────────
 fn l2_norm_collect(vec: &[f32]) -> Vec<f32> {
@@ -84,6 +114,18 @@ fn fnv_old(text: &str) -> Vec<f32> {
 fn fnv_new(text: &str) -> Vec<f32> {
     let mut e = vec![0.0_f32; DIM];
     for token in tokenize_iter(text) {
+        let hash = fnv1a_hash(token.as_bytes());
+        let index = (hash as usize) % DIM;
+        let sign = if (hash >> 63) == 1 { 1.0 } else { -1.0 };
+        e[index] += sign;
+    }
+    l2_norm_in_place(&mut e);
+    e
+}
+#[allow(clippy::cast_possible_truncation)]
+fn fnv_ascii(text: &str) -> Vec<f32> {
+    let mut e = vec![0.0_f32; DIM];
+    for token in tokenize_ascii_iter(text) {
         let hash = fnv1a_hash(token.as_bytes());
         let index = (hash as usize) % DIM;
         let sign = if (hash >> 63) == 1 { 1.0 } else { -1.0 };
@@ -204,6 +246,7 @@ fn bench_hash_embed(c: &mut Criterion) {
 
     // Correctness sanity: old and new must be bit-identical.
     debug_assert_eq!(fnv_old(&doc), fnv_new(&doc));
+    debug_assert_eq!(fnv_new(&doc), fnv_ascii(&doc));
     debug_assert_eq!(jl_old(&doc), jl_new(&doc));
     // ILP variants must match the scalar JL output exactly.
     debug_assert_eq!(jl_old(&doc), jl_ilp2(&doc));
@@ -218,6 +261,17 @@ fn bench_hash_embed(c: &mut Criterion) {
             b.iter(|| black_box(fnv_new(black_box(t))));
         });
         fg.finish();
+    }
+
+    {
+        let mut tg = c.benchmark_group("hash_embed_tokenize_ascii");
+        tg.bench_with_input("current_char_split", doc.as_str(), |b, t| {
+            b.iter(|| black_box(fnv_new(black_box(t))));
+        });
+        tg.bench_with_input("ascii_bytes", doc.as_str(), |b, t| {
+            b.iter(|| black_box(fnv_ascii(black_box(t))));
+        });
+        tg.finish();
     }
 
     {
@@ -249,7 +303,7 @@ fn bench_hash_embed(c: &mut Criterion) {
     // isolated from tokenize/normalize: scalar-ILP vs the AVX2 u64×4 dispatch.
     {
         use frankensearch_embed::{
-            jl_accumulate_lanes, jl_accumulate_lanes8, jl_accumulate_lanes_scalar,
+            jl_accumulate_lanes, jl_accumulate_lanes_scalar, jl_accumulate_lanes8,
         };
         const DIM: usize = 384;
         const GROUPS: usize = 2000; // ~8000 tokens' worth of 4-chain groups
