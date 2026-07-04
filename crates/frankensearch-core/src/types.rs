@@ -5,9 +5,11 @@ use std::time::Duration;
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
-/// Document identifier type. `CompactString` (SSO) stores ids ≤24 bytes inline, so
-/// the per-query `limit_all` doc_id clones (RRF/blend/resolve materialization) are
-/// a stack memcpy instead of a heap alloc — 29.8× cheaper for short ids
+/// Document identifier type.
+///
+/// `CompactString` (SSO) stores ids ≤24 bytes inline, so the per-query
+/// `limit_all` `doc_id` clones (RRF/blend/resolve materialization) are a stack
+/// memcpy instead of a heap alloc — 29.8× cheaper for short ids
 /// (`doc_id_clone_sso` bench). Drop-in for `String` at read sites (`Deref<str>`,
 /// `as_str`, `From`, `PartialEq`, `Hash`, `Ord`, serde).
 pub type DocId = CompactString;
@@ -531,7 +533,9 @@ mod tests {
             lexical_score: Some(12.5),
             rerank_score: None,
             explanation: None,
-            metadata: Some(std::sync::Arc::new(serde_json::json!({"tags": ["rust", "search"]}))),
+            metadata: Some(std::sync::Arc::new(
+                serde_json::json!({"tags": ["rust", "search"]}),
+            )),
         };
         let json = serde_json::to_string(&result).expect("serialize");
         let roundtripped: ScoredResult = serde_json::from_str(&json).expect("deserialize");
@@ -1039,19 +1043,19 @@ mod tests {
                 stable: 14,
             },
         };
-        if let SearchPhase::Refined {
+        assert!(matches!(phase, SearchPhase::Refined { .. }));
+        let SearchPhase::Refined {
             results,
             latency,
             rank_changes,
             ..
         } = phase
-        {
-            assert_eq!(results.len(), 1);
-            assert_eq!(latency, Duration::from_millis(120));
-            assert_eq!(rank_changes.total(), 20);
-        } else {
-            panic!("expected Refined variant");
-        }
+        else {
+            return;
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(latency, Duration::from_millis(120));
+        assert_eq!(rank_changes.total(), 20);
     }
 
     #[test]
@@ -1077,15 +1081,15 @@ mod tests {
                 fused_count: 20,
             },
         };
-        if let SearchPhase::Reranked {
+        assert!(matches!(phase, SearchPhase::Reranked { .. }));
+        let SearchPhase::Reranked {
             results, latency, ..
         } = phase
-        {
-            assert_eq!(results.len(), 1);
-            assert_eq!(latency, Duration::from_millis(450));
-        } else {
-            panic!("expected Reranked variant");
-        }
+        else {
+            return;
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(latency, Duration::from_millis(450));
     }
 
     #[test]

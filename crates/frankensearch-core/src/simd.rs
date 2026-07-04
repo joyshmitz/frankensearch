@@ -50,8 +50,8 @@ fn scale_f32_in_place_avx2(vec: &mut [f32], factor: f32) {
             _mm256_storeu_ps(vec.as_mut_ptr().add(c * 8), _mm256_mul_ps(v, f));
         }
     }
-    for i in (chunks * 8)..n {
-        vec[i] *= factor;
+    for x in vec.iter_mut().skip(chunks * 8) {
+        *x *= factor;
     }
 }
 

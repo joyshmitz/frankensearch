@@ -19,6 +19,40 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-04 - core fingerprint streaming token windows is a kept internal win; external original-comparator ratio is N/A (Codex)
+
+**Ledger entry for the land:** replaced `DocumentFingerprint::compute`'s transient
+`Vec<&str>` token collection with a two-token rolling window for the 3-token SimHash path.
+The old implementation split the full document into a heap vector, then called
+`tokens.windows(3)`; the new implementation walks `split_whitespace()` once, emits the same
+3-token windows as soon as the third token is available, and keeps the old individual-token
+hashing rule for one- and two-token documents. A unit test compares the streaming path with
+the old slice implementation on empty, whitespace-only, short, long, and Unicode text.
+
+**Measured command (per-crate, same benchmark binary):**
+
+```bash
+AGENT_NAME=Codex \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch exec -- cargo bench -p frankensearch-core --profile release \
+    --bench fingerprint -- fingerprint_compute \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3
+```
+
+RCH ran remotely on `vmi1227854`; `CARGO_TARGET_DIR` was rewritten to a worker-local path by
+`rch`, as expected. The release-profile measurement disabled LTO for the bench binary only,
+matching the bounded short-bench protocol used for other current Codex microbench entries.
+
+| Workload | ORIG allocating token slice | Candidate streaming windows | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `fingerprint_compute/current_alloc_doc300 -> streaming_doc300` | 18.378 us | 17.328 us | **0.943 (~1.06x faster)** | keep |
+
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an
+internal document-fingerprint primitive, not a standalone search-engine comparator. The ratio
+above is against the pre-change in-repo ORIG implementation for this callsite.
+
 ### 2026-07-04 - rerank RRF-combine order-vector bookkeeping is a kept internal win; external original-comparator ratio is N/A (Codex)
 
 **Ledger entry for the land:** replaced `frankensearch-rerank`'s `apply_rrf_combine`

@@ -1,6 +1,6 @@
-//! SimHash vote-accumulation benchmark.
+//! `SimHash` vote-accumulation benchmark.
 //!
-//! `Fingerprint::compute` builds a 64-bit SimHash over 3-token shingles for
+//! `Fingerprint::compute` builds a 64-bit `SimHash` over 3-token shingles for
 //! incremental re-embedding decisions (runs per document). The dominant inner
 //! work is `apply_hash_votes`: for each window's hash, accumulate ±1 into 64 bit
 //! counters. The committed code did `if (bit set) { +1 } else { -1 }` — a
@@ -17,6 +17,8 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use frankensearch_core::filter::fnv1a_hash;
+use frankensearch_core::fingerprint::DocumentFingerprint;
 
 const SHINGLE_SIZE: usize = 3;
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -59,7 +61,7 @@ const fn build_vote_table() -> [[i32; 8]; 256] {
     while byte < 256 {
         let mut k = 0;
         while k < 8 {
-            table[byte][k] = 2 * ((byte >> k) & 1) as i32 - 1;
+            table[byte][k] = if ((byte >> k) & 1) == 0 { -1 } else { 1 };
             k += 1;
         }
         byte += 1;
@@ -97,6 +99,20 @@ fn simhash(tokens: &[&str], mode: u8) -> u64 {
     semantic_hash
 }
 
+fn u32_saturating(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn compute_current_alloc(text: &str) -> DocumentFingerprint {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    DocumentFingerprint {
+        content_hash: fnv1a_hash(text.as_bytes()),
+        semantic_hash: simhash(&tokens, 2),
+        char_count: u32_saturating(text.chars().count()),
+        token_estimate: u32_saturating(tokens.len()),
+    }
+}
+
 fn bench_fingerprint(c: &mut Criterion) {
     // ~300-token document (typical chunk fed to the fingerprinter).
     let text = "the quick brown fox jumps over the lazy dog while the engineer \
@@ -110,14 +126,35 @@ fn bench_fingerprint(c: &mut Criterion) {
     debug_assert_eq!(simhash(&tokens, 1), simhash(&tokens, 2));
 
     // The kept `branchless` (current main) vs the candidate `table` (byte-indexed).
-    let mut g = c.benchmark_group("simhash_votes");
-    g.bench_function("branchless", |b| {
-        b.iter(|| black_box(simhash(black_box(&tokens), 1)));
-    });
-    g.bench_function("table", |b| {
-        b.iter(|| black_box(simhash(black_box(&tokens), 2)));
-    });
-    g.finish();
+    {
+        let mut g = c.benchmark_group("simhash_votes");
+        g.bench_function("branchless", |b| {
+            b.iter(|| black_box(simhash(black_box(&tokens), 1)));
+        });
+        g.bench_function("table", |b| {
+            b.iter(|| black_box(simhash(black_box(&tokens), 2)));
+        });
+        g.finish();
+    }
+
+    // Full production fingerprint path: old `compute` allocated `Vec<&str>` for
+    // all tokens, then slid windows over that slice. Current production streams
+    // the same 3-token windows with a two-token rolling buffer.
+    debug_assert_eq!(
+        compute_current_alloc(&text),
+        DocumentFingerprint::compute(&text)
+    );
+
+    {
+        let mut g = c.benchmark_group("fingerprint_compute");
+        g.bench_function("current_alloc_doc300", |b| {
+            b.iter(|| black_box(compute_current_alloc(black_box(&text))));
+        });
+        g.bench_function("streaming_doc300", |b| {
+            b.iter(|| black_box(DocumentFingerprint::compute(black_box(&text))));
+        });
+        g.finish();
+    }
 }
 
 criterion_group!(benches, bench_fingerprint);

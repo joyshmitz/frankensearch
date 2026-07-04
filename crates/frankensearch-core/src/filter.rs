@@ -281,8 +281,8 @@ impl SearchFilter for DateRangeFilter {
 ///
 /// Identity `Hasher` for `u64` keys that are ALREADY well-distributed hashes (the
 /// FNV-1a `doc_id` hashes the filter stores). A default `HashSet<u64>` re-runs
-/// SipHash over each key (~25 cyc); since the key is already a uniform hash,
-/// passing it straight through is correct (FNV-1a's high bits feed the SwissTable
+/// `SipHash` over each key (~25 cyc); since the key is already a uniform hash,
+/// passing it straight through is correct (FNV-1a's high bits feed the `SwissTable`
 /// control byte) and ~10× cheaper per probe — which dominates the *filtered* vector
 /// scan, where one membership probe runs per candidate before the (cheap, SIMD) dot.
 #[derive(Default, Clone, Copy)]
@@ -320,9 +320,10 @@ impl std::hash::BuildHasher for BuildIdentityHasherU64 {
     }
 }
 
-/// Identity-hashed `u64` set used as a [`BitsetFilter`]'s allow-list and exposed
-/// via [`SearchFilter::candidate_hashes`] so a selective filtered scan can iterate
-/// the allow-set directly instead of probing it per corpus document.
+/// Identity-hashed `u64` set used as a [`BitsetFilter`]'s allow-list.
+///
+/// Exposed via [`SearchFilter::candidate_hashes`] so a selective filtered scan can
+/// iterate the allow-set directly instead of probing it per corpus document.
 pub type DocIdHashSet = HashSet<u64, BuildIdentityHasherU64>;
 
 /// Uses FNV-1a hashing for `O(1)` membership checks. Useful when the set of
@@ -336,7 +337,7 @@ impl BitsetFilter {
     /// Create a filter from pre-computed FNV-1a hashes of `doc_id` values.
     ///
     /// The keys are re-bucketed into an identity-hashed set ([`IdentityHasherU64`])
-    /// so per-probe membership skips SipHash — paid once at construction, amortized
+    /// so per-probe membership skips `SipHash` — paid once at construction, amortized
     /// over every candidate of a filtered scan.
     #[must_use]
     pub fn from_hashes(hashes: HashSet<u64>) -> Self {

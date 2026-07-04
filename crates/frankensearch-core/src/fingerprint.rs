@@ -40,13 +40,13 @@ impl DocumentFingerprint {
     /// Compute a fingerprint for document text.
     #[must_use]
     pub fn compute(text: &str) -> Self {
-        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let semantic = semantic_simhash_text(text);
 
         Self {
             content_hash: fnv1a_hash(text.as_bytes()),
-            semantic_hash: semantic_simhash(&tokens),
+            semantic_hash: semantic.hash,
             char_count: usize_to_u32_saturating(text.chars().count()),
-            token_estimate: usize_to_u32_saturating(tokens.len()),
+            token_estimate: usize_to_u32_saturating(semantic.token_count),
         }
     }
 
@@ -115,6 +115,7 @@ fn usize_to_u32_saturating(value: usize) -> u32 {
 }
 
 #[must_use]
+#[cfg(test)]
 fn semantic_simhash(tokens: &[&str]) -> u64 {
     if tokens.is_empty() {
         return 0;
@@ -132,13 +133,61 @@ fn semantic_simhash(tokens: &[&str]) -> u64 {
         }
     }
 
+    semantic_hash_from_weights(&bit_weights)
+}
+
+struct SemanticSimhash {
+    hash: u64,
+    token_count: usize,
+}
+
+#[must_use]
+fn semantic_simhash_text(text: &str) -> SemanticSimhash {
+    let mut bit_weights = [0_i32; 64];
+    let mut token_count = 0_usize;
+    let mut prev2 = None;
+    let mut prev1 = None;
+
+    for token in text.split_whitespace() {
+        if let (Some(left), Some(mid)) = (prev2, prev1) {
+            let window = [left, mid, token];
+            apply_hash_votes(hash_token_window(&window), &mut bit_weights);
+        }
+        token_count += 1;
+        prev2 = prev1;
+        prev1 = Some(token);
+    }
+
+    if token_count == 0 {
+        return SemanticSimhash {
+            hash: 0,
+            token_count,
+        };
+    }
+
+    if token_count < SHINGLE_SIZE {
+        if let Some(token) = prev2 {
+            apply_hash_votes(fnv1a_hash(token.as_bytes()), &mut bit_weights);
+        }
+        if let Some(token) = prev1 {
+            apply_hash_votes(fnv1a_hash(token.as_bytes()), &mut bit_weights);
+        }
+    }
+
+    SemanticSimhash {
+        hash: semantic_hash_from_weights(&bit_weights),
+        token_count,
+    }
+}
+
+#[must_use]
+fn semantic_hash_from_weights(bit_weights: &[i32; 64]) -> u64 {
     let mut semantic_hash = 0_u64;
     for (bit, weight) in bit_weights.iter().enumerate() {
         if *weight > 0 {
             semantic_hash |= 1_u64 << bit;
         }
     }
-
     semantic_hash
 }
 
@@ -197,7 +246,7 @@ fn hash_token_window(window: &[&str]) -> u64 {
 mod tests {
     use super::{
         DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint,
-        SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD,
+        SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD, semantic_simhash, semantic_simhash_text,
     };
 
     #[test]
@@ -399,6 +448,26 @@ mod tests {
         let fp = DocumentFingerprint::compute("hello world");
         assert_eq!(fp.token_estimate, 2);
         assert!(fp.semantic_hash != 0); // should still produce a non-zero hash
+    }
+
+    #[test]
+    fn streaming_semantic_simhash_matches_slice_reference() {
+        for text in [
+            "",
+            "   \n\t ",
+            "one",
+            "one two",
+            "one two three",
+            "one two three four",
+            "rust async search pipeline with stable semantic windows",
+            "alpha   beta\ngamma\tdelta epsilon",
+            "unicode 世界 search café token",
+        ] {
+            let tokens: Vec<&str> = text.split_whitespace().collect();
+            let streaming = semantic_simhash_text(text);
+            assert_eq!(streaming.hash, semantic_simhash(&tokens), "text={text:?}");
+            assert_eq!(streaming.token_count, tokens.len(), "text={text:?}");
+        }
     }
 
     #[test]
