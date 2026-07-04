@@ -7566,3 +7566,54 @@ original; the only attractive rows are isolated top-10/no-hit noise while the ex
 regress well beyond the 1.03 stop line. This closes the obvious scratch candidate without re-opening already covered
 RRF/sort/hash/ANN/LUT work. The durable blocker remains the same: BOLD `limit_all` asks frankensearch to materialize full
 typed `ScoredResult`s for every document, while the legacy original returns bare Tantivy doc ids.
+
+---
+
+### RRF-combining TWO decorrelated cross-encoders gives corpus-ROBUSTNESS but is NOT worth 2× rerank cost — a single good generalist (ms-marco-L6) is already the safe default (CopperKestrel, 2026-07-03)
+
+Attacked the one headline-open reranker question — *"there is NO safe default reranker"* (`657df16`: each single cross-encoder
+flips by corpus — bge wins SciFact but loses ~23% on ArguAna; ms-marco is a net-positive generalist but mildly hurts SciFact). The
+natural lever the arc had **not** tested: since the two cross-encoders have *different training objectives* (ms-marco =
+web-QA passage ranking, bge = semantic similarity) → **decorrelated errors** — exactly the "MODALITY diversity, not signal
+count" condition (`SEARCH_QUALITY_FINDINGS` #2) that makes fusion pay — **RRF-combine BOTH rerankers as two additional ranked
+sources** and see if the ensemble is corpus-*robust* (net-positive everywhere) where each single reranker is catastrophic
+somewhere. nDCG@10 Δ vs no-rerank, same tuned hybrid candidates (retrieval-32M + weighted RRF k=10, FEED=50), RRF-combine k=60,
+BEIR SciFact/NFCorpus/ArguAna (N=60 queries each):
+
+| dataset | ms-marco-L6 alone | bge-base alone | **ENS retr+ms+bge** (equal) | **ENS retr+½ms+½bge** | ENS ms+bge only (no retr anchor) |
+|---|---:|---:|---:|---:|---:|
+| SciFact  | −0.0036 | **+0.0396** | +0.0097 | +0.0121 | −0.0110 |
+| NFCorpus | **+0.0474** | +0.0160 | +0.0383 | +0.0356 | +0.0367 |
+| ArguAna  | +0.0250 | −0.0192 | +0.0176 | +0.0280 | −0.0170 |
+| **mean uplift** | **+0.0229** | +0.0121 | +0.0219 | **+0.0252** | +0.0029 |
+
+**Finding — the ensemble achieves the robustness goal but FAILS the cost test.** Both anchored ensembles are net-positive on
+**all three** datasets — the ensemble is never catastrophic, while each single reranker is negative on ≥1 corpus (bge −0.0192
+ArguAna / −23% full-dataset; ms −0.0036 SciFact). The decorrelation is real and load-bearing: **bge rescues SciFact where ms
+fails; ms rescues ArguAna where bge fails.** But that robustness is *redundant*: **ms-marco-L6 ALONE is already the robust
+generalist** (net-positive-or-tie on all 3, mean **+0.0229**). The equal-weight ensemble (mean **+0.0219**) is actually *worse*
+than ms-alone at **2× the cross-encoder cost**, and the best ensemble variant (half-weight, mean +0.0252) beats ms-alone by only
+**+0.0023 mean nDCG** (~10% of the reranker's own contribution) — not worth doubling the pipeline's one expensive stage. Where a
+single reranker clearly wins (bge +0.040 SciFact, ms +0.047 NFCorpus) the ensemble *gives up 20-75% of the peak* by averaging in
+the weaker member. So: **ensembling two cross-encoders is the wrong way to buy robustness — the cheaper answer is the single good
+generalist.** This closes "reranker ensembling for a safe default" and *reinforces* the existing rule (`657df16`: reranking is a
+per-CORPUS decision; ms-marco-L6 is the better generalist; RRF-combine + retrieval anchor is the safe integration).
+
+**Two reusable mechanistic sub-findings:**
+1. **The retrieval anchor is load-bearing, not the reranker consensus.** Dropping the retrieval RRF term and fusing the two
+   rerankers alone (`ENS ms+bge only`) *collapses to negative* on SciFact (−0.0110) and ArguAna (−0.0170) — **worse than either
+   single RRF-combine** — because two rerankers fused without the retrieval veto re-expose the deep-false-positive risk that
+   RRF-combine exists to cap. This independently re-derives the prior result (`b114e39`): RRF-combine's safety comes from the
+   *retrieval* source, not from stacking rerankers.
+2. **When you add N reranker sources, normalize their TOTAL weight to ≈ the retrieval source's** (down-weight each to 1/N). The
+   half-weight ensemble beats the equal-weight one on exactly the two datasets where a reranker is *wrong* (SciFact +0.0121 vs
+   +0.0097; ArguAna +0.0280 vs +0.0176), because two full-weight reranker votes out-vote the single retrieval vote 2:1 and pull
+   toward the reranker consensus — precisely *away* from the anchor on the corpus where a reranker misfires. Halving restores the
+   1:1 retrieval:reranker balance. (Practical corollary if you already run two rerankers for another reason: give each 1/N weight.)
+
+This also sharpens the boundary of the "do NOT ensemble multiple EMBEDDERS" finding (`SEARCH_QUALITY_FINDINGS` #2): rerankers, unlike
+model2vec embedders, ARE decorrelated, so the ensemble is at least *never-harmful* (positive on all 3) — but decorrelation buys
+**robustness, not net quality over the best single generalist.** The modality-diversity principle predicts the ensemble won't hurt;
+it does not predict it beats a strong single member. Verified: `model2vec` retrieval-32M + `rank_bm25` hybrid candidates + `fastembed`
+ONNX cross-encoders (`ms-marco-MiniLM-L-6-v2`, `bge-reranker-base`), RRF-combine of retrieval/reranker ranks, BEIR SciFact/NFCorpus/
+ArguAna (N=60, no cargo, no torch).
