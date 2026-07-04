@@ -7353,3 +7353,39 @@ Practical rule stands: **choose the reranker per corpus (or A/B it) and rerank s
 per-query gate** — it captures at most ~8 pts over random where it matters and is unnecessary where it works. This closes
 the tempting "adaptive reranking cuts the cost" lever with a measured NO. Verified: `model2vec` retrieval-32M +
 `rank_bm25`, oracle-reorder nDCG@10 gain vs 8 query-time signals, BEIR SciFact / NFCorpus (no cargo).
+
+---
+
+### Query-length-adaptive tier weighting does NOT beat a static weight — the vector/lexical balance is length-INSENSITIVE (the short-query vector weakness is absolute, not differential) (SlateHarrier, 2026-07-03)
+
+A natural lever suggested by two prior findings — the vector tier "collapses on short queries" (`SEARCH_QUALITY_FINDINGS`)
+and query length is a real per-query signal (`102a854`): make the RRF tier weight **adapt to query length** (down-weight
+the vector tier on short queries where it's weak, up-weight it on long queries), since a single static weight is a
+compromise if the optimal vector/lexical balance shifts with length. First measured the premise — vector-only vs
+lexical-only recall@10 by query-length tertile:
+
+| dataset | SHORT | MID | LONG |
+|---|---|---|---|
+| SciFact | len 4–10: vec .814 / lex .780 (**Δ +.034**) | len 10–14: .735 / .740 (Δ −.005) | len 14–29: .836 / .807 (Δ +.029) |
+| NFCorpus | len 1–2: vec .175 / lex .170 (Δ +.006) | len 2–4: .125 / .139 (Δ −.014) | len 4–12: .144 / .148 (Δ −.004) |
+
+**The vector−lexical gap does NOT track query length** (non-monotonic on SciFact, tiny/flat on NFCorpus). End-to-end,
+qlen-adaptive vector-weight schemes vs the best static vector-weight (swept 0.5–2.0, lexical=1.0):
+
+| dataset | best static (wv) | best qlen-adaptive scheme | Δ nDCG@10 |
+|---|---|---|---|
+| SciFact | wv=1.0 → nDCG 0.6920 | step(short 0.6 / long 1.3) → 0.6934 | **+0.2% (noise)** |
+| NFCorpus | wv=2.0 → nDCG 0.3264 | best adaptive → 0.3218 | **−1.4% (−2.1% worst)** |
+
+**Finding — query-length-adaptive tier weighting does not beat a static weight; on NFCorpus it is strictly worse.** The
+premise is false: on the natural query distributions of these BEIR datasets the optimal vector/lexical fusion balance is
+**length-insensitive**, so no length-conditioned weight can beat the best single static weight (SciFact ties within noise;
+NFCorpus loses, because it wants the vector tier *uniformly* up-weighted — `wv=2.0` — and the adaptive scheme down-weights
+it precisely on the short queries). The mechanism: **the short-query vector weakness is ABSOLUTE, not DIFFERENTIAL** — on
+the very short (1–2 token) NFCorpus queries where the vector tier is weakest, the *lexical* tier is essentially as weak
+(vec .175 ≈ lex .170), so shifting weight toward lexical buys nothing. A hard short query is hard for *both* tiers
+(query underspecification), which is exactly why tier re-weighting can't fix it — the remedy is a better query
+*representation* (or lexical exact-match rescue), not a fusion *knob*. This validates the arc's existing recommendation of
+a **single static stronger-tier weight** (`4cc3b47`/`44566fd`) and closes query-adaptive tier weighting as a lever.
+Verified: `model2vec` retrieval-32M + `rank_bm25`, per-query-length-tertile recall + qlen-adaptive RRF weight sweep, BEIR
+SciFact / NFCorpus (no cargo).
