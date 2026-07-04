@@ -7315,3 +7315,41 @@ tier with enough one-tier rel-vs-FP fidelity to safely promote a one-tier doc ov
 reason it delivers the capstone's final +10–22% nDCG over Tantivy BM25 (`SEARCH_QUALITY_FINDINGS.md`) that no rank- or
 score-fusion knob can reach. Verified: `model2vec` retrieval-32M + `rank_bm25`, per-query-per-tier min-max within-tier
 score, on BEIR SciFact / NFCorpus (no cargo).
+
+---
+
+### Per-query rerank GATING from cheap signals is NOT viable — where gating pays the signal is absent, where a signal exists gating doesn't pay (SlateHarrier, 2026-07-03)
+
+The reranker is the one open tier (`2779703`) but its sole downside is COST (~ms/candidate cross-encoder → 100 ms–1 s
+per top-100 query). The obvious cost fix: rerank only the queries that benefit, via a per-query **gate** on a cheap
+query-time signal (no qrels, no cross-encoder inference). Tested whether any cheap signal predicts a query's
+**oracle-rerank nDCG@10 gain** (`oracle_reorder − hybrid`, the perfect-reranker uplift, computed from qrels as ground
+truth). 8 candidate signals × 2 datasets; the actionable metric = **fraction of total achievable uplift captured when
+reranking only the top-p% of queries ranked by the signal** (random gate captures p; the oracle gate is the ceiling):
+
+| dataset | rerankable q (gain>0) | best cheap signal · cap@30% | oracle-gate cap@30% | random |
+|---|---|---|---|---|
+| SciFact | 44% | `max_cos`/`entropy` · **0.38** (ρ≤0.16, AUROC≤0.58) | **0.82** | 0.30 |
+| NFCorpus | 79% | `qlen` · **0.39** (ρ=+0.36, AUROC 0.68) | 0.59 | 0.30 |
+
+**Finding — per-query rerank gating from cheap signals is NOT viable, because corpus structure is adversarial to it:
+where gating would PAY, no signal FINDS the queries; where a signal EXISTS, gating doesn't pay.** On **SciFact** the
+rerank uplift is highly *concentrated* — a perfect gate captures **82%** of it by reranking just 30% of queries — but no
+cheap query-time signal comes close (best 0.38, ≈ random + 8 pts; Spearman ≤0.16, AUROC ≤0.58): the queries that benefit
+are query-time-**indistinguishable**. On **NFCorpus** a real signal *exists* — **longer queries benefit more from
+reranking** (`qlen` Spearman +0.36, AUROC 0.68) — but gating there has little *value*: 79% of queries are rerankable and
+even the oracle gate concentrates only 59% into the top-30%, so you may as well rerank all. Across all 8 signals tested
+(cross-tier agreement volume, one-tier fraction, top-k fused-score gap and entropy, shallow tier-disagreement, top-10
+consensus fraction, max cosine, query length) the best cheap gate captures only ~0.38–0.39 at a 30% rerank budget on
+*both* datasets — a mere ~8 pts over random.
+
+**This reinforces the frontier's existing rule with a measured mechanism: reranking is a per-CORPUS decision, not a
+per-QUERY one.** The cross-encoder's cost cannot be cheaply clawed back by skipping "easy" queries, because you cannot
+cheaply tell which queries are easy — precisely on the corpus (SciFact) where that would save the most. The one durable
+query-time signal is itself corpus-specific: **query length predicts rerank-benefit on NFCorpus's long-document QA but is
+inert on SciFact's short claims** — consistent with `f81edd6` ("rerank when relevant docs are buried deep by a single
+tier"): long queries over long documents are exactly where one tier buries relevant passages a content reranker recovers.
+Practical rule stands: **choose the reranker per corpus (or A/B it) and rerank shallow-and-uniformly; do not build a
+per-query gate** — it captures at most ~8 pts over random where it matters and is unnecessary where it works. This closes
+the tempting "adaptive reranking cuts the cost" lever with a measured NO. Verified: `model2vec` retrieval-32M +
+`rank_bm25`, oracle-reorder nDCG@10 gain vs 8 query-time signals, BEIR SciFact / NFCorpus (no cargo).
