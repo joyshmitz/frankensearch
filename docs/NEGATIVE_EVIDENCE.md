@@ -7958,23 +7958,29 @@ or an artifact of a *weak embedder*. Re-ran the faithful capstone (hybrid vs **s
 |---|---:|---:|---:|---:|---:|
 | SciFact  | 0.6842 | 0.6331 (< BM25) | **0.7203 (> BM25)** | +3.0% nDCG / +2.8% rec | **+7.9% nDCG / +6.4% rec** |
 | NFCorpus | 0.3294 | 0.3085 (< BM25) | **0.3382 (> BM25)** | +3.0% / +5.3% | **+9.1% / +9.6%** |
+| ArguAna  | 0.3460 | 0.3191 (< BM25) | **0.4133 (≫ BM25)** | **+0.6% / +0.5%** | **+21.4% nDCG / +15.3% rec** |
 
-**Finding — the dense tier's marginal value over a properly-analyzed Tantivy is embedder-gated, and the contextual embedder roughly
-TRIPLES it (+3.0% → +7.9–9.1% nDCG; recall +2.8–5.3% → +6.4–9.6%).** The mechanism is visible in the vector-only column: the **static**
-tier is *weaker* than stemmed BM25 on both corpora (0.633 < 0.684, 0.309 < 0.329), so it can only nudge the fused result; the **contextual**
-tier is *stronger* than stemmed BM25 (0.720 > 0.684, 0.338 > 0.329), so it leads the fusion and the hybrid clears the faithful baseline by a
-real margin. So the earlier "dense tier is modest / largely redundant" conclusion is **correct for the static default but must be qualified:
-it was partly a weak-embedder artifact.** Corrected, unified deployment guidance:
+**Finding — the dense tier's marginal value over a properly-analyzed Tantivy is embedder-gated, and the contextual embedder turns a
++0.6–3.0% nudge into a +7.9–21.4% nDCG win (recall +0.5–5.3% → +6.4–15.3%).** The mechanism is visible in the vector-only column: the
+**static** tier is *weaker* than stemmed BM25 on all 3 corpora (0.633 < 0.684, 0.309 < 0.329, 0.319 < 0.346), so it can only nudge the fused
+result; the **contextual** tier is *stronger* than stemmed BM25 (0.720 > 0.684, 0.338 > 0.329, **0.413 ≫ 0.346**), so it leads the fusion and
+the hybrid clears the faithful baseline by a real margin. **The gating is MOST extreme exactly where the task is most SEMANTIC: ArguAna
+(argument → counter-argument) goes from a useless +0.6% (static) to a transformative +21.4% (contextual)** — static mean-pooling cannot model
+argumentative/negation structure, but the contextual transformer can (consistent with the prior BGE +28.8% ArguAna result, `SEARCH_QUALITY_
+FINDINGS` #1). So the earlier "dense tier is modest / largely redundant" conclusion is **correct for the static default but must be qualified:
+it was partly a weak-embedder artifact, and the qualification is largest on semantically hard corpora.** Corrected, unified deployment
+guidance:
 - **Static embedder (current default):** hybrid ≈ faithful BM25 **+3%** — a near-free nudge; the lexical analyzer is the dominant quality
   source (`de979c7`), and a BM25-only → reranker pipeline is competitive (`3eca5d5`). The dense tier is optional polish.
-- **Contextual embedder (BGE premium):** hybrid beats faithful BM25 by **+8–9% nDCG / +6–10% recall** — a substantial, worth-it gain; here
-  the dense tier *leads*, and the vector index clearly earns its keep. The premium's ~650× embed cost (`SEARCH_QUALITY_FINDINGS` #1) is an
-  index-build one-time cost, so this is the configuration for quality-sensitive corpora.
+- **Contextual embedder (BGE premium):** hybrid beats faithful BM25 by **+8–21% nDCG / +6–15% recall** — a substantial, worth-it gain,
+  *largest on semantically hard corpora* (ArguAna +21%); here the dense tier *leads*, and the vector index clearly earns its keep. The
+  premium's ~650× embed cost (`SEARCH_QUALITY_FINDINGS` #1) is an index-build one-time cost, so this is the configuration for
+  quality-sensitive corpora.
 
 This does not overturn the headline correction — the old **+12–22%** was still inflated (naive baseline + reranker); the honest contextual
-number vs a *faithful* Tantivy is **+8–9%** (retrieval-only, no reranker) — but it materially sharpens it: **the dense tier is a modest
+number vs a *faithful* Tantivy is **+8–21%** (retrieval-only, no reranker) — but it materially sharpens it: **the dense tier is a modest
 complement with the static default and a substantial one with a contextual embedder; the embedder choice is what decides whether the vector
-index is optional or essential.** This also re-frames recommendation #1 — the contextual "premium" isn't just "more embedder quality," it is
-*the* thing that turns the hybrid from a +3% nudge into a +8–9% win over a well-analyzed BM25. Verified: `model2vec` retrieval-32M vs
-`fastembed` BGE-small-en-v1.5 (query-prefixed, `.npy`-cached) + `rank_bm25` stem+stop, tuned RRF hybrid, BEIR SciFact/NFCorpus (no cargo, no
-torch). [ArguAna BGE run in progress — 2-dataset finding, convention-consistent.]
+index is optional or essential — most decisively on semantic corpora.** This also re-frames recommendation #1 — the contextual "premium"
+isn't just "more embedder quality," it is *the* thing that turns the hybrid from a +0.6–3% nudge into a +8–21% win over a well-analyzed BM25.
+Verified: `model2vec` retrieval-32M vs `fastembed` BGE-small-en-v1.5 (query-prefixed, `.npy`-cached) + `rank_bm25` stem+stop, tuned RRF
+hybrid, full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
