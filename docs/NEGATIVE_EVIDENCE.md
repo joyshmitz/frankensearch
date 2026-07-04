@@ -8686,11 +8686,39 @@ aligned blend's defensive `AHashMap<&str, ScorePair>` merge and stream directly 
 | 10000 | 2.2163 ms `[1.8569,2.7936]` | 2.2917 ms `[1.9936,2.5115]` | **1.034** |
 | 100000 | 67.779 ms `[52.004,83.726]` | 34.245 ms `[30.626,37.913]` | **0.505** |
 
-**Decision:** reject the 10k specialization as a standalone lever. Although it is still faster than the older
+**Decision then:** reject the 10k specialization as a standalone lever. Although it is still faster than the older
 materialized ORIG at 10k (2.2917 ms vs 2.6086 ms, ratio 0.878), current main already has the aligned clone-elision win,
-and the unique path is not better at 10k. Production is therefore thresholded: keep `blend_two_tier_aligned` below
-100k hits and use `blend_two_tier_aligned_unique` only for the measured 100k `limit_all` case. Do not re-test the 10k
-unique-blend variant unless a new measurement changes the threshold.
+and the unique path is not better at 10k. Production was therefore thresholded at 100k. This local-fallback result is now
+superseded by the same-worker RCH measurement below.
+
+### 2026-07-04 — CobaltRidge — same-worker RCH overturns the noisy 10k unique-blend reject; threshold lowered to 10k
+
+The required literal command was tried first and rejected by Cargo (`unexpected argument '--release'`):
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench --release -p frankensearch-fusion --bench blend_aligned -- \
+  blend_aligned --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+Successful per-crate bench, same remote worker `ovh-a`:
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release --bench blend_aligned -- \
+  blend_aligned --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+| N | legacy materialized ORIG `current` | current main `aligned` | `aligned_unique` | ratio vs current main | ratio vs ORIG | Decision |
+|---:|---:|---:|---:|---:|---:|---|
+| 10000 | 1.0478 ms `[1.0250,1.0940]` | 1.1052 ms `[1.0767,1.1456]` | 874.55 µs `[868.76,882.15]` | **0.791** | **0.835** | wire |
+| 50000 | 10.876 ms `[10.721,11.097]` | 10.986 ms `[9.9437,12.771]` | 5.5231 ms `[5.3568,5.6369]` | **0.503** | **0.508** | wire |
+| 100000 | 31.353 ms `[24.605,36.328]` | 23.653 ms `[22.331,25.078]` | 12.708 ms `[12.015,14.291]` | **0.537** | **0.405** | already wired |
+
+**Decision now:** the 10k no-ship was measurement noise from a local fallback. Lower
+`ALIGNED_UNIQUE_BLEND_MIN_HITS` from 100k to 10k and keep the 50k bench arm so the crossover remains covered. This is a
+measured ratio-vs-ORIG entry for the BOLD `limit_all` result-assembly surface; external Tantivy/Lucene/Meili ratio is not
+claimed because the bench isolates frankensearch's internal blend/materialization region.
 
 ### 2026-07-04 — CopperKestrel — Abstention/confidence is corpus-specific, NOT universal: the cross-encoder top score is the best "is there a good answer" signal on CLEAN-relevance corpora (AUROC ~0.78) but COLLAPSES on argumentative retrieval, and NO signal (CE or retrieval) supports a corpus-agnostic global threshold
 

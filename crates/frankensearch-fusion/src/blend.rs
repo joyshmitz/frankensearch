@@ -23,7 +23,7 @@ use tracing::{debug, instrument};
 
 const DEFAULT_BLEND_FACTOR: f32 = 0.7;
 const NON_FINITE_SCORE_FALLBACK: f32 = 0.0;
-const ALIGNED_UNIQUE_BLEND_MIN_HITS: usize = 100_000;
+const ALIGNED_UNIQUE_BLEND_MIN_HITS: usize = 10_000;
 
 /// Pre-computed normalization bounds for a score set.
 ///
@@ -346,12 +346,12 @@ pub fn blend_two_tier_aligned_unique(
     blended
 }
 
-/// Blend aligned vector-index hits using the measured large-N specialization.
+/// Blend aligned vector-index hits using the measured vector-index specialization.
 ///
 /// `fast_hits` from the vector index are unique by `doc_id`, but the unique
-/// specialization only pays off at the large `limit_all` shape measured in the
-/// `blend_aligned` bench. Smaller queries keep the defensive map path because
-/// it is neutral/slightly faster at 10k.
+/// specialization only pays off once the defensive map merge dominates. The
+/// `blend_aligned` bench keeps the crossover explicit: the unique path wins at
+/// 10k and above; smaller queries keep the defensive map path.
 #[must_use]
 pub(crate) fn blend_two_tier_aligned_vector_index(
     fast_hits: &[VectorHit],

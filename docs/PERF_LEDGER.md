@@ -2990,23 +2990,24 @@ semantics by merging `fast_hits` through an `AHashMap<&str, ScorePair>`. The pro
 (`TwoTierSearcher` and `SyncTwoTierSearcher`) receive unique doc ids from the vector index, so the large `limit_all`
 case can stream normalized scores directly into the output vector and sort it, skipping the defensive hash-merge.
 
-The 10k subcase is not a current-main win, so it is **not wired** there: `blend_two_tier_aligned_vector_index` keeps the
-existing map-preserving aligned path below 100k hits and switches to the unique path only for the measured 100k shape.
-This drops the ~0-gain/regression variant while keeping the large-N win.
+Follow-up remote RCH measurement on `ovh-a` overturned the earlier noisy local 10k rejection and added the missing 50k
+crossover row. The unique path is now a clean current-main win at 10k, 50k, and 100k, so
+`blend_two_tier_aligned_vector_index` switches to it from 10k hits upward. Smaller queries keep the defensive map path.
 
-**Measured (per-crate, local fallback after RCH worker `vmi1167313` exceeded the 10-minute bench cutoff; target dir
-`/data/projects/.rch-targets/frankensearch-cod`):**
+**Measured (per-crate, remote `ovh-a`; target dir requested as `/data/projects/.rch-targets/search-cod`, rewritten by
+RCH to a worker-scoped path):**
 
 ```bash
-AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod \
-  cargo bench -p frankensearch-fusion --profile release --bench blend_aligned -- \
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release --bench blend_aligned -- \
   blend_aligned --sample-size 10 --warm-up-time 1 --measurement-time 1
 ```
 
 | N | legacy materialized ORIG `current` | current main `aligned` | `aligned_unique` | ratio vs current main | ratio vs ORIG |
 |---:|---:|---:|---:|---:|---:|
-| 10000 | 2.6086 ms `[1.9682,3.0989]` | 2.2163 ms `[1.8569,2.7936]` | 2.2917 ms `[1.9936,2.5115]` | **1.034** (not wired) | 0.878 |
-| 100000 | 75.669 ms `[65.607,86.836]` | 67.779 ms `[52.004,83.726]` | 34.245 ms `[30.626,37.913]` | **0.505 (~1.98× faster)** | **0.452 (~2.21× faster)** |
+| 10000 | 1.0478 ms `[1.0250,1.0940]` | 1.1052 ms `[1.0767,1.1456]` | 874.55 µs `[868.76,882.15]` | **0.791 (~1.26× faster)** | **0.835 (~1.20× faster)** |
+| 50000 | 10.876 ms `[10.721,11.097]` | 10.986 ms `[9.9437,12.771]` | 5.5231 ms `[5.3568,5.6369]` | **0.503 (~1.99× faster)** | **0.508 (~1.97× faster)** |
+| 100000 | 31.353 ms `[24.605,36.328]` | 23.653 ms `[22.331,25.078]` | 12.708 ms `[12.015,14.291]` | **0.537 (~1.86× faster)** | **0.405 (~2.47× faster)** |
 
 Correctness: `aligned_unique_matches_aligned_for_unique_fast_hits` proves bit-identical output for unique fast hits
 across alpha `{0, 0.3, 0.7, 1, NaN}`; the bench also asserts bit-identical output and quality-map size before timing.

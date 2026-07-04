@@ -104,7 +104,7 @@ fn aligned_unique(fast: &[VectorHit], qscores: &[Option<f32>]) -> (Vec<VectorHit
 
 fn bench_blend_aligned(c: &mut Criterion) {
     let mut g = c.benchmark_group("blend_aligned");
-    for n in [10_000usize, 100_000] {
+    for n in [10_000usize, 50_000, 100_000] {
         let fast = fast_hits(n);
         let qscores = quality_scores(n);
 
