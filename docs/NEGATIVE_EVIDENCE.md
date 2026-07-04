@@ -7702,3 +7702,53 @@ shared, small `k`) plus a light tier weight — per-tier `k` collapses to the di
 freedom and re-confirms the prior result from a second direction (the modest available gain is purely from a smaller *shared* `k`≈1-5,
 not from decoupling the tiers). Verified: `model2vec` retrieval-32M + `rank_bm25`, 5×5 per-tier `k` grid at fixed tuned hybrid config,
 full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
+
+---
+
+### Lexical-tier ANALYSIS (stemming + stopword removal) is the LARGEST lexical-side hybrid lever (+3-14% nDCG) — it STRENGTHENS decorrelation, and frankensearch already gets it free via Tantivy (CopperKestrel, 2026-07-03)
+
+Every prior harness finding used a naive tokenizer (`re.findall(r"[a-z0-9]+")` — no stemming, no stopwords), while
+frankensearch's real lexical tier is **Tantivy's default English analyzer, which stems (Snowball/Porter2) and removes
+stopwords**. Tested the gap. A plausible *worry* motivated it: the hybrid's power is **modality diversity — exact-term vs
+semantic → decorrelated errors** (`SEARCH_QUALITY_FINDINGS` #2), and stemming conflates morphology (`study`≈`studies`≈`studying`),
+moving the lexical tier *toward* the semantic tier's generalizing behavior — so stemming might **help BM25-alone but hurt the
+HYBRID by eroding decorrelation.** Measured BM25-alone AND the hybrid for `naive` / `stem` / `stem+stop`, plus a direct
+decorrelation probe (`lex-uniq-rel` = fraction of a query's relevant docs the lexical top-100 finds that the vector top-100
+*misses*). Full BEIR test sets, tuned RRF hybrid (retrieval-32M + weighted RRF k=10, FEED=100). nDCG@10:
+
+| dataset | tokenizer | BM25-alone | Δ | HYBRID | Δ | lex-uniq-rel |
+|---|---|---:|---:|---:|---:|---:|
+| SciFact  | naive | 0.6523 | — | 0.6835 | — | 0.0294 |
+|          | stem  | 0.6781 | +0.0258 | 0.7024 | +0.0189 | 0.0328 |
+|          | **stem+stop** | **0.6842** | **+0.0319** | **0.7048** | **+0.0213 (+3.1%)** | 0.0368 |
+| NFCorpus | naive | 0.3062 | — | 0.3255 | — | 0.0462 |
+|          | stem  | 0.3227 | +0.0165 | 0.3365 | +0.0110 | 0.0465 |
+|          | **stem+stop** | **0.3294** | **+0.0232** | **0.3392** | **+0.0137 (+4.2%)** | 0.0491 |
+| ArguAna  | naive | 0.2589 | — | 0.3053 | — | 0.0033 |
+|          | stem  | 0.2594 | +0.0005 | 0.3079 | +0.0026 | 0.0067 |
+|          | **stem+stop** | **0.3460** | **+0.0871 (+34%)** | **0.3480** | **+0.0427 (+14%)** | 0.0133 |
+
+**Finding — lexical analysis is the largest lexical-side quality lever measured, bigger than ANY fusion knob, and the worry is
+refuted: analysis STRENGTHENS the hybrid's decorrelation, not erodes it.** The full analyzer (`stem+stop`) lifts the hybrid on all
+3 datasets — **+0.0213 SciFact (+3.1%), +0.0137 NFCorpus (+4.2%), +0.0427 ArguAna (+14%)** — vs the naive tokenizer, dwarfing k1/b
+tuning (+1.4%) and field-weighting (≤+0.4%). The refutation is direct: **`lex-uniq-rel` INCREASES with analysis on every dataset**
+(SciFact 0.029→0.037, NFCorpus 0.046→0.049, ArguAna 0.003→0.013) — proper analysis recovers relevant docs that BOTH exact-match
+AND the vector tier missed (morphological variants, and content terms freed from stopword noise), so the lexical tier's
+*complementary* value **rises**. Stemming doesn't blur the lexical tier into the semantic one; it fixes exact-match's brittleness on
+inflection, which is a failure mode the semantic tier *also* has for the specific relevant docs BM25 was missing.
+
+**The two operations contribute differently by corpus — a reusable rule:** on **short-text** corpora (SciFact claims, NFCorpus
+question terms) **stemming** is the main lever (morphological conflation; +0.0258/+0.0165 BM25) and stopwords add a little; on the
+**long-prose** corpus (ArguAna full arguments) **stopword removal is dominant** — stem-alone barely moves it (+0.0005) but
+`stem+stop` jumps **+0.087 BM25 / +0.043 hybrid**, because long argumentative prose is stopword-saturated and BM25's TF saturation
+gets swamped by function words until they're removed. Short text → stem; long prose → stop-first.
+
+**Product implication: this is NOT a code change frankensearch needs — it VALIDATES a design choice it already made.** frankensearch's
+lexical tier is Tantivy, whose default English pipeline already stems + removes stopwords, so the **real product already captures this
++3-14%**; it is the pure-Python *harness* (naive tokenizer) that **understated** the absolute lexical-tier and hybrid quality all along.
+Two consequences: (1) Tantivy's analyzer is a **large, load-bearing contributor** to frankensearch's hybrid, not incidental plumbing —
+keep it (and prefer a stemming+stopword analyzer for any custom lexical field). (2) Prior harness numbers *understate absolute* hybrid
+nDCG by ~+2-4% (short) to +14% (long-prose); the **relative** fusion-mechanics conclusions (RRF vs score-fusion, kernel sharpness,
+tier weight, per-tier `k`) are analyzer-robust and stand — they concern how ranks combine, not how tokens are cut. Verified: `model2vec`
+retrieval-32M + `rank_bm25` with `snowballstemmer` (Snowball English) + sklearn English stopwords, BM25-alone & RRF-hybrid &
+lex-uniq-rel decorrelation probe, full BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
