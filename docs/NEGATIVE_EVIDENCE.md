@@ -8525,3 +8525,26 @@ Having established the hybrid's complementarity is vocabulary/semantic (top-10 J
 4. **Rules out doc-length-adaptive fusion weighting** — the document-side analog of the already-rejected query-length-adaptive weighting (`e837e15`). BOTH length-adaptive fusion variants (query-length and doc-length) are now measured-rejected: length carries no differential tier signal to exploit. Also CONFIRMS default-`b`=0.75 BM25 is already length-neutral (ρ≈0, validating the `43be67e` finding that `b` controls length-norm — at default `b` the residual length correlation is gone) and BGE cosine is length-neutral in the 100–250w range these corpora span.
 
 **Net:** document length is NOT a source of tier decorrelation — the hybrid's complementarity is vocabulary/semantic (`c26651f`), and both tiers are effectively length-blind after their respective normalizations (BM25's `b`, dense unit-norm). A measured negative that closes the doc-length-adaptive-fusion lever and sharpens the "why hybrid" mechanism to purely lexical-vs-semantic. Caveats: full-N; corpora span 150–237w medians (a corpus with extreme length variance or docs exceeding the embedder's 512-token window could differ — that is the separate truncation/chunking question, untested here); arguana length-analysis is uninformative (1-rel/q, recall-saturated). Verified: `fastembed` BGE-small + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `length_bias.py` in `$D`.
+
+### 2026-07-04 — CopperKestrel — RRF fusion POOL depth saturates at ~50 candidates/tier for nDCG@10: shipped POOL=100 is 2× deeper than needed, POOL≈50 is the free efficiency point, >100 is pure waste
+
+Swept the RRF fusion pool depth — how many candidates/tier feed the reciprocal-rank sum before taking top-10 (a distinct knob from the *rerank* FEED `5129bf9` and per-tier `k` `516280a`, neither of which touched the fusion pool itself). BM25+contextual-BGE hybrid, full-N, nDCG@10, Δ vs shipped POOL=100:
+
+| POOL | scifact | nfcorpus | arguana |
+|---:|---:|---:|---:|
+| 10 | −0.0024 | −0.0050 | −0.0074 |
+| 20 | −0.0039 | −0.0008 | −0.0016 |
+| **50** | **+0.0010** | **+0.0016** | **−0.0004** |
+| 100 (shipped) | 0.0000 | 0.0000 | 0.0000 |
+| 200 | +0.0003 | +0.0002 | −0.0001 |
+| 500 | +0.0013 | −0.0001 | −0.0001 |
+
+(absolute nDCG@10 at POOL=50: scifact 0.7393, nfcorpus 0.3614, arguana 0.4199)
+
+**Findings:**
+1. **nDCG@10 SATURATES by POOL≈50 on all 3 corpora**: POOL=50 is within ±0.0016 of POOL=100/200/500 everywhere, and actually EQUALS-or-BEATS the shipped POOL=100 on scifact (+0.0010) and nfcorpus (+0.0016), essentially ties on arguana (−0.0004). **Deeper pools (200, 500) add nothing** (|Δ|≤0.0013, sign-inconsistent = noise).
+2. **There IS a shallow floor**: POOL=10 costs −0.0024…−0.0074, POOL=20 costs −0.0008…−0.0039 — you need ~50 candidates/tier, not 10. A doc strongly ranked by one tier but ranked 20–50 by the other needs the pool to reach it to collect the cross-tier agreement bonus; below ~50 those get truncated out.
+3. **Saturation holds EVEN on the recall-bound corpus**: nfcorpus is 38-rel/q and RECALL-bound (recall@100+ keeps climbing, `c039c3a`), yet its *nDCG@10* still saturates at POOL=50 — because nDCG@10 is top-heavy, the relevants that reach the final top-10 are found within each tier's first ~50 candidates. **Deeper fusion pools help recall@100+ but NOT ranking-at-10.** So the right POOL depends on the metric: ~50 for nDCG@10 / precision-at-k; deeper only if you optimize deep recall.
+4. **Mechanism = RRF sharpness** (`561e8a5`): reciprocal-rank mass concentrates on top ranks — a rank-50 candidate contributes 1/(10+50)=0.017 vs 1/(10+1)=0.091 for rank-1 — so candidates past ~50 rarely accumulate enough to enter the top-10. This is the fusion-pool analog of why the *rerank* FEED also peaks at ~50 (`5129bf9`): both are governed by relevance concentrating in the top ~50, though they are different knobs (RRF sum vs cross-encoder feed).
+
+**Net:** the shipped POOL=100 is SAFE but 2× deeper than necessary — **POOL≈50 gives equal-or-better nDCG@10 at half the per-tier candidate processing** (a free ~2× reduction in fusion + downstream feed work; not a quality win — the nDCG delta is ~0 — an efficiency finding). Don't go below ~50 (real floor) and don't bother above ~100 (pure waste) unless optimizing deep recall. Caveats: full-N, single shipped tier-weight (1.3/1.0), nDCG@10 metric (deep-recall metrics would want more). Verified: `fastembed` BGE-small + `rank_bm25` stem+stop (snowball), BEIR scifact/nfcorpus/arguana full test sets, no cargo/torch. `pool_depth.py` in `$D`.
