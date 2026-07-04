@@ -58,6 +58,35 @@ External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because
 internal reranker reorder primitive, not a standalone search-quality comparator. The ratio
 above is against the pre-change in-repo ORIG implementation for this callsite.
 
+### 2026-07-04 - rerank RRF reciprocal-rank table precompute is noise/regression (CobaltRidge)
+
+**Lever tested and reverted:** layered a `reciprocal_rank: Vec<f64>` table on top of the kept
+`RrfOrder` path so fused-key assignment indexed precomputed `1/(k+rank)` values instead of doing
+two scalar divisions per candidate. This looked plausible because the rerank window reuses the same
+rank denominator twice, but the extra allocation and indexing did not beat the simple arithmetic.
+
+**Measured command (per-crate, short local fallback):**
+
+```bash
+AGENT_NAME=CobaltRidge \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo bench -p frankensearch-rerank --profile release \
+    --bench combine_reorder_cost_ab -- rrf_combine \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3
+```
+
+| Workload | kept order-vector path | reciprocal-table candidate | ratio vs kept path | Decision |
+|---|---:|---:|---:|---|
+| `rerank_combine_reorder/rrf_combine_order_vec -> rrf_combine_recip_order_vec` (N=20) | 492.45 ns | 477.93 ns | **0.9705** | noise |
+| `rerank_combine_reorder/rrf_combine_order_vec -> rrf_combine_recip_order_vec` (N=50) | 1.1085 us | 1.0862 us | **0.9799** | noise |
+| `rerank_combine_reorder/rrf_combine_order_vec -> rrf_combine_recip_order_vec` (N=100) | 2.1133 us | 2.0687 us | **0.9789** | noise |
+| `rerank_combine_reorder/rrf_combine_order_vec -> rrf_combine_recip_order_vec` (N=200) | 3.8165 us | 3.9969 us | **1.0473** | regression |
+
+**Decision:** drop the reciprocal-rank table. Future work should not precompute the rank reciprocal
+table for this small rerank window unless it eliminates another allocation at the same time.
+
 ### 2026-07-04 - sync refined vector score lookup is a kept internal win; external original-comparator ratio is N/A (Codex)
 
 **Ledger entry for the land:** replaced the vector-only refined result assembly in
