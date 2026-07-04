@@ -7905,3 +7905,41 @@ FINDINGS.md`'s capstone table should be read as vs a *naive* BM25 baseline; the 
 Caveat: this is the no-reranker retrieval comparison and specifically nDCG@10/recall@10; the recall edge (which feeds the reranker) is the
 dense tier's most durable contribution. Verified: `model2vec` retrieval-32M + `rank_bm25` with naive vs `snowballstemmer`+sklearn-stopword
 analysis, identical tuned RRF hybrid, full BEIR SciFact/NFCorpus/ArguAna/SciDocs (no cargo, no torch).
+
+---
+
+### The dense tier is a WEAK reranker candidate-feeder too: reranking BM25-alone is competitive with (sometimes better than) reranking the hybrid — "recall feeds the reranker" does not hold cleanly (CopperKestrel, 2026-07-04)
+
+The headline correction (`de979c7`) showed the dense tier adds only +2–3% nDCG for *retrieval*, and I hedged that its remaining value is
+the extra **recall that feeds a reranker** (the reranker-feed metric). Tested that hedge directly: rerank the **same** cross-encoder
+(`ms-marco-L6`, RRF-combine) over two candidate sources — **BM25-alone (stem+stop)** top-50 vs the **full hybrid** top-50 — and compare
+the final reranked nDCG@10. (Reranked the union once per query and read each source's ordering off the cached scores.) BEIR, N=40/corpus
+(cross-encoder subsample — treat per-dataset deltas as directional, not precise):
+
+| corpus | reranked BM25-alone | reranked hybrid | **Δ (hybrid − BM25)** | feed recall@50 Δ (hybrid − BM25) |
+|---|---:|---:|---:|---:|
+| SciFact  | 0.7938 | 0.8059 | **+0.0121** | +0.0250 (more recall → better) |
+| NFCorpus | **0.4142** | 0.4068 | **−0.0074** | +0.0140 (more recall → **worse**) |
+| ArguAna  | 0.3664 | 0.3819 | **+0.0155** | −0.0250 (**less** recall → better) |
+
+**Finding — the dense tier's recall does NOT reliably convert to better reranked quality; reranking a cheap BM25-only candidate list is
+competitive with reranking the full hybrid (mean Δ ≈ +0.007 nDCG, sign inconsistent, |Δ| ≤ 0.016).** The "recall feeds the reranker"
+defense of the dense tier fails on its own mechanism — **feed-recall and reranked-nDCG are decoupled in sign here**: (1) **NFCorpus**, the
+corpus where this reranker is *strongest* (+23%), is where the hybrid feed *hurts* the reranked output (−0.0074) *despite* feeding +0.014
+more recall — the vector tier injects semantically-plausible-but-irrelevant candidates (**topical distractors**) that a strong reranker then
+promotes into the top-10. (2) **ArguAna** shows the converse: BM25-alone already has **recall@50 = 1.000** (the single relevant doc is
+always in BM25's top-50), the hybrid actually has *lower* feed recall (0.975 — vector candidates pushed the relevant doc out for some
+queries), yet the hybrid reranks *better* (+0.0155) — so the benefit there is the pre-rerank *ordering*, not recall. Only SciFact shows the
+naively-expected "more feed recall → better reranked." **Net: for a reranked pipeline the expensive vector index is a marginal,
+sometimes-negative contributor to the candidate pool — a BM25(stem+stop) → cross-encoder pipeline captures most of the quality (and beats
+the hybrid on the corpus where reranking matters most) at a fraction of the infra.**
+
+**Combined value picture for the dense tier (this session):** retrieval-only, **+0.6–3.0% nDCG** over a faithful Tantivy (`de979c7`);
+as a reranker feeder, **≈0 net** (−0.007 to +0.016, inconsistent). So the dense tier is a **modest, near-free complement in retrieval-only
+mode and largely redundant once you rerank** — it is *not* the dominant source of quality in either regime; the lexical analyzer (retrieval)
+and the cross-encoder (reranked) are. This does not make the dense tier *harmful* (retrieval-only it is net-positive and sub-ms), but it
+sharpens the deployment guidance: **if you will rerank, a BM25-only candidate generator is a legitimate, cheaper choice** — the vector index
+earns its keep mainly in the *no-reranker* path (where it adds the +2–3%) and on genuinely semantic corpora where BM25 recall is poor.
+Caveats: N=40 subsample (per-dataset deltas are within noise; the robust claim is "small and inconsistent," not the precise values), single
+reranker (ms-marco-L6); a different/stronger reranker or deeper feed could shift it. Verified: `model2vec` retrieval-32M + `rank_bm25`
+(stem+stop) candidate generation + `fastembed` ms-marco-L6 RRF-combine rerank of the union, BEIR SciFact/NFCorpus/ArguAna (no cargo, no torch).
