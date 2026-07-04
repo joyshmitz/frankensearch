@@ -74,9 +74,9 @@ fn classify_old(query: &str) -> u8 {
     }
 }
 
-/// The committed (pre-change) grouped `looks_like_identifier`: one whitespace
-/// check, but still three separate Unicode case scans. A/B baseline for the
-/// single-pass case-flag + `take(4)` word-count change.
+/// The committed grouped `looks_like_identifier` before the ASCII-byte fast path:
+/// one whitespace check, one Unicode case-flag pass, allocation-free issue-id
+/// split, and capped word count.
 fn looks_like_identifier_current(s: &str) -> bool {
     if !s.chars().any(char::is_whitespace) {
         if s.contains('/') || s.contains('\\') || s.contains('.') || s.contains("::") {
@@ -85,10 +85,21 @@ fn looks_like_identifier_current(s: &str) -> bool {
         if s.contains('_') {
             return true;
         }
-        let has_lower = s.chars().any(char::is_lowercase);
-        let has_upper = s.chars().any(char::is_uppercase);
-        let first_upper = s.chars().next().is_some_and(char::is_uppercase);
-        let rest_lower = s.chars().skip(1).all(char::is_lowercase);
+        let mut has_lower = false;
+        let mut has_upper = false;
+        let mut first_upper = false;
+        let mut rest_lower = true;
+        for (i, c) in s.chars().enumerate() {
+            let is_lower = c.is_lowercase();
+            let is_upper = c.is_uppercase();
+            has_lower |= is_lower;
+            has_upper |= is_upper;
+            if i == 0 {
+                first_upper = is_upper;
+            } else if !is_lower {
+                rest_lower = false;
+            }
+        }
         if has_lower && has_upper && !(first_upper && rest_lower) {
             return true;
         }
@@ -117,7 +128,7 @@ fn classify_current(query: &str) -> u8 {
     if looks_like_identifier_current(trimmed) {
         return 1;
     }
-    if trimmed.split_whitespace().count() <= 3 {
+    if trimmed.split_whitespace().take(4).count() <= 3 {
         2
     } else {
         3

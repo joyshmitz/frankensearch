@@ -67,6 +67,66 @@ impl QueryClass {
 
     /// Heuristic check for identifier-like queries.
     fn looks_like_identifier(s: &str) -> bool {
+        if s.is_ascii() {
+            return Self::looks_like_identifier_ascii(s);
+        }
+
+        Self::looks_like_identifier_unicode(s)
+    }
+
+    /// ASCII-specialized identifier check. For ASCII input, byte predicates are
+    /// equivalent to the Unicode character predicates used by the fallback, but
+    /// avoid UTF-8 decoding and multi-pass `chars()` scans on the common query path.
+    fn looks_like_identifier_ascii(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        if !bytes.iter().any(u8::is_ascii_whitespace) {
+            if s.contains('/') || s.contains('\\') || s.contains('.') || s.contains("::") {
+                return true;
+            }
+
+            if s.contains('_') {
+                return true;
+            }
+
+            let mut has_lower = false;
+            let mut has_upper = false;
+            let mut first_upper = false;
+            let mut rest_lower = true;
+            for (i, &b) in bytes.iter().enumerate() {
+                let is_lower = b.is_ascii_lowercase();
+                let is_upper = b.is_ascii_uppercase();
+                has_lower |= is_lower;
+                has_upper |= is_upper;
+                if i == 0 {
+                    first_upper = is_upper;
+                } else if !is_lower {
+                    rest_lower = false;
+                }
+            }
+            if has_lower && has_upper && !(first_upper && rest_lower) {
+                return true;
+            }
+
+            if let Some((prefix, suffix)) = s.rsplit_once('-')
+                && !prefix.is_empty()
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_digit())
+                && prefix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return true;
+            }
+        }
+
+        if s.starts_with("fn ") || s.starts_with("struct ") || s.starts_with("impl ") {
+            return true;
+        }
+
+        false
+    }
+
+    fn looks_like_identifier_unicode(s: &str) -> bool {
         // Whitespace presence gates every single-token heuristic below; compute it
         // once instead of rescanning the string for each check (the prior code ran
         // `chars().any(is_whitespace)` up to four times). Grouping the no-whitespace
