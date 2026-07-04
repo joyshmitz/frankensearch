@@ -7824,3 +7824,46 @@ hurt by aggressive expansion (−0.0040), placing it with SciFact/NFCorpus and a
 recommendation is overfit to the original three datasets; the one surprise (lexical-dominant corpus) makes the core call stronger, not
 weaker.** Verified: `model2vec` retrieval-32M + `rank_bm25` (naive & stem+stop) + RRF hybrid (k-sweep, tuned weights) + score-interp RM3,
 BEIR **SciDocs** (500q, downloaded fresh; no cargo, no torch).
+
+---
+
+### Label-free auto-tuning of the fusion tier-weight is NOT possible from QPP score-statistics (cross-tier score-shape confound) — AND, under Tantivy-faithful analysis, the LEXICAL tier leads on all 4 corpora (CopperKestrel, 2026-07-04)
+
+The arc recommends "**up-weight the STRONGER tier**" (`44566fd`) — but "stronger" is decided by nDCG, which needs relevance labels. Tested
+the natural next lever: can a **label-free, unsupervised** signal pick the stronger tier per corpus, so the fusion weight self-configures
+at index time with no qrels? (The per-QUERY version of adaptivity was rejected for variance, `102a854`; a per-CORPUS aggregate over
+hundreds of queries has far less variance, so it deserved its own test.) Computed four classic query-performance-prediction (QPP)
+score-statistics per tier per corpus — **NQC** (normalized query commitment = std(top-10)/corpus-mean), rank-1 **std-gap** z-score,
+within-tier **ordinal gap** `(s₁−s₁₀)/(s₁−s₁₀₀)`, and top-10 **coefficient of variation** — and checked whether each picks the same
+tier that nDCG@10 says is stronger, across 4 BEIR corpora (SciFact/NFCorpus/ArguAna/SciDocs), lexical tier = Tantivy-faithful stem+stop:
+
+| corpus | nDCG vec / lex → TRUE | NQC vec / lex | every signal predicts |
+|---|---|---|---|
+| SciFact  | 0.633 / **0.684** → LEX | 0.41 / **5.52** | LEX |
+| NFCorpus | 0.309 / **0.329** → LEX | 0.65 / **130.2** | LEX |
+| ArguAna  | 0.319 / **0.346** → LEX | 1.20 / **6.59** | LEX |
+| SciDocs  | 0.131 / **0.151** → LEX | 0.32 / **3.00** | LEX |
+
+**Finding — QPP score-statistics CANNOT compare cross-tier strength; the label-free auto-tune is rejected.** Every signal "predicts
+LEX" on all 4 corpora and scores a perfect 4/4 — but this is a **double artifact, not a working predictor**: (1) **zero label variance** —
+all 4 corpora happen to be lexical-stronger (see below), so a constant "always LEX" also scores 4/4; the test cannot demonstrate
+*discrimination*. (2) **cross-tier score-shape confound** — BM25's NQC (3.0–130) is **5–200× larger than cosine's** (0.3–1.2) *regardless
+of which tier is actually better*, purely because BM25 scores are **sparse and unbounded** (a few matched docs with large, dispersed
+scores → huge std/mean) while normalized-embedding cosine lives in a **tight bounded band** (all docs score 0.2–0.7 → tiny std/mean). So
+every "commitment"/dispersion statistic reads the tier's **intrinsic score distribution shape**, which is fixed by the retrieval
+*mechanism* (lexical-sparse vs dense-bounded), **not** by retrieval *quality*. The signal would call BM25 "more committed" even on a
+corpus where BM25 is far worse. **Conclusion: you cannot auto-select the fusion tier-weight from unsupervised score statistics — the
+stronger-tier decision needs a small labeled dev set, or you fall back to the arc's safe default (light weight ~1.0–1.3 + small `k`,
+`44566fd`), which is exactly why that default exists.** This closes "QPP-driven label-free fusion auto-tuning" with a mechanism.
+
+**Surfaced correction (why the test was degenerate) — under Tantivy-faithful analysis the LEXICAL tier is the STRONGER single tier by
+nDCG@10 on ALL 4 corpora**, not the vector tier: SciFact 0.684 > 0.633, NFCorpus 0.329 > 0.309, ArguAna 0.346 > 0.319, SciDocs 0.151 >
+0.131. The earlier "the vector tier alone beats real BM25 on all 3" (`SEARCH_QUALITY_FINDINGS` #2 / the ArguAna correction near line 5949)
+was measured on the **naive-tokenizer** BM25 and by **recall@10**; applying this session's stemming correction (`24c0f4a`: naive tokenizer
+understates BM25 +3–14%) and measuring **ranking quality (nDCG@10)**, the ordering **flips — the properly-analyzed lexical tier leads
+everywhere measured.** So "up-weight the stronger tier" resolves to **up-weight LEXICAL** on all four corpora once the lexical tier is
+given the analyzer Tantivy actually runs; the vector tier's role is the **decorrelated complement**, not the lead. (Recall@10 may still
+favor the vector tier on some corpora — this claim is specifically nDCG@10, the ranking metric.) This does not change the hybrid-as-default
+call — the hybrid still beats both tiers on all 4 (`84f362b`) — it corrects which tier is the *lead partner* and reinforces that the
+stronger-tier decision is label-dependent. Verified: `model2vec` retrieval-32M + `rank_bm25` (stem+stop) tier scores, 4 QPP signals vs
+nDCG@10, BEIR SciFact/NFCorpus/ArguAna/SciDocs (no cargo, no torch).
