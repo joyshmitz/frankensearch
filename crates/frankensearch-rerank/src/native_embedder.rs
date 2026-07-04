@@ -67,7 +67,10 @@ impl NativeEmbedder {
         let tok_path = dir.join(TOKENIZER_JSON);
         if !tok_path.is_file() {
             return Err(SearchError::ModelNotFound {
-                name: format!("{MODEL_NAME} (missing {TOKENIZER_JSON} in {})", dir.display()),
+                name: format!(
+                    "{MODEL_NAME} (missing {TOKENIZER_JSON} in {})",
+                    dir.display()
+                ),
             });
         }
         let mut tokenizer =
@@ -244,6 +247,9 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].len(), DIM);
         let cos: f32 = v.iter().zip(&batch[0]).map(|(a, b)| a * b).sum();
-        assert!(cos > 0.999, "single vs batch embedding mismatch (cos {cos})");
+        assert!(
+            cos > 0.999,
+            "single vs batch embedding mismatch (cos {cos})"
+        );
     }
 }

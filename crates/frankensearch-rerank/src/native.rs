@@ -1109,8 +1109,15 @@ impl Model {
             .map_err(|e| rerank_err("embed.extract", e))?;
         for i in 0..L {
             let p = format!("bert.encoder.layer.{i}");
-            emb_vals =
-                self.encoder_layer_raw(emb_vals, total, &offsets, &lens, &p, scale_f, &mut scratch)?;
+            emb_vals = self.encoder_layer_raw(
+                emb_vals,
+                total,
+                &offsets,
+                &lens,
+                &p,
+                scale_f,
+                &mut scratch,
+            )?;
         }
         self.s.truncate_autograd_graph(self.weights_boundary);
 
