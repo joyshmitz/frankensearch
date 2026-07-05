@@ -341,9 +341,29 @@ impl Embedder for CachedEmbedder {
                     }
                 }
                 // Fan the distinct embeddings back out to every slot that needed them.
+                // Move the owned inner result into its last output slot; clone only
+                // same-batch duplicates that need the vector more than once.
+                let mut miss_use_counts = vec![0_usize; embedded.len()];
+                for maybe_idx in &slot_miss {
+                    if let Some(idx) = *maybe_idx {
+                        miss_use_counts[idx] += 1;
+                    }
+                }
+                let mut embedded_slots: Vec<Option<Vec<f32>>> =
+                    embedded.into_iter().map(Some).collect();
                 for (slot, maybe_idx) in slot_miss.iter().enumerate() {
                     if let Some(idx) = *maybe_idx {
-                        out[slot] = Some(embedded[idx].clone());
+                        let use_count = &mut miss_use_counts[idx];
+                        *use_count = use_count.saturating_sub(1);
+                        let vec = if *use_count == 0 {
+                            embedded_slots[idx].take().expect("embedding slot filled")
+                        } else {
+                            embedded_slots[idx]
+                                .as_ref()
+                                .expect("embedding slot filled")
+                                .clone()
+                        };
+                        out[slot] = Some(vec);
                     }
                 }
             }

@@ -29,7 +29,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hint::black_box;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{CachePolicy, S3FifoCache, S3FifoConfig};
 
 const DIM: usize = 384;
@@ -143,6 +143,66 @@ fn replay_s3fifo(stream: &[u64]) -> (usize, usize) {
     (hits, misses)
 }
 
+fn embedding(seed: usize) -> Vec<f32> {
+    (0..DIM)
+        .map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let x = ((seed * 131) ^ (i * 17)) as f32;
+            x.sin()
+        })
+        .collect()
+}
+
+fn batch_slots_distinct(n: usize) -> Vec<Option<usize>> {
+    (0..n).map(Some).collect()
+}
+
+fn batch_slots_repeated(n: usize, unique: usize) -> Vec<Option<usize>> {
+    (0..n).map(|i| Some(i % unique)).collect()
+}
+
+fn fanout_clone_all(slot_miss: &[Option<usize>], embedded: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(slot_miss.len());
+    out.resize_with(slot_miss.len(), || None);
+    for (slot, maybe_idx) in slot_miss.iter().enumerate() {
+        if let Some(idx) = *maybe_idx {
+            out[slot] = Some(embedded[idx].clone());
+        }
+    }
+    out.into_iter()
+        .map(|v| v.expect("every miss slot filled"))
+        .collect()
+}
+
+fn fanout_move_last(slot_miss: &[Option<usize>], embedded: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(slot_miss.len());
+    out.resize_with(slot_miss.len(), || None);
+    let mut miss_use_counts = vec![0_usize; embedded.len()];
+    for maybe_idx in slot_miss {
+        if let Some(idx) = *maybe_idx {
+            miss_use_counts[idx] += 1;
+        }
+    }
+    let mut embedded_slots: Vec<Option<Vec<f32>>> = embedded.into_iter().map(Some).collect();
+    for (slot, maybe_idx) in slot_miss.iter().enumerate() {
+        if let Some(idx) = *maybe_idx {
+            miss_use_counts[idx] = miss_use_counts[idx].saturating_sub(1);
+            let vec = if miss_use_counts[idx] == 0 {
+                embedded_slots[idx].take().expect("embedding slot filled")
+            } else {
+                embedded_slots[idx]
+                    .as_ref()
+                    .expect("embedding slot filled")
+                    .clone()
+            };
+            out[slot] = Some(vec);
+        }
+    }
+    out.into_iter()
+        .map(|v| v.expect("every miss slot filled"))
+        .collect()
+}
+
 fn bench_cache_replay(c: &mut Criterion) {
     let traces: [(&str, Vec<u64>); 3] = [
         ("zipf_s2_u2000", zipf_stream(ACCESSES, 2000, 2.0, 0xa11ce)),
@@ -165,16 +225,46 @@ fn bench_cache_replay(c: &mut Criterion) {
         );
     }
 
-    let mut g = c.benchmark_group("cache_replay");
-    for (name, stream) in &traces {
-        g.bench_function(format!("fifo/{name}"), |b| {
-            b.iter(|| black_box(replay_fifo(black_box(stream))));
+    {
+        let mut g = c.benchmark_group("cache_replay");
+        for (name, stream) in &traces {
+            g.bench_function(format!("fifo/{name}"), |b| {
+                b.iter(|| black_box(replay_fifo(black_box(stream))));
+            });
+            g.bench_function(format!("s3fifo/{name}"), |b| {
+                b.iter(|| black_box(replay_s3fifo(black_box(stream))));
+            });
+        }
+        g.finish();
+    }
+
+    let mut fanout = c.benchmark_group("batch_miss_fanout");
+    for (label, slots, unique) in [
+        ("distinct_256", batch_slots_distinct(256), 256_usize),
+        ("repeat4_256", batch_slots_repeated(256, 64), 64_usize),
+    ] {
+        let embedded: Vec<Vec<f32>> = (0..unique).map(embedding).collect();
+        assert_eq!(
+            fanout_clone_all(&slots, &embedded),
+            fanout_move_last(&slots, embedded.clone())
+        );
+
+        fanout.bench_with_input(BenchmarkId::new("clone_all", label), &(), |b, ()| {
+            b.iter_batched(
+                || embedded.clone(),
+                |e| black_box(fanout_clone_all(black_box(&slots), &e)),
+                BatchSize::SmallInput,
+            );
         });
-        g.bench_function(format!("s3fifo/{name}"), |b| {
-            b.iter(|| black_box(replay_s3fifo(black_box(stream))));
+        fanout.bench_with_input(BenchmarkId::new("move_last", label), &(), |b, ()| {
+            b.iter_batched(
+                || embedded.clone(),
+                |e| black_box(fanout_move_last(black_box(&slots), e)),
+                BatchSize::SmallInput,
+            );
         });
     }
-    g.finish();
+    fanout.finish();
 }
 
 criterion_group!(benches, bench_cache_replay);

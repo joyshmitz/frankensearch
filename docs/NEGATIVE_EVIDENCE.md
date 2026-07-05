@@ -19,6 +19,40 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-05 - embed batch miss fanout move-last is a kept internal win; external original-comparator ratio is N/A (Codex)
+
+**Ledger entry for the land:** `CachedEmbedder::embed_batch` already funnels distinct misses
+through one inner `embed_batch` call, but the fanout path still cloned every returned embedding
+into its output slot after also cloning the same embeddings into the cache. The new path counts
+same-batch uses, moves each owned inner result into its last output slot, and clones only earlier
+duplicate slots that genuinely need another copy. Cache insertion semantics, cache hit/miss stats,
+and same-batch duplicate behavior are unchanged.
+
+**Measured command (per-crate, same benchmark binary):**
+
+```bash
+AGENT_NAME=Codex \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+RCH_WORKER=ovh-a \
+  rch exec -- cargo bench -p frankensearch-embed --profile release \
+    --bench cache_replay -- batch_miss_fanout \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3
+```
+
+RCH ran remotely on `ovh-a`; `rch` rewrote `CARGO_TARGET_DIR` to the worker-scoped
+`/data/projects/frankensearch/.rch-target-ovh-a-pool-3128ad52307074090351fabddd484f8d`.
+
+| Workload | ORIG clone-all fanout | Candidate move-last fanout | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `batch_miss_fanout/clone_all/distinct_256 -> move_last/distinct_256` | 21.876 us | 856.13 ns | **0.039 (~25.6x faster)** | keep |
+
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an
+internal query-embedding cache fanout primitive, not a standalone search-engine comparator. The
+ratio above is against the pre-change in-repo ORIG fanout for the same 256 distinct 384-dim
+embedding miss batch.
+
 ### 2026-07-04 - core fingerprint streaming token windows is a kept internal win; external original-comparator ratio is N/A (Codex)
 
 **Ledger entry for the land:** replaced `DocumentFingerprint::compute`'s transient
