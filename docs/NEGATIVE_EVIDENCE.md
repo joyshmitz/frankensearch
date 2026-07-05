@@ -19,6 +19,85 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-05 - FSVI selective-filter gather landed only for <2%; 5%+ is rejected (CobaltRidge)
+
+**Ledger entry for the land:** the in-memory `BitsetFilter` gather was already shipped, but the
+file-backed FSVI path still scanned every record and probed the filter hash before each dot. The new
+FSVI path treats the sorted record table as a succinct inverted structure: for a small hash allow-list,
+binary-search each allowed hash range, gather the matching live positions, then exact-scan only those
+vectors. The gather handles hash collisions/duplicate hashes by scanning the whole equal-hash range and
+skipping tombstones; WAL entries still use the existing filtered WAL scan.
+
+**Measured command (per-crate, short RCH):**
+
+```bash
+AGENT_NAME=CobaltRidge \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+    --bench filtered_gather -- fsvi_filtered_gather \
+    --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+RCH ran remotely on `vmi1227854`; `CARGO_TARGET_DIR` was rewritten to a worker-scoped path. The bench
+asserted parity for forced ORIG scan, forced gather, and the public path before timing.
+
+| Workload | ORIG file-backed scan | Candidate FSVI gather | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `fsvi_filtered_gather/sel_permille_1` (0.1%, 50 docs) | 254.10 us | 13.470 us | **0.053 (~18.9x faster)** | keep |
+| `fsvi_filtered_gather/sel_permille_5` (0.5%, 250 docs) | 163.14 us | 75.535 us | **0.463 (~2.16x faster)** | keep |
+| `fsvi_filtered_gather/sel_permille_10` (1%, 500 docs) | 367.28 us | 171.90 us | **0.468 (~2.14x faster)** | keep |
+| `fsvi_filtered_gather/sel_permille_20` (2%, 1000 docs) | 405.78 us | 341.54 us | 0.842 (~1.19x faster) | too thin for gate |
+| `fsvi_filtered_gather/sel_permille_50` (5%, 2500 docs) | 488.78 us | 2.3601 ms | **4.83x slower** | reject |
+| `fsvi_filtered_gather/sel_permille_100` (10%, 5000 docs) | 1.1463 ms | 4.9463 ms | **4.31x slower** | reject |
+| `fsvi_filtered_gather/sel_permille_250` (25%, 12500 docs) | 4.0870 ms | 9.9984 ms | **2.45x slower** | reject |
+| `fsvi_filtered_gather/sel_permille_500` (50%, 25000 docs) | 4.8188 ms | 13.094 ms | **2.72x slower** | reject |
+
+**Decision:** landed the FSVI gather only behind a conservative `<2%` selectivity gate
+(`GATHER_SELECTIVITY_DIVISOR = 50`). Do **not** re-widen this gate or retry the 5%+ file-backed gather
+without a different representation that removes the per-hash `log2(N)` record-table probe cost.
+External Tantivy/Lucene/Meilisearch comparator ratio remains **N/A**; the ratios above are against the
+pre-change in-repo ORIG file-backed filtered scan on the same synthetic FSVI workload.
+
+### 2026-07-05 - native rerank CLS final-layer rank-1 attention is a kept internal win; external original-comparator ratio is N/A (Codex)
+
+**Ledger entry for the land:** the native cross-encoder's final encoder layer only needs the
+`[CLS]` row that feeds the pooler, but `fused_attention_cls` still repacked full K/V head-major
+buffers and launched two tiny `bmm` kernels with `m = 1`. The new path treats final-layer CLS
+attention as the rank-1 operation it is: compute each head's single query-vs-key score row directly
+from the fused QKV buffer with `f32x8`, run the existing fused softmax, then compute the weighted
+value sum directly into the `[H]` output row. Earlier full-token attention layers and the long-doc
+tape fallback are unchanged.
+
+**Measured command (per-crate, short RCH, cleaned-code rerun):**
+
+```bash
+AGENT_NAME=Codex \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+RCH_WORKER=ovh-a \
+  rch exec -- cargo bench -p frankensearch-rerank --features native \
+    --profile release --bench cls_attention_ab -- cls_attention \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5
+```
+
+RCH ran remotely on `ovh-a`; `rch` rewrote `CARGO_TARGET_DIR` to the worker-scoped
+`/data/projects/frankensearch/.rch-target-ovh-a-pool-6506c93c0b5528bd235a66e7c27e2e88`.
+The benchmark asserts the direct kernel output is within `1.0e-4` max absolute delta of the
+ORIG `bmm`/repack comparator before collecting samples.
+
+| Workload | ORIG CLS `bmm`/K-V repack | Candidate direct rank-1 CLS | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=64) | 50.911 us | 5.8774 us | **0.115 (~8.66x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=128) | 135.13 us | 12.516 us | **0.093 (~10.8x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=256) | 211.83 us | 27.025 us | **0.128 (~7.84x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=512) | 418.31 us | 55.895 us | **0.134 (~7.48x faster)** | keep |
+
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an
+internal native cross-encoder final-layer attention primitive, not a standalone search-engine
+comparator. The ratio above is against the pre-change in-repo ORIG CLS `bmm`/repack path for the
+same fused-QKV final-layer attention workload.
+
 ### 2026-07-05 - embed all-distinct miss batch direct return is a kept internal win; external original-comparator ratio is N/A (CobaltRidge)
 
 **Ledger entry for the land:** `CachedEmbedder::embed_batch` already deduplicates same-batch

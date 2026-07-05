@@ -159,6 +159,7 @@ negative or noisy and are recorded in `docs/NEGATIVE_EVIDENCE.md`.
 | 2026-07-04 | frankensearch-fusion | **`SyncTwoTierSearcher` refined lexical fusion: route `blended` through unique RRF merge** — the refined semantic slice is produced by `blend_two_tier_aligned(&fast_hits, &quality_scores, ...)`, so it inherits `fast_hits`' unique doc ids. The old refined lexical branch still called the dedup merge and paid an O(N) `seen_semantic` set that can never fire for this callsite. The `collect_limit_all` bench now has a paired callsite A/B that builds the same blended refined slice, asserts full `FusedHit` equality between legacy and unique paths, then times both arms in one Criterion run. Remote strict RCH proof on `ovh-a`, target dir `/data/projects/.rch-targets/frankensearch-cod`: `cargo bench -p frankensearch-fusion --profile release --bench collect_limit_all refined_rrf_callsite -- --sample-size 10 --warm-up-time 1 --measurement-time 1`. External original-comparator ratio is N/A; caveat recorded in `docs/NEGATIVE_EVIDENCE.md`. | `refined_rrf_callsite/{dedup→unique}` (N=10k) | 770.14 µs | 661.37 µs | **0.859 (~1.16×)** | KEEP (CobaltRidge) |
 | 2026-07-04 | frankensearch-fusion | **`SyncTwoTierSearcher` vector-only refined result assembly: replace doc-id score maps with aligned numeric lookup** — the no-lexical refined path already has `fast_hits` aligned with `quality_scores_for_hits`, and `blend_two_tier_aligned_vector_index` preserves `VectorHit.index` in each blended output. The old path rebuilt two `AHashMap<&str, f32>` maps (`fast_scores`, `quality_scores`) and probed both by `doc_id` for every output row. The new path builds one aligned score lookup keyed by `index` (dense slab for compact spans, `AHashMap<u32, _>` fallback for sparse spans) and moves owned `doc_id`s into `ScoredResult` unchanged. A permanent unit test compares dense and sparse layouts against the previous doc-id-map semantics. Per-crate proof used `AGENT_NAME=Codex CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod rch exec -- cargo bench -p frankensearch-fusion --profile release --bench score_map lookup -- --sample-size 10 --warm-up-time 1 --measurement-time 1`; `rch` fell open locally because no worker was admissible. Ratio-vs-ORIG audit entry recorded in `docs/NEGATIVE_EVIDENCE.md`. | `score_map/lookup_current→lookup_aligned` (N=10k); (N=100k) | 1.0584 ms; 19.845 ms | 37.104 µs; 379.92 µs | **0.035 (~28.5×); 0.019 (~52.2×)** | KEEP (Codex) |
 | 2026-07-04 | frankensearch-rerank | **`RrfCombine` reorder bookkeeping: collapse four intermediate vectors into one order vector** — `apply_rrf_combine` still allocated/sorted `by_rerank`, inverted it into `rerank_rank`, built a `key` vector, sorted a separate `perm`, then cloned into `reordered`. The new path carries `position` and `fused_key` in one `RrfOrder` vector: sort by rerank score, write fused RRF keys in place, sort by fused key with the same doc-id tiebreaker, then apply the final permutation. A unit test compares against the previous five-vector reference implementation. Per-crate proof used `AGENT_NAME=Codex CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo bench -p frankensearch-rerank --profile release --bench combine_reorder_cost_ab -- rrf_combine --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3`; the exact rch/full-LTO release path did not produce samples in the bounded window, recorded in `docs/NEGATIVE_EVIDENCE.md`. | `rerank_combine_reorder/rrf_combine_current→rrf_combine_order_vec` (N=20; 50; 100; 200) | 549.26 ns; 1.2107 µs; 2.1862 µs; 4.4715 µs | 479.86 ns; 1.0628 µs; 2.0193 µs; 3.9125 µs | **0.874; 0.878; 0.924; 0.875** | KEEP (Codex) |
+| 2026-07-05 | frankensearch-rerank | **Native reranker final-layer CLS attention: replace `m=1` BMM/repack with direct SIMD rank-1 attention** — the last encoder layer only needs each document's `[CLS]` output row, but the previous `fused_attention_cls` still copied K/V into head-major scratch and launched two tiny `bmm` calls. The new path scores the single CLS query against keys directly from the fused QKV buffer with `f32x8`, reuses the existing fused softmax, and accumulates the value row directly into `[H]`. Earlier full-token attention layers and the long-doc tape path are unchanged. The A/B bench carries the old BMM/repack comparator and asserts max abs delta <= `1.0e-4` before timing. Per-crate proof used `AGENT_NAME=Codex CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 RCH_WORKER=ovh-a rch exec -- cargo bench -p frankensearch-rerank --features native --profile release --bench cls_attention_ab -- cls_attention --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5`; RCH ran on `ovh-a`. Ratio-vs-ORIG audit entry recorded in `docs/NEGATIVE_EVIDENCE.md`. | `cls_attention/bmm_repack_orig→direct_rank1` (seq=64; 128; 256; 512) | 50.911 µs; 135.13 µs; 211.83 µs; 418.31 µs | 5.8774 µs; 12.516 µs; 27.025 µs; 55.895 µs | **0.115; 0.093; 0.128; 0.134** | KEEP (Codex) |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim256/f32_bytes` | 10.839 ms | 3.647 ms | **0.336** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators | `dot/dim384/f32_bytes` | 14.084 ms | 5.333 ms | **0.379** | KEEP |
 | 2026-06-24 | frankensearch-index | `f32_bytes` fixed-array decode + 4 accumulators (`BlueGull` pinned-worker confirmation) | `dot/dim256/f32_bytes/10000` | 3.4835 ms | 0.66126 ms | **0.190** | KEEP (`vmi1149989`) |
@@ -3018,3 +3019,36 @@ across alpha `{0, 0.3, 0.7, 1, NaN}`; the bench also asserts bit-identical outpu
 Conformance: `cargo test -p frankensearch-fusion --lib blend::tests` passed (42 passed, 1 ignored perf harness);
 `cargo check -p frankensearch-fusion --all-targets` passed (existing bench dead-code warnings only); exact touched-file
 `rustfmt --edition 2024 --check` passed.
+
+---
+
+## 2026-07-05 — FSVI selective-filter gather: sorted-record-table range gather for <2% allow-lists (CobaltRidge)
+
+**Lever LANDED (file-backed twin of the earlier in-memory gather, with a tighter gate).** FSVI filtered
+search still scanned every record and probed the allow-list before each dot. The record table is already
+sorted by `doc_id_hash`, so a small `BitsetFilter` can invert the loop: binary-search each allowed hash
+range, gather all live positions in that equal-hash range (collision-safe), then exact-score only those
+vectors. WAL entries keep the existing filtered WAL scan.
+
+**Measured (per-crate short RCH, `filtered_gather` FSVI A/B; ORIG = forced pre-change file-backed
+per-document scan, candidate = forced file-backed gather):**
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench filtered_gather -- fsvi_filtered_gather \
+  --sample-size 10 --warm-up-time 1 --measurement-time 1
+```
+
+| selectivity | ORIG scan | gather | ratio vs ORIG |
+|---:|---:|---:|---:|
+| 0.1% | 254.10 us | 13.470 us | **0.053 (~18.9x)** |
+| 0.5% | 163.14 us | 75.535 us | **0.463 (~2.16x)** |
+| 1% | 367.28 us | 171.90 us | **0.468 (~2.14x)** |
+
+The same sweep rejected wider gates: 2% was only 0.842, while 5% was **4.83x slower**. Production is
+therefore gated at `<2%` (`GATHER_SELECTIVITY_DIVISOR = 50`). Conformance: `cargo check -p
+frankensearch-index --all-targets` passed via RCH; `cargo test -p frankensearch-index --lib --
+--test-threads=1` passed locally through `rch` fallback (**389/389**). The new
+`selective_bitset_filter_uses_file_backed_gather` test asserts forced scan, forced gather, and public
+search agree.

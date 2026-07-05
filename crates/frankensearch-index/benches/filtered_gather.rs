@@ -24,10 +24,12 @@
 
 use std::collections::HashSet;
 use std::hint::black_box;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::filter::{BitsetFilter, fnv1a_hash};
-use frankensearch_index::InMemoryVectorIndex;
+use frankensearch_index::{InMemoryVectorIndex, VectorIndex};
 
 const N: usize = 50_000;
 const DIM: usize = 384;
@@ -86,6 +88,30 @@ fn ids(hits: &[frankensearch_core::VectorHit]) -> Vec<String> {
     hits.iter().map(|h| h.doc_id.to_string()).collect()
 }
 
+fn bench_index_path() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "frankensearch-filtered-gather-{}-{nanos}.fsvi",
+        std::process::id()
+    ))
+}
+
+fn build_fsvi_index(doc_ids: &[String], vectors: &[Vec<f32>]) -> VectorIndex {
+    let path = bench_index_path();
+    let mut writer =
+        VectorIndex::create(&path, "filtered-gather-bench", DIM).expect("create file-backed index");
+    for (doc_id, vector) in doc_ids.iter().zip(vectors) {
+        writer
+            .write_record(doc_id, vector)
+            .expect("write file-backed vector");
+    }
+    writer.finish().expect("finish file-backed index");
+    VectorIndex::open(&path).expect("open file-backed index")
+}
+
 fn bench_filtered_gather(c: &mut Criterion) {
     let centroids: Vec<Vec<f32>> = (0..CLUSTERS)
         .map(|i| normalize(raw_vector(0xc000_0000 + i as u64)))
@@ -109,9 +135,14 @@ fn bench_filtered_gather(c: &mut Criterion) {
         let allow = (N as f64 * s) as usize;
         let filter = allow_filter(allow);
         for q in &queries {
-            let scan = ids(&index.bench_scan_filtered(q, K, Some(&filter)).expect("scan"));
+            let scan = ids(&index
+                .bench_scan_filtered(q, K, Some(&filter))
+                .expect("scan"));
             let gather = ids(&index.bench_gather_filtered(q, K, &filter).expect("gather"));
-            assert_eq!(scan, gather, "gather must be bit-identical to scan (sel={s})");
+            assert_eq!(
+                scan, gather,
+                "gather must be bit-identical to scan (sel={s})"
+            );
         }
         eprintln!("[filtered_gather] sel={s} allow≈{allow} parity OK");
     }
@@ -149,5 +180,76 @@ fn bench_filtered_gather(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_filtered_gather);
+fn bench_fsvi_filtered_gather(c: &mut Criterion) {
+    let centroids: Vec<Vec<f32>> = (0..CLUSTERS)
+        .map(|i| normalize(raw_vector(0xc000_0000 + i as u64)))
+        .collect();
+    let doc_ids: Vec<String> = (0..N).map(|i| format!("doc-{i:06}")).collect();
+    let vectors: Vec<Vec<f32>> = (0..N)
+        .map(|i| make_vector(&centroids, i % CLUSTERS, i as u64 + 1))
+        .collect();
+    let index = build_fsvi_index(&doc_ids, &vectors);
+
+    let queries: Vec<Vec<f32>> = (0..QUERIES)
+        .map(|q| make_vector(&centroids, q % CLUSTERS, 0xbeef_0000 + q as u64))
+        .collect();
+
+    let selectivities: [f64; 8] = [0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.25, 0.50];
+
+    for &s in &selectivities {
+        let allow = (N as f64 * s) as usize;
+        let filter = allow_filter(allow);
+        for q in &queries {
+            let scan = ids(&index
+                .bench_scan_filtered(q, K, Some(&filter))
+                .expect("scan"));
+            let gather = ids(&index.bench_gather_filtered(q, K, &filter).expect("gather"));
+            assert_eq!(
+                scan, gather,
+                "file-backed gather must be bit-identical to scan (sel={s})"
+            );
+            let public = ids(&index.search_top_k(q, K, Some(&filter)).expect("public"));
+            if allow.saturating_mul(50) < N {
+                assert_eq!(
+                    public, scan,
+                    "public file-backed search must take the gather-equivalent result (sel={s})"
+                );
+            }
+        }
+        eprintln!("[fsvi_filtered_gather] sel={s} allow≈{allow} parity OK");
+    }
+
+    let mut qi = 0usize;
+    for &s in &selectivities {
+        let allow = (N as f64 * s) as usize;
+        let filter = allow_filter(allow);
+        let pct = (s * 1000.0) as usize;
+        let mut g = c.benchmark_group(format!("fsvi_filtered_gather/sel_permille_{pct}"));
+        g.bench_function("scan", |b| {
+            b.iter(|| {
+                let q = &queries[qi % QUERIES];
+                qi += 1;
+                black_box(
+                    index
+                        .bench_scan_filtered(black_box(q), K, Some(&filter))
+                        .expect("scan"),
+                )
+            });
+        });
+        g.bench_function("gather", |b| {
+            b.iter(|| {
+                let q = &queries[qi % QUERIES];
+                qi += 1;
+                black_box(
+                    index
+                        .bench_gather_filtered(black_box(q), K, &filter)
+                        .expect("gather"),
+                )
+            });
+        });
+        g.finish();
+    }
+}
+
+criterion_group!(benches, bench_filtered_gather, bench_fsvi_filtered_gather);
 criterion_main!(benches);

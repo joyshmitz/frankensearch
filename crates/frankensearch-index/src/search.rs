@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use ahash::AHashSet;
 
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{DocIdHashSet, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 
@@ -21,6 +21,13 @@ use half::f16;
 pub const PARALLEL_THRESHOLD: usize = 10_000;
 /// Chunk size per Rayon task in the parallel scan path.
 pub const PARALLEL_CHUNK_SIZE: usize = 1_024;
+/// Selectivity threshold for the file-backed gather fast-path. A hash-addressable
+/// filter must be smaller than `record_count / GATHER_SELECTIVITY_DIVISOR` before
+/// we invert the loop and binary-search/gather the allowed hash ranges. The FSVI
+/// crossover is lower than the in-memory gather because each allowed hash pays
+/// `log2(N)` record-table probes; the short `filtered_gather` sweep keeps clear of
+/// the measured 5% regression.
+const GATHER_SELECTIVITY_DIVISOR: usize = 50;
 
 /// Configurable parameters for vector search parallelism.
 ///
@@ -144,6 +151,64 @@ impl VectorIndex {
         )
     }
 
+    /// Bench-only: force the old per-document filtered scan, bypassing the
+    /// selective-filter gather fast-path.
+    #[doc(hidden)]
+    pub fn bench_scan_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.ensure_query_dimension(query)?;
+        let has_main = self.record_count() > 0;
+        let has_wal = !self.wal_entries.is_empty();
+        if limit == 0 || (!has_main && !has_wal) {
+            return Ok(Vec::new());
+        }
+        let use_parallel = parallel_search_enabled() && self.record_count() >= PARALLEL_THRESHOLD;
+        let mut heap = if has_main {
+            if use_parallel {
+                self.scan_parallel(query, limit, filter, PARALLEL_CHUNK_SIZE)?
+            } else {
+                self.scan_sequential(query, limit, filter)?
+            }
+        } else {
+            BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
+        };
+        if has_wal {
+            self.scan_wal(query, &mut heap, limit, filter)?;
+        }
+        self.resolve_hits(heap)
+    }
+
+    /// Bench-only: force the selective-filter gather path, ignoring the production
+    /// selectivity gate.
+    #[doc(hidden)]
+    pub fn bench_gather_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: &dyn SearchFilter,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.ensure_query_dimension(query)?;
+        if limit == 0 || (self.record_count() == 0 && self.wal_entries.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let Some(allowed) = filter.candidate_hashes() else {
+            return self.bench_scan_filtered(query, limit, Some(filter));
+        };
+        let mut heap = if self.record_count() > 0 {
+            self.scan_gather_hashes(allowed, query, limit)?
+        } else {
+            BinaryHeap::with_capacity(limit.min(self.wal_entries.len()).saturating_add(1))
+        };
+        if !self.wal_entries.is_empty() {
+            self.scan_wal(query, &mut heap, limit, Some(filter))?;
+        }
+        self.resolve_hits(heap)
+    }
+
     fn search_top_k_internal(
         &self,
         query: &[f32],
@@ -194,7 +259,9 @@ impl VectorIndex {
         }
 
         let mut heap = if has_main {
-            if use_parallel {
+            if let Some(gathered) = self.try_gather_filtered(query, limit, filter)? {
+                gathered
+            } else if use_parallel {
                 self.scan_parallel(query, limit, filter, chunk_size)?
             } else {
                 self.scan_sequential(query, limit, filter)?
@@ -583,6 +650,149 @@ impl VectorIndex {
             }
         }
         Ok(winners)
+    }
+
+    fn try_gather_filtered(
+        &self,
+        query: &[f32],
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Option<BinaryHeap<HeapEntry>>> {
+        let Some(active_filter) = filter else {
+            return Ok(None);
+        };
+        let Some(allowed) = active_filter.candidate_hashes() else {
+            return Ok(None);
+        };
+        let count = self.record_count();
+        if count == 0 || allowed.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) >= count {
+            return Ok(None);
+        }
+        self.scan_gather_hashes(allowed, query, limit).map(Some)
+    }
+
+    fn scan_gather_hashes(
+        &self,
+        allowed: &DocIdHashSet,
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        let positions = self.gather_positions_for_hashes(allowed)?;
+        self.scan_gather_positions(&positions, query, limit)
+    }
+
+    fn gather_positions_for_hashes(&self, allowed: &DocIdHashSet) -> SearchResult<Vec<usize>> {
+        let mut positions = Vec::with_capacity(allowed.len());
+        for &hash in allowed {
+            let Some((start, end)) = self.hash_range(hash)? else {
+                continue;
+            };
+            for index in start..end {
+                let entry = self.record_at(index)?;
+                if (entry.flags & 0x0001) == 0 {
+                    positions.push(index);
+                }
+            }
+        }
+        positions.sort_unstable();
+        Ok(positions)
+    }
+
+    fn hash_range(&self, hash: u64) -> SearchResult<Option<(usize, usize)>> {
+        let count = self.record_count();
+        let start = self.lower_bound_hash(hash, 0, count)?;
+        if start == count || self.record_at(start)?.doc_id_hash != hash {
+            return Ok(None);
+        }
+        let end = self.upper_bound_hash(hash, start + 1, count)?;
+        Ok(Some((start, end)))
+    }
+
+    fn lower_bound_hash(&self, hash: u64, mut low: usize, mut high: usize) -> SearchResult<usize> {
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.record_at(mid)?.doc_id_hash < hash {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
+    }
+
+    fn upper_bound_hash(&self, hash: u64, mut low: usize, mut high: usize) -> SearchResult<usize> {
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.record_at(mid)?.doc_id_hash <= hash {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        Ok(low)
+    }
+
+    fn scan_gather_positions(
+        &self,
+        positions: &[usize],
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        if positions.len() > PARALLEL_CHUNK_SIZE {
+            let partials: SearchResult<Vec<BinaryHeap<HeapEntry>>> = positions
+                .par_chunks(PARALLEL_CHUNK_SIZE)
+                .map(|chunk| self.gather_range(chunk, query, limit))
+                .collect();
+            return Ok(merge_partial_heaps(partials?, limit));
+        }
+        self.gather_range(positions, query, limit)
+    }
+
+    fn gather_range(
+        &self,
+        positions: &[usize],
+        query: &[f32],
+        limit: usize,
+    ) -> SearchResult<BinaryHeap<HeapEntry>> {
+        let mut heap = BinaryHeap::with_capacity(limit.min(positions.len()).saturating_add(1));
+        let dim = self.dimension();
+        let mut cutoff = f32::NEG_INFINITY;
+
+        match self.quantization() {
+            Quantization::F16 => {
+                let stride = dim * 2;
+                for &index in positions {
+                    let vector_offset = self.vectors_offset + index * stride;
+                    let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                    let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
+                    if heap.len() < limit || score_key(score) >= cutoff {
+                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                        if heap.len() >= limit
+                            && let Some(&worst) = heap.peek()
+                        {
+                            cutoff = score_key(worst.score);
+                        }
+                    }
+                }
+            }
+            Quantization::F32 => {
+                let stride = dim * 4;
+                for &index in positions {
+                    let vector_offset = self.vectors_offset + index * stride;
+                    let vector_bytes = &self.data[vector_offset..vector_offset + stride];
+                    let score = dot_product_f32_bytes_f32(vector_bytes, query)?;
+                    if heap.len() < limit || score_key(score) >= cutoff {
+                        insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
+                        if heap.len() >= limit
+                            && let Some(&worst) = heap.peek()
+                        {
+                            cutoff = score_key(worst.score);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(heap)
     }
 
     fn scan_range_chunk(
@@ -1168,6 +1378,10 @@ mod tests {
             .collect()
     }
 
+    fn hit_ids(hits: &[VectorHit]) -> Vec<String> {
+        hits.iter().map(|hit| hit.doc_id.to_string()).collect()
+    }
+
     #[test]
     fn int8_two_pass_keep_all_matches_exact() {
         // With a multiplier large enough to retain every record, pass-1 keeps all
@@ -1576,6 +1790,40 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-a");
+    }
+
+    #[test]
+    fn selective_bitset_filter_uses_file_backed_gather() {
+        let path = temp_index_path("fsvi-selective-gather");
+        let rows: Vec<(String, Vec<f32>)> = (0..256)
+            .map(|i| {
+                let x = f32::from(u16::try_from(i % 31).expect("small test value")) / 31.0;
+                let y = f32::from(u16::try_from(i / 31).expect("small test value")) / 10.0;
+                (format!("doc-{i:03}"), vec![x, y, 0.25, 0.5])
+            })
+            .collect();
+        let refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+            .collect();
+        write_index(&path, &refs).expect("write index");
+
+        let index = VectorIndex::open(&path).expect("open index");
+        let filter =
+            frankensearch_core::BitsetFilter::from_doc_ids(["doc-003", "doc-097", "doc-203"]);
+        let query = [0.7, 0.3, 0.0, 0.0];
+        let scan = index
+            .bench_scan_filtered(&query, 3, Some(&filter))
+            .expect("forced scan");
+        let gather = index
+            .bench_gather_filtered(&query, 3, &filter)
+            .expect("forced gather");
+        let public = index
+            .search_top_k(&query, 3, Some(&filter))
+            .expect("public search");
+
+        assert_eq!(hit_ids(&gather), hit_ids(&scan));
+        assert_eq!(hit_ids(&public), hit_ids(&scan));
     }
 
     #[test]
