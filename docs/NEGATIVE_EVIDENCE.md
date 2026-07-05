@@ -9388,3 +9388,21 @@ Route-next from `112117c` (which measured nfcorpus+arguana). Ran the remaining t
 4. **Equal-weight is the robust default; CE×1.5 is higher-variance (per-corpus).** CE-heavy is best on semantic arguana (+0.0112) but takes a real −0.0048 loss on saturated scifact — consistent with `112117c` finding 3 (up-weight the CE only on hard semantic corpora, with a dev set).
 
 **Net:** the `112117c` reranker score-fusion win is confirmed across all 4 BEIR corpora at N=100 — deploy **pool-min-max SCORE fusion of retrieval-score ⊕ CE-score, equal-weight**, in place of the shipped RRF-combine (`5129bf9`): mean +0.0032 nDCG@10, positive on 3/4 and a −0.0009 tie on the one saturated corpus, and strictly better than rank fusion even where the reranker is net-negative. Remaining route-next: full-N (not N=100) confirm; and a learned/dev-set CE weight (the per-corpus optimum spans equal→×1.5). Caveats: N=100, jina-turbo, FEED=50, retrieval score = hybrid RRF-fused score, CE score = raw logit min-max'd over the feed. Verified: `fastembed` jina-reranker-v1-turbo-en + BGE + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana/scidocs N=100, no cargo/torch. `rerank_scorefuse.py` / `rerank_scorefuse2.py` in `$D`.
+
+### 2026-07-05 — OnyxPlover — FULL-N confirm of the reranker SCORE-fusion win (`112117c`/`bd1bf4c`): at full test-set N the equal-weight win STRENGTHENS — beats RRF-combine on all 3 (scifact +0.0078, nfcorpus +0.0059, arguana +0.0027; the N=100 scifact tie was a subsample artifact) — and a CE-weight sweep shows w_ce≈1.5 is the most uniform default
+
+Ran the `bd1bf4c` route-next: full test sets (not N=100) for scifact/nfcorpus/arguana, jina-turbo, FEED=50, plus a free CE-weight sweep (CE computed once/query).
+
+| Δ SCORE-fuse − RRF-combine (full-N) | scifact | nfcorpus | arguana |
+|---|---|---|---|
+| w_ce=0.5 | +0.0048 | +0.0006 | −0.0012 |
+| **w_ce=1.0 (equal)** | **+0.0078** | **+0.0059** | **+0.0027** |
+| w_ce=1.5 | +0.0064 | +0.0065 | +0.0062 |
+| w_ce=2.0 | +0.0056 | +0.0065 | +0.0082 |
+
+**Findings:**
+1. **At full-N the equal-weight win STRENGTHENS — positive on all 3, no tie.** SCORE-fuse(retrieval-score ⊕ CE-score, equal) beats RRF-combine by +0.0078 / +0.0059 / +0.0027 (mean +0.0055). The N=100 scifact −0.0009 tie (`bd1bf4c`) was a subsample artifact: full-N scifact base drops 0.794→0.738 (the first-100 queries are easier/more-saturated, leaving less reranker headroom), and with the harder queries included the score-fusion win is clear (+0.0078). Confirms the memory lesson that N=100 absolute nDCG drifts while relative gains hold — here the relative gain grew.
+2. **CE-weight profile: w_ce≈1.5 is the most UNIFORM default; the per-corpus optimum still ranges equal→heavy.** w_ce=1.5 is +0.0062…+0.0065 on all 3 (tightest band, min +0.0062 vs equal's min +0.0027); arguana improves monotonically with CE weight (+0.0027→+0.0082 as 1.0→2.0, the semantic-corpus CE-heavy preference from `112117c`), scifact peaks at equal (+0.0078). So: equal-weight = safe untuned default (positive everywhere); w_ce≈1.5 = better fixed default if you can't tune (most uniform); up-weight further only on hard semantic corpora.
+3. **The retrieval anchor guards the low end:** even w_ce=0.5 (retrieval-heavy) is within noise (worst −0.0012 arguana), and no weight is substantially negative — score fusion never degrades to the negative pure-CE regime because mm(retrieval-score) is always summed in (the `5129bf9`/`ec62699` veto, preserved).
+
+**Net:** the reranker SCORE-fusion win (`112117c`) is confirmed at FULL test-set N on scifact/nfcorpus/arguana — the equal-weight upgrade over the shipped RRF-combine is +0.0027…+0.0078 (mean +0.0055) and never negative, and w_ce≈1.5 tightens it to a uniform +0.0062…+0.0065. The N=100 caveat is retired for these 3 (scidocs remains N=100 confirm +0.0041, `bd1bf4c`; full-N scidocs skipped — 1000 queries, and it is the net-negative-reranking corpus). Deploy pool-min-max SCORE fusion of retrieval-score ⊕ CE-score (equal-weight default, or w_ce≈1.5) in place of RRF-combine. Route-next: learned/dev-set CE weight (per-corpus optimum spans equal→2.0). Verified: `fastembed` jina-reranker-v1-turbo-en + BGE + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana FULL N, no cargo/torch. `rerank_scorefuse_fulln.py` in `$D`.
