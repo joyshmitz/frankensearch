@@ -1,9 +1,9 @@
 //! Pure-Rust cross-encoder reranker backed by frankentorch (no ONNX / no `ort`).
 //!
 //! Reimplements the `cross-encoder/ms-marco-MiniLM-L6-v2` `BertForSequenceClassification`
-//! forward pass (6 layers, hidden 384, 12 heads, exact GELU, LayerNorm eps 1e-12,
+//! forward pass (6 layers, hidden 384, 12 heads, exact GELU, `LayerNorm` eps 1e-12,
 //! `[CLS]` pooler + classifier, `sigmoid(logit)`) on frankentorch tensors, matching the
-//! ONNX dynamic-quant scheme: an **f32 substrate** (embeddings, LayerNorm, softmax,
+//! ONNX dynamic-quant scheme: an **f32 substrate** (embeddings, `LayerNorm`, softmax,
 //! GELU, tanh) with **int8 Linear matmuls** (bd-1nl13.10/.15). Every Linear (attention
 //! QKV/output, FFN, pooler, classifier) is statically int8-quantized per output channel
 //! at load; its activation is dynamically int8-quantized per row at forward
@@ -13,7 +13,7 @@
 //! Embedding lookups go through `tensor_index_select` rather than `tensor_embedding`:
 //! `index_select` preserves the weight dtype (f32 in/f32 out, frankentorch-40i), whereas
 //! `tensor_embedding`'s custom gather still materialises f64. The two are semantically
-//! identical here (no `padding_idx`). LayerNorm hits frankentorch's f32 fused no-grad
+//! identical here (no `padding_idx`). `LayerNorm` hits frankentorch's f32 fused no-grad
 //! fast path.
 //!
 //! The only reranker backend (ort/ONNX was removed in bd-1nl13.6); feature-gated
@@ -38,7 +38,9 @@ const L: usize = 6;
 const NH: usize = 12;
 const HD: usize = H / NH; // 32
 const INTER: usize = 4 * H; // 1536 — FFN intermediate width
-const EPS: f64 = 1e-12;
+const EPS: f64 = 1.0e-12;
+const EPS_F32: f32 = 1.0e-12;
+const ATTN_SCALE_F32: f32 = 0.176_776_69;
 pub(crate) const DEFAULT_MAX_LENGTH: usize = 512;
 /// Token budget per batched forward. Documents are reranked in chunks whose total
 /// token count stays under this cap so the chunk's attention intermediates (which
@@ -65,6 +67,10 @@ fn rerank_err(ctx: &str, e: impl std::fmt::Display) -> SearchError {
         model: MODEL_NAME.to_owned(),
         source: format!("{ctx}: {e}").into(),
     }
+}
+
+fn index_to_i64(index: usize, ctx: &str) -> SearchResult<i64> {
+    i64::try_from(index).map_err(|_| rerank_err(ctx, format!("index {index} exceeds i64::MAX")))
 }
 
 /// In-place fused scale + numerically-stable softmax for one attention-score row.
@@ -202,6 +208,46 @@ fn fast_gelu_inplace(data: &mut [f32]) {
     }
 }
 
+#[inline]
+fn f32x8_from_slice(slice: &[f32]) -> f32x8 {
+    let mut buf = [0.0f32; 8];
+    buf.copy_from_slice(&slice[..8]);
+    f32x8::new(buf)
+}
+
+#[inline]
+fn dot_hd(q: &[f32], k: &[f32]) -> f32 {
+    debug_assert_eq!(q.len(), HD);
+    debug_assert_eq!(k.len(), HD);
+    (f32x8_from_slice(&q[0..]) * f32x8_from_slice(&k[0..])
+        + f32x8_from_slice(&q[8..]) * f32x8_from_slice(&k[8..])
+        + f32x8_from_slice(&q[16..]) * f32x8_from_slice(&k[16..])
+        + f32x8_from_slice(&q[24..]) * f32x8_from_slice(&k[24..]))
+    .reduce_add()
+}
+
+fn weighted_value_sum_hd(qkv: &[f32], probs: &[f32], s_len: usize, head: usize, out: &mut [f32]) {
+    debug_assert_eq!(probs.len(), s_len);
+    debug_assert_eq!(out.len(), HD);
+    const STRIDE: usize = 3 * H;
+    let mut acc0 = f32x8::splat(0.0);
+    let mut acc1 = f32x8::splat(0.0);
+    let mut acc2 = f32x8::splat(0.0);
+    let mut acc3 = f32x8::splat(0.0);
+    for (j, &prob) in probs.iter().enumerate() {
+        let p = f32x8::splat(prob);
+        let base = j * STRIDE + 2 * H + head * HD;
+        acc0 += p * f32x8_from_slice(&qkv[base..base + 8]);
+        acc1 += p * f32x8_from_slice(&qkv[base + 8..base + 16]);
+        acc2 += p * f32x8_from_slice(&qkv[base + 16..base + 24]);
+        acc3 += p * f32x8_from_slice(&qkv[base + 24..base + 32]);
+    }
+    out[0..8].copy_from_slice(&acc0.to_array());
+    out[8..16].copy_from_slice(&acc1.to_array());
+    out[16..24].copy_from_slice(&acc2.to_array());
+    out[24..32].copy_from_slice(&acc3.to_array());
+}
+
 /// Reusable per-document attention scratch. Holds the head-major repack operands and
 /// the two `bmm` output buffers so a whole forward's worth of attention calls (every
 /// document × every layer) reuse one set of allocations instead of allocating —
@@ -250,7 +296,7 @@ impl AttnScratch {
 /// runs the S² inner loop one dot at a time, which dominates at seq ≥ 256 (it was
 /// ~9× over the FLOP floor — a register-blocked GEMM does the same MACs far faster).
 /// So repack each head's Q/K/V into the head-major layout the batched `bmm` kernel
-/// (`gemm::sgemm`, cache-blocking) wants, do QKᵀ and ·V as two batched GEMMs with a
+/// (`gemm::sgemm`, cache-blocking) wants, do `QKᵀ` and ·V as two batched GEMMs with a
 /// vectorized softmax between, and transpose the context back. The repacks and both
 /// GEMM outputs land in the caller's reused `scratch`, so the hot loop does not
 /// allocate. The `bmm` kernel parallelizes across the NH head-batches internally and
@@ -330,10 +376,11 @@ fn fused_attention(
 ///
 /// The reranker's logit is read solely from `[CLS]` of the final layer, so the last
 /// encoder layer never needs any other token's attention output. `[CLS]` still attends
-/// to every key, so K/V are repacked in full, but Q is a single row — the two `bmm`s
-/// collapse to `[1, HD] @ [HD, S]` and `[1, S] @ [S, HD]` per head (m = 1), i.e. ~S×
-/// less attention work than the full `fused_attention`. Bit-exact to row 0 of it.
-/// Reuses the same `scratch` (strict prefixes of the full-attention buffers).
+/// to every key, but the operation is rank-1 per head: one `[HD]` query row scores all
+/// keys, then one probability row weights the values. Running that directly over the
+/// fused QKV buffer avoids the old head-major K/V repacks plus two tiny `bmm` launches
+/// whose `m = 1` shape is below the GEMM kernel's useful blocking regime. The softmax
+/// kernel and output layout stay the same; only the CLS-only final layer uses this path.
 fn fused_attention_cls(
     scratch: &mut AttnScratch,
     qkv: &[f32],
@@ -349,52 +396,21 @@ fn fused_attention_cls(
     }
     const STRIDE: usize = 3 * H;
     scratch.ensure(s_len);
-    let hm = s_len * H;
     let sc = NH * s_len;
-    let AttnScratch {
-        q_hm,
-        kt,
-        v_hm,
-        scores,
-        ctx_hm,
-    } = scratch;
-    // Q[CLS] head-major [NH, 1, HD] (token 0's query) uses the first NH*HD == H slots.
-    let q_cls = &mut q_hm[..H];
-    let (kt, v_hm) = (&mut kt[..hm], &mut v_hm[..hm]);
-    let scores = &mut scores[..sc];
-    let ctx_hm = &mut ctx_hm[..H];
     for h in 0..NH {
-        q_cls[h * HD..h * HD + HD].copy_from_slice(&qkv[h * HD..h * HD + HD]);
-    }
-    for j in 0..s_len {
-        let base = j * STRIDE;
-        for h in 0..NH {
-            let hmj = (h * s_len + j) * HD;
-            v_hm[hmj..hmj + HD]
-                .copy_from_slice(&qkv[base + 2 * H + h * HD..base + 2 * H + h * HD + HD]);
+        let q = &qkv[h * HD..h * HD + HD];
+        let row = &mut scratch.scores[h * s_len..(h + 1) * s_len];
+        for (j, slot) in row.iter_mut().enumerate() {
+            let k_base = j * STRIDE + H + h * HD;
+            *slot = dot_hd(q, &qkv[k_base..k_base + HD]);
         }
     }
-    for h in 0..NH {
-        for d in 0..HD {
-            let col = H + h * HD + d;
-            let row = &mut kt[h * HD * s_len + d * s_len..h * HD * s_len + d * s_len + s_len];
-            for (j, slot) in row.iter_mut().enumerate() {
-                *slot = qkv[j * STRIDE + col];
-            }
-        }
-    }
-    // scores [NH, 1, S] = Q[CLS] @ Kᵀ, then fused-scale softmax over the S keys (one row per head).
-    let qm = TensorMeta::from_shape(vec![NH, 1, HD], DType::F32, Device::Cpu);
-    let km = TensorMeta::from_shape(vec![NH, HD, s_len], DType::F32, Device::Cpu);
-    ft_api::bmm_tensor_contiguous_f32_into(q_cls, kt, &qm, &km, scores)
-        .expect("attn CLS QKᵀ bmm: shapes are internally consistent");
+    let scores = &mut scratch.scores[..sc];
     fast_softmax_inplace(scores, NH, s_len, scale);
-    // ctx_hm [NH, 1, HD] = scores @ V — already laid out as the [H] CLS context (head-major HD blocks).
-    let sm = TensorMeta::from_shape(vec![NH, 1, s_len], DType::F32, Device::Cpu);
-    let vm = TensorMeta::from_shape(vec![NH, s_len, HD], DType::F32, Device::Cpu);
-    ft_api::bmm_tensor_contiguous_f32_into(scores, v_hm, &sm, &vm, ctx_hm)
-        .expect("attn CLS ·V bmm: shapes are internally consistent");
-    out.copy_from_slice(ctx_hm);
+    for h in 0..NH {
+        let row = &scores[h * s_len..(h + 1) * s_len];
+        weighted_value_sum_hd(qkv, row, s_len, h, &mut out[h * HD..h * HD + HD]);
+    }
 }
 
 /// A Linear layer's weights, statically quantized to int8 with per-output-channel
@@ -419,13 +435,13 @@ struct QLinear {
 /// forward pass, so it lives behind a `Mutex` in `NativeReranker`.
 pub(crate) struct Model {
     s: FrankenTorchSession,
-    /// f32 leaf nodes for the non-Linear parameters (word/position/token_type
-    /// embeddings and every LayerNorm weight/bias) — these stay in f32.
+    /// f32 leaf nodes for the non-Linear parameters (`word/position/token_type`
+    /// embeddings and every `LayerNorm` weight/bias) — these stay in f32.
     w: HashMap<String, TensorNodeId>,
     /// int8-quantized Linear weights (attention QKV/output, FFN, pooler,
     /// classifier), keyed by the layer prefix (the weight name minus `.weight`).
     qw: HashMap<String, QLinear>,
-    /// Raw f32 values for the LayerNorm weight/bias parameters (same data as the
+    /// Raw f32 values for the `LayerNorm` weight/bias parameters (same data as the
     /// `w` leaves, shared via `Arc`), so the tape-free fused-layer path can call the
     /// `add_layer_norm` kernel directly without round-tripping through the session.
     raw_params: HashMap<String, Arc<Vec<f32>>>,
@@ -448,7 +464,7 @@ impl Model {
 
     /// `y = layer(x)` via the int8 kernel directly on raw f32 buffers (no tape
     /// node) — the tape-free counterpart of [`Self::linear`]. Output width is the
-    /// QLinear's `out`; input width is its `in_`.
+    /// `QLinear`'s `out`; input width is its `in_`.
     fn linear_raw(&self, x: &[f32], m: usize, prefix: &str) -> SearchResult<Vec<f32>> {
         let q = self
             .qw
@@ -489,7 +505,7 @@ impl Model {
             Some(bias),
             m,
             H,
-            EPS as f32,
+            EPS_F32,
         ))
     }
 
@@ -502,7 +518,7 @@ impl Model {
     /// `scratch` is reused across documents and layers to avoid per-call allocation.
     fn encoder_layer_raw(
         &self,
-        emb: Vec<f32>,
+        emb: &[f32],
         total: usize,
         offsets: &[usize],
         lens: &[usize],
@@ -511,7 +527,8 @@ impl Model {
         scratch: &mut AttnScratch,
     ) -> SearchResult<Vec<f32>> {
         // Fused QKV projection (batched over all the chunk's tokens).
-        let qkv = self.linear_raw(&emb, total, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
+        // Fused QKV projection output shape: [total, 3H].
+        let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?;
         // Per-document self-attention written straight into one re-concatenated
         // [total, H] context (no per-doc temporary).
         let mut ctx = vec![0.0f32; total * H];
@@ -527,7 +544,7 @@ impl Model {
         }
         let attn = self.linear_raw(&ctx, total, &format!("{p}.attention.output.dense"))?;
         let emb = self.add_ln_raw(
-            &emb,
+            emb,
             &attn,
             total,
             &format!("{p}.attention.output.LayerNorm"),
@@ -562,7 +579,8 @@ impl Model {
     ) -> SearchResult<Vec<f32>> {
         let n_docs = lens.len();
         // Fused QKV over all tokens (K/V needed in full for the CLS query's attention).
-        let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?; // [total, 3H]
+        // Fused QKV projection output shape: [total, 3H].
+        let qkv = self.linear_raw(emb, total, &format!("{p}.attention.self.qkv"))?;
         // CLS-only self-attention per document written straight into a compact
         // [n_docs, H] context.
         let mut ctx = vec![0.0f32; n_docs * H];
@@ -591,7 +609,7 @@ impl Model {
     }
 
     /// y = x @ Wᵀ + b via the int8 dynamic-quant kernel (weight stored row-major
-    /// [out, in], PyTorch convention). The f32 activation `x` is dynamically
+    /// [out, in], `PyTorch` convention). The f32 activation `x` is dynamically
     /// quantized per-row; the weight is statically int8-quantized per-output-channel;
     /// the result is dequantized back to an f32 node.
     fn linear(&mut self, x: TensorNodeId, prefix: &str) -> SearchResult<TensorNodeId> {
@@ -623,7 +641,7 @@ impl Model {
             .map_err(|e| rerank_err("index_tensor", e))
     }
 
-    /// Fused residual-add + LayerNorm `layer_norm(a + b)` (the "add & norm") in one
+    /// Fused residual-add + `LayerNorm` `layer_norm(a + b)` (the "add & norm") in one
     /// op, so the residual sum is never materialized as its own tensor (2 per layer).
     fn add_ln(
         &mut self,
@@ -685,7 +703,7 @@ impl Model {
         &mut self,
         qkv: TensorNodeId,
         s_len: usize,
-        scale: f64,
+        scale: f32,
     ) -> SearchResult<TensorNodeId> {
         let ctx_vals = {
             let qkv_v = self
@@ -694,7 +712,7 @@ impl Model {
                 .map_err(|e| rerank_err("attn.qkv_vals", e))?;
             let mut scratch = AttnScratch::default();
             let mut ctx = vec![0.0f32; s_len * H];
-            fused_attention(&mut scratch, qkv_v, s_len, scale as f32, &mut ctx);
+            fused_attention(&mut scratch, qkv_v, s_len, scale, &mut ctx);
             ctx
         };
         self.s
@@ -711,7 +729,7 @@ impl Model {
         k: TensorNodeId,
         v: TensorNodeId,
         s_len: usize,
-        scale: f64,
+        scale: f32,
     ) -> SearchResult<TensorNodeId> {
         let q = self.heads(q, s_len)?;
         let k = self.heads(k, s_len)?;
@@ -729,7 +747,7 @@ impl Model {
                 .s
                 .tensor_values_f32_mut(scores)
                 .map_err(|e| rerank_err("attn.softmax_mut", e))?;
-            fast_softmax_inplace(slice, NH * s_len, s_len, scale as f32);
+            fast_softmax_inplace(slice, NH * s_len, s_len, scale);
         }
         let ctx = self
             .s
@@ -755,7 +773,7 @@ impl Model {
         emb: TensorNodeId,
         p: &str,
         s_len: usize,
-        scale: f64,
+        scale: f32,
     ) -> SearchResult<TensorNodeId> {
         if s_len <= FUSED_ATTN_MAX_SEQ {
             let qkv = self.linear(emb, &format!("{p}.attention.self.qkv"))?;
@@ -775,7 +793,7 @@ impl Model {
     /// overhead), so this is `#[cfg(test)]`-only.
     ///
     /// Runs entirely in f32: weights are f32 leaves and every op preserves f32, so
-    /// embedding/matmul/softmax/layer_norm all stay in the f32 kernels.
+    /// `embedding/matmul/softmax/layer_norm` all stay in the f32 kernels.
     #[cfg(test)]
     fn forward(&mut self, ids: &[i64], typ: &[i64]) -> SearchResult<f32> {
         let s_len = ids.len();
@@ -783,7 +801,9 @@ impl Model {
         // `index_select(weight, dim=0, indices)` is the embedding lookup; unlike
         // `tensor_embedding` it preserves the f32 weight dtype (frankentorch-40i).
         let id_t = self.idx(ids)?;
-        let pos: Vec<i64> = (0..s_len as i64).collect();
+        let pos: Vec<i64> = (0..s_len)
+            .map(|i| index_to_i64(i, "forward.position"))
+            .collect::<SearchResult<_>>()?;
         let pos_t = self.idx(&pos)?;
         let typ_t = self.idx(typ)?;
         let we = self.g("bert.embeddings.word_embeddings.weight")?;
@@ -808,7 +828,7 @@ impl Model {
         // Fuse the third-embedding add with the embedding LayerNorm.
         let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
-        let scale = 1.0 / (HD as f64).sqrt();
+        let scale = ATTN_SCALE_F32;
         for i in 0..L {
             let p = format!("bert.encoder.layer.{i}");
             // self-attention (fused-QKV + fused kernel, or separate-QKV + bmm by len)
@@ -852,7 +872,7 @@ impl Model {
     ///
     /// Layout is **varlen**: the documents' tokens are concatenated end-to-end
     /// (NO padding, NO mask) into one `[Σlenₙ, H]` activation. Every per-token op
-    /// (the int8 Linears, LayerNorm, GELU, residuals) runs once over the whole
+    /// (the int8 Linears, `LayerNorm`, GELU, residuals) runs once over the whole
     /// `Σlenₙ` rows, so each statically-quantized weight is loaded once and reused
     /// across all the documents' tokens instead of being re-streamed per document
     /// — that weight-reuse is what lifts the int8 GEMM toward peak and beats a
@@ -888,7 +908,7 @@ impl Model {
         for (ids, typ) in batch {
             for (i, (&id, &t)) in ids.iter().zip(typ.iter()).enumerate() {
                 ids_flat.push(id);
-                pos_flat.push(i as i64);
+                pos_flat.push(index_to_i64(i, "forward_batch.position")?);
                 typ_flat.push(t);
             }
         }
@@ -918,12 +938,11 @@ impl Model {
         // Fuse the third-embedding add with the embedding LayerNorm.
         let mut emb = self.add_ln(emb_wp, e_typ, "bert.embeddings.LayerNorm")?;
 
-        let scale = 1.0 / (HD as f64).sqrt();
+        let scale = ATTN_SCALE_F32;
         // True once the final layer has already collapsed the activation to one
         // `[CLS]` row per document (`[n_docs, H]`), so the pooler gathers identity
         // rows instead of the per-doc offsets.
-        let mut cls_prepacked = false;
-        if lens.iter().all(|&l| l <= FUSED_ATTN_MAX_SEQ) {
+        let cls_prepacked = if lens.iter().all(|&l| l <= FUSED_ATTN_MAX_SEQ) {
             // Tape-free fused-layer path (every doc short): extract the activation
             // once, run the encoder layers entirely on raw f32 buffers through the
             // SAME optimized kernels (fused QKV + fused attention + add&norm +
@@ -931,7 +950,6 @@ impl Model {
             // truncation, then reinsert once for the pooler. Bit-identical to the
             // tape path. The FINAL layer computes only each doc's `[CLS]` row (the
             // sole token the pooler reads), skipping ~S× of its attn-out + FFN work.
-            let scale_f = scale as f32;
             // One attention scratch reused across every layer (and document) of this
             // chunk's forward, so the head-major repacks + the two bmm outputs are
             // allocated once instead of per attention call.
@@ -943,12 +961,12 @@ impl Model {
             for i in 0..L - 1 {
                 let p = format!("bert.encoder.layer.{i}");
                 emb_vals = self.encoder_layer_raw(
-                    emb_vals,
+                    &emb_vals,
                     total,
                     &offsets,
                     &lens,
                     &p,
-                    scale_f,
+                    scale,
                     &mut scratch,
                 )?;
             }
@@ -959,14 +977,14 @@ impl Model {
                 &lens,
                 total,
                 &p_last,
-                scale_f,
+                scale,
                 &mut scratch,
             )?;
             emb = self
                 .s
                 .tensor_variable_f32(cls_vals, vec![n_docs, H], false)
                 .map_err(|e| rerank_err("batch.emb_reinsert", e))?;
-            cls_prepacked = true;
+            true
         } else {
             // Long-document path: separate-QKV + cache-blocking bmm attention through
             // the tape (a long doc in the chunk; rare).
@@ -1003,14 +1021,20 @@ impl Model {
                 let ffn = self.linear(inter, &format!("{p}.output.dense"))?;
                 emb = self.add_ln(emb, ffn, &format!("{p}.output.LayerNorm"))?;
             }
-        }
+            false
+        };
         // Pooler on each document's [CLS] row → [N, H]. When the final layer already
         // emitted one CLS row per doc (`cls_prepacked`), those are rows 0..n_docs;
         // otherwise CLS is the first token of each doc, row `offsets[n]`.
         let cls_idx: Vec<i64> = if cls_prepacked {
-            (0..n_docs as i64).collect()
+            (0..n_docs)
+                .map(|i| index_to_i64(i, "forward_batch.cls_idx"))
+                .collect::<SearchResult<_>>()?
         } else {
-            offsets.iter().map(|&o| o as i64).collect()
+            offsets
+                .iter()
+                .map(|&o| index_to_i64(o, "forward_batch.cls_offset"))
+                .collect::<SearchResult<_>>()?
         };
         let cls_t = self.idx(&cls_idx)?;
         let cls = self
@@ -1070,7 +1094,7 @@ impl Model {
         for ids in batch {
             for (i, &id) in ids.iter().enumerate() {
                 ids_flat.push(id);
-                pos_flat.push(i as i64);
+                pos_flat.push(index_to_i64(i, "embed_forward.position")?);
                 typ_flat.push(0i64);
             }
         }
@@ -1101,7 +1125,7 @@ impl Model {
 
         // Encoder: ALL L layers on raw f32 buffers (mean-pooling needs every token's
         // final hidden state, so no CLS-only last layer). Same kernels as the reranker.
-        let scale_f = (1.0 / (HD as f64).sqrt()) as f32;
+        let scale = ATTN_SCALE_F32;
         let mut scratch = AttnScratch::default();
         let mut emb_vals = self
             .s
@@ -1109,15 +1133,8 @@ impl Model {
             .map_err(|e| rerank_err("embed.extract", e))?;
         for i in 0..L {
             let p = format!("bert.encoder.layer.{i}");
-            emb_vals = self.encoder_layer_raw(
-                emb_vals,
-                total,
-                &offsets,
-                &lens,
-                &p,
-                scale_f,
-                &mut scratch,
-            )?;
+            emb_vals =
+                self.encoder_layer_raw(&emb_vals, total, &offsets, &lens, &p, scale, &mut scratch)?;
         }
         self.s.truncate_autograd_graph(self.weights_boundary);
 
@@ -1255,13 +1272,13 @@ impl NativeReranker {
 }
 
 /// A weight tensor is a Linear weight (to be int8-quantized) iff it is a `.weight`
-/// that is neither a LayerNorm gain nor an embedding table.
+/// that is neither a `LayerNorm` gain nor an embedding table.
 fn is_linear_weight(name: &str) -> bool {
     name.ends_with(".weight") && !name.contains("LayerNorm") && !name.contains("embeddings")
 }
 
 /// Parsed, immutable weight data: int8 Linear weights keyed by layer prefix, plus
-/// the f32 embedding/LayerNorm parameter values. Parsed and quantized once, then
+/// the f32 `embedding/LayerNorm` parameter values. Parsed and quantized once, then
 /// cloned (cheaply, via `Arc`) into each session by [`build_model`].
 pub(crate) struct SharedWeights {
     qw: HashMap<String, QLinear>,
@@ -1269,7 +1286,7 @@ pub(crate) struct SharedWeights {
 }
 
 /// Parse a safetensors file: int8-quantize the Linear weights (per output channel)
-/// and keep the embeddings + LayerNorm parameters as f32. Non-F32 tensors (e.g. the
+/// and keep the embeddings + `LayerNorm` parameters as f32. Non-F32 tensors (e.g. the
 /// I64 `position_ids` buffer) are skipped — those indices are regenerated at forward.
 pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
     let bytes = fs::read(path).map_err(|e| SearchError::ModelLoadFailed {
@@ -1282,7 +1299,11 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
             source: "safetensors file too small".into(),
         });
     }
-    let header_len = u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")) as usize;
+    let header_len = usize::try_from(u64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes")))
+        .map_err(|_| SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: "safetensors header length exceeds usize::MAX".into(),
+        })?;
     let header_end = 8usize
         .checked_add(header_len)
         .filter(|&e| e <= bytes.len())
@@ -1322,9 +1343,19 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
             .and_then(serde_json::Value::as_array)
             .map(|a| {
                 a.iter()
-                    .filter_map(|x| x.as_u64().map(|u| u as usize))
-                    .collect()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|u| {
+                        usize::try_from(u).map_err(|_| SearchError::ModelLoadFailed {
+                            path: path.to_path_buf(),
+                            source: format!(
+                                "safetensors tensor {name} shape dimension exceeds usize::MAX"
+                            )
+                            .into(),
+                        })
+                    })
+                    .collect::<SearchResult<_>>()
             })
+            .transpose()?
             .unwrap_or_default();
         let offsets = info
             .get("data_offsets")
@@ -1333,14 +1364,26 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                 path: path.to_path_buf(),
                 source: format!("safetensors tensor {name} missing data_offsets").into(),
             })?;
-        let start = offsets
-            .first()
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
-        let end = offsets
-            .get(1)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) as usize;
+        let start = usize::try_from(
+            offsets
+                .first()
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+        .map_err(|_| SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: format!("safetensors tensor {name} start offset exceeds usize::MAX").into(),
+        })?;
+        let end = usize::try_from(
+            offsets
+                .get(1)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+        .map_err(|_| SearchError::ModelLoadFailed {
+            path: path.to_path_buf(),
+            source: format!("safetensors tensor {name} end offset exceeds usize::MAX").into(),
+        })?;
         if start > end || end > data.len() {
             return Err(SearchError::ModelLoadFailed {
                 path: path.to_path_buf(),
@@ -1418,9 +1461,8 @@ pub(crate) fn parse_weights(path: &Path) -> SearchResult<SharedWeights> {
                     packed,
                 },
             );
-        } else if name.ends_with(".bias") && !name.contains("LayerNorm") {
+        } else if name.strip_suffix(".bias").is_some() && !name.contains("LayerNorm") {
             // Linear bias — already folded into its QLinear above; do not keep as f32.
-            continue;
         } else {
             // f32 parameter: embeddings and LayerNorm weight/bias.
             f32_params.insert(name.clone(), (Arc::new(vals.clone()), shape.clone()));
@@ -1634,22 +1676,22 @@ mod tests {
         (
             "how to fix a failing release workflow",
             "the release pipeline builds cross platform binaries and uploads them to github",
-            -9.808567,
+            -9.808_567,
         ),
         (
             "how to fix a failing release workflow",
             "bananas are a good source of potassium and taste sweet",
-            -11.332987,
+            -11.332_987,
         ),
         (
             "what is the capital of france",
             "paris is the capital and most populous city of france",
-            7.472003,
+            7.472_003,
         ),
         (
             "rust memory safety",
             "the borrow checker enforces ownership rules at compile time",
-            -11.367251,
+            -11.367_251,
         ),
     ];
 
@@ -1681,7 +1723,7 @@ mod tests {
                 .rerank_sync(query, &[doc("d", document)])
                 .expect("rerank_sync");
             assert_eq!(scored.len(), 1, "one doc in, one score out");
-            let logit = scored[0].raw_logit.expect("raw logit present") as f64;
+            let logit = f64::from(scored[0].raw_logit.expect("raw logit present"));
             let diff = (logit - ref_logit).abs();
             max_diff = max_diff.max(diff);
             logits.push(logit);
@@ -1728,6 +1770,7 @@ mod tests {
             .map(|(ids, typ)| model.forward(ids, typ).expect("forward"))
             .collect();
         let batched = model.forward_batch(&batch).expect("forward_batch");
+        drop(model);
         assert_eq!(batched.len(), per_doc.len());
         for (i, (b, p)) in batched.iter().zip(&per_doc).enumerate() {
             let diff = (f64::from(*b) - f64::from(*p)).abs();

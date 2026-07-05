@@ -1483,7 +1483,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(i, _doc)| RerankScore {
-                        doc_id: format!("wrong-{i}").into(),
+                        doc_id: format!("wrong-{i}"),
                         score: 0.5,
                         original_rank: i,
                         raw_logit: None,

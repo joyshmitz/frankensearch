@@ -81,17 +81,17 @@ RCH_WORKER=ovh-a \
     --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5
 ```
 
-RCH ran remotely on `ovh-a`; `rch` rewrote `CARGO_TARGET_DIR` to the worker-scoped
-`/data/projects/frankensearch/.rch-target-ovh-a-pool-6506c93c0b5528bd235a66e7c27e2e88`.
+RCH selected `hz2` despite the `RCH_WORKER=ovh-a` hint; `rch` rewrote `CARGO_TARGET_DIR` to the
+worker-scoped `/data/projects/frankensearch/.rch-target-hz2-pool-6506c93c0b5528bd235a66e7c27e2e88`.
 The benchmark asserts the direct kernel output is within `1.0e-4` max absolute delta of the
 ORIG `bmm`/repack comparator before collecting samples.
 
 | Workload | ORIG CLS `bmm`/K-V repack | Candidate direct rank-1 CLS | Ratio vs ORIG | Decision |
 |---|---:|---:|---:|---|
-| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=64) | 50.911 us | 5.8774 us | **0.115 (~8.66x faster)** | keep |
-| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=128) | 135.13 us | 12.516 us | **0.093 (~10.8x faster)** | keep |
-| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=256) | 211.83 us | 27.025 us | **0.128 (~7.84x faster)** | keep |
-| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=512) | 418.31 us | 55.895 us | **0.134 (~7.48x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=64) | 500.13 us | 6.2809 us | **0.0126 (~79.6x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=128) | 562.44 us | 14.196 us | **0.0252 (~39.6x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=256) | 738.20 us | 34.720 us | **0.0470 (~21.3x faster)** | keep |
+| `cls_attention/bmm_repack_orig -> direct_rank1` (seq=512) | 1.7997 ms | 71.815 us | **0.0399 (~25.1x faster)** | keep |
 
 External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an
 internal native cross-encoder final-layer attention primitive, not a standalone search-engine

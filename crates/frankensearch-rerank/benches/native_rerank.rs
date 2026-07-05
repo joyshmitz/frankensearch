@@ -32,13 +32,13 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::traits::{RerankDocument, SyncRerank};
 use frankensearch_rerank::NativeReranker;
 
-/// Staged reference model (model_f32.safetensors + tokenizer.json).
+/// Staged reference model (`model_f32.safetensors` + `tokenizer.json`).
 const MODEL_DIR: &str = "/private/tmp/ee-reranker-port/model";
 const QUERY: &str = "what is the capital city of france and its population";
 
 /// Word counts chosen to land near 128 / 256 / 512 total tokens for the
 /// `[CLS] query [SEP] doc [SEP]` input; the actual per-doc latency for each is
-/// logged at startup so the numbers stay interpretable even if WordPiece
+/// logged at startup so the numbers stay interpretable even if `WordPiece`
 /// tokenization drifts from the nominal target.
 const SEQ_CONFIGS: &[(&str, usize)] = &[("seq~128", 90), ("seq~256", 215), ("seq~512", 460)];
 
@@ -118,37 +118,41 @@ fn bench_native_rerank(c: &mut Criterion) {
         );
     }
 
-    let mut g = c.benchmark_group("native_rerank_per_doc");
-    g.sample_size(10);
-    g.warm_up_time(Duration::from_secs(2));
-    g.measurement_time(Duration::from_secs(8));
-    for (label, nw) in SEQ_CONFIGS {
-        let docs = vec![RerankDocument {
-            doc_id: "d0".into(),
-            text: filler_doc(*nw),
-        }];
-        g.bench_with_input(BenchmarkId::from_parameter(label), &docs, |b, docs| {
-            b.iter(|| reranker.rerank_sync(QUERY, docs).expect("rerank"));
-        });
+    {
+        let mut g = c.benchmark_group("native_rerank_per_doc");
+        g.sample_size(10);
+        g.warm_up_time(Duration::from_secs(2));
+        g.measurement_time(Duration::from_secs(8));
+        for (label, nw) in SEQ_CONFIGS {
+            let docs = vec![RerankDocument {
+                doc_id: "d0".into(),
+                text: filler_doc(*nw),
+            }];
+            g.bench_with_input(BenchmarkId::from_parameter(label), &docs, |b, docs| {
+                b.iter(|| reranker.rerank_sync(QUERY, docs).expect("rerank"));
+            });
+        }
+        g.finish();
     }
-    g.finish();
 
     // Linearity check: 10 docs @ seq~256 should ≈ 10 × per-doc(seq~256),
     // validating the extrapolation used for the 50/100-doc table.
-    let mut g2 = c.benchmark_group("native_rerank_linearity");
-    g2.sample_size(10);
-    g2.warm_up_time(Duration::from_secs(2));
-    g2.measurement_time(Duration::from_secs(12));
-    let docs10: Vec<RerankDocument> = (0..10)
-        .map(|i| RerankDocument {
-            doc_id: format!("d{i}").into(),
-            text: filler_doc(215),
-        })
-        .collect();
-    g2.bench_function("10docs_seq~256", |b| {
-        b.iter(|| reranker.rerank_sync(QUERY, &docs10).expect("rerank"));
-    });
-    g2.finish();
+    {
+        let mut g2 = c.benchmark_group("native_rerank_linearity");
+        g2.sample_size(10);
+        g2.warm_up_time(Duration::from_secs(2));
+        g2.measurement_time(Duration::from_secs(12));
+        let docs10: Vec<RerankDocument> = (0..10)
+            .map(|i| RerankDocument {
+                doc_id: format!("d{i}"),
+                text: filler_doc(215),
+            })
+            .collect();
+        g2.bench_function("10docs_seq~256", |b| {
+            b.iter(|| reranker.rerank_sync(QUERY, &docs10).expect("rerank"));
+        });
+        g2.finish();
+    }
 }
 
 criterion_group!(benches, bench_native_rerank);

@@ -3,7 +3,7 @@
 //! ONNX / no `ort`).
 //!
 //! It reuses the reranker's validated, SIMD/int8-optimized BERT encoder verbatim
-//! (same 6-layer MiniLM forward, same kernels via [`crate::native::Model::embed_forward`]);
+//! (same 6-layer `MiniLM` forward, same kernels via [`crate::native::Model::embed_forward`]);
 //! it differs only at the head — **mean-pool over every token + L2-normalize** instead
 //! of the `[CLS]` pooler + classifier — and in tokenization (one text, token-type ids
 //! all 0). Because there is no ONNX Runtime, there is no AVX-static-init hazard: the
@@ -31,7 +31,7 @@ const DIM: usize = 384;
 /// forward's attention intermediates stay memory-bounded.
 const MAX_BATCH_TOKENS: usize = 2048;
 
-/// Pure-Rust frankentorch MiniLM sentence-embedder.
+/// Pure-Rust frankentorch `MiniLM` sentence-embedder.
 pub struct NativeEmbedder {
     /// One frankentorch session behind a `Mutex` (each forward parallelizes internally
     /// across cores; calls are serialized, so no nested-rayon-under-lock hazard) — same
@@ -161,6 +161,7 @@ impl SyncEmbed for NativeEmbedder {
         let ids = self.tokenize(text)?;
         let mut model = self.lock_model()?;
         let mut out = model.embed_forward(&[ids])?;
+        drop(model);
         Ok(out.pop().unwrap_or_else(|| vec![0.0; DIM]))
     }
 
@@ -191,6 +192,7 @@ impl SyncEmbed for NativeEmbedder {
             out.extend(model.embed_forward(&token_batches[start..end])?);
             start = end;
         }
+        drop(model);
         Ok(out)
     }
 
