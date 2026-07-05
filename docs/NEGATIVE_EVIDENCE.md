@@ -19,6 +19,41 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-05 - embed all-distinct miss batch direct return is a kept internal win; external original-comparator ratio is N/A (CobaltRidge)
+
+**Ledger entry for the land:** `CachedEmbedder::embed_batch` already deduplicates same-batch
+misses and moves each owned inner result into its last needed output slot. The all-distinct miss
+case still fell through that generic fanout path even though every returned embedding maps to the
+same output position. The new path admits the embeddings to the cache, then returns the owned
+`inner.embed_batch` result directly when every input was a distinct miss. Mixed cache-hit batches
+and same-batch duplicates continue to use the existing generic fanout path.
+
+**Measured command (per-crate, short local fallback after bounded RCH no-sample compile):**
+
+```bash
+AGENT_NAME=CobaltRidge \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false \
+CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo bench -p frankensearch-embed --profile release \
+    --bench cache_replay -- batch_all_distinct_miss_return \
+    --sample-size 30 --warm-up-time 0.2 --measurement-time 1
+```
+
+`rch exec -- cargo bench -p frankensearch-embed --profile release --bench cache_replay -- batch_all_distinct_miss_return ...`
+was tried first on `vmi1227854` and interrupted before samples after the bounded cold remote compile
+window. The local fallback used the requested dedicated `CARGO_TARGET_DIR`.
+
+| Workload | ORIG generic post-cache fanout | Candidate direct owned return | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `batch_all_distinct_miss_return/current_generic -> direct_return` (64 distinct misses) | 9.1285 us | 7.5173 us | **0.823 (~1.22x faster)** | keep |
+| `batch_all_distinct_miss_return/current_generic -> direct_return` (256 distinct misses) | 39.701 us | 29.872 us | **0.752 (~1.33x faster)** | keep |
+
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** because this is an
+internal query-embedding cache batch-return primitive, not a standalone search-engine comparator.
+The ratio above is against the pre-change in-repo ORIG generic all-distinct miss fanout for the
+same cache-admit + 384-dim embedding batch workload.
+
 ### 2026-07-05 - embed batch miss fanout move-last is a kept internal win; external original-comparator ratio is N/A (Codex)
 
 **Ledger entry for the land:** `CachedEmbedder::embed_batch` already funnels distinct misses

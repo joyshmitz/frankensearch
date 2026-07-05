@@ -203,6 +203,28 @@ fn fanout_move_last(slot_miss: &[Option<usize>], embedded: Vec<Vec<f32>>) -> Vec
         .collect()
 }
 
+fn admit_and_fanout_current(
+    keys: &[String],
+    slot_miss: &[Option<usize>],
+    embedded: Vec<Vec<f32>>,
+) -> Vec<Vec<f32>> {
+    let mut cache = HashMap::with_capacity(keys.len());
+    for (idx, vec) in embedded.iter().enumerate() {
+        cache.insert(keys[idx].as_str(), vec.clone());
+    }
+    black_box(cache.len());
+    fanout_move_last(slot_miss, embedded)
+}
+
+fn admit_and_return_distinct(keys: &[String], embedded: Vec<Vec<f32>>) -> Vec<Vec<f32>> {
+    let mut cache = HashMap::with_capacity(keys.len());
+    for (idx, vec) in embedded.iter().enumerate() {
+        cache.insert(keys[idx].as_str(), vec.clone());
+    }
+    black_box(cache.len());
+    embedded
+}
+
 fn bench_cache_replay(c: &mut Criterion) {
     let traces: [(&str, Vec<u64>); 3] = [
         ("zipf_s2_u2000", zipf_stream(ACCESSES, 2000, 2.0, 0xa11ce)),
@@ -238,33 +260,80 @@ fn bench_cache_replay(c: &mut Criterion) {
         g.finish();
     }
 
-    let mut fanout = c.benchmark_group("batch_miss_fanout");
-    for (label, slots, unique) in [
-        ("distinct_256", batch_slots_distinct(256), 256_usize),
-        ("repeat4_256", batch_slots_repeated(256, 64), 64_usize),
-    ] {
-        let embedded: Vec<Vec<f32>> = (0..unique).map(embedding).collect();
-        assert_eq!(
-            fanout_clone_all(&slots, &embedded),
-            fanout_move_last(&slots, embedded.clone())
-        );
+    {
+        let mut fanout = c.benchmark_group("batch_miss_fanout");
+        for (label, slots, unique) in [
+            ("distinct_256", batch_slots_distinct(256), 256_usize),
+            ("repeat4_256", batch_slots_repeated(256, 64), 64_usize),
+        ] {
+            let embedded: Vec<Vec<f32>> = (0..unique).map(embedding).collect();
+            assert_eq!(
+                fanout_clone_all(&slots, &embedded),
+                fanout_move_last(&slots, embedded.clone())
+            );
 
-        fanout.bench_with_input(BenchmarkId::new("clone_all", label), &(), |b, ()| {
-            b.iter_batched(
-                || embedded.clone(),
-                |e| black_box(fanout_clone_all(black_box(&slots), &e)),
-                BatchSize::SmallInput,
-            );
-        });
-        fanout.bench_with_input(BenchmarkId::new("move_last", label), &(), |b, ()| {
-            b.iter_batched(
-                || embedded.clone(),
-                |e| black_box(fanout_move_last(black_box(&slots), e)),
-                BatchSize::SmallInput,
-            );
-        });
+            fanout.bench_with_input(BenchmarkId::new("clone_all", label), &(), |b, ()| {
+                b.iter_batched(
+                    || embedded.clone(),
+                    |e| black_box(fanout_clone_all(black_box(&slots), &e)),
+                    BatchSize::SmallInput,
+                );
+            });
+            fanout.bench_with_input(BenchmarkId::new("move_last", label), &(), |b, ()| {
+                b.iter_batched(
+                    || embedded.clone(),
+                    |e| black_box(fanout_move_last(black_box(&slots), e)),
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+        fanout.finish();
     }
-    fanout.finish();
+
+    {
+        let mut distinct_return = c.benchmark_group("batch_all_distinct_miss_return");
+        for (label, slots, unique) in [
+            ("distinct_64", batch_slots_distinct(64), 64_usize),
+            ("distinct_256", batch_slots_distinct(256), 256_usize),
+        ] {
+            let keys: Vec<String> = (0..unique).map(|i| format!("query-{i}")).collect();
+            let embedded: Vec<Vec<f32>> = (0..unique).map(embedding).collect();
+            assert_eq!(
+                admit_and_fanout_current(&keys, &slots, embedded.clone()),
+                admit_and_return_distinct(&keys, embedded.clone())
+            );
+
+            distinct_return.bench_with_input(
+                BenchmarkId::new("current_generic", label),
+                &(),
+                |b, ()| {
+                    b.iter_batched(
+                        || embedded.clone(),
+                        |e| {
+                            black_box(admit_and_fanout_current(
+                                black_box(&keys),
+                                black_box(&slots),
+                                e,
+                            ))
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+            distinct_return.bench_with_input(
+                BenchmarkId::new("direct_return", label),
+                &(),
+                |b, ()| {
+                    b.iter_batched(
+                        || embedded.clone(),
+                        |e| black_box(admit_and_return_distinct(black_box(&keys), e)),
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
+        }
+        distinct_return.finish();
+    }
 }
 
 criterion_group!(benches, bench_cache_replay);

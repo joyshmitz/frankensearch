@@ -333,12 +333,16 @@ impl Embedder for CachedEmbedder {
             // that called `inner.embed` N times, defeating a batching inner (e.g.
             // fastembed embeds the whole batch in a single model invocation). N → 1.
             if !miss_texts.is_empty() {
+                let all_slots_are_distinct_misses = miss_texts.len() == texts.len();
                 let embedded = self.inner.embed_batch(cx, &miss_texts).await?;
                 {
                     let mut cache = self.state_lock();
                     for (idx, vec) in embedded.iter().enumerate() {
                         cache.insert(miss_texts[idx].to_owned(), vec.clone());
                     }
+                }
+                if all_slots_are_distinct_misses && embedded.len() == miss_texts.len() {
+                    return Ok(embedded);
                 }
                 // Fan the distinct embeddings back out to every slot that needed them.
                 // Move the owned inner result into its last output slot; clone only
