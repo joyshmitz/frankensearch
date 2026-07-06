@@ -3052,3 +3052,54 @@ frankensearch-index --all-targets` passed via RCH; `cargo test -p frankensearch-
 --test-threads=1` passed locally through `rch` fallback (**389/389**). The new
 `selective_bitset_filter_uses_file_backed_gather` test asserts forced scan, forced gather, and public
 search agree.
+
+### 2026-07-05 — Early-abandon (ADSampling-class) EXACT top-k dense scan: 0.885× (~13% faster), fine-granularity only (FlintOsprey)
+
+**Lever:** a radically different top-k dense-scan primitive vs the incumbent "compute every candidate's
+full dot, then top-k" flat scan. Store dense vectors with dimensions **energy-reordered** (one-time
+index-build transform, free at query time — dot is permutation-invariant) and precompute per-vector
+**block suffix L2 norms**. At query time accumulate each candidate's dot in `block`-dim chunks; once the
+top-k heap is full, the Cauchy–Schwarz bound `partial + ‖q_suffix‖·‖v_suffix‖` is the *max achievable*
+full dot — if it ≤ the k-th best, the candidate can never enter top-k → **abandon** the remaining dims.
+Energy-ordering collapses the suffix norm fast, so far-from-query candidates abandon after 1–2 blocks.
+This is **EXACT**: both arms use the same block summation order, so a non-abandoned candidate has a
+byte-identical dot; the bench asserts identical top-k (ids + order) before timing.
+
+**Measured command (per-crate, short RCH):**
+
+```bash
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-op \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench early_abandon_scan -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+Workload: `early_abandon_scan` — N=50k, dim=384, k=10, 32 queries, 64 clusters, realistic dense-index
+distribution (skewed spectral envelope ≈ real singular-value decay + within-cluster cos≈0.75).
+
+| variant | time (median) | ratio vs `full` (ORIG) | blocks computed |
+|---|---:|---:|---:|
+| `full` (flat scan, ORIG) | 2.5312 ms | 1.000× | 100% |
+| **`abandon_block32`** | **2.2401 ms** | **0.885× (~13% faster)** | 13.3% (abandons after ~1.6/12 blocks) |
+| `abandon_block64` | 3.7852 ms | 1.495× (slower) | 19.5% |
+| `abandon_block128` | 6.1515 ms | 2.430× (slower) | 35.7% |
+
+CIs are **non-overlapping** (`full` low 2.4574 ms > `abandon32` high 2.2988 ms → worst-case ratio still
+0.935× < 0.97 win threshold; best-case 0.825×). Top-k **bit-identical** (parity assert passes).
+
+**Finding — granularity must be FINE.** Only `block=32` wins; `block=64/128` regress and get *worse* with
+coarseness, because the minimum work before the first cutoff check is one full block (128 dims for
+block128 vs 32 for block32) — coarse blocks pay 128–384 dims of dot before they can abandon, erasing the
+prune. Fine blocks pay more horizontal reduces but abandon after ~51 dims; the abandonment win dominates.
+
+**Distribution caveat (load-bearing).** The earlier config (`op-ea-bench.out`, NOISE=0.30 diffuse,
+white-spectrum synthetic vectors) measured this primitive as a **loss** (0.58×/0.77× — a regression),
+computing 87–91% of blocks. That was the *same synthetic-diffuseness artifact* that produced the false
+ANN rejection (`ann-in-bold-viable`): a flat energy spectrum keeps every suffix norm large, so the bound
+never tightens and nothing abandons. Real dense indices have a steep spectrum + tight clusters — the
+regime measured here — where the primitive wins. **Never reject a distribution-sensitive vector lever on
+white-noise/diffuse synthetic data.**
+
+**Scope / route-next:** bench-validated primitive (exact, +13% at fine granularity). Production wiring is
+the follow-up — needs the energy-reorder transform + block-suffix-norm sidecar in the real vector index
+format, and re-measurement on a real embedded corpus (potion/BGE 130k, per `frontier-exhausted-*`).
+Conformance: `frankensearch-index` bench crate compiles + runs green via RCH (exit 0, parity asserts pass).

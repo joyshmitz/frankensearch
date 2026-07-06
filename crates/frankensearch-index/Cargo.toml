@@ -113,3 +113,7 @@ harness = false
 [[bench]]
 name = "real_qlen_vector"
 harness = false
+
+[[bench]]
+name = "early_abandon_scan"
+harness = false
