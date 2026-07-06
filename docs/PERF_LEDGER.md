@@ -3220,3 +3220,50 @@ candidate-major group layout + cluster-sort + per-lane suffix norms in the real 
 (cluster-ordered storage is natural for IVF-style indexes); re-measure on the real 130k corpus. Compose
 with int8 (candidate-major int8 group scan). Conformance: bench compiles + runs green via RCH (exit 0);
 score-equivalence + zero-swap asserts pass for every (k) pair.
+
+### 2026-07-06 — QUERY-DIRECTED cluster traversal: 0.24–0.27× vs flat (4.1×/3.7×), 2.5× over the transposed scan (FlintOsprey)
+
+**The biggest dense-scan win of the arc — and it stacks on the transposed primitive above.** That scan
+(`7afaadf`) visits cluster-groups in arbitrary storage order, so far clusters scanned BEFORE the query's
+own cluster don't abandon (the cutoff is still loose from low-scoring far candidates) → ~28–30% of blocks
+computed. Fix: precompute per-cluster centroids `μ_c` (one-time, free at query time); at query compute the
+64 cheap dots `q·μ_c` (~0.13% of a full scan), sort clusters by descending similarity, and traverse
+cluster-groups **near-cluster-first**. The near cluster is scanned first → the top-k cutoff jumps to the
+true level immediately → every subsequent far cluster's group abandons after block 0. EXACT: no cluster is
+skipped (unlike a loose cluster-bound prune — the max-radius residual bound ≈0.62 exceeds the score gap
+≈0.61 in 384-dim, useless); the traversal ORDER only changes WHEN the cutoff tightens, and the
+per-candidate suffix-norm bound still guarantees no true top-k is dropped.
+
+**Measured command:**
+
+```bash
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench cluster_ordered_scan -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+Workload: N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters, swept k∈{10,100}
+(medians, ratio vs `full` at the same k):
+
+| variant | k=10 | k=100 |
+|---|---:|---:|
+| `full_k{k}` (flat scan, ORIG) | 2.755 ms · 1.000× | 2.831 ms · 1.000× |
+| `transposed_unord_k{k}` (= `7afaadf`) | 1.625 ms · 0.590× | 2.027 ms · 0.716× |
+| **`transposed_ord_k{k}`** (query-directed) | **0.668 ms · 0.242×** | **0.770 ms · 0.272×** |
+
+**Findings:**
+1. **0.242× / 0.272× vs the flat scan (4.1× / 3.7× faster), non-overlapping CIs** (worst-case 0.267× /
+   0.293×) — and **0.41× / 0.38× vs the landed transposed** (a further 2.4–2.6× on top of the previous best).
+2. **Block-count HALVED**: 28.2%→14.0% (k=10), 30.4%→15.0% (k=100). The near cluster's ~781 candidates are
+   scanned deep; the other ~63 clusters abandon at block 0 because the cutoff is already at the true top-k
+   level. The 64 centroid dots (~0.13% overhead) pay for themselves many times over.
+3. **k-robust**: the win holds at both k (unlike the row-major variants that flipped sign at k=100).
+4. **Exact** up to f32 summation order (inherits the transposed vertical accumulation): boundary id-swaps
+   **0/320** and **0/3200**, scores match <1e-4 → identical top-k set.
+
+**Scope / route-next:** this makes the dense scan an EXACT IVF (guaranteed recall 1.0), not the approximate
+probe-N-clusters IVF (`HnswIndex`, a recall/latency trade). Production wiring: cluster-ordered storage +
+per-cluster centroids in the vector index (IVF layout is standard); the traversal is the query path.
+Compose with int8. Re-measure on the real 130k corpus (the win scales with cluster separation — well-
+separated clusters skip more; report is on realistic synthetic). Conformance: bench compiles + runs green
+via RCH (exit 0); score-equivalence + zero-swap asserts pass for every (k).

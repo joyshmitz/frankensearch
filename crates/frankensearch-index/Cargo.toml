@@ -125,3 +125,7 @@ harness = false
 [[bench]]
 name = "adsampling_transposed_scan"
 harness = false
+
+[[bench]]
+name = "cluster_ordered_scan"
+harness = false
