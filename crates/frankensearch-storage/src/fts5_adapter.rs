@@ -383,7 +383,7 @@ impl LexicalSearch for Fts5LexicalSearch {
                     .and_then(|s| serde_json::from_str(s).ok());
 
                 results.push(ScoredResult {
-                    doc_id,
+                    doc_id: doc_id.into(),
                     score: bm25_score,
                     source: ScoreSource::Lexical,
                     index: None,
