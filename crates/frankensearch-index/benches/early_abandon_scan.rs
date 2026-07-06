@@ -16,8 +16,14 @@
 //! to the full scan; an abandoned candidate provably cannot enter top-k. The bench
 //! asserts identical top-k (ids + order) before timing.
 //!
-//! A/B: `full` (no prune, reordered layout) vs `abandon_block{32,64}` (prune).
-//! Both call the identical SIMD block-dot, so the ratio isolates the pruning.
+//! A/B (swept over k∈{10,100}): `full_k{k}` (no prune, reordered layout) vs
+//! `abandon_block{32,64,128}_k{k}` (check-every-block prune) vs
+//! `abandon_stride3_k{k}` (prune with a strided bound-check: reduce+check after
+//! block 0, then every 3 blocks — fewer latency-bound horizontal reduces). Both
+//! prune arms call the identical SIMD block-dot, so the ratio isolates pruning.
+//! Finding: check-every-block wins at k=10 but regresses at k=100 (the reduce
+//! overhead scales with blocks-survived as the cutoff loosens); the strided
+//! variant wins at BOTH k by amortizing the reduce over several blocks.
 //!
 //! ```bash
 //! CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-op \
@@ -32,7 +38,11 @@ use wide::f32x8;
 
 const N: usize = 50_000;
 const DIM: usize = 384;
-const K: usize = 10;
+/// Swept top-k depths: k=10 (final retrieval) and k=100 (fusion-pool /
+/// rerank-feed candidate-gen depth). The check-every-block abandon wins at k=10
+/// but regresses at k=100 (looser cutoff → more blocks survived → the
+/// per-block horizontal reduce dominates); the strided abandon wins at both.
+const KS: [usize; 2] = [10, 100];
 const QUERIES: usize = 32;
 const CLUSTERS: usize = 64;
 // Real-embedding within-cluster tightness (cos(vec,centroid) ~0.75) — NOT the
@@ -187,6 +197,72 @@ fn topk_abandon(
     (top, blocks_done)
 }
 
+/// Accumulate one 32-dim block into 4 live f32x8 accumulators WITHOUT reducing.
+#[inline]
+fn accum_block32(acc: &mut [f32x8; 4], a: &[f32], b: &[f32]) {
+    let mut chunk = [0.0f32; 8];
+    let mut chb = [0.0f32; 8];
+    chunk.copy_from_slice(&a[0..8]);
+    chb.copy_from_slice(&b[0..8]);
+    acc[0] += f32x8::from(chunk) * f32x8::from(chb);
+    chunk.copy_from_slice(&a[8..16]);
+    chb.copy_from_slice(&b[8..16]);
+    acc[1] += f32x8::from(chunk) * f32x8::from(chb);
+    chunk.copy_from_slice(&a[16..24]);
+    chb.copy_from_slice(&b[16..24]);
+    acc[2] += f32x8::from(chunk) * f32x8::from(chb);
+    chunk.copy_from_slice(&a[24..32]);
+    chb.copy_from_slice(&b[24..32]);
+    acc[3] += f32x8::from(chunk) * f32x8::from(chb);
+}
+#[inline]
+fn reduce4(acc: &[f32x8; 4]) -> f32 {
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])).reduce_add()
+}
+
+/// Adaptive-stride early-abandon: block=32 accumulation into LIVE accumulators,
+/// but only reduce+check the Cauchy–Schwarz bound after block 0 (to catch the
+/// far-candidate majority in one reduce) and then every `STRIDE` blocks. Fewer
+/// horizontal reduces than the check-every-block variant. EXACT: checking less
+/// often can only DELAY an abandon, never cause a wrong one (the bound remains a
+/// valid upper bound at each check), so top-k is unchanged.
+fn topk_abandon_stride(
+    rq: &[f32],
+    qsuf: &[f32],
+    rvecs: &[f32],
+    vsuf: &[f32],
+    k: usize,
+    stride: usize,
+) -> (Vec<(f32, usize)>, u64) {
+    const BLOCK: usize = 32;
+    let nb = DIM / BLOCK;
+    let mut top: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
+    let mut blocks_done: u64 = 0;
+    for i in 0..N {
+        let v = &rvecs[i * DIM..(i + 1) * DIM];
+        let vs = &vsuf[i * (nb + 1)..(i + 1) * (nb + 1)];
+        let full = top.len() == k;
+        let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+        let mut acc = [f32x8::splat(0.0); 4];
+        let mut abandoned = false;
+        for b in 0..nb {
+            accum_block32(&mut acc, &rq[b * BLOCK..], &v[b * BLOCK..]);
+            blocks_done += 1;
+            if full && (b == 0 || (b + 1) % stride == 0) {
+                let bound = reduce4(&acc) + qsuf[b + 1] * vs[b + 1];
+                if bound <= cutoff {
+                    abandoned = true;
+                    break;
+                }
+            }
+        }
+        if !abandoned {
+            offer(&mut top, k, reduce4(&acc), i);
+        }
+    }
+    (top, blocks_done)
+}
+
 /// Descending energy order of dimensions across the corpus.
 fn energy_order(vectors: &[Vec<f32>]) -> Vec<usize> {
     let mut energy = vec![0.0f64; DIM];
@@ -238,6 +314,7 @@ fn bench_early_abandon(c: &mut Criterion) {
     }
     let rqueries: Vec<Vec<f32>> = queries.iter().map(|q| reorder(q, &order)).collect();
 
+    const STRIDE: usize = 3;
     let mut group = c.benchmark_group("early_abandon_scan");
     for block in [32usize, 64, 128] {
         let nb = DIM / block;
@@ -248,45 +325,75 @@ fn bench_early_abandon(c: &mut Criterion) {
         }
         let qsuf: Vec<Vec<f32>> = rqueries.iter().map(|q| suffix_norms(q, block)).collect();
 
-        // ── parity + abandonment-rate report (once per block size) ──
-        let mut total_blocks = 0u64;
-        for (qi, rq) in rqueries.iter().enumerate() {
-            let full = topk_full(rq, &rvecs, K);
-            let (pruned, bd) = topk_abandon(rq, &qsuf[qi], &rvecs, &vsuf, block, K);
-            total_blocks += bd;
-            assert_eq!(
-                full.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
-                pruned.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
-                "top-k mismatch (block={block}, q={qi})"
+        for &k in &KS {
+            // ── parity + abandonment-rate report (check-every-block abandon) ──
+            let mut total_blocks = 0u64;
+            for (qi, rq) in rqueries.iter().enumerate() {
+                let full = topk_full(rq, &rvecs, k);
+                let (pruned, bd) = topk_abandon(rq, &qsuf[qi], &rvecs, &vsuf, block, k);
+                total_blocks += bd;
+                assert_eq!(
+                    full.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
+                    pruned.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
+                    "top-k mismatch (block={block}, k={k}, q={qi})"
+                );
+            }
+            let avg_frac = total_blocks as f64 / (QUERIES as f64 * N as f64 * nb as f64);
+            eprintln!(
+                "[early_abandon] block={block} nb={nb} N={N} dim={DIM} k={k}: \
+                 blocks computed = {:.1}% of full ({:.2} of {nb} blocks/cand avg)",
+                avg_frac * 100.0,
+                avg_frac * nb as f64
             );
-        }
-        let avg_frac = total_blocks as f64 / (QUERIES as f64 * N as f64 * nb as f64);
-        eprintln!(
-            "[early_abandon] block={block} nb={nb} N={N} dim={DIM} k={K}: \
-             blocks computed = {:.1}% of full ({:.2} of {nb} blocks/cand avg)",
-            avg_frac * 100.0,
-            avg_frac * nb as f64
-        );
 
-        if block == 32 {
+            if block == 32 {
+                // ── strided abandon: parity + abandonment report ──
+                let mut stride_blocks = 0u64;
+                for (qi, rq) in rqueries.iter().enumerate() {
+                    let full = topk_full(rq, &rvecs, k);
+                    let (st, bd) = topk_abandon_stride(rq, &qsuf[qi], &rvecs, &vsuf, k, STRIDE);
+                    stride_blocks += bd;
+                    assert_eq!(
+                        full.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
+                        st.iter().map(|&(_, i)| i).collect::<Vec<_>>(),
+                        "stride top-k mismatch (k={k}, q={qi})"
+                    );
+                }
+                let sfrac = stride_blocks as f64 / (QUERIES as f64 * N as f64 * nb as f64);
+                eprintln!(
+                    "[early_abandon] stride={STRIDE} k={k}: blocks computed = {:.1}% of full ({:.2} of {nb} blocks/cand avg)",
+                    sfrac * 100.0,
+                    sfrac * nb as f64
+                );
+
+                let mut qi = 0usize;
+                group.bench_function(format!("full_k{k}"), |b| {
+                    b.iter(|| {
+                        let rq = &rqueries[qi % QUERIES];
+                        qi += 1;
+                        black_box(topk_full(black_box(rq), &rvecs, k))
+                    });
+                });
+                let mut qi = 0usize;
+                group.bench_function(format!("abandon_stride3_k{k}"), |b| {
+                    b.iter(|| {
+                        let rq = &rqueries[qi % QUERIES];
+                        let qs = &qsuf[qi % QUERIES];
+                        qi += 1;
+                        black_box(topk_abandon_stride(black_box(rq), qs, &rvecs, &vsuf, k, STRIDE))
+                    });
+                });
+            }
             let mut qi = 0usize;
-            group.bench_function("full", |b| {
+            group.bench_function(format!("abandon_block{block}_k{k}"), |b| {
                 b.iter(|| {
                     let rq = &rqueries[qi % QUERIES];
+                    let qs = &qsuf[qi % QUERIES];
                     qi += 1;
-                    black_box(topk_full(black_box(rq), &rvecs, K))
+                    black_box(topk_abandon(black_box(rq), qs, &rvecs, &vsuf, block, k))
                 });
             });
         }
-        let mut qi = 0usize;
-        group.bench_function(format!("abandon_block{block}"), |b| {
-            b.iter(|| {
-                let rq = &rqueries[qi % QUERIES];
-                let qs = &qsuf[qi % QUERIES];
-                qi += 1;
-                black_box(topk_abandon(black_box(rq), qs, &rvecs, &vsuf, block, K))
-            });
-        });
     }
     group.finish();
 }

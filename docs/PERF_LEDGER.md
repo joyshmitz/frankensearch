@@ -3118,3 +3118,50 @@ accumulators live across blocks; reduce only at the bound check, or check every 
 per-block horizontal-reduce cost that scales with blocks-computed — the one lever that could recover
 larger-k. (Two other follow-ups rejected: cutoff-SEEDING — `40d2aed`, `NEGATIVE_EVIDENCE.md`; and
 coarse blocks — block64/128 regress at both k.)
+
+### 2026-07-05 — Early-abandon RESOLVED: adaptive-stride bound-check wins at BOTH k=10 and k=100 (recovers the prod-k regression) (FlintOsprey)
+
+**Lever (resolves the caveat above):** the check-every-block abandon regresses at k=100 because it does one
+horizontal `reduce_add` per block computed, and a looser k=100 cutoff means more blocks survive. Fix:
+accumulate block=32 dots into **live f32x8 accumulators** and only reduce+check the Cauchy–Schwarz bound
+after block 0 (catches the far-candidate majority in one reduce) and then every **3** blocks
+(`abandon_stride3`). Checking less often is EXACT — it can only delay an abandon, never cause a wrong one
+(the bound stays a valid upper bound at each check) — parity assert confirms bit-identical top-k. This
+amortizes the latency-bound reduce over several blocks.
+
+**Measured command:**
+
+```bash
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-op \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench early_abandon_scan -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+Workload: `early_abandon_scan` — N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters,
+swept k∈{10,100} in one run (medians, ratio vs `full` at the same k):
+
+| variant | k=10 | k=100 |
+|---|---:|---:|
+| `full_k{k}` (flat scan, ORIG) | 2.726 ms · 1.000× | 2.475 ms · 1.000× |
+| **`abandon_stride3_k{k}`** | **1.600 ms · 0.587× (WIN)** | **2.375 ms · 0.960× (win)** |
+| `abandon_block32_k{k}` (check-every-block) | 2.049 ms · 0.752× (win) | 2.556 ms · 1.033× (regress) |
+| `abandon_block64_k{k}` | 3.655 ms · 1.341× | 3.659 ms · 1.479× |
+| `abandon_block128_k{k}` | 5.920 ms · 2.172× | 5.854 ms · 2.366× |
+
+**Findings:**
+1. **`abandon_stride3` strictly dominates check-every-block at both k** (k=10: 0.587× vs 0.752×; k=100:
+   0.960× vs 1.033×). Ship the strided variant, not the check-every-block one.
+2. **k=10 win is large + clean** (0.587×, non-overlapping CIs: `full` low 2.6678 ms > `stride3` high
+   2.1192 ms). This supersedes the standalone k=10 block32 number in the `b524033` row above — the strided
+   variant is faster there too.
+3. **k=100 stride win is marginal + run-noisy** (0.960× this run with overlapping CIs; **0.865×** in a
+   prior dedicated k=100 run with non-overlapping CIs). Call it ~0.87–0.96× — a real but modest win at
+   production depth. The load-bearing point is that it does NOT regress the way check-every-block does
+   (1.03–1.21×): striding makes the exact early-abandon **k-robust** instead of small-k-only.
+4. Coarse blocks (64/128) still lose at both k — fine granularity + strided checks is the right combo.
+
+**Scope / route-next:** exact, bench-validated, k-robust. Production wiring unchanged (energy-reorder +
+block-suffix-norm sidecar; re-measure on the real 130k corpus). Remaining headroom at k=100 is the
+approximate/probabilistic ADSampling bound (trades exactness for a bigger prune) — the one un-taken lever.
+Conformance: bench compiles + runs green via RCH (exit 0); parity asserts pass for every (block, k) pair
+(bit-identical top-k vs the flat scan).
