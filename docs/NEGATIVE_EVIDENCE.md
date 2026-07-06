@@ -9449,3 +9449,58 @@ remaining ~0.6-block gap to the floor is not cheaply closable at the retrieval l
 Reverted the seeded variant via Edit (kept `b524033` bench pristine — the file diff vs HEAD is empty).
 Conformance: bench compiled + ran green via RCH (exit 0), parity asserts passed (the seeded top-k was
 bit-identical to the flat scan on all 32 queries — the rejection is purely on cost, not correctness).
+
+---
+
+### 2026-07-06 — FlintOsprey — APPROXIMATE bounds on the dense top-k scan are a dead end for cosine/MIPS: the ADSampling concentration bound DESTROYS recall (0.00) and ε-relaxed CS adds NO speed over the exact bound — the exact transposed primitive (`7afaadf`) already captures ~all available pruning
+
+**Context / lever:** the exact early-abandon arc left one "un-taken lever" — the APPROXIMATE regime (prune
+harder than the worst-case Cauchy–Schwarz bound, trading a little recall for speed). Tested two bounds on
+top of the landed candidate-transposed cluster-grouped scan (`7afaadf`), measuring recall@k vs the exact
+top-k AND speed:
+1. **ADSampling concentration bound** `partial + z·‖q_suf‖·‖v_suf‖/√(remaining_dims)` — for random-
+   direction residuals `q·v_suffix` concentrates around 0 with std ~1/√m, so this is ~√m≈18× tighter.
+2. **ε-relaxed Cauchy–Schwarz** `partial + ε·‖q_suf‖·‖v_suf‖` (ε<1) — prune a little more than exact.
+
+**Measured command (per-crate, RCH `search-cc` lane):**
+
+```bash
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench adsampling_transposed_scan -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+Workload: N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters, swept k∈{10,100}.
+
+| variant | recall@10 | recall@100 | time vs `full` (ORIG) | blocks computed |
+|---|---:|---:|---:|---:|
+| `exact` (CS bound, = `7afaadf`) | 1.0000 | 1.0000 | 0.65× | 28–30% |
+| `ads_z3` (concentration) | **0.0000** | **0.0619** | 0.22–0.28× | 13–16% |
+| `eps097` (ε=0.97) | 1.0000 | 1.0000 | ≈ exact (noise) | 27–30% |
+| `eps090` (ε=0.90) | 1.0000 | 1.0000 | 0.94× of exact (within noise) | 26–28% |
+
+**Findings (both REJECTED, unifying mechanism):**
+1. **Concentration bound → recall COLLAPSE (0.00 @k10, 0.06 @k100)** despite 4.5× more speed. Mechanism:
+   the concentration assumption (`q·v_suffix` ~ random, mean 0) is FALSE for exactly the candidates you
+   want — a true top-k match is one whose vector is ALIGNED with the query, so its suffix residual
+   `q·v_suffix` is large & positive, not concentrated. The `/√m` bound underestimates the aligned tail →
+   prunes the true matches. **ADSampling/concentration works for L2 NN (residuals ≈ random) but NOT for
+   cosine/MIPS top-k.** There is no intermediate `z`: recall stays ~0 until `z→√m`, which recovers the
+   exact bound (no extra pruning).
+2. **ε-relaxed CS keeps recall 1.0 but buys NO speed.** ε=0.90 doesn't drop recall (the true top-k's
+   suffix-alignment cos < 0.90, so the 10%-tighter bound never prunes them) — but it also barely prunes
+   more (blocks 28%→26%), because the exact bound ALREADY abandons far candidates at block 0; ε only
+   affects the handful of borderline candidates. The 0.94× vs exact is within run-to-run noise (eps097 even
+   measured *slower*).
+3. **UNIFYING: the approximate headroom on a cosine/MIPS dense scan is illusory.** Candidates split cleanly
+   into far (abandoned exactly at block 0) and aligned-true (must be scanned). A cheaper bound either keeps
+   pruning only the far ones (no gain over exact) or starts eating the aligned true matches (recall
+   collapse). There is no useful middle regime. **The exact candidate-transposed early-abandon (`7afaadf`)
+   is the right stopping point for this hot path** — don't re-try approximate/probabilistic pruning here.
+
+Bench `crates/frankensearch-index/benches/adsampling_transposed_scan.rs` **kept as bench-only negative
+evidence** (the `batched_query_scan`/73a77fc precedent), NOT wired into anything — no production code was
+touched, so there is nothing to revert. Conformance: compiles + runs green via RCH (exit 0); the exact
+arm's score-equivalence assert passes and recall is computed vs the flat-scan top-k. Caveat: recall
+measured on realistic synthetic (skewed-spectrum + tight clusters); the concentration collapse is a
+structural property of MIPS (alignment), not a synthetic artifact, so it holds on real corpora.

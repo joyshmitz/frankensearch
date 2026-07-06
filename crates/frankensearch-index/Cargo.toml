@@ -121,3 +121,7 @@ harness = false
 [[bench]]
 name = "transposed_abandon_scan"
 harness = false
+
+[[bench]]
+name = "adsampling_transposed_scan"
+harness = false
