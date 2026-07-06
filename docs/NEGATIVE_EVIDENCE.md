@@ -9504,3 +9504,40 @@ touched, so there is nothing to revert. Conformance: compiles + runs green via R
 arm's score-equivalence assert passes and recall is computed vs the flat-scan top-k. Caveat: recall
 measured on realistic synthetic (skewed-spectrum + tight clusters); the concentration collapse is a
 structural property of MIPS (alignment), not a synthetic artifact, so it holds on real corpora.
+
+### 2026-07-06 — FlintOsprey — Row-major per-candidate centroid-distance PREFILTER loses to the transposed traversal (reduce-elimination > block-count reduction)
+
+**Lever tested.** On a ROW-MAJOR early-abandon dense scan, add an EXACT per-candidate zero-block skip:
+precompute `dist[i] = ‖v_i − μ_{c(i)}‖`; when the top-k heap is full, skip candidate `i` entirely (before
+computing even block 0) if `qmu[c(i)] + dist[i] ≤ cutoff`, where `qmu[c] = q·μ_c`. This is the Cauchy–Schwarz
+per-candidate centroid bound `q·v ≤ q·μ_c + ‖q‖·‖v−μ_c‖` (‖q‖ normalized), tighter than a cluster max-radius
+bound because it uses each candidate's OWN residual. Combined with query-directed cluster traversal (visit
+clusters by descending `q·μ_c` so the cutoff tightens immediately). Bench `rowmajor_prefilter_scan.rs`,
+arms `full_k{k}` / `rowmajor_ord_k{k}` (no prefilter) / `rowmajor_ord_prefilter_k{k}`.
+
+**Measured** (`CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc rch exec -- cargo bench -p
+frankensearch-index --profile release --bench rowmajor_prefilter_scan`, N=50k dim=384):
+
+| arm | k=10 | k=100 | blocks computed |
+|---|---|---|---|
+| `full` (flat, noisy this run) | 3.96 ms | 3.64 ms | 100% |
+| `rowmajor_ord` (no prefilter) | 1.882 ms | 2.477 ms | 12.6% / 13.5% |
+| `rowmajor_ord_prefilter` | **1.270 ms** (CI 1.244–1.302) | **1.704 ms** (CI 1.678–1.723) | **7.6% / 9.4%** |
+| *transposed traversal `2945ed8` (prior run)* | *0.668 ms* | *0.766 ms* | *14% / 15%* |
+
+**The prefilter WORKS** — it is EXACT (score-equivalence parity green, 0 boundary swaps) and cuts row-major
+blocks 12.6%→7.6% (k10) / 13.5%→9.4% (k100), a clean **1.5× over `rowmajor_ord`** (0.675×/0.688× within-run).
+**BUT it does NOT beat the current best.** Normalizing by each run's `full` baseline (this worker's `full`
+was ~1.44× the transposed run's `full`, so worker-adjust): `rowmajor_ord_prefilter` ≈ 0.321×/0.469× vs flat
+where transposed `2945ed8` = 0.242×/0.272×. **Row-major-prefilter computes HALF the blocks (7.6% vs 14%) yet
+is ~1.3–1.9× SLOWER** than the transposed scan.
+
+**Mechanism / unifying lesson.** On this FMA-compute-bound cosine scan, **eliminating the per-candidate
+horizontal `reduce_add` (transposed 8-wide vertical accumulation) is a stronger lever than reducing the
+block-count (per-candidate skipping).** The row-major layout pays one horizontal reduce per computed block;
+even at 7.6% blocks that reduce cost outweighs the transposed scan's extra blocks at 14%. The prefilter's
+per-candidate flexibility is exactly what the transposed group layout CAN'T exploit — to skip a transposed
+group you need ALL 8 lanes' bounds ≤ cutoff (~0.4⁸ ≈ 0.07% of groups, vs ~40% of individual candidates), and
+the group/cluster max-radius bound (~0.7) never clears the cutoff (~0.6) in 384-dim. So the prefilter's value
+is stranded in the slower row-major layout. **Don't pursue row-major per-candidate prefiltering; the
+transposed reduce-free accumulation is the dominant primitive.** Bench kept as evidence (`rowmajor_prefilter_scan.rs`).
