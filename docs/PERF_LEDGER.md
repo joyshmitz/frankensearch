@@ -3318,3 +3318,52 @@ zero block cost. Production wiring: (cluster, residual)-sorted storage + per-gro
 per-cluster centroids in the vector index. Compose with int8 (candidate-major int8 group scan). Re-measure
 on the real 130k corpus (win scales with within-cluster residual spread — hub/edge structure skips more).
 Conformance: bench compiles + runs green via RCH (exit 0); score-equivalence + zero-swap asserts pass ∀k.
+
+---
+
+## 2026-07-06 — FlintOsprey — RESIDUAL-SPACE (centered) early-abandon: scan q·(v−μ_c) — 1.10× / 1.19× over 05b57f3 (0.131× / 0.159× vs flat)
+
+`bench(index) residual_abandon_scan` — new CURRENT BEST of the exact early-abandon arc, stacks on the
+residual-bucketed scan (`05b57f3`).
+
+```
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench residual_abandon_scan
+```
+
+Workload: N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters, swept k∈{10,100}
+(medians, ratio vs `full` at the same k):
+
+| variant | k=10 | k=100 |
+|---|---:|---:|
+| `full_k{k}` (flat scan, ORIG) | 2.934 ms · 1.000× | 2.888 ms · 1.000× |
+| `bucketed_skip_k{k}` (= `05b57f3`, prior best) | 0.4227 ms · 0.144× | 0.5433 ms · 0.188× |
+| **`residual_scan_k{k}`** (centered r) | **0.3849 ms · 0.131×** | **0.4580 ms · 0.159×** |
+
+**Primitive.** The scan bounds `q·v ≤ q·v[0:b] + ‖q_suf‖·‖v_suf‖` with `‖v_suf‖≈‖v‖=1`. But
+`q·v = q·μ_c + q·r`, `r=v−μ_c`, and in tight clusters `‖r‖≈0.3 ≪ 1`. Store the CENTERED residual `r`
+transposed (with residual suffix norms), reconstruct the score per lane via `gqmu[lane]=q·μ_{c(lane)}`, and
+bound `q·v ≤ gqmu + q·r[0:b] + ‖q_suf‖·‖r_suf‖`. The CS slack `‖q_suf‖·‖r_suf‖` is ~3× smaller → the bound
+tightens ~3× faster. Check-then-compute abandons one block earlier and folds the block-0 skip in as its b=0
+case; the per-lane `gqmu` makes boundary groups (lanes straddling clusters) exact with NO special-case.
+
+**Findings:**
+1. **0.131× / 0.159× vs flat (7.6× / 6.3× faster) — and 0.910× / 0.843× vs the prior best `05b57f3`**
+   (a further 1.10× / 1.19×). CIs non-overlapping at both k: residual [379,391]µs / [445,473]µs vs
+   bucketed [415,431]µs / [524,563]µs.
+2. **Blocks 8.7→6.5% (k10), 10.6→7.6% (k100)** — a 25% / 28% cut. The centering is what drives it: far
+   groups clear at block 0 (same skip) AND the near cluster's non-top-k candidates now abandon early
+   (the raw `‖v_suf‖`≈1 kept the old bound loose enough to force a deep near-cluster scan; the small
+   `‖r_suf‖` lets them go).
+3. **Block cut (25/28%) exceeds the time cut (10/19%)** — the per-lane `gqmu` gather (8 loads/group) +
+   two-part reconstruction is per-group overhead that amortizes better at the deeper k=100 scan → the
+   larger k=100 win. Still net-positive at both k.
+4. **Exact** (recall 1.0 up to f32 summation order): boundary id-swaps **0/320** and **0/3200**, scores
+   <1e-4 → identical top-k set (the two-part `q·μ_c + q·r` reconstruction matches direct `q·v` within tol).
+
+**Scope / route-next:** stacks cleanly on the bucketed layout + query-directed traversal; keeps the dense
+scan an EXACT IVF (recall 1.0). Storage: centered residuals + per-cluster centroids + residual suffix norms
+(same footprint as raw + a centroid table). Compose with int8 on the residual body (residuals are small →
+quantize well). Re-measure on the real 130k corpus (win scales with cluster tightness `‖r‖/‖v‖`).
+Conformance: bench compiles + runs green via RCH (exit 0); score-equivalence + zero-swap asserts pass ∀k.

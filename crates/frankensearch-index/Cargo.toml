@@ -137,3 +137,7 @@ harness = false
 [[bench]]
 name = "bucketed_transposed_scan"
 harness = false
+
+[[bench]]
+name = "residual_abandon_scan"
+harness = false
