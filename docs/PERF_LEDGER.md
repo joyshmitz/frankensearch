@@ -3103,3 +3103,18 @@ white-noise/diffuse synthetic data.**
 the follow-up — needs the energy-reorder transform + block-suffix-norm sidecar in the real vector index
 format, and re-measurement on a real embedded corpus (potion/BGE 130k, per `frontier-exhausted-*`).
 Conformance: `frankensearch-index` bench crate compiles + runs green via RCH (exit 0, parity asserts pass).
+
+**★ SCOPE CAVEAT — the win is sharp-cutoff-gated (small k ONLY); it REGRESSES at production top-k.**
+Re-measured at **k=100** (fusion-pool / rerank-feed depth): `abandon_block32` = 3.0174 ms vs `full`
+2.4888 ms = **1.212× (a REGRESSION)**, even though it still computes only 17.6% of blocks (2.11/12 vs
+1.59/12 at k=10). Mechanism: `full` does ONE horizontal `reduce_add` per candidate (one dot over all 384
+dims); `abandon` does ONE reduce PER BLOCK computed. At k=10 candidates abandon in ~1.59 blocks so the
+~7.5× fewer multiply-adds beat the 1.59 latency-bound reduces (win); at k=100 the cutoff loosens (the
+100th-best score is lower → looser bound) so candidates survive ~2.11 blocks and the extra reduces
+dominate the saved multiply-adds. So this primitive is a win ONLY for **small-k exact dense retrieval
+(k≈10)**; do NOT deploy it for the k≈50–100 candidate generation that feeds RRF fusion / the reranker —
+there it regresses. Route-next to widen it: an **accumulator-preserving early-abandon** (keep the f32x8
+accumulators live across blocks; reduce only at the bound check, or check every N blocks) to cut the
+per-block horizontal-reduce cost that scales with blocks-computed — the one lever that could recover
+larger-k. (Two other follow-ups rejected: cutoff-SEEDING — `40d2aed`, `NEGATIVE_EVIDENCE.md`; and
+coarse blocks — block64/128 regress at both k.)
