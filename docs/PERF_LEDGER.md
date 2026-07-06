@@ -3165,3 +3165,58 @@ block-suffix-norm sidecar; re-measure on the real 130k corpus). Remaining headro
 approximate/probabilistic ADSampling bound (trades exactness for a bigger prune) — the one un-taken lever.
 Conformance: bench compiles + runs green via RCH (exit 0); parity asserts pass for every (block, k) pair
 (bit-identical top-k vs the flat scan).
+
+### 2026-07-06 — CANDIDATE-TRANSPOSED cluster-grouped early-abandon: 0.748× at PRODUCTION k=100 (beats row-major) (FlintOsprey)
+
+**Radically different execution model** vs both the flat scan and the row-major early-abandon above. The
+row-major early-abandon's limit at production k (k=100 regresses, `43cb4b4` above) is the per-candidate
+horizontal `reduce_add` — one per candidate per block, and the batched-GEMM probe already proved the scan
+is FMA-compute-bound not bandwidth-bound (`NEGATIVE_EVIDENCE.md` 73a77fc). This primitive attacks the
+reduce directly: process candidates in **groups of 8 stored candidate-major** (`tvecs[g·DIM·8 + d·8 + l]`),
+so the 8 partial dots live in ONE `f32x8` accumulator and accumulation is **vertical** —
+`acc += splat(q[d])·v_lanes[d]` — with **zero horizontal reduces during the scan**. Two one-time
+index-build transforms (free at query time): energy-reorder dims (suffix-norm bound collapse) +
+**cluster-sort candidates** so a group of 8 is intra-cluster → a far cluster abandons all 8 lanes together
+(one max-fold bound check, 8× fewer reduces than row-major; no SIMD divergence). Group abandons when its
+max lane-bound ≤ the k-th best.
+
+**Measured command:**
+
+```bash
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench transposed_abandon_scan -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+Workload: N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters, swept k∈{10,100}
+(medians, ratio vs `full` at the same k):
+
+| variant | k=10 | k=100 |
+|---|---:|---:|
+| `full_k{k}` (flat scan, ORIG) | 2.465 ms · 1.000× | 2.728 ms · 1.000× |
+| **`transposed_k{k}`** | **1.848 ms · 0.750× (WIN)** | **2.040 ms · 0.748× (WIN)** |
+
+**Findings:**
+1. **Clean win at BOTH k, non-overlapping CIs** (k=10 `full` low 2.357 > `transposed` high 1.906; k=100
+   `full` low 2.653 > `transposed` high 2.145; worst-case ratios 0.809× / 0.808×). k=10 was 0.635× in a
+   first run — call it ~0.64–0.75×.
+2. **The production-depth story: transposed = 0.748× at k=100**, vs row-major at k=100 (stride ~0.87–0.96×
+   marginal; check-every-block 1.03–1.21× REGRESSION, `43cb4b4`/`c64b1f1`). Transposed is the k-robust
+   dense-scan primitive — it wins *most* where row-major fails, because eliminating the per-candidate
+   reduce matters most when the cutoff loosens and more blocks are computed.
+3. **It computes MORE blocks** (28.2% k=10 / 30.4% k=100, vs row-major 13.3% / 17.6%) — group divergence +
+   cluster-boundary groups. It wins anyway: it trades block-count for reduce-elimination + 8-wide vertical
+   FMA, and the trade nets out ~0.75× at both k.
+
+**Correctness (honest):** exact up to **f32 summation order** — the per-dim vertical accumulation differs
+from the row-major 4-accumulator kernel, so dots differ at the ULP level → NOT bit-identical. Verified the
+top-k SCORES match position-wise within 1e-4 AND **boundary id-swaps = 0/320 (k=10) and 0/3200 (k=100)**
+across all queries → the top-k SET is identical in practice; only tie-order among ~equal scores could
+differ. Immaterial for retrieval. (The first run's strict ordered-id assert flagged a tie-order swap at
+k=100 — a false correctness alarm, corrected to score-equivalence.)
+
+**Scope / route-next:** exact-in-real-arithmetic, k-robust, bench-validated. Production wiring needs the
+candidate-major group layout + cluster-sort + per-lane suffix norms in the real vector index format
+(cluster-ordered storage is natural for IVF-style indexes); re-measure on the real 130k corpus. Compose
+with int8 (candidate-major int8 group scan). Conformance: bench compiles + runs green via RCH (exit 0);
+score-equivalence + zero-swap asserts pass for every (k) pair.

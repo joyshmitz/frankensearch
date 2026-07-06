@@ -117,3 +117,7 @@ harness = false
 [[bench]]
 name = "early_abandon_scan"
 harness = false
+
+[[bench]]
+name = "transposed_abandon_scan"
+harness = false
