@@ -9406,3 +9406,46 @@ Ran the `bd1bf4c` route-next: full test sets (not N=100) for scifact/nfcorpus/ar
 3. **The retrieval anchor guards the low end:** even w_ce=0.5 (retrieval-heavy) is within noise (worst −0.0012 arguana), and no weight is substantially negative — score fusion never degrades to the negative pure-CE regime because mm(retrieval-score) is always summed in (the `5129bf9`/`ec62699` veto, preserved).
 
 **Net:** the reranker SCORE-fusion win (`112117c`) is confirmed at FULL test-set N on scifact/nfcorpus/arguana — the equal-weight upgrade over the shipped RRF-combine is +0.0027…+0.0078 (mean +0.0055) and never negative, and w_ce≈1.5 tightens it to a uniform +0.0062…+0.0065. The N=100 caveat is retired for these 3 (scidocs remains N=100 confirm +0.0041, `bd1bf4c`; full-N scidocs skipped — 1000 queries, and it is the net-negative-reranking corpus). Deploy pool-min-max SCORE fusion of retrieval-score ⊕ CE-score (equal-weight default, or w_ce≈1.5) in place of RRF-combine. Route-next: learned/dev-set CE weight (per-corpus optimum spans equal→2.0). Verified: `fastembed` jina-reranker-v1-turbo-en + BGE + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana FULL N, no cargo/torch. `rerank_scorefuse_fulln.py` in `$D`.
+
+---
+
+### 2026-07-05 — FlintOsprey — Cutoff-SEEDING the early-abandon top-k scan does NOT pay: the base scan is already near the 1-block floor, so the seed prefilter's own ≥1-block/candidate cost exceeds the <1 block it saves (1.007× ≈ wash, worse than the unseeded 0.749× win `b524033`)
+
+**Context / lever:** follow-up to the landed early-abandon win (`b524033`, `docs/PERF_LEDGER.md`).
+That exact scan starts with cutoff = −∞ until the top-k heap fills, so the first candidates rarely
+abandon. Idea: SEED the abandon cutoff with a cheap lower bound on the true k-th score before scanning —
+a first-block (32-dim) partial-dot prefilter over all N, take the `4k` partial-leaders, compute their
+exact dots, and use the k-th as the seed. A subset's k-th ≤ the global k-th, so the seed is a valid lower
+bound → **bit-exact** (parity assert passed, no true top-k wrongly abandoned) — a "guaranteed-recall-1.0
+top-k at approx-scan speed" primitive, distinct from the shipped int8 two-pass (which is not
+recall-guaranteed).
+
+**Measured command (per-crate, warm RCH):**
+
+```bash
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/fs-op \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench early_abandon_scan -- --sample-size 20 --warm-up-time 1 --measurement-time 2
+```
+
+Workload: `early_abandon_scan` — N=50k, dim=384, k=10, realistic skewed-spectrum + tight-cluster data.
+
+| variant | time (median) | ratio vs `full` (ORIG) |
+|---|---:|---:|
+| `full` (flat scan, ORIG) | 2.5073 ms | 1.000× |
+| `abandon_block32_seeded` | 2.5250 ms | **1.007× (wash — REJECTED)** |
+| `abandon_block32` (landed, unseeded) | 1.8771 ms | 0.749× (win reconfirmed) |
+
+**Mechanism (why seeding can't pay here):** the unseeded scan already abandons at **1.59 of 12
+blocks/candidate** (13.3% of full) — within ~0.6 blocks of the hard 1-block floor. So a tighter cutoff can
+save at most ~0.6 block/candidate. But the seed prefilter itself scans one full block (32 dims) over all N
+= exactly ~1 block/candidate, plus an O(N) `select_nth` and `4k` full 384-dim dots. The prefilter's own
+cost (≥1 block/candidate) structurally exceeds the <1 block it could save → net wash. **General rule: a
+cutoff-seeding / candidate-prefilter stage only pays when the base scan is FAR from its abandonment floor;
+once the base early-abandon is near the 1-block floor, any prefilter that costs ≥1 block/candidate is
+dominated.** Corollary: the landed unseeded block32 is already near-optimal for this primitive — the
+remaining ~0.6-block gap to the floor is not cheaply closable at the retrieval level.
+
+Reverted the seeded variant via Edit (kept `b524033` bench pristine — the file diff vs HEAD is empty).
+Conformance: bench compiled + ran green via RCH (exit 0), parity asserts passed (the seeded top-k was
+bit-identical to the flat scan on all 32 queries — the rejection is purely on cost, not correctness).
