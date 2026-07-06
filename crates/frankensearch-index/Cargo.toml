@@ -133,3 +133,7 @@ harness = false
 [[bench]]
 name = "rowmajor_prefilter_scan"
 harness = false
+
+[[bench]]
+name = "bucketed_transposed_scan"
+harness = false

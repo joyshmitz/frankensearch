@@ -3267,3 +3267,54 @@ per-cluster centroids in the vector index (IVF layout is standard); the traversa
 Compose with int8. Re-measure on the real 130k corpus (the win scales with cluster separation — well-
 separated clusters skip more; report is on realistic synthetic). Conformance: bench compiles + runs green
 via RCH (exit 0); score-equivalence + zero-swap asserts pass for every (k).
+
+---
+
+## 2026-07-06 — FlintOsprey — RESIDUAL-BUCKETED transposed groups: exact pre-block-0 skip (dense top-k) — 1.75× / 1.43× over the prior best (0.169× / 0.218× vs flat)
+
+`bench(index) bucketed_transposed_scan` — new CURRENT BEST of the exact early-abandon arc, stacks on the
+query-directed cluster traversal (`2945ed8`).
+
+```
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench bucketed_transposed_scan
+```
+
+Workload: N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters, swept k∈{10,100}
+(medians, ratio vs `full` at the same k):
+
+| variant | k=10 | k=100 |
+|---|---:|---:|
+| `full_k{k}` (flat scan, ORIG) | 2.607 ms · 1.000× | 2.617 ms · 1.000× |
+| `transposed_ord_k{k}` (= `2945ed8`, prior best) | 0.7745 ms · 0.297× | 0.8155 ms · 0.312× |
+| **`bucketed_skip_k{k}`** (residual-bucketed + skip) | **0.4417 ms · 0.169×** | **0.5698 ms · 0.218×** |
+
+**Primitive.** Sort each cluster's members by residual `dist[i]=‖v_i−μ_c‖` at INDEX time (query-independent,
+core-first), then pack candidate-transposed groups of 8 → each group is residual-HOMOGENEOUS. At query,
+before computing block 0 for a group, apply the exact whole-group skip `q·μ_c + max_lane(dist) ≤ cutoff`
+(valid Cauchy–Schwarz upper bound for every lane, ‖q‖=1). Homogeneous groups have a TIGHT `max_lane(dist)`
+(≈ the group's dist level, not the whole cluster's max-radius), so far-residual groups clear the cutoff and
+skip entirely — porting the per-candidate pruning of `rowmajor_prefilter` (REJECTED: too slow in row-major)
+into the reduce-free transposed layout that already won on reduce-elimination.
+
+**Findings:**
+1. **0.169× / 0.218× vs flat (5.9× / 4.6× faster), non-overlapping CIs** — and **0.570× / 0.699× vs the
+   prior best `2945ed8`** (a further 1.75× / 1.43× on top of it). CIs: bucketed_skip [432,452]µs /
+   [558,582]µs vs transposed_ord [752,798]µs / [787,848]µs — disjoint at both k.
+2. **The skip is the win; bucketing alone is neutral.** Block-% base=14.0/15.0, bkt_noskip=13.9/15.0
+   (bucketing the layout without the explicit skip does ~nothing), bkt_skip=8.7/10.6. Bucketing's role is
+   to make the skip FIRE: 57.4% (k10) / 47.7% (k100) of groups are skippable at the final cutoff. This is
+   exactly why the loose *cluster*-radius skip failed (max-radius 0.62 > gap 0.61) but the per-*group*
+   residual bound succeeds — homogeneous grouping tightens the bound below the cutoff.
+3. **Exact** (recall 1.0 up to f32 summation order, inherited from the transposed vertical accumulation):
+   boundary id-swaps **0/320** and **0/3200**, scores <1e-4 → identical top-k set. Boundary groups whose 8
+   lanes straddle two clusters (dist vs different μ) are flagged unskippable, preserving the bound's validity.
+4. **Fallback-safe**: the skip is one compare per group; if within-cluster residual variance were low it
+   would simply never fire and the scan degrades to `2945ed8`. Here it fires hard.
+
+**Scope / route-next:** keeps the dense scan an EXACT IVF (guaranteed recall 1.0), now probing far cells at
+zero block cost. Production wiring: (cluster, residual)-sorted storage + per-group residual maxima +
+per-cluster centroids in the vector index. Compose with int8 (candidate-major int8 group scan). Re-measure
+on the real 130k corpus (win scales with within-cluster residual spread — hub/edge structure skips more).
+Conformance: bench compiles + runs green via RCH (exit 0); score-equivalence + zero-swap asserts pass ∀k.
