@@ -145,3 +145,7 @@ harness = false
 [[bench]]
 name = "residual_ilp_scan"
 harness = false
+
+[[bench]]
+name = "residual_mask_scan"
+harness = false

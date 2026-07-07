@@ -9570,3 +9570,43 @@ the deeper near-cluster scan there is even more load-bound. This matches the pri
 negative). **Do not add accumulators to the transposed scan kernel.** The gqmu-splat half of the same bench
 DID win (see PERF_LEDGER) — the per-group overhead was the GATHER, not the accumulator count. Bench kept as
 evidence (all three arms).
+
+### 2026-07-06 — FlintOsprey — Bound-check reduce-elimination (simd_le().all() vs to_array()+fold) is WITHIN THE NOISE FLOOR
+
+**Lever tested.** The transposed scan eliminated the DOT's horizontal reduce (vertical f32x8 accumulation),
+but the early-abandon bound check still did `maxlane(bound) = bound.to_array().iter().fold(max)` every block
+— a stack copy + 7-way scalar fold on the block-to-block critical path. Replaced it with
+`bound.simd_le(splat(cutoff)).all()` (SIMD compare + movemask, ~3 ops vs ~15-25). Bench `residual_mask_scan`,
+arms `residual_splat` (= `0c107f3`, fold) vs `residual_mask` (simd_le().all()). The bench asserts
+`blocks_match` between arms, so abandonment is provably identical — only the check COST differs.
+
+**Measured** (N=50k dim=384, TWO runs on rch hz2 to disambiguate):
+
+| mask/splat | run 1 | run 2 |
+|---|---:|---:|
+| k=10 | 0.881× (win) | 0.988× (tie) |
+| k=100 | 1.072× (regress) | 0.876× (win) |
+
+**The sign flips across runs at BOTH k** — within-run CIs are non-overlapping but the cross-run variance
+(the `splat` baseline swung 352→470 µs at k=100, ~20%; ~343 vs ~412 µs at k=10 across the ilp/mask benches)
+swamps the effect. So the change is real but **too small to reliably measure via rch** (a ~3-5% effect under
+~±20% worker noise). Not landable (the arc's bar is reproducible non-overlapping CIs; two runs disagreeing on
+sign fails it).
+
+**Mechanism / why it's free.** This CONFIRMS the FMA-throughput-bound diagnosis (see the 4-acc ILP rejection
+above): the bound-check reduce is COMPUTE that overlaps the idle non-FMA ports of a throughput-bound FMA
+kernel → cheapening it doesn't move the critical path. Contrast the gqmu-splat win (`0c107f3`, reliable
+1.16×/1.12×): that removed 8 GATHERS — memory loads on the score-reconstruction critical path, a real cost.
+LESSON: on a throughput-bound kernel, per-group MEMORY overhead (gather) is worth eliminating; per-block
+COMPUTE overhead (a horizontal reduce) is already overlapped and free. Bench kept as evidence. Do not re-try
+bound-check micro-opts on this kernel.
+
+**ROUTE-NEXT / BLOCKER (the arc's real frontier).** The transposed f32 residual scan is FMA-throughput-bound
+on SYNTHETIC data (batched-scan `73a77fc` + 4-acc ILP regression + this). Its remaining exact levers reduce
+FMA COUNT via a tighter bound, which needs residual STRUCTURE (energy-concentrated dims → residual-energy dim
+reorder / PCA subspace bound) — INVISIBLE on white-noise synthetic residuals, but real on actual embeddings.
+So the highest-value next step is **real-corpus (130k) validation**, which is HARD-BLOCKED in this env: no
+`*.bin` embedding slab on disk, none git-committable (~200MB → the rch worker can't receive it), and no
+potion model / corpus.txt present to regenerate one. Unblock = provision a real-embedding slab to the rch
+worker (git-LFS, or generate worker-side from the model + corpus). The synthetic arc stands at 8.3×/7.5× vs
+flat (exact, recall 1.0) across 5 stacked primitives (2945ed8→05b57f3→8d13097→0c107f3).
