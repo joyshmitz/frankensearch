@@ -66,5 +66,11 @@ name = "softmax_simdmax"
 harness = false
 required-features = ["native"]
 
+# FFN GELU ILP: 1 group/iter (shipped) vs 2/4 independent groups interleaved.
+[[bench]]
+name = "gelu_ilp"
+harness = false
+required-features = ["native"]
+
 [lints]
 workspace = true

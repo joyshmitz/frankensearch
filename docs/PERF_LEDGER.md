@@ -3453,3 +3453,46 @@ change correctness), but unmeasurable via rch (the `native_rerank` end-to-end be
 model). Next reranker levers to probe: the same strided access in the EARLIER (non-CLS, full m×n) encoder
 layers, and the softmax `exp` cost. Conformance: bench compiles + runs green via RCH (exit 0); bit-identity
 asserted ∀ s_len.
+
+---
+
+## 2026-07-07 — FFN GELU instruction-level parallelism (FlintOsprey)
+
+Commit lands `fast_gelu_inplace` (native.rs) ILP-4 unroll; bench `gelu_ilp`. Exact-GELU over the FFN
+intermediate `[total, 1536]` is a **measured ~10-14% of the cross-encoder forward** (native.rs:180 comment).
+Medians, ratio vs the shipped one-group-per-iter loop (`base` = ORIG):
+
+| buffer (FFN rows × 1536) | `base` (ORIG) | `ilp2` | `ilp4` (LANDED) | ilp4 ratio |
+|---|---:|---:|---:|---:|
+| 1 (1536) | 4.252 µs | 4.079 µs | 4.101 µs | 0.965× |
+| 8 (12 288) | 40.08 µs | 38.32 µs | 38.28 µs | 0.955× |
+| 64 (98 304) | 484.9 µs | 460.2 µs | 463.1 µs | 0.955× |
+| 512 (786 432) | 2.964 ms | 2.925 ms | 2.878 ms | 0.971× (CIs overlap) |
+
+**Primitive.** The shipped inner loop processes ONE `f32x8` lane group per iteration: load 8 → the full
+`gelu_vec8` dependency chain (`z → |z| → t=1/(1+c·|z|) → 5-term Horner erf poly → exp(-z²) → copysign →
+0.5·x·(1+erf)`) → store 8. That chain is **latency-bound** (each op waits on the prior; the reciprocal and
+`exp` are high-latency but pipelined-throughput units), so a single group in flight leaves the FMA/EXP ports
+mostly idle. GELU is a **pure elementwise map** (no cross-lane reduction), so consecutive groups are fully
+independent — issuing 4 `gelu_vec8` back-to-back lets the core overlap their latency chains → latency-bound
+→ throughput-bound. Same lever class as the f16-dot 4-accumulator win (1.45×).
+
+**Findings:**
+1. **0.955-0.965× (~4-5% faster) at the in-cache widths** (1-64 FFN rows), non-overlapping CIs. The win
+   **fades to ~3% (overlapping CI) at the 3 MB buffer** (512 rows) where the kernel turns
+   memory-bandwidth-bound (streaming 3 MB in+out dominates the compute overlap). Chose **ilp4** over ilp2: it
+   is the most uniform across the sweep (0.955-0.971, never regresses, and wins the large/batched regime that
+   ilp2 gives back at 0.987×).
+2. **Exact / BYTE-identical**: each 8-element group gets the identical `gelu_vec8` at the identical position —
+   no reduction is reassociated (unlike the rejected softmax max-reduce, 75f0f8f) — so this is unconditionally
+   bit-identical (parity asserts max-delta **0.0** for both ilp2 and ilp4 ∀ size). Distribution-independent.
+3. Distinct from the softmax rejection: that tested a *reduce* (exp-bound, the max pass was negligible); this
+   tests the exp/poly **throughput** on an independent-lane map, which was never before probed.
+
+**Scope / route-next:** validated on the self-contained kernel microbench (reimplements `gelu_vec8` with
+identical A–S 7.1.26 constants); landed directly into `native.rs` (byte-identical, so end-to-end ranking is
+unchanged — the `native_rerank` end-to-end bench still SKIPs without the staged model, but the change cannot
+alter output). The dominant reranker compute (the int8 Linear/FFN GEMMs, ~2/3 FLOPs) lives in `frankentorch`
+(`ft-kernel-cpu`, a git dep) — not a frankensearch file, so not landable here; `forward_batch` already
+batches all docs' tokens for full weight-reuse. Conformance: library compiles + links via RCH with
+`--features native` (exit 0, `Finished` clean); bench green (exit 0); bit-identity asserted ∀ size.
