@@ -3367,3 +3367,46 @@ scan an EXACT IVF (recall 1.0). Storage: centered residuals + per-cluster centro
 (same footprint as raw + a centroid table). Compose with int8 on the residual body (residuals are small →
 quantize well). Re-measure on the real 130k corpus (win scales with cluster tightness `‖r‖/‖v‖`).
 Conformance: bench compiles + runs green via RCH (exit 0); score-equivalence + zero-swap asserts pass ∀k.
+
+---
+
+## 2026-07-06 — FlintOsprey — gqmu SPLAT-not-gather (transposed residual kernel) — 1.16× / 1.12× over 8d13097 (0.121× / 0.134× vs flat)
+
+`bench(index) residual_ilp_scan` — new CURRENT BEST of the exact early-abandon arc. Removes the per-group
+score-reconstruction gather that the landed residual scan (`8d13097`) paid on every group.
+
+```
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench residual_ilp_scan
+```
+
+Workload: N=50k, dim=384, 32 queries, realistic skewed-spectrum + tight clusters, swept k∈{10,100}
+(medians, ratio vs `full` at the same k):
+
+| variant | k=10 | k=100 |
+|---|---:|---:|
+| `full_k{k}` (flat scan, ORIG) | 2.823 ms · 1.000× | 2.833 ms · 1.000× |
+| `residual_base_k{k}` (= `8d13097`) | 0.3986 ms · 0.141× | 0.4255 ms · 0.150× |
+| **`residual_splat_k{k}`** (gqmu splat) | **0.3427 ms · 0.121×** | **0.3797 ms · 0.134×** |
+| `residual_fast_k{k}` (splat + 4-acc ILP) | 0.3590 ms · 0.127× | 0.4201 ms · 0.148× |
+
+**Primitive.** The residual scan reconstructs each lane's score as `gqmu[lane]=q·μ_{c(lane)}` + `q·r`.
+`8d13097` built `gqmu` with 8 per-lane gathers on EVERY group. But in the (cluster,dist)-bucketed layout
+99% of groups are intra-cluster (all 8 lanes share cluster c), so `gqmu = f32x8::splat(qmu[c])` — one splat,
+no gather. Only boundary groups (flagged `intra=false`) still gather per-lane, preserving exactness.
+
+**Findings:**
+1. **0.860× / 0.892× vs the prior best `8d13097`** (1.16× / 1.12×), non-overlapping CIs at both k
+   (splat [334,352]µs / [373,387]µs vs base [391,406]µs / [420,432]µs). **0.121× / 0.134× vs flat**
+   (8.3× / 7.5×). This directly closes the ledger-noted "block cut 25/28% > time cut 10/19%" gap on
+   `8d13097` — the per-group gather WAS the overhead beyond the dot.
+2. **Exact** (recall 1.0 up to f32 summation order): boundary id-swaps 0/320 & 0/3200, scores <1e-4.
+3. Cheap + safe: pure win from eliminating gathers on the common path; degrades to per-lane gather at
+   cluster boundaries. Stacks on the residual/bucketed/traversal arc with no layout change.
+
+**Scope / route-next:** the gather elimination is layout-inherent (bucketing already made groups
+intra-cluster); production just stores `gqmu` as a splat on the fast path. See the companion
+NEGATIVE_EVIDENCE entry: the 4-accumulator ILP on the same block dot REGRESSES (load-bound, not
+latency-bound) — do not add accumulators to this kernel. Conformance: bench compiles + runs green via RCH
+(exit 0); score-equivalence + zero-swap asserts pass ∀k.

@@ -9541,3 +9541,32 @@ group you need ALL 8 lanes' bounds ≤ cutoff (~0.4⁸ ≈ 0.07% of groups, vs ~
 the group/cluster max-radius bound (~0.7) never clears the cutoff (~0.6) in 384-dim. So the prefilter's value
 is stranded in the slower row-major layout. **Don't pursue row-major per-candidate prefiltering; the
 transposed reduce-free accumulation is the dominant primitive.** Bench kept as evidence (`rowmajor_prefilter_scan.rs`).
+
+### 2026-07-06 — FlintOsprey — 4-accumulator ILP on the transposed residual block dot REGRESSES (load-bound, not latency-bound)
+
+**Lever tested.** The transposed early-abandon block dot accumulates `acc += splat(rq[d])·body[d]` into a
+SINGLE `f32x8` accumulator — a dependent FMA chain, hypothesised latency-bound (the full-scan `dot_block`
+and the landed `dot_i8_i8`/`f32_bytes` kernels all use 4 accumulators). Split the 32-dim block over 4
+independent accumulators (combine `(a0+a1)+(a2+a3)` before the bound check + at scoring). Bench
+`residual_ilp_scan`, arm `residual_fast` (4-acc, built on the `residual_splat` gqmu-splat win) vs
+`residual_splat` (single-acc).
+
+**Measured** (N=50k dim=384, same run):
+
+| | k=10 | k=100 |
+|---|---:|---:|
+| `residual_splat` (1 acc) | 0.3427 ms | 0.3797 ms |
+| `residual_fast` (4 acc) | 0.3590 ms | 0.4201 ms |
+| ratio (fast/splat) | **1.048× SLOWER** | **1.106× SLOWER** |
+
+**Mechanism.** The transposed block dot is a scalar-broadcast × 8-lane FMA with a body load per dim (32
+bytes/dim streamed from L2/L3, dominated by the ~12MB near-cluster scan). It is **LOAD-bound, not
+FMA-latency-bound**, so the FMA units already have slack — extra accumulators don't hide latency that isn't
+on the critical path, and the 4-acc version ADDS cost: the per-block `(a0+a1)+(a2+a3)` combine (3 f32x8
+adds/block) and 4 separate load-temps. The regression is worse at k=100 (10.6%) than k=10 (4.8%) because
+the deeper near-cluster scan there is even more load-bound. This matches the prior finding (NEGATIVE_EVIDENCE
+2026-06-26: f32 kernels are "more load-bound, so less ILP headroom"; `f32_f32` 4-acc only won ~1.06× on a
+*two-load* dot — this *one-load broadcast* dot has even less headroom, and the combine overhead tips it
+negative). **Do not add accumulators to the transposed scan kernel.** The gqmu-splat half of the same bench
+DID win (see PERF_LEDGER) — the per-group overhead was the GATHER, not the accumulator count. Bench kept as
+evidence (all three arms).
