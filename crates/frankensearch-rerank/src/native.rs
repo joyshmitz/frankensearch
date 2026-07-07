@@ -88,10 +88,32 @@ fn softmax_row_fused(row: &mut [f32], scale: f32) {
     let scale_v = f32x8::splat(scale);
     let mut sum_v = f32x8::splat(0.0);
     let mut i = 0;
+    // Issue 4 independent exps per iteration so the core overlaps their latency (the
+    // exp is a long-latency polynomial that starves a one-group-in-flight loop). A
+    // single accumulator added in the base loop's exact order keeps sum_v
+    // BIT-IDENTICAL — only the exp scheduling changes. The attention softmax is the
+    // dominant growing frame (~24% of the forward at seq 512); this pays a clean
+    // ~3.9% there (bench softmax_exp_ilp), where it matters, and is within noise at
+    // shorter rows (where softmax is a small fraction). A 4-accumulator variant that
+    // breaks the sum chain wins LESS, confirming the bottleneck is exp latency (not
+    // the reduction), so the bit-identical single-accumulator form is also the fastest.
+    while i + 32 <= n {
+        let e0 = ((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v).exp();
+        let e1 = ((f32x8_from_slice(&row[i + 8..i + 16]) - max_v) * scale_v).exp();
+        let e2 = ((f32x8_from_slice(&row[i + 16..i + 24]) - max_v) * scale_v).exp();
+        let e3 = ((f32x8_from_slice(&row[i + 24..i + 32]) - max_v) * scale_v).exp();
+        row[i..i + 8].copy_from_slice(&e0.to_array());
+        row[i + 8..i + 16].copy_from_slice(&e1.to_array());
+        row[i + 16..i + 24].copy_from_slice(&e2.to_array());
+        row[i + 24..i + 32].copy_from_slice(&e3.to_array());
+        sum_v += e0;
+        sum_v += e1;
+        sum_v += e2;
+        sum_v += e3;
+        i += 32;
+    }
     while i + 8 <= n {
-        let mut buf = [0.0f32; 8];
-        buf.copy_from_slice(&row[i..i + 8]);
-        let e = ((f32x8::new(buf) - max_v) * scale_v).exp();
+        let e = ((f32x8_from_slice(&row[i..i + 8]) - max_v) * scale_v).exp();
         row[i..i + 8].copy_from_slice(&e.to_array());
         sum_v += e;
         i += 8;

@@ -72,5 +72,11 @@ name = "gelu_ilp"
 harness = false
 required-features = ["native"]
 
+# Attention softmax EXP-throughput ILP: 1 exp/iter (shipped) vs 4 interleaved exps.
+[[bench]]
+name = "softmax_exp_ilp"
+harness = false
+required-features = ["native"]
+
 [lints]
 workspace = true

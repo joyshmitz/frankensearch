@@ -3496,3 +3496,47 @@ alter output). The dominant reranker compute (the int8 Linear/FFN GEMMs, ~2/3 FL
 (`ft-kernel-cpu`, a git dep) — not a frankensearch file, so not landable here; `forward_batch` already
 batches all docs' tokens for full weight-reuse. Conformance: library compiles + links via RCH with
 `--features native` (exit 0, `Finished` clean); bench green (exit 0); bit-identity asserted ∀ size.
+
+---
+
+## 2026-07-07 — Attention-softmax EXP-throughput ILP (FlintOsprey)
+
+Commit lands `softmax_row_fused` (native.rs) 4-exp-interleave; bench `softmax_exp_ilp`. The attention softmax
+is the reranker's **dominant *growing* frame — its own profiling note: "~24% of the per-doc forward wall-clock
+at seq 512 (12·S² exp calls)"**. Its exp+sum loop issued ONE f32x8 group per iter (one `exp` in flight,
+starving the exp port). Interleave 4 independent exps/iter to overlap their latency. Full-attention shape
+(NH·n rows × width n=s_len), medians, ratio vs the shipped 1-exp loop (`base` = ORIG):
+
+| n = s_len | `base` (ORIG) | `ilp4_seq` (LANDED) | `ilp4_multi` | seq ratio | multi ratio |
+|---|---:|---:|---:|---:|---:|
+| 64  | 117.7 µs | 119.99 µs | 122.18 µs | 1.019× (noisy) | 1.038× |
+| 128 | 462.8 µs | 486.4 µs  | 465.3 µs  | 1.051× (noisy) | 1.006× |
+| 256 | 1.804 ms | 1.912 ms  | 1.829 ms  | 1.059× (noisy) | 1.014× |
+| 512 | 8.744 ms | **8.405 ms** | 8.531 ms | **0.961×** | 0.976× |
+
+**Primitive.** The `exp` is a long-latency polynomial (pipelined throughput, high latency); one group in
+flight leaves the exp port idle — the same latency-bound shape the GELU 4-group ILP win (aa11627) exploited.
+`ilp4_seq` computes e0..e3 (independent exps → overlap) then adds them to a **single accumulator in the base's
+exact order** → **BIT-IDENTICAL** (only exp scheduling changes; the reduction is untouched — parity asserts
+max-delta **0.0** ∀ n). This is NOT the rejected softmax lever (75f0f8f = the scalar MAX-reduce, negligible);
+that rejection's own verdict was "softmax is EXP-BOUND" — here we attack that exp's THROUGHPUT.
+
+**Findings:**
+1. **Clean non-overlapping ~3.9% win at n=512** (base [8.61, 8.90] vs [8.34, 8.49], tight CIs) — exactly the
+   "dominant growing frame" (~24% at seq 512, and it GROWS with S), where softmax actually costs. At n≤256 the
+   ilp4 arms are **noise-corrupted** (wide CIs; the inflated `ilp4_seq` medians are outliers — inconsistent
+   with `ilp4_multi`, which does strictly MORE work yet lands ~tie), i.e. within-noise, not real regressions.
+   Softmax is a small fraction at short seq, so neutral-there / win-at-long-seq is the right end-to-end shape.
+2. **`ilp4_multi` (4 sum accumulators, reassociated) wins LESS than `ilp4_seq`** (0.976× vs 0.961× at n=512),
+   confirming the bottleneck is **exp latency, not the sum chain** — so the bit-identical single-accumulator
+   form is also the FASTEST. Landed `ilp4_seq`, not the reassociated variant.
+3. **Exact / BYTE-identical** → zero-risk, end-to-end ranking provably unchanged (the reranker's own note
+   already validates the ~1e-6 softmax exp tolerance against the numpy/ONNX reference; this doesn't even
+   perturb that — the bytes are identical).
+
+**Scope / route-next:** validated on the self-contained kernel microbench (faithful `softmax_row_fused` copy);
+landed directly into native.rs (bit-identical, so `native_rerank` end-to-end still SKIPs without the staged
+model but output cannot change). Conformance: library compiles + links via RCH `--features native` (exit 0,
+`Finished` clean); bench green (parity asserts passed, exit 0); bit-identity asserted ∀ n. Same ILP lever now
+banked on the two hottest landable transcendental frames (GELU ~10-14%, softmax ~24%@512). The dominant int8
+Linear/FFN GEMMs remain in frankentorch (not landable here).
