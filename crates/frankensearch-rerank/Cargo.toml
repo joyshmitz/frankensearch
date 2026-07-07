@@ -54,5 +54,11 @@ name = "cls_attention_ab"
 harness = false
 required-features = ["native"]
 
+# CLS attention SW-prefetch of the strided K/V access: direct rank-1 vs + prefetch.
+[[bench]]
+name = "cls_attention_prefetch"
+harness = false
+required-features = ["native"]
+
 [lints]
 workspace = true

@@ -3410,3 +3410,46 @@ intra-cluster); production just stores `gqmu` as a splat on the fast path. See t
 NEGATIVE_EVIDENCE entry: the 4-accumulator ILP on the same block dot REGRESSES (load-bound, not
 latency-bound) — do not add accumulators to this kernel. Conformance: bench compiles + runs green via RCH
 (exit 0); score-equivalence + zero-swap asserts pass ∀k.
+
+---
+
+## 2026-07-07 — FlintOsprey — CLS-attention SW-PREFETCH of the strided K/V access (reranker) — up to 1.11× over the shipped direct rank-1 (grows with s_len)
+
+`bench(rerank) cls_attention_prefetch` — first perf lever on the RERANKER tier (the vector-scan arc is
+synthetic-floored). Improves the shipped `direct_rank1` CLS attention (`738fffb`).
+
+```
+AGENT_NAME=FlintOsprey CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
+  rch exec -- cargo bench -p frankensearch-rerank --features native --profile release \
+  --bench cls_attention_prefetch
+```
+
+Cross-encoder final-layer CLS attention (H=384, NH=12, HD=32), medians, ratio vs the shipped `direct_rank1`:
+
+| s_len | `direct_rank1` (ORIG) | `direct_prefetch` | ratio |
+|---|---:|---:|---:|
+| 64 | 6.744 µs | 6.326 µs | 0.938× |
+| 128 | 14.376 µs | 13.840 µs | 0.963× (CIs overlap) |
+| 256 | 32.339 µs | 29.944 µs | 0.926× |
+| 512 | 77.701 µs | 70.192 µs | 0.903× |
+
+**Primitive.** In the direct CLS attention, for a fixed head the per-token K and V live `STRIDE = 3H = 1152`
+floats (~4.6 KB) apart in the interleaved qkv buffer — so the QK dot loop and the weighted-value-sum loop
+touch a fresh, scattered cache line per token. A 4.6 KB constant stride is at/beyond the HW stride-
+prefetcher's reach, so both loops are memory-latency-bound at large `s_len`. Added `_mm_prefetch(_MM_HINT_T0)`
+of token `j+4`'s K (QK loop) and V (value loop).
+
+**Findings:**
+1. **0.938× / 0.926× / 0.903× at s_len 64 / 256 / 512** (non-overlapping CIs; s_len=128 a wash within noise).
+   The win **grows with s_len** — larger qkv (s_len=512 → 2.36 MB, streams from L3) has more strided-load
+   latency to hide, confirming the mechanism. The production cross-encoder range (256–512) gets the most.
+2. **Exact / bit-identical**: prefetch is a hint, output max-delta from `direct_rank1` is **0.0** (asserted).
+3. Distribution-independent (a memory-latency lever, not data-dependent) — unlike the vector-scan arc's
+   bound-tightening levers, this does not need real-corpus structure to pay.
+
+**Scope / route-next:** validated on the self-contained kernel microbench; production wiring is a 2-line add
+to `native.rs`'s `cls_attention` (the `k_base` QK loop + `weighted_value_sum_hd` V loop) — safe (a hint can't
+change correctness), but unmeasurable via rch (the `native_rerank` end-to-end bench SKIPs without the staged
+model). Next reranker levers to probe: the same strided access in the EARLIER (non-CLS, full m×n) encoder
+layers, and the softmax `exp` cost. Conformance: bench compiles + runs green via RCH (exit 0); bit-identity
+asserted ∀ s_len.
