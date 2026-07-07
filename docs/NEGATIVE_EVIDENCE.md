@@ -9649,3 +9649,38 @@ core utilization under load than intra-query). Not k-robust → not landed. Benc
 touched) beats brute-force parallelism (3.3× on 16 cores) — and the two barely compose once the work is
 already minimal. The arc's serial wins are the right lever; spend parallelism across queries, not within.
 Route-next unchanged: real-corpus 130k validation (structure-exploiting bounds), still data-blocked.
+
+### 2026-07-07 — FlintOsprey — Attention softmax SIMD max-reduce is within noise (exp-dominated) + a pre-existing rerank test blocker
+
+**Lever tested.** `softmax_row_fused` (native.rs) does exp/sum in SIMD but the initial max-reduce
+`for &x in row { max = max.max(x) }` is SCALAR (LLVM won't auto-vectorize an f32 max-reduction without
+fast-math). Replaced it with an f32x8 `max` accumulate + one horizontal fold per row. Exact/bit-identical
+(max associative for finite logits; parity max-delta 0). Bench `softmax_simdmax`, full-attention shape
+(NH·n rows of width n), `scalar_max` (shipped) vs `simd_max`.
+
+**Measured** (rch hz2, `--features native`):
+
+| n | scalar_max | simd_max | ratio |
+|---|---:|---:|---:|
+| 64 | 118.3 µs | 123.4 µs | **1.043× SLOWER** |
+| 128 | 495.7 µs | 466.5 µs | 0.941× (CIs overlap) |
+| 256 | 1.861 ms | 1.817 ms | 0.976× (overlap) |
+| 512 | 9.073 ms | 8.958 ms | 0.987× (overlap) |
+
+**No non-overlapping CI at any n; n=64 regresses.** REJECTED. **Mechanism:** absolute time at n=64 is ~2.4
+ns/softmax-element — that's the transcendental `exp` dominating. The scalar max-reduce is ~sub-ns/element (a
+negligible fraction), so SIMD-izing it is lost in the exp noise, and the SIMD variant's per-row horizontal-
+fold + branch overhead makes it *slower* on small rows. **The attention softmax is exp-bound, not
+max-reduce-bound** — don't chase the max-reduce; a real softmax lever would need a cheaper `exp` (numerically
+risky for reranker scores) or fewer softmax calls (batched cross-encoder). Bench kept as evidence.
+
+**PRE-EXISTING BLOCKER surfaced (not mine).** `cargo test -p frankensearch-rerank --features native` does
+NOT COMPILE on origin/main: `pipeline.rs:1359` (test `rerank_preserves_metadata`) assigns
+`c.metadata = Some(Arc::new(Value::String(..)))` but the test-target build reports the field wants bare
+`Value` — a `cfg-gated-feature-migration-blindspot` recurrence (cf. the ANN break d462e00), the
+`ScoredResult.metadata: Option<Arc<Value>>` migration skew vs this `#[cfg(test)]`/`--features native`-gated
+test. Code is byte-identical on origin/main; I never touched pipeline.rs. This blocks reranker `cargo test`
+conformance AND thus verification of any production wiring in native.rs (e.g. wiring the LANDED CLS-attention
+prefetch win `6af65a7`, whose measurement is bench-only and clean). Reranker BENCHES are unaffected (bench
+builds skip `#[cfg(test)]` units). Owner action: align the test to the field type (drop the `Arc::new` wrap
+or fix the field) so `--features native` tests compile.

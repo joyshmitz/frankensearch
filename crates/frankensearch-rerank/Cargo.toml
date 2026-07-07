@@ -60,5 +60,11 @@ name = "cls_attention_prefetch"
 harness = false
 required-features = ["native"]
 
+# Attention softmax: scalar max-reduce (shipped) vs f32x8 SIMD max-reduce.
+[[bench]]
+name = "softmax_simdmax"
+harness = false
+required-features = ["native"]
+
 [lints]
 workspace = true
