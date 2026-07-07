@@ -9610,3 +9610,42 @@ So the highest-value next step is **real-corpus (130k) validation**, which is HA
 potion model / corpus.txt present to regenerate one. Unblock = provision a real-embedding slab to the rch
 worker (git-LFS, or generate worker-side from the model + corpus). The synthetic arc stands at 8.3×/7.5× vs
 flat (exact, recall 1.0) across 5 stacked primitives (2945ed8→05b57f3→8d13097→0c107f3).
+
+### 2026-07-07 — FlintOsprey — The exact early-abandon arc DOMINATES parallelism (not subsumed); parallelizing the residual scan itself is marginal (REJECTED)
+
+**Context/why.** The whole arc (`2945ed8`→`0c107f3`, 8.3×/7.5× vs SERIAL flat) was benched serial-vs-serial.
+But the real product `InMemoryVectorIndex::search_top_k` is ALREADY rayon-parallel (NEGATIVE_EVIDENCE
+2026-06-24/26). On a 16-thread worker, parallel flat could subsume a serial 8.3× win. Tested both.
+
+**Two things measured** (`residual_parallel_scan`, N=50k dim=384, rayon=16 threads, all arms EXACT — 0 swaps):
+
+| arm | k=10 | k=100 |
+|---|---:|---:|
+| `full_serial` (f32 flat) | 2.890 ms | 2.906 ms |
+| `full_parallel` (f32, 16-thread — production-shape) | 0.871 ms | 0.876 ms |
+| `residual_serial` (= `0c107f3`, 1 thread) | 0.410 ms | 0.427 ms |
+| `residual_parallel` (seed + parallel chunks) | 0.349 ms | 0.438 ms |
+
+**RESULT 1 — the arc DOMINATES parallelism (the important finding).** At EQUAL f32 precision,
+single-threaded `residual_serial` beats the 16-thread `full_parallel` by **2.13× / 2.05×** (0.470× / 0.487×).
+Parallel flat scales only **3.3×** from serial flat on 16 threads — it is MEMORY-BANDWIDTH-bound (the 76MB
+sweep saturates bandwidth long before 16 cores), so brute-force parallelism hits a wall that algorithmic
+work-reduction (early-abandon touches ~6.5% of the data) sails past. So the arc is NOT subsumed by
+production's parallelism — it beats it ~2× on one core. **Caveat (honest):** production flat is f16 (half
+bandwidth) → real production parallel-flat is ~2× faster than this f32 `full_parallel`, so vs real production
+`residual_serial` is closer to a TIE; BUT f16 is a SEPARABLE ~2× that applies to the residual body too
+(residuals are small, quantize tightly), so composing f16 keeps the algorithmic lead. The clean equal-
+precision claim stands: work-reduction > parallelism on this bandwidth-bound scan.
+
+**RESULT 2 — parallelizing the residual scan is marginal (REJECTED as a primitive).** `residual_parallel`
+(serial-seed the near core for a tight cutoff, then rayon-parallel the rest with it — exact, 0 swaps) vs
+`residual_serial`: **0.852× (win, CIs disjoint) at k=10 but 1.026× (tie/slight-regress, CIs overlap) at
+k=100.** Only ~1.17×/1.0× from 16 threads because the residual scan is ALREADY minimal-work (~410µs) and
+partly bandwidth-bound on the near cluster: the serial seed + rayon dispatch + merge-dedup overhead cancel
+most of the parallel benefit, and it's redundant with production's existing across-query parallelism (better
+core utilization under load than intra-query). Not k-robust → not landed. Bench kept as evidence.
+
+**LESSON.** On a bandwidth-bound top-k scan, ALGORITHMIC work-reduction (early-abandon, ~15× less data
+touched) beats brute-force parallelism (3.3× on 16 cores) — and the two barely compose once the work is
+already minimal. The arc's serial wins are the right lever; spend parallelism across queries, not within.
+Route-next unchanged: real-corpus 130k validation (structure-exploiting bounds), still data-blocked.
