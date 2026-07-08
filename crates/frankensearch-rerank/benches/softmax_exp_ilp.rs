@@ -15,16 +15,16 @@
 //! overlaps their latency.
 //!
 //! Two candidates:
-//!   * `ilp4_seq`  — compute e0..e3 (independent exps overlap), then `sum_v += e0;
-//!                   += e1; += e2; += e3` in the base's EXACT order + a single
-//!                   accumulator → BYTE-IDENTICAL to `base` (only the exp SCHEDULING
-//!                   changes; the reduction is untouched). Parity asserts max-delta 0.
-//!   * `ilp4_multi` — 4 independent sum accumulators (breaks the loop-carried add
-//!                   chain) then combine → REASSOCIATED (~1e-7, below the softmax's
-//!                   own validated ~1e-6 exp tolerance; ranking-invariant, NOT
-//!                   bit-identical). Tests whether the serial sum chain even matters.
+//! * `ilp4_seq` computes e0..e3 (independent exps overlap), then `sum_v += e0;
+//!   += e1; += e2; += e3` in the base's exact order with a single accumulator. It is
+//!   byte-identical to `base`; only the exp scheduling changes, and parity asserts
+//!   max-delta 0.
+//! * `ilp4_multi` uses 4 independent sum accumulators, breaking the loop-carried add
+//!   chain, then combines them. It is reassociated (~1e-7, below the softmax's own
+//!   validated ~1e-6 exp tolerance), ranking-invariant, and not bit-identical. This
+//!   tests whether the serial sum chain matters.
 //!
-//! Shape = full-attention softmax (NH·n rows of width n), swept over n = s_len.
+//! Shape = full-attention softmax (NH·n rows of width n), swept over n = `s_len`.
 //!
 //! ```bash
 //! CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
@@ -78,7 +78,7 @@ fn softmax_base(row: &mut [f32], scale: f32) {
     }
 }
 
-/// CANDIDATE A (BYTE-IDENTICAL): 4 independent exps/iter, single in-order sum_v.
+/// CANDIDATE A (BYTE-IDENTICAL): 4 independent exps/iter, single in-order `sum_v`.
 fn softmax_ilp4_seq(row: &mut [f32], scale: f32) {
     let n = row.len();
     let mut max_raw = f32::NEG_INFINITY;
@@ -209,10 +209,24 @@ fn bench(c: &mut Criterion) {
         softmax_rows(&mut a, n, SCALE, 0);
         softmax_rows(&mut bseq, n, SCALE, 1);
         softmax_rows(&mut bmul, n, SCALE, 2);
-        let dseq = a.iter().zip(&bseq).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let dmul = a.iter().zip(&bmul).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(dseq == 0.0, "ilp4_seq diverged from base by {dseq} (n={n}) — must be byte-identical");
-        assert!(dmul < 1e-6, "ilp4_multi diverged from base by {dmul} (n={n}) — exceeds softmax ~1e-6 tolerance");
+        let dseq = a
+            .iter()
+            .zip(&bseq)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let dmul = a
+            .iter()
+            .zip(&bmul)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            dseq == 0.0,
+            "ilp4_seq diverged from base by {dseq} (n={n}) — must be byte-identical"
+        );
+        assert!(
+            dmul < 1e-6,
+            "ilp4_multi diverged from base by {dmul} (n={n}) — exceeds softmax ~1e-6 tolerance"
+        );
 
         // No per-iter reset: softmax does data-independent WORK and stays finite.
         for (kind, name) in [(0u8, "base"), (1u8, "ilp4_seq"), (2u8, "ilp4_multi")] {

@@ -41,6 +41,7 @@ const INTER: usize = 4 * H; // 1536 — FFN intermediate width
 const EPS: f64 = 1.0e-12;
 const EPS_F32: f32 = 1.0e-12;
 const ATTN_SCALE_F32: f32 = 0.176_776_69;
+const CLS_Q_CACHE_MIN_SEQ: usize = 256;
 pub(crate) const DEFAULT_MAX_LENGTH: usize = 512;
 /// Token budget per batched forward. Documents are reranked in chunks whose total
 /// token count stays under this cap so the chunk's attention intermediates (which
@@ -264,6 +265,27 @@ fn dot_hd(q: &[f32], k: &[f32]) -> f32 {
     .reduce_add()
 }
 
+#[inline]
+fn q_lanes(q: &[f32]) -> [f32x8; 4] {
+    debug_assert_eq!(q.len(), HD);
+    [
+        f32x8_from_slice(&q[0..]),
+        f32x8_from_slice(&q[8..]),
+        f32x8_from_slice(&q[16..]),
+        f32x8_from_slice(&q[24..]),
+    ]
+}
+
+#[inline]
+fn dot_hd_q_lanes(q: [f32x8; 4], k: &[f32]) -> f32 {
+    debug_assert_eq!(k.len(), HD);
+    (q[0] * f32x8_from_slice(&k[0..])
+        + q[1] * f32x8_from_slice(&k[8..])
+        + q[2] * f32x8_from_slice(&k[16..])
+        + q[3] * f32x8_from_slice(&k[24..]))
+    .reduce_add()
+}
+
 fn weighted_value_sum_hd(qkv: &[f32], probs: &[f32], s_len: usize, head: usize, out: &mut [f32]) {
     debug_assert_eq!(probs.len(), s_len);
     debug_assert_eq!(out.len(), HD);
@@ -436,11 +458,19 @@ fn fused_attention_cls(
     scratch.ensure(s_len);
     let sc = NH * s_len;
     for h in 0..NH {
-        let q = &qkv[h * HD..h * HD + HD];
         let row = &mut scratch.scores[h * s_len..(h + 1) * s_len];
-        for (j, slot) in row.iter_mut().enumerate() {
-            let k_base = j * STRIDE + H + h * HD;
-            *slot = dot_hd(q, &qkv[k_base..k_base + HD]);
+        if s_len >= CLS_Q_CACHE_MIN_SEQ {
+            let q = q_lanes(&qkv[h * HD..h * HD + HD]);
+            for (j, slot) in row.iter_mut().enumerate() {
+                let k_base = j * STRIDE + H + h * HD;
+                *slot = dot_hd_q_lanes(q, &qkv[k_base..k_base + HD]);
+            }
+        } else {
+            let q = &qkv[h * HD..h * HD + HD];
+            for (j, slot) in row.iter_mut().enumerate() {
+                let k_base = j * STRIDE + H + h * HD;
+                *slot = dot_hd(q, &qkv[k_base..k_base + HD]);
+            }
         }
     }
     let scores = &mut scratch.scores[..sc];

@@ -3540,3 +3540,35 @@ model but output cannot change). Conformance: library compiles + links via RCH `
 `Finished` clean); bench green (parity asserts passed, exit 0); bit-identity asserted ∀ n. Same ILP lever now
 banked on the two hottest landable transcendental frames (GELU ~10-14%, softmax ~24%@512). The dominant int8
 Linear/FFN GEMMs remain in frankentorch (not landable here).
+
+---
+
+## 2026-07-08 — CLS-attention query-lane cache for long final-layer attention (SearchCod)
+
+Commit lands a gated final-layer CLS attention primitive in `native.rs`: for `s_len >= 256`, load the four
+SIMD query lane groups once per head and reuse them for every token's K dot product. The old direct rank-1
+path rebuilt the same four `f32x8` query lanes for every token dot. The arithmetic grouping for each
+`q·k` score is unchanged; only invariant query-lane materialization moves out of the token loop. Shorter
+sequences keep the existing direct path because the blanket q-cache form regressed at `s_len=128`.
+
+Measured command family (per-crate release-profile RCH, target dir requested by the user):
+
+```bash
+AGENT_NAME=SearchCod RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-rerank --features native \
+    --profile release --bench cls_attention_ab -- cls_attention \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5
+```
+
+| Workload | ORIG `direct_rank1` | Candidate `q_cached` | Ratio vs ORIG | Worker | Decision |
+|---|---:|---:|---:|---|---|
+| `cls_attention/q_cached/256` | 26.929 us | 22.583 us | 0.839 | vmi1293453 | keep behind `s_len >= 256` |
+| `cls_attention/q_cached/384` | 52.192 us | 48.273 us | 0.925 | hz2 | keep behind `s_len >= 256` |
+| `cls_attention/q_cached/512` | 49.687 us | 45.861 us | 0.923 | vmi1293453 | keep behind `s_len >= 256` |
+| `cls_attention/q_cached/512` focused confirm | 54.262 us | 50.979 us | 0.940 | ovh-a | confirm |
+
+**Scope / proof:** the bench asserts the q-cached output matches the BMM reference within `1.0e-4` for every
+swept length. The production path is stricter than the benchmarked candidate: it uses q-cache only at
+`s_len >= 256`, preserving the old direct rank-1 path for 64 and 128 token cases. No softmax, value-sum,
+prefetch, or BMM repack behavior is changed.

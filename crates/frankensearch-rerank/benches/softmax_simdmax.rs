@@ -74,7 +74,11 @@ fn softmax_row_simd_max(row: &mut [f32], scale: f32) {
         max_v8 = max_v8.max(f32x8_from_slice(&row[i..i + 8]));
         i += 8;
     }
-    let mut max_raw = max_v8.to_array().iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut max_raw = max_v8
+        .to_array()
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
     while i < row.len() {
         max_raw = max_raw.max(row[i]);
         i += 1;
@@ -135,8 +139,15 @@ fn bench(c: &mut Criterion) {
         let mut b = base.clone();
         softmax_rows(&mut a, n, SCALE, false);
         softmax_rows(&mut b, n, SCALE, true);
-        let md = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(md == 0.0, "simd max-reduce diverged from scalar by {md} (n={n}) — must be bit-identical");
+        let md = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            md == 0.0,
+            "simd max-reduce diverged from scalar by {md} (n={n}) — must be bit-identical"
+        );
 
         // No per-iter reset: softmax does data-independent WORK (max/exp/sum/normalize
         // loops are the same regardless of values) and its output stays finite, so

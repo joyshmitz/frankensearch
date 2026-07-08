@@ -72,6 +72,25 @@ fn dot_hd(q: &[f32], k: &[f32]) -> f32 {
     .reduce_add()
 }
 
+#[inline]
+fn q_lanes(q: &[f32]) -> [f32x8; 4] {
+    [
+        f32x8_from_slice(&q[0..]),
+        f32x8_from_slice(&q[8..]),
+        f32x8_from_slice(&q[16..]),
+        f32x8_from_slice(&q[24..]),
+    ]
+}
+
+#[inline]
+fn dot_hd_q_lanes(q: [f32x8; 4], k: &[f32]) -> f32 {
+    (q[0] * f32x8_from_slice(&k[0..])
+        + q[1] * f32x8_from_slice(&k[8..])
+        + q[2] * f32x8_from_slice(&k[16..])
+        + q[3] * f32x8_from_slice(&k[24..]))
+    .reduce_add()
+}
+
 fn softmax_row_fused(row: &mut [f32], scale: f32) {
     let mut max_raw = f32::NEG_INFINITY;
     for &x in row.iter() {
@@ -186,6 +205,25 @@ fn cls_attention_direct(scratch: &mut Scratch, qkv: &[f32], s_len: usize, out: &
     }
 }
 
+fn cls_attention_q_cached(scratch: &mut Scratch, qkv: &[f32], s_len: usize, out: &mut [f32]) {
+    scratch.ensure(s_len);
+    let sc = NH * s_len;
+    for head in 0..NH {
+        let q = q_lanes(&qkv[head * HD..head * HD + HD]);
+        let row = &mut scratch.scores[head * s_len..(head + 1) * s_len];
+        for (j, slot) in row.iter_mut().enumerate() {
+            let k_base = j * STRIDE + H + head * HD;
+            *slot = dot_hd_q_lanes(q, &qkv[k_base..k_base + HD]);
+        }
+    }
+    let scores = &mut scratch.scores[..sc];
+    softmax_rows(scores, NH, s_len, SCALE);
+    for head in 0..NH {
+        let row = &scores[head * s_len..(head + 1) * s_len];
+        weighted_value_sum_hd(qkv, row, head, &mut out[head * HD..head * HD + HD]);
+    }
+}
+
 fn qkv_fixture(s_len: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(s_len * STRIDE);
     for i in 0..s_len * STRIDE {
@@ -213,7 +251,7 @@ fn bench(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(100));
     group.measurement_time(Duration::from_millis(500));
 
-    for &s_len in &[64usize, 128, 256, 512] {
+    for &s_len in &[64usize, 128, 256, 384, 512] {
         let qkv = qkv_fixture(s_len);
         let mut bmm_scratch = Scratch::default();
         let mut direct_scratch = Scratch::default();
@@ -221,6 +259,8 @@ fn bench(c: &mut Criterion) {
         let mut actual = vec![0.0f32; H];
         cls_attention_bmm_repack(&mut bmm_scratch, &qkv, s_len, &mut expected);
         cls_attention_direct(&mut direct_scratch, &qkv, s_len, &mut actual);
+        assert_close(&expected, &actual);
+        cls_attention_q_cached(&mut direct_scratch, &qkv, s_len, &mut actual);
         assert_close(&expected, &actual);
 
         group.bench_with_input(
@@ -245,6 +285,19 @@ fn bench(c: &mut Criterion) {
             let mut out = vec![0.0f32; H];
             b.iter(|| {
                 cls_attention_direct(
+                    black_box(&mut scratch),
+                    black_box(qkv),
+                    black_box(s_len),
+                    black_box(&mut out),
+                );
+                black_box(&out);
+            });
+        });
+        group.bench_with_input(BenchmarkId::new("q_cached", s_len), &qkv, |b, qkv| {
+            let mut scratch = Scratch::default();
+            let mut out = vec![0.0f32; H];
+            b.iter(|| {
+                cls_attention_q_cached(
                     black_box(&mut scratch),
                     black_box(qkv),
                     black_box(s_len),

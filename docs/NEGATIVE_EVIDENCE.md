@@ -9751,3 +9751,34 @@ remote run is the keep/reject proof below. RCH rewrote the target dir to
 probabilities but loses the current path's simpler split loops; on the worker proof it is neutral/slower all
 the way through max length. Do not retry this exact fused tail without a lower-level implementation that keeps
 the vector exp throughput while reducing the per-lane value accumulation overhead.
+
+### 2026-07-08 — SearchCod — Blanket CLS q-lane cache regresses at 128 tokens; keep only the long-seq gate
+
+**Lever tested.** Cache the four SIMD query lane groups once per head in final-layer CLS attention, then reuse
+those lanes for every token's K dot product. This removes repeated query-lane materialization from the token
+loop and is bit-preserving for each `q·k` score, but the blanket form was measured across sequence lengths
+before production wiring.
+
+**Measured command:**
+
+```bash
+AGENT_NAME=SearchCod RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR,RUST_LOG \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod RUST_LOG=off \
+  rch exec -- cargo bench -p frankensearch-rerank --features native \
+    --profile release --bench cls_attention_ab -- cls_attention \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5
+```
+
+RCH ran remotely on `vmi1293453`.
+
+| Workload | ORIG `direct_rank1` median | Blanket `q_cached` median | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `cls_attention/q_cached/64` | 5.9659 us | 5.5353 us | 0.928x | not wired; avoid two-island gate |
+| `cls_attention/q_cached/128` | 10.453 us | 11.897 us | 1.138x | reject |
+| `cls_attention/q_cached/256` | 26.929 us | 22.583 us | 0.839x | keep only under long-seq gate |
+| `cls_attention/q_cached/512` | 49.687 us | 45.861 us | 0.923x | keep only under long-seq gate |
+
+**Decision:** do **not** use q-lane caching as a blanket replacement for `fused_attention_cls`; specifically,
+do not route `s_len=128` through it. The landed production form is gated at `s_len >= 256`, with an additional
+focused `s_len=384` confirmation in `docs/PERF_LEDGER.md`. Re-testing this family should focus on the gate
+boundary, not on removing the threshold.

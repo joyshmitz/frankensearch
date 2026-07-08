@@ -172,10 +172,24 @@ fn bench(c: &mut Criterion) {
         gelu_base(&mut a);
         gelu_ilp2(&mut b2);
         gelu_ilp4(&mut b4);
-        let d2 = a.iter().zip(&b2).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let d4 = a.iter().zip(&b4).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(d2 == 0.0, "ilp2 diverged from base by {d2} (rows={rows}) — must be byte-identical");
-        assert!(d4 == 0.0, "ilp4 diverged from base by {d4} (rows={rows}) — must be byte-identical");
+        let d2 = a
+            .iter()
+            .zip(&b2)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let d4 = a
+            .iter()
+            .zip(&b4)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            d2 == 0.0,
+            "ilp2 diverged from base by {d2} (rows={rows}) — must be byte-identical"
+        );
+        assert!(
+            d4 == 0.0,
+            "ilp4 diverged from base by {d4} (rows={rows}) — must be byte-identical"
+        );
 
         // No per-iter reset: GELU is a pure elementwise map doing data-independent
         // WORK (poly + exp evaluated regardless of value) and its output stays finite,

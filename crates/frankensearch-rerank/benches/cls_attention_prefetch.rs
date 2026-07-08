@@ -10,7 +10,7 @@
 //! (value loop). Prefetch is a hint — output is bit-identical to `direct` (parity
 //! asserts max-delta 0), so this is exact and distribution-independent.
 //!
-//! Arms: `direct_rank1` (= shipped) vs `direct_prefetch` (new). Swept over s_len.
+//! Arms: `direct_rank1` (= shipped) vs `direct_prefetch` (new). Swept over `s_len`.
 //!
 //! ```bash
 //! CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
@@ -98,15 +98,15 @@ fn softmax_rows(data: &mut [f32], rows: usize, n: usize, scale: f32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 #[allow(unsafe_code)]
-fn prefetch(_qkv: &[f32], _idx: usize) {
+fn prefetch(qkv: &[f32], idx: usize) {
     #[cfg(target_arch = "x86_64")]
     // SAFETY: _mm_prefetch is a hint; idx is only dereferenced by hardware and any
     // address is architecturally valid to prefetch. We bound idx < len anyway.
     unsafe {
-        if _idx < _qkv.len() {
-            _mm_prefetch(_qkv.as_ptr().add(_idx) as *const i8, _MM_HINT_T0);
+        if idx < qkv.len() {
+            _mm_prefetch(qkv.as_ptr().add(idx).cast::<i8>(), _MM_HINT_T0);
         }
     }
 }
@@ -133,7 +133,13 @@ fn weighted_value_sum_hd(qkv: &[f32], probs: &[f32], head: usize, out: &mut [f32
     out[24..32].copy_from_slice(&acc3.to_array());
 }
 
-fn cls_attention_direct(scratch: &mut Scratch, qkv: &[f32], s_len: usize, out: &mut [f32], pf: bool) {
+fn cls_attention_direct(
+    scratch: &mut Scratch,
+    qkv: &[f32],
+    s_len: usize,
+    out: &mut [f32],
+    pf: bool,
+) {
     scratch.ensure(s_len);
     let sc = NH * s_len;
     for head in 0..NH {
@@ -165,8 +171,15 @@ fn qkv_fixture(s_len: usize) -> Vec<f32> {
 }
 
 fn assert_close(a: &[f32], b: &[f32]) {
-    let max_delta = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-    assert!(max_delta == 0.0, "prefetch variant diverged from direct by {max_delta} (must be bit-identical)");
+    let max_delta = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_delta == 0.0,
+        "prefetch variant diverged from direct by {max_delta} (must be bit-identical)"
+    );
 }
 
 fn bench(c: &mut Criterion) {
@@ -189,18 +202,34 @@ fn bench(c: &mut Criterion) {
             let mut scratch = Scratch::default();
             let mut out = vec![0.0f32; H];
             b.iter(|| {
-                cls_attention_direct(black_box(&mut scratch), black_box(qkv), black_box(s_len), black_box(&mut out), false);
+                cls_attention_direct(
+                    black_box(&mut scratch),
+                    black_box(qkv),
+                    black_box(s_len),
+                    black_box(&mut out),
+                    false,
+                );
                 black_box(&out);
             });
         });
-        group.bench_with_input(BenchmarkId::new("direct_prefetch", s_len), &qkv, |b, qkv| {
-            let mut scratch = Scratch::default();
-            let mut out = vec![0.0f32; H];
-            b.iter(|| {
-                cls_attention_direct(black_box(&mut scratch), black_box(qkv), black_box(s_len), black_box(&mut out), true);
-                black_box(&out);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("direct_prefetch", s_len),
+            &qkv,
+            |b, qkv| {
+                let mut scratch = Scratch::default();
+                let mut out = vec![0.0f32; H];
+                b.iter(|| {
+                    cls_attention_direct(
+                        black_box(&mut scratch),
+                        black_box(qkv),
+                        black_box(s_len),
+                        black_box(&mut out),
+                        true,
+                    );
+                    black_box(&out);
+                });
+            },
+        );
     }
     group.finish();
 }
