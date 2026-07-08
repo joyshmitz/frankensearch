@@ -9684,3 +9684,70 @@ conformance AND thus verification of any production wiring in native.rs (e.g. wi
 prefetch win `6af65a7`, whose measurement is bench-only and clean). Reranker BENCHES are unaffected (bench
 builds skip `#[cfg(test)]` units). Owner action: align the test to the field type (drop the `Arc::new` wrap
 or fix the field) so `--features native` tests compile.
+
+### 2026-07-08 — CobaltRidge — CLS-attention prefetch production wiring did not reproduce (REJECTED)
+
+**Lever tested.** Revisited the `cls_attention_prefetch` route-next from bench-only commit `6af65a7`: wire
+the measured `_mm_prefetch` helper into `native.rs`'s final-layer CLS QK loop and weighted-value loop. The old
+bench row looked like a 7-10% long-sequence win, but production wiring needs a fresh same-lane proof before
+landing.
+
+**Measured command.** The user requested `cargo bench --release`; this checkout rejects that bench form, so
+the supported release-profile equivalent was used with the requested target dir:
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch exec -- cargo bench -p frankensearch-rerank --features native \
+    --profile release --bench cls_attention_prefetch -- cls_attention_prefetch \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3
+```
+
+RCH had no admissible worker and ran locally. The bench asserts max-delta 0.0 between ORIG and prefetched
+output before timing.
+
+| s_len | ORIG `direct_rank1` median | `direct_prefetch` median | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| 64 | 6.4203 us | 6.9231 us | 1.078x | reject |
+| 128 | 15.305 us | 15.333 us | 1.002x | reject |
+| 256 | 32.221 us | 31.229 us | 0.969x, CI overlap | reject |
+| 512 | 64.232 us | 65.016 us | 1.012x | reject |
+
+**Decision:** do not wire the fixed-distance `j+4` prefetch helper into production. The requested-lane rerun
+does not reproduce the old scratch win; only the 256 row brushes the keep threshold and its CIs overlap, while
+512 is neutral/slower. Future prefetch work needs a materially different primitive, such as an
+architecture-gated distance sweep with same-worker proof.
+
+### 2026-07-08 — CobaltRidge — CLS fused softmax-value tail is hardware-sensitive (REJECTED)
+
+**Lever tested.** Dug a new FlashAttention-style primitive on the same hot final-layer CLS attention tail:
+keep the raw QK score row, but fuse softmax exponentiation with value accumulation so the path no longer
+writes normalized probabilities and rereads them in a separate weighted-value pass. The temporary A/B arm was
+added to `cls_attention_ab`, measured, then reverted; no production code remains.
+
+**Measured command:**
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch exec -- cargo bench -p frankensearch-rerank --features native \
+    --profile release --bench cls_attention_ab -- cls_attention \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5
+```
+
+The first local fallback showed a tempting 512-only win, but RCH then selected `vmi1227854`; the same-worker
+remote run is the keep/reject proof below. RCH rewrote the target dir to
+`.rch-target-vmi1227854-pool-6506c93c0b5528bd235a66e7c27e2e88`.
+
+| s_len | ORIG `direct_rank1` median | `fused_softmax_value` median | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| 64 | 5.9707 us | 6.1778 us | 1.035x | reject |
+| 128 | 12.547 us | 12.692 us | 1.012x | reject |
+| 256 | 25.139 us | 25.819 us | 1.027x | reject |
+| 384 | 39.874 us | 41.834 us | 1.049x | reject |
+| 512 | 57.818 us | 58.312 us | 1.009x | reject |
+
+**Decision:** no production change. Fusing the softmax-value tail saves a write/read of normalized
+probabilities but loses the current path's simpler split loops; on the worker proof it is neutral/slower all
+the way through max length. Do not retry this exact fused tail without a lower-level implementation that keeps
+the vector exp throughput while reducing the per-lane value accumulation overhead.
