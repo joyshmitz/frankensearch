@@ -10057,6 +10057,32 @@ A bold structurally-different probe, the OPPOSITE SIGN of neighbor-smoothing (`5
 
 **Net: the deployable (query-free) hubness/CSLS correction is REJECTED** — marginal and corpus-fragile, and its cheapest viable proxy's apparent win is decorrelation not retrieval (oracle-refuted). The primitive class has a real but modest ceiling (~+0.005 on 3/4) realizable ONLY with QUERY-SIDE hubness: maintain per-doc k-occurrence over a background query log / query-embedding stream, then `s'=cos−β·r_d^query`. That is a genuine route-next FEATURE (needs a query log), not a cheap graph-reuse drop-in. Ties the "hybrid absorbs dense micro-opts" theme (`43be67e`/`19787ed`/`6d1612c`): a dense-side correction the hybrid mostly absorbs, robust only where the embedder's topical signal actively MISLEADS. No Rust land (no query-free primitive worth shipping); no code change → conformance unaffected. Verified: `fastembed` BGE-small + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana/scidocs full test sets, no cargo/torch. `hubness_csls.py` (doc-density) / `hubness_query.py` (oracle) / `hubness_centroid.py` (centroid + ABT) in `$D`.
 
+### 2026-07-09 — SearchCod — REJECTED: storage `check_dedup_batch` slot-aligned VALUES join loses to the LEGACY ORIGINAL Rust map materialization
+
+Re-profiled away from the previously mined exact-id/fusion/vector/rerank/embedding/TUI paths and targeted
+`frankensearch-storage::Storage::check_dedup_batch`, a storage lookup path that builds dedup decisions for ingest
+batches. Primitive class: **algebraic-fusion / data-layout**. The rejected candidate pushed the request batch into
+SQLite as an ordered `WITH requested(ord, doc_id) AS (VALUES ...)` relation and consumed slot-aligned rows, removing
+the Rust `HashMap<String, DedupRow>` materialization and per-input map probe.
+
+Bench: local fallback after the requested RCH release test job stopped making progress in optimized storage
+codegen. Command:
+`CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod cargo bench -p frankensearch-storage --profile release --bench dedup_batch -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.8`.
+The bench carries the LEGACY ORIGINAL map implementation in the same binary, asserts equal decisions before timing,
+and uses a mixed batch of missing, embedded, changed, failed, and skipped docs.
+
+| batch | LEGACY ORIGINAL median | VALUES slot-join median | ratio-vs-ORIG |
+|---:|---:|---:|---:|
+| 32 | 412.75 us | 477.96 us | 1.158x slower |
+| 128 | 4.6572 ms | 5.1901 ms | 1.114x slower |
+| 384 | 40.948 ms | 49.202 ms | 1.202x slower |
+
+Verdict: **REJECTED and production code restored**. SQLite's CTE/VALUES planning and left-join cost outweighed the
+saved Rust map allocation/probes on this path. Do not re-try the ordered `VALUES`/slot-alignment rewrite for
+`check_dedup_batch`; the legacy `IN (...)` query plus Rust map remains faster for the measured ingest batch shapes.
+Conformance: focused storage dedup tests GREEN (`cargo test -p frankensearch-storage check_dedup`, 12 passed / 0
+failed). Repro bench retained as `crates/frankensearch-storage/benches/dedup_batch.rs`.
+
 ### 2026-07-09 — FlintOsprey — LANDED (reverses the round-3 rejection): QUERY-SIDE hubness correction — estimating each doc's hub-ness from a leakage-free BACKGROUND QUERY SAMPLE realizes the headroom the query-free proxies could not — all-positive +0.0033 mean hybrid nDCG@10 (β=0.2), with genuine DENSE-tier gains on stance/citation corpora (arguana +0.0128, scidocs +0.0078)
 
 Direct follow-up to the round-3 hubness REJECTION (`64ac8b7`), which showed the mechanism is real (leaky oracle ~+0.005 on 3/4) but NO query-free proxy (doc-density/centroid/PC) captures it — they conflate hubs with tight relevant clusters. The route-next was "true hubness is a QUERY-distribution statistic; needs a query sample." Tested that directly, **leakage-free**: split each corpus's queries DISJOINTLY (interleaved), estimate per-doc `r_d` = mean cos of doc `d` to its Kq=10 nearest BACKGROUND queries, apply `s'(q,d)=cos−β·r_d` to the held-out EVAL half. BGE-small hybrid, `rank_bm25` stem+stop, full BEIR, nDCG@10, `background_hubness.py` in `$D`:

@@ -3865,3 +3865,25 @@ touched-file UBS scan still reports pre-existing panic/unwrap inventories in exi
 
 One adjacent compile fix is included: `tools/optimize_params` now fills the newly added `RrfConfig` fields via
 `..RrfConfig::default()`, which was required for the workspace compile proof to stay green.
+
+---
+
+## 2026-07-09 — Storage dedup batch VALUES slot-join REJECTED (SearchCod)
+
+Different hot path from the recent search/fusion/TUI lanes: `frankensearch-storage::Storage::check_dedup_batch`.
+Primitive class: **algebraic-fusion / data-layout**. Candidate replaced the LEGACY ORIGINAL `IN (...)` query plus
+Rust `HashMap<String, DedupRow>` with an ordered `WITH requested(ord, doc_id) AS (VALUES ...)` relation returning
+slot-aligned rows. Production code was restored after measurement.
+
+Bench command (local fallback after the requested RCH release test job stopped making progress in optimized
+storage codegen): `CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod cargo bench -p frankensearch-storage --profile release --bench dedup_batch -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.8`.
+
+| batch | LEGACY ORIGINAL median | VALUES slot-join median | ratio-vs-ORIG |
+|---:|---:|---:|---:|
+| 32 | 412.75 us | 477.96 us | 1.158x slower |
+| 128 | 4.6572 ms | 5.1901 ms | 1.114x slower |
+| 384 | 40.948 ms | 49.202 ms | 1.202x slower |
+
+Conclusion: no ship. The CTE/VALUES join costs more than it saves in Rust map allocation/probes for the measured
+batch shapes. Focused conformance: `cargo test -p frankensearch-storage check_dedup` passed 12 tests / 0 failed.
+Repro bench retained at `crates/frankensearch-storage/benches/dedup_batch.rs`.
