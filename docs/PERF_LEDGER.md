@@ -3640,6 +3640,37 @@ Giesen widen is itself bit-exact to `f16::to_f32()` (exhaustively verified in si
 Conformance: `cargo test -p frankensearch-index --lib` = **389 passed / 0 failed**; bench green via RCH (exit
 0, parity asserted). Files: `simd.rs` (widen8_f16_bytes → pub(crate)), `search.rs` (quantize rewrite + import).
 
+## 2026-07-09 — f16-slab → 4-bit slab packing SIMD widen (SearchCod)
+
+Runtime commit `11ba0a9` closes the route-next from the int8 quantization entry above: `pack_4bit_f16_bytes`
+now builds the signed 4-bit two-pass slab by decoding f16 bytes 8 lanes at a time through
+`simd.rs::widen8_f16_bytes`, then keeps the existing scalar max-abs scale, rounding, clamp, and nibble packing.
+Primitive class: **SIMD-within-register / branchless widen**. This is a different path from the rejected live
+search stream state-cell and storage VALUES attempts; it touches only the cold slab build for the 4-bit
+two-pass vector scan.
+
+Measured command (per-crate RCH, worker `hz2`; the bench embeds the LEGACY ORIGINAL scalar packer and asserts
+`scalar == simd_widen` before timing each row):
+
+```bash
+AGENT_NAME=SearchCod \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+    --bench f16_slab_pack4bit -- f16_slab_pack4bit \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.35 --noplot
+```
+
+| vectors | LEGACY ORIGINAL scalar decode | SIMD widen packer | ratio-vs-ORIG | Decision |
+|---:|---:|---:|---:|---|
+| 1,000 | 2.7226 ms | 1.3581 ms | 0.499 / 2.00x faster | keep |
+| 10,000 | 27.041 ms | 14.328 ms | 0.530 / 1.89x faster | keep |
+| 50,000 | 136.35 ms | 69.297 ms | 0.508 / 1.97x faster | keep |
+
+Proof: the same Giesen widen helper is already exhaustively checked against `f16::to_f32()` in `simd.rs`; the
+bench's equality assert covers the full 4-bit slab bytes for every measured vector count. Since the scale is
+corpus-wide and the nibble packer is unchanged, query rankings and byte layout are unchanged. Conformance for
+this ledger closeout is the RCH bench exit 0 plus focused index checks below in this session.
+
 ---
 
 ## 2026-07-09 — Ops historical analytics percentile selection (SearchCod)
