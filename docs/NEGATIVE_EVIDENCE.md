@@ -9980,3 +9980,43 @@ faster than, moving exact percentile selection into Rust for this materializatio
 should first profile a structurally different primitive such as a covering `(project_key, instance_id, ts_ms,
 latency_us)` index, incremental rollup deltas, or bounded-memory approximate sketches with an explicit accuracy
 contract.
+
+---
+
+### 2026-07-08 — FlintOsprey — Tombstone bitmap does NOT pay in the REAL fused int8 scan: isolation win (0.921×) evaporates end-to-end (wash / ~2% slower) because the FMA-bound loop already hides the flag read
+
+Last round (`df2f82c`) an ISOLATION bench (`tombstone_bitmap_scan`) showed a contiguous 1-bit/vector "live"
+bitmap beating the file-backed `VectorIndex` int8 scan's strided per-record flag read by **0.921× / ~8.6%**
+on the common (scattered ~1% tombstone) case — the hypothesis being that the flag is a costly SECOND memory
+stream (16-byte-strided records region, separate from the int8 slab) whose TLB/prefetcher pressure the bitmap
+removes. This round I WIRED it into production (`VectorIndex::int8_scan_range` + a `tombstone_live_bitmap:
+OnceLock<Vec<u64>>` built lazily, kept current at the sole in-place flag mutator `set_record_flags`, reset on
+`compact`) with a soft-delete cache-coherence test, then measured the **real end-to-end path** via
+`fsvi_int8_two_pass` (N=100k, dim=384, k=10, mult=5, real on-disk index) as a faithful A/B (bitmap-read vs the
+LEGACY strided-flag loop, toggling only that inner check):
+
+| int8_mult5 arm | median | 95% CI | recall@10 |
+|---|---:|---|---:|
+| LEGACY ORIGINAL (strided flag) | **961.20 µs** | [947.11, 975.28] | 1.0000 |
+| bitmap (wired) | **979.64 µs** | [957.45, 1016.3] | 1.0000 |
+
+**Ratio vs ORIG = 1.019× (~2% SLOWER), CIs heavily overlapping → no win; a wash-to-slight-regression.** REVERTED
+the wiring cleanly (390/390 lib tests incl. the coherence test had passed — the change was *correct*, just not
+*faster*). Conformance GREEN (code restored bit-for-bit to HEAD).
+
+**Why the isolation bench overstated (the lesson):** the real int8 pass-1 is **FMA-compute-bound**, not
+bandwidth-bound (see "batched query scan compute-bound"). In the fused loop the strided 2-byte flag load issues
+on the load ports and completes *in the shadow of* the ~384-wide int8 dot's latency — it is effectively free.
+Removing it therefore saves nothing, and the bitmap's `shift/mask/bounds-check` adds a hair of ALU, netting
+≈0 (slightly negative). The isolation microbench measured a bare scan loop where the flag access was NOT hidden
+by enough surrounding compute, so it manufactured an ~8.6% delta that does not exist in the optimized fused
+path. **METHODOLOGY: an isolation A/B of a secondary MEMORY access can overstate its cost whenever the real
+loop hides that access under compute; only the end-to-end A/B on the actual code path is authoritative.** This
+corrects the `df2f82c` "worth wiring" conclusion.
+
+**Route-next (untested, low-confidence):** the bitmap could still pay on a genuinely BANDWIDTH-bound scan where
+the flag read is NOT hidden — e.g. the exact **F32** flat scan (`scan_range_chunk`, 1536 B/vec, noted
+bandwidth-bound at 100k elsewhere in this doc) rather than the compute-bound int8/f16 scans. Not pursued: the
+F32 exact path is not the shipped ANN hot path, and the expected win is small. The `tombstone_bitmap_scan`
+isolation bench (`df2f82c`) stays as a cautionary artifact; do not re-wire the bitmap into any COMPUTE-bound
+scan.
