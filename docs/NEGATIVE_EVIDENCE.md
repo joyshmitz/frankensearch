@@ -10100,3 +10100,45 @@ Direct follow-up to the round-3 hubness REJECTION (`64ac8b7`), which showed the 
 3. **The measured value is a LOWER BOUND.** `r_d` was estimated from only 150–500 background queries (half the test set); a production query log (thousands) estimates hubness far better, so the deployable win is ≥ the measured +0.0033. β=0.2 is the never-negative default; β=0.3 is higher-gain on stance/citation corpora (arguana +0.0089) at the cost of a scifact tie.
 
 **LANDED (Rust, `ba5052a`):** `hubness` module in `frankensearch-fusion` — `apply_hubness_penalty` (query-time O(pool) subtract indexed by `VectorHit::index`) + `compute_query_hubness` (offline/amortized builder: per-doc mean-cos to the Kq nearest sample queries, recomputed periodically from the query log). 7 unit tests GREEN incl. the hub-demotion property. Latency A/B vs the no-correction ORIGINAL (bench `hubness_penalty`: query-time correction is LATENCY-NEUTRAL vs the no-op ORIGINAL — identity 166/295/2802 ns vs correct 175/292/2711 ns at pool 50/100/1000, within noise, the subtract is free under the clone; the offline builder is ~109 ms/696 ms @ 2000×200/5000×500 docs×queries, amortized). Non-breaking, opt-in; the query-sample builder is the deployment dependency (a rolling query-embedding sample — the engine already sees the query stream). Verified: `fastembed` BGE-small + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana/scidocs, disjoint leakage-free split, no cargo/torch for the quality measurement. Route-next: larger background samples (predicted to lift toward the +0.005 oracle); compose with pool-min-max fusion (`45530fb`) — hubness acts on dense scores pre-fusion, orthogonal to the fusion normalization.
+
+### 2026-07-09 — SearchCod — REJECTED: live-search stream state-cell data layout loses on final release A/B
+
+**Ledger scan before trying this:** avoided the recent exhausted rows in core classification/canonicalization/fingerprint,
+fusion materialization/RRF, rerank attention/softmax, TUI palette/keymap, FSFS sidecar/tokenizer/sniff paths, and index
+scan/tombstone variants. The chosen path was different: `LiveSearchStreamEmitter::publish_search`, called from
+`TwoTierSearcher::emit_search_telemetry` after every emitted search telemetry envelope.
+
+**Primitive class:** data-layout / synchronization fusion, inspired by the graveyard queue/ring-buffer family but kept
+inside the existing safe synchronous API. Candidate collapsed the queue plus `next_sequence`, emitted/drop/backpressure,
+and pending-drop counters into one mutex-protected state cell, pre-sized the bounded `VecDeque`, and explicitly released
+the guard before returning the publish outcome. Since the old implementation already takes the queue mutex, the hypothesis
+was that separately atomic counters were redundant synchronization work in the full-buffer lossy path.
+
+**Final measured proof (deciding run):**
+
+```bash
+AGENT_NAME=SearchCod \
+CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod \
+rch exec -- cargo bench -p frankensearch-core --profile release \
+  --bench search_stream_publish search_stream_publish \
+  -- --sample-size 20 --warm-up-time 1 --measurement-time 1
+```
+
+RCH worker: `vmi1293453`. Same-binary A/B against a benchmark-local copy of the LEGACY ORIGINAL atomic-counter emitter.
+
+| row | median | 95% CI | ratio vs ORIG |
+|---|---:|---:|---:|
+| `search_stream_publish/full_lossy_cap1024/legacy_atomic_ORIG` | 237.59 ns | [226.43, 247.79] ns | 1.000 |
+| `search_stream_publish/full_lossy_cap1024/state_cell` | 265.76 ns | [254.42, 276.94] ns | **1.119 slower** |
+
+**Decision:** REJECTED and production source restored. Do not retry the "put all live-search stream counters inside the
+queue mutex" version for this single-producer full-buffer path. The reduced atomic traffic is outweighed by the larger
+locked state / counter updates in the measured code. A future attempt needs a genuinely different profile, such as
+contended multi-producer publishing, and a different primitive class (for example a real bounded ring queue), not this
+state-cell rewrite.
+
+**Conformance/evidence:** `cargo test -p frankensearch-core --lib collectors` was GREEN (76/76) on the candidate before
+the final revert; `cargo clippy -p frankensearch-core --lib --bench search_stream_publish -- -D warnings` was GREEN after
+the lock-lifetime fix; `rustfmt --check crates/frankensearch-core/src/collectors.rs
+crates/frankensearch-core/benches/search_stream_publish.rs` was GREEN. `cargo check -p frankensearch-core --all-targets`
+exited 0 with the existing `simhash_vote_simd` unsafe-op warnings. No runtime code shipped.
