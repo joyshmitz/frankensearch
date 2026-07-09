@@ -89,5 +89,9 @@ harness = false
 name = "code_tokenize"
 harness = false
 
+[[bench]]
+name = "code_sidecar_score"
+harness = false
+
 [lints]
 workspace = true

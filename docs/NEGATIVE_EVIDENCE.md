@@ -9894,9 +9894,9 @@ CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod RUST_LOG=o
 
 | Candidate count | LEGACY ORIGINAL `score_query` loop | LANDED `prior_signals` | Ratio vs ORIG |
 |---:|---:|---:|---:|
-| 32 | 47.266 us | 37.336 us | 0.790 / 1.266x faster |
-| 128 | 194.71 us | 153.70 us | 0.789 / 1.267x faster |
-| 512 | 870.96 us | 707.56 us | 0.812 / 1.231x faster |
+| 32 | 42.975 us | 35.938 us | 0.836 / 1.196x faster |
+| 128 | 182.99 us | 149.91 us | 0.819 / 1.221x faster |
+| 512 | 779.62 us | 624.79 us | 0.801 / 1.248x faster |
 
 **Do not repeat / misroute:** this does not revive the rejected FSFS token-scanner variants, signal-token
 materialization, durability trailer packing, storage batching, exact-id fusion probes, dense vector top-k

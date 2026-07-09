@@ -145,6 +145,12 @@ pub struct CodeStructureMatchEvidence {
     pub matched_signals: Vec<CodeStructureMatchedSignal>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedCodeStructureQuery {
+    tokens: BTreeSet<String>,
+    normalized: String,
+}
+
 /// Candidate row after optional sidecar adjustment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeStructureRankedCandidate {
@@ -211,9 +217,13 @@ impl CodeStructureSidecar {
         query: &str,
         candidates: &[FusedCandidate],
     ) -> HashMap<String, RankingPriorSignals> {
+        let prepared_query = prepare_query(query);
         let mut signals = HashMap::new();
         for candidate in candidates {
-            let evidence = self.score_query(query, &candidate.doc_id);
+            let Some(document) = self.documents.get(&candidate.doc_id) else {
+                continue;
+            };
+            let evidence = score_document_prepared(&prepared_query, document);
             if evidence.score > 0.0 {
                 signals.insert(
                     candidate.doc_id.clone(),
@@ -232,19 +242,29 @@ impl CodeStructureSidecar {
         config: CodeStructureSidecarConfig,
     ) -> Vec<CodeStructureRankedCandidate> {
         let config = config.normalized();
+        let prepared_query = config.enabled.then(|| prepare_query(query));
         let mut ranked: Vec<CodeStructureRankedCandidate> = candidates
             .iter()
             .map(|candidate| {
-                let evidence = if config.enabled {
-                    self.score_query(query, &candidate.doc_id)
-                } else {
-                    CodeStructureMatchEvidence {
+                let evidence = prepared_query.as_ref().map_or_else(
+                    || CodeStructureMatchEvidence {
                         doc_id: candidate.doc_id.clone(),
                         score: 0.0,
                         reason_code: "code_structure.disabled".to_owned(),
                         matched_signals: Vec::new(),
-                    }
-                };
+                    },
+                    |prepared_query| {
+                        self.documents.get(&candidate.doc_id).map_or_else(
+                            || CodeStructureMatchEvidence {
+                                doc_id: candidate.doc_id.clone(),
+                                score: 0.0,
+                                reason_code: "code_structure.no_document".to_owned(),
+                                matched_signals: Vec::new(),
+                            },
+                            |document| score_document_prepared(prepared_query, document),
+                        )
+                    },
+                );
                 let sidecar_boost = config.boost_for(evidence.score);
                 CodeStructureRankedCandidate {
                     doc_id: candidate.doc_id.clone(),
@@ -404,9 +424,23 @@ fn python_decl_name(line: &str, prefix: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn prepare_query(query: &str) -> PreparedCodeStructureQuery {
+    PreparedCodeStructureQuery {
+        tokens: tokenize(query),
+        normalized: normalize_signal_value(query),
+    }
+}
+
 fn score_document(query: &str, document: &CodeStructureDocument) -> CodeStructureMatchEvidence {
-    let query_tokens = tokenize(query);
-    if query_tokens.is_empty() {
+    let prepared_query = prepare_query(query);
+    score_document_prepared(&prepared_query, document)
+}
+
+fn score_document_prepared(
+    prepared_query: &PreparedCodeStructureQuery,
+    document: &CodeStructureDocument,
+) -> CodeStructureMatchEvidence {
+    if prepared_query.tokens.is_empty() {
         return CodeStructureMatchEvidence {
             doc_id: document.doc_id.clone(),
             score: 0.0,
@@ -415,7 +449,6 @@ fn score_document(query: &str, document: &CodeStructureDocument) -> CodeStructur
         };
     }
 
-    let normalized_query = normalize_signal_value(query);
     let mut raw_score = 0.0;
     let mut matched = BTreeSet::new();
     // Reused across signals: the per-token lowercase scratch is allocated once for
@@ -424,7 +457,7 @@ fn score_document(query: &str, document: &CodeStructureDocument) -> CodeStructur
 
     for signal in &document.signals {
         if let Some(token) =
-            smallest_matching_token(&query_tokens, &signal.value, &mut token_scratch)
+            smallest_matching_token(&prepared_query.tokens, &signal.value, &mut token_scratch)
         {
             raw_score += signal_weight(signal.kind);
             matched.insert(CodeStructureMatchedSignal {
@@ -433,7 +466,8 @@ fn score_document(query: &str, document: &CodeStructureDocument) -> CodeStructur
                 matched_token: token,
             });
         }
-        if normalized_query.len() >= 3 && signal.value.contains(&normalized_query) {
+        if prepared_query.normalized.len() >= 3 && signal.value.contains(&prepared_query.normalized)
+        {
             raw_score += 0.2;
         }
     }
@@ -578,7 +612,7 @@ fn smallest_matching_token(
 
 #[inline]
 fn consider_token(best: &mut Option<String>, current: &str, query_tokens: &BTreeSet<String>) {
-    if query_tokens.contains(current) && best.as_deref().map_or(true, |b| current < b) {
+    if query_tokens.contains(current) && best.as_deref().is_none_or(|best| current < best) {
         *best = Some(current.to_owned());
     }
 }
@@ -655,10 +689,10 @@ mod tests {
             "authenticate_user_session",
             "src/auth/login_handler.rs",
             "NoMatchHereJustFiller",
-            "rank_symbols rank_symbols",     // duplicate token
-            "café Σigma auth naïve",         // non-ASCII: fallback path
-            "\u{212A}elvin token",           // KELVIN SIGN → ascii 'k' (fallback)
-            "user",                          // single token
+            "rank_symbols rank_symbols", // duplicate token
+            "café Σigma auth naïve",     // non-ASCII: fallback path
+            "\u{212A}elvin token",       // KELVIN SIGN → ascii 'k' (fallback)
+            "user",                      // single token
         ];
         for qs in &query_sets {
             let query: BTreeSet<String> = qs.iter().map(|s| (*s).to_owned()).collect();
@@ -692,8 +726,8 @@ mod tests {
             "  ##   Authentication  Guide   ",
             "\ttrait   TokenStore\t",
             "MixedCase_Ident",
-            "café  Σigma  NAÏVE",              // non-ASCII: only ASCII is lowercased
-            "line\u{000B}with\u{000B}vtab",     // vertical tab is Unicode whitespace
+            "café  Σigma  NAÏVE", // non-ASCII: only ASCII is lowercased
+            "line\u{000B}with\u{000B}vtab", // vertical tab is Unicode whitespace
             "trailing and leading  \n\t ",
         ];
         for value in cases {
@@ -862,6 +896,35 @@ mod tests {
 
         assert_eq!(boosted[0].doc_id, "doc-b");
         assert!(boosted[0].prior_boost > 0.0);
+    }
+
+    #[test]
+    fn prior_signals_match_legacy_per_candidate_scoring() {
+        let sidecar = CodeStructureSidecar::from_documents([
+            ("doc-a", "src/rank.rs", "pub fn rank_symbols() {}"),
+            ("doc-b", "docs/rank.md", "# Ranking Symbols\n"),
+        ]);
+        let candidates = vec![
+            candidate("doc-a", 0.4),
+            candidate("missing", 0.3),
+            candidate("doc-b", 0.2),
+        ];
+        let query = "rank symbols";
+        let mut legacy = HashMap::new();
+        for candidate in &candidates {
+            let evidence = sidecar.score_query(query, &candidate.doc_id);
+            if evidence.score > 0.0 {
+                legacy.insert(
+                    candidate.doc_id.clone(),
+                    RankingPriorSignals::default().with_code_structure(Some(evidence.score)),
+                );
+            }
+        }
+
+        assert_eq!(
+            sidecar.prior_signals_for_candidates(query, &candidates),
+            legacy
+        );
     }
 
     #[test]

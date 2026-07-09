@@ -3572,3 +3572,37 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod RUST_LOG=off \
 swept length. The production path is stricter than the benchmarked candidate: it uses q-cache only at
 `s_len >= 256`, preserving the old direct rank-1 path for 64 and 128 token cases. No softmax, value-sum,
 prefetch, or BMM repack behavior is changed.
+
+---
+
+## 2026-07-09 — FSFS code-structure sidecar query-state hoist across candidates (SearchCod)
+
+Commit lands an algebraic/dataflow-fusion primitive in `frankensearch-fsfs`'s code-structure sidecar:
+`prior_signals_for_candidates` and enabled `rank_candidates` now prepare the query token set and normalized
+query string once per candidate list, then score each document with that prepared query. The legacy original
+prepared the same query state inside `score_query(query, doc_id)` once per candidate. This is a different path
+from the rejected rerank attention, dense vector top-k, fusion exact-id/materialization, storage batching, and
+durability trailer seams.
+
+Measured command (requested RCH runs on `vmi1264463` went stale twice and were cancelled cleanly; this is the
+local fallback using the requested target dir and release profile):
+
+```bash
+AGENT_NAME=SearchCod \
+CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod RUST_LOG=off \
+  cargo bench -p frankensearch-fsfs --no-default-features --profile release \
+    --bench code_sidecar_score -- sidecar_candidate_score \
+    --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+| Candidate count | LEGACY ORIGINAL `score_query` loop | LANDED `prior_signals` | Ratio vs ORIG | Decision |
+|---:|---:|---:|---:|---|
+| 32 | 42.975 us | 35.938 us | 0.836 / 1.196x faster | keep |
+| 128 | 182.99 us | 149.91 us | 0.819 / 1.221x faster | keep |
+| 512 | 779.62 us | 624.79 us | 0.801 / 1.248x faster | keep |
+
+**Primitive / proof:** this factors invariant query preparation out of the candidate loop. `score_query` is
+unchanged for single-document callers and remains the legacy comparator in the bench. The benchmark asserts
+the candidate-list map equals the legacy per-candidate loop before timing, and the unit test
+`prior_signals_match_legacy_per_candidate_scoring` covers matching rows plus missing-document behavior. Output
+reason codes, matched signals, sidecar boosts, and deterministic tie-breaks are unchanged.
