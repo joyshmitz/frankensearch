@@ -91,7 +91,10 @@ pub use queue::{
     EmbeddingJob, EmbeddingQueue, EmbeddingQueueConfig, EmbeddingRequest, JobOutcome, QueueMetrics,
 };
 pub use refresh::{RefreshMetrics, RefreshMetricsSnapshot, RefreshWorker, RefreshWorkerConfig};
-pub use rrf::{RrfConfig, candidate_count, pool_minmax_fuse, rrf_fuse, rrf_fuse_with_graph};
+pub use rrf::{
+    RrfConfig, candidate_count, pool_minmax_fuse, pool_minmax_fuse_merge, rrf_fuse,
+    rrf_fuse_with_graph,
+};
 pub use searcher::TwoTierSearcher;
 pub use smooth::{SmoothConfig, neighbor_smooth};
 pub use sync_searcher::{SyncLexicalSearch, SyncSearchIterator, SyncTwoTierSearcher};

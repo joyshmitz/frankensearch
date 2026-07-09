@@ -608,6 +608,127 @@ pub fn pool_minmax_fuse(
         .collect()
 }
 
+/// Merge-structured [`pool_minmax_fuse`] — **bit-identical** output, built so the final sort
+/// receives a **near-sorted** (semantic-ordered) input.
+///
+/// The value-map [`pool_minmax_fuse`] accumulates every doc into one `N`-entry
+/// `HashMap<&str, FusedHitScratch>` and then `into_values()` in **random** hash order, forcing
+/// a from-scratch `O(N log N)` sort on the `limit_all` shape (window ≥ N). This variant instead
+/// keeps only a small `&str → (rank, score)` **lexical** contribution map (cache-resident) and
+/// walks the already-score-sorted `semantic` slice **once in order**, emitting each fused hit
+/// directly into `results`. A semantic-only doc's fused score is the monotone
+/// `semantic_weight · minmax_norm(score)`, so it lands in fused order and the final sort runs
+/// near-`O(N)` (pdqsort is adaptive). Same structure that made [`rrf_fuse_with_graph_merge`]
+/// beat the RRF value-map on the `limit_all` shape (`4aeb66b`, 1.31–1.46×).
+///
+/// **Bit-identical** to [`pool_minmax_fuse`]: f64 addition is commutative (emitting
+/// `semantic + lexical` yields the same fused score as `lexical + semantic`), the same
+/// first-occurrence dedup on each tier, and the same total-order [`FusedHitScratch::cmp_for_ranking`]
+/// comparator. Verified by `pool_minmax_merge_matches_map`. This is the variant a searcher should
+/// wire once pool-min-max fusion is enabled (as the searcher already uses
+/// [`rrf_fuse_with_graph_merge_unique`] over the map RRF).
+#[must_use]
+#[allow(clippy::similar_names)] // `lex_map` (contribution map) vs `lex_max` (pool max)
+#[instrument(
+    name = "frankensearch::pool_minmax_fuse_merge",
+    skip(lexical, semantic),
+    fields(
+        lexical_count = lexical.len(),
+        semantic_count = semantic.len(),
+        limit,
+        offset,
+    )
+)]
+pub fn pool_minmax_fuse_merge(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+) -> Vec<FusedHit> {
+    let lexical_weight = sanitize_tier_weight(config.lexical_weight);
+    let semantic_weight = sanitize_tier_weight(config.semantic_weight);
+    let tiebreak = config.tiebreak;
+
+    let (lex_min, lex_max) = pool_min_max(lexical.iter().map(|r| r.score));
+    let (sem_min, sem_max) = pool_min_max(semantic.iter().map(|h| h.score));
+
+    // Small cache-resident lexical contribution map (first occurrence wins, matching the
+    // value-map version's `Entry::Occupied … lexical_rank.is_some() … continue`).
+    let mut lex_map: AHashMap<&str, (usize, f32)> = AHashMap::with_capacity(lexical.len());
+    for (rank, result) in lexical.iter().enumerate() {
+        lex_map
+            .entry(result.doc_id.as_str())
+            .or_insert((rank, result.score));
+    }
+
+    let capacity = (lexical.len() + semantic.len()) * 3 / 4 + 1;
+    let mut results: Vec<FusedHitScratch<'_>> = Vec::with_capacity(capacity);
+    let mut seen_semantic: ahash::AHashSet<&str> = ahash::AHashSet::with_capacity(semantic.len());
+
+    // Walk the score-sorted `semantic` slice once → near-sorted `results`.
+    for (rank, hit) in semantic.iter().enumerate() {
+        let doc_id = hit.doc_id.as_str();
+        if !seen_semantic.insert(doc_id) {
+            continue; // first semantic occurrence wins (matches the value-map version)
+        }
+        let lex = lex_map.remove(doc_id);
+        let sem_norm = minmax_norm(hit.score, sem_min, sem_max);
+        // `semantic + lexical` == the map version's `lexical + semantic` (f64 add commutes).
+        let mut fused = semantic_weight * sem_norm;
+        if let Some((_, lex_score)) = lex {
+            fused += lexical_weight * minmax_norm(lex_score, lex_min, lex_max);
+        }
+        results.push(FusedHitScratch {
+            doc_id,
+            rrf_score: fused,
+            lexical_rank: lex.map(|(r, _)| r),
+            semantic_rank: Some(rank),
+            semantic_index: Some(hit.index),
+            graph_rank: None,
+            lexical_score: lex.map(|(_, s)| s),
+            semantic_score: Some(hit.score),
+            graph_score: None,
+            in_both_sources: lex.is_some(),
+        });
+    }
+    // Lexical-only docs (never seen in semantic): the semantic tier contributes its pool
+    // minimum (= 0.0 for min-max), so the fused score is the lexical term alone — identical to
+    // the map version's `lexical_weight · lex_norm + semantic_weight · 0.0`.
+    for (doc_id, (lex_rank, lex_score)) in lex_map.drain() {
+        results.push(FusedHitScratch {
+            doc_id,
+            rrf_score: lexical_weight * minmax_norm(lex_score, lex_min, lex_max),
+            lexical_rank: Some(lex_rank),
+            semantic_rank: None,
+            semantic_index: None,
+            graph_rank: None,
+            lexical_score: Some(lex_score),
+            semantic_score: None,
+            graph_score: None,
+            in_both_sources: false,
+        });
+    }
+
+    let window = limit.saturating_add(offset);
+    if window == 0 {
+        return Vec::new();
+    }
+    if window < results.len() {
+        let nth_index = window.saturating_sub(1);
+        results.select_nth_unstable_by(nth_index, |a, b| a.cmp_for_ranking(b, tiebreak));
+        results.truncate(window);
+    }
+    results.sort_unstable_by(|a, b| a.cmp_for_ranking(b, tiebreak));
+
+    results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(FusedHitScratch::into_owned)
+        .collect()
+}
+
 /// Merge-structured RRF: identical result to [`rrf_fuse_with_graph`], built so the
 /// final sort receives a **near-sorted** (semantic-ordered) input.
 ///
@@ -1038,6 +1159,78 @@ mod tests {
                     x.in_both_sources, y.in_both_sources,
                     "trial {trial} row {i}: in_both"
                 );
+                assert_eq!(
+                    x.lexical_score.map(f32::to_bits),
+                    y.lexical_score.map(f32::to_bits),
+                    "trial {trial} row {i}: lexical_score"
+                );
+                assert_eq!(
+                    x.semantic_score.map(f32::to_bits),
+                    y.semantic_score.map(f32::to_bits),
+                    "trial {trial} row {i}: semantic_score"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pool_minmax_merge_matches_map() {
+        // Same randomized harness as `merge_matches_map_fusion`, applied to the pool-min-max
+        // operator: `pool_minmax_fuse_merge` must be byte-identical to the value-map
+        // `pool_minmax_fuse` across varied overlap / dedup / pagination scenarios.
+        let mut st = 0x1234_5678_9ABC_DEF0_u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for trial in 0..40 {
+            let n_lex = (next() % 30) as usize;
+            let n_sem = (next() % 40) as usize;
+            let pool = 1 + (next() % 25) as usize;
+            let id = |x: u64| format!("doc-{:04}", x % pool as u64);
+
+            let lexical: Vec<ScoredResult> = (0..n_lex)
+                .map(|_| lexical_hit(&id(next()), (next() % 1000) as f32 * 0.01))
+                .collect();
+            // Semantic scores DESCENDING (score-sorted, as a vector index returns) so the merge
+            // path's near-sorted assumption is exercised; bit-identity must hold regardless.
+            let mut semantic: Vec<VectorHit> = (0..n_sem)
+                .map(|_| VectorHit {
+                    index: (next() % 10_000) as u32,
+                    score: (next() % 1000) as f32 * 0.001,
+                    doc_id: id(next()).into(),
+                })
+                .collect();
+            semantic.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+            // Vary tier weights across trials to exercise the weighted sum.
+            let cfg = RrfConfig {
+                lexical_weight: 1.0 + (next() % 3) as f64,
+                semantic_weight: 1.0 + (next() % 3) as f64,
+                ..RrfConfig::default()
+            };
+            let limit = 1 + (next() % 50) as usize;
+            let offset = (next() % 5) as usize;
+
+            let a = pool_minmax_fuse(&lexical, &semantic, limit, offset, &cfg);
+            let b = pool_minmax_fuse_merge(&lexical, &semantic, limit, offset, &cfg);
+
+            assert_eq!(a.len(), b.len(), "trial {trial}: length differs");
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert_eq!(x.doc_id, y.doc_id, "trial {trial} row {i}: doc_id");
+                assert_eq!(
+                    x.rrf_score.to_bits(),
+                    y.rrf_score.to_bits(),
+                    "trial {trial} row {i}: fused score not byte-identical ({} vs {})",
+                    x.rrf_score,
+                    y.rrf_score
+                );
+                assert_eq!(x.lexical_rank, y.lexical_rank, "trial {trial} row {i}: lexical_rank");
+                assert_eq!(x.semantic_rank, y.semantic_rank, "trial {trial} row {i}: semantic_rank");
+                assert_eq!(x.semantic_index, y.semantic_index, "trial {trial} row {i}: semantic_index");
+                assert_eq!(x.in_both_sources, y.in_both_sources, "trial {trial} row {i}: in_both");
                 assert_eq!(
                     x.lexical_score.map(f32::to_bits),
                     y.lexical_score.map(f32::to_bits),

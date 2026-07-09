@@ -57,6 +57,10 @@ name = "pool_minmax_fuse"
 harness = false
 
 [[bench]]
+name = "pool_minmax_merge_ab"
+harness = false
+
+[[bench]]
 name = "neighbor_smooth"
 harness = false
 

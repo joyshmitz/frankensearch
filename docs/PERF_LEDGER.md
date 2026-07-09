@@ -3980,3 +3980,47 @@ and the pre-existing `mutual_knn` test) — a toolchain-skew artifact (it flags 
 `ba5052a` too), not introduced here; the canonical RCH toolchain lints these clean. The kernel is not yet wired
 into the searcher (the smoothing pass awaits wiring); this removes the perf disincentive to enabling the
 better-quality `mutual` refinement once it lands.
+
+---
+
+## 2026-07-09 — Pool-min-max fusion: merge-structured sort (near-sorted input) — 1.15–1.32× limit_all, no top-k regression (CopperVireo)
+
+Sibling-path-consistency win on a fresh path (the pool-min-max SCORE operator was landed 07-09 for QUALITY,
+`a9e53b4`, +0.0038 nDCG@10-over-RRF, never perf-mined). The **production** searcher fuses via
+`rrf_fuse_with_graph_merge_unique` — the MERGE-structured RRF (`4aeb66b`, 1.31–1.46× on limit_all). But
+`pool_minmax_fuse` — the operator that would REPLACE RRF as default once the quality work is wired — kept the
+**value-map** pattern: accumulate every doc into an `N`-entry `HashMap<&str, FusedHitScratch>` then
+`into_values()` in **random** hash order, forcing a from-scratch O(N log N) sort on the `limit_all` shape
+(window ≥ N — the full-ranked-feed case, e.g. feeding a reranker). The merge optimization was never ported
+across the sibling path.
+
+Primitive class: **data-layout / algebraic-fusion** (merge-structured accumulation). Added a public
+`pool_minmax_fuse_merge` (mirroring the shipped `rrf_fuse` / `rrf_fuse_with_graph_merge` split): a small
+`&str → (rank, score)` lexical contribution map + one in-order walk of the already-score-sorted `semantic`
+slice, emitting fused hits directly so `results` is **near-sorted** and the final sort runs near-O(N) (pdqsort
+is adaptive). **Bit-identical** to `pool_minmax_fuse`: f64 add commutes (emit `semantic + lexical` == the
+map's `lexical + semantic`), same first-occurrence dedup on each tier, same total-order comparator (ends in
+`doc_id`).
+
+Bench `pool_minmax_merge_ab` (isolated local target `search-copper`; ~50% overlap heavy-tailed pools, semantic
+score-sorted; unique N ≈ 1.5·pool):
+
+| pool | shape | LEGACY ORIGINAL (value-map) | merge | ratio vs ORIG |
+|---:|---|---:|---:|---:|
+| 50   | limit_all | 5.55 µs | 4.82 µs | 0.869 / **1.15×** |
+| 100  | limit_all | 11.58 µs | 9.62 µs | 0.831 / **1.20×** |
+| 1000 | limit_all | 146.48 µs | 110.74 µs | 0.756 / **1.32×** |
+| 1000 | top10 (guard) | 59.15 µs | 49.28 µs | 0.833 / **1.20×** |
+
+CIs fully separated at every row (e.g. limit_all/1000 merge [108.5, 113.0] µs vs ORIG [143.9, 149.3] µs). The
+limit_all win **grows with pool** (1.15×→1.20×→1.32×) as the near-sorted adaptive sort's advantage scales — and
+there is **no top-k regression**: the smaller contribution maps (vs the N-entry value map) make the merge
+~1.15–1.20× faster on the top10 shape too. Parity: the A/B bench asserts bit-identity (doc_id + fused-score
+bits + index + in_both) for both shapes at all pool sizes before timing; new `pool_minmax_merge_matches_map`
+unit test = 40 randomized trials (varied overlap/dedup/weights/pagination) byte-identical. Conformance GREEN:
+`cargo test -p frankensearch-fusion --lib rrf::` = **50 passed / 0 failed**; `cargo clippy --no-deps -p
+frankensearch-fusion --lib --tests --bench pool_minmax_merge_ab -- -D warnings` reports zero findings in the
+touched code (the `lex_map`/`lex_max` `similar_names` pedantic lint carries a scoped `#[allow]`; the crate-wide
+run surfaces only the pre-existing toolchain-drift lints in untouched modules). `pool_minmax_fuse_merge` is
+unwired like the base operator; it is the variant to wire when pool-min-max fusion is enabled, closing the
+sort-latency gap vs the merge-RRF the searcher already uses.
