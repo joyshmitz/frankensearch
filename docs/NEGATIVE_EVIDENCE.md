@@ -9782,3 +9782,41 @@ RCH ran remotely on `vmi1293453`.
 do not route `s_len=128` through it. The landed production form is gated at `s_len >= 256`, with an additional
 focused `s_len=384` confirmation in `docs/PERF_LEDGER.md`. Re-testing this family should focus on the gate
 boundary, not on removing the threshold.
+
+---
+
+## 2026-07-08 — Model2Vec embed GATHER software-prefetch: latency-bound only at doc-length T, regresses short queries → REJECTED (FlintOsprey)
+
+**Different seam (per re-profiling guidance):** left the reranker-kernel seam; profiled the per-query + per-doc
+**embedding** path. `Model2VecEmbedder::embed_sync` mean-pools token vectors — for each token id it gathers a
+random row `emb[id*256 .. +256]` of the `[vocab≈30k, 256]` (~30 MB) static table and AVX2-accumulates it.
+Hypothesis: the indirect gather is memory-latency-bound (random row = HW-unpredictable miss), and since the
+whole token-id sequence is known upfront, `_mm_prefetch` of token `i+4`'s row while accumulating token `i`
+should hide the miss (the CLS-attention prefetch primitive, applied to an indirect gather). Bench
+`model2vec_gather_prefetch` (calls the REAL `simd::accumulate_f32_into`; uniform-random ids = cache-cold
+regime), medians, ratio vs the shipped no-prefetch loop (`base`):
+
+| T tokens | `base` | `pf_head` (1 line) | `pf_row` (16 lines) | pf_head | pf_row |
+|---|---:|---:|---:|---:|---:|
+| 16 (query)  | 231 ns  | 346 ns  | 363 ns  | 1.49× | 1.57× |
+| 64          | 1.379 µs| 1.318 µs| 1.616 µs| 0.956× | 1.17× |
+| 256 (doc)   | 6.876 µs| 7.617 µs| **5.969 µs** | 1.11× | **0.868×** |
+
+**Why it fails as a shippable lever:** the result is physically consistent but conditional — `pf_row` gives a
+clean **non-overlapping ~13% win at t=256** (base [6.55, 7.23] vs [5.82, 6.12] µs: the table goes cold, the
+gather IS latency-bound there) but a **real regression at short T** (t=16: 1.5× SLOWER, non-overlapping the
+wrong way — 16 rows × 1 KB fit in L1/L2, so there are no misses to hide and the prefetch µops + index/branch
+are pure overhead). Short sequences are exactly **query embedding** (the user-facing latency path), so an
+UNCONDITIONAL prefetch regresses the case that matters most. `pf_head` (prefetch only the row's first line) is
+noisy-neutral-to-negative everywhere — never a win. An adaptive gate (`pf_row` only when `ids.len() ≥ τ`)
+could keep the doc-embedding win without the query regression, BUT the crossover is between t=64 (loses) and
+t=256 (wins) and is **untested**, so no τ can be chosen that is provably non-regressing over the 128–512 doc
+range — and the salvageable win is **index-time-only** (doc embedding), not user-facing. Not landing a fiddly
+gated micro-optimization on a single noisy run.
+
+**Lesson:** an indirect-gather prefetch pays ONLY when the gather table is larger than cache AND the sequence
+is long enough to actually miss; for short inputs the working set stays resident and prefetch is negative.
+Model2Vec query embedding (~10–60 tokens) is in the resident regime → the gather is NOT the latency bottleneck
+there. Bench kept as the reproducible artifact. Conformance: bench compiles + runs green via RCH (exit 0,
+`Finished`); parity asserts bit-identical sum ∀ T (prefetch is a hint). Route-next if ever revisited: measure
+t∈{128,512} to bracket τ, and only for the index-time doc-embedding throughput budget — never the query path.

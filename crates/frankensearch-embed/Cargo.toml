@@ -54,6 +54,11 @@ harness = false
 name = "cache_replay"
 harness = false
 
+# Model2Vec embed gather: shipped loop vs software-prefetch of the indirect row gather.
+[[bench]]
+name = "model2vec_gather_prefetch"
+harness = false
+
 [build-dependencies]
 sha2 = { workspace = true }
 
