@@ -98,6 +98,8 @@ pub enum PaletteState {
 pub struct CommandPalette {
     /// All registered actions.
     actions: Vec<Action>,
+    /// Lowercased searchable fields, kept parallel to `actions`.
+    search_index: Vec<ActionSearchIndex>,
     /// Current search query.
     query: String,
     /// Current selection index in filtered results.
@@ -106,12 +108,38 @@ pub struct CommandPalette {
     state: PaletteState,
 }
 
+struct ActionSearchIndex {
+    id: String,
+    label: String,
+    description: Option<String>,
+}
+
+impl ActionSearchIndex {
+    fn from_action(action: &Action) -> Self {
+        Self {
+            id: action.id.to_lowercase(),
+            label: action.label.to_lowercase(),
+            description: action.description.as_ref().map(|desc| desc.to_lowercase()),
+        }
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.label.contains(query)
+            || self.id.contains(query)
+            || self
+                .description
+                .as_ref()
+                .is_some_and(|desc| desc.contains(query))
+    }
+}
+
 impl CommandPalette {
     /// Create an empty command palette.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             actions: Vec::new(),
+            search_index: Vec::new(),
             query: String::new(),
             selected: 0,
             state: PaletteState::Closed,
@@ -120,6 +148,8 @@ impl CommandPalette {
 
     /// Register an action.
     pub fn register(&mut self, action: Action) {
+        self.search_index
+            .push(ActionSearchIndex::from_action(&action));
         self.actions.push(action);
     }
 
@@ -179,13 +209,8 @@ impl CommandPalette {
         let query_lower = self.query.to_lowercase();
         self.actions
             .iter()
-            .filter(|a| {
-                a.label.to_lowercase().contains(&query_lower)
-                    || a.id.to_lowercase().contains(&query_lower)
-                    || a.description
-                        .as_ref()
-                        .is_some_and(|d| d.to_lowercase().contains(&query_lower))
-            })
+            .zip(&self.search_index)
+            .filter_map(|(action, searchable)| searchable.matches(&query_lower).then_some(action))
             .collect()
     }
 
@@ -267,6 +292,46 @@ mod tests {
         palette
     }
 
+    fn set_query(palette: &mut CommandPalette, query: &str) {
+        palette.open();
+        for ch in query.chars() {
+            palette.push_char(ch);
+        }
+    }
+
+    fn legacy_filtered_ids(palette: &CommandPalette, query: &str) -> Vec<String> {
+        if query.is_empty() {
+            return palette
+                .actions
+                .iter()
+                .map(|action| action.id.clone())
+                .collect();
+        }
+
+        let query_lower = query.to_lowercase();
+        palette
+            .actions
+            .iter()
+            .filter(|action| {
+                action.label.to_lowercase().contains(&query_lower)
+                    || action.id.to_lowercase().contains(&query_lower)
+                    || action
+                        .description
+                        .as_ref()
+                        .is_some_and(|desc| desc.to_lowercase().contains(&query_lower))
+            })
+            .map(|action| action.id.clone())
+            .collect()
+    }
+
+    fn filtered_ids(palette: &CommandPalette) -> Vec<String> {
+        palette
+            .filtered()
+            .into_iter()
+            .map(|action| action.id.clone())
+            .collect()
+    }
+
     #[test]
     fn palette_starts_closed() {
         let palette = CommandPalette::new();
@@ -311,13 +376,28 @@ mod tests {
     #[test]
     fn palette_filter_by_description() {
         let mut palette = sample_palette();
-        palette.open();
-        for ch in "structured".chars() {
-            palette.push_char(ch);
-        }
+        set_query(&mut palette, "structured");
         let results = palette.filtered();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "debug.logs");
+    }
+
+    #[test]
+    fn palette_filter_matches_legacy_normalization() {
+        let mut palette = sample_palette();
+        palette.register(
+            Action::new(
+                "custom.cafe",
+                "Open Café",
+                ActionCategory::Custom("Locale".to_string()),
+            )
+            .with_description("Éclair-friendly Unicode search"),
+        );
+
+        for query in ["", "SEA", "nav.", "structured", "theme", "éclair"] {
+            set_query(&mut palette, query);
+            assert_eq!(filtered_ids(&palette), legacy_filtered_ids(&palette, query));
+        }
     }
 
     #[test]

@@ -3742,3 +3742,30 @@ The kernel is O(pool·M) and nearly free atop an existing k-NN neighbor graph. C
 (opt-in; `Similar` edges only, so it composes with the graph-PageRank/citation consumers). Searcher-wiring
 (supply the ANN/HNSW neighbor graph at fuse time) = separate product step. Files: `smooth.rs` (kernel + 8 tests),
 `lib.rs` (re-export), `benches/neighbor_smooth.rs`, `Cargo.toml`.
+
+---
+
+## 2026-07-09 — TUI command-palette cached search index LANDED in Rust (SearchCod)
+
+Fresh path after the rejection-ledger review: `frankensearch-tui` command-palette filtering, not the recent
+fusion/index/rerank/fsfs/storage/ops lanes. The hot loop was re-normalizing every action field with
+`to_lowercase()` on each filter pass; shell/ops overlay paths call this during palette typing, navigation,
+confirmation, and render. Primitive class: **data-layout / algebraic-fusion**. Registration now builds a
+private lowercased search index parallel to the public `Action` vector, preserving `Action`'s serialized shape
+and keeping filter semantics identical to the legacy lowercase-per-call scan.
+
+Latency (RCH worker `hz1`, command:
+`CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod rch exec -- cargo bench -p frankensearch-tui --profile release --bench palette_filter -- palette_filter --sample-size 20 --warm-up-time 0.1 --measurement-time 0.45 --noplot`):
+
+| actions | legacy_ORIG median | cached_index median | ratio-vs-ORIG |
+|---:|---:|---:|---:|
+| 128 | 10.314 us | 5.2096 us | 0.505 / 1.98x faster |
+| 1,024 | 82.127 us | 45.063 us | 0.549 / 1.82x faster |
+| 4,096 | 330.60 us | 154.66 us | 0.468 / 2.14x faster |
+
+Proof: the benchmark asserts equal hit counts against an embedded `legacy_ORIG` comparator before timing;
+`palette_filter_matches_legacy_normalization` compares result IDs for empty, case-folded, id-prefix,
+description, theme, and Unicode-description queries. Conformance GREEN:
+`rch exec -- cargo check -p frankensearch-tui --all-targets` on `hz2`; local fallback release tests with isolated
+target `cargo test -p frankensearch-tui --profile release` = **202 passed / 0 failed**, doctests ok;
+`cargo clippy -p frankensearch-tui --all-targets --profile release -- -D warnings`; `cargo fmt -p frankensearch-tui --check`.
