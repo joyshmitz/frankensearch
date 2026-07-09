@@ -61,6 +61,10 @@ name = "neighbor_smooth"
 harness = false
 
 [[bench]]
+name = "hubness_penalty"
+harness = false
+
+[[bench]]
 name = "federated_fuse"
 harness = false
 

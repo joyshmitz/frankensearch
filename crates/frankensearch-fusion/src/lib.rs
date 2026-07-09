@@ -19,6 +19,7 @@ pub mod conformal;
 pub mod daemon_fallback;
 pub mod federated;
 pub mod feedback;
+pub mod hubness;
 #[cfg(feature = "graph")]
 pub mod graph_rank;
 pub mod incremental;
@@ -61,6 +62,7 @@ pub use conformal::{
 pub use daemon_fallback::{DaemonFallbackEmbedder, DaemonFallbackReranker, NoopDaemonClient};
 pub use federated::{FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher};
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
+pub use hubness::{HubnessConfig, apply_hubness_penalty, compute_query_hubness};
 #[cfg(feature = "graph")]
 pub use graph_rank::GraphRanker;
 pub use incremental::{IncrementalConfig, IncrementalSearcher, SearchPlan, SearchStrategy};
