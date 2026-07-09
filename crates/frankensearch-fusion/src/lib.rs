@@ -33,6 +33,7 @@ pub mod queue;
 pub mod refresh;
 pub mod rrf;
 pub mod searcher;
+pub mod smooth;
 pub mod sync_searcher;
 
 pub use adaptive::{
@@ -90,4 +91,5 @@ pub use queue::{
 pub use refresh::{RefreshMetrics, RefreshMetricsSnapshot, RefreshWorker, RefreshWorkerConfig};
 pub use rrf::{RrfConfig, candidate_count, pool_minmax_fuse, rrf_fuse, rrf_fuse_with_graph};
 pub use searcher::TwoTierSearcher;
+pub use smooth::{SmoothConfig, neighbor_smooth};
 pub use sync_searcher::{SyncLexicalSearch, SyncSearchIterator, SyncTwoTierSearcher};
