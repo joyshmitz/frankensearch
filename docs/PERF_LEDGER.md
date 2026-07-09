@@ -3639,3 +3639,36 @@ Giesen widen is itself bit-exact to `f16::to_f32()` (exhaustively verified in si
 — it is the 4-bit two-pass slab build, "not wired into the BOLD hybrid", so left as the obvious follow-up.
 Conformance: `cargo test -p frankensearch-index --lib` = **389 passed / 0 failed**; bench green via RCH (exit
 0, parity asserted). Files: `simd.rs` (widen8_f16_bytes → pub(crate)), `search.rs` (quantize rewrite + import).
+
+---
+
+## 2026-07-09 — Ops historical analytics percentile selection (SearchCod)
+
+Commit routes `HistoricalAnalyticsScreen::percentile` through exact order-statistic selection instead of
+sorting the whole telemetry vector to read one rank. This is an ops/control-plane analytics path, separate
+from the previously rejected search, rerank, vector, fusion, embed, storage, durability, and FSFS paths.
+
+Measured command (per-crate RCH, worker `ovh-a`, requested target dir; `rch` rewrote the remote target dir to a
+worker-scoped path):
+
+```bash
+AGENT_NAME=SearchCod \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-ops --profile release \
+    --bench percentile_select -- ops_percentile_p95 \
+    --sample-size 10 --warm-up-time 0.1 --measurement-time 0.3
+```
+
+| Telemetry values | LEGACY ORIGINAL full sort | LANDED `select_nth_unstable` | Ratio vs ORIG | Decision |
+|---:|---:|---:|---:|---|
+| 64 | 178.62 ns | 77.185 ns | 0.432 / 2.31x faster | keep |
+| 512 | 2.3279 us | 740.78 ns | 0.318 / 3.14x faster | keep |
+| 4,096 | 24.087 us | 5.8299 us | 0.242 / 4.13x faster | keep |
+| 16,384 | 114.12 us | 13.991 us | 0.123 / 8.16x faster | keep |
+
+**Primitive / proof:** data-layout/order-statistic selection. The rank math is unchanged; the vector is cloned
+as before, then `select_nth_unstable(index)` partitions directly to the same element the old sorted vector
+would have returned. The bench asserts p95 equality against the legacy full-sort comparator before timing,
+and `percentile_matches_full_sort_reference` covers duplicates, unsorted inputs, clamped percentages, and
+boundary ranks. Focused release-profile conformance via RCH:
+`cargo test -p frankensearch-ops percentile --profile release` = **29 passed / 0 failed**.

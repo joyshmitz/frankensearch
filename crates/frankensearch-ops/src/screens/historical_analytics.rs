@@ -677,13 +677,13 @@ impl HistoricalAnalyticsScreen {
         if values.is_empty() {
             return 0;
         }
-        let mut sorted = values.to_vec();
-        sorted.sort_unstable();
-        let len_minus_one = sorted.len().saturating_sub(1);
+        let mut selected = values.to_vec();
+        let len_minus_one = selected.len().saturating_sub(1);
         let pct_usize = usize::from(pct.min(100));
         let numerator = len_minus_one.saturating_mul(pct_usize).saturating_add(50);
         let index = numerator.saturating_div(100).min(len_minus_one);
-        sorted[index]
+        let (_, value, _) = selected.select_nth_unstable(index);
+        *value
     }
 
     const fn window_scale(window: TimeWindow) -> (u64, u64) {
@@ -2021,6 +2021,29 @@ mod tests {
         let values = [1, 2, 3];
         let p200 = HistoricalAnalyticsScreen::percentile(&values, 200);
         assert_eq!(p200, 3);
+    }
+
+    #[test]
+    fn percentile_matches_full_sort_reference() {
+        let cases: &[&[u64]] = &[
+            &[7, 7, 7, 7],
+            &[100, 1, 50, 50, 2, 99, 3],
+            &[0, 13, 13, 1024, 8, 8, 4096, 2, 2, 2, 1],
+        ];
+        for values in cases {
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            let len_minus_one = sorted.len().saturating_sub(1);
+            for pct in [0, 1, 5, 25, 50, 75, 95, 99, 100, 200] {
+                let pct_usize = usize::from(pct.min(100));
+                let numerator = len_minus_one.saturating_mul(pct_usize).saturating_add(50);
+                let index = numerator.saturating_div(100).min(len_minus_one);
+                assert_eq!(
+                    HistoricalAnalyticsScreen::percentile(values, pct),
+                    sorted[index]
+                );
+            }
+        }
     }
 
     // ── window_scale ──

@@ -11,6 +11,10 @@ description = "Operations control-plane TUI for frankensearch fleet monitoring"
 name = "frankensearch-ops"
 path = "src/main.rs"
 
+[[bench]]
+name = "percentile_select"
+harness = false
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
@@ -36,6 +40,7 @@ time = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = "0.3"
 
