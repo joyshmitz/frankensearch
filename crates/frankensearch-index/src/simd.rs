@@ -88,7 +88,7 @@ fn widen8_f16_lanes(h: u32x8) -> f32x8 {
 /// 8 scalar `from_le_bytes` reads and the stack round-trip of building a `[u32; 8]`.
 #[cfg(target_endian = "little")]
 #[inline(always)]
-fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
+pub(crate) fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
     let lanes = bytemuck::cast::<[u8; 16], u16x8>(*b);
     widen8_f16_lanes(u32x8::from(lanes))
 }
@@ -96,7 +96,7 @@ fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
 /// Big-endian fallback: decode each `u16` explicitly as little-endian.
 #[cfg(target_endian = "big")]
 #[inline(always)]
-fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
+pub(crate) fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
     let lanes: [u32; 8] = [
         u32::from(u16::from_le_bytes([b[0], b[1]])),
         u32::from(u16::from_le_bytes([b[2], b[3]])),

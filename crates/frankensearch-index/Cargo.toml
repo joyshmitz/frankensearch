@@ -153,3 +153,7 @@ harness = false
 [[bench]]
 name = "residual_parallel_scan"
 harness = false
+
+[[bench]]
+name = "f16_slab_quantize"
+harness = false

@@ -3606,3 +3606,36 @@ unchanged for single-document callers and remains the legacy comparator in the b
 the candidate-list map equals the legacy per-candidate loop before timing, and the unit test
 `prior_signals_match_legacy_per_candidate_scoring` covers matching rows plus missing-document behavior. Output
 reason codes, matched signals, sidecar boosts, and deterministic tie-breaks are unchanged.
+
+---
+
+## 2026-07-09 — f16-slab → int8 quantization SIMD widen (FlintOsprey)
+
+Commit routes `search.rs::quantize_f16_bytes_to_i8` through the branchless SIMD f16→f32 widen
+(`simd.rs::widen8_f16_bytes`, Giesen magic-multiply, bit-exact) instead of a scalar per-element
+`f16::from_le_bytes(..).to_f32()`. This builds (lazily, once, cached in `int8_slab`) the int8 quantization of
+the whole F16 main-vector region for the int8 two-pass scan — the decode-bound bottleneck the f16-DOT arc
+already SIMD-ized, but this sibling quantize path was **missed** and stayed scalar (a
+sibling-path-consistency gap). Bench `f16_slab_quantize` (dim=384), medians, ratio vs the scalar decode (ORIG):
+
+| vectors | scalar (ORIG) | simd_widen | ratio |
+|---|---:|---:|---:|
+| 1 000  | 2.552 ms | 1.723 ms | **0.675×** |
+| 10 000 | 27.18 ms | 16.76 ms | **0.617×** |
+| 50 000 | 175.7 ms | 110.2 ms | **0.627×** (~1.60×) |
+
+Throughput 150 → 225 Melem/s, all CIs non-overlapping. At 130k×384 this trims ~170 ms off the first int8
+query's cold-start (the lazy `int8_slab` build).
+
+**Primitive (SIMD data-layout / branchless widen).** The f16 decode is the documented bottleneck
+(NEG_EV: "the f16 paths are decode-bound"); `widen8_f16_bytes` widens 8 f16 lanes per instruction group via
+the Giesen denormal-multiply trick. The scale/round/clamp stays SCALAR (per-element, identical to the shipped
+code) and the max-abs reduction is order-independent, so the output int8 slab is **BIT-IDENTICAL** — verified
+by the bench parity assert (`scalar == simd` ∀ vectors, incl. 50k) and 389/389 index lib tests green. The
+Giesen widen is itself bit-exact to `f16::to_f32()` (exhaustively verified in simd.rs over all 65 536 patterns).
+
+**Scope / route-next:** landed the int8 path (measured). The sibling `pack_4bit_f16_bytes` (search.rs) has the
+**identical scalar-decode gap** and the identical fix applies (SIMD decode → scalar nibble-pack, bit-identical)
+— it is the 4-bit two-pass slab build, "not wired into the BOLD hybrid", so left as the obvious follow-up.
+Conformance: `cargo test -p frankensearch-index --lib` = **389 passed / 0 failed**; bench green via RCH (exit
+0, parity asserted). Files: `simd.rs` (widen8_f16_bytes → pub(crate)), `search.rs` (quantize rewrite + import).
