@@ -3769,3 +3769,39 @@ description, theme, and Unicode-description queries. Conformance GREEN:
 `rch exec -- cargo check -p frankensearch-tui --all-targets` on `hz2`; local fallback release tests with isolated
 target `cargo test -p frankensearch-tui --profile release` = **202 passed / 0 failed**, doctests ok;
 `cargo clippy -p frankensearch-tui --all-targets --profile release -- -D warnings`; `cargo fmt -p frankensearch-tui --check`.
+
+---
+
+## 2026-07-09 — QUERY-HUBNESS dense-score correction LANDED in Rust (ba5052a, FlintOsprey)
+
+QUALITY-vein land #3, and a **structurally-different** primitive class from the prior two (fusion-normalization
+`a9e53b4`, graph-diffusion smoothing `257c468`): a **query-distribution doc statistic**. High-dim cosine
+retrieval has HUBS (docs near many queries regardless of relevance) that crowd out specific answers; demote them
+`s'(q,d)=cos(q,d)−β·r_d`, `r_d` = doc's mean cosine to its Kq nearest *sample queries*.
+
+This REVERSES the round-3 rejection (`64ac8b7`): the query-FREE proxies (doc-density/centroid/PC) conflate hubs
+with tight relevant clusters and are corpus-fragile. Measuring the QUERY-SIDE estimate **leakage-free** (disjoint
+query split; `r_d` from a background half, applied to the held-out eval half) shows the mechanism is realizable.
+
+**Quality (Python-measured, BGE-small hybrid, full BEIR, β=0.2, leakage-free):** all-positive, **mean +0.0033
+nDCG@10** — scifact +0.0010, nfcorpus +0.0026, arguana +0.0067, scidocs +0.0030 — with GENUINE dense-tier gains
+where topical centrality anti-correlates with relevance (arguana counter-argument stance dense **+0.0128**,
+scidocs citation **+0.0078**). A LOWER BOUND: `r_d` came from only 150–500 background queries; a production query
+log (thousands) estimates it better. β=0.3 is higher-gain on stance/citation corpora (arguana +0.0089).
+
+**Latency (measured, bench `hubness_penalty`, vs the no-correction ORIGINAL = identity β=0 pool clone):**
+| pool | ORIGINAL | correct β=0.2 |
+|---:|---:|---:|
+| 50   | 166 ns  | 175 ns  |
+| 100  | 295 ns  | 292 ns  |
+| 1000 | 2.80 µs | 2.71 µs |
+
+Query-time correction is **LATENCY-NEUTRAL** (the multiply-subtract is free under the pool clone; deltas within
+noise). The offline `compute_query_hubness` builder is ~109 ms / 696 ms @ 2000×200 / 5000×500 docs×queries —
+amortized (recomputed periodically from the query log), not per query.
+
+Conformance: 7 unit tests GREEN incl. the hub-demotion property; full fusion suite 848 lib + 77 integration tests GREEN (0 failed).
+NON-BREAKING (opt-in). Deployment dependency: a background query-embedding sample (the engine already sees the
+query stream). Structurally orthogonal to fusion normalization (acts on dense scores pre-fusion) → composes with
+pool-min-max (`a9e53b4`). Files: `hubness.rs` (kernel + builder + 7 tests), `lib.rs`, `benches/hubness_penalty.rs`,
+`Cargo.toml`. Full measured detail + the round-3→round-4 arc in `docs/NEGATIVE_EVIDENCE.md`.
