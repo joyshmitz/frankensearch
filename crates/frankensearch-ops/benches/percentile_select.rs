@@ -13,6 +13,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_ops::FrameQualityTracker;
 
 fn percentile_index(len: usize, pct: u8) -> usize {
     let len_minus_one = len.saturating_sub(1);
@@ -80,5 +81,94 @@ fn bench_percentile_select(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_percentile_select);
+#[derive(Clone)]
+struct LegacyFrameQualityTracker {
+    window: usize,
+    samples: Vec<u16>,
+    cursor: usize,
+    total_frames: u64,
+}
+
+impl LegacyFrameQualityTracker {
+    fn new(window: usize) -> Self {
+        let window = window.max(1);
+        Self {
+            window,
+            samples: vec![0; window],
+            cursor: 0,
+            total_frames: 0,
+        }
+    }
+
+    fn record(&mut self, duration_ms: u16) {
+        self.samples[self.cursor] = duration_ms;
+        self.cursor = (self.cursor + 1) % self.window;
+        self.total_frames += 1;
+    }
+
+    fn p95_frame_time_ms(&self) -> u16 {
+        let window_u64 = u64::try_from(self.window).unwrap_or(u64::MAX);
+        let active = usize::try_from(self.total_frames.min(window_u64)).unwrap_or(self.window);
+        if active == 0 {
+            return 0;
+        }
+        let mut sorted: Vec<u16> = self.samples[..active].to_vec();
+        sorted.sort_unstable();
+        let idx = active.saturating_mul(95).div_ceil(100);
+        sorted[idx.min(active - 1)]
+    }
+}
+
+fn build_frame_durations(window: usize) -> Vec<u16> {
+    let mut x = 0xd1b5_4a32_d192_ed03_u64 ^ u64::try_from(window).unwrap_or(u64::MAX);
+    (0..(window * 3))
+        .map(|i| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let jitter = u16::try_from(x % 11).unwrap_or(0);
+            if i % 251 == 0 {
+                300 + jitter
+            } else if i % 19 == 0 {
+                34 + jitter
+            } else if i % 7 == 0 {
+                18 + jitter
+            } else {
+                10 + jitter
+            }
+        })
+        .collect()
+}
+
+fn bench_frame_quality_p95(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ops_frame_quality_p95");
+    for &window in &[64_usize, 128, 512, 2_048] {
+        let durations = build_frame_durations(window);
+        let mut legacy = LegacyFrameQualityTracker::new(window);
+        let mut current = FrameQualityTracker::new(window);
+        for duration_ms in durations {
+            legacy.record(duration_ms);
+            current.record(duration_ms);
+        }
+        assert_eq!(legacy.p95_frame_time_ms(), current.p95_frame_time_ms());
+
+        group.bench_with_input(
+            BenchmarkId::new("legacy_sort_ORIG", window),
+            &legacy,
+            |b, tracker| {
+                b.iter(|| black_box(tracker.p95_frame_time_ms()));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("histogram", window),
+            &current,
+            |b, tracker| {
+                b.iter(|| black_box(tracker.p95_frame_time_ms()));
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_percentile_select, bench_frame_quality_p95);
 criterion_main!(benches);

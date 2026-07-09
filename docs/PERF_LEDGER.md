@@ -4024,3 +4024,38 @@ touched code (the `lex_map`/`lex_max` `similar_names` pedantic lint carries a sc
 run surfaces only the pre-existing toolchain-drift lints in untouched modules). `pool_minmax_fuse_merge` is
 unwired like the base operator; it is the variant to wire when pool-min-max fusion is enabled, closing the
 sort-latency gap vs the merge-RRF the searcher already uses.
+
+---
+
+## 2026-07-09 — Ops frame-quality P95 exact histogram LANDED (SearchCod)
+
+Fresh path after the rejection-ledger review: live `frankensearch-ops` TUI frame-quality tracking,
+specifically `FrameQualityTracker::p95_frame_time_ms`. This is distinct from the rejected ops SLO rollup
+SQL-percentile lever: the rollup path materializes historical telemetry through SQLite, while this path is an
+in-memory render-loop window queried every ops UI frame.
+
+Primitive class: **data-layout / succinct-structure**. The tracker now keeps an exact sliding histogram while it
+updates the ring buffer, replacing the LEGACY ORIGINAL clone-and-sort P95 query. Buckets `0..128` live inline and
+long frames spill into a sparse `BTreeMap`, so common TUI frame times stay in a compact fixed array while overflow
+durations remain exact.
+
+Bench (RCH worker `ovh-a`; same Criterion binary embeds the LEGACY ORIGINAL sort tracker and asserts equal P95
+before timing):
+
+```bash
+AGENT_NAME=SearchCod RCH_WORKER=ovh-a CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-ops --profile release \
+  --bench percentile_select -- ops_frame_quality_p95 \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+| window | LEGACY ORIGINAL clone+sort median | exact histogram median | ratio-vs-ORIG |
+|---:|---:|---:|---:|
+| 64 | 375.49 ns | 14.549 ns | 0.0387 / 25.8x faster |
+| 128 | 589.99 ns | 15.789 ns | 0.0268 / 37.4x faster |
+| 512 | 3.2019 us | 22.602 ns | 0.00706 / 141.7x faster |
+| 2,048 | 14.006 us | 14.909 ns | 0.00106 / 939.4x faster |
+
+Conformance GREEN: focused release test `cargo test -p frankensearch-ops frame_quality_tracker --profile
+release` passed 5/5 frame-quality tests; `cargo check -p frankensearch-ops --all-targets`, `cargo clippy -p
+frankensearch-ops --all-targets -- -D warnings`, and `cargo fmt -p frankensearch-ops --check` passed.

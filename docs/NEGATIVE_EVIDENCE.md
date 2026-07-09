@@ -10142,3 +10142,40 @@ the final revert; `cargo clippy -p frankensearch-core --lib --bench search_strea
 the lock-lifetime fix; `rustfmt --check crates/frankensearch-core/src/collectors.rs
 crates/frankensearch-core/benches/search_stream_publish.rs` was GREEN. `cargo check -p frankensearch-core --all-targets`
 exited 0 with the existing `simhash_vote_simd` unsafe-op warnings. No runtime code shipped.
+
+### 2026-07-09 — SearchCod — LANDED: live ops frame-quality P95 exact sliding histogram beats the LEGACY ORIGINAL clone+sort tracker
+
+Re-read this ledger before choosing the path. I did not repeat the rejected durability codec/trailer attempts,
+FSFS sniff/token scanners, query-state sidecars, exact-id/fusion/vector/rerank/embed lanes, storage dedup
+slot-join, or the ops SLO rollup `select_nth_unstable` rewrite. The new path is the live ops render-loop
+`FrameQualityTracker::p95_frame_time_ms`, not historical SQLite SLO materialization.
+
+Primitive class: **data-layout / succinct-structure**. The landed tracker maintains an exact sliding histogram as
+the frame-duration ring advances. Common frame times use a 128-bucket inline array; rare long frames are counted in
+a sparse `BTreeMap<u16, u32>`. Querying P95 now scans counts instead of cloning and sorting the active window, while
+the ring-buffer update removes the outgoing sample and inserts the incoming sample so values stay exact after wrap.
+
+Bench command (RCH worker `ovh-a`; the same bench binary carries the LEGACY ORIGINAL sort tracker and asserts
+equal P95 before timing):
+
+```bash
+AGENT_NAME=SearchCod RCH_WORKER=ovh-a CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-ops --profile release \
+  --bench percentile_select -- ops_frame_quality_p95 \
+  --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+| window | LEGACY ORIGINAL clone+sort median | exact histogram median | ratio-vs-ORIG |
+|---:|---:|---:|---:|
+| 64 | 375.49 ns | 14.549 ns | 0.0387 / 25.8x faster |
+| 128 | 589.99 ns | 15.789 ns | 0.0268 / 37.4x faster |
+| 512 | 3.2019 us | 22.602 ns | 0.00706 / 141.7x faster |
+| 2,048 | 14.006 us | 14.909 ns | 0.00106 / 939.4x faster |
+
+Decision: **KEEP**. This is a measured render-loop win with exact semantics and a direct ratio-vs-ORIG comparator.
+Do not confuse it with the rejected ops SLO rollup lever; dropping SQLite ordering and selecting historical
+rollup percentiles in Rust remains rejected for that materialization shape.
+
+Conformance GREEN before commit: `cargo test -p frankensearch-ops frame_quality_tracker --profile release` passed
+5/5 frame-quality tests; `cargo check -p frankensearch-ops --all-targets`, `cargo clippy -p frankensearch-ops
+--all-targets -- -D warnings`, and `cargo fmt -p frankensearch-ops --check` passed.

@@ -8,6 +8,8 @@
 //! - **Frame-time quality**: render budgets and violation detection
 //! - **Reduced motion**: animation timing constants gated on `MotionPreference`
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::preferences::{DisplayPreferences, MotionPreference};
@@ -31,6 +33,8 @@ pub const FRAME_DROP_THRESHOLD_MS: u16 = 33;
 /// Maximum acceptable input-to-visual-feedback latency in milliseconds.
 /// Exceeding this feels sluggish to the user (100ms perceptual threshold).
 pub const INPUT_FEEDBACK_BUDGET_MS: u16 = 100;
+
+const FRAME_TIME_INLINE_HISTOGRAM_BUCKETS: usize = 128;
 
 /// Frame-time quality constraint for a specific render phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +141,10 @@ pub struct FrameQualityTracker {
     on_budget_count: u64,
     /// Count of dropped frames.
     dropped_count: u64,
+    /// Exact millisecond histogram for common TUI frame durations.
+    inline_histogram: [u32; FRAME_TIME_INLINE_HISTOGRAM_BUCKETS],
+    /// Sparse exact counts for unusually long frames.
+    overflow_histogram: BTreeMap<u16, u32>,
 }
 
 impl FrameQualityTracker {
@@ -151,12 +159,19 @@ impl FrameQualityTracker {
             total_frames: 0,
             on_budget_count: 0,
             dropped_count: 0,
+            inline_histogram: [0; FRAME_TIME_INLINE_HISTOGRAM_BUCKETS],
+            overflow_histogram: BTreeMap::new(),
         }
     }
 
     /// Record a frame duration.
     pub fn record(&mut self, duration_ms: u16) {
+        let window_u64 = u64::try_from(self.window).unwrap_or(u64::MAX);
+        if self.total_frames >= window_u64 {
+            self.decrement_histogram(self.samples[self.cursor]);
+        }
         self.samples[self.cursor] = duration_ms;
+        self.increment_histogram(duration_ms);
         self.cursor = (self.cursor + 1) % self.window;
         self.total_frames += 1;
         match FrameQualityVerdict::classify(duration_ms) {
@@ -196,21 +211,57 @@ impl FrameQualityTracker {
 
     /// P95 frame time from the current window.
     #[must_use]
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_possible_truncation
-    )]
     pub fn p95_frame_time_ms(&self) -> u16 {
-        let active = self.total_frames.min(self.window as u64) as usize;
+        let window_u64 = u64::try_from(self.window).unwrap_or(u64::MAX);
+        let active = usize::try_from(self.total_frames.min(window_u64)).unwrap_or(self.window);
         if active == 0 {
             return 0;
         }
-        let mut sorted: Vec<u16> = self.samples[..active].to_vec();
-        sorted.sort_unstable();
-        let idx = ((active as f64) * 0.95).ceil() as usize;
-        sorted[idx.min(active - 1)]
+        let idx = active.saturating_mul(95).div_ceil(100);
+        let rank = idx.min(active - 1) + 1;
+        let mut seen = 0usize;
+        for (duration_ms, count) in self.inline_histogram.iter().enumerate() {
+            seen = seen.saturating_add(usize::try_from(*count).unwrap_or(usize::MAX));
+            if seen >= rank {
+                return u16::try_from(duration_ms).unwrap_or(u16::MAX);
+            }
+        }
+        for (&duration_ms, &count) in &self.overflow_histogram {
+            seen = seen.saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+            if seen >= rank {
+                return duration_ms;
+            }
+        }
+        0
+    }
+
+    fn increment_histogram(&mut self, duration_ms: u16) {
+        let bucket = usize::from(duration_ms);
+        if bucket < FRAME_TIME_INLINE_HISTOGRAM_BUCKETS {
+            self.inline_histogram[bucket] = self.inline_histogram[bucket].saturating_add(1);
+        } else {
+            let count = self.overflow_histogram.entry(duration_ms).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn decrement_histogram(&mut self, duration_ms: u16) {
+        let bucket = usize::from(duration_ms);
+        if bucket < FRAME_TIME_INLINE_HISTOGRAM_BUCKETS {
+            self.inline_histogram[bucket] = self.inline_histogram[bucket].saturating_sub(1);
+            return;
+        }
+
+        let remove = self
+            .overflow_histogram
+            .get_mut(&duration_ms)
+            .is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+        if remove {
+            self.overflow_histogram.remove(&duration_ms);
+        }
     }
 }
 
@@ -442,6 +493,47 @@ mod tests {
         }
         let p95 = tracker.p95_frame_time_ms();
         assert!((95..=100).contains(&p95));
+    }
+
+    #[test]
+    fn frame_quality_tracker_p95_matches_sort_after_wrap() {
+        fn reference(values: &[u16]) -> u16 {
+            if values.is_empty() {
+                return 0;
+            }
+            let mut sorted = values.to_vec();
+            sorted.sort_unstable();
+            let idx = sorted.len().saturating_mul(95).div_ceil(100);
+            sorted[idx.min(sorted.len() - 1)]
+        }
+
+        let mut tracker = FrameQualityTracker::new(8);
+        let mut window = Vec::new();
+        for duration_ms in [
+            12_u16,
+            14,
+            16,
+            21,
+            34,
+            255,
+            13,
+            15,
+            1024,
+            18,
+            19,
+            u16::MAX,
+            17,
+            11,
+            10,
+            9,
+        ] {
+            tracker.record(duration_ms);
+            window.push(duration_ms);
+            if window.len() > 8 {
+                window.remove(0);
+            }
+            assert_eq!(tracker.p95_frame_time_ms(), reference(&window));
+        }
     }
 
     #[test]
