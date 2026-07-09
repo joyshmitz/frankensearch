@@ -3672,3 +3672,38 @@ would have returned. The bench asserts p95 equality against the legacy full-sort
 and `percentile_matches_full_sort_reference` covers duplicates, unsorted inputs, clamped percentages, and
 boundary ranks. Focused release-profile conformance via RCH:
 `cargo test -p frankensearch-ops percentile --profile release` = **29 passed / 0 failed**.
+
+---
+
+## 2026-07-08 — Pool-local min-max SCORE fusion LANDED in Rust (a9e53b4, FlintOsprey)
+
+First QUALITY-vein land after the perf-latency frontier closed (user greenlit the pivot from perf rejections).
+Ported the strongest measured BEIR fusion result (NEGATIVE_EVIDENCE `45530fb`) into Rust: `pool_minmax_fuse`,
+a drop-in sibling of `rrf_fuse`. Per tier, min-max normalize the raw scores WITHIN the retrieved pool -> [0,1];
+out-of-pool docs get the pool minimum (0 for min-max); tier-weighted sum; sorted by the existing deterministic
+FusedHit comparator. Recovers the score MAGNITUDE RRF's rank transform discards (runaway vs marginal top match).
+
+QUALITY (the WIN, Python-measured: fastembed BGE-small + rank_bm25 stem/stop, full BEIR test sets, POOL in {50,100}):
+**+0.0038 mean nDCG@10 over RRF, POSITIVE on all 4 corpora** (scifact +0.0052, nfcorpus +0.0067, arguana
++0.0003, scidocs +0.0030), never-negative. Top-order magnitude recovery, not a recall change.
+
+LATENCY (measured, bench `pool_minmax_fuse`, vs production merge-optimized `rrf_fuse` = LEGACY ORIGINAL):
+
+| pool | rrf_fuse (ORIG) | pool_minmax | ratio vs ORIG |
+|---:|---:|---:|---:|
+| 50   | 2.2948 us | 2.8137 us | 1.23x |
+| 100  | 4.2728 us | 5.2950 us | 1.24x |
+| 1000 | 38.757 us | 52.100 us | 1.34x |
+
+HONEST CORRECTION to the a9e53b4 commit message ("latency-neutral by construction"): pool_minmax is
+**~1.23-1.34x SLOWER**, because production `rrf_fuse` uses the merge-structure optimization (`4aeb66b`,
+near-sorted sort input) whereas pool_minmax does a from-scratch full sort of the value map. Both are O(pool) —
+only the constant differs. END-TO-END NEGLIGIBLE: fusion is us-scale (the ~13us delta at pool=1000 is nothing
+beside the ms-scale vector/lexical search), and the +0.0038 nDCG quality gain is the deliverable. Route-next:
+port the merge-structure to pool_minmax if fusion latency ever matters.
+
+Conformance: 7 unit tests GREEN incl. the magnitude-recovery property (a semantic-only high-magnitude doc
+outranks an in-BOTH marginal doc — RRF's exact weakness). NON-BREAKING (rrf_fuse untouched; opt-in). Enabler:
+`FusedHitScratch` already carried raw per-tier scores (RRF only used ranks), so no new plumbing. Searcher-wiring
+/ default switch = separate product decision (keep RRF where per-query pool stats are unreliable). Files:
+`rrf.rs` (pool_minmax_fuse + 7 tests), `lib.rs` (re-export), `benches/pool_minmax_fuse.rs`, `Cargo.toml`.
