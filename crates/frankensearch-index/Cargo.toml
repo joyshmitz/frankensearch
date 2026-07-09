@@ -161,3 +161,7 @@ harness = false
 [[bench]]
 name = "f16_slab_pack4bit"
 harness = false
+
+[[bench]]
+name = "tombstone_bitmap_scan"
+harness = false
