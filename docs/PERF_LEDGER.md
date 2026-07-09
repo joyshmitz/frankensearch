@@ -3707,3 +3707,38 @@ outranks an in-BOTH marginal doc — RRF's exact weakness). NON-BREAKING (rrf_fu
 `FusedHitScratch` already carried raw per-tier scores (RRF only used ranks), so no new plumbing. Searcher-wiring
 / default switch = separate product decision (keep RRF where per-query pool stats are unreliable). Files:
 `rrf.rs` (pool_minmax_fuse + 7 tests), `lib.rs` (re-export), `benches/pool_minmax_fuse.rs`, `Cargo.toml`.
+
+---
+
+## 2026-07-09 — kNN neighbor SMOOTHING (graph score-diffusion) LANDED in Rust (257c468, FlintOsprey)
+
+QUALITY-vein land #2 after the perf-latency frontier closed (following pool-min-max fusion `a9e53b4`).
+A **structurally-different** primitive class from tier fusion: **label-propagation / manifold-ranking** over
+the doc-doc dense k-NN graph. Each candidate borrows score from its dense nearest neighbors —
+`smoothed(d)=(1−α)cos(q,d)+α·mean_{n∈NN(d)∩pool}cos(q,n)` — rescuing below-threshold relevants that sit
+inside clusters of confident results (a RECALL mechanism, unlike RRF/pool-min-max which reorder a fixed set).
+
+**Quality (Python-measured, BGE-small hybrid, full BEIR test sets, α=0.3/M=10, the DEPLOYABLE pool-restricted
+form — `neighbor_smooth_pool.py`):** mean **+0.0039 nDCG@10** over no-smooth — nfcorpus **+0.0114**, arguana
+**+0.0052**, scidocs **+0.0026** (recall-bound + semantic corpora), −0.0035 on recall-saturated scifact
+(recall-saturation-gated). NEW finding: pool-restriction (the deployable form) BEATS the full-cosine Python
+form on the two most recall-bound corpora (nfcorpus +0.0114 vs +0.0070) — averaging only in-pool neighbors
+drops the out-of-pool low-cosine drag. Full detail + table in `docs/NEGATIVE_EVIDENCE.md`.
+
+**Latency (measured, bench `neighbor_smooth`, vs the no-smooth ORIGINAL = identity α=0 pool clone):**
+| pool | ORIGINAL (no-smooth clone) | smooth α=0.3 | +mutual (opt-in) |
+|---:|---:|---:|---:|
+| 50   | 0.17 µs | 5.9 µs   | 28.7 µs |
+| 100  | 0.31 µs | 12.2 µs  | 63.8 µs |
+| 1000 | 2.9 µs  | 158.9 µs | 704 µs  |
+
+The diffusion pass adds ~12 µs/query at the realistic fusion POOL=100 (`ebb3377`: nDCG@10 saturates ≤50-100
+cand/tier) — µs-scale, negligible beside the ms-scale vector+lexical search; the "nearly free atop a k-NN
+neighbor graph" claim holds. The large ratio-vs-ORIGINAL is only because ORIGINAL is a bare pool clone (no-op);
+the meaningful figure is the ~12 µs absolute. mutual-kNN (reciprocal-edge, the recall-bound opt-in) costs ~5×.
+
+The kernel is O(pool·M) and nearly free atop an existing k-NN neighbor graph. Conformance:
+8 unit tests GREEN incl. the cluster-rescue property; full fusion suite 841 lib + 77 integration tests GREEN (0 failed). NON-BREAKING
+(opt-in; `Similar` edges only, so it composes with the graph-PageRank/citation consumers). Searcher-wiring
+(supply the ANN/HNSW neighbor graph at fuse time) = separate product step. Files: `smooth.rs` (kernel + 8 tests),
+`lib.rs` (re-export), `benches/neighbor_smooth.rs`, `Cargo.toml`.
