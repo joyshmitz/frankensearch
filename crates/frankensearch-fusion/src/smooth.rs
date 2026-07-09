@@ -32,7 +32,7 @@
 //!
 //! The kernel is O(pool · M): nearly free atop an existing ANN neighbor graph.
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
 
 /// Parameters for [`neighbor_smooth`].
@@ -87,6 +87,12 @@ pub fn neighbor_smooth(
         return hits.to_vec();
     }
 
+    // Reciprocal (mutual-kNN) gating is a distinct, heavier kernel — route it to the
+    // integer-relabeled path that answers reciprocity in O(1) instead of an O(deg) String scan.
+    if config.mutual {
+        return mutual_neighbor_smooth(hits, graph, config);
+    }
+
     // Pool score map: cos(q, ·) for every retrieved candidate. Neighbor lookup is
     // restricted to this set (the engine only scored these docs for this query).
     let pool: AHashMap<&str, f32> = hits
@@ -136,9 +142,6 @@ fn in_pool_neighbor_mean(
         let Some(&neighbor_score) = pool.get(neighbor) else {
             continue; // out-of-pool: cos(q, neighbor) unknown → skip (pool-restricted)
         };
-        if config.mutual && !is_similar_neighbor(graph, neighbor, doc) {
-            continue;
-        }
         sum += neighbor_score;
         count += 1;
     }
@@ -149,12 +152,99 @@ fn in_pool_neighbor_mean(
     }
 }
 
-/// Whether `target` is a `Similar` neighbor of `node` (for mutual-kNN gating).
-fn is_similar_neighbor(graph: &DocumentGraph, node: &str, target: &str) -> bool {
-    graph
-        .neighbors(node)
-        .iter()
-        .any(|e| e.edge_type == EdgeType::Similar && e.neighbor_doc_id == target)
+/// Mutual (reciprocal-kNN) diffusion — the `config.mutual` kernel.
+///
+/// Structurally distinct from the direct non-mutual path: a *single* walk over each candidate's
+/// `Similar` adjacency hashes every neighbor string exactly once, simultaneously
+///
+/// 1. recording every **in-pool directed** `Similar` edge `src → dst` in a packed-`u64`
+///    (`src_idx << 32 | dst_idx`) reciprocity `AHashSet` (uncapped — matching the ORIGINAL
+///    `is_similar_neighbor`'s full-adjacency scan), and
+/// 2. capturing the in-pool subset of each candidate's first `m` *examined* `Similar` edges (its
+///    diffusion neighbors) as a flat integer CSR of `(neighbor_idx, neighbor_score)`.
+///
+/// The diffusion is then pure integer work: reciprocity — "does neighbor `n` point back to
+/// candidate `d`?" — becomes an O(1) `recip.contains((n_idx << 32) | d_idx)`, replacing the
+/// ORIGINAL's O(deg(n)) linear `String`-equality scan per neighbor per candidate. Bit-identical
+/// to the direct form (same edge-visit order, same reciprocity relation, same accumulation
+/// order). Measured **1.21×/1.35×/1.50× faster** at pool 50/100/1000 (`neighbor_smooth_recip_ab`,
+/// `docs/PERF_LEDGER.md`); the win grows with the pool because more reciprocity checks amortize
+/// the O(deg) → O(1) shift.
+// Pool indices and CSR offsets are bounded by the retrieved candidate count (thousands), always
+// well below `u32::MAX`, so the `u32` relabel/packing is exact for any realistic pool.
+#[allow(clippy::cast_possible_truncation)]
+fn mutual_neighbor_smooth(
+    hits: &[VectorHit],
+    graph: &DocumentGraph,
+    config: &SmoothConfig,
+) -> Vec<VectorHit> {
+    let n = hits.len();
+    let m = config.m;
+
+    // Pool: doc_id → (dense pool index, cos-to-query score). One lookup yields both the neighbor
+    // score (diffusion) and its index (reciprocity), so each neighbor string is hashed once.
+    let mut pool: AHashMap<&str, (u32, f32)> = AHashMap::with_capacity(n);
+    for (i, h) in hits.iter().enumerate() {
+        pool.insert(h.doc_id.as_str(), (i as u32, h.score));
+    }
+
+    // One adjacency walk builds both structures.
+    let mut recip: AHashSet<u64> = AHashSet::with_capacity(n * m);
+    let mut fwd_flat: Vec<(u32, f32)> = Vec::with_capacity(n * m);
+    let mut fwd_off: Vec<u32> = Vec::with_capacity(n + 1);
+    fwd_off.push(0);
+    for (i, h) in hits.iter().enumerate() {
+        let src = (i as u64) << 32;
+        let mut examined = 0usize;
+        for edge in graph.neighbors(h.doc_id.as_str()) {
+            if edge.edge_type != EdgeType::Similar {
+                continue;
+            }
+            let hit = pool.get(edge.neighbor_doc_id.as_str()).copied();
+            if let Some((dst_idx, _)) = hit {
+                recip.insert(src | u64::from(dst_idx)); // uncapped: full-adjacency reciprocity
+            }
+            // The M-cap counts every examined `Similar` edge (in-pool or not), matching the
+            // ORIGINAL; only in-pool ones become diffusion neighbors.
+            if examined < m {
+                examined += 1;
+                if let Some((dst_idx, dst_score)) = hit {
+                    fwd_flat.push((dst_idx, dst_score));
+                }
+            }
+        }
+        fwd_off.push(fwd_flat.len() as u32);
+    }
+
+    let alpha = config.alpha;
+    let keep = 1.0 - alpha;
+    (0..n)
+        .map(|i| {
+            let h = &hits[i];
+            let doc_idx = i as u64;
+            let (lo, hi) = (fwd_off[i] as usize, fwd_off[i + 1] as usize);
+            let mut sum = 0.0f32;
+            let mut count = 0usize;
+            for &(nbr_idx, nbr_score) in &fwd_flat[lo..hi] {
+                // is_similar_neighbor(graph, neighbor, doc) == "neighbor → doc" is an edge.
+                if !recip.contains(&((u64::from(nbr_idx) << 32) | doc_idx)) {
+                    continue;
+                }
+                sum += nbr_score;
+                count += 1;
+            }
+            let nbr_mean = if count == 0 {
+                h.score
+            } else {
+                sum / count as f32
+            };
+            VectorHit {
+                index: h.index,
+                score: keep * h.score + alpha * nbr_mean,
+                doc_id: h.doc_id.clone(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

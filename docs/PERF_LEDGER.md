@@ -3887,3 +3887,65 @@ storage codegen): `CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/se
 Conclusion: no ship. The CTE/VALUES join costs more than it saves in Rust map allocation/probes for the measured
 batch shapes. Focused conformance: `cargo test -p frankensearch-storage check_dedup` passed 12 tests / 0 failed.
 Repro bench retained at `crates/frankensearch-storage/benches/dedup_batch.rs`.
+
+---
+
+## 2026-07-09 — Mutual-kNN neighbor-smoothing reciprocity: O(1) packed-edge set replaces O(deg) String scan — 1.21×/1.35×/1.50× (CopperVireo)
+
+Fresh path after the perf hot-core rejection streak (vector early-abandon seeding/approx-bounds/ILP,
+rerank CLS-prefetch/softmax-max, SimHash tableless votes, tombstone bitmap, embed gather, ops percentile,
+durability trailer — all rejected 07-06→07-09). This is the **first perf dig into the freshly-landed fusion
+QUALITY kernels** (`smooth.rs` `neighbor_smooth`, `257c468`), which were written for correctness and never
+perf-mined; it touches none of the exhausted paths above and leaves the shipped scores bit-identical.
+
+Primitive class: **succinct-structure / integer relabel + O(1) set membership**. In the `mutual`
+(reciprocal-kNN) config — the documented "no-regret refinement" for recall-bound corpora — the LEGACY
+ORIGINAL gates each candidate `d`'s in-pool neighbor `n` on whether `n` points *back* to `d`, realized as
+`is_similar_neighbor(graph, n, d)` = a std-SipHash `HashMap<String,_>` lookup **plus** an O(deg(n)) linear
+`String`-equality scan, called once per in-pool neighbor per candidate → **O(pool · M · deg)** String
+compares on top of the O(pool · M) diffusion. Profiling (the shipped `neighbor_smooth` bench) showed `mutual`
+running 5–6× the non-mutual path — the entire gap is that reciprocity scan.
+
+The landed kernel (`mutual_neighbor_smooth`) relabels the pool to dense `u32` indices and, in **one** walk
+over each candidate's `Similar` adjacency (each neighbor string hashed exactly once), builds both (a) a
+packed-`u64` (`src_idx << 32 | dst_idx`) `AHashSet` of every in-pool directed `Similar` edge — uncapped, to
+match the ORIGINAL's full-adjacency scan — and (b) a flat integer CSR of the M-capped in-pool forward
+neighbors. The diffusion pass is then pure integer work: reciprocity is an O(1)
+`recip.contains((n_idx << 32) | d_idx)`, with no second `graph.neighbors` SipHash lookup. **Non-mutual is
+byte-for-byte the ORIGINAL** (compute-floored single-hop diffusion — irreducible per-edge hashing, no
+headroom).
+
+Bench `neighbor_smooth_recip_ab` (isolated local target `search-copper`; the first cross-build baseline read
+3.29 ms @ pool 1000 but was contention-inflated — the quiescent figure is ~1.1 ms). ORIG is measured **first
+AND last** (`ORIG2`) to bracket the first-arm ordering bias, which was only ~1–3% here and is dwarfed by the
+win:
+
+| pool | LEGACY ORIGINAL (ORIG / ORIG2) | landed `v3` | ratio vs ORIG2 |
+|---:|---:|---:|---:|
+| 50   | 37.96 / 37.60 µs | 31.12 µs | 0.828 / **1.21× faster** |
+| 100  | 85.62 / 82.81 µs | 61.36 µs | 0.741 / **1.35× faster** |
+| 1000 | 1104.8 / 1086.9 µs | 724.35 µs | 0.667 / **1.50× faster** |
+
+CIs are fully separated at every size (pool 1000: landed [706.9, 742.9] µs vs ORIG2 [1062.7, 1114.5] µs;
+pool 100: [60.4, 62.4] vs [81.1, 84.6]). The win **grows with pool** because larger pools issue more
+reciprocity checks that amortize the O(deg) → O(1) shift — and it is a **lower bound** for real k-NN graphs
+with hub nodes (higher deg = a longer ORIGINAL linear scan, unchanged O(1) landed). A first eager candidate
+(`v2`, also benched) that rebuilt the reciprocity set in a *separate* full-adjacency pass won only ~1.15×
+because it re-hashed each edge string ~1.5×; fusing recip-build + forward-capture into a single hash-once
+walk (`v3`) is what cleared the noise — v3 beats v2 by 12–24% (e.g. 724 vs 951 µs @ pool 1000). Non-mutual
+regression guard: `nonmutual_v3` tracks `nonmutual_ORIG` within measurement noise at all sizes (byte-identical
+code path).
+
+Parity: the bench asserts the candidate is **bit-identical** (`score.to_bits()` + `index` + `doc_id`) to
+`neighbor_smooth` for both configs at every pool size before timing. Conformance GREEN:
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/search-copper cargo test -p frankensearch-fusion --lib smooth::`
+= **8 passed / 0 failed** (incl. `mutual_knn_ignores_one_way_edges`, `m_cap_limits_neighbors`,
+`hand_computed_mean`, `cluster_rescues_below_threshold_relevant`); `cargo clippy --no-deps -p
+frankensearch-fusion --lib --tests --bench neighbor_smooth_recip_ab -- -D warnings` reports **zero findings in
+the touched code** (`smooth.rs` additions + the new bench; the `usize→u32` relabel carries the codebase's
+existing `#[allow(clippy::cast_possible_truncation)]` idiom from `federated.rs`). The crate-wide run surfaces
+only **pre-existing** lints in untouched modules under the drifted local nightly (blend/feedback/hubness/mmr/ope
+and the pre-existing `mutual_knn` test) — a toolchain-skew artifact (it flags the already-shipped `hubness.rs`
+`ba5052a` too), not introduced here; the canonical RCH toolchain lints these clean. The kernel is not yet wired
+into the searcher (the smoothing pass awaits wiring); this removes the perf disincentive to enabling the
+better-quality `mutual` refinement once it lands.
