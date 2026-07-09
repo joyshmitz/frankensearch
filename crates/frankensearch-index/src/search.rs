@@ -1244,12 +1244,25 @@ fn pack_4bit_query(query: &[f32]) -> Vec<u8> {
 /// (`dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale (a constant
 /// factor, so the dot ranking is preserved).
 fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
-    let mut max_abs = 0.0_f32;
-    for chunk in bytes.chunks_exact(2) {
-        let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32().abs();
+    // Same decode-bound gap as `quantize_f16_bytes_to_i8`: SIMD-widen the f16 decode
+    // (simd.rs::widen8_f16_bytes, Giesen, bit-exact) and keep the max-abs reduction
+    // + nibble packing scalar → BIT-IDENTICAL 4-bit slab. Pass 2 decodes 8 dims per
+    // group within each vector (scalar tail for dims not a multiple of 8).
+    let n = bytes.len();
+    let mut maxv = f32x8::splat(0.0);
+    let mut i = 0;
+    while i + 16 <= n {
+        let v = crate::simd::widen8_f16_bytes(bytes[i..i + 16].try_into().expect("16 bytes"));
+        maxv = maxv.max(v.abs());
+        i += 16;
+    }
+    let mut max_abs = maxv.to_array().into_iter().fold(0.0_f32, f32::max);
+    while i + 2 <= n {
+        let value = f16::from_le_bytes([bytes[i], bytes[i + 1]]).to_f32().abs();
         if value > max_abs {
             max_abs = value;
         }
+        i += 2;
     }
     let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
     let count = bytes.len() / (dim * 2);
@@ -1258,7 +1271,22 @@ fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
     for v in 0..count {
         let base = v * dim * 2;
         let out = v * bytes_per_vector;
-        for d in 0..dim {
+        let mut d = 0;
+        while d + 8 <= dim {
+            let off = base + d * 2;
+            let vv = crate::simd::widen8_f16_bytes(bytes[off..off + 16].try_into().expect("16 bytes"));
+            for (j, value) in vv.to_array().into_iter().enumerate() {
+                let dd = d + j;
+                let nib = nibble_of(value, scale);
+                if dd % 2 == 0 {
+                    slab[out + dd / 2] |= nib;
+                } else {
+                    slab[out + dd / 2] |= nib << 4;
+                }
+            }
+            d += 8;
+        }
+        while d < dim {
             let value = f16::from_le_bytes([bytes[base + d * 2], bytes[base + d * 2 + 1]]).to_f32();
             let nib = nibble_of(value, scale);
             if d % 2 == 0 {
@@ -1266,6 +1294,7 @@ fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
             } else {
                 slab[out + d / 2] |= nib << 4;
             }
+            d += 1;
         }
     }
     slab

@@ -157,3 +157,7 @@ harness = false
 [[bench]]
 name = "f16_slab_quantize"
 harness = false
+
+[[bench]]
+name = "f16_slab_pack4bit"
+harness = false
