@@ -47,3 +47,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "simhash_vote_simd"
+harness = false

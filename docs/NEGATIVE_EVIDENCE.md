@@ -9871,3 +9871,71 @@ or exact trailer preallocation as a `FileProtector::protect_file` lever. In the 
 vector and trailer `Vec` growth are lost in codec source/repair symbol copies plus temp-file write/fsync noise.
 Only revisit trailer packing if an isolated trailer-serialization benchmark first proves the trailer packer
 itself is hot, or if a separate no-fsync in-memory sidecar path becomes the measured bottleneck.
+
+---
+
+## 2026-07-09 — FSFS sidecar query-state hoist is a local LEGACY-ORIG win, not an external engine ratio (SearchCod)
+
+**Scope guardrail:** the shipped `code_structure_sidecar` change is a measured win against frankensearch's
+legacy original caller shape: a loop that invoked `CodeStructureSidecar::score_query(query, doc_id)` once per
+candidate, re-tokenizing and re-normalizing the same query every time. It is **not** a Lucene/Tantivy/Meili or
+end-to-end search-engine comparator ratio. Do not cite this as an external system win.
+
+Measured command (RCH attempts on `vmi1264463` went stale; local fallback used the requested
+`CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod`):
+
+```bash
+AGENT_NAME=SearchCod \
+CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod RUST_LOG=off \
+  cargo bench -p frankensearch-fsfs --no-default-features --profile release \
+    --bench code_sidecar_score -- sidecar_candidate_score \
+    --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+| Candidate count | LEGACY ORIGINAL `score_query` loop | LANDED `prior_signals` | Ratio vs ORIG |
+|---:|---:|---:|---:|
+| 32 | 47.266 us | 37.336 us | 0.790 / 1.266x faster |
+| 128 | 194.71 us | 153.70 us | 0.789 / 1.267x faster |
+| 512 | 870.96 us | 707.56 us | 0.812 / 1.231x faster |
+
+**Do not repeat / misroute:** this does not revive the rejected FSFS token-scanner variants, signal-token
+materialization, durability trailer packing, storage batching, exact-id fusion probes, dense vector top-k
+seeding, or rerank attention lanes. The primitive class was query-state factorization across a candidate list;
+the next FSFS sidecar attempt should first profile a different frame or a different data structure with its own
+legacy-original comparator.
+
+---
+
+## 2026-07-08 — SimHash vote accumulation: tableless AVX2 bit-expansion is 1.5-2.1× SLOWER than the L1 table + votes are a small simhash fraction → REJECTED (FlintOsprey)
+
+**Different seam (re-profiling after embed gather):** the fingerprint SimHash `apply_hash_votes` (index-time,
+per-doc re-embedding decision, 130k×) accumulates 64 ±1 votes/shingle-window via 8 `VOTE_TABLE[byte]` L1
+loads. Hypothesis: the 8 table loads/window are a load-dependency bottleneck; a **tableless AVX2 bit→±1
+expansion** (`broadcast(byte) & [1,2,…,128]` → `cmpeq` → `-(2m+1)`, no loads — a SWAR/SIMD primitive) would
+win. Bench `simhash_vote_simd` (faithful FNV + VOTE_TABLE; bit-identical output hash asserted), medians:
+
+| bench | table_i32 | simd_expand | ratio |
+|---|---:|---:|---:|
+| votes_only n=256  | 1.233 µs | 1.887 µs | **1.53× SLOWER** |
+| votes_only n=1024 | 4.596 µs | 9.643 µs | **2.10× SLOWER** |
+| full simhash t=1024 | 39.59 µs | 39.67 µs | 1.002 (tie) |
+| full simhash t=256  | 9.902 µs | 9.440 µs | 0.953 (CIs overlap = noise) |
+
+**Why it fails (two independent reasons):**
+1. **The tableless SIMD is 1.5-2.1× SLOWER than the L1 table** (isolated bench, clean). The hypothesis was
+   backwards: `VOTE_TABLE` is 8 KB (256×[i32;8]) → **L1-resident**, and an L1 load is ~4-5 cyc *pipelined*
+   (throughput ~2/cyc), so `load table[byte]` + one vectorized 8-wide add is CHEAPER than the SIMD path's
+   ~9 ALU ops/byte (broadcast + and + cmpeq + 2 add + sub + load + add + store). The table isn't the
+   bottleneck; recomputing votes with ALU is strictly more work.
+2. **Votes are a SMALL fraction of simhash.** Full-simhash is a near-**tie** (t=1024: 1.002×) even though the
+   SIMD votes are 2× slower — because `hash_token_window` (byte-at-a-time FNV-1a over each 3-token window,
+   overlapping) + `split_whitespace` tokenization + the `Vec<&str>` dominate. So even a vote SPEEDUP would be
+   diluted to nothing; the FNV is the real cost and is **semantics-locked** (a rollable/SWAR hash would change
+   simhash values → change re-embedding decisions — see NEG_EV `storage::content_hash` SHA-256 lock class).
+
+**Lesson:** don't assume "table lookup = load bottleneck" — a small (L1-resident) lookup table + vectorized
+add beats a tableless SIMD ALU expansion; the load is fast and pipelined. And always isolate the sub-kernel
+(here votes are a small fraction, so the full-path A/B was noise-dominated and would have mis-signalled).
+Bench kept as artifact. Conformance: bench compiles + runs green via RCH (exit 0, `Finished`); output hash
+bit-identical (table vs simd) asserted ∀ input. The core preprocessing perf surface (canonicalize mined,
+fingerprint FNV+votes now both exhausted, `quantization.rs` dead-code, MMR cosine rounding-locked) is closed.
