@@ -9820,3 +9820,54 @@ Model2Vec query embedding (~10–60 tokens) is in the resident regime → the ga
 there. Bench kept as the reproducible artifact. Conformance: bench compiles + runs green via RCH (exit 0,
 `Finished`); parity asserts bit-identical sum ∀ T (prefetch is a hint). Route-next if ever revisited: measure
 t∈{128,512} to bracket τ, and only for the index-time doc-embedding throughput budget — never the query path.
+
+---
+
+## 2026-07-09 — Durability repair-trailer direct tuple packer is not a clean `protect_file` win → REJECTED (CobaltRidge)
+
+**Different path profiled:** left rerank/vector/fusion work and used `frankensearch-durability`'s existing
+Criterion bench to profile the file-protection lane. Prior rejection entries were read first: this does **not**
+retry the rejected GF(256)/RaptorQ SIMD idea from `codec.rs`, and does not touch storage batching, fsfs token
+scanners, lexical materialization, vector scan, or CLS attention. The profiled hot row was `protect_file` encode,
+not raw hash verification:
+
+```bash
+AGENT_NAME=CobaltRidge \
+CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod \
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch exec -- cargo bench -p frankensearch-durability --profile release \
+    --bench durability_bench -- --sample-size 10 --warm-up-time 0.2 --measurement-time 0.5
+```
+
+RCH ran this profile remotely on `ovh-a`. The largest row was `encode_throughput/10MB` at **23.078 ms**
+median; `encode_throughput/1MB` was **1.760 ms**. In contrast, raw `verify_xxh3_fast_path/10MB` was
+**303.33 us**, `protect_verify_roundtrip/5MB` was **820.25 us**, and `repair_1mb_single_block_corruption`
+was **1.8732 ms**.
+
+**Primitive tested and reverted:** a data-layout repair-trailer packer. `FileProtector::protect_file` used to
+move `encoded.repair_symbols` into a temporary `Vec<RepairSymbol>`, then `serialize_repair_trailer` appended
+symbol frames into a growable `Vec::new()`. The candidate serialized directly from the codec's
+`Vec<(esi, Vec<u8>)>` and preallocated the exact trailer byte capacity. Trailer bytes and CRC format were
+unchanged; this only removed the adapter vector and buffer growth.
+
+**Comparator evidence:** post-change RCH had no admissible workers and fell back locally, so the remote `ovh-a`
+profile is not used as a keep comparator. I created a detached original worktree at
+`/data/projects/frankensearch-orig-durability-20260709` (`5422ba6`), copied the main checkout's `Cargo.lock`,
+and reran the same local fallback bench with `--locked`.
+
+| Workload | ORIG locked local median | Candidate local median | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `encode_throughput/1MB` | 14.561 ms | 14.545 ms | 0.999 | no change |
+| `encode_throughput/10MB` | 96.631 ms | 62.397 ms | 0.646 | reject: ORIG CI was 64.550-134.30 ms, Criterion p=0.11/no-change |
+
+One unpinned original comparator run is intentionally discarded: before the lockfile was copied into the
+worktree, Cargo resolved `fsqlite` 0.1.15 instead of the main checkout's locked 0.1.12 family. That drifted
+run measured `encode_throughput/10MB` at **57.015 ms**, which would make the candidate **1.094× slower**. It
+is not a valid comparator, but it confirms the local full-path row is too noisy to claim a keep from the
+locked outlier-heavy run.
+
+**Decision:** source reverted; docs-only rejection. Do **not** retry direct tuple repair-trailer serialization
+or exact trailer preallocation as a `FileProtector::protect_file` lever. In the measured full path, the adapter
+vector and trailer `Vec` growth are lost in codec source/repair symbol copies plus temp-file write/fsync noise.
+Only revisit trailer packing if an isolated trailer-serialization benchmark first proves the trailer packer
+itself is hot, or if a separate no-fsync in-memory sidecar path becomes the measured bottleneck.
