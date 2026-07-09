@@ -10179,3 +10179,70 @@ rollup percentiles in Rust remains rejected for that materialization shape.
 Conformance GREEN before commit: `cargo test -p frankensearch-ops frame_quality_tracker --profile release` passed
 5/5 frame-quality tests; `cargo check -p frankensearch-ops --all-targets`, `cargo clippy -p frankensearch-ops
 --all-targets -- -D warnings`, and `cargo fmt -p frankensearch-ops --check` passed.
+
+---
+
+### 2026-07-09 — CobaltRidge — REJECTED: flat CSR (contiguous edge array + offsets) LOSES to the shipped `Vec<Vec>` dense CSR in the graph-rank PageRank power iteration — the two-pass build DOUBLES the per-edge `doc_id`-string hash probes, and the small graphs are L2-resident so the sequential-sweep locality gain is negligible (1.22×/1.29× SLOWER)
+
+**Different profiled path (structurally-different primitive class):** `GraphRanker::rank_phase1`
+(`frankensearch-fusion/src/graph_rank.rs`, feature-gated `graph`) — the query-biased PageRank power iteration.
+Not in any prior rejection row (avoids the exact-id/vector-topk/rerank-attention/embed-gather/fsfs-token/
+storage-batch/SimHash-vote/durability-trailer/ops-rollup/live-stream/tombstone/dedup-slot-join/sidecar paths).
+Primitive class: **data-layout / succinct-structure** — replace the shipped per-node
+`Vec<Vec<(usize, f64)>>` adjacency (the LANDED HashMap-per-iteration → dense-CSR transform) with a **true flat
+CSR**: one contiguous `edges_flat: Vec<(usize, f64)>` (all rows concatenated in node-index order) plus an
+`offsets: Vec<usize>` array. Hypothesis (textbook GEMM/sparse-graph layout): (a) build drops from `n` row-`Vec`
+heap allocations to two; (b) since the power iteration walks `src = 0..n` in order, the inner edge loop becomes
+a single **sequential** sweep of `edges_flat` instead of chasing `n` scattered heap blocks on every one of the
+20 passes.
+
+**LEGACY ORIGINAL** for this dig: the shipped `Vec<Vec<(usize,f64)>>` dense CSR (the `rank_new` arm — the
+already-landed win over the `rank_old` HashMap-per-iter path). Same-binary A/B in `benches/graph_rank.rs`
+(self-contained old/vecvec-ORIG/flat copies), medians, all CIs fully separated:
+
+| case | LEGACY ORIGINAL `Vec<Vec>` CSR | flat CSR | ratio vs ORIG | decision |
+|---|---:|---:|---:|---|
+| `n500_deg6`  | **151.12 µs** [149.95, 152.90] | 185.07 µs [180.36, 191.22] | **1.22× slower** | reject |
+| `n2000_deg8` | **826.90 µs** [804.06, 851.03] | 1068.0 µs [1045.0, 1096.9] | **1.29× slower** | reject |
+
+```bash
+AGENT_NAME=CobaltRidge CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cobaltridge \
+  cargo bench -p frankensearch-fusion --bench graph_rank --profile release -- \
+  --sample-size 40 --warm-up-time 0.5 --measurement-time 2.5
+```
+
+**Why it fails (two independent reasons, hypothesis was backwards):**
+1. **The two-pass CSR build DOUBLES the expensive per-edge `doc_id`-string hash probes.** To size each row
+   (offsets) from a hash-ordered adjacency you need a counting pass; that pass probes `idx.contains_key(nb)`
+   for every edge, and the scatter pass then probes `idx.get(nb)` again — **two** `HashMap<&str, usize>` string
+   probes per edge vs the ORIGINAL's **one** `idx.get`. The neighbor-string hash+probe dominates the build, so
+   doubling it swamps everything. (The single-pass `Vec<Vec>` build IS essentially the natural per-src
+   bucketing already — a flat CSR can't beat it without either double-scanning or a bucket-then-flatten copy.)
+2. **The graphs are small (n ≤ 2000, ~L2-resident), so the traversal-locality win is negligible.** The `Vec<Vec>`
+   inner-loop pointer-chase (`&csr[src]` → a scattered heap block) is already cache-cheap at these sizes —
+   the row blocks, allocated in a tight build loop, land near each other in the allocator arena. The 20-pass
+   power iteration therefore gains almost nothing from `edges_flat`'s sequential sweep, while paying the
+   doubled build.
+
+**Lesson:** a `Vec<Vec<T>>` adjacency is **already near-optimal** for a *build-dominated, small-graph*
+traversal — flattening it to CSR is not free: rebuilding offsets from an unordered (hash-keyed) source doubles
+the per-edge key probes, and the sequential-sweep locality gain only materializes when the traversal is
+genuinely **bandwidth-bound** (edge array ≫ L2). Don't assume "contiguous CSR > Vec<Vec>" for a graph whose
+edges fit in cache; measure the build cost, which here is the whole game. Mirrors the `tombstone_bitmap` lesson
+(a memory-layout change only pays where the access is *not* already hidden/cheap).
+
+**Decision:** REJECTED; production restored **bit-for-bit** (`git diff crates/frankensearch-fusion/src/graph_rank.rs
+crates/frankensearch-fusion/benches/graph_rank.rs` empty). Parity was clean before revert: the flat CSR is
+bit-identical (same node indexing, same per-node valid-edge order → same `next[dst] += base*weight`
+accumulation → same f64 fixed point) — `cargo test -p frankensearch-fusion --lib --features graph graph_rank::`
+= **4 passed / 0 failed** (incl. `dense_rank_matches_reference_ranking`), and the A/B bench asserted
+`rank_new == rank_flat` for both graph sizes before timing. Local same-machine A/B (isolated target
+`search-cobaltridge` to avoid sibling-build lock contention); same-binary so the ratio is machine-independent.
+
+**Route-next (untested, low-confidence):** flat CSR could still pay on a genuinely LARGE graph (n ≫ 10⁴, edge
+array ≫ L2) where the power-iteration traversal is bandwidth-bound AND the build is done **single-pass** (resolve
+each neighbor's `idx` exactly once — e.g. bucket-count into a scratch during a first-and-only probe, or intern
+doc_ids to integers up front so the "hash probe" becomes an array index). But `graph_rank` is a feature-gated
+phase-1 hook seeded from a retrieved candidate pool (hundreds of nodes), never fed 10⁴⁺-node graphs on the hot
+path, so this is not pursued. Do **not** re-try a two-pass flat CSR on `graph_rank` for these sizes.
+
