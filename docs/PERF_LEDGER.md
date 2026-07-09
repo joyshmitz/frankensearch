@@ -3832,3 +3832,36 @@ actions for a 40-event shell workload before timing.
 Conformance: `AGENT_NAME=SearchCod CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod cargo test -p frankensearch-tui input::tests --profile release`
 passed 11 input tests / 0 failed, including default-fast-path equivalence, unknown-key miss equivalence,
 override of a default binding, and unbind behavior.
+
+---
+
+## 2026-07-09 — Core host-attribution fixed-universe resolver LANDED in Rust (SearchCod)
+
+Fresh path after the rejection-ledger review: `frankensearch-core` host-project attribution resolution, which feeds
+ops host identity but is distinct from the recent exact-id, vector scan, rerank, embed gather, fsfs, storage,
+fusion-quality, durability, ops percentile/rollup, and TUI palette work. Primitive class:
+**succinct-structure / fixed-universe bitmask**. The resolver now maps aliases into a 4-bit project universe and
+uses rolling token windows for multi-token aliases, replacing the legacy candidate `Vec`, collision `BTreeSet`,
+per-hint token `Vec`, alias token `Vec`, and token `BTreeSet` construction.
+
+Latency (RCH worker `hz2`, command:
+`AGENT_NAME=SearchCod CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod rch exec -- cargo bench -p frankensearch-core --profile release --bench host_attribution_resolve -- host_attribution_resolve --sample-size 12 --warm-up-time 0.1 --measurement-time 0.35 --noplot`):
+
+| docs | LEGACY ORIGINAL median | landed median | ratio-vs-ORIG |
+|---:|---:|---:|---:|
+| 64 | 58.231 us | 9.4185 us | 0.162 / 6.18x faster |
+| 1,024 | 957.43 us | 151.30 us | 0.158 / 6.33x faster |
+| 16,384 | 15.554 ms | 2.4793 ms | 0.159 / 6.27x faster |
+
+Proof: the benchmark embeds the LEGACY ORIGINAL resolver and asserts exact `HostProjectAttribution` equality
+before timing every row. `host_project_attribution_matches_alias_boundaries` covers alias boundaries,
+multi-token aliases, non-alias substrings, weight precedence, and collision demotion. Conformance GREEN:
+`rch exec -- cargo test -p frankensearch-core host_project_attribution_matches_alias_boundaries --profile release`
+= **1 passed / 0 failed**; `rch exec -- cargo check --workspace --all-targets`; `rch exec -- cargo clippy -p
+frankensearch-core --lib --tests --bench host_attribution_resolve -- -D warnings`; `rch exec -- cargo clippy
+--no-deps -p optimize-params --all-targets -- -D warnings`; `rustfmt --edition 2024 --check` on touched Rust
+files. UBS was run on the new benchmark: **0 critical / 1 expected benchmark assertion warning**; the wider
+touched-file UBS scan still reports pre-existing panic/unwrap inventories in existing test/tool code.
+
+One adjacent compile fix is included: `tools/optimize_params` now fills the newly added `RrfConfig` fields via
+`..RrfConfig::default()`, which was required for the workspace compile proof to stay green.

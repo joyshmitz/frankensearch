@@ -6,7 +6,6 @@
 //! - Shared conformance validators for schema-version and redaction compliance.
 //! - A harness that runs fixture-based contract checks with actionable diagnostics.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -125,6 +124,13 @@ impl HostProjectAttribution {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    project: &'static str,
+    weight: u8,
+    reason: &'static str,
+}
+
 /// Resolve canonical host-project attribution from adapter identity + telemetry hints.
 ///
 /// The algorithm is deterministic with source-precedence tie breaks:
@@ -135,63 +141,35 @@ pub fn resolve_host_project_attribution(
     telemetry_project_key: Option<&str>,
     host_name_hint: Option<&str>,
 ) -> HostProjectAttribution {
-    #[derive(Debug, Clone, Copy)]
-    struct Candidate {
-        project: &'static str,
-        weight: u8,
-        reason: &'static str,
-    }
+    let mut seen_project_mask = 0_u8;
+    let mut winner = None;
 
-    let mut candidates: Vec<Candidate> = Vec::new();
+    observe_project_candidates(
+        identity_host_project,
+        4,
+        "adapter_identity",
+        &mut seen_project_mask,
+        &mut winner,
+    );
+    observe_project_candidates(
+        telemetry_project_key,
+        3,
+        "telemetry_project_key",
+        &mut seen_project_mask,
+        &mut winner,
+    );
+    observe_project_candidates(
+        host_name_hint,
+        1,
+        "host_name",
+        &mut seen_project_mask,
+        &mut winner,
+    );
 
-    if let Some(hint) = identity_host_project {
-        for project in canonical_projects_from_hint(hint) {
-            candidates.push(Candidate {
-                project,
-                weight: 4,
-                reason: "adapter_identity",
-            });
-        }
-    }
-
-    if let Some(hint) = telemetry_project_key {
-        for project in canonical_projects_from_hint(hint) {
-            candidates.push(Candidate {
-                project,
-                weight: 3,
-                reason: "telemetry_project_key",
-            });
-        }
-    }
-
-    if let Some(hint) = host_name_hint {
-        for project in canonical_projects_from_hint(hint) {
-            candidates.push(Candidate {
-                project,
-                weight: 1,
-                reason: "host_name",
-            });
-        }
-    }
-
-    if candidates.is_empty() {
-        return HostProjectAttribution::unknown("attribution.unknown");
-    }
-
-    let unique_projects: BTreeSet<&str> = candidates
-        .iter()
-        .map(|candidate| candidate.project)
-        .collect();
-    let collision = unique_projects.len() > 1;
-
-    let Some(winner) = candidates.into_iter().max_by(|left, right| {
-        left.weight
-            .cmp(&right.weight)
-            .then_with(|| right.project.cmp(left.project))
-            .then_with(|| right.reason.cmp(left.reason))
-    }) else {
+    let Some(winner) = winner else {
         return HostProjectAttribution::unknown("attribution.unknown");
     };
+    let collision = seen_project_mask.count_ones() > 1;
 
     let mut confidence_score: u8 = match winner.weight {
         4 => 95,
@@ -215,6 +193,62 @@ pub fn resolve_host_project_attribution(
         reason_code,
         collision,
     }
+}
+
+const PROJECT_CODING_AGENT_SESSION_SEARCH: u8 = 1 << 0;
+const PROJECT_FRANKENTERM: u8 = 1 << 1;
+const PROJECT_MCP_AGENT_MAIL_RUST: u8 = 1 << 2;
+const PROJECT_XF: u8 = 1 << 3;
+
+const PROJECTS_BY_TIE_ORDER: &[(u8, &str)] = &[
+    (
+        PROJECT_CODING_AGENT_SESSION_SEARCH,
+        "coding_agent_session_search",
+    ),
+    (PROJECT_FRANKENTERM, "frankenterm"),
+    (PROJECT_MCP_AGENT_MAIL_RUST, "mcp_agent_mail_rust"),
+    (PROJECT_XF, "xf"),
+];
+
+fn observe_project_candidates(
+    hint: Option<&str>,
+    weight: u8,
+    reason: &'static str,
+    seen_project_mask: &mut u8,
+    winner: &mut Option<Candidate>,
+) {
+    let Some(hint) = hint else {
+        return;
+    };
+    let project_mask = canonical_project_mask_from_hint(hint);
+    if project_mask == 0 {
+        return;
+    }
+
+    *seen_project_mask |= project_mask;
+    for (project_bit, project) in PROJECTS_BY_TIE_ORDER {
+        if project_mask & project_bit == 0 {
+            continue;
+        }
+        let candidate = Candidate {
+            project,
+            weight,
+            reason,
+        };
+        let replace = winner
+            .as_ref()
+            .is_none_or(|current| candidate_beats(candidate, *current));
+        if replace {
+            *winner = Some(candidate);
+        }
+    }
+}
+
+fn candidate_beats(left: Candidate, right: Candidate) -> bool {
+    left.weight > right.weight
+        || (left.weight == right.weight
+            && (left.project < right.project
+                || (left.project == right.project && left.reason < right.reason)))
 }
 
 /// Lifecycle hooks exposed to host adapters.
@@ -1130,72 +1164,48 @@ fn canonical_identity_pair_violation(
     None
 }
 
-fn canonical_projects_from_hint(hint: &str) -> Vec<&'static str> {
-    const CANONICAL_ALIASES: &[(&str, &[&str])] = &[
-        (
-            "coding_agent_session_search",
-            &[
-                "coding_agent_session_search",
-                "codingagentsessionsearch",
-                "cass",
-            ],
-        ),
-        ("xf", &["xf"]),
-        (
-            "mcp_agent_mail_rust",
-            &[
-                "mcp_agent_mail_rust",
-                "mcpagentmailrust",
-                "mcpagentmail",
-                "agent_mail",
-                "agentmail",
-                "amail",
-            ],
-        ),
-        ("frankenterm", &["frankenterm"]),
-    ];
-
+fn canonical_project_mask_from_hint(hint: &str) -> u8 {
     let normalized = normalize_project_hint(hint);
     if normalized.is_empty() {
-        return Vec::new();
-    }
-    let ordered_tokens: Vec<&str> = normalized
-        .split('_')
-        .filter(|token| !token.is_empty())
-        .collect();
-    let tokens: BTreeSet<&str> = ordered_tokens.iter().copied().collect();
-
-    let mut matches = Vec::new();
-    for (canonical, aliases) in CANONICAL_ALIASES {
-        if aliases
-            .iter()
-            .any(|alias| alias_matches_hint(&normalized, &ordered_tokens, &tokens, alias))
-        {
-            matches.push(*canonical);
-        }
+        return 0;
     }
 
-    matches.sort_unstable();
-    matches.dedup();
-    matches
+    project_mask_from_normalized_hint(&normalized)
 }
 
-fn alias_matches_hint(
-    normalized_hint: &str,
-    ordered_hint_tokens: &[&str],
-    hint_tokens: &BTreeSet<&str>,
-    alias: &str,
-) -> bool {
-    if normalized_hint == alias || hint_tokens.contains(alias) {
-        return true;
+fn project_mask_from_normalized_hint(normalized: &str) -> u8 {
+    let mut project_mask = 0_u8;
+    let mut prev3 = "";
+    let mut prev2 = "";
+    let mut prev1 = "";
+
+    for part in normalized.split('_') {
+        project_mask |= project_mask_from_single_part(part);
+        if prev1 == "agent" && part == "mail" {
+            project_mask |= PROJECT_MCP_AGENT_MAIL_RUST;
+        }
+        if prev3 == "coding" && prev2 == "agent" && prev1 == "session" && part == "search" {
+            project_mask |= PROJECT_CODING_AGENT_SESSION_SEARCH;
+        }
+        if prev3 == "mcp" && prev2 == "agent" && prev1 == "mail" && part == "rust" {
+            project_mask |= PROJECT_MCP_AGENT_MAIL_RUST;
+        }
+        prev3 = prev2;
+        prev2 = prev1;
+        prev1 = part;
     }
 
-    let alias_tokens: Vec<&str> = alias.split('_').filter(|token| !token.is_empty()).collect();
-    alias_tokens.len() > 1
-        && alias_tokens.len() <= ordered_hint_tokens.len()
-        && ordered_hint_tokens
-            .windows(alias_tokens.len())
-            .any(|window| window == alias_tokens.as_slice())
+    project_mask
+}
+
+fn project_mask_from_single_part(part: &str) -> u8 {
+    match part {
+        "cass" | "codingagentsessionsearch" => PROJECT_CODING_AGENT_SESSION_SEARCH,
+        "xf" => PROJECT_XF,
+        "frankenterm" => PROJECT_FRANKENTERM,
+        "mcpagentmailrust" | "mcpagentmail" | "agentmail" | "amail" => PROJECT_MCP_AGENT_MAIL_RUST,
+        _ => 0,
+    }
 }
 
 fn normalize_project_hint(hint: &str) -> String {
@@ -1779,6 +1789,74 @@ mod tests {
                 identity.runtime_role.as_deref(),
                 Some(host.default_runtime_role())
             );
+        }
+    }
+
+    #[test]
+    fn host_project_attribution_matches_alias_boundaries() {
+        let cases = [
+            (
+                None,
+                Some("foo-cass-bar"),
+                None,
+                "coding_agent_session_search",
+                85,
+                "attribution.telemetry_project_key",
+                false,
+            ),
+            (
+                None,
+                Some("cassandra"),
+                Some("mystery-box"),
+                "unknown",
+                20,
+                "attribution.unknown",
+                false,
+            ),
+            (
+                None,
+                Some("mcp-agent-mail-runner"),
+                None,
+                "mcp_agent_mail_rust",
+                85,
+                "attribution.telemetry_project_key",
+                false,
+            ),
+            (
+                None,
+                Some("prefixxf"),
+                Some("worker"),
+                "unknown",
+                20,
+                "attribution.unknown",
+                false,
+            ),
+            (
+                Some("xf"),
+                Some("cass-host"),
+                Some("coding-agent-session-search"),
+                "xf",
+                70,
+                "attribution.collision",
+                true,
+            ),
+        ];
+
+        for (
+            identity,
+            telemetry,
+            host,
+            expected_project,
+            expected_confidence,
+            expected_reason,
+            expected_collision,
+        ) in cases
+        {
+            let attribution = resolve_host_project_attribution(identity, telemetry, host);
+            assert_eq!(attribution.resolved_project_key, expected_project);
+            assert_eq!(attribution.confidence_score, expected_confidence);
+            assert_eq!(attribution.reason_code, expected_reason);
+            assert_eq!(attribution.collision, expected_collision);
         }
     }
 

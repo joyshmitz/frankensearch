@@ -45,6 +45,10 @@ harness = false
 name = "parsed_query"
 harness = false
 
+[[bench]]
+name = "host_attribution_resolve"
+harness = false
+
 [lints]
 workspace = true
 
