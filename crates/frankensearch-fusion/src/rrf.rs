@@ -430,6 +430,184 @@ pub fn rrf_fuse_with_graph(
     output
 }
 
+// ─── Pool-Local Min-Max Score Fusion ────────────────────────────────────────
+
+/// Min and max of a tier's retrieved pool. Returns `(+inf, -inf)` for an empty
+/// pool (so [`minmax_norm`] degenerates every score to `0.0`, contributing nothing).
+#[inline]
+fn pool_min_max(scores: impl Iterator<Item = f32>) -> (f32, f32) {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for s in scores {
+        if s < min {
+            min = s;
+        }
+        if s > max {
+            max = s;
+        }
+    }
+    (min, max)
+}
+
+/// Min-max normalize `score` into `[0, 1]` over its tier pool. A degenerate pool
+/// (`max == min`, or empty) maps every score to `0.0` (no divide-by-zero, no
+/// spurious ranking signal from a flat tier).
+#[inline]
+fn minmax_norm(score: f32, min: f32, max: f32) -> f64 {
+    let range = max - min;
+    if range > 0.0 {
+        f64::from((score - min) / range)
+    } else {
+        0.0
+    }
+}
+
+/// Fuse lexical and semantic results by **pool-local min-max score fusion** — a
+/// drop-in alternative to [`rrf_fuse`] that recovers the score MAGNITUDE the rank
+/// transform discards.
+///
+/// # Algorithm
+///
+/// 1. For each tier, min-max normalize its raw scores **within its retrieved pool**
+///    (the input slice) to `[0, 1]`.
+/// 2. A document a tier did *not* retrieve gets that tier's pool **minimum**
+///    normalized value — which is `0.0` for min-max.
+/// 3. The fused score is the tier-weighted sum of the two normalized scores.
+/// 4. Sort by the same deterministic ordering as RRF ([`FusedHitScratch::cmp_for_ranking`],
+///    the fused score living in `rrf_score`), then paginate.
+///
+/// # Why it beats RRF
+///
+/// RRF flattens a runaway top match (`score ≫ the rest of the pool`) and a marginal
+/// one to the same "rank 1". Pool-local min-max keeps that magnitude, and calibrating
+/// **over the retrieved pool** (not the zero-swamped full corpus) avoids the outlier
+/// crushing that makes naive score fusion lose to RRF. Measured **+0.0038 mean
+/// nDCG@10 over RRF across 4 BEIR corpora, never-negative** at pool depths 50 and 100
+/// (`docs/NEGATIVE_EVIDENCE.md`, `45530fb`). Tier weights reuse [`RrfConfig`].
+#[must_use]
+#[instrument(
+    name = "frankensearch::pool_minmax_fuse",
+    skip(lexical, semantic),
+    fields(
+        lexical_count = lexical.len(),
+        semantic_count = semantic.len(),
+        limit,
+        offset,
+    )
+)]
+pub fn pool_minmax_fuse(
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+) -> Vec<FusedHit> {
+    let lexical_weight = sanitize_tier_weight(config.lexical_weight);
+    let semantic_weight = sanitize_tier_weight(config.semantic_weight);
+    let tiebreak = config.tiebreak;
+
+    // Pool statistics over each tier's retrieved pool (the input slice).
+    let (lex_min, lex_max) = pool_min_max(lexical.iter().map(|r| r.score));
+    let (sem_min, sem_max) = pool_min_max(semantic.iter().map(|h| h.score));
+
+    let capacity = (lexical.len() + semantic.len()) * 3 / 4 + 1;
+    let mut hits: AHashMap<&str, FusedHitScratch<'_>> = AHashMap::with_capacity(capacity);
+
+    // Accumulate ranks + raw scores (dedup on first, best, occurrence — same as RRF).
+    for (rank, result) in lexical.iter().enumerate() {
+        match hits.entry(result.doc_id.as_str()) {
+            Entry::Occupied(mut e) => {
+                let hit = e.get_mut();
+                if hit.lexical_rank.is_some() {
+                    continue;
+                }
+                hit.lexical_rank = Some(rank);
+                hit.lexical_score = Some(result.score);
+                if hit.semantic_rank.is_some() {
+                    hit.in_both_sources = true;
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(FusedHitScratch {
+                    doc_id: result.doc_id.as_str(),
+                    rrf_score: 0.0,
+                    lexical_rank: Some(rank),
+                    semantic_rank: None,
+                    semantic_index: None,
+                    graph_rank: None,
+                    lexical_score: Some(result.score),
+                    semantic_score: None,
+                    graph_score: None,
+                    in_both_sources: false,
+                });
+            }
+        }
+    }
+    for (rank, hit) in semantic.iter().enumerate() {
+        match hits.entry(hit.doc_id.as_str()) {
+            Entry::Occupied(mut e) => {
+                let fh = e.get_mut();
+                if fh.semantic_rank.is_some() {
+                    continue;
+                }
+                fh.semantic_rank = Some(rank);
+                fh.semantic_score = Some(hit.score);
+                fh.semantic_index = Some(hit.index);
+                if fh.lexical_rank.is_some() {
+                    fh.in_both_sources = true;
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(FusedHitScratch {
+                    doc_id: hit.doc_id.as_str(),
+                    rrf_score: 0.0,
+                    lexical_rank: None,
+                    semantic_rank: Some(rank),
+                    semantic_index: Some(hit.index),
+                    graph_rank: None,
+                    lexical_score: None,
+                    semantic_score: Some(hit.score),
+                    graph_score: None,
+                    in_both_sources: false,
+                });
+            }
+        }
+    }
+
+    let mut results: Vec<FusedHitScratch<'_>> = hits.into_values().collect();
+
+    // Fused score = tier-weighted sum of pool-normalized scores; a tier that did not
+    // retrieve a doc contributes its pool minimum (= 0.0 for min-max). Stored in
+    // `rrf_score` so the existing deterministic comparator sorts on it.
+    for h in &mut results {
+        let lex_norm = h
+            .lexical_score
+            .map_or(0.0_f64, |s| minmax_norm(s, lex_min, lex_max));
+        let sem_norm = h
+            .semantic_score
+            .map_or(0.0_f64, |s| minmax_norm(s, sem_min, sem_max));
+        h.rrf_score = lexical_weight * lex_norm + semantic_weight * sem_norm;
+    }
+
+    let window = limit.saturating_add(offset);
+    if window == 0 {
+        return Vec::new();
+    }
+    if window < results.len() {
+        let nth_index = window.saturating_sub(1);
+        results.select_nth_unstable_by(nth_index, |a, b| a.cmp_for_ranking(b, tiebreak));
+        results.truncate(window);
+    }
+    results.sort_unstable_by(|a, b| a.cmp_for_ranking(b, tiebreak));
+
+    results
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(FusedHitScratch::into_owned)
+        .collect()
+}
+
 /// Merge-structured RRF: identical result to [`rrf_fuse_with_graph`], built so the
 /// final sort receives a **near-sorted** (semantic-ordered) input.
 ///
@@ -709,6 +887,88 @@ mod tests {
             explanation: None,
             metadata: None,
         }
+    }
+
+    // ─── Pool-local min-max score fusion ────────────────────────────────
+
+    fn fused_ids(hits: &[FusedHit]) -> Vec<String> {
+        hits.iter().map(|h| h.doc_id.to_string()).collect()
+    }
+
+    #[test]
+    fn pool_minmax_recovers_top_match_magnitude() {
+        // lexical pool [10,2,1] -> a=1.0, b=0.111, c=0.0
+        // semantic pool [0.9,0.5,0.4] -> a=1.0, d=0.2, b=0.0
+        let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 2.0), lexical_hit("c", 1.0)];
+        let semantic = [semantic_hit("a", 0.9), semantic_hit("d", 0.5), semantic_hit("b", 0.4)];
+        let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
+        // a=2.0, d=0.2, b=0.111, c=0.0. Crucially d (semantic-only, higher magnitude)
+        // outranks b (in BOTH sources but marginal in each) — the magnitude recovery
+        // RRF's rank transform discards.
+        assert_eq!(fused_ids(&out), vec!["a", "d", "b", "c"]);
+        // Fused score is the tier-weighted sum of normalized scores.
+        assert!((out[0].rrf_score - 2.0).abs() < 1e-6, "a should be 1.0+1.0");
+        assert!((out[1].rrf_score - 0.2).abs() < 1e-6, "d should be 0.0+0.2");
+    }
+
+    #[test]
+    fn pool_minmax_out_of_pool_contributes_zero() {
+        // c is lexical-only: its semantic contribution must be the semantic pool
+        // minimum normalized value = 0.0 (not the mean, not skipped).
+        let lexical = [lexical_hit("a", 10.0), lexical_hit("c", 1.0)];
+        let semantic = [semantic_hit("a", 0.8), semantic_hit("z", 0.2)];
+        let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
+        let c = out.iter().find(|h| h.doc_id.as_str() == "c").unwrap();
+        // c: lex (1-1)/9 = 0.0 (pool min) + sem out-of-pool 0.0 = 0.0
+        assert!((c.rrf_score - 0.0).abs() < 1e-6);
+        assert!(!c.in_both_sources);
+    }
+
+    #[test]
+    fn pool_minmax_degenerate_pool_no_divide_by_zero() {
+        // All lexical scores equal → range 0 → every lexical norm is 0.0 (safe).
+        let lexical = [lexical_hit("a", 5.0), lexical_hit("b", 5.0)];
+        let semantic = [semantic_hit("a", 0.8), semantic_hit("b", 0.2)];
+        let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
+        // Only semantic differentiates: a=1.0, b=0.0.
+        assert_eq!(fused_ids(&out), vec!["a", "b"]);
+        assert!((out[0].rrf_score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pool_minmax_empty_lexical_tier() {
+        let lexical: [ScoredResult; 0] = [];
+        let semantic = [semantic_hit("a", 0.9), semantic_hit("b", 0.1)];
+        let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
+        assert_eq!(fused_ids(&out), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn pool_minmax_tier_weights_reweight_the_sum() {
+        // lexical: a=1.0,b=0.0 ; semantic: b=1.0,a=0.0. Up-weighting semantic 2x flips
+        // the order to prefer the semantically-strong doc.
+        let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 1.0)];
+        let semantic = [semantic_hit("b", 1.0), semantic_hit("a", 0.0)];
+        let config = RrfConfig { semantic_weight: 2.0, ..RrfConfig::default() };
+        let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &config);
+        // a=1.0*1.0=1.0 ; b=2.0*1.0=2.0 → b first.
+        assert_eq!(fused_ids(&out), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn pool_minmax_pagination_offset_limit() {
+        let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 2.0), lexical_hit("c", 1.0)];
+        let semantic = [semantic_hit("a", 0.9), semantic_hit("d", 0.5), semantic_hit("b", 0.4)];
+        // Full order is [a, d, b, c]; skip 1, take 2 → [d, b].
+        let out = pool_minmax_fuse(&lexical, &semantic, 2, 1, &RrfConfig::default());
+        assert_eq!(fused_ids(&out), vec!["d", "b"]);
+    }
+
+    #[test]
+    fn pool_minmax_empty_window_is_empty() {
+        let lexical = [lexical_hit("a", 10.0)];
+        let semantic = [semantic_hit("a", 0.9)];
+        assert!(pool_minmax_fuse(&lexical, &semantic, 0, 0, &RrfConfig::default()).is_empty());
     }
 
     // ─── Merge fusion bit-identity ──────────────────────────────────────

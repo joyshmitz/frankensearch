@@ -53,6 +53,10 @@ name = "rrf_fuse"
 harness = false
 
 [[bench]]
+name = "pool_minmax_fuse"
+harness = false
+
+[[bench]]
 name = "federated_fuse"
 harness = false
 
