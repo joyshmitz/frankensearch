@@ -9939,3 +9939,44 @@ add beats a tableless SIMD ALU expansion; the load is fast and pipelined. And al
 Bench kept as artifact. Conformance: bench compiles + runs green via RCH (exit 0, `Finished`); output hash
 bit-identical (table vs simd) asserted ∀ input. The core preprocessing perf surface (canonicalize mined,
 fingerprint FNV+votes now both exhausted, `quantization.rs` dead-code, MMR cosine rounding-locked) is closed.
+
+---
+
+## 2026-07-09 — Ops SLO rollup percentile selection: exact local `select_nth_unstable` loses to SQLite ordering (SearchCod)
+
+**Different profiled path:** `frankensearch-ops` telemetry rollup materialization, specifically
+`refresh_search_summaries_for_instance` and `materialize_slo_rollups_and_anomalies`. The negative ledger had no
+ops-rollup row; this avoids the rejected exact-id, vector top-k, rerank attention, embed gather, fsfs token,
+storage batching, SimHash vote, and durability trailer paths.
+
+**Primitive tried:** exact order-statistic selection / data-layout shift. Candidate removed
+`ORDER BY latency_us ASC` from the rollup SQL queries and computed p50/p95/p99/p95-memory with local
+`select_nth_unstable`, preserving nearest-rank percentile values. This follows the graveyard's selection-vector
+and streaming-telemetry direction, but keeps exact output instead of switching to an approximate sketch.
+
+Bench harness: temporary `frankensearch-ops` criterion bench over a deterministic 48-tick in-memory telemetry
+fixture (~3,978 search events) timing the two rollup entrypoints after ingest setup.
+
+Same-machine local proof, requested target dir:
+
+```bash
+AGENT_NAME=SearchCod CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod RUST_LOG=off \
+  cargo bench -p frankensearch-ops --profile release --bench slo_rollup_materialize -- \
+  ops_slo_rollup --sample-size 10 --warm-up-time 0.1 --measurement-time 0.5
+```
+
+| Row | LEGACY ORIGINAL sorted SQL | Candidate local selection | Ratio vs ORIG | Decision |
+|---|---:|---:|---:|---|
+| `ops_slo_rollup/refresh_search_summaries` | 383.84 ms | 400.30 ms | 1.043 | reject |
+| `ops_slo_rollup/materialize_slo_rollups` | 518.83 ms | 562.10 ms | 1.083 | reject |
+
+RCH per-crate runs with the requested command were also negative but cross-worker, so they are not the primary
+comparator: ORIG on `hz1` over the larger 96-tick fixture was 1.2188 s / 1.2242 s; candidate on
+`vmi1152480` was 1.3460 s / 1.8660 s.
+
+**Decision:** source reverted; docs-only rejection. Do **not** retry "drop SQL latency ordering and select
+percentiles in Rust" as an ops rollup lever. The SQLite ordered query path is competitive with, and locally
+faster than, moving exact percentile selection into Rust for this materialization shape. A future ops attempt
+should first profile a structurally different primitive such as a covering `(project_key, instance_id, ts_ms,
+latency_us)` index, incremental rollup deltas, or bounded-memory approximate sketches with an explicit accuracy
+contract.
