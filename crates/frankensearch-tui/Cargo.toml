@@ -33,5 +33,9 @@ serde_json = { workspace = true }
 name = "palette_filter"
 harness = false
 
+[[bench]]
+name = "keymap_resolve"
+harness = false
+
 [lints]
 workspace = true

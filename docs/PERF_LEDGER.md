@@ -3805,3 +3805,30 @@ NON-BREAKING (opt-in). Deployment dependency: a background query-embedding sampl
 query stream). Structurally orthogonal to fusion normalization (acts on dense scores pre-fusion) → composes with
 pool-min-max (`a9e53b4`). Files: `hubness.rs` (kernel + builder + 7 tests), `lib.rs`, `benches/hubness_penalty.rs`,
 `Cargo.toml`. Full measured detail + the round-3→round-4 arc in `docs/NEGATIVE_EVIDENCE.md`.
+
+---
+
+## 2026-07-09 — TUI default keymap static dispatch LANDED (SearchCod)
+
+Different profiled path after the rejection streak: `frankensearch-tui` input dispatch, specifically the
+per-keypress `Keymap::resolve` calls in the shell/palette/overlay event loop. This does not touch exact-id
+fusion, vector top-k, rerank attention, embedding gather, FSFS token scanners, durability trailer packing,
+storage batching, ops percentile selection, tombstone bitmaps, or fusion quality reranking.
+
+Primitive class: **succinct-structure / static command alphabet**. The default keymap is a fixed 24-binding
+terminal command alphabet, but the legacy path always probed a `HashMap<(KeyCode, Modifiers), KeyAction>`.
+The landed path dispatches the unmodified default map through a static match table and falls back to the
+legacy `HashMap` as soon as `bind` or `unbind` mutates the map, so custom keymaps keep their exact semantics.
+
+Bench: `AGENT_NAME=SearchCod CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod cargo bench -p frankensearch-tui --profile release --bench keymap_resolve -- --sample-size 10 --warm-up-time 1 --measurement-time 1`
+using the allowed local fallback after the post-rebase RCH verification job on `vmi1167313` stopped making
+progress. The bench replicates the LEGACY ORIGINAL HashMap resolver in the same binary and asserts identical
+actions for a 40-event shell workload before timing.
+
+| row | LEGACY ORIGINAL `HashMap` | static dispatch | ratio vs ORIG |
+|---|---:|---:|---:|
+| `tui_keymap_resolve/40_event_shell_mix` | 777.96 ns | 135.89 ns | **0.175 (~5.72x)** |
+
+Conformance: `AGENT_NAME=SearchCod CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod cargo test -p frankensearch-tui input::tests --profile release`
+passed 11 input tests / 0 failed, including default-fast-path equivalence, unknown-key miss equivalence,
+override of a default binding, and unbind behavior.

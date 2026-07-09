@@ -308,7 +308,10 @@ impl EvalContext {
         }
 
         let config = params_to_config(x);
-        let rrf_config = RrfConfig { k: config.rrf_k };
+        let rrf_config = RrfConfig {
+            k: config.rrf_k,
+            ..RrfConfig::default()
+        };
         let candidate_count = 10_usize
             .saturating_mul(config.candidate_multiplier)
             .min(self.doc_ids.len());

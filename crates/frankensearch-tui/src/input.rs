@@ -99,13 +99,14 @@ pub struct KeyBinding {
 /// Configurable keymap that resolves key events to semantic actions.
 pub struct Keymap {
     bindings: HashMap<(KeyCode, Modifiers), KeyAction>,
+    defaults_active: bool,
 }
 
 impl Keymap {
     /// Create a keymap with the default bindings.
     #[must_use]
     pub fn default_bindings() -> Self {
-        let mut bindings = HashMap::new();
+        let mut bindings = HashMap::with_capacity(DEFAULT_BINDING_COUNT);
 
         // Quit
         bindings.insert((KeyCode::Char('q'), Modifiers::NONE), KeyAction::Quit);
@@ -156,22 +157,30 @@ impl Keymap {
         bindings.insert((KeyCode::Backspace, Modifiers::NONE), KeyAction::Delete);
         bindings.insert((KeyCode::Char('y'), Modifiers::CTRL), KeyAction::Copy);
 
-        Self { bindings }
+        Self {
+            bindings,
+            defaults_active: true,
+        }
     }
 
     /// Resolve a key event to a semantic action.
     #[must_use]
     pub fn resolve(&self, key: KeyCode, modifiers: Modifiers) -> Option<&KeyAction> {
+        if self.defaults_active {
+            return Self::default_action(key, modifiers);
+        }
         self.bindings.get(&(key, modifiers))
     }
 
     /// Add or override a binding.
     pub fn bind(&mut self, key: KeyCode, modifiers: Modifiers, action: KeyAction) {
+        self.defaults_active = false;
         self.bindings.insert((key, modifiers), action);
     }
 
     /// Remove a binding.
     pub fn unbind(&mut self, key: KeyCode, modifiers: Modifiers) {
+        self.defaults_active = false;
         self.bindings.remove(&(key, modifiers));
     }
 
@@ -186,7 +195,57 @@ impl Keymap {
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    fn default_action(key: KeyCode, modifiers: Modifiers) -> Option<&'static KeyAction> {
+        match (key, modifiers.bits()) {
+            (KeyCode::Char('q'), MOD_NONE) | (KeyCode::Char('c'), MOD_CTRL) => Some(&ACTION_QUIT),
+            (KeyCode::Char('p'), MOD_CTRL) | (KeyCode::Char(':'), MOD_NONE) => {
+                Some(&ACTION_TOGGLE_PALETTE)
+            }
+            (KeyCode::Tab, MOD_NONE) => Some(&ACTION_NEXT_SCREEN),
+            (KeyCode::BackTab, MOD_SHIFT) => Some(&ACTION_PREV_SCREEN),
+            (KeyCode::Char('?') | KeyCode::F(1), MOD_NONE) => Some(&ACTION_TOGGLE_HELP),
+            (KeyCode::Escape, MOD_NONE) => Some(&ACTION_DISMISS),
+            (KeyCode::Up | KeyCode::Char('k'), MOD_NONE) => Some(&ACTION_UP),
+            (KeyCode::Down | KeyCode::Char('j'), MOD_NONE) => Some(&ACTION_DOWN),
+            (KeyCode::Left | KeyCode::Char('h'), MOD_NONE) => Some(&ACTION_LEFT),
+            (KeyCode::Right | KeyCode::Char('l'), MOD_NONE) => Some(&ACTION_RIGHT),
+            (KeyCode::PageUp, MOD_NONE) => Some(&ACTION_PAGE_UP),
+            (KeyCode::PageDown, MOD_NONE) => Some(&ACTION_PAGE_DOWN),
+            (KeyCode::Home, MOD_NONE) => Some(&ACTION_HOME),
+            (KeyCode::End, MOD_NONE) => Some(&ACTION_END),
+            (KeyCode::Char('t'), MOD_CTRL) => Some(&ACTION_CYCLE_THEME),
+            (KeyCode::Enter, MOD_NONE) => Some(&ACTION_CONFIRM),
+            (KeyCode::Backspace, MOD_NONE) => Some(&ACTION_DELETE),
+            (KeyCode::Char('y'), MOD_CTRL) => Some(&ACTION_COPY),
+            _ => None,
+        }
+    }
 }
+
+const DEFAULT_BINDING_COUNT: usize = 24;
+const MOD_NONE: u8 = 0;
+const MOD_SHIFT: u8 = 0b0001;
+const MOD_CTRL: u8 = 0b0100;
+
+static ACTION_QUIT: KeyAction = KeyAction::Quit;
+static ACTION_TOGGLE_PALETTE: KeyAction = KeyAction::TogglePalette;
+static ACTION_NEXT_SCREEN: KeyAction = KeyAction::NextScreen;
+static ACTION_PREV_SCREEN: KeyAction = KeyAction::PrevScreen;
+static ACTION_TOGGLE_HELP: KeyAction = KeyAction::ToggleHelp;
+static ACTION_CYCLE_THEME: KeyAction = KeyAction::CycleTheme;
+static ACTION_DISMISS: KeyAction = KeyAction::Dismiss;
+static ACTION_UP: KeyAction = KeyAction::Up;
+static ACTION_DOWN: KeyAction = KeyAction::Down;
+static ACTION_LEFT: KeyAction = KeyAction::Left;
+static ACTION_RIGHT: KeyAction = KeyAction::Right;
+static ACTION_PAGE_UP: KeyAction = KeyAction::PageUp;
+static ACTION_PAGE_DOWN: KeyAction = KeyAction::PageDown;
+static ACTION_HOME: KeyAction = KeyAction::Home;
+static ACTION_END: KeyAction = KeyAction::End;
+static ACTION_CONFIRM: KeyAction = KeyAction::Confirm;
+static ACTION_DELETE: KeyAction = KeyAction::Delete;
+static ACTION_COPY: KeyAction = KeyAction::Copy;
 
 impl Default for Keymap {
     fn default() -> Self {
@@ -252,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn default_fast_path_matches_default_hashmap() {
+        let keymap = Keymap::default_bindings();
+        for ((key, modifiers), action) in &keymap.bindings {
+            assert_eq!(Keymap::default_action(*key, *modifiers), Some(action));
+        }
+        assert_eq!(
+            keymap.resolve(KeyCode::Char('z'), Modifiers::NONE),
+            keymap.bindings.get(&(KeyCode::Char('z'), Modifiers::NONE))
+        );
+        assert_eq!(
+            keymap.resolve(KeyCode::Char('q'), Modifiers::CTRL),
+            keymap.bindings.get(&(KeyCode::Char('q'), Modifiers::CTRL))
+        );
+    }
+
+    #[test]
     fn custom_binding() {
         let mut keymap = Keymap::default_bindings();
         keymap.bind(
@@ -261,6 +336,18 @@ mod tests {
         );
         let action = keymap.resolve(KeyCode::Char('s'), Modifiers::CTRL);
         assert_eq!(action, Some(&KeyAction::Custom("save".to_string())));
+    }
+
+    #[test]
+    fn custom_binding_overrides_default_binding() {
+        let mut keymap = Keymap::default_bindings();
+        keymap.bind(
+            KeyCode::Char('q'),
+            Modifiers::NONE,
+            KeyAction::Custom("close-pane".to_string()),
+        );
+        let action = keymap.resolve(KeyCode::Char('q'), Modifiers::NONE);
+        assert_eq!(action, Some(&KeyAction::Custom("close-pane".to_string())));
     }
 
     #[test]
