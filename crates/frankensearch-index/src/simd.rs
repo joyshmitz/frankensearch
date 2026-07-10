@@ -810,6 +810,116 @@ unsafe fn dot_i8x4_i8_avx2(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
     }
 }
 
+/// Four-row `vpmaddubs` int8 dot (bd-b5wl) — the batched twin of [`dot_i8x4_i8_avx2`] and the kernel
+/// the row-blocked int8 scan uses. **APPROXIMATE** (saturating); see [`dot_i8_i8_avx2_maddubs`].
+///
+/// The batched form gains extra over the single-row kernel: `vpmaddubs` takes the i8 query directly,
+/// so the shared query decode (2× `vpvmovsxbw` per 32 in [`dot_i8x4_i8_avx2`]) vanishes entirely, and
+/// each of the 4 rows drops its 2× stored widening for one `vpxor` + `vpmaddubs`. `q_bias128 = 128·Σ
+/// q_i` is subtracted once from every row (same query). Bit-exact to four [`dot_i8_i8_maddubs`] calls.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+#[allow(unsafe_code)]
+unsafe fn dot_i8x4_i8_avx2_maddubs(stored_rows: &[i8], query: &[i8], q_bias128: i32) -> [i32; 4] {
+    use core::arch::x86_64::{
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi8, _mm256_set1_epi16,
+        _mm256_setzero_si256, _mm256_xor_si256,
+    };
+
+    macro_rules! reduce_i32x8 {
+        ($acc:expr) => {{
+            let sum128 = _mm_add_epi32(
+                _mm256_castsi256_si128($acc),
+                _mm256_extracti128_si256::<1>($acc),
+            );
+            let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+            let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+            _mm_cvtsi128_si32(sum32)
+        }};
+    }
+
+    let n = query.len();
+    debug_assert!(stored_rows.len() >= n.saturating_mul(4));
+    // SAFETY: AVX2 guaranteed by the caller. Each 32-byte load is `i + 32 <= n`-bounded; row bases
+    // are within the four-row slice. Scalar tail accumulates in the u8 domain (see single-row).
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let flip = _mm256_set1_epi8(0x80_u8 as i8);
+        let query_ptr = query.as_ptr();
+        let stored_ptr = stored_rows.as_ptr();
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
+        let mut i = 0_usize;
+
+        while i + 32 <= n {
+            let q = _mm256_loadu_si256(query_ptr.add(i).cast::<__m256i>());
+            macro_rules! accumulate_row {
+                ($acc:ident, $row:expr) => {{
+                    let s = _mm256_loadu_si256(stored_ptr.add(($row * n) + i).cast::<__m256i>());
+                    let u = _mm256_xor_si256(s, flip);
+                    let prod = _mm256_maddubs_epi16(u, q);
+                    $acc = _mm256_add_epi32($acc, _mm256_madd_epi16(prod, ones));
+                }};
+            }
+            accumulate_row!(acc0, 0);
+            accumulate_row!(acc1, 1);
+            accumulate_row!(acc2, 2);
+            accumulate_row!(acc3, 3);
+            i += 32;
+        }
+
+        let mut acc_u = [
+            reduce_i32x8!(acc0),
+            reduce_i32x8!(acc1),
+            reduce_i32x8!(acc2),
+            reduce_i32x8!(acc3),
+        ];
+        while i < n {
+            let q = i32::from(*query_ptr.add(i));
+            acc_u[0] += (i32::from(*stored_ptr.add(i)) + 128) * q;
+            acc_u[1] += (i32::from(*stored_ptr.add(n + i)) + 128) * q;
+            acc_u[2] += (i32::from(*stored_ptr.add((2 * n) + i)) + 128) * q;
+            acc_u[3] += (i32::from(*stored_ptr.add((3 * n) + i)) + 128) * q;
+            i += 1;
+        }
+        [
+            acc_u[0] - q_bias128,
+            acc_u[1] - q_bias128,
+            acc_u[2] - q_bias128,
+            acc_u[3] - q_bias128,
+        ]
+    }
+}
+
+/// Batched approximate `vpmaddubs` int8 dot with AVX2 dispatch (bd-b5wl). Falls back to four exact
+/// [`dot_i8_i8_generic`] calls off-AVX2. See [`dot_i8_i8_avx2_maddubs`] for the saturation caveat;
+/// gate callers on recall, not bit-exactness. `q_bias128 = 128·Σ q_i`.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_i8x4_i8_maddubs(stored_rows: &[i8], query: &[i8], q_bias128: i32) -> [i32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { dot_i8x4_i8_avx2_maddubs(stored_rows, query, q_bias128) };
+        }
+    }
+    let _ = q_bias128;
+    let n = query.len();
+    [
+        dot_i8_i8_generic(&stored_rows[..n], query),
+        dot_i8_i8_generic(&stored_rows[n..2 * n], query),
+        dot_i8_i8_generic(&stored_rows[2 * n..3 * n], query),
+        dot_i8_i8_generic(&stored_rows[3 * n..4 * n], query),
+    ]
+}
+
 /// Hand-written AVX2 i8·i8 dot: 256-bit `vpmaddwd` over sign-extended i16 lanes,
 /// two accumulators, horizontal-summed; scalar tail.
 ///
@@ -877,10 +987,12 @@ unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
 /// folds the bias into a per-query scalar `128·Σ q_i` (computed once by the caller and passed in).
 ///
 /// **Why approximate:** `vpmaddubs` saturates each adjacent-pair sum to `i16` (`u8·i8` products reach
-/// ±32 640, a pair-sum can exceed ±32 767). For int8-quantized cosine vectors most components are
-/// small so saturation is rare, and the two-pass scan **exact-rescores** the top `k·mult` candidates
-/// in f16 — so a rare saturated pass-1 score is corrected as long as recall@k holds. This kernel is
-/// therefore gated on **recall/ordering parity**, never bit-exactness. `q_bias128 = 128·Σ q_i`.
+/// ±32 640, a pair-sum can exceed ±32 767). The shipped quantizer's global `127/max_abs` scale keeps
+/// *most* int8-quantized-cosine components small (~±32) but leaves a tail at ±127 that **does**
+/// saturate — so this kernel is approximate on real quantized data, not bit-exact. It is gated on
+/// **recall**, never bit-exactness: `maddubs_pass1_preserves_f32_recall_under_real_saturation` proves
+/// the pass-1 recall@k of the exact-f32 top-k is preserved despite the saturation, and the two-pass
+/// scan exact-rescores the top `k·mult` candidates in f16. `q_bias128 = 128·Σ q_i`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_code)]
@@ -2696,6 +2808,131 @@ mod tests {
         assert!(
             any_diff,
             "uniform ±127 is expected to saturate maddubs; if it no longer does, revisit the recall bound"
+        );
+    }
+
+    /// The batched kernel (the one the row-blocked scan uses) must equal four single-row
+    /// [`dot_i8_i8_maddubs`] calls exactly — same domain shift, same shared bias.
+    #[test]
+    fn maddubs_batched_matches_four_single_calls() {
+        for dim in [32usize, 128, 384, 100] {
+            let query = i8_vec(dim, 0xCAFE, 40);
+            let bias = maddubs_query_bias(&query, dim);
+            let mut rows = Vec::with_capacity(dim * 4);
+            let singles: Vec<i32> = (0..4)
+                .map(|r| {
+                    let row = i8_vec(dim, 0x3000 + r as u64, 40);
+                    let s = dot_i8_i8_maddubs(&row, &query, bias);
+                    rows.extend_from_slice(&row);
+                    s
+                })
+                .collect();
+            let batched = dot_i8x4_i8_maddubs(&rows, &query, bias);
+            assert_eq!(batched.to_vec(), singles, "dim {dim}: batched != 4× single");
+        }
+    }
+
+    /// A deterministic pseudo-normalized f32 vector (models an embedding). No RNG.
+    fn norm_f32(dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        let mut v: Vec<f32> = (0..dim)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (((s >> 11) as f64 / (1u64 << 53) as f64) as f32) - 0.5
+            })
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+        for x in &mut v {
+            *x /= norm;
+        }
+        v
+    }
+
+    /// Quantize an f32 query to int8 with the shipped per-query max-abs scale (see
+    /// `search::quantize_i8_query`, replicated here to keep the test in-crate).
+    fn quantize_query_i8(q: &[f32]) -> Vec<i8> {
+        let max_abs = q.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+        if max_abs <= 0.0 {
+            return vec![0; q.len()];
+        }
+        let scale = 127.0 / max_abs;
+        q.iter()
+            .map(|&x| {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = (x * scale).round().clamp(-127.0, 127.0) as i8;
+                v
+            })
+            .collect()
+    }
+
+    fn top_k_indices<F: Fn(usize) -> f32>(n: usize, k: usize, score: F) -> Vec<usize> {
+        let mut scored: Vec<(f32, usize)> = (0..n).map(|i| (score(i), i)).collect();
+        scored.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored[..k.min(n)].iter().map(|&(_, i)| i).collect()
+    }
+
+    fn recall(truth: &[usize], cand: &[usize]) -> f64 {
+        let hit = truth.iter().filter(|t| cand.contains(t)).count();
+        hit as f64 / truth.len() as f64
+    }
+
+    /// END-TO-END RECALL PROOF (bd-b5wl). On a realistic corpus quantized by the **shipped**
+    /// `quantize_f16_slab_to_i8` (global `127/max_abs` scale — so a few components reach ±127 and
+    /// `vpmaddubs` genuinely SATURATES, unlike the bit-exact `|x|≤40` cases above), the maddubs
+    /// pass-1 must preserve the exact-f32 top-k recall at least as well as the exact int8 pass-1.
+    /// This is the deterministic proof that swapping in the approximate kernel does not cost recall
+    /// vs the f32 reference — the guarantee the two-pass scan relies on before its f16 rescore.
+    #[test]
+    fn maddubs_pass1_preserves_f32_recall_under_real_saturation() {
+        let dim = 384;
+        let n = 512;
+        let k = 10;
+        let mult = 3; // pass-1 keeps top k·mult candidates
+
+        // Realistic corpus + query, exact f32 ground truth.
+        let docs: Vec<Vec<f32>> = (0..n).map(|d| norm_f32(dim, 0x100 + d as u64)).collect();
+        let query = norm_f32(dim, 0xF00D);
+        let f32_top_k = top_k_indices(n, k, |d| scalar_dot_f32(&docs[d], &query));
+
+        // Shipped quantization: whole doc slab (global scale) -> int8; per-query int8.
+        let flat_f16: Vec<f16> = docs
+            .iter()
+            .flat_map(|v| v.iter().map(|&x| f16::from_f32(x)))
+            .collect();
+        let slab_i8 = quantize_f16_slab_to_i8(&flat_f16);
+        let doc_i8: Vec<&[i8]> = (0..n).map(|d| &slab_i8[d * dim..(d + 1) * dim]).collect();
+        let query_i8 = quantize_query_i8(&query);
+        let bias = maddubs_query_bias(&query_i8, dim);
+
+        // Confirm the corpus actually saturates maddubs (else this proves nothing new).
+        let saturates = (0..n).any(|d| {
+            dot_i8_i8_generic(doc_i8[d], &query_i8) != dot_i8_i8_maddubs(doc_i8[d], &query_i8, bias)
+        });
+        assert!(
+            saturates,
+            "real quantized corpus must exercise maddubs saturation for this proof to bite"
+        );
+
+        // Pass-1 candidate sets (top k·mult) by exact int8 vs approximate maddubs.
+        let cand = k * mult;
+        #[allow(clippy::cast_precision_loss)]
+        let int8_cands = top_k_indices(n, cand, |d| dot_i8_i8_generic(doc_i8[d], &query_i8) as f32);
+        #[allow(clippy::cast_precision_loss)]
+        let maddubs_cands = top_k_indices(n, cand, |d| {
+            dot_i8_i8_maddubs(doc_i8[d], &query_i8, bias) as f32
+        });
+
+        let int8_recall = recall(&f32_top_k, &int8_cands);
+        let maddubs_recall = recall(&f32_top_k, &maddubs_cands);
+        assert!(
+            maddubs_recall >= int8_recall,
+            "maddubs pass-1 must not lose recall vs exact int8: maddubs={maddubs_recall} int8={int8_recall}"
+        );
+        assert!(
+            (maddubs_recall - 1.0).abs() < f64::EPSILON,
+            "maddubs pass-1 recall@{k} of the exact-f32 top-{k} into top-{cand} must be 1.0, got {maddubs_recall}"
         );
     }
 

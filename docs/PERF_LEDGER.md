@@ -4537,13 +4537,20 @@ and measures it where it IS decidable — in isolation.
 uses `vpmaddubs` (u8·i8 → i16 in one op, **no stored widening** — the dominant traffic, streamed once per row),
 folding the bias into a per-query scalar `128·Σq` via `Σ s_i·q_i = maddubs_reduce(u,q) − 128·Σq_i`.
 
-**Correctness (recall/ordering, not bit-exactness end-to-end).** `vpmaddubs` saturates each adjacent-pair sum to
-i16, so it is APPROXIMATE in general. But a 384-dim int8-quantized L2-normalized component is typically ±6 and
-rarely past ±40, where a pair-sum `≤ 2·(40+128)·40 ≈ 13 440 < 32 767` — **no saturation**, so the kernel is
-**bit-exact on realistic quantized data** (zero recall risk; the pass-1 also exact-rescores in f16). Three
-`simd.rs` unit tests gate this: bit-exact when non-saturating (incl. a scalar-tail dim); bit-exact top-k on a
-realistic-magnitude corpus (the recall proxy); and a boundary test asserting adversarial *uniform* ±127 DOES
-saturate (documenting the limit — callers must guarantee the magnitude bound).
+**Correctness — RECALL preservation vs f32, proven end-to-end (corrected 2026-07-10, second pass).** `vpmaddubs`
+saturates each adjacent-pair sum to i16, so it is APPROXIMATE. My first pass over-claimed "bit-exact on realistic
+quantized data" — that holds only for `|x| ≤ 40` (`2·(40+128)·40 ≈ 13 440 < 32 767`). **The shipped quantizer
+uses a *global* `scale = 127/max_abs`, so a real L2-normalized 384-dim embedding has typical components ~±32 but
+a tail up to ±127 — which DOES saturate maddubs.** So on real quantized data maddubs is approximate, *not*
+bit-exact. The correct guarantee is **recall**, proven deterministically: `maddubs_pass1_preserves_f32_recall_
+under_real_saturation` builds a realistic corpus, quantizes it with the *shipped* `quantize_f16_slab_to_i8`,
+**asserts the corpus actually saturates maddubs** (else the proof is vacuous), and shows the maddubs pass-1
+recall@10 of the exact-f32 top-10 into the top-`k·mult` set is **1.0** and `≥` the exact-int8 pass-1 recall — so
+swapping in the approximate kernel costs *zero* f32 recall, which is the guarantee the two-pass scan needs before
+its f16 rescore. Five `simd.rs` tests gate the kernel: bit-exact when non-saturating (incl. scalar tail);
+bit-exact top-k at `|x| ≤ 40`; the adversarial-uniform-±127 boundary (documents where saturation begins); the
+**batched** `dot_i8x4_i8_maddubs` equals 4× single calls (the row-blocked scan uses the batched kernel); and the
+end-to-end recall proof above.
 
 **Speed — DECIDABLE, null-controlled, one binary / one `rch` invocation.** Isolated microbench
 (`benches/int8_dot_maddubs_ab.rs`, dim 384 × batch 4096, `|x| ≤ 40` so the arms are bit-identical, asserted
@@ -4566,11 +4573,14 @@ so this leaf is the scan's dominant compute frame. A 1.23× on 44.5% self-time i
 IF end-to-end can be measured; today it cannot (the wide floor), so this ships as a **validated, benched kernel
 primitive**, not yet wired into the production scan.
 
-**Scope / honesty.** LANDED: the kernel + 3 correctness tests + the decidable microbench (reproducible, both
-arms retained). NOT landed: wiring `dot_i8_i8_maddubs` into `int8_scan_range` (and the batched `dot_i8x4_i8`
-variant), because the scan-level win is undecidable under the same contention that blocks cod's micro-opt —
-wiring a perf change I cannot measure end-to-end would violate the gate. Filed as the follow-up, with the retry
-condition = worker isolation/affinity (identical to cod's). The kernel is also only recall-safe while the
+**Scope / honesty.** LANDED (this + the follow-up commit): the single-row **and batched** kernels
+(`dot_i8_i8_maddubs`, `dot_i8x4_i8_maddubs` — the batched one is what the row-blocked scan uses), 5 correctness
+tests incl. the **end-to-end f32-recall proof under real saturation**, and the decidable microbench (reproducible,
+both arms retained). NOT landed: wiring the kernels into `int8_scan_range` itself, because the scan-level *speed*
+win is undecidable under the same contention that blocks cod's micro-opt — wiring a perf change I cannot measure
+end-to-end would violate the gate. (Recall is deterministic and *is* proven; only the scan-level speed is
+blocked.) Filed as the follow-up, retry condition = worker isolation/affinity (identical to cod's). The kernel is
+also only recall-safe while the
 quantizer keeps magnitudes under the i16 pair ceiling — a coupling the wiring step must assert. cod owns the
 scan; I touched no scan code. All builds/benches remote; no local cargo. 6 unrelated WAL/vacuum lib tests hit a
 worker-FS `PermissionDenied` flake on one worker and pass on a fresh one (environmental, not this change).

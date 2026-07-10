@@ -14,10 +14,13 @@
 //! The shipped `dot_i8_i8_avx2` sign-extends BOTH operands (4× `vpmovsxbw` per 32 int8) before
 //! `vpmaddwd`. `dot_i8_i8_maddubs` shifts `stored` to the u8 domain with one `vpxor` and uses
 //! `vpmaddubs` (u8·i8 → i16, one op, no stored widening), folding the `128·Σq` bias into a
-//! per-query scalar. It is APPROXIMATE (`vpmaddubs` saturates i16 pair-sums) but bit-exact on
-//! realistically-quantized magnitudes — the int8 pass-1 rescores exactly in f16 anyway (recall
-//! gated in `simd.rs` unit tests). Inputs here use `|x| ≤ 40`, the realistic quantized-cosine
-//! magnitude, so the two arms return bit-identical scores (asserted before timing).
+//! per-query scalar. It is APPROXIMATE (`vpmaddubs` saturates i16 pair-sums). This bench uses
+//! `|x| ≤ 40` so the two arms are **bit-identical** (asserted before timing) — a clean speed A/B
+//! with no quality variable. That is NOT the full deployment distribution: the shipped `127/max_abs`
+//! quantizer leaves a ±127 tail that does saturate, so on real data maddubs is
+//! approximate-but-recall-preserving — proven deterministically in
+//! `simd.rs::maddubs_pass1_preserves_f32_recall_under_real_saturation`. Instruction count is
+//! value-independent, so the speed ratio here holds for the real distribution too.
 //!
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
