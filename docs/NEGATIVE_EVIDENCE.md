@@ -9985,6 +9985,18 @@ contract.
 
 ### 2026-07-08 — FlintOsprey — Tombstone bitmap does NOT pay in the REAL fused int8 scan: isolation win (0.921×) evaporates end-to-end (wash / ~2% slower) because the FMA-bound loop already hides the flag read
 
+> **⚠ 2026-07-10 LEDGER-INTEGRITY AUDIT (cc_fse): reachability HOLDS, but the fixture never exercised the case the
+> lever targets; REOPENED as `bd-6m8p`.** Good news first: `benches/fsvi_int8_two_pass.rs` does link
+> `frankensearch_index::VectorIndex` and drives the real scan, and the strided flag load (`search.rs:486-506`) is
+> **unconditional per record** — non-zero self-time, ~100k executions per scan. The row is not dead-code.
+> **But the bench creates zero tombstones** (no `set_record_flags` / soft-delete anywhere in it; both arms report
+> `recall@10 = 1.0000`, corroborating that no record is ever excluded), whereas the isolation bench that motivated
+> the lever used **~1% scattered tombstones**. At 0% density the liveness branch is 100% not-taken and perfectly
+> predicted in *both* arms, so the only regime where a bitmap can differ from a strided flag — mispredicting on
+> scattered dead rows, where a bitmap admits branchless masking — was never measured end-to-end. The stated
+> mechanism (an FMA-bound loop hides the load) is sound for the *read*; the *branch* claim is untested. The bitmap
+> arm was also reverted, so the A/B cannot be re-run. Re-measure at 1% density before treating as do-not-retry.
+
 Last round (`df2f82c`) an ISOLATION bench (`tombstone_bitmap_scan`) showed a contiguous 1-bit/vector "live"
 bitmap beating the file-backed `VectorIndex` int8 scan's strided per-record flag read by **0.921× / ~8.6%**
 on the common (scattered ~1% tombstone) case — the hypothesis being that the flag is a costly SECOND memory
@@ -10041,6 +10053,14 @@ Pivot-to-quality land #2 (after pool-min-max fusion `a9e53b4`). Second structura
 **LANDED (Rust, `257c468`):** `neighbor_smooth` in `frankensearch-fusion/src/smooth.rs` (re-exported), a pure O(pool·M) kernel over core's `DocumentGraph` (`Similar` edges only, composing with `Reference`/`CoLocation` graph consumers), mutual-kNN opt-in (the `4fd5802` no-regret refinement), identity fast-path. 8 unit tests GREEN incl. the cluster-rescue property (a marooned relevant lifted above an isolated higher-raw-score non-relevant). Latency A/B vs the no-smooth ORIGINAL (bench `neighbor_smooth`: the diffusion pass adds ~5.9µs/12.2µs/158.9µs over the no-op ORIGINAL at pool 50/100/1000 — us-scale, negligible at realistic fusion pool depths (<=100), "nearly free atop a neighbor graph" confirmed; mutual-kNN opt-in ~5x). Non-breaking, opt-in; searcher-wiring (supply the ANN neighbor graph at fuse time — the HNSW edges are already materialized, `84ed934`) = separate product step. Verified: `fastembed` BGE-small + `rank_bm25` stem+stop, BEIR scifact/nfcorpus/arguana/scidocs full test sets, no cargo/torch for the quality measurement. Route-next: measure mutual-kNN under pool-restriction (predicted to further help recall-bound); wire the HNSW graph so smoothing runs on real ANN neighbors (approx-NN vs exact-NN fidelity, HNSW recall ~0.99).
 
 ### 2026-07-09 — FlintOsprey — REJECTED (deployable): HUBNESS / CSLS dense-score correction (demote high-density "hub" docs) has REAL but modest oracle headroom (~+0.005 nDCG@10 on 3/4 via query k-occurrence) — but NO query-free proxy captures it (doc-density flukes/misses, centroid & PC-removal go negative); realizing it needs query-side hubness (a query log)
+
+> **✅ 2026-07-10 LEDGER-INTEGRITY AUDIT (cc_fse): rule INAPPLICABLE, row STANDS, and it has already been correctly
+> superseded.** There is no Rust code and no criterion bench here — the evidence is nDCG deltas from a Python BEIR
+> harness, so "self-time of the function under test" has no referent. Execution *is* established by the measurements
+> themselves: the proxies produced non-zero, sign-varying deltas (centroid −0.0040 hybrid on arguana, PC-removal
+> −0.0102 on scifact), which a never-executed correction cannot do. And the row already did the right thing — it
+> named the route-next ("needs query-side hubness"), which `ba5052a` then took, reversing the rejection with an
+> all-positive +0.0033; that query-side form is now wired into Phase-1 (`9b33d16`). No action.
 
 A bold structurally-different probe, the OPPOSITE SIGN of neighbor-smoothing (`543684e`): **demote** topical hubs (docs near everything regardless of relevance) rather than **promote** cluster members. From the CSLS / hubness literature (Conneau et al. cross-lingual retrieval; Radovanović et al. hubness). CSLS `= 2cos(q,d) − r_q − r_d`; `r_q` is a per-query constant (cancels under within-query ranking AND under pool-min-max), so the deployable ranking primitive reduces to a per-doc **hubness PENALTY** `s'(q,d)=cos(q,d) − β·r_d`. Tested 3 query-free `r_d` proxies + 1 leaky oracle. BGE-small hybrid, `rank_bm25` stem+stop, full BEIR test sets, nDCG@10. Best-β hybrid Δ vs no-correction:
 
@@ -10183,6 +10203,16 @@ Conformance GREEN before commit: `cargo test -p frankensearch-ops frame_quality_
 ---
 
 ### 2026-07-09 — CobaltRidge — REJECTED: flat CSR (contiguous edge array + offsets) LOSES to the shipped `Vec<Vec>` dense CSR in the graph-rank PageRank power iteration — the two-pass build DOUBLES the per-edge `doc_id`-string hash probes, and the small graphs are L2-resident so the sequential-sweep locality gain is negligible (1.22×/1.29× SLOWER)
+
+> **⚠ 2026-07-10 LEDGER-INTEGRITY AUDIT (cc_fse): DOWNGRADED — does not satisfy the self-time rule; REOPENED as
+> `bd-i40y`.** `benches/graph_rank.rs` imports only `std` and `criterion` — it never links `frankensearch_fusion`,
+> so the function under test, `GraphRanker::rank_phase1`, has **0.000% self-time by construction**. Both arms were
+> bench-local copies. The `rank_new` ORIG copy *is* a faithful structural mirror of production's CSR build
+> (`graph_rank.rs:157`, same `Vec<Vec<(usize, f64)>>`, same weight filter), so the flat-vs-`Vec<Vec>` comparison is
+> informative and the decision is probably right — but it is evidence about a copy, not the shipped path, and the
+> copy uses `std::HashMap` where production's `idx` may not. Worse, the `flat` arm has since been deleted (`grep -c
+> flat` → 0), so the row **cannot be re-run**. Do not treat as do-not-retry until re-measured against the shipped
+> symbol with both arms retained.
 
 **Different profiled path (structurally-different primitive class):** `GraphRanker::rank_phase1`
 (`frankensearch-fusion/src/graph_rank.rs`, feature-gated `graph`) — the query-biased PageRank power iteration.
@@ -10424,3 +10454,76 @@ the standard-library `peek_mut` root-assignment substitution for the current k=1
 Retry condition: a materially different heap implementation/codegen, candidate distribution, or selection
 primitive that removes comparisons or heap maintenance altogether. Route next to a different alien
 primitive in the scan/selection envelope; this rejection is not a parity ceiling.
+
+---
+
+## 2026-07-10 — LEDGER INTEGRITY CORRECTION: four closed rows lack non-zero candidate self-time (cod_fse)
+
+The current evidence rule requires a profile to prove that the function named by a REJECT actually ran,
+with **non-zero flat self-time**, before that row can steer later work. Session history and the retained
+benches were audited for the four explicitly named closed rows before resuming `bd-b5wl`:
+
+| closed row | historical candidate call | retained candidate arm | candidate flat self-time | current evidence status |
+|---|---|---|---:|---|
+| flat-CSR `graph_rank` | yes | no (`rank_flat` was removed) | **not recorded** | UNVERIFIED |
+| tombstone bitmap in the fused int8 scan | yes | no (only the discredited isolation bench remains) | **not recorded** | UNVERIFIED; old A/B also used two separate `rch` invocations |
+| slot-aligned `VALUES` dedup join | yes | yes (`slot_join_check_dedup_batch`) | **not recorded** | UNVERIFIED pending a profile |
+| query-free HUBNESS/CSLS correction | no Rust candidate was landed or retained; quality-only Python probe | no | **not applicable / not recorded** | INVALID as function-level performance evidence |
+
+This is not a claim that the three temporary Rust candidates were dead: history proves all three functions
+were called. The query-free hubness row is different: it rejected external quality probes, explicitly landed
+no Rust code, and therefore has no function whose self-time could validate a performance REJECT. None of the
+four has the required profiler evidence, and the tombstone ratio
+also fails today's one-binary/one-`rch`-invocation substrate. Therefore their numerical REJECT conclusions
+must not be treated as profile-backed routing evidence until recreated and sampled. The user's explicit
+closed-scope instruction still keeps all three out of the present attempt; this audit does not authorize a
+retry or touch the fusion/searcher-owned surfaces.
+
+### 2026-07-10 — cc_fse — LEDGER-INTEGRITY AUDIT of four closed rows: 3 of 4 measured a COPY or a reverted arm, so the shipped symbol had 0.000% self-time or the A/B cannot be re-run — 3 reopened, 1 stands
+
+Applied the ledger-integrity rule (verify the benchmark actually exercises the function under test before
+trusting a REJECT) to the four rows named for audit: flat-CSR `graph_rank`, tombstone bitmap in the fused int8
+scan, slot-aligned `VALUES` dedup join, and the query-free HUBNESS/CSLS correction.
+
+**Instrument.** For "does this bench execute the shipped symbol?", *linkage analysis is strictly stronger than a
+sampled profile*: a profile can attribute a symbol's cycles to an inlined caller, or miss it under a low sample
+rate, and then you cannot distinguish "inlined" from "never called". Whether a bench crate imports the crate
+under test is dispositive and costs one `grep`. Sampling was therefore used only where linkage holds and the
+question is "how much", not "at all". No `perf` run was needed to reach any verdict below.
+
+| row | bench links crate under test? | shipped-symbol self-time | candidate arm retained? | verdict |
+|---|---|---|---|---|
+| flat-CSR `graph_rank` | **NO** — `std` + `criterion` only | **0.000%** (structural) | **NO** (`grep -c flat` → 0) | **INVALID as evidence about the shipped path; non-reproducible → REOPEN `bd-i40y`** |
+| tombstone bitmap, fused int8 | yes (`VectorIndex`) | non-zero (~100k flag loads/scan) | **NO** (reverted) | **UNSOUND FIXTURE → REOPEN `bd-6m8p`** |
+| slot-aligned `VALUES` dedup join | imports `Storage`, but benches copies | **0.000%** (`check_dedup_batch` never called) | yes (+ parity assert) | **PROXY-MEASURED → RE-VERIFY `bd-0j5e`** |
+| query-free HUBNESS/CSLS | N/A (Python, no Rust, no bench) | N/A | N/A | **rule inapplicable; row STANDS, already superseded by `ba5052a`** |
+
+**The one that is genuinely dead code.** `benches/graph_rank.rs` imports only `std::collections::HashMap`,
+`std::hint::black_box` and `criterion`. It never links `frankensearch_fusion`, so `GraphRanker::rank_phase1` —
+the function the row is *about* — executed exactly zero times. Both arms were bench-local copies. The ORIG copy
+(`rank_new`) is a faithful structural mirror of production's CSR build, so the comparison is informative and the
+"flat CSR loses" decision is probably right; but it is a claim about a copy, and the `flat` arm has since been
+deleted, so it cannot be re-run at all. That is a do-not-retry row resting on unreproducible proxy evidence.
+
+**The subtler one.** The tombstone row is *not* dead code — the bench drives the real `VectorIndex` scan and the
+strided flag load at `search.rs:486-506` is unconditional per record. But the bench **creates no tombstones**, and
+both arms report `recall@10 = 1.0000`, confirming no record is ever excluded. The isolation bench that motivated
+the lever used ~1% scattered tombstones. At 0% density the liveness branch is 100% not-taken and perfectly
+predicted in both arms, so the single regime where a bitmap can beat a strided flag — branch mispredicts on
+scattered dead rows, which a bitmap can convert to branchless masking — was never exercised end-to-end. The row's
+mechanism (an FMA-bound loop hides the *load*) is sound; its implicit claim about the *branch* is untested.
+Reachability of a code path is necessary but not sufficient: the path must be exercised **in the state the lever
+targets**. Zero-tombstone is to a tombstone bitmap what an already-sorted pool was to a re-sort (`9b33d16`).
+
+**Systemic finding.** Three of four rows cannot be re-run today, because the candidate arm was deleted once the
+lever was rejected. A REJECT you cannot re-run is a REJECT you cannot audit — and it still functions as a
+do-not-retry gate on future work. The repo already contains the right pattern and simply does not apply it
+uniformly: `benches/hubness_dot_ab.rs` keeps *both* arms as timed arms specifically "so the rejection stays
+reproducible" (`10252`). Proposed standard, filed as `bd-i40y`/`bd-6m8p`/`bd-0j5e`: a REJECT row is only binding
+if (1) its bench links and calls the shipped symbol, (2) both arms are retained in-tree, and (3) it records the
+reachability evidence — self-time, or an execution/displacement counter as in `neighbor_smooth`/`hubness_penalty`.
+
+**Scope/honesty.** No code changed; this is an evidence audit. Nothing here says flat-CSR or the bitmap or the
+slot-join *would* win — only that the rows as written do not license closing those doors. `cod` owns the int8 ADC
+sidecar in `-index`; `bd-6m8p` is filed, not started. All commands run for this audit were `grep`/`sed` reads; no
+cargo, local or remote.

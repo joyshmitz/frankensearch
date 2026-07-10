@@ -3903,6 +3903,15 @@ One adjacent compile fix is included: `tools/optimize_params` now fills the newl
 
 ## 2026-07-09 — Storage dedup batch VALUES slot-join REJECTED (SearchCod)
 
+> **⚠ 2026-07-10 LEDGER-INTEGRITY AUDIT (cc_fse): PROXY-MEASURED — production symbol has 0.000% self-time; needs
+> re-verification (`bd-0j5e`).** `benches/dedup_batch.rs` imports `Storage`, but only to build the SQLite fixture:
+> `Storage::check_dedup_batch` (`content_hash.rs:146`) is **never called**. Both arms are bench-local copies
+> (`legacy_check_dedup_batch:114`, `slot_join_check_dedup_batch:191`). Unlike the graph_rank row this one is
+> *reproducible* — both arms are retained and cross-checked by a parity assert (`:105-108`) — and both hit a real
+> SQLite, so the SQL work is genuine and the ~1.16×/1.11×/1.20× conclusion is plausible. But the row is evidence
+> about a copy of the shipped query, not the shipped query, so it does not satisfy the self-time rule. Re-point the
+> `legacy` arm at `Storage::check_dedup_batch` before treating as do-not-retry.
+
 Different hot path from the recent search/fusion/TUI lanes: `frankensearch-storage::Storage::check_dedup_batch`.
 Primitive class: **algebraic-fusion / data-layout**. Candidate replaced the LEGACY ORIGINAL `IN (...)` query plus
 Rust `HashMap<String, DedupRow>` with an ordered `WITH requested(ord, doc_id) AS (VALUES ...)` relation returning
