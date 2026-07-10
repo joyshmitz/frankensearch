@@ -31,7 +31,9 @@ fn build_pool(pool: usize) -> (Vec<VectorHit>, Vec<f32>) {
         })
         .collect();
     // per-doc hubness in [0,1], heavy near the front (hubs)
-    let hubness: Vec<f32> = (0..pool).map(|i| 0.9 - (i as f32 / pool as f32) * 0.6).collect();
+    let hubness: Vec<f32> = (0..pool)
+        .map(|i| 0.9 - (i as f32 / pool as f32) * 0.6)
+        .collect();
     (hits, hubness)
 }
 
@@ -40,7 +42,10 @@ fn vecs(n: usize, dim: usize, seed: u32) -> Vec<Vec<f32>> {
     (0..n)
         .map(|i| {
             let mut v: Vec<f32> = (0..dim)
-                .map(|j| (((i as u32 * 2_654_435_761 + j as u32 * 40_503 + seed) % 997) as f32) / 997.0 - 0.5)
+                .map(|j| {
+                    (((i as u32 * 2_654_435_761 + j as u32 * 40_503 + seed) % 997) as f32) / 997.0
+                        - 0.5
+                })
                 .collect();
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
             for x in &mut v {
@@ -84,10 +89,22 @@ fn bench(c: &mut Criterion) {
         eprintln!("[reachability] pool {pool}: {displaced}/{pool} hits displaced by the re-sort");
 
         g.bench_with_input(BenchmarkId::new("identity", pool), &(), |b, ()| {
-            b.iter(|| black_box(apply_hubness_penalty(black_box(&hits), black_box(&hub), &identity)));
+            b.iter(|| {
+                black_box(apply_hubness_penalty(
+                    black_box(&hits),
+                    black_box(&hub),
+                    &identity,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("correct", pool), &(), |b, ()| {
-            b.iter(|| black_box(apply_hubness_penalty(black_box(&hits), black_box(&hub), &correct)));
+            b.iter(|| {
+                black_box(apply_hubness_penalty(
+                    black_box(&hits),
+                    black_box(&hub),
+                    &correct,
+                ))
+            });
         });
 
         // ── Searcher wiring (bd-kdjr): the re-sort that makes the demotion reach fusion ──
@@ -109,6 +126,57 @@ fn bench(c: &mut Criterion) {
             out.sort_unstable_by(VectorHit::cmp_rank);
             out
         };
+        // NULL CONTROL (A/A): the same arm twice, identical interleaved structure. It measures the
+        // harness noise floor, which must be read before any lever ratio below is believed.
+        g.bench_with_input(BenchmarkId::new("paired_null_a", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(apply_hubness_penalty(
+                            black_box(&hits),
+                            black_box(&hub),
+                            &correct,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(apply_hubness_penalty(
+                            black_box(&hits),
+                            black_box(&hub),
+                            &correct,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("paired_null_b", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(apply_hubness_penalty(
+                            black_box(&hits),
+                            black_box(&hub),
+                            &correct,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(apply_hubness_penalty(
+                            black_box(&hits),
+                            black_box(&hub),
+                            &correct,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+
         g.bench_with_input(BenchmarkId::new("paired_correct", pool), &(), |b, ()| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
@@ -129,26 +197,30 @@ fn bench(c: &mut Criterion) {
                 total
             });
         });
-        g.bench_with_input(BenchmarkId::new("paired_correct_ranked", pool), &(), |b, ()| {
-            b.iter_custom(|iters| {
-                let mut total = Duration::ZERO;
-                for _ in 0..iters {
-                    for _ in 0..PAIR_BATCH {
-                        black_box(apply_hubness_penalty(
-                            black_box(&hits),
-                            black_box(&hub),
-                            &correct,
-                        ));
+        g.bench_with_input(
+            BenchmarkId::new("paired_correct_ranked", pool),
+            &(),
+            |b, ()| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        for _ in 0..PAIR_BATCH {
+                            black_box(apply_hubness_penalty(
+                                black_box(&hits),
+                                black_box(&hub),
+                                &correct,
+                            ));
+                        }
+                        let t = Instant::now();
+                        for _ in 0..PAIR_BATCH {
+                            black_box(ranked(black_box(&hits), black_box(&hub)));
+                        }
+                        total += t.elapsed();
                     }
-                    let t = Instant::now();
-                    for _ in 0..PAIR_BATCH {
-                        black_box(ranked(black_box(&hits), black_box(&hub)));
-                    }
-                    total += t.elapsed();
-                }
-                total
-            });
-        });
+                    total
+                });
+            },
+        );
     }
     g.finish();
 
@@ -163,9 +235,19 @@ fn bench(c: &mut Criterion) {
         let qv = vecs(queries, dim, 7);
         let dref: Vec<&[f32]> = dv.iter().map(Vec::as_slice).collect();
         let qref: Vec<&[f32]> = qv.iter().map(Vec::as_slice).collect();
-        gb.bench_with_input(BenchmarkId::new("build", format!("{docs}x{queries}")), &(), |b, ()| {
-            b.iter(|| black_box(compute_query_hubness(black_box(&dref), black_box(&qref), 10)));
-        });
+        gb.bench_with_input(
+            BenchmarkId::new("build", format!("{docs}x{queries}")),
+            &(),
+            |b, ()| {
+                b.iter(|| {
+                    black_box(compute_query_hubness(
+                        black_box(&dref),
+                        black_box(&qref),
+                        10,
+                    ))
+                });
+            },
+        );
     }
     gb.finish();
 }

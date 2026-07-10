@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 use frankensearch_fusion::{SmoothConfig, neighbor_smooth, neighbor_smooth_ranked};
 
 /// Calls per timed region in the interleaved paired sampler — amortizes the `Instant::now()` pair.
@@ -110,6 +111,65 @@ fn bench(c: &mut Criterion) {
         );
         eprintln!("[reachability] pool {pool}: {displaced}/{pool} hits displaced by the re-sort");
 
+        // ── DECIDABILITY: alternating-round paired sampler + A/A null control ──────────────
+        //
+        // The criterion `paired_*` arms below CANNOT decide this lever: criterion runs the two arms
+        // as separate benchmarks minutes apart, so worker drift between them is not cancelled. Its
+        // A/A null measured 1.1265x at pool 50 — a 12.65% floor, larger than the effect. The sampler
+        // here runs both arms in ONE routine in alternating rounds and takes the median per-round
+        // ratio, collapsing the floor. Gate on the median against the null spread, not on cv.
+        let null = paired_median_ratio(
+            41,
+            8,
+            || {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ));
+            },
+            || {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ));
+            },
+        );
+        let lever = paired_median_ratio(
+            41,
+            8,
+            || {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ));
+            },
+            || {
+                black_box(neighbor_smooth_ranked(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ));
+            },
+        );
+        eprintln!(
+            "[null]  pool {pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] pool {pool}: re-sort median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
+
         g.bench_with_input(BenchmarkId::new("identity", pool), &(), |b, ()| {
             b.iter(|| {
                 black_box(neighbor_smooth(
@@ -157,6 +217,61 @@ fn bench(c: &mut Criterion) {
         // every iteration and times only its own, so the two benchmarks perform identical total
         // work and see identical machine state; drift hits both equally and cancels in the ratio.
         // Calls are batched so the two `Instant::now()` reads amortize to <2% of the timed region.
+        //
+        // NULL CONTROL (A/A): the SAME arm registered twice with the identical interleaved
+        // structure, measuring this harness's noise floor. Read it BEFORE believing any lever
+        // ratio below — an effect smaller than the floor is indistinguishable from noise, and a
+        // WIN or REJECT resting on such an effect is meaningless. The re-sort cost measured here
+        // is only ~7–11%, so the floor is load bearing, not ceremony.
+        g.bench_with_input(BenchmarkId::new("paired_null_a", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(neighbor_smooth(
+                            black_box(&hits),
+                            black_box(&graph),
+                            &smooth,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(neighbor_smooth(
+                            black_box(&hits),
+                            black_box(&graph),
+                            &smooth,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("paired_null_b", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(neighbor_smooth(
+                            black_box(&hits),
+                            black_box(&graph),
+                            &smooth,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(neighbor_smooth(
+                            black_box(&hits),
+                            black_box(&graph),
+                            &smooth,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+
         g.bench_with_input(BenchmarkId::new("paired_smooth", pool), &(), |b, ()| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;

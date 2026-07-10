@@ -4374,15 +4374,45 @@ identical machine state, so drift cancels in the ratio. CI widths fell from ±6%
 | 100  | 92–95/100  | 194.31 µs | 215.86 µs | **1.111×** |
 | 1000 | 985–992/1000 | 2.8912 ms | 3.2037 ms | **1.108×** |
 
-So the re-sort costs **7–11% of the smoothing kernel**, not 0.8–1.5%: ≈19.5 µs at pool 1000, versus the
-2.25 µs the short-circuited fixture reported. Cross-validated below: the same sort on a hubness-permuted pool
-of 1000 costs ≈20.8 µs in a *different* bench — two independent measurements of the same primitive agreeing to
-6%. **The land itself stands** — 19.5 µs against a 15 ms Phase-1 budget is 0.13%, and the re-sort is a
-correctness requirement, not an optimization. Only the cost claim moves.
+> **⚠ 2026-07-10 SECOND CORRECTION (cc_fse): these ratios had NO null control; two of the three are NOT decidable.**
+> The table above registered `paired_smooth`/`paired_smooth_ranked` as two *criterion* benchmarks. Criterion runs
+> them sequentially, minutes apart, so drift between the arms is not cancelled — the internal timed/untimed
+> interleaving only equalizes state *within* an arm. An A/A null control (the same `neighbor_smooth` as both arms)
+> proved it: **criterion-level null median = 1.1265× at pool 50, 0.9268× at pool 100** (worker `hz1`, 120 samples) —
+> a floor of ±12% that does not even contain 1.000. The `1.072×` and `1.111×` rows above sit **inside** that floor
+> and were never measurable that way.
+>
+> Fixed the harness (`crates/frankensearch-fusion/src/bench_support.rs`, `paired_median_ratio`): both arms run in
+> **one** routine in **alternating rounds** (`r` even → `a,b`; odd → `b,a`), ratio taken **per round**, median over
+> rounds. Gate on the **median vs the null's p5..p95 spread**, not on `cv` (`cv < 5%` is unattainable on this fleet).
+> Re-measured, worker `hz1`, binary sha256 `c287dde1ed774abca36faa470ffe3d91cfdb265c1f0c944fff3c4f568403c08d`,
+> 41 rounds × 8 inner:
+>
+> | pool | displaced | NULL median [p5,p95] | re-sort median [p5,p95] | verdict |
+> |---:|---:|---|---|---|
+> | 50   | 44/50   | 1.0012 [0.758, 1.517] | 1.0724 [0.770, 1.525] | **INSIDE NULL FLOOR — not decidable** |
+> | 100  | 95/100  | 1.0035 [0.879, 1.136] | 1.0937 [0.951, 1.255] | **INSIDE NULL FLOOR — not decidable** |
+> | 1000 | 985/1000 | 1.0003 [0.976, 1.058] | **1.1096 [1.081, 1.143]** | **DECIDABLE** (lever p5 1.081 > null p95 1.058) |
+>
+> **Only the pool-1000 claim survives: the re-sort costs ~11% there, cleanly outside the floor.** At pool 50/100 the
+> per-round noise on such a small workload swamps a ~7–9% effect; the true cost is *probably* similar (the mechanism
+> is identical) but is **not measurable** on this hardware at that size, so no ratio is claimed. The earlier `7–11%`
+> band overstated confidence at the small pools.
+>
+> **Self-time NOW OBTAINED** (worker `hetzner1`, `--profile release-perf` so symbols resolve, sha256
+> `9deaed1e96889448c203bdbd7afb280130f676d671b2696c2a4fb024ebd19607`, `perf record -F 997 -e cycles:u`, `smooth/1000`
+> arm): `neighbor_smooth` kernel **48.76%**, `DocumentGraph::neighbors` 11.60%, and the re-sort —
+> `quicksort::<VectorHit, cmp_rank>` 1.36% + `small_sort_general::<VectorHit, cmp_rank>` 0.99% = **~2.35% self-time**
+> — consistent with an ~11% delta measured against just the kernel's share. (The `rayon par_sort::<f64>` frames are
+> criterion's own percentile math, not shipped code.) This discharges the self-time obligation for the pool-1000 row.
+>
+> **The land still stands** regardless: at pool 1000 the whole `smooth_ranked` call is ~3.2 ms *inside the bench*,
+> but the real Phase-1 semantic pool is tens of candidates, and the re-sort is a correctness requirement (fusion
+> assigns ranks by position), not an optimization. Only the *cost measurement* is corrected — from a false-precise
+> 7–11% to "~11% at pool 1000, undecidable below."
 
 DCE ruled out per arm: every input goes through `black_box`, every returned `Vec` is consumed through
-`black_box`, and the reachability gate compares real outputs. No `perf` self-time was taken (rch-remote,
-`perf_event_paranoid` unavailable); displacement count is the reachability evidence recorded in its place.
+`black_box`, and the reachability gate compares real outputs.
 
 Lesson (generalizes): **an assert that the kernel changed its output does not prove a downstream stage has
 work.** Gate each measured stage on its own observable — here, "did the sort move anything?" — and print it.
@@ -4436,6 +4466,15 @@ calls; reachability gate asserts the sort permutes the pool and prints the count
 | 50   | 41/50    | 2.2276 µs (139.2 ns/call) | 10.417 µs (651.1 ns/call) | **4.676×** |
 | 100  | 92/100   | 4.1002 µs (256.3 ns/call) | 26.759 µs (1.672 µs/call) | **6.526×** |
 | 1000 | 992/1000 | 37.441 µs (2.340 µs/call) | 370.40 µs (23.15 µs/call) | **9.893×** |
+
+> **✅ 2026-07-10 NULL CONTROL added (cc_fse): all three rows DECIDABLE by a wide margin.** These ratios predate the
+> null-control rule, so an A/A control was run (same `apply_hubness_penalty` as both arms, worker `hz1`, binary
+> sha256 `b0776692416eee956e9f6f33af13b6cadf8f08ad181cb3f546e5ae5932eaf421`, 120 samples): null median 1.077 [range
+> 0.967, 1.196] at pool 50, 1.001 [0.995, 1.008] at pool 100, 0.972 [0.942, 1.003] at pool 1000. The lever effect
+> (4.68×/6.53×/9.89×) clears the floor by **4–10×** at every pool — unlike the smoothing re-sort (see the two
+> corrections above), which is a same-primitive sort but on a much larger base kernel, so its ~11% effect is only
+> decidable at pool 1000. The hubness verdict stands unchanged; it was simply never at risk from the floor because
+> the base O(pool) subtract is ~100× cheaper than the sort it precedes.
 
 **The mechanism, and why the ratio is the opposite of smoothing's.** `apply_hubness_penalty` is a trivial
 O(pool) subtract (~2.3 ns/doc); the mandatory re-sort is O(pool log pool) over a nearly-fully-permuted pool
