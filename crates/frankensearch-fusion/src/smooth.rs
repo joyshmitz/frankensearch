@@ -77,6 +77,9 @@ impl SmoothConfig {
 /// This is a pure, allocation-bounded transform: it borrows `hits` and `graph` and touches
 /// no global state. On an identity config, empty graph, or empty pool it clones `hits`
 /// unchanged.
+///
+/// **Callers that feed a rank-based fusion operator want [`neighbor_smooth_ranked`] instead** —
+/// see its docs for why re-sorting is a correctness requirement, not a cosmetic one.
 #[must_use]
 pub fn neighbor_smooth(
     hits: &[VectorHit],
@@ -247,6 +250,37 @@ fn mutual_neighbor_smooth(
         .collect()
 }
 
+/// [`neighbor_smooth`] followed by a deterministic descending re-sort.
+///
+/// **Why the re-sort is a correctness requirement.** The rank-based fusion operators
+/// (`rrf_fuse_with_graph_merge_unique` and friends) walk the `semantic` slice *once, in order*,
+/// and assign each hit's rank from its **position** — they never re-sort it, because a vector
+/// index already returns score-sorted hits. Smoothing rewrites those scores, so a doc the
+/// diffusion promoted would keep its old, worse rank and the promotion would be silently
+/// discarded. Worse, the merge's near-sorted assumption would be violated. Re-sorting restores
+/// the invariant "position == rank" that fusion depends on.
+///
+/// Ties break on `doc_id` so the pool order is a total order and the pipeline stays replayable.
+/// Identity config / empty graph / empty pool short-circuits to `neighbor_smooth`'s clone, whose
+/// input was already sorted, so the sort is skipped entirely.
+#[must_use]
+pub fn neighbor_smooth_ranked(
+    hits: &[VectorHit],
+    graph: &DocumentGraph,
+    config: &SmoothConfig,
+) -> Vec<VectorHit> {
+    if config.is_identity() || graph.is_empty() || hits.is_empty() {
+        return hits.to_vec();
+    }
+    let mut smoothed = neighbor_smooth(hits, graph, config);
+    smoothed.sort_unstable_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.doc_id.cmp(&b.doc_id))
+    });
+    smoothed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +313,115 @@ mod tests {
         };
         let out = neighbor_smooth(&hits, &g, &cfg);
         assert_eq!(out, hits);
+    }
+
+    // ─── neighbor_smooth_ranked (searcher wiring, bd-kdjr) ──────────────────
+
+    /// PARITY GATE. The disabled config must leave the pool byte-identical — same order, same
+    /// score bits. This is what makes wiring the pass into the searcher a no-op by default.
+    #[test]
+    fn ranked_identity_is_byte_identical() {
+        let hits = vec![hit("a", 0.9), hit("b", 0.5), hit("c", 0.4)];
+        let g = sim_graph(&[("a", "b"), ("b", "a"), ("b", "c")]);
+        let off = SmoothConfig {
+            alpha: 0.0,
+            ..Default::default()
+        };
+        let out = neighbor_smooth_ranked(&hits, &g, &off);
+        assert_eq!(out.len(), hits.len());
+        for (x, y) in out.iter().zip(&hits) {
+            assert_eq!(x.doc_id, y.doc_id);
+            assert_eq!(x.score.to_bits(), y.score.to_bits(), "doc {}", x.doc_id);
+        }
+        // An empty graph is the other disabled path.
+        let on = SmoothConfig::default();
+        let empty = DocumentGraph::new();
+        assert_eq!(neighbor_smooth_ranked(&hits, &empty, &on), hits);
+    }
+
+    /// CORRECTNESS GATE (the reason `_ranked` exists). Fusion assigns ranks by *position*, so a
+    /// doc the diffusion promoted must actually move up the slice. Plain `neighbor_smooth` leaves
+    /// it in place with a better score — the promotion would be silently discarded by RRF.
+    #[test]
+    fn ranked_reorders_a_promoted_doc_where_plain_smooth_does_not() {
+        // `c` starts last but sits in a tight cluster with the two top hits, so diffusion lifts
+        // it above `b`, a loner.
+        let hits = vec![hit("a", 0.90), hit("b", 0.60), hit("c", 0.55)];
+        let g = sim_graph(&[("c", "a"), ("a", "c"), ("c", "d"), ("d", "c")]);
+        let cfg = SmoothConfig {
+            alpha: 0.5,
+            m: 10,
+            mutual: false,
+        };
+
+        let plain = neighbor_smooth(&hits, &g, &cfg);
+        let ranked = neighbor_smooth_ranked(&hits, &g, &cfg);
+
+        // Same multiset of scores; only the order differs.
+        let plain_c = plain.iter().find(|h| h.doc_id == "c").unwrap().score;
+        let ranked_c = ranked.iter().find(|h| h.doc_id == "c").unwrap().score;
+        assert_eq!(plain_c.to_bits(), ranked_c.to_bits());
+
+        // Diffusion lifted c above b...
+        let b = plain.iter().find(|h| h.doc_id == "b").unwrap().score;
+        assert!(
+            ranked_c > b,
+            "smoothing should lift c ({ranked_c}) over b ({b})"
+        );
+        // ...but only the ranked form puts it there.
+        let plain_pos = plain.iter().position(|h| h.doc_id == "c").unwrap();
+        let ranked_pos = ranked.iter().position(|h| h.doc_id == "c").unwrap();
+        assert_eq!(plain_pos, 2, "plain smooth leaves c in its original slot");
+        assert_eq!(ranked_pos, 1, "ranked smooth moves c ahead of b");
+
+        // The result is a total order (ties broken on doc_id), so replay is deterministic.
+        // Compared with `total_cmp` — the very comparator the sort uses — so an exact score tie
+        // is a real tie here, not a float-epsilon question.
+        assert!(
+            ranked
+                .windows(2)
+                .all(|w| match w[0].score.total_cmp(&w[1].score) {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Equal => w[0].doc_id <= w[1].doc_id,
+                    std::cmp::Ordering::Less => false,
+                }),
+            "ranked pool must be sorted desc with doc_id tiebreak"
+        );
+    }
+
+    /// QUALITY GATE. Smoothing's claimed nDCG gain, measured in Rust via core's `ndcg_at_k` —
+    /// not merely cited from the Python BEIR harness. `c` is the relevant answer, under-scored by
+    /// the embedder but adjacent in the k-NN graph to the strong hit `a`; `b` is an irrelevant
+    /// loner that outscores it. Diffusion recovers `c`.
+    #[test]
+    fn ranked_smoothing_improves_ndcg_over_no_smoothing() {
+        use frankensearch_core::metrics_eval::ndcg_at_k;
+
+        let hits = vec![hit("a", 0.90), hit("b", 0.60), hit("c", 0.55)];
+        let g = sim_graph(&[("c", "a"), ("a", "c")]);
+        let cfg = SmoothConfig {
+            alpha: 0.5,
+            m: 10,
+            mutual: false,
+        };
+        let relevant = ["c"];
+
+        let ids =
+            |v: &[VectorHit]| -> Vec<String> { v.iter().map(|h| h.doc_id.to_string()).collect() };
+        fn as_refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+
+        let before = ids(&hits);
+        let after = ids(&neighbor_smooth_ranked(&hits, &g, &cfg));
+
+        let ndcg_before = ndcg_at_k(&as_refs(&before), &relevant, 10);
+        let ndcg_after = ndcg_at_k(&as_refs(&after), &relevant, 10);
+        assert!(
+            ndcg_after > ndcg_before,
+            "smoothed nDCG@10 {ndcg_after} should beat unsmoothed {ndcg_before} \
+             (before {before:?}, after {after:?})"
+        );
     }
 
     #[test]

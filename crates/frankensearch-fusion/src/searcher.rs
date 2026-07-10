@@ -362,6 +362,21 @@ impl TwoTierSearcher {
         self
     }
 
+    /// The Phase-1 neighbour-smoothing config, or `None` when the pass is disabled.
+    ///
+    /// Returning `None` (rather than an identity [`SmoothConfig`]) is deliberate: it lets the
+    /// caller skip the pass entirely instead of paying `neighbor_smooth`'s identity clone of the
+    /// whole pool. `alpha == 0.0` is the default, so the default path never allocates.
+    #[cfg(feature = "graph")]
+    fn smoothing_config(&self) -> Option<crate::smooth::SmoothConfig> {
+        let cfg = crate::smooth::SmoothConfig {
+            alpha: self.config.neighbor_smoothing_alpha,
+            m: self.config.neighbor_smoothing_m,
+            mutual: self.config.neighbor_smoothing_mutual,
+        };
+        (!cfg.is_identity()).then_some(cfg)
+    }
+
     /// Set the host adapter used to receive canonical telemetry envelopes.
     #[must_use]
     pub fn with_host_adapter(mut self, host_adapter: Arc<dyn HostAdapter>) -> Self {
@@ -1168,6 +1183,18 @@ impl TwoTierSearcher {
                 } else {
                     fast_hits
                 };
+                // k-NN neighbour smoothing (graph score-diffusion) over the retrieved semantic
+                // pool. Off by default (`alpha == 0.0`), and when off the pass is never entered,
+                // so the default path pays nothing and stays byte-identical. Fusion assigns
+                // ranks by *position*, so `neighbor_smooth_ranked` re-sorts — see its docs.
+                #[cfg(feature = "graph")]
+                let fast_hits = match (self.document_graph.as_ref(), self.smoothing_config()) {
+                    (Some(graph), Some(smooth_cfg)) => {
+                        crate::smooth::neighbor_smooth_ranked(&fast_hits, graph, &smooth_cfg)
+                    }
+                    _ => fast_hits,
+                };
+
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.semantic_candidates = fast_hits.len();
                 metrics.phase1_vectors_searched = self.index.doc_count();
@@ -3893,6 +3920,100 @@ mod tests {
                 "graph candidates matching negation should be filtered before fusion",
             );
         });
+    }
+
+    /// Phase-1 doc order for `build_test_index(4)`, whose doc `i` is the one-hot `e_{i mod 4}`.
+    /// The stub query embeds to `e_0`, so `doc-{0,4,8}` score 1.0 and the other seven score 0.0.
+    #[cfg(feature = "graph")]
+    fn initial_docs_for(config: TwoTierConfig, graph: Option<DocumentGraph>) -> Vec<String> {
+        let mut docs: Vec<String> = Vec::new();
+        let sink = &mut docs;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, config);
+            let searcher = match graph {
+                Some(graph) => searcher.with_document_graph(Arc::new(graph)),
+                None => searcher,
+            };
+
+            searcher
+                .search(
+                    &cx,
+                    "neighbor smoothing query",
+                    10,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            *sink = results
+                                .into_iter()
+                                .map(|result| result.doc_id.to_string())
+                                .collect();
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+        });
+        docs
+    }
+
+    /// PARITY GATE for the wiring (bd-kdjr). `neighbor_smoothing_alpha` defaults to `0.0`, so
+    /// attaching a document graph must not perturb Phase-1 at all — the smoothing arm is never
+    /// entered and `fast_hits` moves through untouched. This is what makes the wiring a
+    /// zero-cost default rather than a behaviour change.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn smoothing_is_inert_by_default_even_with_a_document_graph() {
+        let mut graph = DocumentGraph::new();
+        graph.add_edge("doc-7", "doc-0", frankensearch_core::EdgeType::Similar, 1.0);
+
+        let without_graph = initial_docs_for(TwoTierConfig::default(), None);
+        let with_graph = initial_docs_for(TwoTierConfig::default(), Some(graph));
+
+        assert_eq!(
+            without_graph, with_graph,
+            "alpha=0.0 must leave the Phase-1 ranking byte-identical",
+        );
+    }
+
+    /// END-TO-END GATE for the wiring (bd-kdjr). `doc-7` is a zero-scoring candidate that sits on
+    /// a `Similar` edge to `doc-0`, a perfect-scoring hit. Diffusion lifts it to `α·1.0 = 0.5`,
+    /// which must carry through `neighbor_smooth_ranked`'s re-sort *and* rank-based fusion to
+    /// move it ahead of the untouched zero-scorers it started behind. Proves the smoothed score
+    /// actually reaches the final ranking rather than being discarded by position-assigned ranks.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn smoothing_promotes_a_graph_neighbor_of_a_top_hit_through_fusion() {
+        let mut graph = DocumentGraph::new();
+        graph.add_edge("doc-7", "doc-0", frankensearch_core::EdgeType::Similar, 1.0);
+
+        let smoothing = TwoTierConfig {
+            neighbor_smoothing_alpha: 0.5,
+            ..TwoTierConfig::default()
+        };
+
+        let baseline = initial_docs_for(TwoTierConfig::default(), Some(graph.clone()));
+        let smoothed = initial_docs_for(smoothing, Some(graph));
+
+        let rank = |docs: &[String], id: &str| {
+            docs.iter()
+                .position(|doc| doc.as_str() == id)
+                .unwrap_or_else(|| panic!("{id} missing from {docs:?}"))
+        };
+
+        // `doc-2` is an isolated zero-scorer: no Similar edges, so smoothing collapses to
+        // identity on it. It is the fixed reference `doc-7` must overtake.
+        assert!(
+            rank(&baseline, "doc-7") > rank(&baseline, "doc-2"),
+            "unsmoothed, doc-7 trails the isolated zero-scorer doc-2: {baseline:?}",
+        );
+        assert!(
+            rank(&smoothed, "doc-7") < rank(&smoothed, "doc-2"),
+            "smoothing must promote doc-7 (neighbor of top hit doc-0) past doc-2: {smoothed:?}",
+        );
+        // The perfect-scoring hit is isolated in the graph, so diffusion must not disturb it.
+        assert_eq!(rank(&smoothed, "doc-0"), 0, "top hit must stay on top");
     }
 
     #[test]

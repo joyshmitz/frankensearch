@@ -96,5 +96,5 @@ pub use rrf::{
     rrf_fuse, rrf_fuse_with_graph,
 };
 pub use searcher::TwoTierSearcher;
-pub use smooth::{SmoothConfig, neighbor_smooth};
+pub use smooth::{SmoothConfig, neighbor_smooth, neighbor_smooth_ranked};
 pub use sync_searcher::{SyncLexicalSearch, SyncSearchIterator, SyncTwoTierSearcher};

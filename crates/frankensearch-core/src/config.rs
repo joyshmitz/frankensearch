@@ -55,6 +55,7 @@ pub enum FusionStrategy {
 /// | `FRANKENSEARCH_QUALITY_TIMEOUT`  | `quality_timeout_ms` | `500`    |
 /// | `FRANKENSEARCH_HNSW_THRESHOLD`   | `hnsw_threshold`   | `50000`    |
 /// | `FRANKENSEARCH_FUSION_STRATEGY`  | `fusion_strategy`  | `rrf`      |
+/// | `FRANKENSEARCH_SMOOTHING_ALPHA`  | `neighbor_smoothing_alpha` | `0.0` (off) |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TwoTierConfig {
@@ -89,6 +90,24 @@ pub struct TwoTierConfig {
     /// How Phase-1 fuses the lexical and semantic candidate lists.
     /// Default: [`FusionStrategy::Rrf`] — the current behaviour, byte-identical.
     pub fusion_strategy: FusionStrategy,
+
+    /// Diffusion weight for k-NN neighbour smoothing of the Phase-1 semantic pool.
+    ///
+    /// `0.0` (default) disables the pass entirely — the searcher never calls it, so the default
+    /// path is byte-identical and pays nothing. `0.3` is the label-free never-worse setting.
+    /// Requires the `graph` feature *and* a document graph attached via `with_document_graph`;
+    /// with either absent the pass is skipped.
+    ///
+    /// Measured (`docs/PERF_LEDGER.md`, `257c468`): **+0.0039 mean nDCG@10** over no smoothing,
+    /// and the deployable pool-restricted form beats full-cosine on recall-bound corpora.
+    pub neighbor_smoothing_alpha: f32,
+
+    /// Number of nearest `Similar` neighbours averaged per candidate when smoothing. Default `10`.
+    pub neighbor_smoothing_m: usize,
+
+    /// Require reciprocal (mutual) k-NN edges when smoothing. Cuts hub and one-way-edge noise at
+    /// ~5× the kernel cost. Default `false`.
+    pub neighbor_smoothing_mutual: bool,
 
     /// Optional telemetry exporter callback target.
     ///
@@ -138,6 +157,9 @@ impl Default for TwoTierConfig {
             graph_ranking_enabled: false,
             graph_ranking_weight: 0.5,
             fusion_strategy: FusionStrategy::Rrf,
+            neighbor_smoothing_alpha: 0.0,
+            neighbor_smoothing_m: 10,
+            neighbor_smoothing_mutual: false,
             metrics_exporter: None,
             explain: false,
             hnsw_ef_search: 100,
@@ -223,6 +245,18 @@ impl TwoTierConfig {
                     var = "FRANKENSEARCH_FAST_ONLY",
                     value = %val,
                     "invalid value (expected boolean), keeping default"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("FRANKENSEARCH_SMOOTHING_ALPHA") {
+            match val.parse::<f32>() {
+                Ok(a) if a.is_finite() && (0.0..=1.0).contains(&a) => {
+                    self.neighbor_smoothing_alpha = a;
+                }
+                _ => tracing::warn!(
+                    var = "FRANKENSEARCH_SMOOTHING_ALPHA",
+                    value = %val,
+                    "invalid value (expected f32 in 0.0..=1.0), keeping default"
                 ),
             }
         }

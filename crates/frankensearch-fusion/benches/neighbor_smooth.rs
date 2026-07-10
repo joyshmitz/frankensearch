@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
-use frankensearch_fusion::{SmoothConfig, neighbor_smooth};
+use frankensearch_fusion::{SmoothConfig, neighbor_smooth, neighbor_smooth_ranked};
 
 /// A pool of `pool` candidates with heavy-tailed cosine scores, and an M-nearest `Similar`
 /// graph where each doc links to the `m` following docs (a synthetic cluster chain, all
@@ -58,9 +58,21 @@ fn bench(c: &mut Criterion) {
     g.warm_up_time(Duration::from_millis(400));
     g.measurement_time(Duration::from_millis(2000));
 
-    let identity = SmoothConfig { alpha: 0.0, m: 10, mutual: false };
-    let smooth = SmoothConfig { alpha: 0.3, m: 10, mutual: false };
-    let mutual = SmoothConfig { alpha: 0.3, m: 10, mutual: true };
+    let identity = SmoothConfig {
+        alpha: 0.0,
+        m: 10,
+        mutual: false,
+    };
+    let smooth = SmoothConfig {
+        alpha: 0.3,
+        m: 10,
+        mutual: false,
+    };
+    let mutual = SmoothConfig {
+        alpha: 0.3,
+        m: 10,
+        mutual: true,
+    };
 
     for &pool in &[50usize, 100, 1000] {
         let (hits, graph) = build(pool, 10);
@@ -70,13 +82,64 @@ fn bench(c: &mut Criterion) {
         assert!((s[10].score - hits[10].score).abs() > 1e-9);
 
         g.bench_with_input(BenchmarkId::new("identity", pool), &(), |b, ()| {
-            b.iter(|| black_box(neighbor_smooth(black_box(&hits), black_box(&graph), &identity)));
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &identity,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("smooth", pool), &(), |b, ()| {
-            b.iter(|| black_box(neighbor_smooth(black_box(&hits), black_box(&graph), &smooth)));
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("mutual", pool), &(), |b, ()| {
-            b.iter(|| black_box(neighbor_smooth(black_box(&hits), black_box(&graph), &mutual)));
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &mutual,
+                ))
+            });
+        });
+
+        // ── Searcher wiring (bd-kdjr): the re-sort that makes smoothing usable by rank fusion ──
+        //
+        // `smooth` (ORIG) is the bare kernel; `smooth_ranked` is what the searcher actually calls.
+        // The delta is the deterministic descending re-sort, which is a CORRECTNESS requirement:
+        // fusion assigns ranks by position, so without it a promoted doc keeps its old rank.
+        // ORIG is measured again at the end (`smooth2`) to bracket criterion's ordering bias.
+        //
+        // The default-off path is not benched because it does not exist as work: the searcher's
+        // `match` yields `fast_hits` by move when smoothing is disabled — no call, no clone.
+        assert_eq!(
+            neighbor_smooth_ranked(&hits, &graph, &identity),
+            hits,
+            "identity must be byte-identical passthrough at pool {pool}"
+        );
+        g.bench_with_input(BenchmarkId::new("smooth_ranked", pool), &(), |b, ()| {
+            b.iter(|| {
+                black_box(neighbor_smooth_ranked(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ))
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("smooth2", pool), &(), |b, ()| {
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ))
+            });
         });
     }
     g.finish();
