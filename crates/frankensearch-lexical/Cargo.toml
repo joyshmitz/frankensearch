@@ -6,6 +6,10 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
+bench-internals = ["frankensearch-core/bench-internals"]
+
 [dependencies]
 frankensearch-core = { workspace = true }
 asupersync = { workspace = true }
@@ -40,3 +44,8 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "tokenizer_char_walk_ab"
+harness = false
+required-features = ["bench-internals"]

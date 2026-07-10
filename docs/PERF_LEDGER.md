@@ -4584,3 +4584,40 @@ also only recall-safe while the
 quantizer keeps magnitudes under the i16 pair ceiling — a coupling the wiring step must assert. cod owns the
 scan; I touched no scan code. All builds/benches remote; no local cargo. 6 unrelated WAL/vacuum lib tests hit a
 worker-FS `PermissionDenied` flake on one worker and pass on a fresh one (environmental, not this change).
+
+## 2026-07-10 — WIN: ASCII byte fast-path in the cass tokenizer's `next_char_from` — 1.355× on the per-char scan, bit-identical (cc_fse)
+
+Dug a **different primitive** after the vector-scan vein slowed (f16 decode-bound; FMA + chunk-size both
+rejected this session): the **lexical tokenizer**. `frankensearch-lexical`'s cass tokenizer scans text
+char-by-char via `next_char_from(text, off)`, called from `advance` / `scan_ascii_token` / `scan_cjk_token`
+for **every character** at index time (per doc) and query time (per query). The original did
+`text[off..].chars().next()` + `ch.len_utf8()` — a full UTF-8 decode per char.
+
+**The lever.** The tokenizer's inputs (English prose, code identifiers, doc IDs) are overwhelmingly ASCII, and
+`off` is always a char boundary, so a leading byte `< 128` is a complete single-byte UTF-8 char. The fast-path
+returns `(b as char, off + 1)` directly, skipping the `chars().next()` decode and the `len_utf8()` recompute;
+non-ASCII lead bytes fall through to the original decode. **Bit-identical** for all inputs.
+
+**Recall/ordering — trivially preserved.** `next_char_from_ascii_matches_decode` asserts the fast path yields the
+byte-for-byte same `(char, next_offset)` sequence as the decode on ASCII, multi-byte, combining-mark, emoji, CJK,
+and mixed inputs — so token boundaries (hence BM25 terms, hence ranking) are unchanged. All 83 lexical lib tests
+pass with the fast-path live.
+
+**Speed — DECIDABLE WIN.** Isolated null-controlled microbench (`benches/tokenizer_char_walk_ab.rs`, 48 KiB
+realistic mostly-ASCII corpus, shared alternating-round sampler, one binary / one `rch` invocation, worker
+`hz2`/`hetzner2`, binary sha256 `4a519c768d15007d0fb466f05f7143b791c386cf2ed6a6b897c39a84e5dd5ff5`, 41 rounds ×
+4). Ratio = fast/ORIG, `<1.0` = faster:
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (decode vs decode) | 1.0285 [0.8784, 1.2218] |
+| fast / ORIG | **0.7379 [0.6640, 0.8929]** |
+
+fast/ORIG median 0.7379 = **1.355× faster**, and the median is clearly below the null p5 (0.8784) → decidable.
+This is the per-char scan primitive; the full tokenizer sees a smaller-but-real share since `advance` also does
+`push_str` + offset bookkeeping, but the scan itself is the changed hot inner loop.
+
+**SHIPPED in place** (`next_char_from` is now the fast path; the pre-fast-path decode retained doc-hidden as
+`next_char_from_slow` + the `cass_char_walk_*` harnesses so the A/B stays reproducible, both arms in-tree).
+Recall-preserving, decidable, live. All builds/benches remote; no local cargo; fmt clean; ubs adds no new
+criticals (HEAD already exits 1 on pre-existing `.unwrap()`s).

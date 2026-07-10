@@ -83,8 +83,53 @@ fn is_cass_tokenizer_cjk(c: char) -> bool {
 
 #[inline]
 fn next_char_from(text: &str, offset: usize) -> Option<(char, usize)> {
+    // ASCII fast-path: the tokenizer scans char-by-char, and its inputs (English, code, IDs) are
+    // overwhelmingly ASCII. `offset` is always a char boundary (the tokenizer only advances by whole
+    // chars), so a leading byte `< 128` is a complete single-byte UTF-8 char — return it directly,
+    // skipping the `chars().next()` UTF-8 decode + `len_utf8()` recompute. Bit-identical to the slow
+    // path for every input (asserted in `next_char_from_ascii_matches_decode`).
+    let b = *text.as_bytes().get(offset)?;
+    if b < 128 {
+        return Some((b as char, offset + 1));
+    }
     let ch = text[offset..].chars().next()?;
     Some((ch, offset + ch.len_utf8()))
+}
+
+/// Pre-fast-path [`next_char_from`], retained doc-hidden for the same-binary A/B and the parity
+/// test. Not a shipping path.
+#[doc(hidden)]
+#[must_use]
+pub fn next_char_from_slow(text: &str, offset: usize) -> Option<(char, usize)> {
+    let ch = text[offset..].chars().next()?;
+    Some((ch, offset + ch.len_utf8()))
+}
+
+/// Doc-hidden bench harness: walk `text` char-by-char via the shipped (ASCII-fast) `next_char_from`,
+/// folding char values so the loop cannot be optimized away. Mirrors the tokenizer's scan cost.
+#[doc(hidden)]
+#[must_use]
+pub fn cass_char_walk_fast(text: &str) -> u64 {
+    let mut acc = 0u64;
+    let mut off = 0usize;
+    while let Some((ch, next)) = next_char_from(text, off) {
+        acc = acc.wrapping_add(ch as u64);
+        off = next;
+    }
+    acc
+}
+
+/// Doc-hidden bench harness: the same walk via [`next_char_from_slow`] (the pre-fast-path decode).
+#[doc(hidden)]
+#[must_use]
+pub fn cass_char_walk_slow(text: &str) -> u64 {
+    let mut acc = 0u64;
+    let mut off = 0usize;
+    while let Some((ch, next)) = next_char_from_slow(text, off) {
+        acc = acc.wrapping_add(ch as u64);
+        off = next;
+    }
+    acc
 }
 
 impl Tokenizer for CassTokenizer {
@@ -2303,6 +2348,41 @@ mod cass_query_tests {
                 batch_count: 2,
             }
         );
+    }
+
+    #[test]
+    fn next_char_from_ascii_matches_decode() {
+        // The ASCII fast-path must produce the byte-for-byte same (char, next_offset) sequence as
+        // the UTF-8 decode on every input — ASCII, multi-byte, and mixed — since it feeds the
+        // tokenizer whose token boundaries must not shift.
+        for text in [
+            "",
+            "hello world",
+            "bd-q3fy ID_42",
+            "éclair café",
+            "日本語 mixed 한국어 text",
+            "a\u{300}b\u{1F600}c", // combining mark + emoji interleaved with ascii
+            "\u{4E00}\u{4E01}xyz",
+        ] {
+            let mut off = 0usize;
+            loop {
+                let fast = next_char_from(text, off);
+                let slow = next_char_from_slow(text, off);
+                assert_eq!(fast, slow, "mismatch in {text:?} at offset {off}");
+                match fast {
+                    Some((_, next)) => off = next,
+                    None => break,
+                }
+            }
+        }
+        // And the full-walk harnesses must agree.
+        for text in ["hello world code_id-42", "日本語 mixed", ""] {
+            assert_eq!(
+                cass_char_walk_fast(text),
+                cass_char_walk_slow(text),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
