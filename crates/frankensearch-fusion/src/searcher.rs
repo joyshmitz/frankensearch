@@ -64,7 +64,7 @@ use crate::mmr::MmrConfig;
 use crate::mmr::mmr_rerank;
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
-use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, rrf_fuse_with_graph_merge_unique};
+use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1218,7 +1218,8 @@ impl TwoTierSearcher {
                                 )
                             },
                             |graph| {
-                                let fused = rrf_fuse_with_graph_merge_unique(
+                                let fused = fuse_by_strategy(
+                                    self.config.fusion_strategy,
                                     &[],
                                     &fast_hits,
                                     graph,
@@ -1240,7 +1241,8 @@ impl TwoTierSearcher {
                     |lexical| {
                         let fused = graph_candidates.as_ref().map_or_else(
                             || {
-                                rrf_fuse_with_graph_merge_unique(
+                                fuse_by_strategy(
+                                    self.config.fusion_strategy,
                                     lexical,
                                     &fast_hits,
                                     &[],
@@ -1251,7 +1253,8 @@ impl TwoTierSearcher {
                                 )
                             },
                             |graph| {
-                                rrf_fuse_with_graph_merge_unique(
+                                fuse_by_strategy(
+                                    self.config.fusion_strategy,
                                     lexical,
                                     &fast_hits,
                                     graph,

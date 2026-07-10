@@ -4211,3 +4211,55 @@ frankensearch-fusion --all-targets` → 0 errors, no warnings on the changed fil
 rustfmt introduces no new drift (the 4 residual `hubness.rs` sites pre-exist on `origin/main`).
 Original-comparator ratio **N/A** (offline builder, not the query path). Files: `hubness.rs`,
 `benches/hubness_dot_ab.rs`.
+
+---
+
+### 2026-07-09 — bd-2ocs: wire pool-min-max fusion into both searchers behind a `FusionStrategy` knob — dispatch latency-neutral (cc_fs)
+
+**Lever (`frankensearch-core/src/config.rs`, `frankensearch-fusion/src/{rrf,searcher,sync_searcher}.rs`).**
+`pool_minmax_fuse_merge` (`8ad515a`, +0.0038 mean nDCG@10 over RRF on BEIR, `a9e53b4`) was landed, unit-tested,
+benched — and had **zero callers**. Both searchers hard-coded `rrf_fuse_with_graph_merge_unique`. This wires it
+in behind `TwoTierConfig::fusion_strategy` (`FusionStrategy::{Rrf, PoolMinMax}`, env
+`FRANKENSEARCH_FUSION_STRATEGY`), defaulting to `Rrf`.
+
+This is exactly what the ledger routes to: the `a9e53b4` entry parks the default switch as "a separate product
+decision (keep RRF where per-query pool stats are unreliable)", and the `8ad515a` entry names
+`pool_minmax_fuse_merge` "the variant to wire when pool-min-max fusion is enabled". So the knob is **opt-in**;
+the default is not flipped. All four call sites (2 in `sync_searcher`, 2 in `searcher`) now go through one
+dispatch point, `fuse_by_strategy`.
+
+**PARITY GATE (behaviour).** `default_strategy_is_byte_identical_to_rrf` compares the dispatched default
+against a direct RRF call element-by-element on `f32::to_bits()` — the wiring is a no-op for every existing
+caller. `pool_minmax_with_graph_falls_back_to_rrf_not_dropping_graph` pins the one asymmetry:
+`pool_minmax_fuse_merge` has **no graph arm**, so a non-empty graph falls back to RRF rather than silently
+discarding a graph signal the caller explicitly enabled (the test asserts the graph-only doc survives).
+
+**QUALITY GATE (nDCG).** `pool_minmax_beats_rrf_on_ndcg_when_magnitude_carries_the_signal` measures, in Rust,
+via core's `ndcg_at_k` — it does not merely cite the Python harness. Ground truth `d` is semantic-only but
+overwhelmingly similar; `b` is marginal in both lists. RRF's rank transform rewards `b` for appearing twice and
+buries `d`; pool-min-max sees `d`'s magnitude and promotes it. nDCG@10 strictly increases. That is the same
+mechanism behind the +0.0038 BEIR result.
+
+**SPEED GATE (dispatch overhead).** The risk of a wiring commit is that the added `match` costs the default
+path. Measured as an explicit A/B in `pool_minmax_merge_ab` — ORIG = direct `rrf_fuse_with_graph_merge_unique`
+(what shipped before), candidate = via `fuse_by_strategy(Rrf, ..)`, ORIG measured **first and last**. All arms
+`cv_pct < 5`:
+
+| pool | ORIG direct RRF | via dispatch | ORIG2 (bias) | ratio-vs-ORIG |
+|---:|---:|---:|---:|---:|
+| 50   | 3.6890 µs (cv 2.21) | 3.6650 µs (cv 3.73) | 3.7071 µs (cv 2.28) | **0.991** |
+| 100  | 7.8882 µs (cv 1.34) | 7.8956 µs (cv 0.59) | 7.8902 µs (cv 0.89) | **1.001** |
+| 1000 | 99.351 µs (cv 0.93) | 99.301 µs (cv 0.62) | 99.125 µs (cv 1.97) | **1.001** |
+
+The dispatched arm lands **inside the ORIG/ORIG2 bracket at every pool** — the `match` on a `Copy` enum
+vanishes under inlining. Default path is latency-neutral, measured rather than asserted.
+
+**And when the knob is ON**, `pool_minmax_fuse_merge` vs RRF at the `limit_all` shape (same run): pool 50
+4.1730 µs vs 3.6890 (1.13× slower), pool 100 8.4783 vs 7.8882 (1.07× slower), pool 1000 **93.285 µs vs 99.351
+(0.94, i.e. 1.07× FASTER)**. Fusion is µs-scale against a ms-scale search, so all three are immaterial
+end-to-end; the +0.0038 nDCG is the point.
+
+Conformance: `cargo test -p frankensearch-core -p frankensearch-fusion --lib` → **898 + 856 passed, 0 failed**
+(4 new tests). `cargo clippy -p frankensearch-core -p frankensearch-fusion --all-targets` → 0 errors, no
+warnings on changed lines. `ubs` → 0 critical on changed lines (its 7 criticals are `.unwrap()` in
+pre-existing tests). Original-comparator ratio **N/A** (internal fusion-operator selection; default unchanged).

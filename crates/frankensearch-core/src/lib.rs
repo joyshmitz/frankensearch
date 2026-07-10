@@ -59,7 +59,7 @@ pub use commit_replay::{
     CommitEntry, CommitOutcome, CommitReplayEngine, DocumentOp, ReplayConsumer, ReplayPolicy,
     ReplayWatermark, SkipReason,
 };
-pub use config::{TwoTierConfig, TwoTierMetrics};
+pub use config::{FusionStrategy, TwoTierConfig, TwoTierMetrics};
 pub use contract_sanity::{
     AdapterContractResult, CompatibilityStatus, ContractSanityChecker, ContractSanityReport,
     ContractViolationDiagnostic, MAX_SCHEMA_VERSION_LAG, ViolationSeverity, classify_version,

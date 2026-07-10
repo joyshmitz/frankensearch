@@ -15,7 +15,7 @@
 use std::collections::hash_map::Entry;
 
 use ahash::AHashMap;
-use frankensearch_core::{FusedHit, ScoredResult, VectorHit};
+use frankensearch_core::{FusedHit, FusionStrategy, ScoredResult, VectorHit};
 use tracing::{Level, debug, instrument};
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -768,6 +768,43 @@ pub fn rrf_fuse_with_graph_merge(
     )
 }
 
+/// The single Phase-1 fusion entry point: dispatch the configured [`FusionStrategy`].
+///
+/// [`FusionStrategy::Rrf`] (the default) routes to [`rrf_fuse_with_graph_merge_unique`], so a
+/// default-configured searcher produces **byte-identical** results to before this dispatch existed.
+///
+/// [`FusionStrategy::PoolMinMax`] routes to [`pool_minmax_fuse_merge`] — but **only when there is
+/// no graph contribution**. That operator has no graph arm, and silently discarding a graph signal
+/// the caller explicitly enabled would be worse than ignoring their fusion preference, so a
+/// non-empty `graph` falls back to RRF. `graph_ranking_enabled` defaults to `false`, so in the
+/// common case the preference is honoured.
+#[must_use]
+pub fn fuse_by_strategy(
+    strategy: FusionStrategy,
+    lexical: &[ScoredResult],
+    semantic: &[VectorHit],
+    graph: &[ScoredResult],
+    graph_weight: f64,
+    limit: usize,
+    offset: usize,
+    config: &RrfConfig,
+) -> Vec<FusedHit> {
+    match strategy {
+        FusionStrategy::PoolMinMax if graph.is_empty() => {
+            pool_minmax_fuse_merge(lexical, semantic, limit, offset, config)
+        }
+        FusionStrategy::Rrf | FusionStrategy::PoolMinMax => rrf_fuse_with_graph_merge_unique(
+            lexical,
+            semantic,
+            graph,
+            graph_weight,
+            limit,
+            offset,
+            config,
+        ),
+    }
+}
+
 /// Like [`rrf_fuse_with_graph_merge`] but **assumes the `semantic` slice has no
 /// duplicate `doc_id`s**.
 ///
@@ -1016,12 +1053,175 @@ mod tests {
         hits.iter().map(|h| h.doc_id.to_string()).collect()
     }
 
+    // ─── FusionStrategy dispatch (searcher wiring) ──────────────────────
+
+    /// PARITY GATE. The default strategy must be byte-identical to calling the RRF entry point
+    /// directly — this is what makes wiring the dispatch into both searchers a no-op for every
+    /// existing caller.
+    #[test]
+    fn default_strategy_is_byte_identical_to_rrf() {
+        let lexical = [
+            lexical_hit("a", 10.0),
+            lexical_hit("b", 2.0),
+            lexical_hit("c", 1.0),
+        ];
+        let semantic = [
+            semantic_hit("a", 0.9),
+            semantic_hit("d", 0.5),
+            semantic_hit("b", 0.4),
+        ];
+        let cfg = RrfConfig::default();
+
+        let direct = rrf_fuse_with_graph_merge_unique(&lexical, &semantic, &[], 0.0, 10, 0, &cfg);
+        let via = fuse_by_strategy(
+            FusionStrategy::default(),
+            &lexical,
+            &semantic,
+            &[],
+            0.0,
+            10,
+            0,
+            &cfg,
+        );
+        assert_eq!(FusionStrategy::default(), FusionStrategy::Rrf);
+        assert_eq!(fused_ids(&via), fused_ids(&direct));
+        for (x, y) in via.iter().zip(&direct) {
+            assert_eq!(
+                x.rrf_score.to_bits(),
+                y.rrf_score.to_bits(),
+                "doc {}",
+                x.doc_id
+            );
+        }
+    }
+
+    #[test]
+    fn pool_minmax_strategy_routes_to_pool_minmax_merge() {
+        let lexical = [
+            lexical_hit("a", 10.0),
+            lexical_hit("b", 2.0),
+            lexical_hit("c", 1.0),
+        ];
+        let semantic = [
+            semantic_hit("a", 0.9),
+            semantic_hit("d", 0.5),
+            semantic_hit("b", 0.4),
+        ];
+        let cfg = RrfConfig::default();
+
+        let direct = pool_minmax_fuse_merge(&lexical, &semantic, 10, 0, &cfg);
+        let via = fuse_by_strategy(
+            FusionStrategy::PoolMinMax,
+            &lexical,
+            &semantic,
+            &[],
+            0.0,
+            10,
+            0,
+            &cfg,
+        );
+        assert_eq!(fused_ids(&via), fused_ids(&direct));
+        // And it really is the magnitude-recovering order, not RRF's.
+        assert_eq!(fused_ids(&via), vec!["a", "d", "b", "c"]);
+    }
+
+    /// `pool_minmax_fuse_merge` has no graph arm. Rather than silently drop a graph signal the
+    /// caller explicitly enabled, a non-empty graph falls back to RRF.
+    #[test]
+    fn pool_minmax_with_graph_falls_back_to_rrf_not_dropping_graph() {
+        let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 2.0)];
+        let semantic = [semantic_hit("a", 0.9), semantic_hit("d", 0.5)];
+        let graph = [graph_hit("z", 0.99)];
+        let cfg = RrfConfig::default();
+
+        let via = fuse_by_strategy(
+            FusionStrategy::PoolMinMax,
+            &lexical,
+            &semantic,
+            &graph,
+            0.5,
+            10,
+            0,
+            &cfg,
+        );
+        let rrf = rrf_fuse_with_graph_merge_unique(&lexical, &semantic, &graph, 0.5, 10, 0, &cfg);
+        assert_eq!(fused_ids(&via), fused_ids(&rrf), "must fall back to RRF");
+        assert!(
+            fused_ids(&via).contains(&"z".to_string()),
+            "graph-only doc must survive; dropping it would be a silent correctness loss"
+        );
+    }
+
+    /// QUALITY GATE. The claimed nDCG advantage is not just a rank permutation — measure it.
+    ///
+    /// Ground truth: `d` is the relevant answer. It is semantic-only but overwhelmingly similar;
+    /// `b` is a marginal doc that happens to appear in *both* lists. RRF's rank transform rewards
+    /// `b` for its dual appearance and buries `d`; pool-min-max sees `d`'s magnitude and promotes
+    /// it. This is the exact mechanism behind the +0.0038 mean nDCG@10 measured on BEIR.
+    #[test]
+    fn pool_minmax_beats_rrf_on_ndcg_when_magnitude_carries_the_signal() {
+        use frankensearch_core::metrics_eval::ndcg_at_k;
+
+        let lexical = [
+            lexical_hit("a", 10.0),
+            lexical_hit("b", 2.0),
+            lexical_hit("c", 1.0),
+        ];
+        let semantic = [
+            semantic_hit("a", 0.9),
+            semantic_hit("d", 0.5),
+            semantic_hit("b", 0.4),
+        ];
+        let cfg = RrfConfig::default();
+        let relevant = ["d"];
+
+        let rrf = fused_ids(&fuse_by_strategy(
+            FusionStrategy::Rrf,
+            &lexical,
+            &semantic,
+            &[],
+            0.0,
+            10,
+            0,
+            &cfg,
+        ));
+        let pmm = fused_ids(&fuse_by_strategy(
+            FusionStrategy::PoolMinMax,
+            &lexical,
+            &semantic,
+            &[],
+            0.0,
+            10,
+            0,
+            &cfg,
+        ));
+
+        fn as_refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        let ndcg_rrf = ndcg_at_k(&as_refs(&rrf), &relevant, 10);
+        let ndcg_pmm = ndcg_at_k(&as_refs(&pmm), &relevant, 10);
+
+        assert!(
+            ndcg_pmm > ndcg_rrf,
+            "pool_minmax nDCG@10 {ndcg_pmm} should beat rrf {ndcg_rrf} (rrf order {rrf:?}, pmm order {pmm:?})"
+        );
+    }
+
     #[test]
     fn pool_minmax_recovers_top_match_magnitude() {
         // lexical pool [10,2,1] -> a=1.0, b=0.111, c=0.0
         // semantic pool [0.9,0.5,0.4] -> a=1.0, d=0.2, b=0.0
-        let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 2.0), lexical_hit("c", 1.0)];
-        let semantic = [semantic_hit("a", 0.9), semantic_hit("d", 0.5), semantic_hit("b", 0.4)];
+        let lexical = [
+            lexical_hit("a", 10.0),
+            lexical_hit("b", 2.0),
+            lexical_hit("c", 1.0),
+        ];
+        let semantic = [
+            semantic_hit("a", 0.9),
+            semantic_hit("d", 0.5),
+            semantic_hit("b", 0.4),
+        ];
         let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
         // a=2.0, d=0.2, b=0.111, c=0.0. Crucially d (semantic-only, higher magnitude)
         // outranks b (in BOTH sources but marginal in each) — the magnitude recovery
@@ -1070,7 +1270,10 @@ mod tests {
         // the order to prefer the semantically-strong doc.
         let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 1.0)];
         let semantic = [semantic_hit("b", 1.0), semantic_hit("a", 0.0)];
-        let config = RrfConfig { semantic_weight: 2.0, ..RrfConfig::default() };
+        let config = RrfConfig {
+            semantic_weight: 2.0,
+            ..RrfConfig::default()
+        };
         let out = pool_minmax_fuse(&lexical, &semantic, 10, 0, &config);
         // a=1.0*1.0=1.0 ; b=2.0*1.0=2.0 → b first.
         assert_eq!(fused_ids(&out), vec!["b", "a"]);
@@ -1078,8 +1281,16 @@ mod tests {
 
     #[test]
     fn pool_minmax_pagination_offset_limit() {
-        let lexical = [lexical_hit("a", 10.0), lexical_hit("b", 2.0), lexical_hit("c", 1.0)];
-        let semantic = [semantic_hit("a", 0.9), semantic_hit("d", 0.5), semantic_hit("b", 0.4)];
+        let lexical = [
+            lexical_hit("a", 10.0),
+            lexical_hit("b", 2.0),
+            lexical_hit("c", 1.0),
+        ];
+        let semantic = [
+            semantic_hit("a", 0.9),
+            semantic_hit("d", 0.5),
+            semantic_hit("b", 0.4),
+        ];
         // Full order is [a, d, b, c]; skip 1, take 2 → [d, b].
         let out = pool_minmax_fuse(&lexical, &semantic, 2, 1, &RrfConfig::default());
         assert_eq!(fused_ids(&out), vec!["d", "b"]);
@@ -1227,10 +1438,22 @@ mod tests {
                     x.rrf_score,
                     y.rrf_score
                 );
-                assert_eq!(x.lexical_rank, y.lexical_rank, "trial {trial} row {i}: lexical_rank");
-                assert_eq!(x.semantic_rank, y.semantic_rank, "trial {trial} row {i}: semantic_rank");
-                assert_eq!(x.semantic_index, y.semantic_index, "trial {trial} row {i}: semantic_index");
-                assert_eq!(x.in_both_sources, y.in_both_sources, "trial {trial} row {i}: in_both");
+                assert_eq!(
+                    x.lexical_rank, y.lexical_rank,
+                    "trial {trial} row {i}: lexical_rank"
+                );
+                assert_eq!(
+                    x.semantic_rank, y.semantic_rank,
+                    "trial {trial} row {i}: semantic_rank"
+                );
+                assert_eq!(
+                    x.semantic_index, y.semantic_index,
+                    "trial {trial} row {i}: semantic_index"
+                );
+                assert_eq!(
+                    x.in_both_sources, y.in_both_sources,
+                    "trial {trial} row {i}: in_both"
+                );
                 assert_eq!(
                     x.lexical_score.map(f32::to_bits),
                     y.lexical_score.map(f32::to_bits),

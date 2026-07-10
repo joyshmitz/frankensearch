@@ -23,8 +23,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_core::{FusedHit, ScoreSource, ScoredResult, VectorHit};
-use frankensearch_fusion::{RrfConfig, pool_minmax_fuse, pool_minmax_fuse_merge};
+use frankensearch_core::{FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit};
+use frankensearch_fusion::rrf::rrf_fuse_with_graph_merge_unique;
+use frankensearch_fusion::{RrfConfig, fuse_by_strategy, pool_minmax_fuse, pool_minmax_fuse_merge};
 
 fn lexical(doc: &str, score: f32) -> ScoredResult {
     ScoredResult {
@@ -42,7 +43,11 @@ fn lexical(doc: &str, score: f32) -> ScoredResult {
 }
 
 fn semantic(doc: &str, score: f32, index: u32) -> VectorHit {
-    VectorHit { index, score, doc_id: doc.into() }
+    VectorHit {
+        index,
+        score,
+        doc_id: doc.into(),
+    }
 }
 
 /// Two pools of `pool` candidates with ~50% doc overlap (shared docs in the middle), heavy-tailed
@@ -54,7 +59,13 @@ fn build(pool: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
         .collect();
     let half = pool / 2;
     let sem: Vec<VectorHit> = (half..pool + half)
-        .map(|i| semantic(&format!("doc{i:06}"), 1.0 / ((i - half) as f32 + 1.0), i as u32))
+        .map(|i| {
+            semantic(
+                &format!("doc{i:06}"),
+                1.0 / ((i - half) as f32 + 1.0),
+                i as u32,
+            )
+        })
         .collect();
     (lex, sem)
 }
@@ -78,8 +89,30 @@ fn assert_bit_identical(
             x.rrf_score,
             y.rrf_score
         );
-        assert_eq!(x.semantic_index, y.semantic_index, "{tag} row {i}: semantic_index");
-        assert_eq!(x.in_both_sources, y.in_both_sources, "{tag} row {i}: in_both");
+        assert_eq!(
+            x.semantic_index, y.semantic_index,
+            "{tag} row {i}: semantic_index"
+        );
+        assert_eq!(
+            x.in_both_sources, y.in_both_sources,
+            "{tag} row {i}: in_both"
+        );
+    }
+}
+
+/// `FusedHit` has no `PartialEq`, so compare the fields that define a ranking: order, doc, and the
+/// fused score to the bit.
+fn assert_fused_identical(a: &[FusedHit], b: &[FusedHit], tag: &str) {
+    assert_eq!(a.len(), b.len(), "{tag}: length differs");
+    for (i, (x, y)) in a.iter().zip(b).enumerate() {
+        assert_eq!(x.doc_id, y.doc_id, "{tag} row {i}: doc_id");
+        assert_eq!(
+            x.rrf_score.to_bits(),
+            y.rrf_score.to_bits(),
+            "{tag} row {i}: fused score ({} vs {})",
+            x.rrf_score,
+            y.rrf_score
+        );
     }
 }
 
@@ -99,22 +132,115 @@ fn bench(c: &mut Criterion) {
 
         // limit_all — the shape the merge structure targets.
         g.bench_with_input(BenchmarkId::new("limit_all_ORIG", pool), &(), |b, ()| {
-            b.iter(|| black_box(pool_minmax_fuse(black_box(&lex), black_box(&sem), all, 0, &cfg)));
+            b.iter(|| {
+                black_box(pool_minmax_fuse(
+                    black_box(&lex),
+                    black_box(&sem),
+                    all,
+                    0,
+                    &cfg,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("limit_all_merge", pool), &(), |b, ()| {
             b.iter(|| {
-                black_box(pool_minmax_fuse_merge(black_box(&lex), black_box(&sem), all, 0, &cfg))
+                black_box(pool_minmax_fuse_merge(
+                    black_box(&lex),
+                    black_box(&sem),
+                    all,
+                    0,
+                    &cfg,
+                ))
             });
         });
         // top10 — regression guard (select_nth dominates; merge must not lose here).
         g.bench_with_input(BenchmarkId::new("top10_ORIG", pool), &(), |b, ()| {
-            b.iter(|| black_box(pool_minmax_fuse(black_box(&lex), black_box(&sem), 10, 0, &cfg)));
+            b.iter(|| {
+                black_box(pool_minmax_fuse(
+                    black_box(&lex),
+                    black_box(&sem),
+                    10,
+                    0,
+                    &cfg,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("top10_merge", pool), &(), |b, ()| {
             b.iter(|| {
-                black_box(pool_minmax_fuse_merge(black_box(&lex), black_box(&sem), 10, 0, &cfg))
+                black_box(pool_minmax_fuse_merge(
+                    black_box(&lex),
+                    black_box(&sem),
+                    10,
+                    0,
+                    &cfg,
+                ))
             });
         });
+
+        // ── Searcher-wiring dispatch overhead (bd-2ocs) ──────────────────────────────────────
+        //
+        // Both searchers now call `fuse_by_strategy` instead of the RRF entry point directly.
+        // The DEFAULT strategy must be latency-neutral, not merely byte-identical: this pair is
+        // the ORIGINAL (direct call, what shipped before the wiring) vs the dispatched call.
+        // Any gap is the cost of one `match` on a `Copy` enum, and must vanish under inlining.
+        assert_fused_identical(
+            &fuse_by_strategy(FusionStrategy::Rrf, &lex, &sem, &[], 0.0, all, 0, &cfg),
+            &rrf_fuse_with_graph_merge_unique(&lex, &sem, &[], 0.0, all, 0, &cfg),
+            &format!("dispatch(Rrf) vs direct RRF at pool {pool}"),
+        );
+        g.bench_with_input(
+            BenchmarkId::new("dispatch_ORIG_direct_rrf", pool),
+            &(),
+            |b, ()| {
+                b.iter(|| {
+                    black_box(rrf_fuse_with_graph_merge_unique(
+                        black_box(&lex),
+                        black_box(&sem),
+                        &[],
+                        0.0,
+                        all,
+                        0,
+                        &cfg,
+                    ))
+                });
+            },
+        );
+        g.bench_with_input(
+            BenchmarkId::new("dispatch_via_strategy_rrf", pool),
+            &(),
+            |b, ()| {
+                b.iter(|| {
+                    black_box(fuse_by_strategy(
+                        black_box(FusionStrategy::Rrf),
+                        black_box(&lex),
+                        black_box(&sem),
+                        &[],
+                        0.0,
+                        all,
+                        0,
+                        &cfg,
+                    ))
+                });
+            },
+        );
+        // ORIG measured last too, to bracket criterion's arm-ordering bias.
+        g.bench_with_input(
+            BenchmarkId::new("dispatch_ORIG_direct_rrf2", pool),
+            &(),
+            |b, ()| {
+                b.iter(|| {
+                    black_box(rrf_fuse_with_graph_merge_unique(
+                        black_box(&lex),
+                        black_box(&sem),
+                        &[],
+                        0.0,
+                        all,
+                        0,
+                        &cfg,
+                    ))
+                });
+            },
+        );
     }
     g.finish();
 }

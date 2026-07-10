@@ -11,6 +11,33 @@ use crate::query_class::QueryClass;
 use crate::traits::MetricsExporter;
 use crate::types::RankChanges;
 
+/// Which operator fuses the Phase-1 lexical and semantic candidate lists.
+///
+/// Two structurally different primitives. RRF is purely *rank*-based, so it is immune to
+/// score-scale mismatch between BM25 and cosine — but it therefore discards score *magnitude*,
+/// and a semantic-only document with an overwhelming cosine cannot outrank a marginal document
+/// that merely appears in both lists. Pool-min-max normalizes each tier's scores over its own
+/// retrieved pool and fuses the normalized scores, recovering that magnitude signal.
+///
+/// Measured on the BEIR harness (see `docs/NEGATIVE_EVIDENCE.md`): pool-min-max is **+0.0038 mean
+/// nDCG@10** over RRF across four corpora. It is **not** a universal win — where a tier's pool
+/// statistics are unreliable (tiny or degenerate pools, one-sided retrieval) the min-max
+/// normalization amplifies noise, which is why [`FusionStrategy::Rrf`] remains the default and
+/// the switch is opt-in rather than a flipped default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FusionStrategy {
+    /// Reciprocal Rank Fusion (K = `rrf_k`). Rank-based, scale-free, the shipped default.
+    #[default]
+    Rrf,
+    /// Pool-local min-max score fusion. Recovers magnitude; needs trustworthy pool statistics.
+    ///
+    /// Graph ranking is **not** supported by this operator — `pool_minmax_fuse_merge` has no
+    /// graph arm. When `graph_ranking_enabled` is also set, fusion falls back to
+    /// [`FusionStrategy::Rrf`] so the graph contribution is never silently dropped.
+    PoolMinMax,
+}
+
 /// Configuration for the two-tier progressive search pipeline.
 ///
 /// All fields have sensible defaults. Override selectively via the builder
@@ -27,6 +54,7 @@ use crate::types::RankChanges;
 /// | `FRANKENSEARCH_GRAPH_RANKING_WEIGHT` | `graph_ranking_weight` | `0.5` |
 /// | `FRANKENSEARCH_QUALITY_TIMEOUT`  | `quality_timeout_ms` | `500`    |
 /// | `FRANKENSEARCH_HNSW_THRESHOLD`   | `hnsw_threshold`   | `50000`    |
+/// | `FRANKENSEARCH_FUSION_STRATEGY`  | `fusion_strategy`  | `rrf`      |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TwoTierConfig {
@@ -57,6 +85,10 @@ pub struct TwoTierConfig {
     /// Relative graph signal weight when graph ranking is enabled (0.0-1.0).
     /// Default: 0.5.
     pub graph_ranking_weight: f64,
+
+    /// How Phase-1 fuses the lexical and semantic candidate lists.
+    /// Default: [`FusionStrategy::Rrf`] — the current behaviour, byte-identical.
+    pub fusion_strategy: FusionStrategy,
 
     /// Optional telemetry exporter callback target.
     ///
@@ -105,6 +137,7 @@ impl Default for TwoTierConfig {
             fast_only: false,
             graph_ranking_enabled: false,
             graph_ranking_weight: 0.5,
+            fusion_strategy: FusionStrategy::Rrf,
             metrics_exporter: None,
             explain: false,
             hnsw_ef_search: 100,
@@ -190,6 +223,17 @@ impl TwoTierConfig {
                     var = "FRANKENSEARCH_FAST_ONLY",
                     value = %val,
                     "invalid value (expected boolean), keeping default"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("FRANKENSEARCH_FUSION_STRATEGY") {
+            match val.trim().to_ascii_lowercase().as_str() {
+                "rrf" => self.fusion_strategy = FusionStrategy::Rrf,
+                "pool_minmax" | "pool-minmax" => self.fusion_strategy = FusionStrategy::PoolMinMax,
+                _ => tracing::warn!(
+                    var = "FRANKENSEARCH_FUSION_STRATEGY",
+                    value = %val,
+                    "invalid value (expected `rrf` or `pool_minmax`), keeping default"
                 ),
             }
         }
