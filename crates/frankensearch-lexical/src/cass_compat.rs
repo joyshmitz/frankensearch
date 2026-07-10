@@ -1492,11 +1492,28 @@ fn cass_push_prefix_term(out: &mut String, term: &str) {
 }
 
 /// Generate edge n-grams from text for prefix search acceleration.
+///
+/// For each word, emits its length-2..N prefixes (capped at 20 chars) space-separated. The original
+/// re-decoded every word with `char_indices` to find prefix boundaries — a **second** UTF-8 decode
+/// on top of the `split` that already scanned the text. For an **ASCII word** (the common case for
+/// English/code/IDs), char boundaries are byte positions, so the prefixes are `word[..2..=min(len,
+/// 20)]` directly — no `char_indices` decode. Non-ASCII words take the original boundary-collecting
+/// path. Byte-for-byte identical output (`cass_generate_edge_ngrams_matches_slow`).
 #[must_use]
 pub fn cass_generate_edge_ngrams(text: &str) -> String {
     const MAX_NGRAM_INDICES: usize = 21;
     let mut ngrams = String::with_capacity(text.len() * 2);
     for word in text.split(|c: char| !c.is_alphanumeric()) {
+        // ASCII fast-path: byte positions ARE char boundaries, so skip the `char_indices` re-decode
+        // and slice prefixes directly. `2..=upper` is empty (no prefixes) when `upper < 2`.
+        if word.is_ascii() {
+            let upper = word.len().min(MAX_NGRAM_INDICES - 1);
+            for end in 2..=upper {
+                cass_push_prefix_term(&mut ngrams, &word[..end]);
+            }
+            continue;
+        }
+
         let mut indices = [0usize; MAX_NGRAM_INDICES];
         let mut index_count = 0usize;
 
@@ -1513,6 +1530,37 @@ pub fn cass_generate_edge_ngrams(text: &str) -> String {
             index_count += 1;
         }
 
+        if index_count < 3 {
+            continue;
+        }
+        for &end_idx in &indices[2..index_count] {
+            cass_push_prefix_term(&mut ngrams, &word[..end_idx]);
+        }
+    }
+    ngrams
+}
+
+/// Pre-ASCII-fast-path [`cass_generate_edge_ngrams`], retained doc-hidden for the same-binary A/B +
+/// parity test.
+#[doc(hidden)]
+#[must_use]
+pub fn cass_generate_edge_ngrams_slow(text: &str) -> String {
+    const MAX_NGRAM_INDICES: usize = 21;
+    let mut ngrams = String::with_capacity(text.len() * 2);
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        let mut indices = [0usize; MAX_NGRAM_INDICES];
+        let mut index_count = 0usize;
+        for (i, _) in word.char_indices() {
+            if index_count == MAX_NGRAM_INDICES {
+                break;
+            }
+            indices[index_count] = i;
+            index_count += 1;
+        }
+        if index_count < MAX_NGRAM_INDICES {
+            indices[index_count] = word.len();
+            index_count += 1;
+        }
         if index_count < 3 {
             continue;
         }
@@ -2471,6 +2519,30 @@ mod cass_query_tests {
         assert_eq!(cass_build_preview("hello", 10), "hello");
         assert_eq!(cass_build_preview("hello world", 5), "hello…");
         assert_eq!(cass_build_preview("éclair", 3), "écl…");
+    }
+
+    /// PARITY GATE: the ASCII-fast `cass_generate_edge_ngrams` must equal the char_indices original
+    /// for ASCII words (fast path), non-ASCII words (fallback), and mixed text — including the
+    /// 20-char cap, short words (<3 chars → nothing), and words straddling the ASCII/Unicode split.
+    #[test]
+    fn cass_generate_edge_ngrams_matches_slow() {
+        for text in [
+            "",
+            "x",
+            "hi",
+            "hello world",
+            "bd-q3fy ID_42 snake_case",
+            "abcdefghijklmnopqrstuvwxyz longwordovercap",
+            "éclair café naïve",
+            "日本語 hello 한국어 world",
+            "aB3 café x9 déjà vu 12345678901234567890123",
+        ] {
+            assert_eq!(
+                cass_generate_edge_ngrams(text),
+                cass_generate_edge_ngrams_slow(text),
+                "mismatch for {text:?}"
+            );
+        }
     }
 
     /// PARITY GATE: the O(1) `cass_prefix_source` must return the byte-identical prefix as the

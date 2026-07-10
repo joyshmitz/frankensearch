@@ -59,3 +59,8 @@ required-features = ["bench-internals"]
 name = "prefix_source_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "edge_ngrams_ab"
+harness = false
+required-features = ["bench-internals"]

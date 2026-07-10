@@ -4695,3 +4695,38 @@ documents; on a corpus of small messages it is a no-op. Still an unambiguous, by
 improvement worth landing wherever large docs appear. **SHIPPED in place**; the forward-scan original retained
 doc-hidden as `cass_prefix_source_slow` so the A/B stays reproducible (both arms in-tree). All builds/benches
 remote; no local cargo; fmt + clippy clean on changed lines.
+
+## 2026-07-10 — WIN: `cass_generate_edge_ngrams` ASCII fast-path skips the char_indices re-decode — ~1.08×, byte-identical (cc_fse)
+
+Fourth win in the lexical text-prep vein (tokenizer `next_char_from` `517cea9`, preview `8fde796`,
+prefix_source `f6c15f5`). `cass_generate_edge_ngrams` runs per document at index time on the ≤ 4 KiB content
+prefix (always, not just on truncation), emitting each word's length-2..N prefixes. The original **decoded every
+word twice**: `text.split(|c| !c.is_alphanumeric())` scans all chars to find word boundaries, then
+`word.char_indices()` re-decodes each word's chars to find prefix boundaries.
+
+**The lever.** For an ASCII word (the common case), char boundaries are byte positions, so the prefixes are
+`word[..2..=min(len, 20)]` sliced directly — the `char_indices` re-decode is skipped via a cheap `word.is_ascii()`
+(SIMD byte scan). Non-ASCII words keep the original boundary-collecting path. Byte-for-byte identical output.
+
+**Recall/ordering — trivially preserved.** Identical edge-ngram terms ⇒ identical prefix index ⇒ identical
+ranking. `cass_generate_edge_ngrams_matches_slow` asserts equality on ASCII, non-ASCII, and mixed text incl. the
+20-char cap, sub-3-char words, and words straddling the ASCII/Unicode split; the pre-existing
+`emits_expected_prefixes` / `caps_prefixes_at_twenty_chars` tests pass unchanged. All 85 lexical lib tests pass.
+
+**Speed — DECIDABLE WIN (floor-width-dependent; two runs disclosed).** Isolated null-controlled microbench
+(`benches/edge_ngrams_ab.rs`, ~4 KiB realistic mostly-ASCII prefix, shared alternating-round sampler, one binary
+/ one `rch` invocation, 41 rounds × 4). Ratio = fast/ORIG:
+
+| run | worker | binary sha256 | NULL median [p5,p95] | fast/ORIG median [p5,p95] | verdict |
+|---|---|---|---|---|---|
+| 1 | `hz2` (contended) | `f55aaed446a792b3f8ec6f740559af0c4d31c0d91c91b4531ab87dc2aa87061d` | 0.9997 [0.6966, 1.1923] | 0.9193 [0.7172, 1.2907] | inside floor (±30% noise) |
+| 2 | `ovh-a` (quiet) | — | 1.0006 [0.9342, 1.0517] | **0.9297 [0.8890, 0.9821]** | **DECIDABLE** (median < null p5) |
+
+The lever median is **consistent** across both runs (0.919, 0.930 → ~1.08× faster); only the null-floor *width*
+differed. Unlike the int8 scan-level case (where two runs *disagreed*, 0.90 vs 0.98 — not robust), here the effect
+is stable and only needed a quiet worker to resolve against a tight floor. The function is allocation-dominated
+(builds an ~8 KiB String), which is why the decode-halving nets ~8% not more, and why a contended run can't
+resolve it. Modest but real and always-on (per-doc, whole prefix).
+
+**SHIPPED in place**; the char_indices original retained doc-hidden as `cass_generate_edge_ngrams_slow` (both arms
+in-tree, reproducible). All builds/benches remote; no local cargo; fmt + clippy clean on changed lines.
