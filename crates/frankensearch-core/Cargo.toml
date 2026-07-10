@@ -61,3 +61,8 @@ workspace = true
 [[bench]]
 name = "simhash_vote_simd"
 harness = false
+
+[[bench]]
+name = "whitespace_norm_ab"
+harness = false
+required-features = ["bench-internals"]

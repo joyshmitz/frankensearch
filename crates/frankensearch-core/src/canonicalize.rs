@@ -416,9 +416,63 @@ fn strip_list_marker(line: &str) -> Cow<'_, str> {
 
 /// Normalize whitespace: collapse runs to single space, trim.
 fn normalize_whitespace(text: &str) -> String {
+    // Byte-level scan with an ASCII fast-path. The original `text.chars()` decoded EVERY char and ran
+    // the Unicode `is_whitespace()` per char, then re-encoded each kept char via `push(c)`. Here an
+    // ASCII byte (the common case) is classified by a cheap byte test and copied without a decode,
+    // and only a non-ASCII lead byte decodes a char. For ASCII, `char::is_whitespace()` equals
+    // `is_ascii_whitespace() || b == 0x0B` — U+000B (vertical tab) is Unicode `White_Space` but NOT
+    // `u8::is_ascii_whitespace`, so it must be added back. Byte-for-byte identical output
+    // (`normalize_whitespace_matches_slow`).
     let mut result = String::with_capacity(text.len());
     let mut prev_whitespace = true; // Start as true to trim leading
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 0x80 {
+            if b == 0x0B || b.is_ascii_whitespace() {
+                if !prev_whitespace {
+                    result.push(' ');
+                    prev_whitespace = true;
+                }
+            } else {
+                result.push(char::from(b));
+                prev_whitespace = false;
+            }
+            i += 1;
+        } else {
+            let ch = text[i..]
+                .chars()
+                .next()
+                .unwrap_or(char::REPLACEMENT_CHARACTER);
+            let len = ch.len_utf8();
+            if ch.is_whitespace() {
+                if !prev_whitespace {
+                    result.push(' ');
+                    prev_whitespace = true;
+                }
+            } else {
+                result.push(ch);
+                prev_whitespace = false;
+            }
+            i += len;
+        }
+    }
 
+    // Drop any trailing space the loop pushed, in place — avoids a second full
+    // allocation via `trim_end().to_string()`.
+    let trimmed_len = result.trim_end().len();
+    result.truncate(trimmed_len);
+    result
+}
+
+/// Pre-byte-fast-path [`normalize_whitespace`], retained for the same-binary A/B + parity test.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn normalize_whitespace_slow(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut prev_whitespace = true;
     for c in text.chars() {
         if c.is_whitespace() {
             if !prev_whitespace {
@@ -430,12 +484,17 @@ fn normalize_whitespace(text: &str) -> String {
             prev_whitespace = false;
         }
     }
-
-    // Drop any trailing space the loop pushed, in place — avoids a second full
-    // allocation via `trim_end().to_string()`.
     let trimmed_len = result.trim_end().len();
     result.truncate(trimmed_len);
     result
+}
+
+/// Doc-hidden bench wrapper for the shipped (byte-fast) `normalize_whitespace` (it is private).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn normalize_whitespace_fast_bench(text: &str) -> String {
+    normalize_whitespace(text)
 }
 
 /// Filter out low-signal content.
@@ -477,6 +536,34 @@ mod tests {
     use std::fmt::Write;
 
     use super::*;
+
+    /// PARITY GATE: the byte-fast `normalize_whitespace` must equal the char-by-char original for
+    /// ASCII, every ASCII whitespace byte (incl. the tricky U+000B vertical tab), Unicode whitespace
+    /// (NBSP U+00A0, NEL U+0085, ideographic space U+3000, en/em spaces), runs, leading/trailing, and
+    /// mixed ASCII/Unicode text.
+    #[test]
+    fn normalize_whitespace_matches_slow() {
+        let cases = [
+            "",
+            "   ",
+            "hello world",
+            "  leading and   collapsed\ttabs\n\n and trailing  ",
+            "a\u{0B}b\u{0C}c\u{0D}d\u{09}e", // vertical tab, form feed, CR, tab between letters
+            "no\u{00A0}break\u{00A0}space",  // NBSP is Unicode whitespace
+            "next\u{0085}line and \u{3000}ideographic",
+            "café  déjà\tvu  \u{2003}em space",
+            "日本語　テスト", // ideographic space U+3000 between CJK
+            "mix\u{0B}\u{00A0}\u{09}collapse",
+            "trailing unicode ws\u{00A0}",
+        ];
+        for text in cases {
+            assert_eq!(
+                normalize_whitespace(text),
+                normalize_whitespace_slow(text),
+                "mismatch for {text:?}"
+            );
+        }
+    }
 
     #[test]
     fn nfc_normalization() {

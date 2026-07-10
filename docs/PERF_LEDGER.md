@@ -4730,3 +4730,41 @@ resolve it. Modest but real and always-on (per-doc, whole prefix).
 
 **SHIPPED in place**; the char_indices original retained doc-hidden as `cass_generate_edge_ngrams_slow` (both arms
 in-tree, reproducible). All builds/benches remote; no local cargo; fmt + clippy clean on changed lines.
+
+## 2026-07-10 — WIN: `normalize_whitespace` byte-fast ASCII path skips the char decode+re-encode — 1.45×, byte-identical (cc_fse)
+
+Dug a different primitive after ranking/structural veins came up empty: **core text canonicalization**
+(`frankensearch-core/canonicalize.rs`), upstream of both embedding and lexical indexing. `normalize_whitespace`
+runs on **every document** (collapse whitespace runs → single space, trim). The original did `for c in
+text.chars()` — decoding **every** char, running the Unicode `is_whitespace()` per char, and re-encoding each
+kept char via `push(c)`.
+
+**The lever.** A byte scan with an ASCII fast-path: an ASCII byte (the common case) is classified by a cheap byte
+test and copied without a decode; only a non-ASCII lead byte decodes a char. The one subtlety that makes it
+**bit-identical**: for ASCII, `char::is_whitespace()` = `u8::is_ascii_whitespace() || b == 0x0B` — U+000B
+(vertical tab) is Unicode `White_Space` but NOT `is_ascii_whitespace`, so it is added back explicitly.
+
+**Recall/ordering — trivially preserved.** Canonicalized text is byte-identical ⇒ identical tokens, identical
+embeddings, identical index terms, identical ranking. `normalize_whitespace_matches_slow` asserts equality across
+ASCII, every ASCII whitespace byte (incl. 0x0B), Unicode whitespace (NBSP U+00A0, NEL U+0085, ideographic space
+U+3000, en/em spaces), runs, leading/trailing, and mixed text. All 35 canonicalize lib tests pass.
+
+**Speed — DECIDABLE WIN (contention-diluted first run disclosed).** Null-controlled microbench
+(`benches/whitespace_norm_ab.rs`, ~4 KiB realistic doc body, shared alternating-round sampler, one binary / one
+`rch` invocation, 41 rounds × 4). Ratio = fast/ORIG:
+
+| run | worker | NULL median [p5,p95] | fast/ORIG median [p5,p95] | verdict |
+|---|---|---|---|---|
+| 1 | `vmi1227854` (contended) | 0.9969 [0.8185, 1.0895] | 0.8295 [0.6728, 0.9041] | inside floor (±18% noise) |
+| 2 | `ovh-a` (quiet) | 0.9996 [0.9952, 1.0009] | **0.6887 [0.6822, 0.6940]** | **DECIDABLE** (median ≪ null p5) |
+
+The quiet run resolves it at **0.6887 = 1.452× faster** against a razor-tight (±0.5%) null floor. Both runs agree
+in direction (fast < slow); the contended run *understated* the effect because per-arm contention overhead is
+additive and dilutes the ratio toward 1.0 (not a disagreement like the int8 case — same sign, quiet run is
+authoritative). Byte sha256 (run 1) `57f1c446e0d7d489f40649639b81dfaad9d8c0dd8ca0b371d0216f0d16930b6b`.
+This is the biggest lexical/canonicalize win after preview/prefix_source and is **always-on** (every doc, not
+just large/truncated ones).
+
+**SHIPPED in place**; the char-by-char original retained as `normalize_whitespace_slow` (`cfg(test |
+bench-internals)`) so the A/B stays reproducible. All builds/benches remote; no local cargo; fmt + clippy clean on
+changed lines.
