@@ -11038,3 +11038,31 @@ pool-min-max re-decided). Not in the prompt's list but noted for completeness.
 **HOLD.** No further ownable, unblocked, decidable lever is available without one of the above external unblocks
 or a new workload. Recommend: resume when worker isolation lands (unblocks the int8 scan-level A/B), or on a
 product decision for ANN / a query-log for hubness `r_d` (`bd-bc2n`/`bd-sj36`). No code changed in this entry.
+
+### 2026-07-10 — cc_fse — RANKING tier profiled (prompt added "ranking"): no worthwhile ownable decidable lever — MMR is heaviest but off-by-default; its f64-AVX2 dot angle is bit-identical yet EV-negative; RRF/blend/sort/materialize floored
+
+Profile-first pass over the ranking primitives after the prompt added "ranking" to the lane list.
+
+**MMR (`mmr.rs`) — the heaviest ranking compute, already optimized + a fresh angle rejected on EV.** The
+diversity rerank is O(k·n) `cosine_sim_pre` dots. Already landed: hoisted L2 norms, incremental running-max
+(O(k·n) not O(k²·n)), and a 4-accumulator f64 dot (`efbfe33`, 1.6×). Prior rejection (`NEGATIVE_EVIDENCE:3084`):
+"SIMD/**f32** would change rounding" — MMR is rounding-locked because `mmr_rerank`'s test asserts *bit-identical*
+selection. **New angle considered:** the workspace builds at generic x86-64 = SSE2 (no `target-cpu`; the
+2026-07-10 ISA finding), so the scalar 4-acc auto-vectorizes only to SSE2 **f64x2** (2-wide). A
+runtime-dispatched AVX2 **f64x4** (4-wide) dot with a left-associative reduce matching `acc[0]+acc[1]+acc[2]+
+acc[3]`, `mul`+`add` (not `fma`), and stride-4 lane grouping would be **bit-identical** to the scalar 4-acc
+(distinct from the rejected *f32* SIMD) and ~2× on the dot. **REJECTED on expected value, not correctness:**
+`MmrConfig::default { enabled: false }` — MMR is **off by default** (opt-in Phase-3 diversity rerank), so the
+payoff is conditional, and it would introduce hand-written `unsafe` AVX2 into the `frankensearch-fusion` crate
+(currently unsafe-free) or couple MMR's bit-identity to a new index kernel. Not worth it for an off-by-default
+path. If MMR ever becomes default-on, this is the retry: AVX2 f64x4 dot, bit-identical, ~2× — file under the
+ISA-baseline-limited-autovec class alongside the f16/int8 runtime-dispatch kernels.
+
+**Default ranking path — floored (prior ledger, re-confirmed).** RRF `rrf_fuse` + sort + two-tier blend +
+`ScoredResult` materialization: "fusion result-assembly FLOORED 2026-07-02" (every clone/move site audited),
+merge-structured RRF landed (`4aeb66b`), blend_two_tier_aligned landed, metadata-Arc/doc_id-SSO/CompactString
+landed. `normalize.rs` min-max/z-score is a small per-query candidate-array op (tens–hundreds of scores),
+near-optimal (two-pass reduction is inherent), low absolute impact.
+
+**Net:** ranking adds nothing to the frontier map's HOLD. The one fresh idea (AVX2 f64x4 MMR dot) is bit-identical
+and real but EV-negative while MMR is off by default. No code changed.
