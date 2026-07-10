@@ -4656,3 +4656,42 @@ far more than the decode.
 **SHIPPED in place** (`cass_build_preview` is now the bulk-copy; the char-by-char original retained doc-hidden as
 `cass_build_preview_slow` so the A/B stays reproducible, both arms in-tree). Recall-preserving, decidable, live.
 All builds/benches remote; no local cargo; fmt clean; clippy clean on changed lines.
+
+## 2026-07-10 — WIN: `cass_prefix_source` O(n)→O(1) — backward `is_char_boundary` walk replaces a forward `char_indices` scan (~3333× on the truncation path, byte-identical) (cc_fse)
+
+Third win in the lexical text-prep vein (after tokenizer `next_char_from` `517cea9` and preview bulk-copy
+`8fde796`). `cass_prefix_source` runs **per document at index time**
+(`cass_build_content_prefix_and_preview`, `CONTENT_PREFIX_MAX_BYTES = 4 KiB`), taking the ≤ `max_bytes`
+char-boundary prefix of content that then feeds edge-ngram generation. For content over the cap, the original
+walked `char_indices` **forward from byte 0**, decoding ~`max_bytes` chars just to locate the boundary near
+byte 4096 — O(max_bytes).
+
+**The lever.** The largest char boundary ≤ `max_bytes` is at most one UTF-8 char width (≤ 3 bytes) below
+`max_bytes`, so a backward `is_char_boundary(end)` walk from `max_bytes` finds it in **≤ 4 checks** — O(1). It
+computes the identical cut (largest char boundary ≤ `max_bytes`), rounding a mid-multibyte-char index down to
+the boundary exactly as the forward scan did.
+
+**Recall/ordering — trivially preserved.** Byte-identical prefix ⇒ identical edge-ngrams ⇒ identical index terms
+⇒ identical ranking. `cass_prefix_source_matches_slow` asserts equality across content lengths and `max_bytes`
+∈ {0,1,2,3,4,5,7,100,499,500,501,10k} on ASCII, multibyte, and mixed content — cuts at/before/after a boundary,
+mid-multibyte (must round down), at 0, and past the end. All 85 lexical lib tests pass.
+
+**Speed — DECIDABLE WIN.** Isolated null-controlled microbench (`benches/prefix_source_ab.rs`, 256 calls on a
+64 KiB doc per timed region — both arms take the truncation path; shared alternating-round sampler, one binary /
+one `rch` invocation, worker `hz2`/`hetzner2`, binary sha256
+`fc2e09db9afd34eb979b7a648a5057128287433482b9b38ab64cc89824b41dcf`, 41 rounds × 4). Ratio = fast/ORIG:
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (forward_scan vs forward_scan) | 0.9970 [0.9373, 1.0434] |
+| fast / ORIG | **0.0003 [0.0003, 0.0003]** |
+
+fast/ORIG median 0.0003 = **~3333× faster** — the O(4096) forward decode vs the O(≤4) boundary walk. Decidable
+by an enormous margin against a tight null floor.
+
+**Honest scope.** This is a *complexity* fix, so the ratio is huge, but it **only triggers on content > 4 KiB**
+(smaller docs early-return identically in both). The absolute per-doc saving is one ~4 KiB char-scan on large
+documents; on a corpus of small messages it is a no-op. Still an unambiguous, byte-identical O(n)→O(1)
+improvement worth landing wherever large docs appear. **SHIPPED in place**; the forward-scan original retained
+doc-hidden as `cass_prefix_source_slow` so the A/B stays reproducible (both arms in-tree). All builds/benches
+remote; no local cargo; fmt + clippy clean on changed lines.

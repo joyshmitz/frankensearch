@@ -1582,7 +1582,29 @@ fn cass_build_content_prefix_and_preview(content: &str) -> (String, String) {
     )
 }
 
+/// The largest char-boundary prefix of `content` that is `≤ max_bytes` bytes.
+///
+/// The original walked `char_indices` forward from byte 0 — O(max_bytes) char decodes just to locate
+/// the boundary near `max_bytes`. Since UTF-8 chars are ≤ 4 bytes, the largest boundary `≤ max_bytes`
+/// is at most 3 bytes below `max_bytes`, so a backward `is_char_boundary` walk finds it in **≤ 4
+/// steps** — O(1). Byte-for-byte identical result (`cass_prefix_source_matches_slow`).
 fn cass_prefix_source(content: &str, max_bytes: usize) -> &str {
+    if content.len() <= max_bytes {
+        return content;
+    }
+    // `max_bytes < content.len()` here, so it is a valid index; `is_char_boundary(0)` is always true,
+    // so the walk terminates within one UTF-8 char width.
+    let mut end = max_bytes;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
+
+/// Pre-O(1) [`cass_prefix_source`], retained doc-hidden for the same-binary A/B + parity test.
+#[doc(hidden)]
+#[must_use]
+pub fn cass_prefix_source_slow(content: &str, max_bytes: usize) -> &str {
     if content.len() <= max_bytes {
         return content;
     }
@@ -1594,6 +1616,13 @@ fn cass_prefix_source(content: &str, max_bytes: usize) -> &str {
         end = byte_idx;
     }
     &content[..end]
+}
+
+/// Doc-hidden bench wrapper (the shipped `cass_prefix_source` is private).
+#[doc(hidden)]
+#[must_use]
+pub fn cass_prefix_source_fast_bench(content: &str, max_bytes: usize) -> usize {
+    cass_prefix_source(content, max_bytes).len()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2442,6 +2471,27 @@ mod cass_query_tests {
         assert_eq!(cass_build_preview("hello", 10), "hello");
         assert_eq!(cass_build_preview("hello world", 5), "hello…");
         assert_eq!(cass_build_preview("éclair", 3), "écl…");
+    }
+
+    /// PARITY GATE: the O(1) `cass_prefix_source` must return the byte-identical prefix as the
+    /// forward-scan original for every content/max_bytes combination — including cuts that land
+    /// mid-multibyte-char (must round down to the boundary), at a boundary, at 0, and past the end.
+    #[test]
+    fn cass_prefix_source_matches_slow() {
+        let ascii = "abcdefghij".repeat(50); // 500 bytes
+        let uni = "aéb日cé".repeat(50); // multibyte, varied widths
+        for content in ["", "x", "abc", ascii.as_str(), uni.as_str()] {
+            for max_bytes in [0usize, 1, 2, 3, 4, 5, 7, 100, 499, 500, 501, 10_000] {
+                let fast = cass_prefix_source(content, max_bytes);
+                let slow = cass_prefix_source_slow(content, max_bytes);
+                assert_eq!(
+                    fast,
+                    slow,
+                    "content.len()={} max_bytes={max_bytes}",
+                    content.len()
+                );
+            }
+        }
     }
 
     /// PARITY GATE: the bulk-copy `cass_build_preview` must equal the char-by-char original for

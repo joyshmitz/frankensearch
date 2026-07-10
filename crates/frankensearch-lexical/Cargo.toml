@@ -54,3 +54,8 @@ required-features = ["bench-internals"]
 name = "preview_build_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "prefix_source_ab"
+harness = false
+required-features = ["bench-internals"]
