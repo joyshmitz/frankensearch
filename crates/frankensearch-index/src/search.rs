@@ -100,6 +100,40 @@ impl Ord for HeapEntry {
     }
 }
 
+/// Largest dimension whose entire `[-127 * 127 * dim, 127 * 127 * dim]` integer
+/// dot range is exactly representable as f32. The common 384-dimensional path can
+/// therefore rank raw i32 values while preserving the shipped i32-to-f32 order.
+const MAX_EXACT_I8_DOT_DIM: usize = 1_040;
+
+/// Packed pass-1 ordering key for the int8 two-pass scan. Larger means worse, so
+/// `BinaryHeap::peek` remains the cutoff. The high word reverses score order
+/// (higher scores become smaller keys); the low word preserves the full `usize`
+/// index as the deterministic tiebreak (lower indices are better).
+type Int8HeapKey = u128;
+
+#[allow(clippy::inline_always)]
+#[inline(always)]
+const fn int8_heap_key(index: usize, score: i32) -> Int8HeapKey {
+    let ascending_score = (score as u32) ^ 0x8000_0000;
+    let descending_score = !ascending_score;
+    ((descending_score as u128) << usize::BITS) | index as u128
+}
+
+#[allow(clippy::inline_always)]
+#[inline(always)]
+fn int8_heap_key_from_f32(index: usize, score: i32) -> Int8HeapKey {
+    let score = score as f32;
+    let bits = score.to_bits();
+    let sign_mask = (bits >> 31).wrapping_neg() | 0x8000_0000;
+    let ascending_score = bits ^ sign_mask;
+    let descending_score = !ascending_score;
+    ((descending_score as u128) << usize::BITS) | index as u128
+}
+
+const fn int8_heap_index(key: Int8HeapKey) -> usize {
+    key as usize
+}
+
 impl VectorIndex {
     /// Brute-force cosine-similarity top-k search over all records.
     ///
@@ -332,7 +366,7 @@ impl VectorIndex {
             self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
         } else {
             let chunk_count = count.div_ceil(INT8_PARALLEL_CHUNK_SIZE);
-            let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
+            let partials: Vec<BinaryHeap<Int8HeapKey>> = (0..chunk_count)
                 .into_par_iter()
                 .map(|chunk_index| {
                     let start = chunk_index * INT8_PARALLEL_CHUNK_SIZE;
@@ -340,7 +374,7 @@ impl VectorIndex {
                     self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
                 })
                 .collect();
-            merge_partial_heaps(partials, candidate_count)
+            merge_int8_partial_heaps(partials, candidate_count)
         };
 
         // Pass 2: exact f16 rescore of the candidates through the SAME bounded-heap
@@ -349,10 +383,11 @@ impl VectorIndex {
         let stride = dim * 2;
         let mut heap = BinaryHeap::with_capacity(k.saturating_add(1));
         for candidate in candidate_heap {
-            let vector_offset = self.vectors_offset + candidate.index * stride;
+            let index = int8_heap_index(candidate);
+            let vector_offset = self.vectors_offset + index * stride;
             let vector_bytes = &self.data[vector_offset..vector_offset + stride];
             let score = dot_product_f16_bytes_f32(vector_bytes, query)?;
-            insert_candidate(&mut heap, HeapEntry::new(candidate.index, score), k);
+            insert_candidate(&mut heap, HeapEntry::new(index, score), k);
         }
         self.resolve_hits(heap)
     }
@@ -367,10 +402,32 @@ impl VectorIndex {
         start: usize,
         end: usize,
         limit: usize,
-    ) -> BinaryHeap<HeapEntry> {
+    ) -> BinaryHeap<Int8HeapKey> {
+        if limit == 0 {
+            return BinaryHeap::new();
+        }
+        if self.dimension() <= MAX_EXACT_I8_DOT_DIM {
+            self.int8_scan_range_with_key(slab, query_i8, start, end, limit, int8_heap_key)
+        } else {
+            self.int8_scan_range_with_key(slab, query_i8, start, end, limit, int8_heap_key_from_f32)
+        }
+    }
+
+    fn int8_scan_range_with_key<F>(
+        &self,
+        slab: &[i8],
+        query_i8: &[i8],
+        start: usize,
+        end: usize,
+        limit: usize,
+        make_key: F,
+    ) -> BinaryHeap<Int8HeapKey>
+    where
+        F: Fn(usize, i32) -> Int8HeapKey,
+    {
         let dim = self.dimension();
         let mut heap = BinaryHeap::with_capacity(limit.min(end - start).saturating_add(1));
-        let mut cutoff = f32::NEG_INFINITY;
+        let mut cutoff = Int8HeapKey::MAX;
         let mut flags_offset = self.records_offset + start * 16 + 14;
         let mut slab_offset = start * dim;
 
@@ -379,16 +436,16 @@ impl VectorIndex {
             let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
             if (flags & 0x0001) == 0 {
                 let stored = &slab[slab_offset..slab_offset + dim];
-                // int8 dots peak well below 2^24 for realistic dims, so `i32 as f32`
-                // is exact and preserves the candidate ranking + index tie-break.
-                let score = dot_i8_i8(stored, query_i8) as f32;
-                if heap.len() < limit || score_key(score) >= cutoff {
-                    insert_candidate(&mut heap, HeapEntry::new(index, score), limit);
-                    if heap.len() >= limit
-                        && let Some(&worst) = heap.peek()
-                    {
-                        cutoff = score_key(worst.score);
+                let candidate = make_key(index, dot_i8_i8(stored, query_i8));
+                if heap.len() < limit {
+                    heap.push(candidate);
+                    if heap.len() == limit {
+                        cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
                     }
+                } else if candidate < cutoff {
+                    let _ = heap.pop();
+                    heap.push(candidate);
+                    cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
                 }
             }
             flags_offset += 16;
@@ -1319,6 +1376,28 @@ fn merge_partial_heaps(
     for heap in partial_heaps {
         for entry in heap {
             insert_candidate(&mut merged, entry, limit);
+        }
+    }
+    merged
+}
+
+fn merge_int8_partial_heaps(
+    partial_heaps: Vec<BinaryHeap<Int8HeapKey>>,
+    limit: usize,
+) -> BinaryHeap<Int8HeapKey> {
+    let total_elements = partial_heaps
+        .iter()
+        .map(BinaryHeap::len)
+        .fold(0_usize, usize::saturating_add);
+    let mut merged = BinaryHeap::with_capacity(limit.min(total_elements).saturating_add(1));
+    for heap in partial_heaps {
+        for candidate in heap {
+            if merged.len() < limit {
+                merged.push(candidate);
+            } else if merged.peek().is_some_and(|&worst| candidate < worst) {
+                let _ = merged.pop();
+                merged.push(candidate);
+            }
         }
     }
     merged
@@ -2339,6 +2418,83 @@ mod tests {
         // Lower index wins the tiebreak
         assert!(candidate_is_better(left, right));
         assert!(!candidate_is_better(right, left));
+    }
+
+    #[test]
+    fn int8_heap_keys_match_legacy_score_and_index_order() {
+        let exact_scores = [-16_774_160, -1, 0, 1, 16_774_160];
+        let indices = [0, 17, usize::MAX];
+        for &left_score in &exact_scores {
+            for &left_index in &indices {
+                for &right_score in &exact_scores {
+                    for &right_index in &indices {
+                        let packed = int8_heap_key(left_index, left_score)
+                            .cmp(&int8_heap_key(right_index, right_score));
+                        let legacy = HeapEntry::new(left_index, left_score as f32)
+                            .cmp(&HeapEntry::new(right_index, right_score as f32));
+                        assert_eq!(packed, legacy);
+                    }
+                }
+                assert_eq!(
+                    int8_heap_index(int8_heap_key(left_index, left_score)),
+                    left_index
+                );
+            }
+        }
+
+        // Above the consecutive-integer f32 range, distinct i32 dots can collapse
+        // to the same float. The fallback must preserve that legacy tie behavior.
+        let fallback_scores = [i32::MIN, -16_777_217, 16_777_216, 16_777_217, i32::MAX];
+        for &left_score in &fallback_scores {
+            for &right_score in &fallback_scores {
+                let packed = int8_heap_key_from_f32(11, left_score)
+                    .cmp(&int8_heap_key_from_f32(29, right_score));
+                let legacy = HeapEntry::new(11, left_score as f32)
+                    .cmp(&HeapEntry::new(29, right_score as f32));
+                assert_eq!(packed, legacy);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_int8_merge_matches_legacy_heap_merge() {
+        let partitions = [
+            [(0_usize, 90_i32), (1, 40), (2, 40)],
+            [(3, 100), (4, -5), (5, 40)],
+            [(6, 70), (7, 40), (8, i32::MIN)],
+        ];
+        for limit in [0, 1, 3, 9] {
+            let legacy_parts = partitions
+                .iter()
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|&(index, score)| HeapEntry::new(index, score as f32))
+                        .collect::<BinaryHeap<_>>()
+                })
+                .collect();
+            let packed_parts = partitions
+                .iter()
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .map(|&(index, score)| int8_heap_key(index, score))
+                        .collect::<BinaryHeap<_>>()
+                })
+                .collect();
+
+            let mut legacy_indices = merge_partial_heaps(legacy_parts, limit)
+                .into_iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>();
+            let mut packed_indices = merge_int8_partial_heaps(packed_parts, limit)
+                .into_iter()
+                .map(int8_heap_index)
+                .collect::<Vec<_>>();
+            legacy_indices.sort_unstable();
+            packed_indices.sort_unstable();
+            assert_eq!(packed_indices, legacy_indices);
+        }
     }
 
     #[test]
