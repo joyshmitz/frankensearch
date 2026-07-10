@@ -98,6 +98,9 @@ harness = false
 [[bench]]
 name = "graph_rank"
 harness = false
+# Links the shipped `GraphRanker::rank_phase1` (cfg-gated) so the bench measures production,
+# not a bench-local copy -- see bd-i40y / the 2026-07-10 ledger-integrity audit.
+required-features = ["graph"]
 
 [[bench]]
 name = "rank_map"

@@ -1,28 +1,43 @@
 //! Graph-rank (query-biased PageRank) power-iteration benchmark.
 //!
-//! `GraphRanker::rank_phase1` ran the power iteration over a
-//! `HashMap<String, f64>` rebuilt every iteration, cloning a `String` doc_id key
-//! on every teleport/edge relaxation (all keys already present, so the clones
-//! were dead) and re-checking each edge's weight finiteness every pass. The new
-//! path dense-indexes the graph once and iterates over reused `Vec<f64>` buffers
-//! (CSR edges, hoisted weight filter). This bench replicates old vs new
-//! self-contained (the engine internals are private) over a realistic graph.
+//! `GraphRanker::rank_phase1` ran the power iteration over a `HashMap<String, f64>` rebuilt every
+//! iteration, cloning a `String` doc_id key on every teleport/edge relaxation (all keys already
+//! present, so the clones were dead) and re-checking each edge's weight finiteness every pass. The
+//! new path dense-indexes the graph once and iterates over reused `Vec<f64>` buffers (CSR edges,
+//! hoisted weight filter). `rank_old`/`rank_new` below reproduce those two shapes self-contained.
 //!
-//! Run with:
+//! **Read this before citing a number from here (bd-i40y).** Until 2026-07-10 this bench imported
+//! only `std` and `criterion`: it never linked `frankensearch_fusion`, so `GraphRanker::rank_phase1`
+//! — the function it is named for — had **0.000% self-time** and was never called. A REJECT row
+//! (flat CSR, `NEGATIVE_EVIDENCE` 2026-07-09) was decided on `rank_new` alone. The `paired_prod` /
+//! `paired_copy` arms now bench the **shipped symbol** against that copy, with a reachability gate
+//! (`rank_phase1` must return `Some`) and a printed fidelity diagnostic. Measured: the copy ranks
+//! identically (top-50 agreement 50/50) but runs **1.11×/1.13× cheaper** than production, because it
+//! is handed a pre-normalized personalization and skips the `ranks_map` rebuild and `ScoredResult`
+//! construction. It is a faithful *ranker* proxy and a biased *cost* proxy.
+//!
+//! Run with (remote, fail-closed; a local build is a disk-pressure incident):
 //! ```bash
-//! CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \
-//!   rch exec -- cargo bench -p frankensearch-fusion --bench graph_rank
+//! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
+//!   rch exec -- cargo bench -p frankensearch-fusion --features graph --bench graph_rank
 //! ```
 
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::time::{Duration, Instant};
 
+use asupersync::Cx;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
+use frankensearch_fusion::GraphRanker;
 
 const RESTART: f64 = 0.15;
 const WALK: f64 = 1.0 - RESTART;
 const MAX_ITER: usize = 20;
 const TOL: f64 = 1e-6;
+
+/// Calls per timed region in the interleaved paired sampler.
+const PAIR_BATCH: u32 = 4;
 
 type Adj = HashMap<String, Vec<(String, f32)>>;
 
@@ -217,19 +232,191 @@ fn make_graph(n: usize, deg: usize) -> (Adj, Vec<(String, f64)>) {
     (adj, pers)
 }
 
+// ── PRODUCTION FIXTURE (bd-i40y) ─────────────────────────────────────────────
+//
+// The rows that used this bench (`flat CSR REJECTED`, NEGATIVE_EVIDENCE 2026-07-09) measured only the
+// bench-local `rank_old`/`rank_new` copies above: the bench imported nothing but `std` and `criterion`,
+// so `GraphRanker::rank_phase1` — the function those rows are *about* — had 0.000% self-time and was
+// never called. The arms below fix that by benching the shipped symbol.
+//
+// The `DocumentGraph` is the single source of truth: `adj` is derived FROM it, so the copy and
+// production see byte-identical edge sets. That matters because `DocumentGraph::add_edge` *upserts*
+// duplicate `(neighbor, edge_type)` pairs while a raw `Vec` push does not — building the two
+// independently would silently give production fewer edges and flatter the comparison.
+
+/// Build the production graph plus its seed hits, using the same LCG as `make_graph`.
+fn make_prod(n: usize, deg: usize) -> (DocumentGraph, Vec<VectorHit>) {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut graph = DocumentGraph::new();
+    for i in 0..n {
+        for _ in 0..deg {
+            let j = (next() as usize) % n;
+            if j != i {
+                let w = 0.25 + (next() % 1000) as f32 / 1000.0;
+                graph.add_edge(format!("d{i:05}"), format!("d{j:05}"), EdgeType::Similar, w);
+            }
+        }
+    }
+    // 10 seeds, mirroring `make_graph`'s personalization. `rank_phase1` normalizes internally.
+    let seeds: Vec<VectorHit> = (0..10u32)
+        .map(|s| VectorHit {
+            index: s,
+            score: 0.5 + s as f32 * 0.05,
+            doc_id: format!("d{:05}", (s as usize * 37) % n).into(),
+        })
+        .collect();
+    (graph, seeds)
+}
+
+/// Derive the copy's `Adj` from the production graph so both arms see the same edges.
+fn adj_from_graph(graph: &DocumentGraph) -> Adj {
+    graph
+        .adjacency()
+        .iter()
+        .map(|(doc, edges)| {
+            (
+                doc.to_string(),
+                edges
+                    .iter()
+                    .map(|e| (e.neighbor_doc_id.to_string(), e.weight))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Replicate `GraphRanker::personalization_from_seed_hits` (private): max score per in-graph doc,
+/// then normalize to sum 1 — exactly what `make_graph` hands `rank_new`.
+fn pers_from_seeds(graph: &DocumentGraph, seeds: &[VectorHit]) -> Vec<(String, f64)> {
+    let mut w: HashMap<String, f64> = HashMap::new();
+    for hit in seeds {
+        if !graph.contains_node(&hit.doc_id) {
+            continue;
+        }
+        let score = f64::from(hit.score);
+        if !score.is_finite() || score <= 0.0 {
+            continue;
+        }
+        let e = w.entry(hit.doc_id.to_string()).or_insert(0.0);
+        if score > *e {
+            *e = score;
+        }
+    }
+    let total: f64 = w.values().sum();
+    if total > 0.0 {
+        for v in w.values_mut() {
+            *v /= total;
+        }
+    }
+    w.into_iter().collect()
+}
+
 fn bench_graph_rank(c: &mut Criterion) {
     let cases = [(500usize, 6usize), (2000, 8)];
     let mut g = c.benchmark_group("graph_rank");
     for (n, deg) in cases {
         let (adj, pers) = make_graph(n, deg);
         let limit = 50;
-        debug_assert_eq!(rank_old(&adj, &pers, limit), rank_new(&adj, &pers, limit));
+        // Was `debug_assert_eq!`, which is compiled OUT of the release bench — the parity gate
+        // between the two copies never actually ran. It runs once per case; the cost is noise.
+        assert_eq!(rank_old(&adj, &pers, limit), rank_new(&adj, &pers, limit));
         let id = format!("n{n}_deg{deg}");
         g.bench_with_input(BenchmarkId::new("old", &id), &(), |b, ()| {
             b.iter(|| black_box(rank_old(black_box(&adj), black_box(&pers), limit)));
         });
         g.bench_with_input(BenchmarkId::new("new", &id), &(), |b, ()| {
             b.iter(|| black_box(rank_new(black_box(&adj), black_box(&pers), limit)));
+        });
+
+        // ── The shipped symbol, vs the copy the REJECT rows actually measured ──
+        let (graph, seeds) = make_prod(n, deg);
+        let prod_adj = adj_from_graph(&graph);
+        let prod_pers = pers_from_seeds(&graph, &seeds);
+        let cx = Cx::for_testing();
+        let ranker = GraphRanker::new();
+
+        // REACHABILITY GATE. `rank_phase1` returns `None` on an empty graph or empty
+        // personalization; a `None` here would mean the paired arm below times a no-op.
+        let prod_out = ranker
+            .rank_phase1(&cx, "graph rank query", &graph, &seeds, limit)
+            .expect("rank_phase1 must return Some -- else this bench measures nothing");
+        assert!(
+            !prod_out.is_empty(),
+            "{id}: rank_phase1 returned no results"
+        );
+        eprintln!(
+            "[reachability] {id}: rank_phase1 -> {} results over {} nodes",
+            prod_out.len(),
+            graph.adjacency().len()
+        );
+
+        // FIDELITY DIAGNOSTIC (printed, not asserted): does the bench-local copy that the REJECT
+        // rows used actually rank like production? Float accumulation order and HashMap node
+        // indexing differ, so exact equality is not required -- but a low match count would mean
+        // the copy was never a valid stand-in and those rows measured a different algorithm.
+        let copy_out = rank_new(&prod_adj, &prod_pers, limit);
+        let common = prod_out.len().min(copy_out.len());
+        let matches = prod_out
+            .iter()
+            .zip(&copy_out)
+            .filter(|(p, c)| p.doc_id.as_str() == c.as_str())
+            .count();
+        eprintln!(
+            "[fidelity] {id}: top-{limit} positional agreement prod-vs-copy = {matches}/{common}"
+        );
+
+        // INTERLEAVED PAIRED SAMPLER: each arm runs BOTH implementations per iteration and times
+        // only its own, so worker/thermal drift cancels in the ratio (criterion group members run
+        // sequentially, so a plain side-by-side registration would not).
+        g.bench_with_input(BenchmarkId::new("paired_prod", &id), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(rank_new(black_box(&prod_adj), black_box(&prod_pers), limit));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("paired_copy", &id), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(rank_new(black_box(&prod_adj), black_box(&prod_pers), limit));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
         });
     }
     g.finish();

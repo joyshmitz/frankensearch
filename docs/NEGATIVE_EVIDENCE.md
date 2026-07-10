@@ -10213,6 +10213,27 @@ Conformance GREEN before commit: `cargo test -p frankensearch-ops frame_quality_
 > copy uses `std::HashMap` where production's `idx` may not. Worse, the `flat` arm has since been deleted (`grep -c
 > flat` → 0), so the row **cannot be re-run**. Do not treat as do-not-retry until re-measured against the shipped
 > symbol with both arms retained.
+>
+> **✅ 2026-07-10 FOLLOW-UP, MEASURED (cc_fse, `bd-i40y` partially discharged).** The bench now links and calls the
+> shipped symbol (`required-features = ["graph"]`), with a reachability gate (`rank_phase1` must return `Some` — it
+> returns 50 results over 500/2000 nodes) and a printed fidelity diagnostic. Interleaved paired sampler, one binary,
+> one `rch` invocation (`hz2`), `PAIR_BATCH = 4`, per-call figures:
+>
+> | case | prod `rank_phase1` | bench copy `rank_new` | prod/copy | top-50 order agreement |
+> |---|---:|---:|---:|---:|
+> | `n500_deg6`  | 193.7 µs | 174.5 µs | **1.110×** | **50/50** |
+> | `n2000_deg8` | 1015.1 µs | 896.9 µs | **1.132×** | **50/50** |
+>
+> **The copy is a faithful *ranker* proxy and a biased *cost* proxy.** It reproduces production's ranking exactly
+> (50/50 positional agreement at both sizes), so the flat-vs-`Vec<Vec>` *decision* does transfer, and my "INVALID"
+> verdict above was too harsh — corrected here rather than quietly. But the copy runs **11–13% cheaper per call**:
+> it is handed a pre-normalized personalization and skips `personalization_from_seed_hits`, the `ranks_map` rebuild
+> and `ScoredResult` construction. The original row's `1.22×`/`1.29×` flat-CSR penalties were therefore measured
+> against a denominator missing ~11–13% of production's per-call work, so they **overstate** the penalty that layout
+> would carry on the shipped path. Sign unchanged (flat CSR still loses); magnitude inflated. Also found: the row's
+> only parity check between its two arms was a `debug_assert_eq!`, **compiled out of the release bench** — it never
+> ran once. Now a real `assert_eq!`. Remaining for `bd-i40y`: restore a `flat` arm against the shipped function
+> (needs a `bench-internals` feature to reach the private helpers) before the row closes on its own terms.
 
 **Different profiled path (structurally-different primitive class):** `GraphRanker::rank_phase1`
 (`frankensearch-fusion/src/graph_rank.rs`, feature-gated `graph`) — the query-biased PageRank power iteration.
