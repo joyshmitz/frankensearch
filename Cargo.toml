@@ -221,3 +221,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.release-perf]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
