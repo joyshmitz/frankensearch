@@ -10584,3 +10584,37 @@ leaf `dot_i8_i8_avx2` had 38.37%. The profile artifact is
 the production lever. Retry condition: preserve the same one-binary interleaving and parity gates, but make
 each Criterion iteration a fixed multi-query AB/BA batch and report batch-normalized per-search means; this
 amortizes worker scheduling jitter without splitting arms across workers or invocations.
+
+---
+
+## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: batch16 int8 row-block A/B misses CV gate by 0.0318 point (cod_fse)
+
+**This again rejects the timing bundle, not the candidate.** The recorded retry condition above was exercised
+as one fail-closed RCH invocation on worker `ovh-a` (AMD Ryzen 7 5800X), with both arms in one binary and a
+fixed 16-query AB/BA batch inside every Criterion iteration. Inputs and results remained black-boxed, and the
+table divides Criterion's batch mean, standard deviation, and confidence interval by 16. The exact
+release-perf binary SHA-256 was
+`68f1383b40ba9699504c6aadbf84ef08847bafe394f6a0f0ae06b39bb186d1ef`.
+
+| arm | per-search mean [95% CI] | per-search stddev | CV | candidate/original |
+|---|---:|---:|---:|---:|
+| paired ORIGINAL mult3 | 369.320 us [366.312, 372.813] | 12.010 us | 3.2520% | — |
+| paired four-row candidate mult3 | 377.028 us [373.414, 381.040] | 13.901 us | 3.6871% | 1.020871 |
+| paired ORIGINAL mult5 | 389.228 us [384.234, 394.927] | 19.585 us | **5.0318%** | — |
+| paired four-row candidate mult5 | 390.174 us [387.495, 392.998] | 10.001 us | 2.5633% | 1.002430 |
+
+Recall@10 and nDCG@10 were exactly 1.0000 for both arms at multipliers 2, 3, 5, and 10, with bit-exact
+index/doc/score parity. Both ratios miss the speed ratchet, but the strict **CV <5%** rule makes the complete
+bundle invalid: 5.0318% is not rounded down to a pass.
+
+**Ledger-integrity profile.** The exact measured binary's candidate benchmark was sampled for 30 seconds with
+frame-pointer call graphs on the same worker. `dot_i8x4_i8_avx2` recorded **39.06% flat self-time** and its
+dispatch wrapper recorded 0.77%; the interleaved ORIGINAL `dot_i8_i8_avx2` recorded 39.19%. Perf captured
+110,151 samples with zero lost. Artifact:
+`/tmp/bd-b5wl-row4-ab2-profile-20260710-1427-root.perf.data` on `ovh-a`, SHA-256
+`4a31835e2699edcbd5c8c081672f6d0a66d5dcadee350e7695a4d7a270d07ee1`.
+
+**Decision:** REJECT batch16 as the final measurement substrate; do not bind the production lever from this
+bundle. Retry condition: batch exactly all 32 fixture queries per Criterion iteration. That both reduces the
+remaining estimator noise and makes each iteration's query weighting identical even when Criterion chooses
+different iteration counts for the two independently estimated arms.
