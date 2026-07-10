@@ -10795,3 +10795,56 @@ widen-loads while retaining all stored widening, multiply-adds, four horizontal 
 cost; it also gives each row one accumulator instead of the incumbent's dual-chain ILP. Profile artifact:
 `/tmp/bd-b5wl-1948a65-mult3-profile30.perf.data`, SHA-256
 `eae9311dfdf6ac5d2f94df73c21ea1e8e446578568d6d42736ed827732eb4076`.
+
+---
+
+## 2026-07-10 — REJECTED MEASUREMENT BUNDLE / BLOCKER: balanced null control cannot resolve int8 row blocks (cod_fse)
+
+**This rejects the measurement bundle, not the four-row candidate or the int8 ADC family.** The superseding
+null-controlled substrate ran as one fail-closed `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec --
+cargo bench ...` invocation on worker `vmi1227854` (AMD EPYC, AVX2). ORIGINAL and candidate were linked in
+one release-perf binary, every input and returned hit vector was black-boxed, and `RAYON_NUM_THREADS=4` was
+held fixed. For each multiplier, `paired(ORIGINAL, ORIGINAL)` ran before
+`paired(ORIGINAL, four-row-candidate)`. Each of 41 observations combined one AB and one BA round as
+`sqrt((B_AB/A_AB)*(B_BA/A_BA))`; successive observations reversed which order ran first. Every timed arm
+covered eight identical 32-query corpora (256 searches), with an independent aligned query cursor. The exact
+measured binary SHA-256 was
+`ffb2201d65e9f69be557ca755fffaac67941f72ff79a601f7da3102a92f7059e`.
+
+The median ratio is the gate; CV is disclosure only. `R` is the candidate median divided by the null median,
+and `[L,U]` is the null's p5/p95 divided by its median. Both null envelopes contain 1.0, but worker contention
+made their empirical per-function floors far wider than the candidate effect:
+
+| mult | NULL median [p5,p95] | normalized floor `[L,U]` | NULL A / B mean us (CV) | candidate median [p5,p95] | calibrated `R` | base / candidate mean us (CV) | verdict |
+|---:|---|---|---|---|---:|---|---|
+| 3 | 1.051801 [0.801109, 1.373810] | [0.761654, 1.306149] | 787.501 (31.879%) / 840.219 (35.038%) | 1.195742 [0.990342, 1.602010] | 1.136852 | 823.420 (32.086%) / 998.455 (26.880%) | **INSIDE NULL FLOOR** |
+| 5 | 1.013350 [0.797078, 1.214939] | [0.786578, 1.198934] | 891.935 (34.664%) / 889.055 (32.970%) | 1.208710 [0.935211, 1.447219] | 1.192786 | 792.905 (33.743%) / 932.812 (29.789%) | **INSIDE NULL FLOOR** |
+
+The predeclared keep gate required mult3 `R < 0.97` and `R < L`, with mult5 `R <= U`. Mult3 lies inside its
+null floor; mult5 is also inside, only 0.006148 below its upper floor. Therefore the honest result is
+**UNDECIDABLE**. The later sequential Criterion estimates are profile diagnostics only and are not used as an
+A/B ratio. Recall@10 and nDCG@10 were exactly 1.0000 for both arms at multipliers 2, 3, 5, and 10, and the
+bench asserted bit-exact index/doc-id/score parity before timing.
+
+**ISA audit.** The exact measured binary was disassembled on the AVX2 worker before interpreting the result.
+Both `dot_i8_i8_avx2` and `dot_i8x4_i8_avx2` contain YMM `vpmovsxbw`, `vpmaddwd`, and `vpaddd`; the hot int8
+scan is already 256-bit despite the portable generic x86-64 crate baseline. A global `target-cpu=native` or
+`+avx2` build is not a missing 2x width lever for this leaf.
+
+**Ledger-integrity profile.** The exact measured bytes were then run directly on the same worker under
+`perf record -F 997 -e cycles:u -g --call-graph fp`, pinned to CPUs 2-5. Criterion explicitly reported
+`Profiling fsvi_int8_two_pass_ab/paired_candidate_mult3_batch32` for 30 seconds. The artifact captured
+657,870 samples across the complete 196.062-second process with zero `PERF_RECORD_LOST` records. Candidate
+leaf `dot_i8x4_i8_avx2` had **23.36% flat self-time**; ORIGINAL `dot_i8_i8_avx2` had 44.54%, candidate
+`int8_scan_range` 12.79%, and ORIGINAL `int8_scan_range_orig` 14.11%. This proves both arms executed real
+shipped/bench-retained code rather than a copy or revert. Artifact
+`/tmp/bd-b5wl-row4-nullmedian-20260710-1640.perf.data` on `vmi1227854`, SHA-256
+`c4d59434c7eee3c20211d0154b19469aaa4d9d2d007e41e23b958d00787c99aa`.
+
+**Decision / concrete blocker:** restore the production scan to ORIGINAL and retain the four-row path as a
+hidden bench-only candidate so this row remains reproducible. Do not retry this candidate under the current
+RCH scheduling state or increase batching again to force separation. Retry condition: an external state
+change that supplies worker isolation/affinity for the entire one-invocation paired run, with the same
+41-balanced-pair / 256-search substrate producing a materially narrower null floor that still contains 1.0.
+This is not a parity ceiling: different int8 primitives (for example a quantizer-domain-safe `vpmaddubs`
+signed-dot transform or a packed transposed slab) remain separate veins.

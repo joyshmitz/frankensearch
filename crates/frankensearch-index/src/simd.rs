@@ -682,6 +682,134 @@ pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
     dot_i8_i8_generic(stored, query)
 }
 
+/// Four adjacent int8-vector dots with one shared query decode.
+///
+/// `stored_rows` contains four row-major vectors of `query.len()` elements each.
+/// The AVX2 path loads and sign-extends every 32-byte query block once, then reuses
+/// those lanes across all four stored rows. Each returned score is bit-identical
+/// to a separate [`dot_i8_i8`] call.
+#[inline(never)]
+pub(crate) fn dot_i8x4_i8(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
+    let required = query
+        .len()
+        .checked_mul(4)
+        .expect("four-row int8 dot length overflow");
+    assert!(
+        stored_rows.len() >= required,
+        "four-row int8 dot requires {required} stored elements"
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present and the caller supplies four full rows.
+            #[allow(unsafe_code)]
+            return unsafe { dot_i8x4_i8_avx2(stored_rows, query) };
+        }
+    }
+    dot_i8x4_i8_generic(stored_rows, query)
+}
+
+fn dot_i8x4_i8_generic(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
+    let dim = query.len();
+    if dim == 0 {
+        return [0; 4];
+    }
+    let (row0, rest) = stored_rows.split_at(dim);
+    let (row1, rest) = rest.split_at(dim);
+    let (row2, row3) = rest.split_at(dim);
+    [
+        dot_i8_i8_generic(row0, query),
+        dot_i8_i8_generic(row1, query),
+        dot_i8_i8_generic(row2, query),
+        dot_i8_i8_generic(&row3[..dim], query),
+    ]
+}
+
+/// AVX2 four-row int8 dot. Query loads and i8-to-i16 sign extensions are shared
+/// across the four independent row accumulators.
+///
+/// # Safety
+/// The caller must ensure AVX2 is available and `stored_rows` contains at least
+/// four complete `query.len()`-element rows.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+#[allow(unsafe_code)]
+unsafe fn dot_i8x4_i8_avx2(stored_rows: &[i8], query: &[i8]) -> [i32; 4] {
+    use core::arch::x86_64::{
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
+    };
+
+    macro_rules! reduce_i32x8 {
+        ($acc:expr) => {{
+            let sum128 = _mm_add_epi32(
+                _mm256_castsi256_si128($acc),
+                _mm256_extracti128_si256::<1>($acc),
+            );
+            let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+            let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+            _mm_cvtsi128_si32(sum32)
+        }};
+    }
+
+    let n = query.len();
+    debug_assert!(stored_rows.len() >= n.saturating_mul(4));
+    // SAFETY: AVX2 is guaranteed by the caller. Each 32-byte query/stored load is
+    // bounded by `i + 32 <= n`; row bases are within the four-row input slice.
+    unsafe {
+        let query_ptr = query.as_ptr();
+        let stored_ptr = stored_rows.as_ptr();
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut acc2 = _mm256_setzero_si256();
+        let mut acc3 = _mm256_setzero_si256();
+        let mut i = 0_usize;
+
+        while i + 32 <= n {
+            let q = _mm256_loadu_si256(query_ptr.add(i).cast::<__m256i>());
+            let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q));
+            let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(q));
+
+            macro_rules! accumulate_row {
+                ($acc:ident, $row:expr) => {{
+                    let s = _mm256_loadu_si256(stored_ptr.add(($row * n) + i).cast::<__m256i>());
+                    let s_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(s));
+                    let s_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(s));
+                    let products = _mm256_add_epi32(
+                        _mm256_madd_epi16(s_lo, q_lo),
+                        _mm256_madd_epi16(s_hi, q_hi),
+                    );
+                    $acc = _mm256_add_epi32($acc, products);
+                }};
+            }
+
+            accumulate_row!(acc0, 0);
+            accumulate_row!(acc1, 1);
+            accumulate_row!(acc2, 2);
+            accumulate_row!(acc3, 3);
+            i += 32;
+        }
+
+        let mut result = [
+            reduce_i32x8!(acc0),
+            reduce_i32x8!(acc1),
+            reduce_i32x8!(acc2),
+            reduce_i32x8!(acc3),
+        ];
+        while i < n {
+            let q = i32::from(*query_ptr.add(i));
+            result[0] += i32::from(*stored_ptr.add(i)) * q;
+            result[1] += i32::from(*stored_ptr.add(n + i)) * q;
+            result[2] += i32::from(*stored_ptr.add((2 * n) + i)) * q;
+            result[3] += i32::from(*stored_ptr.add((3 * n) + i)) * q;
+            i += 1;
+        }
+        result
+    }
+}
+
 /// Hand-written AVX2 i8·i8 dot: 256-bit `vpmaddwd` over sign-extended i16 lanes,
 /// two accumulators, horizontal-summed; scalar tail.
 ///
@@ -1517,6 +1645,50 @@ mod tests {
             #[allow(unsafe_code)]
             let avx2 = unsafe { dot_i8_i8_avx2(&s, &q) };
             assert_eq!(generic, avx2, "dim={dim}");
+        }
+    }
+
+    #[test]
+    fn four_row_int8_dot_matches_four_independent_dots() {
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        let mut next_i8 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_possible_truncation)]
+            ((state >> 24) as i8)
+        };
+
+        for &dim in &[
+            0_usize, 1, 7, 31, 32, 33, 63, 64, 65, 255, 256, 383, 384, 385, 1_040, 1_041,
+        ] {
+            let mut stored: Vec<i8> = (0..(4 * dim)).map(|_| next_i8()).collect();
+            let mut query: Vec<i8> = (0..dim).map(|_| next_i8()).collect();
+            if dim >= 2 {
+                query[0] = i8::MIN;
+                query[1] = i8::MAX;
+                for row in 0..4 {
+                    stored[row * dim] = i8::MIN;
+                    stored[(row * dim) + 1] = i8::MAX;
+                }
+            }
+
+            let expected =
+                core::array::from_fn(|row| dot_i8_i8(&stored[row * dim..(row + 1) * dim], &query));
+            assert_eq!(dot_i8x4_i8(&stored, &query), expected, "dim={dim}");
+            assert_eq!(
+                dot_i8x4_i8_generic(&stored, &query),
+                expected,
+                "generic dim={dim}"
+            );
+
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: avx2 verified present above and `stored` has four rows.
+                #[allow(unsafe_code)]
+                let avx2 = unsafe { dot_i8x4_i8_avx2(&stored, &query) };
+                assert_eq!(avx2, expected, "avx2 dim={dim}");
+            }
         }
     }
 

@@ -10,6 +10,7 @@ use frankensearch_core::filter::{DocIdHashSet, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 
+use crate::simd::dot_i8x4_i8;
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
     PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8,
@@ -132,6 +133,25 @@ fn int8_heap_key_from_f32(index: usize, score: i32) -> Int8HeapKey {
 
 const fn int8_heap_index(key: Int8HeapKey) -> usize {
     key as usize
+}
+
+#[inline]
+fn retain_int8_candidate(
+    heap: &mut BinaryHeap<Int8HeapKey>,
+    cutoff: &mut Int8HeapKey,
+    candidate: Int8HeapKey,
+    limit: usize,
+) {
+    if heap.len() < limit {
+        heap.push(candidate);
+        if heap.len() == limit {
+            *cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
+        }
+    } else if candidate < *cutoff {
+        let _ = heap.pop();
+        heap.push(candidate);
+        *cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
+    }
 }
 
 impl VectorIndex {
@@ -334,6 +354,41 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_two_pass_impl::<false>(query, k, candidate_multiplier)
+    }
+
+    /// Exact pre-row-block implementation retained only for same-binary
+    /// performance comparisons. Production callers should use
+    /// [`Self::search_top_k_int8_two_pass`].
+    #[doc(hidden)]
+    pub fn bench_search_top_k_int8_two_pass_orig(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_two_pass_impl::<false>(query, k, candidate_multiplier)
+    }
+
+    /// Four-row query-decode-reuse candidate retained only so the null-controlled
+    /// negative measurement stays reproducible. Production callers use
+    /// [`Self::search_top_k_int8_two_pass`].
+    #[doc(hidden)]
+    pub fn bench_search_top_k_int8_two_pass_row_block_candidate(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_two_pass_impl::<true>(query, k, candidate_multiplier)
+    }
+
+    fn search_top_k_int8_two_pass_impl<const ROW_BLOCKED: bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
         let count = self.record_count();
         // Fall back to the exact scan for anything this fast path does not cover.
         if k == 0
@@ -363,7 +418,11 @@ impl VectorIndex {
         // local top-N heaps; larger chunks keep enough Rayon tasks while shrinking
         // the post-scan merge fan-in.
         let candidate_heap = if count < PARALLEL_THRESHOLD {
-            self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
+            if ROW_BLOCKED {
+                self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
+            } else {
+                self.int8_scan_range_orig(slab, &query_i8, 0, count, candidate_count)
+            }
         } else {
             let chunk_count = count.div_ceil(INT8_PARALLEL_CHUNK_SIZE);
             let partials: Vec<BinaryHeap<Int8HeapKey>> = (0..chunk_count)
@@ -371,7 +430,11 @@ impl VectorIndex {
                 .map(|chunk_index| {
                     let start = chunk_index * INT8_PARALLEL_CHUNK_SIZE;
                     let end = (start + INT8_PARALLEL_CHUNK_SIZE).min(count);
-                    self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
+                    if ROW_BLOCKED {
+                        self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
+                    } else {
+                        self.int8_scan_range_orig(slab, &query_i8, start, end, candidate_count)
+                    }
                 })
                 .collect();
             merge_int8_partial_heaps(partials, candidate_count)
@@ -390,6 +453,73 @@ impl VectorIndex {
             insert_candidate(&mut heap, HeapEntry::new(index, score), k);
         }
         self.resolve_hits(heap)
+    }
+
+    fn int8_scan_range_orig(
+        &self,
+        slab: &[i8],
+        query_i8: &[i8],
+        start: usize,
+        end: usize,
+        limit: usize,
+    ) -> BinaryHeap<Int8HeapKey> {
+        if limit == 0 {
+            return BinaryHeap::new();
+        }
+        if self.dimension() <= MAX_EXACT_I8_DOT_DIM {
+            self.int8_scan_range_orig_with_key(slab, query_i8, start, end, limit, int8_heap_key)
+        } else {
+            self.int8_scan_range_orig_with_key(
+                slab,
+                query_i8,
+                start,
+                end,
+                limit,
+                int8_heap_key_from_f32,
+            )
+        }
+    }
+
+    /// Exact `1948a65` per-row scan retained for the in-binary ORIGINAL arm.
+    fn int8_scan_range_orig_with_key<F>(
+        &self,
+        slab: &[i8],
+        query_i8: &[i8],
+        start: usize,
+        end: usize,
+        limit: usize,
+        make_key: F,
+    ) -> BinaryHeap<Int8HeapKey>
+    where
+        F: Fn(usize, i32) -> Int8HeapKey,
+    {
+        let dim = self.dimension();
+        let mut heap = BinaryHeap::with_capacity(limit.min(end - start).saturating_add(1));
+        let mut cutoff = Int8HeapKey::MAX;
+        let mut flags_offset = self.records_offset + start * 16 + 14;
+        let mut slab_offset = start * dim;
+
+        for index in start..end {
+            let flags_bytes = &self.data[flags_offset..flags_offset + 2];
+            let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
+            if (flags & 0x0001) == 0 {
+                let stored = &slab[slab_offset..slab_offset + dim];
+                let candidate = make_key(index, dot_i8_i8(stored, query_i8));
+                if heap.len() < limit {
+                    heap.push(candidate);
+                    if heap.len() == limit {
+                        cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
+                    }
+                } else if candidate < cutoff {
+                    let _ = heap.pop();
+                    heap.push(candidate);
+                    cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
+                }
+            }
+            flags_offset += 16;
+            slab_offset += dim;
+        }
+        heap
     }
 
     /// Bounded-heap int8 scan of records `[start, end)` over the int8 `slab`
@@ -431,23 +561,61 @@ impl VectorIndex {
         let mut flags_offset = self.records_offset + start * 16 + 14;
         let mut slab_offset = start * dim;
 
-        for index in start..end {
+        let mut index = start;
+        while index + 4 <= end {
+            let flags0 = u16::from_le_bytes([self.data[flags_offset], self.data[flags_offset + 1]]);
+            let flags1 =
+                u16::from_le_bytes([self.data[flags_offset + 16], self.data[flags_offset + 17]]);
+            let flags2 =
+                u16::from_le_bytes([self.data[flags_offset + 32], self.data[flags_offset + 33]]);
+            let flags3 =
+                u16::from_le_bytes([self.data[flags_offset + 48], self.data[flags_offset + 49]]);
+            let flags = [flags0, flags1, flags2, flags3];
+
+            if ((flags0 | flags1 | flags2 | flags3) & 0x0001) == 0 {
+                let stored_rows = &slab[slab_offset..slab_offset + 4 * dim];
+                let scores = dot_i8x4_i8(stored_rows, query_i8);
+                for (lane, score) in scores.into_iter().enumerate() {
+                    retain_int8_candidate(
+                        &mut heap,
+                        &mut cutoff,
+                        make_key(index + lane, score),
+                        limit,
+                    );
+                }
+            } else {
+                for (lane, flags) in flags.into_iter().enumerate() {
+                    if (flags & 0x0001) == 0 {
+                        let row_offset = slab_offset + lane * dim;
+                        let stored = &slab[row_offset..row_offset + dim];
+                        retain_int8_candidate(
+                            &mut heap,
+                            &mut cutoff,
+                            make_key(index + lane, dot_i8_i8(stored, query_i8)),
+                            limit,
+                        );
+                    }
+                }
+            }
+
+            index += 4;
+            flags_offset += 64;
+            slab_offset += 4 * dim;
+        }
+
+        while index < end {
             let flags_bytes = &self.data[flags_offset..flags_offset + 2];
             let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
             if (flags & 0x0001) == 0 {
                 let stored = &slab[slab_offset..slab_offset + dim];
-                let candidate = make_key(index, dot_i8_i8(stored, query_i8));
-                if heap.len() < limit {
-                    heap.push(candidate);
-                    if heap.len() == limit {
-                        cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
-                    }
-                } else if candidate < cutoff {
-                    let _ = heap.pop();
-                    heap.push(candidate);
-                    cutoff = heap.peek().copied().unwrap_or(Int8HeapKey::MAX);
-                }
+                retain_int8_candidate(
+                    &mut heap,
+                    &mut cutoff,
+                    make_key(index, dot_i8_i8(stored, query_i8)),
+                    limit,
+                );
             }
+            index += 1;
             flags_offset += 16;
             slab_offset += dim;
         }
@@ -1516,6 +1684,62 @@ mod tests {
                 exact_ids, approx_ids,
                 "int8 two-pass (keep-all) must match exact search_top_k for query {qi}"
             );
+        }
+    }
+
+    #[test]
+    fn int8_row_block_matches_orig_with_tombstones_and_tail() {
+        // Cross the parallel threshold and leave a three-row tail in the final
+        // chunk. Tombstones in two different four-row blocks force the exact
+        // per-row fallback while the remaining blocks use the fused x4 kernel.
+        let path = temp_index_path("int8-row-block-orig-parity");
+        let dim = 33;
+        let count = 10_003;
+        let vectors: Vec<Vec<f32>> = (0..count)
+            .map(|i| {
+                (0..dim)
+                    .map(|j| {
+                        let mut s = (i as u64).wrapping_mul(2_654_435_761)
+                            ^ (j as u64).wrapping_mul(40_503);
+                        s ^= s >> 13;
+                        ((s & 0xffff) as f32 / 65_535.0) - 0.5
+                    })
+                    .collect()
+            })
+            .collect();
+        let rows = create_rows(&vectors);
+        let row_refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+            .collect();
+        write_index(&path, &row_refs).expect("write index");
+        let mut index = VectorIndex::open(&path).expect("open index");
+        index
+            .soft_delete_batch(&["doc-001", "doc-004", "doc-4097", "doc-10002"])
+            .expect("soft delete mixed rows");
+
+        for qi in 0..3_usize {
+            let query: Vec<f32> = (0..dim)
+                .map(|j| (((qi * 11 + j * 7) % 29) as f32 / 29.0) - 0.5)
+                .collect();
+            for mult in [2, 3, 5, 10] {
+                let orig = index
+                    .bench_search_top_k_int8_two_pass_orig(&query, 10, mult)
+                    .expect("original int8 two-pass");
+                let candidate = index
+                    .bench_search_top_k_int8_two_pass_row_block_candidate(&query, 10, mult)
+                    .expect("row-blocked int8 two-pass");
+                assert_eq!(candidate.len(), orig.len());
+                for (candidate_hit, orig_hit) in candidate.iter().zip(&orig) {
+                    assert_eq!(candidate_hit.index, orig_hit.index, "qi={qi} mult={mult}");
+                    assert_eq!(candidate_hit.doc_id, orig_hit.doc_id, "qi={qi} mult={mult}");
+                    assert_eq!(
+                        candidate_hit.score.to_bits(),
+                        orig_hit.score.to_bits(),
+                        "qi={qi} mult={mult}"
+                    );
+                }
+            }
         }
     }
 
