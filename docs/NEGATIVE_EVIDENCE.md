@@ -10997,3 +10997,44 @@ decode-bound and mined (FMA rejected, 4-acc ILP landed), chunk tuning doesn't pa
 algorithmic (early-abandon needs an index-build dim-reorder + suffix-norm transform — cross-lane, real-corpus
 validation) or quantized (int8 maddubs landed; scan-level speed blocked on worker isolation, bd-sqwx). All
 builds/benches remote; no local cargo; no production change.
+
+### 2026-07-10 — cc_fse — FRONTIER MAP + HOLD: the frankensearch-ownable search hot paths are mined; remaining wins need external state (worker isolation / product sign-off / Tantivy-internal)
+
+After a long session mining scan → fusion → lexical, the ownable, unblocked, decidable levers are exhausted.
+Concise map of each primitive the prompt named (lexical/scan/index/postings/tokenizer), what shipped, and what
+is left.
+
+**LEXICAL text-prep (per-doc index path) — 4 WINS this session, now optimized.** All byte-identical, each shipped
+in place with the original retained doc-hidden + a reproducible null-controlled A/B:
+- tokenizer `next_char_from` ASCII byte fast-path — **1.355×** (`517cea9`).
+- `cass_build_preview` bulk-copy vs char-by-char push — **3.07×** (`8fde796`).
+- `cass_prefix_source` O(n)→O(1) boundary walk — ~3333× on the >4 KiB truncation path (`f6c15f5`).
+- `cass_generate_edge_ngrams` ASCII fast-path (skip char_indices re-decode) — **~1.08×** (`b7e87dc`).
+Remaining lexical functions are NOT worth a lever: `CassNormalizeAndLimit` already uses `make_ascii_lowercase`
+(optimal); `HyphenDecompose` early-outs for non-hyphenated tokens and its hyphenated allocs are Tantivy-required;
+`CjkBigramDecompose`/`cjk_bigrams` fire only on CJK; `cass_sanitize_query`/`cass_escape_regex`/
+`cass_parse_boolean_query`/`cass_build_tantivy_query` are **query-time** (once per query — dominated by Tantivy's
+search, not the parse). The base tokenizer's per-token `token.text.push_str` copy is required by Tantivy's owned
+`Token`.
+
+**VECTOR SCAN — exhausted/blocked (this session + prior).** f16 dot is `cvtph2ps`-decode-bound: FMA rejected
+(median 1.0351, inside floor, `e1f8eea`), chunk-size widening rejected (median 1.0445, `3809124`), 4-acc ILP
+already landed. int8: `vpmaddubs` kernel landed 1.23× isolated + recall-proven (`fc194e9`/`05633ad`), but the
+**scan-level** speedup is not robustly decidable under fleet contention (two runs disagreed, `bf5d045`) — blocked
+on worker isolation (`bd-sqwx`), same block as cod's int8 micro-opt.
+
+**POSTINGS / BM25 — not ownable.** These are Tantivy internals; frankensearch wraps them.
+
+**FUSION — heavily mined earlier this session** (null-control harness promoted to core; smoothing/hubness wired;
+pool-min-max re-decided). Not in the prompt's list but noted for completeness.
+
+**Blocked levers with real headroom, awaiting external state (not codeable now):**
+- int8 maddubs **scan-level** speed → worker isolation/affinity so the ~1.09× clears the null floor (`bd-sqwx`).
+- ANN-in-BOLD (2.6–5× vector tier @ ≥0.975 recall) → a recall-budget **product sign-off** (`ann-in-bold-viable`).
+- early-abandon / bucketed scan → an index-build dim-reorder + suffix-norm transform (cross-cutting format
+  change) + real-corpus validation.
+- symbolized self-time for any frame-level claim → `rch exec` cannot pin the one perf-capable worker (`bd-e41k`).
+
+**HOLD.** No further ownable, unblocked, decidable lever is available without one of the above external unblocks
+or a new workload. Recommend: resume when worker isolation lands (unblocks the int8 scan-level A/B), or on a
+product decision for ANN / a query-log for hubness `r_d` (`bd-bc2n`/`bd-sj36`). No code changed in this entry.
