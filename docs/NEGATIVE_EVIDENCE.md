@@ -10283,3 +10283,45 @@ kernel genuinely is not a drop-in there and its hand-rolled 4-accumulator loop s
 
 **Verified:** RCH worker `hz2`, one Criterion binary, `ORIG_scalar` first AND last (ordering bias 0.04–0.79%),
 parity gates green (`simd` bit-identical to shipped; all candidates within `max Δr_d < 1e-4` of scalar).
+
+---
+
+## 2026-07-10 — REJECTED: pre-widened int8 query sidecar for FSVI two-pass pass-1 — quality parity holds, but AVX2 scan regresses 4–6% (cod_fs)
+
+**Rejected lever (`bd-b5wl`).** Pre-widen the int8 query once into per-32-byte `[i16; 16]` low/high sidecar
+lanes and call a new `dot_i8_prepared` from `VectorIndex::int8_scan_range`, mirroring the landed
+`dot_4bit_prepared` query-lane win. The hypothesis was that avoiding query `i8 -> i16` sign-extension for
+every row would extend the f16/4-bit/int8 slab family into a more fused end-to-end int8 scan.
+
+**Ledger/negative-evidence check before trying:** no prior rejection existed for int8 prepared query lanes.
+Closed no-retry items were respected: no flat-CSR graph-rank retry, no tombstone-bitmap-in-fused-int8 retry,
+no slot-aligned VALUES dedup join.
+
+**Same-worker A/B, RCH `ovh-a`, release profile, `fsvi_int8_two_pass`, N=100k, dim=384, k=10, sample-size 10,
+warm-up 0.1 s, measurement 0.5 s.** Baseline was a detached worktree at `8aa33b1`
+(`perf(index): dispatch FSVI int8 byte slab quantizer`); candidate was the prepared-query patch before revert.
+
+| arm | old code | prepared-query candidate | ratio | quality gate |
+|---|---:|---:|---:|---|
+| flat exact | 1.4936 ms [1.4644, 1.5210] | 1.4617 ms [1.4489, 1.4746] | 0.979 | exact reference |
+| int8_mult5 | **446.77 µs** [438.64, 459.60] | 464.52 µs [456.84, 472.46] | **1.040 / 4.0% slower** | recall@10=1.0000, nDCG@10=1.0000 |
+| int8_mult10 | **515.56 µs** [501.84, 527.32] | 545.71 µs [526.90, 571.33] | **1.058 / 5.8% slower** | recall@10=1.0000, nDCG@10=1.0000 |
+
+Candidate-only visibility added to the bench: `int8_mult3` was 425.22 µs [415.09, 440.37] with
+recall@10=1.0000 and nDCG@10=1.0000. This is useful route-next evidence for a separate candidate-budget
+sweep, but it is not evidence for the prepared-query sidecar because the old code did not time a mult3 arm
+in the baseline worktree.
+
+**Why it loses:** the current AVX2 `dot_i8_i8` query decode is cheap and L1-hot: it loads 32 query bytes and
+uses two `vpmovsxbw` sign-extends per 32 dims. The prepared sidecar replaces that with two 32-byte i16 loads
+per 32 dims (64 query-side bytes), so it doubles query operand load footprint while only removing cheap
+sign-extension uops. The stored vector still has to be sign-extended per row. At dim=384, the extra sidecar
+traffic and pointer chasing outweigh the decode saved.
+
+**Decision:** REJECTED; production source restored to the original `dot_i8_i8` scan path. Keep only the
+benchmark quality-gate improvement (`nDCG@K` printout and `int8_mult3` latency arm), because the user-facing
+method now requires recall **and** nDCG parity gates for this lane. Do **not** retry a per-dot i16 query
+sidecar. Retry condition: only revisit query preparation as a different primitive that reuses the widened
+query registers across multiple stored rows per chunk (row-blocked/k-row dot) or uses a hardware dot-product
+instruction path that reduces both decode and load pressure; otherwise measure the candidate-budget
+multiplier sweep separately.

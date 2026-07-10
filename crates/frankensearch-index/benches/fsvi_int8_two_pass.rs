@@ -64,6 +64,29 @@ fn recall_at_k(exact: &[String], approx: &[String]) -> f64 {
     hits as f64 / exact.len().max(1) as f64
 }
 
+fn ndcg_at_k(exact: &[String], approx: &[String]) -> f64 {
+    let k = exact.len().min(approx.len());
+    if k == 0 {
+        return 1.0;
+    }
+    let gain_for = |doc: &str| {
+        exact
+            .iter()
+            .position(|id| id == doc)
+            .map_or(0.0, |rank| (k - rank) as f64)
+    };
+    let dcg: f64 = approx
+        .iter()
+        .take(k)
+        .enumerate()
+        .map(|(rank, doc)| gain_for(doc) / ((rank + 2) as f64).log2())
+        .sum();
+    let ideal: f64 = (0..k)
+        .map(|rank| (k - rank) as f64 / ((rank + 2) as f64).log2())
+        .sum();
+    dcg / ideal
+}
+
 fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
     let dir = std::env::temp_dir().join(format!("fsvi_int8_two_pass_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create bench dir");
@@ -101,7 +124,8 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
 
     // ── Recall@K sweep over candidate_multiplier. ──
     for mult in [2usize, 3, 5, 10] {
-        let mut total = 0.0;
+        let mut recall_total = 0.0;
+        let mut ndcg_total = 0.0;
         for (qi, query) in queries.iter().enumerate() {
             let approx: Vec<String> = index
                 .search_top_k_int8_two_pass(query, K, mult)
@@ -109,15 +133,17 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
                 .into_iter()
                 .map(|h| h.doc_id.to_string())
                 .collect();
-            total += recall_at_k(&exact[qi], &approx);
+            recall_total += recall_at_k(&exact[qi], &approx);
+            ndcg_total += ndcg_at_k(&exact[qi], &approx);
         }
         eprintln!(
-            "[fsvi_int8_two_pass] N={N} dim={DIM} k={K} mult={mult} recall@{K}={:.4}",
-            total / QUERIES as f64
+            "[fsvi_int8_two_pass] N={N} dim={DIM} k={K} mult={mult} recall@{K}={:.4} ndcg@{K}={:.4}",
+            recall_total / QUERIES as f64,
+            ndcg_total / QUERIES as f64
         );
     }
 
-    // ── Latency: flat exact vs int8 two-pass at mult=5 and mult=10. ──
+    // ── Latency: flat exact vs int8 two-pass across quality-gated budgets. ──
     let mut qi = 0usize;
     let mut g = c.benchmark_group("fsvi_int8_two_pass");
     g.bench_function("flat", |b| {
@@ -127,7 +153,7 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
             black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
         });
     });
-    for mult in [5usize, 10] {
+    for mult in [3usize, 5, 10] {
         g.bench_function(format!("int8_mult{mult}"), |b| {
             b.iter(|| {
                 let q = &queries[qi % QUERIES];
