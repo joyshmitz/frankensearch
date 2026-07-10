@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{FusedHit, FusionStrategy, ScoreSource, ScoredResult, VectorHit};
+use frankensearch_fusion::bench_support::paired_median_ratio;
 use frankensearch_fusion::rrf::rrf_fuse_with_graph_merge_unique;
 use frankensearch_fusion::{RrfConfig, fuse_by_strategy, pool_minmax_fuse, pool_minmax_fuse_merge};
 
@@ -129,6 +130,74 @@ fn bench(c: &mut Criterion) {
 
         assert_bit_identical(&lex, &sem, all, &cfg, &format!("limit_all/{pool}"));
         assert_bit_identical(&lex, &sem, 10, &cfg, &format!("top10/{pool}"));
+
+        // ── DECIDABILITY: A/A null control vs the limit_all merge lever (bd-zgq6) ──────────
+        //
+        // The criterion `limit_all_ORIG`/`limit_all_merge` arms below run as separate benchmarks,
+        // minutes apart, so drift between them is NOT cancelled — its A/A null on this fleet is
+        // ~±12%, and the claimed merge win (1.15–1.32×) partly sits inside that. This alternating
+        // -round sampler (shared harness, promoted to core) collapses the floor and gives a
+        // decidable verdict. Gate on the median vs the null p5..p95 spread.
+        let null = paired_median_ratio(
+            41,
+            8,
+            || {
+                black_box(pool_minmax_fuse(
+                    black_box(&lex),
+                    black_box(&sem),
+                    all,
+                    0,
+                    &cfg,
+                ));
+            },
+            || {
+                black_box(pool_minmax_fuse(
+                    black_box(&lex),
+                    black_box(&sem),
+                    all,
+                    0,
+                    &cfg,
+                ));
+            },
+        );
+        // Candidate = merge / ORIG, so <1.0 means the merge structure is faster.
+        let lever = paired_median_ratio(
+            41,
+            8,
+            || {
+                black_box(pool_minmax_fuse(
+                    black_box(&lex),
+                    black_box(&sem),
+                    all,
+                    0,
+                    &cfg,
+                ));
+            },
+            || {
+                black_box(pool_minmax_fuse_merge(
+                    black_box(&lex),
+                    black_box(&sem),
+                    all,
+                    0,
+                    &cfg,
+                ));
+            },
+        );
+        eprintln!(
+            "[null]  limit_all/{pool}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] limit_all/{pool}: merge/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR (not decidable)"
+            }
+        );
 
         // limit_all — the shape the merge structure targets.
         g.bench_with_input(BenchmarkId::new("limit_all_ORIG", pool), &(), |b, ()| {

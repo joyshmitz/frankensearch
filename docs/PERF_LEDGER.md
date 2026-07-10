@@ -3996,6 +3996,28 @@ better-quality `mutual` refinement once it lands.
 
 ## 2026-07-09 — Pool-min-max fusion: merge-structured sort (near-sorted input) — 1.15–1.32× limit_all, no top-k regression (CopperVireo)
 
+> **✅ 2026-07-10 NULL CONTROL (cc_fse, `bd-zgq6`): WIN CONFIRMED and STRENGTHENED at pool 1000; pool 50/100 were
+> NOT decidable.** The `1.15–1.32×` above came from two separate criterion arms (`limit_all_ORIG`/`limit_all_merge`)
+> which do not cancel drift. Re-measured with the shared alternating-round sampler + A/A null control
+> (`frankensearch_core::bench_support::paired_median_ratio`, now used by this bench), worker `hz1`, binary sha256
+> `c137a84a28908edabecb2ac85aa5efbc8d85440d6a35b9076f9873430c9a5229`, 41 rounds × 8. Ratio is **merge/ORIG**, so
+> `<1.0` = merge faster:
+>
+> | pool | NULL median [p5,p95] | merge/ORIG median [p5,p95] | verdict |
+> |---:|---|---|---|
+> | 50   | 0.9972 [0.762, 1.010] | 0.9152 [0.669, 0.943] | **INSIDE FLOOR — not decidable** |
+> | 100  | 1.0011 [0.868, 1.151] | 0.9237 [0.826, 1.094] | **INSIDE FLOOR — not decidable** |
+> | 1000 | 1.0015 [0.969, 1.036] | **0.7400 [0.710, 0.934]** | **DECIDABLE — merge 1.35× faster** (lever p95 0.934 < null p5 0.969) |
+>
+> At pool 1000 the merge structure is **1.35× faster** — clearly outside the floor, and *better* than the original
+> `1.32×`. But at pool 50/100 the workload is tiny and the ±12–15% null floor swallows the effect: the original
+> `1.15×` pool-50 figure was **inside the noise floor** and never decidable that way. Same shape as the smoothing
+> re-sort (2026-07-10 second correction): a structural sort win that is real and grows with N, decidable only once
+> N is large enough that the per-round noise no longer dominates. **The WIN stands** (the shipped production shape
+> is `limit_all` returning a full feed to the reranker, i.e. large N); only the small-pool magnitudes are withdrawn.
+> Bit-identity between the two operators is asserted before timing (unchanged). No self-time taken (the sort is the
+> whole measured routine; bit-identity + the reachability of both operators is the execution evidence).
+
 Sibling-path-consistency win on a fresh path (the pool-min-max SCORE operator was landed 07-09 for QUALITY,
 `a9e53b4`, +0.0038 nDCG@10-over-RRF, never perf-mined). The **production** searcher fuses via
 `rrf_fuse_with_graph_merge_unique` — the MERGE-structured RRF (`4aeb66b`, 1.31–1.46× on limit_all). But

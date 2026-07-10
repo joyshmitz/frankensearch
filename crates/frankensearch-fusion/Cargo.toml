@@ -69,6 +69,8 @@ harness = false
 [[bench]]
 name = "pool_minmax_merge_ab"
 harness = false
+# Uses the shared null-control sampler (bd-zgq6).
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "neighbor_smooth"
