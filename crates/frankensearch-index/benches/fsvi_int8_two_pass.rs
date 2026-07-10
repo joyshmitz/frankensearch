@@ -168,7 +168,7 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
     }
     g.finish();
 
-    std::fs::remove_dir_all(&dir).ok();
+    eprintln!("[fsvi_int8_two_pass] retained fixture at {}", dir.display());
 }
 
 criterion_group!(benches, bench_fsvi_int8_two_pass);
