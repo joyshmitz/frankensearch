@@ -442,6 +442,85 @@ unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> 
     result
 }
 
+/// `vfmadd`-based f16-bytes·f32 dot — **REJECTED bench-only candidate**, retained so the negative
+/// result stays reproducible (`docs/NEGATIVE_EVIDENCE.md`, 2026-07-10). Same 4-accumulator structure
+/// and F16C decode as [`dot_product_f16_bytes_f32_avx2`], but the SIMD main loop fuses `stored·q +
+/// acc` into one `_mm256_fmadd_ps` instead of a separate `_mm256_mul_ps` + `_mm256_add_ps`. It is
+/// sub-ULP-different but order-preserving (`fma_f16_dot_is_ulp_close_and_order_preserving`) — so it
+/// *could* have shipped. It does not: the kernel is **`cvtph2ps`-decode-bound**, not FP-port-bound,
+/// so fusing the arithmetic buys nothing. Null-controlled microbench: fma/ORIG median **1.0351**,
+/// inside the null floor [0.9140, 1.0488] (if anything marginally slower). Do not wire into the
+/// scan.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c,fma")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_product_f16_bytes_f32_fma_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
+    use core::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+    let dim = query.len();
+    let chunks = dim / 8;
+    let mut arr = [0.0_f32; 8];
+    macro_rules! fma_chunk {
+        ($c:expr, $acc:expr) => {{
+            let f16bits = _mm_loadu_si128(stored_bytes.as_ptr().add($c * 16).cast::<__m128i>());
+            let stored = _mm256_cvtph_ps(f16bits);
+            let q = _mm256_loadu_ps(query.as_ptr().add($c * 8));
+            $acc = _mm256_fmadd_ps(stored, q, $acc);
+        }};
+    }
+    // SAFETY: avx2+f16c+fma by contract; every load is `chunk_index < chunks`-bounded.
+    unsafe {
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut s2 = _mm256_setzero_ps();
+        let mut s3 = _mm256_setzero_ps();
+        let mut c = 0;
+        while c + 4 <= chunks {
+            fma_chunk!(c, s0);
+            fma_chunk!(c + 1, s1);
+            fma_chunk!(c + 2, s2);
+            fma_chunk!(c + 3, s3);
+            c += 4;
+        }
+        while c < chunks {
+            fma_chunk!(c, s0);
+            c += 1;
+        }
+        let sum = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+        _mm256_storeu_ps(arr.as_mut_ptr(), sum);
+    }
+    let mut result = f32x8::from(arr).reduce_add();
+    for index in (chunks * 8)..dim {
+        let b = &stored_bytes[index * 2..];
+        let val = f16::from_le_bytes([b[0], b[1]]).to_f32();
+        result = val.mul_add(query[index], result);
+    }
+    result
+}
+
+/// FMA f16-bytes·f32 dot with AVX2+F16C+FMA dispatch (scan lever). Falls back to the exact
+/// [`dot_product_f16_bytes_f32_generic`] off-dispatch. See [`dot_product_f16_bytes_f32_fma_avx2`] for
+/// the sub-ULP (ranking-safe) caveat.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_product_f16_bytes_f32_fma(stored_bytes: &[u8], query: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("f16c")
+            && std::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: avx2+f16c+fma verified present by the runtime checks above.
+            #[allow(unsafe_code)]
+            return unsafe { dot_product_f16_bytes_f32_fma_avx2(stored_bytes, query) };
+        }
+    }
+    dot_product_f16_bytes_f32_generic(stored_bytes, query)
+}
+
 /// Portable (`wide`-SIMD) f16-bytes·f32 dot — the AVX2+F16C-dispatch fallback and
 /// the path on non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) for the bench A/B.
 #[doc(hidden)]
@@ -2808,6 +2887,69 @@ mod tests {
         assert!(
             any_diff,
             "uniform ±127 is expected to saturate maddubs; if it no longer does, revisit the recall bound"
+        );
+    }
+
+    /// CORRECTNESS + ORDERING GATE for the FMA f16 dot (scan lever). FMA is not bit-identical to
+    /// mul+add (it rounds the product-sum once vs twice), but the difference is sub-ULP relative to
+    /// the score scale, and — the load-bearing property for a *ranking* kernel — it must not reorder
+    /// a corpus vs the shipped kernel. Asserts a tiny relative delta AND identical top-k order on a
+    /// realistic f16 corpus.
+    #[test]
+    fn fma_f16_dot_is_ulp_close_and_order_preserving() {
+        let dim = 384;
+        let query: Vec<f32> = {
+            let mut v: Vec<f32> = (0..dim)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 40) as f32 / 1e6 - 0.5)
+                .collect();
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            for x in &mut v {
+                *x /= n;
+            }
+            v
+        };
+        let mk_bytes = |seed: u64| -> Vec<u8> {
+            let mut s = seed | 1;
+            let mut f: Vec<f32> = (0..dim)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    ((s >> 40) as f32 / 1e6) - 0.5
+                })
+                .collect();
+            let n = f.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            for x in &mut f {
+                *x /= n;
+            }
+            f.iter()
+                .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+
+        let mut base: Vec<(f32, usize)> = Vec::new();
+        let mut fma: Vec<(f32, usize)> = Vec::new();
+        let mut max_rel = 0.0_f64;
+        for v in 0..128usize {
+            let bytes = mk_bytes(0x50 + v as u64);
+            let b = dot_product_f16_bytes_f32(&bytes, &query).expect("base");
+            let f = dot_product_f16_bytes_f32_fma(&bytes, &query);
+            let scale = f64::from(b.abs().max(1e-6));
+            max_rel = max_rel.max(f64::from((b - f).abs()) / scale);
+            base.push((b, v));
+            fma.push((f, v));
+        }
+        assert!(
+            max_rel < 1e-4,
+            "FMA vs mul+add relative delta {max_rel} exceeds the sub-ULP ranking-safe band"
+        );
+        base.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        fma.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let btop: Vec<usize> = base[..10].iter().map(|&(_, v)| v).collect();
+        let ftop: Vec<usize> = fma[..10].iter().map(|&(_, v)| v).collect();
+        assert_eq!(
+            btop, ftop,
+            "FMA must not reorder the top-10 vs the shipped f16 dot"
         );
     }
 

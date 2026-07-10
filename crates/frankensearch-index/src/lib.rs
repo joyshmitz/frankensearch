@@ -84,12 +84,13 @@ pub use search::{PARALLEL_CHUNK_SIZE, PARALLEL_THRESHOLD, SearchParams};
 pub use simd::{
     PreparedQuery4bit, cosine_similarity_f16, dot_4bit_prepared, dot_4bit_prepared_generic,
     dot_i8_i8, dot_i8_i8_generic, dot_i8_i8_maddubs, dot_i8x4_i8_maddubs, dot_packed_4bit,
-    dot_product_f16_bytes_f32, dot_product_f16_bytes_f32_generic, dot_product_f16_f32,
-    dot_product_f16_f32_generic, dot_product_f32_bytes_f32, dot_product_f32_bytes_f32_generic,
-    dot_product_f32_f32, dot_product_f32_f32_generic, encode_f32_to_f16_extend,
-    encode_f32_to_f16_extend_generic, maddubs_query_bias, pack_f16_slab_to_4bit,
-    pack_f16_slab_to_4bit_generic, prepare_4bit_query, quantize_f16_le_bytes_to_i8,
-    quantize_f16_le_bytes_to_i8_generic, quantize_f16_slab_to_i8, quantize_f16_slab_to_i8_generic,
+    dot_product_f16_bytes_f32, dot_product_f16_bytes_f32_fma, dot_product_f16_bytes_f32_generic,
+    dot_product_f16_f32, dot_product_f16_f32_generic, dot_product_f32_bytes_f32,
+    dot_product_f32_bytes_f32_generic, dot_product_f32_f32, dot_product_f32_f32_generic,
+    encode_f32_to_f16_extend, encode_f32_to_f16_extend_generic, maddubs_query_bias,
+    pack_f16_slab_to_4bit, pack_f16_slab_to_4bit_generic, prepare_4bit_query,
+    quantize_f16_le_bytes_to_i8, quantize_f16_le_bytes_to_i8_generic, quantize_f16_slab_to_i8,
+    quantize_f16_slab_to_i8_generic,
 };
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,

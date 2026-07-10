@@ -177,3 +177,8 @@ required-features = ["bench-internals"]
 name = "int8_scan_maddubs_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "f16_dot_fma_ab"
+harness = false
+required-features = ["bench-internals"]

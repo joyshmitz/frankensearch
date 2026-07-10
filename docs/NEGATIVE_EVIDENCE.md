@@ -10926,3 +10926,40 @@ kernel** (the isolated 1.23× is decidable and stands, `int8_dot_maddubs_ab`). R
 variance collapses and a real ~1.09× median can clear the floor repeatably. Self-time: the maddubs leaf
 replaces the 44.54%-self-time `dot_i8_i8_avx2` frame (cod's `perf`), so the Amdahl ceiling is fixed and
 real; only the measurement is blocked. No production behaviour changed; all builds/benches remote.
+
+### 2026-07-10 — cc_fse — REJECTED: FMA in the f16 flat-scan dot buys nothing — the kernel is `cvtph2ps`-DECODE-bound, not FP-port-bound (fma/ORIG median 1.0351, inside the null floor)
+
+**Profile-first was blocked**, so this is measure-the-lever with a strong prior. The f16 flat scan
+(`scan_range_chunk` → `dot_product_f16_bytes_f32`) is the default vector-search hot path; I wanted a fresh frame
+table but `perf` is usable only on `hetzner1` and `rch exec` cannot pin a worker — three assignments (`hz2`,
+`fixmydocuments` ×2) produced no symbolized samples (bd-e41k). So I reasoned from cod's int8 profile + the ledger
+("f16 dot is decode-bound, 4-acc ILP landed") and tested the one **unmined** micro-lever: the shipped f16 dot's
+SIMD body does a separate `_mm256_mul_ps` + `_mm256_add_ps` per chunk (two ops), while the scalar tail already
+uses `mul_add` (FMA). Replacing the body's mul+add with `_mm256_fmadd_ps` (one op) would relieve FP-port pressure
+**iff** the kernel is FP-port-bound rather than `cvtph2ps`-decode-bound.
+
+**Correctness — PASSED (so it could have shipped).** FMA rounds the product-sum once vs mul+add's twice, a
+sub-ULP difference; `fma_f16_dot_is_ulp_close_and_order_preserving` asserts relative delta < 1e-4 AND identical
+top-10 order on a realistic f16 corpus. Ranking-safe, same class as `mmr::cosine_sim_pre`. So the reject is on
+speed alone, not correctness.
+
+**Speed — NO WIN (the reject).** Isolated null-controlled microbench (`benches/f16_dot_fma_ab.rs`, dim 384 ×
+batch 4096, shared alternating-round sampler, one binary / one `rch` invocation, worker `hz2`/`hetzner2`, binary
+sha256 `d0cd5939d978e831984342f9c7daa56210b9ea0b8eb3777d93010783289b7486`, 41 rounds × 4):
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (mul+add vs mul+add) | 0.9946 [0.9140, 1.0488] |
+| fma / ORIG | **1.0351 [0.9658, 1.0991]** |
+
+fma/ORIG median 1.0351 is **inside** the null floor [0.9140, 1.0488] — not decidable, and if anything marginally
+*slower*. FMA does not beat mul+add. **Mechanism confirmed:** the f16 dot is bound by the `cvtph2ps` decode
+(~1/cycle on Zen), so fusing the FP arithmetic — which was not the bottleneck — buys nothing. This closes a gap
+the ledger implied but never measured directly (the "4-acc ILP" landing was about accumulators, not FMA).
+
+**Retained** as a doc-hidden bench-only candidate (`dot_product_f16_bytes_f32_fma`) + test + bench so the
+rejection stays reproducible (both arms in-tree, per the ledger-integrity standard). No production behaviour
+changed. Route-next: the only remaining f16-scan wins are algorithmic (early-abandon/bucketed — real-corpus
+validation) or the quantized paths (int8 maddubs kernel landed; its scan-level speed blocked on worker isolation,
+bd-sqwx), not a dot micro-op. Self-time not obtained (perf-worker pinning blocked); the decode-bound conclusion
+rests on the null-controlled ratio + the mechanism. All builds/benches remote; no local cargo.
