@@ -10527,3 +10527,39 @@ reachability evidence — self-time, or an execution/displacement counter as in 
 slot-join *would* win — only that the rows as written do not license closing those doors. `cod` owns the int8 ADC
 sidecar in `-index`; `bd-6m8p` is filed, not started. All commands run for this audit were `grep`/`sed` reads; no
 cargo, local or remote.
+
+---
+
+## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: unbatched paired int8 row-block A/B exceeds the 5% CV gate (cod_fse)
+
+**This rejects the timing bundle, not the row-blocked candidate.** The first same-binary A/B of the four-row
+AVX2 query-reuse candidate ran both ORIGINAL and candidate in every measured routine, counterbalanced AB/BA
+order, and black-boxed both input and result. It was one `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch
+exec -- cargo bench ...` invocation on worker `hz1` (AMD EPYC-Milan, four cores/eight threads), with
+`RAYON_NUM_THREADS=4`, `release-perf`, frame pointers, N=100k, dim=384, k=10, 50 samples, 2 s warm-up, and
+10 s measurement. The exact binary SHA-256 was
+`bd7d9f391be72a07e35a8feb397a8822f5f5cc112d5c23c10590e779dd04f333`.
+
+| arm | Criterion JSON mean | stddev | CV | candidate/original |
+|---|---:|---:|---:|---:|
+| paired ORIGINAL mult3 | 702.141 us | 75.852 us | **10.80%** | — |
+| paired four-row candidate mult3 | 691.757 us | 20.621 us | 2.98% | 0.9852 |
+| paired ORIGINAL mult5 | 729.482 us | 63.880 us | **8.76%** | — |
+| paired four-row candidate mult5 | 798.669 us | 61.533 us | **7.70%** | 1.0948 |
+
+Recall@10 and nDCG@10 were both exactly 1.0000 for both arms at multipliers 2, 3, 5, and 10, and the bench
+also asserted bit-exact index/doc/score parity. The apparent mult3 improvement and mult5 loss are **not a
+keep/reject verdict** because three of four arms violate the predeclared CV <5% gate.
+
+**Ledger-integrity profile.** Before recording this rejected bundle, the exact measured binary was run for
+30 seconds under `perf record -F 997 -e cycles:u -g --call-graph fp`, pinned to CPUs 0-3. The profile captured
+111,336 samples with zero lost. The candidate leaf `dot_i8x4_i8_avx2` had **39.24% flat self-time** and its
+runtime-dispatch wrapper `dot_i8x4_i8` had 0.98%, proving the candidate executed; the interleaved ORIGINAL
+leaf `dot_i8_i8_avx2` had 38.37%. The profile artifact is
+`/tmp/bd-b5wl-row4-ab1-profile-20260710-1415.perf.data` on `hz1`, SHA-256
+`8965dce4c9acecdc559c91de9cf005e11dd7c40b32a28e7244159c8c62231687`.
+
+**Decision:** REJECT this unbatched measurement configuration only. Do not use its ratios to accept or reject
+the production lever. Retry condition: preserve the same one-binary interleaving and parity gates, but make
+each Criterion iteration a fixed multi-query AB/BA batch and report batch-normalized per-search means; this
+amortizes worker scheduling jitter without splitting arms across workers or invocations.
