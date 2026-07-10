@@ -4152,3 +4152,62 @@ and each `r_d` is independent — a rayon `par_iter()` measured **5.85× on top 
 @ 1000×100×384) and is **bit-identical** to the serial `simd` arm (indexed parallel iterator preserves order;
 no element's arithmetic changes; asserted by the `simd_par` vs `simd` gate). Held back as a separate lever
 because it changes the threading behaviour of a public library fn and wants a work-based threshold.
+
+---
+
+### 2026-07-09 — hubness `r_d` builder: rayon over the outer doc loop — 5.49× on top of the AVX2 dot, bit-identical (cc_fs)
+
+**Lever (bd-i8sp, `crates/frankensearch-fusion/src/hubness.rs`).** Follow-up to `8bf3a00` (which replaced the
+hand-rolled dot with the vector tier's AVX2 `dot_product_f32_f32`, 10.89×). Each doc's `r_d` depends only on
+that doc and the whole query sample — never on the other docs — so the outer `doc_vecs.iter().map(..)` is
+embarrassingly parallel. It now runs on rayon above [`PARALLEL_THRESHOLD`] **dot products** of total work
+(`docs · queries`), serial below, where the pool's fork/join overhead would dominate a microsecond batch.
+
+The threshold counts dot products, **not documents**: one doc's work is `queries · dim` multiply-adds, so a
+doc-count gate would misjudge a small corpus against a large query log. `PARALLEL_THRESHOLD` already carries
+the same "10k dot products" meaning in `frankensearch-index`'s flat scan, so the constant transfers intact.
+
+**Parity: BIT-IDENTICAL, not merely ULP-equal.** rayon's *indexed* parallel iterator collects in input order
+and no element's arithmetic changes — only the scheduling does. Proven three ways: the unit test
+`hubness_par_matches_serial_across_threshold` evaluates the *same two docs* below the gate (2×60 = 120 dot
+products, serial) and above it (200×60 = 12 000, rayon) and requires their `r_d` to agree to the bit — padding
+cannot change a doc's `r_d`, which isolates the branch as the only variable — and also asserts every padded
+slot holds the filler's value, catching reordering. The `hubness_dot_ab` bench additionally gates `simd_par`
+bit-identical to `simd` *and* to the shipped builder before any timing.
+
+**Measured (RCH worker, one Criterion binary, all arms share a build + machine; `ORIG_scalar` measured first
+AND last; `shipped` arm times the real `compute_query_hubness`, not a bench mirror):**
+
+```bash
+AGENT_NAME=cc_fs RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/hub-dot \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release --bench hubness_dot_ab
+```
+
+Decisive shape `hubness_build/500x200x384` — **every arm passes the cv_pct < 5 keep-gate**:
+
+| arm | mean | cv_pct | ratio vs ORIG | ratio vs `simd` |
+|---|---:|---:|---:|---:|
+| `ORIG_scalar` (pre-`8bf3a00` scalar dot, serial) | 22.748 ms | 0.50 | 1.000 | — |
+| `simd` (AVX2 dot, serial — the `8bf3a00` baseline) | 2.3430 ms | 1.89 | 0.103 / 9.71× | 1.000 |
+| **`shipped` (AVX2 dot + rayon)** | **426.65 µs** | **1.81** | **0.0188 / 53.3×** | **0.182 / 5.49×** |
+| `ORIG_scalar2` (ordering-bias control) | 23.080 ms | 0.26 | bias 1.46% | — |
+
+**Honest caveat on the second shape.** At `1000x100x384` the worker was contended during this run and the
+serial baselines destabilized: `simd` cv **14.79** and `multiacc` cv **5.70**, both failing the gate. Its
+`shipped` arm is clean (381.47 µs, cv 3.06) and beats the `ORIG_scalar2` control (22.447 ms, cv 0.72) by
+58.8×, but the *on-top-of-simd* ratio at that shape is **not quoted** because its denominator failed cv. The
+500×200×384 row above is the ledgered result. An earlier quiescent run measured 6.22×/6.42× on the same lever;
+5.49× is the conservative figure taken from the run where every arm cleared the gate.
+
+**Method note (cost me a re-run).** Criterion's in-code `benchmark_group.measurement_time()` **overrides** the
+`--measurement-time` CLI flag. The first attempt at tightening cv passed the flag and silently re-measured at
+the old 3 s window (`shipped` cv 7.33). cv shrinks with *iterations per sample*, so the fix is a longer
+`measurement_time` (3 s → 12 s) in the bench source; raising `sample_size` would *shrink* per-sample
+iterations and make cv worse.
+
+Conformance: `cargo test -p frankensearch-fusion --lib` → **852 passed, 0 failed**. `cargo clippy -p
+frankensearch-fusion --all-targets` → 0 errors, no warnings on the changed files. `ubs` exit 0, 0 critical.
+rustfmt introduces no new drift (the 4 residual `hubness.rs` sites pre-exist on `origin/main`).
+Original-comparator ratio **N/A** (offline builder, not the query path). Files: `hubness.rs`,
+`benches/hubness_dot_ab.rs`.

@@ -15,12 +15,13 @@
 //!      already depends on frankensearch-index, so this arm is pure reuse, not new code.
 //!      **KEPT: 11.34× on the dot, 10.89×/11.28× on the builder.** `multiacc` is retained as a
 //!      timed arm so the rejection stays reproducible rather than merely asserted.
-//! 2. **Outer loop (route-next, not yet landed).** Each doc's `r_d` is independent, so the
-//!    `doc_vecs.iter().map(..)` can be a rayon `par_iter()`. An indexed parallel iterator preserves
-//!    order and no element's arithmetic changes, so this is **bit-identical**, not merely ULP-equal
-//!    — the `simd` vs `simd_par` gate below asserts exactly that. Measured **5.85× on top of
-//!    `simd`** (2.0565 ms → 351.66 µs @ 1000×100×384). Held back as a separate lever: it changes
-//!    the threading behaviour of a public library fn and wants a work-based threshold.
+//! 2. **Outer loop (LANDED: `simd_par`).** Each doc's `r_d` is independent, so the
+//!    `doc_vecs.iter().map(..)` is a rayon `par_iter()` above `PARALLEL_THRESHOLD` dot products of
+//!    total work. An indexed parallel iterator preserves order and no element's arithmetic changes,
+//!    so this is **bit-identical**, not merely ULP-equal — the `simd_par` vs `simd` and `simd_par`
+//!    vs `shipped` gates below assert exactly that. Measured **5.85× on top of `simd`**
+//!    (2.0565 ms → 351.66 µs @ 1000×100×384). The `shipped` arm times the real
+//!    [`compute_query_hubness`] entry point, which takes the rayon branch at both shapes here.
 //!
 //! Parity gates run before any timing:
 //! - `simd` mirror is **bit-identical** to the shipped [`compute_query_hubness`] (mirror faithful —
@@ -212,9 +213,12 @@ fn bench(c: &mut Criterion) {
         let r_simd_par = hubness_par(&doc_vecs, &query_sample, kq, dot_simd);
         let r_ship = compute_query_hubness(&doc_vecs, &query_sample, kq);
 
-        // `simd` is what `hubness::dot` now delegates to, so the mirror must be bit-identical to
-        // the shipped builder. This is the gate that catches the bench drifting from src.
+        // `hubness::dot` delegates to the same AVX2 kernel as `dot_simd`, and above
+        // PARALLEL_THRESHOLD dot products the shipped builder takes its rayon branch — so the
+        // shipped result must be bit-identical to BOTH mirrors. These gates catch the bench
+        // drifting from src, and pin rayon to scheduling-only effects.
         assert_bit_identical(&r_simd, &r_ship, "simd mirror vs shipped");
+        assert_bit_identical(&r_simd_par, &r_ship, "simd_par mirror vs shipped");
         // rayon reorders scheduling, never arithmetic.
         assert_bit_identical(&r_simd_par, &r_simd, "simd_par vs simd");
         // Every reassociated candidate leaves the kq-nearest selection intact.
@@ -227,9 +231,14 @@ fn bench(c: &mut Criterion) {
         }
 
         let mut g = c.benchmark_group("hubness_build");
+        // The rayon arms are ~380 µs, short enough that fork/join jitter dominates a criterion
+        // sample built from few iterations. Criterion ramps iterations per sample to fill
+        // `measurement_time`, so a longer window (not a larger `sample_size`, which *shrinks*
+        // per-sample iterations) is what drives cv_pct down. At 3 s the `shipped` arm measured
+        // cv 7.3%; 12 s puts it under the 5% keep-gate.
         g.sample_size(30);
-        g.warm_up_time(Duration::from_millis(500));
-        g.measurement_time(Duration::from_millis(3000));
+        g.warm_up_time(Duration::from_millis(2000));
+        g.measurement_time(Duration::from_millis(12_000));
         let id = format!("{docs}x{queries}x{dim}");
         g.bench_with_input(BenchmarkId::new("ORIG_scalar", &id), &(), |bch, ()| {
             bch.iter(|| {
@@ -268,6 +277,18 @@ fn bench(c: &mut Criterion) {
                     black_box(&query_sample),
                     kq,
                     dot_simd,
+                ))
+            });
+        });
+        // The shipped public fn. Both shapes here exceed PARALLEL_THRESHOLD dot products, so this
+        // arm exercises its rayon branch and should track `simd_par`. Timing the real entry point
+        // — not just a mirror — is what the ledger ratio is quoted from.
+        g.bench_with_input(BenchmarkId::new("shipped", &id), &(), |bch, ()| {
+            bch.iter(|| {
+                black_box(compute_query_hubness(
+                    black_box(&doc_vecs),
+                    black_box(&query_sample),
+                    kq,
                 ))
             });
         });

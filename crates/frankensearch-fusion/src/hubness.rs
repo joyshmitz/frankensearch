@@ -28,7 +28,8 @@
 //!   pool, indexed by [`VectorHit::index`].
 
 use frankensearch_core::VectorHit;
-use frankensearch_index::dot_product_f32_f32;
+use frankensearch_index::{PARALLEL_THRESHOLD, dot_product_f32_f32};
+use rayon::prelude::*;
 
 /// Parameters for [`apply_hubness_penalty`] / [`compute_query_hubness`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -87,6 +88,19 @@ pub fn apply_hubness_penalty(
 /// (dot = cosine). Returns one `r_d` per doc in `doc_vecs` order (aligned with the vector-store
 /// index, so it indexes directly in [`apply_hubness_penalty`]). Empty sample / `kq == 0` → all
 /// zeros (identity). O(docs · queries · dim).
+///
+/// Each doc's `r_d` depends only on that doc and the whole query sample, so the outer loop is
+/// embarrassingly parallel. Above [`PARALLEL_THRESHOLD`] dot products of total work it runs on
+/// rayon; below it the pool's fork/join overhead would dominate a batch that already finishes in
+/// microseconds. The two branches are **bit-identical**, not merely ULP-equal: rayon's *indexed*
+/// parallel iterator collects in input order, and no element's arithmetic changes — only the
+/// scheduling does. `hubness_par_matches_serial_across_threshold` and the `hubness_dot_ab`
+/// `simd_par` vs `simd` gate both assert this.
+///
+/// The threshold counts **dot products** (`docs · queries`), not docs: one doc's work is
+/// `queries · dim` multiply-adds, so a doc-count gate would misjudge a small corpus against a
+/// large query log. [`PARALLEL_THRESHOLD`] carries the same "10k dot products" meaning in the
+/// vector tier's flat scan.
 #[must_use]
 pub fn compute_query_hubness(
     doc_vecs: &[&[f32]],
@@ -97,18 +111,30 @@ pub fn compute_query_hubness(
         return vec![0.0; doc_vecs.len()];
     }
     let k = kq.min(query_sample.len());
-    doc_vecs
-        .iter()
-        .map(|d| {
-            let mut sims: Vec<f32> = query_sample.iter().map(|q| dot(d, q)).collect();
-            let n = sims.len();
-            // Partition so the k largest sims land in [n-k..]; mean them = mean of the kq
-            // nearest queries. `pivot` is the element at n-k, `top` the k-1 above it.
-            let (_, pivot, top) = sims.select_nth_unstable_by(n - k, |a, b| a.total_cmp(b));
-            let sum: f32 = *pivot + top.iter().sum::<f32>();
-            sum / k as f32
-        })
-        .collect()
+    let work = doc_vecs.len().saturating_mul(query_sample.len());
+    if work >= PARALLEL_THRESHOLD {
+        doc_vecs
+            .par_iter()
+            .map(|d| doc_hubness(d, query_sample, k))
+            .collect()
+    } else {
+        doc_vecs
+            .iter()
+            .map(|d| doc_hubness(d, query_sample, k))
+            .collect()
+    }
+}
+
+/// One doc's `r_d`: the mean cosine to its `k` nearest queries in the sample.
+#[inline]
+fn doc_hubness(doc: &[f32], query_sample: &[&[f32]], k: usize) -> f32 {
+    let mut sims: Vec<f32> = query_sample.iter().map(|q| dot(doc, q)).collect();
+    let n = sims.len();
+    // Partition so the k largest sims land in [n-k..]; mean them = mean of the kq
+    // nearest queries. `pivot` is the element at n-k, `top` the k-1 above it.
+    let (_, pivot, top) = sims.select_nth_unstable_by(n - k, |a, b| a.total_cmp(b));
+    let sum: f32 = *pivot + top.iter().sum::<f32>();
+    sum / k as f32
 }
 
 /// Cosine dot of two L2-normalized vectors.
@@ -223,6 +249,67 @@ mod tests {
                 (r[i] - expect).abs() < 1e-6,
                 "doc {i}: {} vs scalar {expect}",
                 r[i]
+            );
+        }
+    }
+
+    /// The rayon branch must be **bit-identical** to the serial one, not merely close.
+    ///
+    /// A doc's `r_d` depends only on that doc and the query sample — never on how many *other*
+    /// docs are present. So the same two docs can be evaluated below the parallel threshold (2
+    /// docs × 60 queries = 120 dot products, serial) and above it (200 docs × 60 = 12 000,
+    /// rayon); their `r_d` must agree to the bit. That pins ordering (rayon's indexed parallel
+    /// iterator collects in input order) and arithmetic (unchanged per element) simultaneously.
+    #[test]
+    fn hubness_par_matches_serial_across_threshold() {
+        let dim = 32;
+        let mk = |seed: f32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim).map(|i| ((i as f32) * seed + seed).cos()).collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.into_iter().map(|x| x / norm).collect()
+        };
+        let queries: Vec<Vec<f32>> = (0..60).map(|i| mk(0.11 * (i as f32 + 1.0))).collect();
+        let qrefs: Vec<&[f32]> = queries.iter().map(Vec::as_slice).collect();
+
+        let d0 = mk(3.7);
+        let d1 = mk(9.1);
+
+        // Below threshold: 2 × 60 = 120 < PARALLEL_THRESHOLD → serial branch.
+        let serial: Vec<&[f32]> = vec![&d0, &d1];
+        assert!(
+            serial.len() * qrefs.len() < PARALLEL_THRESHOLD,
+            "test must stay serial"
+        );
+        let r_serial = compute_query_hubness(&serial, &qrefs, 10);
+
+        // Above threshold: 200 × 60 = 12 000 ≥ PARALLEL_THRESHOLD → rayon branch. The first two
+        // docs are the same two; padding cannot change their r_d.
+        let filler = mk(1.9);
+        let mut parallel: Vec<&[f32]> = vec![&d0, &d1];
+        parallel.extend(std::iter::repeat_n(filler.as_slice(), 198));
+        assert!(
+            parallel.len() * qrefs.len() >= PARALLEL_THRESHOLD,
+            "test must go parallel"
+        );
+        let r_parallel = compute_query_hubness(&parallel, &qrefs, 10);
+
+        assert_eq!(r_parallel.len(), 200);
+        for i in 0..2 {
+            assert_eq!(
+                r_serial[i].to_bits(),
+                r_parallel[i].to_bits(),
+                "doc {i}: serial {} vs parallel {}",
+                r_serial[i],
+                r_parallel[i]
+            );
+        }
+        // Order is preserved: every padded slot holds the filler's r_d, not a shuffled value.
+        let filler_rd = r_parallel[2];
+        for (i, r) in r_parallel.iter().enumerate().skip(2) {
+            assert_eq!(
+                r.to_bits(),
+                filler_rd.to_bits(),
+                "padded slot {i} out of order"
             );
         }
     }
