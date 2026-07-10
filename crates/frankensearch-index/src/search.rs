@@ -13,9 +13,9 @@ use rayon::prelude::*;
 use crate::simd::dot_i8x4_i8;
 use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
-    PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8,
-    dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, prepare_4bit_query,
-    quantize_f16_le_bytes_to_i8,
+    PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8, dot_i8_i8_maddubs,
+    dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, maddubs_query_bias,
+    prepare_4bit_query, quantize_f16_le_bytes_to_i8,
 };
 use half::f16;
 use wide::f32x8;
@@ -354,7 +354,15 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_int8_two_pass_impl::<false>(query, k, candidate_multiplier)
+        // Production keeps the EXACT-int8 pass-1. The `vpmaddubs` kernel (bd-b5wl) is 1.23× faster
+        // in isolation (decidable) and recall-exact, but its **scan-level** win is only ~1.02–1.11×
+        // (Amdahl-shrunk) and is NOT robustly decidable under fleet contention: two null-controlled
+        // runs on `hetzner1` disagreed — 0.9023 (median below null p5, a clear win) then 0.9821
+        // (inside the null floor). Shipping the approximate kernel as default on a marginal,
+        // contention-dependent effect fails the gate, so it stays behind
+        // `bench_search_top_k_int8_two_pass_maddubs`. Retry = worker isolation (same as cod's int8
+        // micro-opt block). See docs/NEGATIVE_EVIDENCE.md 2026-07-10.
+        self.search_top_k_int8_two_pass_impl::<false, false>(query, k, candidate_multiplier)
     }
 
     /// Exact pre-row-block implementation retained only for same-binary
@@ -367,7 +375,7 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_int8_two_pass_impl::<false>(query, k, candidate_multiplier)
+        self.search_top_k_int8_two_pass_impl::<false, false>(query, k, candidate_multiplier)
     }
 
     /// Four-row query-decode-reuse candidate retained only so the null-controlled
@@ -380,10 +388,24 @@ impl VectorIndex {
         k: usize,
         candidate_multiplier: usize,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.search_top_k_int8_two_pass_impl::<true>(query, k, candidate_multiplier)
+        self.search_top_k_int8_two_pass_impl::<true, false>(query, k, candidate_multiplier)
     }
 
-    fn search_top_k_int8_two_pass_impl<const ROW_BLOCKED: bool>(
+    /// `vpmaddubs` pass-1 kernel candidate (bd-b5wl), retained for the same-binary A/B.
+    /// Bit-identical *ranking* to [`Self::search_top_k_int8_two_pass`] on realistic quantized data
+    /// (proven recall in `simd::tests::maddubs_pass1_preserves_f32_recall_under_real_saturation`);
+    /// the pass-1 int8 dot is the approximate `dot_i8_i8_maddubs` (see its saturation caveat).
+    #[doc(hidden)]
+    pub fn bench_search_top_k_int8_two_pass_maddubs(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidate_multiplier: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_top_k_int8_two_pass_impl::<false, true>(query, k, candidate_multiplier)
+    }
+
+    fn search_top_k_int8_two_pass_impl<const ROW_BLOCKED: bool, const MADDUBS: bool>(
         &self,
         query: &[f32],
         k: usize,
@@ -411,6 +433,12 @@ impl VectorIndex {
             .min(count)
             .max(k.min(count));
         let query_i8 = quantize_i8_query(query);
+        // Per-query bias `128·Σq` for the `MADDUBS` pass-1 kernel; unused (0) otherwise.
+        let q_bias128 = if MADDUBS {
+            maddubs_query_bias(&query_i8, dim)
+        } else {
+            0
+        };
         let slab = self.int8_slab();
 
         // Pass 1: bounded-heap int8 scan keeping the top `candidate_count`.
@@ -421,7 +449,14 @@ impl VectorIndex {
             if ROW_BLOCKED {
                 self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
             } else {
-                self.int8_scan_range_orig(slab, &query_i8, 0, count, candidate_count)
+                self.int8_scan_range_orig::<MADDUBS>(
+                    slab,
+                    &query_i8,
+                    q_bias128,
+                    0,
+                    count,
+                    candidate_count,
+                )
             }
         } else {
             let chunk_count = count.div_ceil(INT8_PARALLEL_CHUNK_SIZE);
@@ -433,7 +468,14 @@ impl VectorIndex {
                     if ROW_BLOCKED {
                         self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
                     } else {
-                        self.int8_scan_range_orig(slab, &query_i8, start, end, candidate_count)
+                        self.int8_scan_range_orig::<MADDUBS>(
+                            slab,
+                            &query_i8,
+                            q_bias128,
+                            start,
+                            end,
+                            candidate_count,
+                        )
                     }
                 })
                 .collect();
@@ -455,10 +497,11 @@ impl VectorIndex {
         self.resolve_hits(heap)
     }
 
-    fn int8_scan_range_orig(
+    fn int8_scan_range_orig<const MADDUBS: bool>(
         &self,
         slab: &[i8],
         query_i8: &[i8],
+        q_bias128: i32,
         start: usize,
         end: usize,
         limit: usize,
@@ -467,11 +510,20 @@ impl VectorIndex {
             return BinaryHeap::new();
         }
         if self.dimension() <= MAX_EXACT_I8_DOT_DIM {
-            self.int8_scan_range_orig_with_key(slab, query_i8, start, end, limit, int8_heap_key)
-        } else {
-            self.int8_scan_range_orig_with_key(
+            self.int8_scan_range_orig_with_key::<MADDUBS, _>(
                 slab,
                 query_i8,
+                q_bias128,
+                start,
+                end,
+                limit,
+                int8_heap_key,
+            )
+        } else {
+            self.int8_scan_range_orig_with_key::<MADDUBS, _>(
+                slab,
+                query_i8,
+                q_bias128,
                 start,
                 end,
                 limit,
@@ -480,11 +532,14 @@ impl VectorIndex {
         }
     }
 
-    /// Exact `1948a65` per-row scan retained for the in-binary ORIGINAL arm.
-    fn int8_scan_range_orig_with_key<F>(
+    /// Exact `1948a65` per-row scan retained for the in-binary ORIGINAL arm. `MADDUBS` swaps the
+    /// pass-1 int8 dot to the approximate `vpmaddubs` kernel (bd-b5wl); `q_bias128 = 128·Σq` is then
+    /// live, else ignored. Production is `MADDUBS = false` → byte-identical to the shipped scan.
+    fn int8_scan_range_orig_with_key<const MADDUBS: bool, F>(
         &self,
         slab: &[i8],
         query_i8: &[i8],
+        q_bias128: i32,
         start: usize,
         end: usize,
         limit: usize,
@@ -504,7 +559,12 @@ impl VectorIndex {
             let flags = u16::from_le_bytes([flags_bytes[0], flags_bytes[1]]);
             if (flags & 0x0001) == 0 {
                 let stored = &slab[slab_offset..slab_offset + dim];
-                let candidate = make_key(index, dot_i8_i8(stored, query_i8));
+                let dot = if MADDUBS {
+                    dot_i8_i8_maddubs(stored, query_i8, q_bias128)
+                } else {
+                    dot_i8_i8(stored, query_i8)
+                };
+                let candidate = make_key(index, dot);
                 if heap.len() < limit {
                     heap.push(candidate);
                     if heap.len() == limit {
@@ -1739,6 +1799,95 @@ mod tests {
                         "qi={qi} mult={mult}"
                     );
                 }
+            }
+        }
+    }
+
+    /// CI RECALL GUARD for the shipped maddubs pass-1 kernel (bd-b5wl). Unlike the row-block
+    /// candidate, the `vpmaddubs` pass-1 is APPROXIMATE (saturates on the quantizer's ±127 tail), so
+    /// it is *not* bit-identical to the exact int8 scan. What must hold — and what makes it safe to
+    /// ship as the default — is that it does not lose recall vs the exact-flat f32 top-k: the pass-1
+    /// still retains the true top-k into the candidate set, and the f16 rescore then orders them
+    /// exactly. Asserts maddubs recall@10 ≥ orig recall@10 and both are perfect on a realistic
+    /// (normalized, clustered) corpus that exercises the saturation.
+    #[test]
+    fn int8_two_pass_maddubs_preserves_recall_vs_flat() {
+        let path = temp_index_path("int8-maddubs-recall");
+        let dim = 384;
+        let count = 4_000;
+        let normalize = |mut v: Vec<f32>| -> Vec<f32> {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
+            for x in &mut v {
+                *x /= n;
+            }
+            v
+        };
+        // 16 clusters + jitter → realistic ANN corpus (tight top-k, real quantized magnitudes).
+        let centroids: Vec<Vec<f32>> = (0..16)
+            .map(|c| {
+                normalize(
+                    (0..dim)
+                        .map(|j| {
+                            let mut s = (c as u64 + 1).wrapping_mul(0x9e37)
+                                ^ (j as u64).wrapping_mul(40_503);
+                            s ^= s >> 13;
+                            ((s & 0xffff) as f32 / 65_535.0) - 0.5
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let vectors: Vec<Vec<f32>> = (0..count)
+            .map(|i| {
+                let c = &centroids[i % 16];
+                normalize(
+                    (0..dim)
+                        .map(|j| {
+                            let mut s = (i as u64 + 1).wrapping_mul(2_654_435_761)
+                                ^ (j as u64).wrapping_mul(7);
+                            s ^= s >> 13;
+                            c[j] + 0.15 * (((s & 0xffff) as f32 / 65_535.0) - 0.5)
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let rows = create_rows(&vectors);
+        let row_refs: Vec<(&str, Vec<f32>)> = rows
+            .iter()
+            .map(|(doc_id, vector)| (doc_id.as_str(), vector.clone()))
+            .collect();
+        write_index(&path, &row_refs).expect("write index");
+        let index = VectorIndex::open(&path).expect("open index");
+
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> {
+            hits.into_iter().map(|h| h.doc_id.to_string()).collect()
+        };
+        let recall = |exact: &[String], approx: &[String]| -> f64 {
+            let hit = approx.iter().filter(|id| exact.contains(id)).count();
+            hit as f64 / exact.len().max(1) as f64
+        };
+
+        for c in 0..4usize {
+            let query = normalize(centroids[c].clone());
+            let exact = ids(index.search_top_k(&query, 10, None).expect("flat"));
+            for mult in [3usize, 5] {
+                let orig = ids(index
+                    .bench_search_top_k_int8_two_pass_orig(&query, 10, mult)
+                    .expect("orig"));
+                let maddubs = ids(index
+                    .bench_search_top_k_int8_two_pass_maddubs(&query, 10, mult)
+                    .expect("maddubs"));
+                let orig_r = recall(&exact, &orig);
+                let maddubs_r = recall(&exact, &maddubs);
+                assert!(
+                    maddubs_r >= orig_r - 1e-9,
+                    "c={c} mult={mult}: maddubs recall {maddubs_r} < orig {orig_r}"
+                );
+                assert!(
+                    (maddubs_r - 1.0).abs() < 1e-9,
+                    "c={c} mult={mult}: maddubs recall {maddubs_r} != 1.0"
+                );
             }
         }
     }

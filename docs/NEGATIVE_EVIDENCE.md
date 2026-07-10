@@ -10887,3 +10887,42 @@ land and measure on the real scan, gated by the now-shared null-control harness.
 **Method note:** could not fact-check worker CPU flags through `rch` — `rch exec` rejects non-compilation commands
 (`RCH-E301`), so `sh -c 'grep avx2 /proc/cpuinfo'` is refused. The dispatch-fires conclusion rests on the perf
 frames + fleet hardware instead. No code changed; ISA is a config/analysis finding. sha256/self-time N/A (no A/B run).
+
+### 2026-07-10 — cc_fse — BLOCKER (scan-level, bd-b5wl): the `vpmaddubs` pass-1 wiring is recall-exact and 1.23× at the KERNEL, but its SCAN-level speedup (~1.02–1.11×, Amdahl-shrunk) is NOT robustly decidable — two null-controlled runs disagreed, one inside the floor
+
+Wired the landed `vpmaddubs` kernel (fc194e9/05633ad) into the production two-pass scan behind a
+`const MADDUBS: bool` on `search_top_k_int8_two_pass_impl` (default `false` → byte-identical;
+`bench_search_top_k_int8_two_pass_maddubs` exposes the candidate), then measured the WHOLE scan
+end-to-end on a real 40k-vector file-backed `VectorIndex` with the tight alternating-round null
+control (`frankensearch_core::bench_support`), `RCH_REQUIRE_REMOTE=1`, worker `hetzner1`, `--noplot`,
+`bench_..._orig` (exact int8 pass-1) vs `bench_..._maddubs`, ratio = maddubs/ORIG (`<1.0` = faster):
+
+| run | binary sha256 | NULL median [p5,p95] | maddubs/ORIG median [p5,p95] | verdict |
+|---|---|---|---|---|
+| 1 | `874eb3821e2349f05b4629b9706116a59eb8d932e4190743475f5798c30b2cff` | 0.9994 [0.9293, 1.0461] | 0.9023 [0.8684, 0.9460] | DECIDABLE WIN (median < null p5) |
+| 2 | `3bc72b3a066056e27199a387202f82d998215a59f29ff78a1824daff895bd37d` | 0.9972 [0.9651, 1.0706] | **0.9821 [0.9544, 1.0211]** | **INSIDE NULL FLOOR — not decidable** |
+
+**Recall — PRESERVED, deterministic, not the blocker.** Both runs: `recall@10 = 1.0000` for orig AND
+maddubs vs exact-flat f32 (mult 5, N 40k). CI-guarded by `int8_two_pass_maddubs_preserves_recall_vs_flat`
+(FSVI corpus, realistic clustered, real quantized ±127 tail → maddubs saturates yet recall = 1.0) and
+`simd::tests::maddubs_pass1_preserves_f32_recall_under_real_saturation` (kernel level). The correctness
+half of bd-b5wl is fully discharged.
+
+**Why not decidable — the median gate is not cleanly cleared, and repeated runs contradict.** Run 1's
+median (0.9023) fell below its null p5 (0.9293) → a clean win, matching the Amdahl prediction (1.23×
+kernel × 44.54% self-time leaf ⇒ ~1.09× scan ⇒ ~0.917 median). But run 2, same binary logic, measured
+0.9821 — *inside* its null floor. The effect (~1.02–1.11×) is small enough that fleet contention swings
+the ORIG arm between runs, so a single run can land on either side of the decidability line. Run 1's
+"win" was not robust. This is exactly cod's earlier int8 blocker (`ffb2201d…`, CV 32–35%): the
+scan-level int8 A/B is contention-limited, and a tighter *within-run* null control does not fix a
+*between-run* instability driven by whole-run worker load.
+
+**Decision.** Did NOT ship the default flip (tried it — all 400 index lib tests passed with maddubs as
+default, so it is *correct* to ship, just not *proven faster*). Reverted `search_top_k_int8_two_pass` to
+the exact-int8 pass-1; the maddubs scan stays reproducible behind `bench_..._maddubs`, and the kernel is
+wired and ready. **This is a REJECT of the scan-level speedup claim on this substrate, not of the
+kernel** (the isolated 1.23× is decidable and stands, `int8_dot_maddubs_ab`). Retry condition
+(identical to cod's): worker isolation/affinity for the whole one-invocation run, so the between-run ORIG
+variance collapses and a real ~1.09× median can clear the floor repeatably. Self-time: the maddubs leaf
+replaces the 44.54%-self-time `dot_i8_i8_avx2` frame (cod's `perf`), so the Amdahl ceiling is fixed and
+real; only the measurement is blocked. No production behaviour changed; all builds/benches remote.
