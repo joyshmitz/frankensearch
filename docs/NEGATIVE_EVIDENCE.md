@@ -11066,3 +11066,32 @@ near-optimal (two-pass reduction is inherent), low absolute impact.
 
 **Net:** ranking adds nothing to the frontier map's HOLD. The one fresh idea (AVX2 f64x4 MMR dot) is bit-identical
 and real but EV-negative while MMR is off by default. No code changed.
+
+### 2026-07-10 — cc_fse — DIFFERENT-PRIMITIVE attempt (posting compression / SIMD scan / skip-lists / succinct) = EMPTY on the ownable surface; profile-first across FSVI structure confirms mined/indexed → HOLD
+
+Prompt pushed for a structural index primitive. Profile-first across every ownable search-path structure:
+
+- **Posting compression / skip-lists → NOT OWNABLE.** frankensearch's lexical tier is a thin **Tantivy** wrapper;
+  postings, skip-lists, and their compression are Tantivy internals. The ownable lexical surface is the cass
+  tokenizer/text-prep, already mined this session (4 wins: `next_char_from`, preview, prefix_source, edge_ngrams).
+- **Succinct index (FSVI) → already tried, REJECTED.** The vector index is a flat brute-force scan (no postings).
+  Its succinct angle — a tombstone liveness **bitmap** replacing the strided per-record flag read — was wired and
+  measured end-to-end (`36de60d`): a wash (~2% slower), because the FMA-bound int8/f16 scan hides the flag load.
+- **SIMD scan (FSVI dots) → MINED.** f16 (`cvtph2ps`-decode-bound: FMA + chunk-size rejected this session, 4-acc
+  landed), int8 (`vpmaddubs` kernel landed 1.23× isolated, scan-level blocked on worker isolation `bd-sqwx`),
+  4-bit packed (landed). No further in-format compute lever.
+- **FSVI record table / doc_id resolution / delete-lookup → optimized.** 16-byte records (`doc_id_hash` u64 +
+  `offset` u32 + `len` u16 + flags) are **sorted by `doc_id_hash`** with binary-search lookup
+  (`find_first_hash_match`), so `soft_delete_batch` is O(M log N) — and it's a mutation, not search. Winner
+  materialization (`resolve_sorted_entries`) is O(k) with a WAL hash pre-screen + pre-computed hashes +
+  CompactString (mined, "limit_all materialize clone → CompactString"). The doc_id **strings** region is read
+  only for the k winners (not scanned); front-coding it would save mmap bytes but adds decode on the k lookups —
+  not a scan-latency win.
+
+The "avoid the full scan" structural wins (ANN/IVF/early-abandon) are the real remaining primitives, but all
+blocked: ANN-in-BOLD needs a recall-budget **product sign-off**; early-abandon/bucketed needs an index-build
+dim-reorder + suffix-norm **format transform** + real-corpus validation. Neither is an unblocked codeable lever.
+
+**HOLD.** The new-primitive attempt is genuinely empty on the ownable, unblocked surface. Same three unblocks as
+the frontier map: worker isolation (int8 scan-level + self-time + MMR-AVX2-f64 if MMR goes default-on), ANN
+product sign-off, hubness query-log. No code changed.
