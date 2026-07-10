@@ -4301,21 +4301,20 @@ ranks. `doc-0` stays at rank 0 (isolated ⇒ α collapses).
 adjacent in the k-NN graph to a confident hit, and diffusion recovers it. nDCG@10 strictly increases — the same
 recall mechanism behind the +0.0039 BEIR result.
 
-**SPEED GATE.** `neighbor_smooth` bench, one binary ⇒ same worker; ORIG (`smooth`) measured **first and last**
-(`smooth2`) to bracket criterion ordering bias. All arms CI width < 1.6% of the mid:
+**SPEED GATE — ⚠ RETRACTED. The re-sort never sorted anything; see the correction entry below.** Numbers kept
+verbatim for audit:
 
-| pool | identity (α=0 clone) | ORIG `smooth` | `smooth_ranked` | ORIG2 `smooth2` (bias) | re-sort cost vs ORIG bracket |
-|---:|---:|---:|---:|---:|---:|
-| 50   | 138.05 ns | 5.6084 µs | 5.6867 µs | 5.6271 µs | **+1.2%** |
-| 100  | 247.83 ns | 11.707 µs | 11.767 µs | 11.635 µs | **+0.8%** |
-| 1000 | 2.3386 µs | 151.55 µs | 154.28 µs | 152.50 µs | **+1.5%** |
+> `neighbor_smooth` bench, one binary ⇒ same worker; ORIG (`smooth`) measured first and last (`smooth2`).
+>
+> | pool | identity (α=0 clone) | ORIG `smooth` | `smooth_ranked` | ORIG2 `smooth2` | re-sort cost |
+> |---:|---:|---:|---:|---:|---:|
+> | 50   | 138.05 ns | 5.6084 µs | 5.6867 µs | 5.6271 µs | +1.2% |
+> | 100  | 247.83 ns | 11.707 µs | 11.767 µs | 11.635 µs | +0.8% |
+> | 1000 | 2.3386 µs | 151.55 µs | 154.28 µs | 152.50 µs | +1.5% |
 
-The ORIG/ORIG2 bracket is tight (≤0.6% drift), so the re-sort's cost is small but **real**, not noise: at pool
-1000 `smooth_ranked`'s CI `[153.20, 155.65]` clears `smooth2`'s `[152.16, 153.00]`. It is this cheap because
-the input is already score-sorted and diffusion perturbs it only mildly — pdqsort's near-sorted adaptivity
-(the same property exploited by the merge-structured RRF, `4aeb66b`) absorbs it. Absolute cost is µs-scale
-against a 15 ms Phase-1 budget. Note: smoothing runs inside the `vector_search_ms` window, so enabling it
-attributes its latency to that metric rather than leaving it unaccounted.
+Smoothing runs inside the `vector_search_ms` window, so enabling it attributes its latency to that metric
+rather than leaving it unaccounted. That note stands, and the parity/correctness/quality gates above are
+unaffected — only the *cost of the re-sort* was mismeasured.
 
 `mutual` (reciprocal-kNN, the ledger's no-regret refinement) is exposed as `neighbor_smoothing_mutual` and
 costs ~4.3× the direct kernel at pool 50–1000 (24.28 / 50.46 / 538.12 µs) — still µs-scale, still opt-in.
@@ -4325,7 +4324,131 @@ failed** (5 new tests); default-features (`graph` off) → **859 passed, 0 faile
 compiles and the default is untouched. `cargo clippy --no-deps -p frankensearch-fusion --features graph
 --all-targets` → 0 warnings on changed lines (the surviving `smooth.rs` similar-binding warning is on
 pre-existing `d_nm`/`d_m`). `cargo fmt --check` → 0 diffs on changed lines (crate-wide drift pre-exists).
-`ubs` → exit 0. Original-comparator ratio **N/A** (opt-in Phase-1 quality pass; default byte-identical).
+`ubs` → **exit 1, mis-stated as exit 0 here** (the `$?` read was `tail`'s through a pipe, not `ubs`'s);
+`searcher.rs` already exits 1 at `HEAD~1` on 6 `doc_id == "doc-0"` "secret comparison" false positives.
+Original-comparator ratio **N/A** (opt-in Phase-1 quality pass; default byte-identical).
 
 Route-next: the hubness half of `bd-kdjr` — `apply_hubness_penalty` still has no searcher caller and needs the
 background-query-sample `r_d` table plumbed through (`ba5052a` landed the builder). Same dead-kernel shape.
+
+## 2026-07-10 — CORRECTION to the entry above: its re-sort cost measured DEAD CODE (pdqsort short-circuit); true cost is 7–11%, not 0.8–1.5% (cc_fse)
+
+**What was wrong.** `neighbor_smooth`'s bench fixture linked each doc to the `m` *following* docs
+(`nbr = (i+j) % pool`) over the monotone score `1/(i+1)`. Every doc's neighbours therefore scored strictly
+below it, and diffusing a convex decreasing sequence preserves its order — so `neighbor_smooth_ranked`
+received an **already-sorted** pool and `sort_unstable_by` short-circuited on its sortedness check. The
+`smooth_ranked` arm was timing an O(n) *detection pass*, not a sort. The kernel ran (scores changed, which the
+old `assert!((s[10].score - hits[10].score).abs() > 1e-9)` confirmed) — but the *code under measurement*, the
+sort, did nothing. Changing scores is not evidence that a downstream sort has work.
+
+**How it was caught.** A reachability gate now runs before the timed arms: it sorts the smoothed pool, counts
+how many hits move, and **panics if zero**. On the old fixture it panicked at pool 50 on the first run.
+
+**The fix.** Neighbours are now *scattered* (`(i*37 + j*101) % pool`), so a low-ranked doc can borrow from a
+high-scoring cluster and overtake its neighbours — the promotion smoothing exists to produce. Displacement is
+now **41–44/50, 92–95/100, 985–992/1000**, printed by the gate each run.
+
+**Substrate also corrected.** The ORIG-first-and-last bracket (`smooth`/`smooth2`) does **not** cancel drift —
+criterion group members run sequentially. It only *exposes* drift, and it did: one run showed ORIG at 28.18 µs
+and ORIG2 at 20.85 µs (35% apart) with `smooth_ranked` landing *below* ORIG2, which is physically impossible
+since `ranked = smooth + sort`. Both benches now use an **interleaved paired sampler**: each arm's measured
+routine runs *both* implementations every iteration and times only its own via `iter_custom`, batched
+`PAIR_BATCH = 16` so the `Instant::now()` pair amortizes to <2%. Both arms then do identical total work and see
+identical machine state, so drift cancels in the ratio. CI widths fell from ±6% to **±0.2%**.
+
+**Corrected re-sort cost** (interleaved paired, one binary, one `rch` invocation on `ovh-a`; each timed region
+= 16 calls, so `PAIR_BATCH` cancels in the ratio):
+
+| pool | displaced | ORIG `paired_smooth` | `paired_smooth_ranked` | ratio |
+|---:|---:|---:|---:|---:|
+| 50   | 41–44/50   | 91.846 µs | 98.454 µs | **1.072×** |
+| 100  | 92–95/100  | 194.31 µs | 215.86 µs | **1.111×** |
+| 1000 | 985–992/1000 | 2.8912 ms | 3.2037 ms | **1.108×** |
+
+So the re-sort costs **7–11% of the smoothing kernel**, not 0.8–1.5%: ≈19.5 µs at pool 1000, versus the
+2.25 µs the short-circuited fixture reported. Cross-validated below: the same sort on a hubness-permuted pool
+of 1000 costs ≈20.8 µs in a *different* bench — two independent measurements of the same primitive agreeing to
+6%. **The land itself stands** — 19.5 µs against a 15 ms Phase-1 budget is 0.13%, and the re-sort is a
+correctness requirement, not an optimization. Only the cost claim moves.
+
+DCE ruled out per arm: every input goes through `black_box`, every returned `Vec` is consumed through
+`black_box`, and the reachability gate compares real outputs. No `perf` self-time was taken (rch-remote,
+`perf_event_paranoid` unavailable); displacement count is the reachability evidence recorded in its place.
+
+Lesson (generalizes): **an assert that the kernel changed its output does not prove a downstream stage has
+work.** Gate each measured stage on its own observable — here, "did the sort move anything?" — and print it.
+
+## 2026-07-10 — Query-hubness demotion WIRED into `TwoTierSearcher` Phase-1; the O(pool) subtract is dwarfed 4.7–9.9× by its mandatory re-sort (cc_fse)
+
+Closes the hubness half of `bd-kdjr`. `apply_hubness_penalty` / `compute_query_hubness` (`ba5052a`; **+0.0033
+mean hybrid nDCG@10** at β=0.2, all-positive on 4 BEIR corpora, dense-tier +0.0128 arguana / +0.0078 scidocs)
+had been landed, unit-tested, benched and AVX2-optimized (`10.89×` builder) — with **zero callers**. Third
+instance of the dead-quality-kernel shape after pool-min-max (`49a914c`) and smoothing (`14fc1fc`).
+
+Now wired behind `TwoTierConfig::hubness_beta` (env `FRANKENSEARCH_HUBNESS_BETA`), `0.0` (off) by default, plus
+`TwoTierSearcher::with_hubness_table(Arc<[f32]>)` for the `r_d` table. Note the gating differs from smoothing's:
+hubness needs **no** `DocumentGraph`, so it is *not* behind `feature = "graph"`. Only the query-**side** form is
+wired; the query-free proxies (doc-density, centroid, PC-removal) stay REJECTED (`64ac8b7`), and the config doc
+says so at the knob.
+
+**Composition.** Both corrections now run through one private `correct_phase1_pool`, which applies hubness,
+then smoothing, then re-sorts **once**. Hubness runs first on purpose: a hub is by construction adjacent to many
+docs, so diffusing an uncorrected pool would let each hub inject its inflated score into the neighbour means of
+exactly the specific answers the penalty exists to rescue. Smoothing's output values do not depend on its input
+order, so one sort after both passes is equivalent to sorting after each — and cheaper. With both off the pool
+returns **by move**: no call, no clone, no sort.
+
+**Shared comparator + a latent NaN bug fixed.** Both corrections must re-sort, so the comparator moved to
+`VectorHit::cmp_rank` (core). Writing it exposed a real defect in the *shipped* `neighbor_smooth_ranked`: it
+sorted with a bare descending `b.score.total_cmp(&a.score)`, and IEEE 754 `totalOrder` ranks `+NaN` above
+`+inf` — so a NaN score sorted to **rank 0**. `cmp_rank` inherits `cmp_by_score`'s NaN-last mapping and adds the
+`doc_id` tiebreak for replayability. Hubness subtracts `β·r_d` and can propagate a NaN from a corrupted table
+straight into that sort, so this is load bearing, not theoretical. `cmp_rank_sorts_nan_last_unlike_bare_total_cmp`
+pins both behaviours, asserting the bare form's trap explicitly.
+
+**PARITY GATE.** `correct_phase1_pool_is_identity_when_both_corrections_are_off` — with an `r_d` table attached
+and `beta = 0.0`, the pool comes back with identical order and identical score **bits**, and unsorted.
+End-to-end, `hubness_demotes_a_hub_through_fusion_and_is_inert_by_default` asserts the attached table changes
+nothing at the default β.
+
+**CORRECTNESS GATE.** `hubness_demotes_a_hub_below_an_equal_scoring_non_hub_and_resorts` (pool level) and the
+end-to-end test (real searcher, fused output): `doc-8`, `doc-0`, `doc-4` all score 1.0; marking the *leader*
+`doc-8` a hub (`r_d = 1.0`, β=0.5 ⇒ 0.5) must push it behind both non-hubs yet keep it ahead of the 0.0 pool —
+demoted, not dropped. **ORDERING GATE.**
+`hubness_is_applied_before_smoothing_so_hubs_do_not_leak_into_neighbor_means` discriminates the two orders
+numerically: `doc-1` diffusing from the hub `doc-4` must score `0.5·0 + 0.5·(1.0 − 0.5·1.0) = 0.25`; smoothing
+first would yield `0.5`.
+
+**SPEED GATE** (interleaved paired sampler, one binary, one `rch` invocation on `ovh-a`; timed region = 16
+calls; reachability gate asserts the sort permutes the pool and prints the count):
+
+| pool | displaced | ORIG `paired_correct` | `paired_correct_ranked` | ratio |
+|---:|---:|---:|---:|---:|
+| 50   | 41/50    | 2.2276 µs (139.2 ns/call) | 10.417 µs (651.1 ns/call) | **4.676×** |
+| 100  | 92/100   | 4.1002 µs (256.3 ns/call) | 26.759 µs (1.672 µs/call) | **6.526×** |
+| 1000 | 992/1000 | 37.441 µs (2.340 µs/call) | 370.40 µs (23.15 µs/call) | **9.893×** |
+
+**The mechanism, and why the ratio is the opposite of smoothing's.** `apply_hubness_penalty` is a trivial
+O(pool) subtract (~2.3 ns/doc); the mandatory re-sort is O(pool log pool) over a nearly-fully-permuted pool
+(992/1000 displaced). So the *same* sort that costs 7–11% of the O(pool·M) smoothing kernel costs **4.7–9.9×**
+the hubness kernel, and the ratio grows with pool as `log pool` does. The absolute sort cost agrees across both
+benches at pool 1000 (20.8 µs here, 19.5 µs there — 6% apart), which is the cross-check that the two paired
+samplers are measuring the same primitive. Absolute worst case is 23.15 µs at pool 1000 = **0.15% of the 15 ms
+Phase-1 budget**, and it is opt-in; the +0.0033 nDCG is the point. Route-next if it ever matters: the two
+corrections could sort by a radix pass over the `f32` score bits instead of comparison pdqsort, or fuse the
+demotion into the vector tier's top-k heap so the pool is never unsorted.
+
+Conformance: `cargo test -p frankensearch-fusion --features graph` → **871 passed, 0 failed** (+4 tests);
+default features (`graph` off) → **862 passed, 0 failed**, proving the ungated hubness arm compiles without the
+graph feature and the default path is untouched. `cargo test -p frankensearch-core --lib` → **900 passed, 0
+failed** (+2). `cargo clippy --no-deps` → 0 warnings on changed lines (`more than 3 bools` on `TwoTierConfig`
+and `smooth.rs`'s `d_nm`/`d_m` similar-bindings both pre-date this change — verified against `HEAD~1`).
+`cargo fmt --check` → 0 diffs on changed lines. `ubs` → exit 1, but **zero net-new criticals**: `searcher.rs`
+already exits 1 at `HEAD` (6 `doc_id == "doc-0"` "secret comparison" false positives + 1 test `panic!`), and
+the duplicated `rank` closure was extracted into one shared helper so this change adds no new `panic!` site.
+All builds/benches ran remotely via `rch` (workers `ovh-a`/`hz1`/`hz2`); no local cargo.
+Original-comparator ratio **N/A** (opt-in Phase-1 quality pass; default byte-identical).
+
+Route-next: `bd-kdjr` is now closed for both kernels, but the `r_d` table has **no builder wired into any
+product** — `compute_query_hubness` needs a background query sample (a rolling query log) plumbed from the
+host. Until then `with_hubness_table` is caller-supplied only, and the knob ships off.

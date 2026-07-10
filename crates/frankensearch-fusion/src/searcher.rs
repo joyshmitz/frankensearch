@@ -150,6 +150,8 @@ pub struct TwoTierSearcher {
     search_params: Option<SearchParams>,
     #[cfg(feature = "graph")]
     document_graph: Option<Arc<DocumentGraph>>,
+    /// Per-doc query-hubness `r_d`, indexed by [`VectorHit::index`]. See `with_hubness_table`.
+    hubness_table: Option<Arc<[f32]>>,
     /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
     embedding_cache_capacity: Option<usize>,
     resource_cpu_state: Mutex<Option<CpuJiffiesSnapshot>>,
@@ -197,6 +199,7 @@ impl TwoTierSearcher {
             search_params: None,
             #[cfg(feature = "graph")]
             document_graph: None,
+            hubness_table: None,
             embedding_cache_capacity: None,
             resource_cpu_state: Mutex::new(None),
         }
@@ -362,6 +365,18 @@ impl TwoTierSearcher {
         self
     }
 
+    /// Attach the per-doc query-hubness table `r_d`, indexed by [`VectorHit::index`] (i.e. aligned
+    /// with the vector store), as produced by [`crate::hubness::compute_query_hubness`] from a
+    /// background query sample.
+    ///
+    /// Inert unless [`TwoTierConfig::hubness_beta`] is `> 0.0`. `r_d` must be a *query-distribution*
+    /// statistic: query-free proxies were measured and rejected (`64ac8b7`).
+    #[must_use]
+    pub fn with_hubness_table(mut self, hubness: Arc<[f32]>) -> Self {
+        self.hubness_table = Some(hubness);
+        self
+    }
+
     /// The Phase-1 neighbour-smoothing config, or `None` when the pass is disabled.
     ///
     /// Returning `None` (rather than an identity [`SmoothConfig`]) is deliberate: it lets the
@@ -375,6 +390,62 @@ impl TwoTierSearcher {
             mutual: self.config.neighbor_smoothing_mutual,
         };
         (!cfg.is_identity()).then_some(cfg)
+    }
+
+    /// The attached `r_d` table paired with a live hubness config, or `None` when the pass is
+    /// disabled (default `beta == 0.0`, or no table attached). Same skip-don't-clone rationale as
+    /// [`Self::smoothing_config`].
+    fn hubness_correction(&self) -> Option<(&[f32], crate::hubness::HubnessConfig)> {
+        let cfg = crate::hubness::HubnessConfig {
+            beta: self.config.hubness_beta,
+            ..crate::hubness::HubnessConfig::default()
+        };
+        if cfg.is_identity() {
+            return None;
+        }
+        self.hubness_table.as_deref().map(|rd| (rd, cfg))
+    }
+
+    /// Phase-1 dense-score corrections over the retrieved semantic pool: query-hubness demotion,
+    /// then k-NN graph diffusion, re-sorted **once** at the end.
+    ///
+    /// Both passes are off by default, and when both are off the pool is returned by move — no
+    /// call, no clone, no sort — so the default path is byte-identical and pays nothing.
+    ///
+    /// **Hubness runs before smoothing** because diffusion must propagate *de-hubbed* scores. A hub
+    /// is by construction adjacent to many docs, so smoothing an uncorrected pool would let each hub
+    /// inject its inflated score into the neighbour means of exactly the specific answers the
+    /// hubness penalty exists to rescue.
+    ///
+    /// **The re-sort is a correctness requirement, not cosmetics.** The rank-based fusion operators
+    /// take each hit's rank from its *position* in this slice and never re-sort it (a vector index
+    /// already returns score-sorted hits). Either correction rewrites scores, so without a re-sort a
+    /// demoted hub keeps its rank, a promoted doc keeps its worse one, and the merge's near-sorted
+    /// precondition is violated. Smoothing's output values do not depend on its input order, so
+    /// sorting once after both passes is equivalent to sorting after each — and cheaper.
+    fn correct_phase1_pool(&self, hits: Vec<VectorHit>) -> Vec<VectorHit> {
+        let hubness = self.hubness_correction();
+
+        #[cfg(feature = "graph")]
+        if let (Some(graph), Some(smooth_cfg)) =
+            (self.document_graph.as_ref(), self.smoothing_config())
+        {
+            let demoted = match hubness {
+                Some((rd, cfg)) => crate::hubness::apply_hubness_penalty(&hits, rd, &cfg),
+                None => hits,
+            };
+            // Smoothing is the last stage here, and it re-sorts internally.
+            return crate::smooth::neighbor_smooth_ranked(&demoted, graph, &smooth_cfg);
+        }
+
+        match hubness {
+            Some((rd, cfg)) => {
+                let mut demoted = crate::hubness::apply_hubness_penalty(&hits, rd, &cfg);
+                demoted.sort_unstable_by(VectorHit::cmp_rank);
+                demoted
+            }
+            None => hits,
+        }
     }
 
     /// Set the host adapter used to receive canonical telemetry envelopes.
@@ -1183,17 +1254,11 @@ impl TwoTierSearcher {
                 } else {
                     fast_hits
                 };
-                // k-NN neighbour smoothing (graph score-diffusion) over the retrieved semantic
-                // pool. Off by default (`alpha == 0.0`), and when off the pass is never entered,
-                // so the default path pays nothing and stays byte-identical. Fusion assigns
-                // ranks by *position*, so `neighbor_smooth_ranked` re-sorts — see its docs.
-                #[cfg(feature = "graph")]
-                let fast_hits = match (self.document_graph.as_ref(), self.smoothing_config()) {
-                    (Some(graph), Some(smooth_cfg)) => {
-                        crate::smooth::neighbor_smooth_ranked(&fast_hits, graph, &smooth_cfg)
-                    }
-                    _ => fast_hits,
-                };
+                // Dense-score corrections (hubness demotion, k-NN diffusion) over the semantic
+                // pool. Both off by default, in which case the pool is returned by move and this
+                // costs nothing. Timed inside `vector_search_ms` — they are part of producing the
+                // semantic candidate list, and leaving them unaccounted would understate Phase-1.
+                let fast_hits = self.correct_phase1_pool(fast_hits);
 
                 metrics.vector_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
                 metrics.semantic_candidates = fast_hits.len();
@@ -3958,6 +4023,208 @@ mod tests {
         docs
     }
 
+    // ─── Phase-1 score corrections: hubness demotion + smoothing (bd-kdjr) ──────────────────
+
+    fn pool_searcher(config: TwoTierConfig) -> TwoTierSearcher {
+        let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        TwoTierSearcher::new(index, fast, config)
+    }
+
+    fn vhit(index: u32, score: f32, doc_id: &str) -> VectorHit {
+        VectorHit {
+            index,
+            score,
+            doc_id: doc_id.into(),
+        }
+    }
+
+    /// Position of `id` in a Phase-1 result list — i.e. the rank fusion assigned it.
+    fn rank(docs: &[String], id: &str) -> usize {
+        docs.iter()
+            .position(|doc| doc.as_str() == id)
+            .unwrap_or_else(|| panic!("{id} missing from {docs:?}"))
+    }
+
+    /// PARITY GATE. Both corrections off (the default) ⇒ `correct_phase1_pool` returns the pool
+    /// untouched: same order, same score bits, and no sort — even with an `r_d` table attached.
+    #[test]
+    fn correct_phase1_pool_is_identity_when_both_corrections_are_off() {
+        let hits = vec![
+            vhit(0, 0.9, "doc-0"),
+            vhit(4, 0.9, "doc-4"),
+            vhit(1, 0.1, "doc-1"),
+        ];
+        let searcher = pool_searcher(TwoTierConfig::default())
+            .with_hubness_table(Arc::from(vec![0.0, 0.0, 0.0, 0.0, 1.0].as_slice()));
+
+        let out = searcher.correct_phase1_pool(hits.clone());
+
+        assert_eq!(out.len(), hits.len());
+        for (a, b) in out.iter().zip(&hits) {
+            assert_eq!(a.doc_id, b.doc_id, "order must be preserved (no sort)");
+            assert_eq!(a.score.to_bits(), b.score.to_bits(), "doc {}", a.doc_id);
+        }
+    }
+
+    /// A hub (high `r_d`) must be demoted below an equally-scoring non-hub, and the pool re-sorted
+    /// so the demotion reaches fusion's position-assigned ranks.
+    #[test]
+    fn hubness_demotes_a_hub_below_an_equal_scoring_non_hub_and_resorts() {
+        // doc-4 is the hub: r_d = 1.0 at vector-store index 4.
+        let r_d = vec![0.0, 0.0, 0.0, 0.0, 1.0];
+        let config = TwoTierConfig {
+            hubness_beta: 0.5,
+            ..TwoTierConfig::default()
+        };
+        let searcher = pool_searcher(config).with_hubness_table(Arc::from(r_d.as_slice()));
+
+        // doc-4 leads on raw score (tie with doc-0, earlier position).
+        let hits = vec![
+            vhit(4, 1.0, "doc-4"),
+            vhit(0, 1.0, "doc-0"),
+            vhit(1, 0.2, "doc-1"),
+        ];
+        let out = searcher.correct_phase1_pool(hits);
+
+        let ids: Vec<&str> = out.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["doc-0", "doc-4", "doc-1"],
+            "hub doc-4 (1.0 − 0.5·1.0 = 0.5) must fall behind doc-0 (1.0) and stay ahead of doc-1 (0.2)",
+        );
+        assert!(
+            (out[1].score - 0.5).abs() < 1e-6,
+            "hub score: {}",
+            out[1].score
+        );
+        // A doc with no r_d entry / zero hubness is untouched.
+        assert!((out[0].score - 1.0).abs() < 1e-6);
+    }
+
+    /// ORDERING GATE. Hubness runs BEFORE smoothing, so diffusion propagates de-hubbed scores.
+    /// `doc-1` borrows from its only `Similar` neighbour, the hub `doc-4`. Hubness-first gives
+    /// `doc-1 = 0.5·0.0 + 0.5·(1.0 − 0.5·1.0) = 0.25`; smoothing-first would give
+    /// `0.5·0.0 + 0.5·1.0 = 0.5`, letting the hub inject its inflated score into exactly the
+    /// specific answer the penalty exists to rescue. The exact score discriminates the two.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn hubness_is_applied_before_smoothing_so_hubs_do_not_leak_into_neighbor_means() {
+        let mut graph = DocumentGraph::new();
+        graph.add_edge("doc-1", "doc-4", frankensearch_core::EdgeType::Similar, 1.0);
+
+        let config = TwoTierConfig {
+            hubness_beta: 0.5,
+            neighbor_smoothing_alpha: 0.5,
+            ..TwoTierConfig::default()
+        };
+        let searcher = pool_searcher(config)
+            .with_hubness_table(Arc::from(vec![0.0, 0.0, 0.0, 0.0, 1.0].as_slice()))
+            .with_document_graph(Arc::new(graph));
+
+        let hits = vec![
+            vhit(0, 1.0, "doc-0"),
+            vhit(4, 1.0, "doc-4"),
+            vhit(1, 0.0, "doc-1"),
+        ];
+        let out = searcher.correct_phase1_pool(hits);
+
+        let score_of = |id: &str| out.iter().find(|h| h.doc_id == id).unwrap().score;
+        assert!(
+            (score_of("doc-1") - 0.25).abs() < 1e-6,
+            "doc-1 must diffuse from the DE-HUBBED doc-4 (expected 0.25, got {}); \
+             0.5 would mean smoothing ran first",
+            score_of("doc-1"),
+        );
+        // doc-4 keeps its own demoted score (no outgoing Similar edges ⇒ α collapses).
+        assert!((score_of("doc-4") - 0.5).abs() < 1e-6);
+        assert!((score_of("doc-0") - 1.0).abs() < 1e-6);
+        // And the pool is sorted exactly once, descending.
+        let ids: Vec<&str> = out.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, ["doc-0", "doc-4", "doc-1"]);
+    }
+
+    /// Phase-1 doc order with an `r_d` table attached — end-to-end through the real searcher, so
+    /// the correction is proven to be *reached* by the pipeline, not merely correct in isolation.
+    fn initial_docs_with_hubness(
+        config: TwoTierConfig,
+        hubness: Option<Arc<[f32]>>,
+    ) -> Vec<String> {
+        let mut docs: Vec<String> = Vec::new();
+        let sink = &mut docs;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, config);
+            let searcher = match hubness {
+                Some(table) => searcher.with_hubness_table(table),
+                None => searcher,
+            };
+
+            searcher
+                .search(
+                    &cx,
+                    "hubness correction query",
+                    10,
+                    |_| None,
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            *sink = results
+                                .into_iter()
+                                .map(|result| result.doc_id.to_string())
+                                .collect();
+                        }
+                    },
+                )
+                .await
+                .expect("search should succeed");
+        });
+        docs
+    }
+
+    /// END-TO-END GATE. `doc-0`, `doc-4` and `doc-8` all score 1.0 (they are `e_0`, the query) and
+    /// the top-k heap hands them back as `doc-8, doc-0, doc-4`. Marking the *leader* `doc-8` a hub
+    /// must push it behind both equal-scoring non-hubs in the FUSED output, while keeping it ahead
+    /// of the zero-scorers (demoted, not dropped). With `hubness_beta = 0.0` (default) the same
+    /// table is inert.
+    #[test]
+    fn hubness_demotes_a_hub_through_fusion_and_is_inert_by_default() {
+        // r_d = 1.0 only at vector-store index 8 (doc-8), the baseline rank-0 doc.
+        let mut r_d = vec![0.0f32; 10];
+        r_d[8] = 1.0;
+        let table: Arc<[f32]> = Arc::from(r_d.as_slice());
+
+        let baseline = initial_docs_with_hubness(TwoTierConfig::default(), Some(table.clone()));
+        assert_eq!(
+            baseline,
+            initial_docs_with_hubness(TwoTierConfig::default(), None),
+            "beta=0.0 must make the attached r_d table inert",
+        );
+        assert_eq!(
+            rank(&baseline, "doc-8"),
+            0,
+            "uncorrected, the hub leads the pool: {baseline:?}",
+        );
+
+        let corrected = initial_docs_with_hubness(
+            TwoTierConfig {
+                hubness_beta: 0.5,
+                ..TwoTierConfig::default()
+            },
+            Some(table),
+        );
+        // 1.0 − 0.5·1.0 = 0.5: behind both 1.0 non-hubs, ahead of the 0.0 pool.
+        assert!(
+            rank(&corrected, "doc-8") > rank(&corrected, "doc-0")
+                && rank(&corrected, "doc-8") > rank(&corrected, "doc-4"),
+            "hubness must demote the hub behind the equal-scoring non-hubs: {corrected:?}",
+        );
+        assert!(
+            rank(&corrected, "doc-8") < rank(&corrected, "doc-1"),
+            "the hub is demoted, not dropped — 0.5 still beats the zero-scorers: {corrected:?}",
+        );
+    }
+
     /// PARITY GATE for the wiring (bd-kdjr). `neighbor_smoothing_alpha` defaults to `0.0`, so
     /// attaching a document graph must not perturb Phase-1 at all — the smoothing arm is never
     /// entered and `fast_hits` moves through untouched. This is what makes the wiring a
@@ -3995,12 +4262,6 @@ mod tests {
 
         let baseline = initial_docs_for(TwoTierConfig::default(), Some(graph.clone()));
         let smoothed = initial_docs_for(smoothing, Some(graph));
-
-        let rank = |docs: &[String], id: &str| {
-            docs.iter()
-                .position(|doc| doc.as_str() == id)
-                .unwrap_or_else(|| panic!("{id} missing from {docs:?}"))
-        };
 
         // `doc-2` is an isolated zero-scorer: no Similar edges, so smoothing collapses to
         // identity on it. It is the fixed reference `doc-7` must overtake.

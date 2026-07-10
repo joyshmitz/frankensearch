@@ -56,6 +56,7 @@ pub enum FusionStrategy {
 /// | `FRANKENSEARCH_HNSW_THRESHOLD`   | `hnsw_threshold`   | `50000`    |
 /// | `FRANKENSEARCH_FUSION_STRATEGY`  | `fusion_strategy`  | `rrf`      |
 /// | `FRANKENSEARCH_SMOOTHING_ALPHA`  | `neighbor_smoothing_alpha` | `0.0` (off) |
+/// | `FRANKENSEARCH_HUBNESS_BETA`     | `hubness_beta`     | `0.0` (off) |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TwoTierConfig {
@@ -109,6 +110,21 @@ pub struct TwoTierConfig {
     /// ~5× the kernel cost. Default `false`.
     pub neighbor_smoothing_mutual: bool,
 
+    /// Penalty weight for the query-hubness dense-score correction `s'(q,d) = cos(q,d) − β·r_d`.
+    ///
+    /// `0.0` (default) disables the pass entirely — the searcher never calls it, so the default
+    /// path is byte-identical and pays nothing. Requires an `r_d` table attached via
+    /// `with_hubness_table`; with it absent the pass is skipped.
+    ///
+    /// `0.2` is the never-negative cross-corpus setting; raise toward `0.3` on stance/citation
+    /// corpora where topical centrality anti-correlates with relevance. Measured
+    /// (`docs/NEGATIVE_EVIDENCE.md`, `ba5052a`): **+0.0033 mean hybrid nDCG@10** at β=0.2,
+    /// all-positive across 4 BEIR corpora, with dense-tier gains of +0.0128 (arguana) / +0.0078
+    /// (scidocs). The `r_d` table must be a **query-distribution** statistic built by
+    /// `compute_query_hubness` from a background query sample — the cheap query-free proxies
+    /// (doc-doc density, centroid distance, PC removal) were REJECTED (`64ac8b7`).
+    pub hubness_beta: f32,
+
     /// Optional telemetry exporter callback target.
     ///
     /// `None` means telemetry callbacks are skipped entirely (zero-overhead
@@ -160,6 +176,7 @@ impl Default for TwoTierConfig {
             neighbor_smoothing_alpha: 0.0,
             neighbor_smoothing_m: 10,
             neighbor_smoothing_mutual: false,
+            hubness_beta: 0.0,
             metrics_exporter: None,
             explain: false,
             hnsw_ef_search: 100,
@@ -255,6 +272,16 @@ impl TwoTierConfig {
                 }
                 _ => tracing::warn!(
                     var = "FRANKENSEARCH_SMOOTHING_ALPHA",
+                    value = %val,
+                    "invalid value (expected f32 in 0.0..=1.0), keeping default"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("FRANKENSEARCH_HUBNESS_BETA") {
+            match val.parse::<f32>() {
+                Ok(b) if b.is_finite() && (0.0..=1.0).contains(&b) => self.hubness_beta = b,
+                _ => tracing::warn!(
+                    var = "FRANKENSEARCH_HUBNESS_BETA",
                     value = %val,
                     "invalid value (expected f32 in 0.0..=1.0), keeping default"
                 ),

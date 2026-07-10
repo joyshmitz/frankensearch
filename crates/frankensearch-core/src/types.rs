@@ -105,6 +105,24 @@ impl VectorHit {
         // Descending: higher scores first.
         b.total_cmp(&a)
     }
+
+    /// [`Self::cmp_by_score`] refined into a **total order** by breaking ties on `doc_id`.
+    ///
+    /// Phase-1 score-correction passes (hubness demotion, k-NN smoothing) rewrite scores and must
+    /// re-sort, because the rank-based fusion operators take each hit's rank from its *position*
+    /// in the slice. Sorting on score alone leaves tied hits in an order that depends on the
+    /// upstream pool, so an identical query could fuse differently across runs; the `doc_id`
+    /// tiebreak makes the corrected pool replayable.
+    ///
+    /// Inherits `cmp_by_score`'s NaN-last semantics. That is *not* what a bare
+    /// `b.score.total_cmp(&a.score)` gives: IEEE 754 `totalOrder` ranks `+NaN` above `+inf`, so a
+    /// descending `total_cmp` would sort a NaN score to rank 0 — exactly the doc a corrupted
+    /// correction statistic would produce.
+    #[must_use]
+    pub fn cmp_rank(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp_by_score(other)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
 }
 
 /// A hit from hybrid fusion (lexical + semantic combined via RRF).
@@ -398,6 +416,53 @@ pub enum SearchPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vhit(index: u32, score: f32, doc_id: &str) -> VectorHit {
+        VectorHit {
+            index,
+            score,
+            doc_id: doc_id.into(),
+        }
+    }
+
+    /// `cmp_rank` must be a total order: score descending, ties broken on `doc_id`.
+    #[test]
+    fn cmp_rank_breaks_score_ties_on_doc_id() {
+        let mut hits = [
+            vhit(0, 0.5, "b"),
+            vhit(1, 0.9, "z"),
+            vhit(2, 0.5, "a"),
+            vhit(3, 0.5, "c"),
+        ];
+        hits.sort_unstable_by(VectorHit::cmp_rank);
+        let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, ["z", "a", "b", "c"]);
+    }
+
+    /// NaN sorts LAST, inheriting `cmp_by_score`. A bare descending `total_cmp` would do the
+    /// opposite — IEEE 754 `totalOrder` ranks `+NaN` above `+inf`, putting a corrupted score at
+    /// rank 0. Phase-1 score corrections re-sort with this comparator, so the distinction is load
+    /// bearing.
+    #[test]
+    fn cmp_rank_sorts_nan_last_unlike_bare_total_cmp() {
+        let mut hits = [
+            vhit(0, f32::NAN, "nan"),
+            vhit(1, 0.1, "lo"),
+            vhit(2, 0.9, "hi"),
+        ];
+        hits.sort_unstable_by(VectorHit::cmp_rank);
+        let ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, ["hi", "lo", "nan"], "NaN must sort last");
+
+        // The trap this guards against.
+        let mut bare = [vhit(0, f32::NAN, "nan"), vhit(1, 0.9, "hi")];
+        bare.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+        assert_eq!(
+            bare[0].doc_id.as_str(),
+            "nan",
+            "bare descending total_cmp puts +NaN at rank 0 — the reason cmp_rank exists"
+        );
+    }
 
     #[test]
     fn indexable_document_builder() {

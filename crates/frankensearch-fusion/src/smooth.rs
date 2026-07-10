@@ -260,9 +260,10 @@ fn mutual_neighbor_smooth(
 /// discarded. Worse, the merge's near-sorted assumption would be violated. Re-sorting restores
 /// the invariant "position == rank" that fusion depends on.
 ///
-/// Ties break on `doc_id` so the pool order is a total order and the pipeline stays replayable.
-/// Identity config / empty graph / empty pool short-circuits to `neighbor_smooth`'s clone, whose
-/// input was already sorted, so the sort is skipped entirely.
+/// Sorts by [`VectorHit::cmp_rank`] — score descending, NaN last, ties broken on `doc_id` so the
+/// pool order is a total order and the pipeline stays replayable. Identity config / empty graph /
+/// empty pool short-circuits to `neighbor_smooth`'s clone, whose input was already sorted, so the
+/// sort is skipped entirely.
 #[must_use]
 pub fn neighbor_smooth_ranked(
     hits: &[VectorHit],
@@ -273,11 +274,7 @@ pub fn neighbor_smooth_ranked(
         return hits.to_vec();
     }
     let mut smoothed = neighbor_smooth(hits, graph, config);
-    smoothed.sort_unstable_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.doc_id.cmp(&b.doc_id))
-    });
+    smoothed.sort_unstable_by(VectorHit::cmp_rank);
     smoothed
 }
 

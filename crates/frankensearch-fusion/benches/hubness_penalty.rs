@@ -13,7 +13,10 @@
 //! ```
 
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Calls per timed region in the interleaved paired sampler — amortizes the `Instant::now()` pair.
+const PAIR_BATCH: u32 = 16;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::VectorHit;
@@ -63,11 +66,88 @@ fn bench(c: &mut Criterion) {
         assert_eq!(s.len(), pool);
         assert!((s[10].score - hits[10].score).abs() > 1e-9);
 
+        // REACHABILITY GATE for the `correct_ranked` arm. If the corrected pool were already in
+        // sorted order, `sort_unstable_by` would short-circuit and the arm would time a detection
+        // pass over dead code rather than a real sort. Assert the penalty genuinely permutes the
+        // pool, and report how far, so the measured re-sort cost is attributable to actual work.
+        let mut ranked = s.clone();
+        ranked.sort_unstable_by(VectorHit::cmp_rank);
+        let displaced = s
+            .iter()
+            .zip(&ranked)
+            .filter(|(a, b)| a.doc_id != b.doc_id)
+            .count();
+        assert!(
+            displaced > 0,
+            "pool {pool}: hubness left the pool already sorted — the sort arm would measure nothing"
+        );
+        eprintln!("[reachability] pool {pool}: {displaced}/{pool} hits displaced by the re-sort");
+
         g.bench_with_input(BenchmarkId::new("identity", pool), &(), |b, ()| {
             b.iter(|| black_box(apply_hubness_penalty(black_box(&hits), black_box(&hub), &identity)));
         });
         g.bench_with_input(BenchmarkId::new("correct", pool), &(), |b, ()| {
             b.iter(|| black_box(apply_hubness_penalty(black_box(&hits), black_box(&hub), &correct)));
+        });
+
+        // ── Searcher wiring (bd-kdjr): the re-sort that makes the demotion reach fusion ──
+        //
+        // `correct` (ORIG) is the bare O(pool) subtract; the searcher must additionally re-sort,
+        // because rank-based fusion assigns ranks by POSITION — without it a demoted hub keeps its
+        // rank and the correction is silently discarded. `correct2` re-measures ORIG last to
+        // bracket criterion's ordering bias. The identity arm is not the searcher's default path:
+        // when `beta == 0.0` the searcher never calls the kernel at all (the pool moves through).
+        //
+        // The input is score-sorted and hubness is heaviest at the front, so the penalty perturbs
+        // a sorted pool — the same near-sorted shape the real Phase-1 pool has.
+        // INTERLEAVED PAIRED SAMPLER — see `neighbor_smooth.rs` for the rationale. Criterion group
+        // members run sequentially, so an ORIG-first-and-last bracket exposes drift rather than
+        // cancelling it. Each arm below runs BOTH implementations per iteration and times only its
+        // own, batched so the `Instant::now()` pair amortizes.
+        let ranked = |hits: &[VectorHit], hub: &[f32]| {
+            let mut out = apply_hubness_penalty(hits, hub, &correct);
+            out.sort_unstable_by(VectorHit::cmp_rank);
+            out
+        };
+        g.bench_with_input(BenchmarkId::new("paired_correct", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranked(black_box(&hits), black_box(&hub)));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(apply_hubness_penalty(
+                            black_box(&hits),
+                            black_box(&hub),
+                            &correct,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("paired_correct_ranked", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(apply_hubness_penalty(
+                            black_box(&hits),
+                            black_box(&hub),
+                            &correct,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranked(black_box(&hits), black_box(&hub)));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
         });
     }
     g.finish();

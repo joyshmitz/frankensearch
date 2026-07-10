@@ -13,15 +13,25 @@
 //! ```
 
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
 use frankensearch_fusion::{SmoothConfig, neighbor_smooth, neighbor_smooth_ranked};
 
+/// Calls per timed region in the interleaved paired sampler — amortizes the `Instant::now()` pair.
+const PAIR_BATCH: u32 = 16;
+
 /// A pool of `pool` candidates with heavy-tailed cosine scores, and an M-nearest `Similar`
-/// graph where each doc links to the `m` following docs (a synthetic cluster chain, all
-/// in-pool so the kernel does real averaging work).
+/// graph, all in-pool so the kernel does real averaging work.
+///
+/// Neighbours are **scattered** (`i*37 + j*101 mod pool`), not the `m` following docs. That is
+/// load bearing for the `smooth_ranked` arm: with a forward chain, every doc's neighbours score
+/// strictly below it, so diffusing a convex decreasing sequence preserves its order and the pool
+/// comes out ALREADY SORTED — `sort_unstable_by` then short-circuits on its sortedness check and
+/// the arm times a detection pass over dead code instead of a sort. A scattered graph lets a
+/// low-ranked doc borrow from a high-scoring cluster and actually overtake its neighbours, which
+/// is the promotion smoothing exists to produce. The reachability gate in `bench` asserts this.
 fn build(pool: usize, m: usize) -> (Vec<VectorHit>, DocumentGraph) {
     let hits: Vec<VectorHit> = (0..pool)
         .map(|i| VectorHit {
@@ -33,7 +43,10 @@ fn build(pool: usize, m: usize) -> (Vec<VectorHit>, DocumentGraph) {
     let mut graph = DocumentGraph::new();
     for i in 0..pool {
         for j in 1..=m {
-            let nbr = (i + j) % pool;
+            let nbr = (i * 37 + j * 101) % pool;
+            if nbr == i {
+                continue;
+            }
             graph.add_edge(
                 format!("doc{i:06}"),
                 format!("doc{nbr:06}"),
@@ -81,6 +94,22 @@ fn bench(c: &mut Criterion) {
         assert_eq!(s.len(), pool);
         assert!((s[10].score - hits[10].score).abs() > 1e-9);
 
+        // REACHABILITY GATE for the `smooth_ranked` arm. Changing scores is not enough: if
+        // diffusion left the pool in sorted order, `sort_unstable_by` would short-circuit and the
+        // arm would time a detection pass over dead code, making the "re-sort is nearly free"
+        // claim an artifact. Assert the sort genuinely permutes the pool, and report by how much.
+        let ranked = neighbor_smooth_ranked(&hits, &graph, &smooth);
+        let displaced = s
+            .iter()
+            .zip(&ranked)
+            .filter(|(a, b)| a.doc_id != b.doc_id)
+            .count();
+        assert!(
+            displaced > 0,
+            "pool {pool}: smoothing left the pool already sorted — the sort arm would measure nothing"
+        );
+        eprintln!("[reachability] pool {pool}: {displaced}/{pool} hits displaced by the re-sort");
+
         g.bench_with_input(BenchmarkId::new("identity", pool), &(), |b, ()| {
             b.iter(|| {
                 black_box(neighbor_smooth(
@@ -114,7 +143,6 @@ fn bench(c: &mut Criterion) {
         // `smooth` (ORIG) is the bare kernel; `smooth_ranked` is what the searcher actually calls.
         // The delta is the deterministic descending re-sort, which is a CORRECTNESS requirement:
         // fusion assigns ranks by position, so without it a promoted doc keeps its old rank.
-        // ORIG is measured again at the end (`smooth2`) to bracket criterion's ordering bias.
         //
         // The default-off path is not benched because it does not exist as work: the searcher's
         // `match` yields `fast_hits` by move when smoothing is disabled — no call, no clone.
@@ -123,24 +151,64 @@ fn bench(c: &mut Criterion) {
             hits,
             "identity must be byte-identical passthrough at pool {pool}"
         );
-        g.bench_with_input(BenchmarkId::new("smooth_ranked", pool), &(), |b, ()| {
-            b.iter(|| {
-                black_box(neighbor_smooth_ranked(
-                    black_box(&hits),
-                    black_box(&graph),
-                    &smooth,
-                ))
+        // INTERLEAVED PAIRED SAMPLER. Criterion group members run *sequentially*, so registering
+        // ORIG and CAND side by side (even ORIG-first-and-last) does not cancel worker or thermal
+        // drift — it only exposes it. Here each arm's measured routine runs BOTH implementations
+        // every iteration and times only its own, so the two benchmarks perform identical total
+        // work and see identical machine state; drift hits both equally and cancels in the ratio.
+        // Calls are batched so the two `Instant::now()` reads amortize to <2% of the timed region.
+        g.bench_with_input(BenchmarkId::new("paired_smooth", pool), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(neighbor_smooth_ranked(
+                            black_box(&hits),
+                            black_box(&graph),
+                            &smooth,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(neighbor_smooth(
+                            black_box(&hits),
+                            black_box(&graph),
+                            &smooth,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
             });
         });
-        g.bench_with_input(BenchmarkId::new("smooth2", pool), &(), |b, ()| {
-            b.iter(|| {
-                black_box(neighbor_smooth(
-                    black_box(&hits),
-                    black_box(&graph),
-                    &smooth,
-                ))
-            });
-        });
+        g.bench_with_input(
+            BenchmarkId::new("paired_smooth_ranked", pool),
+            &(),
+            |b, ()| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        for _ in 0..PAIR_BATCH {
+                            black_box(neighbor_smooth(
+                                black_box(&hits),
+                                black_box(&graph),
+                                &smooth,
+                            ));
+                        }
+                        let t = Instant::now();
+                        for _ in 0..PAIR_BATCH {
+                            black_box(neighbor_smooth_ranked(
+                                black_box(&hits),
+                                black_box(&graph),
+                                &smooth,
+                            ));
+                        }
+                        total += t.elapsed();
+                    }
+                    total
+                });
+            },
+        );
     }
     g.finish();
 }
