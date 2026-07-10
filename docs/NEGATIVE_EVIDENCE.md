@@ -10761,3 +10761,37 @@ all failed at least one strict CV gate despite non-zero candidate self-time. Ret
 state change that provides worker-level isolation or affinity/pinning for the entire one-binary RCH
 invocation, or a demonstrably quiet worker on which all four arm CVs are below 5%. Until then, neither landing
 nor permanently rejecting the production row-block code would satisfy the honest keep gate.
+
+---
+
+## 2026-07-10 — PROFILE ROUTING RECORD: fresh packed-key int8 baseline is 88.79% AVX2 dot self-time (cod_fse)
+
+Before the row-block lever was selected, the exact `1948a65` release-perf benchmark binary was sampled on
+`vmi1167313` for 30 seconds with `RAYON_NUM_THREADS=4`, CPUs 2-5, `cycles:u`, 997 Hz, frame-pointer call
+graphs, and the `fsvi_int8_two_pass/int8_mult3` row. Binary SHA-256:
+`35bf589f793a168570ba0288b33d80ca45fd90ce7525cebb36a9922e36498538`. Perf captured 52,445 samples with
+zero lost; sample duration was 36.484 seconds. This is the complete flat-self frame table at the required
+>=0.1% cutoff:
+
+| rank | flat self | frame |
+|---:|---:|---|
+| 1 | 88.79% | `frankensearch_index::simd::dot_i8_i8_avx2` |
+| 2 | 6.72% | `VectorIndex::int8_scan_range` |
+| 3 | 0.75% | `dot_product_f16_bytes_f32_avx2` |
+| 4 | 0.25% | `search_top_k_int8_two_pass` |
+| 5 | 0.21% | `malloc` |
+| 6 | 0.18% | crossbeam deque `Stealer::steal` |
+| 7 | 0.17% | futex mutex `lock_contended` |
+| 8 | 0.13% | Rayon bridge helper |
+| 9 | 0.11% | Rayon `join_context` |
+| 10 | 0.11% | Rayon `wait_until_cold` |
+| 11 | 0.10% | `core::str::converts::from_utf8` |
+
+The top frame belongs to the previously rejected prepared-query/extra-accumulator neighborhood. That row's
+explicit retry condition, however, allowed query widening reused across multiple stored rows, so the tested
+mechanism was a structurally distinct four-row block rather than another per-dot sidecar. Its exact candidate
+profiles above proved live execution but codegen showed why reuse washed out: it removes only L1-hot query
+widen-loads while retaining all stored widening, multiply-adds, four horizontal reductions, and wrapper ABI
+cost; it also gives each row one accumulator instead of the incumbent's dual-chain ILP. Profile artifact:
+`/tmp/bd-b5wl-1948a65-mult3-profile30.perf.data`, SHA-256
+`eae9311dfdf6ac5d2f94df73c21ea1e8e446578568d6d42736ed827732eb4076`.
