@@ -4802,3 +4802,35 @@ contention-outlier round; the median gate at 1.0 vs 0.0725 is unambiguous.)
 queries early-return identically), so it's a large-doc win, not always-on. **SHIPPED in place**; the char_indices
 original retained as `truncate_to_chars_slow` (`cfg(test | bench-internals)`) so the A/B stays reproducible. All
 builds/benches remote; no local cargo; fmt + clippy clean on changed lines.
+
+## 2026-07-10 — WIN: fingerprint `char_count` ASCII fast-path removes a redundant full-text decode — 2.85×, identical count (cc_fse)
+
+Continuing the byte-fast sweep. `DocumentFingerprint::compute` runs per document at ingest (dedup / re-embed
+decision) and computed `char_count` as `text.chars().count()` — a **second** full-text UTF-8 decode on top of the
+one `semantic_simhash_text`'s tokenization already does. Meanwhile `fnv1a_hash` already scanned the bytes. So
+`compute` decoded the text twice.
+
+**The lever.** For ASCII (the common case for English/code), the char count equals the byte length, and
+`str::is_ascii` is a SIMD byte scan far cheaper than a per-char decode: `char_count(text) = if text.is_ascii() {
+text.len() } else { text.chars().count() }`. Non-ASCII falls back. Identical result for every input.
+
+**Recall/ordering — trivially preserved.** `char_count` is dedup metadata (the char-count-delta re-embed
+heuristic), not search output; and the value is identical anyway. `char_count_matches_slow` asserts equality on
+ASCII, pure-multibyte (byte-len ≠ char-count), combining marks, emoji, and mixed text. All 22 fingerprint lib
+tests pass.
+
+**Speed — DECIDABLE WIN.** Null-controlled microbench (`benches/char_count_ab.rs`, all-ASCII 4 KiB doc × 256 per
+timed region — the fast path only fires on fully-ASCII text; a stray non-ASCII char falls back, which the parity
+test covers; shared alternating-round sampler, one binary / one `rch` invocation, worker `hz2`, binary sha256
+`3d83a2e5adc7171035e5f5263d5f2ed3e4e9b446b5f4ff8be7b0fb4c243fe45a`, 41 rounds × 4):
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (chars_count vs chars_count) | 0.9994 [0.8675, 1.0903] |
+| fast / ORIG | **0.3512 [0.2989, 0.4776]** |
+
+fast/ORIG median 0.3512 = **2.85× faster** on the char-count op; lever p95 (0.478) well below null p5 (0.868),
+decidable. **Scope:** char_count is a *fraction* of `compute` (the simhash tokenize+hash dominates), so the
+per-doc `compute`-level win is smaller — but it eliminates one of two redundant full-text decodes, always-on for
+ASCII docs. **SHIPPED in place**; `chars().count()` retained as `char_count_slow` (`cfg(test | bench-internals)`).
+All builds/benches remote; no local cargo; fmt + clippy clean on changed lines.

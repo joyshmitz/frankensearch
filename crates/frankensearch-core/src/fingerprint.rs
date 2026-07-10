@@ -45,7 +45,7 @@ impl DocumentFingerprint {
         Self {
             content_hash: fnv1a_hash(text.as_bytes()),
             semantic_hash: semantic.hash,
-            char_count: usize_to_u32_saturating(text.chars().count()),
+            char_count: usize_to_u32_saturating(char_count(text)),
             token_estimate: usize_to_u32_saturating(semantic.token_count),
         }
     }
@@ -139,6 +139,37 @@ fn semantic_simhash(tokens: &[&str]) -> u64 {
 struct SemanticSimhash {
     hash: u64,
     token_count: usize,
+}
+
+/// Character count with an ASCII fast-path.
+///
+/// `text.chars().count()` decodes every char — a *second* full-text decode on top of the one
+/// `semantic_simhash_text` already does. For ASCII (the common case) the char count equals the byte
+/// length, and `str::is_ascii` is a SIMD byte scan far cheaper than a per-char decode. Non-ASCII
+/// falls back to the decode. Identical result for every input (`char_count_matches_slow`).
+#[must_use]
+fn char_count(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.chars().count()
+    }
+}
+
+/// Pre-fast-path char count (`text.chars().count()`), retained for the same-binary A/B + parity test.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn char_count_slow(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// Doc-hidden bench wrapper for the shipped (ASCII-fast) `char_count` (it is private).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn char_count_fast_bench(text: &str) -> usize {
+    char_count(text)
 }
 
 #[must_use]
@@ -246,8 +277,32 @@ fn hash_token_window(window: &[&str]) -> u64 {
 mod tests {
     use super::{
         DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint,
-        SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD, semantic_simhash, semantic_simhash_text,
+        SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD, char_count, char_count_slow, semantic_simhash,
+        semantic_simhash_text,
     };
+
+    /// PARITY GATE: the ASCII-fast `char_count` must equal `text.chars().count()` for ASCII, pure
+    /// multibyte (byte-len > char-count), mixed, empty, and combining-mark inputs.
+    #[test]
+    fn char_count_matches_slow() {
+        for text in [
+            "",
+            "hello world",
+            "café déjà vu",
+            "日本語のテスト",
+            "a\u{0301}b\u{1F600}c", // combining acute + emoji + ascii
+            "mix ascii and 日本 text 123",
+            &"x".repeat(5000),
+            &"é".repeat(5000),
+        ] {
+            assert_eq!(
+                char_count(text),
+                char_count_slow(text),
+                "mismatch for len {}",
+                text.len()
+            );
+        }
+    }
 
     #[test]
     fn identical_text_produces_identical_fingerprint() {
