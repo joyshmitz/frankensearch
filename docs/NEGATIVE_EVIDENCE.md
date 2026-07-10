@@ -10726,3 +10726,38 @@ index/doc/score parity.
 **Decision:** REJECT the 60-second flat-sampling bundle. Retry condition: double flat measurement to 120
 seconds with the same 20 samples and full-query batch, which should roughly double work per sample and reduce
 the lone unstable estimator without changing code or splitting the A/B across workers.
+
+---
+
+## 2026-07-10 — REJECTED MEASUREMENT BUNDLE / BLOCKER: 120-second flat samples remain scheduler-dominated (cod_fse)
+
+**This rejects the timing bundle and surfaces an infrastructure blocker; it does not bind the candidate.**
+The final recorded retry ran one fail-closed RCH invocation on `ovh-a` (AMD Ryzen 7 5800X) after admission
+reported zero remaining worker slots. Both arms remained in every measured routine, each sample averaged
+complete 32-query AB/BA batches for a 120-second flat-sampling target, and inputs/results were black-boxed.
+Exact release-perf binary SHA-256:
+`259c0845cb0a7581bd086f36424e70181ac3a07736e3646af7aab0b0ff5877e4`.
+
+| arm | per-search mean [95% CI] | per-search stddev | CV | candidate/original |
+|---|---:|---:|---:|---:|
+| paired ORIGINAL mult3 | 417.244 us [393.834, 442.313] | 56.648 us | **13.5768%** | — |
+| paired four-row candidate mult3 | 502.702 us [390.429, 689.394] | 374.243 us | **74.4462%** | 1.204816 |
+| paired ORIGINAL mult5 | 390.122 us [386.538, 395.250] | 10.495 us | 2.6901% | — |
+| paired four-row candidate mult5 | 463.983 us [415.603, 539.443] | 152.609 us | **32.8911%** | 1.189327 |
+
+Recall@10 and nDCG@10 were exactly 1.0000 for both arms at multipliers 2, 3, 5, and 10, and all
+index/doc/score outputs matched bit-for-bit. Three of four CVs fail the <5% gate even after doubling the work
+per sample, so these large apparent losses are scheduling evidence only.
+
+**Ledger-integrity profile.** The exact measured candidate benchmark was pinned and profiled for 30 seconds.
+`dot_i8x4_i8_avx2` had **43.60% flat self-time**, its dispatch wrapper had 0.60%, and the interleaved ORIGINAL
+`dot_i8_i8_avx2` had 41.59%. Perf captured 152,688 samples with zero lost. Artifact:
+`/tmp/bd-b5wl-row4-ab5-profile-20260710-1527-root.perf.data` on `ovh-a`, SHA-256
+`e696716bbd69e445fe8206421cec7c854953ce00d65abf570c98164ab74b8e63`.
+
+**Decision / concrete blocker:** REJECT this measurement bundle and stop retrying the row-block family under
+the current remote scheduler. Unbatched, batch16, batch32 linear, 60-second flat, and 120-second flat bundles
+all failed at least one strict CV gate despite non-zero candidate self-time. Retry condition: an external
+state change that provides worker-level isolation or affinity/pinning for the entire one-binary RCH
+invocation, or a demonstrably quiet worker on which all four arm CVs are below 5%. Until then, neither landing
+nor permanently rejecting the production row-block code would satisfy the honest keep gate.
