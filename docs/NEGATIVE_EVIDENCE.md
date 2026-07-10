@@ -10325,3 +10325,28 @@ sidecar. Retry condition: only revisit query preparation as a different primitiv
 query registers across multiple stored rows per chunk (row-blocked/k-row dot) or uses a hardware dot-product
 instruction path that reduces both decode and load pressure; otherwise measure the candidate-budget
 multiplier sweep separately.
+
+---
+
+## 2026-07-10 — REJECTED: 8k-row chunks for FSVI int8 two-pass pass-1 — over-widens the merge/fan-in lever and misses the fastest mult3 row (cod_fs)
+
+**Rejected tuning point (`bd-b5wl`).** After profiling the current file-backed int8 two-pass shape, the ranked
+source hotspot was not the int8 dot itself but pass-1 selection fan-in: the exact-scan 1k Rayon chunk size
+creates about 98 local bounded heaps at N=100k, then merges up to `chunks * k * mult` local winners before the
+final f16 rescore. The tested lever widened int8-only chunks to 8k rows to shrink local heap production.
+
+**Same-worker A/B, RCH `ovh-a`, release profile, `fsvi_int8_two_pass`, N=100k, dim=384, k=10, sample-size 10,
+warm-up 0.1 s, measurement 0.5 s.** Quality parity held for every measured budget:
+recall@10=1.0000 and nDCG@10=1.0000 at mult=2/3/5/10.
+
+| arm | 1k baseline | 8k candidate | ratio | decision |
+|---|---:|---:|---:|---|
+| int8_mult3 | **506.18 us** [499.97, 511.16] | 528.57 us [503.90, 558.80] | **1.044 / 4.4% slower** | REJECT |
+| int8_mult5 | 551.20 us [535.06, 573.45] | 541.32 us [532.08, 549.39] | 0.982 / 1.8% faster | not enough to keep |
+| int8_mult10 | 629.33 us [613.01, 658.18] | 573.69 us [562.15, 585.52] | 0.912 / 8.8% faster | secondary only |
+
+**Decision:** REJECTED as a final chunk size because it slows or destabilizes the fastest quality-gated arm
+(`mult3`) and only pays clearly at larger candidate budgets. The kept variant is 4k chunks, which preserves
+more Rayon parallelism and improves both `mult3` and `mult5`. Do not retry 8k chunks for the standard
+N=100k/dim384/k=10 FSVI int8 two-pass row unless a future workload proves `mult10+` is the product-critical
+budget or the worker/core topology changes enough to make 8k the parallelism sweet spot.

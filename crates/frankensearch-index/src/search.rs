@@ -23,6 +23,7 @@ use wide::f32x8;
 pub const PARALLEL_THRESHOLD: usize = 10_000;
 /// Chunk size per Rayon task in the parallel scan path.
 pub const PARALLEL_CHUNK_SIZE: usize = 1_024;
+const INT8_PARALLEL_CHUNK_SIZE: usize = PARALLEL_CHUNK_SIZE * 4;
 /// Selectivity threshold for the file-backed gather fast-path. A hash-addressable
 /// filter must be smaller than `record_count / GATHER_SELECTIVITY_DIVISOR` before
 /// we invert the loop and binary-search/gather the allowed hash ranges. The FSVI
@@ -323,17 +324,19 @@ impl VectorIndex {
         let query_i8 = quantize_i8_query(query);
         let slab = self.int8_slab();
 
-        // Pass 1: bounded-heap int8 scan keeping the top `candidate_count`, parallel
-        // above the same threshold/chunking as the exact scan so it uses all cores.
+        // Pass 1: bounded-heap int8 scan keeping the top `candidate_count`.
+        // The int8 dot is cheap enough that exact-scan sized chunks overproduce
+        // local top-N heaps; larger chunks keep enough Rayon tasks while shrinking
+        // the post-scan merge fan-in.
         let candidate_heap = if count < PARALLEL_THRESHOLD {
             self.int8_scan_range(slab, &query_i8, 0, count, candidate_count)
         } else {
-            let chunk_count = count.div_ceil(PARALLEL_CHUNK_SIZE);
+            let chunk_count = count.div_ceil(INT8_PARALLEL_CHUNK_SIZE);
             let partials: Vec<BinaryHeap<HeapEntry>> = (0..chunk_count)
                 .into_par_iter()
                 .map(|chunk_index| {
-                    let start = chunk_index * PARALLEL_CHUNK_SIZE;
-                    let end = (start + PARALLEL_CHUNK_SIZE).min(count);
+                    let start = chunk_index * INT8_PARALLEL_CHUNK_SIZE;
+                    let end = (start + INT8_PARALLEL_CHUNK_SIZE).min(count);
                     self.int8_scan_range(slab, &query_i8, start, end, candidate_count)
                 })
                 .collect();
