@@ -10651,3 +10651,34 @@ the interleaved ORIGINAL `dot_i8_i8_avx2` had 29.51%. Perf captured 58,914 sampl
 and one-binary interleaving, but use flat sampling with a multi-second target per sample so transient remote
 worker scheduling is averaged within each estimate. If strict-remote scheduling cannot produce all four CVs
 below 5%, that is an infrastructure blocker rather than evidence for or against the production candidate.
+
+---
+
+## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: 60-second flat sampling leaves one mult5 CV above gate (cod_fse)
+
+**This rejects the timing bundle, not yet the candidate.** Criterion flat sampling was encoded in the bench
+source and run in one fail-closed RCH invocation on `hz1` (AMD EPYC-Milan, four cores/eight threads). Each of
+20 samples averaged a fixed number of complete 32-query AB/BA batches; both arms ran inside every measured
+routine, and the table divides batch values by 32. Exact release-perf binary SHA-256:
+`d594c1ad61a04a0a60ae3ddaa5db7d5664b08a08c7bfa25336bac170a2575f1d`.
+
+| arm | per-search mean [95% CI] | per-search stddev | CV | candidate/original |
+|---|---:|---:|---:|---:|
+| paired ORIGINAL mult3 | 690.942 us [682.880, 699.716] | 19.840 us | 2.8714% | — |
+| paired four-row candidate mult3 | 705.582 us [699.465, 713.319] | 16.246 us | 2.3025% | 1.021188 |
+| paired ORIGINAL mult5 | 789.947 us [773.097, 809.805] | 43.123 us | **5.4590%** | — |
+| paired four-row candidate mult5 | 805.947 us [795.212, 816.877] | 25.373 us | 3.1482% | 1.020255 |
+
+Both candidate ratios are losses, but the ORIGINAL mult5 CV still violates the strict <5% gate. Recall@10
+and nDCG@10 were exactly 1.0000 for both arms at multipliers 2, 3, 5, and 10, with bit-exact
+index/doc/score parity.
+
+**Ledger-integrity profile.** A 30-second profile of the exact measured candidate benchmark recorded
+`dot_i8x4_i8_avx2` at **38.65% flat self-time**, its dispatch wrapper at 1.03%, and the interleaved ORIGINAL
+`dot_i8_i8_avx2` at 38.20%. Perf captured 106,439 samples with zero lost. Artifact:
+`/tmp/bd-b5wl-row4-ab4-profile-20260710-1511.perf.data` on `hz1`, SHA-256
+`4fadeb1bbc813e447c67db6459e2c65113170b69305ff6ab50843f844113e70f`.
+
+**Decision:** REJECT the 60-second flat-sampling bundle. Retry condition: double flat measurement to 120
+seconds with the same 20 samples and full-query batch, which should roughly double work per sample and reduce
+the lone unstable estimator without changing code or splitting the A/B across workers.
