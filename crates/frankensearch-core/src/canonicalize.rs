@@ -523,12 +523,43 @@ fn truncate_to_chars(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_owned();
     }
+    // ASCII fast-path: if the first `max_chars` bytes are all ASCII, they are exactly `max_chars`
+    // single-byte chars and byte `max_chars` is a char boundary — cut there directly, skipping the
+    // O(max_chars) `char_indices` decode. `is_ascii()` is a SIMD byte scan; `max_chars < text.len()`
+    // here, so the slice is valid. Byte-identical to the decode path (`truncate_to_chars_matches_slow`).
+    if text.as_bytes()[..max_chars].is_ascii() {
+        return text[..max_chars].to_owned();
+    }
     for (count, (idx, _)) in text.char_indices().enumerate() {
         if count == max_chars {
             return text[..idx].to_owned();
         }
     }
     text.to_owned()
+}
+
+/// Pre-ASCII-fast-path [`truncate_to_chars`], retained for the same-binary A/B + parity test.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn truncate_to_chars_slow(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_owned();
+    }
+    for (count, (idx, _)) in text.char_indices().enumerate() {
+        if count == max_chars {
+            return text[..idx].to_owned();
+        }
+    }
+    text.to_owned()
+}
+
+/// Doc-hidden bench wrapper for the shipped (ASCII-fast) `truncate_to_chars` (it is private).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn truncate_to_chars_fast_bench(text: &str, max_chars: usize) -> String {
+    truncate_to_chars(text, max_chars)
 }
 
 #[cfg(test)]
@@ -541,6 +572,33 @@ mod tests {
     /// ASCII, every ASCII whitespace byte (incl. the tricky U+000B vertical tab), Unicode whitespace
     /// (NBSP U+00A0, NEL U+0085, ideographic space U+3000, en/em spaces), runs, leading/trailing, and
     /// mixed ASCII/Unicode text.
+    /// PARITY GATE: the ASCII-fast `truncate_to_chars` must equal the char_indices original — for
+    /// content shorter/equal/longer than the cap, ASCII and multibyte, and cuts landing on an ASCII
+    /// boundary, before a multibyte char, and mid-multibyte (must round down to the char boundary).
+    #[test]
+    fn truncate_to_chars_matches_slow() {
+        let ascii = "abcdefghij".repeat(300); // 3000 bytes, all ASCII
+        let uni = "aéb日cé".repeat(300); // multibyte at varied positions
+        let lead = format!("{}{}", "x".repeat(50), "é".repeat(50)); // ascii then multibyte
+        for text in [
+            "",
+            "hi",
+            "hello world",
+            ascii.as_str(),
+            uni.as_str(),
+            lead.as_str(),
+        ] {
+            for max_chars in [0usize, 1, 3, 49, 50, 51, 100, 500, 2000, 100_000] {
+                assert_eq!(
+                    truncate_to_chars(text, max_chars),
+                    truncate_to_chars_slow(text, max_chars),
+                    "text.len()={} max_chars={max_chars}",
+                    text.len()
+                );
+            }
+        }
+    }
+
     #[test]
     fn normalize_whitespace_matches_slow() {
         let cases = [

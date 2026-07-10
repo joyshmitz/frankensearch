@@ -66,3 +66,8 @@ harness = false
 name = "whitespace_norm_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "truncate_chars_ab"
+harness = false
+required-features = ["bench-internals"]

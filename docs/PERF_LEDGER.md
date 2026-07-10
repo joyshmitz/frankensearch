@@ -4768,3 +4768,37 @@ just large/truncated ones).
 **SHIPPED in place**; the char-by-char original retained as `normalize_whitespace_slow` (`cfg(test |
 bench-internals)`) so the A/B stays reproducible. All builds/benches remote; no local cargo; fmt + clippy clean on
 changed lines.
+
+## 2026-07-10 — WIN: `truncate_to_chars` ASCII fast-path skips the char_indices scan — ~13.8× on the truncation path, byte-identical (cc_fse)
+
+Continuing the byte-fast ASCII sweep. `truncate_to_chars` caps canonicalized doc/query text at `max_length`
+chars (default 2000), called per-doc AND per-query. Short text (≤ cap bytes) already early-returns; for longer
+text the original forward-scanned `char_indices` — O(max_chars) UTF-8 decodes — to find the cut.
+
+**The lever (sibling of `cass_prefix_source` `f6c15f5`).** If the first `max_chars` *bytes* are ASCII, they are
+exactly `max_chars` single-byte chars and byte `max_chars` is a char boundary — so cut at `text[..max_chars]`
+directly. `text.as_bytes()[..max_chars].is_ascii()` is a SIMD byte scan (~memcpy speed); the char_indices decode
+is skipped entirely on ASCII prefixes. Non-ASCII prefixes fall back to the decode. Byte-identical.
+
+**Recall/ordering — trivially preserved.** Same truncated text ⇒ same canonicalized doc ⇒ same tokens/embeddings/
+index terms/ranking. `truncate_to_chars_matches_slow` asserts equality across content shorter/equal/longer than
+the cap, ASCII and multibyte, and cuts on an ASCII boundary / before a multibyte char / mid-multibyte (rounds
+down). All 36 canonicalize lib tests pass.
+
+**Speed — DECIDABLE WIN.** Null-controlled microbench (`benches/truncate_chars_ab.rs`, 16 KiB ASCII doc, both arms
+take the truncation scan, shared alternating-round sampler, one binary / one `rch` invocation, worker `hz1`,
+binary sha256 `0e8c88467ba0e115727966ea6ae00a91f8ae29d21b59c3414734baa92d8a4213`, 41 rounds × 4):
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (char_indices vs char_indices) | 1.0000 [0.9546, 1.9072] |
+| fast / ORIG | **0.0725 [0.0688, 0.0764]** |
+
+fast/ORIG median 0.0725 = **~13.8× faster** — a SIMD `is_ascii` byte scan vs 2000 char decodes; the lever's p95
+(0.076) is far below the null p5 (0.955), decidable by an enormous margin. (The null's p95 1.9 is a single
+contention-outlier round; the median gate at 1.0 vs 0.0725 is unambiguous.)
+
+**Honest scope:** like `prefix_source`, this triggers only on text over the byte cap (long docs; short docs +
+queries early-return identically), so it's a large-doc win, not always-on. **SHIPPED in place**; the char_indices
+original retained as `truncate_to_chars_slow` (`cfg(test | bench-internals)`) so the A/B stays reproducible. All
+builds/benches remote; no local cargo; fmt + clippy clean on changed lines.
