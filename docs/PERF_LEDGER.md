@@ -4522,3 +4522,55 @@ Original-comparator ratio **N/A** (opt-in Phase-1 quality pass; default byte-ide
 Route-next: `bd-kdjr` is now closed for both kernels, but the `r_d` table has **no builder wired into any
 product** — `compute_query_hubness` needs a background query sample (a rolling query log) plumbed from the
 host. Until then `with_hubness_table` is caller-supplied only, and the knob ships off.
+
+## 2026-07-10 — WIN (kernel-level): `vpmaddubs` int8 dot is 1.23× the shipped `vpmovsxbw`+`vpmaddwd` kernel, bit-exact on realistic quantized magnitudes — DECIDABLE against a null control (cc_fse, bd-b5wl)
+
+Owned bd-b5wl while cod is walled. The int8 ADC two-pass scan is already implemented and correct (cod:
+recall@10 = nDCG@10 = 1.0000 at mult 2/3/5/10, bit-exact parity asserted; the headline int8-two-pass-vs-flat
+win is ~7.1× at 130k). cod's *specific* pass-1 micro-opt is correctly BLOCKED — not wrong, but the end-to-end
+scan A/B is **undecidable under fleet contention** (null floor CV 32–35%, wider than the effect after Amdahl).
+cod's documented route-next: "a quantizer-domain-safe `vpmaddubs` signed-dot transform." This lands that kernel
+and measures it where it IS decidable — in isolation.
+
+**The lever.** The shipped `dot_i8_i8_avx2` sign-extends **both** operands (4× `vpmovsxbw` per 32 int8) before
+`vpmaddwd`. `dot_i8_i8_maddubs` shifts `stored` to the u8 domain with one `vpxor` (`i8 + 128 ≡ i8 ⊕ 0x80`) and
+uses `vpmaddubs` (u8·i8 → i16 in one op, **no stored widening** — the dominant traffic, streamed once per row),
+folding the bias into a per-query scalar `128·Σq` via `Σ s_i·q_i = maddubs_reduce(u,q) − 128·Σq_i`.
+
+**Correctness (recall/ordering, not bit-exactness end-to-end).** `vpmaddubs` saturates each adjacent-pair sum to
+i16, so it is APPROXIMATE in general. But a 384-dim int8-quantized L2-normalized component is typically ±6 and
+rarely past ±40, where a pair-sum `≤ 2·(40+128)·40 ≈ 13 440 < 32 767` — **no saturation**, so the kernel is
+**bit-exact on realistic quantized data** (zero recall risk; the pass-1 also exact-rescores in f16). Three
+`simd.rs` unit tests gate this: bit-exact when non-saturating (incl. a scalar-tail dim); bit-exact top-k on a
+realistic-magnitude corpus (the recall proxy); and a boundary test asserting adversarial *uniform* ±127 DOES
+saturate (documenting the limit — callers must guarantee the magnitude bound).
+
+**Speed — DECIDABLE, null-controlled, one binary / one `rch` invocation.** Isolated microbench
+(`benches/int8_dot_maddubs_ab.rs`, dim 384 × batch 4096, `|x| ≤ 40` so the arms are bit-identical, asserted
+before timing), shared alternating-round sampler + A/A null control (`frankensearch_core::bench_support`), worker
+`fixmydocuments` (`HOSTID`), binary sha256 `79286c4a4d2ceba00c127fbce5842a37dfa6776b41a5f78daf931adef25e37ca`,
+41 rounds × 4:
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (ORIG vs ORIG) | 0.9996 [0.9223, 1.0405] |
+| maddubs / ORIG | **0.8141 [0.7839, 0.8693]** |
+
+Ratio = maddubs/ORIG, so `<1.0` = faster. The lever's p95 (0.8693) is **below** the null's p5 (0.9223), so the
+`0.8141 = 1.228× faster` verdict is **DECIDABLE** — the effect clears the noise floor. Not the hypothesized 2×
+(the `stored` load is still memory-bound; maddubs adds port pressure), but a real 1.23× on a hot leaf.
+
+**Self-time.** From cod's `perf record -F 997 -e cycles:u` on the exact int8 scan binary (`vmi1227854`): the
+single-row `dot_i8_i8_avx2` is **44.54%** flat self-time in the ORIG scan, the 4-row `dot_i8x4_i8_avx2` 23.36% —
+so this leaf is the scan's dominant compute frame. A 1.23× on 44.5% self-time is a meaningful scan-level lever
+IF end-to-end can be measured; today it cannot (the wide floor), so this ships as a **validated, benched kernel
+primitive**, not yet wired into the production scan.
+
+**Scope / honesty.** LANDED: the kernel + 3 correctness tests + the decidable microbench (reproducible, both
+arms retained). NOT landed: wiring `dot_i8_i8_maddubs` into `int8_scan_range` (and the batched `dot_i8x4_i8`
+variant), because the scan-level win is undecidable under the same contention that blocks cod's micro-opt —
+wiring a perf change I cannot measure end-to-end would violate the gate. Filed as the follow-up, with the retry
+condition = worker isolation/affinity (identical to cod's). The kernel is also only recall-safe while the
+quantizer keeps magnitudes under the i16 pair ceiling — a coupling the wiring step must assert. cod owns the
+scan; I touched no scan code. All builds/benches remote; no local cargo. 6 unrelated WAL/vacuum lib tests hit a
+worker-FS `PermissionDenied` flake on one worker and pass on a fresh one (environmental, not this change).

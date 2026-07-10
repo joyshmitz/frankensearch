@@ -862,6 +862,108 @@ unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
     }
 }
 
+/// `vpmaddubs`-based i8·i8 dot (bd-b5wl route-next). **APPROXIMATE** — the pass-1 ADC scan.
+///
+/// The shipped [`dot_i8_i8_avx2`] sign-extends **both** operands (4× `vpmovsxbw` per 32 int8) before
+/// `vpmaddwd`. `vpmaddubs` (`_mm256_maddubs_epi16`) multiply-adds a u8 operand against an i8 operand
+/// directly, eliminating the *stored*-operand widening — the dominant memory traffic, since `stored`
+/// is streamed once per row. Domain shift `u_i = s_i + 128` (a single `vpxor` with `0x80`, since
+/// `i8 + 128 ≡ i8 ⊕ 0x80` in two's complement) makes `stored` unsigned; the identity
+///
+/// ```text
+/// Σ s_i·q_i = Σ (u_i − 128)·q_i = maddubs_reduce(u, q) − 128·Σ q_i
+/// ```
+///
+/// folds the bias into a per-query scalar `128·Σ q_i` (computed once by the caller and passed in).
+///
+/// **Why approximate:** `vpmaddubs` saturates each adjacent-pair sum to `i16` (`u8·i8` products reach
+/// ±32 640, a pair-sum can exceed ±32 767). For int8-quantized cosine vectors most components are
+/// small so saturation is rare, and the two-pass scan **exact-rescores** the top `k·mult` candidates
+/// in f16 — so a rare saturated pass-1 score is corrected as long as recall@k holds. This kernel is
+/// therefore gated on **recall/ordering parity**, never bit-exactness. `q_bias128 = 128·Σ q_i`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_i8_i8_avx2_maddubs(stored: &[i8], query: &[i8], q_bias128: i32) -> i32 {
+    use core::arch::x86_64::{
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_extracti128_si256, _mm256_loadu_si256,
+        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_set1_epi8, _mm256_set1_epi16,
+        _mm256_setzero_si256, _mm256_xor_si256,
+    };
+    let n = stored.len().min(query.len());
+    // SAFETY: avx2 guaranteed by the caller/dispatch; every load is `i + 32 <= n`-bounded; the
+    // scalar tail covers `n % 32`. `q_bias128 = 128·Σ q_i` is supplied over the same `n`.
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let flip = _mm256_set1_epi8(0x80_u8 as i8);
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        let mut i = 0_usize;
+        while i + 32 <= n {
+            let s = _mm256_loadu_si256(stored.as_ptr().add(i).cast::<__m256i>());
+            let q = _mm256_loadu_si256(query.as_ptr().add(i).cast::<__m256i>());
+            // u = s + 128 (i8 -> u8 domain) via sign-bit flip; maddubs(u8, i8) -> i16 pair-sums
+            // (SATURATING); widen those to i32 by multiply-add against ones.
+            let u = _mm256_xor_si256(s, flip);
+            let prod0 = _mm256_maddubs_epi16(u, q);
+            acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(prod0, ones));
+            i += 32;
+            if i + 32 <= n {
+                let s = _mm256_loadu_si256(stored.as_ptr().add(i).cast::<__m256i>());
+                let q = _mm256_loadu_si256(query.as_ptr().add(i).cast::<__m256i>());
+                let u = _mm256_xor_si256(s, flip);
+                let prod1 = _mm256_maddubs_epi16(u, q);
+                acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(prod1, ones));
+                i += 32;
+            }
+        }
+        let acc = _mm256_add_epi32(acc0, acc1);
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256::<1>(acc),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+        // Σ_aligned u_i·q_i in the u8 domain. The scalar tail must accumulate in the SAME u8 domain
+        // — `(s_i + 128)·q_i` — so the single `128·Σq` bias (computed over all `n`) subtracts
+        // exactly. Adding the tail in the signed domain would over-subtract by `128·Σ_tail q_i`.
+        let mut acc_u = _mm_cvtsi128_si32(sum32);
+        while i < n {
+            acc_u += (i32::from(stored[i]) + 128) * i32::from(query[i]);
+            i += 1;
+        }
+        acc_u - q_bias128
+    }
+}
+
+/// Approximate `vpmaddubs` i8·i8 dot with runtime AVX2 dispatch (bd-b5wl). Falls back to the exact
+/// [`dot_i8_i8_generic`] off-AVX2 or off-x86. See [`dot_i8_i8_avx2_maddubs`] for the saturation
+/// caveat; callers must gate on recall, not bit-exactness. `q_bias128` is ignored by the fallback.
+#[doc(hidden)]
+#[must_use]
+pub fn dot_i8_i8_maddubs(stored: &[i8], query: &[i8], q_bias128: i32) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { dot_i8_i8_avx2_maddubs(stored, query, q_bias128) };
+        }
+    }
+    let _ = q_bias128;
+    dot_i8_i8_generic(stored, query)
+}
+
+/// `128·Σ q_i` over the common prefix — the per-query bias for [`dot_i8_i8_maddubs`].
+#[doc(hidden)]
+#[must_use]
+pub fn maddubs_query_bias(query: &[i8], dim: usize) -> i32 {
+    let n = query.len().min(dim);
+    128 * query[..n].iter().map(|&x| i32::from(x)).sum::<i32>()
+}
+
 /// Portable (`wide`-SIMD) i8·i8 dot — the AVX2-dispatch fallback and the path on
 /// non-x86_64 / pre-AVX2 hosts. Exposed (doc-hidden) so the `dot_product` bench
 /// can A/B it against the AVX2 kernel.
@@ -2514,6 +2616,86 @@ mod tests {
         assert!(
             (simd - scalar).abs() < 1e-4,
             "256d: simd={simd}, scalar={scalar}"
+        );
+    }
+
+    // ── vpmaddubs approximate int8 dot (bd-b5wl) ────────────────────────────
+
+    /// Deterministic int8 vectors with a bounded magnitude (no RNG in tests).
+    fn i8_vec(n: usize, seed: u64, bound: i32) -> Vec<i8> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // map into [-bound, bound]
+                let m = (2 * bound + 1) as u64;
+                (((s % m) as i32) - bound) as i8
+            })
+            .collect()
+    }
+
+    /// CORRECTNESS GATE. On magnitudes where no adjacent-pair `u8·i8` sum can exceed `i16`, the
+    /// `vpmaddubs` kernel is **bit-exact** to the scalar dot — proving the domain shift and the
+    /// `128·Σq` bias are correct. Bound 90: `u∈[0,218]`, `q∈[-90,90]`, pair-sum ≤ 2·218·90 ≈ 39k
+    /// can still saturate, so use bound 63 for the strict-exact case: 2·191·63 ≈ 24k < 32767.
+    #[test]
+    fn maddubs_is_bit_exact_when_pairs_do_not_saturate() {
+        for dim in [32usize, 64, 128, 384, 100 /* has a scalar tail */] {
+            let stored = i8_vec(dim, 0x1234, 63);
+            let query = i8_vec(dim, 0x9abc, 63);
+            let exact = dot_i8_i8_generic(&stored, &query);
+            let bias = maddubs_query_bias(&query, dim);
+            let approx = dot_i8_i8_maddubs(&stored, &query, bias);
+            assert_eq!(
+                exact, approx,
+                "dim {dim}: maddubs must be exact on non-saturating magnitudes"
+            );
+        }
+    }
+
+    /// RECALL-SAFETY GATE. The real pass-1 input is int8 quantized from L2-normalized vectors, so a
+    /// 384-dim component is typically `~127/√384 ≈ ±6`, rarely past `±40`. At those magnitudes an
+    /// adjacent-pair `u8·i8` sum is `≤ 2·(40+128)·40 ≈ 13 440 < 32 767`, so `vpmaddubs` **never
+    /// saturates** and the kernel is bit-exact — zero recall risk on realistic quantized data.
+    /// Asserted bit-exact top-10 ordering over a realistic-magnitude corpus (the recall proxy).
+    #[test]
+    fn maddubs_is_exact_on_realistically_quantized_magnitudes() {
+        let dim = 384;
+        let query = i8_vec(dim, 0x5555, 40);
+        let bias = maddubs_query_bias(&query, dim);
+        for v in 0..64usize {
+            let stored = i8_vec(dim, 0x1000 + v as u64, 40);
+            assert_eq!(
+                dot_i8_i8_generic(&stored, &query),
+                dot_i8_i8_maddubs(&stored, &query, bias),
+                "realistic magnitude (|x|≤40): maddubs must be bit-exact, so top-k order is exact"
+            );
+        }
+    }
+
+    /// BOUNDARY / honesty test. At the adversarial *uniform* full int8 range (`±127` on every
+    /// component — not a real quantized distribution), adjacent pairs DO saturate and the kernel is
+    /// NOT bit-exact. This documents the limit: `dot_i8_i8_maddubs` is only recall-safe when the
+    /// quantizer keeps per-pair magnitudes under the `i16` ceiling. Callers must not feed it
+    /// arbitrary int8 without that guarantee.
+    #[test]
+    fn maddubs_saturates_at_adversarial_uniform_full_range() {
+        let dim = 384;
+        let query = i8_vec(dim, 0x7777, 127);
+        let bias = maddubs_query_bias(&query, dim);
+        let mut any_diff = false;
+        for v in 0..64usize {
+            let stored = i8_vec(dim, 0x2000 + v as u64, 127);
+            if dot_i8_i8_generic(&stored, &query) != dot_i8_i8_maddubs(&stored, &query, bias) {
+                any_diff = true;
+                break;
+            }
+        }
+        assert!(
+            any_diff,
+            "uniform ±127 is expected to saturate maddubs; if it no longer does, revisit the recall bound"
         );
     }
 
