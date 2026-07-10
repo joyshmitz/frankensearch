@@ -14,6 +14,7 @@ use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
     PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8,
     dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, prepare_4bit_query,
+    quantize_f16_le_bytes_to_i8,
 };
 use half::f16;
 use wide::f32x8;
@@ -400,7 +401,7 @@ impl VectorIndex {
             let count = self.record_count();
             let dim = self.dimension();
             let byte_len = count * dim * 2;
-            quantize_f16_bytes_to_i8(
+            quantize_f16_le_bytes_to_i8(
                 &self.data[self.vectors_offset..self.vectors_offset + byte_len],
             )
         })
@@ -1166,54 +1167,6 @@ fn quantize_i8_query(query: &[f32]) -> Vec<i8> {
         .collect()
 }
 
-/// Quantize a contiguous little-endian f16 vector region to int8 with one
-/// corpus-wide max-abs scale (a constant factor, so `Σ q_a·q_b` stays monotonic
-/// with the true dot). Reads f16 directly from the mapped bytes.
-fn quantize_f16_bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
-    // Decode the f16 slab 8 lanes at a time via the branchless SIMD widen (the
-    // decode-bound bottleneck — see docs/NEGATIVE_EVIDENCE.md); the scale/round/clamp
-    // stays scalar so the output is BIT-IDENTICAL to the per-element scalar decode
-    // (the widen is bit-exact to `f16::to_f32()`; the max-abs reduction is
-    // order-independent). ~1.6× over the scalar decode (bench `f16_slab_quantize`).
-    let n = bytes.len();
-    // Pass 1: max-abs (SIMD abs+max, scalar tail).
-    let mut maxv = f32x8::splat(0.0);
-    let mut i = 0;
-    while i + 16 <= n {
-        let v = crate::simd::widen8_f16_bytes(bytes[i..i + 16].try_into().expect("16 bytes"));
-        maxv = maxv.max(v.abs());
-        i += 16;
-    }
-    let mut max_abs = maxv.to_array().into_iter().fold(0.0_f32, f32::max);
-    while i + 2 <= n {
-        let value = f16::from_le_bytes([bytes[i], bytes[i + 1]]).to_f32().abs();
-        if value > max_abs {
-            max_abs = value;
-        }
-        i += 2;
-    }
-    if max_abs <= 0.0 {
-        return vec![0; n / 2];
-    }
-    let scale = 127.0 / max_abs;
-    // Pass 2: SIMD decode → scalar scale/round/clamp (bit-identical to the original).
-    let mut out = Vec::with_capacity(n / 2);
-    let mut i = 0;
-    while i + 16 <= n {
-        let v = crate::simd::widen8_f16_bytes(bytes[i..i + 16].try_into().expect("16 bytes"));
-        for value in v.to_array() {
-            out.push((value * scale).round().clamp(-127.0, 127.0) as i8);
-        }
-        i += 16;
-    }
-    while i + 2 <= n {
-        let value = f16::from_le_bytes([bytes[i], bytes[i + 1]]).to_f32();
-        out.push((value * scale).round().clamp(-127.0, 127.0) as i8);
-        i += 2;
-    }
-    out
-}
-
 /// Quantize one component to a signed 4-bit nibble (`[-7, 7]`, 4-bit two's
 /// complement in the low 4 bits) given a scale.
 #[inline]
@@ -1274,7 +1227,8 @@ fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
         let mut d = 0;
         while d + 8 <= dim {
             let off = base + d * 2;
-            let vv = crate::simd::widen8_f16_bytes(bytes[off..off + 16].try_into().expect("16 bytes"));
+            let vv =
+                crate::simd::widen8_f16_bytes(bytes[off..off + 16].try_into().expect("16 bytes"));
             for (j, value) in vv.to_array().into_iter().enumerate() {
                 let dd = d + j;
                 let nib = nibble_of(value, scale);

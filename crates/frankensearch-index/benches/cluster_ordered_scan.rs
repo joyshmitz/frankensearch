@@ -125,7 +125,12 @@ fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
 fn topk_full(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut top = Vec::with_capacity(k + 1);
     for i in 0..N {
-        offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+        offer(
+            &mut top,
+            k,
+            dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+            i,
+        );
     }
     top
 }
@@ -187,7 +192,11 @@ fn topk_ordered(
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             let mut acc = f32x8::splat(0.0);
             let mut abandoned = false;
             for b in 0..nb {
@@ -301,11 +310,27 @@ fn bench_cluster_ordered(c: &mut Criterion) {
         let mut swaps = 0usize;
         for (qi, rq) in rqueries.iter().enumerate() {
             let full = topk_full(rq, &rvecs, k);
-            let (u, bu) =
-                topk_ordered(rq, &qsuf[qi], &tvecs, &tvsuf, &cand_ids, &ident, &cluster_groups, k);
+            let (u, bu) = topk_ordered(
+                rq,
+                &qsuf[qi],
+                &tvecs,
+                &tvsuf,
+                &cand_ids,
+                &ident,
+                &cluster_groups,
+                k,
+            );
             let ord = cluster_order(rq, &cent);
-            let (o, bo) =
-                topk_ordered(rq, &qsuf[qi], &tvecs, &tvsuf, &cand_ids, &ord, &cluster_groups, k);
+            let (o, bo) = topk_ordered(
+                rq,
+                &qsuf[qi],
+                &tvecs,
+                &tvsuf,
+                &cand_ids,
+                &ord,
+                &cluster_groups,
+                k,
+            );
             blk_unord += bu;
             blk_ord += bo;
             let fs: Vec<f32> = full.iter().map(|&(s, _)| s).collect();

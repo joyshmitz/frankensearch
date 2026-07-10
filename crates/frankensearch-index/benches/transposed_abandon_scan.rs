@@ -200,7 +200,11 @@ fn topk_transposed(
         let vbase = g * DIM * LANES;
         let sbase = g * (nb + 1) * LANES;
         let full = top.len() == k;
-        let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+        let cutoff = if full {
+            top[k - 1].0
+        } else {
+            f32::NEG_INFINITY
+        };
         let mut acc = f32x8::splat(0.0);
         let mut abandoned = false;
         for b in 0..nb {
@@ -210,7 +214,9 @@ fn topk_transposed(
             }
             blocks_done += LANES as u64;
             if full {
-                sn.copy_from_slice(&tvsuf[sbase + (b + 1) * LANES..sbase + (b + 1) * LANES + LANES]);
+                sn.copy_from_slice(
+                    &tvsuf[sbase + (b + 1) * LANES..sbase + (b + 1) * LANES + LANES],
+                );
                 let bound = acc + f32x8::splat(qsuf[b + 1]) * f32x8::from(sn);
                 let maxb = bound
                     .to_array()

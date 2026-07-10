@@ -88,7 +88,8 @@ pub use simd::{
     dot_product_f32_bytes_f32, dot_product_f32_bytes_f32_generic, dot_product_f32_f32,
     dot_product_f32_f32_generic, encode_f32_to_f16_extend, encode_f32_to_f16_extend_generic,
     pack_f16_slab_to_4bit, pack_f16_slab_to_4bit_generic, prepare_4bit_query,
-    quantize_f16_slab_to_i8, quantize_f16_slab_to_i8_generic,
+    quantize_f16_le_bytes_to_i8, quantize_f16_le_bytes_to_i8_generic, quantize_f16_slab_to_i8,
+    quantize_f16_slab_to_i8_generic,
 };
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
@@ -2019,7 +2020,10 @@ fn write_vector_slab<W: Write>(
                     // the slab is byte-identical to the per-element path.
                     #[allow(unsafe_code)]
                     let bytes = unsafe {
-                        core::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), scratch.len() * 2)
+                        core::slice::from_raw_parts(
+                            scratch.as_ptr().cast::<u8>(),
+                            scratch.len() * 2,
+                        )
                     };
                     writer.write_all(bytes)?;
                 }
@@ -2438,7 +2442,10 @@ mod tests {
             .search_top_k(&query, 64, None)
             .expect("final search");
         let deleted_ids: HashSet<String> = (0..32).map(|i| format!("doc-{i:03}")).collect();
-        assert!(hits.iter().all(|hit| !deleted_ids.contains(hit.doc_id.as_str())));
+        assert!(
+            hits.iter()
+                .all(|hit| !deleted_ids.contains(hit.doc_id.as_str()))
+        );
 
         std::fs::remove_file(&path).ok();
     }

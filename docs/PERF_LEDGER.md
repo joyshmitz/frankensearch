@@ -4059,6 +4059,54 @@ AGENT_NAME=SearchCod RCH_WORKER=ovh-a CARGO_TARGET_DIR=/data/projects/.rch-targe
 Conformance GREEN: focused release test `cargo test -p frankensearch-ops frame_quality_tracker --profile
 release` passed 5/5 frame-quality tests; `cargo check -p frankensearch-ops --all-targets`, `cargo clippy -p
 frankensearch-ops --all-targets -- -D warnings`, and `cargo fmt -p frankensearch-ops --check` passed.
+
+---
+
+### 2026-07-10 - bd-b5wl: FSVI int8 sidecar byte quantizer uses AVX2+F16C dispatch - 3.77x vs prior mmap path (cod_fs)
+
+**Ledger-grep.** This does not retry the closed tombstone-bitmap fused int8 scan, flat-CSR graph_rank
+layout, or slot-aligned VALUES dedup join rejections. Prior positive rows already landed f16-slab int8 and
+4-bit SIMD quantizers for owned `&[f16]` slabs; the missing production gap was the mmap-backed FSVI byte
+slab path used by `VectorIndex::int8_slab()`.
+
+**Lever (`crates/frankensearch-index`).** Added `simd::quantize_f16_le_bytes_to_i8`, the byte-slab twin of
+`quantize_f16_slab_to_i8`. On little-endian x86 with AVX2+F16C, it reads mapped FSVI f16 bytes directly,
+does a vector max-abs pass, then vector scale/round/clamp into the exact int8 sidecar bytes. The generic
+fallback keeps the same scalar little-endian contract. `VectorIndex::int8_slab()` now calls the dispatched
+helper instead of the older branchless-widen plus scalar round loop.
+
+**Measured (same RCH worker `hz2`, one Criterion binary, release profile):**
+
+```bash
+AGENT_NAME=cod_fs RCH_WORKER=hz2 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cod-fs \
+  rch exec -- cargo bench -p frankensearch-index --profile release \
+  --bench f16_slab_quantize -- f16_slab_quantize --sample-size 10 \
+  --warm-up-time 0.1 --measurement-time 0.35 --noplot
+```
+
+| f16 slab | scalar byte path | prior `simd_widen` mmap path | kept `dispatch` | ratio vs prior |
+|---:|---:|---:|---:|---:|
+| 1,000 x 384 | 2.3531 ms | 1.4057 ms | 361.33 us | 0.257 / 3.89x |
+| 10,000 x 384 | 24.813 ms | 14.007 ms | 3.4300 ms | 0.245 / 4.08x |
+| 50,000 x 384 | 121.06 ms | 69.949 ms | 18.571 ms | 0.266 / 3.77x |
+
+Criterion CI half-width for the kept 50k row is about 3.4% (17.994-19.254 ms around 18.571 ms), under
+the 5% keep gate. Original-comparator ratio is **N/A** for this sub-row: it is the FSVI int8 sidecar build
+inside the vector scan path, not a Lucene/Meilisearch query benchmark by itself.
+
+**Parity.** The bench asserts `scalar == simd_widen == dispatch` before timing for every slab size. Focused
+release test passed: `cargo test -p frankensearch-index --profile release avx2_quantize_i8_bytes_matches_generic -- --nocapture`
+on RCH worker `hz2` (1 passed, 389 filtered out). The production scan consumes byte-identical int8 sidecars,
+so retrieval ordering is unchanged by this lever.
+
+**Profiler status.** The hotspot was the production FSVI byte-slab build row in `f16_slab_quantize`; the
+same binary shows the previous mmap path spending 69.949 ms at 50k x 384 before the kept dispatch arm drops
+that to 18.571 ms. `perf stat -e cycles,instructions,cache-misses` and `cargo flamegraph` were both
+attempted on RCH worker `hz2`, but RCH's non-compilation wrapper rebuilt the benchmark and did not yield a
+usable filtered-bench profile; the interrupted `perf stat` counters covered 271.6 s of wrapper/build time,
+so they are intentionally rejected as proof. Route next profiling through a directly retained bench binary
+or an RCH artifact mode that preserves the executable.
+
 ---
 
 ### 2026-07-09 — hubness `r_d` builder: reuse the vector tier's AVX2 dot instead of hand-rolling — 10.89× (cc_fs)

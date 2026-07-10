@@ -24,8 +24,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_index::quantize_f16_le_bytes_to_i8;
 use half::f16;
-use wide::{f32x8, u32x8, u16x8};
+use wide::{f32x8, u16x8, u32x8};
 
 const DIM: usize = 384;
 
@@ -138,14 +139,29 @@ fn bench(c: &mut Criterion) {
         // Parity: SIMD widen is bit-exact + scalar round unchanged → identical i8.
         let a = quantize_scalar(&slab);
         let b = quantize_simd(&slab);
-        assert!(a == b, "simd quantize diverged from scalar (vectors={vectors}) — must be bit-identical");
+        assert!(
+            a == b,
+            "simd quantize diverged from scalar (vectors={vectors}) — must be bit-identical"
+        );
+        let d = quantize_f16_le_bytes_to_i8(&slab);
+        assert!(
+            a == d,
+            "dispatch quantize diverged from scalar (vectors={vectors}) — must be bit-identical"
+        );
 
         group.throughput(criterion::Throughput::Elements((vectors * DIM) as u64));
         group.bench_with_input(BenchmarkId::new("scalar", vectors), &slab, |bn, slab| {
             bn.iter(|| black_box(quantize_scalar(black_box(slab))));
         });
-        group.bench_with_input(BenchmarkId::new("simd_widen", vectors), &slab, |bn, slab| {
-            bn.iter(|| black_box(quantize_simd(black_box(slab))));
+        group.bench_with_input(
+            BenchmarkId::new("simd_widen", vectors),
+            &slab,
+            |bn, slab| {
+                bn.iter(|| black_box(quantize_simd(black_box(slab))));
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("dispatch", vectors), &slab, |bn, slab| {
+            bn.iter(|| black_box(quantize_f16_le_bytes_to_i8(black_box(slab))));
         });
     }
     group.finish();

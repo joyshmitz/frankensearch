@@ -1048,8 +1048,10 @@ mod tests {
         let index = write_index(&fsvi_path, &vectors).expect("index");
         let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
         // Calibration queries disjoint from... they're near corpus points, fine for wiring.
-        let calibration: Vec<Vec<f32>> =
-            (5..1_600).step_by(64).map(|s| normalized_vector(s, 384)).collect();
+        let calibration: Vec<Vec<f32>> = (5..1_600)
+            .step_by(64)
+            .map(|s| normalized_vector(s, 384))
+            .collect();
         let candidate_efs = [10usize, 40, 100, 200];
 
         // target=0.0 is always certified => cheapest ef, and the sweep must
@@ -1059,8 +1061,15 @@ mod tests {
             .expect("certify")
             .expect("some");
         assert!(trivial.chosen.meets_target);
-        assert_eq!(trivial.chosen.ef_search, 10, "cheapest ef for a trivial target");
-        assert_eq!(trivial.sweep.len(), 1, "short-circuits at the first certified ef");
+        assert_eq!(
+            trivial.chosen.ef_search, 10,
+            "cheapest ef for a trivial target"
+        );
+        assert_eq!(
+            trivial.sweep.len(),
+            1,
+            "short-circuits at the first certified ef"
+        );
 
         // An unreachable target => no ef meets it, fall back to the best-certifiable
         // (largest ef here, since recall is non-decreasing in ef), full sweep measured,
@@ -1070,7 +1079,11 @@ mod tests {
             .expect("certify")
             .expect("some");
         assert!(!strict.chosen.meets_target);
-        assert_eq!(strict.sweep.len(), candidate_efs.len(), "measures all when none certifies");
+        assert_eq!(
+            strict.sweep.len(),
+            candidate_efs.len(),
+            "measures all when none certifies"
+        );
         assert!((0.0..=1.0).contains(&strict.chosen.certified_recall));
         // The best-certifiable fallback should be a high ef with a strong bound on
         // this tight synthetic corpus (sanity: ANN recovers most exact neighbours).

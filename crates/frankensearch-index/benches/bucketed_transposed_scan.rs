@@ -133,7 +133,12 @@ fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
 fn topk_full(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut top = Vec::with_capacity(k + 1);
     for i in 0..N {
-        offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+        offer(
+            &mut top,
+            k,
+            dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+            i,
+        );
     }
     top
 }
@@ -214,7 +219,14 @@ fn build_layout(perm: &[usize], rvecs: &[f32], dist: &[f32]) -> Layout {
     for g in 0..ngroups {
         cluster_groups[cand_ids[g * LANES] % CLUSTERS].push(g);
     }
-    Layout { tvecs, tvsuf, cand_ids, gmax_dist, gskippable, cluster_groups }
+    Layout {
+        tvecs,
+        tvsuf,
+        cand_ids,
+        gmax_dist,
+        gskippable,
+        cluster_groups,
+    }
 }
 
 /// Transposed cluster-grouped early-abandon, visiting clusters in `order`.
@@ -241,7 +253,11 @@ fn topk_ordered(
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             // Exact pre-block-0 whole-group skip: every lane obeys
             // q·v ≤ q·μ_c + ‖q‖·‖v−μ_c‖ ≤ qc + gmax_dist[g] (‖q‖=1).
             if skip && full && lay.gskippable[g] && qc + lay.gmax_dist[g] <= cutoff {
@@ -431,7 +447,15 @@ fn bench_bucketed(c: &mut Criterion) {
                 let qs = &qsuf[qi % QUERIES];
                 qi += 1;
                 let (qmu, ord) = query_centroids(black_box(rq), &cent);
-                black_box(topk_ordered(black_box(rq), qs, &lay_cluster, &qmu, &ord, k, false))
+                black_box(topk_ordered(
+                    black_box(rq),
+                    qs,
+                    &lay_cluster,
+                    &qmu,
+                    &ord,
+                    k,
+                    false,
+                ))
             });
         });
         let mut qi = 0usize;
@@ -441,7 +465,15 @@ fn bench_bucketed(c: &mut Criterion) {
                 let qs = &qsuf[qi % QUERIES];
                 qi += 1;
                 let (qmu, ord) = query_centroids(black_box(rq), &cent);
-                black_box(topk_ordered(black_box(rq), qs, &lay_bucket, &qmu, &ord, k, true))
+                black_box(topk_ordered(
+                    black_box(rq),
+                    qs,
+                    &lay_bucket,
+                    &qmu,
+                    &ord,
+                    k,
+                    true,
+                ))
             });
         });
     }

@@ -176,7 +176,11 @@ fn topk_abandon(
         let v = &rvecs[i * DIM..(i + 1) * DIM];
         let vs = &vsuf[i * (nb + 1)..(i + 1) * (nb + 1)];
         let full = top.len() == k;
-        let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+        let cutoff = if full {
+            top[k - 1].0
+        } else {
+            f32::NEG_INFINITY
+        };
         let mut partial = 0.0f32;
         let mut abandoned = false;
         for b in 0..nb {
@@ -242,7 +246,11 @@ fn topk_abandon_stride(
         let v = &rvecs[i * DIM..(i + 1) * DIM];
         let vs = &vsuf[i * (nb + 1)..(i + 1) * (nb + 1)];
         let full = top.len() == k;
-        let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+        let cutoff = if full {
+            top[k - 1].0
+        } else {
+            f32::NEG_INFINITY
+        };
         let mut acc = [f32x8::splat(0.0); 4];
         let mut abandoned = false;
         for b in 0..nb {
@@ -380,7 +388,14 @@ fn bench_early_abandon(c: &mut Criterion) {
                         let rq = &rqueries[qi % QUERIES];
                         let qs = &qsuf[qi % QUERIES];
                         qi += 1;
-                        black_box(topk_abandon_stride(black_box(rq), qs, &rvecs, &vsuf, k, STRIDE))
+                        black_box(topk_abandon_stride(
+                            black_box(rq),
+                            qs,
+                            &rvecs,
+                            &vsuf,
+                            k,
+                            STRIDE,
+                        ))
                     });
                 });
             }

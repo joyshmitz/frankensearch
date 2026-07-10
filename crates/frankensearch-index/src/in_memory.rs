@@ -638,10 +638,8 @@ impl InMemoryVectorIndex {
         self.hash_to_pos
             .get_or_init(|| {
                 let hashes = self.doc_id_hashes();
-                let mut map = HashMap::with_capacity_and_hasher(
-                    hashes.len(),
-                    BuildIdentityHasherU64,
-                );
+                let mut map =
+                    HashMap::with_capacity_and_hasher(hashes.len(), BuildIdentityHasherU64);
                 for (pos, &h) in hashes.iter().enumerate() {
                     if map.insert(h, pos).is_some() {
                         // Hash collision (or duplicate doc_id): the map can hold
@@ -726,17 +724,14 @@ impl InMemoryVectorIndex {
         // Selectivity gate: gather pays a map lookup + sort per allowed hash, so it
         // only wins when the allow-set is a small fraction of the corpus. Above the
         // crossover the per-document scan (which skips the gather's setup) is faster.
-        if allowed
-            .len()
-            .saturating_mul(GATHER_SELECTIVITY_DIVISOR)
-            >= count
-        {
+        if allowed.len().saturating_mul(GATHER_SELECTIVITY_DIVISOR) >= count {
             return Ok(None);
         }
         let Some(map) = self.hash_to_pos() else {
             return Ok(None);
         };
-        let mut positions: Vec<usize> = allowed.iter().filter_map(|h| map.get(h).copied()).collect();
+        let mut positions: Vec<usize> =
+            allowed.iter().filter_map(|h| map.get(h).copied()).collect();
         // Ascending position order → sequential slab access (cache-friendly); not
         // required for correctness (the heap's total order is position-independent).
         positions.sort_unstable();
@@ -1528,27 +1523,43 @@ mod tests {
         use frankensearch_core::filter::BitsetFilter;
         let dim = 16;
         let doc_ids: Vec<String> = (0..500).map(|i| format!("doc-{i:04}")).collect();
-        let vectors: Vec<Vec<f32>> = (0..500).map(|i| make_normalized_vec(dim, i as f32)).collect();
+        let vectors: Vec<Vec<f32>> = (0..500)
+            .map(|i| make_normalized_vec(dim, i as f32))
+            .collect();
         // ~5% allow-set (well under the selectivity gate) → gather path is taken.
         let allowed: Vec<String> = doc_ids.iter().step_by(20).cloned().collect();
         let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
         let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
 
-        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id.to_string()).collect() };
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> {
+            hits.into_iter().map(|h| h.doc_id.to_string()).collect()
+        };
         for qseed in [1.0_f32, 42.0, 313.0] {
             let query = make_normalized_vec(dim, qseed);
-            let scan = ids(index.bench_scan_filtered(&query, 10, Some(&filter)).unwrap());
+            let scan = ids(index
+                .bench_scan_filtered(&query, 10, Some(&filter))
+                .unwrap());
             let gather = ids(index.bench_gather_filtered(&query, 10, &filter).unwrap());
             let public = ids(index.search_top_k(&query, 10, Some(&filter)).unwrap());
-            let int8 = ids(index.search_top_k_int8_two_pass_filtered(&query, 10, 3, Some(&filter)).unwrap());
-            let fourbit = ids(index.search_top_k_4bit_two_pass_filtered(&query, 10, 3, Some(&filter)).unwrap());
+            let int8 = ids(index
+                .search_top_k_int8_two_pass_filtered(&query, 10, 3, Some(&filter))
+                .unwrap());
+            let fourbit = ids(index
+                .search_top_k_4bit_two_pass_filtered(&query, 10, 3, Some(&filter))
+                .unwrap());
             for id in &gather {
                 assert!(allowed.contains(id), "gather returned filtered-out {id}");
             }
             assert_eq!(gather, scan, "gather != scan (qseed={qseed})");
             assert_eq!(public, scan, "search_top_k gather != scan (qseed={qseed})");
-            assert_eq!(int8, scan, "int8 two-pass gather != exact scan (qseed={qseed})");
-            assert_eq!(fourbit, scan, "4bit two-pass gather != exact scan (qseed={qseed})");
+            assert_eq!(
+                int8, scan,
+                "int8 two-pass gather != exact scan (qseed={qseed})"
+            );
+            assert_eq!(
+                fourbit, scan,
+                "4bit two-pass gather != exact scan (qseed={qseed})"
+            );
         }
     }
 
@@ -1563,13 +1574,20 @@ mod tests {
         let vectors: Vec<Vec<f32>> = (0..n).map(|i| make_normalized_vec(dim, i as f32)).collect();
         // ~half the corpus (1500 > 1024 chunk size) → parallel gather.
         let allowed: Vec<String> = doc_ids.iter().step_by(2).cloned().collect();
-        assert!(allowed.len() > PARALLEL_CHUNK_SIZE, "must exceed chunk size");
+        assert!(
+            allowed.len() > PARALLEL_CHUNK_SIZE,
+            "must exceed chunk size"
+        );
         let filter = BitsetFilter::from_doc_ids(allowed.iter().cloned());
         let index = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
-        let ids = |hits: Vec<VectorHit>| -> Vec<String> { hits.into_iter().map(|h| h.doc_id.to_string()).collect() };
+        let ids = |hits: Vec<VectorHit>| -> Vec<String> {
+            hits.into_iter().map(|h| h.doc_id.to_string()).collect()
+        };
         for qseed in [2.0_f32, 99.0, 1234.0] {
             let query = make_normalized_vec(dim, qseed);
-            let scan = ids(index.bench_scan_filtered(&query, 25, Some(&filter)).unwrap());
+            let scan = ids(index
+                .bench_scan_filtered(&query, 25, Some(&filter))
+                .unwrap());
             let gather = ids(index.bench_gather_filtered(&query, 25, &filter).unwrap());
             assert_eq!(gather, scan, "parallel gather != scan (qseed={qseed})");
         }

@@ -39,14 +39,19 @@ const FLAG_OFFSET: usize = 14; // low byte of the u16 flags field
 /// every LIVE candidate, then a `>= cutoff` gate avoids the heap push for losers.
 /// Returns the top-K as (score, index) sorted desc with index tie-break.
 #[inline]
-fn push_candidate(heap: &mut BinaryHeap<Reverse<(i32, usize)>>, cutoff: &mut i32, s: i32, j: usize) {
+fn push_candidate(
+    heap: &mut BinaryHeap<Reverse<(i32, usize)>>,
+    cutoff: &mut i32,
+    s: i32,
+    j: usize,
+) {
     if heap.len() < K || s > *cutoff {
         heap.push(Reverse((s, j)));
         if heap.len() > K {
             heap.pop();
         }
         if heap.len() >= K {
-            *cutoff = heap.peek().unwrap().0 .0;
+            *cutoff = heap.peek().unwrap().0.0;
         }
     }
 }
@@ -164,13 +169,30 @@ fn bench(c: &mut Criterion) {
         // Parity: identical top-K from both flag-access strategies.
         let a = scan_records_flag(&slab, &records, &query, n);
         let b = scan_bitmap(&slab, &bitmap, &query, n);
-        assert!(a == b, "bitmap scan diverged from records scan ({name}) — must match");
+        assert!(
+            a == b,
+            "bitmap scan diverged from records scan ({name}) — must match"
+        );
 
         group.bench_with_input(BenchmarkId::new("records_flag", name), &(), |bn, ()| {
-            bn.iter(|| black_box(scan_records_flag(black_box(&slab), black_box(&records), black_box(&query), n)));
+            bn.iter(|| {
+                black_box(scan_records_flag(
+                    black_box(&slab),
+                    black_box(&records),
+                    black_box(&query),
+                    n,
+                ))
+            });
         });
         group.bench_with_input(BenchmarkId::new("bitmap", name), &(), |bn, ()| {
-            bn.iter(|| black_box(scan_bitmap(black_box(&slab), black_box(&bitmap), black_box(&query), n)));
+            bn.iter(|| {
+                black_box(scan_bitmap(
+                    black_box(&slab),
+                    black_box(&bitmap),
+                    black_box(&query),
+                    n,
+                ))
+            });
         });
     }
     group.finish();

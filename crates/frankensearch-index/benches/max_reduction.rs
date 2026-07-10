@@ -67,7 +67,11 @@ fn bench(c: &mut Criterion) {
     for &n in &[128_usize, 512, 2048] {
         let row = build_row(n, 0x1234 ^ (n as u64));
         // Equivalence (finite inputs ⇒ identical max).
-        assert_eq!(max_scalar(&row), max_simd(&row), "simd max must equal scalar at n={n}");
+        assert_eq!(
+            max_scalar(&row),
+            max_simd(&row),
+            "simd max must equal scalar at n={n}"
+        );
 
         group.bench_with_input(BenchmarkId::new("scalar", n), &n, |bch, _| {
             bch.iter(|| black_box(max_scalar(black_box(&row))));

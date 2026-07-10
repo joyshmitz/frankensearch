@@ -123,7 +123,12 @@ fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
 fn topk_full(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut top = Vec::with_capacity(k + 1);
     for i in 0..N {
-        offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+        offer(
+            &mut top,
+            k,
+            dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+            i,
+        );
     }
     top
 }
@@ -198,7 +203,14 @@ fn build_layout(perm: &[usize], body_src: &[f32]) -> Layout {
     for g in 0..ngroups {
         cluster_groups[cand_ids[g * LANES] % CLUSTERS].push(g);
     }
-    Layout { body, suf, cand_ids, cand_cluster, intra, cluster_groups }
+    Layout {
+        body,
+        suf,
+        cand_ids,
+        cand_cluster,
+        intra,
+        cluster_groups,
+    }
 }
 
 fn query_centroids(rq: &[f32], cent: &[f32]) -> (Vec<f32>, Vec<usize>) {
@@ -215,11 +227,21 @@ fn query_centroids(rq: &[f32], cent: &[f32]) -> (Vec<f32>, Vec<usize>) {
 
 #[inline]
 fn maxlane(v: f32x8) -> f32 {
-    v.to_array().iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    v.to_array()
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max)
 }
 
 /// BASE (== 8d13097): single accumulator, per-lane gqmu gather always.
-fn topk_base(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_base(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let nb = DIM / BLOCK;
     let mut top: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
     let mut blocks_done: u64 = 0;
@@ -231,7 +253,11 @@ fn topk_base(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             for lane in 0..LANES {
                 gq[lane] = qmu[lay.cand_cluster[g * LANES + lane]];
             }
@@ -265,7 +291,14 @@ fn topk_base(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize
 }
 
 /// SPLAT: single accumulator, gqmu splat for intra-cluster groups (gather only at boundaries).
-fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_splat(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let nb = DIM / BLOCK;
     let mut top: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
     let mut blocks_done: u64 = 0;
@@ -278,7 +311,11 @@ fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usiz
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             let gqmu = if lay.intra[g] {
                 f32x8::splat(qc)
             } else {
@@ -316,7 +353,14 @@ fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usiz
 }
 
 /// FAST: gqmu splat + 4-accumulator block dot (break the FMA latency chain).
-fn topk_fast(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_fast(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let nb = DIM / BLOCK;
     let mut top: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
     let mut blocks_done: u64 = 0;
@@ -332,7 +376,11 @@ fn topk_fast(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             let gqmu = if lay.intra[g] {
                 f32x8::splat(qc)
             } else {
@@ -467,7 +515,10 @@ fn bench_ilp(c: &mut Criterion) {
             let fids: std::collections::HashSet<usize> = full.iter().map(|&(_, i)| i).collect();
             swaps += fast.iter().filter(|&&(_, i)| !fids.contains(&i)).count();
         }
-        eprintln!("[residual_ilp] k={k}: boundary id-swaps (fast)={swaps}/{}", QUERIES * k);
+        eprintln!(
+            "[residual_ilp] k={k}: boundary id-swaps (fast)={swaps}/{}",
+            QUERIES * k
+        );
         let _ = nb;
 
         let mut qi = 0usize;

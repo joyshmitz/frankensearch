@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use half::f16;
-use wide::{f32x8, u32x8, u16x8};
+use wide::{f32x8, u16x8, u32x8};
 
 const DIM: usize = 384;
 
@@ -157,15 +157,22 @@ fn bench(c: &mut Criterion) {
         let slab = slab_fixture(vectors);
         let a = pack_scalar(&slab, DIM);
         let b = pack_simd(&slab, DIM);
-        assert!(a == b, "simd pack diverged from scalar (vectors={vectors}) — must be bit-identical");
+        assert!(
+            a == b,
+            "simd pack diverged from scalar (vectors={vectors}) — must be bit-identical"
+        );
 
         group.throughput(criterion::Throughput::Elements((vectors * DIM) as u64));
         group.bench_with_input(BenchmarkId::new("scalar", vectors), &slab, |bn, slab| {
             bn.iter(|| black_box(pack_scalar(black_box(slab), DIM)));
         });
-        group.bench_with_input(BenchmarkId::new("simd_widen", vectors), &slab, |bn, slab| {
-            bn.iter(|| black_box(pack_simd(black_box(slab), DIM)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("simd_widen", vectors),
+            &slab,
+            |bn, slab| {
+                bn.iter(|| black_box(pack_simd(black_box(slab), DIM)));
+            },
+        );
     }
     group.finish();
 }

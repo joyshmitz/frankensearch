@@ -161,7 +161,10 @@ fn bench(c: &mut Criterion) {
                     // over `u16`, so native bytes equal the LE on-disk encoding.
                     #[allow(unsafe_code)]
                     let bytes = unsafe {
-                        core::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), scratch.len() * 2)
+                        core::slice::from_raw_parts(
+                            scratch.as_ptr().cast::<u8>(),
+                            scratch.len() * 2,
+                        )
                     };
                     out.write_all(bytes).unwrap();
                 }

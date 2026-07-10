@@ -104,7 +104,10 @@ fn rotate(r: &[f32], x: &[f32], dim: usize) -> Vec<f32> {
 
 fn load_slab(path: &str, dim: usize) -> Vec<Vec<f32>> {
     let bytes = std::fs::read(path).expect("read slab");
-    assert!(bytes.len() % (dim * 4) == 0, "slab size not a multiple of dim*4");
+    assert!(
+        bytes.len() % (dim * 4) == 0,
+        "slab size not a multiple of dim*4"
+    );
     let n = bytes.len() / (dim * 4);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {

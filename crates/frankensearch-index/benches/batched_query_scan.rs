@@ -36,12 +36,14 @@ const DIM: usize = 384;
 /// widened f32 values are bit-identical; we just do it **once** per corpus vector
 /// instead of once per (corpus vector, query) pair. `DIM` is a multiple of 8, so
 /// the scalar tail never runs in this bench.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "f16c"))]
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "f16c"
+))]
 #[inline]
 fn decode_f16_bytes_to_f32(src: &[u8], dst: &mut [f32]) {
-    use std::arch::x86_64::{
-        __m128i, _mm256_cvtph_ps, _mm256_storeu_ps, _mm_loadu_si128,
-    };
+    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm256_cvtph_ps, _mm256_storeu_ps};
     let n = dst.len();
     let mut i = 0;
     // SAFETY: cfg-gated to avx2+f16c; reads 16 B and writes 8 f32 per step within
@@ -60,7 +62,11 @@ fn decode_f16_bytes_to_f32(src: &[u8], dst: &mut [f32]) {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "f16c")))]
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "f16c"
+)))]
 #[inline]
 fn decode_f16_bytes_to_f32(src: &[u8], dst: &mut [f32]) {
     for (i, d) in dst.iter_mut().enumerate() {
@@ -193,7 +199,9 @@ fn bench(c: &mut Criterion) {
                 BenchmarkId::new("sequential", format!("n{n}_b{b}")),
                 &b,
                 |bch, _| {
-                    bch.iter(|| black_box(scan_sequential(&corpus, n, stride, black_box(&queries))));
+                    bch.iter(|| {
+                        black_box(scan_sequential(&corpus, n, stride, black_box(&queries)))
+                    });
                 },
             );
             group.bench_with_input(

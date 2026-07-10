@@ -118,7 +118,12 @@ fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
 fn topk_full(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut top = Vec::with_capacity(k + 1);
     for i in 0..N {
-        offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+        offer(
+            &mut top,
+            k,
+            dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+            i,
+        );
     }
     top
 }
@@ -192,7 +197,14 @@ fn build_layout(perm: &[usize], body_src: &[f32]) -> Layout {
     for g in 0..ngroups {
         cluster_groups[cand_ids[g * LANES] % CLUSTERS].push(g);
     }
-    Layout { body, suf, cand_ids, cand_cluster, intra, cluster_groups }
+    Layout {
+        body,
+        suf,
+        cand_ids,
+        cand_cluster,
+        intra,
+        cluster_groups,
+    }
 }
 
 fn query_centroids(rq: &[f32], cent: &[f32]) -> (Vec<f32>, Vec<usize>) {
@@ -208,7 +220,14 @@ fn query_centroids(rq: &[f32], cent: &[f32]) -> (Vec<f32>, Vec<usize>) {
 }
 
 #[inline]
-fn build_gqmu(lay: &Layout, g: usize, c: usize, qc: f32, qmu: &[f32], gq: &mut [f32; LANES]) -> f32x8 {
+fn build_gqmu(
+    lay: &Layout,
+    g: usize,
+    c: usize,
+    qc: f32,
+    qmu: &[f32],
+    gq: &mut [f32; LANES],
+) -> f32x8 {
     let _ = c;
     if lay.intra[g] {
         f32x8::splat(qc)
@@ -221,7 +240,14 @@ fn build_gqmu(lay: &Layout, g: usize, c: usize, qc: f32, qmu: &[f32], gq: &mut [
 }
 
 /// SPLAT (= 0c107f3): to_array() + scalar fold bound check.
-fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_splat(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let nb = DIM / BLOCK;
     let mut top: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
     let mut blocks_done: u64 = 0;
@@ -234,7 +260,11 @@ fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usiz
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             let gqmu = build_gqmu(lay, g, c, qc, qmu, &mut gq);
             let mut acc = f32x8::splat(0.0);
             let mut abandoned = false;
@@ -242,7 +272,11 @@ fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usiz
                 if full {
                     sn.copy_from_slice(&lay.suf[sbase + b * LANES..sbase + b * LANES + LANES]);
                     let bound = gqmu + acc + f32x8::splat(qsuf[b]) * f32x8::from(sn);
-                    let maxb = bound.to_array().iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let maxb = bound
+                        .to_array()
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
                     if maxb <= cutoff {
                         abandoned = true;
                         break;
@@ -266,7 +300,14 @@ fn topk_splat(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usiz
 }
 
 /// MASK: simd_le().all() bound check — no horizontal reduce.
-fn topk_mask(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_mask(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let nb = DIM / BLOCK;
     let mut top: Vec<(f32, usize)> = Vec::with_capacity(k + 1);
     let mut blocks_done: u64 = 0;
@@ -279,7 +320,11 @@ fn topk_mask(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             let cutv = f32x8::splat(cutoff);
             let gqmu = build_gqmu(lay, g, c, qc, qmu, &mut gq);
             let mut acc = f32x8::splat(0.0);
@@ -392,7 +437,10 @@ fn bench_mask(c: &mut Criterion) {
             let fids: std::collections::HashSet<usize> = full.iter().map(|&(_, i)| i).collect();
             swaps += mask.iter().filter(|&&(_, i)| !fids.contains(&i)).count();
         }
-        eprintln!("[residual_mask] k={k}: boundary id-swaps (mask)={swaps}/{}", QUERIES * k);
+        eprintln!(
+            "[residual_mask] k={k}: boundary id-swaps (mask)={swaps}/{}",
+            QUERIES * k
+        );
 
         let mut qi = 0usize;
         group.bench_function(format!("full_k{k}"), |b| {

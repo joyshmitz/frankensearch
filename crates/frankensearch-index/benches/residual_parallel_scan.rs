@@ -111,7 +111,10 @@ fn dot_block(a: &[f32], b: &[f32], len: usize) -> f32 {
 #[inline]
 fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
     if top.len() < k {
-        let pos = top.iter().position(|&(s, _)| s < score).unwrap_or(top.len());
+        let pos = top
+            .iter()
+            .position(|&(s, _)| s < score)
+            .unwrap_or(top.len());
         top.insert(pos, (score, idx));
     } else if score > top[k - 1].0 {
         let pos = top.iter().position(|&(s, _)| s < score).unwrap_or(k - 1);
@@ -123,7 +126,12 @@ fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
 fn topk_full(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut top = Vec::with_capacity(k + 1);
     for i in 0..N {
-        offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+        offer(
+            &mut top,
+            k,
+            dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+            i,
+        );
     }
     top
 }
@@ -139,7 +147,12 @@ fn topk_full_par(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
             let hi = ((t + 1) * csz).min(N);
             let mut top = Vec::with_capacity(k + 1);
             for i in lo..hi {
-                offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+                offer(
+                    &mut top,
+                    k,
+                    dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+                    i,
+                );
             }
             top
         })
@@ -222,7 +235,14 @@ fn build_layout(perm: &[usize], body_src: &[f32]) -> Layout {
     for g in 0..ngroups {
         cluster_groups[cand_ids[g * LANES] % CLUSTERS].push(g);
     }
-    Layout { body, suf, cand_ids, cand_cluster, intra, cluster_groups }
+    Layout {
+        body,
+        suf,
+        cand_ids,
+        cand_cluster,
+        intra,
+        cluster_groups,
+    }
 }
 
 fn query_centroids(rq: &[f32], cent: &[f32]) -> (Vec<f32>, Vec<usize>) {
@@ -257,7 +277,11 @@ fn scan_group_list(
         let vbase = g * DIM * LANES;
         let sbase = g * (nb + 1) * LANES;
         let full = top.len() == k;
-        let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+        let cutoff = if full {
+            top[k - 1].0
+        } else {
+            f32::NEG_INFINITY
+        };
         let gqmu = if lay.intra[g] {
             f32x8::splat(qmu[lay.cand_cluster[g * LANES]])
         } else {
@@ -272,7 +296,11 @@ fn scan_group_list(
             if full {
                 sn.copy_from_slice(&lay.suf[sbase + b * LANES..sbase + b * LANES + LANES]);
                 let bound = gqmu + acc + f32x8::splat(qsuf[b]) * f32x8::from(sn);
-                let maxb = bound.to_array().iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let maxb = bound
+                    .to_array()
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 if maxb <= cutoff {
                     abandoned = true;
                     break;
@@ -302,16 +330,31 @@ fn ordered_groups(lay: &Layout, order: &[usize]) -> Vec<usize> {
 }
 
 /// SERIAL residual early-abandon (= `0c107f3`): one pass over the ordered groups.
-fn topk_residual_serial(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_residual_serial(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let og = ordered_groups(lay, order);
     scan_group_list(rq, qsuf, lay, qmu, &og, k, Vec::with_capacity(k + 1))
 }
 
 /// PARALLEL residual early-abandon: serial seed of the near core, then parallel chunks.
-fn topk_residual_par(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order: &[usize], k: usize) -> (Vec<(f32, usize)>, u64) {
+fn topk_residual_par(
+    rq: &[f32],
+    qsuf: &[f32],
+    lay: &Layout,
+    qmu: &[f32],
+    order: &[usize],
+    k: usize,
+) -> (Vec<(f32, usize)>, u64) {
     let og = ordered_groups(lay, order);
     let sn = SEED.min(og.len());
-    let (seed_top, seed_blk) = scan_group_list(rq, qsuf, lay, qmu, &og[0..sn], k, Vec::with_capacity(k + 1));
+    let (seed_top, seed_blk) =
+        scan_group_list(rq, qsuf, lay, qmu, &og[0..sn], k, Vec::with_capacity(k + 1));
     let rest = &og[sn..];
     if rest.is_empty() {
         return (seed_top, seed_blk);
@@ -346,7 +389,10 @@ fn topk_residual_par(rq: &[f32], qsuf: &[f32], lay: &Layout, qmu: &[f32], order:
 
 fn bench_parallel(c: &mut Criterion) {
     assert_eq!(N % LANES, 0);
-    eprintln!("[residual_parallel] rayon threads = {}", rayon::current_num_threads());
+    eprintln!(
+        "[residual_parallel] rayon threads = {}",
+        rayon::current_num_threads()
+    );
     let centroids0: Vec<Vec<f32>> = (0..CLUSTERS)
         .map(|i| normalize(shape(raw_vector(0xc000_0000 + i as u64))))
         .collect();
@@ -421,7 +467,10 @@ fn bench_parallel(c: &mut Criterion) {
                 let ts: Vec<f32> = r.iter().map(|&(s, _)| s).collect();
                 for j in 0..k {
                     let tol = 1e-4 * fs[j].abs().max(1.0);
-                    assert!((fs[j] - ts[j]).abs() <= tol, "{lbl} score mismatch rank {j} (k={k},q={qi})");
+                    assert!(
+                        (fs[j] - ts[j]).abs() <= tol,
+                        "{lbl} score mismatch rank {j} (k={k},q={qi})"
+                    );
                 }
             }
             swaps_s += rs.iter().filter(|&&(_, i)| !fids.contains(&i)).count();

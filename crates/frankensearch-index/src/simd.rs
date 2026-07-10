@@ -181,15 +181,24 @@ unsafe fn dot_product_f32_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
             );
             acc1 = _mm256_add_ps(
                 acc1,
-                _mm256_mul_ps(_mm256_loadu_ps(ap.add(o + 8)), _mm256_loadu_ps(bp.add(o + 8))),
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(ap.add(o + 8)),
+                    _mm256_loadu_ps(bp.add(o + 8)),
+                ),
             );
             acc2 = _mm256_add_ps(
                 acc2,
-                _mm256_mul_ps(_mm256_loadu_ps(ap.add(o + 16)), _mm256_loadu_ps(bp.add(o + 16))),
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(ap.add(o + 16)),
+                    _mm256_loadu_ps(bp.add(o + 16)),
+                ),
             );
             acc3 = _mm256_add_ps(
                 acc3,
-                _mm256_mul_ps(_mm256_loadu_ps(ap.add(o + 24)), _mm256_loadu_ps(bp.add(o + 24))),
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(ap.add(o + 24)),
+                    _mm256_loadu_ps(bp.add(o + 24)),
+                ),
             );
         }
         let mut sum = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
@@ -243,8 +252,8 @@ pub fn dot_product_f16_f32(stored: &[f16], query: &[f32]) -> SearchResult<f32> {
 #[must_use]
 unsafe fn dot_product_f16_f32_avx2(stored: &[f16], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
-        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
-        _mm256_storeu_ps, _mm_loadu_si128,
+        __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps,
     };
     let n = stored.len().min(query.len());
     let chunks = n / 8;
@@ -385,8 +394,8 @@ pub fn dot_product_f16_bytes_f32(stored_bytes: &[u8], query: &[f32]) -> SearchRe
 #[must_use]
 unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
-        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
-        _mm256_storeu_ps, _mm_loadu_si128,
+        __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps,
     };
     let dim = query.len();
     let chunks = dim / 8;
@@ -396,8 +405,7 @@ unsafe fn dot_product_f16_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> 
     // (s2+s3)` tree matched bit-for-bit in `dot_product_f16_bytes_f32_generic`.
     macro_rules! mul_chunk {
         ($c:expr) => {{
-            let f16bits =
-                _mm_loadu_si128(stored_bytes.as_ptr().add($c * 16).cast::<__m128i>());
+            let f16bits = _mm_loadu_si128(stored_bytes.as_ptr().add($c * 16).cast::<__m128i>());
             let stored = _mm256_cvtph_ps(f16bits);
             let q = _mm256_loadu_ps(query.as_ptr().add($c * 8));
             _mm256_mul_ps(stored, q)
@@ -547,15 +555,24 @@ unsafe fn dot_product_f32_bytes_f32_avx2(stored_bytes: &[u8], query: &[f32]) -> 
             );
             acc1 = _mm256_add_ps(
                 acc1,
-                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o + 8)), _mm256_loadu_ps(qptr.add(o + 8))),
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(sptr.add(o + 8)),
+                    _mm256_loadu_ps(qptr.add(o + 8)),
+                ),
             );
             acc2 = _mm256_add_ps(
                 acc2,
-                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o + 16)), _mm256_loadu_ps(qptr.add(o + 16))),
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(sptr.add(o + 16)),
+                    _mm256_loadu_ps(qptr.add(o + 16)),
+                ),
             );
             acc3 = _mm256_add_ps(
                 acc3,
-                _mm256_mul_ps(_mm256_loadu_ps(sptr.add(o + 24)), _mm256_loadu_ps(qptr.add(o + 24))),
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(sptr.add(o + 24)),
+                    _mm256_loadu_ps(qptr.add(o + 24)),
+                ),
             );
         }
         let mut sum = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
@@ -677,9 +694,9 @@ pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
 #[must_use]
 unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
     use core::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
-        _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
     };
     let n = stored.len().min(query.len());
     // SAFETY: avx2 is guaranteed by the caller / `dot_i8_i8` dispatch; every load
@@ -850,10 +867,10 @@ pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
 #[must_use]
 unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi16, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
+        __m128i, __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
+        _mm_unpackhi_epi64, _mm256_add_epi16, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
         _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_mullo_epi16,
         _mm256_set1_epi16, _mm256_setzero_si256, _mm256_slli_epi16, _mm256_srai_epi16,
-        _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32, _mm_unpackhi_epi64,
     };
     let chunks = stored.len() / 16;
     let n = chunks.min(query.low.len());
@@ -864,8 +881,7 @@ unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i3
         // Reduce 16 i16 lanes → i32 (`vpmaddwd` by ones, then hsum the 8 i32).
         let hsum16 = |acc: __m256i| -> i32 {
             let m = _mm256_madd_epi16(acc, _mm256_set1_epi16(1));
-            let p128 =
-                _mm_add_epi32(_mm256_castsi256_si128(m), _mm256_extracti128_si256::<1>(m));
+            let p128 = _mm_add_epi32(_mm256_castsi256_si128(m), _mm256_extracti128_si256::<1>(m));
             let p64 = _mm_add_epi32(p128, _mm_unpackhi_epi64(p128, p128));
             let p32 = _mm_add_epi32(p64, _mm_shuffle_epi32::<0b01>(p64));
             _mm_cvtsi128_si32(p32)
@@ -1002,6 +1018,26 @@ pub fn quantize_f16_slab_to_i8(vectors_f16: &[f16]) -> Vec<i8> {
     quantize_f16_slab_to_i8_generic(vectors_f16)
 }
 
+/// Quantize a contiguous little-endian f16 byte slab to int8 with one corpus-wide
+/// max-abs scale.
+///
+/// This is the mmap-backed twin of [`quantize_f16_slab_to_i8`]: FSVI stores f16
+/// vectors as little-endian bytes, so the file-backed int8 two-pass path can use
+/// the same AVX2+F16C quantization pipeline without first materializing a `Vec<f16>`.
+#[must_use]
+pub fn quantize_f16_le_bytes_to_i8(bytes: &[u8]) -> Vec<i8> {
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above; on
+            // little-endian x86, FSVI little-endian bytes are valid F16C inputs.
+            #[allow(unsafe_code)]
+            return unsafe { quantize_f16_le_bytes_to_i8_avx2(bytes) };
+        }
+    }
+    quantize_f16_le_bytes_to_i8_generic(bytes)
+}
+
 /// Hand-written AVX2+F16C int8 slab quantizer. Bit-identical to the scalar kernel:
 /// `max` is exact/associative so the vector max-abs equals the scalar fold; the
 /// round is `f32::round` (half-away-from-zero) emulated as `trunc(v + copysign(0.5,
@@ -1017,10 +1053,10 @@ pub fn quantize_f16_slab_to_i8(vectors_f16: &[f16]) -> Vec<i8> {
 #[must_use]
 unsafe fn quantize_f16_slab_to_i8_avx2(vectors_f16: &[f16]) -> Vec<i8> {
     use core::arch::x86_64::{
-        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm256_add_ps, _mm256_and_ps, _mm256_cvtph_ps,
-        _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps,
-        _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps, _mm256_storeu_si256,
-        _mm_loadu_si128,
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_loadu_si128, _mm256_add_ps, _mm256_and_ps,
+        _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
+        _mm256_or_ps, _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        _mm256_storeu_si256,
     };
     let n = vectors_f16.len();
     let chunks = n / 8;
@@ -1087,6 +1123,97 @@ unsafe fn quantize_f16_slab_to_i8_avx2(vectors_f16: &[f16]) -> Vec<i8> {
     out
 }
 
+/// Hand-written AVX2+F16C int8 quantizer over little-endian f16 bytes. Same
+/// arithmetic as [`quantize_f16_slab_to_i8_avx2`], but reads the mapped FSVI byte
+/// slab directly.
+///
+/// # Safety
+/// Caller must ensure `avx2` + `f16c` are available and that the target is
+/// little-endian. The dispatch in [`quantize_f16_le_bytes_to_i8`] guarantees this.
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(
+    clippy::cast_ptr_alignment,
+    clippy::many_single_char_names,
+    unsafe_code
+)]
+#[must_use]
+unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
+    use core::arch::x86_64::{
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_loadu_si128, _mm256_add_ps, _mm256_and_ps,
+        _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
+        _mm256_or_ps, _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        _mm256_storeu_si256,
+    };
+    let n = bytes.len() / 2;
+    let chunks = n / 8;
+
+    let mut max_abs = 0.0_f32;
+    // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded.
+    unsafe {
+        let abs_mask = _mm256_set1_ps(f32::from_bits(0x7fff_ffff));
+        let mut vmax = _mm256_setzero_ps();
+        for c in 0..chunks {
+            let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
+            vmax = _mm256_max_ps(vmax, _mm256_and_ps(x, abs_mask));
+        }
+        let mut arr = [0.0_f32; 8];
+        _mm256_storeu_ps(arr.as_mut_ptr(), vmax);
+        for &v in &arr {
+            max_abs = max_abs.max(v);
+        }
+    }
+    let mut tail = chunks * 16;
+    while tail + 2 <= bytes.len() {
+        let value = f16::from_le_bytes([bytes[tail], bytes[tail + 1]])
+            .to_f32()
+            .abs();
+        max_abs = max_abs.max(value);
+        tail += 2;
+    }
+    if max_abs <= 0.0 {
+        return vec![0_i8; n];
+    }
+    let scale = 127.0 / max_abs;
+
+    let mut out = Vec::with_capacity(n);
+    // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded.
+    unsafe {
+        let vscale = _mm256_set1_ps(scale);
+        let vhalf = _mm256_set1_ps(0.5);
+        let vmaxc = _mm256_set1_ps(127.0);
+        let vminc = _mm256_set1_ps(-127.0);
+        let vsign = _mm256_set1_ps(-0.0);
+        let mut tmp = [0_i32; 8];
+        for c in 0..chunks {
+            let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
+            let v = _mm256_mul_ps(x, vscale);
+            let half_signed = _mm256_or_ps(vhalf, _mm256_and_ps(v, vsign));
+            let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(
+                _mm256_add_ps(v, half_signed),
+            );
+            let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vminc), vmaxc);
+            let i = _mm256_cvttps_epi32(clamped);
+            _mm256_storeu_si256(tmp.as_mut_ptr().cast(), i);
+            for &t in &tmp {
+                #[allow(clippy::cast_possible_truncation)]
+                out.push(t as i8);
+            }
+        }
+    }
+    let mut tail = chunks * 16;
+    while tail + 2 <= bytes.len() {
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(
+            (f16::from_le_bytes([bytes[tail], bytes[tail + 1]]).to_f32() * scale)
+                .round()
+                .clamp(-127.0, 127.0) as i8,
+        );
+        tail += 2;
+    }
+    out
+}
+
 /// Portable scalar int8 slab quantizer — the AVX2+F16C-dispatch fallback. Exposed
 /// (doc-hidden) for the bench A/B.
 #[doc(hidden)]
@@ -1105,6 +1232,32 @@ pub fn quantize_f16_slab_to_i8_generic(vectors_f16: &[f16]) -> Vec<i8> {
         .map(|x| {
             #[allow(clippy::cast_possible_truncation)]
             let q = (x.to_f32() * scale).round().clamp(-127.0, 127.0) as i8;
+            q
+        })
+        .collect()
+}
+
+/// Portable scalar little-endian f16-byte int8 quantizer — the byte-slab fallback
+/// and the A/B baseline for the mmap-backed FSVI path.
+#[doc(hidden)]
+#[must_use]
+pub fn quantize_f16_le_bytes_to_i8_generic(bytes: &[u8]) -> Vec<i8> {
+    let mut max_abs = 0.0_f32;
+    for chunk in bytes.chunks_exact(2) {
+        let value = f16::from_le_bytes([chunk[0], chunk[1]]).to_f32().abs();
+        max_abs = max_abs.max(value);
+    }
+    if max_abs <= 0.0 {
+        return vec![0_i8; bytes.len() / 2];
+    }
+    let scale = 127.0 / max_abs;
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            #[allow(clippy::cast_possible_truncation)]
+            let q = (f16::from_le_bytes([chunk[0], chunk[1]]).to_f32() * scale)
+                .round()
+                .clamp(-127.0, 127.0) as i8;
             q
         })
         .collect()
@@ -1151,10 +1304,10 @@ pub fn pack_f16_slab_to_4bit(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
 #[must_use]
 unsafe fn pack_f16_slab_to_4bit_avx2(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
     use core::arch::x86_64::{
-        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm256_add_ps, _mm256_and_ps, _mm256_cvtph_ps,
-        _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps,
-        _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps, _mm256_storeu_si256,
-        _mm_loadu_si128,
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_loadu_si128, _mm256_add_ps, _mm256_and_ps,
+        _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
+        _mm256_or_ps, _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+        _mm256_storeu_si256,
     };
     if dim == 0 {
         return Vec::new();
@@ -1203,8 +1356,7 @@ unsafe fn pack_f16_slab_to_4bit_avx2(vectors_f16: &[f16], dim: usize) -> Vec<u8>
             let out = v * bytes_per_vector;
             let mut d = 0;
             while d + 8 <= dim {
-                let x =
-                    _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add((base + d) * 2).cast()));
+                let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add((base + d) * 2).cast()));
                 let vv = _mm256_mul_ps(x, vscale);
                 let half_signed = _mm256_or_ps(vhalf, _mm256_and_ps(vv, vsign));
                 let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(
@@ -1299,7 +1451,7 @@ pub fn encode_f32_to_f16_extend(src: &[f32], dst: &mut Vec<f16>) {
 #[allow(unsafe_code)]
 unsafe fn encode_f32_to_f16_extend_avx2(src: &[f32], dst: &mut Vec<f16>) {
     use core::arch::x86_64::{
-        _MM_FROUND_TO_NEAREST_INT, __m128i, _mm256_cvtps_ph, _mm256_loadu_ps, _mm_storeu_si128,
+        __m128i, _MM_FROUND_TO_NEAREST_INT, _mm_storeu_si128, _mm256_cvtps_ph, _mm256_loadu_ps,
     };
     let n = src.len();
     let chunks = n / 8;
@@ -1355,7 +1507,9 @@ mod tests {
             #[allow(clippy::cast_possible_truncation)]
             ((state >> 24) as i8)
         };
-        for &dim in &[0_usize, 1, 7, 8, 31, 32, 33, 63, 64, 65, 100, 256, 384, 511, 512] {
+        for &dim in &[
+            0_usize, 1, 7, 8, 31, 32, 33, 63, 64, 65, 100, 256, 384, 511, 512,
+        ] {
             let s: Vec<i8> = (0..dim).map(|_| next_i8()).collect();
             let q: Vec<i8> = (0..dim).map(|_| next_i8()).collect();
             let generic = dot_i8_i8_generic(&s, &q);
@@ -1546,6 +1700,40 @@ mod tests {
         #[allow(unsafe_code)]
         let avx2_zero = unsafe { quantize_f16_slab_to_i8_avx2(&zeros) };
         assert_eq!(quantize_f16_slab_to_i8_generic(&zeros), avx2_zero);
+    }
+
+    /// The mmap-backed little-endian f16 byte quantizer must match its scalar
+    /// byte fallback exactly, including sub-8 tails and the all-zero slab.
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    fn avx2_quantize_i8_bytes_matches_generic() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
+            return;
+        }
+        let mut state = 0x8734_2190_abcd_ef55_u64;
+        let mut next_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_precision_loss)]
+            (((state >> 40) as f32 / (1_u64 << 23) as f32) - 1.0)
+        };
+        for &n in &[0_usize, 1, 7, 8, 9, 16, 31, 100, 384, 769] {
+            let mut bytes = Vec::with_capacity(n * 2);
+            for _ in 0..n {
+                bytes.extend_from_slice(&f16::from_f32(next_f32() * 3.0).to_le_bytes());
+            }
+            let generic = quantize_f16_le_bytes_to_i8_generic(&bytes);
+            // SAFETY: avx2+f16c verified present above.
+            #[allow(unsafe_code)]
+            let avx2 = unsafe { quantize_f16_le_bytes_to_i8_avx2(&bytes) };
+            assert_eq!(generic, avx2, "n={n}");
+        }
+        let zeros = vec![0_u8; 80];
+        // SAFETY: avx2+f16c verified present above.
+        #[allow(unsafe_code)]
+        let avx2_zero = unsafe { quantize_f16_le_bytes_to_i8_avx2(&zeros) };
+        assert_eq!(quantize_f16_le_bytes_to_i8_generic(&zeros), avx2_zero);
     }
 
     /// The runtime AVX2+F16C 4-bit slab packer must be byte-for-byte identical to

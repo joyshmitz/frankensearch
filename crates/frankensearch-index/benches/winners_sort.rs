@@ -32,7 +32,11 @@ struct HeapEntry {
 /// Mirrors `search::score_key`: NaN sorts as the worst score.
 #[inline]
 fn score_key(score: f32) -> f32 {
-    if score.is_nan() { f32::NEG_INFINITY } else { score }
+    if score.is_nan() {
+        f32::NEG_INFINITY
+    } else {
+        score
+    }
 }
 
 /// Mirrors `search::compare_best_first` — strict total order (unique `index` tiebreak).

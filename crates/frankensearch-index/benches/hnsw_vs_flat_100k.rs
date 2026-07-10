@@ -19,8 +19,8 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
     use std::hint::black_box;
 
     use frankensearch_index::{
-        HNSW_DEFAULT_EF_SEARCH, HnswConfig, HnswIndex, Quantization, VectorIndex,
-        certified_min_ef, certified_min_ef_mean,
+        HNSW_DEFAULT_EF_SEARCH, HnswConfig, HnswIndex, Quantization, VectorIndex, certified_min_ef,
+        certified_min_ef_mean,
     };
 
     const N: usize = 100_000;
@@ -258,8 +258,12 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
          TAIL(per-query, alpha={ALPHA}): ef={tail_ef} lower_bound={:.4} meets={} holdout@{K}={:.4} | \
          MEAN(average, Bernstein, delta={DELTA}): ef={mean_ef} lower_bound={:.4} meets={} holdout@{K}={:.4} \
          (compare hnsw_tail_certified_ef{tail_ef} and hnsw_mean_certified_ef{mean_ef} vs flat for the two certified speedups)",
-        tail.certified_recall, tail.meets_target, tail_holdout,
-        mean.certified_recall, mean.meets_target, mean_holdout
+        tail.certified_recall,
+        tail.meets_target,
+        tail_holdout,
+        mean.certified_recall,
+        mean.meets_target,
+        mean_holdout
     );
 
     let _ = std::fs::remove_file(&path);

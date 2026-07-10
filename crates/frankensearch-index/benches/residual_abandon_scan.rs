@@ -123,7 +123,12 @@ fn offer(top: &mut Vec<(f32, usize)>, k: usize, score: f32, idx: usize) {
 fn topk_full(rq: &[f32], rvecs: &[f32], k: usize) -> Vec<(f32, usize)> {
     let mut top = Vec::with_capacity(k + 1);
     for i in 0..N {
-        offer(&mut top, k, dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM), i);
+        offer(
+            &mut top,
+            k,
+            dot_block(rq, &rvecs[i * DIM..(i + 1) * DIM], DIM),
+            i,
+        );
     }
     top
 }
@@ -172,11 +177,7 @@ struct Layout {
 
 /// Pack `perm` into the transposed layout. `body_of(cand)` supplies the per-vector
 /// body (raw `v` or centered residual `r`); `dist` is the residual norm sidecar.
-fn build_layout(
-    perm: &[usize],
-    body_src: &[f32],
-    dist: &[f32],
-) -> Layout {
+fn build_layout(perm: &[usize], body_src: &[f32], dist: &[f32]) -> Layout {
     let nb = DIM / BLOCK;
     let ngroups = N / LANES;
     let mut body = vec![0.0f32; N * DIM];
@@ -213,7 +214,15 @@ fn build_layout(
     for g in 0..ngroups {
         cluster_groups[cand_ids[g * LANES] % CLUSTERS].push(g);
     }
-    Layout { body, suf, cand_ids, cand_cluster, gmax_dist, gskippable, cluster_groups }
+    Layout {
+        body,
+        suf,
+        cand_ids,
+        cand_cluster,
+        gmax_dist,
+        gskippable,
+        cluster_groups,
+    }
 }
 
 /// `qmu[c] = q·μ_c` + cluster ids sorted by descending qmu (near cluster first).
@@ -251,7 +260,11 @@ fn topk_bucketed(
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             if full && lay.gskippable[g] && qc + lay.gmax_dist[g] <= cutoff {
                 continue;
             }
@@ -264,9 +277,15 @@ fn topk_bucketed(
                 }
                 blocks_done += LANES as u64;
                 if full {
-                    sn.copy_from_slice(&lay.suf[sbase + (b + 1) * LANES..sbase + (b + 1) * LANES + LANES]);
+                    sn.copy_from_slice(
+                        &lay.suf[sbase + (b + 1) * LANES..sbase + (b + 1) * LANES + LANES],
+                    );
                     let bound = acc + f32x8::splat(qsuf[b + 1]) * f32x8::from(sn);
-                    let maxb = bound.to_array().iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let maxb = bound
+                        .to_array()
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
                     if maxb <= cutoff {
                         abandoned = true;
                         break;
@@ -306,7 +325,11 @@ fn topk_residual(
             let vbase = g * DIM * LANES;
             let sbase = g * (nb + 1) * LANES;
             let full = top.len() == k;
-            let cutoff = if full { top[k - 1].0 } else { f32::NEG_INFINITY };
+            let cutoff = if full {
+                top[k - 1].0
+            } else {
+                f32::NEG_INFINITY
+            };
             // Per-lane centroid dot (exact for boundary groups too).
             for lane in 0..LANES {
                 gq[lane] = qmu[lay.cand_cluster[g * LANES + lane]];
@@ -319,7 +342,11 @@ fn topk_residual(
                     // check-then-compute: bound uses residual suffix from block b.
                     sn.copy_from_slice(&lay.suf[sbase + b * LANES..sbase + b * LANES + LANES]);
                     let bound = gqmu + acc + f32x8::splat(qsuf[b]) * f32x8::from(sn);
-                    let maxb = bound.to_array().iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let maxb = bound
+                        .to_array()
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
                     if maxb <= cutoff {
                         abandoned = true;
                         break;

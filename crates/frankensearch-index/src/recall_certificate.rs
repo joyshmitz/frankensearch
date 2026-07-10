@@ -57,7 +57,11 @@ pub fn conformal_recall_lower_bound(recalls: &[f64], alpha: f64) -> f64 {
         return 0.0;
     }
     // Rank k = floor(alpha * (n + 1)) in [0, n]. k == 0 => cannot certify > 0.
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let rank = (alpha * (n as f64 + 1.0)).floor() as usize;
     if rank == 0 {
         return 0.0;
@@ -276,7 +280,10 @@ pub fn calibrate_certified_ef(
         sweep.push(candidate);
         if candidate.meets_target {
             // Cheapest certified ef found — do NOT measure any larger candidate.
-            return Some(EfCalibration { chosen: candidate, sweep });
+            return Some(EfCalibration {
+                chosen: candidate,
+                sweep,
+            });
         }
         let better = match best {
             Some(b) => bound > b.certified_recall,
@@ -297,7 +304,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
             self.0
         }
         /// Uniform f64 in [0, 1).
@@ -406,7 +416,10 @@ mod tests {
         }
         #[allow(clippy::cast_precision_loss)]
         let miss_rate = misses as f64 / trials as f64;
-        assert!(miss_rate <= delta, "mean LCB coverage violated: {miss_rate:.4} > {delta}");
+        assert!(
+            miss_rate <= delta,
+            "mean LCB coverage violated: {miss_rate:.4} > {delta}"
+        );
     }
 
     #[test]
@@ -421,15 +434,19 @@ mod tests {
         let mut misses = 0usize;
         for _ in 0..trials {
             // recall in {0.9, 1.0}: P(1.0)=0.7 -> mean 0.97, low variance.
-            let cal: Vec<f64> =
-                (0..n).map(|_| if lcg.unit() < 0.7 { 1.0 } else { 0.9 }).collect();
+            let cal: Vec<f64> = (0..n)
+                .map(|_| if lcg.unit() < 0.7 { 1.0 } else { 0.9 })
+                .collect();
             if true_mean < mean_recall_lower_bound_bernstein(&cal, delta) {
                 misses += 1;
             }
         }
         #[allow(clippy::cast_precision_loss)]
         let miss_rate = misses as f64 / trials as f64;
-        assert!(miss_rate <= delta, "Bernstein LCB coverage violated: {miss_rate:.4} > {delta}");
+        assert!(
+            miss_rate <= delta,
+            "Bernstein LCB coverage violated: {miss_rate:.4} > {delta}"
+        );
     }
 
     #[test]
@@ -466,8 +483,14 @@ mod tests {
         // 0.95 exactly at the boundary; make the target strict enough that the tail
         // mode must climb to ef=100 while the mean mode stays at ef=40.
         let mean_choice = certified_min_ef_mean(&calibration, 0.95, 0.05).unwrap();
-        assert!(mean_choice.meets_target, "mean bound should certify at 0.95");
-        assert_eq!(mean_choice.ef_search, 40, "mean mode certifies the cheaper ef=40");
+        assert!(
+            mean_choice.meets_target,
+            "mean bound should certify at 0.95"
+        );
+        assert_eq!(
+            mean_choice.ef_search, 40,
+            "mean mode certifies the cheaper ef=40"
+        );
         assert!(mean_choice.certified_recall >= 0.95);
 
         // Sanity: the Bernstein mean bound at ef=40 clears 0.95 where Hoeffding does not
@@ -526,7 +549,11 @@ mod tests {
         .unwrap();
         assert!(cal.chosen.meets_target);
         assert_eq!(cal.chosen.ef_search, 40, "cheapest certified ef");
-        assert_eq!(measured, vec![20, 40], "must stop measuring once ef=40 certifies");
+        assert_eq!(
+            measured,
+            vec![20, 40],
+            "must stop measuring once ef=40 certifies"
+        );
         assert_eq!(cal.sweep.len(), 2);
     }
 
@@ -550,7 +577,18 @@ mod tests {
         assert_eq!(cal.sweep.len(), 3);
         // Empty candidate set -> None, and the closure is never called.
         let mut never = 0usize;
-        assert!(calibrate_certified_ef(&[], |_| { never += 1; vec![1.0] }, 0.9, 0.05).is_none());
+        assert!(
+            calibrate_certified_ef(
+                &[],
+                |_| {
+                    never += 1;
+                    vec![1.0]
+                },
+                0.9,
+                0.05
+            )
+            .is_none()
+        );
         assert_eq!(never, 0);
     }
 
@@ -560,8 +598,13 @@ mod tests {
     #[test]
     fn certificate_catches_heuristic_overconfidence() {
         // ef/k = 100/10 -> heuristic estimate = 0.9 + 0.1*log2(10) ≈ 1.232 -> 1.0.
-        let heuristic = 0.1_f64.mul_add((100.0_f64 / 10.0).log2(), 0.9).clamp(0.0, 1.0);
-        assert!(heuristic >= 0.999, "heuristic claims ~perfect recall: {heuristic}");
+        let heuristic = 0.1_f64
+            .mul_add((100.0_f64 / 10.0).log2(), 0.9)
+            .clamp(0.0, 1.0);
+        assert!(
+            heuristic >= 0.999,
+            "heuristic claims ~perfect recall: {heuristic}"
+        );
         // But measured recall at that ef is actually ~0.85 on this corpus:
         let measured = vec![0.85; 500];
         let certified = conformal_recall_lower_bound(&measured, 0.05);

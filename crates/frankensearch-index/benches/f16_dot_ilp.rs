@@ -56,8 +56,8 @@ fn build_corpus(n: usize, dim: usize, seed: u64) -> Vec<u8> {
 #[target_feature(enable = "avx2,f16c")]
 unsafe fn dot_f16_1acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
-        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
-        _mm256_storeu_ps, _mm_loadu_si128,
+        __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps,
     };
     let dim = query.len();
     let chunks = dim / 8;
@@ -75,7 +75,9 @@ unsafe fn dot_f16_1acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
     let mut result = arr.iter().sum::<f32>();
     for index in (chunks * 8)..dim {
         let b = &stored_bytes[index * 2..];
-        result = f16::from_le_bytes([b[0], b[1]]).to_f32().mul_add(query[index], result);
+        result = f16::from_le_bytes([b[0], b[1]])
+            .to_f32()
+            .mul_add(query[index], result);
     }
     result
 }
@@ -86,8 +88,8 @@ unsafe fn dot_f16_1acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
 #[target_feature(enable = "avx2,f16c")]
 unsafe fn dot_f16_4acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
     use core::arch::x86_64::{
-        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps, _mm256_setzero_ps,
-        _mm256_storeu_ps, _mm_loadu_si128,
+        __m128i, _mm_loadu_si128, _mm256_add_ps, _mm256_cvtph_ps, _mm256_loadu_ps, _mm256_mul_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps,
     };
     let dim = query.len();
     let chunks = dim / 8;
@@ -123,7 +125,9 @@ unsafe fn dot_f16_4acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
     let mut result = arr.iter().sum::<f32>();
     for index in (chunks * 8)..dim {
         let b = &stored_bytes[index * 2..];
-        result = f16::from_le_bytes([b[0], b[1]]).to_f32().mul_add(query[index], result);
+        result = f16::from_le_bytes([b[0], b[1]])
+            .to_f32()
+            .mul_add(query[index], result);
     }
     result
 }

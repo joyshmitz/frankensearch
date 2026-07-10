@@ -18,9 +18,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 fn bench_ann_stratified_ef(c: &mut Criterion) {
     use std::hint::black_box;
 
-    use frankensearch_index::{
-        HnswConfig, HnswIndex, Quantization, VectorIndex, certified_min_ef,
-    };
+    use frankensearch_index::{HnswConfig, HnswIndex, Quantization, VectorIndex, certified_min_ef};
 
     const DIM: usize = 128;
     // Corpus size (env-overridable so the same bench can probe the steeper
@@ -59,19 +57,31 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
         }
         v
     }
-    let centroids: Vec<Vec<f32>> =
-        (0..CLUSTERS).map(|cl| normalize(raw(0xC000_0000 + cl as u64))).collect();
+    let centroids: Vec<Vec<f32>> = (0..CLUSTERS)
+        .map(|cl| normalize(raw(0xC000_0000 + cl as u64)))
+        .collect();
     let make = |cluster: usize, seed: u64| -> Vec<f32> {
-        let noise = if cluster < CLUSTERS / 2 { TIGHT_NOISE } else { DIFFUSE_NOISE };
+        let noise = if cluster < CLUSTERS / 2 {
+            TIGHT_NOISE
+        } else {
+            DIFFUSE_NOISE
+        };
         let r = raw(seed);
-        normalize(centroids[cluster].iter().zip(&r).map(|(a, n)| a + noise * n).collect())
+        normalize(
+            centroids[cluster]
+                .iter()
+                .zip(&r)
+                .map(|(a, n)| a + noise * n)
+                .collect(),
+        )
     };
 
     // Corpus + index + HNSW.
     let path = std::env::temp_dir().join(format!("fs_strat_{}.fsvi", std::process::id()));
     {
-        let mut w = VectorIndex::create_with_revision(&path, "hash", "bench", DIM, Quantization::F32)
-            .expect("create writer");
+        let mut w =
+            VectorIndex::create_with_revision(&path, "hash", "bench", DIM, Quantization::F32)
+                .expect("create writer");
         for i in 0..n {
             let v = make(i % CLUSTERS, i as u64 + 1);
             w.write_record(&format!("doc-{i:06}"), &v).expect("write");
@@ -79,8 +89,14 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
         w.finish().expect("finish");
     }
     let index = VectorIndex::open(&path).expect("open");
-    let hnsw = HnswIndex::build_from_vector_index(&index, HnswConfig { m: 32, ..HnswConfig::default() })
-        .expect("build hnsw");
+    let hnsw = HnswIndex::build_from_vector_index(
+        &index,
+        HnswConfig {
+            m: 32,
+            ..HnswConfig::default()
+        },
+    )
+    .expect("build hnsw");
 
     let ann_ids = |q: &[f32], ef: usize| -> Vec<String> {
         hnsw.knn_search(q, K, ef)
@@ -121,22 +137,27 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
             .collect()
     };
 
-    let tight_cal: Vec<Vec<f32>> =
-        (0..CAL_PER_STRATUM).map(|i| make(i % (CLUSTERS / 2), 0x00A1_0000 + i as u64)).collect();
+    let tight_cal: Vec<Vec<f32>> = (0..CAL_PER_STRATUM)
+        .map(|i| make(i % (CLUSTERS / 2), 0x00A1_0000 + i as u64))
+        .collect();
     let diffuse_cal: Vec<Vec<f32>> = (0..CAL_PER_STRATUM)
         .map(|i| make(CLUSTERS / 2 + i % (CLUSTERS / 2), 0x00B2_0000 + i as u64))
         .collect();
     let mut global_cal = tight_cal.clone();
     global_cal.extend(diffuse_cal.clone());
 
-    let tight_ef = certified_min_ef(&samples(&tight_cal), TARGET, ALPHA).expect("tight").ef_search;
-    let diffuse_ef =
-        certified_min_ef(&samples(&diffuse_cal), TARGET, ALPHA).expect("diffuse").ef_search;
+    let tight_ef = certified_min_ef(&samples(&tight_cal), TARGET, ALPHA)
+        .expect("tight")
+        .ef_search;
+    let diffuse_ef = certified_min_ef(&samples(&diffuse_cal), TARGET, ALPHA)
+        .expect("diffuse")
+        .ef_search;
     // Population-conformal global: certifies a fresh MIXED query at target — but the
     // mixed tail is diluted by easy queries, so it does NOT certify the diffuse
     // stratum on its own.
-    let global_pop_ef =
-        certified_min_ef(&samples(&global_cal), TARGET, ALPHA).expect("global").ef_search;
+    let global_pop_ef = certified_min_ef(&samples(&global_cal), TARGET, ALPHA)
+        .expect("global")
+        .ef_search;
     // Per-group global: the ef a NON-stratified system must run for EVERYONE to
     // certify EVERY stratum (the apples-to-apples baseline for the stratified router,
     // which also certifies every stratum).
@@ -153,12 +174,17 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
                 best_ci = ci;
             }
         }
-        if best_ci < CLUSTERS / 2 { tight_ef } else { diffuse_ef }
+        if best_ci < CLUSTERS / 2 {
+            tight_ef
+        } else {
+            diffuse_ef
+        }
     };
 
     // Held-out mixed queries + their exact top-k (for honest recall under routing).
-    let holdout: Vec<Vec<f32>> =
-        (0..HOLDOUT).map(|i| make(i % CLUSTERS, 0x00D0_0000 + i as u64)).collect();
+    let holdout: Vec<Vec<f32>> = (0..HOLDOUT)
+        .map(|i| make(i % CLUSTERS, 0x00D0_0000 + i as u64))
+        .collect();
     let holdout_exact: Vec<Vec<String>> = holdout.iter().map(|q| exact_ids(q)).collect();
     let routed: Vec<usize> = holdout.iter().map(|q| route_ef(q)).collect();
 
@@ -197,7 +223,10 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
         b.iter(|| {
             let i = qi % HOLDOUT;
             qi += 1;
-            black_box(hnsw.knn_search(black_box(&holdout[i]), K, global_pop_ef).expect("ann"))
+            black_box(
+                hnsw.knn_search(black_box(&holdout[i]), K, global_pop_ef)
+                    .expect("ann"),
+            )
         });
     });
     let mut qp = 0usize;
@@ -205,7 +234,10 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
         b.iter(|| {
             let i = qp % HOLDOUT;
             qp += 1;
-            black_box(hnsw.knn_search(black_box(&holdout[i]), K, pergroup_ef).expect("ann"))
+            black_box(
+                hnsw.knn_search(black_box(&holdout[i]), K, pergroup_ef)
+                    .expect("ann"),
+            )
         });
     });
     let mut qj = 0usize;
@@ -213,7 +245,10 @@ fn bench_ann_stratified_ef(c: &mut Criterion) {
         b.iter(|| {
             let i = qj % HOLDOUT;
             qj += 1;
-            black_box(hnsw.knn_search(black_box(&holdout[i]), K, routed[i]).expect("ann"))
+            black_box(
+                hnsw.knn_search(black_box(&holdout[i]), K, routed[i])
+                    .expect("ann"),
+            )
         });
     });
     g.finish();

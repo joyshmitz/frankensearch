@@ -38,9 +38,9 @@ fn build_corpus(n: usize, dim: usize, seed: u64) -> Vec<i8> {
 #[target_feature(enable = "avx2")]
 unsafe fn dot_i8_2acc(stored: &[i8], query: &[i8]) -> i32 {
     use core::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
-        _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
     };
     let n = stored.len().min(query.len());
     unsafe {
@@ -59,8 +59,10 @@ unsafe fn dot_i8_2acc(stored: &[i8], query: &[i8]) -> i32 {
             i += 32;
         }
         let acc = _mm256_add_epi32(acc0, acc1);
-        let sum128 =
-            _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256::<1>(acc));
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256::<1>(acc),
+        );
         let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
         let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
         let mut sum = _mm_cvtsi128_si32(sum32);
@@ -78,9 +80,9 @@ unsafe fn dot_i8_2acc(stored: &[i8], query: &[i8]) -> i32 {
 #[target_feature(enable = "avx2")]
 unsafe fn dot_i8_4acc(stored: &[i8], query: &[i8]) -> i32 {
     use core::arch::x86_64::{
-        __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
-        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
-        _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
     };
     let n = stored.len().min(query.len());
     macro_rules! madd_at {
@@ -116,8 +118,10 @@ unsafe fn dot_i8_4acc(stored: &[i8], query: &[i8]) -> i32 {
             i += 32;
         }
         let acc = _mm256_add_epi32(_mm256_add_epi32(acc0, acc1), _mm256_add_epi32(acc2, acc3));
-        let sum128 =
-            _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256::<1>(acc));
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256::<1>(acc),
+        );
         let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
         let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
         let mut sum = _mm_cvtsi128_si32(sum32);

@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_index::{
-    InMemoryVectorIndex, dot_4bit_prepared, dot_4bit_prepared_generic, dot_i8_i8, dot_i8_i8_generic,
-    dot_product_f16_bytes_f32, dot_product_f16_bytes_f32_generic,
+    InMemoryVectorIndex, dot_4bit_prepared, dot_4bit_prepared_generic, dot_i8_i8,
+    dot_i8_i8_generic, dot_product_f16_bytes_f32, dot_product_f16_bytes_f32_generic,
     dot_product_f16_f32, dot_product_f16_f32_generic, dot_product_f32_bytes_f32,
     dot_product_f32_bytes_f32_generic, dot_product_f32_f32, dot_product_f32_f32_generic,
     prepare_4bit_query,
