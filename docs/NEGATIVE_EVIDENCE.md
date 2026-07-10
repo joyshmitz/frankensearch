@@ -10618,3 +10618,36 @@ dispatch wrapper recorded 0.77%; the interleaved ORIGINAL `dot_i8_i8_avx2` recor
 bundle. Retry condition: batch exactly all 32 fixture queries per Criterion iteration. That both reduces the
 remaining estimator noise and makes each iteration's query weighting identical even when Criterion chooses
 different iteration counts for the two independently estimated arms.
+
+---
+
+## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: batch32 linear sampling collides with active worker contention (cod_fse)
+
+**This rejects the timing bundle, not the candidate.** The full-query retry ran as one fail-closed RCH
+invocation on `vmi1152480` (AMD EPYC, 10 physical CPUs), with 32-query AB/BA batches, both arms in every
+measured routine, black-boxed inputs/results, exact output parity, and batch-normalized values below. The
+worker was heavily contended during measurement: Criterion could schedule only one batch per sample, and
+per-search latency expanded by roughly an order of magnitude. Exact release-perf binary SHA-256:
+`dd6ac2fb8fe11b201f1ae5601b669db46805cba6f598a49c147e705e401625d5`.
+
+| arm | per-search mean [95% CI] | per-search stddev | CV | candidate/original |
+|---|---:|---:|---:|---:|
+| paired ORIGINAL mult3 | 4738.366 us [4210.696, 5309.716] | 1993.049 us | **42.0620%** | — |
+| paired four-row candidate mult3 | 5870.419 us [5241.993, 6524.415] | 2340.496 us | **39.8693%** | 1.238912 |
+| paired ORIGINAL mult5 | 4636.996 us [3996.285, 5420.563] | 2589.925 us | **55.8535%** | — |
+| paired four-row candidate mult5 | 4776.620 us [4234.295, 5337.158] | 2009.908 us | **42.0780%** | 1.030111 |
+
+Recall@10 and nDCG@10 remained exactly 1.0000 for both arms at multipliers 2, 3, 5, and 10, and the
+index/doc/score outputs were bit-exact. Every latency CV fails the <5% gate, so the ratios are scheduling
+evidence only and cannot decide the lever.
+
+**Ledger-integrity profile.** The exact measured candidate benchmark was separately pinned to CPUs 2-5 and
+sampled for 30 seconds. `dot_i8x4_i8_avx2` had **36.40% flat self-time**, its dispatch wrapper had 1.22%, and
+the interleaved ORIGINAL `dot_i8_i8_avx2` had 29.51%. Perf captured 58,914 samples with zero lost. Artifact:
+`/tmp/bd-b5wl-row4-ab3-profile-20260710-1446.perf.data` on `vmi1152480`, SHA-256
+`84cd7b70026b62cd15a45a6efcf8a27a202ce0fbbf4275b0e79849ab583f08c1`.
+
+**Decision:** REJECT the default linear-sampling batch32 bundle. Retry condition: keep the full-query batch
+and one-binary interleaving, but use flat sampling with a multi-second target per sample so transient remote
+worker scheduling is averaged within each estimate. If strict-remote scheduling cannot produce all four CVs
+below 5%, that is an infrastructure blocker rather than evidence for or against the production candidate.
