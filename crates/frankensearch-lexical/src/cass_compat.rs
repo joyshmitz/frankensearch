@@ -1524,8 +1524,37 @@ pub fn cass_generate_edge_ngrams(text: &str) -> String {
 }
 
 /// Build a bounded-length preview from message content.
+///
+/// Takes the first `max_chars` characters and appends `…` if the content is longer. One
+/// `char_indices` scan finds the cut byte-offset, then a single `push_str` bulk-copies the prefix
+/// into a pre-sized buffer — versus pushing `max_chars` chars individually (each re-encoding the
+/// char and growing an unallocated `String` through repeated reallocations). Byte-for-byte identical
+/// output (`cass_build_preview_matches_slow`).
 #[must_use]
 pub fn cass_build_preview(content: &str, max_chars: usize) -> String {
+    // Byte offset just past the `max_chars`-th char, or `content.len()` if there are fewer.
+    let mut cut = content.len();
+    let mut count = 0usize;
+    for (byte_idx, _) in content.char_indices() {
+        if count == max_chars {
+            cut = byte_idx;
+            break;
+        }
+        count += 1;
+    }
+    let truncated = cut < content.len();
+    let mut out = String::with_capacity(cut + if truncated { '…'.len_utf8() } else { 0 });
+    out.push_str(&content[..cut]);
+    if truncated {
+        out.push('…');
+    }
+    out
+}
+
+/// Pre-bulk-copy [`cass_build_preview`], retained doc-hidden for the same-binary A/B + parity test.
+#[doc(hidden)]
+#[must_use]
+pub fn cass_build_preview_slow(content: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut chars = content.chars();
     for _ in 0..max_chars {
@@ -2413,6 +2442,25 @@ mod cass_query_tests {
         assert_eq!(cass_build_preview("hello", 10), "hello");
         assert_eq!(cass_build_preview("hello world", 5), "hello…");
         assert_eq!(cass_build_preview("éclair", 3), "écl…");
+    }
+
+    /// PARITY GATE: the bulk-copy `cass_build_preview` must equal the char-by-char original for
+    /// every content length / `max_chars` / ASCII-vs-Unicode combination (boundary at, before, and
+    /// after the cut; empty; all-multibyte).
+    #[test]
+    fn cass_build_preview_matches_slow() {
+        let ascii = "the quick brown fox jumps over the lazy dog ".repeat(20);
+        let uni = "café 日本語 éclair 한국어 naïve ".repeat(20);
+        for content in ["", "x", "hello world", ascii.as_str(), uni.as_str()] {
+            for max_chars in [0usize, 1, 3, 4, 5, 10, 50, 400, 100_000] {
+                assert_eq!(
+                    cass_build_preview(content, max_chars),
+                    cass_build_preview_slow(content, max_chars),
+                    "content.len()={} max_chars={max_chars}",
+                    content.len()
+                );
+            }
+        }
     }
 
     #[test]

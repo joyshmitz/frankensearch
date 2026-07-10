@@ -49,3 +49,8 @@ workspace = true
 name = "tokenizer_char_walk_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "preview_build_ab"
+harness = false
+required-features = ["bench-internals"]

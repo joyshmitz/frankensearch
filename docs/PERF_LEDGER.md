@@ -4621,3 +4621,38 @@ This is the per-char scan primitive; the full tokenizer sees a smaller-but-real 
 `next_char_from_slow` + the `cass_char_walk_*` harnesses so the A/B stays reproducible, both arms in-tree).
 Recall-preserving, decidable, live. All builds/benches remote; no local cargo; fmt clean; ubs adds no new
 criticals (HEAD already exits 1 on pre-existing `.unwrap()`s).
+
+## 2026-07-10 — WIN: `cass_build_preview` bulk-copy vs char-by-char push — 3.07×, byte-identical (cc_fse)
+
+Sibling of the tokenizer `next_char_from` win (`517cea9`), same lexical vein. `cass_build_preview` runs **per
+document at index time** (`cass_build_content_prefix_and_preview`, `PREVIEW_MAX_CHARS = 400`), truncating content
+to N chars + `…`. The original pushed up to `max_chars` chars **one at a time** into a `String::new()` — each
+`out.push(ch)` re-encodes the char to UTF-8, and the unallocated buffer grows through repeated reallocations.
+
+**The lever.** One `char_indices` scan finds the cut byte-offset, then a single `push_str` bulk-copies the prefix
+(a memcpy) into a `String::with_capacity(...)`. Same decode count, but zero per-char re-encode and zero
+reallocations. Byte-for-byte identical output.
+
+**Recall/ordering — trivially preserved.** The preview text is unchanged (bit-identical), so nothing about
+indexing or ranking moves. `cass_build_preview_matches_slow` asserts equality across content lengths, `max_chars`
+∈ {0,1,3,4,5,10,50,400,100k}, and ASCII/Unicode/mixed inputs (boundary at/before/after the cut, empty,
+all-multibyte); `cass_build_preview_preserves_existing_behavior` pins the documented cases (incl. `max_chars=0`
+→ `…`). All 84 lexical lib tests pass.
+
+**Speed — DECIDABLE WIN.** Isolated null-controlled microbench (`benches/preview_build_ab.rs`, 256 previews of a
+~2 KiB message per timed region — both arms hit the truncation path, the common real-doc case; shared
+alternating-round sampler, one binary / one `rch` invocation, worker `hz2`/`hetzner2`, binary sha256
+`676e029299a9b9d56158ede166f825d9f6a681c08ae1ae49f8fdd560215840af`, 41 rounds × 4). Ratio = fast/ORIG:
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (char_push vs char_push) | 1.0005 [0.9620, 1.0283] |
+| fast / ORIG | **0.3258 [0.3193, 0.4553]** |
+
+fast/ORIG median 0.3258 = **3.07× faster**, and the lever's p95 (0.4553) is far below the null p5 (0.9620) —
+decidable by a wide margin against a tight (±3%) null floor. The per-char re-encode + realloc growth dominated
+far more than the decode.
+
+**SHIPPED in place** (`cass_build_preview` is now the bulk-copy; the char-by-char original retained doc-hidden as
+`cass_build_preview_slow` so the A/B stays reproducible, both arms in-tree). Recall-preserving, decidable, live.
+All builds/benches remote; no local cargo; fmt clean; clippy clean on changed lines.
