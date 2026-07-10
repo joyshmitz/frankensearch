@@ -28,6 +28,7 @@
 //!   pool, indexed by [`VectorHit::index`].
 
 use frankensearch_core::VectorHit;
+use frankensearch_index::dot_product_f32_f32;
 
 /// Parameters for [`apply_hubness_penalty`] / [`compute_query_hubness`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,9 +111,27 @@ pub fn compute_query_hubness(
         .collect()
 }
 
+/// Cosine dot of two L2-normalized vectors.
+///
+/// Delegates to the vector tier's [`dot_product_f32_f32`] — a hand-written AVX2 kernel carrying
+/// four `f32x8` accumulators (32 lanes of ILP) with a portable `wide` fallback off-x86.
+/// [`compute_query_hubness`] is O(docs·queries·dim) and wholly dominated by this dot, and the
+/// ORIGINAL here was a scalar `iter().zip().map(..).sum()`: one f32 accumulator, a serial add
+/// chain LLVM cannot reassociate without fast-math, latency-bound regardless of how wide the
+/// multiplies vectorize. Reusing the shipped kernel rather than hand-rolling a reduction is
+/// **11.3× on the 384-dim dot / 10.9× on the builder** (`hubness_dot_ab`); an 8-accumulator
+/// scalar loop relying on LLVM's SLP vectorizer reached only 2.6× and was rejected.
+///
+/// Slicing to the common length keeps the ORIGINAL's `zip` truncation semantics, which also makes
+/// the kernel's `DimensionMismatch` unreachable. The reassociation is the same accepted
+/// search-time ULP trade as [`crate::mmr`]'s `cosine_sim_pre`: `r_d` is an approximate demotion
+/// statistic (`β·r_d` moves the dense score by ~1e-2) and its `select_nth` of the kq nearest
+/// queries is robust to sub-ULP perturbation — `hubness_dot_ab` gates selection-equality
+/// (max `Δr_d` < 1e-4) against the scalar ORIGINAL before timing.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let len = a.len().min(b.len());
+    dot_product_f32_f32(&a[..len], &b[..len]).unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -175,6 +194,49 @@ mod tests {
         let queries: Vec<&[f32]> = vec![&qa, &qb, &qc];
         let r = compute_query_hubness(&docs, &queries, 2);
         assert!((r[0] - 0.8).abs() < 1e-6, "r_d {}", r[0]);
+    }
+
+    /// The other tests use 2-dim vectors, which only exercise the dot kernel's scalar tail.
+    /// 43 = 32 (one AVX2 group) + 8 (one chunk) + 3 (tail), so this covers every branch of
+    /// `dot_product_f32_f32` and pins the reassociated result to a scalar reference.
+    #[test]
+    fn hubness_matches_scalar_reference_across_kernel_blocks() {
+        let dim = 43;
+        let mk = |seed: f32| -> Vec<f32> {
+            let raw: Vec<f32> = (0..dim).map(|i| ((i as f32) * seed).sin()).collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            raw.into_iter().map(|x| x / norm).collect()
+        };
+        let d0 = mk(0.7);
+        let d1 = mk(1.3);
+        let q0 = mk(2.1);
+        let q1 = mk(0.35);
+        let docs: Vec<&[f32]> = vec![&d0, &d1];
+        let queries: Vec<&[f32]> = vec![&q0, &q1];
+
+        let scalar_dot =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+        let r = compute_query_hubness(&docs, &queries, 2);
+        for (i, d) in docs.iter().enumerate() {
+            let expect = queries.iter().map(|q| scalar_dot(d, q)).sum::<f32>() / 2.0;
+            assert!(
+                (r[i] - expect).abs() < 1e-6,
+                "doc {i}: {} vs scalar {expect}",
+                r[i]
+            );
+        }
+    }
+
+    /// A doc shorter than the query truncates to the common length (the ORIGINAL `zip` semantics),
+    /// rather than hitting the kernel's `DimensionMismatch`.
+    #[test]
+    fn ragged_lengths_truncate_to_common_prefix() {
+        let d = [1.0f32, 0.0, 0.0];
+        let q = [1.0f32, 0.0]; // shorter than the doc
+        let docs: Vec<&[f32]> = vec![&d];
+        let queries: Vec<&[f32]> = vec![&q];
+        let r = compute_query_hubness(&docs, &queries, 1);
+        assert!((r[0] - 1.0).abs() < 1e-6, "r_d {}", r[0]);
     }
 
     #[test]

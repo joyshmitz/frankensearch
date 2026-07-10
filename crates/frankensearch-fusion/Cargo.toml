@@ -31,6 +31,9 @@ time = { workspace = true }
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
+# hubness_dot_ab: A/B the private `dot` against the shipped AVX2 kernel + a rayon outer loop.
+frankensearch-index = { workspace = true }
+rayon = { workspace = true }
 # compact_str: SSO-string clone-cost probe for the limit_all doc_id materialization
 # lever (dev-only; already a transitive workspace dep). See doc_id_clone_sso bench.
 compact_str = "0.9"
@@ -70,6 +73,10 @@ harness = false
 
 [[bench]]
 name = "hubness_penalty"
+harness = false
+
+[[bench]]
+name = "hubness_dot_ab"
 harness = false
 
 [[bench]]

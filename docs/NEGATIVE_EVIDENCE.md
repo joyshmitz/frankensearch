@@ -10246,3 +10246,40 @@ doc_ids to integers up front so the "hash probe" becomes an array index). But `g
 phase-1 hook seeded from a retrieved candidate pool (hundreds of nodes), never fed 10⁴⁺-node graphs on the hot
 path, so this is not pursued. Do **not** re-try a two-pass flat CSR on `graph_rank` for these sizes.
 
+
+---
+
+## 2026-07-09 — REJECTED: hand-rolled 8-accumulator scalar dot in `hubness::dot` — 4.4× slower than reusing the shipped AVX2 kernel (cc_fs)
+
+**The rejected lever.** Break the single-accumulator loop-carried dependency in `hubness::dot` by fanning the
+f32 reduction across **eight independent accumulators** (a full AVX2 register's worth), so LLVM's SLP
+vectorizer can emit 256-bit FMA. Textbook multi-accumulator ILP — the same primitive that won on
+`mmr::cosine_sim_pre` (4×f64, `efbfe33`) and the f16 dot (`82e151f`).
+
+**It works, and it is still the wrong answer.** Measured 2.53–2.59× over the scalar ORIGINAL. But
+`frankensearch-fusion` already depends on `frankensearch-index`, which already exports
+`dot_product_f32_f32` — a **hand-written AVX2 kernel** (4×`f32x8` = 32 lanes of ILP, `wide` fallback). Simply
+calling it is **11.34×**. The hand-rolled loop is **4.40× slower than the code already sitting one crate away**
+(86.233 ns vs 19.619 ns on a 384-dim dot), because it can only get vector code if the SLP vectorizer
+cooperates, whereas the shipped kernel uses intrinsics unconditionally under a runtime `avx2` check.
+
+| arm | 384-dim dot | build 1000×100×384 | vs ORIG |
+|---|---:|---:|---:|
+| ORIG scalar `iter().sum()` | 222.53 ns | 22.389 ms | 1.00 |
+| `multiacc` (8×f32, **REJECTED**) | 86.233 ns | 8.8560 ms | 2.53–2.59× |
+| `simd` reuse (**KEPT**, `PERF_LEDGER`) | 19.619 ns | 2.0565 ms | **10.89–11.34×** |
+
+Both arms are retained as timed arms in `benches/hubness_dot_ab.rs` so the rejection stays reproducible
+rather than merely asserted.
+
+**LESSON (generalizes the sibling-path-consistency method).** That method says: when a kernel looks slow,
+check whether its *production sibling* already carries an optimization it lacks. The failure mode this entry
+records is the inverse — I reached for a **new hand-rolled primitive before grepping for an existing one**.
+Before hand-writing any numeric reduction in this workspace, `rg 'pub fn dot_|pub fn cosine' crates/frankensearch-index/src/simd.rs`
+first; that module already ships f32·f32, f16·f32, f16-bytes·f32, i8·i8 and packed-4bit kernels with runtime
+dispatch. Counter-example that keeps this honest: `mmr::cosine_sim_pre` accumulates in **f64**, so the f32
+kernel genuinely is not a drop-in there and its hand-rolled 4-accumulator loop stays justified — the check is
+"same precision class + same contract", not "looks like a dot".
+
+**Verified:** RCH worker `hz2`, one Criterion binary, `ORIG_scalar` first AND last (ordering bias 0.04–0.79%),
+parity gates green (`simd` bit-identical to shipped; all candidates within `max Δr_d < 1e-4` of scalar).

@@ -4059,3 +4059,48 @@ AGENT_NAME=SearchCod RCH_WORKER=ovh-a CARGO_TARGET_DIR=/data/projects/.rch-targe
 Conformance GREEN: focused release test `cargo test -p frankensearch-ops frame_quality_tracker --profile
 release` passed 5/5 frame-quality tests; `cargo check -p frankensearch-ops --all-targets`, `cargo clippy -p
 frankensearch-ops --all-targets -- -D warnings`, and `cargo fmt -p frankensearch-ops --check` passed.
+---
+
+### 2026-07-09 — hubness `r_d` builder: reuse the vector tier's AVX2 dot instead of hand-rolling — 10.89× (cc_fs)
+
+**Lever (sibling-path consistency, `crates/frankensearch-fusion/src/hubness.rs`).** `compute_query_hubness`
+builds the per-doc query-hubness table `r_d` (mean cosine of each doc to its `kq` nearest background sample
+queries) — an offline/amortized **O(docs · queries · dim)** batch this ledger already clocked at ~109 ms /
+696 ms @ 2000×200 / 5000×500. Its inner kernel was a private scalar `dot`:
+`a.iter().zip(b).map(|(x,y)| x*y).sum()` — one f32 accumulator, a serial add chain LLVM cannot reassociate
+without fast-math, latency-bound at ~1 add / 4–5 cyc no matter how wide the multiplies vectorize.
+
+`frankensearch-fusion` **already depends on `frankensearch-index`**, which already exports
+`dot_product_f32_f32`: a hand-written AVX2 kernel with four `f32x8` accumulators (32 lanes of ILP) and a
+portable `wide` fallback. The fix is *deleting* the local reduction and calling it. Slicing to
+`a.len().min(b.len())` preserves the ORIGINAL's `zip` truncation, making `DimensionMismatch` unreachable.
+
+**Measured (RCH worker `hz2`, one Criterion binary so every arm shares a build + machine; `ORIG_scalar`
+measured first AND last to bracket ordering bias — 0.04–0.79%):**
+
+```bash
+AGENT_NAME=cc_fs RCH_ENV_ALLOWLIST=AGENT_NAME,CARGO_TARGET_DIR \
+CARGO_TARGET_DIR=/data/projects/.rch-targets/hub-dot \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release --bench hubness_dot_ab
+```
+
+| workload | ORIG scalar | **simd (kept)** | ratio-vs-ORIG | rejected `multiacc` |
+|---|---:|---:|---:|---:|
+| `hubness_dot_micro` 384-dim dot | 222.53 ns | **19.619 ns** | **0.088 / 11.34×** | 86.233 ns (2.58×) |
+| `hubness_build/1000x100x384` | 22.389 ms | **2.0565 ms** | **0.092 / 10.89×** | 8.8560 ms (2.53×) |
+| `hubness_build/500x200x384` | 22.748 ms | **2.0166 ms** | **0.089 / 11.28×** | 8.7997 ms (2.59×) |
+
+CI widths ≤ ±0.5%; `ORIG_scalar2` control 22.465 ms / 22.756 ms.
+
+**Parity.** The bench gates before timing: the `simd` mirror is **bit-identical** to the shipped
+`compute_query_hubness`, and every reassociated candidate stays within `max Δr_d < 1e-4` of the scalar
+ORIGINAL (the `select_nth` of the kq nearest queries is unchanged; `β·r_d` moves a dense score by ~1e-2).
+Same accepted search-time ULP class as `mmr::cosine_sim_pre`. Two new unit tests cover a dim-43 vector
+(32-wide group + 8-wide chunk + 3-elem tail, pinned to a scalar reference) and ragged-length truncation.
+
+**Scope:** original-comparator ratio **N/A** (offline builder, not the query path). Files: `hubness.rs`,
+`benches/hubness_dot_ab.rs`, `Cargo.toml` (dev-deps). **Route next:** the outer per-doc loop is still serial
+and each `r_d` is independent — a rayon `par_iter()` measured **5.85× on top of this** (2.0565 ms → 351.66 µs
+@ 1000×100×384) and is **bit-identical** to the serial `simd` arm (indexed parallel iterator preserves order;
+no element's arithmetic changes; asserted by the `simd_par` vs `simd` gate). Held back as a separate lever
+because it changes the threading behaviour of a public library fn and wants a work-based threshold.
