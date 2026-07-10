@@ -10963,3 +10963,37 @@ changed. Route-next: the only remaining f16-scan wins are algorithmic (early-aba
 validation) or the quantized paths (int8 maddubs kernel landed; its scan-level speed blocked on worker isolation,
 bd-sqwx), not a dot micro-op. Self-time not obtained (perf-worker pinning blocked); the decode-bound conclusion
 rests on the null-controlled ratio + the mechanism. All builds/benches remote; no local cargo.
+
+### 2026-07-10 — cc_fse — REJECTED: widening the f16 flat-scan parallel chunk size (1024→4096) does NOT transfer cod's int8 win — the f16 dot is decode-bound (dot-dominated), so merge fan-in is a small fraction (chunk4096/chunk1024 median 1.0445, inside the null floor)
+
+cod widened the **int8** scan's parallel chunk to 4096 (`fd06f77`, ~1.12–1.17×): the int8 dot is cheap, so its
+post-scan merge fan-in dominated and fewer/larger chunks paid. The **f16** scan still uses `PARALLEL_CHUNK_SIZE =
+1024`. Hypothesis under test: does the same widening help the f16 flat scan? Mechanistic prediction: **no** — the
+f16 dot is `cvtph2ps`-decode-bound (this session's FMA reject), i.e. per-vector-expensive, so the merge fan-in is
+a much smaller fraction of the scan than for the cheap int8 dot.
+
+**Recall/ordering — trivially preserved.** Chunk size does not change results: the scan is exact and
+chunk-invariant (any global top-k item is in the top-k of its own chunk regardless of boundary). The bench
+asserts byte-identical top-k (`doc_id` + `score.to_bits()`) between chunk 1024 and 4096 before timing — passed.
+Measured via a runtime `SearchParams.parallel_chunk_size`, so **no source change** was needed and production stays
+`1024`.
+
+**Speed — NO WIN.** Null-controlled A/B (`benches/f16_chunk_size_ab.rs`, real 40k-vector file-backed
+`VectorIndex`, 16 queries, K=10, shared alternating-round sampler, one binary / one `rch` invocation, worker
+`ovh-a`, binary sha256 `06acfb157b53422dda637c7231449a4e4e1867a64155a7558a1cf247ef39b568`, 41 rounds × 2):
+
+| arm | median [p5, p95] |
+|---|---|
+| NULL (chunk1024 vs chunk1024) | 0.9743 [0.7901, 1.1521] |
+| chunk4096 / chunk1024 | **1.0445 [0.9038, 1.2327]** |
+
+chunk4096/chunk1024 median 1.0445 is **inside** the null floor and if anything marginally *slower*. The null
+floor is wide (±20%) at this N/query count under contention, but the lever median is > 1.0 regardless — there is
+no win to resolve. **Mechanism confirmed:** the f16 scan is dot/decode-bound, not merge-fan-in-bound, so the int8
+chunk-widening win does not transfer. Keep `PARALLEL_CHUNK_SIZE = 1024` for f16.
+
+Retained as `f16_chunk_size_ab` so the negative stays reproducible. Route-next for the f16 flat scan: the dot is
+decode-bound and mined (FMA rejected, 4-acc ILP landed), chunk tuning doesn't pay, and the remaining wins are
+algorithmic (early-abandon needs an index-build dim-reorder + suffix-norm transform — cross-lane, real-corpus
+validation) or quantized (int8 maddubs landed; scan-level speed blocked on worker isolation, bd-sqwx). All
+builds/benches remote; no local cargo; no production change.
