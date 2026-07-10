@@ -11,12 +11,12 @@
 //! - **Feedback**: Implicit relevance feedback with exponentially-decaying boost map.
 
 pub mod adaptive;
+#[cfg(feature = "bench-internals")]
+pub mod bench_support;
 pub mod blend;
 pub mod cache;
 pub mod calibration;
 pub mod circuit_breaker;
-#[cfg(feature = "bench-internals")]
-pub mod bench_support;
 pub mod conformal;
 pub mod daemon_fallback;
 pub mod federated;

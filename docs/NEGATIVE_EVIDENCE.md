@@ -10848,3 +10848,42 @@ change that supplies worker isolation/affinity for the entire one-invocation pai
 41-balanced-pair / 256-search substrate producing a materially narrower null floor that still contains 1.0.
 This is not a parity ceiling: different int8 primitives (for example a quantizer-domain-safe `vpmaddubs`
 signed-dot transform or a packed transposed slab) remain separate veins.
+
+### 2026-07-10 — cc_fse — ISA baseline check for -search: the "+avx2 build = free 2× on int8 ADC" fix does NOT apply — the hot int8 kernel is already AVX2 via RUNTIME DISPATCH, not the compile baseline (frankenscipy's 1.745× came from AUTOVECTORIZED code; this is explicit intrinsics)
+
+**The hypothesis** (frankenredis popcount 3.14×, frankenscipy cholesky 1.745×): the workspace has no
+`.cargo/config.toml`, no `RUSTFLAGS`, no `target-cpu` — verified — so it builds at the **generic x86-64 baseline
+= SSE2 only**. If the int8 ADC scan were autovectorized SIMD, that would emit 128-bit SSE2 on AVX2 workers and a
+`-C target-cpu=x86-64-v3` (or `+avx2`) build would roughly double it for free.
+
+**Why it does NOT apply to the hot int8 path (mechanism).** frankensearch does not rely on autovectorization for
+its hot kernels. `frankensearch-index::simd::dot_i8_i8` (the int8 dot) is a **runtime-dispatched** kernel:
+
+```
+pub fn dot_i8_i8(stored, query) -> i32 {
+    if std::is_x86_feature_detected!("avx2") { return unsafe { dot_i8_i8_avx2(stored, query) }; }
+    dot_i8_i8_generic(stored, query)
+}
+#[target_feature(enable = "avx2")] unsafe fn dot_i8_i8_avx2(..) { /* real 256-bit intrinsics */ }
+```
+
+`#[target_feature(enable = "avx2")]` compiles that function with AVX2 codegen **regardless of the crate's compile
+baseline**, and `is_x86_feature_detected!` selects it at runtime. The int8 two-pass scan
+(`search_top_k_int8_two_pass_impl` → `int8_scan_range` → `dot_i8x4_i8`, same dispatch shape) therefore already
+runs 256-bit AVX2 on every AVX2 worker. Proof the dispatch fires: cod's `bd-b5wl` `perf record` on `ovh-a`
+resolved `dot_i8_i8`/`dot_i8x4_i8` frames, and every Contabo/Hetzner/OVH VPS in the fleet is Haswell+ (AVX2 is a
+2013 feature). The same runtime-dispatch shape guards every other hot kernel (`simd.rs:138/232/369/508/676/703`:
+f16/f32 dots, quantizers). **So the frankenscipy/frankenredis build fix buys ~0 on the int8 ADC hot path here —
+the SIMD width is chosen by `target_feature` + runtime detection, not by `target-cpu`.**
+
+**Residual, non-zero opportunity (handed to cod, `bd-yb3k`).** The `_generic` fallbacks (`dot_i8_i8_generic`,
+`simd.rs:870`) and a handful of **non-dispatched** `wide::f32x8` sites *outside* any `target_feature` fn
+(`search.rs:1420` max-reduction; the exact-f16-rescore path) DO compile at SSE2 baseline — `wide`'s `f32x8`
+becomes 2× 128-bit ops instead of 1× 256-bit. A workspace `target-cpu=x86-64-v3` build would widen those. But:
+(a) they are the *rescore* / tail, not the pass-1 int8 scan that dominates, so the ceiling is small; (b) it is a
+**workspace-wide** config change that would rebuild and perturb cod's in-flight `bd-b5wl` A/B, so it is cod's to
+land and measure on the real scan, gated by the now-shared null-control harness. Not a "free 2×".
+
+**Method note:** could not fact-check worker CPU flags through `rch` — `rch exec` rejects non-compilation commands
+(`RCH-E301`), so `sh -c 'grep avx2 /proc/cpuinfo'` is refused. The dispatch-fires conclusion rests on the perf
+frames + fleet hardware instead. No code changed; ISA is a config/analysis finding. sha256/self-time N/A (no A/B run).

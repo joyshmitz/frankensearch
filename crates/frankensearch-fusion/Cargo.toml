@@ -15,8 +15,9 @@ graph = []
 # `bench_support` paired/null-control sampler, so an A/B can vary ONE thing inside the shipped
 # function instead of comparing bench-local copies. Never enabled by a shipping profile; see
 # bd-i40y / the 2026-07-10 ledger-integrity audit. Deliberately does NOT imply `graph`: the
-# smoothing/hubness benches need the sampler but not the graph-ranking module.
-bench-internals = []
+# smoothing/hubness benches need the sampler but not the graph-ranking module. Pulls in core's
+# `bench_support` (the shared paired sampler + null control), re-exported from `crate::bench_support`.
+bench-internals = ["frankensearch-core/bench-internals"]
 
 [dependencies]
 frankensearch-core = { workspace = true }

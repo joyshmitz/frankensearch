@@ -6,6 +6,12 @@ edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes `bench_support` (the alternating-round paired sampler + A/A null control) to every
+# crate's benches. std-only, never enabled by a shipping profile. See docs/PERF_LEDGER.md
+# (2026-07-10 null-control harness) and bd-zgq6.
+bench-internals = []
+
 [dependencies]
 asupersync = { workspace = true }
 thiserror = { workspace = true }

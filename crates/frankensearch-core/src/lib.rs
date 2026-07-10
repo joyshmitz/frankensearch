@@ -8,6 +8,8 @@
 //! other crate in the workspace.
 
 pub mod activation;
+#[cfg(feature = "bench-internals")]
+pub mod bench_support;
 pub mod cache;
 pub mod canonicalize;
 pub mod collectors;
