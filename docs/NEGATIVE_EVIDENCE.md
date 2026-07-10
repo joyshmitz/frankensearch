@@ -10876,7 +10876,7 @@ resolved `dot_i8_i8`/`dot_i8x4_i8` frames, and every Contabo/Hetzner/OVH VPS in 
 f16/f32 dots, quantizers). **So the frankenscipy/frankenredis build fix buys ~0 on the int8 ADC hot path here —
 the SIMD width is chosen by `target_feature` + runtime detection, not by `target-cpu`.**
 
-**Residual, non-zero opportunity (handed to cod, `bd-yb3k`).** The `_generic` fallbacks (`dot_i8_i8_generic`,
+**Residual, non-zero opportunity (handed to cod, `bd-yt8m`).** The `_generic` fallbacks (`dot_i8_i8_generic`,
 `simd.rs:870`) and a handful of **non-dispatched** `wide::f32x8` sites *outside* any `target_feature` fn
 (`search.rs:1420` max-reduction; the exact-f16-rescore path) DO compile at SSE2 baseline — `wide`'s `f32x8`
 becomes 2× 128-bit ops instead of 1× 256-bit. A workspace `target-cpu=x86-64-v3` build would widen those. But:
