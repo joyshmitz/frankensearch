@@ -10350,3 +10350,77 @@ recall@10=1.0000 and nDCG@10=1.0000 at mult=2/3/5/10.
 more Rayon parallelism and improves both `mult3` and `mult5`. Do not retry 8k chunks for the standard
 N=100k/dim384/k=10 FSVI int8 two-pass row unless a future workload proves `mult10+` is the product-critical
 budget or the worker/core topology changes enough to make 8k the parallelism sweet spot.
+
+---
+
+## 2026-07-10 — REJECTED: `BinaryHeap::peek_mut` single-repair replacement in the fused int8 scan — 8.4–9.6% slower (cod_fse)
+
+**Ledger-first routing (`bd-b5wl`).** Before editing, the closed families were checked here and were not
+retried: the int8 prepared-query sidecar, extra int8 accumulators, 8k scan chunks, and the tombstone bitmap
+inside the fused scan. The top sampled leaf below therefore did not authorize another query-side decode or
+accumulator variant. The tested mechanism was the next separately named selection leaf.
+
+**Profile before edit.** The ORIGINAL at `c584124` was built with `release-perf`, line-table symbols, and
+frame pointers on RCH worker `vmi1152480` (AMD EPYC Processor, 10 CPUs). A direct Criterion binary run of
+`fsvi_int8_two_pass/int8_mult3` was sampled for 30 seconds with `perf record -F 997 -e cycles:u -g
+--call-graph fp`; 50,906 samples were captured with zero lost. This is the complete flat self-time frame
+table at the required >=0.1% cutoff:
+
+| rank | flat self | frame | routing |
+|---:|---:|---|---|
+| 1 | 53.31% | `dot_i8_i8_avx2` | closed prepared-query / accumulator family; skipped |
+| 2 | 26.61% | `VectorIndex::int8_scan_range` | scan-loop envelope containing the already-tuned 4k chunk path |
+| 3 | 10.17% | `search::insert_candidate` | first separately named eligible mechanism; tested here |
+| 4 | 1.94% | crossbeam epoch pin | Rayon/runtime |
+| 5 | 1.03% | unresolved kernel frame | kernel |
+| 6 | 0.83% | f16 exact-rescore dot | pass 2, not pass-1 selection |
+| 7 | 0.81% | crossbeam epoch advance | Rayon/runtime |
+| 8 | 0.77% | crossbeam deque steal | Rayon/runtime |
+| 9 | 0.62% | Rayon `wait_until_cold` | Rayon/runtime |
+| 10 | 0.38% | Rayon sleep | Rayon/runtime |
+| 11 | 0.31% | contended futex lock | kernel/runtime |
+| 12 | 0.25% | unresolved kernel frame | kernel |
+| 13 | 0.20% | `malloc` | allocator |
+| 14 | 0.18% | `from_utf8` | benchmark/fixture support |
+| 15 | 0.18% | Rayon join | Rayon/runtime |
+| 16 | 0.16% | `merge_partial_heaps` | pass-1 fan-in |
+| 17 | 0.15% | Rayon bridge | Rayon/runtime |
+| 18 | 0.12% | `wake_specific_thread` | kernel/runtime |
+| 19 | 0.11% | Rayon `StackJob::execute` | Rayon/runtime |
+| 20 | 0.11% | `search_top_k_int8_two_pass` | outer orchestration |
+
+**Rejected lever.** A full bounded heap currently replaces its worst root with `pop()` followed by
+`push()`. Because the incoming candidate is already proven better than that root, the candidate replaced
+the root through `BinaryHeap::peek_mut` and relied on `PeekMut::drop` to restore the heap in one downward
+repair. The intended primitive was one root-to-leaf repair instead of a pop repair plus a push repair; no
+quantization, candidate budget, chunking, score ordering, or rescore code changed.
+
+**Honest pinned A/B/A.** Both frozen binaries were compiled on the same RCH worker and checksum-verified on
+the runtime host. Criterion ran on the same `fixmydocuments` Ryzen 7 5800X worker, pinned to physical CPUs
+4–7 with `RAYON_NUM_THREADS=4`, `release-perf`, N=100k, dim=384, k=10, mult=3, sample-size 50, 2 s warm-up,
+and 10 s measurement. Values below are Criterion JSON means and standard-deviation CVs; all CVs pass the
+<5% gate.
+
+| arm | mean | CV | candidate ratio | recall@10 | nDCG@10 |
+|---|---:|---:|---:|---:|---:|
+| ORIGINAL 1 (`c584124`) | 640.42 us | 3.32% | — | 1.0000 | 1.0000 |
+| `peek_mut` candidate | 701.80 us | 3.50% | **1.0958 / 9.58% slower** | 1.0000 | 1.0000 |
+| ORIGINAL 2 (same frozen binary) | 647.63 us | 2.28% | **1.0836 / 8.36% slower vs this bracket** | 1.0000 | 1.0000 |
+
+Criterion's direct baseline test reports a candidate change interval of **+8.16% to +11.07%**, `p=0.00`.
+The benchmark also rechecked recall@10 and nDCG@10 at multipliers 2, 3, 5, and 10; every value was 1.0000.
+Thus behavior/quality parity holds, but the speed ratchet fails decisively.
+
+**Why the attractive primitive did not transfer.** Release-perf disassembly confirms that the candidate
+does generate a smaller `insert_candidate` body (0x3a0 bytes versus 0x4b0), but static code size is not the
+cost that matters. For this tiny bounded heap, root assignment must sift the incoming candidate from the
+root toward its final leaf. The existing pop path sifts an existing tail element and then appends the
+already-near-cutoff candidate; the emitted pop/push sequence is faster on this workload despite appearing
+to perform two abstract operations. The measured A/B/A bracket, rather than the source-level operation
+count, decides the result.
+
+**Decision:** REJECTED; production `search.rs` was restored byte-for-byte before this entry. Do not retry
+the standard-library `peek_mut` root-assignment substitution for the current k=10, mult=3 bounded heap.
+Retry condition: a materially different heap implementation/codegen, candidate distribution, or selection
+primitive that removes comparisons or heap maintenance altogether. Route next to a different alien
+primitive in the scan/selection envelope; this rejection is not a parity ceiling.
