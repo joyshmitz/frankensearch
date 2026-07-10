@@ -236,6 +236,154 @@ impl GraphRanker {
             .collect();
         Self::finalize_scores(ranks_map, limit)
     }
+
+    /// **Bench-only twin of [`Self::rank_phase1`] using a true flat CSR.** Not a shipping path.
+    ///
+    /// Exists so `benches/graph_rank.rs` can A/B the edge layout as a **single variable** against the
+    /// shipped function: same private personalization, same power iteration, same `finalize_scores`,
+    /// same edge-visit order — the *only* difference is `Vec<Vec<(usize, f64)>>` (one heap block per
+    /// node) versus one contiguous `edges_flat` plus an `offsets` array.
+    ///
+    /// It lives here rather than in the bench because the helpers it must share are private. The
+    /// 2026-07-09 flat-CSR REJECT row was decided on a bench-local *copy* of the whole ranker, whose
+    /// per-call cost is 11–13% below production's (`bd-i40y`); a copy cannot settle a layout question
+    /// about the shipped path. Keeping both arms in-tree is what makes that row reproducible.
+    ///
+    /// Because the edge-visit order per `src` is unchanged, `next[dst]` accumulates in the same order,
+    /// so this is **bit-identical** to `rank_phase1` — the bench asserts that, and a divergence would
+    /// mean the two arms are no longer measuring one variable.
+    #[cfg(feature = "bench-internals")]
+    #[must_use]
+    pub fn rank_phase1_flat(
+        &self,
+        _cx: &Cx,
+        _query: &str,
+        graph: &DocumentGraph,
+        seed_hits: &[VectorHit],
+        limit: usize,
+    ) -> Option<Vec<ScoredResult>> {
+        if graph.is_empty() || limit == 0 {
+            return None;
+        }
+        let personalization = Self::personalization_from_seed_hits(graph, seed_hits);
+        if personalization.is_empty() {
+            return None;
+        }
+
+        let adjacency = graph.adjacency();
+        let n = adjacency.len();
+        let mut nodes: Vec<&GraphDocId> = Vec::with_capacity(n);
+        let mut idx: HashMap<&str, usize> = HashMap::with_capacity(n);
+        for doc_id in adjacency.keys() {
+            idx.insert(doc_id.as_str(), nodes.len());
+            nodes.push(doc_id);
+        }
+
+        // Flat CSR build. This is the hypothesis under test: two heap allocations instead of `n`,
+        // and a sequential sweep of `edges_flat` in the inner loop. The cost is a COUNTING pass,
+        // which re-probes `idx` for every edge — the per-edge `doc_id`-string hash probe is paid
+        // twice, once to size each row and once to fill it.
+        let mut out_sum = vec![0.0_f64; n];
+        let mut offsets = vec![0_usize; n + 1];
+        for (doc_id, edges) in adjacency {
+            let src = idx[doc_id.as_str()];
+            let mut count = 0_usize;
+            for edge in edges {
+                let weight = f64::from(edge.weight);
+                if !weight.is_finite() || weight <= 0.0 {
+                    continue;
+                }
+                if idx.contains_key(edge.neighbor_doc_id.as_str()) {
+                    count += 1;
+                }
+            }
+            offsets[src + 1] = count;
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+        let mut edges_flat = vec![(0_usize, 0.0_f64); offsets[n]];
+        let mut cursor = offsets.clone();
+        for (doc_id, edges) in adjacency {
+            let src = idx[doc_id.as_str()];
+            let mut sum = 0.0_f64;
+            for edge in edges {
+                let weight = f64::from(edge.weight);
+                if !weight.is_finite() || weight <= 0.0 {
+                    continue;
+                }
+                // `sum` counts every finite positive edge, including any whose destination is not
+                // an indexed node — matching `rank_phase1` exactly.
+                sum += weight;
+                if let Some(&dst) = idx.get(edge.neighbor_doc_id.as_str()) {
+                    edges_flat[cursor[src]] = (dst, weight);
+                    cursor[src] += 1;
+                }
+            }
+            out_sum[src] = sum;
+        }
+
+        let seeds: Vec<(usize, f64)> = personalization
+            .iter()
+            .filter_map(|(doc_id, w)| idx.get(doc_id.as_str()).map(|&i| (i, *w)))
+            .collect();
+
+        let teleport_scale = self.restart_probability.clamp(0.0, 1.0);
+        let walk_scale = 1.0 - teleport_scale;
+
+        let mut ranks = vec![0.0_f64; n];
+        for &(i, w) in &seeds {
+            ranks[i] = w;
+        }
+        let mut next = vec![0.0_f64; n];
+
+        for _ in 0..self.max_iterations {
+            next.iter_mut().for_each(|v| *v = 0.0);
+
+            for &(i, w) in &seeds {
+                next[i] += teleport_scale * w;
+            }
+
+            let dangling_mass: f64 = (0..n)
+                .filter(|&i| out_sum[i] <= f64::EPSILON)
+                .map(|i| ranks[i])
+                .sum();
+
+            if dangling_mass > 0.0 {
+                for &(i, w) in &seeds {
+                    next[i] += walk_scale * dangling_mass * w;
+                }
+            }
+
+            for src in 0..n {
+                let rank = ranks[src];
+                if rank <= 0.0 {
+                    continue;
+                }
+                let out_total = out_sum[src];
+                if out_total <= f64::EPSILON {
+                    continue;
+                }
+                let base = walk_scale * rank / out_total;
+                for &(dst, weight) in &edges_flat[offsets[src]..offsets[src + 1]] {
+                    next[dst] += base * weight;
+                }
+            }
+
+            let l1_delta: f64 = (0..n).map(|i| (ranks[i] - next[i]).abs()).sum();
+            std::mem::swap(&mut ranks, &mut next);
+            if l1_delta < self.tolerance {
+                break;
+            }
+        }
+
+        let ranks_map: HashMap<GraphDocId, f64> = nodes
+            .iter()
+            .zip(ranks.iter())
+            .map(|(&doc_id, &rank)| (doc_id.clone(), rank))
+            .collect();
+        Self::finalize_scores(ranks_map, limit)
+    }
 }
 
 #[cfg(test)]

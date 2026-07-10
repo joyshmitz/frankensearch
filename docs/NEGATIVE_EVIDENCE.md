@@ -10228,12 +10228,56 @@ Conformance GREEN before commit: `cargo test -p frankensearch-ops frame_quality_
 > (50/50 positional agreement at both sizes), so the flat-vs-`Vec<Vec>` *decision* does transfer, and my "INVALID"
 > verdict above was too harsh — corrected here rather than quietly. But the copy runs **11–13% cheaper per call**:
 > it is handed a pre-normalized personalization and skips `personalization_from_seed_hits`, the `ranks_map` rebuild
-> and `ScoredResult` construction. The original row's `1.22×`/`1.29×` flat-CSR penalties were therefore measured
-> against a denominator missing ~11–13% of production's per-call work, so they **overstate** the penalty that layout
-> would carry on the shipped path. Sign unchanged (flat CSR still loses); magnitude inflated. Also found: the row's
-> only parity check between its two arms was a `debug_assert_eq!`, **compiled out of the release bench** — it never
-> ran once. Now a real `assert_eq!`. Remaining for `bd-i40y`: restore a `flat` arm against the shipped function
-> (needs a `bench-internals` feature to reach the private helpers) before the row closes on its own terms.
+> and `ScoredResult` construction. Also found: the row's only parity check between its two arms was a
+> `debug_assert_eq!`, **compiled out of the release bench** — it never ran once. Now a real `assert_eq!`.
+> *(An inference drawn here earlier — that the copy's smaller denominator made the old row's ratios "overstate" the
+> penalty — is retracted below: production reproduces them almost exactly.)*
+>
+> **✅✅ 2026-07-10 VERDICT, at production fidelity with a NULL CONTROL (`bd-i40y` closed).** `bench-internals` now
+> ships `GraphRanker::rank_phase1_flat`, a one-variable twin of the shipped function *inside the crate*: same private
+> personalization, same power iteration, same `finalize_scores`, same edge-visit order — only `Vec<Vec<(usize,f64)>>`
+> vs contiguous `edges_flat` + `offsets` differs. PARITY GATE: identical edge-visit order ⇒ identical `next[dst]`
+> accumulation ⇒ the two agree **bit-for-bit** (asserted on `doc_id` *and* `score.to_bits()`); a divergence would mean
+> the arms had stopped measuring one variable. Both arms carry reachability gates (each must return `Some`).
+>
+> Null control = the *same* arm (`rank_phase1`) registered twice with the identical interleaved structure, so it
+> measures the harness's noise floor. One binary, one `rch` invocation, worker `hz2`/`hetzner2`, binary sha256
+> `1e141b947840de1d71ea25efd5b620e1be380011b6b01ac8322165e17e70eec6`, 120 samples, `PAIR_BATCH = 4`:
+>
+> | case | NULL b/a | shipped `Vec<Vec>` | flat CSR | flat/shipped | effect vs null floor |
+> |---|---:|---:|---:|---:|---:|
+> | `n500_deg6`  | **1.0015** | 193.5 µs | 233.3 µs | **1.206×** | 20.5% vs 0.15% |
+> | `n2000_deg8` | **1.0032** | 1006.3 µs | 1314.3 µs | **1.306×** | 30.6% vs 0.32% |
+>
+> `cv_pct` per arm: null_a 4.85 / null_b 6.28 / shipped 9.99 / flat 9.21 (n500); 13.08 / 16.67 / 11.47 / 14.09
+> (n2000). **Per-arm cv exceeds the 5% gate — the tree was not quiesced (a dozen sibling agents building).** But the
+> null control shows the *paired-ratio estimator* has a floor of 0.15–0.32%, because drift lands on both arms inside
+> each measured iteration and cancels in the ratio; the effect is 60–200× that floor. The verdict is therefore safe
+> on this evidence; the exact magnitude should be re-confirmed on a quiesced tree.
+>
+> **REJECT CONFIRMED, and the original row's numbers were right all along.** Flat CSR (two-pass build) loses at
+> production fidelity by 1.206×/1.306×, against the copy-based row's 1.22×/1.29× — reproduced within ~1–2 points.
+> The mechanism the row named is confirmed: the counting pass re-probes `idx` with a `doc_id`-string hash for every
+> edge, so the two-pass build pays the per-edge probe **twice**.
+>
+> **Two retractions of my own, both caught by the null control.** (1) An interim run on `hz1` (contended, no null
+> control, flat-arm `cv = 12.5%`) measured `flat/shipped = 2.049×` at n2000, and I was about to record that the copy
+> "understated the penalty by 1.6×". It was contention noise; the quiesced-er `hz2` run says 1.306×. (2) The
+> "old row's ratios **overstate** the penalty" inference — reasoned from the copy's 11–13% smaller denominator — is
+> **not borne out**: production reproduces the copy's ratios almost exactly. A plausible mechanism is not a
+> measurement. Both claims are withdrawn here rather than quietly.
+>
+> **Self-time: NOT OBTAINED — blocker recorded.** `perf record -e cycles:u` runs on `hetzner1` (`perf_event_paranoid
+> = 4`), but `[profile.release]` sets `strip = true`, so symbols resolve to raw addresses; the `--profile release-perf`
+> retry (`strip = false`) was scheduled by `rch` onto `fixmydocuments`, which produced no perf output, and `rch exec`
+> exposes no `--worker` flag to pin the host. What stands in its place: each arm here *is* the whole measured routine
+> (not a sub-frame), and the bit-identity assert proves `rank_phase1_flat` executed and produced results — a
+> never-executed arm cannot emit a bit-identical ranking. Symbolized self-time remains owed for any *frame-level*
+> claim inside these functions.
+>
+> **Route-next (untested, honest):** `rank_phase1_flat` implements the **two-pass** build the original row described.
+> A **single-pass** flat CSR — size `offsets` from each row's `edges.len()` as an upper bound, fill, then compact —
+> pays no extra hash probe and was never measured. That variant, not this one, is the strongest form of the lever.
 
 **Different profiled path (structurally-different primitive class):** `GraphRanker::rank_phase1`
 (`frankensearch-fusion/src/graph_rank.rs`, feature-gated `graph`) — the query-biased PageRank power iteration.

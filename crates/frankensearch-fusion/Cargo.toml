@@ -11,6 +11,10 @@ default = []
 lexical = ["dep:frankensearch-lexical"]
 rerank = ["dep:frankensearch-rerank"]
 graph = []
+# Exposes bench-only twins of private code paths (e.g. `GraphRanker::rank_phase1_flat`) so an A/B
+# can vary ONE thing inside the shipped function instead of comparing bench-local copies. Never
+# enabled by a shipping profile; see bd-i40y / the 2026-07-10 ledger-integrity audit.
+bench-internals = ["graph"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -100,7 +104,8 @@ name = "graph_rank"
 harness = false
 # Links the shipped `GraphRanker::rank_phase1` (cfg-gated) so the bench measures production,
 # not a bench-local copy -- see bd-i40y / the 2026-07-10 ledger-integrity audit.
-required-features = ["graph"]
+# `bench-internals` adds `rank_phase1_flat`, the one-variable flat-CSR twin.
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "rank_map"

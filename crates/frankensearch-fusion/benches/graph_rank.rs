@@ -16,10 +16,18 @@
 //! is handed a pre-normalized personalization and skips the `ranks_map` rebuild and `ScoredResult`
 //! construction. It is a faithful *ranker* proxy and a biased *cost* proxy.
 //!
-//! Run with (remote, fail-closed; a local build is a disk-pressure incident):
+//! `paired_shipped_csr` vs `paired_flat_csr` is the real lever: `rank_phase1` vs its one-variable
+//! twin `rank_phase1_flat` (feature `bench-internals`), asserted **bit-identical** so the arms differ
+//! by edge layout alone. `paired_null_a` / `paired_null_b` are an **A/A null control** — the same arm
+//! twice — measuring the harness noise floor. Read the null ratio before believing any lever ratio:
+//! an effect smaller than the floor is noise. Measured floor 1.0015/1.0032 (hz2, 120 samples); flat
+//! CSR loses by 1.206×/1.306×, confirming the 2026-07-09 REJECT at production fidelity.
+//!
+//! Run with (remote, fail-closed; a local build is a disk-pressure incident). One binary, one
+//! invocation — an A/B split across two `rch` invocations lands on different workers and is invalid:
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
-//!   rch exec -- cargo bench -p frankensearch-fusion --features graph --bench graph_rank
+//!   rch exec -- cargo bench -p frankensearch-fusion --features bench-internals --bench graph_rank
 //! ```
 
 use std::collections::HashMap;
@@ -370,6 +378,159 @@ fn bench_graph_rank(c: &mut Criterion) {
         eprintln!(
             "[fidelity] {id}: top-{limit} positional agreement prod-vs-copy = {matches}/{common}"
         );
+
+        // ── THE ACTUAL LEVER (bd-i40y): shipped Vec<Vec> CSR vs flat CSR, ONE variable ──
+        //
+        // `rank_phase1_flat` is a twin of `rank_phase1` inside the crate (feature `bench-internals`):
+        // same private personalization, same power iteration, same `finalize_scores`, same edge-visit
+        // order. Only the edge layout differs. The 2026-07-09 REJECT row compared two bench-local
+        // copies instead, which cannot settle a layout question about the shipped path.
+        //
+        // PARITY GATE: identical edge-visit order ⇒ identical `next[dst]` accumulation order ⇒ the two
+        // must agree bit-for-bit. A divergence means the arms stopped measuring one variable, and any
+        // ratio below would be meaningless.
+        let flat_out = ranker
+            .rank_phase1_flat(&cx, "graph rank query", &graph, &seeds, limit)
+            .expect("rank_phase1_flat must return Some -- else the flat arm measures nothing");
+        assert_eq!(
+            flat_out.len(),
+            prod_out.len(),
+            "{id}: flat/shipped result counts diverged"
+        );
+        for (p, f) in prod_out.iter().zip(&flat_out) {
+            assert_eq!(p.doc_id, f.doc_id, "{id}: flat CSR reordered the ranking");
+            assert_eq!(
+                p.score.to_bits(),
+                f.score.to_bits(),
+                "{id}: flat CSR changed doc {} score bits -- arms differ by more than layout",
+                p.doc_id
+            );
+        }
+        eprintln!(
+            "[reachability] {id}: rank_phase1_flat -> {} results, bit-identical to shipped",
+            flat_out.len()
+        );
+
+        // ── NULL CONTROL (A/A): the SAME arm registered twice, identical interleaved structure ──
+        //
+        // This measures the harness's noise floor. Any ratio closer to 1.000 than the null control's
+        // deviation is indistinguishable from noise, and any REJECT of a lever whose effect is below
+        // the floor is meaningless. If the null control is not tight (cv > ~5%, or ratio further than
+        // a few percent from 1.000), the harness is not fit to decide the lever and must be fixed
+        // (more iterations, pinned worker, quiesced tree) BEFORE any conclusion is drawn.
+        g.bench_with_input(BenchmarkId::new("paired_null_a", &id), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("paired_null_b", &id), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+
+        g.bench_with_input(BenchmarkId::new("paired_shipped_csr", &id), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1_flat(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("paired_flat_csr", &id), &(), |b, ()| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    let t = Instant::now();
+                    for _ in 0..PAIR_BATCH {
+                        black_box(ranker.rank_phase1_flat(
+                            black_box(&cx),
+                            "graph rank query",
+                            black_box(&graph),
+                            black_box(&seeds),
+                            limit,
+                        ));
+                    }
+                    total += t.elapsed();
+                }
+                total
+            });
+        });
 
         // INTERLEAVED PAIRED SAMPLER: each arm runs BOTH implementations per iteration and times
         // only its own, so worker/thermal drift cancels in the ratio (criterion group members run
