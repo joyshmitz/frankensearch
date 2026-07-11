@@ -1148,7 +1148,28 @@ fn read_source_text_with_limit(path: &str, max_bytes: usize) -> io::Result<Strin
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
+/// Truncate to the first `max_chars` characters.
+///
+/// `char_indices().nth(max_chars)` finds the byte offset of the `max_chars`-th char while walking
+/// AT MOST `max_chars + 1` chars, so a long document truncated to a short preview no longer decodes
+/// the whole string just to learn it is over the limit (the former `chars().count()` walked every
+/// char, then `take(max_chars)` walked again). Byte-identical for every input
+/// (`truncate_chars_matches_slow`).
+#[doc(hidden)]
+#[must_use]
+pub fn truncate_chars(value: &str, max_chars: usize) -> String {
+    match value.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => value[..byte_idx].to_owned(),
+        None => value.to_owned(),
+    }
+}
+
+/// Pre-lever truncation (`chars().count()` then `take`), retained for the same-binary A/B and the
+/// byte-identity parity test.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn truncate_chars_slow(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
     }
@@ -2248,6 +2269,37 @@ mod tests {
         let input = "\u{1F600}\u{1F601}\u{1F602}";
         let result = truncate_chars(input, 2);
         assert_eq!(result.chars().count(), 2);
+    }
+
+    /// BYTE-IDENTITY GATE: the O(max_chars) `truncate_chars` must equal the former
+    /// `chars().count()`+`take` implementation for every input — within/at/over the limit, ASCII,
+    /// multibyte, combining marks, empty, and `max_chars == 0`.
+    #[test]
+    fn truncate_chars_matches_slow() {
+        let ascii = "the quick brown fox jumps over the lazy dog ".repeat(40);
+        let multi = "café déjà 日本語 🚀 ".repeat(40);
+        let combining = "a\u{0301}e\u{0301}o\u{0301} ".repeat(40);
+        let inputs = [
+            "",
+            "x",
+            "hello",
+            "abcde",
+            "abcdef",
+            "\u{1F600}\u{1F601}\u{1F602}",
+            ascii.as_str(),
+            multi.as_str(),
+            combining.as_str(),
+        ];
+        for input in inputs {
+            for max_chars in [0_usize, 1, 2, 5, 10, 400, 100_000] {
+                assert_eq!(
+                    super::truncate_chars(input, max_chars),
+                    super::truncate_chars_slow(input, max_chars),
+                    "mismatch max_chars={max_chars} len={}",
+                    input.len()
+                );
+            }
+        }
     }
 
     #[test]

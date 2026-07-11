@@ -5063,3 +5063,41 @@ ingest ratio — hashing is one component alongside canonicalization, the dedup 
 It removes redundant work always-on for every ingested document. `hash_hex` retains its original signature and
 byte-for-byte output for other callers; the `to_hex` split also fixes the slow `write!`-per-byte hex encode. All
 builds/benches strictly remote (`RCH_REQUIRE_REMOTE=1`); no local Cargo. Peer files untouched.
+
+## 2026-07-11 — WIN: storage ingest builds the content preview in O(preview) not O(document) — ~2.2–5.7×, byte-identical (cc_fse)
+
+`IngestPipeline::ingest` builds a `MAX_CONTENT_PREVIEW_CHARS` (400) preview from each document's full
+canonical text via `truncate_chars`. The former implementation did `value.chars().count()` — a full UTF-8
+decode of the ENTIRE document — merely to learn it exceeds 400 chars, then `chars().take(400)` decoded again.
+Real documents are far longer than a 400-char preview, so this paid a whole-document decode per ingested doc to
+emit a tiny preview.
+
+**The lever.** `value.char_indices().nth(max_chars)` finds the byte offset of the `max_chars`-th char while
+walking AT MOST `max_chars + 1` chars, then slices: `Some((byte_idx, _)) => value[..byte_idx]`, else the whole
+value. O(max_chars) instead of O(document length).
+
+**Byte-identical.** `value[..byte_idx]` is exactly the first `max_chars` chars (`char_indices` gives char
+boundaries), and the within-limit branch returns the value unchanged — identical to `chars().count()`+`take`.
+Proven by `truncate_chars_matches_slow` (within/at/over the limit × ASCII / multibyte / combining marks / empty /
+`max_chars == 0`, 7 `max_chars` values incl. 0 and 100_000) plus the retained `truncate_chars_*` unit tests and
+the bench's pre-timing assert.
+
+**Speed — DECIDABLE WIN, MEDIAN-gated.** Null-controlled A/B (`benches/truncate_preview_ab.rs`, ORIG =
+`truncate_chars_slow` (count+take) vs CAND = `truncate_chars` (nth+slice), ratio CAND/ORIG, `<1.0` = faster;
+`frankensearch_core::bench_support`, worker `vmi1149989`, 41 rounds × inner 64):
+
+| document (→ 400-char preview) | A/A null median [p5, p95] | CAND/ORIG median [p5, p95] | verdict |
+|---|---|---|---|
+| ascii 2 000 chars    | 0.9945 [0.7760, 1.1819] | **0.4582 [0.3157, 0.5802]** | **DECIDABLE WIN**, ~2.2× |
+| ascii 16 000 chars   | 0.9965 [0.8007, 1.2963] | **0.2084 [0.1628, 0.2828]** | **DECIDABLE WIN**, ~4.8× |
+| multibyte 16 000     | 1.0025 [0.7931, 1.2719] | **0.1743 [0.1489, 0.1970]** | **DECIDABLE WIN**, ~5.7× |
+
+Every lever median is far below its null p5 (0.78–0.80), decidable by a wide margin. The win scales with document
+length (2.2× at 2k → 4.8× at 16k → 5.7× multibyte) — exactly the mechanism: the saving is the avoided
+whole-document decode, which grows with the document while the preview stays fixed. Single-threaded, so the paired
+ratio is contention-robust.
+
+**Scope.** This is a ~2–6× win on the per-document preview-truncation step of ingest (one component alongside
+canonicalization, hashing, dedup SQL, and the WAL), always-on for every document longer than the preview (the
+common case). `truncate_chars` retains its signature and byte-for-byte output. All builds/benches strictly remote
+(`RCH_REQUIRE_REMOTE=1`); no local Cargo. Peer files untouched.

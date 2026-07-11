@@ -40,5 +40,10 @@ name = "content_hash_dual"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "truncate_preview_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true
