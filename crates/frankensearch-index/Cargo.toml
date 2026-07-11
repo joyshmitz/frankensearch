@@ -72,6 +72,11 @@ harness = false
 
 # FSVI (file-backed) int8 two-pass vs flat exact — standalone large-N vector search.
 [[bench]]
+name = "int8_vs_f16_fast_ab"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
 name = "fsvi_int8_two_pass"
 harness = false
 

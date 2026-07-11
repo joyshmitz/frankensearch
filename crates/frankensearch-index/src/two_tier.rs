@@ -347,8 +347,21 @@ impl TwoTierIndex {
             return self.fast_index.mrl_search(query_vec, k, &mrl_config, None);
         }
 
+        // Default (no explicit exact-scan params): the fast tier is a reranked candidate generator
+        // (its hits feed RRF + graph + phase-1 corrections downstream), so use the lossless int8
+        // two-pass rather than the exact f16 scan — matching the sync searcher's fast tier
+        // (`sync_searcher::search_fast_hits`) and strictly MORE accurate than the ANN path this same
+        // method uses when `ann` is enabled. Proven candidate-lossless (`int8_vs_f16_fast_ab`:
+        // set-recall@10 = 1.0000, exact-order-match 32/32) and ~1.3-1.43x faster on the fast-tier
+        // scan. int8 two-pass itself falls back to the exact scan for F32 slabs, WAL-dirty indexes,
+        // or k == 0, so those paths stay bit-identical. Explicit `params` still honour the exact scan
+        // + parallelism configuration.
+        const FAST_TIER_MULT: usize = 3;
         params.map_or_else(
-            || self.fast_index.search_top_k(query_vec, k, None),
+            || {
+                self.fast_index
+                    .search_top_k_int8_two_pass(query_vec, k, FAST_TIER_MULT)
+            },
             |params| {
                 self.fast_index
                     .search_top_k_with_params(query_vec, k, None, params)
