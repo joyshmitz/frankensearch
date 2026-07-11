@@ -11305,3 +11305,50 @@ the paths I had inspected, but I had NOT checked that the async and sync searche
 system has parallel implementations (sync/async, in-memory/file-backed), a "closed" frontier for one is not closed
 for its twin. Grep both. (Also: int8 two-pass being the async default does NOT resurrect ANN — ANN still ties int8,
 now the async default too.)
+
+### 2026-07-11 — cc_fse — FRONTIER SUMMARY (supersedes the earlier same-day "cc-lane closed" HOLDs): 3 levers shipped, both searcher paths now consistent, ANN falsified — recall-preserving cc-lane surface at floor
+
+Consolidated map after a long session. The earlier 2026-07-11 HOLD entries were true for each path inspected
+in isolation but MISSED a sibling divergence between the sync and async searchers — corrected below.
+
+**SHIPPED this session (recall-preserving, median-gated, pushed main+master):**
+1. `03769fc` — simhash byte-fast `split_whitespace` (per-doc ingest tokenizer) — **1.42x**, token-identical
+   (lever median 0.7031 < null p5 0.9785). Found by mining the INGEST path the frontier maps had skipped.
+2. `bc16256` — async `TwoTierIndex::search_fast_with_params` fast tier: exact f16 scan → lossless int8
+   two-pass — **1.43x**, recall@10=1.0000 exact-order-match 32/32 (`int8_vs_f16_fast_ab`; lever median 0.6987
+   < null p5 0.7227, entire distribution <1.0). A SIBLING-CONSISTENCY gap: the sync fast tier already used int8
+   two-pass; the async twin did not.
+
+**MEASURED + REJECTED:** `93289c7` — ANN-in-BOLD. The stale memory claimed "2.6-5x viable" but that compared
+HNSW vs FLAT; vs the real int8 two-pass DEFAULT (added an int8 arm to `hnsw_vs_flat_100k`), int8 two-pass
+(415µs, recall 1.0) TIES HNSW ef40 (423µs, recall 0.98) at the >=0.975 budget — no win. Generalized by cost
+analysis: pruning primitives (ANN/early-abandon/IVF) all tie the int8 cheap-dot floor at 100k because pruning
+overhead ≈ the cheap-int8-dot work saved.
+
+**FRONTIER STATE — recall-preserving cc-lane (lexical/scan/BM25) at floor, verified this session:**
+- SCAN: all dot kernels AVX2 (f16/int8/f32); all scans threshold-gated; int8 two-pass is now the lossless
+  DEFAULT for BOTH searcher paths (sync + async) and BOTH index types. Pruning ties it.
+- SIBLING CONSISTENCY (the productive vein): fast-tier scan (FIXED), quality-tier rescore (consistent: both
+  targeted exact-f16 per-hit), hashers (consistent: both aHash), selective-filter gather (consistent: both
+  index types have it — the FSVI-plumbing route-next was already done), RRF/sort/normalize (shared code).
+- LEXICAL: cass tokenizer 4 wins; id-resolution `ord` fast-field; `truncate_query` O(1) fast-path optimal;
+  query-time text-prep negligible; index-time tokenization is cod's lane.
+- BM25 / postings: Tantivy-owned, not ownable.
+- Per-query orchestration: score-calibration / hubness / MMR / MRL / graph-rank all OFF by default → EV-neg.
+- int8 mult knob: mult=3 vs the mult=2 lossless boundary — lowering saves ~0.3% (pass-2 is ~1% of scan) while
+  cutting recall margin → rejected.
+
+**BLOCKED / decision-gated (unchanged), with retry conditions in the ledger:**
+- int8 pass-1 `vpmaddubs` scan-level (~1.09x) → worker isolation (effect below the fleet-contention floor;
+  two runs disagreed).
+- ANN / early-abandon / IVF → N well past the ~130k pruning crossover, or a concurrent-throughput metric
+  (HNSW 1-core/query vs int8 all-cores/query) — neither modeled by the current single-query-latency benches;
+  early-abandon also needs cod's index-build dim-reorder format.
+- hubness / neighbor-smooth quality gains → a query-log / HNSW-graph-at-fuse-time FEATURE decision, off-by-
+  default kernels.
+
+**HOLD.** No ownable, unblocked, recall-preserving, profile-first lever remains. The frontier is genuinely
+tighter than the earlier HOLDs (both searcher paths now agree on scan selection). Reopens on: worker isolation,
+N >> 130k, a query-log/graph feature decision, or a new metric/workload. METHOD LESSON banked
+([[sibling-path-consistency-audit]] 4th win): when a system has parallel implementations, verify they pick the
+SAME kernel/scan, not just that each is internally optimal.
