@@ -11136,3 +11136,42 @@ stores only F32/F16; int8/4-bit are lazily built for the two-pass. Net: the owna
 surface is at floor beyond this tokenizer; remaining headroom is blocked on external state (int8 pass-1
 `vpmaddubs` scan-level → worker isolation `bd-sqwx`; ANN-in-BOLD → recall-budget sign-off; early-abandon →
 index-build format transform + real-corpus validation).
+
+### 2026-07-11 — cc_fse — FRONTIER + HOLD: full tier-by-tier CODE-LEVEL sweep (lexical/scan/index/BM25/postings/ranking) is empty after banking the ingest simhash win; remaining headroom is decision-gated, not codeable
+
+Instruction was "profile-first ONE lever; if a full sweep is empty, frontier + hold." This session re-read
+the actual hot loops (not asserted from the prior map). One fresh win banked (ingest simhash tokenizer
+`03769fc`, ~1.42×); every other named tier is at its measured floor.
+
+**Tier-by-tier, code-inspected this session:**
+- **SCAN (int8 two-pass = the DEFAULT fast path, `sync_searcher::search_fast_hits` for `search_params==None`).**
+  Pass-1 inner kernel (`int8_scan_range*_with_key`, 130k iters/query) is already threshold-gated (heap touched
+  only when `candidate < cutoff` — one compare for ~all rows) with a 4-row-blocked `dot_i8x4_i8` variant. The
+  only remaining lever is the pass-1 dot micro-op (`vpmaddubs`, 1.23× isolated / ~1.09× scan-level) — BLOCKED on
+  worker isolation (`bd-sqwx`); two prior invocations disagreed under fleet contention. Pass-2 (f16 exact rescore,
+  ~k·mult≈30 rows) is ~1% of pass-1 and already 4-acc ILP. int8 two-pass itself is lossless (candidate-recall@10
+  = 1.0000) so it is not a recall trade.
+- **LEXICAL / BM25 / POSTINGS.** BM25, postings, skip-lists = Tantivy internals, not ownable. The ownable seam
+  (Tantivy hits → frankensearch rows) is mined: candidate-gen id resolution (`collect_id_hits`) already reads the
+  `ord` u64 FAST column (no docstore decompress — the landed 2.56–8.47× id-materialization win), falling back to
+  docstore only for pre-`ord` docs; the docstore-load `search` path is only for FINAL materialization, where
+  loading the doc to return it is inherent. cass tokenizer/text-prep = 4 byte-fast wins already landed.
+- **INDEX.** `Quantization` stores only F32/F16; int8/4-bit are lazily-built (`OnceLock`) for the two-pass.
+  `TwoTierIndex` is a thin coordinator over `VectorIndex` (compute mined). FSVI record table is doc-id-hash-sorted
+  with binary-search lookup; winner materialization is O(k) + CompactString (mined). MRL truncated-dim search is
+  `mrl_search_dims: 0` (OFF by default).
+- **RANKING (added to the lane).** Profiled 2026-07-10 (`4004d84`): MMR is heaviest but `enabled: false` by
+  default; its bit-identical AVX2-f64x4 dot is EV-negative while off-by-default. RRF merge-structured fuse
+  (`4aeb66b`), two-tier blend, sort, and `ScoredResult` materialization are floored. `normalize.rs` min-max/z-score
+  is a tens–hundreds-of-scores per-query op, near-optimal.
+- **INGEST.** simhash tokenizer LANDED (`03769fc`); FNV 3-token-window hashing (75-85% of `semantic_simhash_text`)
+  is bit-identity-LOCKED (FNV-1a `(h⊕b)·PRIME mod 2^64` doesn't distribute over XOR → no window reuse; swapping
+  the hash changes persisted fingerprints). `apply_hash_votes` VOTE_TABLE landed; tableless-AVX2 votes 1.5-2.1×
+  SLOWER (`b02baef`). char_count/normalize_whitespace/truncate_to_chars fingerprint fast-paths already landed.
+  `code_structure_sidecar` = caller-less contract code (tests-only) → dead weight to optimize.
+
+**HOLD.** No ownable, unblocked, recall-preserving, profile-first lever remains. The three unblocks (unchanged):
+worker isolation (→ int8 pass-1 scan-level A/B + symbolized self-time `bd-e41k` + MMR-AVX2 if MMR goes
+default-on), an ANN-in-BOLD recall-budget product sign-off (2.6–5× vector tier, but recall-trading so not
+shippable under "recall preserved" without the budget), or a new workload the current proxies can't model. No
+code changed in this entry.
