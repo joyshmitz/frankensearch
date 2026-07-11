@@ -11271,3 +11271,37 @@ approved deterministic tie-order design; that would be a second query-path lever
 The benchmark and bench-only configurable constructor remain as the reproducible boundary for future Tantivy
 upgrades. The next conflict-free indexing candidate, if a new one-lever session is requested, is the facade's
 deep `IndexableDocument` staging clone in `frankensearch/src/index_builder.rs`; it was not touched here.
+
+### 2026-07-11 — cc_fse — LANDED: async TwoTierIndex fast tier switched to the lossless int8 two-pass (~1.43x, recall-identical) — a SIBLING-CONSISTENCY gap the "frontier closed" claims missed (sync path had it, async did not)
+
+After ~15 iterations of honest HOLD, a re-examination of the ASYNC searcher path found a real recall-preserving
+scan lever the frontier map missed. **Lesson: "frontier closed" must be checked against SIBLING implementations —
+the sync and async searchers had DIVERGENT fast-tier scan defaults.**
+
+**The gap.** frankensearch has two searcher paths: the **sync** `SyncTwoTierSearcher` (fusion/sync_searcher.rs,
+`InMemoryTwoTierIndex`) and the **async** `TwoTierSearcher` (fusion/searcher.rs, file-backed `TwoTierIndex` via
+`IndexCache`). The sync fast tier already used the int8 two-pass (`search_fast_hits`, "use int8 two-pass instead
+of the exact f16 scan"). The async fast tier (`TwoTierIndex::search_fast_with_params`, called at searcher.rs:1246)
+still used the **exact f16 scan** (`search_top_k`) as its non-ANN default. Both feed the same downstream (RRF +
+graph + phase-1 corrections), so both are reranked candidate generators — the exact same justification the sync
+path cites for int8 two-pass applied to the async path too, unexploited.
+
+**The fix (`bc16256`).** `search_fast_with_params` `params == None` fallback: `search_top_k` -> `search_top_k_int8_two_pass(k, mult=3)`, matching sync. Explicit `params` still get the exact scan; int8 two-pass falls back to exact for F32/WAL/k==0 (bit-identical). Strictly MORE accurate than the ANN path this same method uses under `--features ann` (recall 1.0 vs ~0.98).
+
+**Proof (`int8_vs_f16_fast_ab`, N=100k F16 dim=128 k=10, worker vmi1227854):**
+
+| arm | latency (criterion) | recall@10 vs f16-exact |
+|---|---|---|
+| f16_exact (`search_top_k`) | 432.94 µs | 1.0 (reference) |
+| int8_two_pass | 337.22 µs | **1.0000, exact-order-match 32/32** |
+
+Paired null-controlled: lever int8/f16 median **0.6987** [p5 0.5431, p95 0.9443] < null p5 0.7227 -> DECIDABLE WIN;
+the ENTIRE lever ratio distribution is < 1.0 (int8 faster every round). ~1.43x paired / ~1.28x criterion. 40
+two_tier tests pass. Bench kept in-tree (added the int8 arm to `hnsw_vs_flat_100k` earlier too, so ANN/scan evals
+compare against the real baseline).
+
+**Methodological note (corrects the many HOLD entries above):** the "cc-lane frontier closed" claims were true for
+the paths I had inspected, but I had NOT checked that the async and sync searchers agreed on scan selection. When a
+system has parallel implementations (sync/async, in-memory/file-backed), a "closed" frontier for one is not closed
+for its twin. Grep both. (Also: int8 two-pass being the async default does NOT resurrect ANN — ANN still ties int8,
+now the async default too.)
