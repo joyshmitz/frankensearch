@@ -11530,3 +11530,29 @@ to the prior inline fuse). The `merge_ranked` get_mut candidate + the A/B bench 
 > ~0.90, which a ~0.88 median would clear) confirms and ships it. Retry condition: a quiet-fleet window, or a
 completed higher-inner run (target-eviction-free). Method note: single-threaded so genuinely decidable off-fleet-
 contention — this is a "needs a clean substrate" block ([[rch-worker-is-soft-pin-not-isolation]]), NOT a floored lever.
+
+### 2026-07-11 — cc_fse — storage-ingest CPU vein mined (3 wins); remaining ingest/build candidates are I/O-dominated (below-noise end-to-end), deprioritized
+
+The per-document storage ingest CPU path is now mined for redundant/O(n)-when-O(k)/byte-fast levers, all shipped
+this session (byte-identical, MEDIAN-decidable): redundant per-doc SHA-256 → hash once (`b121194`, ~2×);
+content-preview truncation O(document)→O(preview) via `char_indices().nth` (`afe06fa`, ~2.2–5.7×); and the
+`content_length` ASCII fast-path (`54a5b40`, ~2.7×). The remaining full-document scan (canonicalize) is core-owned
+and already byte-fast; `ContentHasher::hash` is SHA over bytes (no decode); to_hex is O(32); dedup/upsert are SQL.
+
+**Deprioritized candidates (spotted, NOT pursued — I/O-dominated ⇒ below-noise end-to-end):**
+- `VectorIndex::append_batch` (`index/lib.rs:753`) clones the whole batch — `self.wal_entries.extend(wal_entries.
+  clone())` — where a reorder would allow a move: the tombstone loop (`:757`) uses only the main index
+  (`find_first_hash_match`/`record_at`/`record_count` are main-index-only, verified — never `self.wal_entries`),
+  so moving the tombstone loop before the extend makes `wal_entries` movable, eliminating the doc_id+embedding
+  clone. Byte-identical. BUT `append_batch` is dominated by the WAL file write + main-index mmap flag writes, so
+  the clone is a small fraction — measuring it would repeat the [[succinct-tombstone-bitmap-proven]] error
+  (isolation overstates a secondary memory op the real loop hides under I/O). Only worth it if profiled hot with
+  `fsync_on_write=false`.
+- `durability::should_rotate` (`file_protector.rs:1228`) `fs::read_to_string` + `lines().count()` reads the whole
+  log file per append to answer a `>= max_entries` threshold — O(file) per append. I/O-bound, log-rotation path,
+  not the search hot path.
+
+Method note: the productive ingest vein was CPU-bound byte-fast ops on the per-doc path; once those are mined, the
+adjacent candidates cross into I/O territory where the campaign's median gate cannot cleanly decide and isolation
+misleads. Route-next for a NEW CPU vein: profile a genuinely hot per-query path (blocked on symbolized self-time,
+`bd-e41k`), or a workload the current benches don't model.
