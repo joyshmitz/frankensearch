@@ -143,8 +143,17 @@ fn bench(c: &mut Criterion) {
         }
     };
 
-    let null = paired_median_ratio(41, 2, run_orig, run_orig);
-    let lever = paired_median_ratio(41, 2, run_orig, run_maddubs);
+    // `inner` averages this many scan batches into ONE timed sample. Under a busy shared fleet the
+    // int8 pass-1 scan is rayon-parallel (all cores), so ms-scale contention bursts hit one paired
+    // arm but not the other and blow up the per-round ratio (null p5 ~0.5 at inner=2). Averaging
+    // 32 batches/sample dilutes sub-batch bursts and tightens the floor WITHOUT biasing the median
+    // ratio estimator — a more-powerful test of the same true effect (bd-b5wl worker-isolation retry).
+    let inner: u32 = std::env::var("SCAN_AB_INNER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let null = paired_median_ratio(41, inner, run_orig, run_orig);
+    let lever = paired_median_ratio(41, inner, run_orig, run_maddubs);
     eprintln!(
         "[null]  scan/{N}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
         null.median, null.p5, null.p95, null.rounds

@@ -11374,3 +11374,67 @@ candidate regression would be false precision. The hard preservation contract fo
 all matching IDs retained plus nDCG ≥0.999999, supplemented by the direct failure-path test. This keep does not
 invalidate the earlier conclusion that direct postings compression is Tantivy-private, nor does it justify
 retrying larger writer budgets.
+
+### 2026-07-11 — cc_fse — BLOCKER STANDS (worker-isolation retry executed): the int8 `vpmaddubs` scan-level A/B is STILL not decidable — `RCH_WORKER` is a soft pin (no hard isolation), the shared fleet is contended, and 16× averaging tightens the floor but the lever stays inside it (bd-b5wl / bd-sqwx)
+
+Picked up the int8 scan-level A/B lane and executed its documented retry condition — *worker isolation, pin ONE
+worker so baseline and candidate run on the SAME worker* — then re-measured `int8_scan_maddubs_ab` (the whole
+int8 two-pass scan on a real 40k×384 file-backed `VectorIndex`, `bench_..._orig` vs `bench_..._maddubs`, ratio =
+maddubs/ORIG, gate = lever median `<` its own A/A null p5). All builds/benches strictly remote (`RCH_REQUIRE_REMOTE=1`,
+no local Cargo). Recall gate passed on every run: `orig = maddubs = 1.0000` @ mult 5, N 40k (the kernel swap is
+recall-exact, unchanged from the correctness proof — not the blocker).
+
+**Finding #1 — `rch` has NO hard worker pin.** The retry condition assumed a worker could be *pinned and
+isolated*. It cannot: `RCH_WORKER=<id>` (alias `RCH_WORKERS`) is a **soft request** — `rch`'s placement model
+(`RequestedWorkerStatus`) honors it only when the requested worker is admissible *and the free top-pick*
+(`honored`); any other outcome (`no_free_slots`, `unavailable`, `wrong_platform`, `already_runs_project`, …) is a
+structured refusal that **falls back to another worker**. `RCH_WORKER=hz1` and `=hz2` both silently swapped
+(hz1→vmi1227854, hz2→vmi1167313); only pinning to the current free top-pick (vmi1293453) was `honored`. There is
+no `rch` flag/env for exclusive/idle-worker reservation, and draining a shared fleet worker would disrupt the
+peer agent swarm. So "worker isolation" as literally specified is **not achievable with the available tooling on
+a busy shared fleet.**
+
+**Finding #2 — the measurement itself already co-locates the arms; the real problem is a contention-skewed NULL.**
+`paired_median_ratio` runs orig and maddubs in alternating rounds inside ONE `rch exec` (one binary, one worker),
+so baseline/candidate *always* share the substrate within a run — the original "two runs disagreed" was
+BETWEEN invocations landing on different workers. Pinning where honored + recording each run's **actual landed
+worker and null-floor width** (the direct contention meter), then escalating averaging (`inner` 2→32, 16× more
+scan batches per timed sample, to dilute the ms-scale contention bursts that hit one paired arm but not the other):
+
+| worker (actual) | inner | free slots | A/A null median [p5, p95] | maddubs/ORIG median [p5, p95] | verdict |
+|---|---|---|---|---|---|
+| vmi1227854 | 2 | 0 | 1.0131 [0.4647, 1.7595] | 1.0901 [0.5224, 2.6711] | inside floor (losing dir) |
+| vmi1167313 | 2 | 0 | 1.0211 [0.5874, 1.5356] | 0.9262 [0.4532, 2.0493] | inside floor (winning dir) |
+| vmi1293453 | 2 | 2 | 0.9604 [0.5231, 1.5405] | 0.9825 [0.6580, 1.7018] | inside floor |
+| vmi1293453 | 32 | 2 | 0.9237 [0.6962, 1.3941] | **0.9206** [0.6129, 1.4226] | inside floor; **lever ≈ null** |
+
+Every run is INSIDE its own null floor → not decidable, reproducing the original instability (the two contended
+inner=2 runs even disagree in *sign*: 1.09 losing vs 0.93 winning). The all-cores rayon pass-1 scan is maximally
+contention-sensitive, so even a "2 free slots" worker yields a ~30–50% CV floor that dwarfs the Amdahl-predicted
+~1.09× (~0.917 median) effect. `inner=32` DID tighten the null (p5 0.52→0.70) — averaging works — but not enough,
+and it cannot fix the null MEDIAN offset (0.92, not 1.0): that offset is a contention skew over the whole run, not
+sub-batch noise, so no amount of `inner` rescues it. Only a genuinely IDLE worker (null median ~1.0, tight p5)
+can, and the fleet was continuously busy with a peer agent swarm (frankensqlite / franken_networkx / franken_whisper
+/ frankenlibc / …) the entire session.
+
+**Honest nuance (NOT "no effect").** In the two least-contended runs the lever tracks the Amdahl prediction:
+0.9825 (inner 2) then **0.9206** (inner 32) on vmi1293453, right at the ~0.917 a 1.23×-kernel × 44.54%-self-time
+frame projects. So the ~1.09× scan-level effect is **plausibly real** — but *unprovable here*, because the A/A
+null control is itself contention-depressed (median 0.92, p5 0.70), so the lever cannot be cleanly separated from
+noise. This is a decidability failure of the substrate, not a demonstration that maddubs is not faster.
+
+**Decision — NOT shipped; blocker stands, retry condition tightened.** Did not flip the production default
+(`search_top_k_int8_two_pass` stays `MADDUBS=false`, byte-identical) — shipping an *approximate* kernel on an
+*unprovable* speedup fails the median gate. The isolated kernel win (`int8_dot_maddubs_ab`, 1.23×, decidable) and
+the deterministic f32-recall proof remain valid and unchanged. Retained + committed the reproducing bench with
+`inner` now env-configurable (`SCAN_AB_INNER`, default 32) so the heavier-averaging measurement reproduces without
+a source edit. **Tightened retry condition:** not merely "worker isolation" (soft-pin ≠ isolation) but a
+substrate that yields a *clean A/A null* (median ~1.0, p5 > ~0.95) — i.e. a genuinely idle worker via a
+quiet-fleet window, an `rch` exclusive-reservation/drain-for-self mechanism, or a hard pin `rch` does not
+currently expose. Absent that, the ~1.09× stays below the achievable measurement floor.
+
+**METHOD LESSON.** A retry condition phrased as "pin one worker" silently assumed the build fleet supports
+worker *isolation*; verify the tooling can actually deliver exclusivity before banking a blocked lever's reopen on
+it. For an all-cores parallel kernel, "same worker" is necessary but not sufficient — you need an *idle* worker,
+because any co-tenant competes for the very cores the kernel parallelizes over, and the paired-ratio null absorbs
+that as an irreducible floor.
