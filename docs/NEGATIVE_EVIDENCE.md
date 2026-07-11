@@ -11095,3 +11095,44 @@ dim-reorder + suffix-norm **format transform** + real-corpus validation. Neither
 **HOLD.** The new-primitive attempt is genuinely empty on the ownable, unblocked surface. Same three unblocks as
 the frontier map: worker isolation (int8 scan-level + self-time + MMR-AVX2-f64 if MMR goes default-on), ANN
 product sign-off, hubness query-log. No code changed.
+
+### 2026-07-11 — cc_fse — LANDED: simhash byte-fast split_whitespace (ingest tokenizer) ~1.42x, token-identical; + the 75-85% sibling (FNV window hashing) is bit-identity-LOCKED (analysis reject)
+
+Mined the **ingest path** (per-document `DocumentFingerprint::compute`), which the 2026-07-10 frontier
+map skipped — it mapped only the *search-time* hot paths (scan/fusion/lexical-query). The simhash
+tokenizer was un-mined and yielded a fresh decidable win.
+
+**WIN (landed `03769fc`).** `semantic_simhash_text` tokenized via `str::split_whitespace`, which decodes
+EVERY char to test `char::is_whitespace`. `SplitWhitespaceFast` classifies ASCII bytes (the common case)
+with a byte test — `is_ascii_whitespace() || b == 0x0B` matches `char::is_whitespace` on ASCII (U+000B is
+Unicode `White_Space` but NOT `is_ascii_whitespace` — the one subtlety) — and decodes a char only for a
+non-ASCII lead byte. Token-identical (`split_whitespace_fast_matches_std`: ASCII/VT/NBSP/NEL/ideographic+em
+space/mixed CJK), so the simhash and every dedup decision are unchanged; recall/ordering preserved. Null
+control (`simhash_tokenize_ab`, ~4 KiB ASCII doc, 41×4, worker hz2): null median 1.0015 [p5 0.9785]; lever
+fast/ORIG median **0.7031** [0.5354, 1.1979] — below the null p5 floor → DECIDABLE WIN, ~1.42× on the
+tokenization scan (~15-25% of `semantic_simhash_text`). Criterion cross-check: 5.08µs → 4.32µs,
+non-overlapping CIs. This is the same class as the four landed cass-tokenizer/text-prep byte-fast paths and
+the char_count/normalize_whitespace/truncate_to_chars fingerprint fast-paths.
+
+**The bigger sibling is LOCKED (analysis reject, not codeable bit-identically).** The bench isolated the
+tokenization at ~15-25% of `semantic_simhash_text`; the other **75-85% is the no-alloc 3-token-window FNV
+hashing** (`hash_token_window`). Two structural angles, both dead ends for a *behavior-identical* lever:
+- **Reuse across overlapping windows** (each token is hashed 3× — as left, then mid, then right of three
+  consecutive windows): FNV-1a state is NOT composable. The step is `h = (h XOR b) * PRIME (mod 2^64)`;
+  multiplication mod 2^64 distributes over ADDITION, not over XOR (GF(2)), so a window/suffix hash cannot
+  be reconstructed from cached per-token states without changing the result. No rolling-hash reuse.
+- **Swap FNV for a cheaper/rolling hash**: changes `semantic_hash` → changes dedup decisions → not
+  behavior-identical (fingerprints are persisted). Rejected on correctness.
+  The remaining FNV byte loop is a serial multiply chain (latency-bound); `apply_hash_votes` already has the
+  compile-time VOTE_TABLE, and the tableless-AVX2 vote expansion was measured 1.5-2.1× SLOWER (`b02baef`).
+  So simhash beyond the tokenizer is floored.
+
+**Also re-confirmed while sweeping for the next lever (no code):** the vector-scan DEFAULT is already the
+lossless int8 two-pass (7.1× vs flat, candidate-recall@10 = 1.0000; wired in `sync_searcher::search_fast_hits`
+for `search_params == None`) — NOT an un-wired opportunity. `code_structure_sidecar::insert_document` /
+`extract_code_structure_signals` are caller-less contract code (only tests call them) — optimizing them is
+dead weight. `TwoTierIndex` is a thin coordinator over `VectorIndex` (compute already mined). `Quantization`
+stores only F32/F16; int8/4-bit are lazily built for the two-pass. Net: the ownable/unblocked/decidable
+surface is at floor beyond this tokenizer; remaining headroom is blocked on external state (int8 pass-1
+`vpmaddubs` scan-level → worker isolation `bd-sqwx`; ANN-in-BOLD → recall-budget sign-off; early-abandon →
+index-build format transform + real-corpus validation).
