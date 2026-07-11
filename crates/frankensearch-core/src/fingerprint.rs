@@ -172,6 +172,82 @@ pub fn char_count_fast_bench(text: &str) -> usize {
     char_count(text)
 }
 
+/// Byte-fast iterator equivalent to `str::split_whitespace()`.
+///
+/// The simhash tokenizer previously used `str::split_whitespace`, which decodes **every** char to
+/// test `char::is_whitespace`. This yields the identical non-empty maximal non-whitespace runs but
+/// classifies ASCII bytes (the common case) with a cheap byte test — `is_ascii_whitespace() || b ==
+/// 0x0B` matches `char::is_whitespace` on ASCII (U+000B is Unicode `White_Space` but not
+/// `is_ascii_whitespace`) — and only decodes a char for a non-ASCII lead byte. Token-identical
+/// (`split_whitespace_fast_matches_std`).
+struct SplitWhitespaceFast<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> Iterator for SplitWhitespaceFast<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let bytes = self.text.as_bytes();
+        let is_ws_at = |pos: usize| -> (bool, usize) {
+            let b = bytes[pos];
+            if b < 0x80 {
+                (b == 0x0B || b.is_ascii_whitespace(), 1)
+            } else {
+                let ch = self.text[pos..]
+                    .chars()
+                    .next()
+                    .unwrap_or(char::REPLACEMENT_CHARACTER);
+                (ch.is_whitespace(), ch.len_utf8())
+            }
+        };
+        // Skip leading whitespace.
+        while self.pos < bytes.len() {
+            let (ws, len) = is_ws_at(self.pos);
+            if ws {
+                self.pos += len;
+            } else {
+                break;
+            }
+        }
+        if self.pos >= bytes.len() {
+            return None;
+        }
+        // Consume the non-whitespace run.
+        let start = self.pos;
+        while self.pos < bytes.len() {
+            let (ws, len) = is_ws_at(self.pos);
+            if ws {
+                break;
+            }
+            self.pos += len;
+        }
+        Some(&self.text[start..self.pos])
+    }
+}
+
+fn split_whitespace_fast(text: &str) -> SplitWhitespaceFast<'_> {
+    SplitWhitespaceFast { text, pos: 0 }
+}
+
+/// Doc-hidden bench harness: iterate the byte-fast tokenizer, folding token lengths (no alloc, so
+/// the timed cost is the tokenization scan the simhash actually pays).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn split_whitespace_fast_lensum(text: &str) -> usize {
+    split_whitespace_fast(text).map(str::len).sum()
+}
+
+/// Doc-hidden bench harness: the same fold over `str::split_whitespace` (the pre-lever tokenizer).
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn split_whitespace_std_lensum(text: &str) -> usize {
+    text.split_whitespace().map(str::len).sum()
+}
+
 #[must_use]
 fn semantic_simhash_text(text: &str) -> SemanticSimhash {
     let mut bit_weights = [0_i32; 64];
@@ -179,7 +255,7 @@ fn semantic_simhash_text(text: &str) -> SemanticSimhash {
     let mut prev2 = None;
     let mut prev1 = None;
 
-    for token in text.split_whitespace() {
+    for token in split_whitespace_fast(text) {
         if let (Some(left), Some(mid)) = (prev2, prev1) {
             let window = [left, mid, token];
             apply_hash_votes(hash_token_window(&window), &mut bit_weights);
@@ -280,6 +356,31 @@ mod tests {
         SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD, char_count, char_count_slow, semantic_simhash,
         semantic_simhash_text,
     };
+
+    /// PARITY GATE: the byte-fast tokenizer must yield the byte-for-byte same token sequence as
+    /// `str::split_whitespace` — including U+000B (vertical tab, Unicode whitespace but not
+    /// `is_ascii_whitespace`), Unicode whitespace (NBSP, NEL, ideographic space), leading/trailing/
+    /// runs, empty, all-whitespace, and mixed ASCII/Unicode.
+    #[test]
+    fn split_whitespace_fast_matches_std() {
+        for text in [
+            "",
+            "   ",
+            "one",
+            "the quick brown fox",
+            "  leading   and\ttrailing  ",
+            "a\u{0B}b\u{0C}c\u{0D}d\u{09}e",
+            "no\u{00A0}break\u{00A0}space here",
+            "next\u{0085}line \u{3000}ideographic",
+            "café  déjà\tvu \u{2003}em",
+            "日本語　テスト mixed",
+            "\u{0B}\u{00A0}\ttrim edges\u{00A0}\u{0B}",
+        ] {
+            let fast: Vec<&str> = super::split_whitespace_fast(text).collect();
+            let std: Vec<&str> = text.split_whitespace().collect();
+            assert_eq!(fast, std, "mismatch for {text:?}");
+        }
+    }
 
     /// PARITY GATE: the ASCII-fast `char_count` must equal `text.chars().count()` for ASCII, pure
     /// multibyte (byte-len > char-count), mixed, empty, and combining-mark inputs.

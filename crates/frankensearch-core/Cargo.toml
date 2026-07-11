@@ -76,3 +76,8 @@ required-features = ["bench-internals"]
 name = "char_count_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "simhash_tokenize_ab"
+harness = false
+required-features = ["bench-internals"]
