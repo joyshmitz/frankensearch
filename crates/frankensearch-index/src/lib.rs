@@ -1614,6 +1614,47 @@ impl VectorIndexWriter {
         Ok(())
     }
 
+    /// Bench-only access to the owned record handoff used by `TwoTierIndexBuilder`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` for wrong embedding lengths
+    /// and `SearchError::InvalidConfig` for invalid values.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn write_record_owned_for_benchmark(
+        &mut self,
+        doc_id: String,
+        embedding: Vec<f32>,
+    ) -> SearchResult<()> {
+        if embedding.len() != self.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: embedding.len(),
+            });
+        }
+        if embedding.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "embedding".to_owned(),
+                value: "<contains non-finite values>".to_owned(),
+                reason: "all embedding values must be finite".to_owned(),
+            });
+        }
+        let _ = u16::try_from(doc_id.len()).map_err(|_| SearchError::InvalidConfig {
+            field: "doc_id".to_owned(),
+            value: doc_id.clone(),
+            reason: "doc_id byte length must fit in u16".to_owned(),
+        })?;
+        let doc_id_hash = fnv1a_hash(doc_id.as_bytes());
+        self.records.push(PendingRecord {
+            doc_id,
+            doc_id_hash,
+            flags: 0,
+            embedding,
+        });
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) const fn with_generation(mut self, generation: u8) -> Self {
         self.compaction_gen = generation;
@@ -2174,6 +2215,39 @@ mod tests {
         let vec_a = index.vector_at_f32(pos_a).expect("vector");
         assert_eq!(vec_a.len(), 8);
         assert!((vec_a[0] - 2.0).abs() < 0.002);
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn owned_record_handoff_matches_borrowed_writer_bytes() {
+        let borrowed_path = temp_index_path("borrowed-record-handoff");
+        let owned_path = temp_index_path("owned-record-handoff");
+        let records = vec![
+            ("doc-z".to_owned(), vec![0.25, -0.5, 0.75, 1.0]),
+            ("doc-a".to_owned(), vec![-1.0, 0.5, 0.0, 0.125]),
+            ("doc-m".to_owned(), vec![0.0, 0.25, -0.25, 0.5]),
+        ];
+
+        let mut borrowed = VectorIndex::create(&borrowed_path, "parity", 4).expect("borrowed");
+        for (doc_id, embedding) in &records {
+            borrowed
+                .write_record(doc_id, embedding)
+                .expect("write borrowed record");
+        }
+        borrowed.finish().expect("finish borrowed");
+
+        let mut owned = VectorIndex::create(&owned_path, "parity", 4).expect("owned");
+        for (doc_id, embedding) in records {
+            owned
+                .write_record_owned_for_benchmark(doc_id, embedding)
+                .expect("write owned record");
+        }
+        owned.finish().expect("finish owned");
+
+        assert_eq!(
+            fs::read(&borrowed_path).expect("read borrowed bytes"),
+            fs::read(&owned_path).expect("read owned bytes")
+        );
     }
 
     #[test]

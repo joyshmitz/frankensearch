@@ -192,3 +192,8 @@ required-features = ["bench-internals"]
 name = "f16_chunk_size_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "fsvi_builder_record_transfer"
+harness = false
+required-features = ["bench-internals"]

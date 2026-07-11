@@ -4955,3 +4955,71 @@ back locally; direct `rustfmt --check`, `git diff --check`, and UBS (exit 0, zer
 **Scope.** This is a facade ownership/allocation win feeding the real Tantivy postings build. It does not modify
 or claim a new postings compression codec, BM25 formula, tokenizer, or query scan, and it does not reopen the
 rejected writer-budget family.
+
+## 2026-07-11 — REJECT: owned FSVI handoff wins in isolation, but full-write median stays inside the null floor (cod, bd-5973)
+
+**Different lane from cc-owned lexical/query scan.** A fresh code and ledger sweep reconfirmed that Tantivy
+0.26.1 keeps its postings codec, block size, and skip layout private, while the public 50 MB → 100 MB writer
+budget family is a measured no-retry reject. The next ownable indexing-build cost was in the FSVI two-tier
+builder: it already owned every `(String, Vec<f32>)`, but `finish(self)` borrowed each record into
+`VectorIndexWriter::write_record`, causing the writer to allocate and deep-clone every ID and vector again.
+
+**Profile first.** Before any production edit, the retained `fsvi_builder_record_transfer` harness measured one
+realistic 20,000-document × 384-dimension tier on remote worker `vmi1149989`. The redundant 29.297 MiB record
+deep clone cost **4.260 ms median** [3.481, 6.863], while borrowed writer ingestion cost **16.272 ms median**
+[13.625, 19.159]. The copy was therefore 26.18% of the live handoff path, not a static-code guess. Two later
+runs on `vmi1227854` independently measured 5.390/16.311 ms (33.04%) and 3.998/15.352 ms (26.04%).
+
+**One candidate lever.** The candidate made `TwoTierIndexBuilder::finish` consume `fast_records` and
+`quality_records` into an owned writer entry point. Both arms retained the exact former validation order
+(dimension, finite values, ID length), FNV-1a hash, flags, insertion order, load-bearing stable sort, f16
+encoding, fast-before-quality order, and fsync behavior. No capacity reservation, early ID-set drop, tier
+parallelism, codec change, scan change, or lexical change was combined with the ownership transfer.
+
+**Recall and artifact proof.** The same release binary wrote both the former borrowed arm and the owned arm from
+the 20k fixture. Their complete **16,020,096-byte FSVI files were byte-identical**. Reopened sampled IDs and
+decoded vector `to_bits()` values matched, as did every top-10 ID/index/score bit across eight queries. Therefore
+candidate-vs-original top-10 overlap and original-relative nDCG@10 were both **1.000000**; this is a preservation
+claim, not an absolute external-ground-truth relevance claim. Byte equality also proves unchanged headers, record
+tables, string tables, vector slabs, ordering, and checksums.
+
+**Speed — isolated median passes, full shipping median does not reproduce outside the null floor.** Strict
+remote-only command for both same-worker runs:
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-index --profile release --features bench-internals \
+  --bench fsvi_builder_record_transfer
+```
+
+Worker `vmi1227854`; one release binary per run, 21 AB/BA round pairs. Ratio is owned candidate / borrowed
+original:
+
+| run | gate | A/A null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---|---|---:|---:|---|
+| 1 | writer ingestion | 0.971933 [0.765276, 1.140919] | **0.595650** [0.473512, 0.712427] | decidable isolated win |
+| 1 | transfer + stable sort + encode + fsync | 1.013005 [0.887204, 1.227880] | **0.872784** [0.689716, 1.039306] | barely below null p5; tentative keep |
+| 2, final | writer ingestion | 1.030091 [0.805651, 1.229080] | **0.628700** [0.579356, 0.751003] | decidable isolated win |
+| 2, final | transfer + stable sort + encode + fsync | 0.937580 [0.825111, 1.170674] | **0.853127** [0.735856, 0.969935] | **INSIDE NULL FLOOR** |
+
+The first full-path result cleared its null p5 by only 0.014420. The required rerun kept the same faster
+direction but widened the measured floor: candidate median 0.853127 was **above** null p5 0.825111. The isolated
+handoff is reproducibly faster, but f16 encoding, sort, filesystem work, and fleet noise dilute that effect below
+the full operation's decidability floor. The full-path result is the shipping gate, so the final verdict is
+**REJECT/HOLD**, not an averaged or defended keep.
+
+**Decision and scope.** Production `TwoTierIndexBuilder` and the default writer path were restored exactly to
+HEAD. Only the feature-gated comparator, retained benchmark, parity test, and evidence remain. This does not
+modify BM25/query scan or claim a postings-compression win. The earlier slice-to-owned-vector copy at the builder
+API is a separate route-next, not evidence that this second-copy lever should ship; it requires its own profile
+and cannot be bundled under the one-lever rule.
+
+**Validation and degraded surfaces.** All Cargo work stayed fail-closed remote-only. The candidate crate suite
+passed 402/402 tests, the final rejected tree's retained borrowed-vs-owned byte-parity test passed 1/1, and final
+`cargo check -j 4 --workspace --all-targets` exited 0 remotely. Workspace `cargo clippy ... -D warnings` stopped
+on two pre-existing `frankensearch-core` lints; both package and benchmark-target clippy then stopped on the same
+80 pre-existing `frankensearch-index` lints before providing a clean target-only verdict. Strict-remote
+`cargo fmt --check` was refused with RCH-E301 because formatting is not a compilation command; RCH did not fall
+back locally, and direct `rustfmt --edition 2024 --check` plus `git diff --check` passed. The RCH fleet was
+degraded (9/12 workers healthy), and Agent Mail reservations were unavailable because its SQLite corruption
+circuit breaker was open; both failures were surfaced rather than bypassed.

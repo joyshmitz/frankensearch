@@ -11438,3 +11438,36 @@ worker *isolation*; verify the tooling can actually deliver exclusivity before b
 it. For an all-cores parallel kernel, "same worker" is necessary but not sufficient — you need an *idle* worker,
 because any co-tenant competes for the very cores the kernel parallelizes over, and the paired-ratio null absorbs
 that as an irreducible floor.
+
+### 2026-07-11 — cod — REJECTED: FSVI owned handoff is faster in isolation but below the full-write null floor; production restored (bd-5973)
+
+This follow-up stayed outside cc-owned lexical/query-scan files. Direct BM25/postings compression was not a
+codeable recall-neutral lever: Tantivy 0.26.1 still keeps the codec/block/skip implementation private, and the
+only generic public build knob previously tested here (50 MB → 100 MB writer memory) is a median/quality reject.
+
+The fresh owned indexing frontier was instead the file-backed vector index build. `TwoTierIndexBuilder` buffered
+owned IDs and vectors, then borrowed them into `VectorIndexWriter`, which deep-cloned the full payload a second
+time. A pre-edit remote profile found that copy at 4.260 ms median, 26.18% of the 20k×384 writer handoff. The one
+candidate lever consumed those records into an owned writer method; no schema, ranker, tokenizer, postings
+setting, scan, capacity, sort, encoding, or persistence change was combined with it.
+
+The exact same-binary proof is stronger than a sampled recall tolerance: borrowed and owned arms produced
+byte-identical 16,020,096-byte FSVI files, identical sampled vector bits, and identical top-10 ID/index/score bits
+for eight queries (candidate-vs-original overlap and original-relative nDCG@10 = 1.000000; no absolute external
+relevance claim). On worker `vmi1227854`, the isolated handoff cleared its null floor twice (candidate/original
+0.595650 and 0.628700). The first full transfer+sort+encode+fsync run only barely cleared its null p5:
+0.872784 versus 0.887204. The required final rerun did not reproduce decisibility: candidate median
+**0.853127** [0.735856, 0.969935] was inside the A/A floor of 0.937580 [0.825111, 1.170674]. Faster direction is
+not enough; the full operation is the shipping gate.
+
+**Decision/boundary.** Production source was restored to HEAD; only the feature-gated comparator, benchmark,
+parity test, and this evidence remain. Do not retry this second-copy handoff without a quieter full-write fixture
+whose A/A floor can resolve a roughly 9–14% effect. This does not reopen direct postings compression or the
+rejected writer-budget family. The builder's earlier slice-to-owned-vector copy remains a separate possible
+API/ownership investigation; it requires a fresh profile and must not be bundled with this rejected handoff.
+
+Remote validation passed the candidate's 402-test crate suite, the final retained byte-parity test, and the final
+workspace check. `-D warnings` remains blocked by pre-existing core/index lint debt; strict-remote Cargo format
+correctly refused local fallback, while direct rustfmt and diff checks passed. RCH was degraded at 9/12 healthy
+workers, and Agent Mail's corruption circuit breaker prevented a reservation; neither degraded surface was
+bypassed.
