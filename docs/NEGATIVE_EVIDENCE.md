@@ -11638,3 +11638,42 @@ External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** — thi
 primitive, not a search-quality comparator. The bench (`rfc3339_parse_ab`, gated behind a new
 `bench-internals` feature) asserts full shipped==reference parity before every timing run and remains as
 the reproducer + oracle. Production default is now the fast path.
+
+### 2026-07-11 — cc_fse — LANDED: historical-analytics correlation grouping borrowed-key clone-elision ~1.4–1.9×, byte-identical (frankensearch-ops)
+
+**Same fresh vein ([[ops-tui-fresh-perf-vein]]).** `HistoricalAnalyticsScreen::correlation_rows_for_rows`
+runs per render, grouping the filtered evidence rows by `reason_code`. The legacy path keyed a
+`BTreeMap<String, CorrelationAccumulator>` by `reason_code.clone()` and accumulated a
+`BTreeSet<String>` of projects — **two `String` clones per row**. But the final `CorrelationRow` needs
+`reason_code` owned only once per group and `project_span` is merely the *distinct-project count*.
+
+**Lever (`screens/historical_analytics.rs`).** Extracted the pure core into
+`build_correlation_rows(rows, lag_pressure, drop_pressure)` and switched grouping to **borrowed `&str`
+keys** (`BTreeMap<&str, CorrelationAccumulatorRef<'_>>`, `projects: BTreeSet<&str>`) — the rows outlive
+the map. `reason_code` is now cloned once per output group (not per row); projects are counted without
+cloning. Per-row clones drop from ~2N to ~G (groups). **Byte-identical output:** the sort comparator's
+terminal tiebreak is `reason_code`, which is unique per group, so the result order is fully determined
+independent of the grouping map's iteration order (`&str` and `String` share the same `Ord`).
+
+**Measured command (per-crate, strict remote `vmi1227854`, release, within-process paired AB/BA — both
+arms in one process on one worker, immune to the `RCH_WORKER` soft-pin issue):**
+
+```bash
+AGENT_NAME=cc_fse CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-ops --profile release --features bench-internals \
+    --bench correlation_group_ab
+```
+
+Parity asserted (`output_identical=true`) before every timing run. Ratios are candidate(borrowed)/owned:
+
+| shape rows/reasons/projects | owned median | borrowed median | paired lever [p5,p95] | A/A null [p5,p95] | speedup | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| 2048/16/24 | 0.0959 ms | 0.0614 ms | 0.5308 [0.449, 0.786] | 1.0207 [0.773, 1.262] | **1.88×** | CANDIDATE_FASTER |
+| 8192/24/40 | 0.3436 ms | 0.2027 ms | 0.7177 [0.609, 0.809] | 0.9978 [0.847, 1.156] | **1.39×** | CANDIDATE_FASTER |
+| 16384/32/64 | 0.6499 ms | 0.3918 ms | 0.7076 [0.673, 0.736] | 0.9868 [0.870, 1.083] | **1.41×** | CANDIDATE_FASTER |
+
+All three shapes clear the null floor (`gate_pass=true`, `decision=KEEP`). The speedup scales with
+rows-per-group (more events per `reason_code` = larger relative clone saving), and real evidence logs are
+many-events-per-reason. External Tantivy/Lucene/Meilisearch comparator is **N/A** (internal render-path
+aggregation). 77/77 ops `historical_analytics` lib tests pass (incl. the correlation-correctness tests).
+The owned-key path is retained only behind `bench-internals` as the parity oracle.

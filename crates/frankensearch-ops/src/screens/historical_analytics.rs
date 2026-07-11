@@ -121,12 +121,259 @@ struct CorrelationRow {
     stream_correlation: u8,
 }
 
+/// Legacy owned-key correlation accumulator, retained only for the A/B microbench.
+#[cfg(feature = "bench-internals")]
 #[derive(Default)]
 struct CorrelationAccumulator {
     event_count: usize,
     critical_count: usize,
     confidence_sum: u64,
     projects: BTreeSet<String>,
+}
+
+/// Borrowed-key correlation accumulator: `projects` references `EvidenceRow`
+/// strings that outlive the grouping map, so grouping avoids per-row `String`
+/// clones (distinct projects are still counted exactly).
+#[derive(Default)]
+struct CorrelationAccumulatorRef<'a> {
+    event_count: usize,
+    critical_count: usize,
+    confidence_sum: u64,
+    projects: BTreeSet<&'a str>,
+}
+
+/// Aggregate evidence rows into correlation rows.
+///
+/// Groups by `reason_code` using borrowed `&str` keys — the rows outlive the map,
+/// so `reason_code` is cloned only once per output group (not once per row) and
+/// projects are counted without cloning. The output is byte-identical to the
+/// legacy owned-key form: the sort comparator's terminal `reason_code` tiebreak is
+/// unique per group, so the result order is fully determined regardless of the
+/// grouping map's iteration order.
+fn build_correlation_rows(
+    rows: &[EvidenceRow],
+    lag_pressure: u8,
+    drop_pressure: u8,
+) -> Vec<CorrelationRow> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped: BTreeMap<&str, CorrelationAccumulatorRef<'_>> = BTreeMap::new();
+    for row in rows {
+        let entry = grouped.entry(row.reason_code.as_str()).or_default();
+        entry.event_count = entry.event_count.saturating_add(1);
+        if matches!(row.severity, EventSeverity::Critical) {
+            entry.critical_count = entry.critical_count.saturating_add(1);
+        }
+        entry.confidence_sum = entry
+            .confidence_sum
+            .saturating_add(u64::from(row.confidence));
+        entry.projects.insert(row.project.as_str());
+    }
+
+    let total_events = rows.len().max(1);
+    let mut result = grouped
+        .into_iter()
+        .map(|(reason_code, acc)| {
+            let count_u64 = u64::try_from(acc.event_count).unwrap_or(1);
+            let avg_confidence_u64 = acc
+                .confidence_sum
+                .saturating_add(count_u64 / 2)
+                .saturating_div(count_u64)
+                .min(100);
+            let avg_confidence = u8::try_from(avg_confidence_u64).unwrap_or(100);
+
+            let event_ratio = acc
+                .event_count
+                .saturating_mul(100)
+                .saturating_div(total_events)
+                .min(100);
+            let critical_boost = acc.critical_count.saturating_mul(20).min(100);
+            let pressure = usize::from(lag_pressure)
+                .saturating_add(usize::from(drop_pressure))
+                .saturating_div(4);
+            let score = event_ratio
+                .saturating_add(critical_boost)
+                .saturating_add(pressure)
+                .min(100);
+
+            CorrelationRow {
+                reason_code: reason_code.to_owned(),
+                project_span: acc.projects.len(),
+                event_count: acc.event_count,
+                critical_count: acc.critical_count,
+                avg_confidence,
+                stream_correlation: u8::try_from(score).unwrap_or(100),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    result.sort_by(|left, right| {
+        right
+            .stream_correlation
+            .cmp(&left.stream_correlation)
+            .then_with(|| right.critical_count.cmp(&left.critical_count))
+            .then_with(|| right.event_count.cmp(&left.event_count))
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    result
+}
+
+/// Legacy owned-key correlation grouping, retained only for the A/B microbench.
+#[cfg(feature = "bench-internals")]
+fn build_correlation_rows_legacy_owned(
+    rows: &[EvidenceRow],
+    lag_pressure: u8,
+    drop_pressure: u8,
+) -> Vec<CorrelationRow> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped: BTreeMap<String, CorrelationAccumulator> = BTreeMap::new();
+    for row in rows {
+        let entry = grouped.entry(row.reason_code.clone()).or_default();
+        entry.event_count = entry.event_count.saturating_add(1);
+        if matches!(row.severity, EventSeverity::Critical) {
+            entry.critical_count = entry.critical_count.saturating_add(1);
+        }
+        entry.confidence_sum = entry
+            .confidence_sum
+            .saturating_add(u64::from(row.confidence));
+        entry.projects.insert(row.project.clone());
+    }
+
+    let total_events = rows.len().max(1);
+    let mut result = grouped
+        .into_iter()
+        .map(|(reason_code, acc)| {
+            let count_u64 = u64::try_from(acc.event_count).unwrap_or(1);
+            let avg_confidence_u64 = acc
+                .confidence_sum
+                .saturating_add(count_u64 / 2)
+                .saturating_div(count_u64)
+                .min(100);
+            let avg_confidence = u8::try_from(avg_confidence_u64).unwrap_or(100);
+
+            let event_ratio = acc
+                .event_count
+                .saturating_mul(100)
+                .saturating_div(total_events)
+                .min(100);
+            let critical_boost = acc.critical_count.saturating_mul(20).min(100);
+            let pressure = usize::from(lag_pressure)
+                .saturating_add(usize::from(drop_pressure))
+                .saturating_div(4);
+            let score = event_ratio
+                .saturating_add(critical_boost)
+                .saturating_add(pressure)
+                .min(100);
+
+            CorrelationRow {
+                reason_code,
+                project_span: acc.projects.len(),
+                event_count: acc.event_count,
+                critical_count: acc.critical_count,
+                avg_confidence,
+                stream_correlation: u8::try_from(score).unwrap_or(100),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    result.sort_by(|left, right| {
+        right
+            .stream_correlation
+            .cmp(&left.stream_correlation)
+            .then_with(|| right.critical_count.cmp(&left.critical_count))
+            .then_with(|| right.event_count.cmp(&left.event_count))
+            .then_with(|| left.reason_code.cmp(&right.reason_code))
+    });
+    result
+}
+
+/// Bench-only opaque handle wrapping a synthetic evidence-row corpus.
+#[cfg(feature = "bench-internals")]
+pub struct BenchEvidenceRows(Vec<EvidenceRow>);
+
+/// Bench-only flat projection of a `CorrelationRow` for parity comparison.
+#[cfg(feature = "bench-internals")]
+pub type BenchCorrelationRow = (String, usize, usize, usize, u8, u8);
+
+#[cfg(feature = "bench-internals")]
+fn project_correlation(rows: Vec<CorrelationRow>) -> Vec<BenchCorrelationRow> {
+    rows.into_iter()
+        .map(|row| {
+            (
+                row.reason_code,
+                row.project_span,
+                row.event_count,
+                row.critical_count,
+                row.avg_confidence,
+                row.stream_correlation,
+            )
+        })
+        .collect()
+}
+
+/// Bench-only: build a deterministic evidence-row corpus with `n_reasons` distinct
+/// reason codes and `n_projects` distinct projects across `n_rows` events.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn bench_make_evidence_rows(
+    n_rows: usize,
+    n_reasons: usize,
+    n_projects: usize,
+) -> BenchEvidenceRows {
+    let reasons = n_reasons.max(1);
+    let projects = n_projects.max(1);
+    let rows = (0..n_rows)
+        .map(|index| {
+            let severity = match index % 5 {
+                0 => EventSeverity::Critical,
+                1 => EventSeverity::Warn,
+                _ => EventSeverity::Info,
+            };
+            EvidenceRow {
+                ts_ms: 1_700_000_000_000 + index as u64,
+                project: format!("project-{:04}", index % projects),
+                host: format!("host-{:04}", index % 32),
+                instance_id: format!("instance-{index:06}"),
+                severity,
+                reason_code: format!("reason-code-{:03}", index % reasons),
+                confidence: (index % 101) as u8,
+                replay_handle: format!("replay-{index:06}"),
+            }
+        })
+        .collect();
+    BenchEvidenceRows(rows)
+}
+
+/// Bench-only: shipped borrowed-key correlation grouping over the corpus.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_correlation_borrowed(
+    rows: &BenchEvidenceRows,
+    lag_pressure: u8,
+    drop_pressure: u8,
+) -> Vec<BenchCorrelationRow> {
+    project_correlation(build_correlation_rows(&rows.0, lag_pressure, drop_pressure))
+}
+
+/// Bench-only: legacy owned-key correlation grouping over the corpus.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_correlation_owned(
+    rows: &BenchEvidenceRows,
+    lag_pressure: u8,
+    drop_pressure: u8,
+) -> Vec<BenchCorrelationRow> {
+    project_correlation(build_correlation_rows_legacy_owned(
+        &rows.0,
+        lag_pressure,
+        drop_pressure,
+    ))
 }
 
 /// Historical analytics and explainability cockpit screen.
@@ -603,74 +850,11 @@ impl HistoricalAnalyticsScreen {
     }
 
     fn correlation_rows_for_rows(&self, rows: &[EvidenceRow]) -> Vec<CorrelationRow> {
-        if rows.is_empty() {
-            return Vec::new();
-        }
-
-        let mut grouped: BTreeMap<String, CorrelationAccumulator> = BTreeMap::new();
-        for row in rows {
-            let entry = grouped.entry(row.reason_code.clone()).or_default();
-            entry.event_count = entry.event_count.saturating_add(1);
-            if matches!(row.severity, EventSeverity::Critical) {
-                entry.critical_count = entry.critical_count.saturating_add(1);
-            }
-            entry.confidence_sum = entry
-                .confidence_sum
-                .saturating_add(u64::from(row.confidence));
-            entry.projects.insert(row.project.clone());
-        }
-
         let metrics = self.state.control_plane_metrics();
         let lag_pressure =
             u8::try_from((metrics.ingestion_lag_events / 100).min(100)).unwrap_or(100);
         let drop_pressure = u8::try_from(metrics.dead_letter_events.min(100)).unwrap_or(100);
-
-        let total_events = rows.len().max(1);
-        let mut result = grouped
-            .into_iter()
-            .map(|(reason_code, acc)| {
-                let count_u64 = u64::try_from(acc.event_count).unwrap_or(1);
-                let avg_confidence_u64 = acc
-                    .confidence_sum
-                    .saturating_add(count_u64 / 2)
-                    .saturating_div(count_u64)
-                    .min(100);
-                let avg_confidence = u8::try_from(avg_confidence_u64).unwrap_or(100);
-
-                let event_ratio = acc
-                    .event_count
-                    .saturating_mul(100)
-                    .saturating_div(total_events)
-                    .min(100);
-                let critical_boost = acc.critical_count.saturating_mul(20).min(100);
-                let pressure = usize::from(lag_pressure)
-                    .saturating_add(usize::from(drop_pressure))
-                    .saturating_div(4);
-                let score = event_ratio
-                    .saturating_add(critical_boost)
-                    .saturating_add(pressure)
-                    .min(100);
-
-                CorrelationRow {
-                    reason_code,
-                    project_span: acc.projects.len(),
-                    event_count: acc.event_count,
-                    critical_count: acc.critical_count,
-                    avg_confidence,
-                    stream_correlation: u8::try_from(score).unwrap_or(100),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        result.sort_by(|left, right| {
-            right
-                .stream_correlation
-                .cmp(&left.stream_correlation)
-                .then_with(|| right.critical_count.cmp(&left.critical_count))
-                .then_with(|| right.event_count.cmp(&left.event_count))
-                .then_with(|| left.reason_code.cmp(&right.reason_code))
-        });
-        result
+        build_correlation_rows(rows, lag_pressure, drop_pressure)
     }
 
     fn percentile(values: &[u64], pct: u8) -> u64 {
