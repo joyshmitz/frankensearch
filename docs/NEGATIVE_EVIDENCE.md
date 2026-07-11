@@ -11489,3 +11489,44 @@ No further decidable, byte-identical, profile-first ingest lever remains in stor
 productive method (find a WHOLE redundant expensive op on a hot path) is exhausted here; the redundant-SHA was
 the one instance. Route-next: the fusion/core/embed/fsfs/lexical crates are being actively swept by peers (avoid
 collision); the recall-preserving search/scan lane is blocked (int8 scan-level → worker isolation) or floored.
+
+### 2026-07-11 — cc_fse — fsfs hybrid-fuse merge: `get_mut`/insert is byte-identical + ~1.13× on high-overlap but NOT robustly decidable on the contended fleet (retained, not shipped)
+
+Sibling-consistency audit (the main fusion RRF is already lookup/clone-optimized; the fsfs-local fuse was the
+un-mined twin). `QueryExecutionOrchestrator::fuse_rankings_with_priors` merges score-sorted lexical + semantic
+candidates into a `HashMap<String, FusedCandidate>`. The former shape did, PER candidate, a `merged.get(doc_id)`
+(to skip an already-ranked dup) **and then** a `merged.entry(doc_id.to_string())` — two hashes of the doc_id and
+an owned-key `String` clone on every candidate, including the lexical∩semantic overlap where `and_modify` runs and
+the freshly-cloned key is immediately discarded. The lever (`merge_ranked`, get_mut-or-insert) modifies existing
+entries in place (one hash, no clone) and only new docs pay the insert; the saving is `O·(hash + String clone)`
+over the overlap `O`.
+
+**Byte-identical — proven.** `merge_ranked` == `merge_ranked_orig` over disjoint / full+partial overlap /
+in-tier duplicate doc_ids / tie scores / empty fixtures (`merge_ranked_matches_orig`), and the bench re-asserts
+equality on its overlap fixtures before timing. Final ranked output is deterministically sorted (`fused_cmp`), so
+hasher/insertion-order is irrelevant.
+
+**Speed — REAL but NOT DECIDABLE on the contended fleet.** `benches/fuse_merge_ab.rs`, ORIG = `merge_ranked_orig`
+vs CAND = `merge_ranked`, ratio CAND/ORIG (`<1.0` = faster), worker `vmi1149989` (17-min compile ⇒ heavily
+loaded), 41 rounds × inner 48:
+
+| shape (n / overlap) | A/A null median [p5, p95] | CAND/ORIG median [p5, p95] | verdict |
+|---|---|---|---|
+| 200 / 140 | 0.9999 [0.8490, 1.1179] | 0.8811 [0.6884, 0.9818] | inside null p5 (miss by 0.032) |
+| 200 / 40  | 1.0124 [0.8849, 1.2399] | 0.9542 [0.8997, 1.0913] | inside |
+| 600 / 400 | 1.0058 [0.8580, 1.1430] | 0.8871 [0.8339, 0.9574] | inside null p5 (miss by 0.029) |
+
+The lever is CONSISTENTLY in the winning direction (~1.13× on high overlap, ~1.05× on low overlap — the effect
+scales with overlap, exactly the mechanism), but the ~12% effect is right at this fleet's single-threaded null-CV
+floor (~15%), so the median sits just INSIDE the null p5. This is unlike a phantom "inside-floor" (the effect is
+real, consistent, and mechanism-explained) — the blocker is the contention-widened null, not the absence of an
+effect. A tightening re-run (inner 200, to average the sub-batch contention down) was KILLED mid-compile by pooled-
+target eviction on the busy fleet (same eviction that plagued the int8 scan-level A/B).
+
+**Decision — retained, not shipped.** Per the median gate, an effect that does not clear its own null p5 is not
+shipped. Production keeps `merge_ranked_orig` (the original `get`+`entry` logic, extracted verbatim — byte-identical
+to the prior inline fuse). The `merge_ranked` get_mut candidate + the A/B bench + the parity test are retained
+(campaign "keep both arms" standard, as with the int8 maddubs kernel) so a single run on a QUIET worker (null p5
+> ~0.90, which a ~0.88 median would clear) confirms and ships it. Retry condition: a quiet-fleet window, or a
+completed higher-inner run (target-eviction-free). Method note: single-threaded so genuinely decidable off-fleet-
+contention — this is a "needs a clean substrate" block ([[rch-worker-is-soft-pin-not-isolation]]), NOT a floored lever.

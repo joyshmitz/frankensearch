@@ -784,6 +784,47 @@ impl QueryExecutionOrchestrator {
     ) -> Vec<FusedCandidate> {
         let k = self.fusion_policy.effective_k();
         let tuning = tuning.normalized();
+        // Production keeps the original `get`+`entry` merge (`merge_ranked_orig`). The `get_mut`
+        // candidate `merge_ranked` (bd-0j5e sibling audit) is byte-identical and ~1.13× on
+        // high-overlap fuse merges, but on the contended shared fleet its ~0.88 median sat just
+        // inside the null p5 ~0.85 (single-threaded, so a quiet worker should decide it; the
+        // tightening re-run was killed by target eviction). NOT robustly decidable → retained for
+        // the A/B, not shipped. See docs/NEGATIVE_EVIDENCE.md 2026-07-11.
+        let merged = Self::merge_ranked_orig(k, lexical, semantic);
+
+        let mut fused: Vec<FusedCandidate> = merged
+            .into_values()
+            .map(|mut candidate| {
+                let signals = prior_signals
+                    .get(&candidate.doc_id)
+                    .copied()
+                    .unwrap_or_default();
+                let prior_boost = tuning.boost_for(signals);
+                candidate.prior_boost = prior_boost;
+                candidate.fused_score += prior_boost;
+                candidate
+            })
+            .collect();
+        fused.sort_by(fused_cmp);
+
+        fused.into_iter().skip(offset).take(limit).collect()
+    }
+
+    /// Merge score-sorted lexical + semantic candidates into the fused RRF map.
+    ///
+    /// One `get_mut`-or-`insert` per candidate: an existing entry is modified in place
+    /// (no key clone, single hash), and only a genuinely new doc pays the insert. The
+    /// former shape did a separate `get` (to skip already-ranked dups) *and* an
+    /// `entry(doc_id.to_string())`, hashing twice and cloning the key on every candidate —
+    /// including the lexical∩semantic overlap where the clone was immediately discarded.
+    /// Byte-identical to `merge_ranked_orig` (proven by `merge_ranked_matches_orig`).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn merge_ranked(
+        k: f64,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+    ) -> HashMap<String, FusedCandidate> {
         let mut merged: HashMap<String, FusedCandidate> =
             HashMap::with_capacity(lexical.len() + semantic.len());
 
@@ -793,14 +834,97 @@ impl QueryExecutionOrchestrator {
                 .total_cmp(&sanitize_score(left.score))
                 .then_with(|| left.doc_id.cmp(&right.doc_id))
         });
+        for (rank, candidate) in lexical_ranked.iter().enumerate() {
+            let contribution = rrf_contribution(k, rank);
+            let lexical_score = sanitize_score(candidate.score);
+            if let Some(hit) = merged.get_mut(&candidate.doc_id) {
+                if hit.lexical_rank.is_some() {
+                    continue;
+                }
+                hit.fused_score += contribution;
+                hit.lexical_rank = Some(rank);
+                hit.lexical_score = Some(lexical_score);
+                hit.in_both_sources = true;
+            } else {
+                merged.insert(
+                    candidate.doc_id.clone(),
+                    FusedCandidate {
+                        doc_id: candidate.doc_id.clone(),
+                        fused_score: contribution,
+                        prior_boost: 0.0,
+                        lexical_rank: Some(rank),
+                        semantic_rank: None,
+                        lexical_score: Some(lexical_score),
+                        semantic_score: None,
+                        in_both_sources: false,
+                    },
+                );
+            }
+        }
 
+        let mut semantic_ranked: Vec<&SemanticCandidate> = semantic.iter().collect();
+        semantic_ranked.sort_by(|left, right| {
+            sanitize_score(right.score)
+                .total_cmp(&sanitize_score(left.score))
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
+        for (rank, candidate) in semantic_ranked.iter().enumerate() {
+            let contribution = rrf_contribution(k, rank);
+            let semantic_score = sanitize_score(candidate.score);
+            if let Some(hit) = merged.get_mut(&candidate.doc_id) {
+                if hit.semantic_rank.is_some() {
+                    continue;
+                }
+                hit.fused_score += contribution;
+                hit.semantic_rank = Some(rank);
+                hit.semantic_score = Some(semantic_score);
+                hit.in_both_sources = true;
+            } else {
+                merged.insert(
+                    candidate.doc_id.clone(),
+                    FusedCandidate {
+                        doc_id: candidate.doc_id.clone(),
+                        fused_score: contribution,
+                        prior_boost: 0.0,
+                        lexical_rank: None,
+                        semantic_rank: Some(rank),
+                        lexical_score: None,
+                        semantic_score: Some(semantic_score),
+                        in_both_sources: false,
+                    },
+                );
+            }
+        }
+
+        merged
+    }
+
+    /// Production merge: separate `get` (skip already-ranked dups) + `entry(to_string)` per
+    /// candidate. The `merge_ranked` `get_mut` candidate is byte-identical and measured faster on
+    /// high-overlap merges but not robustly decidable on the contended fleet (bd-0j5e), so this
+    /// stays the shipped path.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn merge_ranked_orig(
+        k: f64,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+    ) -> HashMap<String, FusedCandidate> {
+        let mut merged: HashMap<String, FusedCandidate> =
+            HashMap::with_capacity(lexical.len() + semantic.len());
+
+        let mut lexical_ranked: Vec<&LexicalCandidate> = lexical.iter().collect();
+        lexical_ranked.sort_by(|left, right| {
+            sanitize_score(right.score)
+                .total_cmp(&sanitize_score(left.score))
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
         for (rank, candidate) in lexical_ranked.iter().enumerate() {
             if let Some(existing) = merged.get(&candidate.doc_id)
                 && existing.lexical_rank.is_some()
             {
                 continue;
             }
-
             let contribution = rrf_contribution(k, rank);
             let lexical_score = sanitize_score(candidate.score);
             merged
@@ -829,14 +953,12 @@ impl QueryExecutionOrchestrator {
                 .total_cmp(&sanitize_score(left.score))
                 .then_with(|| left.doc_id.cmp(&right.doc_id))
         });
-
         for (rank, candidate) in semantic_ranked.iter().enumerate() {
             if let Some(existing) = merged.get(&candidate.doc_id)
                 && existing.semantic_rank.is_some()
             {
                 continue;
             }
-
             let contribution = rrf_contribution(k, rank);
             let semantic_score = sanitize_score(candidate.score);
             merged
@@ -859,22 +981,7 @@ impl QueryExecutionOrchestrator {
                 });
         }
 
-        let mut fused: Vec<FusedCandidate> = merged
-            .into_values()
-            .map(|mut candidate| {
-                let signals = prior_signals
-                    .get(&candidate.doc_id)
-                    .copied()
-                    .unwrap_or_default();
-                let prior_boost = tuning.boost_for(signals);
-                candidate.prior_boost = prior_boost;
-                candidate.fused_score += prior_boost;
-                candidate
-            })
-            .collect();
-        fused.sort_by(fused_cmp);
-
-        fused.into_iter().skip(offset).take(limit).collect()
+        merged
     }
 
     /// Build search output payload rows from fused candidate rankings.
@@ -1122,8 +1229,8 @@ mod tests {
     use super::{
         CancellationAction, CancellationPoint, DegradationOverride, DegradationPolicy,
         DegradationSignals, DegradationStateMachine, DegradationTransition, DegradedRetrievalMode,
-        LexicalCandidate, QueryExecutionOrchestrator, RankingPriorSignals, RankingPriorTuning,
-        RetrievalStage, SemanticCandidate, status_for_mode,
+        FusedCandidate, LexicalCandidate, QueryExecutionOrchestrator, RankingPriorSignals,
+        RankingPriorTuning, RetrievalStage, SemanticCandidate, status_for_mode,
     };
     use crate::config::{FsfsConfig, PressureProfile};
     use crate::orchestration::BackpressureMode;
@@ -1131,6 +1238,64 @@ mod tests {
     use crate::pressure::PressureState;
     use crate::query_planning::QueryPlanner;
     use std::collections::HashMap;
+
+    /// BYTE-IDENTITY GATE: the production `merge_ranked` (get_mut/insert) must produce the
+    /// same fused map as the retained `merge_ranked_orig` (get + entry) for every fixture —
+    /// disjoint, full/partial overlap, in-tier duplicate doc_ids, tie scores, and empty.
+    #[test]
+    fn merge_ranked_matches_orig() {
+        fn sorted(map: HashMap<String, FusedCandidate>) -> Vec<FusedCandidate> {
+            let mut v: Vec<FusedCandidate> = map.into_values().collect();
+            v.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+            v
+        }
+        let cases: Vec<(Vec<LexicalCandidate>, Vec<SemanticCandidate>)> = vec![
+            (vec![], vec![]),
+            (
+                vec![LexicalCandidate::new("a", 0.9), LexicalCandidate::new("b", 0.5)],
+                vec![],
+            ),
+            (vec![], vec![SemanticCandidate::new("x", 0.8)]),
+            (
+                vec![
+                    LexicalCandidate::new("a", 0.9),
+                    LexicalCandidate::new("b", 0.7),
+                    LexicalCandidate::new("c", 0.3),
+                ],
+                vec![
+                    SemanticCandidate::new("a", 0.6),
+                    SemanticCandidate::new("b", 0.8),
+                    SemanticCandidate::new("d", 0.4),
+                ],
+            ),
+            (
+                vec![
+                    LexicalCandidate::new("a", 0.9),
+                    LexicalCandidate::new("a", 0.4),
+                    LexicalCandidate::new("b", 0.5),
+                ],
+                vec![
+                    SemanticCandidate::new("b", 0.8),
+                    SemanticCandidate::new("b", 0.2),
+                ],
+            ),
+            (
+                vec![LexicalCandidate::new("z", 0.5), LexicalCandidate::new("a", 0.5)],
+                vec![SemanticCandidate::new("a", 0.5), SemanticCandidate::new("z", 0.5)],
+            ),
+        ];
+        for k in [0.0_f64, 60.0, 1.5] {
+            for (lex, sem) in &cases {
+                let new = QueryExecutionOrchestrator::merge_ranked(k, lex, sem);
+                let orig = QueryExecutionOrchestrator::merge_ranked_orig(k, lex, sem);
+                assert_eq!(
+                    sorted(new),
+                    sorted(orig),
+                    "merge mismatch k={k} lex={lex:?} sem={sem:?}"
+                );
+            }
+        }
+    }
 
     fn stage_names(plan: &super::QueryExecutionPlan) -> Vec<RetrievalStage> {
         plan.stages.iter().map(|stage| stage.stage).collect()

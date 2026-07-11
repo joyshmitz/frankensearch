@@ -13,6 +13,8 @@ categories = ["command-line-utilities", "text-processing", "development-tools"]
 default = ["embedded-models"]
 embedded-models = ["frankensearch-embed/bundled-default-models", "frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
 vendored-openssl = ["openssl"]
+# Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
+bench-internals = ["frankensearch-core/bench-internals"]
 
 [lib]
 path = "src/lib.rs"
@@ -92,6 +94,11 @@ harness = false
 [[bench]]
 name = "code_sidecar_score"
 harness = false
+
+[[bench]]
+name = "fuse_merge_ab"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
