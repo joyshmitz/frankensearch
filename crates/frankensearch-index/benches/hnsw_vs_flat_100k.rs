@@ -91,6 +91,30 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
         writer.finish().expect("finish");
     }
     let index = VectorIndex::open(&path).expect("open index");
+
+    // F16 copy of the SAME corpus for the int8 two-pass arm. The production fast-tier
+    // default is int8 two-pass (lossless candidate gen, ~7x vs flat), and it requires an
+    // F16-quantized slab (`search_top_k_int8_two_pass` falls back to exact on F32). Same
+    // vectors, so its latency and recall are directly comparable to `flat` and HNSW here —
+    // this is the baseline ANN would actually have to beat, not the naive flat scan.
+    let path_f16 =
+        std::env::temp_dir().join(format!("fs_hnsw_bench_100k_f16_{}.fsvi", std::process::id()));
+    {
+        let mut writer =
+            VectorIndex::create_with_revision(&path_f16, "hash", "bench", DIM, Quantization::F16)
+                .expect("create f16 writer");
+        for i in 0..N {
+            let v = make_vector(&centroids, i % CLUSTERS, i as u64 + 1);
+            writer
+                .write_record(&format!("doc-{i:06}"), &v)
+                .expect("write f16 record");
+        }
+        writer.finish().expect("finish f16");
+    }
+    let index_f16 = VectorIndex::open(&path_f16).expect("open f16 index");
+    // Production fast-tier candidate multiplier (see sync_searcher::search_fast_hits).
+    const INT8_MULT: usize = 3;
+
     // M is HNSW's primary recall knob (default 16). Bump to 32 (standard high-recall
     // setting) to test whether the default-M recall rejection is config-dependent or
     // fundamental. ef_construction kept at the 200 default.
@@ -205,6 +229,18 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
             black_box(index.search_top_k(black_box(q), K, None).expect("flat"))
         });
     });
+    // The REAL baseline: the production fast-tier default (int8 two-pass, recall-preserving).
+    g.bench_function("int8_two_pass", |b| {
+        b.iter(|| {
+            let q = &queries[qi % QUERIES];
+            qi += 1;
+            black_box(
+                index_f16
+                    .search_top_k_int8_two_pass(black_box(q), K, INT8_MULT)
+                    .expect("int8"),
+            )
+        });
+    });
     for ef in [10usize, 20, 40, HNSW_DEFAULT_EF_SEARCH] {
         g.bench_function(format!("hnsw_ef{ef}"), |b| {
             b.iter(|| {
@@ -253,6 +289,25 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
         );
     }
 
+    // int8 two-pass recall@K vs the F32 exact ground truth (the production default it
+    // would have to beat). Its latency arm above is the number ANN must undercut.
+    {
+        let mut total = 0.0;
+        for (qi, query) in queries.iter().enumerate() {
+            let hits: Vec<String> = index_f16
+                .search_top_k_int8_two_pass(query, K, INT8_MULT)
+                .expect("int8")
+                .into_iter()
+                .map(|h| h.doc_id.to_string())
+                .collect();
+            total += recall_at_k(&flat_topk[qi], &hits);
+        }
+        println!(
+            "INT8_RESULT N={N} dim={DIM} k={K} mult={INT8_MULT} recall@{K}={:.4}",
+            total / QUERIES as f64
+        );
+    }
+
     println!(
         "CERTIFIED_RESULT target={TARGET_RECALL} n_cal={CAL_QUERIES} | \
          TAIL(per-query, alpha={ALPHA}): ef={tail_ef} lower_bound={:.4} meets={} holdout@{K}={:.4} | \
@@ -267,6 +322,7 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
     );
 
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&path_f16);
 }
 
 #[cfg(not(feature = "ann"))]
