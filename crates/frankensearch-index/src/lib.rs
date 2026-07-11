@@ -689,6 +689,27 @@ impl VectorIndex {
     /// `SearchError::InvalidConfig` for invalid values, and
     /// `SearchError::Io` for filesystem failures.
     pub fn append_batch(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
+        self.append_batch_impl::<false>(entries)
+    }
+
+    /// Bench-only candidate that skips already-completed resident-WAL deduplication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and I/O errors as [`Self::append_batch`].
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn bench_append_batch_skip_redundant_dedup(
+        &mut self,
+        entries: &[(String, Vec<f32>)],
+    ) -> SearchResult<()> {
+        self.append_batch_impl::<true>(entries)
+    }
+
+    fn append_batch_impl<const SKIP_REDUNDANT_DEDUP: bool>(
+        &mut self,
+        entries: &[(String, Vec<f32>)],
+    ) -> SearchResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -744,10 +765,13 @@ impl VectorIndex {
             self.wal_config.fsync_on_write,
         )?;
 
-        // Deduplicate existing WAL entries by doc_id before extending.
-        for new_entry in &wal_entries {
-            self.wal_entries
-                .retain(|existing| existing.doc_id != new_entry.doc_id);
+        // `soft_delete_batch` already removed every incoming doc ID from the resident
+        // WAL. Keep the redundant legacy loop available only for the same-binary gate.
+        if !SKIP_REDUNDANT_DEDUP {
+            for new_entry in &wal_entries {
+                self.wal_entries
+                    .retain(|existing| existing.doc_id != new_entry.doc_id);
+            }
         }
         // Add to in-memory entries (immediately searchable).
         self.wal_entries.extend(wal_entries.clone());

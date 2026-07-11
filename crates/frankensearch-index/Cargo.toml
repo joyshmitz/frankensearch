@@ -197,3 +197,8 @@ required-features = ["bench-internals"]
 name = "fsvi_builder_record_transfer"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "wal_append_dedup_ab"
+harness = false
+required-features = ["bench-internals"]

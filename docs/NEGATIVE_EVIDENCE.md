@@ -11556,3 +11556,35 @@ Method note: the productive ingest vein was CPU-bound byte-fast ops on the per-d
 adjacent candidates cross into I/O territory where the campaign's median gate cannot cleanly decide and isolation
 misleads. Route-next for a NEW CPU vein: profile a genuinely hot per-query path (blocked on symbolized self-time,
 `bd-e41k`), or a workload the current benches don't model.
+### 2026-07-11 — cod — HOLD: skipping redundant `append_batch` resident-WAL dedup preserves bytes but misses the MEDIAN gate (bd-ryid)
+
+Negative-ledger and `bv --robot-triage` routing stayed outside cc-owned lexical/query scan and avoided peer-dirty
+storage/fusion surfaces. The fresh indexing frontier was `VectorIndex::append_batch`: after
+`soft_delete_batch` has already set-filtered every incoming ID out of resident WAL, the original scans resident
+WAL again once per unique incoming ID. A pre-candidate remote profile on a 768-resident/256-append/dimension-384
+default-fsync fixture measured that redundant stage at 0.094–0.488 ms median, 3.14–5.87% of the real append.
+
+The one candidate skipped only that second loop. Original and candidate emitted byte-identical WAL sidecars and
+post-compaction FSVI files, with identical immediate/reopened hit IDs, indexes, and score bits for 0/50/100%
+replacement overlap. Recall and ranking are therefore preserved exactly on the proof fixture.
+
+The strict remote-only same-binary gate on worker `vmi1227854` used 21 alternating AB/BA round pairs. Ratios are
+candidate/original:
+
+| overlap | A/A null median [p5, p95] | candidate median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 0% | 1.013899 [0.733108, 1.469368] | 1.008887 [0.680725, 1.221177] | inside floor; 0.991× |
+| 50% | 1.009178 [0.843576, 1.475495] | 0.961359 [0.843038, 1.099357] | inside floor; 1.040× |
+| 100% | 0.952810 [0.672027, 1.157407] | 0.840956 [0.718304, 1.114335] | inside floor; 1.189× |
+
+**Decision/boundary.** Production remains original because no candidate median fell below its null p5. The
+directional 50/100% gains are not promoted into a win. The feature-gated comparator and benchmark remain only as
+a reproducer. Do not retry this exact busy-fleet fixture; reopen only for a materially larger production WAL/batch
+shape or a tighter A/A substrate. This does not reopen postings compression, writer-budget, FSVI owned handoff,
+lexical/query scan, or adjacent deep-clone work.
+
+Strict-remote bench, 402/402 focused release tests, and workspace all-targets check passed. Direct rustfmt/diff
+checks passed and UBS reported zero critical findings. Known pre-existing workspace clippy blockers were not
+re-run after RCH repeatedly rebuilt identical inputs from cold; no direct local Cargo fallback occurred. RCH was
+degraded (9/12 healthy, repeated cold-cache misses), and Agent Mail's corruption circuit breaker prevented a
+reservation; both were surfaced rather than bypassed.

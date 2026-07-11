@@ -5131,3 +5131,59 @@ apply). Shipped on the clean-null decidable ASCII shape + the matching precedent
 
 **Scope.** Always-on for ASCII documents (English/code — the common case); a per-doc ingest char-count step. All
 builds/benches strictly remote (`RCH_REQUIRE_REMOTE=1`); no local Cargo. Peer files untouched.
+## 2026-07-11 — HOLD: `append_batch` resident-WAL dedup skip is byte-identical but inside the full-append null floor (cod, bd-ryid)
+
+**Profile first.** Before the candidate existed, the original `VectorIndex::append_batch` path was measured with
+768 resident WAL entries, a 256-vector append, dimension 384, 32 compacted main records, and the default
+`fsync_on_write=true`. The real product append medians were 2.999/5.640/8.486 ms at 0/50/100% replacement
+overlap. An isolated faithful timing of the later repeated-retain stage measured 0.094/0.331/0.488 ms, or
+3.14%/5.87%/5.75% of those product medians. This was measured work, not a static-complexity guess.
+
+**One candidate lever.** `append_batch` first calls `soft_delete_batch`, which already builds the incoming-ID set,
+filters every matching resident WAL entry, persists that removal when needed, and restores memory plus returns an
+error if the rewrite fails. After serializing the new batch, the original nevertheless scanned resident WAL once
+again for every unique incoming ID. The candidate skips only that provably redundant second loop. It does not
+change validation, incoming duplicate resolution, sidecar encoding, fsync, tombstoning, ordering, vector data,
+compaction, search, or the adjacent owned-vector clone.
+
+**Byte-identical proof.** Original and candidate produced identical WAL sidecar bytes and record counts, identical
+immediate and reopened top-16 IDs/indexes/score bits for replacement-aware queries, and byte-identical compacted
+FSVI files at 0%, 50%, and 100% overlap. Therefore ranking and recall are preserved exactly for the exercised
+surface; this is stronger than a tolerance-based numerical claim.
+
+**Speed — paired MEDIAN gate failed.** Strict remote-only command, worker `vmi1227854`, one release binary,
+21 alternating AB/BA round pairs per shape; ratio is candidate/original:
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -j 4 -p frankensearch-index --profile release --features bench-internals \
+  --bench wal_append_dedup_ab
+```
+
+| overlap | A/A original/original median [p5, p95] | skip/original median [p5, p95] | directional speedup | verdict |
+|---:|---:|---:|---:|---|
+| 0% | 1.013899 [0.733108, 1.469368] | 1.008887 [0.680725, 1.221177] | 0.991× | inside null floor |
+| 50% | 1.009178 [0.843576, 1.475495] | 0.961359 [0.843038, 1.099357] | 1.040× | inside null floor |
+| 100% | 0.952810 [0.672027, 1.157407] | 0.840956 [0.718304, 1.114335] | 1.189× | inside null floor |
+
+The authoritative gate requires the candidate median below its A/A null p5. No shape clears that threshold. The
+50% and 100% directions agree with the mechanism, but direction alone is not a shippable result; the 0% median is
+slightly slower. The full default-fsync operation, not the isolated loop, is the shipping gate.
+
+**Decision and boundary.** **HOLD; production remains original.** The feature-gated comparator and reproducing
+benchmark are retained, but public `append_batch` still selects the legacy loop. Do not retry this same fixture on
+a busy fleet. Reopen only for a demonstrated larger resident-WAL/batch production shape or a substrate whose A/A
+floor can resolve the end-to-end effect. This does not reopen cc-owned lexical/query scan, Tantivy postings codec,
+writer-budget, rejected FSVI handoff, or the adjacent WAL deep-clone families.
+
+**Validation and degraded surfaces.** The exact-output bench exited 0, the focused strict-remote release suite
+passed 402/402 tests, and remote `cargo check -j 4 --workspace --all-targets` exited 0 (with pre-existing warnings
+in unrelated benchmark targets). Direct `rustfmt --edition 2024 --check`, `git diff --check`, and UBS passed; UBS
+reported zero critical findings. Workspace clippy with `-D warnings` was not repeated because the immediately
+preceding index HOLD records already establish pre-existing core/index lint blockers, while RCH was rebuilding
+every command from cold; this degraded surface was not bypassed locally. All counted Cargo work was fail-closed
+remote-only; no direct local Cargo fallback occurred. RCH was degraded at 9/12 healthy workers and then missed
+cache twice on the identical
+worker/target, making each focused release command a cold ~9.5-minute build. Agent Mail registration succeeded,
+but its corruption circuit breaker rejected the file reservation; Git/worktree and Beads truth were used without
+attempting a repair or bypass.
