@@ -81,6 +81,8 @@ pub struct IndexBuilder {
     embedder_stack: Option<EmbedderStack>,
     batch_size: usize,
     on_progress: Option<Box<dyn FnMut(IndexProgress) + Send>>,
+    #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+    clone_lexical_staging_for_benchmark: bool,
 }
 
 impl IndexBuilder {
@@ -94,6 +96,8 @@ impl IndexBuilder {
             embedder_stack: None,
             batch_size: 32,
             on_progress: None,
+            #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+            clone_lexical_staging_for_benchmark: false,
         }
     }
 
@@ -122,6 +126,15 @@ impl IndexBuilder {
     #[must_use]
     pub fn with_progress(mut self, callback: impl FnMut(IndexProgress) + Send + 'static) -> Self {
         self.on_progress = Some(Box::new(callback));
+        self
+    }
+
+    /// Retain the former deep-clone staging path for same-binary performance comparisons.
+    #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_clone_lexical_staging_for_benchmark(mut self) -> Self {
+        self.clone_lexical_staging_for_benchmark = true;
         self
     }
 
@@ -207,11 +220,133 @@ impl IndexBuilder {
         let mut embed_ms = 0.0f64;
         #[cfg(feature = "lexical")]
         let mut lexical_docs = Vec::with_capacity(total);
+        #[cfg(feature = "lexical")]
+        let mut failed_documents = Vec::new();
 
-        // Process documents in batches.
+        // Keep the old borrowed loop available only for the same-binary benchmark arm. This is the
+        // exact former residency behavior: all originals stay in `self.documents` while successful
+        // documents are deep-cloned into lexical staging.
+        #[cfg(all(feature = "lexical", feature = "bench-internals"))]
+        if self.clone_lexical_staging_for_benchmark {
+            for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
+                let batch_start = Instant::now();
+                for doc in batch {
+                    match Self::embed_and_add(
+                        cx,
+                        &fast_embedder,
+                        quality_embedder.as_deref(),
+                        &mut index_builder,
+                        doc,
+                        metrics_exporter.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            doc_count += 1;
+                            lexical_docs.push(doc.clone());
+                        }
+                        Err(err) => {
+                            tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
+                            errors.push((doc.id.clone(), err.to_string()));
+                        }
+                    }
+                }
+                embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(ref mut callback) = self.on_progress {
+                    let completed = (batch_idx + 1).saturating_mul(self.batch_size);
+                    callback(IndexProgress {
+                        completed: completed.min(total),
+                        total,
+                        phase: "embedding",
+                    });
+                }
+            }
+        } else {
+            // `build` owns the input documents, so move successful values into lexical staging.
+            let mut documents = std::mem::take(&mut self.documents).into_iter();
+            let batch_count = total.div_ceil(self.batch_size);
+            for batch_idx in 0..batch_count {
+                let batch_start = Instant::now();
+                for doc in documents.by_ref().take(self.batch_size) {
+                    match Self::embed_and_add(
+                        cx,
+                        &fast_embedder,
+                        quality_embedder.as_deref(),
+                        &mut index_builder,
+                        &doc,
+                        metrics_exporter.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            doc_count += 1;
+                            lexical_docs.push(doc);
+                        }
+                        Err(err) => {
+                            tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
+                            errors.push((doc.id.clone(), err.to_string()));
+                            failed_documents.push(doc);
+                        }
+                    }
+                }
+                embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(ref mut callback) = self.on_progress {
+                    let completed = (batch_idx + 1).saturating_mul(self.batch_size);
+                    callback(IndexProgress {
+                        completed: completed.min(total),
+                        total,
+                        phase: "embedding",
+                    });
+                }
+            }
+        }
+
+        #[cfg(all(feature = "lexical", not(feature = "bench-internals")))]
+        {
+            // `build` owns the input documents, so move successful values into lexical staging.
+            let mut documents = std::mem::take(&mut self.documents).into_iter();
+            let batch_count = total.div_ceil(self.batch_size);
+            for batch_idx in 0..batch_count {
+                let batch_start = Instant::now();
+                for doc in documents.by_ref().take(self.batch_size) {
+                    match Self::embed_and_add(
+                        cx,
+                        &fast_embedder,
+                        quality_embedder.as_deref(),
+                        &mut index_builder,
+                        &doc,
+                        metrics_exporter.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            doc_count += 1;
+                            lexical_docs.push(doc);
+                        }
+                        Err(err) => {
+                            tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
+                            errors.push((doc.id.clone(), err.to_string()));
+                            failed_documents.push(doc);
+                        }
+                    }
+                }
+                embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(ref mut callback) = self.on_progress {
+                    let completed = (batch_idx + 1).saturating_mul(self.batch_size);
+                    callback(IndexProgress {
+                        completed: completed.min(total),
+                        total,
+                        phase: "embedding",
+                    });
+                }
+            }
+        }
+
+        // Without lexical indexing there is no staging clone to remove, so retain the former path
+        // and its metrics/drop timing exactly.
+        #[cfg(not(feature = "lexical"))]
         for (batch_idx, batch) in self.documents.chunks(self.batch_size).enumerate() {
             let batch_start = Instant::now();
-
             for doc in batch {
                 match Self::embed_and_add(
                     cx,
@@ -223,20 +358,14 @@ impl IndexBuilder {
                 )
                 .await
                 {
-                    Ok(()) => {
-                        doc_count += 1;
-                        #[cfg(feature = "lexical")]
-                        lexical_docs.push(doc.clone());
-                    }
+                    Ok(()) => doc_count += 1,
                     Err(err) => {
                         tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                         errors.push((doc.id.clone(), err.to_string()));
                     }
                 }
             }
-
-            embed_ms += batch_start.elapsed().as_secs_f64() * 1000.0;
-
+            embed_ms += batch_start.elapsed().as_secs_f64() * 1_000.0;
             if let Some(ref mut callback) = self.on_progress {
                 let completed = (batch_idx + 1).saturating_mul(self.batch_size);
                 callback(IndexProgress {
@@ -317,14 +446,21 @@ impl IndexBuilder {
             "index build complete"
         );
 
-        Ok(IndexBuildStats {
+        let stats = IndexBuildStats {
             doc_count,
             error_count: errors.len(),
             errors,
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
             embed_ms,
             has_quality_index: has_quality,
-        })
+        };
+
+        // Match the former borrowed-input lifetime: failed documents remain resident until the
+        // entire index build, including lexical commit and metrics export, has completed.
+        #[cfg(feature = "lexical")]
+        drop(failed_documents);
+
+        Ok(stats)
     }
 
     /// Embed a single document and add it to the index builder.
@@ -537,6 +673,44 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lexical")]
+    struct SelectiveFailEmbedder;
+
+    #[cfg(feature = "lexical")]
+    impl Embedder for SelectiveFailEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                if text.contains("fail-fast-embedding") {
+                    return Err(SearchError::EmbeddingFailed {
+                        model: "selective-fail".to_owned(),
+                        source: Box::new(std::io::Error::other("intentional test failure")),
+                    });
+                }
+                Ok(vec![1.0, 0.0, 0.0, 0.0])
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn id(&self) -> &str {
+            "selective-fail"
+        }
+
+        fn model_name(&self) -> &str {
+            "selective-fail"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     #[derive(Debug, Default)]
     struct RecordingExporter {
         search: Mutex<Vec<SearchMetrics>>,
@@ -732,6 +906,40 @@ mod tests {
             let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
             let hits = lexical.search(&cx, "Alpha", 5).await.unwrap();
             assert!(!hits.is_empty());
+        });
+    }
+
+    #[cfg(feature = "lexical")]
+    #[test]
+    fn lexical_staging_excludes_fast_embedding_failures() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stack = EmbedderStack::from_parts(Arc::new(SelectiveFailEmbedder), None);
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .with_batch_size(2)
+                .add_document("doc-first", "first-success sentinel")
+                .add_document("doc-failed", "fail-fast-embedding excluded sentinel")
+                .add_document("doc-last", "last-success sentinel")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.error_count, 1);
+            assert_eq!(stats.errors[0].0, "doc-failed");
+
+            let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
+            let successful = lexical.search_doc_ids(&cx, "sentinel", 10).unwrap();
+            assert_eq!(successful.len(), 2);
+            assert!(successful.iter().any(|hit| hit.doc_id == "doc-first"));
+            assert!(successful.iter().any(|hit| hit.doc_id == "doc-last"));
+            assert!(
+                lexical
+                    .search_doc_ids(&cx, "excluded", 10)
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 

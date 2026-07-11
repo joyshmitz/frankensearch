@@ -4893,3 +4893,65 @@ two fixture `String` clones. Those unrelated/orthogonal cleanups were not mixed 
 Direct pinned `rustfmt --check`, `git diff --check`, and UBS (0 critical, exit 0) passed on the owned files. `rch`
 refused remote `cargo fmt` as a non-compilation command under `RCH_REQUIRE_REMOTE=1`, correctly without a local
 fallback.
+
+## 2026-07-11 — WIN: `IndexBuilder` moves successful documents into lexical staging — 1.30× at 20k, recall preserved (cod)
+
+**Different lane from cc-owned lexical query/scan.** Tantivy keeps its postings codec and block layout private,
+and the immediately preceding 50 MB → 100 MB writer-budget experiment was slower and changed ranked results.
+The next owned indexing cost was in the facade: after embedding each document, `IndexBuilder` deep-cloned the
+complete `IndexableDocument` (content, title, and metadata) solely to keep an owned value for the later Tantivy
+postings build.
+
+**Profile first.** An untouched-original remote run of the retained 20,000-document facade benchmark measured
+14.743 ms in the isolated deep clone (3.962% of 372.106 ms wall). The final same-binary original arm measured a
+12.839 ms clone median, 19.618 ms embedding-plus-staging, 207.089 ms after staging, and 255.885 ms wall: the clone
+was 5.017% of the measured build and therefore a live cost rather than a static-code guess. The fixture uses the
+real facade builder, vector index writes, Tantivy schema/postings build and commit, titles, and four metadata
+fields; corpus construction and temporary-directory creation are outside the timer.
+
+**One lever.** Because `build` owns its input vector, the lexical configuration now consumes those documents and
+moves each successfully embedded value into lexical staging. Failed documents remain resident until the end of
+the build (matching the former borrowed-input lifetime) but are never passed to Tantivy. The non-lexical path is
+unchanged. Batch boundaries, progress callbacks, vector writes, error order, lexical commit, and metrics export
+retain their former order. The exact former borrowed-plus-deep-clone implementation remains available only under
+`bench-internals` for a same-binary comparator.
+
+**Recall and ordering gate.** Six BM25 query classes were evaluated over all 20,000 documents. Final minimum
+recall@20,000 was **1.000000** and minimum original-relative nDCG@20,000 was **1.000000** (hard gate ≥0.999999).
+Independent Tantivy parallel builds did not preserve raw tie order, canonical ranked IDs, or score bits; those
+diagnostics also varied between original builds and are not a valid cross-build identity oracle. The quality gate
+therefore records the honest contract: every matching document is retained and graded order is preserved within
+the stated tolerance, without claiming bit identity. A focused failure-path test additionally proves that a
+document whose required fast embedding fails is excluded from the lexical index while surrounding successes
+remain searchable.
+
+**Speed — paired MEDIAN gate passed.** Strict remote-only final command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch --profile release --features lexical,bench-internals \
+  --bench index_builder_lexical_staging -- --noplot
+```
+
+Worker `vmi1227854`; one release binary, alternating arm order, 21 paired rounds. Ratio is candidate/original:
+
+| gate | median | p5 | p95 | verdict |
+|---|---:|---:|---:|---|
+| A/A original/original null | 1.0166 | 0.8643 | 1.0856 | measured fleet floor |
+| move/original lever | **0.7688** | 0.6156 | 0.8723 | **DECIDABLE WIN**; median below null p5; 1.30× |
+
+Criterion central estimates independently agreed: original **250.68 ms**, candidate **192.76 ms** (~1.30×).
+The paired median is authoritative; Criterion's warning that ten whole-index samples exceed the requested
+one-second collection target is expected for this intentionally heavy fixture.
+
+**Validation.** All Cargo commands were fail-closed remote RCH executions; no local Cargo fallback occurred.
+Final focused tests passed 14 facade unit tests and 4 integration tests. Remote
+`cargo check --workspace --all-targets` exited 0. Workspace clippy with `-D warnings` is blocked by pre-existing
+core debt (`TwoTierConfig` excessive bools and a `canonicalize.rs` doc-markdown lint); remote changed-surface
+clippy for the facade library and retained benchmark passed with `--no-deps -D warnings`. RCH refused remote
+`cargo fmt --check` with `RCH-E301` because formatting is not a compilation command, correctly without falling
+back locally; direct `rustfmt --check`, `git diff --check`, and UBS (exit 0, zero critical findings) passed.
+
+**Scope.** This is a facade ownership/allocation win feeding the real Tantivy postings build. It does not modify
+or claim a new postings compression codec, BM25 formula, tokenizer, or query scan, and it does not reopen the
+rejected writer-budget family.

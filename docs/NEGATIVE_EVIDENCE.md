@@ -11352,3 +11352,25 @@ tighter than the earlier HOLDs (both searcher paths now agree on scan selection)
 N >> 130k, a query-log/graph feature decision, or a new metric/workload. METHOD LESSON banked
 ([[sibling-path-consistency-audit]] 4th win): when a system has parallel implementations, verify they pick the
 SAME kernel/scan, not just that each is internally optimal.
+
+### 2026-07-11 — cod — LANDED: facade lexical-staging ownership transfer ~1.30×; postings codec remains closed
+
+This follow-up respected the cc lexical/query-scan boundary and the prior writer-budget reject. Tantivy 0.26.1
+still does not expose a recall-neutral postings codec/block-size lever, so no compression setting, tokenizer,
+BM25 formula, or query path was changed. Instead, profiling found an owned allocation immediately before the
+postings build: facade `IndexBuilder` kept all original documents alive and deep-cloned every successful
+`IndexableDocument` into lexical staging.
+
+The one production change consumes the facade-owned input and moves successful documents into staging. Failed
+documents retain their former end-of-build lifetime and remain excluded from the lexical index. The exact legacy
+clone arm is benchmark-only. On the final remote 20k-document run, candidate/original median was **0.7688**
+[0.6156, 0.8723] against an A/A null median of 1.0166 [0.8643, 1.0856], a decidable ~1.30× win. Full-corpus
+recall and original-relative nDCG were both 1.000000; the focused failed-embedding test and 18 final facade and
+integration tests passed remotely.
+
+**Important evidence boundary.** Raw tie order, canonical ranked IDs, and BM25 score bits differed across
+independent Tantivy parallel builds, including repeated original observations. Treating those diagnostics as a
+candidate regression would be false precision. The hard preservation contract for this cross-build benchmark is
+all matching IDs retained plus nDCG ≥0.999999, supplemented by the direct failure-path test. This keep does not
+invalidate the earlier conclusion that direct postings compression is Tantivy-private, nor does it justify
+retrying larger writer budgets.

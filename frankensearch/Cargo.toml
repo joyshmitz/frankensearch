@@ -8,6 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["hash"]
+bench-internals = ["frankensearch-core/bench-internals"]
 hash = ["frankensearch-embed/hash"]
 model2vec = ["frankensearch-embed/model2vec"]
 fastembed = ["frankensearch-embed/fastembed"]
@@ -55,6 +56,11 @@ toml = { workspace = true }
 [[bench]]
 name = "search_bench"
 harness = false
+
+[[bench]]
+name = "index_builder_lexical_staging"
+harness = false
+required-features = ["lexical", "bench-internals"]
 
 [lints]
 workspace = true
