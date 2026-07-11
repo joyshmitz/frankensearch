@@ -11471,3 +11471,21 @@ workspace check. `-D warnings` remains blocked by pre-existing core/index lint d
 correctly refused local fallback, while direct rustfmt and diff checks passed. RCH was degraded at 9/12 healthy
 workers, and Agent Mail's corruption circuit breaker prevented a reservation; neither degraded surface was
 bypassed.
+
+### 2026-07-11 — cc_fse — storage/durability INGEST vein at floor after the redundant-SHA win (adjacent survey)
+
+After shipping the per-doc redundant-SHA elimination (`b121194`, PERF_LEDGER 2026-07-11, ~1.85–1.98× on the
+dual-hash step), swept the adjacent ingest surfaces for another whole-redundant-op lever. None decidable:
+- **Sibling ingest twin** (fusion `queue.rs::sha256_hex`, the other content-hash entry point): hashes the
+  canonical text ONCE and uses only the hex — no raw-bytes twin, so no redundant SHA to remove. Its local
+  `hex_encode` is a small fraction of one SHA (not worth a lever). Sibling-consistency audit clean.
+- **`content_length = canonical_text.chars().count()`** (pipeline.rs): an ASCII-fast-path candidate
+  (`is_ascii() { len() }`, same class as the shipped fingerprint `char_count`) but `is_ascii` is a SIMD scan
+  ~1% of the op it replaces at the pipeline level — below the null floor, same reject class as the declined
+  fingerprint fnv+is_ascii fusion. Not benched.
+- **Durability** (`repair_trailer.rs` / codec): already `crc32fast` (SIMD CRC); no redundant serialize/checksum.
+
+No further decidable, byte-identical, profile-first ingest lever remains in storage/durability this pass. The
+productive method (find a WHOLE redundant expensive op on a hot path) is exhausted here; the redundant-SHA was
+the one instance. Route-next: the fusion/core/embed/fsfs/lexical crates are being actively swept by peers (avoid
+collision); the recall-preserving search/scan lane is blocked (int8 scan-level → worker isolation) or floored.
