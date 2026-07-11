@@ -11588,3 +11588,53 @@ checks passed and UBS reported zero critical findings. Known pre-existing worksp
 re-run after RCH repeatedly rebuilt identical inputs from cold; no direct local Cargo fallback occurred. RCH was
 degraded (9/12 healthy, repeated cold-cache misses), and Agent Mail's corruption circuit breaker prevented a
 reservation; both were surfaced rather than bypassed.
+
+### 2026-07-11 — cc_fse — LANDED: RFC3339 ingest-timestamp parser canonical UTC fast path ~1.72×, byte-identical (fresh subsystem: frankensearch-ops telemetry store)
+
+**Vein pivot.** The search-side per-crate CPU frontier is exhaustively mined (this ledger). The two
+workspace crates absent from every prior frontier map are `frankensearch-ops` and `frankensearch-tui`.
+Profiling `frankensearch-ops` fresh: `storage.rs` is SQLite-backed (I/O-dominated), but
+`parse_rfc3339_timestamp_ms` is a **pure, per-ingested-event** function
+(`SearchEventRecord::from_search_envelope` and `ResourceSampleRecord::from_resource_envelope` each call
+it once per telemetry envelope) that used the general-purpose `time` crate
+`OffsetDateTime::parse(_, &Rfc3339)`.
+
+**Lever (`storage.rs`).** Telemetry timestamps are overwhelmingly the canonical UTC form
+`YYYY-MM-DDTHH:MM:SS[.fraction]Z`. Added a strict hand-rolled `fast_parse_rfc3339_utc_ms` (4-digit year
+`1970..=9999`, uppercase `T`/`Z`, leap-aware day validation via `days_in_month`, `days_from_civil`
+epoch-day math, `1..=9` fractional digits) that returns `Some(ms)` **only** for the exact canonical
+shape and `None` for anything else. `parse_rfc3339_timestamp_ms` tries the fast path then defers to the
+retained `time`-crate `parse_rfc3339_timestamp_ms_reference` for every declined input, so `Ok`/`Err`
+behavior is preserved byte-for-byte. Milliseconds are `floor(fraction_ns / 1e6)` = the first three
+fractional digits, matching the reference's `unix_timestamp_nanos() / 1_000_000` truncation for
+post-epoch times.
+
+**Measured command (per-crate, strict remote `vmi1149989`, release profile, pure-function within-process
+paired A/B — both arms always run on the same worker, so this is immune to the `RCH_WORKER` soft-pin
+contention issue that blocks cross-invocation search benches):**
+
+```bash
+AGENT_NAME=cc_fse RCH_WORKER=vmi1149989 CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-ops --profile release --features bench-internals \
+    --bench rfc3339_parse_ab
+```
+
+**Differential parity (proven before timing):** over a 4096-entry canonical corpus (every year/month/
+day/time/fraction-length shape) + a 26-entry adversarial corpus (non-UTC offsets, lowercase `t`/`z`,
+Feb-30, Feb-29 non-leap, month 13, hour 24, `:60` leap second, empty/10-digit fractions, space
+separator, sub-1970 years, trailing junk): `checked=4122 fast_hits=4099 fast_declines=23
+shipped_equals_reference=true fast_some_equals_reference=true`. The shipped parser returned exactly the
+reference parser's result (value and `Ok`/`Err`) for **all 4122 inputs**; the fast path fired on 100% of
+canonical timestamps and correctly declined every non-canonical form.
+
+| Workload | reference (`time` crate) | shipped fast path | ratio vs reference | Decision |
+|---|---:|---:|---:|---|
+| per-call parse median | 33.031 ns | 19.524 ns | — | keep |
+| paired A/A null median [p5, p95] | 0.998738 [0.979181, 1.042354] | — | contains 1.0 | valid floor |
+| paired lever median [p5, p95] | — | 0.582888 [0.524070, 0.621994] | **0.583 (~1.72× faster)** | **KEEP** |
+
+Verdict `CANDIDATE_FASTER` (lever median 0.583 < null p5 0.979); `gate_pass=true`, `decision=KEEP`.
+External Tantivy/Lucene/Meilisearch original-comparator ratio is **N/A** — this is an internal ingest
+primitive, not a search-quality comparator. The bench (`rfc3339_parse_ab`, gated behind a new
+`bench-internals` feature) asserts full shipped==reference parity before every timing run and remains as
+the reproducer + oracle. Production default is now the fast path.

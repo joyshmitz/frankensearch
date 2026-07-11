@@ -429,6 +429,22 @@ const fn telemetry_event_kind(event: &TelemetryEvent) -> &'static str {
 }
 
 fn parse_rfc3339_timestamp_ms(timestamp: &str) -> SearchResult<i64> {
+    // Telemetry timestamps are overwhelmingly the canonical UTC RFC3339 form, which a
+    // strict hand-rolled parser resolves without the general-purpose `time` machinery.
+    // Any input the fast path declines defers to the reference parser, so `Ok`/`Err`
+    // behavior is preserved byte-for-byte (the fast path returns `Some(ms)` only when
+    // the reference parser is guaranteed to return `Ok(ms)`).
+    if let Some(millis) = fast_parse_rfc3339_utc_ms(timestamp) {
+        return Ok(millis);
+    }
+    parse_rfc3339_timestamp_ms_reference(timestamp)
+}
+
+/// General-purpose RFC3339 → epoch-milliseconds parser via the `time` crate.
+///
+/// Retained as the canonical reference (and as the fallback for any input the
+/// [`fast_parse_rfc3339_utc_ms`] fast path declines).
+fn parse_rfc3339_timestamp_ms_reference(timestamp: &str) -> SearchResult<i64> {
     let parsed =
         OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|err| SearchError::InvalidConfig {
             field: "telemetry_envelope.ts".to_owned(),
@@ -441,6 +457,144 @@ fn parse_rfc3339_timestamp_ms(timestamp: &str) -> SearchResult<i64> {
         value: timestamp.to_owned(),
         reason: "parsed milliseconds overflow i64".to_owned(),
     })
+}
+
+/// Days in `month` (`1..=12`) of `year`; `0` for an out-of-range month.
+const fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Days from 1970-01-01 to `year-month-day` (proleptic Gregorian), per Howard
+/// Hinnant's `days_from_civil`. Valid for any real calendar date; the caller must
+/// validate the date's field ranges first.
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Strict fast path for the canonical UTC RFC3339 shape
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z` with a 4-digit year in `1970..=9999`,
+/// uppercase `T`/`Z`, `second <= 59`, and `1..=9` fractional digits when a `.` is
+/// present.
+///
+/// Returns `None` for anything outside this exact shape so callers defer to
+/// [`parse_rfc3339_timestamp_ms_reference`]. When it returns `Some(ms)`, the
+/// reference parser is guaranteed to return `Ok(ms)` — the milliseconds are
+/// `floor(fraction_ns / 1_000_000)`, matching the reference's
+/// `unix_timestamp_nanos() / 1_000_000` truncation for these (post-epoch) times.
+fn fast_parse_rfc3339_utc_ms(timestamp: &str) -> Option<i64> {
+    let bytes = timestamp.as_bytes();
+    // Shortest accepted form "YYYY-MM-DDTHH:MM:SSZ" is 20 bytes.
+    if bytes.len() < 20 {
+        return None;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let digit = |index: usize| -> Option<u32> {
+        let c = bytes[index];
+        c.is_ascii_digit().then(|| u32::from(c - b'0'))
+    };
+    let year = digit(0)? * 1000 + digit(1)? * 100 + digit(2)? * 10 + digit(3)?;
+    let month = digit(5)? * 10 + digit(6)?;
+    let day = digit(8)? * 10 + digit(9)?;
+    let hour = digit(11)? * 10 + digit(12)?;
+    let minute = digit(14)? * 10 + digit(15)?;
+    let second = digit(17)? * 10 + digit(18)?;
+
+    if year < 1970 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let year = i64::from(year);
+    // A zero day, or a day past the (leap-aware) month length — including any
+    // out-of-range month, for which `days_in_month` yields 0 — declines the fast path.
+    if day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+
+    // Trailing part after "SS": either "Z" or ".<1..=9 digits>Z".
+    let rest = &bytes[19..];
+    let millis_frac: i64 = if rest[0] == b'Z' {
+        if rest.len() != 1 {
+            return None;
+        }
+        0
+    } else if rest[0] == b'.' {
+        let mut end = 1;
+        while end < rest.len() && rest[end].is_ascii_digit() {
+            end += 1;
+        }
+        let digits = end - 1;
+        if !(1..=9).contains(&digits) {
+            return None;
+        }
+        // The fractional digits must be immediately followed by a terminating "Z".
+        if end != rest.len() - 1 || rest[end] != b'Z' {
+            return None;
+        }
+        // floor(fraction_ns / 1e6) == the first three fractional digits (zero-padded).
+        let mut millis = 0i64;
+        let mut position = 0usize;
+        while position < 3 {
+            millis *= 10;
+            if position < digits {
+                millis += i64::from(rest[1 + position] - b'0');
+            }
+            position += 1;
+        }
+        millis
+    } else {
+        return None;
+    };
+
+    let days = days_from_civil(year, i64::from(month), i64::from(day));
+    let seconds =
+        days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    Some(seconds * 1000 + millis_frac)
+}
+
+/// Bench-only accessor for the shipped canonical fast path.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_fast_parse_rfc3339_utc_ms(timestamp: &str) -> Option<i64> {
+    fast_parse_rfc3339_utc_ms(timestamp)
+}
+
+/// Bench-only accessor for the reference (`time`-crate) parser, as `Option`.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_parse_rfc3339_reference_ms(timestamp: &str) -> Option<i64> {
+    parse_rfc3339_timestamp_ms_reference(timestamp).ok()
+}
+
+/// Bench-only accessor for the shipped (fast-then-reference) parser, as `Option`.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_parse_rfc3339_timestamp_ms(timestamp: &str) -> Option<i64> {
+    parse_rfc3339_timestamp_ms(timestamp).ok()
 }
 
 /// Upsert payload for `resource_samples`.

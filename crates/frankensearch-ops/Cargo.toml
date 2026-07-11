@@ -11,9 +11,18 @@ description = "Operations control-plane TUI for frankensearch fleet monitoring"
 name = "frankensearch-ops"
 path = "src/main.rs"
 
+[features]
+# Exposes internal pure functions (e.g. the RFC3339 fast path) for A/B microbenches.
+bench-internals = []
+
 [[bench]]
 name = "percentile_select"
 harness = false
+
+[[bench]]
+name = "rfc3339_parse_ab"
+harness = false
+required-features = ["bench-internals"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
