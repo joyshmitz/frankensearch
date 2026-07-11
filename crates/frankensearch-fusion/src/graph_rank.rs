@@ -4,6 +4,7 @@
 //! optional `DocumentGraph` supplied by the caller.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use asupersync::Cx;
 use frankensearch_core::types::{ScoreSource, ScoredResult, VectorHit};
@@ -114,6 +115,37 @@ impl GraphRanker {
     #[must_use]
     pub fn rank_phase1(
         &self,
+        cx: &Cx,
+        query: &str,
+        graph: &DocumentGraph,
+        seed_hits: &[VectorHit],
+        limit: usize,
+    ) -> Option<Vec<ScoredResult>> {
+        self.rank_phase1_with_hasher::<ahash::RandomState>(cx, query, graph, seed_hits, limit)
+    }
+
+    /// Test/bench-only legacy arm for the dense doc-id index's standard `SipHash` hasher.
+    ///
+    /// The production path uses aHash for this lookup-only map. Both arms share this function's
+    /// implementation, and neither iterates the map, so changing the hasher cannot affect node
+    /// numbering, edge visitation, floating-point accumulation, ties, or final ordering.
+    #[cfg(any(test, feature = "bench-internals"))]
+    #[must_use]
+    pub fn rank_phase1_siphash(
+        &self,
+        cx: &Cx,
+        query: &str,
+        graph: &DocumentGraph,
+        seed_hits: &[VectorHit],
+        limit: usize,
+    ) -> Option<Vec<ScoredResult>> {
+        self.rank_phase1_with_hasher::<std::collections::hash_map::RandomState>(
+            cx, query, graph, seed_hits, limit,
+        )
+    }
+
+    fn rank_phase1_with_hasher<S: BuildHasher + Default>(
+        &self,
         _cx: &Cx,
         _query: &str,
         graph: &DocumentGraph,
@@ -146,7 +178,9 @@ impl GraphRanker {
         let adjacency = graph.adjacency();
         let n = adjacency.len();
         let mut nodes: Vec<&GraphDocId> = Vec::with_capacity(n);
-        let mut idx: HashMap<&str, usize> = HashMap::with_capacity(n);
+        // This map is lookup-only after construction; node order comes from `adjacency.keys()`.
+        // The hasher is therefore a pure cost choice and cannot perturb result order or scores.
+        let mut idx: HashMap<&str, usize, S> = HashMap::with_capacity_and_hasher(n, S::default());
         for doc_id in adjacency.keys() {
             idx.insert(doc_id.as_str(), nodes.len());
             nodes.push(doc_id);
@@ -273,7 +307,8 @@ impl GraphRanker {
         let adjacency = graph.adjacency();
         let n = adjacency.len();
         let mut nodes: Vec<&GraphDocId> = Vec::with_capacity(n);
-        let mut idx: HashMap<&str, usize> = HashMap::with_capacity(n);
+        // Match the shipped lookup hasher so this twin still differs only in edge layout.
+        let mut idx: ahash::AHashMap<&str, usize> = ahash::AHashMap::with_capacity(n);
         for doc_id in adjacency.keys() {
             idx.insert(doc_id.as_str(), nodes.len());
             nodes.push(doc_id);
@@ -447,6 +482,40 @@ mod tests {
                 results.iter().any(|result| result.doc_id == "doc-c"),
                 "second hop should get propagated graph signal"
             );
+        });
+    }
+
+    #[test]
+    fn dense_idx_ahash_matches_siphash_bits_and_ordering() {
+        run_test_with_cx(|cx| async move {
+            let mut graph = DocumentGraph::new();
+            graph.add_edge("doc-a", "doc-b", EdgeType::Reference, 1.0);
+            graph.add_edge("doc-a", "doc-c", EdgeType::Reference, 1.0);
+            graph.add_edge("doc-b", "doc-d", EdgeType::Reference, 1.0);
+            graph.add_edge("doc-c", "doc-d", EdgeType::Reference, 1.0);
+            let seed_hits = vec![VectorHit {
+                index: 0,
+                score: 1.0,
+                doc_id: "doc-a".into(),
+            }];
+            let ranker = GraphRanker::new();
+            let ahash = ranker
+                .rank_phase1(&cx, "query", &graph, &seed_hits, 10)
+                .expect("aHash graph rank");
+            let siphash = ranker
+                .rank_phase1_siphash(&cx, "query", &graph, &seed_hits, 10)
+                .expect("SipHash graph rank");
+
+            assert_eq!(ahash.len(), siphash.len());
+            for (fast, legacy) in ahash.iter().zip(&siphash) {
+                assert_eq!(fast.doc_id, legacy.doc_id, "hasher changed ordering");
+                assert_eq!(
+                    fast.score.to_bits(),
+                    legacy.score.to_bits(),
+                    "hasher changed score bits for {}",
+                    fast.doc_id
+                );
+            }
         });
     }
 

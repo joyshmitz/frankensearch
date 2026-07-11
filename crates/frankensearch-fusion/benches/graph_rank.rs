@@ -16,7 +16,11 @@
 //! is handed a pre-normalized personalization and skips the `ranks_map` rebuild and `ScoredResult`
 //! construction. It is a faithful *ranker* proxy and a biased *cost* proxy.
 //!
-//! `paired_shipped_csr` vs `paired_flat_csr` is the real lever: `rank_phase1` vs its one-variable
+//! `hash_siphash` vs `hash_ahash` measures the shipped dense-index hasher change: both arms call
+//! the same generic production implementation, and the lookup table is never iterated. The bench
+//! asserts result count, doc id, score bits, ties, and ordering before an alternating-round median
+//! A/B with an A/A null control. `paired_shipped_csr` vs `paired_flat_csr` retains the earlier
+//! layout lever: `rank_phase1` vs its one-variable
 //! twin `rank_phase1_flat` (feature `bench-internals`), asserted **bit-identical** so the arms differ
 //! by edge layout alone. `paired_null_a` / `paired_null_b` are an **A/A null control** — the same arm
 //! twice — measuring the harness noise floor. Read the null ratio before believing any lever ratio:
@@ -27,7 +31,8 @@
 //! invocation — an A/B split across two `rch` invocations lands on different workers and is invalid:
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
-//!   rch exec -- cargo bench -p frankensearch-fusion --features bench-internals --bench graph_rank
+//!   rch exec -- cargo bench -p frankensearch-fusion \
+//!   --features graph,bench-internals --bench graph_rank
 //! ```
 
 use std::collections::HashMap;
@@ -38,6 +43,7 @@ use asupersync::Cx;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::{DocumentGraph, EdgeType, VectorHit};
 use frankensearch_fusion::GraphRanker;
+use frankensearch_fusion::bench_support::paired_median_ratio;
 
 const RESTART: f64 = 0.15;
 const WALK: f64 = 1.0 - RESTART;
@@ -363,6 +369,88 @@ fn bench_graph_rank(c: &mut Criterion) {
             prod_out.len(),
             graph.adjacency().len()
         );
+
+        // ── CURRENT LEVER (bd-vg3i): lookup-only dense index, SipHash -> aHash ─────────────
+        //
+        // Both arms call the same generic production implementation. `idx` is populated from
+        // `adjacency.keys()` and then only probed, never iterated, so its hasher cannot affect node
+        // numbering, edge visit order, floating-point accumulation, tie-breaking, or output order.
+        let siphash_out = ranker
+            .rank_phase1_siphash(&cx, "graph rank query", &graph, &seeds, limit)
+            .expect("rank_phase1_siphash must return Some -- else the legacy arm measures nothing");
+        assert_eq!(
+            siphash_out.len(),
+            prod_out.len(),
+            "{id}: SipHash/aHash result counts diverged"
+        );
+        for (sip, fast) in siphash_out.iter().zip(&prod_out) {
+            assert_eq!(sip.doc_id, fast.doc_id, "{id}: aHash reordered the ranking");
+            assert_eq!(
+                sip.score.to_bits(),
+                fast.score.to_bits(),
+                "{id}: aHash changed doc {} score bits",
+                sip.doc_id
+            );
+        }
+
+        let run_siphash = || {
+            black_box(ranker.rank_phase1_siphash(
+                black_box(&cx),
+                "graph rank query",
+                black_box(&graph),
+                black_box(&seeds),
+                limit,
+            ));
+        };
+        let run_ahash = || {
+            black_box(ranker.rank_phase1(
+                black_box(&cx),
+                "graph rank query",
+                black_box(&graph),
+                black_box(&seeds),
+                limit,
+            ));
+        };
+        let hash_null = paired_median_ratio(41, PAIR_BATCH, run_siphash, run_siphash);
+        let hash_lever = paired_median_ratio(41, PAIR_BATCH, run_siphash, run_ahash);
+        eprintln!(
+            "[null]  {id}: SipHash/SipHash median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            hash_null.median, hash_null.p5, hash_null.p95, hash_null.rounds
+        );
+        eprintln!(
+            "[lever] {id}: aHash/SipHash median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            hash_lever.median,
+            hash_lever.p5,
+            hash_lever.p95,
+            if hash_lever.decidable_against(&hash_null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR"
+            }
+        );
+
+        g.bench_with_input(BenchmarkId::new("hash_siphash", &id), &(), |b, ()| {
+            b.iter(|| {
+                black_box(ranker.rank_phase1_siphash(
+                    black_box(&cx),
+                    "graph rank query",
+                    black_box(&graph),
+                    black_box(&seeds),
+                    limit,
+                ))
+            });
+        });
+        g.bench_with_input(BenchmarkId::new("hash_ahash", &id), &(), |b, ()| {
+            b.iter(|| {
+                black_box(ranker.rank_phase1(
+                    black_box(&cx),
+                    "graph rank query",
+                    black_box(&graph),
+                    black_box(&seeds),
+                    limit,
+                ))
+            });
+        });
 
         // FIDELITY DIAGNOSTIC (printed, not asserted): does the bench-local copy that the REJECT
         // rows used actually rank like production? Float accumulation order and HashMap node

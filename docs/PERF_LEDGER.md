@@ -4834,3 +4834,62 @@ decidable. **Scope:** char_count is a *fraction* of `compute` (the simhash token
 per-doc `compute`-level win is smaller — but it eliminates one of two redundant full-text decodes, always-on for
 ASCII docs. **SHIPPED in place**; `chars().count()` retained as `char_count_slow` (`cfg(test | bench-internals)`).
 All builds/benches remote; no local cargo; fmt + clippy clean on changed lines.
+
+## 2026-07-10 — WIN: graph-rank dense doc-id index SipHash → aHash — 1.08–1.11×, bit-identical ranking (IndigoOtter)
+
+**Different lane from lexical/vector scan; profile-first routing.** Before the production edit, a
+production-fidelity baseline of the optional query-biased PageRank stage reproduced the existing structural
+signal: its two-pass flat-CSR twin, which pays one extra doc-id string hash probe per edge, was **1.20× slower**
+at 500 nodes (927.3 / 770.0 µs) and **1.26× slower** at 2000 nodes (5.052 / 4.004 ms). Because that twin also
+changes layout and build bookkeeping, this was routing evidence rather than isolated frame attribution; it
+motivated the one-variable whole-production-routine A/B below. The opportunity score was 12 (impact 3 ×
+confidence 4 / effort 1).
+
+**The one lever.** `GraphRanker::rank_phase1` builds a dense `doc_id -> usize` table, then only probes it while
+building adjacency rows and mapping seeds. It never iterates that table: node numbering comes from
+`adjacency.keys()`. The production arm now uses `ahash::RandomState` instead of the standard library's SipHash;
+the test/bench-only legacy arm calls the same generic implementation with `std::hash::RandomState`. Edge layout,
+edge visit order, floating-point operations, final normalization, score sort, and doc-id tie-break are unchanged.
+
+**Recall/ordering proof.** Before timing, `graph_rank` asserts equal result counts and exact equality of every
+ordered `doc_id` and `score.to_bits()` at both 500×6 and 2000×8. The retained unit test includes an equal-weight
+tie and asserts the same exact contract. Exact ordered scores imply recall and ordering parity, not merely an
+approximate quality match.
+
+**Speed — paired MEDIAN gate passed.** Strict remote-only command (one binary / one worker, no local fallback):
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-fusion --features graph,bench-internals \
+  --bench graph_rank -- hash_ --sample-size 60 --warm-up-time 0.2 \
+  --measurement-time 1.0 --noplot
+```
+
+Worker `vmi1227854`; 41 alternating rounds × 4 calls per arm. Ratio = aHash/SipHash, so `<1.0` is faster:
+
+| workload | A/A null median [p5, p95] | aHash/SipHash median [p5, p95] | verdict |
+|---|---|---|---|
+| `n500_deg6` | 1.0005 [0.9340, 1.1080] | **0.9252 [0.2413, 1.2846]** | **DECIDABLE**, median below null p5; 1.081× |
+| `n2000_deg8` | 1.0182 [0.9200, 1.2213] | **0.9016 [0.7547, 1.0218]** | **DECIDABLE**, median below null p5; 1.109× |
+
+An unchanged confirmation on worker `hz1` also passed: `n500_deg6` null 1.0021 [0.9725, 1.0414], lever
+**0.9128** [0.8894, 0.9348] (**1.096×**); `n2000_deg8` null 0.9974 [0.9512, 1.3511], lever **0.8988**
+[0.6325, 1.3414] (**1.113×**). The separate Criterion central estimates agreed on both workers: first run
+197.27→188.20 µs and 1.0243→0.9340 ms; confirmation 256.99→240.44 µs and 1.3451→1.1235 ms. The wide paired
+p5/p95 tails disclose worker contention honestly; the repository gate is the per-round median against the
+same-function A/A band, and both tracked sizes clear that gate in the winning direction twice.
+
+**Scope.** This improves frankensearch's own optional `graph` ranking stage; it is not a Tantivy/Lucene/Meili
+comparison and does not claim a default-path end-to-end ratio. All Cargo work for the baseline, candidate, and
+validation used `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- ...`; no local Cargo fallback occurred.
+
+**Validation.** Remote focused graph tests: 5 passed / 0 failed, including the new exact hasher-parity test and
+the dense-vs-reference ranking test. Remote `cargo check --workspace --all-targets` exited 0. Workspace clippy
+with `-D warnings` remains blocked by pre-existing core debt (`TwoTierConfig` excessive bools and a
+`canonicalize.rs` doc-markdown warning). Focused remote clippy for the owned library and benchmark passed with
+`-D warnings` after allowing only lint classes whose reported sites were verified against `HEAD` as pre-existing:
+hubness doc length, two `needless_for_each` sites, benchmark doc-markdown, two `u64 -> usize` fixture casts, and
+two fixture `String` clones. Those unrelated/orthogonal cleanups were not mixed into this one-lever commit.
+Direct pinned `rustfmt --check`, `git diff --check`, and UBS (0 critical, exit 0) passed on the owned files. `rch`
+refused remote `cargo fmt` as a non-compilation command under `RCH_REQUIRE_REMOTE=1`, correctly without a local
+fallback.
