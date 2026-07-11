@@ -11218,3 +11218,56 @@ concurrent-throughput where HNSW's 1-core-per-query beats int8 two-pass saturati
 metric none of the current single-query-latency benches model). Kept the int8 arm in `hnsw_vs_flat_100k` so
 any future ANN evaluation compares against the real baseline, not flat. No product code changed; the `ann`
 feature stays off-by-default.
+
+### 2026-07-11 — IndigoOtter — REJECTED: generic Tantivy writer budget 50 MB → 100 MB (3 → 6 workers) is slower/noisy and changes ranked BM25 results
+
+This lane deliberately avoided cc-owned lexical query/scan code and tested the ownable index-build control
+surface behind Tantivy's postings writer. Tantivy 0.26.1 does not expose its postings codec or block size:
+postings are hard-wired to the private `BitPacker4x` implementation. Dropping positions, frequencies, or
+field norms is not recall-preserving (quoted phrases and/or BM25 scoring change), while the public docstore
+settings already default to LZ4, 16 KiB blocks, and a dedicated compression thread.
+
+**One lever.** The generic `TantivyIndex` uses `Index::writer(50_000_000)`. Tantivy requires at least 15 MB per
+indexing worker, so on a large host the 50 MB total budget selects only three workers. A same-binary bench-only
+constructor compared that shipping original with a 100 MB budget, which selects six workers at nearly the same
+per-worker arena size. Production stayed at 50 MB throughout the experiment.
+
+**Profile first.** The retained `index_build_postings_ab` bench builds 20,000 deterministic documents through
+the real frankensearch schema, tokenizer, `index_documents`, commit, and BM25 paths. On the decisive worker
+`vmi1227854`, the original phase medians were 0.573 ms create, 73.551 ms enqueue/postings work, 22.605 ms
+commit, and 101.123 ms total. The writer/postings lane is therefore live and material, not a static-code guess.
+
+**Strict remote-only command:**
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-lexical --profile release --features bench-internals \
+  --bench index_build_postings_ab -- --noplot
+```
+
+RCH admitted the decisive benchmark on `vmi1227854`; there was no local fallback for that run.
+
+| Gate | Original 50 MB | Candidate 100 MB | Decision |
+|---|---:|---:|---|
+| searchable segments | 3 | 6 | expected topology change |
+| managed segment bytes | 4,967,989 | 5,014,658 | **1.0094** (0.94% larger) |
+| top-64 overlap vs original (worst of six query classes) | 1.0000 | **0.09375** | recall-preservation FAIL |
+| original-relative graded nDCG@64 (worst query) | 1.0000 | **0.059335** | ordering-preservation FAIL |
+| exact ranked IDs / BM25 score bits | reference | **false / false** | parity FAIL |
+| A/A null median [p5, p95] | 1.0202 [0.5405, 1.8323] | — | wide fleet floor |
+| candidate / original build median [p5, p95] | — | **1.1316 [0.6782, 2.1160]** | slower median, inside null floor |
+
+A post-measurement focused test was requested through the same strict remote-only prefix, but RCH returned
+`no admissible workers: insufficient_slots=8,hard_preflight=1,active_project_exclusion=1` and refused local
+fallback. Per the session contract, no direct local Cargo retry was attempted; the benchmark itself had already
+compiled and executed the focused crate remotely before this capacity boundary surfaced.
+
+**Decision: REJECT.** The 100 MB writer budget neither clears the median speed gate nor preserves the ranked
+BM25 result contract. More writer segments alter Tantivy's result topology/tie outcomes enough to fail the
+strict original-relative recall and ordering gate, and the candidate median points 13.16% slower. Keep
+`WRITER_HEAP_BYTES = 50_000_000`. Do not retry larger generic writer budgets without a separate, explicitly
+approved deterministic tie-order design; that would be a second query-path lever and overlaps cc's lane.
+
+The benchmark and bench-only configurable constructor remain as the reproducible boundary for future Tantivy
+upgrades. The next conflict-free indexing candidate, if a new one-lever session is requested, is the facade's
+deep `IndexableDocument` staging clone in `frankensearch/src/index_builder.rs`; it was not touched here.

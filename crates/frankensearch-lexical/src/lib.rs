@@ -50,6 +50,10 @@ use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::{LexicalSearch, SearchFuture};
 use frankensearch_core::types::{DocId, IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "bench-internals")]
+use tantivy::HasLen;
+#[cfg(feature = "bench-internals")]
+use tantivy::directory::Directory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, STORED, STRING, TextFieldIndexing, TextOptions};
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer};
@@ -545,7 +549,13 @@ impl TantivyIndex {
                 source: Box::new(e),
             })?;
 
-        Self::from_index(index, schema, fields, Some(path.to_path_buf()))
+        Self::from_index(
+            index,
+            schema,
+            fields,
+            Some(path.to_path_buf()),
+            WRITER_HEAP_BYTES,
+        )
     }
 
     /// Open an existing Tantivy index at the given directory path.
@@ -567,7 +577,13 @@ impl TantivyIndex {
             source: Box::new(e),
         })?;
 
-        Self::from_index(index, schema, fields, Some(path.to_path_buf()))
+        Self::from_index(
+            index,
+            schema,
+            fields,
+            Some(path.to_path_buf()),
+            WRITER_HEAP_BYTES,
+        )
     }
 
     /// Create an in-memory Tantivy index (useful for testing).
@@ -578,7 +594,49 @@ impl TantivyIndex {
     pub fn in_memory() -> SearchResult<Self> {
         let (schema, fields) = build_schema();
         let index = Index::create_in_ram(schema.clone());
-        Self::from_index(index, schema, fields, None)
+        Self::from_index(index, schema, fields, None, WRITER_HEAP_BYTES)
+    }
+
+    /// Create an in-memory index with an explicit writer heap budget.
+    ///
+    /// This exists only for same-binary benchmark comparisons of Tantivy's
+    /// writer parallelism. Shipping callers always use [`Self::in_memory`].
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn in_memory_with_writer_heap_bytes(writer_heap_bytes: usize) -> SearchResult<Self> {
+        let (schema, fields) = build_schema();
+        let index = Index::create_in_ram(schema.clone());
+        Self::from_index(index, schema, fields, None, writer_heap_bytes)
+    }
+
+    /// Return `(searchable_segments, managed_index_bytes)` for index-build benchmarks.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn benchmark_index_layout(&self) -> SearchResult<(usize, u64)> {
+        let segment_metas =
+            self.index
+                .searchable_segment_metas()
+                .map_err(|e| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(e),
+                })?;
+        let segment_count = segment_metas.len();
+        let managed_files = self.index.directory().list_managed_files();
+        let mut index_bytes = 0u64;
+        for path in segment_metas
+            .iter()
+            .flat_map(|segment_meta| segment_meta.list_files())
+            .filter(|path| managed_files.contains(path))
+        {
+            let file = self.index.directory().open_read(&path).map_err(|e| {
+                SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(e),
+                }
+            })?;
+            index_bytes = index_bytes.saturating_add(u64::try_from(file.len()).unwrap_or(u64::MAX));
+        }
+        Ok((segment_count, index_bytes))
     }
 
     /// Internal constructor shared by `create`, `open`, and `in_memory`.
@@ -587,6 +645,7 @@ impl TantivyIndex {
         _schema: Schema,
         mut fields: SchemaFields,
         path: Option<PathBuf>,
+        writer_heap_bytes: usize,
     ) -> SearchResult<Self> {
         // Resolve the `ord` fast field against the *actual* index schema so
         // indexes created before this field existed (no `ord`) cleanly fall back
@@ -607,7 +666,7 @@ impl TantivyIndex {
             })?;
 
         let writer = index
-            .writer(WRITER_HEAP_BYTES)
+            .writer(writer_heap_bytes)
             .map_err(|e| SearchError::SubsystemError {
                 subsystem: "tantivy",
                 source: Box::new(e),
