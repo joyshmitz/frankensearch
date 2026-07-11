@@ -18,7 +18,9 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
-use frankensearch_storage::pipeline::{truncate_chars, truncate_chars_slow};
+use frankensearch_storage::pipeline::{
+    content_char_len, content_char_len_slow, truncate_chars, truncate_chars_slow,
+};
 
 const PREVIEW: usize = 400; // MAX_CONTENT_PREVIEW_CHARS
 
@@ -71,16 +73,49 @@ fn bench(c: &mut Criterion) {
             lever.median,
             lever.p5,
             lever.p95,
-            if lever.decidable_against(&null) {
-                if lever.median < 1.0 {
-                    "DECIDABLE WIN"
-                } else {
-                    "DECIDABLE REGRESSION"
-                }
-            } else {
-                "INSIDE NULL FLOOR (not decidable)"
-            }
+            verdict(&lever, &null)
         );
+
+        // ── content_char_len: chars().count() vs is_ascii?len():chars().count() ──
+        assert_eq!(
+            content_char_len(doc),
+            content_char_len_slow(doc),
+            "content_char_len != slow for {label}"
+        );
+        let len_orig = || {
+            black_box(content_char_len_slow(black_box(doc)));
+        };
+        let len_cand = || {
+            black_box(content_char_len(black_box(doc)));
+        };
+        let lnull = paired_median_ratio(41, inner, len_orig, len_orig);
+        let llever = paired_median_ratio(41, inner, len_orig, len_cand);
+        eprintln!(
+            "[null]  clen/{label}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            lnull.median, lnull.p5, lnull.p95, lnull.rounds
+        );
+        eprintln!(
+            "[lever] clen/{label}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            llever.median,
+            llever.p5,
+            llever.p95,
+            verdict(&llever, &lnull)
+        );
+    }
+}
+
+fn verdict(
+    lever: &frankensearch_core::bench_support::PairedRatio,
+    null: &frankensearch_core::bench_support::PairedRatio,
+) -> &'static str {
+    if lever.decidable_against(null) {
+        if lever.median < 1.0 {
+            "DECIDABLE WIN"
+        } else {
+            "DECIDABLE REGRESSION"
+        }
+    } else {
+        "INSIDE NULL FLOOR (not decidable)"
     }
 }
 

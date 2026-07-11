@@ -335,7 +335,10 @@ impl StorageBackedJobRunner {
         // (`hash_hex` would re-hash `canonical_text`). Byte-identical hex, one hash per doc.
         let content_hash_hex = ContentHasher::to_hex(&content_hash);
         let preview = truncate_chars(&canonical_text, MAX_CONTENT_PREVIEW_CHARS);
-        let content_length = canonical_text.chars().count();
+        // ASCII fast-path: for ASCII text the char count equals the byte length, and `str::is_ascii`
+        // is a SIMD byte scan far cheaper than `chars().count()`'s per-char count. Non-ASCII falls
+        // back. Identical result for every input (`content_char_len_matches_slow`).
+        let content_length = content_char_len(&canonical_text);
         let metadata = Some(with_correlation_metadata(request.metadata, &correlation_id));
         let document = DocumentRecord {
             doc_id: request.doc_id.clone(),
@@ -1174,6 +1177,26 @@ pub fn truncate_chars_slow(value: &str, max_chars: usize) -> String {
         return value.to_owned();
     }
     value.chars().take(max_chars).collect()
+}
+
+/// Character count with an ASCII fast-path (`is_ascii` ⇒ byte length). Byte-identical to
+/// `chars().count()` for every input (`content_char_len_matches_slow`).
+#[doc(hidden)]
+#[must_use]
+pub fn content_char_len(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        text.chars().count()
+    }
+}
+
+/// Pre-lever char count (`chars().count()`), retained for the same-binary A/B and the parity test.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn content_char_len_slow(text: &str) -> usize {
+    text.chars().count()
 }
 
 fn unix_timestamp_ms() -> SearchResult<i64> {
@@ -2299,6 +2322,33 @@ mod tests {
                     input.len()
                 );
             }
+        }
+    }
+
+    /// BYTE-IDENTITY GATE: the ASCII-fast `content_char_len` must equal `chars().count()` for ASCII,
+    /// pure-multibyte (byte-len ≠ char-count), combining marks, emoji, mixed, and empty text.
+    #[test]
+    fn content_char_len_matches_slow() {
+        let ascii = "the quick brown fox 123 ".repeat(50);
+        let multi = "café 日本語 🚀 ".repeat(50);
+        let combining = "a\u{0301}e\u{0301} ".repeat(50);
+        for input in [
+            "",
+            "x",
+            "hello world",
+            "café déjà vu",
+            "日本語のテスト",
+            "a\u{0301}b\u{1F600}c",
+            ascii.as_str(),
+            multi.as_str(),
+            combining.as_str(),
+        ] {
+            assert_eq!(
+                super::content_char_len(input),
+                super::content_char_len_slow(input),
+                "mismatch for byte-len {}",
+                input.len()
+            );
         }
     }
 

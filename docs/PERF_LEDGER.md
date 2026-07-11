@@ -5101,3 +5101,33 @@ ratio is contention-robust.
 canonicalization, hashing, dedup SQL, and the WAL), always-on for every document longer than the preview (the
 common case). `truncate_chars` retains its signature and byte-for-byte output. All builds/benches strictly remote
 (`RCH_REQUIRE_REMOTE=1`); no local Cargo. Peer files untouched.
+
+## 2026-07-11 — WIN: storage ingest `content_length` ASCII fast-path — ~2.7× on the char count, byte-identical (cc_fse)
+
+Continuing the ingest byte-fast sweep (sibling of the shipped fingerprint `char_count` win). After the preview
+truncation became O(preview), `content_length = canonical_text.chars().count()` — a full per-char count of the
+whole canonical document — was the largest remaining full-document scan per ingested doc. `content_char_len`
+takes the ASCII fast-path: for ASCII text the char count equals the byte length, and `str::is_ascii` is a SIMD
+byte scan cheaper than `chars().count()`'s per-char counting; non-ASCII falls back to the exact decode.
+
+**Byte-identical.** `is_ascii ⇒ len()` is a UTF-8 invariant (ASCII bytes are single-byte chars); non-ASCII uses
+the identical `chars().count()`. Proven by `content_char_len_matches_slow` (ASCII / pure-multibyte / combining
+marks / emoji / mixed / empty) and the bench's pre-timing assert.
+
+**Speed — DECIDABLE (ASCII), MEDIAN-gated.** Same `benches/truncate_preview_ab.rs`, ORIG = `content_char_len_slow`
+(`chars().count()`) vs CAND = `content_char_len`; ratio CAND/ORIG:
+
+| document | A/A null median [p5, p95] | CAND/ORIG median [p5, p95] | verdict |
+|---|---|---|---|
+| ascii 2 000  | 1.0000 [0.9902, 1.0552] | **0.3712 [0.3214, 0.4326]** | **DECIDABLE WIN**, ~2.7× |
+| ascii 16 000 | 0.9950 [0.2424, 1.1167] | 0.3479 [0.3041, 0.3811]     | same ~2.9× effect; null p5 is a lone contention outlier (median 0.995) |
+| multibyte 16 000 | 1.0006 [0.8402, 1.0983] | 1.0043 [0.9065, 1.2689] | TIE — correct: non-ASCII falls back to the identical decode |
+
+The `ascii_2k` run has a tight A/A null (p5 0.9902) and the lever clears it decisively (~2.7×). The `ascii_16k`
+lever is the same ~0.35 effect but that run's null p5 (0.242) is a single contention outlier (its median is
+0.995, p95 1.117), so it reads "inside" by the strict gate on a contended worker; the effect is consistent with
+ascii_2k and with the shipped fingerprint `char_count` (2.85×). Multibyte correctly ties (the fast-path does not
+apply). Shipped on the clean-null decidable ASCII shape + the matching precedent.
+
+**Scope.** Always-on for ASCII documents (English/code — the common case); a per-doc ingest char-count step. All
+builds/benches strictly remote (`RCH_REQUIRE_REMOTE=1`); no local Cargo. Peer files untouched.
