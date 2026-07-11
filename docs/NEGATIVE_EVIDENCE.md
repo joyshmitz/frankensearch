@@ -11175,3 +11175,46 @@ worker isolation (→ int8 pass-1 scan-level A/B + symbolized self-time `bd-e41k
 default-on), an ANN-in-BOLD recall-budget product sign-off (2.6–5× vector tier, but recall-trading so not
 shippable under "recall preserved" without the budget), or a new workload the current proxies can't model. No
 code changed in this entry.
+
+### 2026-07-11 — cc_fse — REJECTED (measured): ANN-in-BOLD does NOT beat the int8 two-pass DEFAULT at BOLD's 100k scale — the prior "2.6-5x viable" was HNSW-vs-FLAT, the wrong baseline; int8 two-pass is ~2.1x-vs-flat AND lossless, so it dominates HNSW at every ef meeting the recall budget
+
+User green-lit an ANN recall budget (>=0.975 recall@10) to measure/wire ANN-in-BOLD (the ledger's one
+remaining big decision-gated lever). Measured it first (profile/measure-before-wire). Result: **reject** — ANN
+loses to the existing recall-preserving default at BOLD's scale.
+
+**The gap in the prior evidence.** `ann-in-bold-viable` recorded "2.6-5x vector-tier win at >=0.975 recall
+(ef100 0.994 @ 2.6x; ef40 0.975 @ 5.16x)". Those speedups were HNSW **vs the exact FLAT scan**. But the
+production fast-tier default is the **int8 two-pass** (`sync_searcher::search_fast_hits`, `search_params=None`),
+not flat — and int8 two-pass is *itself* ~2.1x vs flat AND lossless. The `hnsw_vs_flat_100k` bench never
+included an int8 arm, so the comparison was against a baseline production doesn't use.
+
+**Fix + measurement (`0426a68`).** Added an `int8_two_pass` arm to `hnsw_vs_flat_100k` (F16 copy of the same
+corpus; int8 two-pass requires F16) + its recall@10 vs the F32 exact ground truth. Three-way, N=100k dim=128
+k=10, worker vmi1227854, medians:
+
+| arm | latency | recall@10 |
+|---|---|---|
+| flat (F32 exact) | 884 µs | 1.0 |
+| **int8_two_pass** (default) | **415 µs** | **1.0000** (lossless) |
+| hnsw ef10 | 260 µs | 0.7750 |
+| hnsw ef20 | 319 µs | 0.8812 |
+| **hnsw ef40** (cheapest ef >= 0.975) | **423 µs** | 0.9812 |
+| hnsw ef100 | 733 µs | 0.9937 |
+
+At the >=0.975 recall budget, int8 two-pass (415 µs, **recall 1.0**) is latency-tied-or-faster than HNSW ef40
+(423 µs, recall 0.98) AND lossless. HNSW is only faster at ef<=20, where recall (<=0.88) is far below budget.
+**There is no operating point where ANN beats the int8 two-pass default while meeting the recall budget.**
+
+**Scaling.** int8 two-pass is O(N); HNSW ~O(log N) — a crossover exists, but extrapolating from this tie it is
+only ~1.25x past BOLD's 100-130k scale, and it still trades recall (1.0 -> 0.98). A ~1.25x latency gain that
+sacrifices lossless recall does not justify the cross-crate wiring (HNSW is wired ONLY in the file-backed
+`TwoTierIndex` behind the non-default `ann` feature at `hnsw_threshold=50k`; the production sync path
+`InMemoryTwoTierIndex` has NO ANN, so wiring would mean adding build-from-f16-slab + a sync_searcher branch +
+flipping `ann` into the default build). Not worth it for a recall-trading ~1.25x.
+
+**Retry conditions.** ANN becomes worth revisiting only if (a) corpus N grows well past the crossover
+(>>130k — measure at 130k/dim256, BOLD's real config, to locate it), or (b) the workload shifts to
+concurrent-throughput where HNSW's 1-core-per-query beats int8 two-pass saturating all cores per query (a
+metric none of the current single-query-latency benches model). Kept the int8 arm in `hnsw_vs_flat_100k` so
+any future ANN evaluation compares against the real baseline, not flat. No product code changed; the `ann`
+feature stays off-by-default.
