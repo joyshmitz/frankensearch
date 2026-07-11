@@ -36,7 +36,11 @@ fn lexical(doc: &str, score: f32) -> ScoredResult {
 }
 
 fn semantic(doc: &str, score: f32, index: u32) -> VectorHit {
-    VectorHit { index, score, doc_id: doc.into() }
+    VectorHit {
+        index,
+        score,
+        doc_id: doc.into(),
+    }
 }
 
 /// Two pools of `pool` candidates with ~50% doc overlap (shared docs in the middle),
@@ -47,7 +51,13 @@ fn build(pool: usize) -> (Vec<ScoredResult>, Vec<VectorHit>) {
         .collect();
     let half = pool / 2;
     let sem: Vec<VectorHit> = (half..pool + half)
-        .map(|i| semantic(&format!("doc{i:06}"), 1.0 / ((i - half) as f32 + 1.0), i as u32))
+        .map(|i| {
+            semantic(
+                &format!("doc{i:06}"),
+                1.0 / ((i - half) as f32 + 1.0),
+                i as u32,
+            )
+        })
         .collect();
     (lex, sem)
 }
@@ -69,7 +79,15 @@ fn bench(c: &mut Criterion) {
             b.iter(|| black_box(rrf_fuse(black_box(&lex), black_box(&sem), 10, 0, &config)));
         });
         g.bench_with_input(BenchmarkId::new("pool_minmax", pool), &(), |b, ()| {
-            b.iter(|| black_box(pool_minmax_fuse(black_box(&lex), black_box(&sem), 10, 0, &config)));
+            b.iter(|| {
+                black_box(pool_minmax_fuse(
+                    black_box(&lex),
+                    black_box(&sem),
+                    10,
+                    0,
+                    &config,
+                ))
+            });
         });
     }
     g.finish();

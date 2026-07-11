@@ -44,7 +44,9 @@ fn cand(id: usize, score: f64) -> Cand {
 /// head: the fused semantic head (≈limit). tail: the full lexical result set;
 /// the first `head_len` ids overlap the head (dedup hits), the rest are new.
 fn make(head_len: usize, tail_len: usize) -> (Vec<Cand>, Vec<Cand>) {
-    let head: Vec<Cand> = (0..head_len).map(|i| cand(i, 1.0 / (i as f64 + 1.0))).collect();
+    let head: Vec<Cand> = (0..head_len)
+        .map(|i| cand(i, 1.0 / (i as f64 + 1.0)))
+        .collect();
     // tail overlaps head on ids [0, head_len) then continues into fresh ids.
     let tail: Vec<Cand> = (0..tail_len)
         .map(|i| cand(i, 1.0 / (i as f64 + 2.0)))

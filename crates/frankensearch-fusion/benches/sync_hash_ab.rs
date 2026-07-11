@@ -34,8 +34,10 @@ fn make(n: usize, off: usize) -> Vec<VHit> {
 fn run_sip(fast: &[VHit], quality: &[VHit]) -> f32 {
     let fast_scores: HashMap<&str, f32> =
         fast.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();
-    let quality_scores: HashMap<&str, f32> =
-        quality.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();
+    let quality_scores: HashMap<&str, f32> = quality
+        .iter()
+        .map(|h| (h.doc_id.as_str(), h.score))
+        .collect();
     let mut seen: HashSet<&str> = HashSet::with_capacity(fast.len());
     let mut acc = 0.0_f32;
     for hit in fast {
@@ -44,7 +46,10 @@ fn run_sip(fast: &[VHit], quality: &[VHit]) -> f32 {
                 .get(hit.doc_id.as_str())
                 .copied()
                 .unwrap_or(hit.score);
-            let q = quality_scores.get(hit.doc_id.as_str()).copied().unwrap_or(0.0);
+            let q = quality_scores
+                .get(hit.doc_id.as_str())
+                .copied()
+                .unwrap_or(0.0);
             acc += f + q;
         }
     }
@@ -55,8 +60,10 @@ fn run_sip(fast: &[VHit], quality: &[VHit]) -> f32 {
 fn run_ahash(fast: &[VHit], quality: &[VHit]) -> f32 {
     let fast_scores: AHashMap<&str, f32> =
         fast.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();
-    let quality_scores: AHashMap<&str, f32> =
-        quality.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();
+    let quality_scores: AHashMap<&str, f32> = quality
+        .iter()
+        .map(|h| (h.doc_id.as_str(), h.score))
+        .collect();
     let mut seen: AHashSet<&str> = AHashSet::with_capacity(fast.len());
     let mut acc = 0.0_f32;
     for hit in fast {
@@ -65,7 +72,10 @@ fn run_ahash(fast: &[VHit], quality: &[VHit]) -> f32 {
                 .get(hit.doc_id.as_str())
                 .copied()
                 .unwrap_or(hit.score);
-            let q = quality_scores.get(hit.doc_id.as_str()).copied().unwrap_or(0.0);
+            let q = quality_scores
+                .get(hit.doc_id.as_str())
+                .copied()
+                .unwrap_or(0.0);
             acc += f + q;
         }
     }

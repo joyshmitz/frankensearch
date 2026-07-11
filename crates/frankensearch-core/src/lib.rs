@@ -38,7 +38,6 @@ pub mod tracing_config;
 pub mod traits;
 pub mod types;
 
-pub use simd::scale_f32_in_place;
 pub use activation::{
     ActiveGeneration, ArtifactVerification, ArtifactVerifier, GenerationController, InvariantCheck,
     check_invariants,
@@ -128,6 +127,7 @@ pub use repair::{
     CorruptionEvent, CorruptionPolicy, DegradedReason, DetectionMethod, RepairAttempt,
     RepairOrchestrator, RepairOutcome, RepairProvider, ServiceState,
 };
+pub use simd::scale_f32_in_place;
 pub use time_travel::{GenerationHistory, RetainedGeneration, RetentionPolicy, TimeTravelResult};
 
 pub use asupersync::Cx;

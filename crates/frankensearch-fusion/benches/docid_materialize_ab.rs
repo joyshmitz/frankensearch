@@ -141,22 +141,19 @@ fn bench(c: &mut Criterion) {
 
         g.bench_with_input(BenchmarkId::new("string", n), &ws, |b, ws| {
             b.iter(|| {
-                let out: Vec<FusedHitString> =
-                    black_box(ws).iter().map(to_string).collect();
+                let out: Vec<FusedHitString> = black_box(ws).iter().map(to_string).collect();
                 black_box(out)
             });
         });
         g.bench_with_input(BenchmarkId::new("compact", n), &ws, |b, ws| {
             b.iter(|| {
-                let out: Vec<FusedHitCompact> =
-                    black_box(ws).iter().map(to_compact).collect();
+                let out: Vec<FusedHitCompact> = black_box(ws).iter().map(to_compact).collect();
                 black_box(out)
             });
         });
         g.bench_with_input(BenchmarkId::new("packed", n), &ws, |b, ws| {
             b.iter(|| {
-                let out: Vec<FusedHitPacked> =
-                    black_box(ws).iter().map(to_packed).collect();
+                let out: Vec<FusedHitPacked> = black_box(ws).iter().map(to_packed).collect();
                 black_box(out)
             });
         });

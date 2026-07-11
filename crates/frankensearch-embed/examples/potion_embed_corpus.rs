@@ -34,7 +34,9 @@ fn main() {
     let emb = Model2VecEmbedder::load(model_dir).expect("load model2vec model");
 
     // ── Smoke check: related pair should out-score an unrelated pair. ──
-    let a = emb.embed_sync("the cat sat on the warm windowsill in the sun").unwrap();
+    let a = emb
+        .embed_sync("the cat sat on the warm windowsill in the sun")
+        .unwrap();
     let b = emb
         .embed_sync("a kitten rested on the sunny window ledge")
         .unwrap();

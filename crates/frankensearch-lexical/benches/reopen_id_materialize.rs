@@ -25,8 +25,22 @@ const N: usize = 20_000;
 const KS: &[usize] = &[10, 1000];
 
 const VOCAB: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "search", "engine",
-    "vector", "lexical", "ranking", "relevance", "document", "query",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "search",
+    "engine",
+    "vector",
+    "lexical",
+    "ranking",
+    "relevance",
+    "document",
+    "query",
 ];
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -99,7 +113,13 @@ fn bench(c: &mut Criterion) {
             });
         });
         g.bench_function(format!("fast/k{k}"), |b| {
-            b.iter(|| black_box(index.search_doc_ids(&cx, black_box(query), k).expect("fast")));
+            b.iter(|| {
+                black_box(
+                    index
+                        .search_doc_ids(&cx, black_box(query), k)
+                        .expect("fast"),
+                )
+            });
         });
     }
     g.finish();

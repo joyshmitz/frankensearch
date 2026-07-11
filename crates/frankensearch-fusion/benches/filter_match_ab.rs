@@ -64,7 +64,9 @@ fn run_old(clauses: &[Clause], docs: &[String]) -> usize {
 
 fn run_new(clauses: &[Clause], docs: &[String]) -> usize {
     let has_path = has_path_contains(clauses); // precomputed once per query
-    docs.iter().filter(|d| matches_new(clauses, has_path, d)).count()
+    docs.iter()
+        .filter(|d| matches_new(clauses, has_path, d))
+        .count()
 }
 
 fn bench(c: &mut Criterion) {

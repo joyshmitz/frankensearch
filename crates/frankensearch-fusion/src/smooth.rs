@@ -98,10 +98,7 @@ pub fn neighbor_smooth(
 
     // Pool score map: cos(q, ·) for every retrieved candidate. Neighbor lookup is
     // restricted to this set (the engine only scored these docs for this query).
-    let pool: AHashMap<&str, f32> = hits
-        .iter()
-        .map(|h| (h.doc_id.as_str(), h.score))
-        .collect();
+    let pool: AHashMap<&str, f32> = hits.iter().map(|h| (h.doc_id.as_str(), h.score)).collect();
 
     let alpha = config.alpha;
     let keep = 1.0 - alpha;
@@ -506,7 +503,11 @@ mod tests {
             },
         );
         let d_nm = non_mutual.iter().find(|h| h.doc_id == "d").unwrap();
-        assert!((d_nm.score - 0.55).abs() < 1e-6, "non-mutual: {}", d_nm.score); // 0.5*0.2+0.5*0.9
+        assert!(
+            (d_nm.score - 0.55).abs() < 1e-6,
+            "non-mutual: {}",
+            d_nm.score
+        ); // 0.5*0.2+0.5*0.9
 
         let mutual = neighbor_smooth(
             &hits,
@@ -518,7 +519,11 @@ mod tests {
             },
         );
         let d_m = mutual.iter().find(|h| h.doc_id == "d").unwrap();
-        assert!((d_m.score - 0.20).abs() < 1e-6, "mutual one-way ignored: {}", d_m.score);
+        assert!(
+            (d_m.score - 0.20).abs() < 1e-6,
+            "mutual one-way ignored: {}",
+            d_m.score
+        );
     }
 
     #[test]
@@ -540,8 +545,16 @@ mod tests {
     #[test]
     fn preserves_index_and_docs() {
         let hits = vec![
-            VectorHit { index: 7, score: 0.5, doc_id: "a".into() },
-            VectorHit { index: 3, score: 0.9, doc_id: "b".into() },
+            VectorHit {
+                index: 7,
+                score: 0.5,
+                doc_id: "a".into(),
+            },
+            VectorHit {
+                index: 3,
+                score: 0.9,
+                doc_id: "b".into(),
+            },
         ];
         let g = sim_graph(&[("a", "b"), ("b", "a")]);
         let out = neighbor_smooth(&hits, &g, &SmoothConfig::default());

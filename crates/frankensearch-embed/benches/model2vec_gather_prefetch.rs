@@ -139,10 +139,24 @@ fn bench(c: &mut Criterion) {
         gather_base(&emb, &ids, &mut a);
         gather_prefetch(&emb, &ids, &mut bh, false);
         gather_prefetch(&emb, &ids, &mut br, true);
-        let dh = a.iter().zip(&bh).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        let dr = a.iter().zip(&br).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        assert!(dh == 0.0, "pf_head diverged from base by {dh} (t={t}) — must be bit-identical");
-        assert!(dr == 0.0, "pf_row diverged from base by {dr} (t={t}) — must be bit-identical");
+        let dh = a
+            .iter()
+            .zip(&bh)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        let dr = a
+            .iter()
+            .zip(&br)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            dh == 0.0,
+            "pf_head diverged from base by {dh} (t={t}) — must be bit-identical"
+        );
+        assert!(
+            dr == 0.0,
+            "pf_row diverged from base by {dr} (t={t}) — must be bit-identical"
+        );
 
         group.bench_with_input(BenchmarkId::new("base", t), &ids, |bn, ids| {
             let mut sum = vec![0.0f32; DIM];

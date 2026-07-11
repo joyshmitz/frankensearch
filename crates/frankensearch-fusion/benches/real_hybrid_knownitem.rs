@@ -39,7 +39,9 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
         env("FS_QUERY_SLAB"),
         env("FS_QUERY_IDS"),
     ) else {
-        eprintln!("[real_hybrid_knownitem] FS_CORPUS_TXT/SLAB + FS_QUERY_TXT/SLAB/IDS unset — skipping.");
+        eprintln!(
+            "[real_hybrid_knownitem] FS_CORPUS_TXT/SLAB + FS_QUERY_TXT/SLAB/IDS unset — skipping."
+        );
         return;
     };
     let dim: usize = env("FS_DIM").and_then(|s| s.parse().ok()).unwrap_or(256);
@@ -81,12 +83,8 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     let doc_ids: Vec<String> = (0..n).map(|i| format!("doc-{i:06}")).collect();
 
     // ── Vector index (real embeddings). ──
-    let vindex = InMemoryVectorIndex::from_vectors(
-        doc_ids.clone(),
-        corpus_vecs[..n].to_vec(),
-        dim,
-    )
-    .expect("vector index");
+    let vindex = InMemoryVectorIndex::from_vectors(doc_ids.clone(), corpus_vecs[..n].to_vec(), dim)
+        .expect("vector index");
 
     // ── Tantivy lexical index (real text) — async build. ──
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -108,9 +106,8 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     });
 
     let cx = asupersync::Cx::for_testing();
-    let rank_of = |ids: &[String], target: &str| -> Option<usize> {
-        ids.iter().position(|d| d == target)
-    };
+    let rank_of =
+        |ids: &[String], target: &str| -> Option<usize> { ids.iter().position(|d| d == target) };
     let recall_mrr = |ids: &[String], target: &str| -> (f64, f64) {
         match rank_of(ids, target) {
             Some(rank) => (1.0, 1.0 / (rank as f64 + 1.0)),
@@ -126,7 +123,9 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     let (mut rl, mut rv, mut ml, mut mv) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for qi in 0..q {
         let target = format!("doc-{:06}", query_src[qi]);
-        let lex_hits = tantivy.search_doc_ids(&cx, &query_texts[qi], K).expect("lex");
+        let lex_hits = tantivy
+            .search_doc_ids(&cx, &query_texts[qi], K)
+            .expect("lex");
         let lex_ids: Vec<String> = lex_hits.iter().map(|h| h.doc_id.to_string()).collect();
         let lex_scored: Vec<ScoredResult> = lex_hits
             .iter()
@@ -156,8 +155,16 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
         targets.push(target);
     }
     let qf = q as f64;
-    eprintln!("[knownitem] lexical(Tantivy): recall@{K}={:.4} MRR@{K}={:.4}", rl / qf, ml / qf);
-    eprintln!("[knownitem] vector(potion):   recall@{K}={:.4} MRR@{K}={:.4}", rv / qf, mv / qf);
+    eprintln!(
+        "[knownitem] lexical(Tantivy): recall@{K}={:.4} MRR@{K}={:.4}",
+        rl / qf,
+        ml / qf
+    );
+    eprintln!(
+        "[knownitem] vector(potion):   recall@{K}={:.4} MRR@{K}={:.4}",
+        rv / qf,
+        mv / qf
+    );
 
     // ── RRF-k sweep: does a sharper (lower-k) fusion keep hybrid's recall win AND
     //    recover the rank-1 MRR that the default k=60 blend dilutes below vector-alone? ──
@@ -174,7 +181,11 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
             rh += a;
             mh += b;
         }
-        eprintln!("[knownitem] hybrid RRF k={k:>5}: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
+        eprintln!(
+            "[knownitem] hybrid RRF k={k:>5}: recall@{K}={:.4} MRR@{K}={:.4}",
+            rh / qf,
+            mh / qf
+        );
     }
 
     // ── Source-weighted RRF (manual; the knob rrf_fuse doesn't expose): up-weight the
@@ -184,7 +195,8 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     for wv in [1.0f64, 2.0, 4.0, 8.0, 16.0] {
         let (mut rh, mut mh) = (0.0f64, 0.0f64);
         for qi in 0..q {
-            let mut score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+            let mut score: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
             for (r, h) in vec_all[qi].iter().enumerate() {
                 *score.entry(h.doc_id.to_string()).or_insert(0.0) += wv / (k + r as f64 + 1.0);
             }
@@ -198,7 +210,11 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
             rh += a;
             mh += b;
         }
-        eprintln!("[knownitem] weighted-RRF vec_w={wv:>4} lex_w=1: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
+        eprintln!(
+            "[knownitem] weighted-RRF vec_w={wv:>4} lex_w=1: recall@{K}={:.4} MRR@{K}={:.4}",
+            rh / qf,
+            mh / qf
+        );
     }
 
     // ── Deterministic-tiebreak variants (equal weight): is a tiebreak-only fix (no
@@ -217,7 +233,8 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     for tb in ["hash", "doc_id"] {
         let (mut rh, mut mh) = (0.0f64, 0.0f64);
         for qi in 0..q {
-            let mut score: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+            let mut score: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
             for (r, h) in vec_all[qi].iter().enumerate() {
                 *score.entry(h.doc_id.to_string()).or_insert(0.0) += 1.0 / (60.0 + r as f64 + 1.0);
             }
@@ -236,7 +253,11 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
             rh += a;
             mh += b;
         }
-        eprintln!("[knownitem] equal-RRF tiebreak={tb:>6}: recall@{K}={:.4} MRR@{K}={:.4}", rh / qf, mh / qf);
+        eprintln!(
+            "[knownitem] equal-RRF tiebreak={tb:>6}: recall@{K}={:.4} MRR@{K}={:.4}",
+            rh / qf,
+            mh / qf
+        );
     }
 
     // ── Latency: lexical vs vector vs hybrid per query. ──
@@ -246,14 +267,22 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
         b.iter(|| {
             let i = qi % q;
             qi += 1;
-            black_box(tantivy.search_doc_ids(&cx, black_box(&query_texts[i]), K).expect("lex"))
+            black_box(
+                tantivy
+                    .search_doc_ids(&cx, black_box(&query_texts[i]), K)
+                    .expect("lex"),
+            )
         });
     });
     g.bench_function("vector", |b| {
         b.iter(|| {
             let i = qi % q;
             qi += 1;
-            black_box(vindex.search_top_k(black_box(&query_vecs[i]), K, None).expect("vec"))
+            black_box(
+                vindex
+                    .search_top_k(black_box(&query_vecs[i]), K, None)
+                    .expect("vec"),
+            )
         });
     });
     g.finish();

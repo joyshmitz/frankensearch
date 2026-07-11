@@ -17,7 +17,6 @@ pub mod model_cache;
 pub mod model_manifest;
 pub mod model_registry;
 pub mod simd;
-pub use simd::accumulate_f32_into;
 pub use auto_detect::{
     DimReduceEmbedder, EmbedderStack, ModelAvailabilityDiagnostic, ModelStatus, TwoTierAvailability,
 };
@@ -26,6 +25,7 @@ pub use batch_coalescer::{
 };
 #[cfg(feature = "bundled-default-models")]
 pub use bundled_default_models::{EmbeddedModelInstallSummary, ensure_default_semantic_models};
+pub use simd::accumulate_f32_into;
 
 // When bundled-default-models is disabled (lite build), provide a no-op
 // `ensure_default_semantic_models` so downstream crates compile without
@@ -96,8 +96,8 @@ pub mod hash_embedder;
 
 #[cfg(feature = "hash")]
 pub use hash_embedder::{
-    HashAlgorithm, HashEmbedder, jl_accumulate_lanes, jl_accumulate_lanes8,
-    jl_accumulate_lanes8_scalar, jl_accumulate_lanes_scalar,
+    HashAlgorithm, HashEmbedder, jl_accumulate_lanes, jl_accumulate_lanes_scalar,
+    jl_accumulate_lanes8, jl_accumulate_lanes8_scalar,
 };
 
 #[cfg(feature = "model2vec")]

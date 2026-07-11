@@ -104,7 +104,11 @@ fn smooth_v2(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
                     sum += nbr_score;
                     count += 1;
                 }
-                let nbr_mean = if count == 0 { h.score } else { sum / count as f32 };
+                let nbr_mean = if count == 0 {
+                    h.score
+                } else {
+                    sum / count as f32
+                };
                 VectorHit {
                     index: h.index,
                     score: keep * h.score + alpha * nbr_mean,
@@ -161,7 +165,11 @@ fn smooth_v2(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
                 sum += nbr_score;
                 count += 1;
             }
-            let nbr_mean = if count == 0 { h.score } else { sum / count as f32 };
+            let nbr_mean = if count == 0 {
+                h.score
+            } else {
+                sum / count as f32
+            };
             VectorHit {
                 index: h.index,
                 score: keep * h.score + alpha * nbr_mean,
@@ -205,7 +213,11 @@ fn smooth_v3(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
                     sum += nbr_score;
                     count += 1;
                 }
-                let nbr_mean = if count == 0 { h.score } else { sum / count as f32 };
+                let nbr_mean = if count == 0 {
+                    h.score
+                } else {
+                    sum / count as f32
+                };
                 VectorHit {
                     index: h.index,
                     score: keep * h.score + alpha * nbr_mean,
@@ -264,7 +276,11 @@ fn smooth_v3(hits: &[VectorHit], graph: &DocumentGraph, config: &SmoothConfig) -
                 sum += nbr_score;
                 count += 1;
             }
-            let nbr_mean = if count == 0 { h.score } else { sum / count as f32 };
+            let nbr_mean = if count == 0 {
+                h.score
+            } else {
+                sum / count as f32
+            };
             VectorHit {
                 index: h.index,
                 score: keep * h.score + alpha * nbr_mean,
@@ -285,7 +301,11 @@ fn assert_bit_identical(hits: &[VectorHit], graph: &DocumentGraph, cfg: &SmoothC
         assert_eq!(x.index, z.index, "{tag}: v3 index mismatch");
         assert_eq!(x.doc_id, y.doc_id, "{tag}: v2 doc_id mismatch");
         assert_eq!(x.doc_id, z.doc_id, "{tag}: v3 doc_id mismatch");
-        assert_eq!(x.score.to_bits(), y.score.to_bits(), "{tag}: v2 score mismatch");
+        assert_eq!(
+            x.score.to_bits(),
+            y.score.to_bits(),
+            "{tag}: v2 score mismatch"
+        );
         assert_eq!(
             x.score.to_bits(),
             z.score.to_bits(),
@@ -302,8 +322,16 @@ fn bench(c: &mut Criterion) {
     g.warm_up_time(Duration::from_millis(400));
     g.measurement_time(Duration::from_millis(2000));
 
-    let smooth = SmoothConfig { alpha: 0.3, m: 10, mutual: false };
-    let mutual = SmoothConfig { alpha: 0.3, m: 10, mutual: true };
+    let smooth = SmoothConfig {
+        alpha: 0.3,
+        m: 10,
+        mutual: false,
+    };
+    let mutual = SmoothConfig {
+        alpha: 0.3,
+        m: 10,
+        mutual: true,
+    };
 
     for &pool in &[50usize, 100, 1000] {
         let (hits, graph) = build(pool, 10);
@@ -315,7 +343,13 @@ fn bench(c: &mut Criterion) {
         // land candidate; v2 (eager recip re-hash) is kept for the stepping-stone comparison.
         // ORIG is measured first AND last so the first-arm ordering bias is bracketed.
         g.bench_with_input(BenchmarkId::new("mutual_ORIG", pool), &(), |b, ()| {
-            b.iter(|| black_box(neighbor_smooth(black_box(&hits), black_box(&graph), &mutual)));
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &mutual,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("mutual_v3", pool), &(), |b, ()| {
             b.iter(|| black_box(smooth_v3(black_box(&hits), black_box(&graph), &mutual)));
@@ -324,11 +358,23 @@ fn bench(c: &mut Criterion) {
             b.iter(|| black_box(smooth_v2(black_box(&hits), black_box(&graph), &mutual)));
         });
         g.bench_with_input(BenchmarkId::new("mutual_ORIG2", pool), &(), |b, ()| {
-            b.iter(|| black_box(neighbor_smooth(black_box(&hits), black_box(&graph), &mutual)));
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &mutual,
+                ))
+            });
         });
         // Non-mutual regression guard: candidate must not lose the default path.
         g.bench_with_input(BenchmarkId::new("nonmutual_ORIG", pool), &(), |b, ()| {
-            b.iter(|| black_box(neighbor_smooth(black_box(&hits), black_box(&graph), &smooth)));
+            b.iter(|| {
+                black_box(neighbor_smooth(
+                    black_box(&hits),
+                    black_box(&graph),
+                    &smooth,
+                ))
+            });
         });
         g.bench_with_input(BenchmarkId::new("nonmutual_v3", pool), &(), |b, ()| {
             b.iter(|| black_box(smooth_v3(black_box(&hits), black_box(&graph), &smooth)));

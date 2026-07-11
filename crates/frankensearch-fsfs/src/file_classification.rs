@@ -1298,9 +1298,24 @@ mod tests {
         for bytes in &cases {
             let got = SniffFeatures::from_bytes(bytes);
             let (rn, rnp, rhb) = sniff_reference(bytes);
-            assert_eq!(got.null_bytes, rn, "null_bytes mismatch (len={})", bytes.len());
-            assert_eq!(got.non_printable_ratio, rnp, "np ratio mismatch (len={})", bytes.len());
-            assert_eq!(got.high_bit_ratio, rhb, "hb ratio mismatch (len={})", bytes.len());
+            assert_eq!(
+                got.null_bytes,
+                rn,
+                "null_bytes mismatch (len={})",
+                bytes.len()
+            );
+            assert_eq!(
+                got.non_printable_ratio,
+                rnp,
+                "np ratio mismatch (len={})",
+                bytes.len()
+            );
+            assert_eq!(
+                got.high_bit_ratio,
+                rhb,
+                "hb ratio mismatch (len={})",
+                bytes.len()
+            );
         }
     }
 

@@ -49,8 +49,24 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 const VOCAB: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "search", "engine",
-    "vector", "lexical", "ranking", "relevance", "document", "query", "hybrid", "fusion",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "search",
+    "engine",
+    "vector",
+    "lexical",
+    "ranking",
+    "relevance",
+    "document",
+    "query",
+    "hybrid",
+    "fusion",
 ];
 
 struct Fixture {
@@ -167,10 +183,22 @@ fn bench(c: &mut Criterion) {
     for &k in KS {
         let hits = &hits_all[..k.min(hits_all.len())];
         g.bench_function(format!("docstore/k{k}"), |bn| {
-            bn.iter(|| black_box(materialize_docstore(&searcher, fx.id_field, black_box(hits))));
+            bn.iter(|| {
+                black_box(materialize_docstore(
+                    &searcher,
+                    fx.id_field,
+                    black_box(hits),
+                ))
+            });
         });
         g.bench_function(format!("numeric_ff/k{k}"), |bn| {
-            bn.iter(|| black_box(materialize_numeric_ff(&searcher, &fx.table, black_box(hits))));
+            bn.iter(|| {
+                black_box(materialize_numeric_ff(
+                    &searcher,
+                    &fx.table,
+                    black_box(hits),
+                ))
+            });
         });
     }
     g.finish();

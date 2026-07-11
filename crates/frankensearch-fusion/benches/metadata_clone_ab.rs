@@ -44,8 +44,7 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("metadata_clone_ab");
     for n in [10_000usize, 100_000] {
         let values: Vec<serde_json::Value> = (0..n).map(realistic_metadata).collect();
-        let arcs: Vec<Arc<serde_json::Value>> =
-            values.iter().cloned().map(Arc::new).collect();
+        let arcs: Vec<Arc<serde_json::Value>> = values.iter().cloned().map(Arc::new).collect();
 
         // Current: N deep clones of Option<Value> (the limit_all materialization).
         g.bench_with_input(BenchmarkId::new("value_deep_clone", n), &values, |b, vs| {

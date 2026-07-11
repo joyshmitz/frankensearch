@@ -102,11 +102,7 @@ pub fn apply_hubness_penalty(
 /// large query log. [`PARALLEL_THRESHOLD`] carries the same "10k dot products" meaning in the
 /// vector tier's flat scan.
 #[must_use]
-pub fn compute_query_hubness(
-    doc_vecs: &[&[f32]],
-    query_sample: &[&[f32]],
-    kq: usize,
-) -> Vec<f32> {
+pub fn compute_query_hubness(doc_vecs: &[&[f32]], query_sample: &[&[f32]], kq: usize) -> Vec<f32> {
     if query_sample.is_empty() || kq == 0 {
         return vec![0.0; doc_vecs.len()];
     }
@@ -165,7 +161,11 @@ mod tests {
     use super::*;
 
     fn hit(index: u32, score: f32) -> VectorHit {
-        VectorHit { index, score, doc_id: format!("d{index}").into() }
+        VectorHit {
+            index,
+            score,
+            doc_id: format!("d{index}").into(),
+        }
     }
 
     #[test]
@@ -182,8 +182,16 @@ mod tests {
         let hits = vec![hit(0, 0.3), hit(1, 0.9)];
         let hub = vec![0.1, 0.8];
         let out = apply_hubness_penalty(&hits, &hub, &HubnessConfig { beta: 0.5, kq: 10 });
-        assert!((out[0].score - (0.3 - 0.05)).abs() < 1e-6, "{}", out[0].score);
-        assert!((out[1].score - (0.9 - 0.40)).abs() < 1e-6, "{}", out[1].score);
+        assert!(
+            (out[0].score - (0.3 - 0.05)).abs() < 1e-6,
+            "{}",
+            out[0].score
+        );
+        assert!(
+            (out[1].score - (0.9 - 0.40)).abs() < 1e-6,
+            "{}",
+            out[1].score
+        );
     }
 
     #[test]
@@ -341,6 +349,11 @@ mod tests {
         let hits = vec![hit(0, 0.80), hit(1, 0.72)];
         let hub = vec![0.75, 0.20];
         let out = apply_hubness_penalty(&hits, &hub, &HubnessConfig { beta: 0.3, kq: 10 });
-        assert!(out[1].score > out[0].score, "rel {} should beat hub {}", out[1].score, out[0].score);
+        assert!(
+            out[1].score > out[0].score,
+            "rel {} should beat hub {}",
+            out[1].score,
+            out[0].score
+        );
     }
 }

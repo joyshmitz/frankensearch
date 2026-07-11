@@ -21,9 +21,9 @@ pub mod conformal;
 pub mod daemon_fallback;
 pub mod federated;
 pub mod feedback;
-pub mod hubness;
 #[cfg(feature = "graph")]
 pub mod graph_rank;
+pub mod hubness;
 pub mod incremental;
 pub mod interaction_lanes;
 pub mod interaction_oracles;
@@ -44,8 +44,8 @@ pub use adaptive::{
     SignalSource,
 };
 pub use blend::{
-    blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique,
-    build_borrowed_rank_map, compute_rank_changes, compute_rank_changes_with_maps, kendall_tau,
+    blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique, build_borrowed_rank_map,
+    compute_rank_changes, compute_rank_changes_with_maps, kendall_tau,
     kendall_tau_with_refined_rank,
 };
 pub use cache::{
@@ -64,9 +64,9 @@ pub use conformal::{
 pub use daemon_fallback::{DaemonFallbackEmbedder, DaemonFallbackReranker, NoopDaemonClient};
 pub use federated::{FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher};
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
-pub use hubness::{HubnessConfig, apply_hubness_penalty, compute_query_hubness};
 #[cfg(feature = "graph")]
 pub use graph_rank::GraphRanker;
+pub use hubness::{HubnessConfig, apply_hubness_penalty, compute_query_hubness};
 pub use incremental::{IncrementalConfig, IncrementalSearcher, SearchPlan, SearchStrategy};
 pub use interaction_lanes::{
     CalibratorChoice, CorpusSlice, ExpectedPhase, FeatureToggles, FixtureQuery, InteractionLane,

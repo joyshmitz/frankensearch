@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 #[derive(Clone)]
 struct VHit {

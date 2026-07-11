@@ -77,7 +77,7 @@ fn apply_votes_table(hash: u64, bit_weights: &mut [i32; 64]) {
 unsafe fn apply_votes_simd_avx2(hash: u64, bit_weights: &mut [i32; 64]) {
     use std::arch::x86_64::{
         _mm256_add_epi32, _mm256_and_si256, _mm256_cmpeq_epi32, _mm256_loadu_si256,
-        _mm256_set1_epi32, _mm256_set_epi32, _mm256_setzero_si256, _mm256_storeu_si256,
+        _mm256_set_epi32, _mm256_set1_epi32, _mm256_setzero_si256, _mm256_storeu_si256,
         _mm256_sub_epi32,
     };
     // lane k holds 1<<k (lane 0 = least-significant bit), matching VOTE_TABLE[b][k]=bit k.
@@ -150,8 +150,22 @@ fn simhash(text: &str, simd: bool) -> u64 {
 
 fn doc(tokens: usize) -> String {
     let words = [
-        "retry", "backoff", "async", "await", "vector", "search", "embedding", "rerank",
-        "token", "hash", "shingle", "fusion", "lexical", "index", "query", "score",
+        "retry",
+        "backoff",
+        "async",
+        "await",
+        "vector",
+        "search",
+        "embedding",
+        "rerank",
+        "token",
+        "hash",
+        "shingle",
+        "fusion",
+        "lexical",
+        "index",
+        "query",
+        "score",
     ];
     let mut s = String::new();
     let mut r = 0x2545_f491_4f6c_dd1d_u64;

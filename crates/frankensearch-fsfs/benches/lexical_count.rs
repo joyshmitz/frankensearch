@@ -2,8 +2,8 @@
 //! Old: `chars()` UTF-8 decode loop. New: byte loop for ASCII text. Bit-identical
 //! for ASCII (is_token_byte(b) == is_token_char(b as char)); the count state
 //! machine is unchanged.
-use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 #[inline]
 fn is_token_char(ch: char) -> bool {
@@ -18,8 +18,12 @@ fn count_old(text: &str) -> usize {
     let mut count = 0;
     let mut in_token = false;
     for ch in text.chars() {
-        if is_token_char(ch) { in_token = true; }
-        else if in_token { in_token = false; count += 1; }
+        if is_token_char(ch) {
+            in_token = true;
+        } else if in_token {
+            in_token = false;
+            count += 1;
+        }
     }
     count + usize::from(in_token)
 }
@@ -29,8 +33,12 @@ fn count_new(text: &str) -> usize {
         let mut count = 0;
         let mut in_token = false;
         for &b in text.as_bytes() {
-            if is_token_byte(b) { in_token = true; }
-            else if in_token { in_token = false; count += 1; }
+            if is_token_byte(b) {
+                in_token = true;
+            } else if in_token {
+                in_token = false;
+                count += 1;
+            }
         }
         return count + usize::from(in_token);
     }
@@ -72,11 +80,21 @@ fn bench_count(c: &mut Criterion) {
     for n in [1024usize, 4096, 16384] {
         let text = make_text(n);
         debug_assert_eq!(count_old(&text), count_new(&text));
-        assert_eq!(count_new(&text), count_lut(&text), "LUT count must match byte path (n{n})");
+        assert_eq!(
+            count_new(&text),
+            count_lut(&text),
+            "LUT count must match byte path (n{n})"
+        );
         let id = format!("ascii_{n}");
-        g.bench_with_input(BenchmarkId::new("chars", &id), &(), |b, ()| b.iter(|| black_box(count_old(black_box(&text)))));
-        g.bench_with_input(BenchmarkId::new("bytes", &id), &(), |b, ()| b.iter(|| black_box(count_new(black_box(&text)))));
-        g.bench_with_input(BenchmarkId::new("lut", &id), &(), |b, ()| b.iter(|| black_box(count_lut(black_box(&text)))));
+        g.bench_with_input(BenchmarkId::new("chars", &id), &(), |b, ()| {
+            b.iter(|| black_box(count_old(black_box(&text))))
+        });
+        g.bench_with_input(BenchmarkId::new("bytes", &id), &(), |b, ()| {
+            b.iter(|| black_box(count_new(black_box(&text))))
+        });
+        g.bench_with_input(BenchmarkId::new("lut", &id), &(), |b, ()| {
+            b.iter(|| black_box(count_lut(black_box(&text))))
+        });
     }
     g.finish();
 }

@@ -84,13 +84,37 @@ fn bench(c: &mut Criterion) {
 
     let mut g = c.benchmark_group("rrf_config_cost/realistic");
     g.bench_function("default", |b| {
-        b.iter(|| black_box(rrf_fuse(black_box(&lex), black_box(&sem), limit, 0, &default)));
+        b.iter(|| {
+            black_box(rrf_fuse(
+                black_box(&lex),
+                black_box(&sem),
+                limit,
+                0,
+                &default,
+            ))
+        });
     });
     g.bench_function("tier_weighted", |b| {
-        b.iter(|| black_box(rrf_fuse(black_box(&lex), black_box(&sem), limit, 0, &weighted)));
+        b.iter(|| {
+            black_box(rrf_fuse(
+                black_box(&lex),
+                black_box(&sem),
+                limit,
+                0,
+                &weighted,
+            ))
+        });
     });
     g.bench_function("hash_tiebreak", |b| {
-        b.iter(|| black_box(rrf_fuse(black_box(&lex), black_box(&sem), limit, 0, &hash_tb)));
+        b.iter(|| {
+            black_box(rrf_fuse(
+                black_box(&lex),
+                black_box(&sem),
+                limit,
+                0,
+                &hash_tb,
+            ))
+        });
     });
     g.finish();
 
@@ -99,10 +123,26 @@ fn bench(c: &mut Criterion) {
     let tlimit = tlex.len() + tsem.len();
     let mut gt = c.benchmark_group("rrf_config_cost/tie_heavy");
     gt.bench_function("lexical_tiebreak", |b| {
-        b.iter(|| black_box(rrf_fuse(black_box(&tlex), black_box(&tsem), tlimit, 0, &default)));
+        b.iter(|| {
+            black_box(rrf_fuse(
+                black_box(&tlex),
+                black_box(&tsem),
+                tlimit,
+                0,
+                &default,
+            ))
+        });
     });
     gt.bench_function("hash_tiebreak", |b| {
-        b.iter(|| black_box(rrf_fuse(black_box(&tlex), black_box(&tsem), tlimit, 0, &hash_tb)));
+        b.iter(|| {
+            black_box(rrf_fuse(
+                black_box(&tlex),
+                black_box(&tsem),
+                tlimit,
+                0,
+                &hash_tb,
+            ))
+        });
     });
     gt.finish();
 }

@@ -134,7 +134,11 @@ fn bench(c: &mut Criterion) {
         let sigs = signals(mult);
         // Parity: old and new must agree on every signal.
         for s in &sigs {
-            assert_eq!(old_match(&query, s), new_match(&query, s), "diverged on {s:?}");
+            assert_eq!(
+                old_match(&query, s),
+                new_match(&query, s),
+                "diverged on {s:?}"
+            );
         }
         let id = format!("signals{}", sigs.len());
         g.bench_with_input(BenchmarkId::new("old", &id), &(), |b, ()| {

@@ -70,12 +70,23 @@ fn bench_blend_sort(c: &mut Criterion) {
         let base = make_blended(n);
         let id = format!("n{n}");
         // Confirm identical top element (and, by total order, identical full order).
-        debug_assert_eq!(sort_stable(base.clone()).doc_id, sort_unstable(base.clone()).doc_id);
+        debug_assert_eq!(
+            sort_stable(base.clone()).doc_id,
+            sort_unstable(base.clone()).doc_id
+        );
         g.bench_with_input(BenchmarkId::new("stable", &id), &base, |b, v| {
-            b.iter_batched(|| v.clone(), |v| black_box(sort_stable(v)), criterion::BatchSize::LargeInput);
+            b.iter_batched(
+                || v.clone(),
+                |v| black_box(sort_stable(v)),
+                criterion::BatchSize::LargeInput,
+            );
         });
         g.bench_with_input(BenchmarkId::new("unstable", &id), &base, |b, v| {
-            b.iter_batched(|| v.clone(), |v| black_box(sort_unstable(v)), criterion::BatchSize::LargeInput);
+            b.iter_batched(
+                || v.clone(),
+                |v| black_box(sort_unstable(v)),
+                criterion::BatchSize::LargeInput,
+            );
         });
     }
     g.finish();

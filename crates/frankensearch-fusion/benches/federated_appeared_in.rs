@@ -177,7 +177,8 @@ fn fuse_bits(shards: &[Shard]) -> Vec<Row> {
     let mut out: Vec<Row> = docs
         .drain()
         .map(|(id, agg)| {
-            let mut appeared: Vec<String> = Vec::with_capacity(agg.appeared_in.count_ones() as usize);
+            let mut appeared: Vec<String> =
+                Vec::with_capacity(agg.appeared_in.count_ones() as usize);
             let mut bits = agg.appeared_in;
             while bits != 0 {
                 let id_bit = bits.trailing_zeros();
@@ -299,8 +300,16 @@ fn bench_federated_appeared_in(c: &mut Criterion) {
     for &(s, h, u) in &[(5usize, 200usize, 600usize), (10, 500, 2500)] {
         let shards = make_shards(s, h, u);
         let id = format!("s{s}_h{h}_u{u}");
-        assert_eq!(fuse_set(&shards), fuse_bits(&shards), "bitset output differs ({id})");
-        assert_eq!(fuse_set(&shards), fuse_vec(&shards), "vec output differs ({id})");
+        assert_eq!(
+            fuse_set(&shards),
+            fuse_bits(&shards),
+            "bitset output differs ({id})"
+        );
+        assert_eq!(
+            fuse_set(&shards),
+            fuse_vec(&shards),
+            "vec output differs ({id})"
+        );
         g.bench_with_input(BenchmarkId::new("btreeset", &id), &shards, |b, sh| {
             b.iter(|| black_box(fuse_set(black_box(sh))));
         });

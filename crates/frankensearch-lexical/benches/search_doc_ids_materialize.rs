@@ -27,8 +27,27 @@ const N: usize = 100_000;
 const KS: &[usize] = &[10, 100, 1000];
 
 const VOCAB: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda",
-    "mu", "nu", "xi", "search", "engine", "vector", "lexical", "ranking", "relevance", "document",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "xi",
+    "search",
+    "engine",
+    "vector",
+    "lexical",
+    "ranking",
+    "relevance",
+    "document",
     "query",
 ];
 

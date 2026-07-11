@@ -71,7 +71,12 @@ fn bench(c: &mut Criterion) {
     for &mult in &[16usize, 128] {
         // Build a batch to amortise per-call criterion overhead (mirrors a
         // document with many extracted signals / a search over many docs).
-        let batch: Vec<&str> = vals.iter().cloned().cycle().take(vals.len() * mult).collect();
+        let batch: Vec<&str> = vals
+            .iter()
+            .cloned()
+            .cycle()
+            .take(vals.len() * mult)
+            .collect();
         let id = format!("n{}", batch.len());
         g.bench_with_input(BenchmarkId::new("old", &id), &(), |b, ()| {
             b.iter(|| {

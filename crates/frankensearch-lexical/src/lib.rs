@@ -643,7 +643,9 @@ impl TantivyIndex {
                 }
             }
             if saw_ord {
-                let needed = usize::try_from(max_ord).unwrap_or(usize::MAX).saturating_add(1);
+                let needed = usize::try_from(max_ord)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
                 if ord_table.len() < needed {
                     ord_table.resize(needed, DocId::default());
                 }
@@ -675,7 +677,9 @@ impl TantivyIndex {
     /// only a future reopen would fall back to the docstore). Written atomically
     /// via a temp file + rename. No-op for in-memory indexes / pre-`ord` schemas.
     fn persist_ord_table(&self) {
-        let Some(dir) = self.path.as_ref() else { return };
+        let Some(dir) = self.path.as_ref() else {
+            return;
+        };
         if self.fields.ord.is_none() {
             return;
         }

@@ -137,8 +137,7 @@ fn fuse_sip(shards: &[Shard]) -> usize {
 }
 
 fn fuse_ahash(shards: &[Shard]) -> usize {
-    let mut docs: HashMap<String, AggDoc, RandomState> =
-        HashMap::with_hasher(RandomState::new());
+    let mut docs: HashMap<String, AggDoc, RandomState> = HashMap::with_hasher(RandomState::new());
     for shard in shards {
         for (rank, hit) in shard.hits.iter().enumerate() {
             accumulate(&mut docs, hit, &shard.name, rank, rank_contribution(rank));

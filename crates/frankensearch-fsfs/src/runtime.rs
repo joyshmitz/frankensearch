@@ -317,9 +317,7 @@ impl SearchFilterExpr {
         // extension-only filters test `doc_id` directly and allocate nothing
         // (~1.7× on ext-only filters, `filter_match_ab` bench). PathContains keeps
         // the SIMD `str::contains` (a naive alloc-free scan measured slower).
-        let lowered = self
-            .has_path_contains
-            .then(|| doc_id.to_ascii_lowercase());
+        let lowered = self.has_path_contains.then(|| doc_id.to_ascii_lowercase());
         self.clauses.iter().all(|clause| match clause {
             SearchFilterClause::PathContains(needle) => {
                 lowered.as_deref().is_some_and(|l| l.contains(needle))
