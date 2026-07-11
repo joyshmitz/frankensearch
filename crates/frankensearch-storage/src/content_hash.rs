@@ -23,10 +23,23 @@ impl ContentHasher {
 
     #[must_use]
     pub fn hash_hex(canonical_text: &str) -> String {
-        let digest = Self::hash(canonical_text);
-        let mut out = String::with_capacity(digest.len() * 2);
-        for byte in digest {
-            let _ = write!(&mut out, "{byte:02x}");
+        Self::to_hex(&Self::hash(canonical_text))
+    }
+
+    /// Lowercase-hex encode an already-computed 32-byte digest.
+    ///
+    /// Byte-identical to the former `write!(out, "{byte:02x}")` loop (proven by
+    /// `to_hex_matches_write_format`), but a direct table encode with no `core::fmt`
+    /// machinery. Split out so callers that need BOTH the raw `[u8; 32]` and its hex
+    /// form (the ingest pipeline) hash the text once and hex-encode the digest, instead
+    /// of running SHA-256 a second time via `hash_hex`.
+    #[must_use]
+    pub fn to_hex(digest: &[u8; 32]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(64);
+        for &byte in digest {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
         }
         out
     }
@@ -474,6 +487,43 @@ mod tests {
             sha256_hex("hello world"),
             ContentHasher::hash_hex("hello world")
         );
+    }
+
+    /// BYTE-IDENTITY GATE: `to_hex` must equal the former `write!(out, "{byte:02x}")`
+    /// loop for every digest, and `hash_hex(text)` must equal `to_hex(hash(text))` — so
+    /// the pipeline's single-hash rewrite keeps `content_hash_hex` bit-for-bit identical.
+    #[test]
+    fn to_hex_matches_write_format() {
+        use std::fmt::Write as _;
+        fn write_hex(digest: &[u8; 32]) -> String {
+            let mut out = String::with_capacity(digest.len() * 2);
+            for byte in digest {
+                let _ = write!(&mut out, "{byte:02x}");
+            }
+            out
+        }
+
+        // Deterministic digests covering every low/high nibble plus boundaries.
+        for seed in 0_u32..512 {
+            let mut digest = [0_u8; 32];
+            for (i, b) in digest.iter_mut().enumerate() {
+                *b = seed
+                    .wrapping_mul(2_654_435_761)
+                    .wrapping_add((i as u32).wrapping_mul(40_503)) as u8;
+            }
+            assert_eq!(ContentHasher::to_hex(&digest), write_hex(&digest));
+        }
+        assert_eq!(ContentHasher::to_hex(&[0x00; 32]), write_hex(&[0x00; 32]));
+        assert_eq!(ContentHasher::to_hex(&[0xff; 32]), write_hex(&[0xff; 32]));
+        assert_eq!(ContentHasher::to_hex(&[0x0f; 32]), write_hex(&[0x0f; 32]));
+
+        for text in ["", "hello world", "rust async search pipeline", "日本語 τεστ"] {
+            assert_eq!(
+                ContentHasher::hash_hex(text),
+                ContentHasher::to_hex(&ContentHasher::hash(text)),
+                "hash_hex must equal to_hex(hash) for {text:?}"
+            );
+        }
     }
 
     #[test]

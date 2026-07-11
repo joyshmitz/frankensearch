@@ -20,6 +20,8 @@ tracing = { workspace = true }
 
 [features]
 fts5 = ["dep:fsqlite-ext-fts5"]
+# Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
+bench-internals = ["frankensearch-core/bench-internals"]
 
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
@@ -32,6 +34,11 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 [[bench]]
 name = "dedup_batch"
 harness = false
+
+[[bench]]
+name = "content_hash_dual"
+harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true

@@ -331,7 +331,9 @@ impl StorageBackedJobRunner {
 
         let now_ms = unix_timestamp_ms()?;
         let content_hash = ContentHasher::hash(&canonical_text);
-        let content_hash_hex = ContentHasher::hash_hex(&canonical_text);
+        // Reuse the digest for the hex form instead of running SHA-256 a second time
+        // (`hash_hex` would re-hash `canonical_text`). Byte-identical hex, one hash per doc.
+        let content_hash_hex = ContentHasher::to_hex(&content_hash);
         let preview = truncate_chars(&canonical_text, MAX_CONTENT_PREVIEW_CHARS);
         let content_length = canonical_text.chars().count();
         let metadata = Some(with_correlation_metadata(request.metadata, &correlation_id));

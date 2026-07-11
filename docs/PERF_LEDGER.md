@@ -5023,3 +5023,43 @@ on two pre-existing `frankensearch-core` lints; both package and benchmark-targe
 back locally, and direct `rustfmt --edition 2024 --check` plus `git diff --check` passed. The RCH fleet was
 degraded (9/12 workers healthy), and Agent Mail reservations were unavailable because its SQLite corruption
 circuit breaker was open; both failures were surfaced rather than bypassed.
+
+## 2026-07-11 — WIN: storage ingest hashes each document ONCE, not twice — ~1.85–1.98× on the dual-hash step, byte-identical (cc_fse)
+
+The per-document ingest pipeline (`storage/pipeline.rs`, the `process` path) needs BOTH the raw 32-byte
+content hash (`DocumentRecord.content_hash` + dedup) and its lowercase-hex form (the `content_hashes`
+seen-count table). It computed them independently — `ContentHasher::hash(&canonical_text)` then
+`ContentHasher::hash_hex(&canonical_text)` — running **SHA-256 over the canonical text twice per document**.
+Since `content_hash_hex == hex(content_hash)`, the second SHA-256 is pure waste.
+
+**The lever.** Added `ContentHasher::to_hex(digest: &[u8; 32]) -> String` (a direct table hex encode,
+replacing the former `write!(out, "{byte:02x}")` `core::fmt` loop), refactored `hash_hex` to
+`to_hex(&hash(text))`, and changed the pipeline to hash once and hex-encode the digest
+(`ContentHasher::to_hex(&content_hash)`). One SHA-256 per document instead of two.
+
+**Byte-identical.** `content_hash` (`[u8; 32]`) is unchanged; `content_hash_hex` is unchanged because
+`to_hex(&hash(t)) == hash_hex(t)`. Proven by `to_hex_matches_write_format`, which asserts `to_hex` equals the
+former `write!`-based encoder over 512 deterministic digests + all-0x00/0xff/0x0f boundaries, and that
+`hash_hex(t) == to_hex(hash(t))` on ASCII/multibyte text. 18 focused `content_hash` lib tests pass.
+
+**Speed — DECIDABLE WIN, MEDIAN-gated.** New null-controlled A/B (`benches/content_hash_dual.rs`, shared
+alternating-round sampler `frankensearch_core::bench_support`, ORIG = `hash` + `hash_hex` = 2 SHA-256, CAND =
+`hash` + `to_hex(&digest)` = 1 SHA-256; ratio = CAND/ORIG, `<1.0` = faster; worker `vmi1227854`, 41 rounds ×
+inner 64):
+
+| canonical text | A/A null median [p5, p95] | CAND/ORIG median [p5, p95] | verdict |
+|---|---|---|---|
+| 256 B    | 1.0000 [0.8022, 1.1856] | **0.5439 [0.4458, 0.5733]** | **DECIDABLE WIN**, ~1.84× |
+| 2 048 B  | 1.0047 [0.8545, 1.3440] | **0.5112 [0.4320, 0.5948]** | **DECIDABLE WIN**, ~1.96× |
+| 16 384 B | 0.9979 [0.9295, 1.1770] | **0.5054 [0.4834, 0.5227]** | **DECIDABLE WIN**, ~1.98× |
+
+The lever median (~0.50–0.54) is far below each null p5 (0.80–0.93), decidable by a wide margin. It matches the
+mechanism exactly: eliminating one of two SHA-256 passes ⇒ ~0.5, approaching 0.505 as the text grows and SHA
+dominates the constant hex-encode. Single-threaded scalar SHA-256, so the paired ratio is robust to fleet
+contention (tight null p5, unlike the rayon vector scan).
+
+**Scope / honesty.** This is a ~2× win on the *dual-hash step* of per-document ingest, not a 2× end-to-end
+ingest ratio — hashing is one component alongside canonicalization, the dedup SQL, document upsert, and the WAL.
+It removes redundant work always-on for every ingested document. `hash_hex` retains its original signature and
+byte-for-byte output for other callers; the `to_hex` split also fixes the slow `write!`-per-byte hex encode. All
+builds/benches strictly remote (`RCH_REQUIRE_REMOTE=1`); no local Cargo. Peer files untouched.
