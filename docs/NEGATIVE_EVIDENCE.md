@@ -12708,3 +12708,30 @@ the oracle gap; (b) even a conservative per-corpus-calibrated cv100 gate already
 scifact/scidocs; (c) the "dense hurts committed-lexical queries" result is a standalone QUALITY lever (a smarter
 hybrid that down-weights dense on high-NQC queries could gain the +0.02–0.04 without any scan skipping). LAND path:
 Rust NQC(cv of top-k BM25) → dense-scan skip/downweight decision, cross-crate lexical→searcher. No Rust this turn.
+
+### 2026-07-12 — cc_fse — PERF LEVER (bottom line): a label-free dense-gate is NOT robustly Pareto (nfcorpus fundamentally needs dense) — but f≈40% is an average-neutral 40%-scan latency lever
+
+Tested whether COMBINING gate signals (cv100 NQC + clarity12, mean percentile-rank) makes the dense-gate robustly
+non-negative across corpora — the landability blocker (`docs/quality_harness/combined_gate_curve.py`, stem+stop,
+delta vs baseline hybrid):
+
+| f (dense skipped) | scifact | nfcorpus | arguana | scidocs | min | mean |
+|---|---:|---:|---:|---:|---:|---:|
+| 25% | +0.0016 | −0.0020 | −0.0026 | +0.0010 | −0.0026 | −0.0005 |
+| 40% | +0.0041 | −0.0046 | −0.0015 | +0.0014 | −0.0046 | **−0.0001** |
+| 50% | +0.0020 | −0.0064 | −0.0039 | −0.0003 | −0.0064 | −0.0021 |
+
+**Bottom line of the dense-gate arc:** combining signals helps only marginally (scidocs f=40% flips +; nfcorpus
+slightly less negative) and does NOT yield a robustly non-negative gate — at every f≥10% at least one corpus
+(always nfcorpus) is meaningfully negative. This is FUNDAMENTAL, not a signal-quality artifact: on nfcorpus dense
+genuinely helps its high-commitment queries too, so NO label-free gate can avoid hurting them → a quality-Pareto
+gate REQUIRES per-corpus knowledge (safe on scifact/scidocs, unsafe on nfcorpus). HOWEVER, two deployable reads
+survive: (1) as a PURE LATENCY lever, f≈40% combined-gate skips 40% of the dominant dense scan for average-neutral
+quality (mean −0.0001) — acceptable if a ±0.005 per-corpus swing is tolerable for the latency; (2) on
+dense-favorable corpora, cv100-gate is Pareto (scifact skip 50% → +0.0031). The ORACLE's ~¾-skip-plus-quality
+(`87083b18`) remains UNREALIZABLE label-free — per-query dense value can't be predicted well from lexical-only
+signals (best corr −0.18), because whether dense surfaces a relevant doc lexical missed is inherently
+dense-dependent. ARC CONCLUSION: dense-gating is a real but MODEST, corpus-calibrated latency lever (≤40% scan
+savings at average-neutral quality), not the ¾-skip free lunch the oracle teased. The stronger remaining play is
+the QUALITY reframe (down-weight dense on high-NQC queries) since the oracle's +0.02–0.04 is a quality ceiling that
+needs no scan-skipping and no per-corpus safety concern. No Rust change.
