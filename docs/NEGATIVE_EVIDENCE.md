@@ -12596,3 +12596,30 @@ is a bad quality/latency trade (negligible nDCG for real added latency). Symmetr
 a little quality on 3/4 with no latency win worth it. **The default pool≈100 is a Pareto-good operating point** —
 near-max quality at far lower cost than 500; confirms the shipped `candidate_pool_size` and rules out both
 enlarging (latency-negative) and shrinking (quality-negative) it. No Rust/conformance change.
+
+### 2026-07-12 — cc_fse — QUALITY→PERF: dense-tier marginal value is corpus-dependent (+0.0017 arguana … +0.0247 scifact); quantifies "hybrid absorbs dense micro-opts" + flags adaptive dense-gating
+
+Perf check this turn (negative-ledger-first): std SipHash `HashMap/HashSet::new()` in fusion/index — all hits are
+opt-in/background (queue/refresh/mmr/graph_rank/conformal/interaction) or the sync_searcher `rank_map` (626) which
+feeds `compute_rank_changes` TELEMETRY and was DELIBERATELY left std by the 8665ce1 aHash migration ("scoped");
+respecting that — no new hot-path SipHash map. Clean. Quality→perf: measured each tier's MARGINAL value on the
+corrected stem+stop baseline (`docs/quality_harness/dense_marginal.py`), 4 corpora, nDCG@10, pool-min-max:
+
+| corpus | dense | lexical | hybrid | dense adds (h−lex) | lexical adds (h−dense) |
+|---|---:|---:|---:|---:|---:|
+| scifact | 0.6331 | 0.6873 | 0.7120 | +0.0247 | +0.0789 |
+| nfcorpus | 0.3089 | 0.3269 | 0.3467 | +0.0197 | +0.0378 |
+| arguana | 0.3328 | 0.3584 | 0.3601 | **+0.0017** | +0.0273 |
+| scidocs | 0.1369 | 0.1562 | 0.1627 | +0.0065 | +0.0258 |
+
+**Findings:** (1) with stem+stop, LEXICAL is the stronger single tier on ALL 4 corpora (lexical's marginal value is
+always large, +0.026..+0.079 — lexical is indispensable). (2) DENSE's marginal contribution is highly
+corpus-dependent: +0.0247 (scifact) / +0.0197 (nfcorpus) / +0.0065 (scidocs) / **+0.0017 (arguana ≈ nothing)**. The
+dense int8 scan is the DOMINANT per-query CPU cost, yet on argument-retrieval-style corpora it buys ~0.
+**Perf implication:** dense is not uniformly worth its latency — a query/corpus-adaptive DENSE-GATING (skip the dense
+scan when it is unlikely to move the hybrid) is a real latency route-next (large scan-cost saving at ≈0 quality cost
+on dense-weak corpora); it needs a label-free "will dense help this query?" signal (open problem — cf the rejected
+label-free tier-weight QPP 72b68de, so gating is non-trivial). (3) QUANTIFIES the recurring "hybrid absorbs dense
+micro-opts" theme (43be67e/19787ed/6d1612c): since dense's marginal hybrid value is ≤ +0.025, any dense-SIDE quality
+tweak (hubness, smoothing) is bounded above by that — explains why dense-side quality levers underdeliver end-to-end.
+No Rust/conformance change.
