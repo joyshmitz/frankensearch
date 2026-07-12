@@ -11952,3 +11952,27 @@ arrays) better than pdqsort at that size; the scratch-alloc saving only pays onc
 **Boundary refinement:** the `winners_sort` `sort_by→sort_unstable_by` win is n-dependent — it wins on LARGE
 sort inputs (index rescored/winners, 1000s) but LOSES on small, tie-heavy top-k windows. Don't apply it to
 small reranked/top-k windows. Production keeps `sort_by`.
+
+### 2026-07-12 — cc_fse — LANDED: MRL rescored top-k threshold-gated `select_nth` ~2× (large sets), no regression small — byte-identical (frankensearch-index)
+
+`mrl.rs` rescores `rescore_top_k` (= `3·limit` by default) candidates then keeps the top `limit`. It
+full-sorted ALL of them and truncated. Now it partitions to the top `limit` with `select_nth_unstable_by`
+(O(n)) and sorts only those. Byte-identical (strict total order: `score` `total_cmp` + unique `index`
+tiebreak ⇒ the top-`limit` partition is unique). **Gated by `SELECT_NTH_MIN = 256`** so small candidate
+sets keep the full sort — directly applying the previous HOLD's n-dependency lesson (`sort`/`select_nth`
+constant factors dominate at small n) to make the change ROBUST (never slower).
+
+**Measured (strict remote, release, within-process paired AB/BA; parity `output_identical=true` all shapes;
+`limit = n/3` mirrors the default `rescore_top_k = 3·limit`):**
+
+| n rescored / limit | select_nth used | legacy median | select median | lever [p5,p95] | speedup |
+|---:|:---:|---:|---:|---:|---:|
+| 90 / 30 | no (< 256) | 1764 ns | 1793 ns | 1.013 [0.881, 1.127] | 0.99× (unchanged, INSIDE_NULL_FLOOR) |
+| 300 / 100 | yes | 6372 ns | 3216 ns | 0.511 [0.456, 0.527] | **1.96×** |
+| 768 / 256 | yes | 18946 ns | 9137 ns | 0.492 [0.330, 0.572] | **2.03×** |
+| 3000 / 1000 | yes | 82052 ns | 35196 ns | 0.437 [0.352, 0.552] | **2.29×** |
+
+`decision=KEEP`. Robust: small sets (n < 256, i.e. MRL `limit < ~86`) are unchanged (no regression); larger
+sets are ~2×. **Boundary payoff:** the n-dependency HOLD (reranker sort, a0fd2090) directly informed the
+threshold that makes THIS win safe — the same lever (`select_nth`/`sort_unstable`) that regresses small n is
+a ~2× win on large n when gated. Bench `mrl_topk_select_ab` replicates the algorithm as the parity oracle.

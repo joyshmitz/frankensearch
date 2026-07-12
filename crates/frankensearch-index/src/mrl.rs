@@ -326,11 +326,23 @@ impl VectorIndex {
         // bit-identical to a stable sort and drops the mergesort scratch alloc.
         // Same lever as the exact-search winners sort (`winners_sort` bench,
         // ~1.16–1.47×; identical `score`+`index` comparator).
-        rescored.sort_unstable_by(|a, b| {
+        let by_score_index = |a: &MrlHeapEntry, b: &MrlHeapEntry| {
             nan_safe(b.score)
                 .total_cmp(&nan_safe(a.score))
                 .then_with(|| a.index.cmp(&b.index))
-        });
+        };
+        // For a large candidate set, partition to the top `limit` in O(n) and sort
+        // only those, instead of a full O(n log n) sort of everything we then discard.
+        // Byte-identical (strict total order ⇒ the top-`limit` partition is unique).
+        // Gated by `SELECT_NTH_MIN` so small sets — where a full sort is already fast
+        // and `select_nth`'s constant factors can dominate (an n-dependent effect
+        // measured on small reranked windows) — keep the original full-sort path.
+        const SELECT_NTH_MIN: usize = 256;
+        if limit < rescored.len() && rescored.len() >= SELECT_NTH_MIN {
+            rescored.select_nth_unstable_by(limit, by_score_index);
+            rescored.truncate(limit);
+        }
+        rescored.sort_unstable_by(by_score_index);
         rescored.truncate(limit);
 
         // Resolve doc_ids.
