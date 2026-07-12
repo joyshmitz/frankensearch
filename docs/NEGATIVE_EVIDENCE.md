@@ -12096,3 +12096,13 @@ call `neighbors()`) so it barely benefits. Action it only if the graph-diffusion
 default-on-hot and the core-dep cost is acceptable — then swap `adjacency` to `AHashMap`, bench `neighbors()`
 lookups over a realistic pool/graph. This is the last concrete measurable-CPU lead; everything else audited
 is trait-bound, external, or opt-in-and-inside-floor.
+
+**RESOLVED (same day): the gating condition is FALSE — don't action.** `neighbor_smoothing_alpha` defaults
+to `0.0` (`searcher.rs:4252`), and `smoothing_config()` returns `None` (not an identity config) when alpha=0
+so the whole graph-diffusion pass — and every `neighbors()`/`DocumentGraph` lookup — is SKIPPED on the
+default path (`searcher.rs:382-386`). So the `adjacency` SipHash cost is paid ONLY when smoothing is
+explicitly enabled (opt-in), where it is also just ~1 hash among the `deg` aHash pool lookups. The
+`DocumentGraph.adjacency` aHash swap is therefore confirmed below the bar (opt-in + inside-floor) and the
+last concrete measurable-CPU lead is CLOSED. No remaining default-hot-path CPU lever exists on the ownable
+surface; the productive directions are the documented three (search-QUALITY / unblock `bd-e41k` / new
+workload).
