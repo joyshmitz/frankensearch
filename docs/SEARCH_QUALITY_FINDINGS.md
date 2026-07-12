@@ -238,7 +238,7 @@ byte-for-byte unchanged), so the recipe is expressible in code with **no** produ
 | Neutral hash RRF tiebreak (#3) | **Shipped, opt-in** `05472cd` | `RrfConfig { tiebreak: RrfTiebreak::Hash, .. }` |
 | RRF `k` (#3) | already configurable | `RrfConfig { k: 10.0, .. }` / `TwoTierConfig.rrf_k` |
 | Deep candidate feed (#3) | already configurable | `candidate_multiplier` |
-| NQC dense down-weight (2026-07-12) | **Foundation landed** `0b4651c2`/`97f5c697` (`nqc_cv` fn, tested, latency-neutral) — rest TODO | (not yet wired; opt-in `dense_nqc_downweight_beta` default 0 planned) |
+| NQC dense down-weight (2026-07-12) | **Shipped, opt-in (sync path)** `d735d6f2` — `nqc_cv`/`NqcDenseWeight` + wired into `SyncTwoTierSearcher`, default off, 873 tests green | `SyncTwoTierSearcher::with_nqc_dense_downweight(beta≈0.5, w_min>0, NqcDenseWeight::from_sample(&query_nqc_sample))`; async `searcher.rs` wiring + real-embedder A/B are follow-ups |
 
 **Remaining work is outward-facing DEFAULT flips (product-gated).** Turning the recipe on *by default* changes
 user-visible ranking output and updates test snapshots, so each needs a product sign-off — each is de-risked to a
