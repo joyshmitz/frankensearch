@@ -12574,3 +12574,25 @@ largest fusion signal), and the average edge is ~+0.001 — within single-run ev
 There is no robust basis to change the shipped min-max normalization; min-max is confirmed a fine, well-justified
 choice. (Direction is not even consistent, unlike pool-min-max>RRF which held 4/4 with larger margins.) Rules out
 a normalization swap for the fusion kernel. No Rust/conformance change.
+
+### 2026-07-12 — cc_fse — QUALITY/LATENCY: fusion pool=100 is Pareto-good — larger pools give ~+0.001 nDCG for ~5× fusion cost (don't enlarge)
+
+Perf check this turn (negative-ledger-first): `.iter().count()` / `collect::<Vec>().len()` / `collect().iter()`
+(avoidable-O(n) / redundant-collect) — zero hits in fusion/index/lexical/rerank/core. Clean. Quality: swept the
+fusion candidate-pool size (engine `candidate_pool_size`, default ~100) for pool-min-max on the stem+stop baseline,
+4 corpora, nDCG@10 (`docs/quality_harness/pool_size_sweep.py`, embed once per corpus, pools sliced in-memory):
+
+| corpus | p=20 | p=50 | p=100 | p=200 | p=500 |
+|---|---|---|---|---|---|
+| scifact | 0.7113 | 0.7110 | **0.7120** | 0.7092 | 0.7114 |
+| nfcorpus | 0.3450 | 0.3466 | 0.3468 | 0.3470 | **0.3488** |
+| arguana | 0.3579 | 0.3593 | 0.3601 | 0.3609 | **0.3615** |
+| scidocs | 0.1599 | 0.1620 | 0.1628 | 0.1625 | **0.1635** |
+
+**Perf-relevant verdict: DON'T enlarge the pool.** p=500 nominally wins 3/4 (nfcorpus/arguana/scidocs improve
+monotone-ish with pool size) but the margin over p=100 is only +0.0007..+0.0020 (within single-run noise) and it
+LOSES on scifact — while a 500-candidate pool is ~5× the per-query fusion + candidate-retrieval work of 100. That
+is a bad quality/latency trade (negligible nDCG for real added latency). Symmetrically, shrinking to p=20/50 costs
+a little quality on 3/4 with no latency win worth it. **The default pool≈100 is a Pareto-good operating point** —
+near-max quality at far lower cost than 500; confirms the shipped `candidate_pool_size` and rules out both
+enlarging (latency-negative) and shrinking (quality-negative) it. No Rust/conformance change.
