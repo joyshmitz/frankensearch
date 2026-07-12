@@ -11677,3 +11677,38 @@ rows-per-group (more events per `reason_code` = larger relative clone saving), a
 many-events-per-reason. External Tantivy/Lucene/Meilisearch comparator is **N/A** (internal render-path
 aggregation). 77/77 ops `historical_analytics` lib tests pass (incl. the correlation-correctness tests).
 The owned-key path is retained only behind `bench-internals` as the parity oracle.
+
+### 2026-07-11 — cc_fse — HOLD (not shipped): alerts-SLO per-project grouping borrowed-key clone-elision is byte-identical + directionally faster but NOT robustly decidable (largest fleet shape inside the null floor)
+
+**Same clone-elision family as the two ops wins above, applied to the next instance of the anti-pattern.**
+`AlertsSloScreen::project_slo_rows` (per render) groups fleet instances into a
+`BTreeMap<String, Vec<&InstanceInfo>>` keyed by `instance.project.clone()` — one `String` clone per
+instance. The candidate keyed by borrowed `&str` (the instance slice outlives the transient map),
+materializing the owned project name once per output group. Same byte-identity argument as correlation:
+the sort's terminal `project` tiebreak is unique per group, so output order is iteration-order-independent.
+
+**Why it is weaker than correlation/RFC3339.** Unlike the correlation grouping (O(G) per-group work, so
+the per-row clone dominated), this function's per-group phase re-iterates each group's instances three
+times and does a `search_metrics.get` (String-hash) per instance. The eliminated clone is therefore a
+much smaller fraction of total work, and the relative saving shrinks as the fleet grows.
+
+**Measured (strict remote `vmi1227854`, release, within-process paired AB/BA; parity `output_identical=true`
+before every timing run):** ratios are candidate(borrowed)/owned.
+
+| shape instances/projects | owned median | borrowed median | paired lever [p5,p95] | A/A null [p5,p95] | speedup | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| 2048/24 | 0.1149 ms | 0.0979 ms | 0.8705 [0.707, 0.939] | 1.0091 [0.914, 1.263] | 1.15× | CANDIDATE_FASTER |
+| 8192/48 | 0.7136 ms | 0.6247 ms | 0.9034 [0.874, 0.935] | 0.9989 [0.950, 1.037] | 1.11× | CANDIDATE_FASTER |
+| 16384/64 | 2.0069 ms | 1.9528 ms | 0.9327 [0.820, 1.079] | 0.9829 [0.903, 1.265] | 1.07× | **INSIDE_NULL_FLOOR** |
+
+**Decision: HOLD, production unchanged.** The candidate is byte-identical and never slower (borrowed
+median < owned at all three shapes), and it clears the floor at 2048/8192 instances, but the largest
+16384-instance shape lands inside its (noisy, p95≈1.27) null floor → `all_shapes_clear_null_floor=false`,
+`decision=HOLD`. Consistent with the campaign's strict decidability gate (cf. `2e05ce3a`, bd-0j5e,
+bd-ryid: not robustly decidable ⇒ not shipped), the borrowed-key refactor + its bench were reverted;
+`project_slo_rows` remains the original owned-key form. **Route-next / boundary:** this closes the ops
+grouping-map clone-elision vein where per-group work is heavy — only the *counter-style* groupings
+(cheap O(G) per-group, like correlation) yield robust wins; re-open only for a grouping whose per-group
+phase is O(G), or at a materially larger, less contended substrate. `fleet.rs project_summary_lines` has
+the same anti-pattern but its grouping loop is dominated by three per-instance HashMap gets, so it is
+expected to be even less decidable — deprioritized.
