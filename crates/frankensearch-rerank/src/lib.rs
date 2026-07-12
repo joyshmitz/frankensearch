@@ -40,3 +40,19 @@ pub const DEFAULT_MODEL_NAME: &str = "rerank-default-v1";
 
 /// Default maximum input token length for cross-encoder query/document pairs.
 pub const DEFAULT_MAX_LENGTH: usize = 512;
+
+/// Convert a token-id slice to `i64`, keeping at most `max_length` ids.
+///
+/// Truncating with `take(max_length)` **before** the `i64` conversion + collect
+/// avoids materializing the discarded tail: for a document that tokenizes to far
+/// more than `max_length` tokens (common when reranking full document bodies), this
+/// is `O(max_length)` instead of `O(total_tokens)`. Byte-identical to
+/// `iter().map(i64::from).collect()` followed by `truncate(max_length)` — both yield
+/// the first `min(len, max_length)` ids.
+#[must_use]
+pub fn ids_to_truncated_i64(ids: &[u32], max_length: usize) -> Vec<i64> {
+    ids.iter()
+        .take(max_length)
+        .map(|&id| i64::from(id))
+        .collect()
+}

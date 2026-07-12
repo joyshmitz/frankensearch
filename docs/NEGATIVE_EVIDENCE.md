@@ -11863,3 +11863,30 @@ came from eliminating repeated *filtering/hashget*, not pass-count. This fleet-*
 cheap `.map().collect()` per pass (no filter, no per-item hashget), so it saves just 2 HashMap/Vec traversals
 against very wide null floors (these µs-scale ops are noise-dominated). Reverted; production keeps the five
 collects. The 538bb9b4 deferral is now resolved as HOLD — do not re-attempt.
+
+### 2026-07-12 — cc_fse — LANDED: reranker tokenizer truncate-before-collect ~2.7–10× on long documents, byte-identical (frankensearch-rerank)
+
+Shape-1 win (skip work over LARGE inputs) found in the RERANK crate (small, fast-compiling; `native_embedder`
+is `native`-gated but the id-materialization is a pure fn benchable feature-free). `NativeEmbedder::tokenize`
+converted the tokenizer's full `&[u32]` id list to `Vec<i64>` and *then* truncated to `max_length` (512) —
+materializing the entire discarded tail for any document that tokenizes beyond the cap (common when reranking
+full document bodies). Extracted `ids_to_truncated_i64` (un-gated in `lib.rs`) that does
+`.take(max_length)` **before** the `i64` conversion + collect: `O(max_length)` not `O(total_tokens)`.
+Byte-identical (both yield the first `min(len, max_length)` ids).
+
+**Measured (strict remote `vmi1264463`, release, within-process paired AB/BA; parity `output_identical=true`
+all lengths; bench compiles WITHOUT the heavy `native` feature):**
+
+| tokens | legacy median | fast median | lever [p5,p95] | verdict |
+|---:|---:|---:|---:|---|
+| 128 (< 512 cap) | 70 ns | 70 ns | 1.001 [0.888, 1.155] | INSIDE_NULL_FLOOR (no tail to skip) |
+| 512 (= cap) | 190 ns | 150 ns | 1.003 [0.993, 1.075] | INSIDE_NULL_FLOOR |
+| 2048 (> cap) | 691 ns | 221 ns | 0.373 [0.292, 0.402] | **CANDIDATE_FASTER 2.68×** |
+| 8192 (≫ cap) | 1582 ns | 150 ns | 0.099 [0.095, 0.109] | **CANDIDATE_FASTER 10.09×** |
+
+`decision=KEEP` (clears the floor for the > cap cases; short docs are a correct wash). The win scales with how
+far the document exceeds the 512-token cap. `cargo check --features native` confirms the `tokenize` call swap
+compiles. External comparator N/A (internal reranker ingest primitive). **Boundary corollary:** this is shape-1
+("skip work over large inputs") not a micro-fusion — the saving is O(total−cap) discarded conversions, which is
+large for long docs, unlike the short-per-item HOLDs. Legacy collect-then-truncate replicated in the bench as
+the parity oracle (`token_id_truncate_ab`, no `native` feature needed).

@@ -141,11 +141,10 @@ impl NativeEmbedder {
                     model: MODEL_NAME.to_owned(),
                     source: format!("tokenize failed: {e}").into(),
                 })?;
-        let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-        if ids.len() > self.max_length {
-            ids.truncate(self.max_length);
-        }
-        Ok(ids)
+        Ok(crate::ids_to_truncated_i64(
+            encoding.get_ids(),
+            self.max_length,
+        ))
     }
 
     fn lock_model(&self) -> SearchResult<std::sync::MutexGuard<'_, Model>> {

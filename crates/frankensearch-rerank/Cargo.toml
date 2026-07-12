@@ -48,6 +48,11 @@ required-features = ["native"]
 name = "combine_reorder_cost_ab"
 harness = false
 
+# Tokenizer id materialization: collect-all-then-truncate vs take-before-collect.
+[[bench]]
+name = "token_id_truncate_ab"
+harness = false
+
 # CLS-only final-layer attention: original m=1 BMM/repack path vs direct rank-1 kernel.
 [[bench]]
 name = "cls_attention_ab"
