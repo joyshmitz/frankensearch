@@ -148,6 +148,16 @@ impl NqcDenseWeight {
         Self { sorted_cv }
     }
 
+    /// Build directly from a batch of per-query lexical score slices — the deployment path
+    /// (replay a query log / rolling window through the lexical tier, feed each query's top-k
+    /// BM25 scores). Computes each query's NQC via [`nqc_cv`] and retains the sample. Empty
+    /// batches (no scores) contribute a `0.0` NQC, which `from_sample` keeps.
+    #[must_use]
+    pub fn from_query_scores<'a>(queries: impl IntoIterator<Item = &'a [f32]>) -> Self {
+        let sample: Vec<f32> = queries.into_iter().map(nqc_cv).collect();
+        Self::from_sample(&sample)
+    }
+
     /// Number of retained samples.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -365,6 +375,19 @@ mod tests {
         assert!((w.percentile(0.0) - 0.0).abs() <= 1e-6, "below all -> 0");
         assert!((w.percentile(1.0) - 1.0).abs() <= 1e-6, "above all -> 1");
         assert!((w.percentile(0.2) - 0.5).abs() <= 1e-6, "<=0.2 is 2/4");
+    }
+
+    #[test]
+    fn nqc_weight_from_query_scores_computes_and_ranks_nqc() {
+        let peaked: &[f32] = &[10.0, 1.0]; // high NQC (cv ≈ 0.818)
+        let uniform: &[f32] = &[5.0, 5.0, 5.0]; // NQC = 0
+        let mid: &[f32] = &[3.0, 2.0];
+        let w = NqcDenseWeight::from_query_scores([peaked, uniform, mid]);
+        assert_eq!(w.len(), 3);
+        // The peaked query sits above the uniform (NQC 0) one in the sampled distribution.
+        assert!(w.percentile(nqc_cv(peaked)) >= w.percentile(nqc_cv(uniform)));
+        // So enabling the down-weight demotes the dense tier more on the high-NQC query.
+        assert!(w.dense_weight(nqc_cv(peaked), 0.5, 0.0) <= w.dense_weight(nqc_cv(uniform), 0.5, 0.0));
     }
 
     #[test]
