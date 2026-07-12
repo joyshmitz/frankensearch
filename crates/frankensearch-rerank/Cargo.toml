@@ -53,6 +53,11 @@ harness = false
 name = "token_id_truncate_ab"
 harness = false
 
+# RRF reorder write-back: clone_from_slice (2N clones) vs move snapshot (N clones).
+[[bench]]
+name = "rrf_reorder_move_ab"
+harness = false
+
 # CLS-only final-layer attention: original m=1 BMM/repack path vs direct rank-1 kernel.
 [[bench]]
 name = "cls_attention_ab"

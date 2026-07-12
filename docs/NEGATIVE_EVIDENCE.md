@@ -11906,3 +11906,28 @@ proven byte-identical + 2.68× at 2048 tokens / 10.09× at 8192 tokens, wash at 
 native` confirms the cross-encoder change compiles (3m03s, no warnings on the changed lines). Ships the same
 proven optimization at a second, hotter callsite by reuse — the right way to land a follow-on (no duplicate
 kernel, no re-measurement of an identical pure fn).
+
+### 2026-07-12 — cc_fse — LANDED: RRF reorder write-back MOVE instead of clone_from_slice ~1.5×, byte-identical (frankensearch-rerank)
+
+`pipeline.rs::apply_rrf_combine` (per query, on the reranked top-k window) reorders by gathering the permuted
+window into a `reordered` snapshot (one clone per slot — unavoidable, the gather reads positions it would
+overwrite) and then did `window.clone_from_slice(&reordered)` — cloning **every element a second time** (2N
+`ScoredResult` clones total). The `clone_from_slice` is a redundant full window copy: the snapshot is already
+the desired content, so it can be **moved** back (`for (slot, value) in window.iter_mut().zip(reordered) { *slot
+= value; }`) — N clones, not 2N. Byte-identical final order.
+
+**Measured (strict remote, release, within-process paired AB/BA; parity `output_identical=true` all sizes;
+bench compiles WITHOUT `native`):**
+
+| window (reranked top-k) | legacy median | move median | lever [p5,p95] | null [p5,p95] | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 1121 ns | 631 ns | 0.677 [0.641, 0.771] | 0.991 [0.847, 1.094] | **1.48×** |
+| 128 | 3816 ns | 2734 ns | 0.649 [0.609, 0.682] | 1.000 [0.899, 1.152] | **1.54×** |
+| 512 | 16765 ns | 11507 ns | 0.657 [0.541, 0.755] | 1.002 [0.936, 1.212] | **1.52×** |
+
+`decision=KEEP`, all sizes clear the floor. **Boundary note:** this DID clear the floor at small N (window=32
+is a realistic top-k) despite my "small-N clone-elision = inside-floor" heuristic — because `clone_from_slice`
+is a FULL redundant window copy (~1/3 of the reorder), not one alloc among many. The distinction is
+*redundant-full-copy* (wins) vs *one-of-many-small-allocs* (inside-floor). Bench `rrf_reorder_move_ab` replicates
+the reorder as the parity oracle. GOTCHA: a non-native rerank bench can still hit `failed to get ft-api` on a
+worker lacking frankentorch — retry on a worker that has it (native check passed there).

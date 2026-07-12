@@ -329,12 +329,17 @@ fn apply_rrf_combine(window: &mut [ScoredResult], k: f32) {
             .then_with(|| window[a.position].doc_id.cmp(&window[b.position].doc_id))
     });
 
-    // Apply the permutation in place (window is small: the reranked top-k).
+    // Gather the permuted window into a snapshot (one clone per slot, unavoidable
+    // because the gather can read positions we'd otherwise overwrite), then MOVE the
+    // snapshot back into `window`. The prior `clone_from_slice(&reordered)` cloned
+    // every element a second time; moving halves the `ScoredResult` clones (2N → N).
     let reordered: Vec<ScoredResult> = order
         .into_iter()
         .map(|entry| window[entry.position].clone())
         .collect();
-    window.clone_from_slice(&reordered);
+    for (slot, value) in window.iter_mut().zip(reordered) {
+        *slot = value;
+    }
 }
 
 #[cfg(test)]
