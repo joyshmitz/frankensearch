@@ -123,6 +123,11 @@ name = "score_map"
 harness = false
 
 [[bench]]
+name = "negation_normalize_ab"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
 name = "sync_hash_ab"
 harness = false
 

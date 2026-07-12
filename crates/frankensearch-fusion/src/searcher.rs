@@ -2816,6 +2816,30 @@ fn find_negative_match(text: &str, exclusions: &NormalizedExclusions) -> Option<
 }
 
 fn normalize_for_negation_match(value: &str) -> String {
+    // Fast path: for pure-ASCII input (the common case for query text and most
+    // document bodies), NFC is the identity and Unicode lowercasing equals ASCII
+    // lowercasing, so we skip the `unicode_normalization` composing iterator and
+    // Unicode case-folding entirely. Byte-identical to the Unicode path for ASCII.
+    if value.is_ascii() {
+        return value.to_ascii_lowercase();
+    }
+    value.nfc().collect::<String>().to_lowercase()
+}
+
+/// Bench-only accessor for the shipped ASCII-fast-path negation normalizer.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_normalize_for_negation_match_fast(value: &str) -> String {
+    normalize_for_negation_match(value)
+}
+
+/// Bench-only reference: the original always-Unicode negation normalizer, retained
+/// as the exact-parity oracle and the A/B baseline.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_normalize_for_negation_match_reference(value: &str) -> String {
     value.nfc().collect::<String>().to_lowercase()
 }
 

@@ -11712,3 +11712,48 @@ grouping-map clone-elision vein where per-group work is heavy — only the *coun
 phase is O(G), or at a materially larger, less contended substrate. `fleet.rs project_summary_lines` has
 the same anti-pattern but its grouping loop is dominated by three per-instance HashMap gets, so it is
 expected to be even less decidable — deprioritized.
+
+### 2026-07-11 — cc_fse — LANDED: negation-match text normalizer ASCII fast path ~97×, byte-identical (frankensearch-fusion search-filter path)
+
+**Sibling hunt for the RFC3339 pattern** ("general-purpose library on a near-always-canonical hot path")
+across the whole workspace found `searcher.rs::normalize_for_negation_match`, which runs on each
+candidate document's `text` when a query carries exclusion terms (`-term`, via `find_negative_match`).
+It always ran `value.nfc().collect::<String>().to_lowercase()` — the full `unicode_normalization` NFC
+composing iterator plus Unicode case-folding over the whole document body, per excluded candidate.
+
+**Lever (`searcher.rs`).** Added an `is_ascii()` fast path: for pure-ASCII input, NFC is provably the
+identity (ASCII has no canonical decomposition/composition) and `str::to_lowercase()` equals
+`to_ascii_lowercase()` (ASCII letters have no Unicode special-casing), so
+`value.nfc().collect::<String>().to_lowercase() == value.to_ascii_lowercase()`. Non-ASCII input still
+takes the full Unicode path, so behavior is byte-identical on every input. ASCII is the overwhelming
+common case for query text and English/code/log document bodies.
+
+**Measured command (per-crate, strict remote `vmi1149989`, release, within-process paired AB/BA — both
+arms in one process on one worker, immune to the `RCH_WORKER` soft-pin issue):**
+
+```bash
+AGENT_NAME=cc_fse CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod \
+  rch exec -- cargo bench -p frankensearch-fusion --profile release --features bench-internals \
+    --bench negation_normalize_ab
+```
+
+**Differential parity (before timing):** over a 640-entry ASCII document corpus (short query terms +
+40–160-word bodies) plus a 10-entry non-ASCII corpus (accented Latin, combining marks requiring NFC
+composition, Cyrillic, CJK, ligatures, empty string): `ascii_checked=640 non_ascii_checked=10
+fast_equals_reference=true` — the fast path equalled the always-Unicode reference for all 650 inputs.
+
+| Workload | reference (always NFC+Unicode) | shipped ASCII fast path | ratio vs reference | Decision |
+|---|---:|---:|---:|---|
+| per-call normalize median | 7.3532 us | 0.0486 us | — | keep |
+| paired A/A null median [p5,p95] | 1.001500 [0.804971, 1.250463] | — | contains 1.0 | valid floor |
+| paired lever median [p5,p95] | — | 0.010302 [0.008831, 0.014231] | **0.0103 (~97.07× faster)** | **KEEP** |
+
+Verdict `CANDIDATE_FASTER` (lever median 0.0103 « null p5 0.805); `gate_pass=true`, `decision=KEEP`.
+The ~97× reflects that Unicode NFC segmentation + case-folding over a document body is far heavier than a
+single `is_ascii` byte scan + ASCII lowercase. External Tantivy/Lucene/Meilisearch comparator is **N/A**
+(internal exclusion-filter primitive). 10/10 fusion negation lib tests pass (incl.
+`normalize_for_negation_match_nfc_composing` and the end-to-end negation-apply tests); clippy clean. The
+original always-Unicode form is retained only behind `bench-internals` as the parity oracle (bench
+`negation_normalize_ab`). Method note: the RFC3339-style "general-purpose lib on a canonical hot path"
+sibling hunt generalizes beyond timestamps to Unicode normalization — grep for `nfc()`/`to_lowercase()`
+over large/hot inputs.
