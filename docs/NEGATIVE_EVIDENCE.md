@@ -12327,3 +12327,32 @@ reallocating char-collect. Applied the exact same proven transformation (`String
 to all three. No re-bench: the code is byte-for-byte the benched arm (~1.38x @ width 120, byte-identical over
 n∈{0,1,4,63,120,256}, verified compile+tests green in 552adbd1). All six ops sparklines are now pre-sized —
 the char-collect-realloc pattern is fully swept from the crate. Shipped.
+
+### 2026-07-12 — cc_fse — RE-AUDIT (negative): fingerprint-compute + lexical-tokenize + tui re-swept, floored/locked/no-home
+
+After landing the ops host_bucket (bd47ed1e) and sparkline ×6 (552adbd1/e14e13f8) wins, swept the adjacent
+CPU surfaces for another lever; all floored/locked/no-home this turn:
+
+- **fingerprint compute (`frankensearch-core/src/fingerprint.rs`, per-doc ingest):** `apply_hash_votes` is
+  already VOTE_TABLE-driven + auto-vectorized (8-wide i32 add; tableless AVX2 REJECTED earlier b02baef).
+  `hash_token_window` is FNV-1a → **bit-identity-locked** (any change alters fingerprint values), and sliding
+  shingle windows share no FNV prefix (each restarts from OFFSET_BASIS with a different leading token) → no
+  incremental reuse. `semantic_hash_from_weights` could go branchless (`h |= (u64::from(w>0))<<bit`) but it is
+  O(64)/doc AND the ingest path is **I/O-dominated** (ledger 852a44b0) → **no end-to-end home** (same class as
+  the `max-reduction` no-home lever 6db7141 that was measured-but-not-shipped). Not landed.
+- **lexical tokenize (`cass_compat.rs`):** `cass_generate_edge_ngrams` already has the ASCII fast-path
+  (edge_ngrams_ab), `cass_push_prefix_term` already takes `&mut String`, `cass_normalize_term_parts/
+  _phrase_terms` are **query-time-rare** (once/query, not per-doc). The three `.to_lowercase()` sites (1769/
+  1776/1938) are query-time; `tracing_config.rs:83` is startup-once — the ASCII-lowercase fast-path family has
+  no hot home here.
+- **ops screens:** grep for the host_bucket family (allocating call inside a `.filter`/`is_none_or`/
+  `is_some_and` closure, compared then dropped) returns **zero** remaining sites — timeline:245 was the only
+  one. heatstrip builders are capped at 24 elems (tiny); percentile family is already count/select_nth-optimal.
+- **tui:** palette-filter + keymap already benched; frame.rs is Duration/metrics timing; theme.rs is
+  compile-time `const fn` palettes (no runtime blend math); accessibility.rs is focus-list management; rendering
+  itself is delegated to the external ftui-* crates (out of workspace).
+
+Net: the ownable CPU-measurable perf surface remains floored. The remaining productive direction is the
+search-QUALITY vein (harness rebuilt + validated this session, docs/quality_harness/), which the perf-loop
+shape does not cover. Route-next perf: only a NEW workload the current probes can't model (concurrency on an
+idle machine, bd-e41k class) or a not-yet-in-Rust feature would reopen it.
