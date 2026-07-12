@@ -12888,3 +12888,35 @@ A/B). **CONCLUSION: the autonomously-completable work on this feature is DONE** 
 `NqcDenseWeight`, no-kernel-change mechanism, latency-neutrality, end-to-end composition test — all landed/tested/
 proven). The one remaining step is a product-gated integration (sample source + opt-in wiring + A/B), precisely
 scoped here. Handing off — further autonomous increments on this feature would be premature hot-path churn.
+
+### 2026-07-12 — Codex — FINAL HOLD: FSFS one-lookup hybrid merge remains inside the higher-inner remote null floor
+
+Negative-ledger-first routing selected the retained FSFS hybrid-fuse candidate rather than reopening the mined
+fusion, rerank, or vector-scan families. In `fuse_rankings_with_priors`, the original `merge_ranked_orig` performs
+`get(doc_id)` followed by `entry(doc_id.to_string())`; the candidate `merge_ranked` uses one
+`get_mut`-or-`insert`, avoiding a second hash and a discarded key clone on lexical/semantic overlap. The retained
+`merge_ranked_matches_orig` oracle covers disjoint/full/partial overlap, within-tier duplicates, ties, and empty
+inputs, and the benchmark re-asserted exact `FusedCandidate` equality before timing.
+
+The previously unfinished tightening run completed strictly remotely on worker `vmi1227854`, in one release
+binary, with 41 alternating A/B rounds and `FUSE_AB_INNER=200` (the retained default):
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 \
+  env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-fsfs --profile release --features bench-internals \
+  --bench fuse_merge_ab
+```
+
+| candidates/tier | overlap | A/A null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---:|---:|---:|---:|---|
+| 200 | 140 | 1.0508 [0.8132, 1.3378] | 0.8846 [0.6873, 0.9830] | inside null floor |
+| 200 | 40 | 1.0056 [0.8802, 1.1440] | 0.9436 [0.8265, 1.1292] | inside null floor |
+| 600 | 400 | 1.0128 [0.8153, 1.1986] | 0.8705 [0.6279, 0.9700] | inside null floor |
+
+The candidate again points faster (~1.06–1.15×), consistent with the mechanism and the earlier lower-inner
+medians, but no candidate median is below its shape's A/A null p5. The higher-inner retry therefore does not make
+the effect decidable on this substrate. **FINAL HOLD / NO SHIP:** production remains on `merge_ranked_orig`; the
+candidate, parity test, and one-binary reproducer stay retained. Do not retry the same shapes on the shared fleet.
+Reopen only with a lower-noise isolated worker or a demonstrated production workload whose overlap/key costs make
+the end-to-end effect clear. No local Cargo fallback ran and no source file changed for this verdict.

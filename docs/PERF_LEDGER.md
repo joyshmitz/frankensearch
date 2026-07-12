@@ -5187,3 +5187,15 @@ cache twice on the identical
 worker/target, making each focused release command a cold ~9.5-minute build. Agent Mail registration succeeded,
 but its corruption circuit breaker rejected the file reservation; Git/worktree and Beads truth were used without
 attempting a repair or bypass.
+
+## 2026-07-12 — HOLD: FSFS `merge_ranked` one-lookup candidate fails the final higher-inner remote gate (Codex)
+
+Retried the retained byte-identical `get_mut`/insert hybrid-fuse candidate against shipped
+`merge_ranked_orig` using the authoritative same-binary alternating-round harness. Strict remote worker
+`vmi1227854`; 41 rounds, `inner=200`; candidate/original ratios were 0.8846 for 200 candidates/tier with 140
+overlap, 0.9436 for 200/40, and 0.8705 for 600/400. Their A/A null p5 floors were respectively 0.8132, 0.8802,
+and 0.8153, so every median remained inside noise. The stable ~1.06–1.15× directional effect is not a shippable
+win under the repository gate. Production remains on `merge_ranked_orig`; source is unchanged. This closes the
+documented higher-inner retry for these shapes. Reopen only on a lower-noise isolated worker or a materially
+larger measured overlap/key-cost workload. Exact command and full intervals are recorded in
+`docs/NEGATIVE_EVIDENCE.md`.
