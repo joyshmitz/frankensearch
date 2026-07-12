@@ -13018,3 +13018,12 @@ remaining NQC work is genuinely PRODUCT/DESIGN, not autonomous: (1) the phase-1-
 potion/model2vec proxy). Continued perf-only loop iterations from here yield feature-hardening, honest negatives, or
 peer-convergence reconciliations — not fresh levers. The productive next step is a product decision (enable/A-B the
 NQC feature, or one of the older product-gated default flips in `SEARCH_QUALITY_FINDINGS.md`).
+
+### 2026-07-12 — cc_fse — SWEEP (negative): durability protectors are I/O verify/repair — no CPU pure-fn lever (extends codec finding)
+
+Post-capstone fresh look at the two largest un-swept durability files (`file_protector.rs` 2648 LOC,
+`fsvi_protector.rs` 1049 LOC) for a benchable pure function. All public surface is `verify(&self, &Path)` /
+`verify_directory(&Path)` / `verify_and_repair(&Path)` — disk I/O (read file, checksum, Reed-Solomon repair), not
+CPU-bound pure computation; the only `fn encode(...)` hits are test-mock reconstructors. So the durability CPU
+surface is confirmed floored beyond the codec (which was already erasure-math wrapping an external crate + I/O). No
+lever. Consistent with the capstone (`3fc062a7`): no perf lever remains on the ownable surface.
