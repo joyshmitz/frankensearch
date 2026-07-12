@@ -12239,3 +12239,9 @@ mined across the codebase — no open instances remain.** This, with the crate-b
 closed route-nexts, and the concurrency/working-set investigations, leaves the ownable measurable-CPU
 surface with no remaining lever on this fleet; the productive direction is search-QUALITY (Python/BEIR
 harness, distinct from rch cargo-bench).
+
+Also swept this pass: **redundant intermediate materialization** (`.collect::<Vec<_>>()` immediately
+re-iterated → could be a lazy chain eliding an alloc) — grepped fusion/index/lexical/rerank; the only hits
+(`index/search.rs:2862`, `rerank/pipeline.rs:571/575`) are TEST code (parity-test heaps / the pipeline test
+module), none in production. That pattern is empty too. Every allocation/partial-selection micro-pattern I
+can enumerate is now checked; further perf turns on this fleet will only reconfirm the floor.
