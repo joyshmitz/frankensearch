@@ -12767,3 +12767,30 @@ pool-min-max fusion kernel (frankensearch-fusion), NQC = cv of top-k BM25 scores
 This is a distinct DEPLOYABLE quality lever (query-distribution-adaptive tier weighting), realized where the general
 label-free tier-weight auto-tune (`72b68de`) failed — because it is a DIRECTIONAL monotone (high-NQC→less-dense),
 grounded in the measured oracle, not a free per-query continuous fit. No Rust this turn (Python-measured).
+
+### 2026-07-12 — cc_fse — LAND-SCOPING (caveat): the dense-downweight win needs per-deployment cv PERCENTILE normalization — a FIXED raw-cv mapping does NOT transfer
+
+Perf check clean (`push_str`/`+&str`/`format!` string-concat in fusion/index loops — zero hits). Deployment-
+faithfulness check for the NQC-adaptive dense-downweight win (`9c1943df`), which used in-set `pctrank(cv)` (mild
+leakage). Tested the deployment-faithful FIXED mapping `w_dense = clip(1 − β·cv, 0, 1)` (raw cv, same β all corpora)
+— `docs/quality_harness/raw_cv_downweight.py`, stem+stop, Δ vs baseline:
+
+| corpus | cv [med, p90] | β=0.1 | β=0.2 | β=0.3 | β=0.4 |
+|---|---|---:|---:|---:|---:|
+| scifact | [0.33, 0.57] | −0.0017 | −0.0031 | −0.0013 | +0.0013 |
+| nfcorpus | [0.42, **5.84**] | +0.0006 | −0.0011 | −0.0030 | −0.0020 |
+| arguana | [0.52, 0.70] | +0.0006 | +0.0009 | +0.0007 | +0.0014 |
+| scidocs | [0.19, 0.30] | +0.0003 | +0.0004 | +0.0005 | +0.0011 |
+
+**FIXED raw-cv mapping FAILS to transfer** — no single β is ≥0 on all 4 corpora (best mean β=0.4 = +0.0004 but
+scifact/nfcorpus negative there). ROOT CAUSE (visible in the cv columns): the top-100 BM25 cv distribution varies
+WIDELY by corpus — scidocs median 0.19, arguana 0.52, nfcorpus p90 5.84 (heavy tail). So `w=1−β·cv` applies an
+inconsistent effective down-weight: barely touches low-cv scidocs, clips to 0 (≡ hard-gate) on nfcorpus's high-cv
+tail → hurts. The in-set `pctrank(cv)` (win `9c1943df`) NORMALIZES each corpus's cv to [0,1] internally, which is
+exactly WHY it was robust. **Refined land path (the win still stands, with the right mapping):** ship
+`w_dense = clip(1 − β·CDF(cv), w_min, 1)` where `CDF(cv)` is the per-deployment cv percentile from an OFFLINE/rolling
+query-sample cv distribution (a streaming-quantile estimator over the query stream — the same infra pattern as the
+query-side hubness builder `ba5052a`), NOT a fixed `β·cv`. This is a slightly heavier land (needs the cv-quantile
+sketch) but standard. LESSON: an adaptive-weight lever validated with in-set percentile ranks is NOT deployable as
+a fixed raw-signal function when the signal's scale is corpus-dependent — verify transfer before scoping the land.
+No Rust this turn.
