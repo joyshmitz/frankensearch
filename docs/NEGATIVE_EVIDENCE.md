@@ -11757,3 +11757,31 @@ original always-Unicode form is retained only behind `bench-internals` as the pa
 `negation_normalize_ab`). Method note: the RFC3339-style "general-purpose lib on a canonical hot path"
 sibling hunt generalizes beyond timestamps to Unicode normalization — grep for `nfc()`/`to_lowercase()`
 over large/hot inputs.
+
+### 2026-07-11 — cc_fse — HOLD (not shipped): `is_ascii()` fast path does NOT transfer to short query-term `to_lowercase()` — no NFC to skip, pre-scan costs more than it saves
+
+**Followed the negation-win route-next** ("more `to_lowercase()` sites") to the remaining `to_lowercase()`
+calls in `frankensearch-lexical` `cass_compat.rs` — `CassWildcardPattern::parse` (query wildcard terms,
+lines ~1769/1776) and `cass_normalize_phrase_terms` (phrase words, ~1938). Applied the same
+`ascii_fast_to_lowercase` (`if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_lowercase() }`).
+
+**Why it fails where negation succeeded.** The 97× negation win came from skipping the
+`unicode_normalization` **NFC composing iterator over large document bodies** — the NFC pass dominated.
+These query-term sites have **no `nfc()`** (plain `to_lowercase()`) and operate on **short** terms
+(≤~16 bytes). For short ASCII input, `str::to_lowercase()` is already cheap, and adding an `is_ascii()`
+full pre-scan before a second `to_ascii_lowercase()` pass makes it **two passes vs one** — a net loss.
+
+**Measured (strict remote `vmi1293453`, release, within-process paired AB/BA over a 1024 mixed-case
+ASCII query-term corpus + 10 non-ASCII; parity `fast_equals_reference=true` for all 1034 inputs):**
+
+| stage | per-call median | paired lever [p5,p95] | A/A null [p5,p95] | verdict |
+|---|---:|---:|---:|---|
+| reference `str::to_lowercase` | 12.195 ns | — | 1.0001 [0.349, 1.519] | — |
+| shipped `is_ascii` fast path | 13.985 ns | 1.0988 [0.9147, 1.343] | — | **INSIDE_NULL_FLOOR** (~0.91×, slightly slower) |
+
+`gate_pass=false`, `decision=HOLD`. Byte-identical but a marginal regression, so **reverted** (production
+stays plain `to_lowercase()`); the candidate + bench were removed. **BOUNDARY LESSON: the `is_ascii()`
+fast-path only pays when it lets you skip genuinely-expensive Unicode machinery (NFC normalization, or
+case-folding over large text) — not for `to_lowercase()` alone on short strings, where the extra
+`is_ascii` scan out-costs the saving.** Don't apply this to the other short-string `to_lowercase()` sites
+(`storage/fts5_adapter.rs:257`, etc.). The negation win stands because it skipped NFC over document bodies.
