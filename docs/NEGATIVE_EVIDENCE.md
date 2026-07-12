@@ -12525,3 +12525,30 @@ production pool-min-max default (stronger than its original measurement suggeste
 for the campaign: earlier fusion-normalization findings measured on basic tokenization UNDERSTATE score-fusion's
 edge — re-measure fusion levers on the stem+stop baseline (`fusion_compare.py`/`stem_stop.py`). Single-corpus
 (scifact); cross-corpus re-check (nfcorpus/arguana/scidocs) is the route-next. No Rust/conformance change.
+
+### 2026-07-12 — cc_fse — QUALITY: pool-min-max > RRF robust 4/4 corpora — but CORRECTS yesterday's "margin grows 4.5×" (cross-harness artifact)
+
+Perf check this turn (negative-ledger-first): the clone-to-read family (`.to_vec()` in fusion/index/lexical/
+rerank) is clean — all sites are opt-in-cold (smooth/hubness/conformal no-op returns, skipped on the alpha=0
+default), inherent-ownership (ingest `embedding.to_vec()`), or once-per-query-small (hnsw query normalize). No
+lever. Continued the quality vein: extended last turn's scifact fusion finding (`fcb1572e`) to ALL 4 BEIR corpora
+(`docs/quality_harness/cross_corpus_fusion.py`), RRF vs pool-min-max on the stem+stop baseline, nDCG@10:
+
+| corpus | RRF_basic | mm_basic | RRF_ss | mm_ss | mm−RRF (ss) |
+|---|---:|---:|---:|---:|---:|
+| scifact | 0.6694 | 0.6957 | 0.6974 | 0.7120 | +0.0146 |
+| nfcorpus | 0.3205 | 0.3359 | 0.3345 | 0.3468 | +0.0123 |
+| arguana | 0.3190 | 0.3376 | 0.3599 | 0.3601 | +0.0001 |
+| scidocs | 0.1543 | 0.1579 | 0.1577 | 0.1628 | +0.0051 |
+
+**ROBUST: pool-min-max > RRF in 4/4 corpora on the stem+stop baseline** (and 4/4 on basic too) — the shipped
+pool-min-max default (`a9e53b4`) is validated cross-corpus, not scifact-specific. **CORRECTION of `fcb1572e`:**
+that entry claimed the pool-min-max margin "GROWS ~4.5× with stem+stop" — WRONG, it compared my harness's
+stem+stop margin (+0.0174) against the memory's `a9e53b4` figure (+0.0038) measured on a DIFFERENT (Rust) harness
+= apples-to-oranges. With a CONSISTENT within-harness basic baseline, the basic-tok margins are
++0.0263/+0.0154/+0.0186/+0.0036, so stem+stop actually **NARROWS** the pool-min-max advantage on 3/4 corpora
+(scifact 0.0263→0.0146; arguana 0.0186→+0.0001 — a sharper lexical signal lets rank-based RRF catch up; scidocs
+is the only one where it slightly grows 0.0036→0.0051). LESSON: never compare a delta across two different
+measurement harnesses — establish the baseline IN the same harness. Net: pool-min-max robustly beats RRF (direction
+holds 4/4 both tokenizations); the mechanism claim "score-fusion edge grows with stem+stop" is RETRACTED. No Rust
+change (validates an already-shipped default).
