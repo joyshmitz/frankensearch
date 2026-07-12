@@ -12165,3 +12165,27 @@ the code's bandwidth without a footprint-controlled A/B (int8 vs 4-bit) — whic
 bandwidth. This closes the concurrent-scan lever; the benches (`concurrent_scan_scaling`,
 `concurrent_int8_vs_4bit`) remain as reusable throughput/scaling harnesses. To get an unconfounded bandwidth
 answer needs a dedicated idle machine (blocked, same class as `bd-e41k`'s worker-isolation gap).
+
+### 2026-07-12 — cc_fse — REFINEMENT: the int8-vs-4bit flat-dot crossover is WORKING-SET-dependent (int8 wins cache-resident/compute-bound; 4-bit's edge appears only >L3/memory-bound)
+
+Resolved the single-thread discrepancy the concurrent A/B surfaced (it read 4-bit 1.14× faster single-thread,
+contradicting the landed "int8 dominates 4-bit"). Ran the AUTHORITATIVE criterion `dot_product` (dim384,
+single-thread) `i8_dot` vs `fourbit_prepared_new` on `vmi1227854`:
+
+| corpus | working set | i8_dot | fourbit_prepared | winner |
+|---|---|---:|---:|---|
+| dot_product N=10000 | 3.84 MiB (**fits L3**) | 199.6 us | 308.8 us | **int8 1.55× faster** |
+| concurrent_int8_vs_4bit N=131072 | 48 MiB (**> L3**) | (436 sc/s) | (497 sc/s) | 4-bit ~1.14× (single-thread) |
+
+**These are CONSISTENT under a working-set interpretation, not a contradiction:** when the corpus fits L3
+the scan is COMPUTE-bound and int8's faster AVX2 `dot_i8_i8` wins (1.55×, confirming memory
+`frontier-exhausted…`); at >L3 the scan turns MEMORY-bound and 4-bit's half-footprint (24 vs 48 MiB) recovers
+an edge. So the landed conclusion is refined: **"int8 dominates 4-bit" holds WHEN THE WORKING SET FITS CACHE**
+(which the original small-corpus/BOLD benches measured), not universally. **BUT this is not a production lever:**
+the shipping default is the int8 TWO-PASS (`~7.1× vs flat @130k`, memory `frontier-exhausted-definitive`),
+whose coarse pass reads only truncated dims — far less data than EITHER flat variant — so it already sidesteps
+the >L3 bandwidth wall that flat-4bit would address; flat-4bit-vs-flat-int8 is moot when two-pass beats both.
+Route-next (academic, only if a 4-bit path is ever reconsidered at scale): a controlled >L3 single-thread
+int8-vs-4bit flat A/B on an idle machine to quantify the crossover precisely (the fleet reading is bandwidth-
+contention-confounded even single-thread). LESSON: cache-resident µbenches (N small) can invert the
+large-corpus conclusion — always note the working-set size vs L3 when comparing quantization footprints.
