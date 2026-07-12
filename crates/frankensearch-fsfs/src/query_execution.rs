@@ -805,7 +805,21 @@ impl QueryExecutionOrchestrator {
                 candidate
             })
             .collect();
-        fused.sort_by(fused_cmp);
+        // `fused_cmp` is a strict total order (fused_score/tier scores, ending in the
+        // unique `doc_id` tiebreak), so `select_nth`/`sort_unstable` are bit-identical
+        // to the stable sort. For a large fused pool we only need the top `offset+limit`
+        // ordered: partition to them in O(n) then sort just those — the MRL/two-tier
+        // top-k lever (`mrl_topk_select_ab`, ~2×). Gated by `SELECT_NTH_MIN` so small
+        // pools keep the stable sort (n-dependent constant factors; see a0fd2090).
+        let end = offset.saturating_add(limit);
+        const SELECT_NTH_MIN: usize = 256;
+        if end > 0 && end < fused.len() && fused.len() >= SELECT_NTH_MIN {
+            fused.select_nth_unstable_by(end - 1, fused_cmp);
+            fused.truncate(end);
+            fused.sort_unstable_by(fused_cmp);
+        } else {
+            fused.sort_by(fused_cmp);
+        }
 
         fused.into_iter().skip(offset).take(limit).collect()
     }

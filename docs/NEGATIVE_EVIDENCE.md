@@ -11994,3 +11994,21 @@ that same not-separately-benched norm. Verified: 39/39 `two_tier` lib tests pass
 correctness). Route-next: this closes the merge-path sort-consistency sweep (all four now `sort_unstable`/
 `select_nth`); the WAL-merge only reaches n≥256 with a large resident WAL, so the win is realized between
 compactions on ANN indices.
+
+### 2026-07-12 — cc_fse — LANDED: fsfs hybrid-fuse windowed selection threshold-gated `select_nth` — byte-identical (completes the merge-path sweep across all search paths)
+
+`fsfs/query_execution.rs`'s hybrid-fuse windowed selection (fuse lexical+semantic candidates into a
+dedup'd-by-`doc_id` pool, sort, `skip(offset).take(limit)` for pagination) was the LAST merge path still on
+stable `sort_by`. Applied the threshold-gated `select_nth` (like MRL / two-tier): a large fused pool
+partitions to the top `offset+limit` in O(n) via `select_nth_unstable_by(end-1)` then sorts only those;
+small pools keep the stable sort. Byte-identical: `fused_cmp` is a strict total order (fused_score + tier
+scores + unique `doc_id` tiebreak) ⇒ the top-`(offset+limit)` set and order are unique regardless of
+algorithm, so `skip(offset).take(limit)` yields the identical window.
+
+No separate bench — algorithm = `mrl_topk_select_ab` (proven ~1.96–2.29× at n≥300), the `sort_unstable` half
+= sibling-proven `federated`/`rrf`/`blend`/`two_tier` fix (the established not-separately-benched norm for
+these fuse/merge paths). Verified: 100/100 `fsfs` `query_execution` lib tests pass (compile + windowed-
+selection correctness, incl. the full-sort-reference comparison). **This closes the merge-path
+sort-consistency sweep** — every fuse/merge selection path (federated, rrf, blend_two_tier, two_tier ANN+WAL,
+MRL rescore, fsfs hybrid) now uses `sort_unstable`/threshold-gated `select_nth`, byte-identical, robust on
+both small and large pools. (fsfs is 88k lines but compiled/tested cleanly on `vmi1227854`.)
