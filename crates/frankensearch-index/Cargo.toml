@@ -206,3 +206,7 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "mrl_topk_select_ab"
 harness = false
+
+[[bench]]
+name = "concurrent_scan_scaling"
+harness = false

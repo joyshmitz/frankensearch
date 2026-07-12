@@ -12106,3 +12106,32 @@ explicitly enabled (opt-in), where it is also just ~1 hash among the `deg` aHash
 last concrete measurable-CPU lead is CLOSED. No remaining default-hot-path CPU lever exists on the ownable
 surface; the productive directions are the documented three (search-QUALITY / unblock `bd-e41k` / new
 workload).
+
+### 2026-07-12 — cc_fse — NEW WORKLOAD RE-OPENS THE FRONTIER: the int8 flat scan is memory-BANDWIDTH-bound under concurrency (efficiency 0.53 @ 8 cores) — the single-thread "int8 dominates 4-bit" conclusion does NOT hold under concurrent serving
+
+Actioned route 3 (build a workload the single-query µbenches don't model). New bench `concurrent_scan_scaling`
+spawns M threads that each flat-scan the SAME shared 48 MiB int8 slab (N=131072, dim=384) and measures
+aggregate-throughput scaling. Strict remote `vmi1293453`, release, available_cores=8:
+
+| threads | agg scans/sec | scaling efficiency |
+|---:|---:|---:|
+| 1 (baseline) | 434.80 | — |
+| 2 | 852.47 | 0.980 |
+| 4 | 1569.77 | 0.903 |
+| 8 (all cores) | 1846.92 | **0.531** |
+
+**Finding.** Throughput scales near-linearly to 2 threads, mildly sub-linear at 4, and SATURATES at 8 cores
+(0.53 efficiency — 8 cores deliver only ~4.25× the single-thread rate). The monotonic
+0.98→0.90→0.53 decay as threads→cores is the signature of **memory-bandwidth saturation** (8 cores each
+streaming the 48 MiB slab, which exceeds L3, contend for the memory controller), not random fleet-CPU noise
+(which would be erratic, not monotone). **This reverses the single-thread conclusion under concurrency:** the
+prior frontier maps + memory (`frontier-exhausted…`) declared "int8 dominates 4-bit — the AVX2 `dot_i8_i8`
+eats 4-bit's bandwidth edge," but that was measured SINGLE-THREAD where the scan is compute-bound. Under
+concurrent serving (the real deployment shape) the scan is **bandwidth-bound**, so 4-bit's half-footprint
+(24 MiB) would relieve the memory-controller pressure and scale better — a real lever the single-query
+benches structurally cannot surface. **The single-QUERY CPU surface is floored, but CONCURRENT serving has an
+open bandwidth lever.** Caveat: measured on a shared fleet worker (some CPU contention possible), but the
+clean monotone thread-scaling shape is bandwidth-characteristic. **Confirming next step:** an int8-vs-4bit
+concurrent bench (`dot_4bit_prepared` half-footprint slab) at 8 cores — predicted 4-bit efficiency stays high
+where int8 drops to 0.53, making 4-bit the throughput winner for concurrent serving (reversing the
+ship-int8-not-4bit call for the concurrent regime).
