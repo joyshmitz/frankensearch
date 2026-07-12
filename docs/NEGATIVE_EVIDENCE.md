@@ -12066,3 +12066,16 @@ Follow-up audit of the two CPU-heavy subsystems the frontier map hadn't explicit
 2026-07-08 user greenlight (memory `pivot-to-quality-pool-minmax-fusion`), the productive vein is now
 search-QUALITY findings via the BEIR harness, not perf micro-opts; the remaining perf frontier needs
 symbolized per-query self-time (blocked `bd-e41k`) or a new workload the current proxies don't model.
+
+### 2026-07-12 — cc_fse — last subsystem checked: embed query cache is trait-bound / embed-dominated (audit complete)
+
+`frankensearch-embed` `cached_embedder.rs` (S3-FIFO query-embedding cache, per query): the clone-on-hit
+(`entry.value.clone()` returns an owned `Vec<f32>`) is bound by the `SyncEmbed::embed -> Vec<f32>` trait
+signature — sharing via `Arc<[f32]>` would be a cross-crate trait change, not a small increment. The
+per-miss key clones (query text into main/ghost queue + set + map — an `Arc<str>` key candidate) sit behind
+the model forward that dominates every miss, so they are inside-floor end-to-end. No ownable measurable
+lever. This completes the crate-by-crate audit: **every crate — core, embed, index, lexical, fusion,
+rerank, storage, durability, fsfs, ops, tui — has been checked; the ownable measured-CPU surface is at
+floor.** Route (unchanged): pivot to search-QUALITY (BEIR harness, memory `pivot-to-quality-pool-minmax-
+fusion` / `search-quality-vein-and-harness`), or unblock symbolized self-time (`bd-e41k`), or build a new
+workload proxy — none of which is a "one small perf lever, quick bench" this turn.
