@@ -12920,3 +12920,22 @@ the effect decidable on this substrate. **FINAL HOLD / NO SHIP:** production rem
 candidate, parity test, and one-binary reproducer stay retained. Do not retry the same shapes on the shared fleet.
 Reopen only with a lower-noise isolated worker or a demonstrated production workload whose overlap/key costs make
 the end-to-end effect clear. No local Cargo fallback ran and no source file changed for this verdict.
+
+### 2026-07-12 — cc_fse — NQC down-weight async-wiring SCOPING: not a sync mirror (phase-2 is a vector blend, not a lexical re-fuse) — deferred as a careful follow-up
+
+After landing the sync-path opt-in wiring (`d735d6f2`), investigated the async `TwoTierSearcher` (`searcher.rs`,
+1790 LOC) for the same wiring. It is NOT a clean mirror of the sync searcher:
+- **Phase-1** fusion = the 3 `fuse_by_strategy` sites (searcher.rs:1313/1336/1348), sharing one `rrf_config` built at
+  :1069. The NQC scaling injects cleanly ONLY in the `|lexical|` arm (:1333) — shadow with
+  `RrfConfig { semantic_weight: self.effective_semantic_weight(lexical), ..rrf_config.clone() }` (RrfConfig is
+  `Clone`, not `Copy`, so `.clone()` avoids moving the config the no-lexical arm still borrows); the no-lexical arm
+  (:1313, `&[]`) correctly keeps the base weight.
+- **Phase-2** (`run_phase2`, :1410) does NOT call `fuse_by_strategy` — it `blend_two_tier_aligned_vector_index`s the
+  fast+quality VECTOR scores and takes `initial_results` (the phase-1 fused output) as input. So the async phase
+  structure differs from sync (whose phase-2 re-fuses lexical at :346). Whether the phase-1 NQC down-weight
+  correctly propagates into the FINAL refined result — vs being overwritten by the phase-2 vector blend — must be
+  TRACED before wiring; a phase-1-only injection could apply the down-weight inconsistently (initial but not
+  refined). **DEFERRED:** wiring a ranking feature into the complex async hot path without that trace risks subtle
+  bugs, and a partial wiring is worse than none. The sync path already ships the feature (`d735d6f2`); the async
+  wiring is a careful, separate follow-up (trace phase-1→phase-2 lexical propagation, then inject at :1333 + wherever
+  the refined result re-derives lexical weight, + full-suite regression). No code change this turn (scoping only).
