@@ -148,6 +148,13 @@ impl NqcDenseWeight {
         Self { sorted_cv }
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn from_values(sample: impl IntoIterator<Item = f32>) -> Self {
+        let mut sorted_cv: Vec<f32> = sample.into_iter().filter(|v| v.is_finite()).collect();
+        sorted_cv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Self { sorted_cv }
+    }
+
     /// Build directly from a batch of per-query lexical score slices — the deployment path
     /// (replay a query log / rolling window through the lexical tier, feed each query's top-k
     /// BM25 scores). Computes each query's NQC via [`nqc_cv`] and retains the sample. Empty
@@ -156,6 +163,26 @@ impl NqcDenseWeight {
     pub fn from_query_scores<'a>(queries: impl IntoIterator<Item = &'a [f32]>) -> Self {
         let sample: Vec<f32> = queries.into_iter().map(nqc_cv).collect();
         Self::from_sample(&sample)
+    }
+
+    /// Exact pre-optimization sample-builder path retained for same-binary benchmarks.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    #[allow(clippy::needless_collect)]
+    pub fn bench_from_query_scores_collect<'a>(
+        queries: impl IntoIterator<Item = &'a [f32]>,
+    ) -> Self {
+        let sample: Vec<f32> = queries.into_iter().map(nqc_cv).collect();
+        Self::from_sample(&sample)
+    }
+
+    /// Single-allocation sample-builder candidate for same-binary benchmarks.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bench_from_query_scores_iter<'a>(queries: impl IntoIterator<Item = &'a [f32]>) -> Self {
+        Self::from_values(queries.into_iter().map(nqc_cv))
     }
 
     /// Number of retained samples.
@@ -388,6 +415,33 @@ mod tests {
         assert!(w.percentile(nqc_cv(peaked)) >= w.percentile(nqc_cv(uniform)));
         // So enabling the down-weight demotes the dense tier more on the high-NQC query.
         assert!(w.dense_weight(nqc_cv(peaked), 0.5, 0.0) <= w.dense_weight(nqc_cv(uniform), 0.5, 0.0));
+    }
+
+    #[test]
+    fn nqc_weight_iterator_builder_is_bit_identical_to_collect_builder() {
+        let queries: &[&[f32]] = &[
+            &[],
+            &[10.0, 1.0],
+            &[5.0, 5.0, 5.0],
+            &[f32::NAN, 4.0, 2.0, f32::INFINITY],
+            &[-4.0, -2.0, 0.0],
+        ];
+        let original = NqcDenseWeight::from_query_scores(queries.iter().copied());
+        let candidate = NqcDenseWeight::from_values(queries.iter().copied().map(nqc_cv));
+        assert_eq!(
+            original
+                .sorted_cv
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>(),
+            candidate
+                .sorted_cv
+                .iter()
+                .copied()
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

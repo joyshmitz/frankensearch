@@ -13027,3 +13027,40 @@ Post-capstone fresh look at the two largest un-swept durability files (`file_pro
 CPU-bound pure computation; the only `fn encode(...)` hits are test-mock reconstructors. So the durability CPU
 surface is confirmed floored beyond the codec (which was already erasure-math wrapping an external crate + I/O). No
 lever. Consistent with the capstone (`3fc062a7`): no perf lever remains on the ownable surface.
+
+### 2026-07-12 — Codex — REJECT: direct NQC sample-builder iterator is exact but remains inside the null floor
+
+Negative-ledger-first routing found one fresh exception to the earlier collect/reduce sweep:
+`NqcDenseWeight::from_query_scores` was introduced later in `6483af3c`. It first collects one NQC value per query
+into a `Vec<f32>`, then `from_sample` allocates a second vector while filtering/copying those values before sort.
+The candidate feeds the per-query NQC iterator directly into that final filtered/sorted vector, removing one
+allocation and O(query-count) copy. Production remained on the original path while a feature-gated same-binary
+comparator exercised both implementations. It asserted exact percentile and dense-weight `f32::to_bits()` parity
+before timing.
+
+Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-fusion --profile release \
+  --features bench-internals --bench nqc_cv_cost_ab
+```
+
+Worker `ovh-b`; one release binary; 41 alternating rounds; 100 BM25 scores/query. Ratio is candidate/original:
+
+| query sample | inner repeats | A/A original null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---:|---:|---:|---:|---|
+| 32 | 512 | 0.9959 [0.9568, 1.0284] | 1.0052 [0.9849, 1.0259] | inside null floor |
+| 256 | 64 | 1.0000 [0.9269, 1.0264] | 1.0012 [0.9167, 1.0370] | inside null floor |
+| 4,096 | 4 | 1.0065 [0.9631, 1.0449] | 1.0071 [0.9856, 1.0398] | inside null floor |
+
+No candidate median clears its null p5, and every median points fractionally slower. The saved O(query-count)
+copy is dominated by computing NQC over O(query-count × 100) scores and sorting the resulting sample. **Decision:
+REJECT; production stays byte-for-byte on the original two-vector constructor.** The comparator and exact-parity
+test remain behind `bench-internals`/tests as a durable boundary. Do not retry this direct-iterator construction
+for top-100 query-score batches without a materially different workload where NQC values are already precomputed.
+The first strict-remote attempt failed before timing on a comparator-only `usize`/`u32` repeat-count mismatch; the
+corrected run above passed and executed remotely. Focused strict-remote release validation passed 6/6 NQC-weight
+tests, including the new exact sorted-CV bit-parity test. No local Cargo fallback ran.

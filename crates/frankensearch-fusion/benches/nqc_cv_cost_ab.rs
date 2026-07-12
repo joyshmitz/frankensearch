@@ -13,6 +13,7 @@ use std::hint::black_box;
 
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
 use frankensearch_core::{ScoreSource, ScoredResult};
+use frankensearch_fusion::NqcDenseWeight;
 use frankensearch_fusion::sync_searcher::{bench_nqc_cv_collect, bench_nqc_cv_iter};
 
 fn make_hits(n: usize) -> Vec<ScoredResult> {
@@ -47,7 +48,74 @@ fn verdict(lever: &PairedRatio, null: &PairedRatio) -> &'static str {
     }
 }
 
+fn make_query_scores(query_count: usize, scores_per_query: usize) -> Vec<Vec<f32>> {
+    (0..query_count)
+        .map(|query| {
+            (0..scores_per_query)
+                .map(|rank| {
+                    20.0 / (1.0 + rank as f32) + ((query * 17 + rank * 7) % 23) as f32 * 0.01
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn query_slices(queries: &[Vec<f32>]) -> impl Iterator<Item = &[f32]> {
+    queries.iter().map(Vec::as_slice)
+}
+
+fn assert_same_weight(original: &NqcDenseWeight, candidate: &NqcDenseWeight) {
+    assert_eq!(original.len(), candidate.len());
+    for cv in [0.0, 0.05, 0.1, 0.25, 0.5, 1.0, f32::INFINITY] {
+        assert_eq!(
+            original.percentile(cv).to_bits(),
+            candidate.percentile(cv).to_bits(),
+            "percentile changed for cv={cv}"
+        );
+        assert_eq!(
+            original.dense_weight(cv, 0.5, 0.1).to_bits(),
+            candidate.dense_weight(cv, 0.5, 0.1).to_bits(),
+            "dense weight changed for cv={cv}"
+        );
+    }
+}
+
+fn bench_sample_builder() {
+    for (query_count, inner) in [(32_usize, 512_u32), (256, 64), (4_096, 4)] {
+        let queries = make_query_scores(query_count, 100);
+        let original = NqcDenseWeight::bench_from_query_scores_collect(query_slices(&queries));
+        let candidate = NqcDenseWeight::bench_from_query_scores_iter(query_slices(&queries));
+        assert_same_weight(&original, &candidate);
+
+        let run_orig = || {
+            black_box(NqcDenseWeight::bench_from_query_scores_collect(black_box(
+                query_slices(&queries),
+            )));
+        };
+        let run_cand = || {
+            black_box(NqcDenseWeight::bench_from_query_scores_iter(black_box(
+                query_slices(&queries),
+            )));
+        };
+        let null = paired_median_ratio(41, inner, run_orig, run_orig);
+        let lever = paired_median_ratio(41, inner, run_orig, run_cand);
+        eprintln!(
+            "[null]  nqc_sample_builder/q{query_count}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] nqc_sample_builder/q{query_count}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            verdict(&lever, &null)
+        );
+    }
+}
+
 fn main() {
+    bench_sample_builder();
+
     let inner = std::env::var("NQC_ALLOC_AB_INNER")
         .ok()
         .and_then(|value| value.parse().ok())
