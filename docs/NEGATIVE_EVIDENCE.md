@@ -12135,3 +12135,33 @@ clean monotone thread-scaling shape is bandwidth-characteristic. **Confirming ne
 concurrent bench (`dot_4bit_prepared` half-footprint slab) at 8 cores — predicted 4-bit efficiency stays high
 where int8 drops to 0.53, making 4-bit the throughput winner for concurrent serving (reversing the
 ship-int8-not-4bit call for the concurrent regime).
+
+### 2026-07-12 — cc_fse — REFUTED (honest correction): the concurrent 4-bit lever does NOT hold — int8/4-bit are ~PARITY under concurrency, and the apparent "bandwidth saturation" is fleet-contention-confounded
+
+Directly tested the `f027a193` hypothesis with `concurrent_int8_vs_4bit`: scan the SAME corpus in both int8
+(48 MiB, `dot_i8_i8`) and 4-bit (24 MiB packed, `dot_4bit_prepared`) layouts at 1..N threads. Strict remote
+`vmi1227854`, 10 cores:
+
+| threads | int8 eff | int8 agg | 4-bit eff | 4-bit agg | 4-bit/int8 agg |
+|---:|---:|---:|---:|---:|---:|
+| 1 | — | 436.1 | — | 497.3 | 1.140 |
+| 2 | 0.931 | 812.0 | 1.016 | 1010.4 | 1.244 |
+| 4 | 0.745 | 1298.9 | 0.622 | 1236.9 | 0.952 |
+| 8 | 0.644 | 2245.9 | 0.586 | 2329.6 | 1.037 |
+| 10 | 0.626 | 2730.1 | 0.559 | 2778.1 | 1.018 |
+
+**Verdict: PARITY** (re-measured 10-thread: int8 2607 vs 4-bit 2584). **The 4-bit lever is NOT confirmed —
+refuted.** Two things kill the `f027a193` hypothesis: (1) 4-bit scales *slightly WORSE* than int8 (eff 0.56
+vs 0.63 @ 10 cores), the OPPOSITE of the bandwidth prediction — if the bottleneck were memory bandwidth,
+4-bit's half-footprint would scale *better*; (2) both layouts saturate to ~0.6 efficiency, so the "saturation"
+is NOT a memory-bandwidth ceiling of the code — it is largely **fleet contention on the shared 10-core
+worker** (other builds/benches steal cores), which the `concurrent_scan_scaling` 0.53 reading also suffered.
+**Correction to `f027a193`:** its "BANDWIDTH_BOUND, 4-bit lever plausible" verdict was over-optimistic —
+confounded by shared-worker CPU contention, not a real code bandwidth wall. The concurrent-serving quant
+choice stays int8 (ship-int8-not-4bit holds in BOTH regimes; 4-bit's raw-flat-scan single-thread edge here
+does not survive concurrency and does not include the FSVI two-pass recall path where int8's ≤4-bit latency
+was originally measured). LESSON: a "scaling efficiency < 1" on a SHARED fleet worker cannot be attributed to
+the code's bandwidth without a footprint-controlled A/B (int8 vs 4-bit) — which here shows contention, not
+bandwidth. This closes the concurrent-scan lever; the benches (`concurrent_scan_scaling`,
+`concurrent_int8_vs_4bit`) remain as reusable throughput/scaling harnesses. To get an unconfounded bandwidth
+answer needs a dedicated idle machine (blocked, same class as `bd-e41k`'s worker-isolation gap).

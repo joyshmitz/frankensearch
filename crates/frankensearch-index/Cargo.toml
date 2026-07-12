@@ -210,3 +210,7 @@ harness = false
 [[bench]]
 name = "concurrent_scan_scaling"
 harness = false
+
+[[bench]]
+name = "concurrent_int8_vs_4bit"
+harness = false
