@@ -12652,3 +12652,31 @@ Distinct from the rejected label-free tier-WEIGHT QPP (`72b68de`): that needed a
 estimate; a binary skip-dense gate tolerates a coarse signal + an asymmetric quality/latency budget. Landing needs a
 Rust "compute BM25 clarity → skip dense scan if above threshold" path (cross-crate: lexical clarity feeds the
 searcher's dense-scan decision) + a chosen operating point. Measured, not yet landed. No Rust change this turn.
+
+### 2026-07-12 — cc_fse — PERF LEVER refinement (dense-gating): NQC/CV is the best gate signal; high-commitment queries are where dense HURTS (Pareto), but signal is corpus-dependent
+
+Continued the dense-gating lever (`b1940a68`): strengthen the label-free/dense-free gate signal. Compared 3 signals
+vs dense's per-query marginal value (`docs/quality_harness/gate_signal_compare.py`), stem+stop, 4 corpora — reporting
+dmarg in the low/high half (by signal median) + Pearson corr:
+
+| corpus | clarity12 (spread/corr) | cv100=NQC (spread/corr) | qlen |
+|---|---|---|---|
+| scifact | 0.029 / −0.10 | **0.062 / −0.18** (high-cv dmarg **−0.006**) | 0.009 / +0.04 |
+| nfcorpus | 0.009 / −0.01 | 0.013 / +0.01 | 0.003 / +0.04 |
+| arguana | 0.001 / −0.00 | 0.003 / +0.03 | 0.008 / −0.00 |
+| scidocs | **0.019 / −0.08** (high dmarg −0.003) | 0.006 / −0.02 | 0.000 / −0.05 |
+
+**Findings:** (1) `cv100` — the coefficient-of-variation std/mean of the top-100 BM25 scores (an NQC-style query-
+commitment predictor) — is the STRONGEST gate on scifact (the highest-dense-value corpus): spread 0.062, corr −0.18
+(best seen). On its high-commitment half, **dense's marginal value is −0.006 → dense HURTS**, so gating dense off
+there is a **PARETO win** (skip the dominant scan AND +0.006 quality; ≈ +0.003 over all scifact queries at −50%
+dense scans). (2) BUT no single signal is robust cross-corpus: `cv100` best on scifact, `clarity12` best on scidocs
+(high-clarity dmarg −0.003, also Pareto), both weak on nfcorpus (where high-cv queries STILL benefit from dense
++0.0125 → cv-gating COSTS there), arguana has no signal (dense uniformly ≈0). `qlen` (# stem+stop terms) has NO
+predictive power anywhere. **Read:** the Pareto sub-population (high-commitment lexical queries where dense actively
+hurts) is REAL and exploitable, and NQC is the best single detector, but a robust production gate needs signal
+COMBINATION (cv100+clarity) and/or a CONSERVATIVE threshold (gate only when the signal is strongly high, not just
+above-median) and likely per-corpus calibration — the modest correlations (best −0.18) cap a single-signal gate.
+Route-next: (a) combined-signal gate + conservative-threshold tradeoff curve (fraction-dense-skipped vs hybrid
+nDCG); (b) the "dense hurts on committed-lexical queries" sub-population is a quality finding independent of gating.
+No Rust change.
