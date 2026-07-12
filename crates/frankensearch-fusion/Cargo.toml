@@ -240,3 +240,4 @@ required-features = ["lexical"]
 [[bench]]
 name = "nqc_cv_cost_ab"
 harness = false
+required-features = ["bench-internals"]

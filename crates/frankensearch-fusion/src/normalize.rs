@@ -84,10 +84,16 @@ pub fn min_max_normalize(scores: &mut [f32]) {
 #[must_use]
 #[allow(clippy::cast_possible_truncation)] // f64 stats -> f32 score domain; precision loss is intentional
 pub fn nqc_cv(scores: &[f32]) -> f32 {
+    nqc_cv_iter(scores.iter().copied())
+}
+
+/// Iterator form of [`nqc_cv`] for callers whose scores already live inside another record type.
+/// Keeps the exact same accumulation order without materializing a temporary score vector.
+pub(crate) fn nqc_cv_iter(scores: impl IntoIterator<Item = f32>) -> f32 {
     let mut sum = 0.0_f64;
     let mut sum_sq = 0.0_f64;
     let mut count = 0_u32;
-    for &value in scores {
+    for value in scores {
         if value.is_finite() {
             let v = f64::from(value);
             sum += v;
@@ -256,8 +262,8 @@ pub fn normalize_scores_with_method(scores: &[f32], method: NormalizationMethod)
 #[cfg(test)]
 mod tests {
     use super::{
-        NormalizationMethod, NqcDenseWeight, min_max_normalize, nqc_cv, normalize_in_place,
-        normalize_scores, normalize_scores_with_method, z_score_normalize,
+        NormalizationMethod, NqcDenseWeight, min_max_normalize, normalize_in_place,
+        normalize_scores, normalize_scores_with_method, nqc_cv, nqc_cv_iter, z_score_normalize,
     };
 
     const EPSILON: f32 = 1e-6;
@@ -324,6 +330,24 @@ mod tests {
         let peaked = nqc_cv(&[10.0, 1.0, 1.0, 1.0]);
         let flat = nqc_cv(&[4.0, 3.0, 3.0, 4.0]);
         assert!(peaked > flat, "peaked={peaked} flat={flat}");
+    }
+
+    #[test]
+    fn nqc_cv_iterator_is_bit_identical_to_slice() {
+        let cases: &[&[f32]] = &[
+            &[],
+            &[1.0, 2.0, 3.0, 5.0],
+            &[f32::NAN, 1.0, f32::INFINITY, 2.0, f32::NEG_INFINITY],
+            &[-4.0, -2.0, 0.0],
+            &[f32::MIN_POSITIVE, 1.0e-20, 1.0e-10, 1.0],
+        ];
+        for &scores in cases {
+            assert_eq!(
+                nqc_cv(scores).to_bits(),
+                nqc_cv_iter(scores.iter().copied()).to_bits(),
+                "iterator reduction changed bits for {scores:?}"
+            );
+        }
     }
 
     #[test]

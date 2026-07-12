@@ -23,7 +23,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes_with_maps};
-use crate::normalize::{NqcDenseWeight, nqc_cv};
+use crate::normalize::{NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -37,6 +37,24 @@ pub trait SyncLexicalSearch: Send + Sync {
     ///
     /// Returns backend-specific lexical retrieval errors.
     fn search_sync(&self, query_vec: &[f32], limit: usize) -> SearchResult<Vec<ScoredResult>>;
+}
+
+/// Former enabled-path NQC shape retained for the same-binary allocation A/B.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+#[allow(clippy::needless_collect)]
+pub fn bench_nqc_cv_collect(lexical: &[ScoredResult]) -> f32 {
+    let scores: Vec<f32> = lexical.iter().map(|hit| hit.score).collect();
+    crate::normalize::nqc_cv(&scores)
+}
+
+/// Shipping enabled-path NQC shape retained for the same-binary allocation A/B.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_nqc_cv_iter(lexical: &[ScoredResult]) -> f32 {
+    nqc_cv_iter(lexical.iter().map(|hit| hit.score))
 }
 
 /// Progressive synchronous searcher backed by [`InMemoryTwoTierIndex`].
@@ -138,8 +156,7 @@ impl SyncTwoTierSearcher {
         if self.nqc_downweight_beta <= 0.0 {
             return self.rrf_semantic_weight;
         }
-        let scores: Vec<f32> = lexical.iter().map(|hit| hit.score).collect();
-        let cv = nqc_cv(&scores);
+        let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
         let factor =
             self.nqc_dense_weight
                 .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
