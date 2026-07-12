@@ -12012,3 +12012,34 @@ selection correctness, incl. the full-sort-reference comparison). **This closes 
 sort-consistency sweep** — every fuse/merge selection path (federated, rrf, blend_two_tier, two_tier ANN+WAL,
 MRL rescore, fsfs hybrid) now uses `sort_unstable`/threshold-gated `select_nth`, byte-identical, robust on
 both small and large pools. (fsfs is 88k lines but compiled/tested cleanly on `vmi1227854`.)
+
+### 2026-07-12 — cc_fse — FRONTIER MAP: the 2026-07-12 session's veins are swept; remaining ownable levers are marginal/slow-crate/blocked
+
+Consolidating a long run of small increments so the next session doesn't re-walk. **Swept this session (10
+shipped wins + 6 measured non-ships):**
+- **Truncate/limit-before-materialize** (skip work over large inputs): rerank embedder + cross-encoder
+  tokenize `take(max_length)` before i64-collect (`62806949`/`0e53b7f9`, 2.7–10× on long docs). Grep
+  `.map().collect()...truncate()` = EMPTY elsewhere in prod.
+- **Redundant-full-copy** (`clone_from_slice`/double-materialize): rerank RRF reorder move-not-clone
+  (`810db34e`, ~1.5×). `.clone_from_slice(` = only that one instance in prod; other `.to_vec()` sites are
+  single NECESSARY copies (`&[T]`→owned) or opt-in quality kernels (`smooth`/`hubness` no-op passthrough).
+- **Merge-path sort/top-k** (`select_nth`/`sort_unstable`, strict total order): ALL fuse/merge selection
+  paths done — federated/rrf/blend (pre-existing; rrf.rs:402 was the origin), MRL rescore (`4b0bc9a7`, ~2×),
+  two_tier ANN+WAL (`e4c25670`), fsfs hybrid (`43bf3a5e`). Threshold-gate (`SELECT_NTH_MIN=256`) is the
+  robust form (n-dependent: `select_nth`/`sort_unstable` LOSE on small tie-heavy pools — `a0fd2090` HOLD).
+- **Ops render/aggregation**: RFC3339 ingest parse ASCII fast-path (`36c59fd7`, 1.72×), correlation
+  borrowed-key grouping (`98f42ed6`, 1.4–1.9×), fleet per-project pass-fusion+hashget-dedup (`f4f98e0a`,
+  1.9×); HOLDs on alerts-SLO grouping / fleet-wide 2→1 / short-string micro-fusions (all inside-floor).
+- **Unicode-over-large-text**: negation-match ASCII fast-path (`6c41ed4e`, 97×). `nfc()`/`to_lowercase()`
+  over doc bodies = EMPTY elsewhere (canonicalize already had its `is_ascii` NFC fast-path).
+- **O(n²) membership** (`Vec::contains`/`position` in loops): grepped fusion/index/lexical/rerank — NONE in
+  production (all range-`contains`, test asserts, or test helpers).
+
+**Remaining ownable candidates, all low-EV:** opt-in quality-kernel no-op copies (`smooth`/`hubness`
+`hits.to_vec()` — only fires when wired+identity-config, needs a by-value signature change); setup-path
+sorts (`interaction_oracles` `sort_by_key(format!)` → `sort_by_cached_key` is byte-identical + clippy-aligned
+but runs once at init, inside-floor); RRF small-pool `select_nth` threshold (predicted wash per the mrl
+n-dependency data). **Genuine remaining frontier = the same as the pre-session HOLD maps:** symbolized
+per-query self-time (blocked `bd-e41k` — release strips symbols, no worker pin) or a NEW workload the current
+BOLD/µbench proxies don't model. The measured-CPU levers on the ownable search+ingest+render surface are at
+floor.
