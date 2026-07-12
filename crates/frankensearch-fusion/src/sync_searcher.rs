@@ -23,6 +23,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes_with_maps};
+use crate::normalize::{NqcDenseWeight, nqc_cv};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -47,6 +48,11 @@ pub struct SyncTwoTierSearcher {
     rrf_lexical_weight: f64,
     rrf_semantic_weight: f64,
     rrf_tiebreak: RrfTiebreak,
+    /// Opt-in NQC dense down-weight (default off, `beta = 0.0`). See
+    /// [`Self::with_nqc_dense_downweight`].
+    nqc_downweight_beta: f32,
+    nqc_downweight_w_min: f32,
+    nqc_dense_weight: NqcDenseWeight,
 }
 
 impl SyncTwoTierSearcher {
@@ -61,6 +67,9 @@ impl SyncTwoTierSearcher {
             rrf_lexical_weight: 1.0,
             rrf_semantic_weight: 1.0,
             rrf_tiebreak: RrfTiebreak::LexicalThenId,
+            nqc_downweight_beta: 0.0,
+            nqc_downweight_w_min: 0.0,
+            nqc_dense_weight: NqcDenseWeight::new(),
         }
     }
 
@@ -98,6 +107,43 @@ impl SyncTwoTierSearcher {
     pub const fn with_rrf_tiebreak(mut self, tiebreak: RrfTiebreak) -> Self {
         self.rrf_tiebreak = tiebreak;
         self
+    }
+
+    /// Enable the opt-in **NQC dense down-weight** (default OFF).
+    ///
+    /// Per query, the dense tier's fusion weight is scaled by
+    /// `clip(1 − beta·CDF(nqc_cv(lexical scores)), w_min, 1)`, where `CDF` is the empirical
+    /// percentile from `weight` — a [`NqcDenseWeight`] built offline from a sample of
+    /// observed NQC values (the query stream). High lexical commitment (high NQC), where the
+    /// dense tier tends to add little or hurt, gets a lower dense weight. Measured aggregate
+    /// gain +0.0022 nDCG@10 (pooled 95% CI `[+0.0008, +0.0035]`); latency-neutral (the NQC is
+    /// a single-pass reduction, only computed when enabled). See `docs/SEARCH_QUALITY_FINDINGS.md`.
+    ///
+    /// `beta <= 0` (the default) or an empty `weight` leaves fusion **byte-identical**.
+    /// Use `w_min > 0` (e.g. the measured `beta ≈ 0.5` already floors the multiplier at
+    /// `0.5`): a scaled semantic weight that reaches `<= 0` is treated as neutral `1.0` by the
+    /// tier-weight sanitizer, which would *undo* the down-weight rather than maximize it.
+    #[must_use]
+    pub fn with_nqc_dense_downweight(mut self, beta: f32, w_min: f32, weight: NqcDenseWeight) -> Self {
+        self.nqc_downweight_beta = beta;
+        self.nqc_downweight_w_min = w_min;
+        self.nqc_dense_weight = weight;
+        self
+    }
+
+    /// The dense-tier fusion weight for this query: the static `rrf_semantic_weight`, scaled
+    /// by the per-query NQC dense down-weight when enabled (`beta > 0`). Off (default) returns
+    /// `rrf_semantic_weight` unchanged with zero extra work.
+    fn effective_semantic_weight(&self, lexical: &[ScoredResult]) -> f64 {
+        if self.nqc_downweight_beta <= 0.0 {
+            return self.rrf_semantic_weight;
+        }
+        let scores: Vec<f32> = lexical.iter().map(|hit| hit.score).collect();
+        let cv = nqc_cv(&scores);
+        let factor =
+            self.nqc_dense_weight
+                .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
+        self.rrf_semantic_weight * f64::from(factor)
     }
 
     /// Execute a synchronous search and return the final result set + metrics.
@@ -208,7 +254,7 @@ impl SyncTwoTierSearcher {
                         &RrfConfig {
                             k: self.config.rrf_k,
                             lexical_weight: self.rrf_lexical_weight,
-                            semantic_weight: self.rrf_semantic_weight,
+                            semantic_weight: self.effective_semantic_weight(lexical),
                             tiebreak: self.rrf_tiebreak,
                         },
                     ),
@@ -300,7 +346,7 @@ impl SyncTwoTierSearcher {
                     &RrfConfig {
                         k: self.config.rrf_k,
                         lexical_weight: self.rrf_lexical_weight,
-                        semantic_weight: self.rrf_semantic_weight,
+                        semantic_weight: self.effective_semantic_weight(lexical),
                         tiebreak: self.rrf_tiebreak,
                     },
                 ),
@@ -391,6 +437,7 @@ impl std::fmt::Debug for SyncTwoTierSearcher {
             .field("rrf_lexical_weight", &self.rrf_lexical_weight)
             .field("rrf_semantic_weight", &self.rrf_semantic_weight)
             .field("rrf_tiebreak", &self.rrf_tiebreak)
+            .field("nqc_downweight_beta", &self.nqc_downweight_beta)
             .finish()
     }
 }
@@ -792,6 +839,42 @@ mod tests {
         assert_ne!(
             sem_res[0].doc_id, lex_res[0].doc_id,
             "opposite tier weights must change the fused top result (weights reach fusion)"
+        );
+    }
+
+    #[test]
+    fn nqc_dense_downweight_flows_through_searcher_to_fusion() {
+        // Both searchers up-weight the dense tier (semantic 5×) so it dominates by default;
+        // enabling the NQC dense down-weight with a sample below the query's NQC drives the
+        // dense weight to 0, so lexical (favoring "c") dominates instead. Different top =>
+        // the opt-in down-weight reaches the fusion RrfConfig.
+        let make_lex = || {
+            Arc::new(StaticLexical {
+                hits: vec![lexical_result("c", 10.0), lexical_result("b", 5.0)],
+            })
+        };
+        let q = [1.0_f32, 0.0];
+
+        let neutral = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_lexical(make_lex())
+            .with_rrf_weights(1.0, 5.0);
+        // Query NQC (cv of lexical scores [10, 5] ≈ 0.333) is above every sampled value, so
+        // its percentile is 1.0 and dense_weight(beta=1, w_min=0.05) = clip(1 - 1·1, 0.05, 1)
+        // = 0.05 → effective semantic weight 5·0.05 = 0.25 (< lexical 1.0), still > 0 so it is
+        // not neutralized by the tier-weight sanitizer.
+        let sample = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3]);
+        let downweighted = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_lexical(make_lex())
+            .with_rrf_weights(1.0, 5.0)
+            .with_nqc_dense_downweight(1.0, 0.05, sample);
+
+        let (neutral_res, _) = neutral.search_collect(&q, 3).unwrap();
+        let (down_res, _) = downweighted.search_collect(&q, 3).unwrap();
+        assert!(!neutral_res.is_empty() && !down_res.is_empty());
+        assert_eq!(down_res[0].doc_id, "c", "zeroing the dense tier lets lexical dominate");
+        assert_ne!(
+            neutral_res[0].doc_id, down_res[0].doc_id,
+            "the NQC dense down-weight must change the fused top (it reaches fusion)"
         );
     }
 

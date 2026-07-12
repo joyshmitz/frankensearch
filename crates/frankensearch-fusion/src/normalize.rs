@@ -125,6 +125,15 @@ pub struct NqcDenseWeight {
 }
 
 impl NqcDenseWeight {
+    /// An empty sketch (yields a neutral `1.0` weight until populated). `const` so it can
+    /// initialize a searcher field in a `const fn` constructor.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            sorted_cv: Vec::new(),
+        }
+    }
+
     /// Build from a sample of observed NQC values (non-finite samples are dropped).
     #[must_use]
     pub fn from_sample(sample: &[f32]) -> Self {
