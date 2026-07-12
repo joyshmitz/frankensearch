@@ -12863,3 +12863,28 @@ caller-side** — (2) a streaming cv-quantile CDF (t-digest over the query strea
 per-query `semantic_weight` scale in the searcher; the fusion kernel + the signal (`nqc_cv`) are both already in
 place. This further de-risks the one-shippable-win land: no ranking-kernel change, so the only product-behavior
 surface is the caller opting in (default off) + the real-embedder A/B. No logic change this turn (doc-only).
+
+### 2026-07-12 — cc_fse — WIRING FEASIBILITY (precise close-out): the NQC down-weight attaches at sync_searcher.rs:208 with NO TwoTierConfig ripple — remaining gap is the cv-SAMPLE SOURCE (a design/product decision)
+
+Verified exactly where/how the final searcher-wiring step attaches, to decide if it's autonomously completable.
+`sync_searcher.rs:200-214` calls `fuse_by_strategy(self.config.fusion_strategy, lexical, ...)` and builds
+`RrfConfig { .., semantic_weight: self.rrf_semantic_weight, .. }` INLINE from searcher fields, with the `lexical`
+hits in scope. So the NQC down-weight injects here in ~6 lines and does NOT require the deferred `TwoTierConfig`
+~35-site plumbing ripple (the known gap that blocks per-tier weights from the high-level builder — it's irrelevant
+at this inline call site). The opt-in injection would be:
+```
+let sem_w = if self.nqc_beta > 0.0 {
+    let cv = nqc_cv(&lexical.iter().map(|r| r.score).collect::<Vec<_>>());
+    self.rrf_semantic_weight * f64::from(self.nqc_weight.dense_weight(cv, self.nqc_beta, self.nqc_w_min))
+} else { self.rrf_semantic_weight };
+```
++ searcher fields `nqc_beta`/`nqc_w_min`/`nqc_weight: NqcDenseWeight` (default `beta=0` → byte-identical).
+**BUT the substantive remaining piece is NOT the injection — it is the cv-SAMPLE SOURCE:** `NqcDenseWeight` must be
+populated from a rolling/offline sample of observed NQC values (the query stream). Wiring the injection with an
+EMPTY `NqcDenseWeight` is inert (neutral weight 1.0 → does nothing). Designing that source — a rolling per-searcher
+buffer (thread-safety on the shared hot path?) vs a periodic offline rebuild vs a config-provided sketch — is a
+DESIGN + PRODUCT decision (it touches the concurrent hot path, only benefits when enabled, and needs real-embedder
+A/B). **CONCLUSION: the autonomously-completable work on this feature is DONE** (signal `nqc_cv`, mapping
+`NqcDenseWeight`, no-kernel-change mechanism, latency-neutrality, end-to-end composition test — all landed/tested/
+proven). The one remaining step is a product-gated integration (sample source + opt-in wiring + A/B), precisely
+scoped here. Handing off — further autonomous increments on this feature would be premature hot-path churn.
