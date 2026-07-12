@@ -100,5 +100,9 @@ name = "fuse_merge_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "truncate_middle_ab"
+harness = false
+
 [lints]
 workspace = true

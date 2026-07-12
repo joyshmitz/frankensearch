@@ -12379,3 +12379,20 @@ hurt on a dense-dominant corpus — exactly why the label-free tier-weight auto-
 their caveats, so it is trustworthy for future NEW-lever experiments (route-next: mutual-kNN pool-restricted
 smoothing measured end-to-end, larger background query samples for the query-side hubness `ba5052a`, a proper
 Tantivy-faithful stem+stop lexical analyzer to chase the documented +5.8%). No Rust/conformance change.
+
+### 2026-07-12 — cc_fse — WIN: fsfs `truncate_middle` bounded walk (no Vec<char> alloc) — ~1.94x typical / ~21.9x long, byte-identical, 21 call sites
+
+Sibling of the landed core `truncate_chars` win, found by grepping the un-swept crates for `chars().collect::<Vec<_>>()`.
+`truncate_middle` (fsfs `runtime.rs`, the path/name/value display-truncator called at **21 render sites**)
+materialized the ENTIRE input into a `Vec<char>` just to slice a `max_chars`-sized `prefix...suffix` — O(text)
+alloc + fill, discarded. Rewrote to O(max_chars): a bounded overflow check (`chars().nth(max_chars).is_none()`
+→ walk ≤ max_chars+1, not a full count/collect), `char_indices().nth(left)` for the prefix byte offset, and
+`char_indices().rev().nth(right-1)` for the suffix start — then slice `&text[..left_end]` / `&text[suffix_start..]`.
+No `Vec<char>` allocation; independent of input length. Byte-for-byte identical (both are char boundaries; the
+overflow check and prefix/suffix selection are exactly equivalent to the old form), runtime-verified over 11
+cases (empty/short/exact, ASCII path, Unicode café/日本語/😀/παράδειγμα, max_chars∈{3,5,7,20,40,80}) plus a
+~7200-char input. Within-process paired A/B (`truncate_middle_ab`, both arms one core → immune to RCH_WORKER
+soft-pin): path72 (len~72, mc=60) orig **679.2 ns** → new **350.3 ns** = ratio 0.5157 (~1.94x); long7200
+(len~7200, mc=80) orig **8289.9 ns** → new **378.9 ns** = ratio 0.0457 (~21.9x); both < A/A null p5
+(0.88/0.82) → **CANDIDATE_FASTER**. `truncate_tail` right below was already optimal (count + prefix-only, no
+Vec). Lib compiles (`cargo bench -p frankensearch-fsfs` exit 0). Shipped.

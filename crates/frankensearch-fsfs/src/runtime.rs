@@ -11865,18 +11865,20 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     if max_chars < 5 {
         return text.chars().take(max_chars).collect();
     }
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars {
+    // Bounded: does the text exceed `max_chars`? Walk at most `max_chars + 1` chars
+    // rather than materializing the whole string into a `Vec<char>` (the old form
+    // allocated O(text) just to slice a `max_chars`-sized prefix+suffix).
+    if text.chars().nth(max_chars).is_none() {
         return text.to_owned();
     }
     let left = (max_chars - 3) / 2;
     let right = max_chars - 3 - left;
-    let prefix = chars.iter().take(left).collect::<String>();
-    let suffix = chars
-        .iter()
-        .skip(chars.len().saturating_sub(right))
-        .collect::<String>();
-    format!("{prefix}...{suffix}")
+    // Byte offset after the first `left` chars, and where the last `right` chars begin
+    // (found by walking `right` chars from the end). Both are char boundaries, so the
+    // slices below are valid and byte-for-byte identical to the old prefix/suffix.
+    let left_end = text.char_indices().nth(left).map_or(text.len(), |(i, _)| i);
+    let suffix_start = text.char_indices().rev().nth(right - 1).map_or(0, |(i, _)| i);
+    format!("{}...{}", &text[..left_end], &text[suffix_start..])
 }
 
 fn truncate_tail(text: &str, max_chars: usize) -> String {
