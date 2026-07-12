@@ -12288,3 +12288,20 @@ one-time `pip install` + BEIR-zip download documented in that README, then `./ve
 <datasets…>`. Route-next quality levers to layer on this baseline (from memory `pivot-to-quality-…`):
 Tantivy-faithful stem+stop lexical analysis, larger candidate pools, mutual-kNN pool-restricted smoothing,
 and the already-landed pool-min-max / graph-diffusion / query-side-hubness kernels measured end-to-end.
+
+### 2026-07-12 — cc_fse — WIN: timeline `host_bucket` returns borrowed `&str` (elide per-event throwaway alloc) — ~1.98x on the filter-compare site
+
+Fresh perf vein per memory `ops-tui-fresh-perf-vein` ("more ops pure fns"). `ActionTimelineScreen::
+host_bucket(instance_id) -> String` split the id on `:`/`-` and returned an **owned** prefix; all three
+branches are subslices of the input. In the hot `filtered_events` loop (timeline.rs:245) the result is used
+only for `eq_ignore_ascii_case(host)` and dropped — a throwaway heap `String` per event whenever a host
+filter is active. Changed the signature to `-> &str` (return the subslice directly); the four owned-consumer
+sites (host-filter set build 319, row build 664, focus line 771 works as `&str`, `selected_host` 805) take an
+explicit `.to_owned()`, so allocation counts there are unchanged — the win is isolated to the filter-compare
+site. Byte-identical (subslice == same content; the four `host_bucket_*` unit tests compare by value and are
+untouched). Within-process paired A/B (`host_bucket_borrow_ab`, both arms one core → immune to RCH_WORKER
+soft-pin), n=2000 ids, filter-site workload (bucket+`eq_ignore_ascii_case`+count): owned **18.40 ns/call** vs
+borrowed **9.30 ns/call** = **1.98x**; lever ratio 0.5057 vs A/A null p5 0.8587 → **CANDIDATE_FASTER** (well
+past the noise floor); arms agree (63 matches). Note: the alerts_slo.rs `host_bucket` twin has a single owned
+consumer (builds `AlertRow.host: String`), so a `&str` return there is neutral — not changed. Lib compiles
+(`cargo bench -p frankensearch-ops` exit 0). Shipped.

@@ -34,6 +34,10 @@ name = "correlation_group_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "host_bucket_borrow_ab"
+harness = false
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }

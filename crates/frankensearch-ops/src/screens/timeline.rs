@@ -257,14 +257,14 @@ impl ActionTimelineScreen {
             .map(|instance| instance.project.as_str())
     }
 
-    fn host_bucket(instance_id: &str) -> String {
+    fn host_bucket(instance_id: &str) -> &str {
         if let Some((host, _)) = instance_id.split_once(':') {
-            return host.to_owned();
+            return host;
         }
         if let Some((host, _)) = instance_id.split_once('-') {
-            return host.to_owned();
+            return host;
         }
-        instance_id.to_owned()
+        instance_id
     }
 
     const fn event_severity(event: &LifecycleEvent) -> EventSeverity {
@@ -316,7 +316,7 @@ impl ActionTimelineScreen {
             .fleet()
             .lifecycle_events
             .iter()
-            .map(|event| Self::host_bucket(&event.instance_id))
+            .map(|event| Self::host_bucket(&event.instance_id).to_owned())
             .collect();
         values.extend(hosts);
         self.host_filter_values = values;
@@ -661,7 +661,7 @@ impl ActionTimelineScreen {
                     .project_for_instance(&event.instance_id)
                     .unwrap_or("unknown")
                     .to_owned();
-                let host = Self::host_bucket(&event.instance_id);
+                let host = Self::host_bucket(&event.instance_id).to_owned();
                 let style = if index == self.selected_row {
                     self.palette.style_highlight().bold()
                 } else {
@@ -802,7 +802,7 @@ impl ActionTimelineScreen {
     pub fn selected_host(&self) -> Option<String> {
         self.filtered_events()
             .get(self.selected_row)
-            .map(|event| Self::host_bucket(&event.instance_id))
+            .map(|event| Self::host_bucket(&event.instance_id).to_owned())
     }
 
     #[cfg(test)]
