@@ -6280,6 +6280,42 @@ mod tests {
     }
 
     #[test]
+    fn builder_nqc_dense_downweight_scales_dense_weight_when_enabled() {
+        use frankensearch_core::ScoreSource;
+        let lex_hit = |id: &str, score: f32| ScoredResult {
+            doc_id: id.into(),
+            score,
+            source: ScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(score),
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        };
+        let hits = [lex_hit("a", 10.0), lex_hit("b", 1.0)]; // peaked → high NQC (cv ≈ 0.818)
+
+        // Default OFF: fields neutral, effective weight == base.
+        let off =
+            TwoTierSearcher::new(build_test_index(4), Arc::new(StubEmbedder::new("f", 4)), TwoTierConfig::default());
+        assert_eq!(off.nqc_downweight_beta, 0.0);
+        assert!((off.effective_semantic_weight(&hits) - off.rrf_semantic_weight).abs() < 1e-12);
+
+        // Enabled: the query NQC is above every sampled value (percentile 1.0), so
+        // dense_weight(beta=0.5) = clip(1 − 0.5·1) = 0.5 → the dense weight is halved.
+        let weight = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3]);
+        let on =
+            TwoTierSearcher::new(build_test_index(4), Arc::new(StubEmbedder::new("f", 4)), TwoTierConfig::default())
+                .with_nqc_dense_downweight(0.5, 0.0, weight);
+        assert!((on.nqc_downweight_beta - 0.5).abs() < 1e-6);
+        assert_eq!(on.nqc_dense_weight.len(), 3);
+        let eff = on.effective_semantic_weight(&hits);
+        assert!((eff - 0.5 * on.rrf_semantic_weight).abs() < 1e-6, "eff={eff}");
+        assert!(eff < on.rrf_semantic_weight);
+    }
+
+    #[test]
     fn builder_without_lexical() {
         let index = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
