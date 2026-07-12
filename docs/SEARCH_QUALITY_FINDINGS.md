@@ -190,6 +190,41 @@ remaining product-gated step.
   query drift). Static mean-pooled doc vectors averaged into the query blur it toward the corpus centroid;
   top-k false positives poison the centroid. Lexical BM25, not vector PRF, is the weak-query remedy.
 
+## 2026-07-12 update — fusion design-space mapped cross-corpus + a NEW leverage (NQC dense down-weight)
+
+Second investigation pass (cc_fse), rebuilt harness (`docs/quality_harness/`, model2vec potion + `rank_bm25`,
+now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords), across all 4 BEIR corpora
+(SciFact / NFCorpus / ArguAna / SciDocs), nDCG@10. Full trail + self-corrections in `NEGATIVE_EVIDENCE.md`.
+
+- **Analyzer validated.** Tantivy Snowball stem+stop lifts lexical **+0.035 (+5.4%)** / hybrid **+0.024 (+3.6%)**
+  on scifact vs basic tokenization — reproduces the documented lever and confirms the production analyzer's real
+  contribution (the engine already runs it). Measure fusion levers on the stem+stop baseline, not basic.
+- **pool-min-max SCORE fusion (`a9e53b4`) validated cross-corpus:** beats RRF on **4/4** corpora (scifact +0.0146,
+  nfcorpus +0.0123, arguana +0.0001, scidocs +0.0051) — the shipped default is confirmed, not scifact-specific.
+- **Fusion knobs ruled out (measured, cross-corpus):** z-score normalization ≈ min-max (WASH, |Δ|≤0.002, loses
+  scifact); candidate pool ≈100 is **Pareto** (larger pools give ~+0.001 nDCG for ~5× fusion+retrieval cost —
+  don't enlarge; smaller costs quality).
+- **★ MAJOR REFRAME — the dense tier is HIGH-VARIANCE.** Per-query, dense is net-neutral-or-**harmful** on **~71–81%**
+  of queries on every corpus (it helps a ~20–30% minority a lot). Its marginal hybrid value ranges +0.0247 (scifact)
+  down to +0.0017 (arguana ≈ nothing). An ORACLE that skips dense exactly where it doesn't help would drop ~¾ of the
+  (dominant-cost) dense scans AND gain +0.017–0.042 nDCG. This quantifies the long-standing "hybrid absorbs dense
+  micro-opts" theme: dense's marginal hybrid value (≤+0.025) upper-bounds any dense-*side* quality tweak.
+- **★ NEW LEVERAGE (landable) — NQC-adaptive dense DOWN-WEIGHT.** Down-weight (not skip) the dense tier on
+  high-commitment queries: `w_dense = clip(1 − β·CDF(cv), w_min, 1)`, `cv` = coefficient-of-variation of the top-k
+  BM25 scores (NQC), β≈0.5. Beats equal-weight pool-min-max on **4/4** corpora; **statistically real POOLED**
+  (3029 queries, +0.0022, bootstrap 95% CI **[+0.0008, +0.0035]**), deployment-validated leakage-free (held-out cv
+  CDF). Small but real, **latency-neutral** (NQC is a single-pass reduction, 0.37× the per-tier min-max the fusion
+  already does). The HARD gate (skip dense) is NOT robustly Pareto (nfcorpus needs dense on its committed queries) —
+  the SOFT down-weight is, because it retains partial dense. LAND-SCOPING: must use a per-deployment cv-**percentile**
+  CDF (streaming t-digest over the query stream) — a fixed `β·cv` does NOT transfer (cv scale is corpus-dependent).
+  **Status:** foundation landed (`frankensearch_fusion::nqc_cv`, `0b4651c2`, tested + latency-benched `97f5c697`);
+  remaining = t-digest CDF sketch + weight application in the pool-min-max path + opt-in `dense_nqc_downweight_beta`
+  (default 0). Validate on the REAL production embedder before enabling — all numbers here are potion/model2vec proxy.
+- **Statistical caution (applies to every single-run number in this harness):** each nDCG figure is a POINT
+  ESTIMATE; treat **±0.003-scale deltas as noise** unless pooled/CI'd. The large deltas above (stem+stop +0.024/
+  +0.035, pool-min-max>RRF +0.017) are trustworthy; the sub-0.003 washes (z-score, pool-size) were correctly read
+  as noise.
+
 ## Implementation status
 
 The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
@@ -203,6 +238,7 @@ byte-for-byte unchanged), so the recipe is expressible in code with **no** produ
 | Neutral hash RRF tiebreak (#3) | **Shipped, opt-in** `05472cd` | `RrfConfig { tiebreak: RrfTiebreak::Hash, .. }` |
 | RRF `k` (#3) | already configurable | `RrfConfig { k: 10.0, .. }` / `TwoTierConfig.rrf_k` |
 | Deep candidate feed (#3) | already configurable | `candidate_multiplier` |
+| NQC dense down-weight (2026-07-12) | **Foundation landed** `0b4651c2`/`97f5c697` (`nqc_cv` fn, tested, latency-neutral) — rest TODO | (not yet wired; opt-in `dense_nqc_downweight_beta` default 0 planned) |
 
 **Remaining work is outward-facing DEFAULT flips (product-gated).** Turning the recipe on *by default* changes
 user-visible ranking output and updates test snapshots, so each needs a product sign-off — each is de-risked to a
