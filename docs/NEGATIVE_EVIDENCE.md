@@ -11976,3 +11976,21 @@ constant factors dominate at small n) to make the change ROBUST (never slower).
 sets are ~2×. **Boundary payoff:** the n-dependency HOLD (reranker sort, a0fd2090) directly informed the
 threshold that makes THIS win safe — the same lever (`select_nth`/`sort_unstable`) that regresses small n is
 a ~2× win on large n when gated. Bench `mrl_topk_select_ab` replicates the algorithm as the parity oracle.
+
+### 2026-07-12 — cc_fse — LANDED: two-tier ANN+WAL merge threshold-gated `select_nth` (sibling-consistency; missing merge-path fix), byte-identical
+
+`two_tier.rs`'s ANN+WAL merge (resolve ANN hits, append resident-WAL rescores, sort, keep top-`k`) was the
+**only merge path still using the stable `sort_by`** — `federated.rs`/`rrf`/`blend_two_tier` all took the
+`sort_unstable` "bit-identical for strict-total-order, drops scratch" fix ("niche cross-shard path, not
+separately benched"). Applied the threshold-gated `select_nth` here (the same proven `mrl_topk_select_ab`
+algorithm, `SELECT_NTH_MIN=256`): a large merged pool (ANN `ef` + resident WAL ≥ 256) partitions to the
+top-`k` in O(n) then sorts only those (~2× per the MRL bench, conservative vs the previous `sort_by`
+baseline); small pools keep the stable sort (no regression). Byte-identical: strict total order (score
+`total_cmp` + unique `index` tiebreak) ⇒ the top-`k` set and its order are unique regardless of algorithm.
+
+No separate bench — the algorithm is `mrl_topk_select_ab` (proven ~1.96–2.29× at n≥300) and the
+`sort_unstable` half is the sibling-proven `federated`/`rrf`/`blend` fix; this niche ANN+WAL path follows
+that same not-separately-benched norm. Verified: 39/39 `two_tier` lib tests pass (compile + search
+correctness). Route-next: this closes the merge-path sort-consistency sweep (all four now `sort_unstable`/
+`select_nth`); the WAL-merge only reaches n≥256 with a large resident WAL, so the win is realized between
+compactions on ANN indices.

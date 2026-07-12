@@ -322,14 +322,28 @@ impl TwoTierIndex {
                         doc_id: entry.doc_id.as_str().into(),
                     });
                 }
-                // Re-sort and truncate after merging
-                hits.sort_by(|a, b| {
+                // Re-sort and truncate after merging. The comparator is a strict
+                // total order (score `total_cmp` + unique `index` tiebreak), so
+                // `select_nth`/`sort_unstable` are bit-identical to the stable sort.
+                // For a large merged pool (ANN `ef` + resident WAL), partition to the
+                // top-`k` in O(n) then sort only those — the MRL rescored top-k lever
+                // (`mrl_topk_select_ab`, ~2×). Gated by `SELECT_NTH_MIN` so small pools
+                // keep the stable sort (n-dependent constant factors; see a0fd2090).
+                let by_score_index = |a: &VectorHit, b: &VectorHit| {
                     b.score
                         .total_cmp(&a.score)
                         .then_with(|| a.index.cmp(&b.index))
-                });
-                if hits.len() > k {
+                };
+                const SELECT_NTH_MIN: usize = 256;
+                if k < hits.len() && hits.len() >= SELECT_NTH_MIN {
+                    hits.select_nth_unstable_by(k, by_score_index);
                     hits.truncate(k);
+                    hits.sort_unstable_by(by_score_index);
+                } else {
+                    hits.sort_by(by_score_index);
+                    if hits.len() > k {
+                        hits.truncate(k);
+                    }
                 }
             } else if hits.len() > k {
                 // If no WAL but we fetched extra for filtering, truncate back to k
