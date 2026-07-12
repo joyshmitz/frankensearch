@@ -38,6 +38,10 @@ required-features = ["bench-internals"]
 name = "host_bucket_borrow_ab"
 harness = false
 
+[[bench]]
+name = "sparkline_build_ab"
+harness = false
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }

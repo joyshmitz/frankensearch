@@ -12305,3 +12305,16 @@ borrowed **9.30 ns/call** = **1.98x**; lever ratio 0.5057 vs A/A null p5 0.8587 
 past the noise floor); arms agree (63 matches). Note: the alerts_slo.rs `host_bucket` twin has a single owned
 consumer (builds `AlertRow.host: String`), so a `&str` return there is neutral — not changed. Lib compiles
 (`cargo bench -p frankensearch-ops` exit 0). Shipped.
+
+### 2026-07-12 — cc_fse — WIN: ops `sparkline` pre-sizes its buffer (elide char-collect reallocs) — ~1.38x, byte-identical, 3 copies
+
+Continuing the fresh ops-render vein. `sparkline(values) = values.iter().map(spark_char).collect::<String>()`
+(3 identical copies: live_stream/project_detail/index_resources) builds a per-frame block-glyph strip. Each
+glyph (U+2581..U+2588) is 3 bytes UTF-8, but `FromIterator<char> for String` reserves only the size_hint
+lower bound = `values.len()` bytes, so the buffer reallocs a couple times as it grows to `3*len`. Replaced
+with an explicit `String::with_capacity(values.len()*3)` + push loop — same glyphs, same order, byte-identical.
+Within-process paired A/B (`sparkline_build_ab`, both arms one core → immune to RCH_WORKER soft-pin), width=120
+(widest per-frame heatstrip): collect **409.96 ns/call** vs presized **297.74 ns/call** = ratio 0.7263 (~1.38x),
+vs A/A null p5 0.8245 → **CANDIDATE_FASTER**; both arms byte-identical over n∈{0,1,4,63,120,256}. NOTE: an
+`unsafe { from_utf8_unchecked }` byte-table arm (contiguous glyphs → byte[2]=0x81+idx) was DROPPED — the crate
+denies `unsafe_code`, so it is not landable regardless of speed. Applied to all 3 copies. Shipped.
