@@ -12189,3 +12189,23 @@ Route-next (academic, only if a 4-bit path is ever reconsidered at scale): a con
 int8-vs-4bit flat A/B on an idle machine to quantify the crossover precisely (the fleet reading is bandwidth-
 contention-confounded even single-thread). LESSON: cache-resident µbenches (N small) can invert the
 large-corpus conclusion — always note the working-set size vs L3 when comparing quantization footprints.
+
+### 2026-07-12 — cc_fse — CLOSES an open route-next: the tombstone-bitmap "bandwidth-bound reopening" is now resolvable — regime CONFIRMED real, but non-default path + fleet-unmeasurable
+
+Connecting this session's concurrency/working-set findings to the oldest untested PERF route-next (the
+`36de60d`/`df2f82c` tombstone-bitmap rejection left "could still pay on a genuinely BANDWIDTH-bound scan
+where the flag read is NOT hidden — e.g. the exact F32 flat scan"). That reopening condition is no longer
+hypothetical: this session's `concurrent_scan_scaling` + working-set analysis (`6af1687a`) CONFIRM the flat
+scan turns memory-bound once the working set exceeds L3 (and the F32 exact scan, 1536 B/vec = 4× int8, hits
+it soonest). **But the route-next still does not open a lever, for two now-proven reasons:** (1) it is the
+non-default F32 EXACT path — the shipped default is the int8 TWO-PASS, whose coarse pass reads truncated dims
+and already minimizes scan traffic (so the bitmap's flag-read saving is a small fraction of an
+already-reduced read); and (2) bandwidth effects are UNMEASURABLE on this contended fleet — `db4100c5`'s
+footprint-controlled A/B showed a half-footprint layout (4-bit) did NOT scale better, i.e. the apparent
+"bandwidth saturation" is worker CPU/bandwidth contention, not a clean code signal, so any bitmap
+bandwidth-win would be indistinguishable from contention noise. **Resolution: the tombstone-bitmap route-next
+is CLOSED** — its regime is real but it is gated on the same dedicated-idle-machine requirement as the rest
+of the concurrency/bandwidth work (bd-e41k class). This is the last untested perf route-next in the ledger;
+with it closed, the ownable measurable-CPU frontier has no remaining open lead on this fleet. Productive
+direction remains search-QUALITY (the pivot-to-quality lands above, Python/BEIR-measured — a different
+harness than rch cargo-bench).
