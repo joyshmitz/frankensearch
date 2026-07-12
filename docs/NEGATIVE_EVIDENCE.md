@@ -12502,3 +12502,26 @@ upgrades the harness to Tantivy-faithful lexical (the basic-tokenization baselin
 by ~3.6%). Actionable follow-through: future harness quality experiments should use `stem_stop.py`'s tokenizer, not
 basic, so measured deltas match the deployed engine. `snowballstemmer` added to the harness setup (README updated).
 No Rust/conformance change.
+
+### 2026-07-12 — cc_fse — QUALITY: landed pool-min-max fusion validated on the corrected stem+stop baseline — beats RRF by +0.0174 (margin GROWS ~4.5× with a faithful analyzer)
+
+Perf check this turn (negative-ledger-first): the missing-pre-size family is clean in fusion/index hot paths
+(`index/lib.rs:514` already `HashSet::with_capacity`; other `Vec::new()` hits are test/WAL-header/thread) — no
+lever. So continued the search-QUALITY vein on last turn's corrected Tantivy-faithful baseline (`8d9ff156`).
+Question: the shipped pool-min-max SCORE fusion (`a9e53b4`, +0.0038 measured on the BASIC-tokenization baseline)
+— does it still beat RRF now that the lexical tier is stem+stop? `docs/quality_harness/fusion_compare.py`,
+scifact stem+stop, 300 test queries, top-100 pools, nDCG@10:
+
+| fusion | hybrid nDCG@10 |
+|---|---:|
+| RRF (k=60) | 0.6946 |
+| pool-min-max (per-tier [0,1] normalize + sum) | **0.7120 (+0.0174 vs RRF)** |
+
+**pool-min-max wins by +0.0174 — ~4.5× the +0.0038 margin documented on basic tokenization.** Mechanism: stem+stop
+sharpens/separates the BM25 score distribution, and min-max SCORE fusion preserves that magnitude signal whereas
+rank-based RRF discards it (collapses scores to ranks). So the shipped default (`a9e53b4`) is not just still-valid
+on the faithful baseline — its advantage over RRF GROWS with a better lexical analyzer. **Read: validates the
+production pool-min-max default (stronger than its original measurement suggested); no new land needed.** Corollary
+for the campaign: earlier fusion-normalization findings measured on basic tokenization UNDERSTATE score-fusion's
+edge — re-measure fusion levers on the stem+stop baseline (`fusion_compare.py`/`stem_stop.py`). Single-corpus
+(scifact); cross-corpus re-check (nfcorpus/arguana/scidocs) is the route-next. No Rust/conformance change.
