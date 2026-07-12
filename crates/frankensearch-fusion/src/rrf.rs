@@ -1286,6 +1286,42 @@ mod tests {
     }
 
     #[test]
+    fn nqc_dense_downweight_composes_end_to_end() {
+        use crate::{NqcDenseWeight, nqc_cv};
+        // The opt-in NQC dense down-weight is realized by composing the three landed pieces
+        // with NO kernel change: NQC from the lexical scores -> per-query dense multiplier ->
+        // scale `semantic_weight` before pool_minmax_fuse. This test is executable docs for
+        // the (caller-side, product-gated) searcher wiring.
+        let lexical = [lexical_hit("L", 10.0), lexical_hit("Lb", 1.0)];
+        let semantic = [semantic_hit("S", 0.9), semantic_hit("Sb", 0.1)];
+
+        // Baseline (equal weights): lexical-only L and semantic-only S both pool-normalize to
+        // 1.0 (a tie); default lexical-favoring tiebreak puts L first.
+        let base = pool_minmax_fuse(&lexical, &semantic, 10, 0, &RrfConfig::default());
+        let base_s = base.iter().find(|h| h.doc_id == "S").unwrap().rrf_score;
+        assert!((base_s - 1.0).abs() < 1e-12, "baseline dense score = 1.0, got {base_s}");
+
+        // Peaked lexical pool -> high NQC -> down-weight the dense tier.
+        let lex_scores: Vec<f32> = lexical.iter().map(|r| r.score).collect();
+        let cv = nqc_cv(&lex_scores);
+        let weight = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3, cv]); // cv is the sample max
+        let w = weight.dense_weight(cv, 0.5, 0.0); // 1 - 0.5*percentile(1.0) = 0.5
+        assert!((w - 0.5).abs() < 1e-6, "high-NQC query -> dense weight 0.5, got {w}");
+
+        // base semantic_weight (1.0) scaled by the per-query dense multiplier `w`.
+        let cfg = RrfConfig {
+            semantic_weight: 1.0 * f64::from(w),
+            ..Default::default()
+        };
+        let down = pool_minmax_fuse(&lexical, &semantic, 10, 0, &cfg);
+        let down_s = down.iter().find(|h| h.doc_id == "S").unwrap().rrf_score;
+        let down_l = down.iter().find(|h| h.doc_id == "L").unwrap().rrf_score;
+        assert!((down_s - 0.5).abs() < 1e-12, "down-weighted dense = 0.5, got {down_s}");
+        assert!(down_l > down_s, "dense down-weight must demote the dense-only doc");
+        assert_eq!(down[0].doc_id, "L", "lexical-only doc now ranks first");
+    }
+
+    #[test]
     fn pool_minmax_pagination_offset_limit() {
         let lexical = [
             lexical_hit("a", 10.0),
