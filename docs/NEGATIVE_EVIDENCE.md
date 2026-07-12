@@ -12356,3 +12356,26 @@ Net: the ownable CPU-measurable perf surface remains floored. The remaining prod
 search-QUALITY vein (harness rebuilt + validated this session, docs/quality_harness/), which the perf-loop
 shape does not cover. Route-next perf: only a NEW workload the current probes can't model (concurrency on an
 idle machine, bd-e41k class) or a not-yet-in-Rust feature would reopen it.
+
+### 2026-07-12 — cc_fse — QUALITY (harness fidelity VALIDATED): rebuilt harness reproduces the documented tier-weight + pool-size levers on scifact
+
+Perf-loop context: the measurable-CPU surface is floored (re-confirmed last turn b1f3561d) and the ledger's
+open perf route-nexts are closed or blocked on an idle machine (bd-e41k). Rather than churn an identical
+"floored" entry, exercised the search-QUALITY vein (user-greenlit 2026-07-08) with the harness rebuilt this
+session (`docs/quality_harness/`). Embedded scifact once and swept RRF tier-weights × pool size in-memory
+(`docs/quality_harness/sweep_rrf.py`), model2vec potion + rank_bm25, 300 test queries, nDCG@10:
+
+- symmetric RRF (pool=100, w=1/1): **0.6691** (matches the rebuilt-baseline 0.6695, within RRF rounding).
+- **up-weight the stronger tier** (lexical 0.6523 > dense 0.6331 on scifact) → pool=100 w=(0.5,1.5) = **0.6862,
+  +0.0171**; monotone in the up-weight and consistent across pool∈{50,100,200}. *Down*-weighting the stronger
+  tier (w=1.25,0.75) HURTS (−0.0072). This reproduces the documented "up-weight-stronger-tier" lever.
+- **pool size** (symmetric): pool=50 = 0.6733 (**+0.0042** vs pool=100), pool=200 = 0.6712 — the documented
+  "sharp-small-k" direction; label-free but small and single-corpus here.
+
+**Honest read: this is harness-fidelity VALIDATION, not a new deployable win.** The +0.0171 tier-weight gain
+requires knowing which tier is stronger (label-derived); a FIXED 0.5/1.5 weight is scifact-specific and would
+hurt on a dense-dominant corpus — exactly why the label-free tier-weight auto-tune was already REJECTED
+(`72b68de`). The value delivered: the rebuilt harness reproduces the campaign's prior documented levers AND
+their caveats, so it is trustworthy for future NEW-lever experiments (route-next: mutual-kNN pool-restricted
+smoothing measured end-to-end, larger background query samples for the query-side hubness `ba5052a`, a proper
+Tantivy-faithful stem+stop lexical analyzer to chase the documented +5.8%). No Rust/conformance change.
