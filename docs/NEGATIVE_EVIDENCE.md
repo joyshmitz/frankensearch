@@ -12680,3 +12680,31 @@ above-median) and likely per-corpus calibration — the modest correlations (bes
 Route-next: (a) combined-signal gate + conservative-threshold tradeoff curve (fraction-dense-skipped vs hybrid
 nDCG); (b) the "dense hurts on committed-lexical queries" sub-population is a quality finding independent of gating.
 No Rust change.
+
+### 2026-07-12 — cc_fse — PERF LEVER (major): dense-gating tradeoff curve + ORACLE — dense is net-neutral/harmful on ~75% of queries; a perfect gate skips ~¾ of dense scans AND gains quality
+
+Built the deployable tradeoff curve for the dense-gating lever (`docs/quality_harness/dense_gate_curve.py`): gate
+dense OFF (use lexical-only) on the top-f fraction of queries by cv100 (NQC, best signal), sweep f, plus an ORACLE
+that skips exactly the queries where dense doesn't help (per-query dmarg ≤ 0). stem+stop, 4 corpora, nDCG@10:
+
+| corpus | base f=0 | f=25% | f=50% | lexical f=100% | ORACLE skip% / nDCG (Δ) |
+|---|---:|---:|---:|---:|---|
+| scifact | 0.7120 | **0.7149** | **0.7151** | 0.6873 | 81.3% / 0.7451 (+0.0331) |
+| nfcorpus | 0.3461 | 0.3430 | 0.3399 | 0.3269 | 71.2% / 0.3631 (+0.0170) |
+| arguana | 0.3601 | 0.3597 | 0.3584 | 0.3584 | 73.8% / 0.4021 (+0.0420) |
+| scidocs | 0.1628 | **0.1639** | 0.1611 | 0.1562 | 73.4% / 0.1859 (+0.0231) |
+
+**MAJOR REFRAME (the oracle): the dense tier is net-neutral-or-HARMFUL on ~71–81% of queries.** dmarg ≤ 0 for
+that fraction on every corpus → a perfect "never let dense hurt" gate would SKIP ~¾ of all dense scans (the
+dominant per-query cost) AND GAIN +0.017..+0.042 hybrid nDCG. Dense is NOT a uniform +value tier — it is
+HIGH-VARIANCE: it helps a ~20–30% minority a lot and hurts/no-ops the majority. The always-run-dense hybrid is
+leaving both LATENCY (¾ of scans wasted) and QUALITY (dense dragging down committed-lexical queries) on the table.
+**Realized by cv100-gate (the deployable, label-free part):** a genuine FREE-LUNCH region on dense-useful corpora
+— scifact skip 50% of dense scans and hybrid RISES to 0.7151 (+0.0031); scidocs skip 25% → 0.1639 (+0.0011). But
+corpus-dependent: nfcorpus gating is quality-negative (dense helps its committed queries too), arguana ≈ neutral
+(dense adds ~0 anyway). The cv100↔oracle GAP is large (cv100 captures a fraction of the ¾-skip / +0.02–0.04
+oracle) → the SIGNAL is the bottleneck, not the opportunity. Route-next: (a) richer/combined gate signal to close
+the oracle gap; (b) even a conservative per-corpus-calibrated cv100 gate already yields Pareto latency+quality on
+scifact/scidocs; (c) the "dense hurts committed-lexical queries" result is a standalone QUALITY lever (a smarter
+hybrid that down-weights dense on high-NQC queries could gain the +0.02–0.04 without any scan skipping). LAND path:
+Rust NQC(cv of top-k BM25) → dense-scan skip/downweight decision, cross-crate lexical→searcher. No Rust this turn.
