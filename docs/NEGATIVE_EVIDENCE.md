@@ -11931,3 +11931,24 @@ is a FULL redundant window copy (~1/3 of the reorder), not one alloc among many.
 *redundant-full-copy* (wins) vs *one-of-many-small-allocs* (inside-floor). Bench `rrf_reorder_move_ab` replicates
 the reorder as the parity oracle. GOTCHA: a non-native rerank bench can still hit `failed to get ft-api` on a
 worker lacking frankentorch — retry on a worker that has it (native check passed there).
+
+### 2026-07-12 — cc_fse — HOLD (not shipped): `sort_by` → `sort_unstable_by` on the reranker PureReorder window regresses the small (common) top-k
+
+`pipeline.rs` `PureReorder` sorts the reranked window with `compare_by_rerank_score` (rerank score desc,
+`doc_id` tiebreak). The fused candidate set is deduped by `doc_id` → strict total order, so `sort_unstable_by`
+is bit-identical (verified `output_identical=true`). This is the `winners_sort` / MRL lever (which won
+~1.16–1.47× on the index rescored-sort). **But it does NOT transfer to the reranker window** because that
+window is SMALL (reranking is expensive → top-k is small) and the scores are heavily tied:
+
+| window (reranked top-k) | stable `sort_by` | `sort_unstable_by` | lever [p5,p95] | null [p5,p95] | verdict |
+|---:|---:|---:|---:|---:|---|
+| 32 | 621 ns | 731 ns | 1.195 [1.130, 1.233] | 1.000 [0.897, 1.063] | **CANDIDATE_SLOWER (0.84×)** |
+| 128 | 4396 ns | 3715 ns | 0.839 [0.380, 0.859] | 0.997 [0.843, 1.033] | CANDIDATE_FASTER 1.19× |
+| 512 | 22143 ns | 19329 ns | 0.874 [0.696, 1.309] | 0.999 [0.799, 1.255] | INSIDE_NULL_FLOOR |
+
+**Decision: HOLD, reverted.** At the realistic small reranked top-k (~32) `sort_unstable_by` is SLOWER —
+timsort (`sort_by`) exploits the many score-ties (run detection + insertion sort for small/near-sorted
+arrays) better than pdqsort at that size; the scratch-alloc saving only pays once n is large enough (128+).
+**Boundary refinement:** the `winners_sort` `sort_by→sort_unstable_by` win is n-dependent — it wins on LARGE
+sort inputs (index rescored/winners, 1000s) but LOSES on small, tie-heavy top-k windows. Don't apply it to
+small reranked/top-k windows. Production keeps `sort_by`.
