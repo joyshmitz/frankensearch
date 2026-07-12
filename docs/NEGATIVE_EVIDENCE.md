@@ -12552,3 +12552,25 @@ is the only one where it slightly grows 0.0036→0.0051). LESSON: never compare 
 measurement harnesses — establish the baseline IN the same harness. Net: pool-min-max robustly beats RRF (direction
 holds 4/4 both tokenizations); the mechanism claim "score-fusion edge grows with stem+stop" is RETRACTED. No Rust
 change (validates an already-shipped default).
+
+### 2026-07-12 — cc_fse — QUALITY (wash/negative): z-score fusion normalization does NOT beat the shipped min-max — no land
+
+Perf check this turn (negative-ledger-first): `format!` inside per-item loops in fusion/index — the hits are all
+test-data generation (`incremental.rs:432/637` doc-id gen) or non-hot (ope/circuit_breaker/queue test loops); no
+per-hit hot-loop `format!` → no `write!`-to-buffer lever. Clean. Quality: sought a LANDABLE improvement to the
+shipped pool-min-max kernel (`a9e53b4`) by swapping its normalization — min-max [0,1] vs z-score (standardize),
+pool fusion, stem+stop baseline, 4 corpora, nDCG@10 (absent-from-pool docs get that tier's pool-minimum
+normalized score in both) — `docs/quality_harness/score_norm_variants.py`:
+
+| corpus | min-max | z-score | z−mm |
+|---|---:|---:|---:|
+| scifact | 0.7120 | 0.7107 | −0.0013 |
+| nfcorpus | 0.3460 | 0.3471 | +0.0011 |
+| arguana | 0.3601 | 0.3622 | +0.0021 |
+| scidocs | 0.1628 | 0.1648 | +0.0020 |
+
+**WASH — no land.** z-score nominally wins 3/4 but every |Δ| ≤ 0.0021, it LOSES on scifact (the corpus with the
+largest fusion signal), and the average edge is ~+0.001 — within single-run eval noise (no CIs at this scale).
+There is no robust basis to change the shipped min-max normalization; min-max is confirmed a fine, well-justified
+choice. (Direction is not even consistent, unlike pool-min-max>RRF which held 4/4 with larger margins.) Rules out
+a normalization swap for the fusion kernel. No Rust/conformance change.
