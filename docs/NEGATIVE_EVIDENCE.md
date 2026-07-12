@@ -12480,3 +12480,25 @@ fast-crate CPU surface.** Landed this session: host_bucket ~1.98× (bd47ed1e), s
 e14e13f8), truncate_middle ~1.9–21.9× (d4a8c811). Remaining perf reopeners are unchanged: a genuinely NEW
 workload the µbenches can't model (idle-machine concurrency, bd-e41k class) or a not-yet-in-Rust feature; the
 live productive vein is search-QUALITY (harness ready at docs/quality_harness/).
+
+### 2026-07-12 — cc_fse — QUALITY: Tantivy-faithful stem+stop reproduces the documented lever (+5.4% lexical / +3.6% hybrid on scifact); harness fidelity upgraded
+
+Perf context: the fast-crate AND fsfs winning-pattern surface is swept (13affc13; fsfs's one materialize-then-take
+hit runtime.rs:18061 is test-only), so pivoted to the greenlit search-QUALITY vein and measured the biggest
+documented lever my rebuilt harness did NOT yet implement. The engine's lexical tier is a Tantivy Snowball(English)
++ stopword analyzer; my harness used basic whitespace tokenization. Added `snowballstemmer` (== Tantivy's stemmer)
++ the standard Lucene/Tantivy English stopword set (`docs/quality_harness/stem_stop.py`), embedded scifact once,
+built TWO BM25 indexes, nDCG@10 over 300 test queries:
+
+| lexical analysis | dense | lexical | hybrid |
+|---|---:|---:|---:|
+| basic (whitespace+lowercase) | 0.6331 | 0.6523 | 0.6725 |
+| stem+stop (Snowball + stopwords) | 0.6331 | **0.6873 (+0.0350, +5.4%)** | **0.6970 (+0.0245, +3.6%)** |
+
+Reproduces the documented stem+stop lever precisely (memory `search-quality-vein-and-harness`: ~+5.8% on scidocs;
++5.4% here on scifact), dense unchanged as expected. **Read: this is NOT a new lever to land** — the engine ALREADY
+runs Tantivy stem+stop, so this CONFIRMS that production analyzer choice contributes a real +3.6% hybrid and
+upgrades the harness to Tantivy-faithful lexical (the basic-tokenization baseline was UNDERSTATING lexical/hybrid
+by ~3.6%). Actionable follow-through: future harness quality experiments should use `stem_stop.py`'s tokenizer, not
+basic, so measured deltas match the deployed engine. `snowballstemmer` added to the harness setup (README updated).
+No Rust/conformance change.

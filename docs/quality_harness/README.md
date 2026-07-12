@@ -8,7 +8,7 @@ kept only in session scratchpads; rebuilt 2026-07-12).
 ## Setup (one-time, needs network)
 ```bash
 python3 -m venv venv
-./venv/bin/pip install model2vec rank_bm25 numpy   # model2vec is numpy-based (no torch)
+./venv/bin/pip install model2vec rank_bm25 numpy snowballstemmer   # model2vec numpy-based (no torch); snowballstemmer for stem+stop
 # BEIR datasets (any name from the BEIR list):
 for ds in scifact nfcorpus arguana scidocs; do
   curl -sL "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/$ds.zip" -o "$ds.zip"
@@ -29,3 +29,9 @@ reproduces the campaign invariant (hybrid ≥ best single tier; lexical is the s
 dense's honest marginal value is small). Documented refinements to layer on: Tantivy-faithful
 stem+stop lexical analysis, larger candidate pools, the landed pool-min-max / graph-diffusion /
 query-side-hubness quality kernels.
+
+## Tantivy-faithful stem+stop (`stem_stop.py`)
+The engine's lexical tier is a Tantivy Snowball(English)+stopword analyzer, not basic tokenization.
+`stem_stop.py` measures both on scifact. Result (2026-07-12, 300q, nDCG@10): stem+stop lifts lexical
+0.6523->0.6873 (+5.4%) and hybrid 0.6725->0.6970 (+3.6%) — reproduces the documented ~+5.8% lever and
+confirms the production analyzer's contribution. Use stem+stop (not basic) for faithful lexical numbers.
