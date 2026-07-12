@@ -12939,3 +12939,16 @@ After landing the sync-path opt-in wiring (`d735d6f2`), investigated the async `
   bugs, and a partial wiring is worse than none. The sync path already ships the feature (`d735d6f2`); the async
   wiring is a careful, separate follow-up (trace phase-1→phase-2 lexical propagation, then inject at :1333 + wherever
   the refined result re-derives lexical weight, + full-suite regression). No code change this turn (scoping only).
+
+### 2026-07-12 — cc_fse — SWEEP (negative): collect-then-reduce family closed after the NQC alloc win — no other iterator-izable production site
+
+Following the peer/converged NQC enabled-path alloc-elimination win (`08ef9680`: collect `Vec<f32>` → iterator
+reduction, ~1.3-1.7x), swept the same pattern (`let x: Vec<f32> = hits.iter().map(|h| h.score).collect()` fed to a
+reduction) across all crates. Production hits: (1) `federated.rs:426` — `raw_scores` feeds
+`normalize_scores_with_method` (min-max), which is NOT a single-pass reduction (needs min/max over the whole slice
+before normalizing any element) → the materialized slice is REQUIRED, not iterator-izable (unlike NQC's pure
+mean/std). (2) everything else is TEST or `#[cfg(bench-internals)]` code (`sync_searcher.rs:48` is the retained ORIG
+A/B arm; `rerank/pipeline.rs:667/682/1401`, `index/search.rs:2890+`, `rrf.rs:1305` are tests). So NQC was the only
+iterator-izable production instance, and it's fixed. The collect-then-reduce lever family is CLOSED. Broader perf
+state unchanged: CPU frontier floored; the productive vein remains the (already-shipped, opt-in) NQC quality feature,
+whose autonomously-buildable pieces are all landed (sync wiring + alloc-free enabled path). No code change.
