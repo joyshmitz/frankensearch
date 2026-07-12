@@ -236,3 +236,7 @@ harness = false
 name = "real_hybrid_knownitem"
 harness = false
 required-features = ["lexical"]
+
+[[bench]]
+name = "nqc_cv_cost_ab"
+harness = false
