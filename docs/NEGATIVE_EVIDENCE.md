@@ -12263,3 +12263,28 @@ lever. **Net state of the campaign: perf CPU frontier exhaustively at floor (thi
 unmeasurable here (needs idle machine, bd-e41k class); quality vein blocked on a harness rebuild.** The
 highest-EV next increment is the harness rebuild (unblocks the only vein with remaining measured gains),
 which does not fit the "rch cargo-bench perf lever" loop shape.
+
+### 2026-07-12 — cc_fse — RESOLVED: search-QUALITY BEIR harness REBUILT + made durable in-repo + baseline reproduces campaign invariants
+
+Executed the harness rebuild flagged as highest-EV in the prior entry, and completed the full loop
+(setup → eval → validate) in one pass. Steps that worked: `python3 -m venv` + `pip install model2vec
+rank_bm25 numpy` (model2vec is numpy-based — **no torch** — so it installs in seconds); scifact from
+`https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip` (5183 docs / 1109 queries /
+qrels test.tsv); `StaticModel.from_pretrained("minishlab/potion-retrieval-32M")` (dim=512) auto-downloads from
+HF on first use. Reimplemented a minimal but engine-faithful harness: dense = cosine of L2-normalized potion
+embeddings, lexical = `rank_bm25` BM25Okapi, fusion = RRF (k=60) over the top-100 pool per tier, metric =
+nDCG@10 over the 300 scifact test queries that carry qrels.
+
+**Baseline (scifact, basic whitespace+lowercase tokenization):** dense **0.6331** · lexical **0.6523** ·
+hybrid **0.6695** — `hybrid_gain_vs_best=+0.0172`, `hybrid_ge_best=True`. This **reproduces the campaign's
+three documented invariants**: (a) hybrid ≥ best single tier; (b) lexical is the stronger single tier on
+scifact; (c) dense's honest marginal value is small (~+1.7% over lexical here). The harness is therefore
+validated against known results and the quality vein is UNBLOCKED for measured findings again.
+
+**Durability fix:** the harness has now been lost TWICE to scratchpad cleanup. To stop the recurrence, the
+eval script + a setup README are committed in-repo at `docs/quality_harness/` (previously it lived only in a
+session scratchpad). Rebuild-from-scratch is no longer needed — a future session only re-runs the
+one-time `pip install` + BEIR-zip download documented in that README, then `./venv/bin/python beir_eval.py
+<datasets…>`. Route-next quality levers to layer on this baseline (from memory `pivot-to-quality-…`):
+Tantivy-faithful stem+stop lexical analysis, larger candidate pools, mutual-kNN pool-restricted smoothing,
+and the already-landed pool-min-max / graph-diffusion / query-side-hubness kernels measured end-to-end.
