@@ -12437,3 +12437,28 @@ sibling-grep method: an alloc-elimination lever clears the floor only when it re
 or eliminates an alloc that is O(large-input); a 2→1 alloc reduction on a short string does not.** `normalize_model_key`
 (cold model-resolution path anyway — no end-to-end home) NOT landed; bench removed (numbers preserved here); no
 production change. This closes the allocation-elimination sweep of the fast crates.
+
+### 2026-07-12 — cc_fse — REJECTED: `Cow`-borrow for `find_negative_match` normalization — 2× REGRESSION (detecting "borrowable" costs ≈ the copy it avoids)
+
+Targeted the host_bucket "borrow-to-zero" class (the alloc-elimination that DOES clear the floor) at a real
+per-hit site: `find_negative_match` (fusion searcher.rs) normalizes the document `text` via
+`normalize_for_negation_match` (always `to_ascii_lowercase()` on ASCII → a full lowercased copy) and only READS
+it (`contains`). Tried returning `Cow<str>` and borrowing when `text` is already all-lowercase ASCII (checked
+via `bytes().any(is_ascii_uppercase)`), delegating the owned String twin to `_cow(..).into_owned()` so the
+term/phrase/test/bench sites were untouched. Byte-identical (parity-asserted over 5 shapes). **REJECTED — 2×
+REGRESSION on the intended win case.** Within-process A/B (`negation_cow_ab`, since reverted), 1000-char docs:
+
+| doc | string ns | cow ns | ratio | verdict |
+|---|---:|---:|---:|---|
+| all-lowercase (borrow "win") | 391.5 | 814.8 | 2.081 | **REGRESSION** |
+| early-uppercase (owned) | 384.7 | 383.4 | 0.997 | ≈tie |
+
+**Why:** to *know* it can borrow, the Cow path must scan the WHOLE doc (`.any(is_ascii_uppercase)` finds no
+uppercase in the lowercase case → scans all 1000 bytes) — and that scalar closure scan costs ≈ 2× the
+vectorized `to_ascii_lowercase` copy it was trying to avoid (std's `to_ascii_lowercase` is SIMD; `bytes().any`
+is not). So you pay a full scan to save a copy that was already ~free (hot allocator + vectorized). **Refined
+host_bucket rule (`bd47ed1e`): borrow-to-zero clears the floor ONLY when the borrow condition is CHEAPLY
+detectable — host_bucket's `split_once` locates a subslice in O(prefix) and the result IS a subslice (no scan
+of the tail). A "borrow iff unchanged" predicate that requires scanning the whole input is self-defeating: the
+detection scan ≈ the transform. Don't Cow-ify a case-fold/normalize unless the source is known-normalized by
+construction.** Reverted via Edit + `rm` (searcher.rs + Cargo.toml pristine vs HEAD); production unchanged.
