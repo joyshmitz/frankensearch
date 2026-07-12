@@ -107,6 +107,69 @@ pub fn nqc_cv(scores: &[f32]) -> f32 {
     (variance.sqrt() / mean) as f32
 }
 
+/// Maps a query's NQC (see [`nqc_cv`]) to a per-query dense-tier weight multiplier for the
+/// opt-in *NQC dense down-weight* (`docs/SEARCH_QUALITY_FINDINGS.md`, 2026-07-12).
+///
+/// Built from a rolling **sample** of observed NQC values (the query stream), so a raw `cv`
+/// is mapped to its distribution **percentile** — a fixed `β·cv` does NOT transfer, because
+/// the NQC scale is corpus-dependent (`docs/NEGATIVE_EVIDENCE.md`, 2026-07-12). Rebuild
+/// periodically from a fresh sample. An empty sample yields a neutral weight of `1.0` (no
+/// down-weight until the sketch has warmed up), so wiring it in is safe at startup.
+///
+/// A caller realizes the down-weight with **no fusion-kernel change**: multiply
+/// `RrfConfig::semantic_weight` per query by [`NqcDenseWeight::dense_weight`].
+#[derive(Debug, Clone, Default)]
+pub struct NqcDenseWeight {
+    /// Ascending sample of observed NQC (`nqc_cv`) values.
+    sorted_cv: Vec<f32>,
+}
+
+impl NqcDenseWeight {
+    /// Build from a sample of observed NQC values (non-finite samples are dropped).
+    #[must_use]
+    pub fn from_sample(sample: &[f32]) -> Self {
+        let mut sorted_cv: Vec<f32> = sample.iter().copied().filter(|v| v.is_finite()).collect();
+        sorted_cv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Self { sorted_cv }
+    }
+
+    /// Number of retained samples.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.sorted_cv.len()
+    }
+
+    /// Whether the sketch has no samples (a neutral, no-down-weight state).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sorted_cv.is_empty()
+    }
+
+    /// Empirical CDF: the fraction of sampled NQC values `<= cv`, in `[0, 1]`. Returns
+    /// `0.0` for an empty sample (→ neutral weight in [`dense_weight`](Self::dense_weight)).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // sample-fraction; counts are small vs f32 mantissa
+    pub fn percentile(&self, cv: f32) -> f32 {
+        if self.sorted_cv.is_empty() {
+            return 0.0;
+        }
+        let below_or_equal = self.sorted_cv.partition_point(|&v| v <= cv);
+        below_or_equal as f32 / self.sorted_cv.len() as f32
+    }
+
+    /// Per-query dense-tier multiplier `clip(1 − β·CDF(cv), w_min, 1)`. Higher NQC (a more
+    /// committed lexical retrieval, where the dense tier tends to add little or hurt) →
+    /// a lower dense weight. `beta` ∈ ~`[0, 1]` (≈0.5 measured best); `w_min` floors it.
+    /// `beta <= 0` (or an empty sketch) returns the neutral `1.0`.
+    #[must_use]
+    pub fn dense_weight(&self, cv: f32, beta: f32, w_min: f32) -> f32 {
+        if beta <= 0.0 {
+            return 1.0;
+        }
+        (1.0 - beta * self.percentile(cv)).clamp(w_min.clamp(0.0, 1.0), 1.0)
+    }
+}
+
 /// In-place z-score normalization.
 ///
 /// Finite values are standardized and then linearly mapped to `[0, 1]` by
@@ -184,8 +247,8 @@ pub fn normalize_scores_with_method(scores: &[f32], method: NormalizationMethod)
 #[cfg(test)]
 mod tests {
     use super::{
-        NormalizationMethod, min_max_normalize, nqc_cv, normalize_in_place, normalize_scores,
-        normalize_scores_with_method, z_score_normalize,
+        NormalizationMethod, NqcDenseWeight, min_max_normalize, nqc_cv, normalize_in_place,
+        normalize_scores, normalize_scores_with_method, z_score_normalize,
     };
 
     const EPSILON: f32 = 1e-6;
@@ -252,6 +315,44 @@ mod tests {
         let peaked = nqc_cv(&[10.0, 1.0, 1.0, 1.0]);
         let flat = nqc_cv(&[4.0, 3.0, 3.0, 4.0]);
         assert!(peaked > flat, "peaked={peaked} flat={flat}");
+    }
+
+    #[test]
+    fn nqc_weight_from_sample_filters_non_finite_and_sorts() {
+        let w = NqcDenseWeight::from_sample(&[0.3, f32::NAN, 0.1, f32::INFINITY, 0.2]);
+        assert_eq!(w.len(), 3);
+        // percentile is monotone in cv over the retained {0.1, 0.2, 0.3}
+        assert!(w.percentile(0.05) <= w.percentile(0.15));
+        assert!(w.percentile(0.15) <= w.percentile(0.25));
+    }
+
+    #[test]
+    fn nqc_weight_percentile_spans_unit_interval() {
+        let w = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3, 0.4]);
+        assert!((w.percentile(0.0) - 0.0).abs() <= 1e-6, "below all -> 0");
+        assert!((w.percentile(1.0) - 1.0).abs() <= 1e-6, "above all -> 1");
+        assert!((w.percentile(0.2) - 0.5).abs() <= 1e-6, "<=0.2 is 2/4");
+    }
+
+    #[test]
+    fn nqc_weight_empty_and_beta_zero_are_neutral() {
+        let empty = NqcDenseWeight::default();
+        assert_eq!(empty.dense_weight(1.23, 0.5, 0.0), 1.0, "empty -> neutral");
+        let w = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3]);
+        assert_eq!(w.dense_weight(0.3, 0.0, 0.0), 1.0, "beta=0 -> neutral");
+    }
+
+    #[test]
+    fn nqc_weight_down_weights_high_commitment_and_clamps() {
+        let w = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3, 0.4]);
+        // High cv (percentile 1.0) with beta=0.5 -> 1 - 0.5*1.0 = 0.5.
+        assert!((w.dense_weight(1.0, 0.5, 0.0) - 0.5).abs() <= 1e-6);
+        // Low cv (percentile 0.0) -> neutral 1.0.
+        assert!((w.dense_weight(0.0, 0.5, 0.0) - 1.0).abs() <= 1e-6);
+        // Monotone: higher cv never increases the weight.
+        assert!(w.dense_weight(0.4, 0.5, 0.0) <= w.dense_weight(0.15, 0.5, 0.0));
+        // w_min floors it: beta=1.0 at percentile 1.0 would be 0.0, clamped up to 0.3.
+        assert!((w.dense_weight(1.0, 1.0, 0.3) - 0.3).abs() <= 1e-6);
     }
 
     #[test]
