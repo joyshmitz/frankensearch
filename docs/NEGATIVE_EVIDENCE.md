@@ -11843,3 +11843,23 @@ alerts-SLO HOLDs: **removing one allocation/pass from a short per-item op does n
 skipping genuinely-expensive work over large inputs (NFC over document bodies) or eliminating many redundant
 FULL passes (fleet 5→1) does.** Reverted; production keeps the two-step replace. Do not retry single-pass
 micro-fusions on the short markdown/query per-line ops.
+
+### 2026-07-12 — cc_fse — HOLD (resolves the 538bb9b4 deferral): fleet-wide value fusion re-measured — byte-identical but INSIDE the null floor (N=2 too small)
+
+Re-attempted the deferred fleet-wide fusion (`selected_monitor_lines`: cpu+memory fused into one pass over
+`resources.values()`, docs+pending into one over `instances` — 2→1 each). This time the `frankensearch-ops`
+release bench completed cleanly (worker `vmi1227854`, 636s, no stall). Byte-identical (`output_identical=true`
+all shapes) but **not decidable**: paired lever vs A/A null —
+
+| shape instances/projects | legacy median | fused median | lever [p5,p95] | null [p5,p95] | verdict |
+|---|---:|---:|---:|---:|---|
+| 2048/24 | 9.08 us | 10.61 us | 1.131 [0.906, 1.350] | 0.997 [0.793, 1.103] | CANDIDATE_SLOWER |
+| 8192/48 | 53.97 us | 49.33 us | 0.916 [0.682, 1.020] | 1.000 [0.681, 1.187] | INSIDE_NULL_FLOOR |
+| 16384/64 | 116.11 us | 106.58 us | 0.947 [0.747, 1.650] | 1.032 [0.677, 1.406] | INSIDE_NULL_FLOOR |
+
+`decision=HOLD`. **Confirms the boundary precisely:** the fleet *project* fusion won 1.9× (`f4f98e0a`) at
+N=5 passes with a repeated `.filter(project==)` comparison + a deduped `resources.get` hashget — the win
+came from eliminating repeated *filtering/hashget*, not pass-count. This fleet-*wide* fusion is only N=2 with
+cheap `.map().collect()` per pass (no filter, no per-item hashget), so it saves just 2 HashMap/Vec traversals
+against very wide null floors (these µs-scale ops are noise-dominated). Reverted; production keeps the five
+collects. The 538bb9b4 deferral is now resolved as HOLD — do not re-attempt.
