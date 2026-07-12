@@ -64,6 +64,7 @@ use crate::mmr::MmrConfig;
 use crate::mmr::mmr_rerank;
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
+use crate::normalize::{NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -141,6 +142,11 @@ pub struct TwoTierSearcher {
     rrf_lexical_weight: f64,
     rrf_semantic_weight: f64,
     rrf_tiebreak: RrfTiebreak,
+    /// Opt-in NQC dense down-weight (default off, `beta = 0.0`). Applied at the phase-1
+    /// hybrid fusion. See [`Self::with_nqc_dense_downweight`].
+    nqc_downweight_beta: f32,
+    nqc_downweight_w_min: f32,
+    nqc_dense_weight: NqcDenseWeight,
     adaptive_fusion: Option<Arc<AdaptiveFusion>>,
     score_calibrator: Option<CalibratorConfig>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
@@ -190,6 +196,9 @@ impl TwoTierSearcher {
             rrf_lexical_weight: 1.0,
             rrf_semantic_weight: 1.0,
             rrf_tiebreak: RrfTiebreak::LexicalThenId,
+            nqc_downweight_beta: 0.0,
+            nqc_downweight_w_min: 0.0,
+            nqc_dense_weight: NqcDenseWeight::new(),
             adaptive_fusion: None,
             score_calibrator: None,
             circuit_breaker: None,
@@ -247,6 +256,42 @@ impl TwoTierSearcher {
     pub fn with_rrf_tiebreak(mut self, tiebreak: RrfTiebreak) -> Self {
         self.rrf_tiebreak = tiebreak;
         self
+    }
+
+    /// Enable the opt-in **NQC dense down-weight** (default OFF), applied at the phase-1
+    /// hybrid fusion.
+    ///
+    /// Per query, the dense tier's phase-1 fusion weight is scaled by
+    /// `clip(1 − beta·CDF(nqc_cv(lexical scores)), w_min, 1)`, where `CDF` is the empirical
+    /// percentile from `weight` — a [`NqcDenseWeight`] built offline from a sample of observed
+    /// NQC values. High lexical commitment (high NQC), where the dense tier tends to add little
+    /// or hurt, gets a lower dense weight. See `docs/SEARCH_QUALITY_FINDINGS.md`.
+    ///
+    /// `beta <= 0` (the default) or an empty `weight` leaves fusion **byte-identical**. Use
+    /// `w_min > 0` (the measured `beta ≈ 0.5` floors the multiplier at `0.5`): a scaled weight
+    /// reaching `<= 0` is treated as neutral `1.0` by the tier-weight sanitizer. NOTE: this
+    /// applies at PHASE-1 only; phase-2 refines the vector tiers from that seeded ranking (see
+    /// the async-wiring trace in `docs/NEGATIVE_EVIDENCE.md`) — validate the refined effect via A/B.
+    #[must_use]
+    pub fn with_nqc_dense_downweight(mut self, beta: f32, w_min: f32, weight: NqcDenseWeight) -> Self {
+        self.nqc_downweight_beta = beta;
+        self.nqc_downweight_w_min = w_min;
+        self.nqc_dense_weight = weight;
+        self
+    }
+
+    /// The dense-tier phase-1 fusion weight for this query: the static `rrf_semantic_weight`,
+    /// scaled by the per-query NQC dense down-weight when enabled (`beta > 0`). Off (default)
+    /// returns `rrf_semantic_weight` unchanged with zero extra work.
+    fn effective_semantic_weight(&self, lexical: &[ScoredResult]) -> f64 {
+        if self.nqc_downweight_beta <= 0.0 {
+            return self.rrf_semantic_weight;
+        }
+        let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
+        let factor =
+            self.nqc_dense_weight
+                .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
+        self.rrf_semantic_weight * f64::from(factor)
     }
 
     /// Set the cross-encoder reranker for Phase 2.
@@ -1331,6 +1376,13 @@ impl TwoTierSearcher {
                         )
                     },
                     |lexical| {
+                        // Opt-in NQC dense down-weight (default off = byte-identical): scale the
+                        // dense tier's phase-1 fusion weight per query. Only where lexical is
+                        // present; the no-lexical arm above keeps the base weight.
+                        let rrf_config = RrfConfig {
+                            semantic_weight: self.effective_semantic_weight(lexical),
+                            ..rrf_config.clone()
+                        };
                         let fused = graph_candidates.as_ref().map_or_else(
                             || {
                                 fuse_by_strategy(
