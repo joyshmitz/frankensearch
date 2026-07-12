@@ -12079,3 +12079,20 @@ rerank, storage, durability, fsfs, ops, tui — has been checked; the ownable me
 floor.** Route (unchanged): pivot to search-QUALITY (BEIR harness, memory `pivot-to-quality-pool-minmax-
 fusion` / `search-quality-vein-and-harness`), or unblock symbolized self-time (`bd-e41k`), or build a new
 workload proxy — none of which is a "one small perf lever, quick bench" this turn.
+
+### 2026-07-12 — cc_fse — ROUTE-NEXT located (not yet actioned): `DocumentGraph.adjacency` is the one missed SipHash→aHash site, but below the bar
+
+A concrete new lead for the next perf pass (better than the generic "surface at floor"): `frankensearch-core`
+`graph.rs:53` `adjacency: HashMap<GraphDocId, Vec<GraphEdge>>` uses `std::collections::HashMap` = **SipHash**,
+the one map the SipHash→aHash migration missed. `neighbors(doc_id)` hashes the key on every lookup — called
+per-hit in `neighbor_smooth` (graph-diffusion) and referenced by `graph_rank`. Byte-identity is SAFE: `get`/
+`contains` callers (smooth) are order-independent, and `graph_rank` is tolerance-based by design (its own
+comment: "the prior std::HashMap accumulation order was already run-to-run non-deterministic… the hasher is
+a pure cost choice"). **Why NOT actioned this turn:** (1) it adds `ahash` as a dependency to the foundational
+`core` crate + changes the `pub fn adjacency() -> &HashMap<…>` return type (a public-API ripple), which is not
+a small increment; (2) per-smooth-hit it's only ~1 SipHash among the `deg` `pool.get()` aHash lookups (pool is
+already `AHashMap`), so the isolated win is likely inside-floor, and `graph_rank` builds its own CSR (doesn't
+call `neighbors()`) so it barely benefits. Action it only if the graph-diffusion path is confirmed
+default-on-hot and the core-dep cost is acceptable — then swap `adjacency` to `AHashMap`, bench `neighbors()`
+lookups over a realistic pool/graph. This is the last concrete measurable-CPU lead; everything else audited
+is trait-bound, external, or opt-in-and-inside-floor.
