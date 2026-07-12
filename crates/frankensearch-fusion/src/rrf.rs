@@ -484,6 +484,12 @@ fn minmax_norm(score: f32, min: f32, max: f32) -> f64 {
 /// crushing that makes naive score fusion lose to RRF. Measured **+0.0038 mean
 /// nDCG@10 over RRF across 4 BEIR corpora, never-negative** at pool depths 50 and 100
 /// (`docs/NEGATIVE_EVIDENCE.md`, `45530fb`). Tier weights reuse [`RrfConfig`].
+///
+/// The opt-in *NQC dense down-weight* (see `docs/SEARCH_QUALITY_FINDINGS.md`, 2026-07-12)
+/// needs **no change here**: a caller realizes it by scaling `config.semantic_weight`
+/// per query by `clip(1 - beta * CDF(nqc_cv(lexical_scores)))` — the same `semantic_weight`
+/// path already covered by the `pool_minmax_tier_weights_reweight_the_sum` test. Remaining
+/// land work is entirely caller-side (the streaming cv-quantile CDF + that per-query scale).
 #[must_use]
 #[instrument(
     name = "frankensearch::pool_minmax_fuse",

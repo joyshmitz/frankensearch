@@ -12849,3 +12849,17 @@ the land case:** the dense down-weight is a REAL but SMALL aggregate quality gai
 a clear-eyed judgment call, not a slam dunk — it should be landed OPT-IN (default 0) and A/B-validated on the REAL
 production embedder (this is potion/model2vec proxy data), where the magnitude may differ. The rigorous conclusion:
 directionally sound, aggregate-significant, small; land only behind a flag with production A/B. No Rust this turn.
+
+### 2026-07-12 — cc_fse — LAND DE-RISK: the NQC dense down-weight needs NO fusion-kernel change (realized via existing `semantic_weight`)
+
+Continuing the NQC dense-downweight land (foundation `nqc_cv` landed `0b4651c2`), traced exactly where the
+per-query weight applies. `pool_minmax_fuse` (rrf.rs:589) computes `rrf_score = lexical_weight*lex_norm +
+semantic_weight*sem_norm`, and `semantic_weight` is already a per-`RrfConfig` (hence per-query) tier weight,
+already tested by `pool_minmax_tier_weights_reweight_the_sum`. So the NQC dense down-weight is realized with ZERO
+kernel surgery: a caller sets `config.semantic_weight = base * clip(1 − β·CDF(nqc_cv(lexical_scores)))` per query.
+Peer sessions (or a future implementer) might otherwise add a redundant `dense_weight`/`dense_scale` param — NOT
+needed. Documented this at the `pool_minmax_fuse` doc-site. **Net: the remaining NQC-downweight land is ENTIRELY
+caller-side** — (2) a streaming cv-quantile CDF (t-digest over the query stream, already a dep) and (3) the
+per-query `semantic_weight` scale in the searcher; the fusion kernel + the signal (`nqc_cv`) are both already in
+place. This further de-risks the one-shippable-win land: no ranking-kernel change, so the only product-behavior
+surface is the caller opting in (default off) + the real-embedder A/B. No logic change this turn (doc-only).
