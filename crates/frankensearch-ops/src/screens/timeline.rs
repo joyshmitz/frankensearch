@@ -482,10 +482,13 @@ impl ActionTimelineScreen {
     }
 
     fn sparkline(values: &[u8]) -> String {
-        values
-            .iter()
-            .map(|value| Self::spark_char(*value))
-            .collect()
+        // Each glyph is a 3-byte block char; pre-size to the exact final length so the
+        // buffer never reallocs (a plain char-collect under-reserves to `len` bytes).
+        let mut out = String::with_capacity(values.len() * 3);
+        for value in values {
+            out.push(Self::spark_char(*value));
+        }
+        out
     }
 
     fn event_pulse(event: &LifecycleEvent, newest_ts: u64, span_ms: u64) -> String {

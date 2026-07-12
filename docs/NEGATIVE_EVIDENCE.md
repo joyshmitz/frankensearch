@@ -12318,3 +12318,12 @@ Within-process paired A/B (`sparkline_build_ab`, both arms one core → immune t
 vs A/A null p5 0.8245 → **CANDIDATE_FASTER**; both arms byte-identical over n∈{0,1,4,63,120,256}. NOTE: an
 `unsafe { from_utf8_unchecked }` byte-table arm (contiguous glyphs → byte[2]=0x81+idx) was DROPPED — the crate
 denies `unsafe_code`, so it is not landable regardless of speed. Applied to all 3 copies. Shipped.
+
+### 2026-07-12 — cc_fse — WIN (sibling-consistency): remaining 3 `sparkline` copies pre-sized (fleet/alerts_slo/timeline)
+
+Follow-up to the sparkline pre-size (552adbd1): a grep for `map(spark_char).collect()` found the ops crate
+actually has SIX identical `sparkline` copies, not three — fleet.rs, alerts_slo.rs, timeline.rs still used the
+reallocating char-collect. Applied the exact same proven transformation (`String::with_capacity(len*3)` + push)
+to all three. No re-bench: the code is byte-for-byte the benched arm (~1.38x @ width 120, byte-identical over
+n∈{0,1,4,63,120,256}, verified compile+tests green in 552adbd1). All six ops sparklines are now pre-sized —
+the char-collect-realloc pattern is fully swept from the crate. Shipped.
