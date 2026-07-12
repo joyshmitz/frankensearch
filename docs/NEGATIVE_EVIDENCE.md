@@ -12043,3 +12043,26 @@ n-dependency data). **Genuine remaining frontier = the same as the pre-session H
 per-query self-time (blocked `bd-e41k` — release strips symbols, no worker pin) or a NEW workload the current
 BOLD/µbench proxies don't model. The measured-CPU levers on the ownable search+ingest+render surface are at
 floor.
+
+### 2026-07-12 — cc_fse — two more subsystems checked EMPTY (extends the 8feb0bb3 frontier map): durability codec is external, tui render is cache-optimized
+
+Follow-up audit of the two CPU-heavy subsystems the frontier map hadn't explicitly covered:
+- **`frankensearch-durability`** (Reed-Solomon/fountain erasure coding): the Galois-field arithmetic is
+  NOT ownable — `codec.rs`'s `encode`/`decode` delegate to `self.codec.encode(&cx, …)`, an external
+  fountain-code dependency. The frankensearch code is pure orchestration (repair-count guardrails, crc32,
+  metrics). No GF hot loop to optimize. The protector paths (`file_protector`/`fsvi_protector`) are
+  I/O-dominated chunk write/read (noted in prior ledger entries).
+- **`frankensearch-tui` render** (`frame.rs`): the layout path is already cache-optimized — `CachedLayout::
+  get_or_compute` returns a **borrowed** `&[Rect]` from a per-area cache (the only `.to_vec()` sites are
+  test scaffolding), so there is no per-frame layout copy. The two identified hot pure fns (`palette`
+  `search_index` precomputed-lowercase, `keymap` static-table `resolve`) were already optimized.
+- **RRF small-pool `select_nth` threshold** (predicted candidate): NOT a lever — `rrf.rs:402`'s
+  unconditional `select_nth_unstable_by` (guarded only by `window < len`) is O(N) and always ≤ a full
+  O(N log N) sort, so it does not regress small pools; a threshold would only risk skipping a beneficial
+  partition. (My MRL/two_tier/fsfs `SELECT_NTH_MIN=256` gate is a safety margin against pdqselect constant
+  factors at tiny N, not a speed necessity.)
+
+**Confirmed: the ownable measured-CPU surface is exhaustively at floor across every crate.** Per the
+2026-07-08 user greenlight (memory `pivot-to-quality-pool-minmax-fusion`), the productive vein is now
+search-QUALITY findings via the BEIR harness, not perf micro-opts; the remaining perf frontier needs
+symbolized per-query self-time (blocked `bd-e41k`) or a new workload the current proxies don't model.
