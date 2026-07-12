@@ -25,6 +25,11 @@ harness = false
 required-features = ["bench-internals"]
 
 [[bench]]
+name = "fleet_project_values_ab"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
 name = "correlation_group_ab"
 harness = false
 required-features = ["bench-internals"]

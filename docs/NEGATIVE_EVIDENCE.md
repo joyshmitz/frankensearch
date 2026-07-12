@@ -11785,3 +11785,29 @@ fast-path only pays when it lets you skip genuinely-expensive Unicode machinery 
 case-folding over large text) — not for `to_lowercase()` alone on short strings, where the extra
 `is_ascii` scan out-costs the saving.** Don't apply this to the other short-string `to_lowercase()` sites
 (`storage/fts5_adapter.rs:257`, etc.). The negation win stands because it skipped NFC over document bodies.
+
+### 2026-07-12 — cc_fse — LANDED: fleet monitor per-project value build fused into one pass ~1.9×, byte-identical (frankensearch-ops)
+
+**Pass-fusion (distinct from the correlation clone-elision).** `FleetOverviewScreen::selected_monitor_lines`
+(per render of the fleet screen) built five per-project value vectors — docs/pending/cpu/memory/p95 — with
+**five separate filtered iterations** over `fleet.instances`, and called `resources.get` **twice** per
+matching instance (once for cpu, once for memory). Extracted `build_project_percentile_values` that does a
+**single pass**: filter once, `resources.get`/`search_metrics.get` once per matching instance, push into all
+five vectors. Byte-identical: `percentile_rank_*` only counts values ≤ target (order-independent), and the
+cpu/memory vectors stay aligned because both were gated on the same `resources.get(..).is_some()`.
+
+**Measured (strict remote `vmi1293453`, release, within-process paired AB/BA; parity `output_identical=true`
+before every timing run):** ratios are fused/legacy.
+
+| shape instances/projects | project instances | legacy median | fused median | paired lever [p5,p95] | A/A null [p5,p95] | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 2048/24 | 871 | 123.16 us | 36.23 us | 0.5132 [0.471, 0.560] | 0.9904 [0.920, 1.117] | **1.95×** |
+| 8192/48 | 3380 | 393.92 us | 250.99 us | 0.5251 [0.454, 0.632] | 1.0012 [0.850, 1.185] | **1.90×** |
+| 16384/64 | 6707 | 1127.39 us | 531.16 us | 0.5078 [0.411, 0.618] | 0.9918 [0.818, 1.263] | **1.97×** |
+
+All three shapes clear the null floor (`gate_pass=true`, `decision=KEEP`). **Why this won where alerts-SLO
+grouping HOLD'd:** the eliminated cost here is 4 redundant *full passes* + a deduped hashget, and the
+per-instance work is cheap (push), so the pass/hashget reduction dominates — versus alerts-SLO where the
+per-group phase re-iterated and diluted the saved clone. External comparator N/A (internal render-path
+aggregation). 66/66 ops `fleet` lib tests pass (incl. the `selected_monitor_*` percentile tests). The
+five-pass form is retained only behind `bench-internals` as the parity oracle (bench `fleet_project_values_ab`).

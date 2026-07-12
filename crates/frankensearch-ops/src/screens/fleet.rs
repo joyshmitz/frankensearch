@@ -23,7 +23,10 @@ use frankensearch_tui::input::InputEvent;
 use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::presets::ViewState;
+use std::collections::HashMap;
+
 use crate::state::AppState;
+use crate::state::{InstanceInfo, ResourceMetrics, SearchMetrics};
 use crate::theme::SemanticPalette;
 
 /// Fleet overview screen showing all discovered instances.
@@ -65,6 +68,196 @@ const FLEET_KEYBINDINGS: &[KeybindingHint] = &[
         description: "Open analytics",
     },
 ];
+
+/// Per-project value vectors for the monitor percentile ranks.
+#[derive(Default)]
+struct ProjectPercentileValues {
+    docs: Vec<u64>,
+    pending: Vec<u64>,
+    cpu: Vec<f64>,
+    memory: Vec<u64>,
+    p95: Vec<u64>,
+}
+
+/// Build the five per-project percentile-rank value vectors in a single pass.
+///
+/// Replaces five separate filtered iterations over `instances` (which called
+/// `resources.get` twice per matching instance for cpu and memory). Byte-identical
+/// to the five-pass form: cpu/memory are pushed together only when
+/// `resources.get(..)` is `Some` (matching the old `filter_map` gating), and
+/// `percentile_rank` is order-independent.
+fn build_project_percentile_values(
+    instances: &[InstanceInfo],
+    resources: &HashMap<String, ResourceMetrics>,
+    search_metrics: &HashMap<String, SearchMetrics>,
+    project: &str,
+) -> ProjectPercentileValues {
+    let mut out = ProjectPercentileValues::default();
+    for item in instances {
+        if item.project != project {
+            continue;
+        }
+        out.docs.push(item.doc_count);
+        out.pending.push(item.pending_jobs);
+        if let Some(metric) = resources.get(&item.id) {
+            out.cpu.push(metric.cpu_percent);
+            out.memory.push(metric.memory_bytes);
+        }
+        if let Some(metric) = search_metrics.get(&item.id) {
+            out.p95.push(metric.p95_latency_us);
+        }
+    }
+    out
+}
+
+/// Legacy five-pass builder, retained only for the A/B microbench.
+#[cfg(feature = "bench-internals")]
+fn build_project_percentile_values_legacy(
+    instances: &[InstanceInfo],
+    resources: &HashMap<String, ResourceMetrics>,
+    search_metrics: &HashMap<String, SearchMetrics>,
+    project: &str,
+) -> ProjectPercentileValues {
+    let docs = instances
+        .iter()
+        .filter(|item| item.project == project)
+        .map(|item| item.doc_count)
+        .collect();
+    let pending = instances
+        .iter()
+        .filter(|item| item.project == project)
+        .map(|item| item.pending_jobs)
+        .collect();
+    let cpu = instances
+        .iter()
+        .filter(|item| item.project == project)
+        .filter_map(|item| resources.get(&item.id).map(|metric| metric.cpu_percent))
+        .collect();
+    let memory = instances
+        .iter()
+        .filter(|item| item.project == project)
+        .filter_map(|item| resources.get(&item.id).map(|metric| metric.memory_bytes))
+        .collect();
+    let p95 = instances
+        .iter()
+        .filter(|item| item.project == project)
+        .filter_map(|item| search_metrics.get(&item.id).map(|metric| metric.p95_latency_us))
+        .collect();
+    ProjectPercentileValues {
+        docs,
+        pending,
+        cpu,
+        memory,
+        p95,
+    }
+}
+
+/// Bench-only opaque handle wrapping a synthetic fleet corpus.
+#[cfg(feature = "bench-internals")]
+pub struct BenchFleetValues {
+    instances: Vec<InstanceInfo>,
+    resources: HashMap<String, ResourceMetrics>,
+    search_metrics: HashMap<String, SearchMetrics>,
+    project: String,
+}
+
+/// Bench-only flat projection of the value vectors for exact parity comparison.
+#[cfg(feature = "bench-internals")]
+pub type BenchProjectValues = (Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>, Vec<u64>);
+
+#[cfg(feature = "bench-internals")]
+fn project_values_bits(values: ProjectPercentileValues) -> BenchProjectValues {
+    (
+        values.docs,
+        values.pending,
+        values.cpu.iter().map(|v| v.to_bits()).collect(),
+        values.memory,
+        values.p95,
+    )
+}
+
+/// Bench-only: build a deterministic fleet where `hit_project` of `n_projects` owns
+/// a large share of the `n_instances`, each with resource + search metrics.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn bench_make_fleet_values(n_instances: usize, n_projects: usize) -> BenchFleetValues {
+    let projects = n_projects.max(1);
+    let mut instances = Vec::with_capacity(n_instances);
+    let mut resources = HashMap::with_capacity(n_instances);
+    let mut search_metrics = HashMap::with_capacity(n_instances);
+    for index in 0..n_instances {
+        let id = format!("instance-{index:06}");
+        // Bias ~40% of instances into project-0000 (the selected project) so the
+        // per-project pass is a substantial share of the fleet.
+        let project = if index % 5 < 2 {
+            "project-0000".to_owned()
+        } else {
+            format!("project-{:04}", index % projects)
+        };
+        // Most instances have resource + search metrics; a few omit them.
+        if index % 7 != 0 {
+            resources.insert(
+                id.clone(),
+                ResourceMetrics {
+                    cpu_percent: (index % 100) as f64,
+                    memory_bytes: (index as u64) * 1_048_576 % 8_000_000_000,
+                    io_read_bytes: (index as u64) * 512,
+                    io_write_bytes: (index as u64) * 256,
+                },
+            );
+        }
+        if index % 6 != 0 {
+            search_metrics.insert(
+                id.clone(),
+                SearchMetrics {
+                    total_searches: (index as u64) % 5_000,
+                    avg_latency_us: 900 + (index as u64) % 1_500,
+                    p95_latency_us: 1_500 + (index as u64 * 37) % 6_000,
+                    refined_count: (index as u64) % 800,
+                },
+            );
+        }
+        instances.push(InstanceInfo {
+            id,
+            project,
+            pid: Some(1000 + index as u32),
+            healthy: index % 4 != 0,
+            doc_count: (index as u64) * 13 % 1_000_000,
+            pending_jobs: (index as u64 * 7) % 4_000,
+        });
+    }
+    BenchFleetValues {
+        instances,
+        resources,
+        search_metrics,
+        project: "project-0000".to_owned(),
+    }
+}
+
+/// Bench-only: shipped fused single-pass builder over the corpus.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_project_values_fused(fleet: &BenchFleetValues) -> BenchProjectValues {
+    project_values_bits(build_project_percentile_values(
+        &fleet.instances,
+        &fleet.resources,
+        &fleet.search_metrics,
+        &fleet.project,
+    ))
+}
+
+/// Bench-only: legacy five-pass builder over the corpus.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_project_values_legacy(fleet: &BenchFleetValues) -> BenchProjectValues {
+    project_values_bits(build_project_percentile_values_legacy(
+        &fleet.instances,
+        &fleet.resources,
+        &fleet.search_metrics,
+        &fleet.project,
+    ))
+}
 
 impl FleetOverviewScreen {
     /// Create a new fleet overview screen.
@@ -224,51 +417,23 @@ impl FleetOverviewScreen {
             .collect();
         let docs_values: Vec<_> = fleet.instances.iter().map(|item| item.doc_count).collect();
 
-        let project_docs_values: Vec<_> = fleet
-            .instances
-            .iter()
-            .filter(|item| item.project == instance.project)
-            .map(|item| item.doc_count)
-            .collect();
-        let project_pending_values: Vec<_> = fleet
-            .instances
-            .iter()
-            .filter(|item| item.project == instance.project)
-            .map(|item| item.pending_jobs)
-            .collect();
-        let project_cpu_values: Vec<_> = fleet
-            .instances
-            .iter()
-            .filter(|item| item.project == instance.project)
-            .filter_map(|item| {
-                fleet
-                    .resources
-                    .get(&item.id)
-                    .map(|metric| metric.cpu_percent)
-            })
-            .collect();
-        let project_memory_values: Vec<_> = fleet
-            .instances
-            .iter()
-            .filter(|item| item.project == instance.project)
-            .filter_map(|item| {
-                fleet
-                    .resources
-                    .get(&item.id)
-                    .map(|metric| metric.memory_bytes)
-            })
-            .collect();
-        let project_p95_values: Vec<_> = fleet
-            .instances
-            .iter()
-            .filter(|item| item.project == instance.project)
-            .filter_map(|item| {
-                fleet
-                    .search_metrics
-                    .get(&item.id)
-                    .map(|metric| metric.p95_latency_us)
-            })
-            .collect();
+        // Fused single pass over the project's instances: the five per-project value
+        // vectors previously used five separate filtered iterations, calling
+        // `resources.get` twice per matching instance (cpu + memory). One pass builds
+        // all five and hits each map once. Byte-identical: `percentile_rank` only
+        // counts values <= target (order-independent), and the cpu/memory vectors stay
+        // aligned because both were gated on the same `resources.get(..).is_some()`.
+        let project_values = build_project_percentile_values(
+            &fleet.instances,
+            &fleet.resources,
+            &fleet.search_metrics,
+            &instance.project,
+        );
+        let project_docs_values = project_values.docs;
+        let project_pending_values = project_values.pending;
+        let project_cpu_values = project_values.cpu;
+        let project_memory_values = project_values.memory;
+        let project_p95_values = project_values.p95;
 
         let docs_line = format!(
             "Docs: {} (project p{} | fleet p{})",
