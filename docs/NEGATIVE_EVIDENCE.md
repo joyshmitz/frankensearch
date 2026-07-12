@@ -12396,3 +12396,27 @@ soft-pin): path72 (len~72, mc=60) orig **679.2 ns** → new **350.3 ns** = ratio
 (len~7200, mc=80) orig **8289.9 ns** → new **378.9 ns** = ratio 0.0457 (~21.9x); both < A/A null p5
 (0.88/0.82) → **CANDIDATE_FASTER**. `truncate_tail` right below was already optimal (count + prefix-only, no
 Vec). Lib compiles (`cargo bench -p frankensearch-fsfs` exit 0). Shipped.
+
+### 2026-07-12 — cc_fse — REJECTED: fsfs `truncate_for_width` bounded-count check (INCONCLUSIVE — the count was never the bottleneck)
+
+Continuing the truncate-family sweep after the `truncate_middle` win (d4a8c811). `truncate_for_width`
+(format_emitter.rs, per search-hit on `snippet.trim()`) tests `text.chars().count() <= max_chars` — a FULL
+count of the whole snippet. Tried the same bounded check as truncate_middle: `text.chars().nth(max_chars).
+is_none()` (walk ≤ max_chars+1), byte-identical. **REJECTED — no win.** Within-process A/B
+(`truncate_width_ab`, since reverted), width=80, both arms byte-identical over 6 ASCII/Unicode cases:
+
+| snippet chars | orig ns | new ns | ratio | null p5 | verdict |
+|---:|---:|---:|---:|---:|---|
+| 100  | 228.0 | 253.8 | 1.113 | 0.763 | INCONCLUSIVE (new SLOWER) |
+| 300  | 244.0 | 254.7 | 1.044 | 0.856 | INCONCLUSIVE |
+| 1000 | 269.9 | 262.7 | 0.974 | 0.841 | INCONCLUSIVE |
+
+**Why it differs from truncate_middle:** truncate_middle's win was eliminating a `Vec<char>` **allocation**
+(malloc + O(text) fill); the count it replaced was incidental. Here the count is all that changes, and
+`str::chars().count()` over ASCII is CHEAP — orig rose only 228→270 ns going 100→1000 chars, i.e. ~+4.6 ns per
++100 chars, so the count is a tiny fraction. The `take(max_chars-1).collect()` alloc + `format!` dominate BOTH
+arms identically, and the bounded `nth`'s Option overhead makes it marginally slower on the common small-snippet
+case. LESSON: a "skip the O(n) scan" lever only clears the floor when the scan is EXPENSIVE work (an alloc, a
+Unicode transform) — a bare ASCII char count is not. `deterministic_truncate` (redaction.rs) and `truncate_tail`
+(runtime.rs) were already bounded/optimal; the fsfs truncate-family sweep is now closed (1 win, 1 reject, 2
+already-optimal). Reverted via Edit + `rm` bench; production unchanged.
