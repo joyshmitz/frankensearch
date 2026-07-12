@@ -12952,3 +12952,19 @@ A/B arm; `rerank/pipeline.rs:667/682/1401`, `index/search.rs:2890+`, `rrf.rs:130
 iterator-izable production instance, and it's fixed. The collect-then-reduce lever family is CLOSED. Broader perf
 state unchanged: CPU frontier floored; the productive vein remains the (already-shipped, opt-in) NQC quality feature,
 whose autonomously-buildable pieces are all landed (sync wiring + alloc-free enabled path). No code change.
+
+### 2026-07-12 — cc_fse — NQC async-wiring TRACE (definitive): phase-2 is a vector blend that does NOT re-fuse lexical (rrf_contribution=0) — async wiring is deliberate design work, not an autonomous increment
+
+Traced the async `TwoTierSearcher` phase-2 (`run_phase2`, searcher.rs:1410) to settle whether the opt-in NQC dense
+down-weight can be safely wired by mirroring the sync path. Findings: `run_phase2` takes `initial_results` (the
+phase-1 fused output — which carries the lexical fusion where an NQC down-weight would apply), rebuilds `fast_hits`
++ `initial_by_doc` from it, then produces refined scores as a `blend_two_tier_aligned_vector_index` of the fast↔
+quality VECTOR tiers weighted by `blend_factor` (`weight: 1-blend_factor` / `blend_factor`), tracking `rank_movement`
+vs the initial rank — with **`rrf_contribution: 0.0`** (it does NOT re-run the lexical RRF fusion in phase-2).
+So the FINAL refined ranking is a phase-2 vector blend layered over phase-1's fused order, and how a phase-1
+semantic-weight down-weight flows into that final order is non-obvious (it shifts the phase-1 fused scores/ranks,
+which phase-2 then refines by vector movement — not a clean multiply). **CONCLUSION: wiring the NQC down-weight into
+the async path is DELIBERATE DESIGN WORK** (decide whether the down-weight applies at phase-1 only, is re-applied in
+the phase-2 blend, and prove the final refined ranking behaves as intended — with tests), NOT a safe autonomous
+mirror of the sync wiring. It stays deferred; the sync path already ships the feature. This closes the async-wiring
+question (no further scoping needed) — it is a scoped task for deliberate/human implementation. No code change.
