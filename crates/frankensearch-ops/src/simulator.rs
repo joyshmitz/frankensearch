@@ -1114,10 +1114,14 @@ fn p95_from_run(run: &SimulationRun) -> u64 {
     if latencies.is_empty() {
         return 0;
     }
-    latencies.sort_unstable();
     let len = latencies.len();
     let idx = ((len.saturating_mul(95)).saturating_sub(1)) / 100;
-    latencies.get(idx).copied().unwrap_or_default()
+    // Reading one order statistic (p95): partition to `idx` in O(n) rather than a full
+    // O(n log n) sort of the whole latency vector — the same lever as `percentile_select`
+    // (~28–52× on the isolated percentile). `len >= 1` here so `idx < len`, and after
+    // `select_nth_unstable(idx)` the element at `idx` is the byte-identical p95.
+    let (_, nth, _) = latencies.select_nth_unstable(idx);
+    *nth
 }
 
 #[derive(Debug, Clone, Copy)]

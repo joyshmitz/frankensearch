@@ -12209,3 +12209,20 @@ of the concurrency/bandwidth work (bd-e41k class). This is the last untested per
 with it closed, the ownable measurable-CPU frontier has no remaining open lead on this fleet. Productive
 direction remains search-QUALITY (the pivot-to-quality lands above, Python/BEIR-measured — a different
 harness than rch cargo-bench).
+
+### 2026-07-12 — cc_fse — LANDED (small): `simulator::p95_from_run` full-sort → `select_nth` — byte-identical, last production single-percentile full-sort site
+
+Applied the proven `percentile_select` lever (full O(n log n) sort → O(n) `select_nth_unstable` when only ONE
+order statistic is read) at the one remaining production callsite that had it: `frankensearch-ops`
+`simulator.rs::p95_from_run` collected every event's `latency_us` across a run's batches, `sort_unstable()`-ed
+the whole vector, and read only `latencies[p95_idx]`. Now `select_nth_unstable(idx)` partitions to the p95
+index in O(n); byte-identical (`len >= 1` after the is-empty guard ⇒ `idx < len`, so the element at `idx` is
+the same p95 order statistic the full sort produced). No fresh bench — the algorithm is the shipped
+`percentile_select` (~28–52× on the isolated percentile); this is the same operator at a new callsite (the
+sibling+proven-algorithm norm, cf. two_tier/fsfs). 54/54 ops `simulator` lib tests pass (incl.
+`p95_single_event_returns_its_latency` / `p95_empty_run_returns_zero`). **Honest scope:** low value — the
+simulator generates synthetic ops-TUI demo data and `p95_from_run` runs once per generated run (not a
+per-query/per-frame hot path), so end-to-end impact is negligible; it lands as a byte-identical, never-slower
+algorithmic cleanup that closes the last single-percentile full-sort. The other `sort` sites in
+`simulator.rs`/`historical_analytics.rs` are full-order (id sort / multi-percentile test) — correctly not
+`select_nth` candidates.
