@@ -11825,3 +11825,21 @@ perf change or block further, the change + bench were reverted; production stays
 (known-good `f4f98e0a` state). **Route-next: re-attempt when RCH is uncontended** — the fusion is smaller
 than the 5→1 project fusion (2→1 twice) so it may land inside the null floor; measure before shipping. The
 proven, higher-value fleet win (`f4f98e0a`, ~1.9×) already stands.
+
+### 2026-07-12 — cc_fse — HOLD (not shipped): dropping the redundant `**` replace in `strip_markdown_line` is byte-identical but INSIDE the null floor
+
+`frankensearch-core` `canonicalize::strip_markdown_line` (per document line at index time) stripped bold
+markdown with `.replace("**", "")` then `.replace('*', "")`. The first pass is provably redundant: removing
+every `**` then every remaining `*` is identical to removing every `*`, and the interleaved `__` pass only
+touches underscores, so star presence cannot change it. Dropping the `**` replace is byte-identical (verified
+`fast_equals_legacy=true` over a 2048-line markdown corpus, 1536 star-lines, incl. non-ASCII).
+
+**Measured (strict remote `vmi1264463`, release, within-process paired AB/BA):** legacy 571.4 ns/line,
+shipped-fused 634.1 ns/line; paired lever median 0.8947 [0.734, 1.070] vs A/A null 1.0032 [0.871, 1.203] →
+verdict `INSIDE_NULL_FLOOR` (lever median 0.895 not below null p5 0.871), `gate_pass=false`, `decision=HOLD`.
+Eliminating ONE of the ~4–6 per-line replace passes/allocations is too small a fraction of a ~571 ns/line op,
+and the null floor is wide — the same diminishing-returns boundary as the query-term `to_lowercase` and
+alerts-SLO HOLDs: **removing one allocation/pass from a short per-item op does not clear the floor; only
+skipping genuinely-expensive work over large inputs (NFC over document bodies) or eliminating many redundant
+FULL passes (fleet 5→1) does.** Reverted; production keeps the two-step replace. Do not retry single-pass
+micro-fusions on the short markdown/query per-line ops.
