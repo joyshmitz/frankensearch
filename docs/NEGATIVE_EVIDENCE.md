@@ -11811,3 +11811,17 @@ per-instance work is cheap (push), so the pass/hashget reduction dominates — v
 per-group phase re-iterated and diluted the saved clone. External comparator N/A (internal render-path
 aggregation). 66/66 ops `fleet` lib tests pass (incl. the `selected_monitor_*` percentile tests). The
 five-pass form is retained only behind `bench-internals` as the parity oracle (bench `fleet_project_values_ab`).
+
+### 2026-07-12 — cc_fse — DEFERRED (not shipped, no measurement): fleet-wide value fusion — RCH ops-crate remote compile stalled >10min repeatedly
+
+Follow-on to the landed fleet per-project fusion (`f4f98e0a`): the five *fleet-wide* value vectors in
+`selected_monitor_lines` have the same shape — `cpu_values`+`memory_values` both iterate
+`resources.values()`, `docs_values`+`pending_values` both iterate `instances` — so cpu+memory and
+docs+pending each fuse 2→1 (byte-identical: each HashMap's iteration order is stable across the old paired
+iterations, and `percentile_rank` is order-independent). Implemented + staged, but the isolated A/B bench
+could **not be measured this session**: the `frankensearch-ops` release bench build repeatedly stalled on a
+contended RCH worker (>9–10 min, several attempts, one 0-byte-output hang). Rather than ship an unmeasured
+perf change or block further, the change + bench were reverted; production stays the five-collect form
+(known-good `f4f98e0a` state). **Route-next: re-attempt when RCH is uncontended** — the fusion is smaller
+than the 5→1 project fusion (2→1 twice) so it may land inside the null floor; measure before shipping. The
+proven, higher-value fleet win (`f4f98e0a`, ~1.9×) already stands.
