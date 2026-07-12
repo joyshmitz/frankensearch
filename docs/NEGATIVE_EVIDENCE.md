@@ -12226,3 +12226,16 @@ per-query/per-frame hot path), so end-to-end impact is negligible; it lands as a
 algorithmic cleanup that closes the last single-percentile full-sort. The other `sort` sites in
 `simulator.rs`/`historical_analytics.rs` are full-order (id sort / multi-percentile test) — correctly not
 `select_nth` candidates.
+
+### 2026-07-12 — cc_fse — the `select_nth`/min-max sibling sweep is COMPLETE (no production sort-for-extremum sites remain)
+
+Terse close of the partial-selection sub-vein after the `p95_from_run` land (`f49438b8`). Grepped every
+crate for `sort*` followed within a few lines by `.first()`/`.last()`/`[0]`/single-index reads (sort-for-
+extremum → replaceable by `min()`/`max()`/`select_nth`, byte-identical, O(n)): the ONLY hit is
+`ops/discovery.rs:1032` which is a `#[test]` (`signal_kind_ord`, verifying the `Ord` derive order), not
+production. Combined with the single-percentile sweep (`p95_from_run` was the last production instance) and
+the merge-path top-k sweep (all done), **the partial-selection / `select_nth` lever family is now fully
+mined across the codebase — no open instances remain.** This, with the crate-by-crate floor audit, the
+closed route-nexts, and the concurrency/working-set investigations, leaves the ownable measurable-CPU
+surface with no remaining lever on this fleet; the productive direction is search-QUALITY (Python/BEIR
+harness, distinct from rch cargo-bench).
