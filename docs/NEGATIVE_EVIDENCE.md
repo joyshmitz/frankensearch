@@ -12462,3 +12462,21 @@ detectable — host_bucket's `split_once` locates a subslice in O(prefix) and th
 of the tail). A "borrow iff unchanged" predicate that requires scanning the whole input is self-defeating: the
 detection scan ≈ the transform. Don't Cow-ify a case-fold/normalize unless the source is known-normalized by
 construction.** Reverted via Edit + `rm` (searcher.rs + Cargo.toml pristine vs HEAD); production unchanged.
+
+### 2026-07-12 — cc_fse — SWEEP (negative): the enumerable winning-pattern families are now closed on the fast-crate surface
+
+Systematic pattern-family grep across the fast (non-fsfs) crates for the shapes that HAVE landed this session,
+all now empty/clean: (1) **materialize-then-take** (`.lines()/.split()/.chars().collect::<Vec>` then
+first/last/nth/index — the truncate_middle winning shape): zero hits in core/fusion/index/lexical/rerank/ops/
+storage. (2) **sort-then-extremum** (`sort*` then `[0]`/`.first()`/`.last()`/`.pop()` — the select_nth lever
+landed in mrl/two_tier/query_execution): zero hits. (3) **hot double-hash** (`contains_key` then `get`/`insert`
+— entry-API lever): the 7 `contains_key` sites are all single membership checks (`blend::compute_rank_changes`
+telemetry, `feedback`/`conformal`/`queue` non-hot, `graph_rank`/`graph.rs` opt-in-cold under the alpha=0-default
+diffusion path), none a real double-lookup. With the earlier closures this session — host_bucket-borrow (search
+crates clean), alloc-elimination (2→1-on-short-string inside-floor `b1712007`; Cow-detection-scan self-defeating
+`999a52ef`), the fsfs truncate-family (1 win + 1 reject + 2 already-optimal), and the char-collect vein
+(sparkline ×6 + truncate_middle landed) — **every enumerable winning-pattern family is now swept on the ownable
+fast-crate CPU surface.** Landed this session: host_bucket ~1.98× (bd47ed1e), sparkline ~1.38× (552adbd1/
+e14e13f8), truncate_middle ~1.9–21.9× (d4a8c811). Remaining perf reopeners are unchanged: a genuinely NEW
+workload the µbenches can't model (idle-machine concurrency, bd-e41k class) or a not-yet-in-Rust feature; the
+live productive vein is search-QUALITY (harness ready at docs/quality_harness/).
