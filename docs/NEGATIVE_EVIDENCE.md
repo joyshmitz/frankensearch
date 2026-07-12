@@ -12623,3 +12623,32 @@ label-free tier-weight QPP 72b68de, so gating is non-trivial). (3) QUANTIFIES th
 micro-opts" theme (43be67e/19787ed/6d1612c): since dense's marginal hybrid value is ≤ +0.025, any dense-SIDE quality
 tweak (hubness, smoothing) is bounded above by that — explains why dense-side quality levers underdeliver end-to-end.
 No Rust/conformance change.
+
+### 2026-07-12 — cc_fse — PERF LEVER (viable, promising): adaptive DENSE-GATING via BM25 clarity — save ~50% of the dominant dense scan at bounded quality cost
+
+Pursued the highest-value perf direction from last turn (`fd855205`): the dense int8 scan is the DOMINANT per-query
+CPU cost, but its marginal value is corpus/query-dependent — so GATE it (skip the scan when it won't help). The gate
+must use a LABEL-FREE, DENSE-FREE signal (decided before running dense) → from lexical + query only. Tested BM25
+CLARITY (top1−top2 relative margin) as the gate signal vs dense's per-query marginal value (hybrid − lexical_alone),
+stem+stop baseline, 4 corpora (`docs/quality_harness/dense_gate_signal.py`):
+
+| corpus | dmarg (low-clarity ½) | dmarg (high-clarity ½) | corr(clarity,dmarg) |
+|---|---:|---:|---:|
+| scifact | +0.0392 | +0.0102 | −0.101 |
+| nfcorpus | +0.0250 | +0.0148 | −0.013 |
+| arguana | +0.0012 | +0.0022 | −0.000 |
+| scidocs | +0.0163 | **−0.0033** | −0.084 |
+
+**VIABLE (directionally): high lexical clarity → dense adds much less.** scifact +0.039→+0.010 (4× less), scidocs
++0.016→**−0.003** (dense HURTS when lexical is confident), arguana uniformly dense-weak (no signal, as expected).
+**Tradeoff if we gate dense OFF on the clarity-high half:** ~50% of dense scans skipped (the dominant per-query cost)
+for hybrid-nDCG cost of only ≈ −0.0051 (scifact) / −0.0074 (nfcorpus) averaged over all queries, and NEUTRAL-to-
+POSITIVE on arguana (−0.0011) / scidocs (+0.0017, an actual GAIN — dense hurts clear-lexical queries there). This is
+the strongest perf-relevant lever surfaced since the CPU frontier closed: a real latency halving of the dominant
+scan at small, bounded quality cost. **Caveat / route-next:** the per-query correlation is WEAK (|corr| ≤ 0.10) — a
+median split shows the aggregate trend but a hard per-query threshold misclassifies many queries; a production gate
+needs threshold tuning and/or a richer signal (NQC/clarity over more ranks, query length, lexical score entropy).
+Distinct from the rejected label-free tier-WEIGHT QPP (`72b68de`): that needed a continuous per-query reliability
+estimate; a binary skip-dense gate tolerates a coarse signal + an asymmetric quality/latency budget. Landing needs a
+Rust "compute BM25 clarity → skip dense scan if above threshold" path (cross-crate: lexical clarity feeds the
+searcher's dense-scan decision) + a chosen operating point. Measured, not yet landed. No Rust change this turn.
