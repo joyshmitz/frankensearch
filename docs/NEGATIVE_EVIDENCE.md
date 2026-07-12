@@ -12823,3 +12823,29 @@ sketch (t-digest/GK over the query stream, refreshed periodically — same infra
 sum; (4) opt-in config `dense_nqc_downweight_beta` (default 0 = current behavior) so it's non-breaking + A/B-able.
 Expected: ~+0.002..+0.004 nDCG@10, robust cross-corpus, latency-neutral (always runs dense; NQC is a cheap reduction
 over scores the lexical tier already has). Measured end-to-end in Python; Rust land is the multi-turn next step.
+
+### 2026-07-12 — cc_fse — STATISTICAL RIGOR (tempers the win): dense-downweight is real POOLED (+0.0022, CI excludes 0) but per-corpus mostly NOT significant
+
+Applied the missing rigor to the dense-downweight win (`9c1943df`/`910f0079`) before any land: bootstrap 95% CI on
+the per-query nDCG delta (down-weight β=0.5 vs equal-weight), 2000 resamples over queries, seed 12345
+(`docs/quality_harness/bootstrap_ci.py`), stem+stop:
+
+| corpus | q | mean Δ | 95% CI | CI>0 |
+|---|---:|---:|---|:---:|
+| scifact | 300 | +0.0060 | [−0.0016, +0.0138] | No |
+| nfcorpus | 323 | +0.0022 | [−0.0006, +0.0051] | No |
+| arguana | 1406 | +0.0011 | [−0.0010, +0.0033] | No |
+| scidocs | 1000 | +0.0024 | [+0.0005, +0.0044] | **Yes** |
+| **POOLED** | 3029 | +0.0022 | **[+0.0008, +0.0035]** | **Yes** |
+
+**HONEST CALIBRATION: the win is statistically real IN AGGREGATE (pooled CI [+0.0008,+0.0035] excludes 0) and the
+DIRECTION is consistent (all 4 point estimates positive), but per-corpus only scidocs is individually significant.**
+The per-query delta variance is large relative to the ~+0.002–0.006 mean effect, so 3/4 single-corpus CIs include 0.
+This TEMPERS the earlier "robust 4/4 win" framing (`9c1943df`): the DIRECTION holds 4/4, the per-corpus MAGNITUDES
+are within noise for 3/4 — the point estimates overstated per-corpus robustness (a caution for every prior single-run
+harness number: they are point estimates, treat ±0.003-scale deltas as noise unless pooled/CI'd). **Net effect on
+the land case:** the dense down-weight is a REAL but SMALL aggregate quality gain (+0.0022 pooled, 95% CI up to
++0.0035). Whether it justifies the implementation cost (NQC + streaming cv-quantile t-digest + fusion wiring) is now
+a clear-eyed judgment call, not a slam dunk — it should be landed OPT-IN (default 0) and A/B-validated on the REAL
+production embedder (this is potion/model2vec proxy data), where the magnitude may differ. The rigorous conclusion:
+directionally sound, aggregate-significant, small; land only behind a flag with production A/B. No Rust this turn.
