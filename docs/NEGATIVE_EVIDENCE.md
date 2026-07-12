@@ -11890,3 +11890,19 @@ compiles. External comparator N/A (internal reranker ingest primitive). **Bounda
 ("skip work over large inputs") not a micro-fusion — the saving is O(total−cap) discarded conversions, which is
 large for long docs, unlike the short-per-item HOLDs. Legacy collect-then-truncate replicated in the bench as
 the parity oracle (`token_id_truncate_ab`, no `native` feature needed).
+
+### 2026-07-12 — cc_fse — LANDED: apply the truncate-before-collect helper to the reranker cross-encoder tokenizer (second callsite, ~2.7–10× on long docs)
+
+Follow-on to `62806949`: `NativeReranker`'s cross-encoder tokenization (`native.rs`, per (query, document)
+pair) had the identical `collect-all-then-truncate` on BOTH `ids` and `type_ids` — materializing the full
+token sequence per side before capping at `max_length` (512). Replaced both with the shared
+`crate::ids_to_truncated_i64` (`take(max_length)` before the i64 conversion). `ids` and `type_ids` share the
+encoding length, so per-side `take` matches the old `if ids.len() > max { truncate both }` — byte-identical.
+This is the reranker HOT path (runs per candidate document on the search path), arguably hotter than the
+embedder callsite fixed in `62806949`.
+
+No new bench: the operation is the already-measured `ids_to_truncated_i64` (bench `token_id_truncate_ab`,
+proven byte-identical + 2.68× at 2048 tokens / 10.09× at 8192 tokens, wash at ≤512). `cargo check --features
+native` confirms the cross-encoder change compiles (3m03s, no warnings on the changed lines). Ships the same
+proven optimization at a second, hotter callsite by reuse — the right way to land a follow-on (no duplicate
+kernel, no re-measurement of an identical pure fn).

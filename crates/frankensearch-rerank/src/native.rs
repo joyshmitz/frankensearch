@@ -1654,16 +1654,13 @@ impl SyncRerank for NativeReranker {
                 .tokenizer
                 .encode((query, doc.text.as_str()), true)
                 .map_err(|e| rerank_err("tokenize", e))?;
-            let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&id| i64::from(id)).collect();
-            let mut typ: Vec<i64> = encoding
-                .get_type_ids()
-                .iter()
-                .map(|&t| i64::from(t))
-                .collect();
-            if ids.len() > self.max_length {
-                ids.truncate(self.max_length);
-                typ.truncate(self.max_length);
-            }
+            // Truncate to `max_length` before the i64 conversion + collect (see
+            // `crate::ids_to_truncated_i64`): for documents that tokenize past the cap
+            // this materializes only `max_length` ids per side instead of the whole
+            // sequence. `ids` and `typ` share the encoding length, so per-side
+            // `take(max_length)` matches the old `if ids.len() > max { truncate both }`.
+            let ids = crate::ids_to_truncated_i64(encoding.get_ids(), self.max_length);
+            let typ = crate::ids_to_truncated_i64(encoding.get_type_ids(), self.max_length);
             encoded.push((ids, typ));
         }
 
