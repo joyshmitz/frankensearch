@@ -24,7 +24,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use frankensearch_ops::screens::historical_analytics::{
-    BenchEvidenceRows, bench_correlation_borrowed, bench_correlation_owned, bench_make_evidence_rows,
+    BenchEvidenceRows, bench_correlation_borrowed, bench_correlation_owned,
+    bench_make_evidence_rows,
 };
 
 const LAG_PRESSURE: u8 = 37;
@@ -34,11 +35,7 @@ const PAIRED_ROUND_PAIRS: usize = 41;
 
 /// (n_rows, n_reasons, n_projects) shapes: many events per group is the realistic
 /// evidence-log shape (clones drop from ~2N to ~G there); the last is a stress case.
-const SHAPES: &[(usize, usize, usize)] = &[
-    (2_048, 16, 24),
-    (8_192, 24, 40),
-    (16_384, 32, 64),
-];
+const SHAPES: &[(usize, usize, usize)] = &[(2_048, 16, 24), (8_192, 24, 40), (16_384, 32, 64)];
 
 #[derive(Clone, Copy)]
 struct RatioDistribution {

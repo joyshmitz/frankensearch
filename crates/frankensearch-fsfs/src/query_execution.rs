@@ -1266,7 +1266,10 @@ mod tests {
         let cases: Vec<(Vec<LexicalCandidate>, Vec<SemanticCandidate>)> = vec![
             (vec![], vec![]),
             (
-                vec![LexicalCandidate::new("a", 0.9), LexicalCandidate::new("b", 0.5)],
+                vec![
+                    LexicalCandidate::new("a", 0.9),
+                    LexicalCandidate::new("b", 0.5),
+                ],
                 vec![],
             ),
             (vec![], vec![SemanticCandidate::new("x", 0.8)]),
@@ -1294,8 +1297,14 @@ mod tests {
                 ],
             ),
             (
-                vec![LexicalCandidate::new("z", 0.5), LexicalCandidate::new("a", 0.5)],
-                vec![SemanticCandidate::new("a", 0.5), SemanticCandidate::new("z", 0.5)],
+                vec![
+                    LexicalCandidate::new("z", 0.5),
+                    LexicalCandidate::new("a", 0.5),
+                ],
+                vec![
+                    SemanticCandidate::new("a", 0.5),
+                    SemanticCandidate::new("z", 0.5),
+                ],
             ),
         ];
         for k in [0.0_f64, 60.0, 1.5] {

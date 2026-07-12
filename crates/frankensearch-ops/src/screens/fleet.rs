@@ -141,7 +141,11 @@ fn build_project_percentile_values_legacy(
     let p95 = instances
         .iter()
         .filter(|item| item.project == project)
-        .filter_map(|item| search_metrics.get(&item.id).map(|metric| metric.p95_latency_us))
+        .filter_map(|item| {
+            search_metrics
+                .get(&item.id)
+                .map(|metric| metric.p95_latency_us)
+        })
         .collect();
     ProjectPercentileValues {
         docs,

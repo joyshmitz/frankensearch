@@ -82,9 +82,30 @@ fn ratio_distribution(mut samples: Vec<f64>) -> RatioDistribution {
 /// representative input for the negation normalizer's hot path.
 fn ascii_document(seed: usize, words: usize) -> String {
     const VOCAB: &[&str] = &[
-        "Vector", "search", "INDEX", "shard", "Latency", "p95", "Throughput", "ranking",
-        "Embedding", "cosine", "TOKEN", "Filter", "exclude", "danger", "Zone", "Segment",
-        "Merge", "COMPACT", "recall", "Precision", "budget", "Query", "class", "Refine",
+        "Vector",
+        "search",
+        "INDEX",
+        "shard",
+        "Latency",
+        "p95",
+        "Throughput",
+        "ranking",
+        "Embedding",
+        "cosine",
+        "TOKEN",
+        "Filter",
+        "exclude",
+        "danger",
+        "Zone",
+        "Segment",
+        "Merge",
+        "COMPACT",
+        "recall",
+        "Precision",
+        "budget",
+        "Query",
+        "class",
+        "Refine",
     ];
     let mut out = String::with_capacity(words * 8);
     for i in 0..words {
@@ -138,7 +159,10 @@ fn prove_parity(ascii: &[String], non_ascii: &[String]) {
             bench_normalize_for_negation_match_reference(value),
             "fast path must equal reference for ASCII input {value:?}"
         );
-        assert!(value.is_ascii(), "ascii corpus entry must be ASCII: {value:?}");
+        assert!(
+            value.is_ascii(),
+            "ascii corpus entry must be ASCII: {value:?}"
+        );
         ascii_checked += 1;
     }
     for value in non_ascii {

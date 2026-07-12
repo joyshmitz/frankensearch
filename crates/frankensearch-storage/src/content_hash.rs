@@ -517,7 +517,12 @@ mod tests {
         assert_eq!(ContentHasher::to_hex(&[0xff; 32]), write_hex(&[0xff; 32]));
         assert_eq!(ContentHasher::to_hex(&[0x0f; 32]), write_hex(&[0x0f; 32]));
 
-        for text in ["", "hello world", "rust async search pipeline", "日本語 τεστ"] {
+        for text in [
+            "",
+            "hello world",
+            "rust async search pipeline",
+            "日本語 τεστ",
+        ] {
             assert_eq!(
                 ContentHasher::hash_hex(text),
                 ContentHasher::to_hex(&ContentHasher::hash(text)),

@@ -71,7 +71,10 @@ fn bench(c: &mut Criterion) {
                 .collect();
         new_v.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
         orig_v.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
-        assert_eq!(new_v, orig_v, "merge_ranked != orig for n={n} overlap={overlap}");
+        assert_eq!(
+            new_v, orig_v,
+            "merge_ranked != orig for n={n} overlap={overlap}"
+        );
 
         let run_orig = || {
             black_box(QueryExecutionOrchestrator::merge_ranked_orig(

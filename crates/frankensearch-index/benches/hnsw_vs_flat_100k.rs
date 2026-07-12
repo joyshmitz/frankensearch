@@ -97,8 +97,10 @@ fn bench_hnsw_vs_flat_100k(c: &mut Criterion) {
     // F16-quantized slab (`search_top_k_int8_two_pass` falls back to exact on F32). Same
     // vectors, so its latency and recall are directly comparable to `flat` and HNSW here —
     // this is the baseline ANN would actually have to beat, not the naive flat scan.
-    let path_f16 =
-        std::env::temp_dir().join(format!("fs_hnsw_bench_100k_f16_{}.fsvi", std::process::id()));
+    let path_f16 = std::env::temp_dir().join(format!(
+        "fs_hnsw_bench_100k_f16_{}.fsvi",
+        std::process::id()
+    ));
     {
         let mut writer =
             VectorIndex::create_with_revision(&path_f16, "hash", "bench", DIM, Quantization::F16)

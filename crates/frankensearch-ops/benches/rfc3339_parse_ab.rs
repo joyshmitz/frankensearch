@@ -162,13 +162,13 @@ fn adversarial_corpus() -> Vec<String> {
         "2026-07-11T20:60:00Z".to_owned(),
         "2026-07-11T20:37:60Z".to_owned(), // leap second, unsupported by `time`
         // Fraction edge cases.
-        "2026-07-11T20:37:46.Z".to_owned(),          // empty fraction
+        "2026-07-11T20:37:46.Z".to_owned(), // empty fraction
         "2026-07-11T20:37:46.1234567890Z".to_owned(), // 10 fractional digits
         // Structural junk.
         "2026-07-11 20:37:46Z".to_owned(), // space separator
         "2026/07/11T20:37:46Z".to_owned(),
         "not-a-timestamp".to_owned(),
-        "2026-07-11T20:37:46".to_owned(), // no zone
+        "2026-07-11T20:37:46".to_owned(),   // no zone
         "2026-07-11T20:37:46Z ".to_owned(), // trailing space
         String::new(),
         // Below the fast-path year floor (valid RFC3339, must defer).

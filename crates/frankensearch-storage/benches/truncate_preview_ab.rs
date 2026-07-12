@@ -33,7 +33,11 @@ fn ascii_doc(chars: usize) -> String {
 }
 
 fn multibyte_doc(chars: usize) -> String {
-    "café déjà 日本語 τест 🚀 ".chars().cycle().take(chars).collect()
+    "café déjà 日本語 τест 🚀 "
+        .chars()
+        .cycle()
+        .take(chars)
+        .collect()
 }
 
 fn bench(c: &mut Criterion) {
