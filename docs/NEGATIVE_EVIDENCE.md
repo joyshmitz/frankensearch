@@ -13001,3 +13001,20 @@ landed the patch-equivalent source as `08ef9680`; this run independently reprodu
 worker. Focused strict-remote release tests passed 6/6, including iterator-vs-slice bit identity. Production keep;
 the old collect wrapper remains only behind `bench-internals` so the result stays reproducible. No local Cargo
 fallback ran.
+
+### 2026-07-12 — cc_fse — CAPSTONE: NQC dense down-weight is autonomously COMPLETE; no perf lever remains
+
+The one new improvement this campaign surfaced (the opt-in NQC dense down-weight) is now fully built to the edge
+of what autonomous work can do — all pieces landed + tested + measured: signal `nqc_cv` (+ alloc-free `nqc_cv_iter`,
+~1.3-1.7x, `08ef9680`), cv→weight mapping `NqcDenseWeight` (percentile CDF, `d5788a8d`), deployment sample-builder
+`from_query_scores` (`6483af3c`), sync wiring (`d735d6f2`) + async phase-1 wiring (`1d6ade78`), composition/enabled-
+path/latency/deployment tests all green (876+ fusion tests), and the full synthesis in `SEARCH_QUALITY_FINDINGS.md`.
+The ENABLE recipe is autonomous: `NqcDenseWeight::from_query_scores(query_log_scores)` →
+`searcher.with_nqc_dense_downweight(0.5, w_min>0, sketch)`. **No perf lever remains on the ownable surface** (CPU
+frontier exhaustively floored; the last fresh instance — the NQC enabled-path alloc — was independently converged by
+Codex + cc_fse and is fixed; the collect-then-reduce family is closed with no other production site). The ONLY
+remaining NQC work is genuinely PRODUCT/DESIGN, not autonomous: (1) the phase-1-only-vs-phase-2-reapply design call
+(phase-2 is a vector blend, `f0960bee`); (2) enable + A/B on the REAL production embedder (all harness numbers are
+potion/model2vec proxy). Continued perf-only loop iterations from here yield feature-hardening, honest negatives, or
+peer-convergence reconciliations — not fresh levers. The productive next step is a product decision (enable/A-B the
+NQC feature, or one of the older product-gated default flips in `SEARCH_QUALITY_FINDINGS.md`).
