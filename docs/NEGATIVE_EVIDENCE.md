@@ -12735,3 +12735,35 @@ dense-dependent. ARC CONCLUSION: dense-gating is a real but MODEST, corpus-calib
 savings at average-neutral quality), not the ¾-skip free lunch the oracle teased. The stronger remaining play is
 the QUALITY reframe (down-weight dense on high-NQC queries) since the oracle's +0.02–0.04 is a quality ceiling that
 needs no scan-skipping and no per-corpus safety concern. No Rust change.
+
+### 2026-07-12 — cc_fse — QUALITY WIN (robust, LANDABLE): NQC-adaptive dense DOWN-WEIGHT beats equal-weight fusion on 4/4 corpora — the soft version the hard gate couldn't be (CORRECTS b495a73e)
+
+Perf check this turn: `collect::<Vec>()`→`.into_iter()` (collect-then-consume) — zero hits in fusion/index/lexical.
+Clean. Closed the dense-adaptive-fusion question with the SOFT twin of the (corpus-dependent) hard gate: instead of
+SKIPPING dense on high-commitment queries, DOWN-WEIGHT it. `fused = w_dense(cv)*dense_norm + lex_norm`, `w_dense =
+1 − β·pctrank(cv100)` (dense weighted less on high-NQC queries; β=0 is the shipped equal-weight pool-min-max).
+`docs/quality_harness/soft_downweight.py`, stem+stop, 4 corpora, nDCG@10, Δ vs β=0 baseline:
+
+| corpus | β=0.25 | β=0.5 | β=0.75 | β=1.0 |
+|---|---:|---:|---:|---:|
+| scifact | +0.0016 | +0.0060 | +0.0040 | +0.0049 |
+| nfcorpus | +0.0015 | +0.0026 | +0.0011 | +0.0017 |
+| arguana | +0.0008 | +0.0011 | +0.0025 | +0.0026 |
+| scidocs | +0.0011 | +0.0024 | +0.0030 | +0.0034 |
+
+**ROBUST WIN: all 16 cells POSITIVE** — every β on every corpus beats equal-weight fusion (β=0.5: mean +0.0030 /
+min +0.0011; β=1.0: mean +0.0032 / min +0.0017). This is the first NEW robust label-free quality improvement of the
+whole investigation, and it is LANDABLE (a query-adaptive dense weight in the fusion kernel, keyed on a lexical-only
+NQC statistic — no labels, no per-corpus calibration, always runs dense so NO latency change and NO corpus-safety
+risk). **CORRECTS the `b495a73e` arc conclusion** (which assumed the quality-reframe faced the same corpus-dependence
+as the hard gate): it does NOT. Mechanism — the HARD gate DROPS dense entirely (w=0) on high-cv queries and so loses
+dense's help on nfcorpus (where committed queries still need it); the SOFT down-weight only REDUCES dense's weight,
+capturing the reduced-drag benefit (dense is net-harmful on ~¾ of queries, `87083b18`) while retaining dense's minority
+upside → net-positive everywhere. Magnitude is modest (+0.001..+0.006, mean ~+0.003, single-run no-CI) but the
+CONSISTENCY (16/16 positive across β and corpus) is strong evidence it is real, unlike the z-score WASH (`6f3cdc95`).
+Deployment note: production maps cv→weight via an offline cv distribution (a rolling query sample; the engine already
+sees the query stream) rather than in-set pctrank. LAND path: `w_dense = clip(1 − β·NQC_pct, w_min, 1)` in the
+pool-min-max fusion kernel (frankensearch-fusion), NQC = cv of top-k BM25 scores from the lexical tier; β≈0.5–1.0.
+This is a distinct DEPLOYABLE quality lever (query-distribution-adaptive tier weighting), realized where the general
+label-free tier-weight auto-tune (`72b68de`) failed — because it is a DIRECTIONAL monotone (high-NQC→less-dense),
+grounded in the measured oracle, not a free per-query continuous fit. No Rust this turn (Python-measured).
