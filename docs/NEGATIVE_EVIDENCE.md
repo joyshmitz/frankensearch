@@ -12968,3 +12968,36 @@ the async path is DELIBERATE DESIGN WORK** (decide whether the down-weight appli
 the phase-2 blend, and prove the final refined ranking behaves as intended — with tests), NOT a safe autonomous
 mirror of the sync wiring. It stays deferred; the sync path already ships the feature. This closes the async-wiring
 question (no further scoping needed) — it is a scoped task for deliberate/human implementation. No code change.
+
+### 2026-07-12 — Codex — WIN: NQC enabled path reduces lexical scores without a temporary `Vec<f32>` — ~1.28–1.52×, bit-identical
+
+Negative-ledger-first inspection found one fresh exception to the completed collect-then-reiterate sweep: the
+newly wired opt-in `SyncTwoTierSearcher` NQC path collected every lexical `ScoredResult::score` into a temporary
+`Vec<f32>` solely to call `nqc_cv`. The lever moves the unchanged f64 sum/sum-square/count loop behind
+`nqc_cv_iter` and feeds the lexical score iterator directly. The default `beta <= 0` path remains an early return;
+only the enabled path changes. Score order, non-finite filtering, count, arithmetic order, percentile lookup,
+fusion ordering, and tie-breaking are unchanged.
+
+The retained comparator calls feature-gated crate functions for the exact former collect path and the shipping
+iterator path, asserting equal `f32::to_bits()` before timing. Strict remote-only command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 \
+  env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-fusion --profile release --features bench-internals \
+  --bench nqc_cv_cost_ab
+```
+
+Worker `vmi1149989`; one release binary; 41 alternating rounds, `inner=2048`; ratio is iterator/collect:
+
+| lexical hits | A/A collect null median [p5, p95] | iterator/collect median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 20 | 0.9940 [0.7191, 1.3981] | **0.6907 [0.5272, 0.8082]** | **DECIDABLE WIN**, ~1.45× |
+| 100 | 0.9852 [0.8174, 1.0793] | **0.7815 [0.7071, 1.0184]** | **DECIDABLE WIN**, ~1.28× |
+| 1,000 | 0.9937 [0.9203, 1.0745] | **0.6559 [0.6012, 0.7202]** | **DECIDABLE WIN**, ~1.52× |
+
+Every candidate median clears its own null p5, including the default top-100 shape. A concurrent mainline commit
+landed the patch-equivalent source as `08ef9680`; this run independently reproduces the keep on a strict-remote
+worker. Focused strict-remote release tests passed 6/6, including iterator-vs-slice bit identity. Production keep;
+the old collect wrapper remains only behind `bench-internals` so the result stays reproducible. No local Cargo
+fallback ran.

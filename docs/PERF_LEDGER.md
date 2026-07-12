@@ -32,6 +32,16 @@ non-semantic/no-quality mode; that reduced the old catastrophic vector-scan resi
 not a universal Tantivy-class win, so the slower natural-language rows are recorded in
 `docs/NEGATIVE_EVIDENCE.md`.
 
+## 2026-07-12 — WIN: NQC enabled-path iterator reduction removes one allocation — ~1.28–1.52× (Codex)
+
+The newly wired sync NQC down-weight collected lexical scores into a temporary `Vec<f32>` and immediately
+reiterated it. `nqc_cv_iter` now consumes the scores directly while preserving the exact f64 operation order and
+`f32` result bits; default-off behavior is unchanged. Same-binary strict-remote A/B on `vmi1149989` (41 rounds,
+`inner=2048`) measured iterator/collect medians **0.6907** at 20 hits, **0.7815** at the default 100 hits, and
+**0.6559** at 1,000 hits. Each cleared its A/A null p5 (0.7191 / 0.8174 / 0.9203), so the win is decisive across
+all shapes. The comparator asserts bit identity before timing; focused remote release tests passed 6/6. Source
+landed patch-equivalently in `08ef9680`; exact command and intervals are in `docs/NEGATIVE_EVIDENCE.md`.
+
 **Measured command (RCH worker `hz2`, per-crate, warm target dir):**
 ```bash
 RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR \
