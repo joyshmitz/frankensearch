@@ -12245,3 +12245,21 @@ re-iterated → could be a lazy chain eliding an alloc) — grepped fusion/index
 (`index/search.rs:2862`, `rerank/pipeline.rs:571/575`) are TEST code (parity-test heaps / the pipeline test
 module), none in production. That pattern is empty too. Every allocation/partial-selection micro-pattern I
 can enumerate is now checked; further perf turns on this fleet will only reconfirm the floor.
+
+### 2026-07-12 — cc_fse — BLOCKER on the productive vein: the search-QUALITY BEIR harness is GONE (prior-session scratchpad cleaned up) — needs a rebuild before quality findings can resume
+
+With the perf CPU surface at floor, checked feasibility of the documented productive vein (search-QUALITY,
+memory `search-quality-vein-and-harness` / `pivot-to-quality-pool-minmax-fusion`). **The pure-Python
+model2vec+rank_bm25 BEIR harness no longer exists**: its scratchpad (`…/426037fc-…/scratchpad`, `$D`) was
+cleaned up, and a filesystem sweep found NO surviving venv (`*/venv/bin/python`), BEIR datasets
+(`corpus.jsonl` for scifact/nfcorpus/arguana/scidocs), model2vec HF cache (`*potion*`), or harness scripts
+(`neighbor_smooth*.py`/`hubness*.py`/`nqc.py`) anywhere under `/data/tmp` or `/home/ubuntu`. So the quality
+vein is NOT a "quick bench" this turn — it first needs a REBUILD: (1) `python -m venv` + `pip install
+model2vec rank_bm25` (network); (2) fetch the `potion-retrieval-32M` model from HF (network); (3) download
+BEIR zips from `https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{scifact,nfcorpus,arguana,
+scidocs}.zip` (network, ~100s MB, disk); (4) reimplement the harness (embed corpus, BM25Okapi index, hybrid
+fusion, nDCG@10 eval). That is a multi-step setup task, appropriate as a dedicated increment, not a one-shot
+lever. **Net state of the campaign: perf CPU frontier exhaustively at floor (this fleet); concurrency/bandwidth
+unmeasurable here (needs idle machine, bd-e41k class); quality vein blocked on a harness rebuild.** The
+highest-EV next increment is the harness rebuild (unblocks the only vein with remaining measured gains),
+which does not fit the "rch cargo-bench perf lever" loop shape.
