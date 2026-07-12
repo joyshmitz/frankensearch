@@ -12794,3 +12794,32 @@ query-side hubness builder `ba5052a`), NOT a fixed `β·cv`. This is a slightly 
 sketch) but standard. LESSON: an adaptive-weight lever validated with in-set percentile ranks is NOT deployable as
 a fixed raw-signal function when the signal's scale is corpus-dependent — verify transfer before scoping the land.
 No Rust this turn.
+
+### 2026-07-12 — cc_fse — QUALITY WIN DEPLOYMENT-VALIDATED (land-ready): held-out-CDF NQC dense down-weight is leakage-free robust 4/4
+
+Perf check clean (`Vec::contains` in a loop = O(n²) membership: only interaction_lanes:844 on a tiny QueryClass enum
+set + test/setup — no hot search-path O(n²)). Closed the LAST validation gap for the dense-downweight win
+(`9c1943df`, land-scoped `46393282`): the TRUE deployment path. Split each corpus's queries into a calibration half
+(odd index) and a disjoint eval half (even index); build the cv empirical CDF from CALIB ONLY; apply
+`w_dense = clip(1 − β·CDF_calib(cv), 0, 1)` to the UNSEEN eval half (`docs/quality_harness/heldout_cdf_downweight.py`).
+This exactly matches the shipping design (offline/rolling query-sample cv sketch → weight live queries). stem+stop,
+nDCG@10 on the eval half, Δ vs eval baseline:
+
+| corpus | eval_q | β=0.5 | β=1.0 |
+|---|---:|---:|---:|
+| scifact | 150 | +0.0113 | +0.0039 |
+| nfcorpus | 162 | +0.0014 | +0.0004 |
+| arguana | 703 | +0.0004 | +0.0013 |
+| scidocs | 500 | +0.0039 | +0.0033 |
+
+**DEPLOYMENT-VALIDATED: 4/4 corpora POSITIVE on both β, leakage-free.** β=0.5: mean +0.0042 / min +0.0004 (even
+STRONGER than the in-set-pctrank +0.0030, so not an in-set artifact). The held-out CDF captures the corpus's cv
+distribution well enough that unseen eval queries get correctly-normalized weights. This closes the dense-downweight
+arc: the lever is a fully de-risked, LAND-READY label-free quality win. **Final land spec (frankensearch-fusion pool-
+min-max kernel):** (1) lexical tier exposes `NQC = cv(top-k BM25 scores) = std/mean`; (2) a streaming cv-quantile
+sketch (t-digest/GK over the query stream, refreshed periodically — same infra family as the query-hubness builder
+`ba5052a`, and t-digest is already a shipped dep per `frontier-exhausted`) yields `CDF(cv)`; (3) fuse with
+`w_dense = clip(1 − β·CDF(cv), w_min, 1)`, β≈0.5, applied to the dense-tier normalized score before the pool-min-max
+sum; (4) opt-in config `dense_nqc_downweight_beta` (default 0 = current behavior) so it's non-breaking + A/B-able.
+Expected: ~+0.002..+0.004 nDCG@10, robust cross-corpus, latency-neutral (always runs dense; NQC is a cheap reduction
+over scores the lexical tier already has). Measured end-to-end in Python; Rust land is the multi-turn next step.
