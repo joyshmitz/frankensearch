@@ -68,6 +68,45 @@ pub fn min_max_normalize(scores: &mut [f32]) {
     }
 }
 
+/// Query-commitment signal (NQC): the population coefficient of variation (σ/μ) of a
+/// score slice — higher means a more peaked/"committed" retrieval.
+///
+/// Non-finite values are ignored. Returns `0.0` for empty input, no finite values, or a
+/// non-positive mean (the intended input is the top-k BM25 scores of a query, which are
+/// positive in practice). Accumulation is in `f64` for numerical stability.
+///
+/// This is the label-free, dense-free signal behind the opt-in *NQC dense down-weight*
+/// (`docs/NEGATIVE_EVIDENCE.md`, 2026-07-12: dense is net-neutral/harmful on ~3/4 of
+/// queries; down-weighting it on high-NQC queries is a small aggregate-significant nDCG
+/// gain, pooled 95% CI `[+0.0008, +0.0035]`). This is the foundational statistic only —
+/// the per-deployment cv→percentile CDF mapping and the fusion weight application are
+/// separate pieces of that (not-yet-wired, default-off) feature.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // f64 stats -> f32 score domain; precision loss is intentional
+pub fn nqc_cv(scores: &[f32]) -> f32 {
+    let mut sum = 0.0_f64;
+    let mut sum_sq = 0.0_f64;
+    let mut count = 0_u32;
+    for &value in scores {
+        if value.is_finite() {
+            let v = f64::from(value);
+            sum += v;
+            sum_sq += v * v;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    let n = f64::from(count);
+    let mean = sum / n;
+    if mean <= f64::from(NUMERIC_EPSILON) {
+        return 0.0;
+    }
+    let variance = (sum_sq / n - mean * mean).max(0.0);
+    (variance.sqrt() / mean) as f32
+}
+
 /// In-place z-score normalization.
 ///
 /// Finite values are standardized and then linearly mapped to `[0, 1]` by
@@ -145,7 +184,7 @@ pub fn normalize_scores_with_method(scores: &[f32], method: NormalizationMethod)
 #[cfg(test)]
 mod tests {
     use super::{
-        NormalizationMethod, min_max_normalize, normalize_in_place, normalize_scores,
+        NormalizationMethod, min_max_normalize, nqc_cv, normalize_in_place, normalize_scores,
         normalize_scores_with_method, z_score_normalize,
     };
 
@@ -180,6 +219,39 @@ mod tests {
         let mut scores = vec![5.0, f32::NAN, f32::INFINITY, 10.0];
         min_max_normalize(&mut scores);
         assert_approx_slice(&scores, &[0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn nqc_cv_matches_population_coefficient_of_variation() {
+        // mean=3, population var=2, std=sqrt(2) -> cv = sqrt(2)/3.
+        let cv = nqc_cv(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!((cv - (2.0_f32).sqrt() / 3.0).abs() <= 1e-5, "cv={cv}");
+    }
+
+    #[test]
+    fn nqc_cv_zero_variance_is_zero() {
+        assert_eq!(nqc_cv(&[5.0, 5.0, 5.0]), 0.0);
+    }
+
+    #[test]
+    fn nqc_cv_empty_and_no_finite_is_zero() {
+        assert_eq!(nqc_cv(&[]), 0.0);
+        assert_eq!(nqc_cv(&[f32::NAN, f32::INFINITY]), 0.0);
+    }
+
+    #[test]
+    fn nqc_cv_ignores_non_finite_values() {
+        let with = nqc_cv(&[1.0, 2.0, 3.0, f32::NAN, f32::INFINITY, 5.0]);
+        let without = nqc_cv(&[1.0, 2.0, 3.0, 5.0]);
+        assert!((with - without).abs() <= 1e-6, "with={with} without={without}");
+    }
+
+    #[test]
+    fn nqc_cv_more_peaked_scores_have_higher_cv() {
+        // A committed retrieval (one dominant score) is more peaked than a flat one.
+        let peaked = nqc_cv(&[10.0, 1.0, 1.0, 1.0]);
+        let flat = nqc_cv(&[4.0, 3.0, 3.0, 4.0]);
+        assert!(peaked > flat, "peaked={peaked} flat={flat}");
     }
 
     #[test]

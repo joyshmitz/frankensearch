@@ -81,7 +81,7 @@ pub use interaction_oracles::{
 };
 pub use mmr::{MmrConfig, mmr_rerank};
 pub use normalize::{
-    NormalizationMethod, min_max_normalize, normalize_in_place, normalize_scores,
+    NormalizationMethod, min_max_normalize, nqc_cv, normalize_in_place, normalize_scores,
     normalize_scores_with_method, z_score_normalize,
 };
 pub use ope::{
