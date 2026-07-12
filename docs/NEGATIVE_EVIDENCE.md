@@ -12420,3 +12420,20 @@ case. LESSON: a "skip the O(n) scan" lever only clears the floor when the scan i
 Unicode transform) — a bare ASCII char count is not. `deterministic_truncate` (redaction.rs) and `truncate_tail`
 (runtime.rs) were already bounded/optimal; the fsfs truncate-family sweep is now closed (1 win, 1 reject, 2
 already-optimal). Reverted via Edit + `rm` bench; production unchanged.
+
+### 2026-07-12 — cc_fse — REJECTED (family-defining): double-alloc→single-alloc on a SHORT string is INSIDE-FLOOR (~1.2×, doesn't clear the null)
+
+The allocation-elimination sweep (memory route-next "prioritize alloc-eliminating sites") surfaced one clean
+candidate: `normalize_model_key` (fsfs runtime.rs) does `chars().filter(is_ascii_alphanumeric).collect::<String>()
+.to_ascii_lowercase()` = TWO allocs, fusable to ONE via `map(|c| c.to_ascii_lowercase()).collect()` (byte-identical
+for ASCII — no Greek final-sigma subtlety under to_ASCII_lowercase). Measured the transform self-contained in the
+FAST core crate (avoiding fsfs's 25min compile) over 5 realistic model keys, within-process A/B, byte-identical:
+two-alloc **197.09 ns/key** → one-alloc **164.90 ns/key**, ratio 0.8367 vs A/A null p5 **0.7814** → **INCONCLUSIVE**
+(does not clear the noise floor). **Family verdict:** eliminating ONE of TWO allocs on a short string (~1.2×) is
+inside-floor — the surviving alloc + the char filter/iterate still dominate, so the relative gain is small and the
+null band (wide for a µbench) swallows it. Contrast host_bucket (`bd47ed1e`), which cleared the floor at ~1.98×
+because it went 1 alloc → **0** (borrow `&str`) AND the remaining op was a trivial compare. **Refined rule for the
+sibling-grep method: an alloc-elimination lever clears the floor only when it removes the LAST alloc (→ borrow/zero)
+or eliminates an alloc that is O(large-input); a 2→1 alloc reduction on a short string does not.** `normalize_model_key`
+(cold model-resolution path anyway — no end-to-end home) NOT landed; bench removed (numbers preserved here); no
+production change. This closes the allocation-elimination sweep of the fast crates.
