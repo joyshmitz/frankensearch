@@ -233,6 +233,12 @@ pub struct AlertsSloScreen {
     project_filter_index: usize,
     reason_filter_index: usize,
     host_filter_index: usize,
+    // Distinct filter-value lists, cached (rebuilt in update_state only when the
+    // fleet changes, mirroring timeline/historical_analytics) so the per-sync
+    // clamp/cycle/render reads don't re-scan ~32k events each time.
+    project_filter_values: Vec<String>,
+    reason_filter_values: Vec<String>,
+    host_filter_values: Vec<String>,
     severity_filter: SeverityFilter,
     project_screen_id: ScreenId,
     live_stream_screen_id: ScreenId,
@@ -294,6 +300,9 @@ impl AlertsSloScreen {
             project_filter_index: 0,
             reason_filter_index: 0,
             host_filter_index: 0,
+            project_filter_values: vec!["all".to_owned()],
+            reason_filter_values: vec!["all".to_owned()],
+            host_filter_values: vec!["all".to_owned()],
             severity_filter: SeverityFilter::All,
             project_screen_id: ScreenId::new("ops.project"),
             live_stream_screen_id: ScreenId::new("ops.live_stream"),
@@ -319,8 +328,17 @@ impl AlertsSloScreen {
 
     /// Update state from shared app snapshot.
     pub fn update_state(&mut self, state: &AppState) {
+        // Cached filter values are a pure function of the fleet; AppState.fleet is
+        // an Arc shared across clones until update_fleet replaces it, so a
+        // pointer-equal fleet means nothing changed — skip the rebuild (which scans
+        // ~32k events) that sync_screen_states would otherwise repeat per navigation.
+        // Same guard as timeline (a85f549d) / historical_analytics (12835bc5).
+        let fleet_changed = !std::ptr::eq(self.state.fleet(), state.fleet());
         let focused = self.selected_alert_key();
         self.state = state.clone();
+        if fleet_changed {
+            self.rebuild_filter_values();
+        }
         self.clamp_filter_indices();
         self.restore_selected_alert(focused);
     }
@@ -486,7 +504,11 @@ impl AlertsSloScreen {
     // directly yields the identical `BTreeSet` with none of that overhead
     // (`all_alerts` maps events 1:1, so the field-sets are unchanged).
 
-    fn project_filters(&self) -> Vec<String> {
+    /// Recompute the three distinct filter-value lists from the current fleet and
+    /// cache them. Called from `update_state` only when the fleet changed. The
+    /// three sets are built while `fleet` is borrowed, then assigned (so the field
+    /// writes don't overlap the shared borrow).
+    fn rebuild_filter_values(&mut self) {
         let fleet = self.state.fleet();
         // Same id->project map as `all_alerts` (or_insert = first occurrence).
         let mut instance_projects: AHashMap<&str, &str> =
@@ -507,35 +529,39 @@ impl AlertsSloScreen {
                     .to_owned()
             })
             .collect();
-        let mut values = vec!["all".to_owned()];
-        values.extend(projects);
-        values
-    }
-
-    fn reason_filters(&self) -> Vec<String> {
-        let reasons: BTreeSet<String> = self
-            .state
-            .fleet()
+        let reasons: BTreeSet<String> = fleet
             .lifecycle_events
             .iter()
             .map(|event| event.reason_code.clone())
             .collect();
-        let mut values = vec!["all".to_owned()];
-        values.extend(reasons);
-        values
-    }
-
-    fn host_filters(&self) -> Vec<String> {
-        let hosts: BTreeSet<String> = self
-            .state
-            .fleet()
+        let hosts: BTreeSet<String> = fleet
             .lifecycle_events
             .iter()
             .map(|event| Self::host_bucket(&event.instance_id))
             .collect();
-        let mut values = vec!["all".to_owned()];
-        values.extend(hosts);
-        values
+
+        let mut project_values = vec!["all".to_owned()];
+        project_values.extend(projects);
+        let mut reason_values = vec!["all".to_owned()];
+        reason_values.extend(reasons);
+        let mut host_values = vec!["all".to_owned()];
+        host_values.extend(hosts);
+
+        self.project_filter_values = project_values;
+        self.reason_filter_values = reason_values;
+        self.host_filter_values = host_values;
+    }
+
+    fn project_filters(&self) -> Vec<String> {
+        self.project_filter_values.clone()
+    }
+
+    fn reason_filters(&self) -> Vec<String> {
+        self.reason_filter_values.clone()
+    }
+
+    fn host_filters(&self) -> Vec<String> {
+        self.host_filter_values.clone()
     }
 
     fn project_for_instance(&self, instance_id: &str) -> Option<&str> {
@@ -1883,6 +1909,21 @@ mod tests {
             AlertsSloScreen::active_filter_value(0, || panic!("list builder must not run")),
             None
         );
+    }
+
+    #[test]
+    fn update_state_skips_filter_rebuild_when_fleet_unchanged_but_keeps_values() {
+        let mut screen = AlertsSloScreen::new();
+        let state = sample_state();
+        screen.update_state(&state);
+        let projects = screen.project_filters().len();
+        let reasons = screen.reason_filters().len();
+        // Re-applying the SAME AppState shares the fleet Arc → rebuild is skipped;
+        // the cached filter-value lists must remain intact.
+        screen.update_state(&state);
+        assert_eq!(screen.project_filters().len(), projects);
+        assert_eq!(screen.reason_filters().len(), reasons);
+        assert!(projects >= 1 && reasons >= 1);
     }
 
     #[test]
