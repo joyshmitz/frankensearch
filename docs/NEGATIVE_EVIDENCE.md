@@ -13531,6 +13531,16 @@ identity would not clear the floor. **The hasher/container micro-optimization su
 integer-key identity/dense-Vec) is now exhaustively closed; the one real win it held (ops string SETs, 2.5×) is
 landed.**
 
+**Third container angle — BTree→Hash-lookup-only swap (the ops `e3c1b2c9` winner) in the search crates = NULL
+(2026-07-13).** Grepped every string-keyed `BTreeMap`/`BTreeSet` in fusion/index/core/lexical: they are either
+(a) opt-in `graph_rank` (`ranks`/`out_sum`/`next` BTreeMaps — `graph` feature, smoothing-off default → below-bar
+per the adjacency closure), or (b) ORDERING-LOAD-BEARING for deterministic serialization — `core`'s
+`generation`/`activation`/`commit_replay`/`e2e_artifact` config/commit/artifact metadata maps use BTree for
+reproducible serialized order, so a Hash swap would break deterministic output (KEEP). NO query-hot lookup-only
+BTree exists to swap. So all three container-optimization patterns from ops (string-set aHash, integer-key
+identity/dense-Vec, BTree→Hash-lookup-only) are confirmed inapplicable to the search crates' query paths — the ops
+container wins were UI-render/state-specific.
+
 ### 2026-07-13 — cc_fse — RESOLVED (by construction, no bench): the last two untested-labeled perf route-nexts — single-pass / large-graph flat CSR on `graph_rank` — are below-bar
 
 The `graph_rank` flat-CSR lever was REJECTED measured (1.22-1.29× slower, two-pass build doubled the per-edge
