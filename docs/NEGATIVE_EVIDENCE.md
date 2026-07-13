@@ -13579,6 +13579,15 @@ no bench.** With this, the pattern-family sweep (quadratic / pass-fusion / redun
 min-max / truncate-before-materialize / Cow-borrow / Arc-share) is confirmed empty on the fusion searcher
 orchestration as well as ops — every ownable default-hot pattern-family surface is drained.
 
+**Extended to the LEXICAL crate (2026-07-13) = also NULL.** Same quadratic grep over
+`frankensearch-lexical` (`cass_compat.rs` 121 KB, `lib.rs` 80 KB): every non-test `.iter().any(...)` is a
+SINGLE-pass scan (token/term predicate, not nested), and the only collection `.contains` inside a `.filter`
+(`lib.rs:629` `managed_files.contains(path)`) is in `benchmark_index_layout` — a COLD diagnostic (index-byte
+accounting, not per-query) over tantivy's managed-files SET (O(1)). The lexical query path is tantivy-backed
+(external BM25 scoring — not ownable Rust). So the hidden-quadratic pattern is confirmed ABSENT from the search
+crates' query paths (fusion orchestration + lexical); it was an ops-render-specific artifact (per-event
+instance-id resolution against `fleet.instances`).
+
 ### 2026-07-13 — cc_fse — PERF-LOOP VERDICT: micro-lever surface fully drained; the ONE real remaining perf lever (dense-scan gating) is a multi-turn corpus-calibrated FEATURE, not a single-turn increment
 
 Consolidating the perf-loop's terminal state (this entry views the dense-gating arc from the PERF vantage; the
