@@ -13064,3 +13064,28 @@ for top-100 query-score batches without a materially different workload where NQ
 The first strict-remote attempt failed before timing on a comparator-only `usize`/`u32` repeat-count mismatch; the
 corrected run above passed and executed remotely. Focused strict-remote release validation passed 6/6 NQC-weight
 tests, including the new exact sorted-CV bit-parity test. No local Cargo fallback ran.
+
+### 2026-07-12 — cc_fse — NQC A/B (thesis CONFIRMED on the committed-lexical regime): known-item down-weight monotonically improves MRR +0.0025
+
+Toward the enable+A/B direction (user-chosen). The Rust real-embedding A/B (`real_hybrid_knownitem`, wired
+`d5cdda8d`) is INFRA-BLOCKED from rch: it reads local `FS_CORPUS_*`/`FS_QUERY_*` artifact files that rch cannot ship
+to the remote worker, and building locally violates the remote-only constraint (memory: real-embedding harness runs
+LOCALLY). So ran the SAME known-item task in Python (`docs/quality_harness/known_item_nqc.py`, potion +
+`rank_bm25` stem+stop + the shipped pool-min-max fusion + NQC down-weight logic): queries = first ~10 words of 400
+held-out scifact docs, target = that doc. These are strongly committed-lexical (a literal doc prefix) → high NQC,
+the regime the thesis says the down-weight helps MOST. Result (pool-min-max, `w_min=0.1`):
+
+| beta | recall@10 | MRR@10 |
+|---|---:|---:|
+| 0.0 (baseline) | 1.0000 | 0.9833 |
+| 0.25 | 1.0000 | 0.9846 |
+| 0.5 | 1.0000 | 0.9858 |
+| 0.75–1.0 | 1.0000 | 0.9858 |
+
+**Thesis CONFIRMED: the NQC dense down-weight MONOTONICALLY improves MRR (+0.0025), recall saturated at 1.0.** On
+these committed-lexical queries the lexical tier ranks the target #1 (literal prefix), and the dense tier was
+occasionally demoting it; down-weighting recovers rank-1. Saturates at beta≥0.5. This is the strongest committed-
+lexical regime, so +0.0025 MRR is the upper end; the earlier BEIR nDCG@10 A/B (mixed query types) was +0.0022
+pooled — consistent direction. Caveat: still potion/model2vec + rank_bm25 (not real Tantivy BM25 / the Rust fusion
+binary) — the Rust `real_hybrid_knownitem` bench runs the identical task on the real code path and is ready for a
+LOCAL run with generated potion slabs (the one remaining step needs local build+run, outside rch-remote-only).
