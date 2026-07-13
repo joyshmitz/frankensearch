@@ -823,7 +823,9 @@ impl AlertsSloScreen {
             })
             .collect::<Vec<_>>();
 
-        rows.sort_by(|left, right| {
+        // Unstable is byte-identical: one row per distinct project (grouped by
+        // project) with `project` as the final tiebreak = strict total order.
+        rows.sort_unstable_by(|left, right| {
             right
                 .burn_ratio
                 .total_cmp(&left.burn_ratio)

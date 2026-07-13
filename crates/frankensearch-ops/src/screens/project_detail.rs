@@ -501,7 +501,9 @@ impl ProjectDetailScreen {
             }
         }
 
-        cards.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        // Unstable is byte-identical: one card per instance with `instance.id`
+        // (`.1`) as the final tiebreak = strict total order.
+        cards.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
 
         let mut lines = vec![Line::from("Top anomaly cards:")];
         if cards.is_empty() {

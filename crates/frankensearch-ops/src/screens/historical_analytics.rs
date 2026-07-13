@@ -212,7 +212,9 @@ fn build_correlation_rows(
         })
         .collect::<Vec<_>>();
 
-    result.sort_by(|left, right| {
+    // Unstable is byte-identical: one row per distinct reason_code with
+    // `reason_code` as the final tiebreak = strict total order.
+    result.sort_unstable_by(|left, right| {
         right
             .stream_correlation
             .cmp(&left.stream_correlation)
@@ -284,7 +286,9 @@ fn build_correlation_rows_legacy_owned(
         })
         .collect::<Vec<_>>();
 
-    result.sort_by(|left, right| {
+    // Unstable is byte-identical: one row per distinct reason_code with
+    // `reason_code` as the final tiebreak = strict total order.
+    result.sort_unstable_by(|left, right| {
         right
             .stream_correlation
             .cmp(&left.stream_correlation)

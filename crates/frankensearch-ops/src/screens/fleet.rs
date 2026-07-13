@@ -926,7 +926,9 @@ impl FleetOverviewScreen {
         }
 
         let mut cards: Vec<(String, ProjectAccumulator)> = accumulators.into_iter().collect();
-        cards.sort_by(|(left_project, left), (right_project, right)| {
+        // Unstable is byte-identical: one card per distinct project with `project`
+        // as the final tiebreak = strict total order.
+        cards.sort_unstable_by(|(left_project, left), (right_project, right)| {
             right
                 .unhealthy_count
                 .cmp(&left.unhealthy_count)
