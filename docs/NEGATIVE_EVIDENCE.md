@@ -13317,3 +13317,44 @@ Criterion independently measured owned extraction at 51.628–57.180 us and borr
 canonicalization or ingest latency. The benchmark parity gate passed before timing; focused production code-block
 validation passed 6/6 strict-remote release tests on `vmi1227854`, including tagged, unclosed, short, long, and
 multiple-block cases plus the byte-exact slow oracle. No local Cargo fallback ran.
+
+### 2026-07-13 — Codex — REJECT: bounded fenced-code line retention regresses long blocks by ~1.70×
+
+Negative-ledger-first inspection revisited fenced-code retention after the one-pass writer, direct-append, and
+borrowed-language keeps shifted the remaining cost. Production still collected every body line in a reusable
+`Vec<&str>`, although collapse output keeps only the first 20 and last 10 lines. The candidate replaced that
+linear collection with one reusable 30-pointer circular accumulator that counted omitted lines and rotated the
+tail in place. This is distinct from the June slice-join rejection: that attempt removed output-time scratch
+vectors while `join`/`format!` dominated; this attempt bounded input retention itself after those dominant
+intermediates were gone.
+
+The temporary same-binary comparator retained the exact pre-change push/clear loop and asserted complete output
+equality before timing over 512 mixed 2–230-line blocks and 24 blocks of 4,096 lines. The rejected source also
+carried a temporary edge-shape oracle for empty, threshold, wrapped-tail, `head=0`, `tail=0`, both-zero,
+language-label, and non-empty-prefix cases; the decisive benchmark regression made a separate test run unnecessary.
+
+Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 RCH_WORKER=vmi1264463 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-core --profile release \
+  --features bench-internals --bench collapse_code_block_ab -- code_line_retention
+```
+
+Worker `vmi1264463`; one release binary; 41 alternating rounds; `inner=4`; ratio is bounded/current:
+
+| workload | A/A current null median [p5, p95] | bounded/current median [p5, p95] | verdict |
+|---|---:|---:|---|
+| `code_line_retention/mixed_512blk` | 1.0076 [0.7900, 1.2988] | 1.2134 [1.0049, 1.5415] | **INSIDE NULL FLOOR** |
+| `code_line_retention/long_24x4096` | 1.0128 [0.8071, 1.2230] | **1.7046 [1.4877, 1.8950]** | **DECIDABLE REGRESSION** |
+
+Criterion agreed: mixed collection was 161.03–169.86 us versus 198.89–212.85 us bounded, and long collection
+was 136.23–143.03 us versus 311.66–335.74 us bounded. The old vector's amortized linear pointer writes are much
+cheaper than the candidate's per-omitted-line branch, indexed overwrite, and tail rotation; reducing peak retained
+pointers from 4,096 to 30 does not pay on this CPU workload. **Decision: REJECT.** Production source and benchmark
+were restored byte-for-byte; this commit retains only the negative boundary. Do not retry a per-line circular
+retention buffer for this 20/10 collapse policy without independent memory-pressure evidence or a materially
+different bulk/chunked design. The completed Cargo command exited 0 on RCH with a cold remote cache; no local
+fallback ran.
