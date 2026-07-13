@@ -13578,3 +13578,37 @@ instance-id resolution against `fleet.instances`), structurally absent from the 
 no bench.** With this, the pattern-family sweep (quadratic / pass-fusion / redundant-copy / hasher / container /
 min-max / truncate-before-materialize / Cow-borrow / Arc-share) is confirmed empty on the fusion searcher
 orchestration as well as ops — every ownable default-hot pattern-family surface is drained.
+
+### 2026-07-13 — cc_fse — PERF-LOOP VERDICT: micro-lever surface fully drained; the ONE real remaining perf lever (dense-scan gating) is a multi-turn corpus-calibrated FEATURE, not a single-turn increment
+
+Consolidating the perf-loop's terminal state (this entry views the dense-gating arc from the PERF vantage; the
+arc's evidence is scattered across per-experiment QUALITY entries `fd855205`…`87083b18`…). Two conclusions:
+
+1. **The byte-identical micro-lever surface is exhaustively drained** — verified this session from every distinct
+   angle: hasher/container (ops string-SETs landed 2.5× `e1cbc30c`; search-crate sets, integer-key
+   identity/dense-Vec = NULL); the highest-EV pattern (hidden quadratic, 2-65× in ops) is structurally absent from
+   the fusion searcher (O(1)-indexed score data); every untested-labeled route-next (flat-CSR single-pass/large,
+   adjacency, tombstone-bitmap, concurrency, alloc-elimination) resolved to closed/blocked/below-bar. No
+   single-turn "quick-bench, commit-this-turn" perf increment remains on the ownable CPU surface.
+
+2. **The ONE real remaining perf lever is DENSE-SCAN GATING (skip the dominant int8 scan when lexical NQC says
+   dense won't help) — but it is NOT a micro-lever:** it is a cross-crate feature (lexical `cv100` = coeff-of-var
+   of top-k BM25 scores → searcher dense-scan decision) that (a) is corpus-calibrated and NOT robustly Pareto
+   label-free (`0b…`/combined-gate: at f≥10% at least one corpus — always nfcorpus, which genuinely needs dense on
+   its committed queries — goes meaningfully negative), so a safe deploy needs per-corpus/operating-point
+   knowledge; (b) as a pure latency lever, f≈40% skip is only *average-neutral* quality (mean −0.0001, ±0.005
+   per-corpus swing); (c) requires the `cv100`/NQC primitive + an offline cv-distribution (rolling query sample)
+   for deployment-faithful percentile mapping. Real EV, but a multi-turn feature with a product operating-point
+   decision (latency saved vs per-corpus quality risk), not a byte-identical micro-lever.
+
+   Its LANDABLE robust twin is the SOFT dense DOWN-WEIGHT (`9c1943df`, all 16 β×corpus cells positive, mean
+   +0.003) — but that is a QUALITY lever (dense still runs → latency-NEUTRAL), and also needs the cv-percentile
+   infra. **LAND-PATH SPEC (shared primitive for both):** a Rust `nqc_cv(top_k_bm25_scores: &[f32]) -> f32`
+   (std/mean, label-free, in the lexical tier) + a cv→percentile map from a rolling query-sample cv-distribution;
+   then EITHER `w_dense = clip(1 − β·NQC_pct, w_min, 1)` in the pool-min-max fusion kernel (quality, safe, robust)
+   OR a `skip dense if NQC_pct > θ` gate in the searcher (latency, corpus-calibrated, riskier). Both need a
+   cross-crate wire + a chosen operating point — human/product scoping, not an autonomous micro-commit.
+
+**Bottom line for the perf loop: there is no further autonomous single-turn CPU perf lever. The remaining EV is
+the dense-gating/down-weight feature (needs scoping) or an idle machine for uncontended concurrency/large-N
+(blocked `bd-e41k`). Continuing to request micro-levers will only yield increasingly marginal NULLs.**
