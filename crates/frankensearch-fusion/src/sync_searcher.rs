@@ -299,6 +299,11 @@ impl SyncTwoTierSearcher {
         metrics.lexical_candidates = lexical_hits.as_ref().map_or(0, Vec::len);
 
         let rrf_started = Instant::now();
+        let query_semantic_weight = lexical_hits
+            .as_ref()
+            .map_or(self.rrf_semantic_weight, |lexical| {
+                self.effective_semantic_weight(lexical)
+            });
         let initial_results = lexical_hits.as_ref().map_or_else(
             || vector_hits_to_scored_results(&fast_hits, k, ScoreSource::SemanticFast, None, None),
             |lexical| {
@@ -314,7 +319,7 @@ impl SyncTwoTierSearcher {
                         &RrfConfig {
                             k: self.config.rrf_k,
                             lexical_weight: self.rrf_lexical_weight,
-                            semantic_weight: self.effective_semantic_weight(lexical),
+                            semantic_weight: query_semantic_weight,
                             tiebreak: self.rrf_tiebreak,
                         },
                     ),
@@ -406,7 +411,7 @@ impl SyncTwoTierSearcher {
                     &RrfConfig {
                         k: self.config.rrf_k,
                         lexical_weight: self.rrf_lexical_weight,
-                        semantic_weight: self.effective_semantic_weight(lexical),
+                        semantic_weight: query_semantic_weight,
                         tiebreak: self.rrf_tiebreak,
                     },
                 ),

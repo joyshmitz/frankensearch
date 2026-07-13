@@ -13131,7 +13131,8 @@ ratio is one reduction/two reductions:
 Every median clears its own null p5. **Decision: KEEP.** Scope is enabled, populated NQC on the synchronous
 full two-phase path; fast-only and unavailable/failing quality paths already computed the weight once, while
 no-lexical/default-off behavior remains unchanged. The ratios cover only this NQC subregion, not whole-search
-latency. No local Cargo fallback ran.
+latency. Focused strict-remote release validation passed 4/4 NQC down-weight tests on `vmi1149989`, including
+sync end-to-end composition and fusion-flow coverage. No local Cargo fallback ran.
 
 ### 2026-07-12 — cc_fse — NQC A/B (thesis CONFIRMED on the committed-lexical regime): known-item down-weight monotonically improves MRR +0.0025
 

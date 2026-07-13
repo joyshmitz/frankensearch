@@ -168,7 +168,77 @@ fn bench_empty_weight() {
     }
 }
 
+fn bench_populated_weight_reuse() {
+    let weight = NqcDenseWeight::from_sample(&[0.05, 0.1, 0.2, 0.3, 0.5, 0.8]);
+    let beta = 0.5;
+    let w_min = 0.1;
+    let semantic_weight = 1.3;
+    let inner = std::env::var("NQC_REUSE_AB_INNER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_048);
+
+    for n in [20_usize, 100, 1_000] {
+        let hits = make_hits(n);
+        let first = bench_nqc_empty_weight_early(&hits, &weight, beta, w_min, semantic_weight);
+        let second = bench_nqc_empty_weight_early(&hits, &weight, beta, w_min, semantic_weight);
+        let reused = bench_nqc_empty_weight_early(&hits, &weight, beta, w_min, semantic_weight);
+        assert_eq!(
+            first.to_bits(),
+            second.to_bits(),
+            "duplicate NQC weight changed for n={n}"
+        );
+        assert_eq!(
+            first.to_bits(),
+            reused.to_bits(),
+            "reused NQC weight changed for n={n}"
+        );
+
+        let run_orig = || {
+            let first = black_box(bench_nqc_empty_weight_early(
+                black_box(&hits),
+                black_box(&weight),
+                beta,
+                w_min,
+                semantic_weight,
+            ));
+            let second = black_box(bench_nqc_empty_weight_early(
+                black_box(&hits),
+                black_box(&weight),
+                beta,
+                w_min,
+                semantic_weight,
+            ));
+            black_box((first, second));
+        };
+        let run_cand = || {
+            let reused = black_box(bench_nqc_empty_weight_early(
+                black_box(&hits),
+                black_box(&weight),
+                beta,
+                w_min,
+                semantic_weight,
+            ));
+            black_box((reused, reused));
+        };
+        let null = paired_median_ratio(41, inner, run_orig, run_orig);
+        let lever = paired_median_ratio(41, inner, run_orig, run_cand);
+        eprintln!(
+            "[null]  nqc_populated_reuse/n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] nqc_populated_reuse/n{n}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            verdict(&lever, &null)
+        );
+    }
+}
+
 fn main() {
+    bench_populated_weight_reuse();
     bench_empty_weight();
     bench_sample_builder();
 

@@ -21,6 +21,27 @@ and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
 pre-change baselines or before/after local hot-path ratios unless explicitly
 marked as original-comparator wins.
 
+## 2026-07-12 — WIN: sync two-phase search reuses populated NQC weight — ~1.92–2.00× in the affected region (Codex)
+
+With NQC down-weighting enabled and warmed up, `SyncTwoTierSearcher::search_internal` reduced the
+same immutable lexical scores once for initial RRF fusion and again for refined RRF fusion. It now
+computes that pure `f64` semantic weight once after lexical retrieval and reuses its exact bits in
+both phase configurations. Fast-only, missing-quality, no-lexical, and default-off behavior is
+unchanged; fusion scoring, ordering, and tie-breaking are untouched.
+
+A same-binary comparator asserted exact tuple `f64::to_bits()` equality before timing. Strict-remote
+worker `vmi1227854`, 41 alternating rounds, `inner=2048`; ratio is one reduction/two reductions:
+
+| lexical hits | A/A two-reduction null p5 | reuse/original median | affected-region speedup |
+|---:|---:|---:|---:|
+| 20 | 0.5841 | **0.5197** | **~1.92×** |
+| 100 | 0.8940 | **0.5042** | **~1.98×** |
+| 1,000 | 0.8229 | **0.5010** | **~2.00×** |
+
+Every candidate median clears its own A/A null floor. These ratios describe the populated-NQC
+weight subregion of a full synchronous two-phase search, not end-to-end search latency. Exact
+intervals and the command are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 ## 2026-07-12 — WIN: empty NQC sketch skips its neutral lexical-score scan — ~17–556× in the affected region (Codex)
 
 When NQC down-weighting was enabled before its query-log sketch had warmed up, both the async and
