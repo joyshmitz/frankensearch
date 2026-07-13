@@ -13598,6 +13598,17 @@ accounting, not per-query) over tantivy's managed-files SET (O(1)). The lexical 
 crates' query paths (fusion orchestration + lexical); it was an ops-render-specific artifact (per-event
 instance-id resolution against `fleet.instances`).
 
+**★ OPS-PATTERN × SEARCH-CRATE SWEEP COMPLETE (2026-07-13).** Every ops-render-winning pattern has now been
+checked against the search crates' query paths, all NULL / inapplicable: hidden-quadratic (fusion + lexical),
+string-set aHash, integer-key identity/dense-Vec (`AlignedScoreLookup` already adaptive), BTree→Hash-lookup-only
+(opt-in graph / serialization-ordered), ingest/canonicalize redundant-COPY (core already `_fast`-mined), and
+PASS-FUSION (last checked: rrf/blend/sync_searcher/normalize make only single-pass reductions per fn;
+`min_max_normalize` already fuses min+max). **Unifying reason the ops wins don't transfer: the ops patterns are
+UI-render/fleet-STATE-specific (per-event resolution, N-pass row aggregation, string-keyed state maps), while the
+search query paths are already O(1)-indexed (score maps / dense CSR / `AlignedScoreLookup`), tantivy-backed
+(external BM25), or serialization-ordered. DON'T re-walk the ops patterns in the search crates — this sweep is
+definitive.**
+
 ### 2026-07-13 — cc_fse — PERF-LOOP VERDICT: micro-lever surface fully drained; the ONE real remaining perf lever (dense-scan gating) is a multi-turn corpus-calibrated FEATURE, not a single-turn increment
 
 Consolidating the perf-loop's terminal state (this entry views the dense-gating arc from the PERF vantage; the
