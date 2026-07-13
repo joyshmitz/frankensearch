@@ -13774,3 +13774,74 @@ entries). **The two axes with genuine remaining slack are BOTH blocked on THIS s
 **So the productive vector-scan lever needs a real 130k corpus (unblock early-abandon validation) or VNNI
 hardware — not another micro-primitive bench.** Route-next is concrete and unblockable (provide corpus/embeddings
 on a worker, or a VNNI machine), not "we're maxed."
+
+### 2026-07-13 — IcyRidge — HOLD: eliminating the second cass boolean-query parse is directional but does not clear the full-builder A/A floor (`bd-wz3o`)
+
+**Negative-ledger-first lever.** `cass_build_tantivy_query` tokenizes `raw_query`, then the original nonempty
+path calls `cass_has_boolean_operators(raw_query)`, which tokenizes the same string again. The candidate derives
+the boolean-operator flag from the first token slice and otherwise uses the identical clause/filter/query-tree
+construction. This is distinct from the already rejected QueryParser caching and hand-built-AST families.
+
+**Behavior oracle.** Before timing, the same binary builds both query trees and asserts identical debug
+representations for realistic plain, textual/symbolic boolean, phrase, negation, Unicode, and long queries. The
+focused differential unit oracle covers empty input, operator-only and trailing-operator input, an unterminated
+quote, two filter configurations, and all of those query classes. No end-to-end Tantivy search-latency or ranking
+claim is made: the measured surface is the full cass query builder only.
+
+**Strict remote same-binary gate.** Commit `75f23b49` retained both complete builders in the existing
+`tokenizer_char_walk_ab` harness. The authoritative run used worker `vmi1153651`, 41 paired rounds with inner 16,
+and ratio candidate/original (`<1.0` is faster):
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1153651 RCH_ENV_ALLOWLIST=AGENT_NAME \
+  AGENT_NAME=IcyRidge env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-lexical --features bench-internals \
+  --profile release --bench tokenizer_char_walk_ab -- \
+  boolean_operator_reparse --noplot
+```
+
+| surface | A/A original/original median [p5, p95] | single-parse/original median [p5, p95] | verdict |
+|---|---:|---:|---|
+| full builder, six-query batch | 1.0020 [0.5213, 2.1816] | 0.8244 [0.3097, 1.4125] | **inside null floor** |
+
+The direction is favorable (~1.21× by the paired median), but the required decision boundary is the A/A null p5
+of 0.5213. The candidate median, 0.8244, does not cross it. Independent Criterion rows also overlap: original
+`23.612 us` point estimate (`[21.861, 25.943] us`) versus candidate `21.578 us` (`[20.742, 22.652] us`). That is
+useful routing evidence, not a shippable measured win on this contended worker.
+
+**Decision.** **HOLD; production remains on the original two-parse path.** The single-parse comparator, full
+builder benchmark, and differential oracle remain behind `test`/`bench-internals` so a materially quieter worker
+or larger demonstrated production query shape can reproduce the experiment. The candidate briefly reached main
+in `75f23b49` while the remote gate was still compiling; this closeout restores production before claiming a win.
+Two earlier strict-remote attempts were invalid evidence: one synced across a concurrent main advance and saw a
+stale core API, and one lost its worker target directory during LTO. Neither ran the benchmark, and no local Cargo
+fallback was used.
+
+### 2026-07-13 — cc_fse — QUANTIFIED the algorithmic slack: IVF candidate-reduction is 40×@131k → 82×@524k vs flat (the N≫130k crossover), but conditional on recall + a real baseline
+
+Went after the "algorithmic candidate-reduction" slack the FMA-saturation synthesis identified. Built + benched
+`ivf_crossover_ab` (IVF: probe P=8 of C=√N clusters, scan only their members, vs flat-scan-all, synthetic
+CLUSTERED f32 data, same dot + bounded top-k both arms):
+
+| N | IVF scanned frac | speedup vs flat |
+|---|---|---|
+| 8 192 | 8.9% | 9.97× |
+| 32 768 | 4.5% | 19.99× |
+| 131 072 | 2.2% | 40.79× |
+| 524 288 | 1.1% | 82.29× |
+
+The reduction is ~`8/√N` of candidates → sub-linear speedup ~`√N/8` that ACCELERATES with N — the concrete
+"N≫130k crossover" from [[ann-in-bold-viable]], quantified. **But three honest caveats keep it a CONDITIONAL
+lever, not a landable win:** (1) the flat baseline here uses a slow scalar `load8` (inflates absolute speedups;
+the candidate FRACTION is exact + baseline-independent, the ×-vs-flat is not); (2) the REAL production baseline is
+the LOSSLESS int8 two-pass (~7× vs flat, recall 1.0) — so IVF's edge over it is ≈ speedup/7 (~5.8×@131k,
+~12×@524k), and the prior measurement `93289c7` found ANN TIES int8 two-pass @100k (no benefit ≤130k), consistent
+with this (int8's lossless 7× is competitive with IVF at ≤130k); (3) IVF is APPROXIMATE — probe-P misses top-k in
+unprobed clusters ⇒ recall<1, real-corpus-dependent (this bench measures SPEED only). **ALSO: the early-abandon
+arc already benched this axis extensively** (`cluster_ordered_scan` = lossless query-directed cluster traversal +
+early-abandon; `adsampling_transposed_scan` = approximate concentration-bound; `transposed_abandon_scan`,
+`residual_*`) — so the algorithmic slack is SYNTHETIC-mined, not un-attacked. **Bottom line: IVF/ANN is the real
+lever for N≫130k deployments (speed accelerates past the int8-two-pass baseline ~12× at 524k), but landing it
+needs (a) real-corpus RECALL validation and (b) wiring ANN into the InMemory path (which has none). The
+concrete unblocker is a large-N (>>130k) real corpus + embeddings staged on a worker.** `ivf_crossover_ab`
+retained; production unchanged (bench-only).
