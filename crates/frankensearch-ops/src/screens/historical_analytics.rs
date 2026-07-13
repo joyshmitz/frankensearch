@@ -485,10 +485,19 @@ impl HistoricalAnalyticsScreen {
 
     /// Update state from the shared app snapshot.
     pub fn update_state(&mut self, state: &AppState) {
+        // The derived rows depend ONLY on the fleet snapshot (evidence_rows from
+        // lifecycle_events + instances, and the filter values from those). Since
+        // AppState.fleet is an Arc shared across clones until `update_fleet`
+        // replaces it, a pointer-equal fleet means nothing changed — skip the
+        // O(events) rebuild (up to ~32k EvidenceRow builds + a sort) that
+        // sync_screen_states would otherwise repeat on every navigation / input.
+        let fleet_changed = !std::ptr::eq(self.state.fleet(), state.fleet());
         let focused = self.selected_evidence_key();
         let (project_filter, reason_filter, host_filter) = self.selected_filter_values();
         self.state = state.clone();
-        self.rebuild_derived_rows();
+        if fleet_changed {
+            self.rebuild_derived_rows();
+        }
         self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_row(focused);
@@ -1485,6 +1494,20 @@ mod tests {
         let rows = screen.correlation_rows();
         assert!(!rows.is_empty());
         assert!(rows.iter().any(|row| row.reason_code.contains("lifecycle")));
+    }
+
+    #[test]
+    fn update_state_skips_rebuild_when_fleet_unchanged_but_keeps_derived_rows() {
+        let mut screen = HistoricalAnalyticsScreen::new();
+        let state = sample_state();
+        screen.update_state(&state);
+        let count = screen.evidence_count();
+        assert_eq!(count, 3);
+        // Re-applying the SAME AppState shares the fleet Arc, so rebuild_derived_rows
+        // is skipped; the previously-built evidence/correlation rows must survive.
+        screen.update_state(&state);
+        assert_eq!(screen.evidence_count(), count);
+        assert!(!screen.correlation_rows().is_empty());
     }
 
     #[test]
