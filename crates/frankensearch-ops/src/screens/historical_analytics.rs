@@ -4,6 +4,7 @@
 //! evidence-log exploration, and export-friendly incident review handles.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ahash::AHashMap;
@@ -648,7 +649,7 @@ impl HistoricalAnalyticsScreen {
         &self.evidence_rows
     }
 
-    fn filtered_evidence_rows(&self) -> Vec<EvidenceRow> {
+    fn filtered_evidence_rows(&self) -> Cow<'_, [EvidenceRow]> {
         let project_filter = self
             .project_filters()
             .get(self.project_filter_index)
@@ -665,25 +666,35 @@ impl HistoricalAnalyticsScreen {
             .cloned()
             .filter(|value| value != "all");
 
-        self.all_evidence_rows()
-            .iter()
-            .filter(|row| {
-                project_filter
-                    .as_deref()
-                    .is_none_or(|project| row.project.eq_ignore_ascii_case(project))
-            })
-            .filter(|row| {
-                reason_filter
-                    .as_deref()
-                    .is_none_or(|reason| row.reason_code.eq_ignore_ascii_case(reason))
-            })
-            .filter(|row| {
-                host_filter
-                    .as_deref()
-                    .is_none_or(|host| row.host.eq_ignore_ascii_case(host))
-            })
-            .cloned()
-            .collect()
+        // No active filter → borrow the cached rows instead of cloning ALL of them
+        // (one row per lifecycle event, five Strings each) on every call. The
+        // evidence_rows are already cached (rebuild_derived_rows), so an unfiltered
+        // read needs no allocation at all.
+        if project_filter.is_none() && reason_filter.is_none() && host_filter.is_none() {
+            return Cow::Borrowed(self.all_evidence_rows());
+        }
+
+        Cow::Owned(
+            self.all_evidence_rows()
+                .iter()
+                .filter(|row| {
+                    project_filter
+                        .as_deref()
+                        .is_none_or(|project| row.project.eq_ignore_ascii_case(project))
+                })
+                .filter(|row| {
+                    reason_filter
+                        .as_deref()
+                        .is_none_or(|reason| row.reason_code.eq_ignore_ascii_case(reason))
+                })
+                .filter(|row| {
+                    host_filter
+                        .as_deref()
+                        .is_none_or(|host| row.host.eq_ignore_ascii_case(host))
+                })
+                .cloned()
+                .collect(),
+        )
     }
 
     fn rebuild_filter_values(&mut self) {
@@ -774,7 +785,9 @@ impl HistoricalAnalyticsScreen {
     }
 
     fn restore_selected_row(&mut self, key: Option<(u64, String, String)>) {
-        let rows = self.filtered_evidence_rows();
+        // `into_owned()` here: this method mutates `self.selected_row` while holding
+        // `rows`, so it can't keep a borrow of `self` from the `Cow::Borrowed` arm.
+        let rows = self.filtered_evidence_rows().into_owned();
         if rows.is_empty() {
             self.selected_row = 0;
             return;
