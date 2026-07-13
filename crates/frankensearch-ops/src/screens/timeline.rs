@@ -5,6 +5,8 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 
+use ahash::AHashMap;
+
 use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
 use ftui_render::frame::Frame;
@@ -229,8 +231,8 @@ impl ActionTimelineScreen {
         // (`project_for_instance`), which made this filter O(events * instances).
         // `or_insert` keeps the first occurrence, matching `.find`'s semantics.
         let fleet = self.state.fleet();
-        let instance_projects: Option<HashMap<&str, &str>> = project_filter.map(|_| {
-            let mut map = HashMap::with_capacity(fleet.instances.len());
+        let instance_projects: Option<AHashMap<&str, &str>> = project_filter.map(|_| {
+            let mut map = AHashMap::with_capacity(fleet.instances.len());
             for instance in &fleet.instances {
                 map.entry(instance.id.as_str())
                     .or_insert(instance.project.as_str());
@@ -311,8 +313,8 @@ impl ActionTimelineScreen {
         // `project_for_instance` find (was O(events * instances)); `or_insert`
         // keeps the first occurrence, matching `.find`. Same fix as
         // `filtered_events` (measured 2.2-65.7x in `project_resolve_ab`).
-        let mut instance_projects: HashMap<&str, &str> =
-            HashMap::with_capacity(fleet.instances.len());
+        let mut instance_projects: AHashMap<&str, &str> =
+            AHashMap::with_capacity(fleet.instances.len());
         for instance in &fleet.instances {
             instance_projects
                 .entry(instance.id.as_str())

@@ -4,7 +4,9 @@
 //! error-budget signals, and capacity risk indicators.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+
+use ahash::AHashMap;
 
 use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
@@ -344,8 +346,8 @@ impl AlertsSloScreen {
         // is called several times per render). `or_insert` keeps the first
         // occurrence, matching `.find`. Same fix as the timeline screen
         // (measured 2.2-65.7x in `project_resolve_ab`).
-        let mut instance_projects: HashMap<&str, &str> =
-            HashMap::with_capacity(fleet.instances.len());
+        let mut instance_projects: AHashMap<&str, &str> =
+            AHashMap::with_capacity(fleet.instances.len());
         for instance in &fleet.instances {
             instance_projects
                 .entry(instance.id.as_str())
@@ -433,8 +435,8 @@ impl AlertsSloScreen {
     fn project_filters(&self) -> Vec<String> {
         let fleet = self.state.fleet();
         // Same id->project map as `all_alerts` (or_insert = first occurrence).
-        let mut instance_projects: HashMap<&str, &str> =
-            HashMap::with_capacity(fleet.instances.len());
+        let mut instance_projects: AHashMap<&str, &str> =
+            AHashMap::with_capacity(fleet.instances.len());
         for instance in &fleet.instances {
             instance_projects
                 .entry(instance.id.as_str())

@@ -78,6 +78,9 @@ ftui-widgets = { workspace = true }
 ftui-tty = { workspace = true }
 ftui-backend = { workspace = true }
 
+# Fast (AES-NI) hasher for the hot per-event instance-id lookup maps
+ahash = { workspace = true }
+
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
