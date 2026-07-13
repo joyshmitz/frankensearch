@@ -20,6 +20,7 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
 use frankensearch_core::canonicalize::{
+    code_block_language_borrowed_bench, code_block_language_owned_bench,
     collapse_code_block_fast_bench, collapse_code_block_slow, push_collapsed_code_block_fast_bench,
 };
 
@@ -63,8 +64,21 @@ fn code_blocks() -> Vec<Vec<String>> {
     blocks
 }
 
+fn fence_headers() -> Vec<&'static str> {
+    let pool = [
+        "```",
+        "```rust",
+        "``` python ",
+        "````typescript",
+        "```   ",
+        "```python-with-a-long-language-name",
+    ];
+    (0..4096).map(|i| pool[i % pool.len()]).collect()
+}
+
 fn bench(c: &mut Criterion) {
     let blocks = code_blocks();
+    let headers = fence_headers();
     let refs: Vec<Vec<&str>> = blocks
         .iter()
         .map(|b| b.iter().map(String::as_str).collect())
@@ -77,6 +91,55 @@ fn bench(c: &mut Criterion) {
             collapse_code_block_slow("rust", lines, HEAD, TAIL),
         );
     }
+
+    for header in &headers {
+        assert_eq!(
+            code_block_language_owned_bench(header),
+            code_block_language_borrowed_bench(header),
+        );
+    }
+    let run_owned_lang = || {
+        let mut acc = 0usize;
+        for header in &headers {
+            let lang = code_block_language_owned_bench(black_box(header));
+            acc = acc.wrapping_add(black_box(lang.len()));
+        }
+        black_box(acc);
+    };
+    let run_borrowed_lang = || {
+        let mut acc = 0usize;
+        for header in &headers {
+            let lang = code_block_language_borrowed_bench(black_box(header));
+            acc = acc.wrapping_add(black_box(lang.len()));
+        }
+        black_box(acc);
+    };
+    let lang_null = paired_median_ratio(41, 16, run_owned_lang, run_owned_lang);
+    let lang_lever = paired_median_ratio(41, 16, run_owned_lang, run_borrowed_lang);
+    eprintln!(
+        "[null]  code_block_lang/{}hdr: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        headers.len(),
+        lang_null.median,
+        lang_null.p5,
+        lang_null.p95,
+        lang_null.rounds
+    );
+    eprintln!(
+        "[lever] code_block_lang/{}hdr: borrowed/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        headers.len(),
+        lang_lever.median,
+        lang_lever.p5,
+        lang_lever.p95,
+        if lang_lever.decidable_against(&lang_null) {
+            if lang_lever.median < 1.0 {
+                "DECIDABLE WIN (borrow language)"
+            } else {
+                "DECIDABLE REGRESSION"
+            }
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
 
     let caller_capacity: usize = refs
         .iter()
@@ -210,6 +273,8 @@ fn bench(c: &mut Criterion) {
     g.bench_function("one_pass", |b| b.iter(run_fast));
     g.bench_function("caller_return_push", |b| b.iter(run_via_returned));
     g.bench_function("caller_direct_append", |b| b.iter(run_via_append));
+    g.bench_function("language_owned", |b| b.iter(run_owned_lang));
+    g.bench_function("language_borrowed", |b| b.iter(run_borrowed_lang));
     g.finish();
 }
 

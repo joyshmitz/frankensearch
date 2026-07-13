@@ -21,6 +21,20 @@ and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
 pre-change baselines or before/after local hot-path ratios unless explicitly
 marked as original-comparator wins.
 
+## 2026-07-12 — WIN: fenced-code language labels borrow the input — ~1.74× in the affected region (Codex)
+
+After direct collapsed-block append removed the dominant returned-buffer allocation, each fenced-code opener
+still copied its already-trimmed language suffix into a temporary `String`. The canonicalizer now retains that
+exact `&str` slice from the input document until the fence closes. Closed and unclosed block output, whitespace
+trimming, language tags, line selection, and final ordering are unchanged; the per-fence label allocation is gone.
+
+Strict-remote worker `vmi1227854`, one release binary, 4,096 mixed empty, short, padded, four-backtick, and long
+fence headers, 41 alternating rounds, `inner=16`; borrowed/owned median **0.5737 [0.5494, 0.6009]** versus A/A
+owned null median 0.9883 [0.9270, 1.0215]. The candidate clears the null p5 decisively, approximately **1.74×**
+faster in language-suffix extraction. Criterion independently measured owned extraction at 51.6–57.2 us and
+borrowed extraction at 29.3–32.5 us. This is not a whole canonicalization or ingest latency claim; exact command,
+parity scope, and validation are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 ## 2026-07-12 — WIN: collapsed code blocks append into the final document buffer — ~1.44× (Codex)
 
 After the one-pass code-block builder landed, `strip_markdown_and_code` still allocated its returned

@@ -13281,3 +13281,39 @@ tests on `vmi1149989`; RCH routed that correctness-only command away from the be
 The benchmark's full-output parity gate passed before timing. A redundant exact-filter rerun was cancelled during
 remote compilation after noticing the bare `--exact` name could not select the fully qualified Rust test; it
 produced no evidence and triggered no fallback. All completed Cargo work was fail-closed remote-only.
+
+### 2026-07-12 — Codex — WIN: fenced-code language labels borrow their input slice — ~1.74×
+
+Negative-ledger-first inspection followed the direct code-block append keep into its shifted residual cost. Each
+opening fence still ran the already-required `trim_start_matches('`').trim()` and then allocated a `String` for
+that language label. Unlike the closed short-string allocation families, this is a one-allocation-to-zero borrow:
+the exact suffix already exists as a slice of the original document, whose lifetime spans the complete scan. No
+detection pass, `Cow`, or output representation change was added.
+
+The keep stores that suffix as `&str` until the matching close or the existing unclosed-fence finalization. It
+uses the identical trim chain and passes identical label bytes to the unchanged collapsed-block writer. The
+same-binary comparator retained the pre-change owned extraction and asserted equality for 4,096 headers cycling
+through empty, `rust`, whitespace-padded, four-backtick, whitespace-only, and long-language shapes before timing.
+
+Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 RCH_WORKER=vmi1227854 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-core --profile release \
+  --features bench-internals --bench collapse_code_block_ab
+```
+
+Worker `vmi1227854`; one release binary; 4,096 headers; 41 alternating rounds; `inner=16`; ratio is
+borrowed/owned:
+
+| workload | A/A owned null median [p5, p95] | borrowed/owned median [p5, p95] | verdict |
+|---|---:|---:|---|
+| `code_block_lang/4096hdr` | 0.9883 [0.9270, 1.0215] | **0.5737 [0.5494, 0.6009]** | **DECIDABLE WIN**, ~1.74× |
+
+Criterion independently measured owned extraction at 51.628–57.180 us and borrowed extraction at
+29.272–32.541 us. **Decision: KEEP.** Scope is language-suffix extraction for fenced code blocks, not whole
+canonicalization or ingest latency. The benchmark parity gate passed before timing; focused production code-block
+validation passed 6/6 strict-remote release tests on `vmi1227854`, including tagged, unclosed, short, long, and
+multiple-block cases plus the byte-exact slow oracle. No local Cargo fallback ran.

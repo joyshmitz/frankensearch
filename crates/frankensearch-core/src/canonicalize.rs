@@ -127,7 +127,7 @@ impl DefaultCanonicalizer {
     fn strip_markdown_and_code(&self, text: &str) -> String {
         let mut result = String::with_capacity(text.len());
         let mut in_code_block = false;
-        let mut code_block_lang = String::new();
+        let mut code_block_lang = "";
         let mut code_lines: Vec<&str> = Vec::new();
 
         for line in text.lines() {
@@ -143,12 +143,12 @@ impl DefaultCanonicalizer {
                     );
                     result.push('\n');
                     code_lines.clear();
-                    code_block_lang.clear();
+                    code_block_lang = "";
                     in_code_block = false;
                 } else {
                     // Start of code block
                     in_code_block = true;
-                    code_block_lang = line.trim_start_matches('`').trim().to_string();
+                    code_block_lang = code_block_language(line);
                 }
             } else if in_code_block {
                 code_lines.push(line);
@@ -176,6 +176,32 @@ impl DefaultCanonicalizer {
 
         result
     }
+}
+
+/// Return the language suffix of a fenced-code opener.
+///
+/// The result is already a slice of the canonicalizer's input, so retaining it
+/// for the duration of the block avoids a throwaway `String` allocation. The
+/// caller has already checked that `line` starts with a fence.
+#[inline]
+fn code_block_language(line: &str) -> &str {
+    line.trim_start_matches('`').trim()
+}
+
+/// Pre-borrow owned language extraction retained for same-binary benchmarks.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn code_block_language_owned_bench(line: &str) -> String {
+    code_block_language(line).to_owned()
+}
+
+/// Shipping borrowed language extraction exposed for same-binary benchmarks.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn code_block_language_borrowed_bench(line: &str) -> &str {
+    code_block_language(line)
 }
 
 /// Append `lines` joined by `'\n'` (no trailing newline) directly into `out` —
@@ -1093,6 +1119,7 @@ mod tests {
         let canon = DefaultCanonicalizer::default();
         let input = "text\n```rust\nfn main() {}\n```\nmore";
         let result = canon.canonicalize(input);
+        assert!(result.contains("[code: rust]"));
         assert!(result.contains("fn main()"));
         assert!(result.contains("more"));
     }
