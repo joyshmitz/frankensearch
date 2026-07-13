@@ -20,7 +20,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
-use frankensearch_lexical::cass_compat::{cass_cjk_collect_fast, cass_cjk_collect_slow};
+use frankensearch_lexical::cass_compat::{
+    cass_cjk_bigrams_direct, cass_cjk_bigrams_staged, cass_cjk_collect_fast, cass_cjk_collect_slow,
+};
+use tantivy::tokenizer::Token;
 
 /// Realistic all-CJK token corpus: runs of Han / Hiragana / Katakana / Hangul
 /// with no whitespace (the shape the bigram decomposer actually receives).
@@ -47,8 +50,26 @@ fn cjk_tokens() -> Vec<String> {
     tokens
 }
 
+fn assert_token_parity(original: &[Token], candidate: &[Token]) {
+    assert_eq!(original.len(), candidate.len());
+    for (original, candidate) in original.iter().zip(candidate) {
+        assert_eq!(original.text, candidate.text);
+        assert_eq!(original.position, candidate.position);
+        assert_eq!(original.offset_from, candidate.offset_from);
+        assert_eq!(original.offset_to, candidate.offset_to);
+        assert_eq!(original.position_length, candidate.position_length);
+    }
+}
+
 fn bench(c: &mut Criterion) {
     let tokens = cjk_tokens();
+    let template = Token {
+        text: String::new(),
+        position: 7,
+        offset_from: 11,
+        offset_to: 42,
+        position_length: 3,
+    };
 
     // Parity before timing: fused == two-pass on the decompose path...
     for t in &tokens {
@@ -61,6 +82,16 @@ fn bench(c: &mut Criterion) {
             cass_cjk_collect_slow(t),
             "parity for {t:?}"
         );
+    }
+
+    let mut staged = Vec::new();
+    let mut direct = Vec::new();
+    for t in &tokens {
+        staged.clear();
+        direct.clear();
+        cass_cjk_bigrams_staged(t, &template, &mut staged);
+        cass_cjk_bigrams_direct(t, &template, &mut direct);
+        assert_token_parity(&staged, &direct);
     }
 
     let run_fast = || {
@@ -77,6 +108,55 @@ fn bench(c: &mut Criterion) {
         }
         black_box(acc);
     };
+    let run_staged = || {
+        let mut pending = Vec::new();
+        let mut acc = 0usize;
+        for t in &tokens {
+            pending.clear();
+            cass_cjk_bigrams_staged(black_box(t), black_box(&template), &mut pending);
+            acc = acc.wrapping_add(pending.len());
+            black_box(&pending);
+        }
+        black_box(acc);
+    };
+    let run_direct = || {
+        let mut pending = Vec::new();
+        let mut acc = 0usize;
+        for t in &tokens {
+            pending.clear();
+            cass_cjk_bigrams_direct(black_box(t), black_box(&template), &mut pending);
+            acc = acc.wrapping_add(pending.len());
+            black_box(&pending);
+        }
+        black_box(acc);
+    };
+
+    let pending_null = paired_median_ratio(41, 4, run_staged, run_staged);
+    let pending_lever = paired_median_ratio(41, 4, run_staged, run_direct);
+    eprintln!(
+        "[null]  cjk_pending/{}tok: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        tokens.len(),
+        pending_null.median,
+        pending_null.p5,
+        pending_null.p95,
+        pending_null.rounds
+    );
+    eprintln!(
+        "[lever] cjk_pending/{}tok: direct/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        tokens.len(),
+        pending_lever.median,
+        pending_lever.p5,
+        pending_lever.p95,
+        if pending_lever.decidable_against(&pending_null) {
+            if pending_lever.median < 1.0 {
+                "DECIDABLE WIN (direct pending)"
+            } else {
+                "DECIDABLE REGRESSION"
+            }
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
 
     // NULL (slow vs slow) then lever (slow=ORIG vs fast). Ratio = fast/ORIG, <1.0 = fused wins.
     let null = paired_median_ratio(41, 4, run_slow, run_slow);
@@ -110,6 +190,8 @@ fn bench(c: &mut Criterion) {
     g.sample_size(30);
     g.bench_function("two_pass", |b| b.iter(run_slow));
     g.bench_function("one_pass", |b| b.iter(run_fast));
+    g.bench_function("staged_pending", |b| b.iter(run_staged));
+    g.bench_function("direct_pending", |b| b.iter(run_direct));
     g.finish();
 }
 

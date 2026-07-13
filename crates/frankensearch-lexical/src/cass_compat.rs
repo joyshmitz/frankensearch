@@ -411,6 +411,51 @@ pub fn cass_cjk_collect_slow(text: &str) -> Option<Vec<char>> {
     Some(chars)
 }
 
+/// Pre-optimization CJK bigram materialization retained for same-binary benchmarks.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn cass_cjk_bigrams_staged(text: &str, token: &Token, pending: &mut Vec<Token>) {
+    let Some(chars) = cass_cjk_collect_fast(text) else {
+        return;
+    };
+    let mut bigrams: Vec<Token> = Vec::with_capacity(chars.len());
+    for i in (0..chars.len() - 1).rev() {
+        let mut bigram = String::with_capacity(8);
+        bigram.push(chars[i]);
+        bigram.push(chars[i + 1]);
+        bigrams.push(Token {
+            text: bigram,
+            position: token.position,
+            offset_from: token.offset_from,
+            offset_to: token.offset_to,
+            position_length: token.position_length,
+        });
+    }
+    pending.extend(bigrams);
+}
+
+/// Direct-to-pending CJK bigram materialization candidate for same-binary benchmarks.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn cass_cjk_bigrams_direct(text: &str, token: &Token, pending: &mut Vec<Token>) {
+    let Some(chars) = cass_cjk_collect_fast(text) else {
+        return;
+    };
+    pending.reserve(chars.len() - 1);
+    for i in (0..chars.len() - 1).rev() {
+        let mut bigram = String::with_capacity(8);
+        bigram.push(chars[i]);
+        bigram.push(chars[i + 1]);
+        pending.push(Token {
+            text: bigram,
+            position: token.position,
+            offset_from: token.offset_from,
+            offset_to: token.offset_to,
+            position_length: token.position_length,
+        });
+    }
+}
+
 /// A [`TokenFilter`] that decomposes tokens consisting entirely of CJK
 /// characters into overlapping character bigrams.
 ///
@@ -470,12 +515,12 @@ impl<T: TokenStream> CjkBigramDecomposeStream<'_, T> {
 
         // Build bigrams in reverse so `.pop()` yields them left-to-right.
         // We replace the original token entirely with bigrams.
-        let mut bigrams: Vec<Token> = Vec::with_capacity(chars.len());
+        self.pending.reserve(chars.len() - 1);
         for i in (0..chars.len() - 1).rev() {
             let mut bigram = String::with_capacity(8);
             bigram.push(chars[i]);
             bigram.push(chars[i + 1]);
-            bigrams.push(Token {
+            self.pending.push(Token {
                 text: bigram,
                 position: token.position,
                 offset_from: token.offset_from,
@@ -484,9 +529,7 @@ impl<T: TokenStream> CjkBigramDecomposeStream<'_, T> {
             });
         }
 
-        // Clear the original token text and replace with bigrams via pending.
         // The first bigram is popped first (it's at the end of the vec).
-        self.pending.extend(bigrams);
     }
 }
 

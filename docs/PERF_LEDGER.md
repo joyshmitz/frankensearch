@@ -21,6 +21,21 @@ and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
 pre-change baselines or before/after local hot-path ratios unless explicitly
 marked as original-comparator wins.
 
+## 2026-07-12 — WIN: CJK bigrams build directly in the reusable pending buffer — ~1.77× in the affected region (Codex)
+
+After the one-pass CJK decoder landed, `CjkBigramDecomposeStream::decompose_cjk` still allocated a
+temporary `Vec<Token>` for every all-CJK run and then moved its contents into the stream's existing
+`pending` vector. The bigrams are now constructed directly in `pending` after reserving the exact
+additional capacity. The reverse loop, string construction, token metadata, and subsequent `.pop()`
+order are identical; only the intermediate vector allocation and transfer disappear.
+
+The retained same-binary comparator checked every token field and vector order before timing.
+Strict-remote worker `vmi1149989`, 2,048 realistic 2–31-character CJK tokens, 41 alternating rounds,
+`inner=4`; direct/staged median **0.5654 [0.4544, 0.6604]** versus A/A null median
+0.9939 [0.8716, 1.2107]. The candidate clears the null p5 decisively, approximately **1.77×** faster
+in bigram materialization. This is not a whole index/query latency claim. Exact command and the
+strict-remote preflight note are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 ## 2026-07-12 — WIN: sync two-phase search reuses populated NQC weight — ~1.92–2.00× in the affected region (Codex)
 
 With NQC down-weighting enabled and warmed up, `SyncTwoTierSearcher::search_internal` reduced the

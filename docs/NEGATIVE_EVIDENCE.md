@@ -13173,3 +13173,37 @@ LOCAL run with generated potion slabs (the one remaining step needs local build+
 - Guard is `.all(pred)` and the collect keeps `pred`-matching chars → for the taken branch the guard scans the WHOLE input (all() runs to completion when every char matches) = a real second pass → **FUSEABLE, bench it** (index-side CJK 2.79×).
 - Guard is `.any(pred)` → it short-circuits on the FIRST match, so the guard is ~O(1) for the taken branch = **nothing to fuse, INSIDE FLOOR, skip** (query-side CJK, this entry).
 This closes the query-side CJK path and refines the double-decode method: only `all()`/`position()`/full-scan guards are fusion candidates; `any()`/`find()`/short-circuit guards are already effectively free on the hot branch.
+
+### 2026-07-12 — Codex — WIN: direct CJK bigram construction removes the temporary token vector — ~1.77×, exact tokens
+
+Negative-ledger-first inspection followed the newly landed CJK decode-pass fusion into its shifted hotspot.
+`CjkBigramDecomposeStream::decompose_cjk` built every run's bigrams in a fresh `Vec<Token>` and immediately moved
+them into the stream's empty, capacity-retaining `pending` vector. The candidate reserves `chars.len() - 1` slots
+in `pending` and pushes the identical tokens there directly. It preserves the reverse index range, each bigram's
+UTF-8 string construction, all token metadata, vector order, and therefore the left-to-right `.pop()` output.
+
+The retained same-binary comparator runs the exact staged original and direct candidate with a persistent pending
+buffer. Before timing it compares text, position, offsets, position length, count, and order for every produced
+token. Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-lexical --profile release \
+  --features bench-internals --bench cjk_bigram_decompose_ab
+```
+
+Worker `vmi1149989`; one release binary; 2,048 realistic 2–31-character CJK tokens; 41 alternating rounds;
+`inner=4`; ratio is direct/staged:
+
+| workload | A/A staged null median [p5, p95] | direct/staged median [p5, p95] | verdict |
+|---|---:|---:|---|
+| `cjk_pending/2048tok` | 0.9939 [0.8716, 1.2107] | **0.5654 [0.4544, 0.6604]** | **DECIDABLE WIN**, ~1.77× |
+
+Criterion independently measured staged pending at 1.155–1.282 ms and direct pending at 0.749–0.814 ms.
+**Decision: KEEP.** Scope is the bigram-materialization region for all-CJK tokens, not whole index/query latency.
+The first strict-remote attempt was refused before Cargo execution with `RCH-E410` because a concurrent core bench
+manifest entry reached the sync before its new source file; rerunning after that peer file appeared passed preflight
+and executed remotely. Focused strict-remote release validation passed 3/3 CJK bigram tests on `vmi1149989`,
+covering multi-bigram order, single-character fallback, and ASCII passthrough. No local fallback ran.
