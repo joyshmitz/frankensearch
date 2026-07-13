@@ -64,7 +64,7 @@ use crate::mmr::MmrConfig;
 use crate::mmr::mmr_rerank;
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
-use crate::normalize::{NqcDenseWeight, nqc_cv_iter};
+use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -147,6 +147,11 @@ pub struct TwoTierSearcher {
     nqc_downweight_beta: f32,
     nqc_downweight_w_min: f32,
     nqc_dense_weight: NqcDenseWeight,
+    /// Opt-in *self-driving* rolling NQC dense down-weight (default off). Takes precedence over
+    /// the static sketch above and learns the query distribution online. See
+    /// [`Self::with_nqc_dense_downweight_adaptive`]. Behind a `Mutex` so per-query observation
+    /// mutates the rolling state while `search` stays `&self`.
+    nqc_adaptive: Option<Mutex<AdaptiveNqcDenseWeight>>,
     adaptive_fusion: Option<Arc<AdaptiveFusion>>,
     score_calibrator: Option<CalibratorConfig>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
@@ -199,6 +204,7 @@ impl TwoTierSearcher {
             nqc_downweight_beta: 0.0,
             nqc_downweight_w_min: 0.0,
             nqc_dense_weight: NqcDenseWeight::new(),
+            nqc_adaptive: None,
             adaptive_fusion: None,
             score_calibrator: None,
             circuit_breaker: None,
@@ -280,10 +286,47 @@ impl TwoTierSearcher {
         self
     }
 
+    /// Enable the **self-driving rolling** NQC dense down-weight (default OFF).
+    ///
+    /// Unlike [`Self::with_nqc_dense_downweight`] (a caller-supplied static sketch), this builds
+    /// and refreshes the cv→percentile sketch *online* from the observed query stream via an
+    /// [`AdaptiveNqcDenseWeight`] — no external sample management. It takes precedence over the
+    /// static sketch when both are set. Cold start is **neutral** (empty sketch → weight `1.0`,
+    /// byte-identical fusion) until `min_samples` queries warm it, so it is safe to enable by
+    /// default. `beta <= 0` disables it. See [`AdaptiveNqcDenseWeight::new`] for the parameters.
+    #[must_use]
+    pub fn with_nqc_dense_downweight_adaptive(
+        mut self,
+        beta: f32,
+        w_min: f32,
+        capacity: usize,
+        min_samples: usize,
+        rebuild_every: usize,
+    ) -> Self {
+        self.nqc_adaptive = Some(Mutex::new(AdaptiveNqcDenseWeight::new(
+            beta,
+            w_min,
+            capacity,
+            min_samples,
+            rebuild_every,
+        )));
+        self
+    }
+
     /// The dense-tier phase-1 fusion weight for this query: the static `rrf_semantic_weight`,
     /// scaled by the per-query NQC dense down-weight when enabled (`beta > 0`). Off (default)
     /// returns `rrf_semantic_weight` unchanged with zero extra work.
     fn effective_semantic_weight(&self, lexical: &[ScoredResult]) -> f64 {
+        // The self-driving rolling down-weight takes precedence: it observes this query's NQC
+        // (warming the online sketch) and scores it against the sketch from prior queries.
+        if let Some(adaptive) = &self.nqc_adaptive {
+            let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
+            let factor = adaptive
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .weight_for_cv(cv);
+            return self.rrf_semantic_weight * f64::from(factor);
+        }
         if self.nqc_downweight_beta <= 0.0 {
             return self.rrf_semantic_weight;
         }
@@ -6330,6 +6373,48 @@ mod tests {
         let eff = on.effective_semantic_weight(&hits);
         assert!((eff - 0.5 * on.rrf_semantic_weight).abs() < 1e-6, "eff={eff}");
         assert!(eff < on.rrf_semantic_weight);
+    }
+
+    #[test]
+    fn builder_nqc_dense_downweight_adaptive_cold_start_then_warms() {
+        use frankensearch_core::ScoreSource;
+        let lex_hit = |id: &str, score: f32| ScoredResult {
+            doc_id: id.into(),
+            score,
+            source: ScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(score),
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        };
+        let searcher = TwoTierSearcher::new(
+            build_test_index(4),
+            Arc::new(StubEmbedder::new("f", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_rrf_weights(1.0, 1.0)
+        .with_nqc_dense_downweight_adaptive(0.5, 0.05, 128, 8, 4);
+
+        // Cold start: the online sketch is empty, so fusion is byte-identical to the base.
+        let flat = [lex_hit("a", 5.0), lex_hit("b", 5.0), lex_hit("c", 5.0)];
+        assert_eq!(
+            searcher.effective_semantic_weight(&flat).to_bits(),
+            searcher.rrf_semantic_weight.to_bits(),
+            "cold-start online sketch is neutral"
+        );
+        // Warm the sketch, then a high-NQC query is down-weighted below the base weight.
+        for _ in 0..12 {
+            let _ = searcher.effective_semantic_weight(&flat);
+        }
+        let peaked = [lex_hit("a", 100.0), lex_hit("b", 1.0), lex_hit("c", 0.5)];
+        let weight = searcher.effective_semantic_weight(&peaked);
+        assert!(
+            weight < searcher.rrf_semantic_weight,
+            "high-NQC query down-weighted after the online sketch warms up, got {weight}"
+        );
     }
 
     #[test]
