@@ -388,10 +388,12 @@ impl AdaptiveNqcDenseWeight {
         self.sampler.observe(cv);
         self.since_rebuild += 1;
         if self.since_rebuild >= self.rebuild_every {
-            // In-place rebuild: reuse the sketch's Vec capacity + a fast unstable total-order
-            // sort (the sampler is all-finite). An empty iter → empty (neutral) sketch during the
-            // pre-`min_samples` warm-up. Avoids the two per-rebuild allocations + stable
-            // partial_cmp sort of the old `sampler.sketch()` path (measured ~3x cheaper).
+            // In-place rebuild: reuse the sketch's Vec capacity + an unstable total-order sort
+            // (the sampler is all-finite). An empty iter → empty (neutral) sketch during the
+            // pre-`min_samples` warm-up. Avoids the old `sampler.sketch()` path's DOUBLE collect
+            // (2 allocs) + stable partial_cmp sort. NOTE: timing-NEUTRAL (nqc_adaptive_cost_ab:
+            // ~614→~613 ns/q overhead, a wash) — the inherent 2048-window sort dominates, so this
+            // is an allocation/copy reduction (less allocator pressure), not a latency speedup.
             if self.sampler.len() >= self.min_samples {
                 self.sketch.rebuild_from_finite(self.sampler.iter());
             } else {

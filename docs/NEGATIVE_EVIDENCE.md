@@ -13612,3 +13612,32 @@ arc's evidence is scattered across per-experiment QUALITY entries `fd855205`…`
 **Bottom line for the perf loop: there is no further autonomous single-turn CPU perf lever. The remaining EV is
 the dense-gating/down-weight feature (needs scoping) or an idle machine for uncontended concurrency/large-N
 (blocked `bd-e41k`). Continuing to request micro-levers will only yield increasingly marginal NULLs.**
+
+### 2026-07-13 — cc_fse — WASH (self-correction): the default-on adaptive-NQC rebuild alloc-elimination is TIMING-NEUTRAL — the inherent 2048-window sort dominates
+
+After shipping the NQC dense down-weight ON BY DEFAULT (`ac081b7d`), benched its ISOLATED per-query cost (new
+`nqc_adaptive_cost_ab`: adaptive `weight_for_cv` vs a bare static `dense_weight` lookup, precomputed cv so
+`nqc_cv` cancels). The adaptive path costs **635 ns/q vs 21 ns/q static = 26×**, ~614 ns/q overhead (p95 1828 ns
+from the every-64-queries sketch rebuild). This is INSIDE-FLOOR end-to-end (0.12% of a ~500us search), but the
+rebuild did visibly-redundant work: `sampler.sketch()`→`from_sample` DOUBLE-collected (VecDeque→Vec, then Vec→Vec
+filtered) + a STABLE `sort_by(partial_cmp)`.
+
+Hypothesized that was the cost and optimized it (`2322da64`): `NqcDenseWeight::rebuild_from_finite` reuses the
+sketch's existing `Vec` (0 alloc after warm-up) + `sort_unstable_by(total_cmp)`, fed by all-finite
+`NqcCvSampler::iter()` (skips the filter). Byte-identical (parity-tested), strictly-less-work.
+
+**MEASURED after: ~613 ns/q overhead (29× ratio) — a WASH (614→613, within noise).** The hypothesis was WRONG:
+the ~613 ns/q (≈39 µs per 64-query rebuild) is dominated by the **inherent sort of the 2048-element window**,
+which the optimization KEPT. Removing the two allocs + swapping stable→unstable/`partial_cmp`→`total_cmp` was
+net-neutral — `total_cmp`'s per-comparison bit-transform cost roughly offsets pdqsort's fewer comparisons, and
+the ~16 KB of allocs is a small fraction of the sort. **The change was KEPT** (byte-identical, never-slower,
+genuinely removes a double-collect + recurring hot-path allocs = real allocator-pressure reduction a warm-bump
+-allocator microbench can't show), but its code comment was **corrected** from a predicted "measured ~3× cheaper"
+(written before the after-run — an overclaim) to the true timing-neutral result. **★ LESSON: "removing redundant
+work is faster" FAILS when the removed work isn't the bottleneck — here an inherent O(n log n) sort dominated, so
+alloc-elimination + a comparator/stability swap were timing-invisible. And: never write "measured Nx" for a
+result you have only predicted; the after-run here refuted the prediction.** The only lever that would actually
+cut the ~613 ns/q is replacing the periodic full re-sort with an incremental order-statistic structure (Fenwick
+tree over quantized cv buckets — O(log B) per observe, no sort), but that is APPROXIMATE (quantized percentile,
+not byte-identical) AND a much bigger change for an inside-floor (0.12%) overhead → NOT pursued. `nqc_adaptive_cost_ab`
+retained as the reproducible per-query-cost harness.
