@@ -338,6 +338,9 @@ impl AlertsSloScreen {
             .map(std::borrow::ToOwned::to_owned)
     }
 
+    /// Test-only oracle: every event as a sorted `AlertRow`. Production
+    /// (`filtered_alerts`) filters each event before building its row.
+    #[cfg(test)]
     fn all_alerts(&self) -> Vec<AlertRow> {
         let fleet = self.state.fleet();
 
@@ -404,25 +407,76 @@ impl AlertsSloScreen {
         let host_filter =
             Self::active_filter_value(self.host_filter_index, || self.host_filters());
 
-        self.all_alerts()
-            .into_iter()
-            .filter(|row| {
-                project_filter
+        let fleet = self.state.fleet();
+        // id -> project map built once (matches all_alerts / project_resolve_ab).
+        let mut instance_projects: AHashMap<&str, &str> =
+            AHashMap::with_capacity(fleet.instances.len());
+        for instance in &fleet.instances {
+            instance_projects
+                .entry(instance.id.as_str())
+                .or_insert(instance.project.as_str());
+        }
+
+        // Test the filters on each event BEFORE building its AlertRow, cheapest
+        // first, so events discarded by an active filter skip the row construction
+        // (host_bucket + instance_id/reason_code clones + suppression). Byte-identical
+        // to building every row then filtering: the filters are ANDed
+        // (order-independent), and the stable sort of the survivors matches a stable
+        // sort of all rows then filtered.
+        let mut rows: Vec<AlertRow> = fleet
+            .lifecycle_events
+            .iter()
+            .filter_map(|event| {
+                let project = instance_projects
+                    .get(event.instance_id.as_str())
+                    .copied()
+                    .unwrap_or("unknown");
+                if project_filter
                     .as_deref()
-                    .is_none_or(|project| row.project.eq_ignore_ascii_case(project))
-            })
-            .filter(|row| self.severity_filter.allows(row.severity))
-            .filter(|row| {
-                reason_filter
+                    .is_some_and(|filter| !project.eq_ignore_ascii_case(filter))
+                {
+                    return None;
+                }
+                let severity = Self::event_severity(event);
+                if !self.severity_filter.allows(severity) {
+                    return None;
+                }
+                if reason_filter
                     .as_deref()
-                    .is_none_or(|reason| row.reason_code.eq_ignore_ascii_case(reason))
-            })
-            .filter(|row| {
-                host_filter
+                    .is_some_and(|filter| !event.reason_code.eq_ignore_ascii_case(filter))
+                {
+                    return None;
+                }
+                let host = Self::host_bucket(&event.instance_id);
+                if host_filter
                     .as_deref()
-                    .is_none_or(|host| row.host.eq_ignore_ascii_case(host))
+                    .is_some_and(|filter| !host.eq_ignore_ascii_case(filter))
+                {
+                    return None;
+                }
+                Some(AlertRow {
+                    ts_ms: event.at_ms,
+                    project: project.to_owned(),
+                    host,
+                    instance_id: event.instance_id.clone(),
+                    severity,
+                    confidence: event.attribution_confidence_score,
+                    suppression_state: Self::suppression_state(event),
+                    reason_code: event.reason_code.clone(),
+                })
             })
-            .collect()
+            .collect();
+
+        rows.sort_by(|left, right| {
+            right
+                .severity
+                .rank()
+                .cmp(&left.severity.rank())
+                .then_with(|| right.ts_ms.cmp(&left.ts_ms))
+                .then_with(|| left.project.cmp(&right.project))
+                .then_with(|| left.instance_id.cmp(&right.instance_id))
+        });
+        rows
     }
 
     // The three filter-value builders below scan `lifecycle_events` for a single
