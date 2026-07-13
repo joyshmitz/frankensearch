@@ -188,6 +188,45 @@ fn bench_real_hybrid_knownitem(c: &mut Criterion) {
         );
     }
 
+    // ── NQC dense DOWN-WEIGHT A/B (opt-in feature, end-to-end on REAL data): build the
+    //    offline NQC sketch from every query's real Tantivy BM25 scores, then per query
+    //    scale the dense tier's pool-min-max weight by clip(1 − beta·CDF(nqc_cv(lex)), w_min, 1).
+    //    beta=0 is the equal-weight pool-min-max baseline. Known-item queries (first ~10 words
+    //    of the target doc) are strongly committed-lexical → high NQC, so the thesis (dense is
+    //    net-neutral/harmful on committed-lexical queries) predicts down-weighting helps/neutral.
+    //    Validates the shipped nqc_cv/NqcDenseWeight/pool_minmax_fuse path vs the Python proxy. ──
+    {
+        use frankensearch_fusion::rrf::pool_minmax_fuse;
+        use frankensearch_fusion::{NqcDenseWeight, nqc_cv};
+        let lex_scores: Vec<Vec<f32>> = lex_all
+            .iter()
+            .map(|hits| hits.iter().map(|h| h.score).collect())
+            .collect();
+        let sketch = NqcDenseWeight::from_query_scores(lex_scores.iter().map(Vec::as_slice));
+        let w_min = 0.1f32;
+        for beta in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            let (mut rh, mut mh) = (0.0f64, 0.0f64);
+            for qi in 0..q {
+                let cv = nqc_cv(&lex_scores[qi]);
+                let sw = f64::from(sketch.dense_weight(cv, beta, w_min));
+                let cfg = RrfConfig {
+                    semantic_weight: sw,
+                    ..Default::default()
+                };
+                let fused = pool_minmax_fuse(&lex_all[qi], &vec_all[qi], K, 0, &cfg);
+                let ids: Vec<String> = fused.iter().map(|h| h.doc_id.to_string()).collect();
+                let (a, b) = recall_mrr(&ids, &targets[qi]);
+                rh += a;
+                mh += b;
+            }
+            eprintln!(
+                "[knownitem] pool-min-max NQC-downweight beta={beta:>4}: recall@{K}={:.4} MRR@{K}={:.4}",
+                rh / qf,
+                mh / qf
+            );
+        }
+    }
+
     // ── Source-weighted RRF (manual; the knob rrf_fuse doesn't expose): up-weight the
     //    more-reliable vector tier. RRF-k is inert above, so this tests whether
     //    weighting recovers MRR ABOVE vector-alone (0.968) while keeping recall high. ──
