@@ -522,31 +522,36 @@ impl ProjectDetailScreen {
         }
 
         let total_instances = instances.len();
-        let unhealthy_count = instances
-            .iter()
-            .filter(|instance| !instance.healthy)
-            .count();
-        let docs_total: u64 = instances.iter().map(|instance| instance.doc_count).sum();
-        let pending_total: u64 = instances.iter().map(|instance| instance.pending_jobs).sum();
-        let search_total: u64 = instances
-            .iter()
-            .map(|instance| {
-                fleet
-                    .search_metrics
-                    .get(&instance.id)
-                    .map_or(0, |metrics| metrics.total_searches)
-            })
-            .sum();
 
-        let cpu_samples: Vec<f64> = instances
-            .iter()
-            .filter_map(|instance| {
-                fleet
-                    .resources
-                    .get(&instance.id)
-                    .map(|metrics| metrics.cpu_percent)
-            })
-            .collect();
+        // One pass over the project's instances instead of six (unhealthy count,
+        // docs/pending/search sums, and the cpu/attribution sample vectors). Same
+        // N->1 fusion as index_resources' summary (6->1, 12049977) and fleet's
+        // 5->1 build_project_percentile_values (f4f98e0a). Byte-identical: the
+        // count and u64 sums are order-independent, the sample vectors keep
+        // instance order, and `map_or(0)` on a missing search metric contributes
+        // nothing (matched by skipping absent gets).
+        let mut unhealthy_count = 0usize;
+        let mut docs_total = 0u64;
+        let mut pending_total = 0u64;
+        let mut search_total = 0u64;
+        let mut cpu_samples: Vec<f64> = Vec::with_capacity(total_instances);
+        let mut attribution_samples: Vec<u64> = Vec::with_capacity(total_instances);
+        for instance in &instances {
+            if !instance.healthy {
+                unhealthy_count += 1;
+            }
+            docs_total += instance.doc_count;
+            pending_total += instance.pending_jobs;
+            if let Some(metrics) = fleet.search_metrics.get(&instance.id) {
+                search_total += metrics.total_searches;
+            }
+            if let Some(metrics) = fleet.resources.get(&instance.id) {
+                cpu_samples.push(metrics.cpu_percent);
+            }
+            if let Some(attribution) = fleet.attribution.get(&instance.id) {
+                attribution_samples.push(u64::from(attribution.confidence_score));
+            }
+        }
         let cpu_avg = if cpu_samples.is_empty() {
             0.0
         } else {
@@ -555,15 +560,6 @@ impl ProjectDetailScreen {
             total / f64::from(denom)
         };
 
-        let attribution_samples: Vec<u64> = instances
-            .iter()
-            .filter_map(|instance| {
-                fleet
-                    .attribution
-                    .get(&instance.id)
-                    .map(|attribution| u64::from(attribution.confidence_score))
-            })
-            .collect();
         let attribution_avg = if attribution_samples.is_empty() {
             0
         } else {
