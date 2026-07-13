@@ -13427,3 +13427,12 @@ oracle, `core/canonicalize.rs` `nfc()` behind a trigger-guarded `Cow`, and the `
 token lowercasing is the same short-string class). No un-optimized hot general-purpose-machinery site remains
 workspace-wide — the sibling-hunt method is exhausted, confirming the CPU-perf frontier closure at the workspace
 level, not just per-crate.
+
+The last previously-unchecked crate, `frankensearch-tui`, was also verified clean: the command-palette search
+(`filtered()`) matches a precomputed lowercased `search_index` (the naive re-lowercase is a test-only oracle);
+`frame.rs` is frame-timing/metrics plus a layout cache with invalidation (already cache-structured, and the real
+per-cell rendering lives in the external `ftui-*` crates); and the `interaction.rs` `BTreeSet` dedup checks are
+one-time spec-validation over ~tens of UI cards (cold, tiny). **DEFINITIVE: the CPU-perf frontier is closed across
+every crate in the workspace.** Further "perf" work here would require a genuinely new workload (the BOLD/µbench
+proxies don't model it), an idle machine for uncontended concurrency/large-N measurement, or a UX/architecture
+decision — not a byte-identical micro-lever. The standing productive vein is search QUALITY.
