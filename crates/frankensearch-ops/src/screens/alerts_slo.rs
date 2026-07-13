@@ -383,22 +383,24 @@ impl AlertsSloScreen {
         rows
     }
 
+    /// Active value for a filter whose selection is `index` into `values` (index 0
+    /// is always the `"all"` sentinel = no filter). Skips building the
+    /// event-scanning `values` list entirely for the common inactive (index 0)
+    /// case; an out-of-range or `"all"` selection is also treated as no filter.
+    fn active_filter_value(index: usize, values: impl FnOnce() -> Vec<String>) -> Option<String> {
+        if index == 0 {
+            return None;
+        }
+        values().get(index).cloned().filter(|value| value != "all")
+    }
+
     fn filtered_alerts(&self) -> Vec<AlertRow> {
-        let project_filter = self
-            .project_filters()
-            .get(self.project_filter_index)
-            .cloned()
-            .filter(|value| value != "all");
-        let reason_filter = self
-            .reason_filters()
-            .get(self.reason_filter_index)
-            .cloned()
-            .filter(|value| value != "all");
-        let host_filter = self
-            .host_filters()
-            .get(self.host_filter_index)
-            .cloned()
-            .filter(|value| value != "all");
+        let project_filter =
+            Self::active_filter_value(self.project_filter_index, || self.project_filters());
+        let reason_filter =
+            Self::active_filter_value(self.reason_filter_index, || self.reason_filters());
+        let host_filter =
+            Self::active_filter_value(self.host_filter_index, || self.host_filters());
 
         self.all_alerts()
             .into_iter()
@@ -1811,6 +1813,24 @@ mod tests {
             screen.selected_project().as_deref(),
             Some("unknown"),
             "real project names should not be dropped as sentinel values"
+        );
+    }
+
+    #[test]
+    fn active_filter_value_matches_full_list_resolution() {
+        let values = || vec!["all".to_owned(), "beta".to_owned(), "gamma".to_owned()];
+        for index in [0usize, 1, 2, 3] {
+            let expected = values().get(index).cloned().filter(|value| value != "all");
+            assert_eq!(
+                AlertsSloScreen::active_filter_value(index, values),
+                expected,
+                "index={index}"
+            );
+        }
+        // Index 0 must return None WITHOUT invoking the (event-scanning) builder.
+        assert_eq!(
+            AlertsSloScreen::active_filter_value(0, || panic!("list builder must not run")),
+            None
         );
     }
 
