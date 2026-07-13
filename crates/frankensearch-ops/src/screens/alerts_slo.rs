@@ -421,31 +421,61 @@ impl AlertsSloScreen {
             .collect()
     }
 
+    // The three filter-value builders below scan `lifecycle_events` for a single
+    // distinct field-set. They used to go through `all_alerts()`, which builds
+    // (and sorts) a full `AlertRow` per event — ~4 allocations/event plus an
+    // O(events log events) sort — just to read one field. Scanning the one field
+    // directly yields the identical `BTreeSet` with none of that overhead
+    // (`all_alerts` maps events 1:1, so the field-sets are unchanged).
+
     fn project_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
-        let projects: BTreeSet<_> = self
-            .all_alerts()
-            .into_iter()
-            .map(|row| row.project)
+        let fleet = self.state.fleet();
+        // Same id->project map as `all_alerts` (or_insert = first occurrence).
+        let mut instance_projects: HashMap<&str, &str> =
+            HashMap::with_capacity(fleet.instances.len());
+        for instance in &fleet.instances {
+            instance_projects
+                .entry(instance.id.as_str())
+                .or_insert(instance.project.as_str());
+        }
+        let projects: BTreeSet<String> = fleet
+            .lifecycle_events
+            .iter()
+            .map(|event| {
+                instance_projects
+                    .get(event.instance_id.as_str())
+                    .copied()
+                    .unwrap_or("unknown")
+                    .to_owned()
+            })
             .collect();
+        let mut values = vec!["all".to_owned()];
         values.extend(projects);
         values
     }
 
     fn reason_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
-        let reasons: BTreeSet<_> = self
-            .all_alerts()
-            .into_iter()
-            .map(|row| row.reason_code)
+        let reasons: BTreeSet<String> = self
+            .state
+            .fleet()
+            .lifecycle_events
+            .iter()
+            .map(|event| event.reason_code.clone())
             .collect();
+        let mut values = vec!["all".to_owned()];
         values.extend(reasons);
         values
     }
 
     fn host_filters(&self) -> Vec<String> {
+        let hosts: BTreeSet<String> = self
+            .state
+            .fleet()
+            .lifecycle_events
+            .iter()
+            .map(|event| Self::host_bucket(&event.instance_id))
+            .collect();
         let mut values = vec!["all".to_owned()];
-        let hosts: BTreeSet<_> = self.all_alerts().into_iter().map(|row| row.host).collect();
         values.extend(hosts);
         values
     }
@@ -1782,6 +1812,53 @@ mod tests {
             Some("unknown"),
             "real project names should not be dropped as sentinel values"
         );
+    }
+
+    #[test]
+    fn filter_builders_match_all_alerts_field_sets() {
+        // The direct single-field scans must yield the identical filter-value Vecs
+        // as extracting each field from the full `all_alerts()` rows.
+        let mut state = sample_state();
+        let mut fleet = state.fleet().clone();
+        // Orphan event: project resolves to "unknown", with a distinct host + reason.
+        fleet.lifecycle_events.push(LifecycleEvent {
+            instance_id: "orphan-host:ghost-1".to_owned(),
+            from: LifecycleState::Started,
+            to: LifecycleState::Stopped,
+            reason_code: "lifecycle.instance.orphan".to_owned(),
+            at_ms: 9_999,
+            attribution_confidence_score: 10,
+            attribution_collision: false,
+        });
+        state.update_fleet(fleet);
+
+        let mut screen = AlertsSloScreen::new();
+        screen.update_state(&state);
+        let rows = screen.all_alerts();
+
+        let mut expected_projects = vec!["all".to_owned()];
+        expected_projects.extend(
+            rows.iter()
+                .map(|row| row.project.clone())
+                .collect::<std::collections::BTreeSet<String>>(),
+        );
+        assert_eq!(screen.project_filters(), expected_projects);
+
+        let mut expected_reasons = vec!["all".to_owned()];
+        expected_reasons.extend(
+            rows.iter()
+                .map(|row| row.reason_code.clone())
+                .collect::<std::collections::BTreeSet<String>>(),
+        );
+        assert_eq!(screen.reason_filters(), expected_reasons);
+
+        let mut expected_hosts = vec!["all".to_owned()];
+        expected_hosts.extend(
+            rows.iter()
+                .map(|row| row.host.clone())
+                .collect::<std::collections::BTreeSet<String>>(),
+        );
+        assert_eq!(screen.host_filters(), expected_hosts);
     }
 
     #[test]
