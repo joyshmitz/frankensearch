@@ -47,6 +47,10 @@ name = "ivf_crossover_ab"
 harness = false
 
 [[bench]]
+name = "ivf_recall_ab"
+harness = false
+
+[[bench]]
 name = "quantize_slab"
 harness = false
 
