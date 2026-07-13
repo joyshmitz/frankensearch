@@ -305,43 +305,58 @@ impl ActionTimelineScreen {
     }
 
     fn rebuild_filter_values(&mut self) {
-        let mut values = vec!["all".to_owned()];
-        let mut projects: BTreeSet<_> = self
-            .state
-            .fleet()
+        let fleet = self.state.fleet();
+
+        // id -> project lookup built once, replacing the per-event linear
+        // `project_for_instance` find (was O(events * instances)); `or_insert`
+        // keeps the first occurrence, matching `.find`. Same fix as
+        // `filtered_events` (measured 2.2-65.7x in `project_resolve_ab`).
+        let mut instance_projects: HashMap<&str, &str> =
+            HashMap::with_capacity(fleet.instances.len());
+        for instance in &fleet.instances {
+            instance_projects
+                .entry(instance.id.as_str())
+                .or_insert(instance.project.as_str());
+        }
+
+        let mut projects: BTreeSet<String> = fleet
             .instances
             .iter()
             .map(|instance| instance.project.clone())
             .collect();
-        projects.extend(self.state.fleet().lifecycle_events.iter().map(|event| {
-            self.project_for_instance(&event.instance_id)
+        projects.extend(fleet.lifecycle_events.iter().map(|event| {
+            instance_projects
+                .get(event.instance_id.as_str())
+                .copied()
                 .unwrap_or("unknown")
                 .to_owned()
         }));
-        values.extend(projects);
-        self.project_filter_values = values;
 
-        let mut values = vec!["all".to_owned()];
-        let reasons: BTreeSet<_> = self
-            .state
-            .fleet()
+        let reasons: BTreeSet<String> = fleet
             .lifecycle_events
             .iter()
             .map(|event| event.reason_code.clone())
             .collect();
-        values.extend(reasons);
-        self.reason_filter_values = values;
 
-        let mut values = vec!["all".to_owned()];
-        let hosts: BTreeSet<_> = self
-            .state
-            .fleet()
+        let hosts: BTreeSet<String> = fleet
             .lifecycle_events
             .iter()
             .map(|event| Self::host_bucket(&event.instance_id).to_owned())
             .collect();
-        values.extend(hosts);
-        self.host_filter_values = values;
+
+        // The `fleet` / `instance_projects` borrows end here; the values above are
+        // owned, so the field assignments below are free of the shared borrow.
+        let mut project_values = vec!["all".to_owned()];
+        project_values.extend(projects);
+        self.project_filter_values = project_values;
+
+        let mut reason_values = vec!["all".to_owned()];
+        reason_values.extend(reasons);
+        self.reason_filter_values = reason_values;
+
+        let mut host_values = vec!["all".to_owned()];
+        host_values.extend(hosts);
+        self.host_filter_values = host_values;
     }
 
     fn project_filters(&self) -> &[String] {
@@ -1218,6 +1233,43 @@ mod tests {
                 event_time_bounds_slow(&events),
                 "bounds parity for {stamps:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rebuild_filter_project_resolution_map_matches_find() {
+        // Instances include a DUPLICATE id so a `SHADOW` project sits after the
+        // original — the map (via `or_insert`) and `.find` must both keep the
+        // FIRST occurrence, the invariant rebuild_filter_values relies on.
+        let mut instances = bench_make_instances(64);
+        instances.push(crate::state::InstanceInfo {
+            id: "instance-000003".to_owned(),
+            project: "SHADOW".to_owned(),
+            pid: None,
+            healthy: true,
+            doc_count: 0,
+            pending_jobs: 0,
+        });
+
+        let mut map: HashMap<&str, &str> = HashMap::with_capacity(instances.len());
+        for instance in &instances {
+            map.entry(instance.id.as_str())
+                .or_insert(instance.project.as_str());
+        }
+
+        for id in [
+            "instance-000003",
+            "instance-000007",
+            "instance-999999",
+            "instance-000000",
+        ] {
+            let via_find = instances
+                .iter()
+                .find(|instance| instance.id == id)
+                .map(|instance| instance.project.as_str())
+                .unwrap_or("unknown");
+            let via_map = map.get(id).copied().unwrap_or("unknown");
+            assert_eq!(via_find, via_map, "project resolution parity for id={id}");
         }
     }
 
