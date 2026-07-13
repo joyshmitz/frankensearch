@@ -4,7 +4,7 @@
 //! backlog, and host resource pressure.
 
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
@@ -386,7 +386,9 @@ impl IndexResourceScreen {
         let delta_pending_total = i128::from(pending_total) - i128::from(baseline_pending_total);
 
         let fleet = self.state.fleet();
-        let filtered_ids: BTreeSet<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
+        // Membership-only (checked against every search-metrics entry below), never
+        // iterated -> HashSet gives O(1) contains vs BTreeSet's O(log rows).
+        let filtered_ids: HashSet<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
         let mut total_searches = 0_u64;
         let mut refined_total = 0_u64;
         for (instance_id, metrics) in &fleet.search_metrics {
