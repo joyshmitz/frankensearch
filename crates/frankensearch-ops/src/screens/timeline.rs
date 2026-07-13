@@ -3,7 +3,7 @@
 //! Visualizes lifecycle transition events to support rapid triage.
 
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
@@ -223,19 +223,29 @@ impl ActionTimelineScreen {
             .map(String::as_str)
             .filter(|value| *value != "all");
 
+        // When a project filter is active, each event's instance id must be
+        // resolved to its project. Build the id -> project lookup ONCE
+        // (O(instances)) instead of a linear `.find` over all instances per event
+        // (`project_for_instance`), which made this filter O(events * instances).
+        // `or_insert` keeps the first occurrence, matching `.find`'s semantics.
+        let fleet = self.state.fleet();
+        let instance_projects: Option<HashMap<&str, &str>> = project_filter.map(|_| {
+            let mut map = HashMap::with_capacity(fleet.instances.len());
+            for instance in &fleet.instances {
+                map.entry(instance.id.as_str())
+                    .or_insert(instance.project.as_str());
+            }
+            map
+        });
+
         self.all_events()
             .into_iter()
             .filter(|event| {
                 project_filter.is_none_or(|project| {
-                    if project.eq_ignore_ascii_case("unknown") {
-                        self.project_for_instance(&event.instance_id).is_none_or(
-                            |instance_project| instance_project.eq_ignore_ascii_case("unknown"),
-                        )
-                    } else {
-                        self.project_for_instance(&event.instance_id).is_some_and(
-                            |instance_project| instance_project.eq_ignore_ascii_case(project),
-                        )
-                    }
+                    let resolved = instance_projects
+                        .as_ref()
+                        .and_then(|map| map.get(event.instance_id.as_str()).copied());
+                    Self::event_project_matches(resolved, project)
                 })
             })
             .filter(|event| self.severity_filter.allows(Self::event_severity(event)))
@@ -255,6 +265,18 @@ impl ActionTimelineScreen {
             .iter()
             .find(|instance| instance.id == instance_id)
             .map(|instance| instance.project.as_str())
+    }
+
+    /// Whether an event whose instance resolves to `resolved` project passes the
+    /// active `project` filter. Mirrors the original inline predicate: an
+    /// "unknown" filter keeps unresolved / "unknown" events; any other filter
+    /// keeps events whose resolved project matches case-insensitively.
+    fn event_project_matches(resolved: Option<&str>, project: &str) -> bool {
+        if project.eq_ignore_ascii_case("unknown") {
+            resolved.is_none_or(|instance_project| instance_project.eq_ignore_ascii_case("unknown"))
+        } else {
+            resolved.is_some_and(|instance_project| instance_project.eq_ignore_ascii_case(project))
+        }
     }
 
     fn host_bucket(instance_id: &str) -> &str {
@@ -1103,6 +1125,66 @@ pub fn bench_rolling_counts_slow(events: &[LifecycleEvent]) -> [usize; ROLLING_W
     rolling_window_counts_slow(events)
 }
 
+/// Bench/test-only: build `n` deterministic instances with `instance-{i:06}` ids
+/// (matching `bench_make_lifecycle_events`' id scheme) across eight projects.
+#[cfg(any(test, feature = "bench-internals"))]
+#[must_use]
+pub fn bench_make_instances(n: usize) -> Vec<crate::state::InstanceInfo> {
+    (0..n.max(1))
+        .map(|i| crate::state::InstanceInfo {
+            id: format!("instance-{i:06}"),
+            project: format!("project-{}", i % 8),
+            pid: Some(i as u32),
+            healthy: i % 3 != 0,
+            doc_count: (i as u64) * 10,
+            pending_jobs: (i as u64) % 5,
+        })
+        .collect()
+}
+
+/// Bench/test-only: legacy per-event linear `.find` over instances to resolve the
+/// project filter — the pre-fix O(events * instances) shape.
+#[cfg(any(test, feature = "bench-internals"))]
+#[must_use]
+pub fn bench_count_project_linear(
+    events: &[LifecycleEvent],
+    instances: &[crate::state::InstanceInfo],
+    project: &str,
+) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            let resolved = instances
+                .iter()
+                .find(|instance| instance.id == event.instance_id)
+                .map(|instance| instance.project.as_str());
+            ActionTimelineScreen::event_project_matches(resolved, project)
+        })
+        .count()
+}
+
+/// Bench/test-only: shipped prebuilt-map project resolution — O(events + instances).
+#[cfg(any(test, feature = "bench-internals"))]
+#[must_use]
+pub fn bench_count_project_mapped(
+    events: &[LifecycleEvent],
+    instances: &[crate::state::InstanceInfo],
+    project: &str,
+) -> usize {
+    let mut map: HashMap<&str, &str> = HashMap::with_capacity(instances.len());
+    for instance in instances {
+        map.entry(instance.id.as_str())
+            .or_insert(instance.project.as_str());
+    }
+    events
+        .iter()
+        .filter(|event| {
+            let resolved = map.get(event.instance_id.as_str()).copied();
+            ActionTimelineScreen::event_project_matches(resolved, project)
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1136,6 +1218,28 @@ mod tests {
                 event_time_bounds_slow(&events),
                 "bounds parity for {stamps:?}"
             );
+        }
+    }
+
+    #[test]
+    fn project_resolve_mapped_matches_linear() {
+        for n in [0usize, 1, 3, 64, 512] {
+            let events = if n == 0 {
+                Vec::new()
+            } else {
+                bench_make_lifecycle_events(n)
+            };
+            // Instances cover only the first n/2 ids, so ~half the events resolve
+            // (project-{i%8}) and the rest resolve to None — exercising both the
+            // matched and unresolved paths of the predicate.
+            let instances = bench_make_instances(n.max(1) / 2 + 1);
+            for project in ["project-3", "PROJECT-3", "unknown", "project-7", "missing"] {
+                assert_eq!(
+                    bench_count_project_linear(&events, &instances, project),
+                    bench_count_project_mapped(&events, &instances, project),
+                    "project-resolve parity for n={n} project={project}"
+                );
+            }
         }
     }
 
