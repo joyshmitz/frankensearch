@@ -6,6 +6,8 @@
 //! when integrated; `std::sync::RwLock` for standalone testing).
 
 use std::collections::{HashMap, HashSet};
+
+use ahash::AHashMap;
 use std::fmt;
 use std::time::Instant;
 
@@ -812,10 +814,11 @@ impl ControlPlaneMetrics {
 pub struct FleetSnapshot {
     /// All discovered instances.
     pub instances: Vec<InstanceInfo>,
-    /// Per-instance resource metrics (keyed by instance ID).
-    pub resources: HashMap<String, ResourceMetrics>,
-    /// Per-instance search metrics (keyed by instance ID).
-    pub search_metrics: HashMap<String, SearchMetrics>,
+    /// Per-instance resource metrics (keyed by instance ID). aHash: `.get()`-hammered
+    /// per-instance per-render across every screen; iteration order is never relied on.
+    pub resources: AHashMap<String, ResourceMetrics>,
+    /// Per-instance search metrics (keyed by instance ID). aHash (same rationale).
+    pub search_metrics: AHashMap<String, SearchMetrics>,
     /// Per-instance project attribution metadata (keyed by instance ID).
     pub attribution: HashMap<String, InstanceAttribution>,
     /// Per-instance lifecycle state snapshots (keyed by instance ID).
@@ -1031,8 +1034,8 @@ mod tests {
                     pending_jobs: 200,
                 },
             ],
-            resources: HashMap::new(),
-            search_metrics: HashMap::new(),
+            resources: AHashMap::new(),
+            search_metrics: AHashMap::new(),
             attribution,
             lifecycle,
             lifecycle_events: Vec::new(),

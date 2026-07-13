@@ -23,7 +23,7 @@ use frankensearch_tui::input::InputEvent;
 use frankensearch_tui::screen::{KeybindingHint, ScreenAction, ScreenContext, ScreenId};
 
 use crate::presets::ViewState;
-use std::collections::HashMap;
+use ahash::AHashMap;
 
 use crate::state::AppState;
 use crate::state::{InstanceInfo, ResourceMetrics, SearchMetrics};
@@ -88,8 +88,8 @@ struct ProjectPercentileValues {
 /// `percentile_rank` is order-independent.
 fn build_project_percentile_values(
     instances: &[InstanceInfo],
-    resources: &HashMap<String, ResourceMetrics>,
-    search_metrics: &HashMap<String, SearchMetrics>,
+    resources: &AHashMap<String, ResourceMetrics>,
+    search_metrics: &AHashMap<String, SearchMetrics>,
     project: &str,
 ) -> ProjectPercentileValues {
     let mut out = ProjectPercentileValues::default();
@@ -137,8 +137,8 @@ fn visible_fleet_totals(visible: &[&InstanceInfo]) -> (usize, u64, u64) {
 #[cfg(feature = "bench-internals")]
 fn build_project_percentile_values_legacy(
     instances: &[InstanceInfo],
-    resources: &HashMap<String, ResourceMetrics>,
-    search_metrics: &HashMap<String, SearchMetrics>,
+    resources: &AHashMap<String, ResourceMetrics>,
+    search_metrics: &AHashMap<String, SearchMetrics>,
     project: &str,
 ) -> ProjectPercentileValues {
     let docs = instances
@@ -183,8 +183,8 @@ fn build_project_percentile_values_legacy(
 #[cfg(feature = "bench-internals")]
 pub struct BenchFleetValues {
     instances: Vec<InstanceInfo>,
-    resources: HashMap<String, ResourceMetrics>,
-    search_metrics: HashMap<String, SearchMetrics>,
+    resources: AHashMap<String, ResourceMetrics>,
+    search_metrics: AHashMap<String, SearchMetrics>,
     project: String,
 }
 
@@ -211,8 +211,8 @@ fn project_values_bits(values: ProjectPercentileValues) -> BenchProjectValues {
 pub fn bench_make_fleet_values(n_instances: usize, n_projects: usize) -> BenchFleetValues {
     let projects = n_projects.max(1);
     let mut instances = Vec::with_capacity(n_instances);
-    let mut resources = HashMap::with_capacity(n_instances);
-    let mut search_metrics = HashMap::with_capacity(n_instances);
+    let mut resources = AHashMap::with_capacity(n_instances);
+    let mut search_metrics = AHashMap::with_capacity(n_instances);
     for index in 0..n_instances {
         let id = format!("instance-{index:06}");
         // Bias ~40% of instances into project-0000 (the selected project) so the
