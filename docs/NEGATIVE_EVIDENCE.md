@@ -13671,3 +13671,21 @@ cut the ~613 ns/q is replacing the periodic full re-sort with an incremental ord
 tree over quantized cv buckets — O(log B) per observe, no sort), but that is APPROXIMATE (quantized percentile,
 not byte-identical) AND a much bigger change for an inside-floor (0.12%) overhead → NOT pursued. `nqc_adaptive_cost_ab`
 retained as the reproducible per-query-cost harness.
+
+### 2026-07-13 — cc_fse — CLOSED: the "search-time reductions still widenable" route-next — the widenable ones are already 4-acc'd
+
+Tested the memory route-next [[search-time-reductions-still-widenable]] ("multi-acc ILP pays on search-time
+scalar f64/f32 reductions; grep `dot +=`/`sum +=` on rerank paths"). Grepped fusion (mmr/smooth/hubness) + index
+(simd) for scalar accumulation loops; traced the two promising leads, both already-optimized or below-bar:
+- **`mmr.rs` `cosine_sim` (single-acc `dot +=`)** LOOKED like a sibling-inconsistency (its twin `cosine_sim_pre`
+  got the landed 4-acc, `efbfe33`), but production MMR (`mmr_rerank`) already uses `cosine_sim_pre` via the `sim`
+  closure (hoisted norms + 4-acc); the surviving `cosine_sim` calls are the DEAD ragged-dim fallback (`mmr.rs:178`,
+  "never happens in practice") and the test oracle `mmr_rerank_reference` (`:388`, indented under the test mod).
+  No production single-acc path.
+- **`index/simd.rs:719` (single `f32x8` accumulator)** is the small TAIL of an already-4-accumulator kernel
+  (`acc0..acc3` in the 32-wide main loop, lines 700-710); a <32-element single-acc tail is correct/optimal.
+- `smooth.rs:145/233` `sum += neighbor_score` = opt-in graph-smoothing (alpha=0 default) over small per-node
+  neighbor sets → below-bar.
+**So every widenable search-time reduction is already 4-acc'd (MMR `cosine_sim_pre`, index dot kernels); the
+remaining `sum +=`/`dot +=` are tails, opt-in-small, or reference oracles.** Route-next CLOSED — don't re-grep
+for un-widened search-time reductions.
