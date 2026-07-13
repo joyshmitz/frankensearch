@@ -5,7 +5,7 @@
 //! Thread safety is provided by the consumer's runtime (asupersync `RwLock`
 //! when integrated; `std::sync::RwLock` for standalone testing).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ahash::AHashMap;
 use std::fmt;
@@ -378,8 +378,8 @@ pub struct LifecycleEvent {
 pub struct ProjectLifecycleTracker {
     config: LifecycleTrackerConfig,
     resolver: ProjectAttributionResolver,
-    attributions: HashMap<String, InstanceAttribution>,
-    lifecycles: HashMap<String, InstanceLifecycle>,
+    attributions: AHashMap<String, InstanceAttribution>,
+    lifecycles: AHashMap<String, InstanceLifecycle>,
     event_log: Vec<LifecycleEvent>,
 }
 
@@ -395,8 +395,8 @@ impl ProjectLifecycleTracker {
         Self {
             config: config.normalized(),
             resolver: ProjectAttributionResolver,
-            attributions: HashMap::new(),
-            lifecycles: HashMap::new(),
+            attributions: AHashMap::new(),
+            lifecycles: AHashMap::new(),
             event_log: Vec::new(),
         }
     }
@@ -554,12 +554,12 @@ impl ProjectLifecycleTracker {
     }
 
     #[must_use]
-    pub fn attribution_snapshot(&self) -> HashMap<String, InstanceAttribution> {
+    pub fn attribution_snapshot(&self) -> AHashMap<String, InstanceAttribution> {
         self.attributions.clone()
     }
 
     #[must_use]
-    pub fn lifecycle_snapshot(&self) -> HashMap<String, InstanceLifecycle> {
+    pub fn lifecycle_snapshot(&self) -> AHashMap<String, InstanceLifecycle> {
         self.lifecycles.clone()
     }
 
@@ -819,10 +819,11 @@ pub struct FleetSnapshot {
     pub resources: AHashMap<String, ResourceMetrics>,
     /// Per-instance search metrics (keyed by instance ID). aHash (same rationale).
     pub search_metrics: AHashMap<String, SearchMetrics>,
-    /// Per-instance project attribution metadata (keyed by instance ID).
-    pub attribution: HashMap<String, InstanceAttribution>,
-    /// Per-instance lifecycle state snapshots (keyed by instance ID).
-    pub lifecycle: HashMap<String, InstanceLifecycle>,
+    /// Per-instance project attribution metadata (keyed by instance ID). aHash:
+    /// `attribution_for` (→ `.get`) is called per-instance in several render loops.
+    pub attribution: AHashMap<String, InstanceAttribution>,
+    /// Per-instance lifecycle state snapshots (keyed by instance ID). aHash (same).
+    pub lifecycle: AHashMap<String, InstanceLifecycle>,
     /// Recent lifecycle transition events for timeline/alerts.
     pub lifecycle_events: Vec<LifecycleEvent>,
 }
@@ -988,7 +989,7 @@ mod tests {
 
     fn sample_snapshot() -> FleetSnapshot {
         let resolver = ProjectAttributionResolver;
-        let mut attribution = HashMap::new();
+        let mut attribution = AHashMap::new();
         attribution.insert(
             "inst-1".to_string(),
             resolver.resolve(
@@ -1002,7 +1003,7 @@ mod tests {
             resolver.resolve(Some("xf"), Some("xf-node-02"), Some("xf")),
         );
 
-        let mut lifecycle = HashMap::new();
+        let mut lifecycle = AHashMap::new();
         let mut lifecycle_1 = InstanceLifecycle::new(1_000);
         lifecycle_1.apply_signal(LifecycleSignal::Heartbeat, 1_250, None);
         lifecycle.insert("inst-1".to_string(), lifecycle_1);
@@ -1985,7 +1986,7 @@ mod tests {
 
     #[test]
     fn fleet_snapshot_stale_count_with_stale() {
-        let mut lifecycle = HashMap::new();
+        let mut lifecycle = AHashMap::new();
         let mut stale = InstanceLifecycle::new(10);
         stale.apply_signal(LifecycleSignal::Heartbeat, 20, None);
         stale.mark_stale_if_heartbeat_gap(10_000, 5_000);
@@ -2003,7 +2004,7 @@ mod tests {
 
     #[test]
     fn fleet_snapshot_attribution_for_hit_miss() {
-        let mut attribution = HashMap::new();
+        let mut attribution = AHashMap::new();
         attribution.insert(
             "inst-1".to_string(),
             InstanceAttribution::unknown(Some("proj"), None, "test"),
@@ -2018,7 +2019,7 @@ mod tests {
 
     #[test]
     fn fleet_snapshot_lifecycle_for_hit_miss() {
-        let mut lifecycle = HashMap::new();
+        let mut lifecycle = AHashMap::new();
         lifecycle.insert("inst-1".to_string(), InstanceLifecycle::new(0));
         let snap = FleetSnapshot {
             lifecycle,
@@ -2185,7 +2186,7 @@ mod tests {
     #[test]
     fn app_state_connection_status_reflects_stale() {
         let mut state = AppState::new();
-        let mut lifecycle = HashMap::new();
+        let mut lifecycle = AHashMap::new();
         let mut stale_lc = InstanceLifecycle::new(10);
         stale_lc.apply_signal(LifecycleSignal::Heartbeat, 20, None);
         stale_lc.mark_stale_if_heartbeat_gap(10_000, 5_000);
