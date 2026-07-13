@@ -905,20 +905,15 @@ impl AlertsSloScreen {
     }
 
     fn filter_summary(&self) -> String {
-        let project = self
-            .project_filters()
-            .get(self.project_filter_index)
-            .cloned()
+        // Reuse the index-0 short-circuit: an inactive (index 0) filter is "all"
+        // without building its event-scanning list. `active_filter_value` returns
+        // None for index 0 / out-of-range / a literal "all", all displayed as "all"
+        // — byte-identical to `list.get(index).cloned().unwrap_or("all")`.
+        let project = Self::active_filter_value(self.project_filter_index, || self.project_filters())
             .unwrap_or_else(|| "all".to_owned());
-        let reason = self
-            .reason_filters()
-            .get(self.reason_filter_index)
-            .cloned()
+        let reason = Self::active_filter_value(self.reason_filter_index, || self.reason_filters())
             .unwrap_or_else(|| "all".to_owned());
-        let host = self
-            .host_filters()
-            .get(self.host_filter_index)
-            .cloned()
+        let host = Self::active_filter_value(self.host_filter_index, || self.host_filters())
             .unwrap_or_else(|| "all".to_owned());
 
         format!(
