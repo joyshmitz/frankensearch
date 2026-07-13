@@ -13709,3 +13709,25 @@ order) or a PROPERTY (e.g. cross-lane ordering-stability, `kitchen_sink ⊇ base
 "workload-independent measured quality win" can still be un-flippable as a DEFAULT when a CONTRACT/oracle test
 layer pins the exact behavior it changes; default-flip blast radius ≠ the win's isolated safety. Route-next: the
 interaction-oracle regeneration (property-vs-golden triage) is the real remaining task for this flip.
+
+### 2026-07-13 — cc_fse — RE-VERIFIED (by code reading, directed): the hot int8 two-pass query/scan path is floored
+
+Directed to find a PERF lever on a hot query/index path (not oracle triage). Re-read the actual scan/select code
+in `frankensearch-index` (`search.rs`, `two_tier.rs`) per "re-measure before assuming" rather than asserting the
+frontier maps' floored claim. Every hot-path op is already optimal:
+- **int8 pass-1 scan** (`search.rs:557-581` inlined + `retain_int8_candidate:138`): BOUNDED top-k heap
+  (`heap.len() < limit` push, else push-only-if `candidate < cutoff` with pop-min), an O(1) `cutoff` fast-reject,
+  tombstone flag-skip (`flags & 1`), and the AVX2 `dot_i8_i8`/`dot_i8_i8_maddubs` kernel. Parallel-chunk
+  (`into_par_iter`) partial heaps.
+- **pass-2 f16 rescore** (`search.rs:489-497`): iterates ONLY the pass-1 candidate heap, exact
+  `dot_product_f16_bytes_f32` (already 4-acc, `82e151f`), bounded via `insert_candidate(.., k)`.
+- **two-tier orchestration sort** (`two_tier.rs:332-347`): already the n-GATED
+  `select_nth_unstable`/`sort_unstable`/`sort_by` split (`4b0bc9a7`, `SELECT_NTH_MIN=256`) — strict-total-order
+  comparator (score desc, unique `index` asc); small pools intentionally keep the stable `sort_by` (a0fd2090).
+- **query int8 quantization** (`quantize_i8_query`, once per query over `dim`≈128-384): inside-floor regardless
+  of SIMD (it is O(dim) once, dwarfed by the O(N-candidates) scan).
+**No un-mined lever on the hot query/index path** — the int8 two-pass scan is the most-mined code in the
+workspace (7.1× vs flat, `early-abandon` arc + AVX2 dispatch + bounded heaps + n-gated select), and a fresh
+code read confirms it: bounded, vectorized, cutoff-gated, tombstone-skipping, both passes. Algorithmic
+early-abandon is the only class beyond this and it's landed/synthetic-validated (route-next = real-corpus 130k,
+data-blocked). NULL.
