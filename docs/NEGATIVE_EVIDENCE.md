@@ -13436,3 +13436,50 @@ one-time spec-validation over ~tens of UI cards (cold, tiny). **DEFINITIVE: the 
 every crate in the workspace.** Further "perf" work here would require a genuinely new workload (the BOLD/µbench
 proxies don't model it), an idle machine for uncontended concurrency/large-N measurement, or a UX/architecture
 decision — not a byte-identical micro-lever. The standing productive vein is search QUALITY.
+
+### 2026-07-13 — cc_fse — CORRECTION to the "DEFINITIVE closure": the SipHash→aHash migration missed the hash-SETs (not just `adjacency`) — filling them LANDED ~2.46-2.51× (higher than the maps' 1.7×)
+
+The two prior aHash-closure claims were both incomplete. Line 12083 named `DocumentGraph.adjacency` as "the one
+missed SipHash→aHash site" (correctly closed: opt-in, smoothing alpha=0 default → skipped). And the "DEFINITIVE
+frontier closed" entry above swept general-purpose-machinery siblings but not hashers. Both overlooked that the
+ops aHash sweep (`626aa865`/`da4f29de`/`16398b9f`/`c2703d06`) converted every hot hash**MAP** (resolution +
+FleetSnapshot) yet left the sibling hash**SETs** on the default SipHash. Three were hot and default-on:
+
+- `index_resources::summary_lines` `filtered_ids` — built from the visible rows, `.contains`'d once per
+  `fleet.search_metrics` entry in the refined-share fold (was BTreeSet→std-HashSet `2e2b7bf0`, never aHashed).
+- `historical_analytics` render-header distinct-project dedup (`de698a1d`, BTreeSet→std-HashSet, `.len()` only).
+- `state.rs::ingest_discovery` `seen` — per-instance membership set; its sibling `lifecycles` map was ALREADY
+  aHash, so this was also a consistency gap.
+
+All three → `ahash::AHashSet` (`e1cbc30c`). Byte-identical (membership/count-only, never iterated; the bench
+asserts count parity at every n). New self-contained within-process paired AB/BA bench `filtered_ids_hash_ab`
+(std `HashSet` vs `AHashSet` over ~14-char id keys; build-set + probe-N kernel):
+
+| n | SipHash µs | aHash µs | speedup | verdict |
+|---:|---:|---:|---:|---|
+| 512 | — | — | 2.46× | CANDIDATE_FASTER |
+| 2048 | 101.5 | 39.3 | 2.51× | CANDIDATE_FASTER |
+| 4096 | 212.7 | 82.1 | 2.47× | CANDIDATE_FASTER |
+
+`decision=ahash-faster, all_shapes_clear_null_floor=true`, parity `count_identical` every n. **★ WHY SETS BEAT
+MAPS (2.5× vs the maps' measured 1.70-1.78× in `instance_map_hash_ab`, `efb5e17f`): a `HashSet<&str>` op is
+PURE-hash-dominated — no value payload to fetch/compare, so aHash's per-hash advantage isn't diluted by the
+bucket-probe/key-compare/value-read that the maps' `.get()` carried. METHOD REFINEMENT: when sweeping a
+SipHash→aHash migration, grep `HashSet<` / `collect::<HashSet` SEPARATELY from HashMap — the membership SETs are
+HIGHER-EV than the resolution maps, not an afterthought. Verify `.contains`/`.len`/`.insert`-only (never
+iterated) for byte-identity.**
+
+With the sets landed, the remaining std-hasher sites are all confirmed below-bar (fail the "not I/O/lock-dominated"
+filter): `data_source.rs::instance_project_keys` — its build loop does a per-instance DB query
+(`latest_search_summary`) that dwarfs the insert, and its sole `.get()` (`project_key_for_instance`) sits behind
+a `Mutex::lock` that dwarfs one hash; `discovery.rs` fields (per-refresh inside the I/O-dominated
+`compute_refresh`); `adjacency` (opt-in, above). **So the ops SipHash→aHash vein is NOW genuinely complete —
+every hot per-render/per-event MAP and SET is aHashed, and every remainder is I/O/lock/opt-in below-noise.** The
+CPU-perf frontier closure stands after this fill; the correction is that "definitive" was one measurable
+sub-vein premature.
+
+Also this turn: `sort_choice_ab` (`bb385969`) retro-measured the already-shipped strict-total-order
+`sort_unstable` sweep (`15dc56b2`/`64934f9f`): n=4096 CANDIDATE_FASTER ~1.31-1.35× (two independent worker runs),
+n≤2048 INSIDE_NULL_FLOOR (wash, no regression) — pdqsort's edge over Timsort grows with n; byte-identical every
+n. Confirms the citation-shipped sort with an honest n-dependent number (win only at the top of the
+`max_retained_events=4096` production range).
