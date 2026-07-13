@@ -43,6 +43,48 @@ struct MonitorRow {
     cpu_percentile: u8,
 }
 
+/// Field totals over the visible monitor rows. `summary_lines` needs six sums
+/// (five `u64`, one `f64`) over the same slice; the legacy code made six separate
+/// passes. Computing them in one fold visits each row once. Byte-identical to six
+/// separate `.sum()` calls: the integer sums are order-independent, and the `f64`
+/// cpu accumulator folds in the same left-to-right row order as
+/// `.map(cpu_percent).sum::<f64>()`. Same N→1 sum-fold fusion as the alerts/SLO
+/// `fleet_rollup_row` (measured tie-small / win-large 1.53–1.87× in
+/// `fleet_rollup_ab`, commit d91b7da3) and the fleet.rs 5→1
+/// `build_project_percentile_values` (f4f98e0a).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct IndexResourceTotals {
+    docs: u64,
+    pending: u64,
+    io_kib: u64,
+    memory_mib: u64,
+    p95_latency_us: u64,
+    cpu_percent: f64,
+}
+
+fn index_resource_totals(rows: &[MonitorRow]) -> IndexResourceTotals {
+    let mut totals = IndexResourceTotals {
+        docs: 0,
+        pending: 0,
+        io_kib: 0,
+        memory_mib: 0,
+        p95_latency_us: 0,
+        // `Iterator::sum::<f64>()` folds from `-0.0`, not `+0.0` (it preserves the
+        // sign of a lone `-0.0` element and yields `-0.0` for an empty slice); seed
+        // the fused accumulator identically so the fusion is bit-exact in every case.
+        cpu_percent: -0.0,
+    };
+    for row in rows {
+        totals.docs += row.docs;
+        totals.pending += row.pending_jobs;
+        totals.io_kib += row.io_kib;
+        totals.memory_mib += row.memory_mib;
+        totals.p95_latency_us += row.p95_latency_us;
+        totals.cpu_percent += row.cpu_percent;
+    }
+    totals
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComparisonWindow {
     CurrentVsPreviousHourEstimate,
@@ -315,12 +357,13 @@ impl IndexResourceScreen {
             ];
         }
 
-        let docs_total: u64 = rows.iter().map(|row| row.docs).sum();
-        let pending_total: u64 = rows.iter().map(|row| row.pending_jobs).sum();
-        let io_total: u64 = rows.iter().map(|row| row.io_kib).sum();
-        let memory_total: u64 = rows.iter().map(|row| row.memory_mib).sum();
-        let p95_total: u64 = rows.iter().map(|row| row.p95_latency_us).sum();
-        let cpu_total: f64 = rows.iter().map(|row| row.cpu_percent).sum();
+        let totals = index_resource_totals(rows);
+        let docs_total = totals.docs;
+        let pending_total = totals.pending;
+        let io_total = totals.io_kib;
+        let memory_total = totals.memory_mib;
+        let p95_total = totals.p95_latency_us;
+        let cpu_total = totals.cpu_percent;
 
         let count_u64 = u64::try_from(rows.len()).unwrap_or(1);
         let count_u32 = u32::try_from(rows.len()).unwrap_or(1);
@@ -709,6 +752,55 @@ impl Screen for IndexResourceScreen {
 mod tests {
     use super::*;
     use crate::state::{FleetSnapshot, InstanceInfo, ResourceMetrics, SearchMetrics};
+
+    /// Six-pass oracle: the legacy per-field sums `summary_lines` used before the
+    /// fused single-pass `index_resource_totals`.
+    fn index_resource_totals_slow(rows: &[MonitorRow]) -> IndexResourceTotals {
+        IndexResourceTotals {
+            docs: rows.iter().map(|row| row.docs).sum(),
+            pending: rows.iter().map(|row| row.pending_jobs).sum(),
+            io_kib: rows.iter().map(|row| row.io_kib).sum(),
+            memory_mib: rows.iter().map(|row| row.memory_mib).sum(),
+            p95_latency_us: rows.iter().map(|row| row.p95_latency_us).sum(),
+            cpu_percent: rows.iter().map(|row| row.cpu_percent).sum(),
+        }
+    }
+
+    fn totals_row(seed: u64) -> MonitorRow {
+        MonitorRow {
+            project: format!("p-{}", seed % 4),
+            instance_id: format!("i-{seed:04}"),
+            healthy: seed % 3 != 0,
+            docs: seed.wrapping_mul(97) % 1_000_000,
+            pending_jobs: (seed * 7) % 4_000,
+            cpu_percent: (seed % 137) as f64 / 3.0,
+            memory_mib: 256 + (seed * 11) % 8_192,
+            io_kib: (seed * 13) % 50_000,
+            p95_latency_us: 1_500 + (seed * 37) % 6_000,
+            docs_percentile: (seed % 101) as u8,
+            p95_percentile: (seed % 101) as u8,
+            cpu_percentile: (seed % 101) as u8,
+        }
+    }
+
+    #[test]
+    fn fused_totals_byte_identical_to_six_pass() {
+        for n in [0usize, 1, 3, 17, 512, 2_048] {
+            let rows: Vec<MonitorRow> = (0..n as u64).map(totals_row).collect();
+            let fused = index_resource_totals(&rows);
+            let slow = index_resource_totals_slow(&rows);
+            assert_eq!(fused.docs, slow.docs, "docs n={n}");
+            assert_eq!(fused.pending, slow.pending, "pending n={n}");
+            assert_eq!(fused.io_kib, slow.io_kib, "io_kib n={n}");
+            assert_eq!(fused.memory_mib, slow.memory_mib, "memory_mib n={n}");
+            assert_eq!(fused.p95_latency_us, slow.p95_latency_us, "p95 n={n}");
+            assert_eq!(
+                fused.cpu_percent.to_bits(),
+                slow.cpu_percent.to_bits(),
+                "cpu_percent bit-identity n={n}"
+            );
+        }
+    }
 
     fn sample_state() -> AppState {
         let mut state = AppState::new();
