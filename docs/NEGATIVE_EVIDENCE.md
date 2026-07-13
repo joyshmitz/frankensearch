@@ -13689,3 +13689,23 @@ scalar f64/f32 reductions; grep `dot +=`/`sum +=` on rerank paths"). Grepped fus
 **So every widenable search-time reduction is already 4-acc'd (MMR `cosine_sim_pre`, index dot kernels); the
 remaining `sum +=`/`dot +=` are tails, opt-in-small, or reference oracles.** Route-next CLOSED — don't re-grep
 for un-widened search-time reductions.
+
+### 2026-07-13 — cc_fse — REVERTED (default flip too broad): Hash RRF tiebreak as DEFAULT breaks 12 interaction-contract ordering oracles
+
+User-authorized the pending default flip "Hash RRF tiebreak → default" (measured unbiased-fairness win `05472cd`,
+shipped opt-in; framed as the "cleanest/least-risky" of the pending default flips since it's workload-independent).
+Flipped both searchers' `new()` default `rrf_tiebreak` `LexicalThenId`→`Hash` (+ docs + the `with_rrf_tiebreak`
+opt-out to restore legacy). **Full fusion suite: FAILED — 12 integration tests failed** (`interaction_integration.rs`
+`all_lanes_run_without_panic` etc.: lane `adaptive_calibration_conformal` had 5 failing ORACLES, +others). The
+interaction-contract oracle suite pins result ORDERING behavior/stability per lane; changing the default tie-break
+reorders exact-score ties, so the ordering oracles mismatch. **The premise was wrong — this is NOT the "clean/
+least-risky" flip: unlike the NQC default flip (`ac081b7d`, full suite green with zero test edits), the tiebreak
+touches the interaction CONTRACT layer.** REVERTED via Edit (both searchers back to `LexicalThenId`; production
+byte-unchanged, src diff vs HEAD empty); the Hash tiebreak stays available OPT-IN via
+`with_rrf_tiebreak(RrfTiebreak::Hash)`. **To land it as the default requires a DELIBERATE interaction-oracle pass:
+determine whether each failing oracle is a GOLDEN snapshot of the legacy tie-order (safe to regenerate to the Hash
+order) or a PROPERTY (e.g. cross-lane ordering-stability, `kitchen_sink ⊇ baseline`) that Hash genuinely violates
+(which would mean Hash is contract-incompatible for those lanes) — NOT a this-turn rubber-stamp.** ★ LESSON: a
+"workload-independent measured quality win" can still be un-flippable as a DEFAULT when a CONTRACT/oracle test
+layer pins the exact behavior it changes; default-flip blast radius ≠ the win's isolated safety. Route-next: the
+interaction-oracle regeneration (property-vs-golden triage) is the real remaining task for this flip.
