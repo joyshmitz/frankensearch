@@ -196,6 +196,9 @@ impl ActionTimelineScreen {
         self.palette = palette;
     }
 
+    /// Test-only oracle: all events sorted descending by timestamp. Production now
+    /// filters-then-sorts the survivors inline in `filtered_events`.
+    #[cfg(test)]
     fn all_events(&self) -> Vec<LifecycleEvent> {
         let mut events = self.state.fleet().lifecycle_events.clone();
         events.sort_by(|left, right| {
@@ -240,8 +243,15 @@ impl ActionTimelineScreen {
             map
         });
 
-        self.all_events()
-            .into_iter()
+        // Filter the BORROWED events first, then sort only the survivors, then clone
+        // them — instead of `all_events()` cloning + sorting ALL events (up to ~32k,
+        // two Strings each) up front only to discard most under an active filter.
+        // Byte-identical: the filters are order-independent, and the stable
+        // `(at_ms desc, instance_id)` sort resolves ties by the survivors' original
+        // order either way (matching a stable sort of the full clone then filter).
+        let mut events: Vec<&LifecycleEvent> = fleet
+            .lifecycle_events
+            .iter()
             .filter(|event| {
                 project_filter.is_none_or(|project| {
                     let resolved = instance_projects
@@ -257,7 +267,14 @@ impl ActionTimelineScreen {
                     Self::host_bucket(&event.instance_id).eq_ignore_ascii_case(host)
                 })
             })
-            .collect()
+            .collect();
+        events.sort_by(|left, right| {
+            right
+                .at_ms
+                .cmp(&left.at_ms)
+                .then_with(|| left.instance_id.cmp(&right.instance_id))
+        });
+        events.into_iter().cloned().collect()
     }
 
     fn project_for_instance(&self, instance_id: &str) -> Option<&str> {
