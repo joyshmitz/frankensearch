@@ -110,17 +110,26 @@ pub struct SyncTwoTierSearcher {
     nqc_downweight_beta: f32,
     nqc_downweight_w_min: f32,
     nqc_dense_weight: NqcDenseWeight,
-    /// Opt-in *self-driving* rolling NQC dense down-weight (default off). When set, it takes
-    /// precedence over the static sketch above and learns the query distribution online. See
-    /// [`Self::with_nqc_dense_downweight_adaptive`]. Behind a `Mutex` so per-query observation
-    /// mutates the rolling state while `search` stays `&self`.
+    /// Self-driving rolling NQC dense down-weight — **on by default**
+    /// ([`AdaptiveNqcDenseWeight::production_default`]). When set, it takes precedence over the
+    /// static sketch above and learns the query distribution online. See
+    /// [`Self::with_nqc_dense_downweight_adaptive`] / [`Self::with_nqc_dense_downweight_disabled`].
+    /// Behind a `Mutex` so per-query observation mutates the rolling state while `search` stays
+    /// `&self`.
     nqc_adaptive: Option<Mutex<AdaptiveNqcDenseWeight>>,
 }
 
 impl SyncTwoTierSearcher {
     /// Create a sync searcher over an in-memory two-tier index.
+    ///
+    /// The self-driving NQC dense down-weight is **on by default**
+    /// ([`AdaptiveNqcDenseWeight::production_default`]) — neutral (byte-identical fusion) during
+    /// its 128-query warm-up, then realizing the measured +0.0022 nDCG@10 gain. Opt out with
+    /// [`Self::with_nqc_dense_downweight_disabled`]; an explicit
+    /// [`Self::with_nqc_dense_downweight`] (static sketch) also overrides it. (No longer `const`
+    /// — the default rolling sketch allocates.)
     #[must_use]
-    pub const fn new(index: Arc<InMemoryTwoTierIndex>, config: TwoTierConfig) -> Self {
+    pub fn new(index: Arc<InMemoryTwoTierIndex>, config: TwoTierConfig) -> Self {
         Self {
             index,
             lexical: None,
@@ -132,7 +141,7 @@ impl SyncTwoTierSearcher {
             nqc_downweight_beta: 0.0,
             nqc_downweight_w_min: 0.0,
             nqc_dense_weight: NqcDenseWeight::new(),
-            nqc_adaptive: None,
+            nqc_adaptive: Some(Mutex::new(AdaptiveNqcDenseWeight::production_default())),
         }
     }
 
@@ -191,10 +200,14 @@ impl SyncTwoTierSearcher {
         self.nqc_downweight_beta = beta;
         self.nqc_downweight_w_min = w_min;
         self.nqc_dense_weight = weight;
+        // An explicit static sketch overrides the default-on adaptive down-weight (which would
+        // otherwise take precedence in `effective_semantic_weight`).
+        self.nqc_adaptive = None;
         self
     }
 
-    /// Enable the **self-driving rolling** NQC dense down-weight (default OFF).
+    /// Enable the **self-driving rolling** NQC dense down-weight (**on by default**; this rebuilds
+    /// it with explicit parameters).
     ///
     /// Unlike [`Self::with_nqc_dense_downweight`] (a caller-supplied static sketch), this builds
     /// and refreshes the cv→percentile sketch *online* from the observed query stream via an

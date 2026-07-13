@@ -147,10 +147,12 @@ pub struct TwoTierSearcher {
     nqc_downweight_beta: f32,
     nqc_downweight_w_min: f32,
     nqc_dense_weight: NqcDenseWeight,
-    /// Opt-in *self-driving* rolling NQC dense down-weight (default off). Takes precedence over
-    /// the static sketch above and learns the query distribution online. See
-    /// [`Self::with_nqc_dense_downweight_adaptive`]. Behind a `Mutex` so per-query observation
-    /// mutates the rolling state while `search` stays `&self`.
+    /// Self-driving rolling NQC dense down-weight — **on by default**
+    /// ([`AdaptiveNqcDenseWeight::production_default`]). Takes precedence over the static sketch
+    /// above and learns the query distribution online. See
+    /// [`Self::with_nqc_dense_downweight_adaptive`] / [`Self::with_nqc_dense_downweight_disabled`].
+    /// Behind a `Mutex` so per-query observation mutates the rolling state while `search` stays
+    /// `&self`.
     nqc_adaptive: Option<Mutex<AdaptiveNqcDenseWeight>>,
     adaptive_fusion: Option<Arc<AdaptiveFusion>>,
     score_calibrator: Option<CalibratorConfig>,
@@ -204,7 +206,10 @@ impl TwoTierSearcher {
             nqc_downweight_beta: 0.0,
             nqc_downweight_w_min: 0.0,
             nqc_dense_weight: NqcDenseWeight::new(),
-            nqc_adaptive: None,
+            // Self-driving NQC dense down-weight ON BY DEFAULT — neutral during its 128-query
+            // warm-up, then realizing the measured +0.0022 nDCG@10 gain. Opt out via
+            // `with_nqc_dense_downweight_disabled`; an explicit static sketch also overrides it.
+            nqc_adaptive: Some(Mutex::new(AdaptiveNqcDenseWeight::production_default())),
             adaptive_fusion: None,
             score_calibrator: None,
             circuit_breaker: None,
@@ -283,10 +288,14 @@ impl TwoTierSearcher {
         self.nqc_downweight_beta = beta;
         self.nqc_downweight_w_min = w_min;
         self.nqc_dense_weight = weight;
+        // An explicit static sketch overrides the default-on adaptive down-weight (which would
+        // otherwise take precedence in `effective_semantic_weight`).
+        self.nqc_adaptive = None;
         self
     }
 
-    /// Enable the **self-driving rolling** NQC dense down-weight (default OFF).
+    /// Enable the **self-driving rolling** NQC dense down-weight (**on by default**; this rebuilds
+    /// it with explicit parameters).
     ///
     /// Unlike [`Self::with_nqc_dense_downweight`] (a caller-supplied static sketch), this builds
     /// and refreshes the cv→percentile sketch *online* from the observed query stream via an
