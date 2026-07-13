@@ -229,7 +229,7 @@ impl LiveSearchStreamScreen {
             .filter(|instance| {
                 project_filter.is_none_or(|project| instance.project.eq_ignore_ascii_case(project))
             })
-            .map(|instance| {
+            .filter_map(|instance| {
                 let metrics = fleet.search_metrics.get(&instance.id);
                 let resources = fleet.resources.get(&instance.id);
                 let searches = metrics.map_or(0, |value| value.total_searches);
@@ -238,6 +238,14 @@ impl LiveSearchStreamScreen {
                 let refined_count = metrics.map_or(0, |value| value.refined_count);
                 let memory_bytes = resources.map_or(0, |value| value.memory_bytes);
                 let host = Self::host_bucket(&instance.id);
+                // Test the host/severity/degraded filters BEFORE building the row's
+                // Strings, so a discarded instance skips the instance_id/project
+                // clones, the correlation id, and the marker join. Byte-identical:
+                // same predicates on the same values (host, severity), and the
+                // survivors are sorted afterwards either way.
+                if host_filter.is_some_and(|filter| !host.eq_ignore_ascii_case(filter)) {
+                    return None;
+                }
                 let mut markers: Vec<&'static str> = Vec::new();
                 if !instance.healthy {
                     markers.push("health");
@@ -261,10 +269,16 @@ impl LiveSearchStreamScreen {
                 } else {
                     StreamSeverity::Info
                 };
+                if !self.severity_filter.allows(severity) {
+                    return None;
+                }
+                if self.degraded_only && matches!(severity, StreamSeverity::Info) {
+                    return None;
+                }
                 if markers.is_empty() {
                     markers.push("nominal");
                 }
-                StreamRowData {
+                Some(StreamRowData {
                     instance_id: instance.id.clone(),
                     correlation_id: Self::correlation_id(
                         &instance.id,
@@ -282,11 +296,8 @@ impl LiveSearchStreamScreen {
                     memory_bytes,
                     severity,
                     degradation_marker: markers.join("+"),
-                }
+                })
             })
-            .filter(|row| host_filter.is_none_or(|host| row.host.eq_ignore_ascii_case(host)))
-            .filter(|row| self.severity_filter.allows(row.severity))
-            .filter(|row| !self.degraded_only || !matches!(row.severity, StreamSeverity::Info))
             .collect();
 
         rows.sort_by(|left, right| {
