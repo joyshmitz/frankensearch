@@ -67,6 +67,10 @@ name = "instance_map_hash_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "sort_choice_ab"
+harness = false
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
