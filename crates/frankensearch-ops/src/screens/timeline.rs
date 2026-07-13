@@ -689,21 +689,13 @@ impl ActionTimelineScreen {
     }
 
     fn rolling_counter_summary(events: &[LifecycleEvent]) -> String {
-        let now_ms = events.first().map_or(0, |event| event.at_ms);
-        let counts = TimeWindow::ALL
-            .iter()
-            .map(|window| {
-                let window_ms = window.seconds().saturating_mul(1_000);
-                let window_start = now_ms.saturating_sub(window_ms);
-                let count = events
-                    .iter()
-                    .filter(|event| event.at_ms >= window_start)
-                    .count();
-                format!("{}={count}", window.label())
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        format!("windows: {counts}")
+        use std::fmt::Write as _;
+        let counts = rolling_window_counts(events);
+        let mut out = String::from("windows:");
+        for (window, count) in TimeWindow::ALL.iter().zip(counts.iter()) {
+            let _ = write!(out, " {}={count}", window.label());
+        }
+        out
     }
 
     fn timeline_summary(events: &[LifecycleEvent]) -> String {
@@ -1014,9 +1006,54 @@ fn event_time_bounds_slow(events: &[LifecycleEvent]) -> (u64, u64) {
     (oldest, newest)
 }
 
+/// Number of rolling windows counted by [`rolling_window_counts`].
+const ROLLING_WINDOW_COUNT: usize = TimeWindow::ALL.len();
+
+/// Per-window counts of events whose `at_ms` is within each `TimeWindow::ALL`
+/// window, computed in ONE pass. `rolling_counter_summary` previously made one
+/// full `filter(at_ms >= window_start).count()` pass PER window (seven passes,
+/// reading each event's `at_ms` seven times and iterating the slice seven
+/// times). This fuses them: each event is visited once and tested against all
+/// seven precomputed window starts. Byte-identical — each window's count is the
+/// same independent threshold count. Same N→1 reduction fusion as the alerts/SLO
+/// `fleet_rollup_row` (8→1 folds, measured tie-small / win-large in
+/// `fleet_rollup_ab`, commit d91b7da3).
+fn rolling_window_counts(events: &[LifecycleEvent]) -> [usize; ROLLING_WINDOW_COUNT] {
+    let now_ms = events.first().map_or(0, |event| event.at_ms);
+    let mut starts = [0u64; ROLLING_WINDOW_COUNT];
+    for (slot, window) in starts.iter_mut().zip(TimeWindow::ALL) {
+        *slot = now_ms.saturating_sub(window.seconds().saturating_mul(1_000));
+    }
+    let mut counts = [0usize; ROLLING_WINDOW_COUNT];
+    for event in events {
+        let at = event.at_ms;
+        for (count, &start) in counts.iter_mut().zip(starts.iter()) {
+            *count += usize::from(at >= start);
+        }
+    }
+    counts
+}
+
+/// Pre-fusion seven-pass form of [`rolling_window_counts`], retained as the
+/// exact-parity bench/test oracle.
+#[cfg(any(test, feature = "bench-internals"))]
+fn rolling_window_counts_slow(events: &[LifecycleEvent]) -> [usize; ROLLING_WINDOW_COUNT] {
+    let now_ms = events.first().map_or(0, |event| event.at_ms);
+    let mut counts = [0usize; ROLLING_WINDOW_COUNT];
+    for (slot, window) in counts.iter_mut().zip(TimeWindow::ALL) {
+        let window_ms = window.seconds().saturating_mul(1_000);
+        let window_start = now_ms.saturating_sub(window_ms);
+        *slot = events
+            .iter()
+            .filter(|event| event.at_ms >= window_start)
+            .count();
+    }
+    counts
+}
+
 /// Bench-only: build `n` deterministic lifecycle events with a spread of `at_ms`
 /// timestamps (the shape `timeline_density_line` scans for its time bounds).
-#[cfg(feature = "bench-internals")]
+#[cfg(any(test, feature = "bench-internals"))]
 #[must_use]
 pub fn bench_make_lifecycle_events(n: usize) -> Vec<LifecycleEvent> {
     let mut events = Vec::with_capacity(n.max(1));
@@ -1052,6 +1089,20 @@ pub fn bench_event_bounds_slow(events: &[LifecycleEvent]) -> (u64, u64) {
     event_time_bounds_slow(events)
 }
 
+/// Bench-only: shipped single-pass rolling-window counts.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_rolling_counts_fused(events: &[LifecycleEvent]) -> [usize; ROLLING_WINDOW_COUNT] {
+    rolling_window_counts(events)
+}
+
+/// Bench-only: legacy seven-pass rolling-window counts.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_rolling_counts_slow(events: &[LifecycleEvent]) -> [usize; ROLLING_WINDOW_COUNT] {
+    rolling_window_counts_slow(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1135,23 @@ mod tests {
                 event_time_bounds_fused(&events),
                 event_time_bounds_slow(&events),
                 "bounds parity for {stamps:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rolling_window_counts_matches_seven_pass() {
+        assert_eq!(
+            rolling_window_counts(&[]),
+            rolling_window_counts_slow(&[]),
+            "rolling window counts parity for empty slice"
+        );
+        for n in [1usize, 3, 64, 512, 4_096] {
+            let events = bench_make_lifecycle_events(n);
+            assert_eq!(
+                rolling_window_counts(&events),
+                rolling_window_counts_slow(&events),
+                "rolling window counts parity for n={n}"
             );
         }
     }
