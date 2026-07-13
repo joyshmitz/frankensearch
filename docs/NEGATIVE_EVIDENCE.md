@@ -13558,3 +13558,23 @@ strongest form"; flat CSR on a genuinely LARGE graph n≫10⁴). Both resolve by
 on the small opt-in graphs, and the large-graph regime that could make it win does not occur.** This closes the
 last untested-labeled perf route-nexts in the ledger (alongside the tombstone-bitmap resolution and the
 hasher/container closures above). No code change.
+
+### 2026-07-13 — cc_fse — NULL: the highest-EV ops pattern (quadratic-over-second-collection, 2-65×) does NOT exist in the fusion searcher orchestration
+
+The biggest ops-render wins this arc were HIDDEN QUADRATICS — a per-item linear `.find`/`.any`/`.position`/
+`.contains` over a SECOND collection inside a `.filter`/`.map`/loop over the first (instance→project resolution:
+`project_resolve_ab` 2.2-65.7×, `c85478ed`). That pattern was swept in ops but never checked in the fusion
+searcher path. Grepped `sync_searcher.rs` / `blend.rs` / `federated.rs` / `rrf.rs` / `searcher.rs` for
+`.iter().(find|any|position|filter)` / `.contains(` / `find_map`. Result: NULL — every non-test hit is either a
+SINGLE-pass count (`quality_scores.iter().filter(is_some).count()` at sync_searcher:390 / searcher:1603;
+`results.iter().filter(in_both_sources).count()` at rrf:384/967 — one linear pass, not nested) or already
+optimal: `find_negative_match` (searcher:2859) normalizes the doc text ONCE (not per term/phrase — no redundant
+work), via the ASCII fast-path (the ~97× negation win `6c41ed4e`), and its `.contains()` loop is over the few
+query `-term`/phrase exclusions (small, and the Cow-borrow variant was already REJECTED). No collection-membership
+quadratic exists because fusion's score data is O(1)-indexed by construction (score maps, dense CSR,
+`AlignedScoreLookup`'s Dense-Vec/Hash adaptive) — the ops quadratics were a UI-render artifact (per-event
+instance-id resolution against `fleet.instances`), structurally absent from the retrieval/fusion pipeline.
+**So the single highest-EV winning pattern does not generalize to the fusion path; confirmed by grep + inspection,
+no bench.** With this, the pattern-family sweep (quadratic / pass-fusion / redundant-copy / hasher / container /
+min-max / truncate-before-materialize / Cow-borrow / Arc-share) is confirmed empty on the fusion searcher
+orchestration as well as ops — every ownable default-hot pattern-family surface is drained.
