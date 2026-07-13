@@ -13753,3 +13753,24 @@ with the GEMM-batch (1.03-1.14×) and int8-vertical rejections: the flat/exact d
 and layout reshuffles that keep the same FMA count don't beat it.** The columnar layout is also NOT the default
 hot path anyway (int8 two-pass is; the exact f32/f16 dot runs only on pass-2 candidates). `columnar_scan_ab`
 retained as the reproducible harness; production unchanged (bench-only).
+
+### 2026-07-13 — cc_fse — the vector-scan dot is FMA-THROUGHPUT-saturated on Zen 3 (columnar wash + 4-acc saturation both MEASURED) → the real slack is algorithmic or AVX-512, both blocked HERE
+
+Not a "floored" assertion — a synthesis of two MEASUREMENTS pinning WHERE the boundary is and WHAT would move it:
+- **Across-candidate parallelism = WASH** (this arc, `columnar_scan_ab`): the tiled-columnar reduce-free scan
+  (8 candidates per SIMD lane-group, no per-candidate horizontal reduce) is 1.02× vs a fair query-hoisted
+  row-major dot — INSIDE_NULL_FLOOR.
+- **Within-candidate ILP = already saturated** (prior, `82e151f`/memory): the exact f16 dot's 4 independent
+  accumulators landed a win, but the int8 4-acc route-next TESTED ~0 (throughput-bound).
+Both ILP mechanisms (lanes across candidates, accumulators within a candidate) fail to beat the scan ⇒ the
+int8/exact dot is **FMA-throughput-saturated on Zen 3**. Any micro-primitive/layout reshuffle that keeps the same
+FMA count cannot win here (columnar, int8-vertical, GEMM-batch, tombstone-bitmap all wash/lose — see their
+entries). **The two axes with genuine remaining slack are BOTH blocked on THIS setup:**
+1. **ALGORITHMIC candidate-reduction** (IVF/clustering/early-abandon — fewer FMAs, not faster FMAs). The
+   early-abandon arc (`b524033`…`0c107f3`) landed 8× synthetic; its route-next is real-corpus-130k validation,
+   DATA-blocked (no labeled corpus + embeddings staged on workers).
+2. **AVX-512 VNNI** (`vpdpbusd`: 4× int8 throughput with direct i32 accumulate, removing the i16→i32 hsum) —
+   Zen-3 has no AVX-512; needs a VNNI-capable worker.
+**So the productive vector-scan lever needs a real 130k corpus (unblock early-abandon validation) or VNNI
+hardware — not another micro-primitive bench.** Route-next is concrete and unblockable (provide corpus/embeddings
+on a worker, or a VNNI machine), not "we're maxed."
