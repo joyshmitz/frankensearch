@@ -13514,3 +13514,19 @@ set-sweep method pays only where the hot keys are STRINGS *and* the set op is th
 not a universal follow-on to a map-only aHash migration.** The SipHash→aHash vein is now closed across the whole
 workspace: ops maps + sets done (`626aa865`…/`e1cbc30c`), search maps done (frontier maps), search sets confirmed
 below-bar here. No production change.
+
+**Same turn — the sibling INTEGER-key angle is also NULL** (identity-hasher / dense-Vec, prompted by filter's
+`DocIdHashSet = HashSet<u64, BuildIdentityHasherU64>`). Grepped every `(A?Hash|BTree)(Map|Set)<u64|u32|usize|i64|
+GraphDocId>`. The one default-hot integer-keyed structure — `fusion/sync_searcher.rs:634`
+`AlignedScoreLookup::Hash(AHashMap<u32, AlignedScores>)` — is ALREADY optimal: it's an adaptive enum with a
+`Dense { base, scores: Vec<Option<..>> }` variant (indexed `hit.index - min_index`, chosen when the index span
+≤ `4·len+1024`) and falls back to the `Hash` map ONLY for genuinely sparse indices — i.e. the "dense integer
+keys → Vec, not HashMap" win is already implemented there. Everything else is opt-in (graph_rank/smooth
+`HashMap<GraphDocId,_>` — smoothing alpha=0 default, per the adjacency closure), I/O (storage `fts5_adapter`
+`row_to_doc`, `job_queue`, durability `codec`, fsfs `watcher` `by_time`), or test/eval (`simd.rs` recall-check
+sets, `metrics_eval` outlier sets). The only aHash→identity micro-candidate, `index/search.rs:1338`
+`wal_hashes: AHashSet<u64>` (doc-id-HASH keys, well-distributed → identity-safe), is a near-free swap — aHash on
+a `u64` is already ~1 multiply, and the per-search `.collect()` that builds the set dominates the probe — so
+identity would not clear the floor. **The hasher/container micro-optimization surface (string-set aHash +
+integer-key identity/dense-Vec) is now exhaustively closed; the one real win it held (ops string SETs, 2.5×) is
+landed.**
