@@ -115,6 +115,80 @@ struct SloProjectRow {
     status: ControlPlaneHealth,
 }
 
+/// Exact-comparison projection of a rollup row (f64 fields as raw bits). `status`
+/// is a deterministic function of `burn_ratio`, so bit-equal `burn_ratio` implies
+/// equal `status`; `project` is the constant `"fleet"`. Used for byte-identity
+/// checks between the fused and eight-pass rollup forms.
+#[cfg(any(test, feature = "bench-internals"))]
+type SloRollupBits = (usize, usize, u64, u64, u64, u64, u64, &'static str);
+
+#[cfg(any(test, feature = "bench-internals"))]
+fn rollup_bits(row: Option<SloProjectRow>) -> Option<SloRollupBits> {
+    row.map(|r| {
+        (
+            r.instance_count,
+            r.unhealthy_count,
+            r.pending_jobs,
+            r.p95_latency_us,
+            r.burn_ratio.to_bits(),
+            r.remaining_ratio.to_bits(),
+            r.backlog_eta_s,
+            r.saturation_risk,
+        )
+    })
+}
+
+/// Bench-only opaque handle wrapping a synthetic set of per-project SLO rows.
+#[cfg(feature = "bench-internals")]
+pub struct BenchSloRollup {
+    rows: Vec<SloProjectRow>,
+}
+
+/// Bench-only: build `n_projects` deterministic per-project rows spanning all
+/// saturation tiers and a range of instance weights / burn ratios.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn bench_make_slo_rollup(n_projects: usize) -> BenchSloRollup {
+    let n = n_projects.max(1);
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let iu = i as u64;
+        let saturation_risk = match i % 5 {
+            0 => "high",
+            1 | 2 => "elevated",
+            _ => "low",
+        };
+        rows.push(SloProjectRow {
+            project: format!("project-{i:04}"),
+            instance_count: 1 + (i % 200),
+            unhealthy_count: i % 17,
+            pending_jobs: (iu * 7) % 4_000,
+            p95_latency_us: 1_500 + (iu * 37) % 6_000,
+            burn_ratio: ((i % 130) as f64) / 100.0,
+            remaining_ratio: 0.0, // not read by the rollup
+            backlog_eta_s: (iu * 13) % 900,
+            saturation_risk,
+            status: ControlPlaneHealth::Healthy, // not read by the rollup
+        });
+    }
+    BenchSloRollup { rows }
+}
+
+/// Bench-only: shipped fused single-pass rollup over the corpus.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_fleet_rollup_fused(input: &BenchSloRollup) -> Option<SloRollupBits> {
+    rollup_bits(AlertsSloScreen::fleet_rollup_row(&input.rows))
+}
+
+/// Bench-only: legacy eight-pass rollup over the corpus.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_fleet_rollup_slow(input: &BenchSloRollup) -> Option<SloRollupBits> {
+    rollup_bits(AlertsSloScreen::fleet_rollup_row_slow(&input.rows))
+}
+
 /// Alerts + SLO + capacity screen for operator triage.
 pub struct AlertsSloScreen {
     id: ScreenId,
@@ -599,6 +673,85 @@ impl AlertsSloScreen {
     }
 
     fn fleet_rollup_row(project_rows: &[SloProjectRow]) -> Option<SloProjectRow> {
+        if project_rows.is_empty() {
+            return None;
+        }
+
+        // Single fused pass replaces eight separate iterations over `project_rows`
+        // (three integer sums, two instance-weighted sums, one max, two
+        // saturation-risk `any` scans). Byte-identical to `fleet_rollup_row_slow`:
+        // integer sums are order-independent; the f64 weighted-burn accumulates in
+        // the same left-to-right row order as the prior `.sum::<f64>()` (so the
+        // fixed point is bit-identical); the `weighted_p95` accumulator uses plain
+        // `+` (matching `.sum::<u64>()`, not saturating) with the per-term
+        // `saturating_mul` preserved; `backlog_eta_s` is `u64` so seeding the max
+        // at 0 is exact; and computing both saturation flags keeps the unchanged
+        // high-then-elevated priority.
+        let mut total_instances: usize = 0;
+        let mut total_unhealthy: usize = 0;
+        let mut total_pending: u64 = 0;
+        let mut weighted_p95_sum: u64 = 0;
+        let mut weighted_burn_sum: f64 = 0.0;
+        let mut backlog_eta_s: u64 = 0;
+        let mut has_high = false;
+        let mut has_elevated = false;
+        for row in project_rows {
+            total_instances += row.instance_count;
+            total_unhealthy += row.unhealthy_count;
+            total_pending += row.pending_jobs;
+            let weight_u64 = u64::try_from(row.instance_count).unwrap_or(0);
+            weighted_p95_sum += row.p95_latency_us.saturating_mul(weight_u64);
+            let weight_f64 = f64::from(u32::try_from(row.instance_count).unwrap_or(0));
+            weighted_burn_sum += row.burn_ratio * weight_f64;
+            backlog_eta_s = backlog_eta_s.max(row.backlog_eta_s);
+            has_high |= matches!(row.saturation_risk, "high");
+            has_elevated |= matches!(row.saturation_risk, "elevated");
+        }
+
+        let total_instances_u64 = u64::try_from(total_instances).unwrap_or(1);
+        let weighted_p95 = weighted_p95_sum
+            .saturating_add(total_instances_u64 / 2)
+            .saturating_div(total_instances_u64);
+
+        let total_instance_weight = f64::from(u32::try_from(total_instances).unwrap_or(1));
+        let weighted_burn = weighted_burn_sum / total_instance_weight;
+
+        let remaining_ratio = (1.0 - weighted_burn).clamp(0.0, 1.0);
+
+        let saturation_risk = if has_high {
+            "high"
+        } else if has_elevated {
+            "elevated"
+        } else {
+            "low"
+        };
+
+        let status = if weighted_burn >= BURN_CRITICAL {
+            ControlPlaneHealth::Critical
+        } else if weighted_burn >= BURN_WARN {
+            ControlPlaneHealth::Degraded
+        } else {
+            ControlPlaneHealth::Healthy
+        };
+
+        Some(SloProjectRow {
+            project: "fleet".to_owned(),
+            instance_count: total_instances,
+            unhealthy_count: total_unhealthy,
+            pending_jobs: total_pending,
+            p95_latency_us: weighted_p95,
+            burn_ratio: weighted_burn,
+            remaining_ratio,
+            backlog_eta_s,
+            saturation_risk,
+            status,
+        })
+    }
+
+    /// Pre-fusion eight-pass form of [`Self::fleet_rollup_row`], retained as the
+    /// exact-parity bench oracle.
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn fleet_rollup_row_slow(project_rows: &[SloProjectRow]) -> Option<SloProjectRow> {
         if project_rows.is_empty() {
             return None;
         }
@@ -1284,6 +1437,48 @@ mod tests {
         ControlPlaneMetrics, FleetSnapshot, InstanceInfo, LifecycleEvent, ResourceMetrics,
         SearchMetrics,
     };
+
+    #[allow(clippy::cast_precision_loss)]
+    fn synth_rows(n: usize) -> Vec<SloProjectRow> {
+        (0..n)
+            .map(|i| {
+                let iu = i as u64;
+                let saturation_risk = match i % 5 {
+                    0 => "high",
+                    1 | 2 => "elevated",
+                    _ => "low",
+                };
+                SloProjectRow {
+                    project: format!("project-{i:04}"),
+                    instance_count: 1 + (i % 200),
+                    unhealthy_count: i % 17,
+                    pending_jobs: (iu * 7) % 4_000,
+                    p95_latency_us: 1_500 + (iu * 37) % 6_000,
+                    burn_ratio: ((i % 130) as f64) / 100.0,
+                    remaining_ratio: 0.0,
+                    backlog_eta_s: (iu * 13) % 900,
+                    saturation_risk,
+                    status: ControlPlaneHealth::Healthy,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fleet_rollup_row_matches_slow() {
+        // Byte-identity: the fused single pass equals the eight-pass form across
+        // empty / single / multi-project shapes (incl. all saturation tiers, so
+        // the high>elevated>low priority and the weighted f64 burn fixed point
+        // are exercised). `rollup_bits` compares f64 fields as raw bits.
+        for n in [0usize, 1, 2, 3, 4, 5, 50, 137, 500] {
+            let rows = synth_rows(n);
+            assert_eq!(
+                rollup_bits(AlertsSloScreen::fleet_rollup_row(&rows)),
+                rollup_bits(AlertsSloScreen::fleet_rollup_row_slow(&rows)),
+                "fused/slow rollup parity for n={n}"
+            );
+        }
+    }
 
     #[allow(clippy::too_many_lines)]
     fn sample_state() -> AppState {

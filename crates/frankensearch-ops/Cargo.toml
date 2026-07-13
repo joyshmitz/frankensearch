@@ -42,6 +42,11 @@ harness = false
 name = "sparkline_build_ab"
 harness = false
 
+[[bench]]
+name = "fleet_rollup_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
