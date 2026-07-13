@@ -102,8 +102,13 @@ fn retain(heap: &mut Vec<(f32, usize)>, score: f32, idx: usize, cutoff: &mut f32
             *cutoff = heap.iter().map(|&(s, _)| s).fold(f32::INFINITY, f32::min);
         }
     } else if score > *cutoff {
-        // replace the current min
-        let (mi, _) = heap.iter().enumerate().min_by(|a, b| a.1.0.total_cmp(&b.1.0)).unwrap();
+        // replace the current min entry (avoid nested-tuple `a.1.0` parse gotcha)
+        let mut mi = 0;
+        for j in 1..heap.len() {
+            if heap[j].0 < heap[mi].0 {
+                mi = j;
+            }
+        }
         heap[mi] = (score, idx);
         *cutoff = heap.iter().map(|&(s, _)| s).fold(f32::INFINITY, f32::min);
     }
