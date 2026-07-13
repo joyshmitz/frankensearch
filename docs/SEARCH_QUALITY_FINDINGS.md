@@ -217,9 +217,16 @@ now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords
   already does). The HARD gate (skip dense) is NOT robustly Pareto (nfcorpus needs dense on its committed queries) —
   the SOFT down-weight is, because it retains partial dense. LAND-SCOPING: must use a per-deployment cv-**percentile**
   CDF (streaming t-digest over the query stream) — a fixed `β·cv` does NOT transfer (cv scale is corpus-dependent).
-  **Status:** foundation landed (`frankensearch_fusion::nqc_cv`, `0b4651c2`, tested + latency-benched `97f5c697`);
-  remaining = t-digest CDF sketch + weight application in the pool-min-max path + opt-in `dense_nqc_downweight_beta`
-  (default 0). Validate on the REAL production embedder before enabling — all numbers here are potion/model2vec proxy.
+  **Status (2026-07-13): ✓ DEPLOYED — LIVE BY DEFAULT.** The full pipeline landed as 6 increments
+  (`66592753` `NqcCvSampler` rolling sample → `749030c2` `AdaptiveNqcDenseWeight` self-driving cv→percentile
+  sketch → `5fa9acfd`/`af1a7678` sync+async searcher wiring → `eb6fa58c` blessed defaults + disable escape →
+  `ac081b7d` default-ON flip). Both searchers now install `AdaptiveNqcDenseWeight::production_default()` (β=0.5,
+  2048-query rolling window, `min_samples`=128, rebuild every 64) in `new()`; it stays neutral (byte-identical
+  fusion) through the 128-query warm-up, then realizes the down-weight online — no external sample management, no
+  per-corpus calibration. The deployment-faithful cv-**percentile** CDF is the rolling empirical sample (not a
+  fixed β·cv). Verified: full fusion suite green (lib 892 / integration 38, exit 0). Opt out via
+  `with_nqc_dense_downweight_disabled()` (byte-identical A/B). Route-next: re-confirm the LIVE Rust default on the
+  REAL production embedder (all nDCG numbers here are potion/model2vec proxy) + an RCH `--all-features` gate.
 - **Statistical caution (applies to every single-run number in this harness):** each nDCG figure is a POINT
   ESTIMATE; treat **±0.003-scale deltas as noise** unless pooled/CI'd. The large deltas above (stem+stop +0.024/
   +0.035, pool-min-max>RRF +0.017) are trustworthy; the sub-0.003 washes (z-score, pool-size) were correctly read
@@ -238,7 +245,7 @@ byte-for-byte unchanged), so the recipe is expressible in code with **no** produ
 | Neutral hash RRF tiebreak (#3) | **Shipped, opt-in** `05472cd` | `RrfConfig { tiebreak: RrfTiebreak::Hash, .. }` |
 | RRF `k` (#3) | already configurable | `RrfConfig { k: 10.0, .. }` / `TwoTierConfig.rrf_k` |
 | Deep candidate feed (#3) | already configurable | `candidate_multiplier` |
-| NQC dense down-weight (2026-07-12) | **Shipped, opt-in (sync path)** `d735d6f2` — `nqc_cv`/`NqcDenseWeight` + wired into `SyncTwoTierSearcher`, default off, 873 tests green | `SyncTwoTierSearcher::with_nqc_dense_downweight(beta≈0.5, w_min>0, NqcDenseWeight::from_sample(&query_nqc_sample))`; async `searcher.rs` wiring + real-embedder A/B are follow-ups |
+| NQC dense down-weight (2026-07-13) | **✓ LIVE (default), both searchers** `ac081b7d` — self-driving `AdaptiveNqcDenseWeight` (rolling online cv→percentile sketch) installed by default in `new()`; neutral through a 128-query warm-up, then the +0.0022 nDCG down-weight. Full fusion suite green (lib 892 + integration 38). | on by default; opt out `with_nqc_dense_downweight_disabled()`; explicit `with_nqc_dense_downweight(β, w_min, sketch)` overrides with a static sketch |
 
 **Remaining work is outward-facing DEFAULT flips (product-gated).** Turning the recipe on *by default* changes
 user-visible ranking output and updates test snapshots, so each needs a product sign-off — each is de-risked to a
