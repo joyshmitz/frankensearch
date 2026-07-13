@@ -5,6 +5,8 @@
 //! required before weighted blending. RRF itself is rank-based and does not
 //! require normalization.
 
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 
 const NON_FINITE_FALLBACK: f32 = 0.0;
@@ -222,6 +224,86 @@ impl NqcDenseWeight {
     }
 }
 
+/// A bounded rolling sample of observed query NQC values that rebuilds a [`NqcDenseWeight`]
+/// on demand — the deployment source [`NqcDenseWeight`]'s docs call for ("a rolling sample of
+/// observed NQC values (the query stream); rebuild periodically"). Retains the most-recent
+/// `capacity` observations so the installed sketch tracks the live query distribution rather
+/// than a stale startup batch (the NQC scale is corpus-dependent, so the percentile map must
+/// be estimated from the deployment's own queries).
+///
+/// Typical wiring: `observe` each query's lexical top-k BM25 scores, then periodically install
+/// `sketch(min_samples)` as the searcher's [`NqcDenseWeight`]. Below `min_samples` the sketch
+/// is empty, so the down-weight stays neutral (byte-identical fusion) during warm-up.
+#[derive(Debug, Clone)]
+pub struct NqcCvSampler {
+    /// Most-recent observed NQC (`nqc_cv`) values, front = oldest.
+    recent: VecDeque<f32>,
+    capacity: usize,
+}
+
+impl NqcCvSampler {
+    /// Create a sampler retaining the most-recent `capacity` NQC observations. A `capacity`
+    /// of `0` is clamped to `1` so at least one observation is always retained.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            recent: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Record one query's NQC. Non-finite observations are ignored; when the sample is full the
+    /// oldest observation is evicted (bounded rolling window).
+    pub fn observe(&mut self, cv: f32) {
+        if !cv.is_finite() {
+            return;
+        }
+        if self.recent.len() == self.capacity {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(cv);
+    }
+
+    /// Record one query from its lexical (BM25) top-k scores — computes [`nqc_cv`] and observes
+    /// it. A degenerate score set (empty / zero-mean) yields a `0.0` NQC, a valid low-commitment
+    /// observation that is retained (matching [`NqcDenseWeight::from_query_scores`]).
+    pub fn observe_lexical_scores(&mut self, scores: &[f32]) {
+        self.observe(nqc_cv(scores));
+    }
+
+    /// Number of retained observations.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.recent.len()
+    }
+
+    /// Whether no observations have been retained yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.recent.is_empty()
+    }
+
+    /// The retention bound (the most-recent-N rolling-window size).
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Build a [`NqcDenseWeight`] from the current sample once at least `min_samples` (and at
+    /// least one) observations have accumulated; below that returns an empty (neutral) sketch so
+    /// the down-weight stays off during warm-up. `min_samples` guards against a percentile map
+    /// estimated from too few queries.
+    #[must_use]
+    pub fn sketch(&self, min_samples: usize) -> NqcDenseWeight {
+        if self.recent.len() < min_samples.max(1) {
+            return NqcDenseWeight::new();
+        }
+        let sample: Vec<f32> = self.recent.iter().copied().collect();
+        NqcDenseWeight::from_sample(&sample)
+    }
+}
+
 /// In-place z-score normalization.
 ///
 /// Finite values are standardized and then linearly mapped to `[0, 1]` by
@@ -299,7 +381,7 @@ pub fn normalize_scores_with_method(scores: &[f32], method: NormalizationMethod)
 #[cfg(test)]
 mod tests {
     use super::{
-        NormalizationMethod, NqcDenseWeight, min_max_normalize, normalize_in_place,
+        NormalizationMethod, NqcCvSampler, NqcDenseWeight, min_max_normalize, normalize_in_place,
         normalize_scores, normalize_scores_with_method, nqc_cv, nqc_cv_iter, z_score_normalize,
     };
 
@@ -341,6 +423,76 @@ mod tests {
         // mean=3, population var=2, std=sqrt(2) -> cv = sqrt(2)/3.
         let cv = nqc_cv(&[1.0, 2.0, 3.0, 4.0, 5.0]);
         assert!((cv - (2.0_f32).sqrt() / 3.0).abs() <= 1e-5, "cv={cv}");
+    }
+
+    #[test]
+    fn nqc_sampler_capacity_zero_retains_at_least_one() {
+        let mut sampler = NqcCvSampler::new(0);
+        assert_eq!(sampler.capacity(), 1);
+        sampler.observe(0.3);
+        sampler.observe(0.5);
+        assert_eq!(sampler.len(), 1, "capacity clamps to 1 -> only the most-recent is kept");
+    }
+
+    #[test]
+    fn nqc_sampler_bounded_rolling_window_evicts_oldest() {
+        let mut sampler = NqcCvSampler::new(3);
+        for cv in [0.1, 0.2, 0.3, 0.4, 0.5] {
+            sampler.observe(cv);
+        }
+        assert_eq!(sampler.len(), 3, "window bounded to the 3 most-recent");
+        // The sketch reflects only the retained window {0.3, 0.4, 0.5}.
+        let weight = sampler.sketch(1);
+        assert_eq!(weight.len(), 3);
+        assert!(
+            (weight.percentile(0.25) - 0.0).abs() <= EPSILON,
+            "0.25 is below the retained window"
+        );
+        assert!(
+            (weight.percentile(0.5) - 1.0).abs() <= EPSILON,
+            "0.5 is the max of the retained window"
+        );
+    }
+
+    #[test]
+    fn nqc_sampler_ignores_non_finite_observations() {
+        let mut sampler = NqcCvSampler::new(8);
+        sampler.observe(f32::NAN);
+        sampler.observe(f32::INFINITY);
+        sampler.observe(f32::NEG_INFINITY);
+        sampler.observe(0.2);
+        assert_eq!(sampler.len(), 1, "only the finite observation is retained");
+    }
+
+    #[test]
+    fn nqc_sampler_sketch_below_min_samples_is_neutral() {
+        let mut sampler = NqcCvSampler::new(8);
+        sampler.observe(0.1);
+        sampler.observe(0.2);
+        let weight = sampler.sketch(5);
+        assert!(weight.is_empty(), "below min_samples -> empty (neutral) sketch");
+        assert!(
+            (weight.dense_weight(0.15, 0.5, 0.1) - 1.0).abs() <= EPSILON,
+            "empty sketch -> neutral dense weight (byte-identical fusion during warm-up)"
+        );
+    }
+
+    #[test]
+    fn nqc_sampler_observe_lexical_scores_matches_from_query_scores() {
+        // Degenerate score sets contribute a 0.0 NQC, retained just like from_query_scores.
+        let mut sampler = NqcCvSampler::new(8);
+        sampler.observe_lexical_scores(&[]); // empty -> 0.0
+        sampler.observe_lexical_scores(&[5.0, 5.0, 5.0]); // zero-variance -> 0.0
+        sampler.observe_lexical_scores(&[10.0, 1.0, 0.5]); // peaked -> positive
+        assert_eq!(sampler.len(), 3);
+        let weight = sampler.sketch(1);
+        assert_eq!(weight.len(), 3);
+        // Two 0.0 observations and one positive -> CDF(0.0) = 2/3.
+        assert!(
+            (weight.percentile(0.0) - 2.0 / 3.0).abs() <= EPSILON,
+            "percentile(0.0)={}",
+            weight.percentile(0.0)
+        );
     }
 
     #[test]
