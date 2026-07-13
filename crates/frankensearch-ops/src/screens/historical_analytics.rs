@@ -4,7 +4,7 @@
 //! evidence-log exploration, and export-friendly incident review handles.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ftui_layout::{Constraint, Flex};
 use ftui_render::cell::PackedRgba;
@@ -1160,7 +1160,9 @@ impl Screen for HistoricalAnalyticsScreen {
                         .instances
                         .iter()
                         .map(|instance| instance.project.as_str())
-                        .collect::<BTreeSet<_>>()
+                        // Distinct-project count only: collected for `.len()`, never
+                        // iterated, so a HashSet dedups in O(N) vs BTreeSet's O(N log N).
+                        .collect::<HashSet<_>>()
                         .len(),
                     self.state.control_plane_health()
                 )),
