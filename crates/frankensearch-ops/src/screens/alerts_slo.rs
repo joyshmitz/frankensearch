@@ -4,7 +4,7 @@
 //! error-budget signals, and capacity risk indicators.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
@@ -337,15 +337,29 @@ impl AlertsSloScreen {
     }
 
     fn all_alerts(&self) -> Vec<AlertRow> {
-        let mut rows = self
-            .state
-            .fleet()
+        let fleet = self.state.fleet();
+
+        // id -> project lookup built once, replacing the per-event linear
+        // `project_for_instance` find (was O(events * instances), and `all_alerts`
+        // is called several times per render). `or_insert` keeps the first
+        // occurrence, matching `.find`. Same fix as the timeline screen
+        // (measured 2.2-65.7x in `project_resolve_ab`).
+        let mut instance_projects: HashMap<&str, &str> =
+            HashMap::with_capacity(fleet.instances.len());
+        for instance in &fleet.instances {
+            instance_projects
+                .entry(instance.id.as_str())
+                .or_insert(instance.project.as_str());
+        }
+
+        let mut rows = fleet
             .lifecycle_events
             .iter()
             .map(|event| AlertRow {
                 ts_ms: event.at_ms,
-                project: self
-                    .project_for_instance(&event.instance_id)
+                project: instance_projects
+                    .get(event.instance_id.as_str())
+                    .copied()
                     .unwrap_or("unknown")
                     .to_owned(),
                 host: Self::host_bucket(&event.instance_id),
