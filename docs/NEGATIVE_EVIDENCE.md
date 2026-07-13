@@ -13483,3 +13483,34 @@ Also this turn: `sort_choice_ab` (`bb385969`) retro-measured the already-shipped
 n≤2048 INSIDE_NULL_FLOOR (wash, no regression) — pdqsort's edge over Timsort grows with n; byte-identical every
 n. Confirms the citation-shipped sort with an honest n-dependent number (win only at the top of the
 `max_retained_events=4096` production range).
+
+### 2026-07-13 — cc_fse — NULL: the "missed hash-SET" gap that paid 2.5× in ops does NOT generalize to the search crates (their hot sets are already specialized or cost-dominated elsewhere)
+
+Applied this session's refined method (grep `HashSet<` / `collect::<HashSet` SEPARATELY from HashMap — ops' aHash
+sweep missed hot SETs → 2.46-2.51×, `e1cbc30c`) to the search crates the frontier maps declared "aHash-done"
+(fusion / index / lexical / rerank / core / embed). Every std `HashSet` site is below-bar; NO default-hot large
+string-keyed membership set survives:
+
+- `core/filter.rs:183` `DocTypeFilter.allowed_types` — the one genuine query-path set (`.contains(doc_type)` per
+  hit at `sync_searcher.rs:567` `.filter(|hit| filter.matches(...))`) — but (a) OPT-IN (only when a DocTypeFilter
+  is configured), (b) TINY (a handful of allowed types), and (c) `matches()` is DOMINATED by the
+  `meta.get("doc_type").and_then(as_str)` serde_json lookup that precedes the `contains`, so the tiny-set SipHash
+  is a negligible fraction of the per-hit cost. Decisively, the HOT doc-id set in the SAME file is ALREADY
+  specialized: `DocIdHashSet = HashSet<u64, BuildIdentityHasherU64>` (identity hash on u64 — strictly better than
+  aHash for ints). So the hot filter membership was solved, just not with aHash.
+- `core/cache.rs` `S3FifoCache` (`entries: HashMap` + `ghost_set: HashSet`, both SipHash) — NO production
+  instantiation anywhere in the workspace (only cache.rs tests + the embed `cache_replay` bench, which uses
+  `S3FifoCache<u64, ()>`); a provided-but-unwired library cache, and its intended `u64` keys want an identity
+  hasher, not aHash. Below-bar.
+- `index/two_tier.rs:649-650` `fast_ids`/`quality_ids` — `.insert()`-only during index BUILD (dup detection), not
+  the query/scan path; cold. `index/lib.rs` `seen_ids`/`to_delete_set` — ingest/delete paths, not query-hot.
+- The remainder are TEST/oracle (`mmr.rs:742`, `interaction_oracles.rs`, `lib.rs:2543/2664`, cache.rs tests) or
+  OFFLINE eval/lint/repair harnesses (`metrics_eval.rs`, `observability_lint.rs`, `repair.rs`) — never on a query.
+
+**★ FINDING: the ops "missed hot SET" win was ops-SPECIFIC — ops had un-specialized short-STRING-keyed hot sets
+(instance-ids), whereas the search crates' hot membership is EITHER already specialized (identity-hashed u64
+doc-ids in filter) OR dominated by a heavier per-item cost (serde_json metadata extraction; I/O ingest). So the
+set-sweep method pays only where the hot keys are STRINGS *and* the set op is the DOMINANT per-item cost — it is
+not a universal follow-on to a map-only aHash migration.** The SipHash→aHash vein is now closed across the whole
+workspace: ops maps + sets done (`626aa865`…/`e1cbc30c`), search maps done (frontier maps), search sets confirmed
+below-bar here. No production change.
