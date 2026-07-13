@@ -13099,6 +13099,40 @@ startup/warm-up state; the ratios are for the isolated effective-weight region, 
 strict-remote release validation passed 4/4 NQC down-weight tests on `vmi1149989`, including exact-bit empty-sketch
 coverage for both searcher siblings. No local Cargo fallback ran.
 
+### 2026-07-12 — Codex — WIN: sync two-phase search reuses populated NQC weight — ~1.92–2.00×, exact bits
+
+Negative-ledger-first inspection found a fresh consequence of the late sync NQC wiring. A full two-phase
+`SyncTwoTierSearcher` query called `effective_semantic_weight` during both initial and refined RRF fusion even
+though both calls read the identical immutable lexical slice and searcher fields. With an enabled, populated
+sketch, that repeated the full O(hit-count) `nqc_cv_iter` reduction. The keep computes the weight once immediately
+after lexical retrieval and copies the same `f64` into both phase configurations. The computation remains inside
+phase-1 timing; phase 2 loses only the redundant work.
+
+The retained same-binary comparator forces the exact current two reductions versus one calculation reused twice,
+and asserts equal tuple-element `f64::to_bits()` before timing. Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-fusion --profile release \
+  --features bench-internals --bench nqc_cv_cost_ab
+```
+
+Worker `vmi1227854`; one release binary; 41 alternating rounds; `inner=2048`; populated sketch;
+ratio is one reduction/two reductions:
+
+| lexical hits | A/A two-reduction null median [p5, p95] | reuse/original median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 20 | 0.9992 [0.5841, 1.4005] | **0.5197 [0.4767, 0.6348]** | **DECIDABLE WIN**, ~1.92× |
+| 100 | 0.9969 [0.8940, 1.1671] | **0.5042 [0.4347, 0.5760]** | **DECIDABLE WIN**, ~1.98× |
+| 1,000 | 0.9850 [0.8229, 1.1229] | **0.5010 [0.4660, 0.5631]** | **DECIDABLE WIN**, ~2.00× |
+
+Every median clears its own null p5. **Decision: KEEP.** Scope is enabled, populated NQC on the synchronous
+full two-phase path; fast-only and unavailable/failing quality paths already computed the weight once, while
+no-lexical/default-off behavior remains unchanged. The ratios cover only this NQC subregion, not whole-search
+latency. No local Cargo fallback ran.
+
 ### 2026-07-12 — cc_fse — NQC A/B (thesis CONFIRMED on the committed-lexical regime): known-item down-weight monotonically improves MRR +0.0025
 
 Toward the enable+A/B direction (user-chosen). The Rust real-embedding A/B (`real_hybrid_knownitem`, wired
@@ -13123,3 +13157,18 @@ lexical regime, so +0.0025 MRR is the upper end; the earlier BEIR nDCG@10 A/B (m
 pooled — consistent direction. Caveat: still potion/model2vec + rank_bm25 (not real Tantivy BM25 / the Rust fusion
 binary) — the Rust `real_hybrid_knownitem` bench runs the identical task on the real code path and is ready for a
 LOCAL run with generated potion slabs (the one remaining step needs local build+run, outside rch-remote-only).
+
+---
+
+## 2026-07-12 — Query-side CJK double-decode fusion REJECTED (INSIDE NULL FLOOR): `any()` guards short-circuit, so there is nothing to fuse
+
+**Candidate.** Sibling of the LANDED index-side win (909d96dd, `CjkBigramDecomposeStream::decompose_cjk` guard+collect fusion, ~2.79×): the QUERY-side CJK path in `frankensearch-lexical/src/cass_compat.rs` `cass_build_term_query_clauses` ran `contains_cjk(term)` (a `chars().any(is_cjk)` guard) immediately followed by `cjk_bigrams(term)` (`chars().filter(is_cjk).collect()`) — two `.chars()` passes over the same term. Fused into one pass (`cass_cjk_query_chars_fast`, filter-collect + `None` when empty), byte-identical (parity test over 11 cases incl. Ext-B 4-byte, mixed-script, interleaved).
+
+**Result: INSIDE NULL FLOOR (a wash, marginally slower).** Bench `cjk_query_chars_ab` (4096 CJK query terms, 2..=16 chars, paired null-controlled): lever fast/ORIG median **1.0370**, p5 0.9036 vs null median 0.9994, p5 0.8898 → NOT decidable; criterion two_decode 288µs vs one_decode 314µs. Production REVERTED (git diff empty vs 909d96dd), bench + helpers + parity test removed.
+
+**Why — the decisive distinction (generalizes the whole guard-then-collect vein):** `contains_cjk` is `chars().**any**(is_cjk)`, which **short-circuits on the first CJK char**. For a CJK-leading term (the only case that reaches `cjk_bigrams`) the "guard" decodes ~1 char, not the whole term — so the second pass it appears to duplicate barely exists; there is ~nothing to fuse away, and the fused `filter().collect()` is if anything a hair slower than `any()`'s early-exit + the identical collect. This is the OPPOSITE of the index-side win, whose guard was `chars().**all**(is_cjk)`: `all()` only short-circuits on a NON-CJK char, so for an all-CJK token it scans the ENTIRE token = a genuine full redundant pass, which is why fusing it won 2.79×.
+
+**RULE for the guard-scan-then-collect grep target (`chars().all(|any(` + `chars().collect|filter().collect`):**
+- Guard is `.all(pred)` and the collect keeps `pred`-matching chars → for the taken branch the guard scans the WHOLE input (all() runs to completion when every char matches) = a real second pass → **FUSEABLE, bench it** (index-side CJK 2.79×).
+- Guard is `.any(pred)` → it short-circuits on the FIRST match, so the guard is ~O(1) for the taken branch = **nothing to fuse, INSIDE FLOOR, skip** (query-side CJK, this entry).
+This closes the query-side CJK path and refines the double-decode method: only `all()`/`position()`/full-scan guards are fusion candidates; `any()`/`find()`/short-circuit guards are already effectively free on the hot branch.
