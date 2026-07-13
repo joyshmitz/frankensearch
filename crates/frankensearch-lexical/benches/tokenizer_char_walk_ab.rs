@@ -7,9 +7,15 @@
 //! (`cass_compat::tests::next_char_from_ascii_matches_decode`), so token boundaries — hence
 //! recall/ordering — are unchanged. This measures the speedup on realistic ASCII-heavy text.
 //!
+//! The `boolean_operator_reparse` group separately compares the full cass query builder's
+//! production two-parse path with a retained single-parse candidate. Both arms build and drop
+//! the same Tantivy query trees; a paired A/A null control determines whether the difference is
+//! resolvable on the worker.
+//!
 //! ```bash
 //! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR \
-//!   rch exec -- cargo bench -p frankensearch-lexical --features bench-internals --bench tokenizer_char_walk_ab
+//!   rch exec -- cargo bench -p frankensearch-lexical --features bench-internals \
+//!     --profile release --bench tokenizer_char_walk_ab
 //! ```
 
 use std::hint::black_box;
@@ -18,7 +24,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
 use frankensearch_lexical::cass_compat::{
     CassQueryFilters, cass_build_schema, cass_build_tantivy_query,
-    cass_build_tantivy_query_with_operator_reparse, cass_char_walk_fast, cass_char_walk_slow,
+    cass_build_tantivy_query_single_parse, cass_char_walk_fast, cass_char_walk_slow,
     cass_fields_from_schema,
 };
 
@@ -122,18 +128,18 @@ fn bench_boolean_operator_reparse(c: &mut Criterion) {
 
     for query in queries {
         assert_eq!(
+            format!("{:?}", cass_build_tantivy_query(query, &filters, &fields)),
             format!(
                 "{:?}",
-                cass_build_tantivy_query_with_operator_reparse(query, &filters, &fields)
+                cass_build_tantivy_query_single_parse(query, &filters, &fields)
             ),
-            format!("{:?}", cass_build_tantivy_query(query, &filters, &fields)),
             "query tree changed for {query:?}"
         );
     }
 
     let run_legacy = || {
         for query in queries {
-            black_box(cass_build_tantivy_query_with_operator_reparse(
+            black_box(cass_build_tantivy_query(
                 black_box(query),
                 black_box(&filters),
                 black_box(&fields),
@@ -142,7 +148,7 @@ fn bench_boolean_operator_reparse(c: &mut Criterion) {
     };
     let run_single_parse = || {
         for query in queries {
-            black_box(cass_build_tantivy_query(
+            black_box(cass_build_tantivy_query_single_parse(
                 black_box(query),
                 black_box(&filters),
                 black_box(&fields),

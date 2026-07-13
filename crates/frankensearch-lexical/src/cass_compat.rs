@@ -2350,23 +2350,23 @@ pub fn cass_build_tantivy_query(
     fields: &CassFields,
 ) -> Box<dyn Query> {
     let tokens = cass_parse_boolean_query(raw_query);
-    let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
+    let has_boolean_operators = !tokens.is_empty() && cass_has_boolean_operators(raw_query);
     cass_build_tantivy_query_from_tokens(tokens, has_boolean_operators, filters, fields)
 }
 
-/// Pre-optimization query builder retained for same-binary performance and
-/// query-tree parity checks. Production callers use [`cass_build_tantivy_query`].
+/// Single-parse candidate retained for same-binary performance and query-tree
+/// parity checks. Production remains on [`cass_build_tantivy_query`] because
+/// the candidate did not clear the paired A/A null floor.
 #[cfg(any(test, feature = "bench-internals"))]
 #[doc(hidden)]
 #[must_use]
-pub fn cass_build_tantivy_query_with_operator_reparse(
+pub fn cass_build_tantivy_query_single_parse(
     raw_query: &str,
     filters: &CassQueryFilters,
     fields: &CassFields,
 ) -> Box<dyn Query> {
     let tokens = cass_parse_boolean_query(raw_query);
-    let has_boolean_operators =
-        !tokens.is_empty() && cass_has_boolean_operators(raw_query);
+    let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
     cass_build_tantivy_query_from_tokens(tokens, has_boolean_operators, filters, fields)
 }
 
@@ -2555,10 +2555,8 @@ mod cass_query_tests {
 
         for filters in &filter_sets {
             for query in queries {
-                let legacy = cass_build_tantivy_query_with_operator_reparse(
-                    query, filters, &fields,
-                );
-                let single_parse = cass_build_tantivy_query(query, filters, &fields);
+                let legacy = cass_build_tantivy_query(query, filters, &fields);
+                let single_parse = cass_build_tantivy_query_single_parse(query, filters, &fields);
                 assert_eq!(
                     format!("{legacy:?}"),
                     format!("{single_parse:?}"),
