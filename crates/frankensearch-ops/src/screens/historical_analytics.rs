@@ -4,7 +4,7 @@
 //! evidence-log exploration, and export-friendly incident review handles.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ftui_layout::{Constraint, Flex};
 use ftui_render::cell::PackedRgba;
@@ -380,7 +380,9 @@ pub fn bench_correlation_owned(
 pub struct HistoricalAnalyticsScreen {
     id: ScreenId,
     state: AppState,
-    project_lookup: BTreeMap<String, String>,
+    // Lookup-only (id -> project); never iterated in order, so a HashMap gives
+    // O(1) resolution instead of BTreeMap's O(log N) per get in rebuild_derived_rows.
+    project_lookup: HashMap<String, String>,
     evidence_rows: Vec<EvidenceRow>,
     project_filter_values: Vec<String>,
     reason_filter_values: Vec<String>,
@@ -446,7 +448,7 @@ impl HistoricalAnalyticsScreen {
         Self {
             id: ScreenId::new("ops.analytics"),
             state: AppState::new(),
-            project_lookup: BTreeMap::new(),
+            project_lookup: HashMap::new(),
             evidence_rows: Vec::new(),
             project_filter_values: vec!["all".to_owned()],
             reason_filter_values: vec!["all".to_owned()],
@@ -594,7 +596,7 @@ impl HistoricalAnalyticsScreen {
             .instances
             .iter()
             .map(|instance| (instance.id.clone(), instance.project.clone()))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<HashMap<_, _>>();
 
         let mut rows = self
             .state
