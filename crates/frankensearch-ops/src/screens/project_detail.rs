@@ -108,7 +108,7 @@ impl ProjectDetailScreen {
     pub fn update_state(&mut self, state: &AppState, view: &ViewState) {
         self.state = state.clone();
         self.view = view.clone();
-        let count = self.project_instances().len();
+        let count = self.project_instances_count();
         if count == 0 {
             self.selected_row = 0;
         } else if self.selected_row >= count {
@@ -127,16 +127,27 @@ impl ProjectDetailScreen {
         self.view.project_filter.as_deref()
     }
 
-    fn project_instances(&self) -> Vec<&crate::state::InstanceInfo> {
-        let Some(project) = self.selected_project() else {
-            return Vec::new();
-        };
+    /// Instances belonging to the selected project (empty when none is selected).
+    /// Shared by `project_instances` (collect) and the count-only clamp path.
+    fn project_instances_iter(&self) -> impl Iterator<Item = &crate::state::InstanceInfo> + '_ {
+        let project = self.selected_project();
         self.state
             .fleet()
             .instances
             .iter()
-            .filter(|instance| instance.project.eq_ignore_ascii_case(project))
-            .collect()
+            .filter(move |instance| {
+                project.is_some_and(|project| instance.project.eq_ignore_ascii_case(project))
+            })
+    }
+
+    /// Count of the selected project's instances without collecting a Vec — used by
+    /// `update_state`'s selection clamp.
+    fn project_instances_count(&self) -> usize {
+        self.project_instances_iter().count()
+    }
+
+    fn project_instances(&self) -> Vec<&crate::state::InstanceInfo> {
+        self.project_instances_iter().collect()
     }
 
     fn render_bar(value: u64, max_value: u64, width: usize) -> String {

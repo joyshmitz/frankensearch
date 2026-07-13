@@ -327,7 +327,7 @@ impl FleetOverviewScreen {
     pub fn update_state(&mut self, state: &AppState, view: &ViewState) {
         self.state = state.clone();
         self.view = view.clone();
-        let visible = self.visible_instances().len();
+        let visible = self.visible_instances_count();
         if visible == 0 {
             self.selected_row = 0;
         } else if self.selected_row >= visible {
@@ -340,19 +340,31 @@ impl FleetOverviewScreen {
         self.palette = palette;
     }
 
-    fn visible_instances(&self) -> Vec<&crate::state::InstanceInfo> {
-        let fleet = self.state.fleet();
-        let mut visible: Vec<_> = fleet
+    /// Instances passing the current view filters, in fleet order. Shared by
+    /// `visible_instances` (which additionally collects + optionally sorts) and by
+    /// the count-only path so the two never drift.
+    fn visible_instances_iter(&self) -> impl Iterator<Item = &crate::state::InstanceInfo> + '_ {
+        self.state
+            .fleet()
             .instances
             .iter()
-            .filter(|inst| !self.view.hide_healthy || !inst.healthy)
-            .filter(|inst| {
+            .filter(move |inst| !self.view.hide_healthy || !inst.healthy)
+            .filter(move |inst| {
                 self.view
                     .project_filter
                     .as_deref()
                     .is_none_or(|project| inst.project.eq_ignore_ascii_case(project))
             })
-            .collect();
+    }
+
+    /// Count of visible instances without collecting a Vec or sorting (the sort
+    /// doesn't affect the count) — used by `update_state`'s selection clamp.
+    fn visible_instances_count(&self) -> usize {
+        self.visible_instances_iter().count()
+    }
+
+    fn visible_instances(&self) -> Vec<&crate::state::InstanceInfo> {
+        let mut visible: Vec<_> = self.visible_instances_iter().collect();
 
         if self.view.unhealthy_first {
             visible.sort_by(|left, right| {
