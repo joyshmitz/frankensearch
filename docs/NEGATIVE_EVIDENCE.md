@@ -13395,3 +13395,21 @@ REMAINING CANDIDATES — REJECTED (recorded so future sessions don't re-walk):
 The clean, decidable, byte-identical ops-TUI lever vein is exhausted. The next productive perf work in this crate
 would require either a new workload the current data model doesn't exercise, a UX decision (table virtualization),
 or profiling under a real running TUI rather than the synthetic per-function harnesses.
+
+### 2026-07-13 — Fusion QUALITY-KERNEL perf sub-vein CONFIRMED floored (the last unverified perf sub-vein)
+
+Cross-checked the correctness-first fusion quality kernels for a missing perf opt (the method that earlier paid
+with mutual-kNN and pool_minmax) — all now floored, confirmed by reading the code:
+
+- `smooth.rs` — already `use ahash::{AHashMap, AHashSet}`; `mutual_neighbor_smooth` already carries the
+  integer-relabeled O(1)-reciprocity path (replacing the O(deg) `String` scan); the pool is an `AHashMap<&str,_>`.
+- `hubness.rs` — `doc_hubness` already uses `select_nth_unstable_by(n-k)` for the kq-nearest (not a full sort),
+  and `dot` already delegates to the vector tier's AVX2 four-accumulator `dot_product_f32_f32` (documented 11.3×,
+  with an 8-accumulator SLP variant already tried and rejected at 2.6×).
+- `normalize.rs` — `min_max_normalize` already computes min AND max in a single fused pass; the only `sort_by`s
+  are `CvDistribution::from_sample`/`from_values`, which run ONCE at distribution build (a small background CV
+  sample), not per query — setup-path, not hot.
+
+Combined with the ops-TUI closure above, the CPU-perf frontier is comprehensively closed across ops, search
+(per the frontier maps), and the fusion quality kernels. Per the project's standing guidance, the remaining
+productive vein is search QUALITY (BEIR harness / new fusion features), which is a different axis than CPU perf.
