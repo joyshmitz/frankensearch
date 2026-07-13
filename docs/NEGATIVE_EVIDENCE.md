@@ -13530,3 +13530,31 @@ a `u64` is already ~1 multiply, and the per-search `.collect()` that builds the 
 identity would not clear the floor. **The hasher/container micro-optimization surface (string-set aHash +
 integer-key identity/dense-Vec) is now exhaustively closed; the one real win it held (ops string SETs, 2.5×) is
 landed.**
+
+### 2026-07-13 — cc_fse — RESOLVED (by construction, no bench): the last two untested-labeled perf route-nexts — single-pass / large-graph flat CSR on `graph_rank` — are below-bar
+
+The `graph_rank` flat-CSR lever was REJECTED measured (1.22-1.29× slower, two-pass build doubled the per-edge
+`doc_id`-string hash probes), but it left two branches literally labeled "untested" (single-pass flat CSR = "the
+strongest form"; flat CSR on a genuinely LARGE graph n≫10⁴). Both resolve by inspecting the shipped build
+(`rank_phase1_with_hasher`, graph_rank.rs:191-207) — no bench needed:
+
+- The shipped `Vec<Vec<(usize,f64)>>` build is ALREADY single-pass over the adjacency, resolving each edge's
+  neighbor EXACTLY ONCE (`idx.get(edge.neighbor_doc_id)`, line 202) into a per-row Vec pre-sized to `edges.len()`.
+- A **single-pass FLAT CSR** must make `offsets` contiguous, but the valid edge count per row is only known AFTER
+  the neighbor probe (non-node neighbors are filtered out), so it must either (a) count first = the rejected
+  two-pass (double probes), or (b) size `offsets` from the raw `edges.len()` UPPER BOUND, fill, then COMPACT the
+  gaps left by dropped neighbors. Path (b) avoids the probe-doubling (single probe/edge, same as shipped) — so it
+  is NOT provably slower like the two-pass — but it trades the shipped build's (n→2) row-allocation saving for an
+  extra O(edges) compaction pass, while on `graph_rank`'s regime (opt-in `graph` feature, hundreds-of-node
+  L2-resident candidate pools) the build is neighbor-hash-probe-DOMINATED, the n arena allocs are already cheap
+  (tight build loop → adjacent blocks, per the measured rejection's reason #2), and the sequential-sweep
+  traversal-locality gain is MOOT at L2-resident sizes. Net: at best a wash on the only sizes that occur, on a
+  NON-DEFAULT path → below-bar.
+- The **large-graph** branch (n≫10⁴, edge array ≫ L2, where the traversal-locality win would finally materialize)
+  is MOOT: `graph_rank` is a feature-gated phase-1 hook seeded from a retrieved candidate pool (hundreds of
+  nodes), never fed 10⁴⁺-node graphs on the hot path.
+
+**RESOLVED: neither untested branch is a production lever — single-pass flat CSR is at-best-a-wash-and-below-bar
+on the small opt-in graphs, and the large-graph regime that could make it win does not occur.** This closes the
+last untested-labeled perf route-nexts in the ledger (alongside the tombstone-bitmap resolution and the
+hasher/container closures above). No code change.
