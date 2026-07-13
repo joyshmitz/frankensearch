@@ -13207,3 +13207,37 @@ The first strict-remote attempt was refused before Cargo execution with `RCH-E41
 manifest entry reached the sync before its new source file; rerunning after that peer file appeared passed preflight
 and executed remotely. Focused strict-remote release validation passed 3/3 CJK bigram tests on `vmi1149989`,
 covering multi-bigram order, single-character fallback, and ASCII passthrough. No local fallback ran.
+
+### 2026-07-12 — Codex — REJECT: reverse-streaming CJK chars is directional but inside the null floor
+
+Negative-ledger-first inspection followed the direct-pending keep into its remaining temporary allocation:
+`CjkBigramDecomposeStream::decompose_cjk` still decodes each accepted token into a `Vec<char>` before constructing
+its bigrams. The candidate consumed the first scalar forward to preserve the ASCII-leading immediate reject, then
+walked the remaining UTF-8 iterator from the back while building bigrams directly in `pending`. For `ABCD` it
+pushed `[CD, BC, AB]`, exactly matching the current stack order. A saved checkpoint truncated partial suffix
+bigrams when an internal non-CJK scalar appeared.
+
+The temporary same-binary comparator asserted every token's text, position, offsets, position length, count, and
+vector order over 2,048 realistic 2–31-character CJK tokens. It also proved empty, single-character, mixed-script,
+and late-invalid rollback paths against a non-empty sentinel prefix before timing. Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-lexical --profile release \
+  --features bench-internals --bench cjk_bigram_decompose_ab
+```
+
+Worker `vmi1227854`; one release binary; 41 alternating rounds; `inner=4`; ratio is streaming/current:
+
+| workload | A/A current null median [p5, p95] | streaming/current median [p5, p95] | verdict |
+|---|---:|---:|---|
+| `cjk_stream/2048tok` | 1.0115 [0.7598, 1.2402] | 0.8482 [0.6258, 1.1241] | **INSIDE NULL FLOOR** |
+
+Criterion agreed directionally (current direct pending 682–764 us; streaming 605–692 us), but the authoritative
+candidate median did not clear its A/A null p5. **Decision: REJECT.** The production source and benchmark were
+restored byte-for-byte; this commit retains only the negative boundary. Do not retry reverse scalar streaming on
+the same 2–31-character corpus unless a lower-noise same-worker harness or a materially larger realistic CJK run
+changes the evidence floor. The cold RCH cache made compilation slow but did not affect same-binary comparability.
+All Cargo execution was fail-closed remote-only; no local fallback ran.
