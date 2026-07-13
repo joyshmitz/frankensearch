@@ -12,7 +12,7 @@ use std::collections::{HashMap, VecDeque};
 // n=30..300), matching the sibling fusion paths (`rrf.rs`, `blend.rs`). `rank_map`
 // below stays std `HashMap` — it feeds `blend::compute_rank_changes_with_maps`.
 use ahash::{AHashMap, AHashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use frankensearch_core::filter::SearchFilter;
@@ -23,7 +23,7 @@ use frankensearch_core::{
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
 use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes_with_maps};
-use crate::normalize::{NqcDenseWeight, nqc_cv_iter};
+use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -110,6 +110,11 @@ pub struct SyncTwoTierSearcher {
     nqc_downweight_beta: f32,
     nqc_downweight_w_min: f32,
     nqc_dense_weight: NqcDenseWeight,
+    /// Opt-in *self-driving* rolling NQC dense down-weight (default off). When set, it takes
+    /// precedence over the static sketch above and learns the query distribution online. See
+    /// [`Self::with_nqc_dense_downweight_adaptive`]. Behind a `Mutex` so per-query observation
+    /// mutates the rolling state while `search` stays `&self`.
+    nqc_adaptive: Option<Mutex<AdaptiveNqcDenseWeight>>,
 }
 
 impl SyncTwoTierSearcher {
@@ -127,6 +132,7 @@ impl SyncTwoTierSearcher {
             nqc_downweight_beta: 0.0,
             nqc_downweight_w_min: 0.0,
             nqc_dense_weight: NqcDenseWeight::new(),
+            nqc_adaptive: None,
         }
     }
 
@@ -188,10 +194,47 @@ impl SyncTwoTierSearcher {
         self
     }
 
+    /// Enable the **self-driving rolling** NQC dense down-weight (default OFF).
+    ///
+    /// Unlike [`Self::with_nqc_dense_downweight`] (a caller-supplied static sketch), this builds
+    /// and refreshes the cv→percentile sketch *online* from the observed query stream via an
+    /// [`AdaptiveNqcDenseWeight`] — no external sample management. It takes precedence over the
+    /// static sketch when both are set. Cold start is **neutral** (empty sketch → weight `1.0`,
+    /// byte-identical fusion) until `min_samples` queries warm it, so it is safe to enable by
+    /// default. `beta <= 0` disables it. See [`AdaptiveNqcDenseWeight::new`] for the parameters.
+    #[must_use]
+    pub fn with_nqc_dense_downweight_adaptive(
+        mut self,
+        beta: f32,
+        w_min: f32,
+        capacity: usize,
+        min_samples: usize,
+        rebuild_every: usize,
+    ) -> Self {
+        self.nqc_adaptive = Some(Mutex::new(AdaptiveNqcDenseWeight::new(
+            beta,
+            w_min,
+            capacity,
+            min_samples,
+            rebuild_every,
+        )));
+        self
+    }
+
     /// The dense-tier fusion weight for this query: the static `rrf_semantic_weight`, scaled
     /// by the per-query NQC dense down-weight when enabled (`beta > 0`). Off (default) returns
     /// `rrf_semantic_weight` unchanged with zero extra work.
     fn effective_semantic_weight(&self, lexical: &[ScoredResult]) -> f64 {
+        // The self-driving rolling down-weight takes precedence: it observes this query's NQC
+        // (warming the online sketch) and scores it against the sketch from prior queries.
+        if let Some(adaptive) = &self.nqc_adaptive {
+            let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
+            let factor = adaptive
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .weight_for_cv(cv);
+            return self.rrf_semantic_weight * f64::from(factor);
+        }
         if self.nqc_downweight_beta <= 0.0 {
             return self.rrf_semantic_weight;
         }
@@ -953,6 +996,48 @@ mod tests {
         assert_ne!(
             neutral_res[0].doc_id, down_res[0].doc_id,
             "the NQC dense down-weight must change the fused top (it reaches fusion)"
+        );
+    }
+
+    #[test]
+    fn nqc_adaptive_cold_start_is_bit_identical_to_base_weight() {
+        // A freshly-enabled adaptive down-weight has an empty online sketch, so a cold-start
+        // query's effective semantic weight is bit-identical to the base (safe to default-on).
+        let hits = [lexical_result("a", 10.0), lexical_result("b", 1.0)];
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_rrf_weights(1.0, 1.3)
+            .with_nqc_dense_downweight_adaptive(0.5, 0.1, 128, 8, 4);
+        assert_eq!(
+            searcher.effective_semantic_weight(&hits).to_bits(),
+            searcher.rrf_semantic_weight.to_bits(),
+            "cold-start (empty online sketch) leaves fusion byte-identical"
+        );
+    }
+
+    #[test]
+    fn nqc_adaptive_warms_up_then_down_weights() {
+        // Warm the online sketch with observed queries, then a high-NQC query lands at a high
+        // percentile and is down-weighted below the base semantic weight (reaches fusion online).
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_rrf_weights(1.0, 1.0)
+            .with_nqc_dense_downweight_adaptive(0.5, 0.05, 128, 8, 4);
+        let warm = [
+            lexical_result("a", 5.0),
+            lexical_result("b", 5.0),
+            lexical_result("c", 5.0),
+        ];
+        for _ in 0..12 {
+            let _ = searcher.effective_semantic_weight(&warm);
+        }
+        let peaked = [
+            lexical_result("a", 100.0),
+            lexical_result("b", 1.0),
+            lexical_result("c", 0.5),
+        ];
+        let weight = searcher.effective_semantic_weight(&peaked);
+        assert!(
+            weight < searcher.rrf_semantic_weight,
+            "a high-NQC query is down-weighted after the online sketch warms up, got {weight}"
         );
     }
 
