@@ -69,3 +69,8 @@ required-features = ["bench-internals"]
 name = "index_build_postings_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "cjk_bigram_decompose_ab"
+harness = false
+required-features = ["bench-internals"]

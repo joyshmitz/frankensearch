@@ -358,6 +358,59 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// One-pass CJK-token collection for the bigram decomposer: decode `text`
+/// **once**, validating that every char is CJK while collecting them. Returns
+/// `Some(chars)` iff the token is entirely CJK with ≥2 chars (the only case
+/// that decomposes into bigrams); `None` otherwise. A non-CJK token bails on
+/// its first char *before* allocating, so the common ASCII/Latin token pays
+/// nothing.
+///
+/// This fuses the two full UTF-8 decode passes the naive form makes — the
+/// guard scan `chars().all(is_cjk)` followed by `chars().collect()` — into a
+/// single pass. Byte-identical to [`cass_cjk_collect_slow`]: `decompose_cjk`
+/// only emits bigrams when all chars are CJK and the count is ≥2, exactly the
+/// `Some` case here (empty, non-CJK, and single-CJK all map to `None`).
+#[doc(hidden)]
+#[must_use]
+pub fn cass_cjk_collect_fast(text: &str) -> Option<Vec<char>> {
+    let mut chars = text.chars();
+    // First char decides the common case: a non-CJK lead (ASCII/Latin/space)
+    // rejects immediately with no allocation.
+    let first = chars.next()?;
+    if !is_cjk(first) {
+        return None;
+    }
+    let mut buf: Vec<char> = Vec::with_capacity(text.len() / 3 + 1);
+    buf.push(first);
+    for c in chars {
+        if !is_cjk(c) {
+            return None;
+        }
+        buf.push(c);
+    }
+    if buf.len() < 2 {
+        // Single CJK character: unchanged (emitted as its own unigram).
+        return None;
+    }
+    Some(buf)
+}
+
+/// The pre-fusion two-pass form, retained as the bench oracle for
+/// [`cass_cjk_collect_fast`]: decode `text` once to validate (`all`) and again
+/// to `collect`.
+#[doc(hidden)]
+#[must_use]
+pub fn cass_cjk_collect_slow(text: &str) -> Option<Vec<char>> {
+    if text.is_empty() || !text.chars().all(is_cjk) {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 2 {
+        return None;
+    }
+    Some(chars)
+}
+
 /// A [`TokenFilter`] that decomposes tokens consisting entirely of CJK
 /// characters into overlapping character bigrams.
 ///
@@ -407,17 +460,13 @@ impl<T: TokenStream> CjkBigramDecomposeStream<'_, T> {
     fn decompose_cjk(&mut self) {
         let token = self.tail.token();
 
-        // Only decompose tokens that are entirely CJK. Most cass tokens are
-        // ASCII, so reject those before allocating the CJK character buffer.
-        if token.text.is_empty() || !token.text.chars().all(is_cjk) {
+        // Only decompose tokens that are entirely CJK with ≥2 chars. One fused
+        // pass validates + collects (most cass tokens are ASCII and reject on
+        // their first char with no allocation); empty / non-CJK / single-CJK
+        // tokens all yield `None` and are left unchanged.
+        let Some(chars) = cass_cjk_collect_fast(&token.text) else {
             return;
-        }
-
-        let chars: Vec<char> = token.text.chars().collect();
-        if chars.len() == 1 {
-            // Single CJK character: emit as unigram (already the token text).
-            return;
-        }
+        };
 
         // Build bigrams in reverse so `.pop()` yields them left-to-right.
         // We replace the original token entirely with bigrams.
@@ -2786,6 +2835,33 @@ mod cass_query_tests {
     fn is_cjk_detects_korean_hangul() {
         assert!(is_cjk('\u{AC00}')); // 가 (hangul start)
         assert!(is_cjk('\u{D558}')); // 하
+    }
+
+    #[test]
+    fn cass_cjk_collect_fast_matches_slow() {
+        // Byte-identity proof for the one-pass fusion: fast == slow on every
+        // reject path and every decompose path.
+        let cases = [
+            "",              // empty -> None
+            "a",             // single ASCII -> None
+            "hello world",   // ASCII with space -> None (space non-CJK)
+            "搜",            // single CJK -> None (unigram, no bigrams)
+            "搜索",          // 2 CJK -> Some
+            "搜索引擎",       // 4 CJK -> Some
+            "検索とうきょう", // mixed CJK scripts -> Some
+            "한국어",         // hangul -> Some
+            "搜a",           // CJK then ASCII -> None (not all-CJK)
+            "a搜",           // ASCII lead -> None
+            "搜 索",         // CJK, space, CJK -> None (space breaks all-CJK)
+            "𠀀𠀁",          // Extension B (4-byte) CJK -> Some
+        ];
+        for c in cases {
+            assert_eq!(
+                cass_cjk_collect_fast(c),
+                cass_cjk_collect_slow(c),
+                "fast/slow parity for {c:?}"
+            );
+        }
     }
 
     #[test]
