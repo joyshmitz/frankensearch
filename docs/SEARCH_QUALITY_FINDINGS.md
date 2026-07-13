@@ -227,8 +227,15 @@ now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords
   fixed β·cv). Verified: fusion suite green under **default features** (lib 892 / integration 38, exit 0) **and `--all-features`**
   (graph/rerank/lexical/bench-internals paths, exit 0) — no feature-gated fallout; cold-start neutrality held
   everywhere (the integration tests run ≤12 queries/searcher, below the 128 warm-up). Opt out via
-  `with_nqc_dense_downweight_disabled()` (byte-identical A/B). Remaining route-next (non-blocking): re-confirm the
-  LIVE Rust default on the REAL production embedder (all nDCG numbers here are potion/model2vec proxy).
+  `with_nqc_dense_downweight_disabled()` (byte-identical A/B). Remaining route-next (non-blocking, SCOPED
+  2026-07-13): re-confirm the LIVE Rust default on a labeled corpus. NOTE the true scope — the `+0.0022` and every
+  nDCG here is from the **Python** proxy harness (`docs/quality_harness/`, model2vec + rank_bm25 reimplementation),
+  which does NOT exercise the shipped Rust code; and that harness is not set up in-repo (deps + BEIR corpora
+  absent). So validating the Rust default is NOT a quick harness re-run — it needs a NEW **Rust** qrels-nDCG
+  harness (the existing `real_hybrid_knownitem` bench measures label-free known-item recall/MRR, not nDCG against
+  qrels), running the real `TwoTierSearcher` with the down-weight default-on vs `with_nqc_dense_downweight_disabled()`.
+  The Rust UNIT tests already prove the mechanism (cv → percentile → weight → fusion); this open item is the
+  end-to-end nDCG confirmation of the Rust implementation, which is a multi-turn harness build.
 - **Statistical caution (applies to every single-run number in this harness):** each nDCG figure is a POINT
   ESTIMATE; treat **±0.003-scale deltas as noise** unless pooled/CI'd. The large deltas above (stem+stop +0.024/
   +0.035, pool-min-max>RRF +0.017) are trustworthy; the sub-0.003 washes (z-score, pool-size) were correctly read
