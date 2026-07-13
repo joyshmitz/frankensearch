@@ -1169,12 +1169,14 @@ impl AlertsSloScreen {
     }
 
     fn build_alert_rows(&self, alerts: &[AlertRow]) -> Vec<Row> {
-        let newest_ts = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
-        let oldest_ts = alerts
-            .iter()
-            .map(|alert| alert.ts_ms)
-            .min()
-            .unwrap_or(newest_ts);
+        if alerts.is_empty() {
+            // No alerts -> no rows (byte-identical to the map-over-empty below),
+            // and lets the fused bounds skip the empty guard.
+            return Vec::new();
+        }
+        // One pass for both time bounds (was two: `.map(ts_ms).max()` then
+        // `.map(ts_ms).min()`). Same measured reduction as `event_bounds_ab`.
+        let (oldest_ts, newest_ts) = alert_time_bounds_fused(alerts);
         let span_ms = newest_ts.saturating_sub(oldest_ts).max(1);
 
         alerts
