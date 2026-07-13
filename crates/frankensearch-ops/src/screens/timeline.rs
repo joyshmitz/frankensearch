@@ -183,10 +183,19 @@ impl ActionTimelineScreen {
 
     /// Update timeline data from shared app state.
     pub fn update_state(&mut self, state: &AppState) {
+        // The cached filter-value lists are a pure function of the fleet (projects
+        // from instances, reasons/hosts from lifecycle_events). AppState.fleet is an
+        // Arc shared across clones until update_fleet replaces it, so a pointer-equal
+        // fleet means nothing changed — skip rebuild_filter_values, which
+        // sync_screen_states would otherwise re-run over ~32k events on every
+        // navigation / input. Same guard as historical_analytics (12835bc5).
+        let fleet_changed = !std::ptr::eq(self.state.fleet(), state.fleet());
         let focused = self.selected_event_key();
         let (project_filter, reason_filter, host_filter) = self.selected_filter_values();
         self.state = state.clone();
-        self.rebuild_filter_values();
+        if fleet_changed {
+            self.rebuild_filter_values();
+        }
         self.restore_filter_indices(&project_filter, &reason_filter, &host_filter);
         self.clamp_filter_indices();
         self.restore_selected_event(focused);
@@ -1421,6 +1430,21 @@ mod tests {
         assert_eq!(events[0].instance_id, "host-a:inst-a");
         assert_eq!(events[1].instance_id, "host-b:inst-b");
         assert_eq!(events[2].instance_id, "host-a:inst-c");
+    }
+
+    #[test]
+    fn update_state_skips_filter_rebuild_when_fleet_unchanged_but_keeps_values() {
+        let mut screen = ActionTimelineScreen::new();
+        let state = sample_state();
+        screen.update_state(&state);
+        let events = screen.filtered_events().len();
+        let projects = screen.project_filters().len();
+        // Re-applying the SAME AppState shares the fleet Arc → rebuild_filter_values
+        // is skipped; the cached filter-value lists must survive intact.
+        screen.update_state(&state);
+        assert_eq!(screen.filtered_events().len(), events);
+        assert_eq!(screen.project_filters().len(), projects);
+        assert!(projects >= 1);
     }
 
     #[test]
