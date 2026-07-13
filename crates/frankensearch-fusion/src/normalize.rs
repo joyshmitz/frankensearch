@@ -304,6 +304,85 @@ impl NqcCvSampler {
     }
 }
 
+/// A self-driving rolling NQC dense down-weight: owns an [`NqcCvSampler`] plus a cached
+/// [`NqcDenseWeight`], observes each query's NQC, and periodically rebuilds the percentile
+/// sketch so the down-weight tracks the live query distribution with no external sample
+/// management. This is the deployment brain that turns the (dormant) static
+/// [`NqcDenseWeight`] into a live default: a searcher holds one behind interior mutability
+/// (matching the crate's existing per-search `Mutex` state) and calls
+/// [`weight_for_cv`](Self::weight_for_cv) each query.
+///
+/// A query is scored against the sketch built from **prior** observations, then contributes
+/// to the sample — so a query never influences its own weight, and the whole thing starts
+/// **neutral** (`1.0`, byte-identical fusion) until `min_samples` observations warm the
+/// sketch. `beta <= 0` disables it entirely (always `1.0`, no observation).
+#[derive(Debug, Clone)]
+pub struct AdaptiveNqcDenseWeight {
+    sampler: NqcCvSampler,
+    sketch: NqcDenseWeight,
+    beta: f32,
+    w_min: f32,
+    min_samples: usize,
+    rebuild_every: usize,
+    since_rebuild: usize,
+}
+
+impl AdaptiveNqcDenseWeight {
+    /// Create a rolling down-weight. `beta` (≈0.5 measured best) and `w_min` are the
+    /// [`NqcDenseWeight::dense_weight`] parameters; `capacity` bounds the rolling sample
+    /// window; `min_samples` is the minimum observations before the sketch activates (below
+    /// it the weight stays neutral); `rebuild_every` is how many observations between sketch
+    /// rebuilds (`0` is clamped to `1`). Starts neutral (empty sketch).
+    #[must_use]
+    pub fn new(
+        beta: f32,
+        w_min: f32,
+        capacity: usize,
+        min_samples: usize,
+        rebuild_every: usize,
+    ) -> Self {
+        Self {
+            sampler: NqcCvSampler::new(capacity),
+            sketch: NqcDenseWeight::new(),
+            beta,
+            w_min,
+            min_samples,
+            rebuild_every: rebuild_every.max(1),
+            since_rebuild: 0,
+        }
+    }
+
+    /// Whether the down-weight is enabled (`beta > 0`). When disabled, [`weight_for_cv`] is a
+    /// no-op returning the neutral `1.0`.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.beta > 0.0
+    }
+
+    /// The dense-tier multiplier for a query with NQC `cv`, using the sketch built from prior
+    /// observations; then records `cv` into the rolling sample and rebuilds the sketch when due.
+    /// Returns the neutral `1.0` while disabled (`beta <= 0`) or during warm-up (empty sketch).
+    pub fn weight_for_cv(&mut self, cv: f32) -> f32 {
+        if self.beta <= 0.0 {
+            return 1.0;
+        }
+        let factor = self.sketch.dense_weight(cv, self.beta, self.w_min);
+        self.sampler.observe(cv);
+        self.since_rebuild += 1;
+        if self.since_rebuild >= self.rebuild_every {
+            self.sketch = self.sampler.sketch(self.min_samples);
+            self.since_rebuild = 0;
+        }
+        factor
+    }
+
+    /// [`weight_for_cv`](Self::weight_for_cv) from a query's lexical (BM25) top-k scores,
+    /// computing its NQC via [`nqc_cv`].
+    pub fn weight_for_lexical_scores(&mut self, scores: &[f32]) -> f32 {
+        self.weight_for_cv(nqc_cv(scores))
+    }
+}
+
 /// In-place z-score normalization.
 ///
 /// Finite values are standardized and then linearly mapped to `[0, 1]` by
@@ -381,8 +460,9 @@ pub fn normalize_scores_with_method(scores: &[f32], method: NormalizationMethod)
 #[cfg(test)]
 mod tests {
     use super::{
-        NormalizationMethod, NqcCvSampler, NqcDenseWeight, min_max_normalize, normalize_in_place,
-        normalize_scores, normalize_scores_with_method, nqc_cv, nqc_cv_iter, z_score_normalize,
+        AdaptiveNqcDenseWeight, NormalizationMethod, NqcCvSampler, NqcDenseWeight,
+        min_max_normalize, normalize_in_place, normalize_scores, normalize_scores_with_method,
+        nqc_cv, nqc_cv_iter, z_score_normalize,
     };
 
     const EPSILON: f32 = 1e-6;
@@ -492,6 +572,58 @@ mod tests {
             (weight.percentile(0.0) - 2.0 / 3.0).abs() <= EPSILON,
             "percentile(0.0)={}",
             weight.percentile(0.0)
+        );
+    }
+
+    #[test]
+    fn adaptive_nqc_warmup_is_neutral_then_activates() {
+        // capacity 100, min_samples 10, rebuild every 5.
+        let mut adaptive = AdaptiveNqcDenseWeight::new(0.5, 0.1, 100, 10, 5);
+        assert!(adaptive.is_active());
+        // First rebuild fires at 5 observations but 5 < min_samples(10) -> still empty/neutral.
+        for i in 0..9 {
+            let w = adaptive.weight_for_cv(0.1 + 0.02 * i as f32);
+            assert!((w - 1.0).abs() <= EPSILON, "warm-up observation {i} must be neutral, got {w}");
+        }
+        // The 10th observation triggers the 2nd rebuild (10 obs >= min_samples) -> sketch active.
+        let _ = adaptive.weight_for_cv(0.3);
+        // A very high cv now maps to a high percentile -> a down-weight strictly below 1.0.
+        let high = adaptive.weight_for_cv(10.0);
+        assert!(high < 1.0, "high-NQC query must be down-weighted after warm-up, got {high}");
+        assert!(high >= 0.1 - EPSILON, "floored at w_min");
+    }
+
+    #[test]
+    fn adaptive_nqc_beta_zero_is_always_neutral() {
+        let mut adaptive = AdaptiveNqcDenseWeight::new(0.0, 0.1, 100, 1, 1);
+        assert!(!adaptive.is_active());
+        for cv in [0.0, 0.5, 5.0, 50.0] {
+            assert!((adaptive.weight_for_cv(cv) - 1.0).abs() <= EPSILON, "beta=0 stays neutral");
+        }
+    }
+
+    #[test]
+    fn adaptive_nqc_query_does_not_influence_its_own_weight() {
+        // Warm a stable low-cv distribution, then a single high-cv query is scored against the
+        // PRIOR (low-cv) sketch -> high percentile -> down-weighted, proving score-before-observe.
+        let mut adaptive = AdaptiveNqcDenseWeight::new(1.0, 0.0, 100, 4, 4);
+        for _ in 0..8 {
+            let _ = adaptive.weight_for_cv(0.05);
+        }
+        let outlier = adaptive.weight_for_cv(9.0);
+        assert!(outlier < 0.5, "an outlier scored against the prior low-cv sketch is down-weighted");
+    }
+
+    #[test]
+    fn adaptive_nqc_lexical_scores_path_matches_cv_path() {
+        let scores = [10.0_f32, 1.0, 0.5];
+        let cv = nqc_cv(&scores);
+        let mut by_scores = AdaptiveNqcDenseWeight::new(0.5, 0.1, 16, 1, 1);
+        let mut by_cv = AdaptiveNqcDenseWeight::new(0.5, 0.1, 16, 1, 1);
+        assert!(
+            (by_scores.weight_for_lexical_scores(&scores) - by_cv.weight_for_cv(cv)).abs()
+                <= EPSILON,
+            "lexical-scores path == precomputed-cv path"
         );
     }
 
