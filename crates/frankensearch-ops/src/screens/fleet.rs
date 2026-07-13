@@ -367,7 +367,10 @@ impl FleetOverviewScreen {
         let mut visible: Vec<_> = self.visible_instances_iter().collect();
 
         if self.view.unhealthy_first {
-            visible.sort_by(|left, right| {
+            // Unstable is byte-identical here: instances have unique ids and `id`
+            // is the final tiebreak, so the comparator is a strict total order
+            // (no ties for a stable sort to preserve) — and it drops the scratch alloc.
+            visible.sort_unstable_by(|left, right| {
                 (left.healthy, left.project.as_str(), left.id.as_str()).cmp(&(
                     right.healthy,
                     right.project.as_str(),

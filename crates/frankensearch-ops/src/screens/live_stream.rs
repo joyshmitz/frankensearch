@@ -300,7 +300,10 @@ impl LiveSearchStreamScreen {
             })
             .collect();
 
-        rows.sort_by(|left, right| {
+        // Unstable is byte-identical: one row per instance with a unique
+        // `instance_id` final tiebreak = strict total order (no ties), and it drops
+        // the stable sort's scratch allocation.
+        rows.sort_unstable_by(|left, right| {
             severity_rank(right.severity)
                 .cmp(&severity_rank(left.severity))
                 .then_with(|| right.searches.cmp(&left.searches))
