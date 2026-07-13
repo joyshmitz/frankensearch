@@ -176,8 +176,74 @@ impl DefaultCanonicalizer {
     }
 }
 
+/// Append `lines` joined by `'\n'` (no trailing newline) directly into `out` —
+/// the `[&str]::join("\n")` semantics without the intermediate `String`.
+fn push_joined<'a>(out: &mut String, mut lines: impl Iterator<Item = &'a str>) {
+    if let Some(first) = lines.next() {
+        out.push_str(first);
+        for line in lines {
+            out.push('\n');
+            out.push_str(line);
+        }
+    }
+}
+
 /// Collapse a code block to first N + last M lines.
+///
+/// Builds the result in one pass directly into the output buffer. The prior form
+/// `format!("[{label}]\n{}", lines.join("\n"))` allocated an intermediate joined
+/// `String` (a full copy of the kept code-block bytes) that `format!` then copied
+/// a *second* time into the returned `String` — a redundant full copy per code
+/// block, on the per-document ingest path. Here `push_joined` writes the kept
+/// lines straight into `out`, so each byte is copied once. Byte-identical to the
+/// `format!`/`join` form (`collapse_code_block_slow`).
 fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> String {
+    use std::fmt::Write as _;
+
+    let collapse = lines.len() > head + tail;
+    // Pre-size to the exact kept bytes so the single build never reallocs: label
+    // + "[]\n" + kept line bytes (with per-line '\n') + the omitted marker.
+    let label_len = if lang.is_empty() { 4 } else { 6 + lang.len() };
+    let kept_bytes: usize = if collapse {
+        lines
+            .iter()
+            .take(head)
+            .chain(lines.iter().skip(lines.len() - tail))
+            .map(|l| l.len() + 1)
+            .sum()
+    } else {
+        lines.iter().map(|l| l.len() + 1).sum()
+    };
+    let mut out =
+        String::with_capacity(label_len + 3 + kept_bytes + if collapse { 32 } else { 0 });
+
+    out.push('[');
+    if lang.is_empty() {
+        out.push_str("code");
+    } else {
+        out.push_str("code: ");
+        out.push_str(lang);
+    }
+    out.push_str("]\n");
+
+    if collapse {
+        push_joined(&mut out, lines.iter().take(head).copied());
+        let omitted = lines.len() - head - tail;
+        let _ = write!(out, "\n[... {omitted} lines omitted ...]\n");
+        push_joined(&mut out, lines.iter().skip(lines.len() - tail).copied());
+    } else {
+        push_joined(&mut out, lines.iter().copied());
+    }
+    out
+}
+
+/// Pre-fusion `format!`/`join` form of [`collapse_code_block`], retained as the
+/// exact-parity bench oracle (it double-copies the kept bytes: `join` then
+/// `format!`).
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn collapse_code_block_slow(lang: &str, lines: &[&str], head: usize, tail: usize) -> String {
     let lang_label = if lang.is_empty() {
         "code".to_string()
     } else {
@@ -185,10 +251,8 @@ fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> 
     };
 
     if lines.len() <= head + tail {
-        // Short enough to keep in full
         format!("[{lang_label}]\n{}", lines.join("\n"))
     } else {
-        // Collapse middle
         let head_part: Vec<_> = lines.iter().take(head).copied().collect();
         let tail_part: Vec<_> = lines.iter().skip(lines.len() - tail).copied().collect();
         let omitted = lines.len() - head - tail;
@@ -198,6 +262,19 @@ fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> 
             tail_part.join("\n")
         )
     }
+}
+
+/// Doc-hidden bench wrapper for the shipped one-pass [`collapse_code_block`].
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn collapse_code_block_fast_bench(
+    lang: &str,
+    lines: &[&str],
+    head: usize,
+    tail: usize,
+) -> String {
+    collapse_code_block(lang, lines, head, tail)
 }
 
 /// Strip markdown formatting from a single line.
@@ -594,6 +671,38 @@ mod tests {
                     truncate_to_chars_slow(text, max_chars),
                     "text.len()={} max_chars={max_chars}",
                     text.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collapse_code_block_matches_slow() {
+        // Byte-identity proof: the one-pass builder equals the format!/join form
+        // across empty/short/exactly-at-threshold/collapsed shapes and edge
+        // head/tail values, with and without a language label.
+        let body: Vec<&str> = (0..50)
+            .map(|i| ["fn main() {", "    let x = 1;", "}", ""][i % 4])
+            .collect();
+        let langs = ["", "rust", "python-with-a-long-name"];
+        let shapes: &[(&[&str], usize, usize)] = &[
+            (&[], 20, 10),
+            (&["only one line"], 20, 10),
+            (&body[..5], 20, 10),   // short (< head+tail): full keep
+            (&body[..30], 20, 10),  // exactly head+tail: full keep
+            (&body[..31], 20, 10),  // one over: collapse
+            (&body[..], 20, 10),    // large collapse
+            (&body[..], 0, 5),      // head=0
+            (&body[..], 5, 0),      // tail=0
+            (&body[..], 0, 0),      // both zero -> collapse, no kept lines
+        ];
+        for lang in langs {
+            for &(lines, head, tail) in shapes {
+                assert_eq!(
+                    collapse_code_block(lang, lines, head, tail),
+                    collapse_code_block_slow(lang, lines, head, tail),
+                    "lang={lang:?} len={} head={head} tail={tail}",
+                    lines.len()
                 );
             }
         }

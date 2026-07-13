@@ -81,3 +81,8 @@ required-features = ["bench-internals"]
 name = "simhash_tokenize_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "collapse_code_block_ab"
+harness = false
+required-features = ["bench-internals"]
