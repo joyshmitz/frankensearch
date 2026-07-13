@@ -71,6 +71,10 @@ required-features = ["bench-internals"]
 name = "sort_choice_ab"
 harness = false
 
+[[bench]]
+name = "filtered_ids_hash_ab"
+harness = false
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }

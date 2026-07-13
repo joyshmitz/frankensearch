@@ -5,9 +5,7 @@
 //! Thread safety is provided by the consumer's runtime (asupersync `RwLock`
 //! when integrated; `std::sync::RwLock` for standalone testing).
 
-use std::collections::HashSet;
-
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -410,7 +408,9 @@ impl ProjectLifecycleTracker {
         instances: &[DiscoveredInstance],
     ) -> Vec<LifecycleEvent> {
         let mut events: Vec<LifecycleEvent> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        // Instance-id membership set (probed once per instance below); aHash beats
+        // the default SipHash on the short id keys, matching the `lifecycles` map.
+        let mut seen: AHashSet<String> = AHashSet::new();
 
         for instance in instances {
             let instance_id = instance.instance_id.clone();

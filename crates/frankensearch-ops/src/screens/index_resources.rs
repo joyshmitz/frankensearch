@@ -4,7 +4,9 @@
 //! backlog, and host resource pressure.
 
 use std::any::Any;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
+
+use ahash::AHashSet;
 
 use ftui_core::geometry::Rect;
 use ftui_layout::{Constraint, Flex};
@@ -390,8 +392,11 @@ impl IndexResourceScreen {
 
         let fleet = self.state.fleet();
         // Membership-only (checked against every search-metrics entry below), never
-        // iterated -> HashSet gives O(1) contains vs BTreeSet's O(log rows).
-        let filtered_ids: HashSet<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
+        // iterated -> a hash set gives O(1) contains vs BTreeSet's O(log rows). aHash
+        // over the short (~14-char) instance-id keys beats the default SipHash on both
+        // the |rows| inserts and the |search_metrics| probes (sibling of the resolution
+        // -map swap measured 1.70-1.78x in instance_map_hash_ab).
+        let filtered_ids: AHashSet<_> = rows.iter().map(|row| row.instance_id.as_str()).collect();
         let mut total_searches = 0_u64;
         let mut refined_total = 0_u64;
         for (instance_id, metrics) in &fleet.search_metrics {

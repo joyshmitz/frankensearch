@@ -5,9 +5,9 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 
 use ftui_layout::{Constraint, Flex};
 use ftui_render::cell::PackedRgba;
@@ -1189,8 +1189,9 @@ impl Screen for HistoricalAnalyticsScreen {
                         .iter()
                         .map(|instance| instance.project.as_str())
                         // Distinct-project count only: collected for `.len()`, never
-                        // iterated, so a HashSet dedups in O(N) vs BTreeSet's O(N log N).
-                        .collect::<HashSet<_>>()
+                        // iterated, so a hash set dedups in O(N) vs BTreeSet's O(N log N);
+                        // aHash over the short project keys beats the default SipHash.
+                        .collect::<AHashSet<_>>()
                         .len(),
                     self.state.control_plane_health()
                 )),
