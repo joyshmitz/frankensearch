@@ -1228,6 +1228,31 @@ pub fn bench_count_project_mapped(
         .count()
 }
 
+/// Bench-only: identical to `bench_count_project_mapped` but with the production
+/// `ahash::AHashMap` hasher (vs the `std` SipHash above) — the SipHash-vs-aHash A/B
+/// that retroactively measures the ops instance-id-map aHash swap (626aa865, which
+/// shipped via citation of the search-crate results).
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_count_project_mapped_ahash(
+    events: &[LifecycleEvent],
+    instances: &[crate::state::InstanceInfo],
+    project: &str,
+) -> usize {
+    let mut map: AHashMap<&str, &str> = AHashMap::with_capacity(instances.len());
+    for instance in instances {
+        map.entry(instance.id.as_str())
+            .or_insert(instance.project.as_str());
+    }
+    events
+        .iter()
+        .filter(|event| {
+            let resolved = map.get(event.instance_id.as_str()).copied();
+            ActionTimelineScreen::event_project_matches(resolved, project)
+        })
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

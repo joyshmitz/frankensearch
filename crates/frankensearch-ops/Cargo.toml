@@ -62,6 +62,11 @@ name = "project_resolve_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "instance_map_hash_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
