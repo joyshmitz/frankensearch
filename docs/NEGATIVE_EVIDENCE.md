@@ -13413,3 +13413,17 @@ with mutual-kNN and pool_minmax) — all now floored, confirmed by reading the c
 Combined with the ops-TUI closure above, the CPU-perf frontier is comprehensively closed across ops, search
 (per the frontier maps), and the fusion quality kernels. Per the project's standing guidance, the remaining
 productive vein is search QUALITY (BEIR harness / new fusion features), which is a different axis than CPU perf.
+
+### 2026-07-13 — Workspace-wide "general-purpose machinery over hot input" sibling hunt: NULL (method exhausted)
+
+Ran the recipe that repeatedly paid earlier (`grep -rE 'OffsetDateTime::parse|nfc\(\)|to_lowercase|chrono|DateTime::parse'`
+across all `crates/*/src`) as a final cross-crate sweep. Every hit is already-handled: the ops RFC3339 parse
+(fast_parse + retained reference oracle), the fusion `normalize_for_negation_match` ascii fast-path (~97×) + its
+oracle, `core/canonicalize.rs` `nfc()` behind a trigger-guarded `Cow`, and the `tui/palette.rs` command search
+(production `filtered()` matches against a **precomputed lowercased `search_index`**; the re-`to_lowercase` at
+`legacy_filtered_ids` is a test-only oracle used solely by one `assert_eq!`). The remainder are cold-path
+(startup config, CLI arg formatting, manifest hash case) or short-string sites already tested-and-rejected
+(lexical `cass_compat` query terms were a net regression / inside-floor per the June boundary; `fts5_adapter`
+token lowercasing is the same short-string class). No un-optimized hot general-purpose-machinery site remains
+workspace-wide — the sibling-hunt method is exhausted, confirming the CPU-perf frontier closure at the workspace
+level, not just per-crate.
