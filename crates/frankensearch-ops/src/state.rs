@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use ahash::AHashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::discovery::{DiscoveredInstance, DiscoveryStatus};
@@ -889,8 +890,11 @@ impl FleetSnapshot {
 /// The render loop reads it via `fleet()`.
 #[derive(Debug, Clone)]
 pub struct AppState {
-    /// Latest fleet snapshot.
-    fleet: FleetSnapshot,
+    /// Latest fleet snapshot. `Arc` so propagating state to every screen
+    /// (`sync_screen_states` clones it ~8× per navigation/input) is a refcount
+    /// bump, not a deep copy of the whole fleet; screens only read it and
+    /// `update_fleet` replaces the whole snapshot, so no in-place mutation.
+    fleet: Arc<FleetSnapshot>,
     /// When the fleet was last updated.
     last_update: Option<Instant>,
     /// Connection status message.
@@ -906,7 +910,7 @@ impl AppState {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            fleet: FleetSnapshot::default(),
+            fleet: Arc::new(FleetSnapshot::default()),
             last_update: None,
             connection_status: "Discovering instances...".to_string(),
             control_plane: ControlPlaneMetrics::default(),
@@ -916,7 +920,7 @@ impl AppState {
 
     /// Update the fleet snapshot.
     pub fn update_fleet(&mut self, snapshot: FleetSnapshot) {
-        self.fleet = snapshot;
+        self.fleet = Arc::new(snapshot);
         self.last_update = Some(Instant::now());
         self.refresh_connection_status();
     }
@@ -936,7 +940,7 @@ impl AppState {
 
     /// Get the current fleet snapshot.
     #[must_use]
-    pub const fn fleet(&self) -> &FleetSnapshot {
+    pub fn fleet(&self) -> &FleetSnapshot {
         &self.fleet
     }
 
