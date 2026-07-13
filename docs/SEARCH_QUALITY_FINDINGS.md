@@ -224,9 +224,11 @@ now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords
   2048-query rolling window, `min_samples`=128, rebuild every 64) in `new()`; it stays neutral (byte-identical
   fusion) through the 128-query warm-up, then realizes the down-weight online — no external sample management, no
   per-corpus calibration. The deployment-faithful cv-**percentile** CDF is the rolling empirical sample (not a
-  fixed β·cv). Verified: full fusion suite green (lib 892 / integration 38, exit 0). Opt out via
-  `with_nqc_dense_downweight_disabled()` (byte-identical A/B). Route-next: re-confirm the LIVE Rust default on the
-  REAL production embedder (all nDCG numbers here are potion/model2vec proxy) + an RCH `--all-features` gate.
+  fixed β·cv). Verified: fusion suite green under **default features** (lib 892 / integration 38, exit 0) **and `--all-features`**
+  (graph/rerank/lexical/bench-internals paths, exit 0) — no feature-gated fallout; cold-start neutrality held
+  everywhere (the integration tests run ≤12 queries/searcher, below the 128 warm-up). Opt out via
+  `with_nqc_dense_downweight_disabled()` (byte-identical A/B). Remaining route-next (non-blocking): re-confirm the
+  LIVE Rust default on the REAL production embedder (all nDCG numbers here are potion/model2vec proxy).
 - **Statistical caution (applies to every single-run number in this harness):** each nDCG figure is a POINT
   ESTIMATE; treat **±0.003-scale deltas as noise** unless pooled/CI'd. The large deltas above (stem+stop +0.024/
   +0.035, pool-min-max>RRF +0.017) are trustworthy; the sub-0.003 washes (z-score, pool-size) were correctly read
