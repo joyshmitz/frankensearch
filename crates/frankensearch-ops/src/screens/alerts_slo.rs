@@ -189,6 +189,40 @@ pub fn bench_fleet_rollup_slow(input: &BenchSloRollup) -> Option<SloRollupBits> 
     rollup_bits(AlertsSloScreen::fleet_rollup_row_slow(&input.rows))
 }
 
+/// Single-pass `(oldest, newest)` `ts_ms` bounds over a non-empty alert slice.
+/// Byte-identical to computing `.map(ts_ms).min()` and `.map(ts_ms).max()`
+/// separately (min and max of the same field), but reads `ts_ms` once per alert
+/// and iterates once. Same min+max reduction as timeline's
+/// `event_time_bounds_fused` (measured a decidable win at every shape in
+/// `event_bounds_ab`, commit 2b8c2dfa).
+fn alert_time_bounds_fused(alerts: &[AlertRow]) -> (u64, u64) {
+    let mut oldest = alerts[0].ts_ms;
+    let mut newest = alerts[0].ts_ms;
+    for alert in &alerts[1..] {
+        let ts = alert.ts_ms;
+        if ts < oldest {
+            oldest = ts;
+        }
+        if ts > newest {
+            newest = ts;
+        }
+    }
+    (oldest, newest)
+}
+
+/// Pre-fusion two-pass form of [`alert_time_bounds_fused`], retained as the
+/// exact-parity test oracle. Assumes a non-empty slice (the caller guards it).
+#[cfg(test)]
+fn alert_time_bounds_slow(alerts: &[AlertRow]) -> (u64, u64) {
+    let newest = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
+    let oldest = alerts
+        .iter()
+        .map(|alert| alert.ts_ms)
+        .min()
+        .unwrap_or(newest);
+    (oldest, newest)
+}
+
 /// Alerts + SLO + capacity screen for operator triage.
 pub struct AlertsSloScreen {
     id: ScreenId,
@@ -978,12 +1012,12 @@ impl AlertsSloScreen {
         if alerts.is_empty() {
             return "density: (no alerts)".to_owned();
         }
-        let newest = alerts.iter().map(|alert| alert.ts_ms).max().unwrap_or(0);
-        let oldest = alerts
-            .iter()
-            .map(|alert| alert.ts_ms)
-            .min()
-            .unwrap_or(newest);
+        // Single pass for both time bounds (was two passes: `.map(ts_ms).max()`
+        // then `.map(ts_ms).min()`, reading `ts_ms` twice per alert). Byte-
+        // identical for the non-empty case reached here: `newest` = max,
+        // `oldest` = min. Same min+max reduction fusion measured a decidable win
+        // at every shape in `event_bounds_ab` (timeline sibling, commit 2b8c2dfa).
+        let (oldest, newest) = alert_time_bounds_fused(alerts);
         let span = newest.saturating_sub(oldest);
         if span == 0 {
             return format!("density: {}", Self::sparkline(&[100]));
@@ -1462,6 +1496,39 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn alert_time_bounds_fused_matches_slow() {
+        // Byte-identity across single / duplicate / ascending / descending /
+        // random ts_ms shapes.
+        let shapes: Vec<Vec<u64>> = vec![
+            vec![1_700_000_000_000],
+            vec![42, 42, 42],
+            vec![1, 2, 3, 4, 5],
+            vec![9, 8, 7, 6, 5],
+            vec![500, 3, 288, 3, 999, 17, 999, 0],
+        ];
+        for stamps in shapes {
+            let alerts: Vec<AlertRow> = stamps
+                .iter()
+                .map(|&ts_ms| AlertRow {
+                    ts_ms,
+                    project: String::new(),
+                    host: String::new(),
+                    instance_id: String::new(),
+                    severity: AlertSeverity::Warn,
+                    confidence: 0,
+                    suppression_state: "active",
+                    reason_code: String::new(),
+                })
+                .collect();
+            assert_eq!(
+                alert_time_bounds_fused(&alerts),
+                alert_time_bounds_slow(&alerts),
+                "bounds parity for {stamps:?}"
+            );
+        }
     }
 
     #[test]
