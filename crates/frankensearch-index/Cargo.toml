@@ -39,6 +39,10 @@ wide = { workspace = true }
 
 # SIMD dot-product hot-loop benchmarks (brute-force vector top-k inner loop).
 [[bench]]
+name = "columnar_scan_ab"
+harness = false
+
+[[bench]]
 name = "quantize_slab"
 harness = false
 
