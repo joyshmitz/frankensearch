@@ -111,6 +111,11 @@ pub struct LiveSearchStreamScreen {
     selected_row: usize,
     project_filter_index: usize,
     host_filter_index: usize,
+    // Distinct project/host filter-value lists, cached (rebuilt in update_state
+    // only when the fleet changes) so row_data (per render) + clamp/cycle don't
+    // re-scan every instance into a BTreeSet each call.
+    project_filter_values: Vec<String>,
+    host_filter_values: Vec<String>,
     severity_filter: StreamSeverityFilter,
     degraded_only: bool,
     palette: SemanticPalette,
@@ -157,6 +162,8 @@ impl LiveSearchStreamScreen {
             selected_row: 0,
             project_filter_index: 0,
             host_filter_index: 0,
+            project_filter_values: vec!["all".to_owned()],
+            host_filter_values: vec!["all".to_owned()],
             severity_filter: StreamSeverityFilter::All,
             degraded_only: false,
             palette: SemanticPalette::dark(),
@@ -165,7 +172,15 @@ impl LiveSearchStreamScreen {
 
     /// Update screen data from shared application state.
     pub fn update_state(&mut self, state: &AppState) {
+        // Cached filter values are a pure function of the fleet; AppState.fleet is an
+        // Arc shared across clones until update_fleet replaces it, so a pointer-equal
+        // fleet means nothing changed — skip the rebuild. Same guard as the other
+        // filter screens (alerts_slo c678d4c2, timeline a85f549d).
+        let fleet_changed = !std::ptr::eq(self.state.fleet(), state.fleet());
         self.state = state.clone();
+        if fleet_changed {
+            self.rebuild_filter_values();
+        }
         self.clamp_filter_index();
         self.clamp_selected_row();
     }
@@ -286,30 +301,36 @@ impl LiveSearchStreamScreen {
         rows
     }
 
-    fn project_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
-        let projects: BTreeSet<_> = self
-            .state
-            .fleet()
+    /// Recompute the cached project/host filter-value lists from the current fleet.
+    /// Called from update_state only when the fleet changed.
+    fn rebuild_filter_values(&mut self) {
+        let fleet = self.state.fleet();
+        let projects: BTreeSet<String> = fleet
             .instances
             .iter()
             .map(|instance| instance.project.clone())
             .collect();
-        values.extend(projects);
-        values
-    }
-
-    fn host_filters(&self) -> Vec<String> {
-        let mut values = vec!["all".to_owned()];
-        let hosts: BTreeSet<_> = self
-            .state
-            .fleet()
+        let hosts: BTreeSet<String> = fleet
             .instances
             .iter()
             .map(|instance| Self::host_bucket(&instance.id))
             .collect();
-        values.extend(hosts);
-        values
+
+        let mut project_values = vec!["all".to_owned()];
+        project_values.extend(projects);
+        let mut host_values = vec!["all".to_owned()];
+        host_values.extend(hosts);
+
+        self.project_filter_values = project_values;
+        self.host_filter_values = host_values;
+    }
+
+    fn project_filters(&self) -> Vec<String> {
+        self.project_filter_values.clone()
+    }
+
+    fn host_filters(&self) -> Vec<String> {
+        self.host_filter_values.clone()
     }
 
     fn clamp_filter_index(&mut self) {
@@ -914,6 +935,21 @@ mod tests {
         assert_eq!(screen.id(), &ScreenId::new("ops.live_stream"));
         assert_eq!(screen.title(), "Live Search Stream");
         assert_eq!(screen.semantic_role(), "log");
+    }
+
+    #[test]
+    fn update_state_skips_filter_rebuild_when_fleet_unchanged_but_keeps_values() {
+        let mut screen = LiveSearchStreamScreen::new();
+        let state = sample_state();
+        screen.update_state(&state);
+        let projects = screen.project_filters().len();
+        let hosts = screen.host_filters().len();
+        // Re-applying the SAME AppState shares the fleet Arc → rebuild is skipped;
+        // the cached filter-value lists must remain intact.
+        screen.update_state(&state);
+        assert_eq!(screen.project_filters().len(), projects);
+        assert_eq!(screen.host_filters().len(), hosts);
+        assert!(projects >= 1 && hosts >= 1);
     }
 
     #[test]
