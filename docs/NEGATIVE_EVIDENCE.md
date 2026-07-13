@@ -13731,3 +13731,25 @@ workspace (7.1× vs flat, `early-abandon` arc + AVX2 dispatch + bounded heaps + 
 code read confirms it: bounded, vectorized, cutoff-gated, tombstone-skipping, both passes. Algorithmic
 early-abandon is the only class beyond this and it's landed/synthetic-validated (route-next = real-corpus 130k,
 data-blocked). NULL.
+
+### 2026-07-13 — cc_fse — WASH (fundamentally-different primitive): tiled-columnar reduce-free scan ≈ row-major once the query is HOISTED (the 2.13× was a strawman)
+
+Directed to implement a FUNDAMENTALLY-different index primitive (not incremental). Built a tiled-columnar
+(SoA) exact-dot scan (`columnar_scan_ab`, `ba84bf5c`): group candidates by 8, store each group's `dim×8` floats
+CONTIGUOUS, scan via `acc += splat(query[d]) * load8(tile[d])` so the 8 SIMD lanes ARE 8 candidates' dots —
+**NO per-candidate horizontal `reduce_add`** (vs the row-major 4-accumulator dot, which reduces once per
+candidate). Different layout AND exec model; distinct from the rejected multi-query GEMM batch (`73a77fc`) and
+int8-vertical (no 32-wide madd).
+- **First run vs a NAIVE row-major → columnar 2.13× @ dim=64** — but a STRAWMAN: that baseline rebuilt the query
+  f32x8 lanes INSIDE the candidate loop (reloading the query per candidate). Not a real kernel.
+- **Fair run (row-major query HOISTED once) → WASH.** `n=16384 dim=128 = 1.0228× INSIDE_NULL_FLOOR`;
+  `decision=MIXED-or-floor` (NOT columnar-faster at all shapes). The eliminated horizontal reduce is offset by the
+  columnar's per-dim query SPLATS + the identical FMA count (both do `dim/8` f32x8-FMAs per candidate). (The
+  small-dim fair number was truncated by an rch artifact-transfer glitch, but the summary confirms not-robust.)
+**★ LESSON (charge the baseline fairly, cf `rrf-sort-key-fattening`): a columnar/transposed layout does NOT
+robustly speed the SINGLE-query exact dot — the reduce it eliminates is a small fixed cost a query-hoisted
+row-major already amortizes; the "2.13×" was query-load redundancy in the strawman, not the layout. Consistent
+with the GEMM-batch (1.03-1.14×) and int8-vertical rejections: the flat/exact dot scan is FMA-throughput-bound,
+and layout reshuffles that keep the same FMA count don't beat it.** The columnar layout is also NOT the default
+hot path anyway (int8 two-pass is; the exact f32/f16 dot runs only on pass-2 candidates). `columnar_scan_ab`
+retained as the reproducible harness; production unchanged (bench-only).
