@@ -110,6 +110,29 @@ fn build_project_percentile_values(
     out
 }
 
+/// `(healthy_count, docs_total, pending_total)` over the visible instances in a
+/// single pass. Four render helpers (`render_compact`, `kpi_tile_lines`,
+/// `status_sparkline_lines`, and the `render` header) each computed this same
+/// triple in THREE separate passes over `visible` (`filter(healthy).count()`
+/// plus two `map().sum()`); fusing visits each instance once. Byte-identical:
+/// the count and both `u64` sums are order-independent. Same N→1 reduction
+/// fusion as `build_project_percentile_values` (fleet 5→1, measured ~1.9× at
+/// every shape in `fleet_project_values_ab`, commit f4f98e0a) — over the fleet
+/// instance set (always thousands), so it clears the null floor at all n.
+fn visible_fleet_totals(visible: &[&InstanceInfo]) -> (usize, u64, u64) {
+    let mut healthy = 0usize;
+    let mut docs = 0u64;
+    let mut pending = 0u64;
+    for instance in visible {
+        if instance.healthy {
+            healthy += 1;
+        }
+        docs += instance.doc_count;
+        pending += instance.pending_jobs;
+    }
+    (healthy, docs, pending)
+}
+
 /// Legacy five-pass builder, retained only for the A/B microbench.
 #[cfg(feature = "bench-internals")]
 fn build_project_percentile_values_legacy(
@@ -687,9 +710,7 @@ impl FleetOverviewScreen {
         let fleet = self.state.fleet();
         let visible = self.visible_instances();
         let visible_count = visible.len();
-        let healthy = visible.iter().filter(|instance| instance.healthy).count();
-        let docs: u64 = visible.iter().map(|instance| instance.doc_count).sum();
-        let pending: u64 = visible.iter().map(|instance| instance.pending_jobs).sum();
+        let (healthy, docs, pending) = visible_fleet_totals(&visible);
         let mut lines = vec![
             Line::from("Fleet Overview"),
             Line::from(format!(
@@ -723,12 +744,9 @@ impl FleetOverviewScreen {
         let visible = self.visible_instances();
         let visible_count = visible.len();
         let total_count = fleet.instance_count();
-        let healthy_count = visible.iter().filter(|instance| instance.healthy).count();
+        let (healthy_count, docs, pending) = visible_fleet_totals(&visible);
         let unhealthy_count = visible_count.saturating_sub(healthy_count);
         let health_pct = Self::ratio_percent_usize(healthy_count, visible_count);
-
-        let docs: u64 = visible.iter().map(|instance| instance.doc_count).sum();
-        let pending: u64 = visible.iter().map(|instance| instance.pending_jobs).sum();
         let pending_pct = Self::ratio_percent_u64(pending, docs.saturating_add(pending));
 
         let search_total: u64 = visible
@@ -793,11 +811,8 @@ impl FleetOverviewScreen {
         let visible = self.visible_instances();
 
         let visible_count = visible.len();
-        let healthy_count = visible.iter().filter(|instance| instance.healthy).count();
+        let (healthy_count, docs, pending) = visible_fleet_totals(&visible);
         let health_pct = Self::ratio_percent_usize(healthy_count, visible_count);
-
-        let docs: u64 = visible.iter().map(|instance| instance.doc_count).sum();
-        let pending: u64 = visible.iter().map(|instance| instance.pending_jobs).sum();
         let pending_pressure = Self::ratio_percent_u64(pending, docs.saturating_add(pending));
         let queue_headroom = 100u8.saturating_sub(pending_pressure);
 
@@ -1151,9 +1166,7 @@ impl Screen for FleetOverviewScreen {
         let fleet = self.state.fleet();
         let visible = self.visible_instances();
         let visible_count = visible.len();
-        let visible_healthy = visible.iter().filter(|inst| inst.healthy).count();
-        let visible_docs: u64 = visible.iter().map(|inst| inst.doc_count).sum();
-        let visible_pending: u64 = visible.iter().map(|inst| inst.pending_jobs).sum();
+        let (visible_healthy, visible_docs, visible_pending) = visible_fleet_totals(&visible);
         let health_badge = self.state.control_plane_health().badge();
         let summary = format!(
             " {visible_count}/{} instances | {visible_healthy} healthy | {visible_docs} docs | {visible_pending} pending | {} density | {health_badge}",
@@ -1358,6 +1371,33 @@ mod tests {
     use super::*;
     use crate::presets::ViewState;
     use crate::state::{FleetSnapshot, ResourceMetrics, SearchMetrics};
+
+    fn totals_instance(seed: u64, healthy: bool) -> InstanceInfo {
+        InstanceInfo {
+            id: format!("i-{seed:04}"),
+            project: format!("p-{}", seed % 3),
+            pid: Some(seed as u32),
+            healthy,
+            doc_count: seed.wrapping_mul(97) % 1_000_000,
+            pending_jobs: (seed * 7) % 4_000,
+        }
+    }
+
+    #[test]
+    fn visible_fleet_totals_matches_three_pass() {
+        for n in [0u64, 1, 3, 512, 2_048] {
+            let owned: Vec<InstanceInfo> =
+                (0..n).map(|i| totals_instance(i, i % 4 != 0)).collect();
+            let visible: Vec<&InstanceInfo> = owned.iter().collect();
+            let fused = visible_fleet_totals(&visible);
+            let slow = (
+                visible.iter().filter(|inst| inst.healthy).count(),
+                visible.iter().map(|inst| inst.doc_count).sum::<u64>(),
+                visible.iter().map(|inst| inst.pending_jobs).sum::<u64>(),
+            );
+            assert_eq!(fused, slow, "n={n}");
+        }
+    }
 
     #[test]
     fn fleet_screen_default() {
