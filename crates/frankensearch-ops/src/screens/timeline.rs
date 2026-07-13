@@ -531,12 +531,10 @@ impl ActionTimelineScreen {
         if events.is_empty() {
             return "density: (no events)".to_owned();
         }
-        let newest = events.iter().map(|event| event.at_ms).max().unwrap_or(0);
-        let oldest = events
-            .iter()
-            .map(|event| event.at_ms)
-            .min()
-            .unwrap_or(newest);
+        // Single pass for both time bounds (was two passes: `.map().max()` then
+        // `.map().min()`, reading `at_ms` twice per event). Byte-identical for the
+        // non-empty case reached here: `newest` = max, `oldest` = min.
+        let (oldest, newest) = event_time_bounds_fused(events);
         let span = newest.saturating_sub(oldest);
         if span == 0 {
             return format!("density: {}", Self::sparkline(&[100]));
@@ -984,9 +982,111 @@ impl Screen for ActionTimelineScreen {
     }
 }
 
+/// Single-pass `(oldest, newest)` `at_ms` bounds over a non-empty event slice.
+/// Byte-identical to computing `.map(at_ms).min()` and `.map(at_ms).max()`
+/// separately (both yield the min and max of the same field), but reads `at_ms`
+/// once per event instead of twice and iterates once instead of twice.
+fn event_time_bounds_fused(events: &[LifecycleEvent]) -> (u64, u64) {
+    let mut oldest = events[0].at_ms;
+    let mut newest = events[0].at_ms;
+    for event in &events[1..] {
+        let at = event.at_ms;
+        if at < oldest {
+            oldest = at;
+        }
+        if at > newest {
+            newest = at;
+        }
+    }
+    (oldest, newest)
+}
+
+/// Pre-fusion two-pass form of [`event_time_bounds_fused`], retained as the
+/// exact-parity bench oracle. Assumes a non-empty slice (the caller guards it).
+#[cfg(any(test, feature = "bench-internals"))]
+fn event_time_bounds_slow(events: &[LifecycleEvent]) -> (u64, u64) {
+    let newest = events.iter().map(|event| event.at_ms).max().unwrap_or(0);
+    let oldest = events
+        .iter()
+        .map(|event| event.at_ms)
+        .min()
+        .unwrap_or(newest);
+    (oldest, newest)
+}
+
+/// Bench-only: build `n` deterministic lifecycle events with a spread of `at_ms`
+/// timestamps (the shape `timeline_density_line` scans for its time bounds).
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_make_lifecycle_events(n: usize) -> Vec<LifecycleEvent> {
+    let mut events = Vec::with_capacity(n.max(1));
+    let mut r = 0x2545_f491_4f6c_dd1d_u64;
+    for i in 0..n.max(1) {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        events.push(LifecycleEvent {
+            instance_id: format!("instance-{i:06}"),
+            from: LifecycleState::Started,
+            to: LifecycleState::Healthy,
+            reason_code: "startup".to_owned(),
+            at_ms: 1_700_000_000_000 + (r % 5_000_000),
+            attribution_confidence_score: (i % 100) as u8,
+            attribution_collision: i % 7 == 0,
+        });
+    }
+    events
+}
+
+/// Bench-only: shipped single-pass time-bounds computation.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_event_bounds_fused(events: &[LifecycleEvent]) -> (u64, u64) {
+    event_time_bounds_fused(events)
+}
+
+/// Bench-only: legacy two-pass time-bounds computation.
+#[cfg(feature = "bench-internals")]
+#[must_use]
+pub fn bench_event_bounds_slow(events: &[LifecycleEvent]) -> (u64, u64) {
+    event_time_bounds_slow(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_time_bounds_fused_matches_slow() {
+        // Byte-identity across single / duplicate-timestamp / ascending /
+        // descending / random shapes.
+        let shapes: Vec<Vec<u64>> = vec![
+            vec![42],
+            vec![7, 7, 7],
+            vec![1, 2, 3, 4, 5],
+            vec![5, 4, 3, 2, 1],
+            vec![100, 3, 88, 3, 250, 17, 250, 0],
+        ];
+        for stamps in shapes {
+            let events: Vec<LifecycleEvent> = stamps
+                .iter()
+                .map(|&at_ms| LifecycleEvent {
+                    instance_id: String::new(),
+                    from: LifecycleState::Started,
+                    to: LifecycleState::Healthy,
+                    reason_code: String::new(),
+                    at_ms,
+                    attribution_confidence_score: 0,
+                    attribution_collision: false,
+                })
+                .collect();
+            assert_eq!(
+                event_time_bounds_fused(&events),
+                event_time_bounds_slow(&events),
+                "bounds parity for {stamps:?}"
+            );
+        }
+    }
 
     fn sample_state() -> AppState {
         let mut state = AppState::new();

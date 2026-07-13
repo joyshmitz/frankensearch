@@ -47,6 +47,11 @@ name = "fleet_rollup_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "event_bounds_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
