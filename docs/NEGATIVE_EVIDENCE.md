@@ -13358,3 +13358,40 @@ were restored byte-for-byte; this commit retains only the negative boundary. Do 
 retention buffer for this 20/10 collapse policy without independent memory-pressure evidence or a materially
 different bulk/chunked design. The completed Cargo command exited 0 on RCH with a cold remote cache; no local
 fallback ran.
+
+## 2026-07-13 — ops-TUI CPU frontier CLOSED this arc; remaining candidates rejected (not clean / below-noise / behavior-changing)
+
+The `frankensearch-ops` TUI (fleet / index_resources / project_detail / live_stream / timeline / alerts_slo /
+historical_analytics screens + `state`) was mined comprehensively this arc — ~29 byte-identical, test-verified
+wins landed on `main` (per-lever detail lives in the session memory `ops-tui-fresh-perf-vein.md`). Categories:
+quadratic-resolution elimination (per-event linear `.find` over instances → prebuilt `AHashMap`, measured
+~2.2–65.7× on the resolution loop in `project_resolve_ab`); N→1 pass / min-max reduction fusions; aHash on every
+instance-id-keyed hot map (the four `FleetSnapshot` maps + all local resolution maps); `Arc<FleetSnapshot>`
+(deep-clone → refcount-bump on the per-navigation `sync_screen_states` propagation, AND its `std::ptr::eq`
+rebuild-skip on all four filter screens); build-before-discard elimination (filter-before-build / filter-then-clone
+/ Cow-borrow) on all four big screens; lookup-only `BTree`→`Hash` container swaps; count-without-collect on the
+selection-clamp paths; and `sort_unstable` for every strict-total-order sort.
+
+REMAINING CANDIDATES — REJECTED (recorded so future sessions don't re-walk):
+
+1. **Table row virtualization** — REJECT (not byte-identical + gated). `build_alert_rows` / `build_rows` /
+   `build_evidence_rows` build a ratatui `Row` per filtered row with no scroll/offset state. Building only the
+   visible window would CHANGE what is rendered (the screens don't currently scroll-to-selected), so it is not a
+   byte-identical optimization. It is also gated: `lifecycle_events` is capped at `max_retained_events` (default
+   4096), so the per-redraw build is bounded, not the 32k the benches stress. Needs a UX decision + windowing
+   logic, not a clean perf lever.
+
+2. **`sort_unstable` on the per-EVENT sorts** (timeline `filtered_events`/`all_events`, alerts_slo
+   `filtered_alerts`/`all_alerts`, historical `rebuild_derived_rows`) — REJECT (breaks byte-identity). Their
+   comparators end in `instance_id`, which is NOT unique per event (multiple events share one instance), so ties
+   exist and the stable sort's tie order is load-bearing; `sort_unstable` would reorder ties. Only the
+   per-INSTANCE / per-GROUP sorts (unique final tiebreak = strict total order) were safe to convert.
+
+3. **discovery/storage sorts + dedup sets** (discovery `identity_keys.sort()` / `kinds.sort()`, storage
+   `seen_event_ids`) — REJECT (below-noise). The discovery sorts are over tiny Vecs (~3–5 identity keys); the
+   storage dedup is the CPU pre-pass of an I/O-dominated batch insert (per-event `insert_search_event_row` DB
+   write dominates). Byte-identical + never-worse in isolation but invisible end-to-end.
+
+The clean, decidable, byte-identical ops-TUI lever vein is exhausted. The next productive perf work in this crate
+would require either a new workload the current data model doesn't exercise, a UX decision (table virtualization),
+or profiling under a real running TUI rather than the synthetic per-function harnesses.
