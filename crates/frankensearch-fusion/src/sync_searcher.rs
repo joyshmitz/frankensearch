@@ -221,6 +221,23 @@ impl SyncTwoTierSearcher {
         self
     }
 
+    /// Enable the rolling NQC dense down-weight with the blessed production defaults
+    /// ([`AdaptiveNqcDenseWeight::production_default`]) — the recommended one-call setup.
+    #[must_use]
+    pub fn with_nqc_dense_downweight_adaptive_defaults(mut self) -> Self {
+        self.nqc_adaptive = Some(Mutex::new(AdaptiveNqcDenseWeight::production_default()));
+        self
+    }
+
+    /// Disable any NQC dense down-weight (static or adaptive) → **byte-identical** fusion.
+    /// The opt-out / A-B escape hatch (also clears a default-on adaptive down-weight).
+    #[must_use]
+    pub fn with_nqc_dense_downweight_disabled(mut self) -> Self {
+        self.nqc_adaptive = None;
+        self.nqc_downweight_beta = 0.0;
+        self
+    }
+
     /// The dense-tier fusion weight for this query: the static `rrf_semantic_weight`, scaled
     /// by the per-query NQC dense down-weight when enabled (`beta > 0`). Off (default) returns
     /// `rrf_semantic_weight` unchanged with zero extra work.
@@ -1038,6 +1055,30 @@ mod tests {
         assert!(
             weight < searcher.rrf_semantic_weight,
             "a high-NQC query is down-weighted after the online sketch warms up, got {weight}"
+        );
+    }
+
+    #[test]
+    fn nqc_adaptive_defaults_enable_neutral_cold_start_and_disabled_clears_it() {
+        let hits = [lexical_result("a", 10.0), lexical_result("b", 1.0)];
+        // Blessed defaults: enabled, but cold-start (empty sketch) is byte-identical to base.
+        let defaults = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_rrf_weights(1.0, 1.3)
+            .with_nqc_dense_downweight_adaptive_defaults();
+        assert_eq!(
+            defaults.effective_semantic_weight(&hits).to_bits(),
+            defaults.rrf_semantic_weight.to_bits(),
+            "production-default cold start is neutral"
+        );
+        // Disabling clears both the adaptive and static paths -> byte-identical, no observation.
+        let disabled = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_rrf_weights(1.0, 1.3)
+            .with_nqc_dense_downweight_adaptive_defaults()
+            .with_nqc_dense_downweight_disabled();
+        assert_eq!(
+            disabled.effective_semantic_weight(&hits).to_bits(),
+            disabled.rrf_semantic_weight.to_bits(),
+            "disabled escape hatch is byte-identical"
         );
     }
 

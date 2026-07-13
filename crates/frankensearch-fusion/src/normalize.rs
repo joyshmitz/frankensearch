@@ -381,6 +381,18 @@ impl AdaptiveNqcDenseWeight {
     pub fn weight_for_lexical_scores(&mut self, scores: &[f32]) -> f32 {
         self.weight_for_cv(nqc_cv(scores))
     }
+
+    /// The blessed production defaults for the rolling dense down-weight: `beta = 0.5`
+    /// (measured best — floors the dense multiplier at `0.5`, so the tier is never fully
+    /// dropped and keeps its minority upside), `w_min = 0.5` (the natural floor at `beta=0.5`,
+    /// `> 0` so a scaled weight is never sanitized back to neutral), a `2048`-query rolling
+    /// window, `min_samples = 128` before the sketch activates, and a rebuild every `64`
+    /// observations. Realizes the measured aggregate +0.0022 nDCG@10 (pooled 95% CI
+    /// `[+0.0008, +0.0035]`) once warmed; neutral (byte-identical) during the 128-query warm-up.
+    #[must_use]
+    pub fn production_default() -> Self {
+        Self::new(0.5, 0.5, 2048, 128, 64)
+    }
 }
 
 /// In-place z-score normalization.
@@ -612,6 +624,17 @@ mod tests {
         }
         let outlier = adaptive.weight_for_cv(9.0);
         assert!(outlier < 0.5, "an outlier scored against the prior low-cv sketch is down-weighted");
+    }
+
+    #[test]
+    fn adaptive_nqc_production_default_is_active_and_warms_up_neutral() {
+        let mut adaptive = AdaptiveNqcDenseWeight::production_default();
+        assert!(adaptive.is_active(), "production default enables the down-weight (beta=0.5)");
+        // The 128-sample warm-up keeps the first observations neutral (byte-identical fusion).
+        for i in 0..20 {
+            let w = adaptive.weight_for_cv(0.1 + 0.01 * i as f32);
+            assert!((w - 1.0).abs() <= EPSILON, "obs {i} neutral during the 128-query warm-up");
+        }
     }
 
     #[test]

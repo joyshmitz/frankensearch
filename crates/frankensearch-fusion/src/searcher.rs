@@ -313,6 +313,23 @@ impl TwoTierSearcher {
         self
     }
 
+    /// Enable the rolling NQC dense down-weight with the blessed production defaults
+    /// ([`AdaptiveNqcDenseWeight::production_default`]) — the recommended one-call setup.
+    #[must_use]
+    pub fn with_nqc_dense_downweight_adaptive_defaults(mut self) -> Self {
+        self.nqc_adaptive = Some(Mutex::new(AdaptiveNqcDenseWeight::production_default()));
+        self
+    }
+
+    /// Disable any NQC dense down-weight (static or adaptive) → **byte-identical** fusion.
+    /// The opt-out / A-B escape hatch (also clears a default-on adaptive down-weight).
+    #[must_use]
+    pub fn with_nqc_dense_downweight_disabled(mut self) -> Self {
+        self.nqc_adaptive = None;
+        self.nqc_downweight_beta = 0.0;
+        self
+    }
+
     /// The dense-tier phase-1 fusion weight for this query: the static `rrf_semantic_weight`,
     /// scaled by the per-query NQC dense down-weight when enabled (`beta > 0`). Off (default)
     /// returns `rrf_semantic_weight` unchanged with zero extra work.
