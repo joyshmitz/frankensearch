@@ -19,7 +19,9 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
-use frankensearch_core::canonicalize::{collapse_code_block_fast_bench, collapse_code_block_slow};
+use frankensearch_core::canonicalize::{
+    collapse_code_block_fast_bench, collapse_code_block_slow, push_collapsed_code_block_fast_bench,
+};
 
 const HEAD: usize = 20;
 const TAIL: usize = 10;
@@ -75,6 +77,77 @@ fn bench(c: &mut Criterion) {
             collapse_code_block_slow("rust", lines, HEAD, TAIL),
         );
     }
+
+    let caller_capacity: usize = refs
+        .iter()
+        .map(|lines| {
+            "```rust\n".len()
+                + lines.iter().map(|line| line.len() + 1).sum::<usize>()
+                + "```\n".len()
+        })
+        .sum();
+    let build_via_returned = || {
+        let mut out = String::with_capacity(caller_capacity);
+        for lines in &refs {
+            out.push_str(&collapse_code_block_fast_bench(
+                black_box("rust"),
+                black_box(lines),
+                HEAD,
+                TAIL,
+            ));
+            out.push('\n');
+        }
+        out
+    };
+    let build_via_append = || {
+        let mut out = String::with_capacity(caller_capacity);
+        for lines in &refs {
+            push_collapsed_code_block_fast_bench(
+                &mut out,
+                black_box("rust"),
+                black_box(lines),
+                HEAD,
+                TAIL,
+            );
+            out.push('\n');
+        }
+        out
+    };
+    assert_eq!(build_via_returned(), build_via_append());
+
+    let run_via_returned = || {
+        black_box(build_via_returned());
+    };
+    let run_via_append = || {
+        black_box(build_via_append());
+    };
+
+    let append_null = paired_median_ratio(41, 4, run_via_returned, run_via_returned);
+    let append_lever = paired_median_ratio(41, 4, run_via_returned, run_via_append);
+    eprintln!(
+        "[null]  collapse_append/{}blk: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        refs.len(),
+        append_null.median,
+        append_null.p5,
+        append_null.p95,
+        append_null.rounds
+    );
+    eprintln!(
+        "[lever] collapse_append/{}blk: append/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        refs.len(),
+        append_lever.median,
+        append_lever.p5,
+        append_lever.p95,
+        if append_lever.decidable_against(&append_null) {
+            if append_lever.median < 1.0 {
+                "DECIDABLE WIN (direct append)"
+            } else {
+                "DECIDABLE REGRESSION"
+            }
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
 
     let run_fast = || {
         let mut acc = 0usize;
@@ -135,6 +208,8 @@ fn bench(c: &mut Criterion) {
     g.sample_size(30);
     g.bench_function("join_format", |b| b.iter(run_slow));
     g.bench_function("one_pass", |b| b.iter(run_fast));
+    g.bench_function("caller_return_push", |b| b.iter(run_via_returned));
+    g.bench_function("caller_direct_append", |b| b.iter(run_via_append));
     g.finish();
 }
 

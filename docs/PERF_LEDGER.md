@@ -21,6 +21,21 @@ and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
 pre-change baselines or before/after local hot-path ratios unless explicitly
 marked as original-comparator wins.
 
+## 2026-07-12 — WIN: collapsed code blocks append into the final document buffer — ~1.44× (Codex)
+
+After the one-pass code-block builder landed, `strip_markdown_and_code` still allocated its returned
+`String` and immediately copied every collapsed byte into the canonicalizer's preallocated `result`.
+Both closed- and unclosed-fence paths now write the same label, kept lines, omitted marker, and language
+tag directly into `result`; the caller still contributes the identical single trailing newline. The old
+returned-buffer form remains behind tests/`bench-internals` as the same-binary oracle.
+
+Strict-remote worker `vmi1227854`, one release binary, 512 realistic code blocks, 41 alternating rounds,
+`inner=4`; direct-append/current median **0.6940 [0.5643, 0.7637]** versus A/A null median
+1.0023 [0.8939, 1.1463]. The candidate clears the null p5 decisively, approximately **1.44×** faster
+in the affected caller region. Criterion independently measured returned-buffer-plus-copy at 80.0–86.9 us
+and direct append at 52.6–55.1 us. This is not a whole canonicalization or ingest latency claim; exact
+command, parity scope, and validation are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 ## 2026-07-12 — WIN: CJK bigrams build directly in the reusable pending buffer — ~1.77× in the affected region (Codex)
 
 After the one-pass CJK decoder landed, `CjkBigramDecomposeStream::decompose_cjk` still allocated a

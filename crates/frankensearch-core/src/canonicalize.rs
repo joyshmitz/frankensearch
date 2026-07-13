@@ -134,12 +134,13 @@ impl DefaultCanonicalizer {
             if line.starts_with("```") {
                 if in_code_block {
                     // End of code block — collapse it
-                    result.push_str(&collapse_code_block(
+                    push_collapsed_code_block(
+                        &mut result,
                         &code_block_lang,
                         &code_lines,
                         self.code_head_lines,
                         self.code_tail_lines,
-                    ));
+                    );
                     result.push('\n');
                     code_lines.clear();
                     code_block_lang.clear();
@@ -163,12 +164,13 @@ impl DefaultCanonicalizer {
 
         // Handle unclosed code block
         if in_code_block && !code_lines.is_empty() {
-            result.push_str(&collapse_code_block(
+            push_collapsed_code_block(
+                &mut result,
                 &code_block_lang,
                 &code_lines,
                 self.code_head_lines,
                 self.code_tail_lines,
-            ));
+            );
             result.push('\n');
         }
 
@@ -188,35 +190,22 @@ fn push_joined<'a>(out: &mut String, mut lines: impl Iterator<Item = &'a str>) {
     }
 }
 
-/// Collapse a code block to first N + last M lines.
+/// Append a code block collapsed to first N + last M lines.
 ///
-/// Builds the result in one pass directly into the output buffer. The prior form
-/// `format!("[{label}]\n{}", lines.join("\n"))` allocated an intermediate joined
-/// `String` (a full copy of the kept code-block bytes) that `format!` then copied
-/// a *second* time into the returned `String` — a redundant full copy per code
-/// block, on the per-document ingest path. Here `push_joined` writes the kept
-/// lines straight into `out`, so each byte is copied once. Byte-identical to the
-/// `format!`/`join` form (`collapse_code_block_slow`).
-fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> String {
+/// Writes into the canonicalizer's existing document buffer so the collapsed
+/// bytes are never allocated in a temporary `String` and copied again by the
+/// caller. The caller owns the trailing newline; this function appends only the
+/// exact former `collapse_code_block` bytes.
+fn push_collapsed_code_block(
+    out: &mut String,
+    lang: &str,
+    lines: &[&str],
+    head: usize,
+    tail: usize,
+) {
     use std::fmt::Write as _;
 
     let collapse = lines.len() > head + tail;
-    // Pre-size to the exact kept bytes so the single build never reallocs: label
-    // + "[]\n" + kept line bytes (with per-line '\n') + the omitted marker.
-    let label_len = if lang.is_empty() { 4 } else { 6 + lang.len() };
-    let kept_bytes: usize = if collapse {
-        lines
-            .iter()
-            .take(head)
-            .chain(lines.iter().skip(lines.len() - tail))
-            .map(|l| l.len() + 1)
-            .sum()
-    } else {
-        lines.iter().map(|l| l.len() + 1).sum()
-    };
-    let mut out =
-        String::with_capacity(label_len + 3 + kept_bytes + if collapse { 32 } else { 0 });
-
     out.push('[');
     if lang.is_empty() {
         out.push_str("code");
@@ -227,13 +216,32 @@ fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> 
     out.push_str("]\n");
 
     if collapse {
-        push_joined(&mut out, lines.iter().take(head).copied());
+        push_joined(out, lines.iter().take(head).copied());
         let omitted = lines.len() - head - tail;
         let _ = write!(out, "\n[... {omitted} lines omitted ...]\n");
-        push_joined(&mut out, lines.iter().skip(lines.len() - tail).copied());
+        push_joined(out, lines.iter().skip(lines.len() - tail).copied());
     } else {
-        push_joined(&mut out, lines.iter().copied());
+        push_joined(out, lines.iter().copied());
     }
+}
+
+/// Pre-direct-append form retained as the exact same-binary comparator.
+#[cfg(any(test, feature = "bench-internals"))]
+fn collapse_code_block(lang: &str, lines: &[&str], head: usize, tail: usize) -> String {
+    let collapse = lines.len() > head + tail;
+    let label_len = if lang.is_empty() { 4 } else { 6 + lang.len() };
+    let kept_bytes: usize = if collapse {
+        lines
+            .iter()
+            .take(head)
+            .chain(lines.iter().skip(lines.len() - tail))
+            .map(|line| line.len() + 1)
+            .sum()
+    } else {
+        lines.iter().map(|line| line.len() + 1).sum()
+    };
+    let mut out = String::with_capacity(label_len + 3 + kept_bytes + if collapse { 32 } else { 0 });
+    push_collapsed_code_block(&mut out, lang, lines, head, tail);
     out
 }
 
@@ -275,6 +283,19 @@ pub fn collapse_code_block_fast_bench(
     tail: usize,
 ) -> String {
     collapse_code_block(lang, lines, head, tail)
+}
+
+/// Doc-hidden bench wrapper for direct append into the caller's output buffer.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn push_collapsed_code_block_fast_bench(
+    out: &mut String,
+    lang: &str,
+    lines: &[&str],
+    head: usize,
+    tail: usize,
+) {
+    push_collapsed_code_block(out, lang, lines, head, tail);
 }
 
 /// Strip markdown formatting from a single line.
@@ -702,6 +723,17 @@ mod tests {
                     collapse_code_block(lang, lines, head, tail),
                     collapse_code_block_slow(lang, lines, head, tail),
                     "lang={lang:?} len={} head={head} tail={tail}",
+                    lines.len()
+                );
+
+                let prefix = "before\n";
+                let expected = format!("{prefix}{}", collapse_code_block(lang, lines, head, tail));
+                let mut appended = prefix.to_owned();
+                push_collapsed_code_block(&mut appended, lang, lines, head, tail);
+                assert_eq!(
+                    appended,
+                    expected,
+                    "append parity: lang={lang:?} len={} head={head} tail={tail}",
                     lines.len()
                 );
             }

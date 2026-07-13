@@ -13241,3 +13241,43 @@ restored byte-for-byte; this commit retains only the negative boundary. Do not r
 the same 2–31-character corpus unless a lower-noise same-worker harness or a materially larger realistic CJK run
 changes the evidence floor. The cold RCH cache made compilation slow but did not affect same-binary comparability.
 All Cargo execution was fail-closed remote-only; no local fallback ran.
+
+### 2026-07-12 — Codex — WIN: direct code-block append removes the returned-buffer allocation and copy — ~1.44×
+
+Negative-ledger-first inspection revisited the June code-block boundary only after the measured one-pass builder
+changed its cost structure. The rejected June lever removed two tiny `Vec<&str>` scratch collections while
+`join`/`format!` still dominated; it measured 1.010 and remains closed. Commit `4c2c7605` later removed those
+dominant intermediates (~1.87×), exposing a distinct caller seam: both closed and unclosed fence paths still did
+`result.push_str(&collapse_code_block(...))`, allocating the returned `String` and copying its complete contents
+into the already-preallocated document buffer.
+
+The keep factors the unchanged label/line/omission writer into `push_collapsed_code_block(&mut result, ...)` and
+uses it at both production call sites. The caller still appends exactly one trailing newline. The retained current
+form allocates its same capacity, calls that identical writer, and returns the temporary only for tests and the
+same-binary comparator. Before timing, the benchmark asserted complete accumulated caller-output equality for
+512 mixed short/full-keep and long/collapsed blocks. The unit oracle also compares appending behind a non-empty
+prefix across empty, threshold, collapsed, `head=0`, `tail=0`, both-zero, and language-label shapes.
+
+Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 RCH_WORKER=vmi1227854 \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-core --profile release \
+  --features bench-internals --bench collapse_code_block_ab
+```
+
+Worker `vmi1227854`; one release binary; 512 blocks; 41 alternating rounds; `inner=4`; ratio is append/current:
+
+| workload | A/A current null median [p5, p95] | append/current median [p5, p95] | verdict |
+|---|---:|---:|---|
+| `collapse_append/512blk` | 1.0023 [0.8939, 1.1463] | **0.6940 [0.5643, 0.7637]** | **DECIDABLE WIN**, ~1.44× |
+
+Criterion measured current returned-buffer-plus-copy at 80.043–86.877 us and direct append at
+52.561–55.132 us. **Decision: KEEP.** Scope is the caller-level collapsed-block assembly region, not whole
+canonicalization or ingest latency. Focused strict-remote release validation passed 5/5 production code-block
+tests on `vmi1149989`; RCH routed that correctness-only command away from the benchmark worker despite the hint.
+The benchmark's full-output parity gate passed before timing. A redundant exact-filter rerun was cancelled during
+remote compilation after noticing the bare `--exact` name could not select the fully qualified Rust test; it
+produced no evidence and triggered no fallback. All completed Cargo work was fail-closed remote-only.
