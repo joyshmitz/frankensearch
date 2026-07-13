@@ -22,13 +22,15 @@ use std::time::Instant;
 
 use wide::f32x8;
 
+// Sized so k-means (N·NLIST·ITERS distance calls) finishes fast; the RECALL-vs-probe curve is
+// the finding here (the speed/N crossover is in ivf_crossover_ab). NLIST≈√N keeps ~N/NLIST per list.
 const DIM: usize = 128;
-const N: usize = 131_072;
-const NLIST: usize = 512; // k-means clusters
-const KMEANS_ITERS: usize = 8;
+const N: usize = 32_768;
+const NLIST: usize = 181; // ~sqrt(N)
+const KMEANS_ITERS: usize = 6;
 const K: usize = 10;
 const NQUERY: usize = 64;
-const PROBES: &[usize] = &[1, 4, 8, 16, 32, 64, 128];
+const PROBES: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
 
 #[inline]
 fn load8(s: &[f32]) -> f32x8 {
