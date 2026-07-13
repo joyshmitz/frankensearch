@@ -2002,6 +2002,10 @@ pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
 #[must_use]
 pub fn cass_has_boolean_operators(query: &str) -> bool {
     let tokens = cass_parse_boolean_query(query);
+    cass_tokens_have_boolean_operators(&tokens)
+}
+
+fn cass_tokens_have_boolean_operators(tokens: &[CassQueryToken]) -> bool {
     tokens.iter().any(|t| {
         matches!(
             t,
@@ -2345,12 +2349,38 @@ pub fn cass_build_tantivy_query(
     filters: &CassQueryFilters,
     fields: &CassFields,
 ) -> Box<dyn Query> {
+    let tokens = cass_parse_boolean_query(raw_query);
+    let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
+    cass_build_tantivy_query_from_tokens(tokens, has_boolean_operators, filters, fields)
+}
+
+/// Pre-optimization query builder retained for same-binary performance and
+/// query-tree parity checks. Production callers use [`cass_build_tantivy_query`].
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+#[must_use]
+pub fn cass_build_tantivy_query_with_operator_reparse(
+    raw_query: &str,
+    filters: &CassQueryFilters,
+    fields: &CassFields,
+) -> Box<dyn Query> {
+    let tokens = cass_parse_boolean_query(raw_query);
+    let has_boolean_operators =
+        !tokens.is_empty() && cass_has_boolean_operators(raw_query);
+    cass_build_tantivy_query_from_tokens(tokens, has_boolean_operators, filters, fields)
+}
+
+fn cass_build_tantivy_query_from_tokens(
+    tokens: Vec<CassQueryToken>,
+    has_boolean_operators: bool,
+    filters: &CassQueryFilters,
+    fields: &CassFields,
+) -> Box<dyn Query> {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-    let tokens = cass_parse_boolean_query(raw_query);
     if tokens.is_empty() {
         clauses.push((Occur::Must, Box::new(AllQuery)));
-    } else if cass_has_boolean_operators(raw_query) {
+    } else if has_boolean_operators {
         clauses.extend(cass_build_boolean_query_clauses(&tokens, fields));
     } else {
         for token in tokens {
@@ -2466,6 +2496,76 @@ mod cass_query_tests {
         assert!(out.contains('*'));
         // Hyphens are now preserved so hyphenated identifiers stay intact.
         assert!(out.contains("hello-world"));
+    }
+
+    #[test]
+    fn cass_boolean_operator_detection_matches_parsed_tokens() {
+        for (query, expected) in [
+            ("", false),
+            ("auth token cache", false),
+            ("auth AND token", true),
+            ("auth && token", true),
+            ("auth OR token", true),
+            ("auth || token", true),
+            ("NOT legacy", true),
+            ("-legacy", true),
+            ("\"exact phrase\"", true),
+            ("search 搜索", false),
+        ] {
+            let tokens = cass_parse_boolean_query(query);
+            assert_eq!(
+                cass_tokens_have_boolean_operators(&tokens),
+                expected,
+                "token-slice detection mismatch for {query:?}"
+            );
+            assert_eq!(
+                cass_has_boolean_operators(query),
+                expected,
+                "public detection mismatch for {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_query_builder_single_parse_matches_operator_reparse() {
+        let fields = fields();
+        let filter_sets = [
+            CassQueryFilters::default(),
+            CassQueryFilters {
+                agents: vec!["claude".to_string(), "codex".to_string()],
+                workspaces: vec!["/data/projects/frankensearch".to_string()],
+                created_from: Some(1_700_000_000_000),
+                created_to: Some(1_800_000_000_000),
+                source_filter: CassSourceFilter::Remote,
+            },
+        ];
+        let queries = [
+            "",
+            "auth token cache",
+            "auth AND token",
+            "auth && token OR cache",
+            "\"exact phrase\" OR cache",
+            "NOT legacy",
+            "-legacy identifier",
+            "AND",
+            "auth OR",
+            "\"unterminated phrase",
+            "search 搜索 NOT stale",
+        ];
+
+        for filters in &filter_sets {
+            for query in queries {
+                let legacy = cass_build_tantivy_query_with_operator_reparse(
+                    query, filters, &fields,
+                );
+                let single_parse = cass_build_tantivy_query(query, filters, &fields);
+                assert_eq!(
+                    format!("{legacy:?}"),
+                    format!("{single_parse:?}"),
+                    "query tree changed for {query:?} with filters {filters:?}"
+                );
+            }
+        }
     }
 
     #[test]

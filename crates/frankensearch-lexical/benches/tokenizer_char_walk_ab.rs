@@ -16,7 +16,11 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use frankensearch_core::bench_support::paired_median_ratio;
-use frankensearch_lexical::cass_compat::{cass_char_walk_fast, cass_char_walk_slow};
+use frankensearch_lexical::cass_compat::{
+    CassQueryFilters, cass_build_schema, cass_build_tantivy_query,
+    cass_build_tantivy_query_with_operator_reparse, cass_char_walk_fast, cass_char_walk_slow,
+    cass_fields_from_schema,
+};
 
 /// A realistic, mostly-ASCII document corpus (English prose + code identifiers + a little Unicode),
 /// which is what the cass tokenizer actually sees.
@@ -103,5 +107,85 @@ fn bench(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench);
+fn bench_boolean_operator_reparse(c: &mut Criterion) {
+    let schema = cass_build_schema();
+    let fields = cass_fields_from_schema(&schema).expect("cass fields");
+    let filters = CassQueryFilters::default();
+    let queries = [
+        "auth token cache",
+        "auth AND token OR cache",
+        "\"exact phrase\" OR cache",
+        "-legacy identifier",
+        "search 搜索 NOT stale",
+        "workspace agent source path conversation title content AND embedding OR tokenizer NOT deprecated",
+    ];
+
+    for query in queries {
+        assert_eq!(
+            format!(
+                "{:?}",
+                cass_build_tantivy_query_with_operator_reparse(query, &filters, &fields)
+            ),
+            format!("{:?}", cass_build_tantivy_query(query, &filters, &fields)),
+            "query tree changed for {query:?}"
+        );
+    }
+
+    let run_legacy = || {
+        for query in queries {
+            black_box(cass_build_tantivy_query_with_operator_reparse(
+                black_box(query),
+                black_box(&filters),
+                black_box(&fields),
+            ));
+        }
+    };
+    let run_single_parse = || {
+        for query in queries {
+            black_box(cass_build_tantivy_query(
+                black_box(query),
+                black_box(&filters),
+                black_box(&fields),
+            ));
+        }
+    };
+
+    // NULL (legacy vs legacy), then a full-builder A/B. Both arms construct and
+    // drop the same Tantivy query tree; only the candidate omits the second
+    // boolean-token parse/allocation.
+    let null = paired_median_ratio(41, 16, run_legacy, run_legacy);
+    let lever = paired_median_ratio(41, 16, run_legacy, run_single_parse);
+    eprintln!(
+        "[null]  boolean_operator_reparse/{}queries: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        queries.len(),
+        null.median,
+        null.p5,
+        null.p95,
+        null.rounds
+    );
+    eprintln!(
+        "[lever] boolean_operator_reparse/{}queries: single_parse_builder/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        queries.len(),
+        lever.median,
+        lever.p5,
+        lever.p95,
+        if lever.decidable_against(&null) {
+            if lever.median < 1.0 {
+                "DECIDABLE WIN (full builder, duplicate parse removed)"
+            } else {
+                "DECIDABLE REGRESSION"
+            }
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
+
+    let mut group = c.benchmark_group("boolean_operator_reparse");
+    group.sample_size(30);
+    group.bench_function("legacy_builder_two_parses", |b| b.iter(run_legacy));
+    group.bench_function("single_parse_builder", |b| b.iter(run_single_parse));
+    group.finish();
+}
+
+criterion_group!(benches, bench, bench_boolean_operator_reparse);
 criterion_main!(benches);
