@@ -13065,6 +13065,40 @@ The first strict-remote attempt failed before timing on a comparator-only `usize
 corrected run above passed and executed remotely. Focused strict-remote release validation passed 6/6 NQC-weight
 tests, including the new exact sorted-CV bit-parity test. No local Cargo fallback ran.
 
+### 2026-07-12 — Codex — WIN: empty `NqcDenseWeight` skips the enabled-path NQC scan — ~17–556×, exact bits
+
+Negative-ledger-first inspection found a fresh exception introduced with the late NQC searcher wiring. The default
+`beta <= 0` configuration already returned immediately, but `beta > 0` with an empty query-log sketch still scanned
+all lexical scores through `nqc_cv_iter`. An empty sketch's empirical CDF is zero for every CV, so the scan cannot
+affect its dense multiplier. Both async and sync searchers now substitute CV `0.0` only for the empty sketch, then
+call the unchanged `dense_weight` function. This skips only the O(hit-count) scan and preserves exact output,
+including the existing clamp/NaN parameter-edge behavior. Populated sketches retain the full reduction.
+
+The retained same-binary comparator exercises the exact former scan and shipping skip-scan paths and asserts equal
+`f64::to_bits()` before timing. Strict fail-closed remote command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 RCH_QUEUE_WHEN_BUSY=1 \
+  RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS=120 RCH_WORKER=ovh-b \
+  env -u CARGO_TARGET_DIR rch --no-self-healing exec -- \
+  cargo bench -j 2 -p frankensearch-fusion --profile release \
+  --features bench-internals --bench nqc_cv_cost_ab
+```
+
+RCH routed this confirmation run to worker `vmi1264463` despite the worker hint. One release binary;
+41 alternating rounds; `inner=2048`; ratio is skip-scan/current scan:
+
+| lexical hits | A/A current-scan null median [p5, p95] | skip-scan/current median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 20 | 1.0057 [0.7726, 1.2962] | **0.0575 [0.0433, 0.0616]** | **DECIDABLE WIN**, ~17.4× |
+| 100 | 1.0051 [0.9026, 1.1642] | **0.0216 [0.0157, 0.0259]** | **DECIDABLE WIN**, ~46.3× |
+| 1,000 | 1.0118 [0.8892, 1.1938] | **0.0018 [0.0016, 0.0027]** | **DECIDABLE WIN**, ~555.6× |
+
+Every candidate median is far below its own null p5. **Decision: KEEP.** Scope is the enabled-but-empty
+startup/warm-up state; the ratios are for the isolated effective-weight region, not end-to-end search. Focused
+strict-remote release validation passed 4/4 NQC down-weight tests on `vmi1149989`, including exact-bit empty-sketch
+coverage for both searcher siblings. No local Cargo fallback ran.
+
 ### 2026-07-12 — cc_fse — NQC A/B (thesis CONFIRMED on the committed-lexical regime): known-item down-weight monotonically improves MRR +0.0025
 
 Toward the enable+A/B direction (user-chosen). The Rust real-embedding A/B (`real_hybrid_knownitem`, wired

@@ -21,6 +21,28 @@ and recorded in `docs/NEGATIVE_EVIDENCE.md`. Rows below remain frankensearch
 pre-change baselines or before/after local hot-path ratios unless explicitly
 marked as original-comparator wins.
 
+## 2026-07-12 — WIN: empty NQC sketch skips its neutral lexical-score scan — ~17–556× in the affected region (Codex)
+
+When NQC down-weighting was enabled before its query-log sketch had warmed up, both the async and
+sync searchers reduced every lexical score through `nqc_cv_iter`; the empty `NqcDenseWeight` then
+mapped that unused CV to the neutral factor `1.0`. The empty-sketch path now substitutes the same
+zero percentile input without the O(hit-count) scan, while still evaluating the existing
+`dense_weight` function. This preserves exact output and existing parameter-edge behavior;
+populated sketches and the default `beta <= 0` path are unchanged.
+
+A same-binary comparator asserted exact `f64::to_bits()` equality before timing. Strict-remote
+worker `vmi1264463`, 41 alternating rounds, `inner=2048`; ratio is skip-scan/current-scan:
+
+| lexical hits | A/A current-scan null p5 | skip-scan/current median | affected-region speedup |
+|---:|---:|---:|---:|
+| 20 | 0.7726 | **0.0575** | **~17.4×** |
+| 100 | 0.9026 | **0.0216** | **~46.3×** |
+| 1,000 | 0.8892 | **0.0018** | **~555.6×** |
+
+Every candidate median clears its A/A null floor decisively. These ratios describe only the
+enabled-but-empty effective-weight region during startup/warm-up, not whole-search latency. The
+exact command and intervals are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
 ## Original-comparator wins
 
 ### 2026-06-25 — BOLD-VERIFY non-semantic zero-hit lexical gate (BlackThrush)

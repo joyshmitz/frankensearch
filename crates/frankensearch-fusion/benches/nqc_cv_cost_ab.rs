@@ -14,7 +14,10 @@ use std::hint::black_box;
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
 use frankensearch_core::{ScoreSource, ScoredResult};
 use frankensearch_fusion::NqcDenseWeight;
-use frankensearch_fusion::sync_searcher::{bench_nqc_cv_collect, bench_nqc_cv_iter};
+use frankensearch_fusion::sync_searcher::{
+    bench_nqc_cv_collect, bench_nqc_cv_iter, bench_nqc_empty_weight_early,
+    bench_nqc_empty_weight_orig,
+};
 
 fn make_hits(n: usize) -> Vec<ScoredResult> {
     (0..n)
@@ -113,7 +116,60 @@ fn bench_sample_builder() {
     }
 }
 
+fn bench_empty_weight() {
+    let weight = NqcDenseWeight::new();
+    let beta = 0.5;
+    let w_min = 0.1;
+    let semantic_weight = 1.3;
+    let inner = std::env::var("NQC_EMPTY_AB_INNER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_048);
+
+    for n in [20_usize, 100, 1_000] {
+        let hits = make_hits(n);
+        assert_eq!(
+            bench_nqc_empty_weight_orig(&hits, &weight, beta, w_min, semantic_weight).to_bits(),
+            bench_nqc_empty_weight_early(&hits, &weight, beta, w_min, semantic_weight).to_bits(),
+            "empty NQC sketch changed the effective weight for n={n}"
+        );
+
+        let run_orig = || {
+            black_box(bench_nqc_empty_weight_orig(
+                black_box(&hits),
+                black_box(&weight),
+                beta,
+                w_min,
+                semantic_weight,
+            ));
+        };
+        let run_cand = || {
+            black_box(bench_nqc_empty_weight_early(
+                black_box(&hits),
+                black_box(&weight),
+                beta,
+                w_min,
+                semantic_weight,
+            ));
+        };
+        let null = paired_median_ratio(41, inner, run_orig, run_orig);
+        let lever = paired_median_ratio(41, inner, run_orig, run_cand);
+        eprintln!(
+            "[null]  nqc_empty_weight/n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] nqc_empty_weight/n{n}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            verdict(&lever, &null)
+        );
+    }
+}
+
 fn main() {
+    bench_empty_weight();
     bench_sample_builder();
 
     let inner = std::env::var("NQC_ALLOC_AB_INNER")

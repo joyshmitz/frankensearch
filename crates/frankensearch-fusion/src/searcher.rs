@@ -287,7 +287,11 @@ impl TwoTierSearcher {
         if self.nqc_downweight_beta <= 0.0 {
             return self.rrf_semantic_weight;
         }
-        let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
+        let cv = if self.nqc_dense_weight.is_empty() {
+            0.0
+        } else {
+            nqc_cv_iter(lexical.iter().map(|hit| hit.score))
+        };
         let factor =
             self.nqc_dense_weight
                 .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
@@ -6301,6 +6305,19 @@ mod tests {
             TwoTierSearcher::new(build_test_index(4), Arc::new(StubEmbedder::new("f", 4)), TwoTierConfig::default());
         assert_eq!(off.nqc_downweight_beta, 0.0);
         assert!((off.effective_semantic_weight(&hits) - off.rrf_semantic_weight).abs() < 1e-12);
+
+        // Enabled but not warmed up: an empty sketch is neutral with no score scan.
+        let empty = TwoTierSearcher::new(
+            build_test_index(4),
+            Arc::new(StubEmbedder::new("f", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_rrf_weights(1.0, 1.3)
+        .with_nqc_dense_downweight(0.5, 0.1, NqcDenseWeight::new());
+        assert_eq!(
+            empty.effective_semantic_weight(&hits).to_bits(),
+            empty.rrf_semantic_weight.to_bits(),
+        );
 
         // Enabled: the query NQC is above every sampled value (percentile 1.0), so
         // dense_weight(beta=0.5) = clip(1 − 0.5·1) = 0.5 → the dense weight is halved.

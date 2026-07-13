@@ -57,6 +57,45 @@ pub fn bench_nqc_cv_iter(lexical: &[ScoredResult]) -> f32 {
     nqc_cv_iter(lexical.iter().map(|hit| hit.score))
 }
 
+/// Enabled-but-empty NQC path before the neutral-sketch early return.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_nqc_empty_weight_orig(
+    lexical: &[ScoredResult],
+    weight: &NqcDenseWeight,
+    beta: f32,
+    w_min: f32,
+    semantic_weight: f64,
+) -> f64 {
+    let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
+    let factor = weight.dense_weight(cv, beta, w_min);
+    semantic_weight * f64::from(factor)
+}
+
+/// Candidate neutral-sketch early return for the enabled NQC path.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn bench_nqc_empty_weight_early(
+    lexical: &[ScoredResult],
+    weight: &NqcDenseWeight,
+    beta: f32,
+    w_min: f32,
+    semantic_weight: f64,
+) -> f64 {
+    if beta <= 0.0 {
+        return semantic_weight;
+    }
+    let cv = if weight.is_empty() {
+        0.0
+    } else {
+        nqc_cv_iter(lexical.iter().map(|hit| hit.score))
+    };
+    let factor = weight.dense_weight(cv, beta, w_min);
+    semantic_weight * f64::from(factor)
+}
+
 /// Progressive synchronous searcher backed by [`InMemoryTwoTierIndex`].
 pub struct SyncTwoTierSearcher {
     index: Arc<InMemoryTwoTierIndex>,
@@ -156,7 +195,11 @@ impl SyncTwoTierSearcher {
         if self.nqc_downweight_beta <= 0.0 {
             return self.rrf_semantic_weight;
         }
-        let cv = nqc_cv_iter(lexical.iter().map(|hit| hit.score));
+        let cv = if self.nqc_dense_weight.is_empty() {
+            0.0
+        } else {
+            nqc_cv_iter(lexical.iter().map(|hit| hit.score))
+        };
         let factor =
             self.nqc_dense_weight
                 .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
@@ -856,6 +899,19 @@ mod tests {
         assert_ne!(
             sem_res[0].doc_id, lex_res[0].doc_id,
             "opposite tier weights must change the fused top result (weights reach fusion)"
+        );
+    }
+
+    #[test]
+    fn nqc_dense_downweight_empty_sketch_is_bit_identical_to_base_weight() {
+        let hits = [lexical_result("a", 10.0), lexical_result("b", 1.0)];
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_rrf_weights(1.0, 1.3)
+            .with_nqc_dense_downweight(0.5, 0.1, NqcDenseWeight::new());
+
+        assert_eq!(
+            searcher.effective_semantic_weight(&hits).to_bits(),
+            searcher.rrf_semantic_weight.to_bits(),
         );
     }
 
