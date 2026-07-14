@@ -341,6 +341,27 @@ lexical-primary fusion with the stronger (lexical) tier up-weighted / dense down
 corpus/query-adaptive gating (skip it where its marginal value washes, e.g. argument retrieval, at the dominant
 per-query latency cost). No Rust change (Python proxy harness). Harness: `docs/quality_harness/lexical_marginal_ci.py`.
 
+## 2026-07-14 update — the pool-min-max > RRF advantage is POOL-SIZE-dependent: real at pool ≥50, a wash at pool 20
+
+Robustness caveat on the fusion CI above (which used POOL=100). Pool size is the latency-relevant knob (smaller
+candidate pool → less dense scan), so `fusion_pool_sweep_ci.py` encodes each corpus once and bootstrap-CIs the
+POOLED per-query nDCG@10 delta (pool-min-max − RRF) at POOL ∈ {20, 50, 100} (stem+stop + model2vec, 3029 queries,
+2000 resamples, seed 12345):
+
+| pool | pooled Δ (mm − rrf) | 95% CI | CI excludes 0 |
+|---:|---:|---|---|
+| 20 | +0.0009 | [−0.0018, +0.0037] | **no (wash)** |
+| 50 | +0.0038 | [+0.0014, +0.0064] | yes |
+| 100 | +0.0043 | [+0.0017, +0.0070] | yes |
+
+**Verdict:** pool-min-max's edge over RRF **only materializes at a candidate pool of ≥50** (+0.004, decisive, reproduces
+the fusion-CI number) and **vanishes to a wash at pool 20** (+0.0009, CI includes 0). At small pools both fusion
+methods pick essentially the same top-k — RRF's rank-only fusion loses little when there are few candidates to
+discriminate, so pool-min-max's score-aware normalization has nothing to exploit. **Implication:** the "prefer
+pool-min-max as the fusion default" recommendation is pool-size-conditional — worth it at the normal deep-candidate
+pool, but at a small low-latency pool the fusion-method choice is immaterial (use the cheaper one). No Rust change
+(Python proxy harness). Harness: `docs/quality_harness/fusion_pool_sweep_ci.py`.
+
 ## Implementation status
 
 The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
