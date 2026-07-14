@@ -1,23 +1,24 @@
 //! Batch dedup lookup benchmark.
 //!
-//! `legacy_original` mirrors the former production shape: one `IN (...)` query,
-//! materialize matching rows into a `HashMap<String, DedupRow>`, then probe it
-//! once per requested doc. `slot_join` embeds the rejected candidate: a
-//! `VALUES` relation carries input order into SQLite and returns slot-aligned
-//! rows.
+//! `production_original` calls the shipped [`Storage::check_dedup_batch`] path:
+//! one `IN (...)` query, materialize matching rows into a
+//! `HashMap<String, DedupRow>`, then probe it once per requested doc. `slot_join`
+//! embeds the candidate: a `VALUES` relation carries input order into `SQLite` and
+//! returns slot-aligned rows. Both arms run in one alternating-round harness,
+//! preceded by a production-vs-mirror-vs-candidate equality oracle.
 //!
 //! Run with:
 //! ```bash
-//! CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod \
-//!   rch exec -- cargo bench -p frankensearch-storage --profile release --bench dedup_batch
+//! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+//!   cargo bench -p frankensearch-storage --features bench-internals \
+//!   --profile release --bench dedup_batch
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{SearchError, SearchResult, bench_support::paired_median_ratio};
 use frankensearch_storage::{DeduplicationDecision, DocumentRecord, EmbeddingStatus, Storage};
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
@@ -102,11 +103,15 @@ fn make_fixture(batch_size: usize) -> DedupFixture {
         }
     }
 
+    let production = storage
+        .check_dedup_batch(&items, EMBEDDER_ID)
+        .expect("production dedup should succeed");
     let legacy = legacy_check_dedup_batch(&storage, &items, EMBEDDER_ID)
         .expect("legacy dedup should succeed");
     let slot_join =
         slot_join_check_dedup_batch(&storage, &items, EMBEDDER_ID).expect("slot join should work");
-    assert_eq!(legacy, slot_join);
+    assert_eq!(production, legacy, "production and legacy mirror diverged");
+    assert_eq!(production, slot_join, "production and slot join diverged");
 
     DedupFixture { storage, items }
 }
@@ -406,50 +411,45 @@ fn storage_error(message: impl Into<String>) -> SearchError {
     }
 }
 
-fn bench_dedup_batch(c: &mut Criterion) {
-    let mut group = c.benchmark_group("check_dedup_batch");
-    group.sample_size(20);
+fn main() {
+    const ROUNDS: usize = 31;
+    const INNER: u32 = 1;
 
+    eprintln!("[config] rounds={ROUNDS} inner={INNER} ratio=slot_join/production_original");
     for batch_size in [32_usize, 128, 384] {
         let fixture = make_fixture(batch_size);
 
-        group.bench_with_input(
-            BenchmarkId::new("legacy_original", batch_size),
-            &fixture,
-            |b, fixture| {
-                b.iter(|| {
-                    black_box(
-                        legacy_check_dedup_batch(
-                            black_box(&fixture.storage),
-                            black_box(&fixture.items),
-                            black_box(EMBEDDER_ID),
-                        )
-                        .expect("legacy dedup should succeed"),
-                    );
-                });
-            },
-        );
+        let production = || {
+            black_box(
+                fixture
+                    .storage
+                    .check_dedup_batch(black_box(&fixture.items), black_box(EMBEDDER_ID))
+                    .expect("production dedup should succeed"),
+            );
+        };
+        let slot_join = || {
+            black_box(
+                slot_join_check_dedup_batch(
+                    black_box(&fixture.storage),
+                    black_box(&fixture.items),
+                    black_box(EMBEDDER_ID),
+                )
+                .expect("slot join dedup should succeed"),
+            );
+        };
 
-        group.bench_with_input(
-            BenchmarkId::new("slot_join", batch_size),
-            &fixture,
-            |b, fixture| {
-                b.iter(|| {
-                    black_box(
-                        slot_join_check_dedup_batch(
-                            black_box(&fixture.storage),
-                            black_box(&fixture.items),
-                            black_box(EMBEDDER_ID),
-                        )
-                        .expect("slot join dedup should succeed"),
-                    );
-                });
-            },
+        let null = paired_median_ratio(ROUNDS, INNER, production, production);
+        let candidate = paired_median_ratio(ROUNDS, INNER, production, slot_join);
+        let verdict = if candidate.median < null.p5 {
+            "DECIDABLE_WIN"
+        } else if candidate.median > null.p95 {
+            "DECIDABLE_REGRESSION"
+        } else {
+            "INSIDE_NULL_FLOOR"
+        };
+        eprintln!(
+            "[paired] batch={batch_size} null_median={:.6} null_p5={:.6} null_p95={:.6} candidate_median={:.6} candidate_p5={:.6} candidate_p95={:.6} verdict={verdict}",
+            null.median, null.p5, null.p95, candidate.median, candidate.p5, candidate.p95,
         );
     }
-
-    group.finish();
 }
-
-criterion_group!(benches, bench_dedup_batch);
-criterion_main!(benches);

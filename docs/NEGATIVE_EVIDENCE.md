@@ -13889,6 +13889,13 @@ symbol directly, retains both implementations, asserts exact parity, and reports
 closes the ledger-integrity retry: do not retry the ordered `VALUES`/slot-alignment primitive for these batch
 shapes unless the production workload changes materially.
 
+**Validation.** The authoritative benchmark and package-wide remote release check both exited 0; the latter
+reported one pre-existing warning in the unrelated `truncate_preview_ab` bench. Dependency-inclusive Clippy
+stopped on three pre-existing `frankensearch-core` lints before reaching storage, while the strict-remote
+`--no-deps` Clippy gate for `dedup_batch` passed with `-D warnings`. Direct `rustfmt --check`, `git diff --check`,
+and UBS completed; UBS reported zero critical findings. Every Cargo command was fail-closed through RCH, with no
+local fallback.
+
 ### 2026-07-13 — cc_fse — IVF lever IMPLEMENTED (k-means + probe + recall@k); recall NUMBERS fleet-blocked (rch rsync-retrieval failing this session)
 
 Directed to implement the IVF candidate-reduction lever (quantified 40-82× vs flat above N≫130k). Implemented it

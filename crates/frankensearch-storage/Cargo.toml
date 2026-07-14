@@ -34,6 +34,7 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 [[bench]]
 name = "dedup_batch"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "content_hash_dual"
