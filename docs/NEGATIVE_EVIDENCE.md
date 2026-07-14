@@ -14856,3 +14856,42 @@ worker reroute, or cache-warming attempt ran.
 **Decision: INVALID/HOLD.** The classifier and benchmark comparator were manually restored; only this blocker
 row and the closed bead ship. The one-pass ASCII classifier remains unmeasured, not rejected. Do not retry this
 core seam until a retained remote release artifact can reach the benchmark binary within the one-command gate.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: bulk sidecar score-only gate lost its retained warm binary to an RCH pool rewrite (`bd-9urb`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` again ranked the later-closed
+`bd-6m8p` tombstone route, so this turn pivoted from core classification to FSFS sidecar ranking and selected an
+existing release benchmark artifact rather than adding a crate or bench. The retained
+`code_sidecar_score` Criterion profile measured `prior_signals_for_candidates` at **35.302 µs**, **149.637 µs**,
+and **646.471 µs** medians for 32, 128, and 512 candidates. Source attribution found a discarded-allocation
+path in every candidate: bulk prior scoring called `score_document_prepared`, materialized a full auditable
+`CodeStructureMatchEvidence` (`BTreeSet` nodes plus cloned signal, document, token, and reason strings), then
+consumed only its `f64` score. The single candidate used the identical signal traversal and floating-point
+accumulation order while testing token membership without constructing evidence. The existing bench retained
+the former production path in the same binary and asserted exact output-map parity before timing. Opportunity
+score was 12.0 (`impact=3 × confidence=4 / effort=1`).
+
+**The only foreground release gate never reached the retained binary.** The command reused the existing
+`code_sidecar_score` bench name and `.rch-targets/search-cod` target, selected only the 512-candidate input, used
+10 samples with 50 ms warm-up and 150 ms measurement time, disabled release LTO, and had a 115-second hard cap:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 AGENT_NAME=IcyRidge \
+  CARGO_TARGET_DIR=/data/projects/frankensearch/.rch-targets/search-cod \
+  CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch --no-self-healing exec -- cargo bench -p frankensearch-fsfs \
+  --no-default-features --features bench-internals --profile release \
+  --bench code_sidecar_score -- 512 --sample-size 10 --warm-up-time 0.05 \
+  --measurement-time 0.15 --noplot
+```
+
+RCH selected `vmi1153651`, spent 32.887 seconds syncing the workspace, and rewrote the known target to the fresh
+worker pool `.rch-target-vmi1153651-pool-d2a4224119eb99d05e7a2f861a5a032f`. Cargo then updated the crates.io
+index and the `frankentorch` git dependency but emitted no completed compilation, parity assertion, or Criterion
+sample before the hard timeout returned exit 124.
+
+**Decision: INVALID/HOLD.** The retained historical medians are attribution only; they do not measure the
+candidate. Production and benchmark changes were manually restored, so only this blocker row and the closed bead
+ship. No second benchmark, local Cargo fallback, worker reroute, cache-warming attempt, or `release-perf` build
+ran. The score-only bulk path remains unmeasured rather than rejected; retry requires RCH to execute the retained
+release artifact instead of replacing it with a fresh worker-scoped target.
