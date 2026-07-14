@@ -266,6 +266,30 @@ cross-corpus CI (~+0.004), not the scifact headline (which overstated a borderli
 doc's own caution: CI single-tier-vs-fusion deltas before quoting them as robust. No Rust change (Python proxy
 harness; does not exercise shipped code). Harness: `docs/quality_harness/fusion_pmm_vs_rrf_ci.py`.
 
+## 2026-07-14 update — bootstrap-CI on the DENSE tier's marginal value (dense is justified pooled + 3/4 corpora, a WASH on arguana)
+
+Companion to the fusion CI above. `dense_marginal.py` reported single-run dense marginal value (hybrid − lexical);
+this doc's caution flags ±0.003-scale single-run deltas as noise, and the arguana ~+0.002 was exactly there. New
+harness `dense_marginal_ci.py` bootstrap-CIs the **per-query nDCG@10 delta (pool-min-max hybrid − lexical-only)**,
+stem+stop + model2vec dense, top-100 pool, per corpus + POOLED (2000 resamples, seed 12345):
+
+| corpus | q | hybrid | lexical | dense marginal (h−lex) | 95% CI | CI excludes 0 |
+|---|---:|---:|---:|---:|---|---|
+| scifact | 300 | 0.7120 | 0.6873 | +0.0247 | [+0.0039, +0.0465] | yes |
+| nfcorpus | 323 | 0.3470 | 0.3269 | +0.0201 | [+0.0088, +0.0320] | yes |
+| arguana | 1406 | 0.3601 | 0.3584 | +0.0017 | [−0.0063, +0.0098] | **no (wash)** |
+| scidocs | 1000 | 0.1626 | 0.1562 | +0.0064 | [+0.0005, +0.0122] | yes (marginal) |
+| **POOLED** | **3029** | — | — | **+0.0075** | **[+0.0026, +0.0122]** | **yes** |
+
+**Verdict:** adding the dense tier to a strong stem+stop lexical tier is **statistically justified pooled (+0.0075,
+CI excludes 0) and on 3/4 corpora** — but the value is MODEST and **corpus-dependent: on arguana (argument
+retrieval) dense's marginal value is a bootstrap WASH** (CI [−0.0063, +0.0098] straddles 0). This CONFIRMS with
+rigor the recurring single-run observation (dense's honest marginal value is small and near-zero on
+argument-style corpora) and directly supports the **corpus/query-adaptive dense-gating** theme: on
+argument-retrieval-style traffic the dense tier — the dominant per-query latency cost — can be skipped at no
+measured quality cost. Note scidocs is decisive but only just (lower bound +0.0005). No Rust change (Python proxy
+harness). Harness: `docs/quality_harness/dense_marginal_ci.py`.
+
 ## Implementation status
 
 The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
