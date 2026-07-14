@@ -14638,3 +14638,34 @@ release build to continue. No release-perf profile, local Cargo fallback, or sec
 **Decision: INVALID/HOLD.** There is no admissible speed or parity result. Production and benchmark files were
 restored exactly; only this blocker record ships. Retry the one-line reservation lever only when RCH can confirm
 an actually warm FSFS release bench artifact on the admitted worker.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: Model2Vec SIMD finish gate was routed to a cold remote release target (`bd-d2a8`)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` again ranked `bd-6m8p`, but the later
+2026-07-12 ledger resolution explicitly closes the tombstone-bitmap route: it targets the non-default F32 exact
+scan and its bandwidth effect is not isolatable on this fleet. This turn therefore pivoted to a fresh embedding
+subsystem seam. `Model2VecEmbedder::embed_sync` already SIMD-accumulates token rows, but its finish still walks
+the 256-float output twice with scalar element-wise multiplication: once for mean scaling and once after the
+order-locked norm-squared reduction. The candidate changed only those two multiplication passes to the shipped
+bit-identical `frankensearch_core::scale_f32_in_place`; reduction order, finite/EPSILON guards, tokenizer,
+gather/prefetch policy, and output layout stayed fixed. A same-binary gate called the production finish symbol,
+retained the exact former scalar finish, and prepared bit parity plus A/A-calibrated 8/32/128-token corpus rows.
+
+**Strict-remote cache blocker.** The single foreground invocation used `RCH_REQUIRE_REMOTE=1`, required
+`--profile release`, a small Criterion filter, and requested the worker that had just built the retained
+Model2Vec benchmark. RCH ignored that preference and selected `vmi1227854`, rewrote the target to its worker pool,
+then downloaded the crate graph and began compiling foundational dependencies (`proc-macro2`, `serde`, `rayon`,
+crypto crates, and others). The run was interrupted immediately on that cold-build evidence, before
+`frankensearch-core`, `frankensearch-embed`, release LTO, the parity assertion, or any timing sample:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1152480 RCH_ENV_ALLOWLIST=AGENT_NAME \
+  AGENT_NAME=IcyRidge timeout 900 env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 \
+  -p frankensearch-embed --features model2vec,bench-internals --profile release \
+  --bench model2vec_gather_prefetch -- model2vec_gather_prefetch/base/16 --noplot
+```
+
+**Decision: INVALID/HOLD.** The candidate never reached parity or timing, so no speed claim is admissible.
+Production and benchmark files were restored exactly; only this blocker record ships. No release-perf profile,
+local Cargo fallback, parallel benchmark, or second attempt ran. Retry this exact sibling-consistency lever only
+when RCH can admit the worker that owns the warm Model2Vec release artifact (or expose a hard worker pin).
