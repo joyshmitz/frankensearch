@@ -14805,3 +14805,28 @@ invocation, worker reroute, or cache-warming chase ran.
 the closed bead ship. Header-only validated decoding remains a warm-path CPU/allocation hypothesis, not a
 measured keep or reject. Do not retry this durability seam until RCH can retain the release dependency graph
 long enough for the single bounded foreground command to reach the timed binary.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: sort-free selective-filter gather never reached its warm-path gate (`bd-v144`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` still ranked `bd-6m8p`, whose
+later 2026-07-12 resolution closes the non-default, fleet-unmeasurable tombstone route. Core, fusion, and
+storage were also ledger-closed, so this turn pivoted to the in-memory index's selective-filter query path.
+The landed gather profile identifies its serial `allowed-hash collect + positions.sort_unstable()` setup as
+the crossover bottleneck after the dot scan became parallel. Because its bounded heap has a strict
+`(score, position)` total order, the candidate removed only that per-query O(m log m) sort. A same-binary
+former sorted arm, duplicate sorted A/A control, and exact `(index, score bits, doc_id)` ranked-output oracle
+were prepared at the production-valid 5% selectivity point. Opportunity score was 6.0
+(`impact=2 × confidence=3 / effort=1`).
+
+**The sole bounded remote command remained a cold build.** The foreground command used 10 samples, 50 ms
+warm-up, 150 ms measurement time, `--profile release`, `LTO=false`, 16 codegen units, strict
+`RCH_REQUIRE_REMOTE=1`, and a hard 300-second outer timeout. RCH selected `vmi1153651` and rewrote the existing
+`.rch-targets/search-cod` request to its worker-scoped namespace, but Cargo updated registries, downloaded the
+dependency graph, and compiled foundational crates through Criterion. The command ended before the index
+benchmark linked or emitted the parity oracle, A/A control, or any timing sample. No local Cargo fallback,
+`release-perf` build, second benchmark, worker reroute, or target-warming chase ran.
+
+**Decision: INVALID/HOLD.** The production change and focused comparator were manually restored; only this
+blocker row and the closed bead ship. Sort-free traversal is unmeasured, not rejected, and should not be retried
+without a demonstrably retained remote release artifact that can reach the warm query path inside one bounded
+foreground command.
