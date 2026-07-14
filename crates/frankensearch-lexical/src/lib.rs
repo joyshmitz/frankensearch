@@ -39,7 +39,6 @@ pub use tantivy::{
     TantivyDocument, Term,
 };
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1088,14 +1087,22 @@ impl TantivyIndex {
             let table = self.ord_table.read().ok()?;
             if table.is_empty() { None } else { Some(table) }
         });
-        let mut columns: HashMap<u32, Option<tantivy::columnar::Column<u64>>> = HashMap::new();
+        // Cache the opened `ord` column per segment in a flat Vec indexed by
+        // `segment_ord` — O(1), no per-hit hash — while still opening each
+        // column lazily on first touch (outer `None` = not yet opened) so
+        // segments no hit lands in are never opened. `segment_ord` is a dense
+        // in-range index for hits from this `searcher`. Only sized on the
+        // fast-field path (`table` present); the docstore path never indexes it.
+        let mut columns: Vec<Option<Option<tantivy::columnar::Column<u64>>>> = Vec::new();
+        if table.is_some() {
+            columns.resize_with(searcher.segment_readers().len(), || None);
+        }
 
         for hit in hits {
             let addr = hit.doc_address;
             let doc_id = match table.as_ref().and_then(|table| {
-                columns
-                    .entry(addr.segment_ord)
-                    .or_insert_with(|| {
+                columns[addr.segment_ord as usize]
+                    .get_or_insert_with(|| {
                         searcher
                             .segment_reader(addr.segment_ord)
                             .fast_fields()

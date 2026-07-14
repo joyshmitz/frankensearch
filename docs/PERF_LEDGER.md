@@ -5337,3 +5337,34 @@ Production was restored exactly; only the reproducible `durability_bench` compar
 line-at-a-time design. A future O(1) cached count must first solve multi-protector/process, restart, failure, and
 external-mutation correctness and show this operational path is actually hot. Full command and proof are in
 `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-14 — LANDED: `collect_id_hits` per-segment column cache is a lazy `Vec` (drops the per-hit `segment_ord` hash), ~1.21× @k1000
+
+**Route and profile.** Sibling-consistency gap on the scan-free `search_doc_ids` path (Tantivy top-k +
+`collect_id_hits`, no dense scan, no metadata decode — the documented "latency-critical, identifiers only" route).
+`collect_id_hits` cached the opened `ord` fast-field column per segment in a **lazy `HashMap<u32, Option<Column>>`**,
+hashing `segment_ord` once per hit (k SipHash-of-u32 per query). The numeric-ff prototype that validated that fast
+field (`id_materialize_numeric_ff`) indexed a `Vec` by `segment_ord` (O(1), no hash), but production regressed to a
+HashMap to keep laziness (open only *touched* segments).
+
+**Candidate and exactness.** Replaced the HashMap with a lazily-populated `Vec<Option<Option<Column>>>`
+(`get_or_insert_with` — O(1) index, no hash, still opens only touched segments; outer `None` = not yet opened).
+Byte-identical: same columns opened, same ords read, same id clones, and the `table`-None and
+empty-slot→`docstore_id` fallback branches unchanged. The full `frankensearch-lexical` lib suite is green
+(**89 passed, 0 failed**) on `vmi1227854`, and the bench asserts `base == cand` on a 4-segment / 1000-hit fixture.
+
+**Paired gate.** Same-binary within-process paired A/B (`collect_ids_map_kind_ab`, `paired_median_ratio`, 41 rounds,
+in-RAM 20k-doc fixture → 4 segments); ratio vec/HASHMAP (`<1` = Vec faster):
+
+| k | A/A null [p5, p95] | vec/HASHMAP [p5, p95] | verdict |
+|---|---:|---:|---|
+| 30 | [0.591, 1.282] | 0.928 [0.703, 1.188] | inside floor |
+| 100 | [0.841, 1.239] | 0.912 [0.804, 1.232] | inside floor |
+| 300 | [0.744, 1.352] | 0.853 [0.690, 1.021] | inside floor |
+| 1000 | [0.841, 1.185] | **0.826** [0.717, 0.982] | **decidable win (~1.21×)** |
+
+**Decision.** **LANDED.** Decidable at k1000 (the large-pool case `search_doc_ids` serves — reranker / fusion
+feeds); directional and never slower below. Byte-identical, zero-downside, landed-precedent class (hot-path map
+hashing, cf the aHash migrations `9543ae6` / `8665ce1`) — removes the per-hit SipHash entirely. This resolves the
+2026-07-14 `collect_id_hits` HOLD in `docs/NEGATIVE_EVIDENCE.md` (held one turn only because the RCH fleet was
+saturated and the edit could not be compile/test-verified remotely). Bench: `collect_ids_map_kind_ab`.
