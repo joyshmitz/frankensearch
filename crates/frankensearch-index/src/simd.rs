@@ -1881,7 +1881,23 @@ pub fn pack_f16_le_bytes_to_4bit_scalar_pack(bytes: &[u8], dim: usize) -> Vec<u8
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
             // SAFETY: avx2 + f16c verified present by the runtime check above.
             #[allow(unsafe_code)]
-            return unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<false>(bytes, dim) };
+            return unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<false, true>(bytes, dim) };
+        }
+    }
+    pack_f16_le_bytes_to_4bit_generic(bytes, dim)
+}
+
+/// Exact explicit-`vroundps` AVX2 path retained for same-binary performance
+/// comparisons. Production callers should use [`pack_f16_le_bytes_to_4bit`].
+#[doc(hidden)]
+#[must_use]
+pub fn pack_f16_le_bytes_to_4bit_explicit_round(bytes: &[u8], dim: usize) -> Vec<u8> {
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<true, true>(bytes, dim) };
         }
     }
     pack_f16_le_bytes_to_4bit_generic(bytes, dim)
@@ -1923,7 +1939,10 @@ pub fn pack_f16_slab_to_4bit(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
     unsafe_code
 )]
 #[must_use]
-unsafe fn pack_f16_le_bytes_to_4bit_avx2_impl<const SIMD_NIBBLE_PACK: bool>(
+unsafe fn pack_f16_le_bytes_to_4bit_avx2_impl<
+    const SIMD_NIBBLE_PACK: bool,
+    const EXPLICIT_ROUND: bool,
+>(
     bytes: &[u8],
     dim: usize,
 ) -> Vec<u8> {
@@ -1996,10 +2015,13 @@ unsafe fn pack_f16_le_bytes_to_4bit_avx2_impl<const SIMD_NIBBLE_PACK: bool>(
                 let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add((base + d) * 2).cast()));
                 let vv = _mm256_mul_ps(x, vscale);
                 let half_signed = _mm256_or_ps(vhalf, _mm256_and_ps(vv, vsign));
-                let rounded = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(
-                    _mm256_add_ps(vv, half_signed),
-                );
-                let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vminc), vmaxc);
+                let biased = _mm256_add_ps(vv, half_signed);
+                let clamp_input = if EXPLICIT_ROUND {
+                    _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(biased)
+                } else {
+                    biased
+                };
+                let clamped = _mm256_min_ps(_mm256_max_ps(clamp_input, vminc), vmaxc);
                 let quantized = _mm256_cvttps_epi32(clamped);
                 if SIMD_NIBBLE_PACK {
                     let lane_bytes = _mm256_shuffle_epi8(quantized, lane_byte_mask);
@@ -2057,7 +2079,7 @@ unsafe fn pack_f16_le_bytes_to_4bit_avx2_impl<const SIMD_NIBBLE_PACK: bool>(
 #[must_use]
 unsafe fn pack_f16_le_bytes_to_4bit_avx2(bytes: &[u8], dim: usize) -> Vec<u8> {
     // SAFETY: inherited from this function's AVX2+F16C contract.
-    unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<true>(bytes, dim) }
+    unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<true, false>(bytes, dim) }
 }
 
 /// AVX2+F16C f16-slice adapter for [`pack_f16_slab_to_4bit`].

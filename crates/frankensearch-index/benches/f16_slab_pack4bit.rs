@@ -1,10 +1,10 @@
-//! AVX2 f16-byte slab packing: scalar nibble writes vs SIMD nibble compaction.
+//! AVX2 f16-byte slab packing: explicit truncating round vs direct conversion.
 //!
-//! The current AVX2+F16C path vectorizes decode, round, and clamp, then stores eight
-//! i32 lanes to a stack array and emits four packed bytes scalarly. The candidate
-//! compacts the same low nibbles with `vpshufb` and performs one 32-bit store.
+//! The current AVX2+F16C path truncates the biased value with `vroundps`, clamps,
+//! then truncates it again with `cvttps_epi32`. The candidate clamps the biased
+//! value directly and lets `cvttps_epi32` perform the one required truncation.
 //!
-//! Arms: two exact current-AVX2 controls around the SIMD-compaction candidate.
+//! Arms: two exact explicit-round controls around the direct-conversion candidate.
 //! The pre-timing assertion requires byte-identical output at dim=384.
 //!
 //! ```bash
@@ -16,7 +16,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_index::{pack_f16_le_bytes_to_4bit, pack_f16_le_bytes_to_4bit_scalar_pack};
+use frankensearch_index::{pack_f16_le_bytes_to_4bit, pack_f16_le_bytes_to_4bit_explicit_round};
 use half::f16;
 
 const DIM: usize = 384;
@@ -43,31 +43,41 @@ fn bench(c: &mut Criterion) {
     let vectors = 10_000_usize;
     let slab = slab_fixture(vectors);
     assert_eq!(
-        pack_f16_le_bytes_to_4bit_scalar_pack(&slab, DIM),
+        pack_f16_le_bytes_to_4bit_explicit_round(&slab, DIM),
         pack_f16_le_bytes_to_4bit(&slab, DIM),
-        "SIMD nibble compaction must be byte-identical to scalar nibble packing"
+        "direct truncating conversion must match the explicit-round path"
     );
 
     group.throughput(criterion::Throughput::Elements((vectors * DIM) as u64));
     group.bench_with_input(
-        BenchmarkId::new("scalar_pack_a", vectors),
+        BenchmarkId::new("explicit_round_a", vectors),
         &slab,
         |bn, slab| {
-            bn.iter(|| black_box(pack_f16_le_bytes_to_4bit_scalar_pack(black_box(slab), DIM)));
+            bn.iter(|| {
+                black_box(pack_f16_le_bytes_to_4bit_explicit_round(
+                    black_box(slab),
+                    DIM,
+                ))
+            });
         },
     );
     group.bench_with_input(
-        BenchmarkId::new("simd_compact", vectors),
+        BenchmarkId::new("cvttps_only", vectors),
         &slab,
         |bn, slab| {
             bn.iter(|| black_box(pack_f16_le_bytes_to_4bit(black_box(slab), DIM)));
         },
     );
     group.bench_with_input(
-        BenchmarkId::new("scalar_pack_b", vectors),
+        BenchmarkId::new("explicit_round_b", vectors),
         &slab,
         |bn, slab| {
-            bn.iter(|| black_box(pack_f16_le_bytes_to_4bit_scalar_pack(black_box(slab), DIM)));
+            bn.iter(|| {
+                black_box(pack_f16_le_bytes_to_4bit_explicit_round(
+                    black_box(slab),
+                    DIM,
+                ))
+            });
         },
     );
     group.finish();
