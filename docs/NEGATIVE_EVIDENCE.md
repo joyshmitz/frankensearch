@@ -14431,3 +14431,19 @@ not pursued. **Lesson: verify a `metadata: None` / discard site is production, n
 before building a lever on it.** No production change; the retracted entry's bench is retained (numbers valid,
 conclusion corrected here). This is the second misread-based over-claim this session (cf the count-free
 fixture-artifact correction) — both now retracted.
+
+### 2026-07-14 — cc_fse — CLOSED (no lever): the sync/async searcher metadata divergence is a NON-issue — `SyncTwoTierSearcher` is a bench-only (BOLD-proxy) harness, not a production path
+
+Sibling-consistency sweep of the two-tier searcher twins. The sync `fused_hits_to_scored_results`
+(`sync_searcher.rs:697`) sets `metadata: None` and takes no `lexical` arg — it does NOT re-attach lexical metadata,
+unlike the async twin (`searcher.rs:2702`, which builds `lexical_metadata_by_doc` and re-attaches winners'
+metadata). That divergence looked like a candidate "sync path deserializes lexical metadata it then drops" waste.
+**Verified it is NOT a production lever:** the only `SyncLexicalSearch` implementations are the `StaticLexical`
+test/bench stubs (`sync_searcher.rs:909` under test cfg; `benches/collect_limit_all.rs:120`), and every
+`SyncTwoTierSearcher::new` call site is a test/bench. `SyncTwoTierSearcher` exists to be the same-binary Lucene/
+Tantivy/Meili BOLD comparator harness (cf `sync_searcher aHash` win `8665ce1`), not a served path — so its fusion
+producing `metadata: None` costs production nothing, and its `search_sync` stubs supply id-only results anyway.
+No change. Recorded so the sync/async metadata divergence is not mistaken for a lever (it would be a third variant
+of this session's retracted metadata misread). The async production metadata path is already winner-deferred
+(`searcher.rs:2709–2714`, clone deferred to top-k winners); the reachable searcher result-assembly surface has no
+remaining byte-identical above-bar gap. `RCH_REQUIRE_REMOTE=1` policy respected; no bench needed (code-verified).
