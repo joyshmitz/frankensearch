@@ -14830,3 +14830,29 @@ benchmark linked or emitted the parity oracle, A/A control, or any timing sample
 blocker row and the closed bead ship. Sort-free traversal is unmeasured, not rejected, and should not be retried
 without a demonstrably retained remote release artifact that can reach the warm query path inside one bounded
 foreground command.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: fused ASCII query classification never reached timing (`bd-5hz0`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` again preferred `bd-6m8p`, but
+the later 2026-07-12 ledger resolution closes that non-default tombstone route. The preceding index-gather seam
+also ended fleet-invalid, so this turn moved to the lightweight core query-evaluation path. The retained
+`query_class` profile measures the shipping ASCII classifier at about 365 ns per representative 11-query mix.
+Code attribution found that ordinary ASCII queries still ran an identifier scan and then a second capped
+`split_whitespace` word scan. The candidate fused punctuation, mixed-case flags, ASCII whitespace, and the
+up-to-four-word count into one byte-state pass, with an early return at the fourth word. Unicode fallback,
+identifier rules, and candidate-budget outputs stayed unchanged. The same binary retained the exact former
+classifier twice for an A/A control and prepared exact class parity over the representative mix plus 256
+deterministic ASCII queries. Opportunity score was 8.0 (`impact=2 × confidence=4 / effort=1`).
+
+**The sole strict-remote release gate remained a cold build.** The foreground command used 10 samples, 50 ms
+warm-up, 150 ms measurement time, `--profile release`, `LTO=false`, 16 codegen units, strict
+`RCH_REQUIRE_REMOTE=1`, and a hard 300-second timeout. RCH selected `vmi1153651` and rewrote
+`.rch-targets/search-cod` to the same worker-scoped namespace as the immediately preceding index attempt.
+Cargo nevertheless updated registries, redownloaded the dependency graph, and rebuilt foundational crates
+through Criterion. The timeout returned exit 124 before `frankensearch-core` linked, so the parity oracle,
+A/A control, and timing arms never executed. No `release-perf` build, local fallback, second benchmark,
+worker reroute, or cache-warming attempt ran.
+
+**Decision: INVALID/HOLD.** The classifier and benchmark comparator were manually restored; only this blocker
+row and the closed bead ship. The one-pass ASCII classifier remains unmeasured, not rejected. Do not retry this
+core seam until a retained remote release artifact can reach the benchmark binary within the one-command gate.
