@@ -19,6 +19,42 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-14 - FSVI 4-bit packed selection key stays inside the paired null floor (IcyRidge, `bd-uwt2`)
+
+**Hypothesis:** the file-backed 4-bit pass-1 still converted every exact `i32` nibble dot to
+`f32`, normalized it through `score_key`, constructed a `HeapEntry`, and used the custom float
+comparator for cutoff/heap maintenance. Replacing that selection state with the int8 sibling's
+badness-ordered packed `u128` `(score, index)` key should remove those per-row operations while
+preserving order exactly. For the measured 384 dimensions every possible 4-bit dot is exactly
+representable as `f32`; the candidate also retained the old post-cast total order above that bound.
+
+**One foreground strict-remote command:**
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_TEST_SLOTS=4 \
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch exec -- cargo bench -j 4 -p frankensearch-index --profile release \
+    --features bench-internals --bench fsvi_4bit_two_pass -- \
+    fsvi_4bit_key_ab --noplot
+```
+
+RCH selected `vmi1227854` and exited 0. The same binary built a 100,000-row, 384-dimensional FSVI
+corpus and compared the legacy float heap with the packed integer heap. All 32 final hit vectors
+were exactly equal before timing; recall@10 remained 0.9625 at mult=2 and 1.0000 at mult=5/10/20.
+
+| Evidence | Legacy / A arm | Candidate / B arm | Decision |
+|---|---:|---:|---|
+| paired A/A control (31 AB/BA pairs, 8 queries/arm) | median 0.994906; p5 0.807283; p95 1.329298 | — | very wide null floor |
+| paired packed-key lever | — | median 0.845875; p5 0.605168; p95 1.205032; calibrated ratio **0.850206** | **inside null p5 floor; no ship** |
+| Criterion sequential diagnostic | 1.0673-1.5351 ms (mean 1.2935 ms) | 0.76952-2.3624 ms (mean 1.7917 ms) | overlapping/noisy; candidate mean slower |
+
+**Decision:** reject and revert the packed-key source, bench, and feature-gate hunks. The attractive
+paired median did not clear its own A/A floor, while the independent sequential diagnostic did not
+confirm direction. Do not retry this direct 4-bit float-heap to packed-key substitution without a
+materially tighter worker-isolation protocol or a profile proving selection has become dominant;
+the fixed 384-dim nibble dot remains the shipped kernel. External Tantivy/Lucene/Meilisearch ratio
+is N/A because this was an internal file-backed vector pass-1 comparison.
+
 ### 2026-07-05 - FSVI selective-filter gather landed only for <2%; 5%+ is rejected (CobaltRidge)
 
 **Ledger entry for the land:** the in-memory `BitsetFilter` gather was already shipped, but the
