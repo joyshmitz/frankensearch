@@ -611,6 +611,49 @@ pub trait LexicalSearch: Send + Sync {
         limit: usize,
     ) -> SearchFuture<'a, Vec<ScoredResult>>;
 
+    /// Search for lexical candidates that will be consumed by hybrid fusion.
+    ///
+    /// The default preserves the full [`Self::search`] result. Backends with a
+    /// cheaper identifier-only path may override this and defer stored metadata
+    /// materialization until [`Self::hydrate_fusion_metadata`] knows which
+    /// candidates survived fusion.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` under the same conditions as [`Self::search`].
+    fn search_fusion_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        self.search(cx, query, limit)
+    }
+
+    /// Whether [`Self::search_fusion_candidates`] omits metadata that must be
+    /// restored for the final fused winners.
+    fn fusion_metadata_is_deferred(&self) -> bool {
+        false
+    }
+
+    /// Restore metadata for final hybrid results produced from deferred fusion
+    /// candidates.
+    ///
+    /// Implementations should ignore results without a lexical score: those
+    /// results did not survive from the lexical candidate pool. The default is
+    /// a no-op because the default candidate path already returns full results.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if winner metadata cannot be materialized.
+    fn hydrate_fusion_metadata<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Index a single document for full-text search.
     ///
     /// # Errors

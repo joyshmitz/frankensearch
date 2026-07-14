@@ -1210,6 +1210,100 @@ impl LexicalSearch for TantivyIndex {
         })
     }
 
+    #[instrument(skip_all, fields(query = %query, limit = limit))]
+    fn search_fusion_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.search_doc_ids(cx, query, limit).map(|hits| {
+                hits.into_iter()
+                    .map(|hit| ScoredResult {
+                        doc_id: hit.doc_id,
+                        score: hit.bm25_score,
+                        source: ScoreSource::Lexical,
+                        index: None,
+                        fast_score: None,
+                        quality_score: None,
+                        lexical_score: Some(hit.bm25_score),
+                        rerank_score: None,
+                        explanation: None,
+                        metadata: None,
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    fn fusion_metadata_is_deferred(&self) -> bool {
+        true
+    }
+
+    #[instrument(skip_all, fields(results = results.len()))]
+    fn hydrate_fusion_metadata<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            let clauses: Vec<(Occur, Box<dyn Query>)> = results
+                .iter()
+                .filter(|result| result.lexical_score.is_some() && result.metadata.is_none())
+                .map(|result| {
+                    let term = Term::from_field_text(self.fields.id, result.doc_id.as_str());
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            if clauses.is_empty() {
+                return Ok(());
+            }
+
+            let limit = clauses.len();
+            let query = BooleanQuery::new(clauses);
+            let searcher = self.reader.searcher();
+            let top_docs = searcher
+                .search(&query, &TopDocs::with_limit(limit).order_by_score())
+                .map_err(|e| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(e),
+                })?;
+
+            for (_, doc_address) in top_docs {
+                let doc = load_doc(&searcher, doc_address)?;
+                let doc_id = doc
+                    .get_first(self.fields.id)
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_else(|| {
+                        debug!("tantivy document missing id field while hydrating metadata");
+                        ""
+                    });
+                let metadata = doc
+                    .get_first(self.fields.metadata_json)
+                    .and_then(|value| value.as_str())
+                    .and_then(|raw| match serde_json::from_str(raw) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            debug!(%doc_id, %error, "failed to deserialize metadata JSON");
+                            None
+                        }
+                    });
+                if let Some(result) = results
+                    .iter_mut()
+                    .find(|result| result.doc_id.as_str() == doc_id)
+                {
+                    result.metadata = metadata;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     fn index_document<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1517,6 +1611,41 @@ mod tests {
 
             let results = idx.search(&cx, "   ", 10).await.expect("search whitespace");
             assert!(results.is_empty());
+        });
+    }
+
+    #[test]
+    fn deferred_fusion_candidates_restore_exact_metadata() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let docs = sample_docs();
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let full = idx.search(&cx, "Rust", 10).await.expect("full search");
+            let mut candidates = idx
+                .search_fusion_candidates(&cx, "Rust", 10)
+                .await
+                .expect("fusion candidates");
+
+            assert!(idx.fusion_metadata_is_deferred());
+            assert_eq!(candidates.len(), full.len());
+            assert!(candidates.iter().all(|result| result.metadata.is_none()));
+            for (candidate, expected) in candidates.iter().zip(&full) {
+                assert_eq!(candidate.doc_id, expected.doc_id);
+                assert_eq!(candidate.score.to_bits(), expected.score.to_bits());
+                assert_eq!(
+                    candidate.lexical_score.map(f32::to_bits),
+                    expected.lexical_score.map(f32::to_bits)
+                );
+            }
+
+            idx.hydrate_fusion_metadata(&cx, &mut candidates)
+                .await
+                .expect("hydrate winners");
+            for (candidate, expected) in candidates.iter().zip(&full) {
+                assert_eq!(candidate.metadata, expected.metadata);
+            }
         });
     }
 

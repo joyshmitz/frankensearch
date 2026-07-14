@@ -1,12 +1,11 @@
-//! Quantify the wasted per-candidate work on the HYBRID fusion path.
+//! Quantify and gate deferred metadata hydration on the HYBRID fusion path.
 //!
 //! The fusion searcher acquires lexical candidates through the `LexicalSearch::search`
 //! trait method, which per hit does `searcher.doc(addr)` (decompress the whole stored
-//! document) AND `serde_json::from_str` on the `metadata_json` field. But RRF hybrid
-//! fusion (`fuse_by_strategy` → `metadata: None`, rrf.rs:1029/1052) DISCARDS that
-//! metadata — only the doc_id + score survive fusion. The fast `search_doc_ids` path
-//! (ord u64 fast field → `table[ord]`, no docstore decompress, no metadata) is an
-//! inherent method NOT on the trait, so fusion cannot use it.
+//! document) AND `serde_json::from_str` on the `metadata_json` field. Hybrid output
+//! preserves metadata, but only final fused lexical winners need it. The candidate
+//! path therefore uses the ord fast field for every candidate, then hydrates metadata
+//! only for winners.
 //!
 //! This measures three per-query materialization shapes over the top-k hits of a
 //! metadata-bearing index, isolating (a) the metadata deserialize share and (b) the
@@ -24,6 +23,9 @@
 use std::hint::black_box;
 
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
+use frankensearch_core::traits::LexicalSearch;
+use frankensearch_core::types::{IndexableDocument, ScoredResult};
+use frankensearch_lexical::TantivyIndex;
 use tantivy::collector::TopDocs;
 use tantivy::columnar::Column;
 use tantivy::query::QueryParser;
@@ -32,6 +34,7 @@ use tantivy::{DocAddress, Index, TantivyDocument, doc};
 
 const N: usize = 30_000;
 const KS: &[usize] = &[30, 100, 300];
+const WINNERS: usize = 10;
 
 fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -177,6 +180,115 @@ fn ratio(a: &PairedRatio, null: &PairedRatio) -> &'static str {
     }
 }
 
+fn build_product_index(
+    runtime: &asupersync::runtime::Runtime,
+    cx: &asupersync::Cx,
+) -> TantivyIndex {
+    let index = TantivyIndex::in_memory().expect("product index");
+    let docs: Vec<IndexableDocument> = (0..N)
+        .map(|i| {
+            IndexableDocument::new(
+                format!("doc-{i:06}"),
+                format!(
+                    "search engine hybrid lexical ranking document query {}",
+                    VOCAB[i % VOCAB.len()]
+                ),
+            )
+            .with_title(format!("Document {i}"))
+            .with_metadata("author", format!("author_{}", i % 97))
+            .with_metadata("source", format!("repo/path/file_{i}.rs"))
+            .with_metadata("lang", "rust")
+            .with_metadata("tags", format!("search,engine,tag_{}", i % 41))
+            .with_metadata("score", format!("{}", i % 1000))
+            .with_metadata("updated", format!("2026-07-{:02}", (i % 28) + 1))
+            .with_metadata("length", "128")
+        })
+        .collect();
+    runtime.block_on(async {
+        index.index_documents(cx, &docs).await.expect("index docs");
+        index.commit(cx).await.expect("commit docs");
+    });
+    index
+}
+
+fn full_winners(
+    runtime: &asupersync::runtime::Runtime,
+    cx: &asupersync::Cx,
+    index: &TantivyIndex,
+    k: usize,
+) -> Vec<ScoredResult> {
+    runtime.block_on(async {
+        let mut results = index.search(cx, "search engine", k).await.expect("full");
+        results.truncate(WINNERS);
+        results
+    })
+}
+
+fn deferred_winners(
+    runtime: &asupersync::runtime::Runtime,
+    cx: &asupersync::Cx,
+    index: &TantivyIndex,
+    k: usize,
+) -> Vec<ScoredResult> {
+    runtime.block_on(async {
+        let mut results = index
+            .search_fusion_candidates(cx, "search engine", k)
+            .await
+            .expect("candidates");
+        results.truncate(WINNERS);
+        index
+            .hydrate_fusion_metadata(cx, &mut results)
+            .await
+            .expect("hydrate");
+        results
+    })
+}
+
+fn run_product_gate() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime");
+    let cx = asupersync::Cx::for_testing();
+    let index = build_product_index(&runtime, &cx);
+    let inner = std::env::var("META_HYDRATE_AB_INNER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4);
+
+    for &k in KS {
+        let full = full_winners(&runtime, &cx, &index, k);
+        let deferred = deferred_winners(&runtime, &cx, &index, k);
+        assert_eq!(
+            serde_json::to_vec(&full).expect("serialize full"),
+            serde_json::to_vec(&deferred).expect("serialize deferred"),
+            "full and deferred winner outputs differ at k={k}"
+        );
+        assert!(
+            deferred.iter().all(|result| result.metadata.is_some()),
+            "winner metadata was not restored at k={k}"
+        );
+
+        let run_full = || {
+            black_box(full_winners(&runtime, &cx, &index, black_box(k)));
+        };
+        let run_deferred = || {
+            black_box(deferred_winners(&runtime, &cx, &index, black_box(k)));
+        };
+        let null = paired_median_ratio(31, inner, run_full, run_full);
+        let candidate = paired_median_ratio(31, inner, run_full, run_deferred);
+        eprintln!(
+            "[product k{k}->w{WINNERS}] null {:.4} [{:.4},{:.4}] | deferred/full {:.4} [{:.4},{:.4}] ({})",
+            null.median,
+            null.p5,
+            null.p95,
+            candidate.median,
+            candidate.p5,
+            candidate.p95,
+            ratio(&candidate, &null),
+        );
+    }
+}
+
 fn main() {
     let fx = build_fixture();
     let reader = fx.index.reader().expect("reader");
@@ -232,4 +344,6 @@ fn main() {
             total.median, total.p5, total.p95, ratio(&total, &null),
         );
     }
+
+    run_product_gate();
 }

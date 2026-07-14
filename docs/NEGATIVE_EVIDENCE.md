@@ -14447,3 +14447,41 @@ No change. Recorded so the sync/async metadata divergence is not mistaken for a 
 of this session's retracted metadata misread). The async production metadata path is already winner-deferred
 (`searcher.rs:2709–2714`, clone deferred to top-k winners); the reachable searcher result-assembly surface has no
 remaining byte-identical above-bar gap. `RCH_REQUIRE_REMOTE=1` policy respected; no bench needed (code-verified).
+
+### 2026-07-14 — IcyRidge — CORRECTION/KEEP: id-only hybrid candidates are parity-safe when metadata is rehydrated only for fused winners (`bd-nv84`)
+
+This revises the immediately preceding correction's final conclusion, not its factual retraction. It remains true
+that async hybrid results preserve lexical metadata and that blindly substituting `metadata: None` is wrong. The
+missed safe shape is: acquire every fusion candidate through the existing ordinal-fast-field ID path, retain the
+winner doc IDs produced by fusion, then exact-ID-query Tantivy and materialize stored metadata only for winners
+whose final result has a lexical score. No raw-metadata representation change is required.
+
+The trait default delegates `search_fusion_candidates` to full `search`, so FTS5/foreign implementations preserve
+their current behavior. Only Tantivy advertises deferred metadata and overrides candidate search/hydration. Every
+direct-return branch remains metadata-bearing: the existing shipped-hash lexical short-circuit still calls
+`search`, while the later lexical short-circuit and dense-failure fallback reload `search` after a deferred
+candidate attempt. A dedicated orchestrator test distinguishes the routes with marker metadata and passed both
+hybrid hydration and direct fallback.
+
+The retained release bench now includes the production trait methods and asserts serialized winner equality before
+timing. At 30/100/300 candidates reduced to ten winners, deferred/full ratios were respectively 0.9973 (inside A/A
+floor), 0.8373 (inside by 0.0013), and **0.5769 [0.5097, 0.6502]** against an A/A p5 of **0.8412**. Thus the
+default-like small pool is neutral, while the 300-row high-fanout pool is a decisive ~1.73× lexical-boundary win.
+Raw fast-field materialization remained 0.2019/0.0783/0.0465 of docstore+metadata, supporting the mechanism but
+not serving as the shipping gate.
+
+Strict-remote foreground command (successful run on `vmi1153651`):
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1153651 \
+RCH_ENV_ALLOWLIST=AGENT_NAME,META_WASTE_AB_INNER,META_HYDRATE_AB_INNER \
+AGENT_NAME=IcyRidge META_WASTE_AB_INNER=32 META_HYDRATE_AB_INNER=3 \
+env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 -p frankensearch-lexical \
+  --features bench-internals --profile release --bench lexical_candidate_metadata_waste_ab
+```
+
+The two focused remote library guards passed (2/2) on the same worker. Two compile-only attempts are excluded:
+one caught the required Tantivy `order_by_score()` collector finalization, and one caught a timing closure returning
+the black-boxed vector instead of unit. Neither produced measurements. Every Cargo invocation was fail-closed
+remote-only; no local fallback or parallel benchmark ran. **Decision: KEEP**, scoped to high-fanout hybrid lexical
+candidate acquisition; do not quote a default-query win from the neutral 30-candidate row.

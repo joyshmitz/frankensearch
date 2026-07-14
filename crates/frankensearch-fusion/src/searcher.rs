@@ -1241,7 +1241,9 @@ impl TwoTierSearcher {
 
             let lex_res = if let Some(lex) = self.lexical.as_ref() {
                 let start_lex = Instant::now();
-                let res = lex.search(cx, semantic_query, lexical_budget).await;
+                let res = lex
+                    .search_fusion_candidates(cx, semantic_query, lexical_budget)
+                    .await;
                 (Some(res), start_lex.elapsed())
             } else {
                 (None, Duration::ZERO)
@@ -1269,8 +1271,12 @@ impl TwoTierSearcher {
                         || (None, Duration::ZERO),
                         |lex| {
                             let start = Instant::now();
-                            let result = poll_immediate(lex.search(cx, semantic_query, lexical_budget))
-                                .unwrap_or_else(|| {
+                            let result = poll_immediate(lex.search_fusion_candidates(
+                                cx,
+                                semantic_query,
+                                lexical_budget,
+                            ))
+                            .unwrap_or_else(|| {
                                     Err(SearchError::SubsystemError {
                                         subsystem: "lexical",
                                         source: "lexical search returned Pending; only sync-in-async implementations are supported in the rayon path".into(),
@@ -1317,12 +1323,23 @@ impl TwoTierSearcher {
             && let Some(lexical) = lexical_results.as_ref()
             && fast_embed_result.is_ok()
         {
+            let lexical = self
+                .lexical_results_for_direct_return(
+                    cx,
+                    semantic_query,
+                    lexical_budget,
+                    normalized_exclusions,
+                    text_fn,
+                    lexical,
+                    metrics,
+                )
+                .await?;
             metrics.skip_reason =
                 Some("non_semantic_fast_embedder_lexical_short_circuit".to_owned());
             metrics.semantic_candidates = 0;
             metrics.vector_search_ms = 0.0;
             metrics.rrf_fusion_ms = 0.0;
-            return Ok(lexical.iter().take(k).cloned().collect());
+            return Ok(lexical.into_iter().take(k).collect());
         }
 
         match fast_embed_result {
@@ -1352,11 +1369,22 @@ impl TwoTierSearcher {
                         self.quality_embedder.is_some(),
                     )
                 {
+                    let lexical = self
+                        .lexical_results_for_direct_return(
+                            cx,
+                            semantic_query,
+                            lexical_budget,
+                            normalized_exclusions,
+                            text_fn,
+                            lexical,
+                            metrics,
+                        )
+                        .await?;
                     metrics.skip_reason = Some("lexical_short_circuit".to_owned());
                     metrics.semantic_candidates = 0;
                     metrics.phase1_vectors_searched = 0;
                     metrics.vector_search_ms = 0.0;
-                    return Ok(lexical.iter().take(base_candidates).cloned().collect());
+                    return Ok(lexical.into_iter().take(base_candidates).collect());
                 }
 
                 // Vector search.
@@ -1416,7 +1444,7 @@ impl TwoTierSearcher {
 
                 // RRF fusion if lexical results are available.
                 let fuse_start = Instant::now();
-                let results = lexical_results.as_ref().map_or_else(
+                let mut results = lexical_results.as_ref().map_or_else(
                     || {
                         graph_candidates.as_ref().map_or_else(
                             || {
@@ -1491,6 +1519,12 @@ impl TwoTierSearcher {
                         )
                     },
                 );
+                if lexical_results.is_some()
+                    && let Some(lexical) = self.lexical.as_ref()
+                    && lexical.fusion_metadata_is_deferred()
+                {
+                    lexical.hydrate_fusion_metadata(cx, &mut results).await?;
+                }
                 metrics.rrf_fusion_ms = fuse_start.elapsed().as_secs_f64() * 1000.0;
 
                 Ok(results)
@@ -1521,13 +1555,51 @@ impl TwoTierSearcher {
                         error = %embed_err,
                         "fast embedding failed, falling back to lexical-only results"
                     );
+                    let lexical = self
+                        .lexical_results_for_direct_return(
+                            cx,
+                            semantic_query,
+                            lexical_budget,
+                            normalized_exclusions,
+                            text_fn,
+                            lexical,
+                            metrics,
+                        )
+                        .await?;
                     metrics.skip_reason = Some("fast_embed_failed".to_owned());
-                    Ok(lexical.iter().take(k).cloned().collect())
+                    Ok(lexical.into_iter().take(k).collect())
                 } else {
                     Err(embed_err)
                 }
             }
         }
+    }
+
+    async fn lexical_results_for_direct_return(
+        &self,
+        cx: &Cx,
+        query: &str,
+        lexical_budget: usize,
+        normalized_exclusions: Option<&NormalizedExclusions>,
+        text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        fusion_candidates: &[ScoredResult],
+        metrics: &mut TwoTierMetrics,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let Some(lexical) = self.lexical.as_ref() else {
+            return Ok(fusion_candidates.to_vec());
+        };
+        if !lexical.fusion_metadata_is_deferred() {
+            return Ok(fusion_candidates.to_vec());
+        }
+
+        let start = Instant::now();
+        let mut results = lexical.search(cx, query, lexical_budget).await?;
+        metrics.lexical_search_ms += start.elapsed().as_secs_f64() * 1000.0;
+        if let Some(exclusions) = normalized_exclusions {
+            results = filter_scored_results_by_negations(results, exclusions, text_fn, "lexical");
+        }
+        metrics.lexical_candidates = results.len();
+        Ok(results)
     }
 
     /// Run Phase 2: quality embedding + blend + optional rerank.
@@ -3318,6 +3390,84 @@ mod tests {
         }
     }
 
+    struct DeferredMetadataLexical;
+
+    impl DeferredMetadataLexical {
+        fn results(limit: usize, metadata_path: Option<&str>) -> Vec<ScoredResult> {
+            (0..limit.min(3))
+                .map(|i| ScoredResult {
+                    doc_id: format!("doc-{i}").into(),
+                    score: (3 - i) as f32,
+                    source: ScoreSource::Lexical,
+                    index: None,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: Some((3 - i) as f32),
+                    rerank_score: None,
+                    explanation: None,
+                    metadata: metadata_path
+                        .map(|path| Arc::new(serde_json::json!({ "path": path }))),
+                })
+                .collect()
+        }
+    }
+
+    impl LexicalSearch for DeferredMetadataLexical {
+        fn search<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            Box::pin(async move { Ok(Self::results(limit, Some("direct"))) })
+        }
+
+        fn search_fusion_candidates<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            Box::pin(async move { Ok(Self::results(limit, None)) })
+        }
+
+        fn fusion_metadata_is_deferred(&self) -> bool {
+            true
+        }
+
+        fn hydrate_fusion_metadata<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            results: &'a mut [ScoredResult],
+        ) -> SearchFuture<'a, ()> {
+            Box::pin(async move {
+                for result in results
+                    .iter_mut()
+                    .filter(|result| result.lexical_score.is_some())
+                {
+                    result.metadata = Some(Arc::new(serde_json::json!({ "path": "hydrated" })));
+                }
+                Ok(())
+            })
+        }
+
+        fn index_document<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _doc: &'a frankensearch_core::types::IndexableDocument,
+        ) -> SearchFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn doc_count(&self) -> usize {
+            3
+        }
+    }
+
     struct CancelledLexical;
 
     impl LexicalSearch for CancelledLexical {
@@ -3597,6 +3747,55 @@ mod tests {
                 metrics.skip_reason.is_some(),
                 "should report skip reason for no quality embedder"
             );
+        });
+    }
+
+    #[test]
+    fn deferred_lexical_metadata_hydrates_hybrid_but_direct_fallback_reloads() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let hybrid = TwoTierSearcher::new(
+                build_test_index(4),
+                Arc::new(StubEmbedder::new("fast", 4)),
+                TwoTierConfig::default(),
+            )
+            .with_lexical(Arc::new(DeferredMetadataLexical));
+            let (hybrid_results, _) = hybrid
+                .search_collect(&cx, "natural language retrieval request", 2)
+                .await
+                .expect("hybrid search");
+            let hybrid_lexical: Vec<_> = hybrid_results
+                .iter()
+                .filter(|result| result.lexical_score.is_some())
+                .collect();
+            assert!(!hybrid_lexical.is_empty());
+            assert!(hybrid_lexical.iter().all(|result| {
+                result
+                    .metadata
+                    .as_deref()
+                    .and_then(|metadata| metadata.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("hydrated")
+            }));
+
+            let fallback = TwoTierSearcher::new(
+                build_test_index(4),
+                Arc::new(FailingEmbedder),
+                TwoTierConfig::default(),
+            )
+            .with_lexical(Arc::new(DeferredMetadataLexical));
+            let (fallback_results, metrics) = fallback
+                .search_collect(&cx, "natural language retrieval request", 2)
+                .await
+                .expect("lexical fallback");
+            assert_eq!(metrics.skip_reason.as_deref(), Some("fast_embed_failed"));
+            assert!(fallback_results.iter().all(|result| {
+                result
+                    .metadata
+                    .as_deref()
+                    .and_then(|metadata| metadata.get("path"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("direct")
+            }));
         });
     }
 

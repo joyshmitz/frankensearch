@@ -5430,3 +5430,37 @@ Direct medians were 602.54 ns/query former and 160.33 ns/query incremental: 442.
 of a 500 µs search. Normal no-feature `frankensearch-fusion` check passed remotely. **Decision: LANDED** —
 the measured dominant sort is removed with exact output and no post-construction allocation. Benchmark:
 `nqc_adaptive_cost_ab`; all Cargo work was fail-closed `RCH_REQUIRE_REMOTE=1`.
+
+## 2026-07-14 — LANDED: hybrid lexical metadata is deferred to fused winners, ~1.73× at 300→10 (`bd-nv84`)
+
+**Corrected route.** The earlier route-next incorrectly said hybrid fusion discarded lexical metadata, and its
+follow-up correctly retracted that claim: async fusion re-attaches metadata to lexical winners. The valid lever
+is narrower. `LexicalSearch::search_fusion_candidates` defaults to the existing full search for foreign
+implementations; Tantivy overrides it with the existing ordinal-fast-field `search_doc_ids` path. After fusion,
+`hydrate_fusion_metadata` performs exact-ID lookups and decompresses/deserializes stored metadata only for final
+results carrying a lexical score. Metadata-bearing lexical short-circuits and embedding-failure fallbacks stay on
+`search`; post-candidate direct-return branches explicitly reload that full path. Opportunity score was 5.0
+(`impact=4 × confidence=5 / effort=4`): measured candidate-overfetch waste on a reachable product boundary, with
+moderate trait/searcher plumbing and an exact metadata contract to preserve.
+
+**Exactness.** The release comparator serialized every field of the ten winner `ScoredResult`s and asserted the
+full and deferred outputs identical before timing, including doc IDs, score bits, source/index fields, and
+metadata. Focused strict-remote tests separately proved Tantivy candidate rank/score-bit parity plus exact metadata
+restoration, and proved the real `TwoTierSearcher` hydrates hybrid winners while an embedding failure returns the
+full direct metadata. Both passed (2/2).
+
+**Production lexical boundary.** One 30k-document in-memory Tantivy index, realistic seven-field metadata,
+query parse/search included, ten final winners, 31 alternating AB/BA pairs. Ratio is deferred/full (`<1` wins):
+
+| lexical candidates → winners | A/A median [p5, p95] | deferred/full median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 30 → 10 | 1.0096 [0.8237, 1.2078] | 0.9973 [0.8341, 1.2273] | neutral / inside floor |
+| 100 → 10 | 0.9639 [0.8360, 1.2226] | 0.8373 [0.7287, 1.0289] | favorable, inside floor |
+| 300 → 10 | 0.9986 [0.8412, 1.2002] | **0.5769 [0.5097, 0.6502]** | **decidable ~1.73×** |
+
+The retained raw materialization rows remain 5–22× faster, but they are supporting mechanism evidence; the table
+above is the shipping boundary. **Decision: LANDED for high-fanout hybrid acquisition.** The default-like 30-row
+case is explicitly neutral, so this is not claimed as a default-query speedup. Authoritative release bench and
+focused tests ran foreground on `vmi1153651` with `RCH_REQUIRE_REMOTE=1`; two earlier compile-only attempts are
+excluded (missing Tantivy collector finalization, then a unit-return bench closure). No Cargo command ran locally.
+Retained benchmark: `lexical_candidate_metadata_waste_ab`.
