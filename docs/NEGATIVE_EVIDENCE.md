@@ -14044,3 +14044,46 @@ of total build time. This closes the route-next left by `bd-5973`; it does not r
 -D warnings` attempt reached the index library and stopped on its established 80-error lint baseline before the
 benchmark target, with no diagnostic in the changed files. Direct `rustfmt`, `git diff --check`, and the pre-commit
 UBS scan passed. Every Cargo command ran through `RCH_REQUIRE_REMOTE=1`; no local fallback occurred.
+
+### 2026-07-14 — cc_fse — REJECT/HOLD: `nqc_cv` reduction 4-accumulator ILP is a robust isolated ~1.6–1.7× (compute-bound, NOT memory-bound) but below the dense-scan-dominated end-to-end query bar
+
+Fresh perf pass, deliberately off IcyRidge's live two-tier builder path (bd-xlpp, held in `c03b0d6e`). The
+shipped-default NQC dense down-weight (`ac081b7d`, live since 2026-07-13) computes `nqc_cv` — the coefficient of
+variation of the lexical BM25 scores — **on every warmed production query** via `effective_semantic_weight` →
+`nqc_cv_iter(lexical.iter().map(|h| h.score))`. The existing `nqc_cv_cost_ab` bench had A/B'd the *allocation*
+shapes (collect-vs-iter, empty-sketch early-return, sample-builder) but never the reduction's *compute*:
+`nqc_cv_iter` accumulates `sum` and `sum_sq` as two single serial f64 dependency chains. Hypothesis — the chains
+are FMA-latency-bound and a 4-accumulator-per-chain ILP reduction speeds them; OR the `.score` reads (strided from
+the wide `ScoredResult` struct) are memory-bound (a wash).
+
+Added a `bench-internals` comparator `bench_nqc_cv_ilp` (four independent `sum`/`sum_sq` lanes over
+`chunks_exact(4)` of the slice, reading `.score` directly; assumes the BM25 all-finite invariant — no per-element
+`is_finite` filter — so quality-equivalent to `nqc_cv_iter` only up to f64 reassociation, asserted within 1e-4, NOT
+bit-identical) plus an `nqc_ilp` arm. Same-binary within-process paired A/B (41 rounds × 2048 inner), lever =
+cand/ORIG (`<1.0` is faster), against an A/A null:
+
+| pool | A/A null median [p5, p95] | ILP cand/ORIG median [p5, p95] | verdict |
+|---|---:|---:|---|
+| 100 | 1.0035 [0.9124, 1.1120] | **0.5759** [0.5264, 0.6357] | decidable win (~1.74×) |
+| 500 | 1.0032 [0.9074, 1.1416] | **0.5773** [0.5007, 0.6532] | decidable win (~1.73×) |
+| 1000 | 1.0081 [0.9180, 1.1391] | **0.6225** [0.5313, 0.7125] | decidable win (~1.61×) |
+| 4000 | 0.9979 [0.8549, 1.0849] | **0.6035** [0.5723, 0.6512] | decidable win (~1.66×) |
+
+**Finding:** the reduction is **compute/FMA-latency-bound, NOT strided-memory-bound** — four independent
+accumulator chains cleanly beat the serial pair at every pool size (lever CIs [0.50, 0.71] fully below the A/A null
+[0.85, 1.14]), even gathering `.score` from a large struct. The isolated win is real and robust.
+
+**Gate / decision — REJECT/HOLD, production byte-for-byte unchanged.** `nqc_cv` is one small O(pool) f64 reduction
+(sub-µs to a few µs), but a production query is dominated by the **dense int8 scan** (hundreds of µs at 130k). A
+~1.6× win there is <0.2% end-to-end at production scale (only a couple percent on toy corpora) — the same "SIMD
+reductions only pay where the loop is a LARGE fraction of a MEASURED hot path" boundary as the native reranker, and
+the same "isolated win, but the full operation is the shipping gate" boundary as `bd-5973`/`bd-xlpp`. Secondary
+blocker: a *safe* landing must preserve `nqc_cv_iter`'s `is_finite` filter (my comparator assumes all-finite);
+reintroducing it as branchless-finite handling erodes the ILP, so even the isolated win shrinks at the point of
+landing. Retained the `bench_nqc_cv_ilp` comparator + `nqc_ilp` bench arm (reproducible); no production path
+changed. Do not re-attempt unless `nqc_cv` becomes a measured-large fraction of a query (e.g. a lexical-only,
+scan-free retrieval mode).
+
+**Validation.** Remote release bench exited 0 on `vmi1227854`. First run silently executed the pre-stage binary
+(rch ships git-add'd files only); staged both files, re-ran, ILP arm
+present and decidable. `RCH_REQUIRE_REMOTE=1` throughout; no local fallback.

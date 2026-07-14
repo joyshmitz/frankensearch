@@ -15,7 +15,7 @@ use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
 use frankensearch_core::{ScoreSource, ScoredResult};
 use frankensearch_fusion::NqcDenseWeight;
 use frankensearch_fusion::sync_searcher::{
-    bench_nqc_cv_collect, bench_nqc_cv_iter, bench_nqc_empty_weight_early,
+    bench_nqc_cv_collect, bench_nqc_cv_ilp, bench_nqc_cv_iter, bench_nqc_empty_weight_early,
     bench_nqc_empty_weight_orig,
 };
 
@@ -269,6 +269,46 @@ fn main() {
         );
         eprintln!(
             "[lever] nqc_alloc/n{n}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            verdict(&lever, &null)
+        );
+    }
+
+    // Reduction ILP: the shipped `nqc_cv_iter` (single serial sum/sum_sq chain) vs a
+    // 4-accumulator strided reduction over the `ScoredResult` slice. Not bit-identical
+    // (f64 reassociation), so assert QUALITY-equivalence (cv within a tight tolerance)
+    // rather than bit identity. Larger pools expose whether the reduction is
+    // compute(FMA-latency)-bound (ILP helps) or strided-memory-bound (ILP is a wash).
+    let inner = std::env::var("NQC_ILP_AB_INNER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_048);
+
+    for n in [100_usize, 500, 1_000, 4_000] {
+        let hits = make_hits(n);
+        let base = bench_nqc_cv_iter(&hits);
+        let ilp = bench_nqc_cv_ilp(&hits);
+        assert!(
+            (base - ilp).abs() <= 1e-4 * (1.0 + base.abs()),
+            "ILP reduction not quality-equivalent for n={n}: iter={base} ilp={ilp}"
+        );
+
+        let run_orig = || {
+            black_box(bench_nqc_cv_iter(black_box(&hits)));
+        };
+        let run_cand = || {
+            black_box(bench_nqc_cv_ilp(black_box(&hits)));
+        };
+        let null = paired_median_ratio(41, inner, run_orig, run_orig);
+        let lever = paired_median_ratio(41, inner, run_orig, run_cand);
+        eprintln!(
+            "[null]  nqc_ilp/n{n}: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] nqc_ilp/n{n}: cand/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
             lever.median,
             lever.p5,
             lever.p95,
