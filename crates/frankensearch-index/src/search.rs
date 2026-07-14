@@ -15,10 +15,8 @@ use crate::wal::{from_wal_index, is_wal_index, to_wal_index};
 use crate::{
     PreparedQuery4bit, Quantization, VectorIndex, dot_4bit_prepared, dot_i8_i8, dot_i8_i8_maddubs,
     dot_product_f16_bytes_f32, dot_product_f32_bytes_f32, dot_product_f32_f32, maddubs_query_bias,
-    prepare_4bit_query, quantize_f16_le_bytes_to_i8,
+    pack_f16_le_bytes_to_4bit, prepare_4bit_query, quantize_f16_le_bytes_to_i8,
 };
-use half::f16;
-use wide::f32x8;
 
 /// Record-count threshold where search switches from sequential to Rayon.
 pub const PARALLEL_THRESHOLD: usize = 10_000;
@@ -821,7 +819,7 @@ impl VectorIndex {
             let count = self.record_count();
             let dim = self.dimension();
             let byte_len = count * dim * 2;
-            pack_4bit_f16_bytes(
+            pack_f16_le_bytes_to_4bit(
                 &self.data[self.vectors_offset..self.vectors_offset + byte_len],
                 dim,
             )
@@ -1479,67 +1477,6 @@ fn pack_4bit_query(query: &[f32]) -> Vec<u8> {
         }
     }
     packed
-}
-
-/// Pack a contiguous little-endian f16 vector region into signed 4-bit nibbles
-/// (`dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale (a constant
-/// factor, so the dot ranking is preserved).
-fn pack_4bit_f16_bytes(bytes: &[u8], dim: usize) -> Vec<u8> {
-    // Same decode-bound gap as `quantize_f16_bytes_to_i8`: SIMD-widen the f16 decode
-    // (simd.rs::widen8_f16_bytes, Giesen, bit-exact) and keep the max-abs reduction
-    // + nibble packing scalar → BIT-IDENTICAL 4-bit slab. Pass 2 decodes 8 dims per
-    // group within each vector (scalar tail for dims not a multiple of 8).
-    let n = bytes.len();
-    let mut maxv = f32x8::splat(0.0);
-    let mut i = 0;
-    while i + 16 <= n {
-        let v = crate::simd::widen8_f16_bytes(bytes[i..i + 16].try_into().expect("16 bytes"));
-        maxv = maxv.max(v.abs());
-        i += 16;
-    }
-    let mut max_abs = maxv.to_array().into_iter().fold(0.0_f32, f32::max);
-    while i + 2 <= n {
-        let value = f16::from_le_bytes([bytes[i], bytes[i + 1]]).to_f32().abs();
-        if value > max_abs {
-            max_abs = value;
-        }
-        i += 2;
-    }
-    let scale = if max_abs > 1e-9 { 7.0 / max_abs } else { 0.0 };
-    let count = bytes.len() / (dim * 2);
-    let bytes_per_vector = dim.div_ceil(2);
-    let mut slab = vec![0_u8; count * bytes_per_vector];
-    for v in 0..count {
-        let base = v * dim * 2;
-        let out = v * bytes_per_vector;
-        let mut d = 0;
-        while d + 8 <= dim {
-            let off = base + d * 2;
-            let vv =
-                crate::simd::widen8_f16_bytes(bytes[off..off + 16].try_into().expect("16 bytes"));
-            for (j, value) in vv.to_array().into_iter().enumerate() {
-                let dd = d + j;
-                let nib = nibble_of(value, scale);
-                if dd % 2 == 0 {
-                    slab[out + dd / 2] |= nib;
-                } else {
-                    slab[out + dd / 2] |= nib << 4;
-                }
-            }
-            d += 8;
-        }
-        while d < dim {
-            let value = f16::from_le_bytes([bytes[base + d * 2], bytes[base + d * 2 + 1]]).to_f32();
-            let nib = nibble_of(value, scale);
-            if d % 2 == 0 {
-                slab[out + d / 2] |= nib;
-            } else {
-                slab[out + d / 2] |= nib << 4;
-            }
-            d += 1;
-        }
-    }
-    slab
 }
 
 pub(crate) const fn score_key(score: f32) -> f32 {

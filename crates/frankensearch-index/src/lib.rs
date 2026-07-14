@@ -88,7 +88,8 @@ pub use simd::{
     dot_product_f16_bytes_f32_generic, dot_product_f16_f32, dot_product_f16_f32_generic,
     dot_product_f32_bytes_f32, dot_product_f32_bytes_f32_generic, dot_product_f32_f32,
     dot_product_f32_f32_generic, encode_f32_to_f16_extend, encode_f32_to_f16_extend_generic,
-    maddubs_query_bias, pack_f16_slab_to_4bit, pack_f16_slab_to_4bit_generic, prepare_4bit_query,
+    maddubs_query_bias, pack_f16_le_bytes_to_4bit, pack_f16_le_bytes_to_4bit_generic,
+    pack_f16_slab_to_4bit, pack_f16_slab_to_4bit_generic, prepare_4bit_query,
     quantize_f16_le_bytes_to_i8, quantize_f16_le_bytes_to_i8_generic, quantize_f16_slab_to_i8,
     quantize_f16_slab_to_i8_generic,
 };
