@@ -14485,3 +14485,27 @@ one caught the required Tantivy `order_by_score()` collector finalization, and o
 the black-boxed vector instead of unit. Neither produced measurements. Every Cargo invocation was fail-closed
 remote-only; no local fallback or parallel benchmark ran. **Decision: KEEP**, scoped to high-fanout hybrid lexical
 candidate acquisition; do not quote a default-query win from the neutral 30-candidate row.
+
+### 2026-07-14 — IcyRidge — KEEP: exact-ID winner hydration does not need BM25 scoring or `TopDocs` ordering (`bd-9d7b`)
+
+**Why this is not a retry of a closed family.** The earlier searcher/result-assembly closures predated the
+winner-hydration code landed immediately above. That new path queried exact unique document IDs with a scored,
+heap-sorted `TopDocs` collector, then discarded every score and the address order before matching stored metadata
+back by ID. This turn tested one adjacent lever: substitute Tantivy's unscored `DocSetCollector`; metadata loading,
+JSON decoding, result lookup, and output ordering remain unchanged. Opportunity score: 6.7
+(`impact=4 × confidence=5 / effort=3`).
+
+**Parity and foreground A/B.** The retained former collector and production collector operated on clones of the
+same candidate results. Full serialized `ScoredResult` vectors matched before timing at 10/30/100/300 hydrated
+winners. On strict-remote worker `vmi1227854`, 31 alternating pairs and four calls per arm produced
+unscored/scored medians **0.8497 / 0.8399 / 0.8262 / 0.8503**. Their scored/scored A/A p5 floors were respectively
+**0.9281 / 0.9443 / 0.8899 / 0.8696**, so every shape is decidable (~1.18–1.21×).
+
+The completed run was an optimized same-binary release build with LTO disabled and 16 codegen units to keep the
+remote link bounded. It supports the relative collector decision only. The normal full-LTO attempt timed out
+during cold link before execution; its retry revealed that RCH discarded the partial target and began another
+cold build, so it was stopped. Neither compile-only attempt contributes timing, and no local Cargo fallback ran.
+The focused strict-remote library guard `deferred_fusion_candidates_restore_exact_metadata` then passed 1/1 on
+the same worker. **Decision: KEEP.** Do not restore a scoring collector to this exact-ID hydration path unless a
+future consumer actually needs BM25 scores or collector order. The source and reproducer reached shared main in
+concurrent commit `8a90fa13`; the dedicated ledger/tracker closeout follows separately.

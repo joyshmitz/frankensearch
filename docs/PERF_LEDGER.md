@@ -5464,3 +5464,38 @@ case is explicitly neutral, so this is not claimed as a default-query speedup. A
 focused tests ran foreground on `vmi1153651` with `RCH_REQUIRE_REMOTE=1`; two earlier compile-only attempts are
 excluded (missing Tantivy collector finalization, then a unit-return bench closure). No Cargo command ran locally.
 Retained benchmark: `lexical_candidate_metadata_waste_ab`.
+
+## 2026-07-14 — LANDED: exact-ID metadata hydration skips BM25 scoring and top-k sorting, ~1.18–1.21× (`bd-9d7b`)
+
+**Fresh seam and one lever.** The preceding winner-only metadata change introduced a new exact-ID hydration
+query. Its `BooleanQuery` used `TopDocs::with_limit(...).order_by_score()`, so Tantivy built BM25 weights, scored
+every matching ID, maintained a heap, and sorted the result even though hydration immediately discarded both
+score and order. Production now uses `DocSetCollector`, which disables scoring and returns the same live document
+addresses. Opportunity score was 6.7 (`impact=4 × confidence=5 / effort=3`): the path is reachable for every
+metadata-bearing hybrid result, the discarded work is explicit, and the change is confined to the collector.
+
+**Exactness.** The retained scored collector and production unscored collector hydrated clones of the same
+candidate vector. Before timing, the benchmark serialized every `ScoredResult` field and asserted byte equality
+at 10, 30, 100, and 300 winners. Input order, scores, ranks, IDs, source fields, and metadata are unchanged; only
+the order in which private document addresses are visited can differ.
+
+**Strict-remote same-binary gate.** One 30k-document Tantivy index with realistic metadata; 31 alternating AB/BA
+rounds, four calls per timed arm; ratio is unscored/scored (`<1` wins):
+
+| hydrated winners | A/A scored null median [p5, p95] | unscored/scored median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 10 | 0.9952 [0.9281, 1.1308] | **0.8497 [0.7838, 0.9413]** | **decidable ~1.18×** |
+| 30 | 1.0026 [0.9443, 1.0412] | **0.8399 [0.7133, 0.9041]** | **decidable ~1.19×** |
+| 100 | 1.0048 [0.8899, 1.3473] | **0.8262 [0.7679, 0.9435]** | **decidable ~1.21×** |
+| 300 | 0.9674 [0.8696, 1.4851] | **0.8503 [0.7741, 0.9771]** | **decidable ~1.18×** |
+
+Every candidate median is below its own A/A p5. The successful foreground run used strict remote worker
+`vmi1227854` and an optimized release build with `lto=false`, `codegen-units=16`; this is a relative same-binary
+claim, not an absolute production-profile latency claim. A prior full-LTO attempt exhausted its 15-minute bound
+during cold linking without running the benchmark, and an identical retry was stopped after RCH discarded the
+partial target and began another cold rebuild; both are compile-only and excluded. No Cargo command fell back
+locally. The focused strict-remote library guard
+`deferred_fusion_candidates_restore_exact_metadata` passed 1/1 on the same worker. **Decision: LANDED.** The
+source/bench were swept from the shared staged index into concurrent main commit `8a90fa13`; this row is the
+dedicated evidence closeout. Retained benchmark:
+`lexical_candidate_metadata_waste_ab` with `META_COLLECTOR_ONLY=1`.

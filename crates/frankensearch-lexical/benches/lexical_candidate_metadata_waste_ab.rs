@@ -1,11 +1,10 @@
-//! Quantify and gate deferred metadata hydration on the HYBRID fusion path.
+//! Quantify and gate deferred metadata work on the HYBRID fusion path.
 //!
-//! The fusion searcher acquires lexical candidates through the `LexicalSearch::search`
-//! trait method, which per hit does `searcher.doc(addr)` (decompress the whole stored
-//! document) AND `serde_json::from_str` on the `metadata_json` field. Hybrid output
-//! preserves metadata, but only final fused lexical winners need it. The candidate
-//! path therefore uses the ord fast field for every candidate, then hydrates metadata
-//! only for winners.
+//! The first gate compares full candidate materialization with ordinal-fast-field
+//! candidate acquisition followed by winner-only metadata hydration. The second gate
+//! isolates that exact-ID hydration step: the retained baseline asks `TopDocs` to score
+//! and heap-sort the matching IDs, while production uses an unscored document-set
+//! collector because hydration consumes neither score nor hit order.
 //!
 //! This measures three per-query materialization shapes over the top-k hits of a
 //! metadata-bearing index, isolating (a) the metadata deserialize share and (b) the
@@ -19,6 +18,8 @@
 //!   cargo bench -p frankensearch-lexical --profile release \
 //!   --features bench-internals --bench lexical_candidate_metadata_waste_ab
 //! ```
+//!
+//! Set `META_COLLECTOR_ONLY=1` to run only the exact-ID collector gate.
 
 use std::hint::black_box;
 
@@ -45,8 +46,22 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 const VOCAB: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "search", "engine", "vector", "lexical",
-    "ranking", "relevance", "document", "query", "hybrid", "fusion",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "search",
+    "engine",
+    "vector",
+    "lexical",
+    "ranking",
+    "relevance",
+    "document",
+    "query",
+    "hybrid",
+    "fusion",
 ];
 
 struct Fixture {
@@ -425,12 +440,16 @@ fn main() {
         .expect("search");
 
     // Parity: id lists identical across all three; report metadata node count once.
-    let (a_ids, meta_nodes) = materialize_docstore_meta(&searcher, fx.id_field, fx.meta_field, &hits_all);
+    let (a_ids, meta_nodes) =
+        materialize_docstore_meta(&searcher, fx.id_field, fx.meta_field, &hits_all);
     let b_ids = materialize_docstore_id(&searcher, fx.id_field, &hits_all);
     let c_ids = materialize_fastfield_id(&searcher, &fx.table, &hits_all);
     assert_eq!(a_ids, b_ids, "docstore_meta vs docstore_id ids differ");
     assert_eq!(a_ids, c_ids, "docstore_meta vs fastfield_id ids differ");
-    eprintln!("segments={} meta_nodes(top-{max_k})={meta_nodes}", searcher.segment_readers().len());
+    eprintln!(
+        "segments={} meta_nodes(top-{max_k})={meta_nodes}",
+        searcher.segment_readers().len()
+    );
 
     let inner = std::env::var("META_WASTE_AB_INNER")
         .ok()
@@ -448,10 +467,18 @@ fn main() {
             ));
         };
         let run_docid = || {
-            black_box(materialize_docstore_id(&searcher, fx.id_field, black_box(hits)));
+            black_box(materialize_docstore_id(
+                &searcher,
+                fx.id_field,
+                black_box(hits),
+            ));
         };
         let run_ffid = || {
-            black_box(materialize_fastfield_id(&searcher, &fx.table, black_box(hits)));
+            black_box(materialize_fastfield_id(
+                &searcher,
+                &fx.table,
+                black_box(hits),
+            ));
         };
         let null = paired_median_ratio(41, inner, run_meta, run_meta);
         // metadata share of A: docstore_id / docstore_meta  (how much of A is the doc+id, rest is metadata)
@@ -460,9 +487,17 @@ fn main() {
         let total = paired_median_ratio(41, inner, run_meta, run_ffid);
         eprintln!(
             "[k{k}] null median {:.4} [{:.4},{:.4}] | docid/meta {:.4} [{:.4},{:.4}] ({}) | ffid/meta {:.4} [{:.4},{:.4}] ({})",
-            null.median, null.p5, null.p95,
-            meta_share.median, meta_share.p5, meta_share.p95, ratio(&meta_share, &null),
-            total.median, total.p5, total.p95, ratio(&total, &null),
+            null.median,
+            null.p5,
+            null.p95,
+            meta_share.median,
+            meta_share.p5,
+            meta_share.p95,
+            ratio(&meta_share, &null),
+            total.median,
+            total.p5,
+            total.p95,
+            ratio(&total, &null),
         );
     }
 
