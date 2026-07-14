@@ -14509,3 +14509,24 @@ The focused strict-remote library guard `deferred_fusion_candidates_restore_exac
 the same worker. **Decision: KEEP.** Do not restore a scoring collector to this exact-ID hydration path unless a
 future consumer actually needs BM25 scores or collector order. The source and reproducer reached shared main in
 concurrent commit `8a90fa13`; the dedicated ledger/tracker closeout follows separately.
+
+### 2026-07-14 — IcyRidge — REJECT: indexing hydration result slots does not clear the null floor (`bd-veet`)
+
+**Why this was fresh.** The preceding winner-hydration landing introduced one new quadratic lookup: after each
+exact-ID stored document was decoded, `results.iter_mut().find(...)` scanned the winner slice by `doc_id`. This
+turn tested exactly one replacement, a borrowed-key `AHashMap` from ID to the first result metadata slot. The
+original linear lookup was retained in the same binary; collector choice, document loading, JSON parsing, output
+order, scores, ranks, and duplicate first-match behavior remained fixed. Full serialized `ScoredResult` parity
+passed at 10/30/100/300 winners.
+
+On strict-remote worker `vmi1153651`, 31 alternating pairs with four calls per arm produced indexed/linear
+medians **0.9879 / 1.0109 / 0.9377 / 0.8845**. The corresponding linear/linear A/A p5 floors were
+**0.5292 / 0.8093 / 0.8499 / 0.7072**. Every candidate stayed inside its own floor; even the directional
+300-winner result was unresolved, while the common 10/30 shapes were neutral.
+
+The completed same-binary run was optimized release with LTO disabled and 16 codegen units, bounded by strict
+`RCH_REQUIRE_REMOTE=1`; no local Cargo fallback ran. An earlier remote compile failed on an `Arc<Value>` helper
+signature before timing and contributes no evidence. Shared main commit `8207cce6` captured the still-pending
+candidate while the foreground build ran, so the closeout removes source, dependency, and benchmark gate in a
+normal forward commit. **Decision: REJECT.** Do not retry a per-call hash index here without both a quieter
+product-real gate and materially larger hydrated winner batches.

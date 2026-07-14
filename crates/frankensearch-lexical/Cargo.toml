@@ -18,7 +18,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 rayon = { workspace = true }
-ahash = { workspace = true }
 
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)

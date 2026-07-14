@@ -5499,3 +5499,31 @@ locally. The focused strict-remote library guard
 source/bench were swept from the shared staged index into concurrent main commit `8a90fa13`; this row is the
 dedicated evidence closeout. Retained benchmark:
 `lexical_candidate_metadata_waste_ab` with `META_COLLECTOR_ONLY=1`.
+
+## 2026-07-14 — REJECT: borrowed hydration result-slot index stays inside the A/A floor (`bd-veet`)
+
+**Fresh seam and one lever.** The winner-hydration path introduced after the earlier lexical quadratic sweep
+loads each exact-ID document and then linearly searches the result slice for its `doc_id`. The candidate replaced
+only that O(winners²) matching with one borrowed-key `AHashMap<&str, &mut Option<Arc<Value>>>`, preserving the
+linear path's first-match behavior for defensive duplicate inputs. Opportunity score was 10.0
+(`impact=4 × confidence=5 / effort=2`). The collector, stored-document loading, JSON decoding, result order,
+scores, ranks, and metadata values were shared between arms.
+
+**Exactness and strict-remote gate.** Full serialized `ScoredResult` vectors matched before timing at every
+winner count. One 30k-document same-binary optimized-release run on strict-remote worker `vmi1153651` used 31
+alternating pairs and four calls per arm; ratio is indexed/linear (`<1` wins):
+
+| hydrated winners | A/A linear null median [p5, p95] | indexed/linear median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 10 | 0.9920 [0.5292, 1.1661] | 0.9879 [0.7899, 1.2269] | inside floor |
+| 30 | 0.9873 [0.8093, 1.3601] | 1.0109 [0.8238, 1.2434] | inside floor |
+| 100 | 0.9363 [0.8499, 1.1810] | 0.9377 [0.8352, 1.1263] | inside floor |
+| 300 | 1.0017 [0.7072, 1.3840] | 0.8845 [0.7011, 1.4234] | inside floor |
+
+No candidate median cleared its own A/A p5. The directional 300-winner result is therefore not admissible, and
+the 10/30-winner product shapes are neutral. The successful gate used `lto=false`, `codegen-units=16` to bound the
+remote link and supports only this relative same-binary decision. A preceding strict-remote compile exposed an
+`Arc<Value>` signature mismatch before execution; it is compile-only and excluded. While the foreground gate was
+running, shared main commit `8207cce6` captured the candidate; this closeout removes it forward rather than
+rewriting pushed history. **Decision: REJECT.** Do not add a per-call hash index to this hydration path without a
+quieter product-real workload that can resolve the effect and demonstrates materially larger winner batches.

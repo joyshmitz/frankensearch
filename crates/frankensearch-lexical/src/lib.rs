@@ -43,7 +43,6 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ahash::AHashMap;
 use asupersync::Cx;
 use asupersync::sync::Mutex;
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -408,38 +407,6 @@ struct SchemaFields {
     /// field. `None` for indexes created before this field existed (resolved by
     /// name in `from_index`); such indexes materialize ids via the docstore.
     ord: Option<Field>,
-}
-
-#[inline]
-fn visit_hydration_docs(
-    fields: SchemaFields,
-    searcher: &Searcher,
-    doc_addresses: impl IntoIterator<Item = DocAddress>,
-    mut visit: impl FnMut(&str, Option<std::sync::Arc<serde_json::Value>>),
-) -> SearchResult<()> {
-    for doc_address in doc_addresses {
-        let doc = load_doc(searcher, doc_address)?;
-        let doc_id = doc
-            .get_first(fields.id)
-            .and_then(|value| value.as_str())
-            .unwrap_or_else(|| {
-                debug!("tantivy document missing id field while hydrating metadata");
-                ""
-            });
-        let metadata = doc
-            .get_first(fields.metadata_json)
-            .and_then(|value| value.as_str())
-            .and_then(|raw| match serde_json::from_str(raw) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    debug!(%doc_id, %error, "failed to deserialize metadata JSON");
-                    None
-                }
-            });
-        visit(doc_id, metadata);
-    }
-
-    Ok(())
 }
 
 /// Build the frankensearch Tantivy schema.
@@ -1170,7 +1137,6 @@ impl TantivyIndex {
         &self,
         results: &mut [ScoredResult],
         unscored: bool,
-        indexed_lookup: bool,
     ) -> SearchResult<()> {
         let clauses: Vec<(Occur, Box<dyn Query>)> = results
             .iter()
@@ -1214,32 +1180,34 @@ impl TantivyIndex {
                 .collect()
         };
 
-        if indexed_lookup {
-            // Fusion results are normally unique by id, but retain the former
-            // linear search's first-match behavior for defensive duplicate input.
-            let mut metadata_slots: AHashMap<&str, &mut Option<std::sync::Arc<serde_json::Value>>> =
-                AHashMap::with_capacity(results.len());
-            for result in results.iter_mut() {
-                metadata_slots
-                    .entry(result.doc_id.as_str())
-                    .or_insert(&mut result.metadata);
+        for doc_address in doc_addresses {
+            let doc = load_doc(&searcher, doc_address)?;
+            let doc_id = doc
+                .get_first(self.fields.id)
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| {
+                    debug!("tantivy document missing id field while hydrating metadata");
+                    ""
+                });
+            let metadata = doc
+                .get_first(self.fields.metadata_json)
+                .and_then(|value| value.as_str())
+                .and_then(|raw| match serde_json::from_str(raw) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        debug!(%doc_id, %error, "failed to deserialize metadata JSON");
+                        None
+                    }
+                });
+            if let Some(result) = results
+                .iter_mut()
+                .find(|result| result.doc_id.as_str() == doc_id)
+            {
+                result.metadata = metadata;
             }
-
-            visit_hydration_docs(self.fields, &searcher, doc_addresses, |doc_id, metadata| {
-                if let Some(slot) = metadata_slots.get_mut(doc_id) {
-                    **slot = metadata;
-                }
-            })
-        } else {
-            visit_hydration_docs(self.fields, &searcher, doc_addresses, |doc_id, metadata| {
-                if let Some(result) = results
-                    .iter_mut()
-                    .find(|result| result.doc_id.as_str() == doc_id)
-                {
-                    result.metadata = metadata;
-                }
-            })
         }
+
+        Ok(())
     }
 
     /// Scored-collector baseline retained for the exact hydration A/B benchmark.
@@ -1250,18 +1218,7 @@ impl TantivyIndex {
         _cx: &'a Cx,
         results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, false, true) })
-    }
-
-    /// Linear result lookup retained for the exact hydration A/B benchmark.
-    #[cfg(feature = "bench-internals")]
-    #[doc(hidden)]
-    pub fn hydrate_fusion_metadata_linear_for_bench<'a>(
-        &'a self,
-        _cx: &'a Cx,
-        results: &'a mut [ScoredResult],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, true, false) })
+        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, false) })
     }
 }
 
@@ -1379,7 +1336,7 @@ impl LexicalSearch for TantivyIndex {
         _cx: &'a Cx,
         results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, true, true) })
+        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, true) })
     }
 
     fn index_document<'a>(
