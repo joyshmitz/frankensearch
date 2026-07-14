@@ -14322,3 +14322,40 @@ The same worker passed the module-qualified exact oracle 1/1 across dimensions 1
 and token counts 0/1/127/128/255/256/511/512/513/1024. An earlier test invocation matched zero tests because
 `--exact` lacked the module path; it is excluded. Every Cargo command was fail-closed remote-only; no local
 fallback occurred.
+
+### 2026-07-14 — cc_fse — HIGH-VALUE ROUTE-NEXT (measured, multi-turn to land): the HYBRID fusion path materializes lexical candidates via docstore+metadata that fusion then DISCARDS — the id-only fast path is 5–23× faster
+
+Code-verified waste, not yet landed. The fusion searcher (`searcher.rs`) acquires lexical candidates through the
+`LexicalSearch::search` **trait** method, which per hit does `searcher.doc(addr)` (decompress the whole stored
+document) AND `serde_json::from_str` on `metadata_json`. But RRF hybrid fusion **discards that metadata**:
+`fuse_by_strategy` → the fused `ScoredResult`s are built with `metadata: None` (`rrf.rs:1029`/`1052`). The fast
+`search_doc_ids` path (ord `u64` FAST field → `table[ord]`, no docstore decompress, no metadata) is an *inherent*
+method NOT on the trait, so fusion cannot use it — it pays full docstore + metadata per candidate and throws the
+metadata away.
+
+Quantified with `lexical_candidate_metadata_waste_ab` (30k-doc in-RAM index, realistic ~8-field metadata JSON per
+doc, 5 segments, same-binary paired A/B, id lists asserted identical across all three arms). Ratios vs the current
+`docstore+metadata` path A (`<1` = faster):
+
+| k | `docstore_id`/A (metadata's share) | `fastfield_id`/A (total win) |
+|---|---:|---:|
+| 30 | 0.349 [0.314, 0.399] decidable | 0.191 [0.141, 0.493] decidable (~5×) |
+| 100 | 0.374 [0.341, 0.467] decidable | **0.073** [0.060, 0.085] decidable (**~13.8×**) |
+| 300 | 0.391 [0.311, 0.435] decidable | **0.044** [0.036, 0.061] decidable (**~22.9×**) |
+
+**Findings:** (1) the metadata `from_str` is ~**60–65%** of the per-candidate docstore work (`docstore_id` alone is
+only ~0.35–0.39 of A). (2) The id-only fast-field path is **5–23× faster** than the current docstore+metadata
+materialization and the win GROWS with k — and every bit of it is wasted on the hybrid path (fused output is
+`metadata: None`). At `lexical_budget` candidates per hybrid query this is real per-query cost, distinct from the
+already-landed `search_doc_ids` numeric-ord win (`14e87e4`) because it also strips the discarded metadata deserialize
+and applies to the *fusion* candidate source, which cannot reach the inherent fast method.
+
+**Why not landed this turn (multi-turn architectural):** the searcher's `lexical_results` (acquired at
+`searcher.rs:1244`/`1272` and fed to fusion) is ALSO returned directly with metadata by the dense-unavailable
+fallback (`searcher.rs:1359`) and the lexical short-circuit (`1196`/`1325`), so it cannot be blindly made id-only.
+A safe land needs: add an id-only method to the `LexicalSearch` trait (default impl delegating to `search` so
+foreign impls don't break; `TantivyIndex` overrides it with `search_doc_ids`), route ONLY the pure-hybrid candidate
+source through it, and keep the metadata-bearing `search` for every path that returns lexical results directly —
+plus the trait method is `async` (`SearchFuture`), so the bench used raw-Tantivy analogues. **Route-next: wire the
+id-only trait method + hybrid routing, prove the direct-return paths still carry metadata, and gate the full sync
+searcher.** Retained the reproducing bench. `RCH_REQUIRE_REMOTE=1` throughout (`vmi1167313`); no local fallback.
