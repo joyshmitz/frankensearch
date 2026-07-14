@@ -14566,3 +14566,31 @@ signature before timing and contributes no evidence. Shared main commit `8207cce
 candidate while the foreground build ran, so the closeout removes source, dependency, and benchmark gate in a
 normal forward commit. **Decision: REJECT.** Do not retry a per-call hash index here without both a quieter
 product-real gate and materially larger hydrated winner batches.
+
+### 2026-07-14 — IcyRidge — REJECT/WASH: four-way AVX2 max-abs reduction does not accelerate the packed-4-bit slab build (`bd-ks90`)
+
+**Fresh lever.** After the mmap f16-byte dispatch and SIMD nibble-compaction keeps, the remaining first pass of
+`pack_f16_le_bytes_to_4bit_avx2` still fed every decoded chunk through one dependent `vmaxps` chain. This turn
+split only that corpus-wide finite max-abs reduction across four independent AVX2 accumulators and reduced them
+once at the end. The scale calculation, round-half-away quantizer, clamp, SIMD nibble compaction, tails, layout,
+and fallback stayed unchanged. A same-binary control retained the exact single-accumulator max pass while using
+the same shipped SIMD pass 2; full 10,000-by-384 output bytes matched before timing.
+
+**One strict-remote foreground run.** RCH selected `vmi1227854`; the optimized release build disabled LTO and
+used 16 codegen units to bound the cold link. Criterion reported single-chain controls **1.3760 ms**
+`[1.3226, 1.4400]` and **1.4499 ms** `[1.3967, 1.5086]`, bracketing the four-way candidate at
+**1.4342 ms** `[1.3171, 1.6157]`. Candidate/control-mean is **1.0150** (a 1.5% regression), while control B/A
+drifted **1.0537** and the candidate interval overlapped both controls. The exact command was:
+
+```text
+env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_TEST_SLOTS=4 \
+  AGENT_NAME=IcyRidge CARGO_PROFILE_RELEASE_LTO=false \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 timeout 900s rch exec -- cargo bench -j 4 \
+  -p frankensearch-index --profile release --bench f16_slab_pack4bit -- \
+  f16_slab_pack4bit --noplot
+```
+
+**Decision: REJECT/WASH.** The max dependency chain is not limiting the now-optimized whole slab packer at this
+shape; four-way ILP is inside same-run control noise and offers no measurable product gain. The implementation,
+public comparator export, and temporary benchmark rewrite were reverted. Do not retry max-accumulator-count
+tuning here without a profile showing the max pass has become dominant; no runtime or benchmark source ships.
