@@ -14615,3 +14615,26 @@ local Cargo fallback or parallel benchmark ran.
 path. The implementation, comparator export, and temporary benchmark rewrite were reverted; no runtime or
 benchmark source ships. Retry this exact byte-compaction lever only with a warm remote release target capable
 of completing the same-binary bracket inside the gate.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: FSFS prior-signal map reservation hit a cold remote cache (`bd-79bn`)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` ranked the reopened tombstone-bitmap bead
+first, but the later 2026-07-12 ledger entry explicitly closes that non-default, fleet-unmeasurable route. The
+next graph-rank single-pass bead is likewise superseded by the 2026-07-13 below-bar construction proof. This
+turn therefore pivoted to the retained FSFS code-sidecar scorer. At the 512-candidate fixture,
+`prior_signals_for_candidates` knows the result-map upper bound but starts from `HashMap::new()`; the fixture's
+query-bearing documents make repeated map growth the only targeted overhead outside unchanged document
+lookup/scoring. The candidate used `HashMap::with_capacity(candidates.len())`; a same-binary former-path arm and
+full map-equality assertion were prepared. Capacity is unobservable, so ordering, scores, evidence, and keys
+would remain identical.
+
+**Strict-remote cache blocker.** The only foreground command used `RCH_REQUIRE_REMOTE=1`, the required
+`--profile release`, the existing `.rch-targets/search-cod` release target, no default FSFS features, and only
+the 512-row reserve group. RCH nevertheless routed it to a worker without that target cache: the worker began
+downloading the complete FSFS dependency graph and compiling from foundational crates. The run was interrupted
+before `frankensearch-fsfs`, LTO, the parity assertion, or Criterion, rather than allowing the prohibited cold
+release build to continue. No release-perf profile, local Cargo fallback, or second benchmark ran.
+
+**Decision: INVALID/HOLD.** There is no admissible speed or parity result. Production and benchmark files were
+restored exactly; only this blocker record ships. Retry the one-line reservation lever only when RCH can confirm
+an actually warm FSFS release bench artifact on the admitted worker.
