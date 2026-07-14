@@ -14594,3 +14594,24 @@ env -u CARGO_TARGET_DIR RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 RCH_TEST_SLOT
 shape; four-way ILP is inside same-run control noise and offers no measurable product gain. The implementation,
 public comparator export, and temporary benchmark rewrite were reverted. Do not retry max-accumulator-count
 tuning here without a profile showing the max pass has become dominant; no runtime or benchmark source ships.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: mmap int8 SIMD byte-store gate never reached timing (`bd-btgh`)
+
+**Fresh lever.** The AVX2+F16C mmap int8 quantizer still spilled each eight-lane `i32` result to a stack array,
+then issued eight scalar `Vec::push` operations. This turn replaced only that epilogue with lane-local
+`vpshufb` low-byte selection and one unaligned eight-byte output store. Max reduction, scaling,
+round-half-away behavior, clamp, tails, dispatch, and output order stayed unchanged. The temporary same-binary
+gate bracketed the candidate with two copies of the exact former store path and asserted full 10,000-by-384
+output equality before timing.
+
+**Strict-remote blocker.** The first fail-closed invocation was placed on `vmi1227854` but stopped during remote
+compilation on a missing `Vec<i8>` type annotation; it never executed the parity gate or Criterion and provides
+no evidence. After that annotation-only correction, the foreground retry was placed on `vmi1153651` and timed
+out after 900 seconds while compiling the optimized `frankensearch-index` benchmark, again before parity or
+Criterion. Both invocations used `RCH_REQUIRE_REMOTE=1`, release with LTO disabled and 16 codegen units, and no
+local Cargo fallback or parallel benchmark ran.
+
+**Decision: INVALID/HOLD.** No throughput claim is admissible because the candidate never reached the timed
+path. The implementation, comparator export, and temporary benchmark rewrite were reverted; no runtime or
+benchmark source ships. Retry this exact byte-compaction lever only with a warm remote release target capable
+of completing the same-binary bracket inside the gate.
