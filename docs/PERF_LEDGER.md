@@ -5322,3 +5322,18 @@ reproducing benchmark remain. Reopen only for a production shape where this copy
 a substrate whose A/A floor can resolve roughly 6%. The final retained tree passed strict-remote all-target index
 check; the target-scoped `-D warnings` Clippy attempt stopped on the pre-existing 80-error index baseline before
 the benchmark. Full evidence and the exact command are in `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-14 — REJECT: reusable line-buffer repair-log count is ~1.50× slower (`bd-7z0x`)
+
+The unresolved `durability::should_rotate` route replaced whole-file `read_to_string` allocation with a
+`BufReader` and one reused `String`, while still consuming the complete log to preserve invalid-UTF-8 behavior.
+Reference and candidate matched missing/empty/unterminated/CRLF/Unicode/invalid inputs, and the full append/rotate
+fixture produced byte-identical active and rotated JSONL files.
+
+Strict-remote same-binary evidence on `vmi1149989` (999 realistic records, 21 AB/BA round pairs, 16 appends per
+arm; ratio candidate/original) was decisively negative: A/A median 1.002217 [0.930668, 1.122853], candidate median
+**1.499345 [1.212310, 1.699262]**. The isolated check agreed (60.297 µs candidate vs 37.496 µs original).
+Production was restored exactly; only the reproducible `durability_bench` comparator remains. Do not retry the
+line-at-a-time design. A future O(1) cached count must first solve multi-protector/process, restart, failure, and
+external-mutation correctness and show this operational path is actually hot. Full command and proof are in
+`docs/NEGATIVE_EVIDENCE.md`.

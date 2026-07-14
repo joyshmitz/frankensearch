@@ -4,8 +4,9 @@
 //!   cargo bench -p frankensearch-durability
 
 use std::hint::black_box;
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_durability::config::DurabilityConfig;
@@ -102,6 +103,280 @@ fn make_protector() -> FileProtector {
     let metrics = Arc::new(DurabilityMetrics::default());
     FileProtector::new_with_metrics(Arc::new(BenchCodec), test_config(), metrics)
         .expect("protector")
+}
+
+// --- Repair-log rotation allocation A/B ---
+
+const REPAIR_LOG_LINE: &[u8] = br#"{"timestamp":"2026-07-14T00:00:00Z","path":"/data/indexes/tenant-0042/shard-0007.fsvi","corrupted":true,"repair_succeeded":true,"bytes_written":1048576,"source_crc32_expected":305419896,"source_crc32_after":305419896,"repair_time_ms":17}
+"#;
+const ROTATION_PAIRED_ROUNDS: usize = 21;
+const ROTATION_INNER_APPENDS: usize = 16;
+
+#[derive(Clone, Copy)]
+enum RotationArm {
+    ReadToString,
+    ReusedLineBuffer,
+}
+
+#[derive(Clone, Copy)]
+struct RatioSummary {
+    median: f64,
+    p5: f64,
+    p95: f64,
+}
+
+impl RatioSummary {
+    fn null_contains_one(self) -> bool {
+        self.p5 <= 1.0 && 1.0 <= self.p95
+    }
+}
+
+fn should_rotate_read_to_string(
+    log_path: &std::path::Path,
+    max_entries: usize,
+) -> std::io::Result<bool> {
+    if !log_path.exists() {
+        return Ok(false);
+    }
+    let contents = std::fs::read_to_string(log_path)?;
+    Ok(contents.lines().count() >= max_entries)
+}
+
+fn should_rotate_reused_line_buffer(
+    log_path: &std::path::Path,
+    max_entries: usize,
+) -> std::io::Result<bool> {
+    if !log_path.exists() {
+        return Ok(false);
+    }
+    let file = std::fs::File::open(log_path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut line_count = 0_usize;
+    while reader.read_line(&mut line)? != 0 {
+        line_count += 1;
+        line.clear();
+    }
+    Ok(line_count >= max_entries)
+}
+
+fn rotation_decision(
+    arm: RotationArm,
+    log_path: &std::path::Path,
+    max_entries: usize,
+) -> std::io::Result<bool> {
+    match arm {
+        RotationArm::ReadToString => should_rotate_read_to_string(log_path, max_entries),
+        RotationArm::ReusedLineBuffer => should_rotate_reused_line_buffer(log_path, max_entries),
+    }
+}
+
+fn seed_repair_log(path: &std::path::Path, entries: usize) -> u64 {
+    let mut file = std::fs::File::create(path).expect("create seeded repair log");
+    for _ in 0..entries {
+        file.write_all(REPAIR_LOG_LINE)
+            .expect("write seeded repair event");
+    }
+    file.metadata().expect("seeded log metadata").len()
+}
+
+fn append_repair_event(
+    arm: RotationArm,
+    log_path: &std::path::Path,
+    rotated_path: &std::path::Path,
+    max_entries: usize,
+) {
+    if rotation_decision(arm, log_path, max_entries).expect("rotation decision") {
+        let _ = std::fs::rename(log_path, rotated_path);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .expect("open repair log for append");
+    file.write_all(REPAIR_LOG_LINE)
+        .expect("append repair event");
+}
+
+fn prove_repair_log_parity() {
+    for &(entries, max_entries) in &[(999, 1_000), (1_000, 1_000)] {
+        let reference_dir = tempfile_dir("repair-log-parity-reference");
+        let candidate_dir = tempfile_dir("repair-log-parity-candidate");
+        let reference_log = reference_dir.join("repair-events.jsonl");
+        let candidate_log = candidate_dir.join("repair-events.jsonl");
+        let reference_rotated = reference_dir.join("repair-events.1.jsonl");
+        let candidate_rotated = candidate_dir.join("repair-events.1.jsonl");
+        seed_repair_log(&reference_log, entries);
+        seed_repair_log(&candidate_log, entries);
+
+        append_repair_event(
+            RotationArm::ReadToString,
+            &reference_log,
+            &reference_rotated,
+            max_entries,
+        );
+        append_repair_event(
+            RotationArm::ReusedLineBuffer,
+            &candidate_log,
+            &candidate_rotated,
+            max_entries,
+        );
+
+        assert_eq!(
+            std::fs::read(&candidate_log).expect("read candidate active log"),
+            std::fs::read(&reference_log).expect("read reference active log"),
+            "active log differs at entries={entries} max_entries={max_entries}"
+        );
+        assert_eq!(
+            candidate_rotated.exists(),
+            reference_rotated.exists(),
+            "rotation decision differs at entries={entries} max_entries={max_entries}"
+        );
+        if reference_rotated.exists() {
+            assert_eq!(
+                std::fs::read(&candidate_rotated).expect("read candidate rotated log"),
+                std::fs::read(&reference_rotated).expect("read reference rotated log"),
+                "rotated log differs at entries={entries} max_entries={max_entries}"
+            );
+        }
+    }
+}
+
+fn timed_append_batch(arm: RotationArm, log_path: &std::path::Path, base_len: u64) -> Duration {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(log_path)
+        .expect("open repair log for reset")
+        .set_len(base_len)
+        .expect("reset repair log before timing");
+
+    let start = Instant::now();
+    for _ in 0..ROTATION_INNER_APPENDS {
+        let rotate = rotation_decision(arm, log_path, 2_048).expect("timed rotation decision");
+        assert!(!rotate, "timed fixture must remain below rotation limit");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(log_path)
+            .expect("open timed repair log");
+        file.write_all(REPAIR_LOG_LINE)
+            .expect("append timed repair event");
+    }
+    let elapsed = start.elapsed();
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(log_path)
+        .expect("open repair log after timing")
+        .set_len(base_len)
+        .expect("reset repair log after timing");
+    elapsed
+}
+
+fn paired_ratio(
+    arm_a: RotationArm,
+    arm_b: RotationArm,
+    path_a: &std::path::Path,
+    path_b: &std::path::Path,
+    base_len: u64,
+) -> RatioSummary {
+    let mut ratios = Vec::with_capacity(ROTATION_PAIRED_ROUNDS);
+    for _ in 0..ROTATION_PAIRED_ROUNDS {
+        let a_ab = timed_append_batch(arm_a, path_a, base_len).as_secs_f64();
+        let b_ab = timed_append_batch(arm_b, path_b, base_len).as_secs_f64();
+        let b_ba = timed_append_batch(arm_b, path_b, base_len).as_secs_f64();
+        let a_ba = timed_append_batch(arm_a, path_a, base_len).as_secs_f64();
+        ratios.push(((b_ab / a_ab) * (b_ba / a_ba)).sqrt());
+    }
+    ratios.sort_unstable_by(f64::total_cmp);
+    let percentile = |pct: usize| ratios[((ratios.len() - 1) * pct + 50) / 100];
+    RatioSummary {
+        median: percentile(50),
+        p5: percentile(5),
+        p95: percentile(95),
+    }
+}
+
+fn bench_repair_log_rotation_ab(c: &mut Criterion) {
+    prove_repair_log_parity();
+
+    let dir = tempfile_dir("repair-log-rotation-ab");
+    let null_a = dir.join("null-a.jsonl");
+    let null_b = dir.join("null-b.jsonl");
+    let reference = dir.join("reference.jsonl");
+    let candidate = dir.join("candidate.jsonl");
+    let base_len = seed_repair_log(&null_a, 999);
+    seed_repair_log(&null_b, 999);
+    seed_repair_log(&reference, 999);
+    seed_repair_log(&candidate, 999);
+
+    for _ in 0..3 {
+        black_box(timed_append_batch(
+            RotationArm::ReadToString,
+            &reference,
+            base_len,
+        ));
+        black_box(timed_append_batch(
+            RotationArm::ReusedLineBuffer,
+            &candidate,
+            base_len,
+        ));
+    }
+
+    let null = paired_ratio(
+        RotationArm::ReadToString,
+        RotationArm::ReadToString,
+        &null_a,
+        &null_b,
+        base_len,
+    );
+    let candidate_ratio = paired_ratio(
+        RotationArm::ReadToString,
+        RotationArm::ReusedLineBuffer,
+        &reference,
+        &candidate,
+        base_len,
+    );
+    let gate_pass = null.null_contains_one() && candidate_ratio.median < null.p5;
+    eprintln!(
+        "[parity] repair_log_append active_and_rotated_bytes=IDENTICAL shapes=999/1000,1000/1000"
+    );
+    eprintln!(
+        "[paired] comparison=null_read_to_string median={:.6} p5={:.6} p95={:.6} round_pairs={ROTATION_PAIRED_ROUNDS}",
+        null.median, null.p5, null.p95
+    );
+    eprintln!(
+        "[paired] comparison=reused_line_buffer_vs_read_to_string median={:.6} p5={:.6} p95={:.6} round_pairs={ROTATION_PAIRED_ROUNDS}",
+        candidate_ratio.median, candidate_ratio.p5, candidate_ratio.p95
+    );
+    eprintln!(
+        "[gate] decision={} speedup={:.6}x null_contains_one={} candidate_median_below_null_p5={}",
+        if gate_pass { "KEEP" } else { "HOLD" },
+        1.0 / candidate_ratio.median,
+        null.null_contains_one(),
+        candidate_ratio.median < null.p5
+    );
+
+    let mut group = c.benchmark_group("repair_log_rotation_check");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("read_to_string/999", |b| {
+        b.iter(|| {
+            black_box(
+                should_rotate_read_to_string(black_box(&reference), black_box(1_000))
+                    .expect("reference rotation check"),
+            );
+        });
+    });
+    group.bench_function("reused_line_buffer/999", |b| {
+        b.iter(|| {
+            black_box(
+                should_rotate_reused_line_buffer(black_box(&candidate), black_box(1_000))
+                    .expect("candidate rotation check"),
+            );
+        });
+    });
+    group.finish();
 }
 
 // --- Encode throughput ---
@@ -307,6 +582,7 @@ criterion_group!(
     bench_protect_verify_roundtrip,
     bench_repair_latency,
     bench_overhead_ratio,
+    bench_repair_log_rotation_ab,
 );
 
 criterion_main!(benches);

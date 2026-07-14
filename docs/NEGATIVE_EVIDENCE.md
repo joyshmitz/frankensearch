@@ -14087,3 +14087,55 @@ scan-free retrieval mode).
 **Validation.** Remote release bench exited 0 on `vmi1227854`. First run silently executed the pre-stage binary
 (rch ships git-add'd files only); staged both files, re-ran, ILP arm
 present and decidable. `RCH_REQUIRE_REMOTE=1` throughout; no local fallback.
+
+### 2026-07-14 — IcyRidge — REJECTED: allocation-free repair-log line counting is byte-identical but about 1.50× slower (`bd-7z0x`)
+
+**Negative-ledger-first route.** The earlier ingest sweep explicitly spotted but did not test
+`durability::should_rotate`: before every repair-event append it uses `fs::read_to_string` plus
+`lines().count()`, temporarily allocating a `String` as large as the bounded JSONL log. This was the only
+unresolved, non-fusion micro-route in that ledger slice. Its opportunity score was 4.0
+(`impact=2 × confidence=4 / effort=2`): bounded operational path rather than query hot path, but an exact and
+cheaply falsifiable allocation hypothesis.
+
+**One candidate.** The candidate opened the log through `BufReader`, reused one `String` with `read_line`, and
+counted records without retaining the whole file. It deliberately read the complete file rather than returning
+at the threshold, preserving the original behavior for invalid UTF-8 after the threshold. Empty files,
+unterminated final lines, LF/CRLF, Unicode, `max_entries == 0`, missing files, and invalid UTF-8 matched the
+original result shape and I/O error kind. The retained benchmark also proved byte-identical active and rotated
+JSONL output at 999/1000 and 1000/1000 entries.
+
+**Strict-remote same-binary gate.** The authoritative fixture starts with 999 realistic 249-byte JSON records
+and times the production rotation-check-plus-append boundary in 21 alternating AB/BA round pairs (16 appends per
+timed arm). Ratio is reused-line-buffer/original (`<1.0` is faster):
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-durability --profile release \
+  --bench durability_bench -- repair_log_rotation_check --noplot
+```
+
+| gate | median [p5, p95] | verdict |
+|---|---:|---|
+| A/A `read_to_string` / `read_to_string` | 1.002217 [0.930668, 1.122853] | valid null (`1.0` contained) |
+| reused line buffer / `read_to_string` | **1.499345 [1.212310, 1.699262]** | **decidably slower** |
+
+The full boundary runs at only 0.666958× the original speed. Criterion's isolated check corroborated the result:
+`read_to_string` was 37.496 µs midpoint versus 60.297 µs for the reusable line buffer. Removing the whole-file
+allocation loses to 999 per-line `read_line` calls and repeated UTF-8 boundary handling.
+
+**Decision and retry boundary.** **REJECT; production restored exactly.** The retained
+`repair_log_rotation_check` comparator is the only code artifact. Do not retry line-at-a-time buffered counting
+for this JSONL shape. Reopen this family only for an O(1) count design that proves correctness across
+`FileProtector` clones, independently constructed protectors/processes, restarts, failed appends/renames, and
+external log mutation, and only if repair-log append is measured hot enough to justify that state complexity.
+
+**Validation.** The fully qualified strict-remote parity test ran 1/1 on `vmi1227854`; an earlier zero-test
+filter run was explicitly discarded. The release benchmark ran on `vmi1149989`, exited 0, asserted exact bytes,
+and contained both A/A and candidate arms in one process. RCH ignored the worker hint for the benchmark, but the
+same-binary design preserves comparability. Every Cargo invocation used `RCH_REQUIRE_REMOTE=1`; no local fallback
+occurred. The restored tree passed strict-remote `cargo check --workspace --all-targets`; only established
+unrelated benchmark/ops warnings appeared. The required strict-remote workspace Clippy attempt stopped before
+durability on four existing core findings (`needless_borrow` twice, `struct_excessive_bools`, and `doc_markdown`).
+Direct `rustfmt --check` and `git diff --check` passed. Exact-file UBS exited 0 with zero critical findings after
+suppressing only its Rust security heuristic, which had misclassified the pre-existing codec `decode` method and
+Criterion `group.finish()` calls as JWT/token code.
