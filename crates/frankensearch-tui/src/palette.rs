@@ -100,6 +100,8 @@ pub struct CommandPalette {
     actions: Vec<Action>,
     /// Lowercased searchable fields, kept parallel to `actions`.
     search_index: Vec<ActionSearchIndex>,
+    /// Ordered action indices matching the current query.
+    matching_indices: Vec<usize>,
     /// Current search query.
     query: String,
     /// Current selection index in filtered results.
@@ -140,6 +142,7 @@ impl CommandPalette {
         Self {
             actions: Vec::new(),
             search_index: Vec::new(),
+            matching_indices: Vec::new(),
             query: String::new(),
             selected: 0,
             state: PaletteState::Closed,
@@ -148,9 +151,19 @@ impl CommandPalette {
 
     /// Register an action.
     pub fn register(&mut self, action: Action) {
-        self.search_index
-            .push(ActionSearchIndex::from_action(&action));
+        let searchable = ActionSearchIndex::from_action(&action);
+        let action_index = self.actions.len();
+        let matches = if self.query.is_empty() {
+            true
+        } else {
+            searchable.matches(&self.query.to_lowercase())
+        };
+
+        self.search_index.push(searchable);
         self.actions.push(action);
+        if matches {
+            self.matching_indices.push(action_index);
+        }
     }
 
     /// Open the palette.
@@ -158,6 +171,7 @@ impl CommandPalette {
         self.state = PaletteState::Open;
         self.query.clear();
         self.selected = 0;
+        self.reset_matches();
     }
 
     /// Close the palette.
@@ -165,6 +179,7 @@ impl CommandPalette {
         self.state = PaletteState::Closed;
         self.query.clear();
         self.selected = 0;
+        self.reset_matches();
     }
 
     /// Toggle the palette open/closed.
@@ -191,26 +206,22 @@ impl CommandPalette {
     pub fn push_char(&mut self, ch: char) {
         self.query.push(ch);
         self.selected = 0;
+        self.rebuild_matches();
     }
 
     /// Remove the last character from the query.
     pub fn pop_char(&mut self) {
         self.query.pop();
         self.selected = 0;
+        self.rebuild_matches();
     }
 
     /// Get filtered actions matching the current query.
     #[must_use]
     pub fn filtered(&self) -> Vec<&Action> {
-        if self.query.is_empty() {
-            return self.actions.iter().collect();
-        }
-
-        let query_lower = self.query.to_lowercase();
-        self.actions
+        self.matching_indices
             .iter()
-            .zip(&self.search_index)
-            .filter_map(|(action, searchable)| searchable.matches(&query_lower).then_some(action))
+            .map(|&action_index| &self.actions[action_index])
             .collect()
     }
 
@@ -222,7 +233,7 @@ impl CommandPalette {
 
     /// Move selection up.
     pub fn select_prev(&mut self) {
-        let count = self.filtered().len();
+        let count = self.matching_indices.len();
         if count > 0 {
             self.selected = if self.selected == 0 {
                 count - 1
@@ -234,7 +245,7 @@ impl CommandPalette {
 
     /// Move selection down.
     pub fn select_next(&mut self) {
-        let count = self.filtered().len();
+        let count = self.matching_indices.len();
         if count > 0 {
             self.selected = (self.selected + 1) % count;
         }
@@ -243,8 +254,9 @@ impl CommandPalette {
     /// Confirm the current selection. Returns the selected action's ID.
     #[must_use]
     pub fn confirm(&self) -> Option<String> {
-        let filtered = self.filtered();
-        filtered.get(self.selected).map(|a| a.id.clone())
+        self.matching_indices
+            .get(self.selected)
+            .map(|&action_index| self.actions[action_index].id.clone())
     }
 
     /// Number of registered actions.
@@ -257,6 +269,29 @@ impl CommandPalette {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.actions.is_empty()
+    }
+
+    fn reset_matches(&mut self) {
+        self.matching_indices.clear();
+        self.matching_indices.extend(0..self.actions.len());
+    }
+
+    fn rebuild_matches(&mut self) {
+        if self.query.is_empty() {
+            self.reset_matches();
+            return;
+        }
+
+        let query_lower = self.query.to_lowercase();
+        self.matching_indices.clear();
+        self.matching_indices.extend(
+            self.search_index
+                .iter()
+                .enumerate()
+                .filter_map(|(index, searchable)| {
+                    searchable.matches(&query_lower).then_some(index)
+                }),
+        );
     }
 }
 
@@ -431,6 +466,27 @@ mod tests {
         assert_eq!(palette.query(), "xy");
         palette.pop_char();
         assert_eq!(palette.query(), "x");
+    }
+
+    #[test]
+    fn palette_register_while_filtered_updates_cached_matches() {
+        let mut palette = sample_palette();
+        set_query(&mut palette, "search");
+        palette.register(Action::new(
+            "search.history",
+            "Open Search History",
+            ActionCategory::Search,
+        ));
+        palette.register(Action::new(
+            "settings.color",
+            "Change Colors",
+            ActionCategory::Settings,
+        ));
+
+        assert_eq!(
+            filtered_ids(&palette),
+            legacy_filtered_ids(&palette, "search")
+        );
     }
 
     #[test]

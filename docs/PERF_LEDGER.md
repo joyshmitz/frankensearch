@@ -5595,3 +5595,34 @@ absolute production-profile latency claim. A preceding strict-remote test compil
 name shadow before execution; qualifying the production function fixed that harness-only issue, and the attempt
 is excluded from performance evidence. No Cargo command ran locally and no second benchmark ran. **Decision:
 LANDED.** Retained comparator: `canonicalize/markdown_link_source_slices` with `bench-internals`.
+
+## 2026-07-14 — TUI palette match-index cache removes repeat navigation scans — ~300× (`bd-072j`, IcyRidge)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` again ranked the reopened tombstone
+bitmap bead, but the later 2026-07-12 ledger resolution closes that non-default, fleet-unmeasurable bandwidth
+route. This turn pivoted to the TUI command palette. The existing palette profile measured one cached-string
+filter scan at **154.66 µs for 4,096 actions**; production arrow navigation called `filtered()` to obtain the
+count, and the following render called it again. Thus the steady-state navigation path rescanned every action
+twice and allocated two result vectors even though neither the query nor action set had changed.
+
+**Single lever.** `CommandPalette` now caches ordered matching action indices when the query or registered
+action set changes. `select_prev`, `select_next`, and `confirm` consume that cache directly; `filtered()` maps
+the cached indices to action references for render. Registration order is preserved, the same full-string
+Unicode `to_lowercase()` normalization runs on every query mutation, opening/closing resets the cache to all
+actions, and registration during an active filter updates the cache. The retained same-binary former arm
+recreates the immediately preceding cached-lowercase scan, and the benchmark asserts identical ordered action
+IDs before timing.
+
+One foreground fail-closed RCH invocation on `vmi1153651` used `cargo bench --profile release` with release
+LTO disabled (no `release-perf`, no local fallback, no retry). Criterion warmed both arms and measured the
+1,024-action navigation-plus-render path:
+
+| arm | 95% interval | central estimate | throughput |
+|---|---:|---:|---:|
+| former cached-string scan twice | 130.47–153.70 µs | **141.01 µs** | 7.2620 Melem/s |
+| cached matches + render materialization | 430.76–508.77 ns | **470.45 ns** | 2.1766 Gelem/s |
+
+Candidate/former ratio is **0.00334**, or **~299.7× faster**. The effect is far beyond the fleet noise floor;
+the result also removes the navigation-side result-vector allocation, leaving only the render API's reference
+vector. The worker-scoped target was cold and required a 10m43s remote compile, but that build used LTO=false
+and the measured Criterion samples were warm. Scoped UBS, rustfmt, and diff checks passed. **Decision: LANDED.**

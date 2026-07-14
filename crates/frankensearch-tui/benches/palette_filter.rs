@@ -4,6 +4,31 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankensearch_tui::{Action, ActionCategory, CommandPalette};
 
+struct FormerSearchIndex {
+    id: String,
+    label: String,
+    description: Option<String>,
+}
+
+impl FormerSearchIndex {
+    fn from_action(action: &Action) -> Self {
+        Self {
+            id: action.id.to_lowercase(),
+            label: action.label.to_lowercase(),
+            description: action.description.as_ref().map(|desc| desc.to_lowercase()),
+        }
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.label.contains(query)
+            || self.id.contains(query)
+            || self
+                .description
+                .as_ref()
+                .is_some_and(|description| description.contains(query))
+    }
+}
+
 fn make_actions(count: usize) -> Vec<Action> {
     (0..count)
         .map(|index| {
@@ -76,6 +101,23 @@ fn legacy_filtered<'a>(actions: &'a [Action], query: &str) -> Vec<&'a Action> {
         .collect()
 }
 
+fn former_cached_index_filtered<'a>(
+    actions: &'a [Action],
+    search_index: &[FormerSearchIndex],
+    query: &str,
+) -> Vec<&'a Action> {
+    if query.is_empty() {
+        return actions.iter().collect();
+    }
+
+    let query_lower = query.to_lowercase();
+    actions
+        .iter()
+        .zip(search_index)
+        .filter_map(|(action, searchable)| searchable.matches(&query_lower).then_some(action))
+        .collect()
+}
+
 fn bench_palette_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("palette_filter");
     group.warm_up_time(Duration::from_millis(100));
@@ -117,6 +159,59 @@ fn bench_palette_filter(c: &mut Criterion) {
     }
 
     group.finish();
+
+    const NAV_ACTIONS: usize = 1_024;
+    let actions = make_actions(NAV_ACTIONS);
+    let search_index: Vec<FormerSearchIndex> =
+        actions.iter().map(FormerSearchIndex::from_action).collect();
+    let query = "vector";
+    let mut palette = make_palette(&actions, query);
+    let former = former_cached_index_filtered(&actions, &search_index, query);
+    let cached = palette.filtered();
+    assert_eq!(former.len(), cached.len());
+    assert!(
+        former
+            .iter()
+            .zip(&cached)
+            .all(|(former_action, cached_action)| former_action.id == cached_action.id)
+    );
+
+    let mut navigation = c.benchmark_group("palette_navigation_cache");
+    navigation.warm_up_time(Duration::from_millis(100));
+    navigation.measurement_time(Duration::from_millis(450));
+    navigation.sample_size(20);
+    navigation.throughput(Throughput::Elements(
+        u64::try_from(NAV_ACTIONS).unwrap_or(u64::MAX),
+    ));
+
+    let mut former_selected = 0usize;
+    navigation.bench_function("former_scan_then_render", |bench| {
+        bench.iter(|| {
+            let count = former_cached_index_filtered(
+                black_box(&actions),
+                black_box(&search_index),
+                black_box(query),
+            )
+            .len();
+            if count > 0 {
+                former_selected = (former_selected + 1) % count;
+            }
+            let rendered = former_cached_index_filtered(
+                black_box(&actions),
+                black_box(&search_index),
+                black_box(query),
+            );
+            black_box((former_selected, rendered.len()))
+        });
+    });
+    navigation.bench_function("cached_matches_then_render", |bench| {
+        bench.iter(|| {
+            palette.select_next();
+            let rendered = palette.filtered();
+            black_box((palette.selected(), rendered.len()))
+        });
+    });
+    navigation.finish();
 }
 
 criterion_group!(benches, bench_palette_filter);
