@@ -14669,3 +14669,34 @@ RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1152480 RCH_ENV_ALLOWLIST=AG
 Production and benchmark files were restored exactly; only this blocker record ships. No release-perf profile,
 local Cargo fallback, parallel benchmark, or second attempt ran. Retry this exact sibling-consistency lever only
 when RCH can admit the worker that owns the warm Model2Vec release artifact (or expose a hard worker pin).
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: hyphen decomposition allocation gate found a cold lexical release pool (`bd-q9u4`)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` still preferred the closed
+`bd-6m8p` tombstone-bitmap route, so this turn moved to the allowed lexical/tokenization subsystem. The older
+tokenizer sweep correctly retained the owned `String` allocation for each Tantivy sub-token, but its broad
+closure also hid one separable allocation: `HyphenDecomposeStream::decompose` first collects borrowed split
+parts into a temporary `Vec<&str>` solely to traverse them in reverse. The candidate iterated `rsplit('-')`
+directly while preserving every required owned output. The same-binary former arm and production arm covered a
+4,096-token hyphen-heavy corpus plus plain, empty-part, duplicate-hyphen, boundary-hyphen, and Unicode cases;
+the prepared gate compared complete `Token` values and an A/A-calibrated paired ratio.
+
+**Strict-remote warm-cache blocker.** The only foreground Cargo invocation used `RCH_REQUIRE_REMOTE=1`, the
+required `--profile release`, a small Criterion filter, and an explicit request for `vmi1227854`, whose recent
+ledger history included lexical release work. RCH honored the worker request but rewrote the target to
+`.rch-target-vmi1227854-pool-f8bc031ea0fafde9f76f004d8ee7e741`; that pool did not contain the benchmark's
+release graph. It downloaded the crate set and began compiling foundational dependencies including
+`proc-macro2`, `libc`, `serde`, `zstd-sys`, and `tantivy-common`. The run was interrupted before
+`frankensearch-lexical`, release LTO, parity, or timing:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1227854 RCH_ENV_ALLOWLIST=AGENT_NAME \
+  AGENT_NAME=IcyRidge timeout 900 env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 \
+  -p frankensearch-lexical --features bench-internals --profile release \
+  --bench tokenizer_char_walk_ab -- hyphen_decompose_parts --noplot
+```
+
+**Decision: INVALID/HOLD.** No parity or performance claim is admissible because the candidate never executed.
+Production and benchmark files were restored exactly; only this blocker record ships. No release-perf profile,
+local Cargo fallback, parallel benchmark, or retry ran. Move to a different subsystem next turn; do not revisit
+this allocation seam until RCH can verify the exact lexical benchmark artifact is warm before dispatch.
