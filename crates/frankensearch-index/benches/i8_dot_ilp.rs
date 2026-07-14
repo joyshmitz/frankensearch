@@ -1,6 +1,6 @@
-//! Int8·int8 AVX2 probes: the shipped dynamic 2-accumulator kernel versus both
-//! the rejected 4-accumulator ILP variant and the kept fixed-shape 384-dim
-//! specialization (`bd-qdw5`). Integer adds associate, so all arms are exact.
+//! Quantized AVX2 dot probes: the shipped dynamic kernels versus the kept
+//! fixed-shape 384-dim int8 (`bd-qdw5`) and prepared 4-bit (`bd-5ihn`)
+//! specializations. Integer adds associate, so all arms are exact.
 //!
 //! Run with:
 //! ```bash
@@ -14,8 +14,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_index::{
+    PreparedQuery4bit, dot_4bit_prepared, dot_4bit_prepared_dynamic, prepare_4bit_query,
+};
 
 const DIM: usize = 384;
+const PACKED_DIM: usize = DIM / 2;
 const N: usize = 4096;
 
 fn xorshift(s: &mut u64) -> i8 {
@@ -29,6 +33,13 @@ fn xorshift(s: &mut u64) -> i8 {
 fn build_corpus(n: usize, dim: usize, seed: u64) -> Vec<i8> {
     let mut s = seed;
     (0..n * dim).map(|_| xorshift(&mut s)).collect()
+}
+
+fn build_fourbit_corpus(seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    (0..N * PACKED_DIM)
+        .map(|_| xorshift(&mut state).to_ne_bytes()[0])
+        .collect()
 }
 
 /// 2-accumulator AVX2 i8·i8 dot — faithful copy of the shipped `dot_i8_i8_avx2`.
@@ -173,6 +184,58 @@ fn paired_fixed_ratio<const CANDIDATE_FIXED: bool>(corpus: &[i8], query: &[i8]) 
     ratios
 }
 
+fn time_fourbit_batch<const FIXED: bool>(
+    corpus: &[u8],
+    query: &PreparedQuery4bit,
+    inner: usize,
+) -> Duration {
+    let started = Instant::now();
+    let mut acc = 0_i32;
+    for _ in 0..inner {
+        for i in 0..N {
+            let vector = &corpus[i * PACKED_DIM..i * PACKED_DIM + PACKED_DIM];
+            let dot = if FIXED {
+                dot_4bit_prepared(black_box(vector), black_box(query))
+            } else {
+                dot_4bit_prepared_dynamic(black_box(vector), black_box(query))
+            };
+            acc = acc.wrapping_add(dot);
+        }
+    }
+    black_box(acc);
+    started.elapsed()
+}
+
+fn paired_fourbit_ratio<const CANDIDATE_FIXED: bool>(
+    corpus: &[u8],
+    query: &PreparedQuery4bit,
+) -> Vec<f64> {
+    const PAIRS: usize = 31;
+    const INNER: usize = 32;
+    let mut ratios = Vec::with_capacity(PAIRS);
+    for pair in 0..PAIRS {
+        let (a1, b1, b2, a2) = if pair.is_multiple_of(2) {
+            (
+                time_fourbit_batch::<false>(corpus, query, INNER),
+                time_fourbit_batch::<CANDIDATE_FIXED>(corpus, query, INNER),
+                time_fourbit_batch::<CANDIDATE_FIXED>(corpus, query, INNER),
+                time_fourbit_batch::<false>(corpus, query, INNER),
+            )
+        } else {
+            let b1 = time_fourbit_batch::<CANDIDATE_FIXED>(corpus, query, INNER);
+            let a1 = time_fourbit_batch::<false>(corpus, query, INNER);
+            let a2 = time_fourbit_batch::<false>(corpus, query, INNER);
+            let b2 = time_fourbit_batch::<CANDIDATE_FIXED>(corpus, query, INNER);
+            (a1, b1, b2, a2)
+        };
+        ratios.push(
+            ((b1.as_secs_f64() / a1.as_secs_f64()) * (b2.as_secs_f64() / a2.as_secs_f64())).sqrt(),
+        );
+    }
+    ratios.sort_unstable_by(f64::total_cmp);
+    ratios
+}
+
 /// 4-accumulator AVX2 i8·i8 dot — unrolls two 32-byte chunks per iteration into
 /// four independent `vpaddd` chains. Bit-identical (integer sum).
 #[cfg(target_arch = "x86_64")]
@@ -291,6 +354,74 @@ fn bench(c: &mut Criterion) {
             bch.iter(|| black_box(time_fixed_batch::<true>(&corpus, &query, 1)))
         });
         fixed_group.finish();
+
+        let fourbit_corpus = build_fourbit_corpus(0x4b17_3840);
+        let fourbit_query_bytes = {
+            let mut state = 0x4b17_d1ce;
+            (0..PACKED_DIM)
+                .map(|_| xorshift(&mut state).to_ne_bytes()[0])
+                .collect::<Vec<_>>()
+        };
+        let fourbit_query = prepare_4bit_query(&fourbit_query_bytes);
+        for i in 0..N {
+            let vector = &fourbit_corpus[i * PACKED_DIM..i * PACKED_DIM + PACKED_DIM];
+            assert_eq!(
+                dot_4bit_prepared_dynamic(vector, &fourbit_query),
+                dot_4bit_prepared(vector, &fourbit_query),
+                "fixed 384-dim 4-bit dot must equal dynamic at row {i}"
+            );
+        }
+        black_box(time_fourbit_batch::<false>(
+            &fourbit_corpus,
+            &fourbit_query,
+            8,
+        ));
+        black_box(time_fourbit_batch::<true>(
+            &fourbit_corpus,
+            &fourbit_query,
+            8,
+        ));
+        let fourbit_null = paired_fourbit_ratio::<false>(&fourbit_corpus, &fourbit_query);
+        let fourbit_lever = paired_fourbit_ratio::<true>(&fourbit_corpus, &fourbit_query);
+        let fourbit_middle = fourbit_null.len() / 2;
+        let fourbit_null_median = fourbit_null[fourbit_middle];
+        let fourbit_lever_median = fourbit_lever[fourbit_middle];
+        eprintln!(
+            "[fourbit-fixed384-paired] null_median={fourbit_null_median:.6} \
+             null_p5={:.6} null_p95={:.6} lever_median={fourbit_lever_median:.6} \
+             lever_p5={:.6} lever_p95={:.6} calibrated_ratio={:.6} \
+             parity=true pairs={}",
+            fourbit_null[1],
+            fourbit_null[fourbit_null.len() - 2],
+            fourbit_lever[1],
+            fourbit_lever[fourbit_lever.len() - 2],
+            fourbit_lever_median / fourbit_null_median,
+            fourbit_lever.len()
+        );
+
+        let mut fourbit_group = c.benchmark_group("fourbit_dot_fixed384");
+        fourbit_group.sample_size(10);
+        fourbit_group.warm_up_time(Duration::from_millis(250));
+        fourbit_group.measurement_time(Duration::from_secs(1));
+        fourbit_group.bench_function("dynamic", |bch| {
+            bch.iter(|| {
+                black_box(time_fourbit_batch::<false>(
+                    &fourbit_corpus,
+                    &fourbit_query,
+                    1,
+                ))
+            })
+        });
+        fourbit_group.bench_function("fixed", |bch| {
+            bch.iter(|| {
+                black_box(time_fourbit_batch::<true>(
+                    &fourbit_corpus,
+                    &fourbit_query,
+                    1,
+                ))
+            })
+        });
+        fourbit_group.finish();
 
         let mut group = c.benchmark_group("i8_dot_ilp");
         group.warm_up_time(Duration::from_millis(500));

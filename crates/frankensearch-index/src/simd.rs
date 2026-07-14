@@ -1299,6 +1299,9 @@ pub struct PreparedQuery4bit {
     tail: Vec<(i32, i32)>,
 }
 
+const FOUR_BIT_DIM384_BYTES: usize = 384 / 2;
+const FOUR_BIT_DIM384_CHUNKS: usize = FOUR_BIT_DIM384_BYTES / 16;
+
 /// Pre-unpack a packed 4-bit query (the loop-invariant operand of a scan). For each
 /// 16-byte chunk, store the sign-extended low/high nibble lanes (`i16x16`); the
 /// remainder bytes go to a scalar `(low, high)` tail.
@@ -1328,6 +1331,32 @@ pub fn prepare_4bit_query(query: &[u8]) -> PreparedQuery4bit {
 /// `(x<<12)>>12` / `(x<<8)>>12`, multiply by the prepared query lanes, and
 /// accumulate vertically (flushing before any `i16` lane can overflow).
 pub fn dot_4bit_prepared(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe {
+                if stored.len() == FOUR_BIT_DIM384_BYTES
+                    && query.low.len() == FOUR_BIT_DIM384_CHUNKS
+                    && query.high.len() == FOUR_BIT_DIM384_CHUNKS
+                    && query.tail.is_empty()
+                {
+                    dot_4bit_prepared_avx2_384(stored, query)
+                } else {
+                    dot_4bit_prepared_avx2(stored, query)
+                }
+            };
+        }
+    }
+    dot_4bit_prepared_generic(stored, query)
+}
+
+/// Exact pre-specialization dispatch retained for same-binary performance
+/// comparisons. Production callers should use [`dot_4bit_prepared`].
+#[doc(hidden)]
+#[must_use]
+pub fn dot_4bit_prepared_dynamic(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -1402,6 +1431,69 @@ unsafe fn dot_4bit_prepared_avx2(stored: &[u8], query: &PreparedQuery4bit) -> i3
         sum += nibble_lo(*sb) * qlo + nibble_hi(*sb) * qhi;
     }
     sum
+}
+
+/// Fixed-shape AVX2 prepared 4-bit dot for the production MiniLM dimension.
+/// Twelve expanded packed chunks fit in one vertical `i16` accumulator, so the
+/// dynamic loop/flush/tail machinery disappears while the reduction tree stays
+/// identical to [`dot_4bit_prepared_avx2`].
+///
+/// # Safety
+/// The caller must ensure AVX2 is available, `stored` contains exactly 192
+/// bytes, and the prepared query contains exactly twelve lanes with no tail.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_4bit_prepared_avx2_384(stored: &[u8], query: &PreparedQuery4bit) -> i32 {
+    use core::arch::x86_64::{
+        __m128i, __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_shuffle_epi32,
+        _mm_unpackhi_epi64, _mm256_add_epi16, _mm256_castsi256_si128, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_slli_epi16, _mm256_srai_epi16,
+    };
+
+    macro_rules! accumulate_chunk {
+        ($chunk:expr, $acc:ident) => {{
+            let sbytes = _mm_loadu_si128(stored.as_ptr().add($chunk * 16).cast::<__m128i>());
+            let s = _mm256_cvtepi8_epi16(sbytes);
+            let s_low = _mm256_srai_epi16::<12>(_mm256_slli_epi16::<12>(s));
+            let s_high = _mm256_srai_epi16::<12>(_mm256_slli_epi16::<8>(s));
+            let q_low = _mm256_loadu_si256(query.low.as_ptr().add($chunk).cast::<__m256i>());
+            let q_high = _mm256_loadu_si256(query.high.as_ptr().add($chunk).cast::<__m256i>());
+            let prod = _mm256_add_epi16(
+                _mm256_mullo_epi16(s_low, q_low),
+                _mm256_mullo_epi16(s_high, q_high),
+            );
+            $acc = _mm256_add_epi16($acc, prod);
+        }};
+    }
+
+    // SAFETY: the dispatch wrapper verifies the exact 192-byte/twelve-chunk
+    // shape and AVX2. Twelve chunks accumulate at most 12*98=1176 per i16 lane.
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+        accumulate_chunk!(0, acc);
+        accumulate_chunk!(1, acc);
+        accumulate_chunk!(2, acc);
+        accumulate_chunk!(3, acc);
+        accumulate_chunk!(4, acc);
+        accumulate_chunk!(5, acc);
+        accumulate_chunk!(6, acc);
+        accumulate_chunk!(7, acc);
+        accumulate_chunk!(8, acc);
+        accumulate_chunk!(9, acc);
+        accumulate_chunk!(10, acc);
+        accumulate_chunk!(11, acc);
+        let pairs = _mm256_madd_epi16(acc, _mm256_set1_epi16(1));
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(pairs),
+            _mm256_extracti128_si256::<1>(pairs),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+        _mm_cvtsi128_si32(sum32)
+    }
 }
 
 /// Portable (`wide`-SIMD) 4-bit prepared dot — the AVX2-dispatch fallback and the
