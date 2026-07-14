@@ -14895,3 +14895,42 @@ candidate. Production and benchmark changes were manually restored, so only this
 ship. No second benchmark, local Cargo fallback, worker reroute, cache-warming attempt, or `release-perf` build
 ran. The score-only bulk path remains unmeasured rather than rejected; retry requires RCH to execute the retained
 release artifact instead of replacing it with a fresh worker-scoped target.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: ASCII negation byte parser never reached the existing warm benchmark (`bd-g8f1`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` again ranked the later-closed
+`bd-6m8p` tombstone route; the preceding FSFS sidecar gate also proved that worker-pool target rewriting was
+discarding retained binaries, so this turn moved to a different subsystem: steady-state query parsing in
+`frankensearch-core`. The existing `parsed_query/not_phrase_new` profile previously measured the shipping
+negation-capable parser at about **668 ns** for a query containing `-term` plus two `NOT "phrase"` exclusions.
+Source attribution found four avoidable allocation/copy classes on the common ASCII form: materialize the whole
+query as `Vec<char>`, allocate each positive word as a `String`, grow a `Vec<String>`, then join/copy those words
+into the final positive query. The single candidate scanned ASCII bytes and copied source slices directly into
+the final output, while retaining the exact character parser for Unicode. The existing `parsed_query` bench name
+carried the former production parser and prepared exact-output assertions across the timed query plus ASCII
+escaping, whitespace, keyword, double-dash, and standalone-dash cases.
+
+**The sole strict-remote release gate remained a cold build.** The foreground command deliberately left
+`CARGO_TARGET_DIR` unset to give RCH's normal retained target the best chance of reuse, selected only the two
+`ascii_negated` arms, used 10 samples with 50 ms warm-up and 150 ms measurement time, disabled release LTO, and
+had a 120-second hard cap:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 AGENT_NAME=IcyRidge \
+  CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch --no-self-healing exec -- cargo bench -p frankensearch-core \
+  --features bench-internals --profile release --bench parsed_query -- \
+  ascii_negated --sample-size 10 --warm-up-time 0.05 \
+  --measurement-time 0.15 --noplot
+```
+
+RCH selected `vmi1153651`, spent **30.206 seconds** syncing 15 workspace roots, then rewrote the default
+`target` to the fresh worker pool
+`.rch-target-vmi1153651-pool-f8bc031ea0fafde9f76f004d8ee7e741`. Cargo updated the crates.io index and the
+`frankentorch` git dependency, but emitted no completed compilation, parity assertion, or Criterion sample before
+the hard timeout returned exit 124.
+
+**Decision: INVALID/HOLD.** The ASCII parser and same-binary comparator were manually restored; only this
+blocker row and the closed bead ship. The idea is unmeasured, not rejected. No second benchmark, local Cargo
+fallback, worker reroute, cache-warming attempt, or `release-perf` build ran. Do not retry this parser until RCH
+can execute the retained `parsed_query` release artifact inside the bounded foreground gate.
