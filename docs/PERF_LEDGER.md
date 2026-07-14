@@ -5368,3 +5368,21 @@ feeds); directional and never slower below. Byte-identical, zero-downside, lande
 hashing, cf the aHash migrations `9543ae6` / `8665ce1`) — removes the per-hit SipHash entirely. This resolves the
 2026-07-14 `collect_id_hits` HOLD in `docs/NEGATIVE_EVIDENCE.md` (held one turn only because the RCH fleet was
 saturated and the edit could not be compile/test-verified remotely). Bench: `collect_ids_map_kind_ab`.
+
+## 2026-07-14 — REJECT/HOLD: Model2Vec full-row prefetch at 256 tokens stays inside the null floor (`bd-r3lf`)
+
+Negative-ledger-first follow-up to the 2026-07-08 gather result: preserve the original loop below 256 tokens and
+prefetch all cache lines of the embedding row four tokens ahead at 256+. The same release binary measured the full
+gather/mean-pool/L2-normalization boundary over two byte-identical 30 MiB tables with a pseudo-random full-table
+sweep, exact output parity, 31 alternating paired rounds, and an A/A null control. Strict-remote foreground run on
+`vmi1153651`; candidate/original ratios below 1 favor prefetch:
+
+| tokens | A/A null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 128 | 0.988 [0.359, 1.374] | 1.012 [0.446, 2.281] | short path preserved |
+| 256 | 1.011 [0.612, 2.840] | **0.791** [0.631, 1.098] | inside null floor |
+| 512 | 1.032 [0.846, 1.337] | **0.809** [0.692, 1.097] | clears null floor |
+
+**Decision:** production restored byte-for-byte because the exact 256-token onset does not clear its null floor.
+The feature-gated exact oracle and reproducer are retained. The 512-token mechanism win is route-next only: a
+512-only threshold would need a final-code paired run and evidence of real production prevalence.

@@ -20,6 +20,8 @@ fastembed = ["dep:fastembed", "dep:openssl-sys"]
 download = ["asupersync/tls", "asupersync/tls-webpki-roots"]
 api = ["asupersync/tls", "asupersync/tls-webpki-roots"]
 bundled-default-models = ["model2vec", "fastembed"]
+# Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
+bench-internals = ["frankensearch-core/bench-internals"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -58,6 +60,7 @@ harness = false
 [[bench]]
 name = "model2vec_gather_prefetch"
 harness = false
+required-features = ["model2vec", "bench-internals"]
 
 [build-dependencies]
 sha2 = { workspace = true }

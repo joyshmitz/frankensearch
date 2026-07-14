@@ -14175,3 +14175,40 @@ the reproducing `collect_ids_map_kind_ab` bench (verified compiling + running re
 **Route-next (concrete, ready-to-land — NOT a rejection): when a worker frees, apply the lazy-`Vec` to
 `collect_id_hits` (mirror the `table`-None and empty-slot→docstore branches exactly), confirm the lexical `--lib`
 suite green (byte-identical), and commit — this is a bankable win.**
+
+### 2026-07-14 — IcyRidge — REJECT/HOLD: Model2Vec full-row prefetch wins at 512 tokens, but the 256-token onset is inside the null floor (`bd-r3lf`)
+
+**Negative-ledger route and one lever.** The 2026-07-08 Model2Vec gather experiment established that
+unconditional full-row software prefetch hurts short queries, while leaving the 128/256/512-token crossover
+unmeasured. This turn tested exactly one candidate: preserve the original loop below 256 tokens, then prefetch
+every cache line of the embedding row four tokens ahead for `token_ids.len() >= 256`.
+
+**Truthful boundary and parity.** The retained same-binary harness measures the complete gather, mean-pool, and
+L2-normalization boundary against the original loop. It uses two byte-identical 30 MiB embedding-table copies and
+a pseudo-random full-table sweep so the benchmark does not collapse into the prior tiny L2-resident working set.
+It asserts exact output equality before timing, then runs 31 alternating A/B and B/A rounds with a paired A/A
+null control. The first strict-remote attempt failed during remote compilation because `bench-internals` was not
+enabled; it ran no benchmark and is excluded from evidence. There was no local fallback. The authoritative
+foreground command completed on `vmi1153651`:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1153651 RCH_ENV_ALLOWLIST=AGENT_NAME \
+AGENT_NAME=IcyRidge env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 \
+  -p frankensearch-embed --features model2vec,bench-internals --profile release \
+  --bench model2vec_gather_prefetch -- --noplot
+```
+
+Candidate/original ratios below 1 favor prefetch:
+
+| tokens | A/A null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 128 | 0.988 [0.359, 1.374] | 1.012 [0.446, 2.281] | short path preserved |
+| 256 | 1.011 [0.612, 2.840] | **0.791** [0.631, 1.098] | inside null floor |
+| 512 | 1.032 [0.846, 1.337] | **0.809** [0.692, 1.097] | clears null floor |
+
+**Decision. REJECT/HOLD.** The chosen 256-token shipping onset does not clear the same-binary null floor, so the
+production path was restored byte-for-byte. The exact oracle and boundary reproducer remain feature-gated behind
+`bench-internals`; normal builds retain no prefetch code. The 512-token result confirms the mechanism but does not
+rescue this candidate: a 512-only threshold is a separate narrower lever that needs a final-code run plus evidence
+that such sequence lengths matter in production. Do not retry the 256-token onset on this fleet without a lower-
+variance protocol.

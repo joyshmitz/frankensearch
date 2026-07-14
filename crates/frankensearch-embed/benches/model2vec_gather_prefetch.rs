@@ -15,9 +15,12 @@
 //! (parity asserts max-delta 0), so this is exact and distribution-independent in
 //! correctness.
 //!
-//! Arms: `base` (= shipped loop) vs `pf_head` (prefetch the row's first line only —
-//! the accumulate then streams the rest via the HW next-line prefetcher) vs `pf_row`
-//! (prefetch all DIM/16 lines of the row). Swept over token count T (query→doc).
+//! Historical Criterion arms retain `base`, `pf_head`, and `pf_row`. The shipping
+//! gate additionally compares the exact former production loop with
+//! `accumulate_model2vec_rows`: no prefetch below 256 tokens, full-row prefetch at
+//! 256+, and mean-scaling plus L2 normalization included. Each timed arm traverses
+//! a full 30 MB table copy so repeated sampling cannot turn the long-document
+//! workload into an L2-resident microbenchmark.
 //!
 //! ```bash
 //! CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
@@ -32,7 +35,8 @@ use std::time::Duration;
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_embed::simd::accumulate_f32_into;
+use frankensearch_core::bench_support::paired_median_ratio;
+use frankensearch_embed::simd::{accumulate_f32_into, accumulate_model2vec_rows};
 
 const VOCAB: usize = 30_000; // potion-base-8M-class vocab
 const DIM: usize = 256; // potion-base-8M dimension → 30k*256*4 ≈ 30 MB table
@@ -64,15 +68,18 @@ fn prefetch_row(_emb: &[f32], _row_start: usize, _full: bool) {
 }
 
 /// SHIPPED: gather each token's row and accumulate, no prefetch (embed_sync loop).
-fn gather_base(emb: &[f32], ids: &[u32], sum: &mut [f32]) {
+fn gather_base(emb: &[f32], ids: &[u32], sum: &mut [f32]) -> usize {
     sum.fill(0.0);
+    let mut count = 0_usize;
     for &id in ids {
         let idx = id as usize;
         if idx < VOCAB {
             let start = idx * DIM;
             accumulate_f32_into(sum, &emb[start..start + DIM]);
+            count += 1;
         }
     }
+    count
 }
 
 /// CANDIDATE: prefetch token `i+PF`'s row while accumulating token `i`.
@@ -91,6 +98,155 @@ fn gather_prefetch(emb: &[f32], ids: &[u32], sum: &mut [f32], full: bool) {
             let start = idx * DIM;
             accumulate_f32_into(sum, &emb[start..start + DIM]);
         }
+    }
+}
+
+fn gather_gated(emb: &[f32], ids: &[u32], sum: &mut [f32]) -> usize {
+    sum.fill(0.0);
+    accumulate_model2vec_rows(sum, emb, ids, VOCAB)
+}
+
+fn finish_mean_pool(sum: &mut [f32], count: usize) {
+    assert!(
+        count > 0,
+        "benchmark corpus must contain in-vocabulary rows"
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0 / count as f32;
+    for value in sum.iter_mut() {
+        *value *= inv;
+    }
+    let norm_sq: f32 = sum.iter().map(|value| value * value).sum();
+    if norm_sq.is_finite() && norm_sq > f32::EPSILON {
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        for value in sum.iter_mut() {
+            *value *= inv_norm;
+        }
+    } else {
+        sum.fill(0.0);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Arm {
+    Original,
+    GatedPrefetch,
+}
+
+fn run_corpus(emb: &[f32], ids: &[u32], tokens_per_doc: usize, sum: &mut [f32], arm: Arm) {
+    for doc_ids in ids.chunks_exact(tokens_per_doc) {
+        let count = match arm {
+            Arm::Original => gather_base(emb, doc_ids, sum),
+            Arm::GatedPrefetch => gather_gated(emb, doc_ids, sum),
+        };
+        finish_mean_pool(sum, count);
+        black_box(&*sum);
+    }
+}
+
+fn corpus_ids(tokens_per_doc: usize) -> Vec<u32> {
+    let docs = VOCAB.div_ceil(tokens_per_doc);
+    (0..docs * tokens_per_doc)
+        .map(|position| ((position * 7_919) % VOCAB) as u32)
+        .collect()
+}
+
+fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
+    for &tokens_per_doc in &[128_usize, 256, 512] {
+        let ids = corpus_ids(tokens_per_doc);
+
+        let mut parity_original = vec![0.0_f32; DIM];
+        let mut parity_candidate = vec![0.0_f32; DIM];
+        run_corpus(
+            emb_original,
+            &ids,
+            tokens_per_doc,
+            &mut parity_original,
+            Arm::Original,
+        );
+        run_corpus(
+            emb_original,
+            &ids,
+            tokens_per_doc,
+            &mut parity_candidate,
+            Arm::GatedPrefetch,
+        );
+        assert_eq!(
+            parity_original
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            parity_candidate
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "gated production path changed pooled output at {tokens_per_doc} tokens"
+        );
+
+        let mut null_original = vec![0.0_f32; DIM];
+        let mut null_clone = vec![0.0_f32; DIM];
+        let null = paired_median_ratio(
+            31,
+            1,
+            || {
+                run_corpus(
+                    black_box(emb_original),
+                    black_box(&ids),
+                    tokens_per_doc,
+                    black_box(&mut null_original),
+                    Arm::Original,
+                );
+            },
+            || {
+                run_corpus(
+                    black_box(emb_candidate),
+                    black_box(&ids),
+                    tokens_per_doc,
+                    black_box(&mut null_clone),
+                    Arm::Original,
+                );
+            },
+        );
+
+        let mut lever_original = vec![0.0_f32; DIM];
+        let mut lever_candidate = vec![0.0_f32; DIM];
+        let lever = paired_median_ratio(
+            31,
+            1,
+            || {
+                run_corpus(
+                    black_box(emb_original),
+                    black_box(&ids),
+                    tokens_per_doc,
+                    black_box(&mut lever_original),
+                    Arm::Original,
+                );
+            },
+            || {
+                run_corpus(
+                    black_box(emb_candidate),
+                    black_box(&ids),
+                    tokens_per_doc,
+                    black_box(&mut lever_candidate),
+                    Arm::GatedPrefetch,
+                );
+            },
+        );
+        let verdict = if tokens_per_doc < 256 {
+            if lever.median > null.p95 {
+                "SHORT_REGRESSION"
+            } else {
+                "SHORT_PRESERVED"
+            }
+        } else if lever.median < null.p5 {
+            "LONG_WIN"
+        } else {
+            "INSIDE_NULL_FLOOR"
+        };
+        eprintln!(
+            "[paired-gate] tokens={tokens_per_doc} null median={:.6} p5={:.6} p95={:.6} gated/original median={:.6} p5={:.6} p95={:.6} verdict={verdict}",
+            null.median, null.p5, null.p95, lever.median, lever.p5, lever.p95,
+        );
     }
 }
 
@@ -128,6 +284,8 @@ fn bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_millis(1000));
 
     let emb = emb_fixture();
+    let emb_candidate = emb.clone();
+    paired_shipping_gate(&emb, &emb_candidate);
 
     for &t in &[16usize, 64, 256] {
         let ids = ids_fixture(t);
@@ -136,7 +294,7 @@ fn bench(c: &mut Criterion) {
         let mut a = vec![0.0f32; DIM];
         let mut bh = vec![0.0f32; DIM];
         let mut br = vec![0.0f32; DIM];
-        gather_base(&emb, &ids, &mut a);
+        let _ = gather_base(&emb, &ids, &mut a);
         gather_prefetch(&emb, &ids, &mut bh, false);
         gather_prefetch(&emb, &ids, &mut br, true);
         let dh = a
@@ -161,7 +319,7 @@ fn bench(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("base", t), &ids, |bn, ids| {
             let mut sum = vec![0.0f32; DIM];
             bn.iter(|| {
-                gather_base(black_box(&emb), black_box(ids), black_box(&mut sum));
+                let _ = gather_base(black_box(&emb), black_box(ids), black_box(&mut sum));
                 black_box(&sum);
             });
         });
