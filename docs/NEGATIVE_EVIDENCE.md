@@ -13970,3 +13970,27 @@ reduction) holds; the exact real probe for recall ≥ 0.99 needs a real corpus.*
 if acceptable, promote IVF from bench/test to an opt-in `src/` index type wired into the InMemory path (no ANN
 today). **★ METHOD LESSON: when rch's rsync drops `cargo bench` stderr, capture a DETERMINISTIC measurement as a
 `#[test]` (`--nocapture` / asserted bounds) — `cargo test` output survived the same broken fleet.**
+
+### 2026-07-13 — cc_fse — IVF recall is ROBUST to cluster overlap (0.998@probe2 even at heavy overlap); real-corpus gate DATA-blocked, so NOT landed yet
+
+Ran the "real-corpus gate" for the validated IVF lever. The definitive gate is DATA-BLOCKED: no `FS_REAL_SLAB`
+(real embedding slab) is staged on the workers or accessible locally (the `real_embed_*` benches SKIP without it),
+so real-embedding recall cannot be measured here. As the best available proxy, swept synthetic cluster OVERLAP
+(noise 0.4→2.5, center spread ±4; higher noise = clusters overlap, the property real embeddings have that
+well-separated synthetic lacks), via the TEST channel (`ivf_recall_test.rs`, since rch still drops `cargo bench`
+stderr):
+- easy (noise 0.4): recall@10 0.954→**1.0000** by probe=2 (from prior run)
+- **hard (noise 2.5, overlapping): recall@10 0.9979 @ probe=2 (34× fewer dots), 1.0000 @ probe=4 (20×)**
+
+**IVF recall does NOT collapse under cluster overlap — it stays ≥0.998 at probe=2 across the difficulty sweep.**
+Strong evidence the sub-linear-reduction-at-high-recall mechanism survives realistic overlap. Test passes
+(monotone + hard-probe-32 ≥ 0.80).
+**LAND DECISION: NOT landed.** Synthetic-robust ≠ real-landable: (1) the definitive real-corpus recall is
+data-blocked; Gaussian overlap approximates but doesn't capture real-embedding manifold/hubness/anisotropy;
+(2) per `93289c7`, real-data ANN hit recall 0.98 (not 1.0) and TIES the int8-two-pass default ≤130k — IVF only
+beats the REAL baseline at N≫130k; (3) the InMemory path has no ANN infra (substantial wiring). Landing a
+production APPROXIMATE index on synthetic-only evidence contradicts the codebase's own ANN real-corpus-first
+lesson. **STATUS: IVF lever = implemented + speed-validated (40-82× vs flat) + recall-robust across a synthetic
+overlap sweep; the ONE remaining pre-land gate is REAL-corpus recall, unblockable by staging `FS_REAL_SLAB`
+(real 130k+ embeddings) on a worker — then, if recall holds at small probe, promote to an opt-in `src/` IVF index
+wired into InMemory.** Bench/test-only; production unchanged.
