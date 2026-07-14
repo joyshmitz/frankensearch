@@ -14700,3 +14700,25 @@ RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1227854 RCH_ENV_ALLOWLIST=AG
 Production and benchmark files were restored exactly; only this blocker record ships. No release-perf profile,
 local Cargo fallback, parallel benchmark, or retry ran. Move to a different subsystem next turn; do not revisit
 this allocation seam until RCH can verify the exact lexical benchmark artifact is warm before dispatch.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: adaptive NQC single-shift candidate never reached timing (`bd-x99j`)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` again surfaced already-resolved work, so
+this turn isolated a fresh steady-state ranking cost in the shipped adaptive NQC sampler. Once its 2,048-value
+window is full, every observation performs both `Vec::remove` and `Vec::insert` shifts. The candidate located
+the old and new positions on the unchanged sorted slice and used one `copy_within` over their displacement.
+The retained warm production benchmark did complete before the candidate edit and attributed the shipped
+incremental-order path at 192.16 ns/query median (205.61 ns/query p95), versus its historical periodic-sort
+control at 701.63 ns/query median. Those numbers characterize the existing path only; they do not measure the
+single-shift candidate.
+
+**Candidate gate blocker.** A same-binary former/candidate harness with exact weight-bit parity was prepared,
+but the candidate A/B never executed. The first full-LTO remote release attempt exhausted the foreground time
+budget during compilation. A bounded `--profile release` build then completed only the pre-edit attribution
+run. The final same-binary candidate invocation again remained compile-only across RCH target routing and was
+stopped without parity or timing rather than extending the invalid warm-target chase. No local Cargo fallback
+or release-perf profile ran.
+
+**Decision: INVALID/HOLD.** There is no admissible candidate result. Production and benchmark files are
+restored exactly; only this blocker record ships. The adaptive NQC lane is closed after this inconclusive gate:
+do not retry or rewarm it—move to a different subsystem and accept the first clean foreground release A/B.
