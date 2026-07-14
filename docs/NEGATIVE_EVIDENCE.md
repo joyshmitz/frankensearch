@@ -14251,3 +14251,39 @@ flat-broad loss. **Route-next (concrete, multi-turn):** an IDF/selectivity-aware
 IDFs), keep the counted path for flat mid-IDF disjunctions — validated on a realistic Zipfian corpus carrying BOTH
 skewed (saturating+rare) and flat (multi-mid-IDF) query shapes before landing. `RCH_REQUIRE_REMOTE=1` throughout
 (`vmi1227854`); no local fallback.
+
+### 2026-07-14 — cc_fse — CORRECTION + DEAD END: the count-free WAND "win" was a FIXTURE ARTIFACT; on a realistic mid-IDF corpus count-free REGRESSES ~2× and the IDF/`min_df` gate predicate FAILS
+
+Tried to LAND the IDF/selectivity-aware count-free gate proposed in the previous entry ("count-free WAND gate is on
+the wrong axis"). Built `count_free_idf_gate_ab` with THREE term-frequency classes the earlier fixture lacked:
+`search` (100% doc frequency), `commonN` (~50%, mid-IDF, ×8), `rareN` (~0.2% selective, ×5000), N=50k, and had it
+print each parsed query's `min(doc_freq)` (the candidate gate signal), the count-free-vs-counted paired ratio, AND
+whether the two collectors return the same ranked hits. Result (free/counted, `<1` = count-free faster; `matches=100`):
+
+| query | min_df | predicate | order_id | set_id | free/counted [p5, p95] | verdict |
+|---|---:|---|---|---|---:|---|
+| flat3_common (`common0 common1 common2`) | 25000 | counted | ✗ | ✗ | 2.22 [1.84, 2.71] | regression |
+| flat5_sat_common (`search + 4 common`) | 25000 | counted | ✓ | ✓ | 2.96 [2.46, 3.40] | regression |
+| skewed3_sat_rare (`search rare7 rare113`) | 87 | **FREE** | ✓ | ✓ | **1.97 [1.52, 2.43]** | **REGRESSION** |
+| mixed3_common_rare (`common0 common1 rare7`) | 115 | **FREE** | ✗ | ✓ | **2.30 [2.14, 2.57]** | **REGRESSION** |
+| sel3_rare (`rare7 rare113 rare509`) | 87 | FREE | ✓ | ✓ | 1.02 [0.91, 1.13] | neutral |
+
+**Two findings that kill the lever.** (1) **The `min_df` predicate FAILS.** `skewed3_sat_rare` and
+`mixed3_common_rare` have a low-`doc_freq` "selective anchor" (min_df 87/115 < 500) so the predicate routes them to
+count-free — yet count-free is a decidable **~2× REGRESSION** there. A selective anchor does NOT make WAND prune
+when the corpus also carries mid-IDF mass. (2) **The previous entry's ~2.3–2.8× "win" was a FIXTURE ARTIFACT.** The
+exact same query shape (`search` + two rare terms) measured **0.357× (2.8× faster)** on the earlier corpus (saturating
+`search` + only rare terms, no mid-IDF) but **1.97× (2× SLOWER)** here once realistic ~50%-frequency terms exist in
+the corpus — even though those mid-IDF terms are not in the query. The count-free benefit is not robust to corpus
+composition and cannot be predicted from the query's own per-term `doc_freq`. This realistic-corpus result reproduces
+CopperLark's original ~2× `natural_language` regression and **vindicates the conservative `≤2-term` gate**.
+
+**Bonus correctness note:** count-free (WAND) and counted are NOT always result-identical — `flat3_common` returns a
+DIFFERENT top-100 doc SET (`set_id=✗`), and `mixed3_common_rare` a different ORDER (`order_id=✗`), because WAND breaks
+BM25 score TIES differently than the full scan. So broadening the count-free gate is a ranking/quality change, not a
+pure perf lever — a further reason to keep it narrow.
+
+**Decision: DEAD END, production unchanged.** A label-free/IDF gate cannot safely extend count-free — the benefit
+reverses sign with corpus composition and the routed queries regress ~2×. Do NOT re-attempt an IDF/`doc_freq`-keyed
+count-free gate. Retained `count_free_idf_gate_ab` (reproduces the reversal + the tie-break parity gap in one binary).
+This corrects the 2026-07-14 "wrong axis" entry. `RCH_REQUIRE_REMOTE=1` throughout (`vmi1227854`); no local fallback.
