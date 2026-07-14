@@ -14753,3 +14753,27 @@ worker/target chase ran.
 and the closed bead ship. Do not retry delimiter-search variants on ordinary short markdown links. Reconsider
 only if a product-real workload demonstrates materially longer labels/URLs where skipped non-delimiter bytes
 dominate the per-call search overhead.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: incremental palette-typing gate found its supposedly warm RCH target cold (`bd-70wy`)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` again ranked `bd-6m8p`, but the later
+2026-07-12 ledger resolution closes that tombstone-bitmap route as non-default and fleet-unmeasurable. The
+fresh residual after `bd-072j` was `CommandPalette::push_char`: each appended character called
+`rebuild_matches`, scanning every cached search record even though a growing ASCII substring query can only
+shrink the previous ordered result set. The single candidate retain-filtered the current indices for ASCII
+appends while preserving the full rebuild for Unicode input and backspace. Prefix-by-prefix ASCII/Unicode
+ordered-ID parity was asserted, and scoped UBS, rustfmt, and diff checks passed before timing.
+
+**Cheap strict-remote gate did not reach timing.** The sole foreground invocation used 1,024 actions, 10
+samples, 50 ms warm-up, 150 ms measurement time, `--profile release`, `LTO=false`, and a hard 300-second outer
+timeout. RCH selected `vmi1153651` and reported the exact worker-scoped target namespace used by the immediately
+preceding successful palette bench (`.rch-target-vmi1153651-pool-3128ad52307074090351fabddd484f8d`). Despite
+that, Cargo redownloaded and began recompiling the full dependency graph rather than incrementally rebuilding
+the two touched TUI files. The run was stopped after the cold rebuild was unambiguous and before five minutes;
+it emitted no Criterion sample, candidate ratio, or admissible speed verdict. There was no local fallback,
+`release-perf` build, second invocation, worker reroute, or target-warming chase.
+
+**Decision: INVALID/HOLD.** Production and benchmark files were restored exactly; only this blocker record and
+the closed bead ship. The ASCII subset mechanism remains unmeasured, not rejected. Do not retry it in this
+turn's target namespace; a future attempt requires an RCH release artifact that is demonstrably retained before
+the bounded foreground command starts.
