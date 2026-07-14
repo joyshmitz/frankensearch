@@ -241,6 +241,31 @@ now with **Tantivy-faithful stem+stop** via `snowballstemmer` + Lucene stopwords
   +0.035, pool-min-max>RRF +0.017) are trustworthy; the sub-0.003 washes (z-score, pool-size) were correctly read
   as noise.
 
+## 2026-07-14 update — bootstrap-CI on the pool-min-max vs RRF fusion default (corrects an over-cited single-run number)
+
+The pool-min-max-beats-RRF result (a9e53b4) was a **single-run point estimate** on scifact ("+0.017, trustworthy").
+Per this doc's own statistical caution (±0.003-scale single-run deltas are noise), that needed a bootstrap CI. New
+harness `fusion_pmm_vs_rrf_ci.py` computes the **per-query nDCG@10 delta (pool-min-max − RRF)** with a 2000-resample
+95% bootstrap CI, stem+stop lexical + model2vec `potion-retrieval-32M` dense, top-100 pool, per corpus + POOLED
+(seed 12345):
+
+| corpus | q | pool-min-max | RRF | Δ (mm−rrf) | 95% CI | CI excludes 0 |
+|---|---:|---:|---:|---:|---|---|
+| scifact | 300 | 0.7120 | 0.7003 | +0.0117 | [−0.0003, +0.0245] | **no (borderline)** |
+| nfcorpus | 323 | 0.3471 | 0.3344 | +0.0127 | [+0.0068, +0.0186] | yes |
+| arguana | 1406 | 0.3601 | 0.3604 | −0.0003 | [−0.0042, +0.0039] | no (wash) |
+| scidocs | 1000 | 0.1627 | 0.1576 | +0.0051 | [+0.0023, +0.0080] | yes |
+| **POOLED** | **3029** | — | — | **+0.0041** | **[+0.0016, +0.0066]** | **yes** |
+
+**Verdict:** pool-min-max is **pooled-decisively but MODESTLY** better than RRF (+0.0041, CI excludes 0 over 3029
+queries) and is **never decisively worse** on any single corpus — so it is a safe-or-better default fusion. BUT the
+effect is corpus-dependent (decisive only on nfcorpus/scidocs; a wash on arguana) and, importantly, **the famous
+scifact "+0.017 trustworthy" single-run number is actually BORDERLINE under bootstrap** — its 95% CI
+[−0.0003, +0.0245] includes zero. So the honest case for pool-min-max as the fusion default rests on the *pooled*
+cross-corpus CI (~+0.004), not the scifact headline (which overstated a borderline result). This reinforces the
+doc's own caution: CI single-tier-vs-fusion deltas before quoting them as robust. No Rust change (Python proxy
+harness; does not exercise shipped code). Harness: `docs/quality_harness/fusion_pmm_vs_rrf_ci.py`.
+
 ## Implementation status
 
 The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
