@@ -14934,3 +14934,38 @@ the hard timeout returned exit 124.
 blocker row and the closed bead ship. The idea is unmeasured, not rejected. No second benchmark, local Cargo
 fallback, worker reroute, cache-warming attempt, or `release-perf` build ran. Do not retry this parser until RCH
 can execute the retained `parsed_query` release artifact inside the bounded foreground gate.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: lazy rerank identity map never reached the existing combine benchmark (`bd-x6pa`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` again ranked the later-closed
+`bd-6m8p` tombstone route, while the immediately preceding core parser gate showed that retained binaries were
+still being replaced by fresh worker targets. This turn therefore pivoted to rerank orchestration and reused the
+existing `combine_reorder_cost_ab` bench. Source attribution found that `rerank_step_with_combine` allocates and
+fills an `included_indices: Vec<usize>` even on the common all-text path, where reranker rank is already the
+candidate index. The candidate kept that map absent until the first missing-text gap, then allocated and
+backfilled it for exact partial-text behavior. The focused comparator used 32 real `ScoredResult` candidates and
+prepared exact document/index parity assertions for both all-text and gapped-text inputs. Opportunity score was
+8.0 (`impact=2 × confidence=4 / effort=1`).
+
+**The sole strict-remote release gate remained a cold dependency update.** The foreground command left
+`CARGO_TARGET_DIR` unset, selected only `rerank_prepare_mapping/32`, used 10 samples with 50 ms warm-up and
+150 ms measurement time, disabled release LTO, and had a 120-second hard cap:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 AGENT_NAME=IcyRidge \
+  CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch --no-self-healing exec -- cargo bench -p frankensearch-rerank \
+  --profile release --bench combine_reorder_cost_ab -- \
+  rerank_prepare_mapping/32 --sample-size 10 --warm-up-time 0.05 \
+  --measurement-time 0.15 --noplot
+```
+
+RCH selected `vmi1153651`, spent **31.645 seconds** syncing 15 roots, and rewrote the default target to
+`.rch-target-vmi1153651-pool-3128ad52307074090351fabddd484f8d`. Cargo then updated the crates.io index and the
+`frankentorch` git dependency but emitted no parity result or Criterion sample before exit 124.
+
+**Decision: INVALID/HOLD.** The production candidate and focused comparator were manually restored; only this
+blocker row and the closed bead ship. The allocation-elision idea is unmeasured, not rejected. No second
+benchmark, local Cargo fallback, worker reroute, cache-warming attempt, or `release-perf` build ran. Do not retry
+this rerank-preparation seam until RCH can execute the retained release artifact inside the bounded foreground
+gate.
