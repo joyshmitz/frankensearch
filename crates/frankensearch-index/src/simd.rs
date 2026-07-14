@@ -755,7 +755,13 @@ pub fn dot_i8_i8(stored: &[i8], query: &[i8]) -> i32 {
         if std::is_x86_feature_detected!("avx2") {
             // SAFETY: avx2 verified present by the runtime check above.
             #[allow(unsafe_code)]
-            return unsafe { dot_i8_i8_avx2(stored, query) };
+            return unsafe {
+                if stored.len() == 384 && query.len() == 384 {
+                    dot_i8_i8_avx2_384(stored, query)
+                } else {
+                    dot_i8_i8_avx2(stored, query)
+                }
+            };
         }
     }
     dot_i8_i8_generic(stored, query)
@@ -1048,6 +1054,66 @@ unsafe fn dot_i8_i8_avx2(stored: &[i8], query: &[i8]) -> i32 {
             i += 1;
         }
         result
+    }
+}
+
+/// Fixed-shape AVX2 i8 dot for the production MiniLM dimension. Expanding the
+/// twelve 32-byte blocks removes the dynamic length, loop control, and scalar
+/// tail from every corpus-vector score while retaining the shipped two-lane
+/// accumulation and exact integer reduction tree.
+///
+/// # Safety
+/// The caller must ensure AVX2 is available and both slices contain exactly 384
+/// elements. [`dot_i8_i8`] enforces both preconditions before dispatching here.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn dot_i8_i8_avx2_384(stored: &[i8], query: &[i8]) -> i32 {
+    use core::arch::x86_64::{
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
+    };
+
+    macro_rules! accumulate32 {
+        ($offset:expr, $acc0:ident, $acc1:ident) => {{
+            let s = _mm256_loadu_si256(stored.as_ptr().add($offset).cast::<__m256i>());
+            let q = _mm256_loadu_si256(query.as_ptr().add($offset).cast::<__m256i>());
+            let s_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(s));
+            let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q));
+            let s_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(s));
+            let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(q));
+            $acc0 = _mm256_add_epi32($acc0, _mm256_madd_epi16(s_lo, q_lo));
+            $acc1 = _mm256_add_epi32($acc1, _mm256_madd_epi16(s_hi, q_hi));
+        }};
+    }
+
+    // SAFETY: the wrapper verifies AVX2 and exact 384-element inputs. Every
+    // expanded load therefore stays within the two slices.
+    unsafe {
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        accumulate32!(0, acc0, acc1);
+        accumulate32!(32, acc0, acc1);
+        accumulate32!(64, acc0, acc1);
+        accumulate32!(96, acc0, acc1);
+        accumulate32!(128, acc0, acc1);
+        accumulate32!(160, acc0, acc1);
+        accumulate32!(192, acc0, acc1);
+        accumulate32!(224, acc0, acc1);
+        accumulate32!(256, acc0, acc1);
+        accumulate32!(288, acc0, acc1);
+        accumulate32!(320, acc0, acc1);
+        accumulate32!(352, acc0, acc1);
+        let acc = _mm256_add_epi32(acc0, acc1);
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256::<1>(acc),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+        _mm_cvtsi128_si32(sum32)
     }
 }
 

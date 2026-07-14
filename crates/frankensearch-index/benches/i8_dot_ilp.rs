@@ -1,8 +1,6 @@
-//! ILP probe for the int8·int8 dot kernel: 2 accumulators (the shipped
-//! `dot_i8_i8_avx2`) vs 4 accumulators. Integer adds associate, so any
-//! accumulator count is bit-identical — this only asks whether the 2-acc kernel
-//! is latency-bound on its `vpaddd` chains (like the f16 dot was) or already
-//! throughput-bound on `vpmovsxbw`/`vpmaddwd`.
+//! Int8·int8 AVX2 probes: the shipped dynamic 2-accumulator kernel versus both
+//! the rejected 4-accumulator ILP variant and the kept fixed-shape 384-dim
+//! specialization (`bd-qdw5`). Integer adds associate, so all arms are exact.
 //!
 //! Run with:
 //! ```bash
@@ -13,7 +11,7 @@
 #![allow(unsafe_code)]
 
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
@@ -72,6 +70,107 @@ unsafe fn dot_i8_2acc(stored: &[i8], query: &[i8]) -> i32 {
         }
         sum
     }
+}
+
+/// Production-shape probe: the shipped two-accumulator reduction specialized
+/// for MiniLM's fixed 384 dimensions. Expanding the 12 blocks removes the
+/// dynamic `min`, loop test/increment, and scalar-tail machinery from every
+/// corpus-vector dot while preserving the exact integer reduction tree.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_2acc_fixed384(stored: &[i8], query: &[i8]) -> i32 {
+    use core::arch::x86_64::{
+        __m256i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_shuffle_epi32, _mm_unpackhi_epi64,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepi8_epi16, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_madd_epi16, _mm256_setzero_si256,
+    };
+    debug_assert_eq!(stored.len(), DIM);
+    debug_assert_eq!(query.len(), DIM);
+    macro_rules! accumulate32 {
+        ($offset:expr, $acc0:ident, $acc1:ident) => {{
+            let s = _mm256_loadu_si256(stored.as_ptr().add($offset).cast::<__m256i>());
+            let q = _mm256_loadu_si256(query.as_ptr().add($offset).cast::<__m256i>());
+            let s_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(s));
+            let q_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q));
+            let s_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(s));
+            let q_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(q));
+            $acc0 = _mm256_add_epi32($acc0, _mm256_madd_epi16(s_lo, q_lo));
+            $acc1 = _mm256_add_epi32($acc1, _mm256_madd_epi16(s_hi, q_hi));
+        }};
+    }
+    unsafe {
+        let mut acc0 = _mm256_setzero_si256();
+        let mut acc1 = _mm256_setzero_si256();
+        accumulate32!(0, acc0, acc1);
+        accumulate32!(32, acc0, acc1);
+        accumulate32!(64, acc0, acc1);
+        accumulate32!(96, acc0, acc1);
+        accumulate32!(128, acc0, acc1);
+        accumulate32!(160, acc0, acc1);
+        accumulate32!(192, acc0, acc1);
+        accumulate32!(224, acc0, acc1);
+        accumulate32!(256, acc0, acc1);
+        accumulate32!(288, acc0, acc1);
+        accumulate32!(320, acc0, acc1);
+        accumulate32!(352, acc0, acc1);
+        let acc = _mm256_add_epi32(acc0, acc1);
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256::<1>(acc),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_unpackhi_epi64(sum128, sum128));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32::<0b01>(sum64));
+        _mm_cvtsi128_si32(sum32)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn time_fixed_batch<const FIXED: bool>(corpus: &[i8], query: &[i8], inner: usize) -> Duration {
+    let started = Instant::now();
+    let mut acc = 0_i32;
+    for _ in 0..inner {
+        for i in 0..N {
+            let vector = &corpus[i * DIM..i * DIM + DIM];
+            let dot = if FIXED {
+                // SAFETY: the benchmark gates AVX2 and passes exact 384-element slices.
+                unsafe { dot_i8_2acc_fixed384(black_box(vector), black_box(query)) }
+            } else {
+                // SAFETY: the benchmark gates AVX2.
+                unsafe { dot_i8_2acc(black_box(vector), black_box(query)) }
+            };
+            acc = acc.wrapping_add(dot);
+        }
+    }
+    black_box(acc);
+    started.elapsed()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn paired_fixed_ratio<const CANDIDATE_FIXED: bool>(corpus: &[i8], query: &[i8]) -> Vec<f64> {
+    const PAIRS: usize = 31;
+    const INNER: usize = 32;
+    let mut ratios = Vec::with_capacity(PAIRS);
+    for pair in 0..PAIRS {
+        let (a1, b1, b2, a2) = if pair.is_multiple_of(2) {
+            (
+                time_fixed_batch::<false>(corpus, query, INNER),
+                time_fixed_batch::<CANDIDATE_FIXED>(corpus, query, INNER),
+                time_fixed_batch::<CANDIDATE_FIXED>(corpus, query, INNER),
+                time_fixed_batch::<false>(corpus, query, INNER),
+            )
+        } else {
+            let b1 = time_fixed_batch::<CANDIDATE_FIXED>(corpus, query, INNER);
+            let a1 = time_fixed_batch::<false>(corpus, query, INNER);
+            let a2 = time_fixed_batch::<false>(corpus, query, INNER);
+            let b2 = time_fixed_batch::<CANDIDATE_FIXED>(corpus, query, INNER);
+            (a1, b1, b2, a2)
+        };
+        ratios.push(
+            ((b1.as_secs_f64() / a1.as_secs_f64()) * (b2.as_secs_f64() / a2.as_secs_f64())).sqrt(),
+        );
+    }
+    ratios.sort_unstable_by(f64::total_cmp);
+    ratios
 }
 
 /// 4-accumulator AVX2 i8·i8 dot — unrolls two 32-byte chunks per iteration into
@@ -155,8 +254,43 @@ fn bench(c: &mut Criterion) {
             let v = &corpus[i * DIM..i * DIM + DIM];
             let a = unsafe { dot_i8_2acc(v, &query) };
             let b = unsafe { dot_i8_4acc(v, &query) };
+            let fixed = unsafe { dot_i8_2acc_fixed384(v, &query) };
             assert_eq!(a, b, "4-acc must equal 2-acc (integer) at {i}");
+            assert_eq!(a, fixed, "fixed-384 must equal dynamic 2-acc at {i}");
         }
+
+        // Paired AB/BA timing with an A/A control calibrates the sub-microsecond
+        // scheduler/order floor in the same binary before Criterion's estimates.
+        black_box(time_fixed_batch::<false>(&corpus, &query, 8));
+        black_box(time_fixed_batch::<true>(&corpus, &query, 8));
+        let null = paired_fixed_ratio::<false>(&corpus, &query);
+        let lever = paired_fixed_ratio::<true>(&corpus, &query);
+        let middle = null.len() / 2;
+        let null_median = null[middle];
+        let lever_median = lever[middle];
+        eprintln!(
+            "[fixed384-paired] null_median={null_median:.6} null_p5={:.6} null_p95={:.6} \
+             lever_median={lever_median:.6} lever_p5={:.6} lever_p95={:.6} \
+             calibrated_ratio={:.6} parity=true pairs={}",
+            null[1],
+            null[null.len() - 2],
+            lever[1],
+            lever[lever.len() - 2],
+            lever_median / null_median,
+            lever.len()
+        );
+
+        let mut fixed_group = c.benchmark_group("i8_dot_fixed384");
+        fixed_group.sample_size(10);
+        fixed_group.warm_up_time(Duration::from_millis(250));
+        fixed_group.measurement_time(Duration::from_secs(1));
+        fixed_group.bench_function("dynamic", |bch| {
+            bch.iter(|| black_box(time_fixed_batch::<false>(&corpus, &query, 1)))
+        });
+        fixed_group.bench_function("fixed", |bch| {
+            bch.iter(|| black_box(time_fixed_batch::<true>(&corpus, &query, 1)))
+        });
+        fixed_group.finish();
 
         let mut group = c.benchmark_group("i8_dot_ilp");
         group.warm_up_time(Duration::from_millis(500));
