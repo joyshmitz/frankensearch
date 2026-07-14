@@ -13913,3 +13913,29 @@ coded and runs but its output is pending a stable rch fleet.** Next: re-run `ivf
 result-retrieval is healthy to capture recall@10(probe); then, if recall is acceptable at a small probe, promote
 the IVF from bench to an opt-in `src/` index type + wire it into the InMemory path (which has no ANN). No
 production change (bench-only).
+
+### 2026-07-13 — cc_fse — IVF lever VALIDATED end-to-end: probe=2 → recall@10 1.0 at 15× fewer dots (synthetic clustered); real-corpus recall is the last gate
+
+Completed the IVF lever (implemented `ivf_recall_ab` + speed `ivf_crossover_ab`) by capturing the RECALL/probe
+Pareto through the TEST channel (`tests/ivf_recall_test.rs`, `ivf_recall_pareto`) — this session's rch dropped
+`cargo bench` stderr on retrieval (6+ eaten runs) but `cargo test --nocapture` output returned. Deterministic
+recall (fixed synthetic seed + k-means), N=16384, NLIST=128, k-means(6 iters):
+
+| probe | recall@10 | scanned (% of N) | dot reduction |
+|---|---|---|---|
+| 1 | 0.9542 | 1.6% | ~61× |
+| 2 | **1.0000** | 6.5% | ~15× |
+| 4-32 | 1.0000 | 14-40% | ~7-3× |
+
+**On well-clustered data IVF gets PERFECT recall@10 at probe=2, scanning only 6.5% of candidates (~15× fewer
+dots); even probe=1 is 0.954 at ~61×.** Combined with `ivf_crossover_ab` (40-82× vs flat at N≫130k), the IVF
+candidate-reduction lever is now IMPLEMENTED + speed-validated + recall-validated (on synthetic). Test passes
+(monotone + probe-32 ≥ 0.90) so it doubles as a regression guard.
+**★ CAVEAT (why not landable yet): synthetic clusters are WELL-SEPARATED (128 Gaussians, ±4 centers, 0.4 noise),
+which OVERSTATES recall — real embeddings cluster far less cleanly, so real-corpus recall at probe=2 would be
+< 1.0 (cf `93289c7`: real-data HNSW ef40 hit 0.98, not 1.0). The lever's SHAPE (small probe → high recall + big
+reduction) holds; the exact real probe for recall ≥ 0.99 needs a real corpus.** NEXT (concrete): run
+`ivf_recall_pareto` against staged REAL embeddings (data-blocked) to pin the real probe/recall/reduction point;
+if acceptable, promote IVF from bench/test to an opt-in `src/` index type wired into the InMemory path (no ANN
+today). **★ METHOD LESSON: when rch's rsync drops `cargo bench` stderr, capture a DETERMINISTIC measurement as a
+`#[test]` (`--nocapture` / asserted bounds) — `cargo test` output survived the same broken fleet.**
