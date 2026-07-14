@@ -14287,3 +14287,38 @@ pure perf lever — a further reason to keep it narrow.
 reverses sign with corpus composition and the routed queries regress ~2×. Do NOT re-attempt an IDF/`doc_freq`-keyed
 count-free gate. Retained `count_free_idf_gate_ab` (reproduces the reversal + the tie-break parity gap in one binary).
 This corrects the 2026-07-14 "wrong axis" entry. `RCH_REQUIRE_REMOTE=1` throughout (`vmi1227854`); no local fallback.
+
+### 2026-07-14 — IcyRidge — RESOLVED/LANDED: Model2Vec full-row prefetch only at 512+ tokens clears the null floor (`bd-vxki`)
+
+This resolves the explicit route-next from `bd-r3lf` without retrying its rejected 256-token onset. The one
+production lever routes `Model2VecEmbedder::embed_sync` through the retained exact gather helper, preserves the
+original loop below 512 tokens and on non-x86 targets, and prefetches every cache line of the embedding row four
+tokens ahead only at 512+. The boundary is product-reachable: storage and fsfs embed canonicalized source-file
+content, the default canonicalizer retains up to 2,000 characters, and the Model2Vec tokenizer call applies no
+additional repo-side token truncation.
+
+The authoritative release benchmark used two byte-identical 30 MiB embedding tables, a pseudo-random full-table
+sweep, the former production loop as the original arm, exact pooled-output bit parity before timing, and 31
+alternating paired rounds with an A/A null control. Candidate/original ratios below 1 favor the shipped helper:
+
+| tokens | A/A null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 128 | 0.997263 [0.727475, 1.359142] | 1.089797 [0.744414, 1.397318] | original path preserved |
+| 256 | 1.000972 [0.825183, 1.159020] | 1.067836 [0.782674, 2.918815] | original path preserved |
+| 512 | 1.018346 [0.750244, 1.279036] | **0.612870** [0.426846, 0.829550] | **decidable win (~1.63×)** |
+
+**Decision: LANDED.** The exact 512-token arm is approximately 38.7% lower latency and clears the A/A p5 by a
+wide margin; sub-512 inputs execute the prior accumulation loop. The strict-remote foreground benchmark completed
+on `vmi1152480` with exit 0; RCH ignored the requested worker hint and selected that worker:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_WORKER=vmi1153651 RCH_ENV_ALLOWLIST=AGENT_NAME \
+AGENT_NAME=IcyRidge env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 \
+  -p frankensearch-embed --features model2vec,bench-internals --profile release \
+  --bench model2vec_gather_prefetch -- --noplot
+```
+
+The same worker passed the module-qualified exact oracle 1/1 across dimensions 1/7/8/31/128/256/257, OOV rows,
+and token counts 0/1/127/128/255/256/511/512/513/1024. An earlier test invocation matched zero tests because
+`--exact` lacked the module path; it is excluded. Every Cargo command was fail-closed remote-only; no local
+fallback occurred.

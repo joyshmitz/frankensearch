@@ -17,15 +17,15 @@
 //!
 //! Historical Criterion arms retain `base`, `pf_head`, and `pf_row`. The shipping
 //! gate additionally compares the exact former production loop with
-//! `accumulate_model2vec_rows`: no prefetch below 256 tokens, full-row prefetch at
-//! 256+, and mean-scaling plus L2 normalization included. Each timed arm traverses
+//! `accumulate_model2vec_rows`: no prefetch below 512 tokens, full-row prefetch at
+//! 512+, and mean-scaling plus L2 normalization included. Each timed arm traverses
 //! a full 30 MB table copy so repeated sampling cannot turn the long-document
 //! workload into an L2-resident microbenchmark.
 //!
 //! ```bash
-//! CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cc \
-//!   rch exec -- cargo bench -p frankensearch-embed --profile release \
-//!     --bench model2vec_gather_prefetch
+//! RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 \
+//!   -p frankensearch-embed --features model2vec,bench-internals \
+//!   --profile release --bench model2vec_gather_prefetch -- --noplot
 //! ```
 
 use std::hint::black_box;
@@ -67,7 +67,7 @@ fn prefetch_row(_emb: &[f32], _row_start: usize, _full: bool) {
     }
 }
 
-/// SHIPPED: gather each token's row and accumulate, no prefetch (embed_sync loop).
+/// ORIGINAL: gather each token's row and accumulate, no prefetch.
 fn gather_base(emb: &[f32], ids: &[u32], sum: &mut [f32]) -> usize {
     sum.fill(0.0);
     let mut count = 0_usize;
@@ -232,7 +232,7 @@ fn paired_shipping_gate(emb_original: &[f32], emb_candidate: &[f32]) {
                 );
             },
         );
-        let verdict = if tokens_per_doc < 256 {
+        let verdict = if tokens_per_doc < 512 {
             if lever.median > null.p95 {
                 "SHORT_REGRESSION"
             } else {

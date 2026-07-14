@@ -5386,3 +5386,24 @@ sweep, exact output parity, 31 alternating paired rounds, and an A/A null contro
 **Decision:** production restored byte-for-byte because the exact 256-token onset does not clear its null floor.
 The feature-gated exact oracle and reproducer are retained. The 512-token mechanism win is route-next only: a
 512-only threshold would need a final-code paired run and evidence of real production prevalence.
+
+## 2026-07-14 — LANDED: Model2Vec full-row prefetch only at 512+ tokens, ~1.63× (`bd-vxki`)
+
+Resolved the `bd-r3lf` route-next as a separate thresholded lever. `Model2VecEmbedder::embed_sync` now uses the
+exact gather helper: the former loop remains unchanged below 512 tokens and on non-x86 targets; 512+ token
+documents prefetch every cache line of the row four tokens ahead. This is a reachable indexing boundary because
+the product embeds canonicalized source-file contents up to the default 2,000-character limit and the tokenizer
+adds no repo-side token truncation.
+
+Strict-remote same-binary foreground evidence on `vmi1152480` (two byte-identical 30 MiB tables, pseudo-random
+full-table sweep, exact pooled-output parity, 31 alternating paired rounds, A/A null; candidate/original):
+
+| tokens | A/A null median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 128 | 0.997263 [0.727475, 1.359142] | 1.089797 [0.744414, 1.397318] | original path preserved |
+| 256 | 1.000972 [0.825183, 1.159020] | 1.067836 [0.782674, 2.918815] | original path preserved |
+| 512 | 1.018346 [0.750244, 1.279036] | **0.612870** [0.426846, 0.829550] | **decidable win (~1.63×)** |
+
+The module-qualified strict-remote exact oracle passed 1/1 across the threshold, varied dimensions, and OOV rows;
+the prior zero-test filter invocation is excluded. **Decision: LANDED** — approximately 38.7% lower latency at
+512 tokens, with the original production accumulation path preserved below the gate.

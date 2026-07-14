@@ -220,21 +220,12 @@ impl Model2VecEmbedder {
 
         // Mean pool: accumulate embeddings for in-vocabulary tokens
         let mut sum = vec![0.0_f32; self.dimensions];
-        let mut count: usize = 0;
-
-        for &token_id in token_ids {
-            let idx = token_id as usize;
-            if idx < self.vocab_size {
-                let start = idx * self.dimensions;
-                let end = start + self.dimensions;
-                let row = &self.embeddings[start..end];
-                // Runtime-AVX2 mean-pool accumulate (bit-identical; ~1.43× over the
-                // SSE2 auto-vec on this no-global-avx2 build).
-                crate::simd::accumulate_f32_into(&mut sum, row);
-                count += 1;
-            }
-            // Out-of-vocabulary tokens are silently skipped (common in Model2Vec)
-        }
+        let count = crate::simd::accumulate_model2vec_rows(
+            &mut sum,
+            &self.embeddings,
+            token_ids,
+            self.vocab_size,
+        );
 
         if count == 0 {
             // All tokens were OOV — return zero vector

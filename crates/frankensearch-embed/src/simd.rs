@@ -36,25 +36,21 @@ pub fn accumulate_f32_into(sum: &mut [f32], row: &[f32]) {
 /// prefetch instructions are added. Long document sequences are the cache-cold
 /// index-time regime where fetching a future full row can overlap the current
 /// row's accumulation.
-#[cfg(feature = "bench-internals")]
-const MODEL2VEC_PREFETCH_MIN_TOKENS: usize = 256;
+const MODEL2VEC_PREFETCH_MIN_TOKENS: usize = 512;
 
 /// Distance, in token rows, between the row being accumulated and prefetched.
-#[cfg(feature = "bench-internals")]
 const MODEL2VEC_PREFETCH_DISTANCE: usize = 4;
 
 /// Number of `f32` values in one 64-byte cache line.
-#[cfg(feature = "bench-internals")]
 const CACHE_LINE_F32: usize = 16;
 
 /// Mean-pool Model2Vec rows into `sum`, returning the number of in-vocabulary rows.
 ///
-/// This mirrors the production gather loop for the benchmark comparator. On
+/// This is the production gather loop and the benchmark's candidate arm. On
 /// x86-64, sequences of at least [`MODEL2VEC_PREFETCH_MIN_TOKENS`] prefetch every
 /// cache line of the row four tokens ahead. Short sequences and non-x86 targets
 /// retain the original no-prefetch loop exactly.
 #[doc(hidden)]
-#[cfg(feature = "bench-internals")]
 #[inline]
 pub fn accumulate_model2vec_rows(
     sum: &mut [f32],
@@ -77,7 +73,6 @@ pub fn accumulate_model2vec_rows(
 }
 
 #[inline]
-#[cfg(feature = "bench-internals")]
 fn accumulate_model2vec_rows_base(
     sum: &mut [f32],
     embeddings: &[f32],
@@ -98,7 +93,6 @@ fn accumulate_model2vec_rows_base(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[cfg(feature = "bench-internals")]
 #[inline]
 fn accumulate_model2vec_rows_prefetched(
     sum: &mut [f32],
@@ -127,7 +121,6 @@ fn accumulate_model2vec_rows_prefetched(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[cfg(feature = "bench-internals")]
 #[inline(always)]
 fn prefetch_f32_row(embeddings: &[f32], start: usize, dimensions: usize) {
     use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
@@ -175,9 +168,7 @@ fn accumulate_f32_into_avx2(sum: &mut [f32], row: &[f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::accumulate_f32_into;
-    #[cfg(feature = "bench-internals")]
-    use super::accumulate_model2vec_rows;
+    use super::{accumulate_f32_into, accumulate_model2vec_rows};
 
     #[test]
     fn avx2_accumulate_matches_scalar() {
@@ -208,7 +199,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "bench-internals")]
     fn model2vec_prefetch_gate_matches_original_gather() {
         const VOCAB: usize = 19;
         for &dimensions in &[1_usize, 7, 8, 31, 128, 256, 257] {
@@ -219,7 +209,7 @@ mod tests {
                     value.mul_add(0.000_976_562_5, -0.5)
                 })
                 .collect();
-            for &tokens in &[0_usize, 1, 127, 128, 255, 256, 257, 512] {
+            for &tokens in &[0_usize, 1, 127, 128, 255, 256, 511, 512, 513, 1024] {
                 let ids: Vec<u32> = (0..tokens)
                     .map(|index| {
                         if index % 17 == 0 {
