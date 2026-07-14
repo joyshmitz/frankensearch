@@ -1,11 +1,10 @@
-//! mmap f16-byte slab → signed-4-bit packing: shipped portable path vs AVX2+F16C.
+//! AVX2 f16-byte slab packing: scalar nibble writes vs SIMD nibble compaction.
 //!
-//! The file-backed FSVI 4-bit scan lazily builds its packed pass-1 slab directly
-//! from mmap little-endian f16 bytes. The shipped path SIMD-widens decode but still
-//! rounds, clamps, and packs every nibble scalarly; the candidate reuses the
-//! in-memory path's AVX2+F16C quantize-and-pack pipeline directly over those bytes.
+//! The current AVX2+F16C path vectorizes decode, round, and clamp, then stores eight
+//! i32 lanes to a stack array and emits four packed bytes scalarly. The candidate
+//! compacts the same low nibbles with `vpshufb` and performs one 32-bit store.
 //!
-//! Arms: two shipped-path null controls around the runtime-dispatched candidate.
+//! Arms: two exact current-AVX2 controls around the SIMD-compaction candidate.
 //! The pre-timing assertion requires byte-identical output at dim=384.
 //!
 //! ```bash
@@ -17,7 +16,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankensearch_index::{pack_f16_le_bytes_to_4bit, pack_f16_le_bytes_to_4bit_generic};
+use frankensearch_index::{pack_f16_le_bytes_to_4bit, pack_f16_le_bytes_to_4bit_scalar_pack};
 use half::f16;
 
 const DIM: usize = 384;
@@ -44,25 +43,33 @@ fn bench(c: &mut Criterion) {
     let vectors = 10_000_usize;
     let slab = slab_fixture(vectors);
     assert_eq!(
-        pack_f16_le_bytes_to_4bit_generic(&slab, DIM),
+        pack_f16_le_bytes_to_4bit_scalar_pack(&slab, DIM),
         pack_f16_le_bytes_to_4bit(&slab, DIM),
-        "AVX2 pack must be byte-identical to the shipped mmap path"
+        "SIMD nibble compaction must be byte-identical to scalar nibble packing"
     );
 
     group.throughput(criterion::Throughput::Elements((vectors * DIM) as u64));
-    group.bench_with_input(BenchmarkId::new("current_a", vectors), &slab, |bn, slab| {
-        bn.iter(|| black_box(pack_f16_le_bytes_to_4bit_generic(black_box(slab), DIM)));
-    });
     group.bench_with_input(
-        BenchmarkId::new("avx2_dispatch", vectors),
+        BenchmarkId::new("scalar_pack_a", vectors),
+        &slab,
+        |bn, slab| {
+            bn.iter(|| black_box(pack_f16_le_bytes_to_4bit_scalar_pack(black_box(slab), DIM)));
+        },
+    );
+    group.bench_with_input(
+        BenchmarkId::new("simd_compact", vectors),
         &slab,
         |bn, slab| {
             bn.iter(|| black_box(pack_f16_le_bytes_to_4bit(black_box(slab), DIM)));
         },
     );
-    group.bench_with_input(BenchmarkId::new("current_b", vectors), &slab, |bn, slab| {
-        bn.iter(|| black_box(pack_f16_le_bytes_to_4bit_generic(black_box(slab), DIM)));
-    });
+    group.bench_with_input(
+        BenchmarkId::new("scalar_pack_b", vectors),
+        &slab,
+        |bn, slab| {
+            bn.iter(|| black_box(pack_f16_le_bytes_to_4bit_scalar_pack(black_box(slab), DIM)));
+        },
+    );
     group.finish();
 }
 

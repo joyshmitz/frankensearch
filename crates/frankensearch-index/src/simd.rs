@@ -1871,6 +1871,22 @@ pub fn pack_f16_le_bytes_to_4bit(bytes: &[u8], dim: usize) -> Vec<u8> {
     pack_f16_le_bytes_to_4bit_generic(bytes, dim)
 }
 
+/// Exact pre-SIMD-compaction AVX2 packer retained for same-binary performance
+/// comparisons. Production callers should use [`pack_f16_le_bytes_to_4bit`].
+#[doc(hidden)]
+#[must_use]
+pub fn pack_f16_le_bytes_to_4bit_scalar_pack(bytes: &[u8], dim: usize) -> Vec<u8> {
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c") {
+            // SAFETY: avx2 + f16c verified present by the runtime check above.
+            #[allow(unsafe_code)]
+            return unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<false>(bytes, dim) };
+        }
+    }
+    pack_f16_le_bytes_to_4bit_generic(bytes, dim)
+}
+
 /// Pack a contiguous f16 slab (`count·dim`) into signed 4-bit nibbles (2 dims/byte,
 /// `dim.div_ceil(2)` bytes/vector) with one corpus-wide max-abs scale — the lazy
 /// 4-bit ADC slab build (the **wired-default** two-pass pass-1 storage). Like the
@@ -1892,8 +1908,9 @@ pub fn pack_f16_slab_to_4bit(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
 /// `vcvtph2ps` decodes 8 f16/instruction for both the max-abs pass and the
 /// quantize pass; the nibble values come from the SAME `×scale` →
 /// round-half-away → clamp(-7,7) → `cvttps_epi32` pipeline as the int8 kernel.
-/// Eight quantized dimensions become four direct byte writes. Bit-identical to
-/// the portable byte kernel (`avx2_pack_4bit_bytes_matches_generic`).
+/// Eight quantized dimensions are compacted in-register with `vpshufb` and
+/// become one 32-bit write. Bit-identical to the portable byte kernel
+/// (`avx2_pack_4bit_bytes_matches_generic`).
 ///
 /// # Safety
 /// Caller must ensure `avx2` + `f16c` are available and the target is
@@ -1906,12 +1923,17 @@ pub fn pack_f16_slab_to_4bit(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
     unsafe_code
 )]
 #[must_use]
-unsafe fn pack_f16_le_bytes_to_4bit_avx2(bytes: &[u8], dim: usize) -> Vec<u8> {
+unsafe fn pack_f16_le_bytes_to_4bit_avx2_impl<const SIMD_NIBBLE_PACK: bool>(
+    bytes: &[u8],
+    dim: usize,
+) -> Vec<u8> {
     use core::arch::x86_64::{
-        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_loadu_si128, _mm256_add_ps, _mm256_and_ps,
-        _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
-        _mm256_or_ps, _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-        _mm256_storeu_si256,
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_cvtsi128_si32, _mm_loadu_si128, _mm256_add_ps,
+        _mm256_and_ps, _mm256_and_si256, _mm256_castsi256_si128, _mm256_cvtph_ps,
+        _mm256_cvttps_epi32, _mm256_extracti128_si256, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
+        _mm256_or_ps, _mm256_or_si256, _mm256_round_ps, _mm256_set_epi64x, _mm256_set1_epi8,
+        _mm256_set1_epi16, _mm256_set1_ps, _mm256_setzero_ps, _mm256_shuffle_epi8,
+        _mm256_srli_epi16, _mm256_storeu_ps, _mm256_storeu_si256,
     };
     if dim == 0 {
         return Vec::new();
@@ -1956,6 +1978,15 @@ unsafe fn pack_f16_le_bytes_to_4bit_avx2(bytes: &[u8], dim: usize) -> Vec<u8> {
         let vmaxc = _mm256_set1_ps(7.0);
         let vminc = _mm256_set1_ps(-7.0);
         let vsign = _mm256_set1_ps(-0.0);
+        // Each 128-bit lane selects the low byte from four i32 quantized lanes,
+        // then compacts the two nibble-pair bytes from offsets 0 and 2.
+        let zero_bytes = i64::from_le_bytes([0x80; 8]);
+        let lane_select = i64::from_le_bytes([0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80]);
+        let pair_select = i64::from_le_bytes([0, 2, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]);
+        let lane_byte_mask = _mm256_set_epi64x(zero_bytes, lane_select, zero_bytes, lane_select);
+        let pair_byte_mask = _mm256_set_epi64x(zero_bytes, pair_select, zero_bytes, pair_select);
+        let nibble_mask = _mm256_set1_epi8(0x0f);
+        let even_nibble_mask = _mm256_set1_epi16(0x000f);
         let mut tmp = [0_i32; 8];
         for v in 0..count {
             let base = v * dim;
@@ -1969,14 +2000,37 @@ unsafe fn pack_f16_le_bytes_to_4bit_avx2(bytes: &[u8], dim: usize) -> Vec<u8> {
                     _mm256_add_ps(vv, half_signed),
                 );
                 let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vminc), vmaxc);
-                _mm256_storeu_si256(tmp.as_mut_ptr().cast(), _mm256_cvttps_epi32(clamped));
-                // 8 dims (d even) → 4 fully-determined bytes: direct write (no RMW).
-                for m in 0..4 {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let lo = (tmp[2 * m] as u8) & 0x0F;
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let hi = (tmp[2 * m + 1] as u8) & 0x0F;
-                    slab[out + d / 2 + m] = lo | (hi << 4);
+                let quantized = _mm256_cvttps_epi32(clamped);
+                if SIMD_NIBBLE_PACK {
+                    let lane_bytes = _mm256_shuffle_epi8(quantized, lane_byte_mask);
+                    let nibbles = _mm256_and_si256(lane_bytes, nibble_mask);
+                    let pairs = _mm256_or_si256(
+                        _mm256_and_si256(nibbles, even_nibble_mask),
+                        _mm256_srli_epi16::<4>(nibbles),
+                    );
+                    let compact = _mm256_shuffle_epi8(pairs, pair_byte_mask);
+                    #[allow(clippy::cast_sign_loss)]
+                    let low = (_mm_cvtsi128_si32(_mm256_castsi256_si128(compact)) as u32) & 0xffff;
+                    #[allow(clippy::cast_sign_loss)]
+                    let high =
+                        (_mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(compact)) as u32) & 0xffff;
+                    let packed = low | (high << 16);
+                    // SAFETY: `d + 8 <= dim` guarantees four output bytes remain;
+                    // unaligned writes are valid for the byte-backed slab.
+                    slab.as_mut_ptr()
+                        .add(out + d / 2)
+                        .cast::<u32>()
+                        .write_unaligned(packed);
+                } else {
+                    _mm256_storeu_si256(tmp.as_mut_ptr().cast(), quantized);
+                    // Exact pre-change path: stack round-trip + four scalar packs.
+                    for m in 0..4 {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let lo = (tmp[2 * m] as u8) & 0x0F;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let hi = (tmp[2 * m + 1] as u8) & 0x0F;
+                        slab[out + d / 2 + m] = lo | (hi << 4);
+                    }
                 }
                 d += 8;
             }
@@ -1995,6 +2049,15 @@ unsafe fn pack_f16_le_bytes_to_4bit_avx2(bytes: &[u8], dim: usize) -> Vec<u8> {
         }
     }
     slab
+}
+
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+#[target_feature(enable = "avx2,f16c")]
+#[allow(unsafe_code)]
+#[must_use]
+unsafe fn pack_f16_le_bytes_to_4bit_avx2(bytes: &[u8], dim: usize) -> Vec<u8> {
+    // SAFETY: inherited from this function's AVX2+F16C contract.
+    unsafe { pack_f16_le_bytes_to_4bit_avx2_impl::<true>(bytes, dim) }
 }
 
 /// AVX2+F16C f16-slice adapter for [`pack_f16_slab_to_4bit`].
