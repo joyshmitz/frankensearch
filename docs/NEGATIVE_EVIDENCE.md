@@ -15005,3 +15005,42 @@ result, or timing sample before exit 124.
 row and the closed bead ship. The generic-analyzer fusion is unmeasured, not rejected. No retry, local Cargo
 fallback, worker reroute, cache-warming chase, or `release-perf` build ran. Retry requires a retained remote
 lexical release artifact that can reach the existing benchmark inside the bounded foreground gate.
+
+### 2026-07-14 — BlackThrush — INVALID/HOLD: borrowed host-hint token scan never reached timing
+
+**Fresh-subsystem route and profile attribution.** The later 2026-07-12 ledger resolution superseded
+`bv --robot-triage`'s stale `bd-6m8p` tombstone recommendation, and the requested
+`tokenizer_char_walk_ab` lane was explicitly excluded. The existing `host_attribution_resolve` profile measures
+the shipping fixed-universe resolver at **9.4185 us per 64 resolutions**. Source attribution found the remaining
+avoidable work in `canonical_project_mask_from_hint`: each of up to three non-empty hints allocated and
+lowercased a temporary normalized `String`, then immediately split it back into tokens. The one candidate
+scanned borrowed ASCII-alphanumeric token slices directly, used exact ASCII-case-insensitive alias comparisons,
+and retained the same rolling token windows. Its same-binary comparator preserved the allocating implementation
+twice for an A/A control and prepared exact full-attribution parity over the timed mix plus case, repeated
+separator, Unicode-separator, and non-ASCII boundary inputs.
+
+**Both strict-remote release commands stopped before the measured path.** A 60-second pre-edit warmth/profile
+gate and the sole 180-second candidate gate pinned `vmi1153651`, used `--profile release`, disabled release LTO,
+selected only the 64-resolution microbench row, and ran in the foreground with `RCH_REQUIRE_REMOTE=1`. The final
+command was:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1153651 RCH_TEST_SLOTS=4 \
+  CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/search-cod timeout 180s \
+  rch exec -- cargo bench -j 4 -p frankensearch-core --profile release \
+  --bench host_attribution_resolve -- \
+  'host_attribution_resolve/(allocating_a|allocating_b|current)/64' \
+  --sample-size 12 --warm-up-time 0.05 --measurement-time 0.20 --noplot
+```
+
+RCH selected `vmi1153651`, spent **30.936 seconds** syncing 15 roots, and reused
+`.rch-target-vmi1153651-pool-3128ad52307074090351fabddd484f8d`. Cargo then updated the crates.io index and the
+`frankentorch` git dependency but emitted no completed compilation, parity assertion, A/A control, or Criterion
+sample before exit 124. The earlier 60-second command stopped at the same dependency update after a 33.836-second
+sync.
+
+**Decision: INVALID/HOLD.** The production source and retained comparator were manually restored exactly; only
+this blocker row ships. Borrowed-token allocation removal is unmeasured, not rejected. No local Cargo fallback,
+worker reroute, detached job, alternate profile, or further cache-warming attempt ran. Retry only when the exact
+remote `host_attribution_resolve` release artifact can reach timing inside one bounded foreground command.
