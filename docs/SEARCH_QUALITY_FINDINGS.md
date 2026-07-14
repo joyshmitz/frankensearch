@@ -290,6 +290,32 @@ argument-retrieval-style traffic the dense tier — the dominant per-query laten
 measured quality cost. Note scidocs is decisive but only just (lower bound +0.0005). No Rust change (Python proxy
 harness). Harness: `docs/quality_harness/dense_marginal_ci.py`.
 
+## 2026-07-14 update — the two shipped dense-reduction levers are ADDITIVE; full stack = +0.0068 pooled over RRF
+
+Third CI in this batch. pool-min-max score fusion and the NQC dense down-weight BOTH damp the dense tier's
+over-contribution — so the natural prior is they OVERLAP (sub-additive). Tested it: `stack_additivity_ci.py`
+bootstrap-CIs, per query (stem+stop + model2vec, top-100 pool, 2000 resamples, seed 12345), two deltas —
+**C = down-weighted-pool-min-max − RRF** (full shipped stack vs naive equal-weight baseline) and
+**B = down-weighted-pool-min-max − pool-min-max** (the down-weight's increment on top of pool-min-max):
+
+| corpus | q | C = stack − RRF | C>0 | B = down-weight increment | B>0 |
+|---|---:|---:|---|---:|---|
+| scifact | 300 | +0.0198 [+0.0064, +0.0336] | yes | +0.0060 [−0.0012, +0.0136] | no |
+| nfcorpus | 323 | +0.0142 [+0.0076, +0.0211] | yes | +0.0025 [−0.0004, +0.0052] | no |
+| arguana | 1406 | +0.0015 [−0.0022, +0.0055] | no (wash) | +0.0011 [−0.0010, +0.0033] | no |
+| scidocs | 1000 | +0.0078 [+0.0047, +0.0109] | yes | +0.0024 [+0.0005, +0.0044] | yes |
+| **POOLED** | **3029** | **+0.0068 [+0.0042, +0.0093]** | **yes** | **+0.0022 [+0.0008, +0.0037]** | **yes** |
+
+**Findings.** (1) **Approximately ADDITIVE, not overlapping:** A(fusion, pool-min-max−RRF = +0.0041 from the fusion
+CI above) + B(down-weight = +0.0022) = **+0.0063 ≈ C(full stack) = +0.0068**. Despite both damping dense, the two
+levers capture *different* slices of its over-contribution — so shipping both is justified (no cannibalization).
+(2) **The full shipped quality stack (pool-min-max + NQC down-weight) delivers +0.0068 nDCG@10 pooled over the naive
+RRF equal-weight baseline** (CI excludes 0, decisive on 3/4 corpora; arguana the recurring wash). (3) The
+down-weight's shipped +0.0022 reproduces exactly at the pooled level (CI-decisive) but is **per-corpus mostly
+BORDERLINE** (only scidocs CI-clean; scifact/nfcorpus straddle 0) — a modest, robust-in-aggregate lever, honest to
+call pooled-real but not per-corpus-decisive. No Rust change (Python proxy harness).
+Harness: `docs/quality_harness/stack_additivity_ci.py`.
+
 ## Implementation status
 
 The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior
