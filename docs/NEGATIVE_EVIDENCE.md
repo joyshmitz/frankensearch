@@ -14401,3 +14401,33 @@ sort rather than just its setup copies.
 passed for both owned Rust files. Every Cargo invocation used `RCH_REQUIRE_REMOTE=1`; no local fallback or
 parallel benchmark ran. Reopen only if a materially different window/rebuild cadence reverses the incremental
 maintenance crossover; the retained comparator makes that boundary reproducible.
+
+### 2026-07-14 — cc_fse — CORRECTION (retracts the prior entry): hybrid fusion does NOT discard lexical metadata — it re-attaches winners' metadata; the "5–23× wasted" claim was a TEST-HELPER MISREAD
+
+Retracting the immediately-preceding "HIGH-VALUE ROUTE-NEXT … the id-only fast path is 5–23× faster" entry
+(`ba820098`). Its premise — that RRF hybrid fusion discards lexical metadata (`fuse_by_strategy → metadata: None`,
+"`rrf.rs:1029/1052`") — is **wrong**: those two `metadata: None` sites are inside `#[cfg(test)] mod tests`
+(`rrf.rs:1010`), the `lexical_hit`/`graph_hit` test fixtures — NOT production output.
+
+**Production PRESERVES the metadata.** The async hybrid path builds its results via
+`fused_hits_to_scored_results` (`searcher.rs:2702`), which constructs
+`lexical_metadata_by_doc: AHashMap<&str, &Arc<Value>>` from the lexical candidates and sets each fused winner's
+`metadata: lexical_metadata_by_doc.get(fh.doc_id.as_str())…` (`searcher.rs:~2788`) — i.e. it re-attaches each
+top-k winner's lexical metadata by doc_id. This is exactly what the existing test
+`fused_hits_to_scored_results_preserves_lexical_metadata` (`searcher.rs:5040`) asserts. So routing the fusion
+lexical source through an id-only (`metadata: None`) path would DROP the winners' metadata — a correctness
+regression, not a free 5–23× win. The `lexical_candidate_metadata_waste_ab` bench numbers themselves stand
+(metadata `from_str` ≈ 60–65% of per-candidate docstore materialization; fast-field id-only is 5–23× faster than
+docstore+metadata), but the CONCLUSION drawn from them was invalid.
+
+**The only residual (much smaller, already partly handled):** `search` deserializes metadata for all
+`lexical_budget` candidates, but only the top-k *winners*' metadata is used. The team already deferred the
+`Value` **clone** to winners (`searcher.rs:2709–2714` comment: "cloning every lexical candidate's often-dropped
+metadata here is wasted … clone deferred to the per-winner lookup"). The remaining waste is the metadata
+**deserialize** for the `(budget − winners)` non-winners — removable only by deferring the deserialize too (have
+`search` return raw metadata strings and `from_str` lazily at the per-winner lookup), which is a `ScoredResult`
+metadata-representation change, not the id-only swap the retracted entry proposed. Bounded and plumbing-heavy;
+not pursued. **Lesson: verify a `metadata: None` / discard site is production, not a `#[cfg(test)]` fixture,
+before building a lever on it.** No production change; the retracted entry's bench is retained (numbers valid,
+conclusion corrected here). This is the second misread-based over-claim this session (cf the count-free
+fixture-artifact correction) — both now retracted.
