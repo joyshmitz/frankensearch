@@ -217,10 +217,23 @@ impl NqcDenseWeight {
     /// the [`from_sample`](Self::from_sample) filter is skipped). Byte-identical to a fresh
     /// `from_sample` for `percentile`/`dense_weight`: same finite multiset, sorted (`total_cmp` ==
     /// `partial_cmp` order on finite f32; equal-element order is irrelevant to the CDF).
+    #[cfg(any(test, feature = "bench-internals"))]
     pub(crate) fn rebuild_from_finite(&mut self, values: impl IntoIterator<Item = f32>) {
         self.sorted_cv.clear();
         self.sorted_cv.extend(values);
         self.sorted_cv.sort_unstable_by(f32::total_cmp);
+    }
+
+    /// Replace the sketch from an already-sorted finite sample. The adaptive rolling sampler
+    /// maintains this order incrementally, so its periodic snapshot needs only a linear copy.
+    fn rebuild_from_sorted(&mut self, sorted: &[f32]) {
+        debug_assert!(
+            sorted
+                .windows(2)
+                .all(|pair| pair[0].total_cmp(&pair[1]).is_le())
+        );
+        self.sorted_cv.clear();
+        self.sorted_cv.extend_from_slice(sorted);
     }
 
     /// Per-query dense-tier multiplier `clip(1 − β·CDF(cv), w_min, 1)`. Higher NQC (a more
@@ -250,7 +263,14 @@ impl NqcDenseWeight {
 pub struct NqcCvSampler {
     /// Most-recent observed NQC (`nqc_cv`) values, front = oldest.
     recent: VecDeque<f32>,
+    /// The same finite rolling sample in ascending total order. Maintaining this alongside
+    /// `recent` replaces the adaptive path's periodic full-window sort with two bounded moves.
+    sorted: Vec<f32>,
     capacity: usize,
+    /// Same-binary benchmark switch for the exact pre-optimization path. Normal builds compile
+    /// out both this field and its branch.
+    #[cfg(feature = "bench-internals")]
+    maintain_sorted: bool,
 }
 
 impl NqcCvSampler {
@@ -261,8 +281,20 @@ impl NqcCvSampler {
         let capacity = capacity.max(1);
         Self {
             recent: VecDeque::with_capacity(capacity),
+            sorted: Vec::with_capacity(capacity),
             capacity,
+            #[cfg(feature = "bench-internals")]
+            maintain_sorted: true,
         }
+    }
+
+    /// Exact pre-optimization sampler for the retained same-binary benchmark: retain only
+    /// insertion order, then sort the whole window at each adaptive rebuild.
+    #[cfg(feature = "bench-internals")]
+    fn legacy(capacity: usize) -> Self {
+        let mut sampler = Self::new(capacity);
+        sampler.maintain_sorted = false;
+        sampler
     }
 
     /// Record one query's NQC. Non-finite observations are ignored; when the sample is full the
@@ -271,10 +303,34 @@ impl NqcCvSampler {
         if !cv.is_finite() {
             return;
         }
-        if self.recent.len() == self.capacity {
-            self.recent.pop_front();
-        }
+        let evicted = if self.recent.len() == self.capacity {
+            self.recent.pop_front()
+        } else {
+            None
+        };
         self.recent.push_back(cv);
+
+        #[cfg(feature = "bench-internals")]
+        if !self.maintain_sorted {
+            return;
+        }
+
+        if let Some(evicted) = evicted {
+            let remove_at = self
+                .sorted
+                .partition_point(|value| value.total_cmp(&evicted).is_lt());
+            debug_assert!(
+                remove_at < self.sorted.len()
+                    && self.sorted[remove_at].to_bits() == evicted.to_bits(),
+                "rolling sorted sample lost its evicted value"
+            );
+            self.sorted.remove(remove_at);
+        }
+        let insert_at = self
+            .sorted
+            .partition_point(|value| value.total_cmp(&cv).is_le());
+        self.sorted.insert(insert_at, cv);
+        debug_assert_eq!(self.sorted.len(), self.recent.len());
     }
 
     /// Record one query from its lexical (BM25) top-k scores — computes [`nqc_cv`] and observes
@@ -302,10 +358,16 @@ impl NqcCvSampler {
         self.capacity
     }
 
-    /// Iterate the retained (all-finite) observations oldest→newest, without allocating —
-    /// feeds [`NqcDenseWeight::rebuild_from_finite`] for an alloc-free periodic rebuild.
+    /// Iterate the retained (all-finite) observations oldest→newest without allocating.
     pub fn iter(&self) -> impl Iterator<Item = f32> + '_ {
         self.recent.iter().copied()
+    }
+
+    /// Borrow the exact rolling multiset in ascending order for an allocation- and sort-free
+    /// periodic sketch snapshot.
+    fn sorted(&self) -> &[f32] {
+        debug_assert_eq!(self.sorted.len(), self.recent.len());
+        &self.sorted
     }
 
     /// Build a [`NqcDenseWeight`] from the current sample once at least `min_samples` (and at
@@ -317,8 +379,13 @@ impl NqcCvSampler {
         if self.recent.len() < min_samples.max(1) {
             return NqcDenseWeight::new();
         }
-        let sample: Vec<f32> = self.recent.iter().copied().collect();
-        NqcDenseWeight::from_sample(&sample)
+        #[cfg(feature = "bench-internals")]
+        if !self.maintain_sorted {
+            return NqcDenseWeight::from_sample(&self.recent.iter().copied().collect::<Vec<_>>());
+        }
+        let mut sketch = NqcDenseWeight::new();
+        sketch.rebuild_from_sorted(self.sorted());
+        sketch
     }
 }
 
@@ -370,6 +437,28 @@ impl AdaptiveNqcDenseWeight {
         }
     }
 
+    /// Exact pre-optimization path retained for same-binary performance and parity gates.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bench_legacy(
+        beta: f32,
+        w_min: f32,
+        capacity: usize,
+        min_samples: usize,
+        rebuild_every: usize,
+    ) -> Self {
+        Self {
+            sampler: NqcCvSampler::legacy(capacity),
+            sketch: NqcDenseWeight::new(),
+            beta,
+            w_min,
+            min_samples,
+            rebuild_every: rebuild_every.max(1),
+            since_rebuild: 0,
+        }
+    }
+
     /// Whether the down-weight is enabled (`beta > 0`). When disabled, [`weight_for_cv`] is a
     /// no-op returning the neutral `1.0`.
     #[must_use]
@@ -388,16 +477,17 @@ impl AdaptiveNqcDenseWeight {
         self.sampler.observe(cv);
         self.since_rebuild += 1;
         if self.since_rebuild >= self.rebuild_every {
-            // In-place rebuild: reuse the sketch's Vec capacity + an unstable total-order sort
-            // (the sampler is all-finite). An empty iter → empty (neutral) sketch during the
-            // pre-`min_samples` warm-up. Avoids the old `sampler.sketch()` path's DOUBLE collect
-            // (2 allocs) + stable partial_cmp sort. NOTE: timing-NEUTRAL (nqc_adaptive_cost_ab:
-            // ~614→~613 ns/q overhead, a wash) — the inherent 2048-window sort dominates, so this
-            // is an allocation/copy reduction (less allocator pressure), not a latency speedup.
             if self.sampler.len() >= self.min_samples {
-                self.sketch.rebuild_from_finite(self.sampler.iter());
+                #[cfg(feature = "bench-internals")]
+                if !self.sampler.maintain_sorted {
+                    self.sketch.rebuild_from_finite(self.sampler.iter());
+                } else {
+                    self.sketch.rebuild_from_sorted(self.sampler.sorted());
+                }
+                #[cfg(not(feature = "bench-internals"))]
+                self.sketch.rebuild_from_sorted(self.sampler.sorted());
             } else {
-                self.sketch.rebuild_from_finite(std::iter::empty());
+                self.sketch.rebuild_from_sorted(&[]);
             }
             self.since_rebuild = 0;
         }
@@ -551,7 +641,11 @@ mod tests {
         assert_eq!(sampler.capacity(), 1);
         sampler.observe(0.3);
         sampler.observe(0.5);
-        assert_eq!(sampler.len(), 1, "capacity clamps to 1 -> only the most-recent is kept");
+        assert_eq!(
+            sampler.len(),
+            1,
+            "capacity clamps to 1 -> only the most-recent is kept"
+        );
     }
 
     #[test]
@@ -590,7 +684,10 @@ mod tests {
         sampler.observe(0.1);
         sampler.observe(0.2);
         let weight = sampler.sketch(5);
-        assert!(weight.is_empty(), "below min_samples -> empty (neutral) sketch");
+        assert!(
+            weight.is_empty(),
+            "below min_samples -> empty (neutral) sketch"
+        );
         assert!(
             (weight.dense_weight(0.15, 0.5, 0.1) - 1.0).abs() <= EPSILON,
             "empty sketch -> neutral dense weight (byte-identical fusion during warm-up)"
@@ -623,13 +720,19 @@ mod tests {
         // First rebuild fires at 5 observations but 5 < min_samples(10) -> still empty/neutral.
         for i in 0..9 {
             let w = adaptive.weight_for_cv(0.1 + 0.02 * i as f32);
-            assert!((w - 1.0).abs() <= EPSILON, "warm-up observation {i} must be neutral, got {w}");
+            assert!(
+                (w - 1.0).abs() <= EPSILON,
+                "warm-up observation {i} must be neutral, got {w}"
+            );
         }
         // The 10th observation triggers the 2nd rebuild (10 obs >= min_samples) -> sketch active.
         let _ = adaptive.weight_for_cv(0.3);
         // A very high cv now maps to a high percentile -> a down-weight strictly below 1.0.
         let high = adaptive.weight_for_cv(10.0);
-        assert!(high < 1.0, "high-NQC query must be down-weighted after warm-up, got {high}");
+        assert!(
+            high < 1.0,
+            "high-NQC query must be down-weighted after warm-up, got {high}"
+        );
         assert!(high >= 0.1 - EPSILON, "floored at w_min");
     }
 
@@ -638,7 +741,10 @@ mod tests {
         let mut adaptive = AdaptiveNqcDenseWeight::new(0.0, 0.1, 100, 1, 1);
         assert!(!adaptive.is_active());
         for cv in [0.0, 0.5, 5.0, 50.0] {
-            assert!((adaptive.weight_for_cv(cv) - 1.0).abs() <= EPSILON, "beta=0 stays neutral");
+            assert!(
+                (adaptive.weight_for_cv(cv) - 1.0).abs() <= EPSILON,
+                "beta=0 stays neutral"
+            );
         }
     }
 
@@ -651,17 +757,26 @@ mod tests {
             let _ = adaptive.weight_for_cv(0.05);
         }
         let outlier = adaptive.weight_for_cv(9.0);
-        assert!(outlier < 0.5, "an outlier scored against the prior low-cv sketch is down-weighted");
+        assert!(
+            outlier < 0.5,
+            "an outlier scored against the prior low-cv sketch is down-weighted"
+        );
     }
 
     #[test]
     fn adaptive_nqc_production_default_is_active_and_warms_up_neutral() {
         let mut adaptive = AdaptiveNqcDenseWeight::production_default();
-        assert!(adaptive.is_active(), "production default enables the down-weight (beta=0.5)");
+        assert!(
+            adaptive.is_active(),
+            "production default enables the down-weight (beta=0.5)"
+        );
         // The 128-sample warm-up keeps the first observations neutral (byte-identical fusion).
         for i in 0..20 {
             let w = adaptive.weight_for_cv(0.1 + 0.01 * i as f32);
-            assert!((w - 1.0).abs() <= EPSILON, "obs {i} neutral during the 128-query warm-up");
+            assert!(
+                (w - 1.0).abs() <= EPSILON,
+                "obs {i} neutral during the 128-query warm-up"
+            );
         }
     }
 
@@ -720,7 +835,10 @@ mod tests {
     fn nqc_cv_ignores_non_finite_values() {
         let with = nqc_cv(&[1.0, 2.0, 3.0, f32::NAN, f32::INFINITY, 5.0]);
         let without = nqc_cv(&[1.0, 2.0, 3.0, 5.0]);
-        assert!((with - without).abs() <= 1e-6, "with={with} without={without}");
+        assert!(
+            (with - without).abs() <= 1e-6,
+            "with={with} without={without}"
+        );
     }
 
     #[test]
@@ -776,7 +894,9 @@ mod tests {
         // The peaked query sits above the uniform (NQC 0) one in the sampled distribution.
         assert!(w.percentile(nqc_cv(peaked)) >= w.percentile(nqc_cv(uniform)));
         // So enabling the down-weight demotes the dense tier more on the high-NQC query.
-        assert!(w.dense_weight(nqc_cv(peaked), 0.5, 0.0) <= w.dense_weight(nqc_cv(uniform), 0.5, 0.0));
+        assert!(
+            w.dense_weight(nqc_cv(peaked), 0.5, 0.0) <= w.dense_weight(nqc_cv(uniform), 0.5, 0.0)
+        );
     }
 
     #[test]

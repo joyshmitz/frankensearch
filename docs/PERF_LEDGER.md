@@ -5407,3 +5407,26 @@ full-table sweep, exact pooled-output parity, 31 alternating paired rounds, A/A 
 The module-qualified strict-remote exact oracle passed 1/1 across the threshold, varied dimensions, and OOV rows;
 the prior zero-test filter invocation is excluded. **Decision: LANDED** — approximately 38.7% lower latency at
 512 tokens, with the original production accumulation path preserved below the gate.
+
+## 2026-07-14 — LANDED: adaptive NQC exact incremental rolling order, ~3.65× (`bd-4hxk`)
+
+**Route and candidate.** The prior adaptive-NQC WASH quantified roughly 613 ns/query and showed that removing
+allocations did not matter because sorting the 2,048-value rolling window every 64 queries dominated. The shipped
+sampler now maintains that exact finite multiset in sorted order as observations arrive, while retaining the
+recency queue for eviction. Periodic snapshots become a linear copy with no sort; scoring still precedes
+observation, snapshot cadence is unchanged, and the preallocated sorted vector costs 8 KiB per production sampler.
+
+**Exactness and paired gate.** The retained former-path constructor runs insertion-order sampling plus the full
+periodic sort in the same release binary. It matched candidate weight bits across 8,192 post-warm observations
+(evictions, duplicates, signed zero, NaN/infinity ignore), then ran 41 alternating pairs on strict-remote worker
+`vmi1227854`; ratio is incremental/former:
+
+| gate | median [p5, p95] | verdict |
+|---|---:|---|
+| A/A former/former | 1.0028 [0.9433, 1.0793] | valid null |
+| incremental/former | **0.2737 [0.2402, 0.2978]** | **KEEP (~3.65×)** |
+
+Direct medians were 602.54 ns/query former and 160.33 ns/query incremental: 442.22 ns/query saved, or 0.0884%
+of a 500 µs search. Normal no-feature `frankensearch-fusion` check passed remotely. **Decision: LANDED** —
+the measured dominant sort is removed with exact output and no post-construction allocation. Benchmark:
+`nqc_adaptive_cost_ab`; all Cargo work was fail-closed `RCH_REQUIRE_REMOTE=1`.

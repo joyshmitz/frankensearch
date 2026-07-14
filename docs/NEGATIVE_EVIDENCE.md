@@ -14359,3 +14359,45 @@ source through it, and keep the metadata-bearing `search` for every path that re
 plus the trait method is `async` (`SearchFuture`), so the bench used raw-Tantivy analogues. **Route-next: wire the
 id-only trait method + hybrid routing, prove the direct-return paths still carry metadata, and gate the full sync
 searcher.** Retained the reproducing bench. `RCH_REQUIRE_REMOTE=1` throughout (`vmi1167313`); no local fallback.
+
+### 2026-07-14 — IcyRidge — LANDED: exact incremental NQC rolling order removes the periodic 2,048-value full sort, ~3.65× (`bd-4hxk`)
+
+**Negative-ledger-first route.** The latest adaptive-NQC WASH measured about 613 ns/query of default-on overhead
+and identified the inherent 2,048-value sort every 64 observations as the remaining cost. Its suggested Fenwick
+tree was approximate and below-bar, but an exact adjacent design had not been tested: keep the bounded rolling
+multiset sorted as observations arrive, then copy it into the same periodic snapshot without sorting. Opportunity
+score was 2.7 (`impact=2 × confidence=4 / effort=3`): a quantified default query path with exact semantics, but
+only 0.12% of the documented 500 µs end-to-end search.
+
+**One lever and exactness.** `NqcCvSampler` now maintains both recency order and total ascending order. A full
+window observation binary-searches/removes the evicted value and binary-searches/inserts the new finite value;
+the adaptive sketch still scores each query against the prior snapshot and still refreshes only every 64 weight
+calls. The maintained vector is preallocated, adds 8 KiB at the production capacity, and allocates nothing
+after construction. The retained `bench_legacy` arm runs the exact former insertion-order + periodic full-sort
+path inside the same production type. Before timing, the release binary proved every returned weight bit-identical
+for 8,192 post-warm observations spanning warm-up, multiple evictions, duplicates, signed zero, and ignored NaN/
+infinity values.
+
+**Strict-remote foreground gate.** One release binary on `vmi1227854`, 41 alternating AB/BA round pairs; ratio is
+incremental-order/former-full-sort (`<1.0` is faster):
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_ENV_ALLOWLIST=AGENT_NAME AGENT_NAME=IcyRidge \
+  env -u CARGO_TARGET_DIR rch exec -- cargo bench -j 4 -p frankensearch-fusion \
+  --features bench-internals --profile release --bench nqc_adaptive_cost_ab
+```
+
+| gate | median [p5, p95] | verdict |
+|---|---:|---|
+| A/A former/full-sort | 1.0028 [0.9433, 1.0793] | valid null (`1.0` contained) |
+| incremental order / former | **0.2737 [0.2402, 0.2978]** | **decidable ~3.65× win** |
+
+The direct profiles agree: 602.54 ns/query former versus 160.33 ns/query incremental, saving 442.22 ns/query
+(0.0884% of a 500 µs search). This reverses the prior allocation-only WASH by removing the actual dominating
+sort rather than just its setup copies.
+
+**Decision and validation.** **LANDED.** The normal no-feature path passed strict-remote
+`cargo check -p frankensearch-fusion --lib` on the same worker. Direct `rustfmt --check` and `git diff --check`
+passed for both owned Rust files. Every Cargo invocation used `RCH_REQUIRE_REMOTE=1`; no local fallback or
+parallel benchmark ran. Reopen only if a materially different window/rebuild cadence reverses the incremental
+maintenance crossover; the retained comparator makes that boundary reproducible.
