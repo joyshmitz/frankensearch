@@ -14777,3 +14777,31 @@ it emitted no Criterion sample, candidate ratio, or admissible speed verdict. Th
 the closed bead ship. The ASCII subset mechanism remains unmeasured, not rejected. Do not retry it in this
 turn's target namespace; a future attempt requires an RCH release artifact that is demonstrably retained before
 the bounded foreground command starts.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: repair-trailer header-only validation hit another cold RCH release target (`bd-bfuc`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` again ranked `bd-6m8p`, but the
+later 2026-07-12 row closes that non-default, fleet-unmeasurable tombstone route. This turn pivoted to the fresh
+durability verification path, avoiding the rejected repair-trailer encode packer and repair-log line-buffer
+families. `FileProtector::verify_file` and the healthy FSVI verification path called
+`deserialize_repair_trailer`, then discarded its `Vec<RepairSymbol>`. The decoder therefore allocated and
+copied every repair-symbol payload after CRC validation even though these callers consumed only the header.
+For the prepared 256 × 4 KiB fixture that meant 1 MiB of needless payload materialization per verification.
+The single candidate retained CRC/header/frame-boundary/symbol-count validation while skipping those copies;
+the retained full decoder was the same-binary comparator. Opportunity score was 6.7
+(`impact=4 × confidence=5 / effort=3`).
+
+**The only foreground gate never reached timing.** The candidate and comparator asserted exact decoded-header
+and symbol-count parity before their 1 MiB Criterion rows. The sole command used 10 samples, 50 ms warm-up,
+150 ms measurement time, `--profile release`, `LTO=false`, 16 codegen units, strict
+`RCH_REQUIRE_REMOTE=1`, and a 300-second outer timeout. RCH admitted `vmi1153651`, then rewrote the existing
+`.rch-targets/search-cod` request to the same worker-scoped namespace used by the preceding turns. Cargo still
+updated registries, downloaded the dependency graph, and cold-compiled from `proc-macro2` through Tantivy and
+Criterion. The timeout fired with exit 124 before the durability crate linked, so there is no Criterion sample,
+parity emission, candidate ratio, or admissible speed verdict. No local fallback, `release-perf` build, second
+invocation, worker reroute, or cache-warming chase ran.
+
+**Decision: INVALID/HOLD.** Production and benchmark files were restored exactly; only this blocker row and
+the closed bead ship. Header-only validated decoding remains a warm-path CPU/allocation hypothesis, not a
+measured keep or reject. Do not retry this durability seam until RCH can retain the release dependency graph
+long enough for the single bounded foreground command to reach the timed binary.
