@@ -14722,3 +14722,34 @@ or release-perf profile ran.
 **Decision: INVALID/HOLD.** There is no admissible candidate result. Production and benchmark files are
 restored exactly; only this blocker record ships. The adaptive NQC lane is closed after this inconclusive gate:
 do not retry or rewarm it—move to a different subsystem and accept the first clean foreground release A/B.
+
+### 2026-07-14 — IcyRidge — REJECT: delimiter-driven markdown-link scan is inside the null floor and ~12% slower (`bd-wyee`)
+
+**Negative-ledger-first route and profile attribution.** `bv --robot-triage` ranked `bd-6m8p`, but the later
+2026-07-12 ledger resolution explicitly closes that tombstone-bitmap route as non-default and
+fleet-unmeasurable. The two preceding markdown-link keeps removed repeated allocations and discarded copies;
+the remaining repeated work in `strip_markdown_links` was the scalar byte scan across label and URL content to
+find balanced ASCII delimiters. The tested single lever replaced those two loops with `memchr2` jumps between
+`[`/`]` and `(`/`)`, retaining the exact scalar source-slice implementation as the comparator. Opportunity
+score was 6.7 (`impact=4 × confidence=5 / effort=3`).
+
+**Exactness and first clean foreground gate.** The same binary asserted byte-for-byte equality before timing
+on 256 links containing nested labels and parenthesized URLs. One strict-remote `--profile release` invocation
+on `vmi1153651` used `lto=false`, 16 codegen units, 41 alternating paired rounds, and four calls per arm. Ratio
+is delimiter-find/source-slices (`<1` wins):
+
+| workload | A/A scalar null median [p5, p95] | delimiter-find/scalar median [p5, p95] | verdict |
+|---|---:|---:|---|
+| 256 nested markdown links | 0.9972 [0.2938, 1.3177] | **1.0894 [0.5902, 3.0185]** | **inside null floor / reject** |
+
+Criterion independently reported central estimates of **28.845 µs → 32.293 µs** (ratio 1.120, about
+12% slower). The short spans contain only a few delimiter events, so repeated `memchr2` setup/calls cost more
+than the compiler's simple scalar depth loop; the broader candidate tail also became noisier. RCH selected the
+previous canonicalize target namespace, but its artifacts had been evicted and were rebuilt remotely; the run
+still used the bounded release profile and completed cleanly. No local Cargo fallback, second benchmark, or
+worker/target chase ran.
+
+**Decision: REJECT.** Production, benchmark, and manifest changes were restored exactly; only this evidence row
+and the closed bead ship. Do not retry delimiter-search variants on ordinary short markdown links. Reconsider
+only if a product-real workload demonstrates materially longer labels/URLs where skipped non-delimiter bytes
+dominate the per-call search overhead.
