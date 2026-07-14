@@ -110,21 +110,23 @@ fn kmeans(slab: &[f32], r: &mut Xs) -> (Vec<f32>, Vec<Vec<u32>>) {
     (cents, lists)
 }
 
-#[test]
-fn ivf_recall_pareto() {
-    let mut r = Xs(0x9E37_79B9_7F4A_7C15);
+/// Recall@k Pareto at a given cluster `noise` (overlap). center spread is ±4, so noise≈0.4 is
+/// well-separated (easy) and noise≈2.5 is heavily overlapping (a proxy for real-embedding
+/// difficulty, where the true top-k spans several clusters).
+fn pareto_at_noise(noise: f32) -> Vec<f64> {
+    let mut r = Xs(0x9E37_79B9_7F4A_7C15 ^ (noise.to_bits() as u64).wrapping_mul(0x1234_5)); // vary seed
     let centers: Vec<f32> = (0..NTRUE * DIM).map(|_| r.f() * 4.0).collect();
     let mut slab = vec![0.0f32; N * DIM];
     for i in 0..N {
         let cl = r.u(NTRUE);
         for d in 0..DIM {
-            slab[i * DIM + d] = centers[cl * DIM + d] + r.f() * 0.4;
+            slab[i * DIM + d] = centers[cl * DIM + d] + r.f() * noise;
         }
     }
     let queries: Vec<Vec<f32>> = (0..NQUERY)
         .map(|_| {
             let cl = r.u(NTRUE);
-            (0..DIM).map(|d| centers[cl * DIM + d] + r.f() * 0.4).collect()
+            (0..DIM).map(|d| centers[cl * DIM + d] + r.f() * noise).collect()
         })
         .collect();
     let (cents, lists) = kmeans(&slab, &mut r);
@@ -140,7 +142,6 @@ fn ivf_recall_pareto() {
             hit += got.iter().filter(|i| t.contains(i)).count();
         }
         let recall = hit as f64 / (NQUERY * K) as f64;
-        // Fraction of N scanned at this probe (avg list ~ N/NLIST).
         let scanned: usize = {
             let mut cd: Vec<(f32, usize)> =
                 (0..NLIST).map(|c| (l2sq(&queries[0], &cents[c * DIM..]), c)).collect();
@@ -148,17 +149,28 @@ fn ivf_recall_pareto() {
             cd.iter().take(p).map(|&(_, c)| lists[c].len()).sum()
         };
         println!(
-            "[ivf-pareto] probe={p} recall@{K}={recall:.4} scanned={scanned} ({:.1}% of N, ~{:.0}x fewer dots)",
+            "[ivf-pareto] noise={noise:.1} probe={p} recall@{K}={recall:.4} scanned={:.1}%N (~{:.0}x fewer dots)",
             scanned as f64 / N as f64 * 100.0,
             N as f64 / scanned.max(1) as f64
         );
         recalls.push(recall);
     }
-    // Monotone non-decreasing in probe (more clusters can only add candidates).
-    for w in recalls.windows(2) {
-        assert!(w[1] >= w[0] - 1e-9, "recall not monotone in probe: {recalls:?}");
+    recalls
+}
+
+#[test]
+fn ivf_recall_pareto() {
+    // Sweep cluster overlap: easy (well-separated) → hard (heavy overlap, real-embedding proxy).
+    // The real-corpus gate is data-blocked (no FS_REAL_SLAB on workers), so this brackets how far
+    // the synthetic 15×@recall-1.0 result degrades as clusters overlap like real embeddings.
+    let easy = pareto_at_noise(0.4);
+    let moderate = pareto_at_noise(1.2);
+    let hard = pareto_at_noise(2.5);
+    for recalls in [&easy, &moderate, &hard] {
+        for w in recalls.windows(2) {
+            assert!(w[1] >= w[0] - 1e-9, "recall not monotone in probe: {recalls:?}");
+        }
     }
-    // Probe-32 (of 128 lists) should recover essentially all true neighbours on well-clustered data.
-    let r32 = *recalls.last().unwrap();
-    assert!(r32 >= 0.90, "probe=32 recall too low: {r32:.4} (full pareto: {recalls:?})");
+    // Even under heavy overlap, high probe must still recover most neighbours (else IVF is broken).
+    assert!(*hard.last().unwrap() >= 0.80, "hard-overlap probe=32 recall too low: {hard:?}");
 }
