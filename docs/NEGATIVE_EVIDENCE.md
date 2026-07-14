@@ -14139,3 +14139,39 @@ durability on four existing core findings (`needless_borrow` twice, `struct_exce
 Direct `rustfmt --check` and `git diff --check` passed. Exact-file UBS exited 0 with zero critical findings after
 suppressing only its Rust security heuristic, which had misclassified the pre-existing codec `decode` method and
 Criterion `group.finish()` calls as JWT/token code.
+
+### 2026-07-14 — cc_fse — DECIDABLE isolated win, HOLD (landing verification fleet-blocked): `collect_id_hits` lazy-`HashMap` → lazy-`Vec` drops the per-hit `segment_ord` hash (~1.21× @k1000)
+
+Sibling-consistency dig on the scan-free `search_doc_ids` path (Tantivy top-k + `collect_id_hits`, no dense scan,
+no metadata decode — the documented "latency-critical, identifiers only" route). `collect_id_hits` caches the
+opened `ord` fast-field column per segment in a **lazy `HashMap<u32, Option<Column>>`**, hashing `segment_ord`
+once per hit (k SipHash-of-u32 per query). But the numeric-ff bench prototype that VALIDATED that fast field
+(`id_materialize_numeric_ff`) indexed a **`Vec` by `segment_ord`** (O(1), no hash) — production regressed to a
+HashMap to keep laziness (open only *touched* segments). Best-of-both candidate: a **lazily-populated
+`Vec<Option<Option<Column>>>`** via `get_or_insert_with` — O(1) index, no hash, still lazy (outer `None` = not
+yet opened). `segment_ord` is a dense, in-range index for hits from this searcher.
+
+Standalone same-binary paired A/B (`collect_ids_map_kind_ab`, `paired_median_ratio`, 41 rounds, in-RAM 20k-doc
+fixture → **4 segments**, `base == cand` byte-identity asserted), vec/HASHMAP median (`<1` = Vec faster) vs A/A null:
+
+| k | vec/HASHMAP [p5, p95] | A/A null [p5, p95] | verdict |
+|---|---:|---:|---|
+| 30 | 0.928 [0.703, 1.188] | [0.591, 1.282] | inside floor |
+| 100 | 0.912 [0.804, 1.232] | [0.841, 1.239] | inside floor |
+| 300 | 0.853 [0.690, 1.021] | [0.744, 1.352] | inside floor |
+| 1000 | **0.826** [0.717, 0.982] | [0.841, 1.185] | **DECIDABLE WIN (~1.21×)** |
+
+The saving GROWS with k (0.93→0.91→0.85→0.83 — more hits pay more hashes) and is decidable at k1000 (the large-pool
+case `search_doc_ids` serves: reranker / fusion feeds); directional but sub-floor at typical k≤300, where the
+per-hit `String` clone + fast-field read dominate and swallow the hash delta. Byte-identical (same columns, ords,
+id clones), zero-downside (never slower), and in the LANDED-precedent class (hot-path map hashing, cf the aHash
+migrations `9543ae6`/`8665ce1` that landed on isolated map-A/B).
+
+**HOLD this turn — production byte-for-byte unchanged (candidate applied then reverted via Edit).** The production
+edit is UNVERIFIED: the RCH fleet was saturated for the whole turn (`no admissible workers:
+insufficient_slots=8, active_project_exclusion=1`; `RCH_REQUIRE_REMOTE=1` correctly refused local fallback), so
+`cargo test -p frankensearch-lexical` never compiled — and unverified production must not reach `main`. Retained
+the reproducing `collect_ids_map_kind_ab` bench (verified compiling + running remotely on `vmi1153651`).
+**Route-next (concrete, ready-to-land — NOT a rejection): when a worker frees, apply the lazy-`Vec` to
+`collect_id_hits` (mirror the `table`-None and empty-slot→docstore branches exactly), confirm the lexical `--lib`
+suite green (byte-identical), and commit — this is a bankable win.**
