@@ -5562,3 +5562,36 @@ after the two scratch buffers first grow. This is a relative same-binary result 
 not a claim about plain-text documents, which never enter this parser. No local Cargo command or second
 benchmark ran. **Decision: LANDED.** Retained comparator: `canonicalize/markdown_link_scratch` with
 `bench-internals`.
+
+## 2026-07-14 — LANDED: slice markdown-link labels from source, ~1.67× paired (`bd-xwb9`)
+
+**Negative-ledger-first attribution and one lever.** The preceding scratch-reuse keep removed per-link
+allocations, but its warm path still copied every label byte into a scratch `String` and then copied it again
+into the result. It also copied every URL byte into a second scratch buffer that valid-link handling immediately
+discarded. Production now scans the existing UTF-8 input by byte index, copies each valid label directly from
+its source slice, and advances past balanced URLs without materializing them. Only ASCII delimiter positions are
+used as slice boundaries, so the nested-bracket and balanced-parenthesis parser remains safe for Unicode input.
+Opportunity score was 6.7 (`impact=4 × confidence=5 / effort=3`): the residual copies were explicit in the
+measured hot loop and the change stayed inside one private canonicalization primitive.
+
+**Exactness.** The retained scratch-reuse implementation and shipping source-slice implementation ran in the
+same binary. Before timing, the benchmark asserted byte-for-byte equality on a 256-link document containing
+nested labels and parenthesized URLs. The focused parity test retains empty/plain, multiple-link, empty-URL,
+closed-only, unclosed-bracket, unbalanced-URL, and Unicode cases. Canonical text, tokens, embeddings, index
+terms, and ranking semantics are unchanged.
+
+**First clean foreground gate (accepted without rerun).** One strict-remote `--profile release` invocation on
+`vmi1153651` used `lto=false`, 16 codegen units, a 100 ms warm-up, and the same release binary for all arms. The
+paired ratio is source-slices/scratch-reuse (`<1` wins):
+
+| workload | A/A scratch-reuse null median [p5, p95] | source-slices/scratch-reuse median [p5, p95] | verdict |
+|---|---:|---:|---|
+| 256 markdown links | 1.0754 [0.7352, 1.3842] | **0.6002 [0.4095, 0.8456]** | **decidable ~1.67×** |
+
+The candidate median is below the null p5 and its p95 is below the null median. Criterion independently reported
+central estimates of **50.377 µs → 32.628 µs** (ratio 0.648, ~1.54×), consistent with removing the label
+double-copy and discarded URL copy. This is a relative same-binary result for markdown-link-heavy input, not an
+absolute production-profile latency claim. A preceding strict-remote test compile exposed a neighboring test
+name shadow before execution; qualifying the production function fixed that harness-only issue, and the attempt
+is excluded from performance evidence. No Cargo command ran locally and no second benchmark ran. **Decision:
+LANDED.** Retained comparator: `canonicalize/markdown_link_source_slices` with `bench-internals`.

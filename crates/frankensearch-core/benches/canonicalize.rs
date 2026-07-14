@@ -21,6 +21,7 @@ use frankensearch_core::bench_support::paired_median_ratio;
 #[cfg(feature = "bench-internals")]
 use frankensearch_core::canonicalize::{
     strip_markdown_links_fresh_buffers_bench, strip_markdown_links_reused_buffers_bench,
+    strip_markdown_links_source_slices_bench,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -84,7 +85,11 @@ fn md_new(line: &str) -> String {
 
 fn bench_nfc(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
-    bench_markdown_link_scratch(c);
+    {
+        let selected = std::env::var("MARKDOWN_LINK_AB").ok();
+        bench_markdown_link_scratch(c, selected.as_deref() == Some("scratch"));
+        bench_markdown_link_source_slices(c, selected.as_deref() == Some("source_slices"));
+    }
 
     let ascii_short = "fn main() { let x = retry_backoff(3); }".to_owned();
     let ascii_doc = "The quick brown fox jumps over the lazy dog. ".repeat(50);
@@ -397,7 +402,7 @@ fn bench_nfc(c: &mut Criterion) {
 }
 
 #[cfg(feature = "bench-internals")]
-fn bench_markdown_link_scratch(c: &mut Criterion) {
+fn markdown_link_fixture() -> String {
     let mut text = String::with_capacity(24_000);
     for i in 0..256 {
         use std::fmt::Write as _;
@@ -406,6 +411,12 @@ fn bench_markdown_link_scratch(c: &mut Criterion) {
             "See [result {i} with nested [label]](https://example.test/path/{i}(detail)) for context. "
         );
     }
+    text
+}
+
+#[cfg(feature = "bench-internals")]
+fn bench_markdown_link_scratch(c: &mut Criterion, run_paired: bool) {
+    let text = markdown_link_fixture();
 
     let former = strip_markdown_links_fresh_buffers_bench(&text);
     let reused = strip_markdown_links_reused_buffers_bench(&text);
@@ -417,32 +428,82 @@ fn bench_markdown_link_scratch(c: &mut Criterion) {
     let run_reused = || {
         black_box(strip_markdown_links_reused_buffers_bench(black_box(&text)));
     };
-    let null = paired_median_ratio(41, 4, run_former, run_former);
-    let lever = paired_median_ratio(41, 4, run_former, run_reused);
-    eprintln!(
-        "[null] markdown_link_scratch: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
-        null.median, null.p5, null.p95, null.rounds
-    );
-    eprintln!(
-        "[lever] markdown_link_scratch: reused/former median {:.4} p5 {:.4} p95 {:.4} -> {}",
-        lever.median,
-        lever.p5,
-        lever.p95,
-        if lever.decidable_against(&null) {
-            if lever.median < 1.0 {
-                "DECIDABLE WIN"
+    if run_paired {
+        let null = paired_median_ratio(41, 4, run_former, run_former);
+        let lever = paired_median_ratio(41, 4, run_former, run_reused);
+        eprintln!(
+            "[null] markdown_link_scratch: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] markdown_link_scratch: reused/former median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                if lever.median < 1.0 {
+                    "DECIDABLE WIN"
+                } else {
+                    "DECIDABLE REGRESSION"
+                }
             } else {
-                "DECIDABLE REGRESSION"
+                "INSIDE NULL FLOOR"
             }
-        } else {
-            "INSIDE NULL FLOOR"
-        }
-    );
+        );
+    }
 
     let mut group = c.benchmark_group("markdown_link_scratch");
     group.sample_size(20);
     group.bench_function("fresh_buffers", |b| b.iter(run_former));
     group.bench_function("reused_buffers", |b| b.iter(run_reused));
+    group.finish();
+}
+
+#[cfg(feature = "bench-internals")]
+fn bench_markdown_link_source_slices(c: &mut Criterion, run_paired: bool) {
+    let text = markdown_link_fixture();
+
+    let former = strip_markdown_links_reused_buffers_bench(&text);
+    let source_slices = strip_markdown_links_source_slices_bench(&text);
+    assert_eq!(
+        source_slices, former,
+        "source slices must preserve exact bytes"
+    );
+
+    let run_former = || {
+        black_box(strip_markdown_links_reused_buffers_bench(black_box(&text)));
+    };
+    let run_source_slices = || {
+        black_box(strip_markdown_links_source_slices_bench(black_box(&text)));
+    };
+    if run_paired {
+        let null = paired_median_ratio(41, 4, run_former, run_former);
+        let lever = paired_median_ratio(41, 4, run_former, run_source_slices);
+        eprintln!(
+            "[null] markdown_link_source_slices: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[lever] markdown_link_source_slices: source_slices/reused median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                if lever.median < 1.0 {
+                    "DECIDABLE WIN"
+                } else {
+                    "DECIDABLE REGRESSION"
+                }
+            } else {
+                "INSIDE NULL FLOOR"
+            }
+        );
+    }
+
+    let mut group = c.benchmark_group("markdown_link_source_slices");
+    group.sample_size(20);
+    group.bench_function("reused_buffers", |b| b.iter(run_former));
+    group.bench_function("source_slices", |b| b.iter(run_source_slices));
     group.finish();
 }
 

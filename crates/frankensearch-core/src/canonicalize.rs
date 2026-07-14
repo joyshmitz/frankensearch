@@ -427,10 +427,78 @@ fn strip_italic_underscores(text: &str) -> String {
 
 /// Strip markdown links: `[text](url)` → `text`.
 fn strip_markdown_links(text: &str) -> String {
+    let bytes = text.as_bytes();
     let mut result = String::with_capacity(text.len());
-    // A markdown-heavy document can contain hundreds of links. Keep the two parser
-    // scratch buffers across candidates so each link does not allocate a fresh
-    // text buffer plus a URL buffer that is immediately discarded on success.
+    let mut cursor = 0;
+
+    // ASCII delimiter bytes cannot occur inside a UTF-8 multibyte code point,
+    // so every index used to slice `text` below is a valid character boundary.
+    while let Some(relative_open) = text[cursor..].find('[') {
+        let open = cursor + relative_open;
+        result.push_str(&text[cursor..open]);
+
+        let mut bracket_depth = 1_usize;
+        let mut scan = open + 1;
+        let mut label_close = None;
+        while scan < bytes.len() {
+            match bytes[scan] {
+                b'[' => bracket_depth += 1,
+                b']' => {
+                    bracket_depth -= 1;
+                    if bracket_depth == 0 {
+                        label_close = Some(scan);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            scan += 1;
+        }
+
+        let Some(close) = label_close else {
+            result.push_str(&text[open..]);
+            return result;
+        };
+
+        if bytes.get(close + 1) == Some(&b'(') {
+            let mut paren_depth = 1_usize;
+            scan = close + 2;
+            let mut url_close = None;
+            while scan < bytes.len() {
+                match bytes[scan] {
+                    b'(' => paren_depth += 1,
+                    b')' => {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            url_close = Some(scan);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                scan += 1;
+            }
+
+            let Some(end) = url_close else {
+                result.push_str(&text[open..]);
+                return result;
+            };
+            result.push_str(&text[open + 1..close]);
+            cursor = end + 1;
+        } else {
+            result.push_str(&text[open..=close]);
+            cursor = close + 1;
+        }
+    }
+
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// Pre-source-slice markdown-link parser retained for same-binary parity and timing.
+#[cfg(any(test, feature = "bench-internals"))]
+fn strip_markdown_links_reused_buffers(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
     let mut link_text = String::new();
     let mut url_part = String::new();
     let mut chars = text.chars().peekable();
@@ -581,11 +649,19 @@ pub fn strip_markdown_links_fresh_buffers_bench(text: &str) -> String {
     strip_markdown_links_fresh_buffers(text)
 }
 
-/// Shipping scratch-reuse path exposed for the retained A/B.
+/// Former scratch-reuse path exposed for the retained A/B.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 #[must_use]
 pub fn strip_markdown_links_reused_buffers_bench(text: &str) -> String {
+    strip_markdown_links_reused_buffers(text)
+}
+
+/// Shipping source-slice path exposed for the retained A/B.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn strip_markdown_links_source_slices_bench(text: &str) -> String {
     strip_markdown_links(text)
 }
 
@@ -958,19 +1034,25 @@ mod tests {
     }
 
     #[test]
-    fn strip_markdown_link_scratch_reuse_matches_former_path() {
+    fn strip_markdown_link_source_slices_match_former_paths() {
         for input in [
             "",
             "plain text",
             "See [the docs](https://example.com/path) for details",
             "[one](a) [two [nested]](b(c)) [three](d)",
+            "] before [empty]() after",
             "prefix [closed only] suffix",
             "prefix [unclosed suffix",
             "Check [link](url( unbalanced. Next sentence.",
             "Unicode [café 日](https://example.test/é) tail",
         ] {
             assert_eq!(
-                strip_markdown_links(input),
+                super::strip_markdown_links(input),
+                strip_markdown_links_reused_buffers(input),
+                "source slices vs scratch reuse, input={input:?}",
+            );
+            assert_eq!(
+                strip_markdown_links_reused_buffers(input),
                 strip_markdown_links_fresh_buffers(input),
                 "input={input:?}",
             );
