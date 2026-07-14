@@ -13994,3 +13994,53 @@ lesson. **STATUS: IVF lever = implemented + speed-validated (40-82× vs flat) + 
 overlap sweep; the ONE remaining pre-land gate is REAL-corpus recall, unblockable by staging `FS_REAL_SLAB`
 (real 130k+ embeddings) on a worker — then, if recall holds at small probe, promote to an opt-in `src/` IVF index
 wired into InMemory.** Bench/test-only; production unchanged.
+
+### 2026-07-13 — IcyRidge — REJECTED: owned two-tier builder API transfer halves add time but full finish stays inside its null floor (`bd-xlpp`)
+
+**Negative-ledger-first route.** The earlier `bd-5973` rejection restored the second owned-record handoff from
+`TwoTierIndexBuilder::finish` into `VectorIndexWriter`, but explicitly left the earlier caller-to-builder
+slice-to-owned-vector copy as a separate route-next requiring its own profile. Production `IndexBuilder` receives
+owned `Vec<f32>` results from both embedders, then borrowed those vectors into `add_fast_record` and
+`add_quality_record`, forcing one avoidable payload clone before the already-rejected writer handoff.
+
+**Profile and one candidate.** The retained 20,000-document × 384-dimension fixture models one 29.297 MiB tier.
+On remote worker `vmi1152480`, its record deep-clone measured **6.076 ms median** [3.377, 16.240], while the
+borrowed builder-add boundary measured **9.611 ms median** [7.906, 21.045]; the clone was 63.22% of that boundary.
+The candidate added owned fast/quality builder entry points and moved the embedder-owned vectors into them. It did
+not change dimensions, duplicate-ID validation, record order, f16 encoding, checksums, sorting, or search.
+
+**Exact proof.** Borrowed and owned builder arms produced byte-identical 16,020,096-byte FSVI artifacts. Eight
+fixture queries produced identical top-10 lengths, indexes, document IDs, and score bits, so recall and nDCG are
+preserved exactly for this surface.
+
+**Speed — isolated win, full shipping gate HOLD.** Strict fail-closed foreground command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -p frankensearch-index --profile release --features bench-internals \
+  --bench fsvi_builder_record_transfer -- builder-api
+```
+
+One release binary, 21 alternating AB/BA round pairs per gate; ratio is owned/borrowed (`<1.0` is faster):
+
+| gate | A/A borrowed/borrowed median [p5, p95] | owned/borrowed median [p5, p95] | verdict |
+|---|---:|---:|---|
+| builder add | 1.021705 [0.826204, 1.460398] | **0.532615** [0.321833, 0.736410] | decidable isolated win |
+| builder add + encode/sort/fsync/open | 0.993935 [0.635516, 1.458783] | **0.937162** [0.623404, 1.304647] | **inside null floor** |
+
+The owned API removes nearly half the measured add-boundary time, but the full-operation median is above its A/A
+p5 by 0.301646. A 6.3% directional reduction is not resolvable inside this fixture's full-path noise floor; the
+full builder operation, not the isolated ownership boundary, is the shipping gate.
+
+**Decision and retry boundary.** **REJECT/HOLD; production remains byte-for-byte original.** The public owned
+entry points and production routing were restored. Only a `bench-internals` comparator and the reproducing
+`builder-api` benchmark mode remain. Do not retry this exact 20k×384 full-write fixture unless a substrate can
+resolve an approximately 6% end-to-end effect, or a demonstrated production shape makes the copy a larger share
+of total build time. This closes the route-next left by `bd-5973`; it does not reopen that rejected second handoff.
+
+**Validation.** The remote release benchmark exited 0. The final restored tree passed strict-remote
+`cargo check -j 4 -p frankensearch-index --all-targets --features bench-internals`; only pre-existing warnings in
+`columnar_scan_ab` and `residual_mask_scan` appeared. A strict-remote target-scoped `cargo clippy --no-deps --
+-D warnings` attempt reached the index library and stopped on its established 80-error lint baseline before the
+benchmark target, with no diagnostic in the changed files. Direct `rustfmt`, `git diff --check`, and the pre-commit
+UBS scan passed. Every Cargo command ran through `RCH_REQUIRE_REMOTE=1`; no local fallback occurred.

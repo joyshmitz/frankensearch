@@ -710,6 +710,40 @@ impl TwoTierIndexBuilder {
         Ok(())
     }
 
+    /// Bench-only comparator that adds an already-owned fast-tier vector record.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` if this record dimension differs
+    /// from previously added fast-tier vectors.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn add_fast_record_owned_for_benchmark(
+        &mut self,
+        doc_id: impl Into<String>,
+        embedding: Vec<f32>,
+    ) -> SearchResult<()> {
+        let dimension = embedding.len();
+        let expected = self.fast_dimension.get_or_insert(dimension);
+        if *expected != dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: *expected,
+                found: dimension,
+            });
+        }
+        let doc_id = doc_id.into();
+        if !self.fast_ids.insert(doc_id.clone()) {
+            return Err(SearchError::InvalidConfig {
+                field: "doc_id".to_owned(),
+                value: doc_id,
+                reason: "duplicate doc_id in fast tier; each document must have a unique id"
+                    .to_owned(),
+            });
+        }
+        self.fast_records.push((doc_id, embedding));
+        Ok(())
+    }
+
     /// Add a quality-tier vector record.
     ///
     /// # Errors

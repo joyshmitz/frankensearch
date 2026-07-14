@@ -5296,3 +5296,29 @@ win under the repository gate. Production remains on `merge_ranked_orig`; source
 documented higher-inner retry for these shapes. Reopen only on a lower-noise isolated worker or a materially
 larger measured overlap/key-cost workload. Exact command and full intervals are recorded in
 `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-13 — HOLD: owned two-tier builder API transfer is isolated-fast but full finish stays inside null (`bd-xlpp`)
+
+**Route and profile.** This was the explicit untested route-next left by the `bd-5973` FSVI writer-handoff
+rejection. Production embedders return owned vectors, but the two-tier builder API borrowed and copied them. On a
+20,000 × 384 one-tier fixture (29.297 MiB), remote profile medians were 6.076 ms for the record deep clone and
+9.611 ms for the borrowed builder-add boundary, so the copy was measurable rather than inferred.
+
+**Candidate and exactness.** One ownership lever moved already-owned embedder vectors into owned builder entry
+points. Borrowed and owned arms produced byte-identical 16,020,096-byte FSVI artifacts plus bit-identical top-10
+results for eight queries; ranking, recall, and nDCG are unchanged.
+
+**Paired gate.** Strict-remote worker `vmi1152480`, one release binary, 21 alternating AB/BA round pairs; ratio is
+owned/borrowed:
+
+| gate | A/A median [p5, p95] | candidate/original median [p5, p95] | verdict |
+|---|---:|---:|---|
+| builder add | 1.021705 [0.826204, 1.460398] | **0.532615** [0.321833, 0.736410] | isolated win |
+| add + encode/sort/fsync/open | 0.993935 [0.635516, 1.458783] | **0.937162** [0.623404, 1.304647] | inside null floor |
+
+**Decision.** **HOLD; production restored.** The isolated boundary is approximately 47% faster, but the full
+operation's 6.3% directional reduction does not clear its A/A p5. Only the feature-gated comparator and
+reproducing benchmark remain. Reopen only for a production shape where this copy is a larger end-to-end share or
+a substrate whose A/A floor can resolve roughly 6%. The final retained tree passed strict-remote all-target index
+check; the target-scoped `-D warnings` Clippy attempt stopped on the pre-existing 80-error index baseline before
+the benchmark. Full evidence and the exact command are in `docs/NEGATIVE_EVIDENCE.md`.

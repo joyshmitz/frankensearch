@@ -1,15 +1,19 @@
-//! Profile and paired gate for the buffered-record handoff into the FSVI writer.
+//! Profile and paired gates for owned-record transfers in the two-tier FSVI builder.
 //!
 //! The fixture models one 20k-document, 384-dimension tier. Fixture construction
-//! and per-arm source cloning stay outside the timer: the measured production work
-//! begins with records already owned by `TwoTierIndexBuilder`.
+//! and per-arm source cloning stay outside the timer. The default gate preserves the
+//! historical builder-to-writer comparison; pass `builder-api` to measure the earlier
+//! caller-to-builder copy.
 
 use std::fs;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use frankensearch_index::{VectorIndex, VectorIndexWriter};
+use frankensearch_core::TwoTierConfig;
+use frankensearch_index::{
+    TwoTierIndex, VECTOR_INDEX_FAST_FILENAME, VectorIndex, VectorIndexWriter,
+};
 
 const DOCUMENTS: usize = 20_000;
 const DIMENSION: usize = 384;
@@ -101,6 +105,77 @@ fn writer_path(label: &str) -> PathBuf {
 fn create_writer(label: &str) -> VectorIndexWriter {
     VectorIndex::create(&writer_path(label), "profile-384", DIMENSION)
         .expect("create in-memory writer state")
+}
+
+fn builder_dir(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "fsvi_builder_api_transfer_{}_{}",
+        std::process::id(),
+        label
+    ))
+}
+
+fn create_builder(label: &str) -> frankensearch_index::TwoTierIndexBuilder {
+    TwoTierIndex::create(&builder_dir(label), TwoTierConfig::default())
+        .expect("create two-tier builder")
+}
+
+fn time_borrowed_builder_add(source: &[(String, Vec<f32>)], label: &str) -> Duration {
+    let records = source.to_vec();
+    let mut builder = create_builder(label);
+    let started = Instant::now();
+    for (doc_id, embedding) in records {
+        builder
+            .add_fast_record(doc_id, &embedding)
+            .expect("add borrowed builder record");
+    }
+    let elapsed = started.elapsed();
+    black_box(&builder);
+    elapsed
+}
+
+fn time_owned_builder_add(source: &[(String, Vec<f32>)], label: &str) -> Duration {
+    let records = source.to_vec();
+    let mut builder = create_builder(label);
+    let started = Instant::now();
+    for (doc_id, embedding) in records {
+        builder
+            .add_fast_record_owned_for_benchmark(doc_id, embedding)
+            .expect("add owned builder record");
+    }
+    let elapsed = started.elapsed();
+    black_box(&builder);
+    elapsed
+}
+
+fn time_borrowed_builder_finish(source: &[(String, Vec<f32>)], label: &str) -> Duration {
+    let records = source.to_vec();
+    let mut builder = create_builder(label);
+    let started = Instant::now();
+    for (doc_id, embedding) in records {
+        builder
+            .add_fast_record(doc_id, &embedding)
+            .expect("add borrowed builder record");
+    }
+    let index = builder.finish().expect("finish borrowed builder");
+    let elapsed = started.elapsed();
+    black_box(&index);
+    elapsed
+}
+
+fn time_owned_builder_finish(source: &[(String, Vec<f32>)], label: &str) -> Duration {
+    let records = source.to_vec();
+    let mut builder = create_builder(label);
+    let started = Instant::now();
+    for (doc_id, embedding) in records {
+        builder
+            .add_fast_record_owned_for_benchmark(doc_id, embedding)
+            .expect("add owned builder record");
+    }
+    let index = builder.finish().expect("finish owned builder");
+    let elapsed = started.elapsed();
+    black_box(&index);
+    elapsed
 }
 
 fn time_borrowed_ingest(source: &[(String, Vec<f32>)], label: &str) -> Duration {
@@ -212,7 +287,7 @@ where
     ratio_distribution(ratios)
 }
 
-fn profile(source: &[(String, Vec<f32>)]) {
+fn profile_writer_handoff(source: &[(String, Vec<f32>)]) {
     let mut clone_samples = Vec::with_capacity(PROFILE_ROUNDS);
     let mut writer_samples = Vec::with_capacity(PROFILE_ROUNDS);
 
@@ -244,7 +319,41 @@ fn profile(source: &[(String, Vec<f32>)]) {
     );
 }
 
-fn prove_parity(source: &[(String, Vec<f32>)]) {
+fn profile_builder_api(source: &[(String, Vec<f32>)]) {
+    let mut clone_samples = Vec::with_capacity(PROFILE_ROUNDS);
+    let mut builder_samples = Vec::with_capacity(PROFILE_ROUNDS);
+
+    for round in 0..PROFILE_ROUNDS {
+        let started = Instant::now();
+        let cloned = source.to_vec();
+        let clone_elapsed = started.elapsed();
+        black_box(&cloned);
+        clone_samples.push(clone_elapsed);
+        drop(cloned);
+
+        builder_samples.push(time_borrowed_builder_add(
+            source,
+            &format!("builder-profile-{round}"),
+        ));
+    }
+
+    let clone_profile = distribution(clone_samples);
+    let builder_profile = distribution(builder_samples);
+    eprintln!(
+        "[profile] record_deep_clone median_ms={:.3} p5_ms={:.3} p95_ms={:.3}",
+        clone_profile.median_ms, clone_profile.p5_ms, clone_profile.p95_ms
+    );
+    eprintln!(
+        "[profile] borrowed_builder_add median_ms={:.3} p5_ms={:.3} p95_ms={:.3}",
+        builder_profile.median_ms, builder_profile.p5_ms, builder_profile.p95_ms
+    );
+    eprintln!(
+        "[profile] clone_to_builder_add_median_fraction={:.4}",
+        clone_profile.median_ms / builder_profile.median_ms
+    );
+}
+
+fn prove_writer_parity(source: &[(String, Vec<f32>)]) {
     let borrowed_path = writer_path("parity-borrowed");
     let owned_path = writer_path("parity-owned");
 
@@ -314,6 +423,58 @@ fn prove_parity(source: &[(String, Vec<f32>)]) {
     );
 }
 
+fn prove_builder_api_parity(source: &[(String, Vec<f32>)]) {
+    let borrowed_dir = builder_dir("builder-parity-borrowed");
+    let owned_dir = builder_dir("builder-parity-owned");
+
+    let mut borrowed = TwoTierIndex::create(&borrowed_dir, TwoTierConfig::default())
+        .expect("create borrowed parity builder");
+    for (doc_id, embedding) in source {
+        borrowed
+            .add_fast_record(doc_id.clone(), embedding)
+            .expect("add borrowed parity record");
+    }
+    let borrowed = borrowed.finish().expect("finish borrowed parity builder");
+
+    let mut owned = TwoTierIndex::create(&owned_dir, TwoTierConfig::default())
+        .expect("create owned parity builder");
+    for (doc_id, embedding) in source.to_vec() {
+        owned
+            .add_fast_record_owned_for_benchmark(doc_id, embedding)
+            .expect("add owned parity record");
+    }
+    let owned = owned.finish().expect("finish owned parity builder");
+
+    let borrowed_bytes = fs::read(borrowed_dir.join(VECTOR_INDEX_FAST_FILENAME))
+        .expect("read borrowed builder file");
+    let owned_bytes =
+        fs::read(owned_dir.join(VECTOR_INDEX_FAST_FILENAME)).expect("read owned builder file");
+    assert_eq!(
+        borrowed_bytes, owned_bytes,
+        "builder FSVI bytes must be identical"
+    );
+
+    for query in source.iter().step_by(DOCUMENTS / PARITY_QUERIES) {
+        let borrowed_hits = borrowed
+            .search_fast(&query.1, 10)
+            .expect("search borrowed builder index");
+        let owned_hits = owned
+            .search_fast(&query.1, 10)
+            .expect("search owned builder index");
+        assert_eq!(borrowed_hits.len(), owned_hits.len());
+        for (borrowed_hit, owned_hit) in borrowed_hits.iter().zip(&owned_hits) {
+            assert_eq!(borrowed_hit.index, owned_hit.index);
+            assert_eq!(borrowed_hit.doc_id, owned_hit.doc_id);
+            assert_eq!(borrowed_hit.score.to_bits(), owned_hit.score.to_bits());
+        }
+    }
+
+    eprintln!(
+        "[parity] builder_api_fsvi_bytes_identical=true bytes={} queries={PARITY_QUERIES} top10_identical=true recall_preserved=true ndcg_preserved=true score_bits_identical=true",
+        borrowed_bytes.len()
+    );
+}
+
 fn print_ratio(label: &str, result: RatioDistribution, null: Option<RatioDistribution>) {
     if let Some(null) = null {
         eprintln!(
@@ -337,35 +498,28 @@ fn print_ratio(label: &str, result: RatioDistribution, null: Option<RatioDistrib
     }
 }
 
-fn main() {
-    let payload_elements = u32::try_from(DOCUMENTS * DIMENSION).expect("payload fits u32");
-    eprintln!(
-        "[profile-config] documents={DOCUMENTS} dimension={DIMENSION} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS} payload_mib={:.3}",
-        f64::from(payload_elements) * 4.0 / (1024.0 * 1024.0)
-    );
-
-    let source = fixture();
-    profile(&source);
-    prove_parity(&source);
+fn run_writer_handoff(source: &[(String, Vec<f32>)]) {
+    profile_writer_handoff(source);
+    prove_writer_parity(source);
 
     let ingest_null = paired_ratio(
-        || time_borrowed_ingest(&source, "ingest-null-a"),
-        || time_borrowed_ingest(&source, "ingest-null-b"),
+        || time_borrowed_ingest(source, "ingest-null-a"),
+        || time_borrowed_ingest(source, "ingest-null-b"),
     );
     let ingest_lever = paired_ratio(
-        || time_borrowed_ingest(&source, "ingest-original"),
-        || time_owned_ingest(&source, "ingest-candidate"),
+        || time_borrowed_ingest(source, "ingest-original"),
+        || time_owned_ingest(source, "ingest-candidate"),
     );
     print_ratio("writer_ingest", ingest_null, None);
     print_ratio("writer_ingest", ingest_lever, Some(ingest_null));
 
     let finish_null = paired_ratio(
-        || time_borrowed_finish(&source, "finish-null-a"),
-        || time_borrowed_finish(&source, "finish-null-b"),
+        || time_borrowed_finish(source, "finish-null-a"),
+        || time_borrowed_finish(source, "finish-null-b"),
     );
     let finish_lever = paired_ratio(
-        || time_borrowed_finish(&source, "finish-original"),
-        || time_owned_finish(&source, "finish-candidate"),
+        || time_borrowed_finish(source, "finish-original"),
+        || time_owned_finish(source, "finish-candidate"),
     );
     print_ratio("writer_transfer_plus_finish", finish_null, None);
     print_ratio(
@@ -384,4 +538,61 @@ fn main() {
             "HOLD"
         }
     );
+}
+
+fn run_builder_api(source: &[(String, Vec<f32>)]) {
+    profile_builder_api(source);
+    prove_builder_api_parity(source);
+
+    let add_null = paired_ratio(
+        || time_borrowed_builder_add(source, "builder-add-null-a"),
+        || time_borrowed_builder_add(source, "builder-add-null-b"),
+    );
+    let add_lever = paired_ratio(
+        || time_borrowed_builder_add(source, "builder-add-original"),
+        || time_owned_builder_add(source, "builder-add-candidate"),
+    );
+    print_ratio("builder_api_add", add_null, None);
+    print_ratio("builder_api_add", add_lever, Some(add_null));
+
+    let finish_null = paired_ratio(
+        || time_borrowed_builder_finish(source, "builder-finish-null-a"),
+        || time_borrowed_builder_finish(source, "builder-finish-null-b"),
+    );
+    let finish_lever = paired_ratio(
+        || time_borrowed_builder_finish(source, "builder-finish-original"),
+        || time_owned_builder_finish(source, "builder-finish-candidate"),
+    );
+    print_ratio("builder_api_add_plus_finish", finish_null, None);
+    print_ratio(
+        "builder_api_add_plus_finish",
+        finish_lever,
+        Some(finish_null),
+    );
+
+    let add_verdict = add_lever.verdict_against(add_null);
+    let finish_verdict = finish_lever.verdict_against(finish_null);
+    eprintln!(
+        "[paired-gate] parity=true add_verdict={add_verdict} finish_verdict={finish_verdict} gate={}",
+        if finish_verdict == "CANDIDATE_FASTER" {
+            "KEEP"
+        } else {
+            "HOLD"
+        }
+    );
+}
+
+fn main() {
+    let payload_elements = u32::try_from(DOCUMENTS * DIMENSION).expect("payload fits u32");
+    eprintln!(
+        "[profile-config] documents={DOCUMENTS} dimension={DIMENSION} profile_rounds={PROFILE_ROUNDS} paired_round_pairs={PAIRED_ROUND_PAIRS} payload_mib={:.3}",
+        f64::from(payload_elements) * 4.0 / (1024.0 * 1024.0)
+    );
+
+    let source = fixture();
+    if std::env::args().any(|argument| argument == "builder-api") {
+        run_builder_api(&source);
+    } else {
+        run_writer_handoff(&source);
+    }
 }
