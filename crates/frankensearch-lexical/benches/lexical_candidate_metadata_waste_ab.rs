@@ -4,7 +4,9 @@
 //! candidate acquisition followed by winner-only metadata hydration. The second gate
 //! isolates that exact-ID hydration step: the retained baseline asks `TopDocs` to score
 //! and heap-sort the matching IDs, while production uses an unscored document-set
-//! collector because hydration consumes neither score nor hit order.
+//! collector because hydration consumes neither score nor hit order. The third gate
+//! compares the former per-document linear result search with production's borrowed-
+//! key result-slot index.
 //!
 //! This measures three per-query materialization shapes over the top-k hits of a
 //! metadata-bearing index, isolating (a) the metadata deserialize share and (b) the
@@ -20,6 +22,7 @@
 //! ```
 //!
 //! Set `META_COLLECTOR_ONLY=1` to run only the exact-ID collector gate.
+//! Set `META_LOOKUP_ONLY=1` to run only the exact-ID result-lookup gate.
 
 use std::hint::black_box;
 
@@ -290,8 +293,10 @@ fn run_product_gate() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
+    let collector_only = std::env::var_os("META_COLLECTOR_ONLY").is_some();
+    let lookup_only = std::env::var_os("META_LOOKUP_ONLY").is_some();
 
-    if std::env::var_os("META_COLLECTOR_ONLY").is_none() {
+    if !collector_only && !lookup_only {
         for &k in KS {
             let full = full_winners(&runtime, &cx, &index, k);
             let deferred = deferred_winners(&runtime, &cx, &index, k);
@@ -326,102 +331,201 @@ fn run_product_gate() {
         }
     }
 
-    let collector_inner = std::env::var("META_COLLECTOR_AB_INNER")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(4);
-    for &winners in HYDRATION_WINNERS {
-        let seed = hydration_candidates(&runtime, &cx, &index, winners);
-        assert_eq!(seed.len(), winners, "unexpected hydration candidate count");
+    if !lookup_only {
+        let collector_inner = std::env::var("META_COLLECTOR_AB_INNER")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4);
+        for &winners in HYDRATION_WINNERS {
+            let seed = hydration_candidates(&runtime, &cx, &index, winners);
+            assert_eq!(seed.len(), winners, "unexpected hydration candidate count");
 
-        let mut scored = seed.clone();
-        runtime.block_on(async {
-            index
-                .hydrate_fusion_metadata_scored_for_bench(&cx, &mut scored)
-                .await
-                .expect("scored hydration parity")
-        });
-        let mut unscored = seed.clone();
-        runtime.block_on(async {
-            index
-                .hydrate_fusion_metadata(&cx, &mut unscored)
-                .await
-                .expect("unscored hydration parity")
-        });
-        assert_eq!(
-            serde_json::to_vec(&scored).expect("serialize scored hydration"),
-            serde_json::to_vec(&unscored).expect("serialize unscored hydration"),
-            "scored and unscored hydration outputs differ at winners={winners}"
-        );
+            let mut scored = seed.clone();
+            runtime.block_on(async {
+                index
+                    .hydrate_fusion_metadata_scored_for_bench(&cx, &mut scored)
+                    .await
+                    .expect("scored hydration parity")
+            });
+            let mut unscored = seed.clone();
+            runtime.block_on(async {
+                index
+                    .hydrate_fusion_metadata(&cx, &mut unscored)
+                    .await
+                    .expect("unscored hydration parity")
+            });
+            assert_eq!(
+                serde_json::to_vec(&scored).expect("serialize scored hydration"),
+                serde_json::to_vec(&unscored).expect("serialize unscored hydration"),
+                "scored and unscored hydration outputs differ at winners={winners}"
+            );
 
-        let mut null_a = seed.clone();
-        let mut null_b = seed.clone();
-        let null = paired_median_ratio(
-            31,
-            collector_inner,
-            || {
-                runtime.block_on(async {
-                    index
-                        .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_a)
-                        .await
-                        .expect("scored hydration null A")
-                });
-                black_box(&null_a);
-                clear_hydrated_metadata(&mut null_a);
-            },
-            || {
-                runtime.block_on(async {
-                    index
-                        .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_b)
-                        .await
-                        .expect("scored hydration null B")
-                });
-                black_box(&null_b);
-                clear_hydrated_metadata(&mut null_b);
-            },
-        );
+            let mut null_a = seed.clone();
+            let mut null_b = seed.clone();
+            let null = paired_median_ratio(
+                31,
+                collector_inner,
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_a)
+                            .await
+                            .expect("scored hydration null A")
+                    });
+                    black_box(&null_a);
+                    clear_hydrated_metadata(&mut null_a);
+                },
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_b)
+                            .await
+                            .expect("scored hydration null B")
+                    });
+                    black_box(&null_b);
+                    clear_hydrated_metadata(&mut null_b);
+                },
+            );
 
-        let mut original = seed.clone();
-        let mut candidate = seed;
-        let unscored_vs_scored = paired_median_ratio(
-            31,
-            collector_inner,
-            || {
-                runtime.block_on(async {
-                    index
-                        .hydrate_fusion_metadata_scored_for_bench(&cx, &mut original)
-                        .await
-                        .expect("scored hydration")
-                });
-                black_box(&original);
-                clear_hydrated_metadata(&mut original);
-            },
-            || {
-                runtime.block_on(async {
-                    index
-                        .hydrate_fusion_metadata(&cx, &mut candidate)
-                        .await
-                        .expect("unscored hydration")
-                });
-                black_box(&candidate);
-                clear_hydrated_metadata(&mut candidate);
-            },
-        );
-        eprintln!(
-            "[hydrate winners={winners}] null {:.4} [{:.4},{:.4}] | unscored/scored {:.4} [{:.4},{:.4}] ({})",
-            null.median,
-            null.p5,
-            null.p95,
-            unscored_vs_scored.median,
-            unscored_vs_scored.p5,
-            unscored_vs_scored.p95,
-            ratio(&unscored_vs_scored, &null),
-        );
+            let mut original = seed.clone();
+            let mut candidate = seed;
+            let unscored_vs_scored = paired_median_ratio(
+                31,
+                collector_inner,
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata_scored_for_bench(&cx, &mut original)
+                            .await
+                            .expect("scored hydration")
+                    });
+                    black_box(&original);
+                    clear_hydrated_metadata(&mut original);
+                },
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata(&cx, &mut candidate)
+                            .await
+                            .expect("unscored hydration")
+                    });
+                    black_box(&candidate);
+                    clear_hydrated_metadata(&mut candidate);
+                },
+            );
+            eprintln!(
+                "[hydrate winners={winners}] null {:.4} [{:.4},{:.4}] | unscored/scored {:.4} [{:.4},{:.4}] ({})",
+                null.median,
+                null.p5,
+                null.p95,
+                unscored_vs_scored.median,
+                unscored_vs_scored.p5,
+                unscored_vs_scored.p95,
+                ratio(&unscored_vs_scored, &null),
+            );
+        }
+    }
+
+    if !collector_only {
+        let lookup_inner = std::env::var("META_LOOKUP_AB_INNER")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4);
+        for &winners in HYDRATION_WINNERS {
+            let seed = hydration_candidates(&runtime, &cx, &index, winners);
+            assert_eq!(seed.len(), winners, "unexpected hydration candidate count");
+
+            let mut linear = seed.clone();
+            runtime.block_on(async {
+                index
+                    .hydrate_fusion_metadata_linear_for_bench(&cx, &mut linear)
+                    .await
+                    .expect("linear hydration parity")
+            });
+            let mut indexed = seed.clone();
+            runtime.block_on(async {
+                index
+                    .hydrate_fusion_metadata(&cx, &mut indexed)
+                    .await
+                    .expect("indexed hydration parity")
+            });
+            assert_eq!(
+                serde_json::to_vec(&linear).expect("serialize linear hydration"),
+                serde_json::to_vec(&indexed).expect("serialize indexed hydration"),
+                "linear and indexed hydration outputs differ at winners={winners}"
+            );
+
+            let mut null_a = seed.clone();
+            let mut null_b = seed.clone();
+            let null = paired_median_ratio(
+                31,
+                lookup_inner,
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata_linear_for_bench(&cx, &mut null_a)
+                            .await
+                            .expect("linear hydration null A")
+                    });
+                    black_box(&null_a);
+                    clear_hydrated_metadata(&mut null_a);
+                },
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata_linear_for_bench(&cx, &mut null_b)
+                            .await
+                            .expect("linear hydration null B")
+                    });
+                    black_box(&null_b);
+                    clear_hydrated_metadata(&mut null_b);
+                },
+            );
+
+            let mut original = seed.clone();
+            let mut candidate = seed;
+            let indexed_vs_linear = paired_median_ratio(
+                31,
+                lookup_inner,
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata_linear_for_bench(&cx, &mut original)
+                            .await
+                            .expect("linear hydration")
+                    });
+                    black_box(&original);
+                    clear_hydrated_metadata(&mut original);
+                },
+                || {
+                    runtime.block_on(async {
+                        index
+                            .hydrate_fusion_metadata(&cx, &mut candidate)
+                            .await
+                            .expect("indexed hydration")
+                    });
+                    black_box(&candidate);
+                    clear_hydrated_metadata(&mut candidate);
+                },
+            );
+            eprintln!(
+                "[lookup winners={winners}] null {:.4} [{:.4},{:.4}] | indexed/linear {:.4} [{:.4},{:.4}] ({})",
+                null.median,
+                null.p5,
+                null.p95,
+                indexed_vs_linear.median,
+                indexed_vs_linear.p5,
+                indexed_vs_linear.p95,
+                ratio(&indexed_vs_linear, &null),
+            );
+        }
     }
 }
 
 fn main() {
-    if std::env::var_os("META_COLLECTOR_ONLY").is_some() {
+    if std::env::var_os("META_COLLECTOR_ONLY").is_some()
+        || std::env::var_os("META_LOOKUP_ONLY").is_some()
+    {
         run_product_gate();
         return;
     }
