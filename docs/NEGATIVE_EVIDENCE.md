@@ -13914,6 +13914,37 @@ result-retrieval is healthy to capture recall@10(probe); then, if recall is acce
 the IVF from bench to an opt-in `src/` index type + wire it into the InMemory path (which has no ANN). No
 production change (bench-only).
 
+### 2026-07-13 — IcyRidge — REJECT CONFIRMED: cass single-parse full-builder delta remains inside a tightened A/A floor (`bd-wz3o`)
+
+The earlier full-builder run was directionally favorable but unusable for a shipping decision: each paired arm
+was only about 0.4 ms and its A/A band spanned `0.5213..2.1816`. This follow-up kept the same six realistic query
+shapes, both complete query builders, and the exact query-tree parity gate, but raised the paired inner count from
+16 to 256 so each arm ran at millisecond scale. No production code changed.
+
+Strict fail-closed foreground command:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_QUEUE_WHEN_BUSY=1 RCH_ENV_ALLOWLIST=AGENT_NAME \
+  AGENT_NAME=IcyRidge env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -j 4 -p frankensearch-lexical --features bench-internals \
+  --profile release --bench tokenizer_char_walk_ab -- boolean_operator_reparse --noplot
+```
+
+Worker `vmi1167313`; one release binary; 41 alternating rounds; `inner=256`; ratio is
+single-parse/production (`<1.0` is faster):
+
+| surface | A/A production/production median [p5, p95] | single-parse/production median [p5, p95] | verdict |
+|---|---:|---:|---|
+| full builder, six-query batch | 0.9872 [0.7747, 1.2570] | 0.8291 [0.5906, 1.0793] | **inside null floor** |
+
+The longer sample substantially narrowed the null band, but the candidate median still did not cross its p5.
+Criterion likewise overlapped: production `20.101..21.950 us` versus single-parse `19.465..21.227 us`.
+**Decision: REJECT for this production-backed query batch; production remains on the original two-parse path.**
+The strengthened comparator stays behind `bench-internals` so the boundary remains reproducible, but do not retry
+this lever without a materially different demonstrated production query distribution or a lower-noise isolated
+worker. Two preflight attempts were refused before Cargo for eight-slot admission; the successful four-slot run
+was fully remote, exited 0, and no local fallback ran.
+
 ### 2026-07-13 — cc_fse — IVF lever VALIDATED end-to-end: probe=2 → recall@10 1.0 at 15× fewer dots (synthetic clustered); real-corpus recall is the last gate
 
 Completed the IVF lever (implemented `ivf_recall_ab` + speed `ivf_crossover_ab`) by capturing the RECALL/probe

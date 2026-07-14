@@ -159,8 +159,11 @@ fn bench_boolean_operator_reparse(c: &mut Criterion) {
     // NULL (legacy vs legacy), then a full-builder A/B. Both arms construct and
     // drop the same Tantivy query tree; only the candidate omits the second
     // boolean-token parse/allocation.
-    let null = paired_median_ratio(41, 16, run_legacy, run_legacy);
-    let lever = paired_median_ratio(41, 16, run_legacy, run_single_parse);
+    // Keep each arm in the millisecond range so worker scheduling jitter does
+    // not dominate this small full-builder delta (the earlier inner=16 run
+    // produced an unusably wide 0.52..2.18 A/A band).
+    let null = paired_median_ratio(41, 256, run_legacy, run_legacy);
+    let lever = paired_median_ratio(41, 256, run_legacy, run_single_parse);
     eprintln!(
         "[null]  boolean_operator_reparse/{}queries: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
         queries.len(),
