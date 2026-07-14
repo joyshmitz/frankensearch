@@ -13845,3 +13845,64 @@ lever for N≫130k deployments (speed accelerates past the int8-two-pass baselin
 needs (a) real-corpus RECALL validation and (b) wiring ANN into the InMemory path (which has none). The
 concrete unblocker is a large-N (>>130k) real corpus + embeddings staged on a worker.** `ivf_crossover_ab`
 retained; production unchanged (bench-only).
+
+### 2026-07-13 — IcyRidge — REJECTED: production-backed `check_dedup_batch` confirms the slot-aligned `VALUES` join is not faster (`bd-0j5e`)
+
+**Why this row was reopened.** The 2026-07-09 rejection compared two benchmark-local copies. Although both
+arms hit real SQLite and agreed exactly, the benchmark never called shipped
+`Storage::check_dedup_batch`; the ledger-integrity audit therefore classified that result as proxy-measured and
+opened `bd-0j5e`. This rerun corrects that reachability gap: the original arm calls the public production
+function on every timed iteration. The retained legacy mirror is now an untimed oracle only.
+
+**One lever and behavior oracle.** The candidate is unchanged: replace production's `IN (...)` query plus Rust
+`HashMap<String, DedupRow>` materialization/probes with an ordered `WITH requested(ord, doc_id) AS (VALUES ...)`
+relation and consume slot-aligned rows. Before timing each shape, the same binary asserts exact equality among
+the shipped production path, the retained legacy mirror, and the slot-join candidate. The fixtures cover
+missing, already-embedded, changed-content, failed, and skipped documents at batch sizes 32, 128, and 384. All
+three equality gates passed; the claim is exact `DeduplicationDecision` vector parity, including order, hashes,
+IDs, variants, and reasons.
+
+**Strict-remote same-binary gate.** The first fail-closed attempt was refused before Cargo because no worker had
+the default eight test slots; no local fallback ran. Matching RCH's reservation to `cargo -j 4` admitted the
+authoritative foreground run on worker `vmi1167313`:
+
+```bash
+RCH_REQUIRE_REMOTE=1 RCH_TEST_SLOTS=4 RCH_ENV_ALLOWLIST=AGENT_NAME \
+  AGENT_NAME=IcyRidge env -u CARGO_TARGET_DIR rch exec -- \
+  cargo bench -j 4 -p frankensearch-storage --features bench-internals \
+  --profile release --bench dedup_batch
+```
+
+One release binary ran 31 alternating AB/BA rounds per shape (`inner=1`). Ratio is
+slot-join/production (`<1.0` is faster):
+
+| batch | A/A production/production median [p5, p95] | slot-join/production median [p5, p95] | verdict |
+|---:|---:|---:|---|
+| 32 | 0.988920 [0.809264, 1.580776] | **1.190797** [0.976931, 1.516631] | inside null floor; 19.1% slower direction |
+| 128 | 1.001862 [0.582044, 1.294866] | **1.073735** [0.934084, 1.504542] | inside null floor; 7.4% slower direction |
+| 384 | 0.992869 [0.652503, 1.238474] | **1.078952** [0.834059, 1.982276] | inside null floor; 7.9% slower direction |
+
+**Decision.** **REJECT; production remains unchanged.** A shippable candidate must put its median below the
+same-function A/A p5. The candidate clears no shape and is slower in direction on all three, agreeing with the
+older proxy result without relying on it. The corrected benchmark remains in-tree and now calls the shipped
+symbol directly, retains both implementations, asserts exact parity, and reports its own paired null floor. This
+closes the ledger-integrity retry: do not retry the ordered `VALUES`/slot-alignment primitive for these batch
+shapes unless the production workload changes materially.
+
+### 2026-07-13 — cc_fse — IVF lever IMPLEMENTED (k-means + probe + recall@k); recall NUMBERS fleet-blocked (rch rsync-retrieval failing this session)
+
+Directed to implement the IVF candidate-reduction lever (quantified 40-82× vs flat above N≫130k). Implemented it
+end-to-end in `ivf_recall_ab` (committed `5e1423e4`): full **k-means** clustering (Lloyd, `NLIST≈√N` lists),
+inverted lists, **probe-P** L2 search, and a **recall@10-vs-probe Pareto** measured against the flat ground
+truth (the landability question `ivf_crossover_ab`'s speed-only bench left open). The bench COMPILES and RUNS to
+exit 0 (~1000s runs = ~15-min cold compile on rch's managed target + a short execute). **But this session's rch
+transfer layer repeatedly failed to return the bench stderr** — 5+ runs across custom (`search-cod`) and managed
+(`env -u CARGO_TARGET_DIR`) targets each ended in `Failed to sync custom CARGO_TARGET_DIR artifacts: rsync
+artifact retrieval failed` or an empty/truncated capture, so the recall/probe Pareto numbers could not be
+captured (the shorter `ivf_crossover_ab` speed numbers DID come back once via `env -u`, so the fleet is
+intermittent, not the bench). Also hit `failed to create directory /data/projects/.rch-targets` on one worker.
+**STATUS: the IVF lever is IMPLEMENTED + speed-validated (40-82× vs flat, `b1725508`); the RECALL validation is
+coded and runs but its output is pending a stable rch fleet.** Next: re-run `ivf_recall_ab` when rch's rsync
+result-retrieval is healthy to capture recall@10(probe); then, if recall is acceptable at a small probe, promote
+the IVF from bench to an opt-in `src/` index type + wire it into the InMemory path (which has no ANN). No
+production change (bench-only).
