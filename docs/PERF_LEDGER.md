@@ -5532,3 +5532,33 @@ remote link and supports only this relative same-binary decision. A preceding st
 running, shared main commit `8207cce6` captured the candidate; this closeout removes it forward rather than
 rewriting pushed history. **Decision: REJECT.** Do not add a per-call hash index to this hydration path without a
 quieter product-real workload that can resolve the effect and demonstrates materially larger winner batches.
+
+## 2026-07-14 — LANDED: reuse markdown-link parser scratch buffers, ~2.23× on link-heavy canonicalization (`bd-xs7l`)
+
+**Negative-ledger-first attribution and one lever.** Core canonicalization's
+`strip_markdown_links` creates a fresh `String` for link text and another for the URL at every `[` candidate.
+The URL buffer is discarded for every valid link. The earlier rejected whitespace run-copy experiment is not
+repeated here: this change retains the existing Unicode character parser and only moves its two scratch buffers
+outside the candidate loop, clearing and reusing their capacity. Plain lines still bypass the link parser, and
+non-link brackets do not allocate until text is pushed.
+
+**Exactness.** The retained former implementation and shipping scratch-reuse implementation ran in the same
+binary. Before timing, the benchmark asserted byte-for-byte equality across a 256-link document containing
+nested link labels and parenthesized URLs. A focused parity test also covers empty/plain input, multiple links,
+closed-only and unclosed brackets, an unbalanced URL, and Unicode link text/URLs. Canonical text—and therefore
+tokens, embeddings, index terms, and ranking—does not change.
+
+**First clean foreground gate (accepted without rerun).** One strict-remote `--profile release` invocation on
+`vmi1227854` used `lto=false` and 16 codegen units to bound the cold release link. The paired ratio is
+reused/former (`<1` wins):
+
+| workload | A/A former null median [p5, p95] | reused/former median [p5, p95] | verdict |
+|---|---:|---:|---|
+| 256 markdown links | 0.9781 [0.5992, 1.9895] | **0.4477 [0.2786, 0.5228]** | **decidable ~2.23×** |
+
+The candidate p95 remains below the noisy null p5. Criterion independently reported central estimates of
+**69.742 µs → 32.094 µs** (ratio 0.460), consistent with eliminating 510 repeated heap allocations per call
+after the two scratch buffers first grow. This is a relative same-binary result for markdown-link-heavy input,
+not a claim about plain-text documents, which never enter this parser. No local Cargo command or second
+benchmark ran. **Decision: LANDED.** Retained comparator: `canonicalize/markdown_link_scratch` with
+`bench-internals`.

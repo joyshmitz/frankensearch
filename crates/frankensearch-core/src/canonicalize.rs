@@ -428,12 +428,17 @@ fn strip_italic_underscores(text: &str) -> String {
 /// Strip markdown links: `[text](url)` → `text`.
 fn strip_markdown_links(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
+    // A markdown-heavy document can contain hundreds of links. Keep the two parser
+    // scratch buffers across candidates so each link does not allocate a fresh
+    // text buffer plus a URL buffer that is immediately discarded on success.
+    let mut link_text = String::new();
+    let mut url_part = String::new();
     let mut chars = text.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '[' {
             // Potential link start
-            let mut link_text = String::new();
+            link_text.clear();
             let mut found_close = false;
             let mut bracket_depth = 1;
 
@@ -453,7 +458,8 @@ fn strip_markdown_links(text: &str) -> String {
             if found_close && chars.peek() == Some(&'(') {
                 // Potential URL start
                 chars.next(); // consume '('
-                let mut url_part = String::from("(");
+                url_part.clear();
+                url_part.push('(');
                 let mut depth = 1;
                 let mut valid_link = false;
 
@@ -496,6 +502,91 @@ fn strip_markdown_links(text: &str) -> String {
     }
 
     result
+}
+
+/// Pre-scratch-reuse markdown-link parser retained for same-binary parity and timing.
+#[cfg(any(test, feature = "bench-internals"))]
+fn strip_markdown_links_fresh_buffers(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let mut link_text = String::new();
+            let mut found_close = false;
+            let mut bracket_depth = 1;
+
+            for inner in chars.by_ref() {
+                if inner == '[' {
+                    bracket_depth += 1;
+                } else if inner == ']' {
+                    bracket_depth -= 1;
+                    if bracket_depth == 0 {
+                        found_close = true;
+                        break;
+                    }
+                }
+                link_text.push(inner);
+            }
+
+            if found_close && chars.peek() == Some(&'(') {
+                chars.next();
+                let mut url_part = String::from("(");
+                let mut depth = 1;
+                let mut valid_link = false;
+
+                for inner in chars.by_ref() {
+                    url_part.push(inner);
+                    match inner {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                valid_link = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if valid_link {
+                    result.push_str(&link_text);
+                } else {
+                    result.push('[');
+                    result.push_str(&link_text);
+                    result.push(']');
+                    result.push_str(&url_part);
+                }
+            } else {
+                result.push('[');
+                result.push_str(&link_text);
+                if found_close {
+                    result.push(']');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Former per-link allocation path exposed for the retained A/B.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn strip_markdown_links_fresh_buffers_bench(text: &str) -> String {
+    strip_markdown_links_fresh_buffers(text)
+}
+
+/// Shipping scratch-reuse path exposed for the retained A/B.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+#[must_use]
+pub fn strip_markdown_links_reused_buffers_bench(text: &str) -> String {
+    strip_markdown_links(text)
 }
 
 /// Strip markdown list markers from the start of a line.
@@ -864,6 +955,26 @@ mod tests {
         let result = canon.canonicalize(input);
         assert!(result.contains("the docs"));
         assert!(!result.contains("https://example.com"));
+    }
+
+    #[test]
+    fn strip_markdown_link_scratch_reuse_matches_former_path() {
+        for input in [
+            "",
+            "plain text",
+            "See [the docs](https://example.com/path) for details",
+            "[one](a) [two [nested]](b(c)) [three](d)",
+            "prefix [closed only] suffix",
+            "prefix [unclosed suffix",
+            "Check [link](url( unbalanced. Next sentence.",
+            "Unicode [café 日](https://example.test/é) tail",
+        ] {
+            assert_eq!(
+                strip_markdown_links(input),
+                strip_markdown_links_fresh_buffers(input),
+                "input={input:?}",
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,12 @@ use std::borrow::Cow;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+#[cfg(feature = "bench-internals")]
+use frankensearch_core::bench_support::paired_median_ratio;
+#[cfg(feature = "bench-internals")]
+use frankensearch_core::canonicalize::{
+    strip_markdown_links_fresh_buffers_bench, strip_markdown_links_reused_buffers_bench,
+};
 use unicode_normalization::UnicodeNormalization;
 
 /// Shipped fast path (mirrors `frankensearch_core::canonicalize::nfc_normalize`).
@@ -77,6 +83,9 @@ fn md_new(line: &str) -> String {
 }
 
 fn bench_nfc(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    bench_markdown_link_scratch(c);
+
     let ascii_short = "fn main() { let x = retry_backoff(3); }".to_owned();
     let ascii_doc = "The quick brown fox jumps over the lazy dog. ".repeat(50);
     let non_ascii = "café façade naïve 日本語 ".repeat(50);
@@ -385,6 +394,56 @@ fn bench_nfc(c: &mut Criterion) {
         });
     });
     cg.finish();
+}
+
+#[cfg(feature = "bench-internals")]
+fn bench_markdown_link_scratch(c: &mut Criterion) {
+    let mut text = String::with_capacity(24_000);
+    for i in 0..256 {
+        use std::fmt::Write as _;
+        let _ = write!(
+            text,
+            "See [result {i} with nested [label]](https://example.test/path/{i}(detail)) for context. "
+        );
+    }
+
+    let former = strip_markdown_links_fresh_buffers_bench(&text);
+    let reused = strip_markdown_links_reused_buffers_bench(&text);
+    assert_eq!(reused, former, "scratch reuse must preserve exact bytes");
+
+    let run_former = || {
+        black_box(strip_markdown_links_fresh_buffers_bench(black_box(&text)));
+    };
+    let run_reused = || {
+        black_box(strip_markdown_links_reused_buffers_bench(black_box(&text)));
+    };
+    let null = paired_median_ratio(41, 4, run_former, run_former);
+    let lever = paired_median_ratio(41, 4, run_former, run_reused);
+    eprintln!(
+        "[null] markdown_link_scratch: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        null.median, null.p5, null.p95, null.rounds
+    );
+    eprintln!(
+        "[lever] markdown_link_scratch: reused/former median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        lever.median,
+        lever.p5,
+        lever.p95,
+        if lever.decidable_against(&null) {
+            if lever.median < 1.0 {
+                "DECIDABLE WIN"
+            } else {
+                "DECIDABLE REGRESSION"
+            }
+        } else {
+            "INSIDE NULL FLOOR"
+        }
+    );
+
+    let mut group = c.benchmark_group("markdown_link_scratch");
+    group.sample_size(20);
+    group.bench_function("fresh_buffers", |b| b.iter(run_former));
+    group.bench_function("reused_buffers", |b| b.iter(run_reused));
+    group.finish();
 }
 
 criterion_group!(benches, bench_nfc);
