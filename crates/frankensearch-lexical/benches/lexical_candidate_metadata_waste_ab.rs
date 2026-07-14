@@ -35,6 +35,7 @@ use tantivy::{DocAddress, Index, TantivyDocument, doc};
 const N: usize = 30_000;
 const KS: &[usize] = &[30, 100, 300];
 const WINNERS: usize = 10;
+const HYDRATION_WINNERS: &[usize] = &[10, 30, 100, 300];
 
 fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -244,6 +245,26 @@ fn deferred_winners(
     })
 }
 
+fn hydration_candidates(
+    runtime: &asupersync::runtime::Runtime,
+    cx: &asupersync::Cx,
+    index: &TantivyIndex,
+    winners: usize,
+) -> Vec<ScoredResult> {
+    runtime.block_on(async {
+        index
+            .search_fusion_candidates(cx, "search engine", winners)
+            .await
+            .expect("hydration candidates")
+    })
+}
+
+fn clear_hydrated_metadata(results: &mut [ScoredResult]) {
+    for result in results {
+        result.metadata = None;
+    }
+}
+
 fn run_product_gate() {
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
@@ -255,41 +276,141 @@ fn run_product_gate() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
 
-    for &k in KS {
-        let full = full_winners(&runtime, &cx, &index, k);
-        let deferred = deferred_winners(&runtime, &cx, &index, k);
+    if std::env::var_os("META_COLLECTOR_ONLY").is_none() {
+        for &k in KS {
+            let full = full_winners(&runtime, &cx, &index, k);
+            let deferred = deferred_winners(&runtime, &cx, &index, k);
+            assert_eq!(
+                serde_json::to_vec(&full).expect("serialize full"),
+                serde_json::to_vec(&deferred).expect("serialize deferred"),
+                "full and deferred winner outputs differ at k={k}"
+            );
+            assert!(
+                deferred.iter().all(|result| result.metadata.is_some()),
+                "winner metadata was not restored at k={k}"
+            );
+
+            let run_full = || {
+                black_box(full_winners(&runtime, &cx, &index, black_box(k)));
+            };
+            let run_deferred = || {
+                black_box(deferred_winners(&runtime, &cx, &index, black_box(k)));
+            };
+            let null = paired_median_ratio(31, inner, run_full, run_full);
+            let candidate = paired_median_ratio(31, inner, run_full, run_deferred);
+            eprintln!(
+                "[product k{k}->w{WINNERS}] null {:.4} [{:.4},{:.4}] | deferred/full {:.4} [{:.4},{:.4}] ({})",
+                null.median,
+                null.p5,
+                null.p95,
+                candidate.median,
+                candidate.p5,
+                candidate.p95,
+                ratio(&candidate, &null),
+            );
+        }
+    }
+
+    let collector_inner = std::env::var("META_COLLECTOR_AB_INNER")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(4);
+    for &winners in HYDRATION_WINNERS {
+        let seed = hydration_candidates(&runtime, &cx, &index, winners);
+        assert_eq!(seed.len(), winners, "unexpected hydration candidate count");
+
+        let mut scored = seed.clone();
+        runtime.block_on(async {
+            index
+                .hydrate_fusion_metadata_scored_for_bench(&cx, &mut scored)
+                .await
+                .expect("scored hydration parity")
+        });
+        let mut unscored = seed.clone();
+        runtime.block_on(async {
+            index
+                .hydrate_fusion_metadata(&cx, &mut unscored)
+                .await
+                .expect("unscored hydration parity")
+        });
         assert_eq!(
-            serde_json::to_vec(&full).expect("serialize full"),
-            serde_json::to_vec(&deferred).expect("serialize deferred"),
-            "full and deferred winner outputs differ at k={k}"
-        );
-        assert!(
-            deferred.iter().all(|result| result.metadata.is_some()),
-            "winner metadata was not restored at k={k}"
+            serde_json::to_vec(&scored).expect("serialize scored hydration"),
+            serde_json::to_vec(&unscored).expect("serialize unscored hydration"),
+            "scored and unscored hydration outputs differ at winners={winners}"
         );
 
-        let run_full = || {
-            black_box(full_winners(&runtime, &cx, &index, black_box(k)));
-        };
-        let run_deferred = || {
-            black_box(deferred_winners(&runtime, &cx, &index, black_box(k)));
-        };
-        let null = paired_median_ratio(31, inner, run_full, run_full);
-        let candidate = paired_median_ratio(31, inner, run_full, run_deferred);
+        let mut null_a = seed.clone();
+        let mut null_b = seed.clone();
+        let null = paired_median_ratio(
+            31,
+            collector_inner,
+            || {
+                runtime.block_on(async {
+                    index
+                        .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_a)
+                        .await
+                        .expect("scored hydration null A")
+                });
+                black_box(&null_a);
+                clear_hydrated_metadata(&mut null_a);
+            },
+            || {
+                runtime.block_on(async {
+                    index
+                        .hydrate_fusion_metadata_scored_for_bench(&cx, &mut null_b)
+                        .await
+                        .expect("scored hydration null B")
+                });
+                black_box(&null_b);
+                clear_hydrated_metadata(&mut null_b);
+            },
+        );
+
+        let mut original = seed.clone();
+        let mut candidate = seed;
+        let unscored_vs_scored = paired_median_ratio(
+            31,
+            collector_inner,
+            || {
+                runtime.block_on(async {
+                    index
+                        .hydrate_fusion_metadata_scored_for_bench(&cx, &mut original)
+                        .await
+                        .expect("scored hydration")
+                });
+                black_box(&original);
+                clear_hydrated_metadata(&mut original);
+            },
+            || {
+                runtime.block_on(async {
+                    index
+                        .hydrate_fusion_metadata(&cx, &mut candidate)
+                        .await
+                        .expect("unscored hydration")
+                });
+                black_box(&candidate);
+                clear_hydrated_metadata(&mut candidate);
+            },
+        );
         eprintln!(
-            "[product k{k}->w{WINNERS}] null {:.4} [{:.4},{:.4}] | deferred/full {:.4} [{:.4},{:.4}] ({})",
+            "[hydrate winners={winners}] null {:.4} [{:.4},{:.4}] | unscored/scored {:.4} [{:.4},{:.4}] ({})",
             null.median,
             null.p5,
             null.p95,
-            candidate.median,
-            candidate.p5,
-            candidate.p95,
-            ratio(&candidate, &null),
+            unscored_vs_scored.median,
+            unscored_vs_scored.p5,
+            unscored_vs_scored.p95,
+            ratio(&unscored_vs_scored, &null),
         );
     }
 }
 
 fn main() {
+    if std::env::var_os("META_COLLECTOR_ONLY").is_some() {
+        run_product_gate();
+        return;
+    }
+
     let fx = build_fixture();
     let reader = fx.index.reader().expect("reader");
     let searcher = reader.searcher();

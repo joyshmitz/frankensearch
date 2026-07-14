@@ -316,6 +316,31 @@ BORDERLINE** (only scidocs CI-clean; scifact/nfcorpus straddle 0) — a modest, 
 call pooled-real but not per-corpus-decisive. No Rust change (Python proxy harness).
 Harness: `docs/quality_harness/stack_additivity_ci.py`.
 
+## 2026-07-14 update — the tier ASYMMETRY, CI'd: lexical is decisive on 4/4 corpora; dense is ~4.4× smaller and a wash on arguana
+
+Companion/mirror to the dense-marginal CI above. `lexical_marginal_ci.py` bootstrap-CIs the **per-query nDCG@10
+delta (pool-min-max hybrid − dense-only)** — the lexical tier's marginal value — same protocol (stem+stop +
+model2vec, top-100 pool, 2000 resamples, seed 12345):
+
+| corpus | q | hybrid | dense-only | lexical marginal (h−dense) | 95% CI | CI excludes 0 |
+|---|---:|---:|---:|---:|---|---|
+| scifact | 300 | 0.7120 | 0.6331 | +0.0789 | [+0.0527, +0.1069] | yes |
+| nfcorpus | 323 | 0.3461 | 0.3089 | +0.0372 | [+0.0252, +0.0489] | yes |
+| arguana | 1406 | 0.3601 | 0.3328 | +0.0273 | [+0.0219, +0.0328] | yes |
+| scidocs | 1000 | 0.1628 | 0.1369 | +0.0258 | [+0.0201, +0.0317] | yes |
+| **POOLED** | **3029** | — | — | **+0.0330** | **[+0.0287, +0.0375]** | **yes** |
+
+**The tier asymmetry, now rigorous (pair with the dense-marginal CI):**
+- **Lexical marginal = +0.0330 pooled, CI-decisive on 4/4 corpora** (including arguana, +0.0273 decisive).
+- **Dense marginal = +0.0075 pooled, CI-decisive on 3/4 — a WASH on arguana** (+0.0017, CI includes 0).
+
+Lexical's contribution is **~4.4× larger** and universally decisive; dense's is small and corpus-dependent. So the
+two tiers are NOT symmetric: **lexical is the indispensable primary tier, dense is the optional secondary tier.**
+This is the rigorous, cross-corpus, CI-backed justification for the architecture the campaign already leans toward —
+lexical-primary fusion with the stronger (lexical) tier up-weighted / dense down-weighted, and dense a candidate for
+corpus/query-adaptive gating (skip it where its marginal value washes, e.g. argument retrieval, at the dominant
+per-query latency cost). No Rust change (Python proxy harness). Harness: `docs/quality_harness/lexical_marginal_ci.py`.
+
 ## Implementation status
 
 The measured levers are now **shipped as opt-in capabilities** — each default-preserving (legacy behavior

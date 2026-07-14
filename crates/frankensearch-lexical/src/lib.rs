@@ -51,6 +51,7 @@ use frankensearch_core::types::{DocId, IndexableDocument, ScoreSource, ScoredRes
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "bench-internals")]
 use tantivy::HasLen;
+use tantivy::collector::DocSetCollector;
 #[cfg(feature = "bench-internals")]
 use tantivy::directory::Directory;
 use tantivy::query::QueryParser;
@@ -1131,6 +1132,94 @@ impl TantivyIndex {
 
         Ok(results)
     }
+
+    fn hydrate_fusion_metadata_with_collector(
+        &self,
+        results: &mut [ScoredResult],
+        unscored: bool,
+    ) -> SearchResult<()> {
+        let clauses: Vec<(Occur, Box<dyn Query>)> = results
+            .iter()
+            .filter(|result| result.lexical_score.is_some() && result.metadata.is_none())
+            .map(|result| {
+                let term = Term::from_field_text(self.fields.id, result.doc_id.as_str());
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        if clauses.is_empty() {
+            return Ok(());
+        }
+
+        let limit = clauses.len();
+        let query = BooleanQuery::new(clauses);
+        let searcher = self.reader.searcher();
+        let doc_addresses: Vec<DocAddress> = if unscored {
+            // Every clause is an exact lookup on the unique `id` field. Hydration
+            // consumes neither BM25 scores nor hit order, so asking Tantivy to
+            // score and heap-sort these documents is pure overhead.
+            searcher
+                .search(&query, &DocSetCollector)
+                .map_err(|error| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(error),
+                })?
+                .into_iter()
+                .collect()
+        } else {
+            searcher
+                .search(&query, &TopDocs::with_limit(limit).order_by_score())
+                .map_err(|error| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(error),
+                })?
+                .into_iter()
+                .map(|(_, doc_address)| doc_address)
+                .collect()
+        };
+
+        for doc_address in doc_addresses {
+            let doc = load_doc(&searcher, doc_address)?;
+            let doc_id = doc
+                .get_first(self.fields.id)
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| {
+                    debug!("tantivy document missing id field while hydrating metadata");
+                    ""
+                });
+            let metadata = doc
+                .get_first(self.fields.metadata_json)
+                .and_then(|value| value.as_str())
+                .and_then(|raw| match serde_json::from_str(raw) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        debug!(%doc_id, %error, "failed to deserialize metadata JSON");
+                        None
+                    }
+                });
+            if let Some(result) = results
+                .iter_mut()
+                .find(|result| result.doc_id.as_str() == doc_id)
+            {
+                result.metadata = metadata;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Scored-collector baseline retained for the exact hydration A/B benchmark.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn hydrate_fusion_metadata_scored_for_bench<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, false) })
+    }
 }
 
 // ─── LexicalSearch implementation ───────────────────────────────────────────
@@ -1247,61 +1336,7 @@ impl LexicalSearch for TantivyIndex {
         _cx: &'a Cx,
         results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            let clauses: Vec<(Occur, Box<dyn Query>)> = results
-                .iter()
-                .filter(|result| result.lexical_score.is_some() && result.metadata.is_none())
-                .map(|result| {
-                    let term = Term::from_field_text(self.fields.id, result.doc_id.as_str());
-                    (
-                        Occur::Should,
-                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
-                    )
-                })
-                .collect();
-            if clauses.is_empty() {
-                return Ok(());
-            }
-
-            let limit = clauses.len();
-            let query = BooleanQuery::new(clauses);
-            let searcher = self.reader.searcher();
-            let top_docs = searcher
-                .search(&query, &TopDocs::with_limit(limit).order_by_score())
-                .map_err(|e| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(e),
-                })?;
-
-            for (_, doc_address) in top_docs {
-                let doc = load_doc(&searcher, doc_address)?;
-                let doc_id = doc
-                    .get_first(self.fields.id)
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_else(|| {
-                        debug!("tantivy document missing id field while hydrating metadata");
-                        ""
-                    });
-                let metadata = doc
-                    .get_first(self.fields.metadata_json)
-                    .and_then(|value| value.as_str())
-                    .and_then(|raw| match serde_json::from_str(raw) {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            debug!(%doc_id, %error, "failed to deserialize metadata JSON");
-                            None
-                        }
-                    });
-                if let Some(result) = results
-                    .iter_mut()
-                    .find(|result| result.doc_id.as_str() == doc_id)
-                {
-                    result.metadata = metadata;
-                }
-            }
-
-            Ok(())
-        })
+        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, true) })
     }
 
     fn index_document<'a>(
