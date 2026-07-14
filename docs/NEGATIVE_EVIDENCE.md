@@ -14212,3 +14212,42 @@ production path was restored byte-for-byte. The exact oracle and boundary reprod
 rescue this candidate: a 512-only threshold is a separate narrower lever that needs a final-code run plus evidence
 that such sequence lengths matter in production. Do not retry the 256-token onset on this fleet without a lower-
 variance protocol.
+
+### 2026-07-14 — cc_fse — count-free WAND wins are SCORE-DISTRIBUTION-dependent, not term-count-dependent: the `term_count ≤ 2` gate misses a decidable ~2.3–2.8× on broad high-fanout queries
+
+Probed the route-next left by the 2026-06-27 "count-free top-k is a mixed result" entry (CopperLark): `search_doc_ids`
+gates the count-free `execute_top_k` (`TopDocs` alone → block-max WAND pruning) to ≤2-term syntax-free queries and
+otherwise runs the counted `execute_query_with_offset` (`TopDocs` + `Count` → full scan, `total_count` discarded).
+The open question was whether the measured ~2× WAND regression appears at 3 terms (→ is a `term_count > 2` → `> 3`
+gate bump safe?). Built `count_free_gate_terms_ab` (40k in-RAM docs, a 100%-saturating `search` term + a 5k rare-term
+vocab at ~0.26% doc frequency each), same-binary paired A/B (`paired_median_ratio`, 41 rounds), ranked hits asserted
+identical (`matches=100` every arm — count-free and counted return the same top-k). Ratio FREE/counted (`<1` = count-free faster):
+
+| query | FREE/counted median [p5, p95] | A/A null [p5, p95] | verdict |
+|---|---:|---:|---|
+| sel2 (`term7 term113`) | 0.905 [0.744, 1.024] | [0.826, 1.247] | inside floor |
+| sel3 (`+ term509`) | 0.980 [0.805, 1.110] | [0.843, 1.257] | inside floor |
+| sel4 (`+ term888`) | 1.040 [0.877, 1.235] | [0.864, 1.144] | inside floor |
+| broad3_sat (`search term7 term113`) | **0.357** [0.310, 0.445] | [0.798, 1.167] | **DECIDABLE ~2.8× faster** |
+| broad5_sat (`search + 4 rare`) | **0.431** [0.412, 0.450] | [0.849, 1.079] | **DECIDABLE ~2.3× faster** |
+
+**Finding — the win/loss axis is score-distribution skew, NOT term count.** (1) Purely-selective queries (all rare
+terms) are NEUTRAL regardless of term count: the matched set is small, so `Count` is cheap and there is little to
+drop. (2) Broad queries with a high-fanout term + selective terms are a BIG count-free win (2.3–2.8×): `Count` must
+full-scan the ~100%-matching `search` posting, while WAND prunes the many low-scoring `search`-only docs against a
+top-100 threshold anchored by the rare terms (skewed scores → clear threshold). **This does NOT contradict
+CopperLark's ~2× regression** on a broad disjunction of multiple mid-IDF terms — there the scores are FLAT (no
+selective term to anchor a high threshold) so WAND pays block-max bookkeeping it cannot amortize. So the count-free
+outcome on broad queries is score-distribution-dependent: skewed (≥1 selective term) → win, flat (all mid-IDF) → loss.
+
+**The current `term_count ≤ 2` gate is on the wrong axis.** It routes the broad-skewed queries (the biggest wins here)
+to the SLOW counted path, and term count cannot separate the win case from the CopperLark loss case. **Decision: no
+land — production unchanged; a safe extension needs per-term selectivity/IDF (`searcher.doc_freq`), not a term-count
+bump.** Retained the reproducing `count_free_gate_terms_ab` bench. **Caveat:** this harness reproduces only the
+skewed-win case (a 100%-saturating term + rare terms); it does NOT contain a mid-IDF term, so the flat-broad
+regression was not re-measured here — the combined picture rests on this broad-skewed win plus CopperLark's
+flat-broad loss. **Route-next (concrete, multi-turn):** an IDF/selectivity-aware count-free gate — route a query to
+`execute_top_k` when it contains ≥1 selective term (max per-term `doc_freq` below a threshold, or a spread in term
+IDFs), keep the counted path for flat mid-IDF disjunctions — validated on a realistic Zipfian corpus carrying BOTH
+skewed (saturating+rare) and flat (multi-mid-IDF) query shapes before landing. `RCH_REQUIRE_REMOTE=1` throughout
+(`vmi1227854`); no local fallback.

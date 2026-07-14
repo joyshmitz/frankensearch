@@ -79,3 +79,8 @@ required-features = ["bench-internals"]
 name = "collect_ids_map_kind_ab"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "count_free_gate_terms_ab"
+harness = false
+required-features = ["bench-internals"]
