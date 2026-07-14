@@ -14969,3 +14969,39 @@ blocker row and the closed bead ship. The allocation-elision idea is unmeasured,
 benchmark, local Cargo fallback, worker reroute, cache-warming attempt, or `release-perf` build ran. Do not retry
 this rerank-preparation seam until RCH can execute the retained release artifact inside the bounded foreground
 gate.
+
+### 2026-07-14 — IcyRidge — INVALID/HOLD: fused generic analyzer never reached the retained lexical benchmark (`bd-r3rd`)
+
+**Hard-pivot route and profile attribution.** `bv --robot-triage` had no actionable open bead in the requested
+postings/tokenizer/ranking areas, so this turn created a focused analyzer bead and stayed out of the exhausted
+query-classification/scan-fusion region. The retained `index_build_postings_ab` profile attributes **73.551 ms**
+of its **101.123 ms** generic-index build to enqueue/tokenization/postings work. Within that live path,
+`TantivyIndex` still composed `SimpleTokenizer` with `LowerCaser`: ASCII input is decoded through
+`char_indices`, then each emitted term is scanned to prove ASCII and scanned again to lowercase. The one
+candidate fused the same split/lowercase semantics into a byte-aware stream with the exact Unicode
+`is_alphanumeric`/`to_lowercase` fallback. The existing `tokenizer_char_walk_ab` binary prepared exact `Token`
+parity over the timed 48 KiB corpus plus punctuation, identifiers, Cyrillic, Greek, Turkish, accented Latin,
+CJK, Japanese, and Korean inputs. Opportunity score was 6.0 (`impact=3 × confidence=4 / effort=2`).
+
+**The sole strict-remote release gate never reached compilation or parity.** The foreground command selected
+only `default_analyzer_fused`, used 10 Criterion samples with 50 ms warm-up and 150 ms measurement time,
+disabled release LTO, and had a 120-second hard cap:
+
+```text
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 AGENT_NAME=IcyRidge \
+  CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  rch --no-self-healing exec -- cargo bench -p frankensearch-lexical \
+  --features bench-internals --profile release --bench tokenizer_char_walk_ab -- \
+  default_analyzer_fused --sample-size 10 --warm-up-time 0.05 \
+  --measurement-time 0.15 --noplot
+```
+
+RCH selected `vmi1153651`, spent **34.000 seconds** syncing 15 roots, and rewrote the default target to the
+previously seen lexical pool `.rch-target-vmi1153651-pool-f8bc031ea0fafde9f76f004d8ee7e741`. Cargo then
+updated the crates.io index and `frankentorch` git dependency without emitting a completed compilation, parity
+result, or timing sample before exit 124.
+
+**Decision: INVALID/HOLD.** The production analyzer and comparator were manually restored; only this blocker
+row and the closed bead ship. The generic-analyzer fusion is unmeasured, not rejected. No retry, local Cargo
+fallback, worker reroute, cache-warming chase, or `release-perf` build ran. Retry requires a retained remote
+lexical release artifact that can reach the existing benchmark inside the bounded foreground gate.
