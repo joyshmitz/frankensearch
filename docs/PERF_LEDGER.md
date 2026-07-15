@@ -5627,6 +5627,32 @@ the result also removes the navigation-side result-vector allocation, leaving on
 vector. The worker-scoped target was cold and required a 10m43s remote compile, but that build used LTO=false
 and the measured Criterion samples were warm. Scoped UBS, rustfmt, and diff checks passed. **Decision: LANDED.**
 
+### 2026-07-15 — mmap int8 quantizer compacts AVX2 lanes to one store (`bd-btgh`, MaroonOriole)
+
+**Profile attribution and one lever.** `VectorIndex::int8_slab` reaches
+`quantize_f16_le_bytes_to_i8_avx2`; its quantize pass already produced eight clamped `i32` lanes, but
+then spilled them to a stack array and performed eight scalar `Vec::push` calls. The kept epilogue uses
+lane-local `vpshufb` to select each lane's low byte, joins the two four-byte halves, and writes one
+unaligned `u64` into reserved output capacity. Max reduction, scale, half-away rounding, clamp, runtime
+dispatch, scalar tail, and output order are unchanged.
+
+The existing `f16_slab_quantize` bench asserted byte-for-byte equality between the scalar and production
+dispatch paths for 1k, 10k, and 50k vectors before timing. Per the one-arm protocol, no baseline was
+rebuilt: the candidate was compared with the stored shipping baselines from `hz2`. One foreground,
+fail-closed RCH `--profile release` measurement ran on `vmi1227854` with LTO disabled; the filter also
+matched the 10k row, yielding a useful scaling corroboration:
+
+| workload | stored shipping baseline | candidate (95% interval) | candidate / baseline |
+|---|---:|---:|---:|
+| `f16_slab_quantize/dispatch/1000` | 361.33 us | **104.55 us** (101.03-109.19 us) | **0.289 (~3.46x faster)** |
+| `f16_slab_quantize/dispatch/10000` | 3.4300 ms | **1.0592 ms** (1.0065-1.1316 ms) | **0.309 (~3.24x faster)** |
+
+Both candidate intervals are far below the conservative 10% cross-worker keep gate, and exact output
+parity preserves all downstream retrieval ordering. Criterion used the bench's retained 30 samples,
+300 ms warm-up, and 1 s measurement. The untimed warm-up completed first in 8m49s; RCH then evicted that
+target and paid another 8m58s cold candidate link, but no timeout, local fallback, `release-perf`, or
+second baseline arm ran. **Decision: LANDED.**
+
 ### 2026-07-15 — TUI palette render iterates cached matches without materialization (BlackThrush)
 
 **Profile attribution and one lever.** The landed palette match-index cache left one steady-state render

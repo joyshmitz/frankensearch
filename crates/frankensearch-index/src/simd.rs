@@ -1719,10 +1719,11 @@ unsafe fn quantize_f16_slab_to_i8_avx2(vectors_f16: &[f16]) -> Vec<i8> {
 #[must_use]
 unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
     use core::arch::x86_64::{
-        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_loadu_si128, _mm256_add_ps, _mm256_and_ps,
-        _mm256_cvtph_ps, _mm256_cvttps_epi32, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps,
-        _mm256_or_ps, _mm256_round_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
-        _mm256_storeu_si256,
+        _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO, _mm_cvtsi128_si32, _mm_loadu_si128, _mm256_add_ps,
+        _mm256_and_ps, _mm256_castsi256_si128, _mm256_cvtph_ps, _mm256_cvttps_epi32,
+        _mm256_extracti128_si256, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps,
+        _mm256_round_ps, _mm256_set_epi64x, _mm256_set1_ps, _mm256_setzero_ps, _mm256_shuffle_epi8,
+        _mm256_storeu_ps,
     };
     let n = bytes.len() / 2;
     let chunks = n / 8;
@@ -1755,7 +1756,7 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
     }
     let scale = 127.0 / max_abs;
 
-    let mut out = Vec::with_capacity(n);
+    let mut out: Vec<i8> = Vec::with_capacity(n);
     // SAFETY: avx2+f16c by contract; loads are `c < chunks`-bounded.
     unsafe {
         let vscale = _mm256_set1_ps(scale);
@@ -1763,7 +1764,11 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
         let vmaxc = _mm256_set1_ps(127.0);
         let vminc = _mm256_set1_ps(-127.0);
         let vsign = _mm256_set1_ps(-0.0);
-        let mut tmp = [0_i32; 8];
+        // Select the low byte from each i32 lane. `vpshufb` operates within
+        // 128-bit lanes, so the two four-byte halves are joined as one u64.
+        let zero_bytes = i64::from_le_bytes([0x80; 8]);
+        let lane_select = i64::from_le_bytes([0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80]);
+        let lane_byte_mask = _mm256_set_epi64x(zero_bytes, lane_select, zero_bytes, lane_select);
         for c in 0..chunks {
             let x = _mm256_cvtph_ps(_mm_loadu_si128(bytes.as_ptr().add(c * 16).cast()));
             let v = _mm256_mul_ps(x, vscale);
@@ -1773,12 +1778,20 @@ unsafe fn quantize_f16_le_bytes_to_i8_avx2(bytes: &[u8]) -> Vec<i8> {
             );
             let clamped = _mm256_min_ps(_mm256_max_ps(rounded, vminc), vmaxc);
             let i = _mm256_cvttps_epi32(clamped);
-            _mm256_storeu_si256(tmp.as_mut_ptr().cast(), i);
-            for &t in &tmp {
-                #[allow(clippy::cast_possible_truncation)]
-                out.push(t as i8);
-            }
+            let lane_bytes = _mm256_shuffle_epi8(i, lane_byte_mask);
+            #[allow(clippy::cast_sign_loss)]
+            let low = _mm_cvtsi128_si32(_mm256_castsi256_si128(lane_bytes)) as u32;
+            #[allow(clippy::cast_sign_loss)]
+            let high = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(lane_bytes)) as u32;
+            let packed = u64::from(low) | (u64::from(high) << 32);
+            // SAFETY: capacity is `n`, and this loop initializes exactly
+            // `chunks * 8 <= n` consecutive bytes before `set_len` below.
+            out.as_mut_ptr()
+                .add(c * 8)
+                .cast::<u64>()
+                .write_unaligned(packed);
         }
+        out.set_len(chunks * 8);
     }
     let mut tail = chunks * 16;
     while tail + 2 <= bytes.len() {
