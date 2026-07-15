@@ -15044,3 +15044,17 @@ sync.
 this blocker row ships. Borrowed-token allocation removal is unmeasured, not rejected. No local Cargo fallback,
 worker reroute, detached job, alternate profile, or further cache-warming attempt ran. Retry only when the exact
 remote `host_attribution_resolve` release artifact can reach timing inside one bounded foreground command.
+
+### 2026-07-14 — BlackThrush — COST-CLOSED: `host_attribution_resolve` is not a bounded-cycle target
+
+The requested untimed strict-remote warm-up completed successfully on `vmi1153651`, but building the existing
+release benchmark took **15m53s**. A subsequent shipping baseline on the same worker and identical worker-scoped
+target rebuilt for **15m15s** before completing `current/64` at **19.206 us** median
+(`[18.367 us, 20.373 us]`). Thus the remote pool did not retain a usable Cargo artifact across jobs, and the
+compile cost alone exceeded the bounded loop twice.
+
+The borrowed-token candidate was prepared only after that baseline, but it was never compiled or measured. It
+has been manually restored, so this row makes **no performance claim** and is not an A/B reject. The completed
+result closes this benchmark family for short perf turns on this worker: do not use any
+`frankensearch-core` bench unless an already-running same-job artifact can be proven without another release
+compile. No timeout, local Cargo fallback, or stash operation occurred.
