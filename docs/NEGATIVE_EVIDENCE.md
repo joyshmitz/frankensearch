@@ -11,6 +11,13 @@ Conventions:
 - A lever is **reverted** if ratio ∈ [0.97, 1.03] (noise) or > 1.03 (regression).
 - Wins (ratio < 0.97, kept) go in `docs/PERF_LEDGER.md`, not here.
 
+### 2026-07-15 — fused ASCII token boundary + FNV hashing (`frankensearch-embed`, FoggyBasin)
+
+- **Hypothesis:** Fusing ASCII token-boundary discovery with FNV-1a updates would remove the shipping path's second scan of each token while preserving `fnv1a-*` embedding bits.
+- **Attribution / parity:** The shipping `Tokens::next_ascii_or_promote` path classifies ASCII bytes once and `fnv1a_hash` walks each returned slice again. A release-profile remote test proved the candidate bit-identical to the tokenized reference across dimensions `1/7/256/384/385`, ASCII boundaries, short-token filtering, mixed Unicode, combining marks, and CJK.
+- **Real candidate-only A/B:** Reused the canonical 384-dimension repeated-ASCII fixture and stored shipping baseline `hash_embed_tokenize_ascii/ascii_bytes = 1.4511 µs` (`ovh-a`, 20 samples). The strict-remote candidate on `vmi1227854`, `--profile release`, 10 samples, 50 ms warm-up, 200 ms measurement, measured `[1.2213 µs 1.3822 µs 1.4744 µs]` with one high-mild outlier. The point ratio is `0.9525`, but the interval ratio spans `0.8416..1.0161`.
+- **Decision:** **REJECT / no ship.** The point estimate is only 4.7% below the fastest stored baseline, the upper bound crosses into a 1.6% regression, and cross-worker routing prevents attributing the small apparent delta to the lever. Source and benchmark arms were reverted; retain this row to close the fused-walk vein unless a same-binary harness can separate it from the noise floor.
+
 Build/bench protocol (per-crate ONLY):
 ```bash
 CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
