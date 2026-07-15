@@ -15058,3 +15058,40 @@ has been manually restored, so this row makes **no performance claim** and is no
 result closes this benchmark family for short perf turns on this worker: do not use any
 `frankensearch-core` bench unless an already-running same-job artifact can be proven without another release
 compile. No timeout, local Cargo fallback, or stash operation occurred.
+
+### 2026-07-15 — BlackThrush — REJECT/WASH: score-only bulk sidecar traversal stays inside the stored-baseline floor (`bd-9urb`)
+
+**Negative-ledger-first route and attribution.** `bv --robot-triage` again ranked `bd-6m8p`, but the later
+2026-07-12 ledger resolution closes that non-default, fleet-unmeasurable tombstone route. This turn therefore
+resumed the unmeasured FSFS bulk-prior seam. The retained `code_sidecar_score` profile measured
+`prior_signals_for_candidates/32` at **35.302 us** on 2026-07-14, corroborated by the landed PERF baseline of
+**35.938 us**. Source attribution showed that every candidate constructed a full
+`CodeStructureMatchEvidence`—matched-signal `BTreeSet`, cloned signal/token/document strings, and reason
+string—before the bulk caller consumed only its `f64` score. Opportunity score was 12.0
+(`impact=3 × confidence=4 / effort=1`).
+
+**Single lever and parity.** The candidate routed only `prior_signals_for_candidates` through a private
+score-only traversal, preserved per-signal floating-point addition order and `sanitize_signal_score`, tested
+token membership without cloning the matched token, and reused one token scratch buffer across candidates.
+`score_query` and `rank_candidates` retained the auditable evidence path. Before Criterion registered its
+timed arms, the existing benchmark asserted exact output-map parity against `score_query` for 32, 128, and 512
+candidates.
+
+**Candidate-only measurement.** Per the RCH eviction constraint, neither baseline was rebuilt. One foreground,
+fail-closed invocation on `vmi1153651` used `cargo bench --profile release`, `LTO=false`, 16 codegen units,
+10 samples, 50 ms warm-up, 150 ms measurement time, and the literal
+`sidecar_candidate_score/prior_signals/32` filter. Its cold 25m43s release build was untimed and had no timeout;
+Criterion then measured only the candidate:
+
+| row | interval | central estimate | candidate/stored baseline |
+|---|---:|---:|---:|
+| score-only candidate, 32 | 31.055–38.408 us | **34.772 us** | **0.985 vs 35.302 us; 0.968 vs 35.938 us** |
+
+That is only **1.5–3.2% faster** than the two stored baselines, well inside the variance floor; the candidate
+interval spans both baseline points and Criterion reported one high mild outlier. The extra score-only token
+scanner is therefore not justified by this product-real 32-candidate row.
+
+**Decision: REJECT/WASH.** Production was manually restored exactly and only this real measured evidence row
+ships. Do not retry evidence-elision variants on the ordinary 32-candidate bulk-prior workload unless a new
+profile shows materially larger evidence payloads or candidate counts are product-critical. No local Cargo,
+`release-perf`, timeout, second baseline build, worker reroute, or stash operation occurred.
