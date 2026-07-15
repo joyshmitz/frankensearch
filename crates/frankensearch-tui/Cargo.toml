@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Shared TUI framework for frankensearch products (fsfs, ops TUI)"
 
 [dependencies]
+ahash = { workspace = true }
 frankensearch-core = { workspace = true }
 
 # Terminal UI rendering (FrankenTUI)

@@ -4,6 +4,28 @@
 > exact bench workload, the before/after timings, and the ratio (new/old; lower is
 > faster). Dead-ends and regressions live in `docs/NEGATIVE_EVIDENCE.md`.
 
+## 2026-07-15 — WIN: customized TUI keymaps use aHash fallback — ~1.72× (`FoggyBasin`)
+
+The default `Keymap` already resolves its fixed 24-binding alphabet through a static match table, but any
+`bind` or `unbind` switches every subsequent keypress to the retained `std::HashMap` fallback. That map is never
+iterated in production: only insert, remove, lookup, length, and emptiness are observable. The fallback now uses
+`AHashMap`; default static dispatch and all customization semantics remain unchanged.
+
+The retained `keymap_resolve` benchmark activates the production fallback with a behavior-neutral rebind and
+asserts exact action parity against the former HashMap for the full 40-event shell workload before timing.
+Per the RCH eviction protocol, the shipping comparator was not rebuilt: its stored Criterion median is
+**778.633 ns** `[728.445, 828.898]` (the canonical PERF row records 777.96 ns). One strict-remote candidate-only
+run on `vmi1153651`, `--profile release`, 10 samples, 50 ms warm-up, and 150 ms measurement produced:
+
+| workload | stored HashMap baseline | AHashMap candidate | ratio | decision |
+|---|---:|---:|---:|---|
+| `tui_keymap_resolve/custom_ahash` (40 events) | 778.633 ns | **453.40 ns** `[409.57, 479.60]` | **0.582 (~1.72×)** | KEEP |
+
+The candidate's upper bound remains ~38% below the stored baseline. Scope is deliberately narrow: customized
+keymaps only; unmodified defaults retain the much faster static dispatch. RCH evicted the target between the
+untimed 14m40s warm-up and measurement, causing a second 16m15s cold link; neither compile duration is timing
+evidence, and no baseline arm or local Cargo command ran.
+
 Build/bench protocol (per-crate ONLY, never workspace-wide):
 ```bash
 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankensearch-cc \

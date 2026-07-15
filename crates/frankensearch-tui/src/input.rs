@@ -4,8 +4,7 @@
 //! [`KeyAction`] values. Product crates extend the action set; the shell
 //! handles navigation-level actions (quit, tab switch, palette toggle).
 
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use ftui_core::event::{KeyCode, Modifiers, MouseEventKind};
 use serde::{Deserialize, Serialize};
 
@@ -98,7 +97,7 @@ pub struct KeyBinding {
 
 /// Configurable keymap that resolves key events to semantic actions.
 pub struct Keymap {
-    bindings: HashMap<(KeyCode, Modifiers), KeyAction>,
+    bindings: AHashMap<(KeyCode, Modifiers), KeyAction>,
     defaults_active: bool,
 }
 
@@ -106,7 +105,7 @@ impl Keymap {
     /// Create a keymap with the default bindings.
     #[must_use]
     pub fn default_bindings() -> Self {
-        let mut bindings = HashMap::with_capacity(DEFAULT_BINDING_COUNT);
+        let mut bindings = AHashMap::with_capacity(DEFAULT_BINDING_COUNT);
 
         // Quit
         bindings.insert((KeyCode::Char('q'), Modifiers::NONE), KeyAction::Quit);

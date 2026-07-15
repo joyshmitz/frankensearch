@@ -138,12 +138,18 @@ fn action_score(action: Option<&KeyAction>) -> u64 {
 fn bench_keymap_resolve(c: &mut Criterion) {
     let legacy = legacy_default_bindings();
     let keymap = Keymap::default_bindings();
+    let mut custom_keymap = Keymap::default_bindings();
+    custom_keymap.bind(KeyCode::Char('q'), Modifiers::NONE, KeyAction::Quit);
     let workload = key_workload();
 
     for &(key, modifiers) in &workload {
         assert_eq!(
             legacy_resolve(&legacy, key, modifiers),
             keymap.resolve(key, modifiers)
+        );
+        assert_eq!(
+            legacy_resolve(&legacy, key, modifiers),
+            custom_keymap.resolve(key, modifiers)
         );
     }
 
@@ -167,6 +173,17 @@ fn bench_keymap_resolve(c: &mut Criterion) {
             for &(key, modifiers) in &workload {
                 score = score.saturating_add(action_score(
                     keymap.resolve(black_box(key), black_box(modifiers)),
+                ));
+            }
+            black_box(score)
+        });
+    });
+    group.bench_function("custom_ahash", |b| {
+        b.iter(|| {
+            let mut score = 0_u64;
+            for &(key, modifiers) in &workload {
+                score = score.saturating_add(action_score(
+                    custom_keymap.resolve(black_box(key), black_box(modifiers)),
                 ));
             }
             black_box(score)
