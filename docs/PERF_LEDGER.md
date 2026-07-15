@@ -1,5 +1,12 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-15 — FSFS prior-signal result-map reservation (`bd-79bn`)
+
+- **Attribution:** `CodeStructureSidecar::prior_signals_for_candidates` knows the candidate upper bound before its dense result loop, but the shipping `HashMap::new()` repeatedly grew the result table. Reserving `candidates.len()` is the only production change; document lookup, score computation, insertion order, keys, and values are unchanged.
+- **Parity:** the existing `code_sidecar_score` harness checks legacy and candidate maps for exact equality before registering every 32/128/512 Criterion arm.
+- **Measurement:** strict remote-only `rch`, worker `vmi1227854`, `--profile release` with LTO disabled, 10 samples, 50 ms warm-up, 150 ms measurement; candidate-only `sidecar_candidate_score/prior_signals/512` after an untimed cold warm-up. Candidate was **543.01 µs** central, interval **[528.01, 569.10] µs**, versus retained shipping baselines **624.79 µs** and **646.471 µs**: **13.1%** and **16.0%** faster respectively.
+- **Scope:** KEEP for the measured dense/all-hit 512-candidate shape. This eagerly reserves for the candidate upper bound, so empty/sparse sidecars trade transient capacity for avoiding dense-path rehashes; do not generalize this result to sparse/no-match latency or memory without a dedicated control.
+
 > Head-to-head measured performance wins **kept** in the tree. Each row cites the
 > exact bench workload, the before/after timings, and the ratio (new/old; lower is
 > faster). Dead-ends and regressions live in `docs/NEGATIVE_EVIDENCE.md`.

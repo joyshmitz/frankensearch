@@ -218,7 +218,7 @@ impl CodeStructureSidecar {
         candidates: &[FusedCandidate],
     ) -> HashMap<String, RankingPriorSignals> {
         let prepared_query = prepare_query(query);
-        let mut signals = HashMap::new();
+        let mut signals = HashMap::with_capacity(candidates.len());
         for candidate in candidates {
             let Some(document) = self.documents.get(&candidate.doc_id) else {
                 continue;
