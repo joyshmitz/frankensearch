@@ -219,10 +219,17 @@ impl CommandPalette {
     /// Get filtered actions matching the current query.
     #[must_use]
     pub fn filtered(&self) -> Vec<&Action> {
+        self.iter_filtered().collect()
+    }
+
+    /// Iterate over filtered actions matching the current query.
+    ///
+    /// The actions are yielded in registration order without allocating an
+    /// intermediate reference vector.
+    pub fn iter_filtered(&self) -> impl ExactSizeIterator<Item = &Action> {
         self.matching_indices
             .iter()
             .map(|&action_index| &self.actions[action_index])
-            .collect()
     }
 
     /// Currently selected index.

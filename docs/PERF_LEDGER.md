@@ -5627,6 +5627,29 @@ the result also removes the navigation-side result-vector allocation, leaving on
 vector. The worker-scoped target was cold and required a 10m43s remote compile, but that build used LTO=false
 and the measured Criterion samples were warm. Scoped UBS, rustfmt, and diff checks passed. **Decision: LANDED.**
 
+### 2026-07-15 — TUI palette render iterates cached matches without materialization (BlackThrush)
+
+**Profile attribution and one lever.** The landed palette match-index cache left one steady-state render
+allocation: `CommandPalette::filtered()` copied every cached match into a fresh `Vec<&Action>` before the ops
+overlay immediately iterated it. `iter_filtered()` now borrows the same ordered index cache directly; the
+allocating API remains as a compatibility collector, while the production overlay consumes the iterator.
+The retained benchmark asserted identical ordered action IDs between the materialized and borrowed views
+before timing.
+
+One untimed, fail-closed remote `--profile release` warm-up completed on `vmi1153651` with LTO disabled.
+RCH then evicted its worker-scoped target despite the pinned worker/path, so the sole candidate command paid
+another cold link; no timeout, local fallback, `release-perf`, or rebuilt baseline was used. Criterion's warm
+samples measured the exact 1,024-action navigation-plus-render-lookup row against the stored current baseline:
+
+| arm | 95% interval | central estimate | candidate / stored baseline |
+|---|---:|---:|---:|
+| stored `cached_matches_then_render` | 430.76–508.77 ns | **470.45 ns** | 1.0 |
+| candidate `cached_match_iter_then_render` | 4.6833–5.0309 ns | **4.8375 ns** | **0.0103 (~97.2× faster)** |
+
+The candidate interval is wholly below the stored baseline interval and removes the profiled allocation while
+preserving registration order. The measurement itself remained cheap (20 samples, 100 ms warm-up, 450 ms
+measurement); only RCH's two cold links were expensive. **Decision: LANDED.**
+
 ### 2026-07-15 — rerank identity included-index map elision (`bd-x6pa`)
 
 **Profile attribution.** `rerank_step_with_combine` allocated and filled `included_indices` for every rerank,

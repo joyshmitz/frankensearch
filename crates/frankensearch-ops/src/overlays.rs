@@ -263,11 +263,10 @@ pub fn render_palette_overlay(
     input.render(chunks[0], frame);
 
     // Filtered results.
-    let filtered = palette.filtered();
     let selected = palette.selected();
 
-    let items: Vec<ListItem> = filtered
-        .iter()
+    let items: Vec<ListItem> = palette
+        .iter_filtered()
         .enumerate()
         .map(|(i, action)| {
             let style = if i == selected {

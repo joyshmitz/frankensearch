@@ -175,6 +175,9 @@ fn bench_palette_filter(c: &mut Criterion) {
             .zip(&cached)
             .all(|(former_action, cached_action)| former_action.id == cached_action.id)
     );
+    assert!(cached.iter().zip(palette.iter_filtered()).all(
+        |(materialized_action, iterated_action)| { materialized_action.id == iterated_action.id }
+    ));
 
     let mut navigation = c.benchmark_group("palette_navigation_cache");
     navigation.warm_up_time(Duration::from_millis(100));
@@ -208,6 +211,13 @@ fn bench_palette_filter(c: &mut Criterion) {
         bench.iter(|| {
             palette.select_next();
             let rendered = palette.filtered();
+            black_box((palette.selected(), rendered.len()))
+        });
+    });
+    navigation.bench_function("cached_match_iter_then_render", |bench| {
+        bench.iter(|| {
+            palette.select_next();
+            let rendered = palette.iter_filtered();
             black_box((palette.selected(), rendered.len()))
         });
     });
