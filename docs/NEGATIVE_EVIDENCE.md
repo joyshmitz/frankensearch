@@ -19,6 +19,37 @@ CARGO_TARGET_DIR=/data/projects/.rch-targets/<agent-lane> \
 
 ---
 
+### 2026-07-15 - Header-only repair-trailer validation regresses 5 MiB healthy verify (`bd-bfuc`)
+
+**Hypothesis:** `FileProtector::verify_file` and the healthy FSVI precheck fully decoded every
+repair symbol only to discard the resulting `Vec<RepairSymbol>`. Profiling the 5 MiB fixture
+attributed 1,280 symbol payload allocations/copies (5 MiB total) to that discard-only decode, so
+a validating parser that retained CRC/header/frame/count checks but skipped payload materialization
+should reduce healthy verification time.
+
+**Workload:** `frankensearch-durability` Criterion
+`protect_verify_roundtrip/5MB`, `--profile release`, 10 samples, 50 ms warm-up, 200 ms measurement.
+The candidate was measured foreground and remote-only on `vmi1227854` after an untimed warm-up;
+RCH evicted that target and paid one additional cold candidate link. Per the one-arm protocol, the
+comparison reuses the stored shipping baseline of **820.25 us** recorded on `ovh-a` rather than
+cold-rebuilding the baseline.
+
+| arm | time | ratio vs. stored baseline |
+|---|---:|---:|
+| stored shipping baseline | 820.25 us | 1.000x |
+| header-only validation candidate | 914.27 us (879.01-938.33 us) | **1.115x** |
+
+**Parity:** before timing, the bench fully decoded and header-only validated the same sidecar,
+asserted exact header equality and symbol-count equality, then required the production preflight
+verify to report healthy. The timed path therefore reached the intended candidate with format and
+health behavior preserved.
+
+**Decision:** **REJECTED and reverted.** Central time regressed **11.5%**; even the candidate's
+lower confidence bound (879.01 us) is slower than the stored baseline. The workers differ, but the
+result is nowhere near the conservative large-win gate required for cross-worker evidence. Do not
+retry discard-only header validation without a same-worker profile showing symbol materialization
+dominates the CRC/hash scans.
+
 ### 2026-07-14 - FSVI 4-bit packed selection key stays inside the paired null floor (IcyRidge, `bd-uwt2`)
 
 **Hypothesis:** the file-backed 4-bit pass-1 still converted every exact `i32` nibble dot to
