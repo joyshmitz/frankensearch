@@ -146,7 +146,7 @@ pub async fn rerank_step_with_combine(
     // Build RerankDocument pairs for candidates that have retrievable text.
     // Track which original indices were included (some may be skipped if text_fn returns None).
     let mut rerank_docs = Vec::with_capacity(rerank_count);
-    let mut included_indices = Vec::with_capacity(rerank_count);
+    let mut included_indices: Option<Vec<usize>> = None;
 
     for (i, candidate) in candidates.iter().take(rerank_count).enumerate() {
         if let Some(text) = text_fn(&candidate.doc_id) {
@@ -154,13 +154,19 @@ pub async fn rerank_step_with_combine(
                 doc_id: candidate.doc_id.to_string(),
                 text,
             });
-            included_indices.push(i);
+            if let Some(indices) = included_indices.as_mut() {
+                indices.push(i);
+            }
+        } else if included_indices.is_none() {
+            let mut indices = Vec::with_capacity(rerank_count);
+            indices.extend(0..i);
+            included_indices = Some(indices);
         }
     }
 
-    if included_indices.len() < min_candidates {
+    if rerank_docs.len() < min_candidates {
         tracing::debug!(
-            with_text = included_indices.len(),
+            with_text = rerank_docs.len(),
             min = min_candidates,
             "skipping rerank: too few candidates with available text"
         );
@@ -199,7 +205,11 @@ pub async fn rerank_step_with_combine(
     // Apply rerank scores to the original candidates using `original_rank`.
     // This keeps scores aligned with the correct doc_id even after the reranker sorts its output.
     for score in scores {
-        if let Some(&candidate_idx) = included_indices.get(score.original_rank) {
+        let candidate_idx = included_indices.as_ref().map_or_else(
+            || (score.original_rank < rerank_docs.len()).then_some(score.original_rank),
+            |indices| indices.get(score.original_rank).copied(),
+        );
+        if let Some(candidate_idx) = candidate_idx {
             if candidates[candidate_idx].doc_id != score.doc_id {
                 tracing::warn!(
                     expected = %candidates[candidate_idx].doc_id,
@@ -259,7 +269,7 @@ pub async fn rerank_step_with_combine(
     }
 
     tracing::debug!(
-        reranked = included_indices.len(),
+        reranked = rerank_docs.len(),
         model = reranker.id(),
         "rerank step complete"
     );

@@ -5626,3 +5626,31 @@ Candidate/former ratio is **0.00334**, or **~299.7× faster**. The effect is far
 the result also removes the navigation-side result-vector allocation, leaving only the render API's reference
 vector. The worker-scoped target was cold and required a 10m43s remote compile, but that build used LTO=false
 and the measured Criterion samples were warm. Scoped UBS, rustfmt, and diff checks passed. **Decision: LANDED.**
+
+### 2026-07-15 — rerank identity included-index map elision (`bd-x6pa`)
+
+**Profile attribution.** `rerank_step_with_combine` allocated and filled `included_indices` for every rerank,
+even when all selected candidates had text and score application therefore used the identity mapping. The
+negative ledger had already isolated this allocation as the remaining mapping-preparation cost (opportunity
+score 8.0) but the prior attempt never reached a timed path.
+
+**Single lever.** The map is now absent on the all-text path. On the first missing-text gap it is allocated,
+backfilled with the preceding identity indices, and maintained exactly as before for the remaining candidates.
+The same-binary benchmark asserts identical resolved indices and checksum for both 32 all-text candidates and
+a fixture with gaps at positions 3, 9, and 22 before timing.
+
+The foreground fail-closed RCH run on `vmi1153651` used `cargo bench --profile release`, release LTO disabled,
+10 samples, 50 ms warm-up, and 150 ms measurement per arm. The cold target received an untimed warm-up first;
+RCH nevertheless discarded its worker cache between invocations and rebuilt before the harness, so build time
+is excluded from the Criterion samples. A corrected literal group filter produced the real A/B:
+
+| arm | 95% interval | central estimate |
+|---|---:|---:|
+| allocating identity map A | 107.62–272.87 ns | **173.98 ns** |
+| lazy identity map | 46.866–63.259 ns | **53.700 ns** |
+| allocating identity map B | 73.969–86.234 ns | **78.659 ns** |
+
+Allocating A was noisy, so the decision uses the faster bracketing control B: candidate/control is **0.683**,
+or **31.7% faster**, and the confidence intervals do not overlap. This is a component mapping-preparation win,
+not an end-to-end model-latency claim. Exact parity passed for both identity and gapped mappings.
+**Decision: LANDED.**
