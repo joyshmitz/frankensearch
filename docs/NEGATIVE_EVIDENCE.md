@@ -15322,3 +15322,33 @@ SQLite-delegated (thin frankensearch-side surface) and fsfs `code_structure_side
 lexical/rerank) hold the remaining levers but are heavily swarmed; the swarm keeps landing clone-elision wins there
 (e.g. `fe866683` repair-trailer reuse landed mid-profile). Finding fresh ones needs symbolized self-time (blocked,
 `bd-e41k`) or claiming a specific unmined hot fn. No code change this pass.
+
+### 2026-07-16 — BlackThrush — NO-LAND (exhaustive sibling-path search) + concrete lead: fsvi_protector trailer-reuse twin of fe866683
+
+Applied the validated sibling-path method (twin of the newest PERF_LEDGER wins) but the four newest wins' twins
+are all done or actively swarmed:
+- **embed parallelize (0b560edc)** → Model2Vec twin LANDED last turn (0cc31182). Done.
+- **fusion async-phase-2 calibration reuse (b6b26619)** → sync + async both use the optimized in-place form;
+  `run_phase1`/`run_phase3` have no owned-Vec-collect-copy (moves via `into_iter`, cheap CompactString clones).
+  `display_hits`/on_phase clone is the known `want_phases` async wash. Done.
+- **index quantize 8-lanes/store (3d42878d)** + mmap (bd-btgh) → both f16→i8 quantizers done; simd.rs is cod's
+  actively-swarmed file. Avoid.
+- **durability repair-trailer reuse (fe866683, 1.19×)** → see lead below.
+
+Also checked: the 4-accumulator NQC cv (`bench_nqc_cv_ilp`, sync_searcher.rs) — already A/B'd in `nqc_cv_cost_ab`
+and NOT landed (NOT bit-identical, f64 reassociation ~1e-13, drops the finite filter; the temp-Vec-elision arm
+`nqc_cv_iter` was the landed win). Lexical has a single tokenizer (no fusion twin). Multi-acc reductions are done
+(MMR 4-acc), offline (hubness builder), or embedding-time-LOCKED (l2_normalize). ApiEmbedder serial-chunk →
+concurrent is I/O-bound + rate-limit-risky, not a clean CPU lever.
+
+**CONCRETE LEAD (ready, high-confidence — do next):** `FsviProtector::verify_and_repair` (fsvi_protector.rs:352)
+is the UNFIXED twin of fe866683. fe866683 made `FileProtector::repair_file_internal` reuse the trailer decoded
+during verification (verify+repair no longer deserialize the same sidecar twice → 1.19×). But `FsviProtector`
+wraps `FileProtector` and calls `verify()` then `repair()` **separately**, so its verify→repair sequence
+re-reads+re-deserializes the trailer across layers (verify_file at :203, repair_file at :269, plus fsvi's own
+xxh3-header decode at :191). The clean fix threads the decoded `(RepairTrailerHeader, Vec<RepairSymbol>)` from the
+corruption-detecting verify into repair — either by exposing a `FileProtector` combined verify+repair that accepts
+a pre-decoded trailer, or a `repair_file` variant taking `Option<decoded_trailer>`. Cold repair-only path (bench
+with a corrupted-fsvi fixture like `repair_1mb_single_block_corruption`). Reserve fsvi_protector.rs +
+file_protector.rs; coordinate with the fe866683 author. No code changed this pass — a moderate cross-protector
+refactor deferred rather than rushed in swarmed durability.
