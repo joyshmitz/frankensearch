@@ -16,6 +16,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use asupersync::Cx;
+use rayon::prelude::*;
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use tracing::instrument;
@@ -26,6 +27,13 @@ use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
 
 /// Required files for a `Model2Vec` model.
 const REQUIRED_FILES: [&str; 2] = ["tokenizer.json", "model.safetensors"];
+
+/// Batch size at/above which `embed_batch` dispatches per-document embedding across
+/// Rayon threads. Each `embed_sync` is ~0.57 ms of independent CPU work (tokenize →
+/// static-row gather → mean-pool → normalize), so parallel dispatch amortizes Rayon
+/// scheduling at a much smaller batch than the FNV hash embedder needs (256); smaller
+/// batches stay serial to preserve single/few-doc latency.
+const PARALLEL_BATCH_MIN: usize = 8;
 
 /// Tensor name candidates, tried in order when discovering the embedding matrix.
 const TENSOR_NAME_CANDIDATES: [&str; 5] =
@@ -244,6 +252,22 @@ impl Model2VecEmbedder {
         Ok(sum)
     }
 
+    /// Embed a batch of texts, dispatching per-document `embed_sync` across Rayon
+    /// threads once the batch reaches [`PARALLEL_BATCH_MIN`]. Each document is
+    /// independent CPU-bound work, so the result is **identical** to the serial loop
+    /// (Rayon's indexed `collect` preserves input order); only the wall-clock differs.
+    pub fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+        if texts.len() >= PARALLEL_BATCH_MIN {
+            texts.par_iter().map(|text| self.embed_sync(text)).collect()
+        } else {
+            let mut results = Vec::with_capacity(texts.len());
+            for text in texts {
+                results.push(self.embed_sync(text)?);
+            }
+            Ok(results)
+        }
+    }
+
     /// The directory this model was loaded from.
     #[must_use]
     pub fn model_dir(&self) -> &Path {
@@ -280,13 +304,7 @@ impl Embedder for Model2VecEmbedder {
         _cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
-        Box::pin(async move {
-            let mut results = Vec::with_capacity(texts.len());
-            for text in texts {
-                results.push(self.embed_sync(text)?);
-            }
-            Ok(results)
-        })
+        Box::pin(async move { self.embed_batch_sync(texts) })
     }
 
     fn dimension(&self) -> usize {
@@ -547,6 +565,32 @@ mod tests {
         assert_eq!(embedder.dimensions, 8);
         assert_eq!(embedder.vocab_size, 12);
         assert_eq!(embedder.name, "test-model");
+    }
+
+    #[test]
+    fn embed_batch_sync_matches_serial_across_parallel_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_model(dir.path(), 12, 8);
+        let embedder = Model2VecEmbedder::load_with_name(dir.path(), "test-model").unwrap();
+
+        // Straddle PARALLEL_BATCH_MIN so both the serial and Rayon paths are exercised.
+        for &batch_size in &[0_usize, 1, PARALLEL_BATCH_MIN - 1, PARALLEL_BATCH_MIN, 17] {
+            let docs: Vec<String> = (0..batch_size)
+                .map(|i| format!("hello world test rust search {i}"))
+                .collect();
+            let texts: Vec<&str> = docs.iter().map(String::as_str).collect();
+
+            let serial: Vec<Vec<f32>> = texts
+                .iter()
+                .map(|t| embedder.embed_sync(t).unwrap())
+                .collect();
+            let batched = embedder.embed_batch_sync(&texts).unwrap();
+
+            assert_eq!(batched.len(), serial.len(), "len at n={batch_size}");
+            for (b, s) in batched.iter().zip(&serial) {
+                assert_eq!(b, s, "embed_batch_sync diverged from serial at n={batch_size}");
+            }
+        }
     }
 
     #[test]

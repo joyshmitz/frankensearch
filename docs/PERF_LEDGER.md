@@ -5800,3 +5800,30 @@ decidable ~1.20×. **Scope note:** this is the built-in fallback codec, NOT the 
 (production uses the external RaptorQ codec via `fsqlite_core::raptorq_integration`; `DefaultSymbolCodec` is the
 crate's documented dependency-free fallback and a public API). A real byte-identical improvement to shipped
 library code, modest in blast radius. Landed `codec.rs` + retained `symbol_build` A/B bench.
+
+### 2026-07-16 — Model2Vec embed_batch parallelizes per-doc across Rayon threads (BlackThrush)
+
+Sibling of the FNV hash embedder's batch parallelization (`0b560edc`): `Model2VecEmbedder::embed_batch` was a
+plain serial `for text in texts { embed_sync(text) }` loop, while `HashEmbedder` had already gained Rayon
+dispatch. Model2Vec is the CPU-bound QUALITY (semantic) embedder — each `embed_sync` is ~0.57 ms of independent
+work (tokenize → static-row gather over a ~30 MB table → mean-pool → L2-normalize) — so batch embedding on the
+ingest path was leaving cores idle. Added `embed_batch_sync` that dispatches per-doc via `par_iter` at/above
+`PARALLEL_BATCH_MIN = 8` (Model2Vec's per-doc cost amortizes Rayon scheduling far below the hash embedder's 256
+threshold); smaller batches stay serial to preserve latency. Rayon moved into the `model2vec` feature. Result is
+**bit-identical** to the serial loop (per-doc work is deterministic, `par_iter().collect()` preserves order) —
+asserted by a new `embed_batch_sync_matches_serial_across_parallel_boundary` unit test.
+
+Bench `model2vec_batch_parallel` (`-p frankensearch-embed --features model2vec`, bench profile no-LTO, 100
+samples), serial vs Rayon-parallel dispatch over the real per-doc gather+pool kernel (30k×256 synthetic table):
+
+| batch | serial | parallel | speedup |
+|---|---|---|---|
+| 64 | 1.558 ms [1.51–1.61] | 0.464 ms [0.42–0.51] | **3.36×** (CIs disjoint) |
+| 256 | 8.045 ms [7.91–8.18] | 5.601 ms [5.28–5.92] | **1.44×** (CIs disjoint) |
+
+Always a decidable win above the threshold. The N=256 speedup is lower because the bench uses **random** token
+ids across the full 30k vocab — worst-case cache behavior that makes the 30 MB-table gather DRAM-bandwidth-bound
+at high concurrency. Real text has Zipfian token locality (hot rows stay cached) and the full `embed_batch` also
+parallelizes tokenization (pure compute), both of which this floor excludes — so the production win is expected
+to meet or exceed these numbers. Landed `model2vec_embedder.rs` + `embed_batch_sync` + parity test; retained the
+`model2vec_batch_parallel` A/B bench.

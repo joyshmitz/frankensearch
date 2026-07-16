@@ -9,7 +9,7 @@ repository.workspace = true
 [features]
 default = ["hash"]
 hash = ["dep:rayon"]
-model2vec = ["dep:safetensors", "dep:tokenizers"]
+model2vec = ["dep:safetensors", "dep:tokenizers", "dep:rayon"]
 # fastembed v5's `hf-hub-rustls-tls` feature does NOT pass
 # default-features = false to hf-hub, so hf-hub still pulls native-tls
 # (openssl-sys) on top of rustls. We pull openssl-sys explicitly with the
@@ -48,6 +48,7 @@ tempfile = "3"
 safetensors = { workspace = true }
 tokenizers = { workspace = true }
 criterion = { workspace = true }
+rayon = { workspace = true }
 
 [[bench]]
 name = "hash_embed"
@@ -62,6 +63,12 @@ harness = false
 name = "model2vec_gather_prefetch"
 harness = false
 required-features = ["model2vec", "bench-internals"]
+
+# Model2Vec embed_batch: serial per-doc loop vs Rayon parallel dispatch across docs.
+[[bench]]
+name = "model2vec_batch_parallel"
+harness = false
+required-features = ["model2vec"]
 
 [build-dependencies]
 sha2 = { workspace = true }
