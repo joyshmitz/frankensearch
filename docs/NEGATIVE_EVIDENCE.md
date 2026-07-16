@@ -15239,3 +15239,33 @@ pipeline overhead, so a scattered wash at the scan loop is a scattered wash end-
 change is warranted. Revisit ONLY if a deployment's compaction cadence leaves indexes persistently >~20%
 clustered-tombstoned. The drift-cancelled paired harness is kept in-tree so the density sweep is reproducible and
 the raw-criterion drift trap is not re-sprung.
+
+### 2026-07-16 — BlackThrush — REVISES "expected SMALL": x86-64-v3 gives ~3.4–4.9× on the wide::f32x8 reduction SITE (`bd-yt8m`)
+
+The `bd-yt8m` ISA audit (bc98552) assumed the non-dispatched `wide::f32x8` sites (search.rs:1420 max-reduction,
+the exact-f16 rescore tail) would gain little from a `-C target-cpu=x86-64-v3` build. Measured otherwise. I can't
+toggle `wide`'s compile-time codegen per-fn, but a hand `#[target_feature(enable="avx2")]` 256-bit reduction emits
+exactly the instructions v3 would, INSIDE the baseline (SSE2) binary — so `max_simd` (wide → 2×128-bit `maxps`)
+vs `max_avx2` (1×256-bit `vmaxps`) is a same-binary A/B for the v3 upside, one build. Added it to the
+`max_reduction` bench (drift-cancelled `paired_median_ratio` + A/A null, `--features bench-internals`, one remote
+`rch` run, no-LTO; parity-asserted bit-identical):
+
+| n | A/A null (median · p5–p95) | avx2/simd (median · p5–p95) | criterion arms simd→avx2 |
+|---|---|---|---|
+| 128 | 1.0000 · 0.992–1.008 | **0.2670** DECIDABLE | 22.7ns → 5.6ns (4.06×) |
+| 512 | 1.0000 · 0.984–1.007 | **0.2053** DECIDABLE | 96.3ns → 28.4ns (3.39×) |
+| 2048 | 1.0004 · 0.514–1.729 | **0.2857** DECIDABLE | 579.5ns → 172.8ns (3.35×) |
+
+**Finding: the SITE-level v3 upside is LARGE (~3.4–4.9×), not "small".** The gap exceeds the naive 2× width ratio
+because the baseline `wide::f32x8` SSE2 path carries abstraction overhead (2×`f32x4` struct, array round-trips)
+that clean 256-bit intrinsics avoid — a v3 build makes `wide` lower to that clean AVX2 directly, for free, at
+every `wide::f32x8` site (this max-reduction shape, the f16 rescore dot, the reranker softmax max). The already-
+AVX2-dispatched int8 pass-1 dot is v3-immune, so the END-TO-END query gain is still bounded by the rescore-tail
+fraction — but each affected tail op is ~3.5× cheaper, materially more than the audit assumed.
+
+**NOT a reject — a promising lever gated on two non-code decisions.** Landing = a workspace `-C
+target-cpu=x86-64-v3` in `.cargo/config.toml` (owned by cod, whole-workspace blast radius) + a DEPLOYMENT-TARGET
+policy call (v3 binaries SIGILL on pre-Haswell/2013 CPUs; the audit notes all *workers* are Haswell+, but shipped
+artifacts may target older). Next step (handed to cod): land the workspace v3 flag behind a build profile, measure
+`fsvi_int8_two_pass` end-to-end baseline-vs-v3 to size the real query gain, and settle the min-CPU-target policy.
+`bd-yt8m` stays OPEN. The `max_avx2` proxy arm is kept in-tree so the site-level upside stays reproducible.

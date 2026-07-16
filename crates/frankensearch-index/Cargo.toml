@@ -116,6 +116,7 @@ harness = false
 [[bench]]
 name = "max_reduction"
 harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
