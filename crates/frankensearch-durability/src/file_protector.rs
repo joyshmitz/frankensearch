@@ -550,29 +550,46 @@ impl FileProtector {
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        // Determine if we have a source file to verify/read
-        if let Some(ref file) = source_file {
+        // Determine if we have a source file to verify/read. Keep the fully
+        // validated trailer when verification finds corruption so repair does
+        // not read and deserialize the same sidecar a second time.
+        let decoded_trailer = if let Some(ref file) = source_file {
             // Verify first - using mmap
             let len = file.metadata()?.len();
-            let healthy = if len == 0 {
+            let (healthy, decoded_trailer) = if len == 0 {
                 let trailer_bytes = fs::read(sidecar_path)?;
-                let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
-                header.source_crc32 == crc32fast::hash(&[]) && header.source_len == 0
+                let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
+                let header = &decoded_trailer.0;
+                (
+                    header.source_crc32 == crc32fast::hash(&[]) && header.source_len == 0,
+                    decoded_trailer,
+                )
             } else {
                 let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
                 let trailer_bytes = fs::read(sidecar_path)?;
-                let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
+                let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
+                let header = &decoded_trailer.0;
                 let actual_crc32 = crc32fast::hash(&mmap);
-                actual_crc32 == header.source_crc32 && len == header.source_len
+                (
+                    actual_crc32 == header.source_crc32 && len == header.source_len,
+                    decoded_trailer,
+                )
             };
 
             if healthy {
                 return Ok(FileRepairOutcome::NotNeeded);
             }
-        }
+            Some(decoded_trailer)
+        } else {
+            None
+        };
 
-        let trailer_bytes = fs::read(sidecar_path)?;
-        let (header, trailer_symbols) = deserialize_repair_trailer(&trailer_bytes)?;
+        let (header, trailer_symbols) = if let Some(decoded_trailer) = decoded_trailer {
+            decoded_trailer
+        } else {
+            let trailer_bytes = fs::read(sidecar_path)?;
+            deserialize_repair_trailer(&trailer_bytes)?
+        };
 
         if header.source_len == 0 {
             let empty_crc32 = crc32fast::hash(&[]);
