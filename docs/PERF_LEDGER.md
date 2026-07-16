@@ -1,5 +1,20 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — Quality-rescore doc_id lookup uses ahash, not SipHash (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` stayed dominated by Quill contract docs with no ready perf bead, so this turn took a sibling-path lead. The workspace declared SipHash→ahash "closed", yet `InMemoryVectorIndex::doc_id_index` — the map behind `index_of_doc_id`, probed once per candidate on every quality query through `quality_scores_for_hits` — was still a std `HashMap<String, usize>` (SipHash). The FNV `hash_to_pos` fast-path in the *same* struct is unsafe to reuse for this lookup (rescore hits are foreign fast-tier doc_ids; a 64-bit FNV collision with a corpus id would return a wrong position and a wrong score), so the safe lever is the hasher swap. Profiling the exact per-hit loop — `map.get(doc_id).map(|&idx| dot_product_f16_f32(vector_slice(idx), query))` — over a 50k / dim-384 fixture at the shipping SipHash confirmed the lookup is a real fraction of per-hit cost alongside the AVX2 f16 dot.
+- **Single lever:** `doc_id_index` is now an `ahash::AHashMap<String, usize>` (one import, the field type, and the single construction site). Keys, first-insert-wins build, `OnceLock` laziness, and the `.get().copied()` lookup are unchanged; the identity-hashed `hash_to_pos` / `doc_id_hashes` maps are untouched.
+- **Same-binary paired A/B:** strict remote-only `rch`, one foreground release binary on worker `vmi1149989`, `--profile release` (LTO disabled, 16 codegen units), 25 samples, 150 ms warm-up, 500 ms measurement. A new `quality_rescore_hasher_ab` bench builds both maps over identical owned `String` keys and times the identical rescore loop (same positions, vectors, query; the f16 dot is byte-identical), asserting a bit-identical `Vec<Option<f32>>` before timing. ahash/siphash (`<1` wins):
+
+| candidates | siphash central | ahash central | ratio | speedup |
+|---:|---:|---:|---:|---:|
+| 128 | 8.3303 µs `[8.0406, 8.6836]` | 6.5518 µs `[6.1035, 7.0522]` | 0.786 | ~1.27× |
+| 300 | 21.298 µs `[19.437, 23.473]` | 14.359 µs `[13.648, 15.242]` | 0.674 | ~1.48× |
+
+Both rows have disjoint confidence intervals (128: `7.0522 < 8.0406`; 300: `15.242 < 19.437`). The 32-candidate ahash arm measured 1.354 µs; its siphash arm's timing line was truncated from rch's buffered stdout and is not claimed.
+- **Verification:** the focused release index lib suite ran 356 tests — **355 passed**, including `in_memory::tests::two_tier_quality_scores`, which drives `quality_scores_for_hits` → `index_of_doc_id` → the changed map. The lone failure, `soft_delete_wal_restores_state_on_rewrite_failure`, is an unrelated filesystem-permission test whose worker cache ran a stale pre-fix revision (its committed graceful-skip guard for root / `CAP_DAC_OVERRIDE` workers sits 172 lines below the reported panic line); it does not touch in-memory hashing. Owned-file `rustfmt` and `git diff --check` passed. The concurrent `collectors.rs` / `cass_compat.rs` work in the tree is independent and not part of this commit.
+- **Scope:** KEEP for the per-hit quality-rescore doc_id lookup. This is a hasher swap on an in-memory map — not a claim of faster end-to-end quality search; embedding, the f16 dot itself, blending, and result assembly are unchanged.
+
 ## 2026-07-16 — Search telemetry sanitization reuses its owned query buffer (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` remained dominated by Quill contract work and exposed no ready legacy performance bead, so this turn pivoted to the fresh core telemetry subsystem. The negative ledger had no exact `sanitize_query_text` result; its older inventory classified collectors as control-plane-only, but the current fusion searcher emits these samples for every configured Initial, Refined, Reranked, and failure phase. Before editing production, the unchanged `current_borrow_collect/short_ascii` arm completed a one-second strict-remote profile on `vmi1149989`.

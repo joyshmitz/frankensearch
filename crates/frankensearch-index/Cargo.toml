@@ -62,6 +62,11 @@ harness = false
 name = "dot_product"
 harness = false
 
+# Per-hit quality-rescore doc_id lookup hasher (SipHash vs ahash) — paired A/B.
+[[bench]]
+name = "quality_rescore_hasher_ab"
+harness = false
+
 # HNSW (ANN) vs flat brute-force vector search — lever validation (latency + recall).
 [[bench]]
 name = "hnsw_vs_flat"

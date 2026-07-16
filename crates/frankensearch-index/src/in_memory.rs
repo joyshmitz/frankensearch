@@ -24,6 +24,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::OnceLock;
 
+use ahash::AHashMap;
 use frankensearch_core::filter::{BuildIdentityHasherU64, SearchFilter, fnv1a_hash};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use half::f16;
@@ -64,7 +65,7 @@ pub struct InMemoryVectorIndex {
     /// linear `doc_ids.iter().position(...)` scan in the per-hit quality-rerank
     /// path (`quality_scores_for_hits`), which was O(hits·N). Built on first
     /// doc-id lookup, so search-only callers pay nothing.
-    doc_id_index: OnceLock<HashMap<String, usize>>,
+    doc_id_index: OnceLock<AHashMap<String, usize>>,
     /// Lazily-built `doc_id_hash → position` map (identity-hashed, same FNV-1a key
     /// space as `BitsetFilter`). Lets a *selective* filtered search gather the
     /// allow-set's positions directly — `O(|allow-set|)` exact dots instead of one
@@ -788,11 +789,14 @@ impl InMemoryVectorIndex {
     /// `doc_ids.iter().position(...)` linear scan. First-insert-wins, matching
     /// `position`'s first-match semantics for any (non-canonical) duplicate ids.
     /// Built once on first lookup (the per-hit quality-rerank path); search-only
-    /// callers never pay the `O(N)` build or its footprint.
+    /// callers never pay the `O(N)` build or its footprint. The map hashes with
+    /// `ahash` (not SipHash): every quality query pays one hash of each hit's
+    /// `doc_id` here, and `ahash` cuts the rescore loop ~1.27–1.48× at 128–300
+    /// candidates (see `quality_rescore_hasher_ab`). Semantics are unchanged.
     fn index_of_doc_id(&self, doc_id: &str) -> Option<usize> {
         self.doc_id_index
             .get_or_init(|| {
-                let mut map = HashMap::with_capacity(self.doc_ids.len());
+                let mut map = AHashMap::with_capacity(self.doc_ids.len());
                 for (i, id) in self.doc_ids.iter().enumerate() {
                     map.entry(id.clone()).or_insert(i);
                 }
