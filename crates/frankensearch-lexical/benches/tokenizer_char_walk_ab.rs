@@ -27,6 +27,8 @@ use frankensearch_lexical::cass_compat::{
     cass_build_tantivy_query_single_parse, cass_char_walk_fast, cass_char_walk_slow,
     cass_fields_from_schema,
 };
+use frankensearch_lexical::default_tokenizer_for_bench;
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, TextAnalyzer, Token, TokenStream};
 
 /// A realistic, mostly-ASCII document corpus (English prose + code identifiers + a little Unicode),
 /// which is what the cass tokenizer actually sees.
@@ -196,5 +198,153 @@ fn bench_boolean_operator_reparse(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench, bench_boolean_operator_reparse);
+fn original_default_tokenizer() -> TextAnalyzer {
+    TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(LowerCaser)
+        .build()
+}
+
+fn collect_tokens(analyzer: &mut TextAnalyzer, text: &str) -> Vec<Token> {
+    let mut stream = analyzer.token_stream(text);
+    let mut tokens = Vec::new();
+    while stream.advance() {
+        tokens.push(stream.token().clone());
+    }
+    tokens
+}
+
+fn token_digest(analyzer: &mut TextAnalyzer, text: &str) -> u64 {
+    let mut stream = analyzer.token_stream(text);
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    while stream.advance() {
+        let token = stream.token();
+        digest ^= u64::try_from(token.offset_from).unwrap_or(u64::MAX);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        digest ^= u64::try_from(token.offset_to).unwrap_or(u64::MAX);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        for byte in token.text.bytes() {
+            digest ^= u64::from(byte);
+            digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    digest
+}
+
+fn generic_ascii_corpus() -> String {
+    let words = [
+        "Search",
+        "INDEX",
+        "tokenizer",
+        "BM25",
+        "postings",
+        "Rust2024",
+        "doc_0042",
+        "camelCase",
+        "ranking",
+        "topK",
+        "alpha",
+        "BETA",
+    ];
+    let mut text = String::with_capacity(48 * 1024);
+    let mut i = 0usize;
+    while text.len() < 48 * 1024 {
+        text.push_str(words[i % words.len()]);
+        text.push(match i % 5 {
+            0 => ' ',
+            1 => '-',
+            2 => '/',
+            3 => '.',
+            _ => '\n',
+        });
+        i += 1;
+    }
+    text
+}
+
+fn bench_default_analyzer(c: &mut Criterion) {
+    let text = generic_ascii_corpus();
+    let parity_inputs = [
+        "",
+        "Hello, happy tax payer!",
+        "POL-358 snake_case_name C++ Rust2024",
+        "Русский ТЕКСТ Ελληνικά ΣΙΓΜΑ",
+        "İstanbul CAFÉ Straße 搜索 テスト 검색",
+        &text,
+    ];
+    for input in parity_inputs {
+        assert_eq!(
+            collect_tokens(&mut original_default_tokenizer(), input),
+            collect_tokens(&mut default_tokenizer_for_bench(), input),
+            "fused default analyzer changed tokens for {input:?}"
+        );
+    }
+
+    let mut null_a = original_default_tokenizer();
+    let mut null_b = original_default_tokenizer();
+    let null = paired_median_ratio(
+        41,
+        4,
+        || {
+            black_box(token_digest(&mut null_a, black_box(&text)));
+        },
+        || {
+            black_box(token_digest(&mut null_b, black_box(&text)));
+        },
+    );
+    let mut original = original_default_tokenizer();
+    let mut fused = default_tokenizer_for_bench();
+    let lever = paired_median_ratio(
+        41,
+        4,
+        || {
+            black_box(token_digest(&mut original, black_box(&text)));
+        },
+        || {
+            black_box(token_digest(&mut fused, black_box(&text)));
+        },
+    );
+    eprintln!(
+        "[null]  default_analyzer/{}KiB: median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+        text.len() / 1024,
+        null.median,
+        null.p5,
+        null.p95,
+        null.rounds
+    );
+    eprintln!(
+        "[lever] default_analyzer/{}KiB: fused/ORIG median {:.4} p5 {:.4} p95 {:.4} -> {}",
+        text.len() / 1024,
+        lever.median,
+        lever.p5,
+        lever.p95,
+        if lever.decidable_against(&null) {
+            if lever.median < 1.0 {
+                "DECIDABLE WIN (fused analyzer faster)"
+            } else {
+                "DECIDABLE REGRESSION"
+            }
+        } else {
+            "INSIDE NULL FLOOR (not decidable)"
+        }
+    );
+
+    let mut group = c.benchmark_group("default_analyzer_fused");
+    group.sample_size(10);
+    group.bench_function("original/48KiB", |b| {
+        let mut analyzer = original_default_tokenizer();
+        b.iter(|| black_box(token_digest(&mut analyzer, black_box(&text))));
+    });
+    group.bench_function("fused/48KiB", |b| {
+        let mut analyzer = default_tokenizer_for_bench();
+        b.iter(|| black_box(token_digest(&mut analyzer, black_box(&text))));
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench,
+    bench_boolean_operator_reparse,
+    bench_default_analyzer
+);
 criterion_main!(benches);
