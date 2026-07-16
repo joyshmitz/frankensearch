@@ -11,9 +11,11 @@
 //! `fast_hits` — eliding N short-String allocations. Output is bit-identical
 //! (asserted once before timing).
 //!
-//! Each arm times the full differing region (quality-side prep + blend + the
-//! downstream `quality_scores` borrow-map build), so the `quality_hits` clone is
-//! charged honestly to the `current` arm.
+//! Each blend arm times the full differing region (quality-side prep + blend +
+//! the downstream `quality_scores` borrow-map build), so the `quality_hits`
+//! clone is charged honestly to the `current` arm. The `quality_score_prep`
+//! group separately measures the async searcher's residual aligned-score
+//! rebuild against reusing the owned vector in place.
 //!
 //! Run with:
 //! ```bash
@@ -24,7 +26,7 @@
 use std::collections::HashMap;
 use std::hint::black_box;
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankensearch_core::VectorHit;
 use frankensearch_fusion::{blend_two_tier, blend_two_tier_aligned, blend_two_tier_aligned_unique};
 
@@ -54,6 +56,52 @@ fn quality_scores(n: usize) -> Vec<Option<f32>> {
             }
         })
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct BenchCalibrator {
+    scale: f64,
+    bias: f64,
+}
+
+fn calibrate(config: Option<BenchCalibrator>, score: f32) -> f32 {
+    let Some(config) = config else {
+        return score;
+    };
+    let calibrated = (f64::from(score) * config.scale + config.bias) as f32;
+    if calibrated.is_finite() {
+        calibrated
+    } else {
+        0.0
+    }
+}
+
+/// Pre-change async Phase-2 prep: borrow the owned input and rebuild every slot.
+fn quality_prep_collect_copy(
+    scores: Vec<Option<f32>>,
+    config: Option<BenchCalibrator>,
+) -> Vec<Option<f32>> {
+    scores
+        .iter()
+        .map(|score| score.map(|value| calibrate(config, value)))
+        .collect()
+}
+
+/// Candidate prep: retain the owned allocation and only walk it when configured.
+fn quality_prep_in_place(
+    mut scores: Vec<Option<f32>>,
+    config: Option<BenchCalibrator>,
+) -> Vec<Option<f32>> {
+    if config.is_some() {
+        for score in scores.iter_mut().flatten() {
+            *score = calibrate(config, *score);
+        }
+    }
+    scores
+}
+
+fn option_bits(scores: &[Option<f32>]) -> Vec<Option<u32>> {
+    scores.iter().map(|score| score.map(f32::to_bits)).collect()
 }
 
 /// Current path: materialize the quality subset (cloning doc_ids), blend, then
@@ -161,5 +209,57 @@ fn bench_blend_aligned(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_blend_aligned);
+fn bench_quality_score_prep(c: &mut Criterion) {
+    let parity_input = vec![
+        None,
+        Some(-0.0),
+        Some(0.25),
+        Some(f32::NAN),
+        Some(f32::INFINITY),
+        Some(f32::NEG_INFINITY),
+    ];
+    for config in [
+        None,
+        Some(BenchCalibrator {
+            scale: 0.75,
+            bias: 0.125,
+        }),
+    ] {
+        let current = quality_prep_collect_copy(parity_input.clone(), config);
+        let candidate = quality_prep_in_place(parity_input.clone(), config);
+        assert_eq!(
+            option_bits(&current),
+            option_bits(&candidate),
+            "aligned calibration prep must preserve every score bit"
+        );
+    }
+
+    let mut g = c.benchmark_group("quality_score_prep");
+    for n in [32usize, 10_000, 100_000] {
+        let scores = quality_scores(n);
+        let config = black_box(None::<BenchCalibrator>);
+        g.bench_with_input(BenchmarkId::new("collect_copy", n), &scores, |b, input| {
+            b.iter_batched(
+                || input.clone(),
+                |owned| {
+                    black_box(quality_prep_collect_copy(
+                        black_box(owned),
+                        black_box(config),
+                    ))
+                },
+                BatchSize::LargeInput,
+            );
+        });
+        g.bench_with_input(BenchmarkId::new("in_place", n), &scores, |b, input| {
+            b.iter_batched(
+                || input.clone(),
+                |owned| black_box(quality_prep_in_place(black_box(owned), black_box(config))),
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench_blend_aligned, bench_quality_score_prep);
 criterion_main!(benches);

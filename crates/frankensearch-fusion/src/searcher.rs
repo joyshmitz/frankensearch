@@ -1724,7 +1724,7 @@ impl TwoTierSearcher {
         // power for non-idempotent calibrators (TemperatureScaling, PlattScaling,
         // IsotonicRegression).
 
-        let quality_scores = self
+        let mut quality_scores = self
             .index
             .quality_scores_for_hits(&quality_vec, &fast_hits)?;
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
@@ -1736,11 +1736,16 @@ impl TwoTierSearcher {
         // that clones one `String` doc_id per quality hit — those doc_ids are only
         // ever read as `&str` (by the blend and the `quality_scores_by_doc` map).
         // Docs with `None` are left out so the blend uses their fast-only score
-        // without penalty. Bit-identical to the old materialized+calibrated path.
-        let quality_scores: Vec<Option<f32>> = quality_scores
-            .iter()
-            .map(|s| s.map(|v| self.calibrate_score(v)))
-            .collect();
+        // without penalty. Reuse the owned aligned vector returned by the index:
+        // the previous collect allocated and copied every slot immediately after
+        // receiving ownership. The default no-calibrator path now skips the pass
+        // entirely; configured calibrators still visit each present score in the
+        // same order and apply the identical scalar transform.
+        if self.score_calibrator.is_some() {
+            for score in quality_scores.iter_mut().flatten() {
+                *score = self.calibrate_score(*score);
+            }
+        }
         let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
         metrics.incomplete_embeddings = fast_hits.len() - quality_count;
         metrics.phase2_vectors_searched = quality_count;
