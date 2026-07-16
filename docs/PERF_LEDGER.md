@@ -1,5 +1,21 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — Hash fallback parallelizes only large embedding batches (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` remained dominated by Quill contract work, while the exact `HashEmbedder::embed_batch` Rayon seam had no entry in either performance ledger. The fresh embed-subsystem path is product-reachable: FSFS sends up to 256 documents through `embed_batch` and fusion refresh can send up to 1,000. Before editing production, the unchanged FNV-384 kernel measured **2.1973 us/document** `[2.0218, 2.4361]` for a typical roughly 100-word document, attributing large serial batches to independent per-document CPU work.
+- **Single lever:** `HashEmbedder` now uses an indexed Rayon map only for batches of at least 256 documents. Smaller batches keep the former serial iterator, including FSFS's default size of 64. Indexed parallel collection preserves input order; each document's FNV/JL embedding remains independent and unchanged.
+- **Same-binary A/B:** one foreground, strict-remote `cargo bench --profile release` measurement ran on warmed worker `vmi1227854` with LTO disabled, 16 codegen units, `RAYON_NUM_THREADS=4`, 10 samples, 100 ms warm-up, and 300 ms requested measurement per arm. Before timing, the harness asserted every output float's exact bits across the serial and Rayon nested vectors. Ratios are Rayon/serial (`<1` wins):
+
+| FNV-384 documents | serial central | Rayon central | ratio | production route |
+|---:|---:|---:|---:|---|
+| 32 | 69.413 us | 141.44 us | 2.038 | serial |
+| 64 | 142.23 us | 355.72 us | 2.501 | serial |
+| 128 | 342.47 us | 224.44 us | 0.655 | serial (conservative noise guard) |
+| 256 | 630.14 us | **329.19 us** | **0.522 (~1.91x)** | Rayon |
+| 1,000 | 2.8511 ms | **0.89733 ms** | **0.315 (~3.18x)** | Rayon |
+
+- **Verification and scope:** the focused release test proved bit-identical serial/batch output for both FNV and JL at empty, 1, 255, 256, and 257-document shapes; scoped release checking of the library, tests, and benches passed. All-target checking is blocked by two unchanged examples that omit their required `fastembed`/`model2vec` features. Strict clippy is likewise blocked by three unchanged `simd.rs` lints; an allow-scoped follow-up was cancelled when the switched worker produced no output for two minutes. Owned-file UBS, rustfmt, and diff checks passed; workspace fmt remains blocked by unrelated existing files. The 256-document confidence intervals were disjoint (`[589.62, 662.13] us` serial versus `[244.01, 418.70] us` Rayon), as were the 1,000-document intervals. The 32/64 regressions are intentionally outside the gate. This is a large-batch hash-fallback throughput win, not an end-to-end neural-embedding claim. **Decision: KEEP.**
+
 ## 2026-07-16 — Async Phase-2 calibration reuses its owned aligned-score vector
 
 - **Attribution:** `TwoTierSearcher::run_phase2` already receives an owned `Vec<Option<f32>>` from `quality_scores_for_hits`, but immediately borrowed it to collect a second vector solely for optional per-score calibration. The retained lever calibrates present scores in place and skips the pass entirely when `score_calibrator` has its default `None` value. Configured calibrators still visit every `Some` in the same order and apply the same scalar transform; missing slots remain missing.

@@ -1,7 +1,7 @@
 //! FNV-1a hash-based embedder for frankensearch.
 //!
 //! Produces deterministic (but non-semantic) embeddings using only hashing —
-//! no model files, no ML inference, zero external dependencies. This is:
+//! no model files and no ML inference. This is:
 //!
 //! - The always-available fallback when no ML models are downloaded
 //! - The test double for pipeline integration tests in CI
@@ -16,6 +16,7 @@
 
 use asupersync::Cx;
 use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture, l2_normalize_in_place};
+use rayon::prelude::*;
 
 /// FNV-1a offset basis (64-bit).
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -28,6 +29,10 @@ const MIN_TOKEN_LEN: usize = 2;
 
 /// Default embedding dimension (matches `MiniLM` for index compatibility).
 const DEFAULT_DIMENSION: usize = 384;
+
+/// Batch size where parallel dispatch amortizes Rayon scheduling for FNV-384.
+/// Smaller batches stay serial to preserve the latency of the default size (64).
+const PARALLEL_BATCH_MIN: usize = 256;
 
 /// Hash algorithm selection for the [`HashEmbedder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +54,7 @@ pub enum HashAlgorithm {
     },
 }
 
-/// Zero-dependency hash-based embedder.
+/// Model-free hash-based embedder.
 ///
 /// Produces deterministic embeddings using FNV-1a hashing. Not semantic —
 /// captures lexical overlap only — but always available and extremely fast.
@@ -110,6 +115,14 @@ impl HashEmbedder {
         match self.algorithm {
             HashAlgorithm::FnvModular => self.embed_fnv_modular(tokenize(text)),
             HashAlgorithm::JLProjection { seed } => self.embed_jl(tokenize(text), seed),
+        }
+    }
+
+    fn embed_batch_sync(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        if texts.len() >= PARALLEL_BATCH_MIN {
+            texts.par_iter().map(|text| self.embed_sync(text)).collect()
+        } else {
+            texts.iter().map(|text| self.embed_sync(text)).collect()
         }
     }
 
@@ -382,7 +395,7 @@ impl Embedder for HashEmbedder {
         _cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<Vec<f32>>> {
-        Box::pin(async move { Ok(texts.iter().map(|t| self.embed_sync(t)).collect()) })
+        Box::pin(async move { Ok(self.embed_batch_sync(texts)) })
     }
 
     fn dimension(&self) -> usize {
@@ -860,14 +873,31 @@ mod tests {
     }
 
     #[test]
-    fn embed_batch_via_sync() {
-        let embedder = HashEmbedder::default_384();
-        let texts = ["hello", "world"];
-        let vecs: Vec<_> = texts.iter().map(|t| embedder.embed_sync(t)).collect();
-        assert_eq!(vecs.len(), 2);
-        assert_eq!(vecs[0].len(), 384);
-        assert_eq!(vecs[1].len(), 384);
-        assert_ne!(vecs[0], vecs[1]);
+    fn embed_batch_matches_serial_across_parallel_boundary() {
+        let embedders = [HashEmbedder::default_384(), HashEmbedder::jl_384(42)];
+        for embedder in &embedders {
+            for &batch_size in &[0_usize, 1, PARALLEL_BATCH_MIN - 1, PARALLEL_BATCH_MIN, 257] {
+                let docs = (0..batch_size)
+                    .map(|index| format!("hello café world document {index}"))
+                    .collect::<Vec<_>>();
+                let texts = docs.iter().map(String::as_str).collect::<Vec<_>>();
+                let serial = texts
+                    .iter()
+                    .map(|text| embedder.embed_sync(text))
+                    .collect::<Vec<_>>();
+                let batch = embedder.embed_batch_sync(&texts);
+                assert_eq!(serial.len(), batch.len());
+                for (serial_row, batch_row) in serial.iter().zip(&batch) {
+                    assert!(
+                        serial_row
+                            .iter()
+                            .zip(batch_row)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "batch mismatch at size {batch_size}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

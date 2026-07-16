@@ -20,9 +20,11 @@
     clippy::many_single_char_names
 )]
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Duration};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use frankensearch_embed::HashEmbedder;
+use rayon::prelude::*;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0100_0000_01b3;
@@ -243,6 +245,17 @@ fn jl_ilp4(text: &str) -> Vec<f32> {
     e
 }
 
+fn embed_batch_serial(embedder: &HashEmbedder, texts: &[&str]) -> Vec<Vec<f32>> {
+    texts.iter().map(|text| embedder.embed_sync(text)).collect()
+}
+
+fn embed_batch_parallel(embedder: &HashEmbedder, texts: &[&str]) -> Vec<Vec<f32>> {
+    texts
+        .par_iter()
+        .map(|text| embedder.embed_sync(text))
+        .collect()
+}
+
 fn bench_hash_embed(c: &mut Criterion) {
     // ~100-word document (typical chunk fed to the embedder).
     let doc = "the quick brown fox jumps over the lazy dog while the engineer \
@@ -257,6 +270,46 @@ fn bench_hash_embed(c: &mut Criterion) {
     // ILP variants must match the scalar JL output exactly.
     debug_assert_eq!(jl_old(&doc), jl_ilp2(&doc));
     debug_assert_eq!(jl_old(&doc), jl_ilp4(&doc));
+
+    {
+        let embedder = HashEmbedder::default_384();
+        let mut bg = c.benchmark_group("hash_embed_batch_fnv");
+        bg.sample_size(10)
+            .warm_up_time(Duration::from_millis(100))
+            .measurement_time(Duration::from_millis(300));
+        for &batch_size in &[32_usize, 64, 128, 256, 1_000] {
+            let docs = (0..batch_size)
+                .map(|index| format!("{doc} batch document {index} with stable benchmark text"))
+                .collect::<Vec<_>>();
+            let texts = docs.iter().map(String::as_str).collect::<Vec<_>>();
+            let serial = embed_batch_serial(&embedder, &texts);
+            let parallel = embed_batch_parallel(&embedder, &texts);
+            assert_eq!(serial.len(), parallel.len());
+            for (serial_row, parallel_row) in serial.iter().zip(&parallel) {
+                assert!(
+                    serial_row
+                        .iter()
+                        .zip(parallel_row)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+
+            bg.throughput(Throughput::Elements(batch_size as u64));
+            bg.bench_with_input(
+                BenchmarkId::new("serial", batch_size),
+                &texts,
+                |b, texts| {
+                    b.iter(|| {
+                        black_box(embed_batch_serial(black_box(&embedder), black_box(texts)))
+                    });
+                },
+            );
+            bg.bench_with_input(BenchmarkId::new("rayon", batch_size), &texts, |b, texts| {
+                b.iter(|| black_box(embed_batch_parallel(black_box(&embedder), black_box(texts))));
+            });
+        }
+        bg.finish();
+    }
 
     {
         let mut fg = c.benchmark_group("hash_embed_fnv");

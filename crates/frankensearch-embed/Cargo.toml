@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["hash"]
-hash = []
+hash = ["dep:rayon"]
 model2vec = ["dep:safetensors", "dep:tokenizers"]
 # fastembed v5's `hf-hub-rustls-tls` feature does NOT pass
 # default-features = false to hf-hub, so hf-hub still pulls native-tls
@@ -31,6 +31,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 sha2 = { workspace = true }
+rayon = { workspace = true, optional = true }
 
 # Feature-gated embedder dependencies
 safetensors = { workspace = true, optional = true }
