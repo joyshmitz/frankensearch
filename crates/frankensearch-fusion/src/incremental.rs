@@ -166,13 +166,10 @@ impl IncrementalSearcher {
     ///
     /// Call this after executing the search plan so the next `plan()` call
     /// can detect prefix extensions and reuse the candidate pool.
-    pub fn update(&mut self, query: &str, result_doc_ids: Vec<String>) {
+    pub fn update(&mut self, query: &str, mut result_doc_ids: Vec<String>) {
         self.last_query = Some(query.to_owned());
-        self.last_doc_ids = if result_doc_ids.len() > self.config.candidate_pool_size {
-            result_doc_ids[..self.config.candidate_pool_size].to_vec()
-        } else {
-            result_doc_ids
-        };
+        result_doc_ids.truncate(self.config.candidate_pool_size);
+        self.last_doc_ids = result_doc_ids;
     }
 
     /// Whether the consumer should trigger a full two-tier refinement.
@@ -435,7 +432,7 @@ mod tests {
         // Only 3 should be kept.
         let plan = s.plan("testi");
         assert!(plan.reuse_candidates);
-        assert_eq!(plan.candidate_doc_ids.len(), 3);
+        assert_eq!(plan.candidate_doc_ids, ["doc-0", "doc-1", "doc-2"]);
     }
 
     // ── should_refine ───────────────────────────────────────────────

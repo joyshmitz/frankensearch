@@ -1,5 +1,20 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — Incremental candidate updates truncate the owned result vector (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` and `br ready` exposed no ready performance bead; the graph was dominated by Quill contract work. A retry of open Model2Vec bead `bd-d2a8` reached only cold dependency builds on two workers, so it remains open with no timing and no reject. The turn then pivoted to the fresh fusion incremental-search subsystem. Before production editing, a faithful profile arm reproduced `IncrementalSearcher::update` taking an owned 256-ID `Vec<String>`, cloning its retained 100-ID prefix with `[..pool].to_vec()`, and dropping the original vector. Input construction was outside the timed region.
+- **Single lever:** `update` now truncates its already-owned result vector to `candidate_pool_size` and moves that vector into `last_doc_ids`. Retained IDs, order, query state, reuse behavior, exact-size/undersized behavior, and zero-sized pools are unchanged; only the redundant retained-prefix allocation and `String` deep clones are removed. The existing size-limit test now also proves the exact retained prefix.
+- **Same-binary paired A/B:** strict remote-only `rch`, one foreground standalone release binary on warmed worker `vmi1227854`, `--profile release` with LTO disabled and 16 codegen units. The first cold execution on that worker was discarded as warm-up; the admitted measurement rebuilt in 0.02 s and used 41 paired AB/BA rounds of 64 operations plus a same-arm A/A null control. Exact parity passed for empty, exact-size, oversized, pool-zero, and Unicode inputs. Ratios are truncate+move/former clone (`<1` wins):
+
+| 256 IDs, retain 100 | former median/op | truncate+move median/op | paired ratio (p5–p95) | speedup |
+|---|---:|---:|---:|---:|
+| short | 7.017 us | 1.805 us | **0.2663** (0.2008–0.4505) | **3.76x** |
+| long URN | 6.679 us | 1.716 us | **0.2368** (0.1546–0.3750) | **4.22x** |
+| Unicode | 6.526 us | 1.770 us | **0.2656** (0.2245–0.3090) | **3.77x** |
+
+  Each candidate median is below its fixture's A/A null p5 (0.9483, 0.8080, and 0.8371 respectively).
+- **Verification and scope:** exact owned-file rustfmt and diff checks passed; UBS exited 0 with no critical findings. A focused remote release test was canceled after the cold worker spent two silent minutes compiling `asupersync`; it never reached the test and is neither failure nor performance evidence. **KEEP** for incremental-search result-state updates when the backend returns more IDs than the configured candidate pool. This is an isolated state-update allocation win, not an end-to-end as-you-type search latency claim; planning still clones the retained pool when returning an owned `SearchPlan`.
+
 ## 2026-07-16 — FSVI two-tier quality rescore uses the fused byte dot, not decode-then-f32-dot (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill contract docs, so this turn extended the sibling-path audit into the FSVI two-tier scoring path. `TwoTierIndex::score_quality_for_fast_index` (the per-hit quality rescore reached on every quality query through `quality_scores_for_hits`) scored each fast-tier hit by calling `VectorIndex::vector_at_f32` — which **allocates a `Vec<f32>` and runs a scalar `half::f16::to_f32` decode loop** — then a separate `dot_product_f32_f32`. Yet the brute-force scan (`search.rs`, 6+ sites) already scores the *same* f16 slab with the fused `dot_product_f16_bytes_f32` (hardware `vcvtph2ps` decode, no allocation). The rescore path was the slow, allocating outlier — a clear sibling-path inconsistency between scan-scoring and rescore-scoring.
