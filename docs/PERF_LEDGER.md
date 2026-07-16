@@ -1,5 +1,12 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — In-memory AVX2 f16→i8 quantization packs eight lanes per store
+
+- **Attribution:** `quantize_f16_slab_to_i8_avx2` already produced eight final i8 values as AVX2 i32 lanes, but spilled all lanes to a stack array and appended them with eight scalar `Vec::push` calls. The retained lever uses `vpshufb` to select each lane's low byte, joins the two 128-bit halves, and writes one unaligned `u64` per eight values. Max-abs reduction, scaling, half-away-from-zero rounding, clamping, scalar tail, zero-slab handling, allocation size, and dispatch are unchanged.
+- **Measurement:** strict remote-only `rch`, same warmed worker `vmi1149989`, `--profile release` with LTO disabled and 16 codegen units, an untimed candidate `--no-run` warm-up, then 20 samples with a 50 ms Criterion warm-up and 150 ms requested measurement. The existing production-dispatch arm `quantize_i8_slab/dispatch/10000` improved from **4.1293 ms** `[3.8827, 4.3934]` to **1.1166 ms** `[1.0627, 1.1712]`: ratio **0.2704**, or **72.96% lower latency** (**3.70× speedup**). Criterion's direct change interval was **−74.951% to −70.739%** (`p = 0.00` at displayed precision); even candidate upper bound divided by baseline lower bound is **0.3017**.
+- **Verification:** the production benchmark asserts exact dispatch/generic equality before timing; the focused release test `simd::tests::avx2_quantize_i8_matches_generic` passed remotely, and scoped `cargo check -p frankensearch-index --all-targets --profile release` passed. Owned-file `rustfmt` and `git diff --check` passed. All-target clippy is blocked by three unchanged `frankensearch-core` lints; no-deps index clippy is independently blocked by the crate's existing lint backlog.
+- **Scope:** KEEP for lazy in-memory int8 slab construction. This does not claim a query-time or end-to-end search speedup, and does not change the mmap-byte quantizer, whose equivalent lane compaction was already present.
+
 ## 2026-07-15 — Durability repair consumes decoded symbols without deep-cloning (`bd-mloy`)
 
 - **Attribution:** `FileProtector::repair_file` already owned the decoded `repair_symbols`, but extended the codec input with `repair_symbols.iter().cloned()`. On the measured 1 MiB / 4 KiB-symbol fixture, that allocated and copied 256 payload buffers (1 MiB total) immediately before decode. Consuming the owned vector is the only production change; ESI values, payload bytes, symbol order, and decoder inputs are unchanged.
