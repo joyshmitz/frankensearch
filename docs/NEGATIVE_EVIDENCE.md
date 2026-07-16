@@ -15206,3 +15206,36 @@ hundreds-of-node candidate pool) never reaches the n≫10⁴ regime where traver
 two-pass flat CSR (REJECTED 1.21–1.31× slower, probe-doubling), path (b) does not regress — it is a true wash.
 This closes the last untested-labeled perf route-next in the ledger; the twin stays in-tree so the row is
 reproducible. Bead `bd-5hlw` closed.
+
+### 2026-07-16 — BlackThrush — WASH at steady-state density, drift-cancelled (closes reopen): tombstone bitmap is below-bar (`bd-6m8p`)
+
+Resolves the `bd-6m8p` reopen (cc_fse: the end-to-end A/B ran at 0% tombstone density, so the branch axis the
+lever targets was never exercised). Rather than touch production `search.rs` (cod owns the int8 ADC sidecar), I
+tested the reopen's untested branch DIRECTLY in the existing `tombstone_bitmap_scan.rs` microbench, which already
+runs the REAL `dot_i8_i8` (AVX2) per live candidate at ~1% scattered and 25% clustered density — so it faithfully
+exercises the liveness branch under the dominant FMA compute, at both densities.
+
+**Method + a methodology catch.** The bench's raw criterion arms (`records_flag` vs `bitmap`) run SEQUENTIALLY, so
+worker frequency/thermal drift between the two full measurements biases their ratio. First run showed a spurious
+scattered `records_flag/bitmap`=**1.34×** — which did NOT reproduce (second run: 1.05×). I added the project-standard
+DRIFT-CANCELLED interleaved `paired_median_ratio` A/B + A/A null (`frankensearch_core::bench_support`) to the bench
+(one remote `rch` run, `bench` profile, no-LTO, `--features bench-internals`, 41 rounds × 4):
+
+| density | A/A null flag/flag (median · p5–p95) | bitmap/flag (median · p5–p95) | verdict |
+|---|---|---|---|
+| scattered ~1% (freshly-compacted, common case) | 1.0020 · 0.694–1.191 | 0.8656 · 0.720–1.245 | INSIDE NULL FLOOR |
+| clustered 25% (batch-deleted / compaction-deferred transient) | 1.0011 · 0.872–1.153 | 0.8625 · 0.749–0.992 | DECIDABLE (~1.16×) |
+
+(This run's criterion arms agree: scattered 1.05× ≈ wash, clustered 1.21×.)
+
+**Decision: below-bar as a production default — CLOSE.** At the realistic **freshly-compacted ~1% scattered**
+density (the steady state) the bitmap is a WASH: the drift-cancelled ratio sits inside a wide (0.69–1.19) A/A null
+floor, and the reopen's branch-mispredict hypothesis is unsupported — at 1% scattered the liveness branch is well
+predicted and the strided-flag load is hidden under the FMA dot exactly as the original rejection reasoned
+([[succinct-tombstone-bitmap-proven]]). The bitmap wins **decidably only at 25% clustered**, where whole-`u64`
+all-dead-word skipping elides real dot compute — but that is a partially-compacted transient, not the state a
+default should be tuned for. End-to-end (`fsvi_int8_two_pass`) can only DILUTE the scan-loop delta with extra
+pipeline overhead, so a scattered wash at the scan loop is a scattered wash end-to-end — no production `search.rs`
+change is warranted. Revisit ONLY if a deployment's compaction cadence leaves indexes persistently >~20%
+clustered-tombstoned. The drift-cancelled paired harness is kept in-tree so the density sweep is reproducible and
+the raw-criterion drift trap is not re-sprung.

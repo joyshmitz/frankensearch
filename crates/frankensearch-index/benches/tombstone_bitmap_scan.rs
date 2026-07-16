@@ -28,6 +28,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use frankensearch_core::bench_support::paired_median_ratio;
 use frankensearch_index::simd::dot_i8_i8;
 
 const DIM: usize = 384;
@@ -172,6 +173,45 @@ fn bench(c: &mut Criterion) {
         assert!(
             a == b,
             "bitmap scan diverged from records scan ({name}) — must match"
+        );
+
+        // DRIFT-CANCELLED interleaved paired A/B (bd-6m8p). The criterion arms below run
+        // SEQUENTIALLY (records_flag fully, then bitmap fully), so worker frequency/thermal drift
+        // between the two full measurements biases their ratio. `paired_median_ratio` interleaves
+        // both arms per round and times only its own, cancelling drift, and an A/A null control
+        // (flag/flag) gives the noise floor the bitmap/flag ratio must clear to be a real effect.
+        let run_flag = || {
+            black_box(scan_records_flag(
+                black_box(&slab),
+                black_box(&records),
+                black_box(&query),
+                n,
+            ));
+        };
+        let run_bitmap = || {
+            black_box(scan_bitmap(
+                black_box(&slab),
+                black_box(&bitmap),
+                black_box(&query),
+                n,
+            ));
+        };
+        let null = paired_median_ratio(41, 4, run_flag, run_flag);
+        let lever = paired_median_ratio(41, 4, run_flag, run_bitmap);
+        eprintln!(
+            "[paired-null  {name}] flag/flag   median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            null.median, null.p5, null.p95, null.rounds
+        );
+        eprintln!(
+            "[paired-lever {name}] bitmap/flag median {:.4} p5 {:.4} p95 {:.4} -> {} (<1 ⇒ bitmap faster)",
+            lever.median,
+            lever.p5,
+            lever.p95,
+            if lever.decidable_against(&null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR"
+            }
         );
 
         group.bench_with_input(BenchmarkId::new("records_flag", name), &(), |bn, ()| {

@@ -184,6 +184,7 @@ harness = false
 [[bench]]
 name = "tombstone_bitmap_scan"
 harness = false
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "int8_dot_maddubs_ab"
