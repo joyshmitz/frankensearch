@@ -1,5 +1,20 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — Search telemetry sanitization reuses its owned query buffer (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` remained dominated by Quill contract work and exposed no ready legacy performance bead, so this turn pivoted to the fresh core telemetry subsystem. The negative ledger had no exact `sanitize_query_text` result; its older inventory classified collectors as control-plane-only, but the current fusion searcher emits these samples for every configured Initial, Refined, Reranked, and failure phase. Before editing production, the unchanged `current_borrow_collect/short_ascii` arm completed a one-second strict-remote profile on `vmi1149989`.
+- **Single lever:** `RuntimeMetricsCollector::emit_search` now gives its already-owned `String` to the sanitizer. Clean queries of at most 500 bytes return the original allocation; trimming and the 500-character cap mutate that buffer with UTF-8-safe boundaries; empty input reuses it for the existing `<empty>` placeholder. Text bytes, Unicode whitespace behavior, character-count truncation, envelope shape, counters, and event ordering are unchanged.
+- **Same-binary A/B:** one foreground strict-remote Criterion binary ran on `vmi1293453` with `--profile release`, LTO disabled, optimization level 2, 256 codegen units, 20 samples, 100 ms warm-up, and 350 ms requested measurement per arm. Fixture cloning was untimed in both arms, and the harness asserted exact current/candidate text equality for every workload before timing. Ratios are candidate/current (`<1` wins):
+
+| query shape | current collect | owned in place | ratio | speedup |
+|---|---:|---:|---:|---:|
+| clean short ASCII | 82.674 ns | **11.094 ns** | **0.134** | **7.45x** |
+| leading/trailing ASCII whitespace | 104.31 ns | **28.351 ns** | **0.272** | **3.68x** |
+| 512-byte ASCII truncation | 549.79 ns | **255.75 ns** | **0.465** | **2.15x** |
+| Unicode whitespace and multibyte text | 102.40 ns | **32.686 ns** | **0.319** | **3.13x** |
+
+- **Verification and scope:** the successful release benchmark compiled the changed production crate and ran all eight A/B arms. Added unit cases cover empty and whitespace-only input, exact and over-limit multibyte boundaries, Unicode whitespace, and clean-buffer pointer reuse. Owned-file rustfmt and diff checks passed. UBS completed; its compiler/lint subchecks were clean, while the whole-file scan exits nonzero on existing test panic/unwrap inventory and a bounds-proven slice heuristic in the changed sanitizer. A focused remote release-test follow-up was cancelled when RCH immediately evicted the just-built pooled target and began recompiling every dependency; that cancellation is neither a test failure nor performance evidence. This is a telemetry-envelope preparation win when collection is configured, not an end-to-end search-latency claim. **Decision: KEEP.**
+
 ## 2026-07-16 — Corrupt repair reuses its already-validated trailer (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` remained dominated by Quill contract work and its visible performance bead was blocked, so this turn pivoted to fresh durability repair work. The negative ledger rejects replacing full repair-trailer validation with a header-only parser after a 5 MiB healthy-verify regression. Profiling the unchanged `repair_1mb_single_block_corruption` path instead exposed a complementary seam: corruption detection fully deserialized and validated the trailer, discarded it, then repair immediately read and fully deserialized the same sidecar again. Before editing production, the unchanged path measured **4.5640 ms** `[4.4213, 4.6570]` on a strict-remote release profile run.

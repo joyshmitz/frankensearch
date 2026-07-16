@@ -397,7 +397,7 @@ impl RuntimeMetricsCollector {
             latency_us,
             memory_bytes,
         } = sample;
-        let query_text = sanitize_query_text(&query_text);
+        let query_text = sanitize_query_text(query_text);
 
         TelemetryEnvelope::new(
             ts,
@@ -849,12 +849,28 @@ pub struct ResourceCollectorSample {
     pub pressure_profile: Option<PressureProfile>,
 }
 
-fn sanitize_query_text(query_text: &str) -> String {
-    let trimmed = query_text.trim();
-    if trimmed.is_empty() {
-        return EMPTY_QUERY_PLACEHOLDER.to_owned();
+fn sanitize_query_text(mut query_text: String) -> String {
+    let leading_trimmed = query_text.trim_start();
+    let start = query_text.len() - leading_trimmed.len();
+    let trimmed_len = leading_trimmed.trim_end().len();
+    if trimmed_len == 0 {
+        query_text.clear();
+        query_text.push_str(EMPTY_QUERY_PLACEHOLDER);
+        return query_text;
     }
-    trimmed.chars().take(MAX_QUERY_TEXT_CHARS).collect()
+    if start == 0 && trimmed_len == query_text.len() && query_text.len() <= MAX_QUERY_TEXT_CHARS {
+        return query_text;
+    }
+
+    let retained_len = query_text[start..start + trimmed_len]
+        .char_indices()
+        .nth(MAX_QUERY_TEXT_CHARS)
+        .map_or(trimmed_len, |(offset, _)| offset);
+    query_text.truncate(start + retained_len);
+    if start != 0 {
+        drop(query_text.drain(..start));
+    }
+    query_text
 }
 
 const fn sanitize_cpu_pct(cpu_pct: f64) -> f64 {
@@ -1248,28 +1264,31 @@ mod tests {
 
     #[test]
     fn sanitize_query_text_empty_string() {
-        assert_eq!(sanitize_query_text(""), EMPTY_QUERY_PLACEHOLDER);
+        assert_eq!(sanitize_query_text(String::new()), EMPTY_QUERY_PLACEHOLDER);
     }
 
     #[test]
     fn sanitize_query_text_whitespace_only() {
-        assert_eq!(sanitize_query_text("   \t\n  "), EMPTY_QUERY_PLACEHOLDER);
+        assert_eq!(
+            sanitize_query_text("   \t\n  ".to_owned()),
+            EMPTY_QUERY_PLACEHOLDER
+        );
     }
 
     #[test]
     fn sanitize_query_text_normal_passthrough() {
-        assert_eq!(sanitize_query_text("hello world"), "hello world");
+        assert_eq!(sanitize_query_text("hello world".to_owned()), "hello world");
     }
 
     #[test]
     fn sanitize_query_text_trims_leading_trailing() {
-        assert_eq!(sanitize_query_text("  spaced  "), "spaced");
+        assert_eq!(sanitize_query_text("  spaced  ".to_owned()), "spaced");
     }
 
     #[test]
     fn sanitize_query_text_truncates_long_input() {
         let long = "a".repeat(600);
-        let result = sanitize_query_text(&long);
+        let result = sanitize_query_text(long);
         assert_eq!(result.len(), MAX_QUERY_TEXT_CHARS);
         assert!(result.chars().all(|c| c == 'a'));
     }
@@ -1277,7 +1296,34 @@ mod tests {
     #[test]
     fn sanitize_query_text_exact_limit_not_truncated() {
         let exact = "b".repeat(MAX_QUERY_TEXT_CHARS);
-        assert_eq!(sanitize_query_text(&exact), exact);
+        assert_eq!(sanitize_query_text(exact.clone()), exact);
+    }
+
+    #[test]
+    fn sanitize_query_text_unicode_boundaries_are_character_counted() {
+        let expected = "é".repeat(MAX_QUERY_TEXT_CHARS);
+        let result = sanitize_query_text("é".repeat(MAX_QUERY_TEXT_CHARS + 1));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn sanitize_query_text_unicode_whitespace_is_trimmed() {
+        assert_eq!(
+            sanitize_query_text("\u{2003}search café 東京\u{2003}".to_owned()),
+            "search café 東京"
+        );
+    }
+
+    #[test]
+    fn sanitize_query_text_reuses_clean_short_input_buffer() {
+        let mut query_text = String::with_capacity(64);
+        query_text.push_str("find authentication error");
+        let input_ptr = query_text.as_ptr();
+
+        let result = sanitize_query_text(query_text);
+
+        assert_eq!(result, "find authentication error");
+        assert_eq!(result.as_ptr(), input_ptr);
     }
 
     // ── sanitize_cpu_pct edge cases ─────────────────────────────────────

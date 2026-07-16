@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankensearch_core::host_adapter::{HostProjectAttribution, resolve_host_project_attribution};
 
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +54,59 @@ const WORKLOADS: &[Workload] = &[
         host: Some("unknown"),
     },
 ];
+
+const MAX_QUERY_TEXT_CHARS: usize = 500;
+const EMPTY_QUERY_PLACEHOLDER: &str = "<empty>";
+const QUERY_WORKLOADS: &[(&str, &str)] = &[
+    ("short_ascii", "find authentication error"),
+    ("trimmed_ascii", "  find authentication error  "),
+    (
+        "long_ascii",
+        concat!(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+    ),
+    ("unicode_edges", "\u{2003}\u{2003}search café 東京\u{2003}"),
+];
+
+fn current_sanitize_query_text(query_text: String) -> String {
+    let trimmed = query_text.trim();
+    if trimmed.is_empty() {
+        return EMPTY_QUERY_PLACEHOLDER.to_owned();
+    }
+    trimmed.chars().take(MAX_QUERY_TEXT_CHARS).collect()
+}
+
+fn owned_sanitize_query_text(mut query_text: String) -> String {
+    let leading_trimmed = query_text.trim_start();
+    let start = query_text.len() - leading_trimmed.len();
+    let trimmed_len = leading_trimmed.trim_end().len();
+    if trimmed_len == 0 {
+        query_text.clear();
+        query_text.push_str(EMPTY_QUERY_PLACEHOLDER);
+        return query_text;
+    }
+    if start == 0 && trimmed_len == query_text.len() && query_text.len() <= MAX_QUERY_TEXT_CHARS {
+        return query_text;
+    }
+
+    let retained_len = query_text[start..start + trimmed_len]
+        .char_indices()
+        .nth(MAX_QUERY_TEXT_CHARS)
+        .map_or(trimmed_len, |(offset, _)| offset);
+    query_text.truncate(start + retained_len);
+    if start != 0 {
+        drop(query_text.drain(..start));
+    }
+    query_text
+}
 
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
@@ -290,5 +343,49 @@ fn bench_host_attribution(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_host_attribution);
+fn bench_query_sanitize(c: &mut Criterion) {
+    for &(_, query) in QUERY_WORKLOADS {
+        assert_eq!(
+            current_sanitize_query_text(query.to_owned()),
+            owned_sanitize_query_text(query.to_owned())
+        );
+    }
+
+    let mut group = c.benchmark_group("telemetry_query_sanitize");
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_millis(350));
+    group.sample_size(20);
+
+    for &(name, query) in QUERY_WORKLOADS {
+        group.throughput(Throughput::Bytes(
+            u64::try_from(query.len()).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::new("current_borrow_collect", name),
+            &query,
+            |bench, query| {
+                bench.iter_batched(
+                    || (*query).to_owned(),
+                    |owned| black_box(current_sanitize_query_text(black_box(owned))),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("owned_in_place", name),
+            &query,
+            |bench, query| {
+                bench.iter_batched(
+                    || (*query).to_owned(),
+                    |owned| black_box(owned_sanitize_query_text(black_box(owned))),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_host_attribution, bench_query_sanitize);
 criterion_main!(benches);
