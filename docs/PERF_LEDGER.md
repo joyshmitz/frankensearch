@@ -5769,3 +5769,27 @@ Allocating A was noisy, so the decision uses the faster bracketing control B: ca
 or **31.7% faster**, and the confidence intervals do not overlap. This is a component mapping-preparation win,
 not an end-to-end model-latency claim. Exact parity passed for both identity and gapped mappings.
 **Decision: LANDED.**
+
+### 2026-07-16 — DefaultSymbolCodec source-symbol build: zero-init elision — ~1.20× at 10MB (BlackThrush)
+
+`DefaultSymbolCodec::encode` (the durability crate's built-in "no external runtime" fallback codec,
+`codec.rs`) materialized each source symbol as `vec![0; symbol_size]` and then `copy_from_slice`d the whole
+window over it — a wasted `memset` per FULL symbol (only the final short symbol needs a zero-padded tail).
+Full symbols now copy directly via `source_data[start..end].to_vec()` (alloc + one `memcpy`, no zero-init);
+the short tail still pads. `start <= end` holds for every valid symbol index, so `end - start` never
+underflows. **Byte-identical output** (bench asserts `build_old == build_new` at 1MB and 10MB).
+
+Same-binary criterion A/B (`symbol_build` bench, `-p frankensearch-durability`, bench profile no-LTO, one
+remote `rch` run, 100 samples), throughput of the symbol-build over an incrementing-byte source:
+
+| size | zero_init_old | direct_copy_new | ratio |
+|---|---|---|---|
+| 1MB | 67.46 µs [65.6–69.6] | 63.93 µs [61.8–66.4] | 1.05× (overlapping CIs — cache-resident, memset cheap) |
+| 10MB | 3.420 ms [3.31–3.54] | 2.844 ms [2.71–3.01] | **1.20× (CIs DISJOINT)** |
+
+The win scales with data size: at 1MB the buffers are cache-resident so the eliminated `memset` is nearly free
+(within noise), while at 10MB (spilling cache) removing the redundant `memset` before the `memcpy` is a clean
+decidable ~1.20×. **Scope note:** this is the built-in fallback codec, NOT the primary production path
+(production uses the external RaptorQ codec via `fsqlite_core::raptorq_integration`; `DefaultSymbolCodec` is the
+crate's documented dependency-free fallback and a public API). A real byte-identical improvement to shipped
+library code, modest in blast radius. Landed `codec.rs` + retained `symbol_build` A/B bench.

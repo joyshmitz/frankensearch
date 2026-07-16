@@ -575,6 +575,75 @@ fn tempfile_dir(prefix: &str) -> std::path::PathBuf {
     dir
 }
 
+// --- DefaultSymbolCodec source-symbol build: zero-init elision A/B ---
+//
+// The built-in `DefaultSymbolCodec::encode` materializes each source symbol. The prior form allocated
+// `vec![0; symbol_size]` and then `copy_from_slice`d the whole window over it — a wasted `memset` per
+// FULL symbol (only the final short symbol needs a zero-padded tail). The new form copies full symbols
+// directly (`to_vec`, no zero-init) and pads only the tail. Output is byte-identical (asserted).
+
+/// Prior symbol build: zero-init every buffer, then overwrite.
+fn build_symbols_old(source: &[u8], symbol_size: usize) -> Vec<Vec<u8>> {
+    let k = source.len().div_ceil(symbol_size).max(1);
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let start = i.saturating_mul(symbol_size);
+        let end = start.saturating_add(symbol_size).min(source.len());
+        let mut symbol = vec![0_u8; symbol_size];
+        if start < end {
+            symbol[..end - start].copy_from_slice(&source[start..end]);
+        }
+        out.push(symbol);
+    }
+    out
+}
+
+/// New symbol build: full symbols copy directly (no zero-init); only the tail pads.
+fn build_symbols_new(source: &[u8], symbol_size: usize) -> Vec<Vec<u8>> {
+    let k = source.len().div_ceil(symbol_size).max(1);
+    let mut out = Vec::with_capacity(k);
+    for i in 0..k {
+        let start = i.saturating_mul(symbol_size);
+        let end = start.saturating_add(symbol_size).min(source.len());
+        let symbol = if end - start == symbol_size {
+            source[start..end].to_vec()
+        } else {
+            let mut symbol = vec![0_u8; symbol_size];
+            if start < end {
+                symbol[..end - start].copy_from_slice(&source[start..end]);
+            }
+            symbol
+        };
+        out.push(symbol);
+    }
+    out
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn bench_symbol_build(c: &mut Criterion) {
+    let symbol_size = 4096_usize;
+    let mut group = c.benchmark_group("symbol_build");
+    for &size_mb in &[1u32, 10] {
+        let data_size = (size_mb * 1024 * 1024) as usize;
+        let source: Vec<u8> = (0..data_size).map(|i| (i % 251) as u8).collect();
+        // Byte-identity gate: the elision must not change any symbol.
+        assert_eq!(
+            build_symbols_old(&source, symbol_size),
+            build_symbols_new(&source, symbol_size),
+            "symbol build diverged at {size_mb}MB"
+        );
+
+        group.throughput(criterion::Throughput::Bytes(u64::from(size_mb) * 1024 * 1024));
+        group.bench_with_input(BenchmarkId::new("zero_init_old", size_mb), &(), |b, ()| {
+            b.iter(|| black_box(build_symbols_old(black_box(&source), symbol_size)));
+        });
+        group.bench_with_input(BenchmarkId::new("direct_copy_new", size_mb), &(), |b, ()| {
+            b.iter(|| black_box(build_symbols_new(black_box(&source), symbol_size)));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_throughput,
@@ -583,6 +652,7 @@ criterion_group!(
     bench_repair_latency,
     bench_overhead_ratio,
     bench_repair_log_rotation_ab,
+    bench_symbol_build,
 );
 
 criterion_main!(benches);

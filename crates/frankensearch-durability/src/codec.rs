@@ -72,10 +72,21 @@ impl SymbolCodec for DefaultSymbolCodec {
         for symbol_idx in 0..k_source {
             let start = symbol_idx.saturating_mul(symbol_size);
             let end = start.saturating_add(symbol_size).min(source_data.len());
-            let mut symbol = vec![0_u8; symbol_size];
-            if start < end {
-                symbol[..end - start].copy_from_slice(&source_data[start..end]);
-            }
+            // A full symbol copies the whole `symbol_size` window, so the prior
+            // `vec![0; symbol_size]` zero-initialized a buffer it then fully
+            // overwrote — a wasted `memset` per symbol. Copy directly instead;
+            // only the final short symbol (`end - start < symbol_size`) needs the
+            // zero-padded tail. `start <= end` always holds here (see `k_source`),
+            // so `end - start` never underflows. Byte-identical output.
+            let symbol = if end - start == symbol_size {
+                source_data[start..end].to_vec()
+            } else {
+                let mut symbol = vec![0_u8; symbol_size];
+                if start < end {
+                    symbol[..end - start].copy_from_slice(&source_data[start..end]);
+                }
+                symbol
+            };
             source_symbols.push((
                 u32::try_from(symbol_idx).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
                     what: "source symbol index as u32".to_owned(),
