@@ -5827,3 +5827,29 @@ at high concurrency. Real text has Zipfian token locality (hot rows stay cached)
 parallelizes tokenization (pure compute), both of which this floor excludes — so the production win is expected
 to meet or exceed these numbers. Landed `model2vec_embedder.rs` + `embed_batch_sync` + parity test; retained the
 `model2vec_batch_parallel` A/B bench.
+
+### 2026-07-16 — verify_and_repair_file reuses the corruption-detection decode — 1.19× (BlackThrush)
+
+Extends fe866683 (which fused the reuse only inside standalone `repair_file_internal`) to the combined
+`FileProtector::verify_and_repair_file` path. On the corrupt path that method ran `verify_file` (mmap + source
+CRC32 + full trailer deserialize) and THEN `repair_file_internal`, which re-verified from scratch (mmap + CRC32 +
+deserialize) — a residual double pass fe866683 left. Now `verify_file_impl` retains the decoded
+`(RepairTrailerHeader, Vec<RepairSymbol>)` and, on detected corruption, hands it straight into a new
+`repair_file_internal(..., verified_decode: Option<...>)`, which skips its own verify entirely. Standalone
+`repair_file` (the fe866683 path) passes `None` and is unchanged; the three public method signatures
+(`verify_file`, `repair_file`, `verify_and_repair_file`) are unchanged. **Byte-identical repaired output**
+asserted (both the reuse and the retained `verify_and_repair_file_no_reuse` bench twin restore the exact original
+1 MB payload).
+
+Bench `verify_repair_reuse` (`-p frankensearch-durability --features bench-internals`, bench profile no-LTO, 100
+samples; re-corrupts a 1 MB single-block each iteration, so the identical corrupt-write cost sits in BOTH timed
+regions and only dilutes the ratio):
+
+| arm | time | ratio |
+|---|---|---|
+| no_reuse (verify + repair's own re-verify) | 4.258 ms [4.13–4.39] | 1.00× |
+| **reuse (verified decode → repair)** | **3.585 ms [3.47–3.70]** | **1.19× (CIs disjoint)** |
+
+15.8% lower end-to-end verify+repair latency; the repair-path-only delta is larger. Cold repair path (corruption
+is rare), but a real byte-identical win completing the fe866683 reuse across the whole verify→repair sequence.
+Landed `file_protector.rs` + retained the `verify_repair_reuse` A/B bench.

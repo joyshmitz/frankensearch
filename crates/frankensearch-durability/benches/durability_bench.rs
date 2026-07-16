@@ -644,6 +644,90 @@ fn bench_symbol_build(c: &mut Criterion) {
     group.finish();
 }
 
+// --- verify_and_repair_file: reuse the corruption-detection decode vs re-verify (bench-internals) ---
+//
+// On the corrupt path `verify_and_repair_file` ran `verify_file` (mmap + source CRC32 + trailer
+// deserialize) and THEN `repair_file_internal` re-ran its own verify (mmap + CRC32 + deserialize) —
+// the residual fe866683's standalone-repair reuse left. The `reuse` arm (shipping) hands the verified
+// decode into repair so it skips that second pass; `no_reuse` is the prior double-work. Byte-identical
+// repaired output (asserted). Re-corrupts each iteration (repair is destructive), so the timed region
+// includes the same corrupt-write cost in both arms — the delta is the eliminated second verify.
+#[allow(clippy::cast_possible_truncation)]
+fn bench_verify_repair_reuse(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    {
+        let config = DurabilityConfig {
+            symbol_size: 4096,
+            repair_overhead: 2.0,
+            ..DurabilityConfig::default()
+        };
+        let metrics = Arc::new(DurabilityMetrics::default());
+        let protector = FileProtector::new_with_metrics(Arc::new(BenchCodec), config, metrics)
+            .expect("protector");
+        let data_size = 1024u32 * 1024; // 1MB
+        let dir = tempfile_dir("bench-vr-reuse");
+        let file = dir.join("vr-target.bin");
+        let payload: Vec<u8> = (0..data_size).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&file, &payload).expect("write source");
+        let _protect = protector.protect_file(&file).expect("protect");
+
+        // Parity: both paths repair to the identical original bytes.
+        let corrupt_and_repair = |reuse: bool| -> Vec<u8> {
+            let mut corrupted = payload.clone();
+            corrupted[0..4096].fill(0xFF);
+            std::fs::write(&file, &corrupted).expect("corrupt");
+            if reuse {
+                protector.verify_and_repair_file(&file).expect("vr");
+            } else {
+                protector.verify_and_repair_file_no_reuse(&file).expect("vr");
+            }
+            std::fs::read(&file).expect("read repaired")
+        };
+        assert_eq!(
+            corrupt_and_repair(false),
+            payload,
+            "no_reuse must restore original"
+        );
+        assert_eq!(
+            corrupt_and_repair(true),
+            payload,
+            "reuse must restore original"
+        );
+
+        let mut group = c.benchmark_group("verify_repair_reuse");
+        group.measurement_time(Duration::from_secs(5));
+        group.bench_function("no_reuse", |b| {
+            b.iter(|| {
+                let mut corrupted = payload.clone();
+                corrupted[0..4096].fill(0xFF);
+                std::fs::write(&file, &corrupted).expect("corrupt");
+                black_box(
+                    protector
+                        .verify_and_repair_file_no_reuse(black_box(&file))
+                        .expect("vr"),
+                );
+            });
+        });
+        group.bench_function("reuse", |b| {
+            b.iter(|| {
+                let mut corrupted = payload.clone();
+                corrupted[0..4096].fill(0xFF);
+                std::fs::write(&file, &corrupted).expect("corrupt");
+                black_box(
+                    protector
+                        .verify_and_repair_file(black_box(&file))
+                        .expect("vr"),
+                );
+            });
+        });
+        group.finish();
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    {
+        let _ = c;
+    }
+}
+
 criterion_group!(
     benches,
     bench_encode_throughput,
@@ -653,6 +737,7 @@ criterion_group!(
     bench_overhead_ratio,
     bench_repair_log_rotation_ab,
     bench_symbol_build,
+    bench_verify_repair_reuse,
 );
 
 criterion_main!(benches);

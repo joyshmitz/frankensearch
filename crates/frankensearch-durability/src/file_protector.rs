@@ -434,12 +434,30 @@ impl FileProtector {
     /// Falls back to CRC32 verification for V1 trailers or when xxh3 hash is zero.
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn verify_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileVerifyResult> {
+        self.verify_file_impl(path, sidecar_path)
+            .map(|(result, _)| result)
+    }
+
+    /// Like [`Self::verify_file`] but also returns the fully-decoded trailer. When
+    /// verification finds corruption, [`Self::verify_and_repair_file`] hands this decode
+    /// straight to repair so it does not re-read the sidecar, re-deserialize the trailer,
+    /// and recompute the source CRC32 a second time (the residual `verify_file` +
+    /// `repair_file_internal` re-verify left by the fe866683 standalone-repair reuse).
+    fn verify_file_impl(
+        &self,
+        path: &Path,
+        sidecar_path: &Path,
+    ) -> SearchResult<(FileVerifyResult, (RepairTrailerHeader, Vec<RepairSymbol>))> {
         let file = fs::File::open(path)?;
         let len = file.metadata()?.len();
 
         // Read trailer first to get expected values
         let trailer_bytes = fs::read(sidecar_path)?;
-        let (header, _) = deserialize_repair_trailer(&trailer_bytes)?;
+        let decoded = deserialize_repair_trailer(&trailer_bytes)?;
+        // Header fields are Copy; take them so `decoded` can be returned unmoved.
+        let source_xxh3 = decoded.0.source_xxh3;
+        let source_crc32 = decoded.0.source_crc32;
+        let source_len = decoded.0.source_len;
 
         // Memory-map the file for hash computation
         let mmap = if len == 0 {
@@ -451,20 +469,21 @@ impl FileProtector {
 
         // Fast path: xxh3 hash check (V2+ trailers have source_xxh3 != 0)
         // This is ~10x faster than CRC32 for large files.
-        if header.source_xxh3 != 0 {
+        if source_xxh3 != 0 {
             let actual_xxh3 = mmap.as_ref().map_or_else(|| xxh3_64(&[]), |m| xxh3_64(m));
 
-            if actual_xxh3 == header.source_xxh3 {
+            if actual_xxh3 == source_xxh3 {
                 // Fast-path success: xxh3 matches, file is healthy
                 let actual_len = mmap.as_ref().map_or(0, |m| saturating_u64(m.len()));
-                return Ok(FileVerifyResult {
+                let result = FileVerifyResult {
                     healthy: true,
-                    expected_crc32: header.source_crc32,
-                    actual_crc32: header.source_crc32, // Not computed, use expected
-                    expected_xxh3: header.source_xxh3,
-                    expected_len: header.source_len,
+                    expected_crc32: source_crc32,
+                    actual_crc32: source_crc32, // Not computed, use expected
+                    expected_xxh3: source_xxh3,
+                    expected_len: source_len,
                     actual_len,
-                });
+                };
+                return Ok((result, decoded));
             }
             // xxh3 mismatch — fall through to CRC32 for detailed result
         }
@@ -475,16 +494,17 @@ impl FileProtector {
             |m| (crc32fast::hash(m), saturating_u64(m.len())),
         );
 
-        let healthy = actual_crc32 == header.source_crc32 && actual_len == header.source_len;
+        let healthy = actual_crc32 == source_crc32 && actual_len == source_len;
 
-        Ok(FileVerifyResult {
+        let result = FileVerifyResult {
             healthy,
-            expected_crc32: header.source_crc32,
+            expected_crc32: source_crc32,
             actual_crc32,
-            expected_xxh3: header.source_xxh3,
-            expected_len: header.source_len,
+            expected_xxh3: source_xxh3,
+            expected_len: source_len,
             actual_len,
-        })
+        };
+        Ok((result, decoded))
     }
 
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
@@ -534,7 +554,7 @@ impl FileProtector {
     #[allow(clippy::too_many_lines)]
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileRepairOutcome> {
-        self.repair_file_internal(path, path, sidecar_path)
+        self.repair_file_internal(path, path, sidecar_path, None)
     }
 
     fn repair_file_internal(
@@ -542,6 +562,7 @@ impl FileProtector {
         dest_path: &Path,
         source_path: &Path,
         sidecar_path: &Path,
+        verified_decode: Option<(RepairTrailerHeader, Vec<RepairSymbol>)>,
     ) -> SearchResult<FileRepairOutcome> {
         self.metrics.record_repair_attempt();
 
@@ -550,45 +571,52 @@ impl FileProtector {
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
         };
-        // Determine if we have a source file to verify/read. Keep the fully
-        // validated trailer when verification finds corruption so repair does
-        // not read and deserialize the same sidecar a second time.
-        let decoded_trailer = if let Some(ref file) = source_file {
-            // Verify first - using mmap
-            let len = file.metadata()?.len();
-            let (healthy, decoded_trailer) = if len == 0 {
-                let trailer_bytes = fs::read(sidecar_path)?;
-                let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
-                let header = &decoded_trailer.0;
-                (
-                    header.source_crc32 == crc32fast::hash(&[]) && header.source_len == 0,
-                    decoded_trailer,
-                )
+        // When the caller (verify_and_repair_file) already detected corruption and decoded the
+        // trailer, reuse that decode: skip the redundant second mmap + source CRC32 + trailer
+        // deserialize this function would otherwise repeat. Standalone repair (`verified_decode
+        // = None`) verifies here, keeping the fully validated trailer when it finds corruption so
+        // it does not read and deserialize the same sidecar a second time (fe866683).
+        let (header, trailer_symbols) = if let Some(decoded) = verified_decode {
+            decoded
+        } else {
+            let decoded_trailer = if let Some(ref file) = source_file {
+                // Verify first - using mmap
+                let len = file.metadata()?.len();
+                let (healthy, decoded_trailer) = if len == 0 {
+                    let trailer_bytes = fs::read(sidecar_path)?;
+                    let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
+                    let header = &decoded_trailer.0;
+                    (
+                        header.source_crc32 == crc32fast::hash(&[]) && header.source_len == 0,
+                        decoded_trailer,
+                    )
+                } else {
+                    let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
+                    let trailer_bytes = fs::read(sidecar_path)?;
+                    let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
+                    let header = &decoded_trailer.0;
+                    let actual_crc32 = crc32fast::hash(&mmap);
+                    (
+                        actual_crc32 == header.source_crc32 && len == header.source_len,
+                        decoded_trailer,
+                    )
+                };
+
+                if healthy {
+                    return Ok(FileRepairOutcome::NotNeeded);
+                }
+                Some(decoded_trailer)
             } else {
-                let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
-                let trailer_bytes = fs::read(sidecar_path)?;
-                let decoded_trailer = deserialize_repair_trailer(&trailer_bytes)?;
-                let header = &decoded_trailer.0;
-                let actual_crc32 = crc32fast::hash(&mmap);
-                (
-                    actual_crc32 == header.source_crc32 && len == header.source_len,
-                    decoded_trailer,
-                )
+                None
             };
 
-            if healthy {
-                return Ok(FileRepairOutcome::NotNeeded);
+            match decoded_trailer {
+                Some(decoded_trailer) => decoded_trailer,
+                None => {
+                    let trailer_bytes = fs::read(sidecar_path)?;
+                    deserialize_repair_trailer(&trailer_bytes)?
+                }
             }
-            Some(decoded_trailer)
-        } else {
-            None
-        };
-
-        let (header, trailer_symbols) = if let Some(decoded_trailer) = decoded_trailer {
-            decoded_trailer
-        } else {
-            let trailer_bytes = fs::read(sidecar_path)?;
-            deserialize_repair_trailer(&trailer_bytes)?
         };
 
         if header.source_len == 0 {
@@ -721,6 +749,26 @@ impl FileProtector {
     ///    attempt repair, verify the result, and clean up or restore the backup.
     /// 4. Log the repair event if `repair_log_dir` is configured.
     pub fn verify_and_repair_file(&self, path: &Path) -> SearchResult<HealthCheckResult> {
+        self.verify_and_repair_file_with(path, true)
+    }
+
+    /// Bench-internal twin: `reuse = false` reproduces the pre-reuse behavior (the follow-up
+    /// repair re-opens/mmaps the source, recomputes its CRC32, and re-deserializes the trailer),
+    /// so `durability_bench` can A/B the corruption-detection decode reuse against it.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn verify_and_repair_file_no_reuse(
+        &self,
+        path: &Path,
+    ) -> SearchResult<HealthCheckResult> {
+        self.verify_and_repair_file_with(path, false)
+    }
+
+    fn verify_and_repair_file_with(
+        &self,
+        path: &Path,
+        reuse: bool,
+    ) -> SearchResult<HealthCheckResult> {
         let sidecar = Self::sidecar_path(path);
         if !sidecar.exists() {
             return Ok(HealthCheckResult {
@@ -729,20 +777,23 @@ impl FileProtector {
             });
         }
 
-        match self.verify_file(path, &sidecar) {
-            Ok(verify) if verify.healthy => {
+        // Verify once, retaining the decoded trailer. On corruption, hand it straight to repair
+        // so it does not re-mmap the source, recompute its CRC32, and re-deserialize the sidecar.
+        let verified_decode = match self.verify_file_impl(path, &sidecar) {
+            Ok((verify, _)) if verify.healthy => {
                 return Ok(HealthCheckResult {
                     path: path.to_path_buf(),
                     status: FileHealth::Intact,
                 });
             }
-            Ok(verify) => {
+            Ok((verify, decoded)) => {
                 debug!(
                     path = %path.display(),
                     expected_crc32 = verify.expected_crc32,
                     actual_crc32 = verify.actual_crc32,
                     "corruption detected"
                 );
+                if reuse { Some(decoded) } else { None }
             }
             Err(SearchError::Io(ref e)) if e.kind() == ErrorKind::NotFound => {
                 // Source file missing entirely — still try repair if auto_repair enabled.
@@ -750,9 +801,10 @@ impl FileProtector {
                     path = %path.display(),
                     "source file missing, will attempt repair from sidecar"
                 );
+                None
             }
             Err(e) => return Err(e),
-        }
+        };
 
         if !self.pipeline_config.auto_repair {
             return Ok(HealthCheckResult {
@@ -781,7 +833,8 @@ impl FileProtector {
 
         let repair_start = Instant::now();
         let source_path_to_read = if had_source { &backup_path } else { path };
-        let outcome = self.repair_file_internal(path, source_path_to_read, &sidecar);
+        let outcome =
+            self.repair_file_internal(path, source_path_to_read, &sidecar, verified_decode);
         let repair_time = repair_start.elapsed();
 
         self.finalize_repair(

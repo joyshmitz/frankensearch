@@ -20,6 +20,10 @@ crc32fast = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 memmap2 = { workspace = true }
 
+[features]
+# Exposes bench-only twins (e.g. FileProtector::verify_and_repair_file_no_reuse) for A/B benches.
+bench-internals = []
+
 [dev-dependencies]
 criterion = { workspace = true }
 
