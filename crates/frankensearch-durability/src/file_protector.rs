@@ -630,7 +630,7 @@ impl FileProtector {
         } else {
             Vec::new()
         };
-        symbols.extend(repair_symbols.iter().cloned());
+        symbols.extend(repair_symbols);
         // Avoid holding a read handle on the source path while writing repaired content.
         drop(source_file);
 

@@ -1,5 +1,12 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-15 — Durability repair consumes decoded symbols without deep-cloning (`bd-mloy`)
+
+- **Attribution:** `FileProtector::repair_file` already owned the decoded `repair_symbols`, but extended the codec input with `repair_symbols.iter().cloned()`. On the measured 1 MiB / 4 KiB-symbol fixture, that allocated and copied 256 payload buffers (1 MiB total) immediately before decode. Consuming the owned vector is the only production change; ESI values, payload bytes, symbol order, and decoder inputs are unchanged.
+- **Measurement:** strict remote-only `rch`, same worker `vmi1227854`, `--profile release` with LTO disabled and 16 codegen units, 10 samples and 50 ms warm-up; the existing repair group enforced its 5 s collection window despite the cheaper 150 ms CLI request. `repair_latency/repair_1mb_single_block_corruption` improved from **4.9248 ms** `[4.8143, 5.1032]` to **4.0529 ms** `[3.6670, 4.4405]`: ratio **0.823**, or **17.7% lower latency** (**1.215× speedup**). Criterion's direct same-target change interval was **−27.241% to −14.649%** (`p = 0.00` at displayed precision); even candidate upper bound divided by baseline lower bound is **0.922**.
+- **Verification:** the exact durability library suite passed remotely under the release profile (**151 passed, 0 failed**), the scoped all-target check passed remotely, and owned-file `rustfmt` plus `git diff --check` passed. Workspace all-target checking remains blocked by an unrelated stale fusion benchmark call to missing `AdaptiveNqcDenseWeight::bench_legacy`; scoped clippy remains blocked by three lints in unchanged `frankensearch-core` sources.
+- **Scope:** KEEP for corrupt-file repair after trailer decode. This removes only the redundant transfer copy; protection, healthy verification, trailer parsing, source-symbol recovery, durable rewrite, and CRC validation are untouched.
+
 ## 2026-07-15 — FSFS prior-signal result-map reservation (`bd-79bn`)
 
 - **Attribution:** `CodeStructureSidecar::prior_signals_for_candidates` knows the candidate upper bound before its dense result loop, but the shipping `HashMap::new()` repeatedly grew the result table. Reserving `candidates.len()` is the only production change; document lookup, score computation, insertion order, keys, and values are unchanged.
