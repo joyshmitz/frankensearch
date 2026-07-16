@@ -419,6 +419,144 @@ impl GraphRanker {
             .collect();
         Self::finalize_scores(ranks_map, limit)
     }
+
+    /// **Bench-only twin (bd-5hlw): single-pass FLAT CSR sized from the `edges.len()` UPPER BOUND.**
+    ///
+    /// The "strongest form" of the flat-CSR lever the ledger left untested. Unlike
+    /// [`Self::rank_phase1_flat`] — which pays a COUNTING pass (a second `idx` probe per edge) to size
+    /// each row exactly — this sizes `offsets` from each row's raw `edges.len()` (NO probe), then fills
+    /// in ONE pass paying a single `idx.get` probe per edge, exactly matching the shipped build's probe
+    /// count. Dropped (non-node) neighbors leave a gap after each row, so `row_end[src]` records where
+    /// the live edges end; the power iteration reads only `edges_flat[offsets[src]..row_end[src]]` — no
+    /// compaction pass. Trades the shipped build's `n` small row allocs for 3 arena allocs plus an
+    /// `edges_flat` over-allocated to the total RAW edge count. Edge-visit order per `src` is unchanged
+    /// ⇒ **bit-identical** to [`Self::rank_phase1`] (the bench asserts it), so the arms differ by edge
+    /// layout and build strategy alone.
+    #[cfg(feature = "bench-internals")]
+    #[must_use]
+    pub fn rank_phase1_flat_upper(
+        &self,
+        _cx: &Cx,
+        _query: &str,
+        graph: &DocumentGraph,
+        seed_hits: &[VectorHit],
+        limit: usize,
+    ) -> Option<Vec<ScoredResult>> {
+        if graph.is_empty() || limit == 0 {
+            return None;
+        }
+        let personalization = Self::personalization_from_seed_hits(graph, seed_hits);
+        if personalization.is_empty() {
+            return None;
+        }
+
+        let adjacency = graph.adjacency();
+        let n = adjacency.len();
+        let mut nodes: Vec<&GraphDocId> = Vec::with_capacity(n);
+        // Match the shipped lookup hasher so this twin still differs only in edge layout/build.
+        let mut idx: ahash::AHashMap<&str, usize> = ahash::AHashMap::with_capacity(n);
+        for doc_id in adjacency.keys() {
+            idx.insert(doc_id.as_str(), nodes.len());
+            nodes.push(doc_id);
+        }
+
+        // UPPER-BOUND flat CSR: size `offsets` from raw edge counts (NO probe), so the single fill
+        // pass pays exactly one `idx` probe per edge like the shipped build (the rejected two-pass
+        // `rank_phase1_flat` paid two). `row_end[src]` marks the end of the LIVE edges written into
+        // row `src`'s upper-bound slot; the gap `[row_end[src], offsets[src + 1])` is never read.
+        let mut out_sum = vec![0.0_f64; n];
+        let mut offsets = vec![0_usize; n + 1];
+        for (doc_id, edges) in adjacency {
+            let src = idx[doc_id.as_str()];
+            offsets[src + 1] = edges.len();
+        }
+        for i in 0..n {
+            offsets[i + 1] += offsets[i];
+        }
+        let mut edges_flat = vec![(0_usize, 0.0_f64); offsets[n]];
+        let mut row_end = vec![0_usize; n];
+        for (doc_id, edges) in adjacency {
+            let src = idx[doc_id.as_str()];
+            let mut cursor = offsets[src];
+            let mut sum = 0.0_f64;
+            for edge in edges {
+                let weight = f64::from(edge.weight);
+                if !weight.is_finite() || weight <= 0.0 {
+                    continue;
+                }
+                // `sum` counts every finite positive edge (incl. non-node destinations) — matches
+                // `rank_phase1` / `rank_phase1_flat` exactly.
+                sum += weight;
+                if let Some(&dst) = idx.get(edge.neighbor_doc_id.as_str()) {
+                    edges_flat[cursor] = (dst, weight);
+                    cursor += 1;
+                }
+            }
+            out_sum[src] = sum;
+            row_end[src] = cursor;
+        }
+
+        let seeds: Vec<(usize, f64)> = personalization
+            .iter()
+            .filter_map(|(doc_id, w)| idx.get(doc_id.as_str()).map(|&i| (i, *w)))
+            .collect();
+
+        let teleport_scale = self.restart_probability.clamp(0.0, 1.0);
+        let walk_scale = 1.0 - teleport_scale;
+
+        let mut ranks = vec![0.0_f64; n];
+        for &(i, w) in &seeds {
+            ranks[i] = w;
+        }
+        let mut next = vec![0.0_f64; n];
+
+        for _ in 0..self.max_iterations {
+            next.iter_mut().for_each(|v| *v = 0.0);
+
+            for &(i, w) in &seeds {
+                next[i] += teleport_scale * w;
+            }
+
+            let dangling_mass: f64 = (0..n)
+                .filter(|&i| out_sum[i] <= f64::EPSILON)
+                .map(|i| ranks[i])
+                .sum();
+
+            if dangling_mass > 0.0 {
+                for &(i, w) in &seeds {
+                    next[i] += walk_scale * dangling_mass * w;
+                }
+            }
+
+            for src in 0..n {
+                let rank = ranks[src];
+                if rank <= 0.0 {
+                    continue;
+                }
+                let out_total = out_sum[src];
+                if out_total <= f64::EPSILON {
+                    continue;
+                }
+                let base = walk_scale * rank / out_total;
+                for &(dst, weight) in &edges_flat[offsets[src]..row_end[src]] {
+                    next[dst] += base * weight;
+                }
+            }
+
+            let l1_delta: f64 = (0..n).map(|i| (ranks[i] - next[i]).abs()).sum();
+            std::mem::swap(&mut ranks, &mut next);
+            if l1_delta < self.tolerance {
+                break;
+            }
+        }
+
+        let ranks_map: HashMap<GraphDocId, f64> = nodes
+            .iter()
+            .zip(ranks.iter())
+            .map(|(&doc_id, &rank)| (doc_id.clone(), rank))
+            .collect();
+        Self::finalize_scores(ranks_map, limit)
+    }
 }
 
 #[cfg(test)]

@@ -15175,3 +15175,34 @@ its exact former three-variant form. This is now a measured perf reject, not a H
 scan-fusion here: the multi-pass early-exit + `memchr` classifier is already near-optimal for short queries.
 Kin to the SimHash-tableless and count-free-WAND rejects (fusing/eliminating passes loses when the
 individual passes are SIMD-optimized and short-circuiting).
+
+### 2026-07-16 — BlackThrush — WASH (measured, closes reopen): single-pass UPPER-BOUND flat CSR on graph_rank is inside the A/A null floor (`bd-5hlw`)
+
+Upgrades cc_fse's 2026-07-13 "RESOLVED by construction, no bench" to a **measured** resolution. `bd-5hlw` is the
+last untested-labeled perf route-next: the "strongest form" of the graph_rank flat-CSR lever — size CSR `offsets`
+from each row's raw `edges.len()` UPPER BOUND (no counting pass), fill in ONE pass paying a single `idx` probe
+per edge (exactly the shipped build's probe count, unlike the rejected two-pass `rank_phase1_flat` which paid
+two), record each row's live end in `row_end`, and read only `edges_flat[offsets[src]..row_end[src]]` (no
+compaction). Trades the shipped `Vec<Vec<(usize,f64)>>` build's `n` small row allocs for 3 arena allocs + an
+`edges_flat` over-allocated to the total raw edge count.
+
+**Method.** Added `GraphRanker::rank_phase1_flat_upper` as a `#[cfg(feature="bench-internals")]` twin next to the
+existing `rank_phase1_flat`, kept in-tree for reproducibility per this bench's convention. Same private
+personalization / power iteration / `finalize_scores` / edge-visit order ⇒ **bit-identical** to shipped
+`rank_phase1` (asserted: result count, doc id, score bits — held on both fixtures, 0 panics). Wired a
+within-process interleaved `paired_median_ratio` A/B (sidesteps the RCH_WORKER soft-pin) with an A/A null
+control, one binary, one remote `rch` invocation (`bench` profile, no-LTO, 41 rounds × PAIR_BATCH=4):
+
+| fixture | A/A null (median · p5–p95) | flat_upper/shipped (median · p5–p95) | verdict |
+|---|---|---|---|
+| n500_deg6 | 1.0064 · 0.925–1.077 | 0.9573 · 0.874–1.049 | INSIDE NULL FLOOR |
+| n2000_deg8 | 0.9614 · 0.860–1.130 | 0.9693 · 0.831–1.237 | INSIDE NULL FLOOR |
+
+**Decision: WASH — not a lever.** On both realistic (500-node) and larger (2000-node) fixtures the ratio is
+indistinguishable from the A/A noise floor (which is itself wide, ±8–13%, at these tiny opt-in `graph`-feature
+pools). Confirms cc_fse's construction argument empirically: at L2-resident, neighbor-hash-probe-DOMINATED build
+sizes the CSR alloc/layout difference is second-order, and graph_rank (a feature-gated phase-1 hook seeded from a
+hundreds-of-node candidate pool) never reaches the n≫10⁴ regime where traversal locality could matter. Unlike the
+two-pass flat CSR (REJECTED 1.21–1.31× slower, probe-doubling), path (b) does not regress — it is a true wash.
+This closes the last untested-labeled perf route-next in the ledger; the twin stays in-tree so the row is
+reproducible. Bead `bd-5hlw` closed.

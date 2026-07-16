@@ -22,7 +22,10 @@
 //! A/B with an A/A null control. `paired_shipped_csr` vs `paired_flat_csr` retains the earlier
 //! layout lever: `rank_phase1` vs its one-variable
 //! twin `rank_phase1_flat` (feature `bench-internals`), asserted **bit-identical** so the arms differ
-//! by edge layout alone. `paired_null_a` / `paired_null_b` are an **A/A null control** — the same arm
+//! by edge layout alone. `[csr-upper]` (bd-5hlw) adds the single-pass twin `rank_phase1_flat_upper`
+//! (offsets from the `edges.len()` upper bound, no counting pass — the "strongest form") vs shipped:
+//! measured a WASH inside the A/A null floor on both fixtures (0.957×/0.969×). `paired_null_a` /
+//! `paired_null_b` are an **A/A null control** — the same arm
 //! twice — measuring the harness noise floor. Read the null ratio before believing any lever ratio:
 //! an effect smaller than the floor is noise. Measured floor 1.0015/1.0032 (hz2, 120 samples); flat
 //! CSR loses by 1.206×/1.306×, confirming the 2026-07-09 REJECT at production fidelity.
@@ -497,6 +500,66 @@ fn bench_graph_rank(c: &mut Criterion) {
         eprintln!(
             "[reachability] {id}: rank_phase1_flat -> {} results, bit-identical to shipped",
             flat_out.len()
+        );
+
+        // ── bd-5hlw: single-pass UPPER-BOUND flat CSR vs shipped Vec<Vec> CSR, ONE variable ──
+        //
+        // `rank_phase1_flat_upper` is the "strongest form" the ledger left untested: it sizes CSR
+        // `offsets` from the raw `edges.len()` upper bound (no counting pass ⇒ one `idx` probe/edge,
+        // same as shipped, unlike `rank_phase1_flat`'s two), fills once, and reads only each row's
+        // live prefix. Same edge-visit order ⇒ bit-identical to shipped (asserted). The A/B isolates
+        // "n small row allocs + scattered blocks" vs "3 arena allocs + one over-allocated flat block".
+        let upper_out = ranker
+            .rank_phase1_flat_upper(&cx, "graph rank query", &graph, &seeds, limit)
+            .expect("rank_phase1_flat_upper must return Some -- else the arm measures nothing");
+        assert_eq!(
+            upper_out.len(),
+            prod_out.len(),
+            "{id}: flat_upper/shipped result counts diverged"
+        );
+        for (p, f) in prod_out.iter().zip(&upper_out) {
+            assert_eq!(p.doc_id, f.doc_id, "{id}: flat_upper CSR reordered the ranking");
+            assert_eq!(
+                p.score.to_bits(),
+                f.score.to_bits(),
+                "{id}: flat_upper CSR changed doc {} score bits -- arms differ by more than layout",
+                p.doc_id
+            );
+        }
+        let run_shipped_csr = || {
+            black_box(ranker.rank_phase1(
+                black_box(&cx),
+                "graph rank query",
+                black_box(&graph),
+                black_box(&seeds),
+                limit,
+            ));
+        };
+        let run_upper_csr = || {
+            black_box(ranker.rank_phase1_flat_upper(
+                black_box(&cx),
+                "graph rank query",
+                black_box(&graph),
+                black_box(&seeds),
+                limit,
+            ));
+        };
+        let upper_null = paired_median_ratio(41, PAIR_BATCH, run_shipped_csr, run_shipped_csr);
+        let upper_lever = paired_median_ratio(41, PAIR_BATCH, run_shipped_csr, run_upper_csr);
+        eprintln!(
+            "[csr-null]  {id}: shipped/shipped median {:.4} p5 {:.4} p95 {:.4} ({} rounds)",
+            upper_null.median, upper_null.p5, upper_null.p95, upper_null.rounds
+        );
+        eprintln!(
+            "[csr-upper] {id}: flat_upper/shipped median {:.4} p5 {:.4} p95 {:.4} -> {}",
+            upper_lever.median,
+            upper_lever.p5,
+            upper_lever.p95,
+            if upper_lever.decidable_against(&upper_null) {
+                "DECIDABLE"
+            } else {
+                "INSIDE NULL FLOOR"
+            }
         );
 
         // ── NULL CONTROL (A/A): the SAME arm registered twice, identical interleaved structure ──
