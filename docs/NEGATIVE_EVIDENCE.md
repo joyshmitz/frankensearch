@@ -15379,3 +15379,28 @@ Cold repair-only path (indexes rarely corrupt), in fe866683's actively-optimized
 author; not worth a rushed multi-layer refactor + new bench this pass. Downgraded from "ready DO-NEXT" to
 "analyzed lead, moderate refactor." No code changed. **Meta: two consecutive ledger-only passes — the CLEAN
 sibling-path levers off the newest wins are drained; remaining durability-reuse levers are all cross-layer.**
+
+### 2026-07-16 — BlackThrush — BELOW-FLOOR / SWARMED: durability #3 + index-quantize #4 siblings not worth taking
+
+Followed up the two remaining sibling-path leads after landing the #2 verify_and_repair_file reuse (d9d77fa3).
+Both are not worth taking this pass:
+
+- **fsvi #3 (`FsviProtector::verify_and_repair`, fsvi_protector.rs:352).** Its corrupt path has a bigger
+  redundancy than #2: `verify()` calls `is_repairable` (a FULL RaptorQ decode to test recoverability) and then
+  `repair()` decodes AGAIN — a double decode. Eliminating it (skip `is_repairable`, let `repair` decide via its
+  `repair_file` verify) requires splitting `verify()` into an intact-check + a repairability step AND changes the
+  unrepairable path (it would leave a `.corrupted` forensic backup instead of erroring with no backup — no test
+  covers it, but it is a behavior change). Worse for measurement: the durability benches use `BenchCodec`, whose
+  decode is a cheap mock, so a bench would only capture the crc32+deserialize part (~1.19×, same class as #2) and
+  NOT the decode-double win. The path is EXTREMELY cold (vector-index corruption repair is far rarer than file
+  repair). Not worth a moderate refactor + behavior change + a bench that understates it. Below the value floor.
+- **index quantize #4 sibling (3d42878d "8 lanes per store").** The natural sibling — the 4-bit pack
+  (`pack_f16_le_bytes_to_4bit_avx2_impl`, simd.rs:~1961) — ALREADY has the vectorized path: a `SIMD_NIBBLE_PACK`
+  const-generic gates a `vpshufb` nibble-pack (2052) vs the old scalar `[0_i32;8]` tmp round-trip (2073). That is
+  cod's ACTIVE optimization A/B in progress in the swarmed `simd.rs`. Avoid.
+
+**State: the sibling-path vein off the four newest wins is now fully worked (embed→Model2Vec landed; fusion
+calibration done; index quantize = cod-active; durability = #2 landed + #3 below-floor). No clean, safe,
+worthwhile, un-swarmed perf lever this pass.** Next: the fsvi #3 stays a deprioritized lead (do it only if the
+verify() split is wanted for its own sake); otherwise wait for quill code or a fresh win to spawn a new twin.
+No code changed.
