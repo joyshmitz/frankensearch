@@ -15269,3 +15269,29 @@ policy call (v3 binaries SIGILL on pre-Haswell/2013 CPUs; the audit notes all *w
 artifacts may target older). Next step (handed to cod): land the workspace v3 flag behind a build profile, measure
 `fsvi_int8_two_pass` end-to-end baseline-vs-v3 to size the real query gain, and settle the min-CPU-target policy.
 `bd-yt8m` stays OPEN. The `max_avx2` proxy arm is kept in-tree so the site-level upside stays reproducible.
+
+### 2026-07-16 — BlackThrush — CLOSE bd-yt8m: x86-64-v3 is a wash on the PRODUCTION hot path (hot dots already AVX2-dispatched)
+
+Finalizes the prior entry (same day, "~3.4–4.9× on the wide::f32x8 reduction SITE"). That kernel A/B is real, but
+a dispatch audit of the actual production vector-search path shows it does NOT apply end-to-end, correcting the
+"promising lever" framing:
+
+- The int8/f16 scan hot path (`search.rs`) calls only the **runtime-dispatched** entrypoints
+  `dot_product_f16_bytes_f32` (simd.rs:359 → `_avx2` when avx2+f16c) and `dot_i8_i8` (→ `_avx2`); it never calls
+  the `_generic` (wide::f32x8) versions, and it contains **no** hot `wide::f32x8` reduction (every `.max()` in
+  `search.rs` is scalar usize/f32 glue — chunk sizes, budgets, one query-norm).
+- So on the AVX2 fleet the hot dots are ALREADY 256-bit AVX2 **regardless of build `target-cpu`**. A workspace
+  `-C target-cpu=x86-64-v3` flag changes nothing on the hot path; it would SIGILL on non-AVX2 CPUs (where the
+  SSE2 `_generic` fallback is the only correct option anyway — its ~3.5× slowness is inherent to that hardware,
+  not a fixable lever).
+- The measured ~3.5× `wide::f32x8`-vs-AVX2 gap therefore only touches: the `_generic` fallbacks (never execute on
+  the AVX2 fleet), remainder tails (<8 elems, negligible), and the **experimental** native reranker
+  (`rerank/native.rs`, bd-2ba5 parking-lot, model-gated) — none a production hot path.
+
+**Decision: below-bar end-to-end → CLOSE bd-yt8m.** No workspace `.cargo/config` change is warranted (confirms
+the original ISA audit's "expected SMALL"; the site-level 3.5× does not reach a dispatched hot path). Resolved by
+dispatch verification rather than a fresh baseline-vs-v3 cross-build: runtime dispatch makes the end-to-end v3
+result deterministically ~1.0×, so an ~18-min two-build confirmation would only restate a code-certain wash. The
+`max_avx2` proxy arm added last turn stays in the `max_reduction` bench as a standing record of the kernel gap.
+If the native reranker is ever productionized, revisit AVX2-dispatching ITS `wide::f32x8` kernels (landable in
+the rerank crate, no workspace flag) — that is the only place the 3.5× would reach real code.
