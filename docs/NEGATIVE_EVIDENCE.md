@@ -15352,3 +15352,30 @@ a pre-decoded trailer, or a `repair_file` variant taking `Option<decoded_trailer
 with a corrupted-fsvi fixture like `repair_1mb_single_block_corruption`). Reserve fsvi_protector.rs +
 file_protector.rs; coordinate with the fe866683 author. No code changed this pass — a moderate cross-protector
 refactor deferred rather than rushed in swarmed durability.
+
+### 2026-07-16 — BlackThrush — CORRECTION of the fsvi trailer-reuse lead: it is a multi-layer refactor + new bench, not a ready lever
+
+Deep-dived the ★ DO-NEXT from the prior entry (fsvi `verify_and_repair` trailer-reuse twin of fe866683). It is
+NOT a clean drop-in — it is a genuine cross-layer refactor with a correctness constraint and no existing bench:
+
+- **fe866683's reuse is only in standalone `FileProtector::repair_file_internal`** (verify+repair share one decode
+  WITHIN that call). The bench `repair_1mb_single_block_corruption` calls `repair_file` (→ that path), so it is
+  already optimized.
+- **`FileProtector::verify_and_repair_file` (file_protector.rs:723) has a RESIDUAL double-deserialize** that
+  fe866683 did NOT fix: it calls `verify_file` (:732, deserializes for corruption detection) THEN
+  `repair_file_internal` (:784, which verifies AGAIN internally). Plus a post-repair `verify_file` (:811,
+  intentional). So the corrupt path deserializes the trailer twice before repair.
+- **`FsviProtector::verify_and_repair` (fsvi_protector.rs:352)** compounds it: `self.verify()` (xxh3 fast-path +
+  `verify_file`) THEN `self.repair()` (→ `repair_file` → `repair_file_internal`, re-verifies). The clean minimal
+  fix (skip `verify_file`, go straight to repair) REGRESSES healthy V1 files (`source_xxh3==0` bypasses the xxh3
+  fast-path → repair() creates an unconditional `.corrupted` backup + reads the source even when healthy).
+- **The real fix (both #2 and #3):** thread the decoded `(RepairTrailerHeader, Vec<RepairSymbol>)` — add
+  `Option<pre_decoded>` to `repair_file_internal` and a `verify_file` variant that RETAINS the decode, so the
+  corruption-detecting verify's decode is reused by repair. Extends fe866683's pattern one layer out.
+- **No existing bench exercises `verify_and_repair_file`** (the repair bench uses standalone `repair_file`), so a
+  new corrupt-file A/B fixture is needed for both FileProtector and fsvi.
+
+Cold repair-only path (indexes rarely corrupt), in fe866683's actively-optimized file → coordinate with its
+author; not worth a rushed multi-layer refactor + new bench this pass. Downgraded from "ready DO-NEXT" to
+"analyzed lead, moderate refactor." No code changed. **Meta: two consecutive ledger-only passes — the CLEAN
+sibling-path levers off the newest wins are drained; remaining durability-reuse levers are all cross-layer.**
