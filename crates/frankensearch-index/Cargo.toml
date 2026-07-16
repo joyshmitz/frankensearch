@@ -67,6 +67,11 @@ harness = false
 name = "quality_rescore_hasher_ab"
 harness = false
 
+# FSVI two-tier quality-rescore scorer: decode+f32dot vs fused byte dot — paired A/B.
+[[bench]]
+name = "quality_rescore_fused_dot_ab"
+harness = false
+
 # HNSW (ANN) vs flat brute-force vector search — lever validation (latency + recall).
 [[bench]]
 name = "hnsw_vs_flat"

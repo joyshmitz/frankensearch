@@ -1289,6 +1289,52 @@ impl VectorIndex {
         }
     }
 
+    /// Raw stored slab bytes of the vector at `index` (`dim * 2` for f16,
+    /// `dim * 4` for f32) — the same window [`Self::vector_at_f32`] decodes, but
+    /// borrowed without materializing an f32 `Vec`. Feeds the fused-kernel scorer.
+    fn vector_bytes(&self, index: usize) -> SearchResult<&[u8]> {
+        self.ensure_index(index)?;
+        let start = self.vector_start(index)?;
+        let byte_len = self
+            .dimension()
+            .checked_mul(self.quantization().bytes_per_element())
+            .ok_or_else(|| index_corrupted(&self.path, "vector byte length overflow"))?;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or_else(|| index_corrupted(&self.path, "vector byte end overflow"))?;
+        if end > self.data.len() {
+            return Err(index_corrupted(&self.path, "vector extends past file end"));
+        }
+        Ok(&self.data[start..end])
+    }
+
+    /// Exact dot of the stored vector at `index` against an f32 `query`, using the
+    /// fused byte-based SIMD kernel (`dot_product_f16_bytes_f32` / `_f32_bytes_f32`)
+    /// the brute-force scan already uses — no per-call f32 `Vec` and a hardware
+    /// (`vcvtph2ps`) f16 decode instead of the scalar [`Self::vector_at_f32`] loop.
+    ///
+    /// For `dim % 32 == 0` (every standard embedding width: 128/256/384/512/768…)
+    /// the fused kernel's 4-accumulator grouping and reduction coincide exactly
+    /// with `vector_at_f32` + `dot_product_f32_f32` and there is no scalar tail, so
+    /// the score is **bit-identical** to the former decode-then-dot path. Other
+    /// dims fall back to that path to preserve exact scores.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the same index/corruption errors as [`Self::vector_at_f32`], and
+    /// `SearchError::DimensionMismatch` when `query.len() != dimension`.
+    pub fn dot_query_at(&self, index: usize, query: &[f32]) -> SearchResult<f32> {
+        if self.dimension() % 32 != 0 {
+            let vector = self.vector_at_f32(index)?;
+            return dot_product_f32_f32(&vector, query);
+        }
+        let bytes = self.vector_bytes(index)?;
+        match self.quantization() {
+            Quantization::F16 => dot_product_f16_bytes_f32(bytes, query),
+            Quantization::F32 => dot_product_f32_bytes_f32(bytes, query),
+        }
+    }
+
     /// Decode a vector as f16 values.
     ///
     /// # Errors

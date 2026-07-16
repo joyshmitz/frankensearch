@@ -452,8 +452,7 @@ impl TwoTierIndex {
 
             if found_score.is_none() {
                 if let Some(qual_idx) = quality_index.find_index_by_doc_id(&hit.doc_id)? {
-                    let quality_vector = quality_index.vector_at_f32(qual_idx)?;
-                    found_score = Some(dot_product_f32_f32(&quality_vector, query_vec)?);
+                    found_score = Some(quality_index.dot_query_at(qual_idx, query_vec)?);
                 }
             }
 
@@ -621,9 +620,9 @@ impl TwoTierIndex {
             },
         };
 
-        let quality_vector = quality_index.vector_at_f32(quality_idx)?;
-
-        dot_product_f32_f32(&quality_vector, query_vec).map(Some)
+        // Fused byte-based dot (no per-hit `Vec<f32>` decode), matching the
+        // brute-force scan's scorer; bit-identical for `dim % 32 == 0`.
+        quality_index.dot_query_at(quality_idx, query_vec).map(Some)
     }
 
     fn quality_index_for_fast_index(&self, fast_idx: usize) -> Option<usize> {
