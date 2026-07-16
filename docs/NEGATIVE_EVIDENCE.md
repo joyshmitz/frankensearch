@@ -15133,3 +15133,45 @@ scanner is therefore not justified by this product-real 32-candidate row.
 ships. Do not retry evidence-elision variants on the ordinary 32-candidate bulk-prior workload unless a new
 profile shows materially larger evidence payloads or candidate counts are product-critical. No local Cargo,
 `release-perf`, timeout, second baseline build, worker reroute, or stash operation occurred.
+
+### 2026-07-16 — BlackThrush — REJECT: fused single-pass ASCII query classification regresses 2.62× (`bd-5hz0`)
+
+Supersedes the two prior INVALID/HOLD attempts on this bead (IcyRidge 2026-07-14; BlackThrush
+2026-07-15), both of which lost their ephemeral RCH pool cache or hit the 2-minute no-output relink
+ceiling before Criterion ran. This time a real foreground measurement completed.
+
+**Lever.** `QueryClass::classify` (`crates/frankensearch-core/src/query_class.rs`) reaches the shipping
+`looks_like_identifier_ascii` fast path, which touches the query in ~7 separate scans
+(`bytes.iter().any(is_ascii_whitespace)`, five `contains` — `/ \ . :: _` — a case-flag loop,
+`rsplit_once('-')` + two `all()`), and then `classify` runs `split_whitespace().take(4).count()`. The
+candidate folded every identifier sub-predicate **and** the capped word count into one byte-state pass,
+respecting the byte-identity corner that the identifier gate uses `u8::is_ascii_whitespace` (excludes VT
+`0x0B`) while `split_whitespace` uses `char::is_whitespace` (includes VT).
+
+**Method.** Added the candidate as a local fn in `benches/query_class.rs` alongside a **local replica of
+the shipping ASCII classifier** (`shipping_local`) so the A/B is inlining-symmetric under the no-LTO bench
+profile — comparing a local fn to the rlib `QueryClass::classify` would let only the candidate inline and
+bias the result. Class-parity was asserted over a 30-case adversarial set (VT-vs-ascii-whitespace,
+PascalCase-vs-mixed-case, multi-dash / leading / trailing-dash issue ids, non-`{alnum,-,_}` bytes, unicode
+fallback) and **passed** — the fused classifier is byte-identical to the shipping one. One foreground
+`rch exec -- cargo bench -p frankensearch-core --bench query_class` on `vmi1227854` (bench profile,
+`lto=false`, cold 9m build untimed, Criterion 100 samples / 3s warm-up / 5s measure) produced:
+
+| variant | central estimate | interval | vs shipping_local |
+|---|---:|---:|---:|
+| `shipping_local` (honest baseline) | 396.5 ns | 383.5–409.6 ns | 1.00× |
+| `shipping_local_aa` (A/A floor) | 438.8 ns | 426.4–451.8 ns | ~11% noise |
+| `new` (rlib `classify`) | 391.8 ns | 380.9–401.9 ns | 0.99× (replica faithful) |
+| **`fused` (candidate)** | **1040.3 ns** | 1019.4–1063.8 ns | **2.62× SLOWER** |
+
+**Why it loses.** The shipping multi-pass **early-exits** on the first matching predicate — most
+identifiers hit `/`, `.`, `_`, or `::` on the first or second `contains`, which are SIMD `memchr` and
+return immediately — whereas the fused pass must visit every byte with ~15 data-dependent flag updates and
+**cannot short-circuit** because the word count needs the full string on the non-identifier branch. For the
+short (11–25 byte) query mix, early-exit + `memchr` beats a scalar all-bytes fused loop by 2.6×.
+
+**Decision: REJECT.** The experimental bench variant was reverted; the canonical `query_class` bench keeps
+its exact former three-variant form. This is now a measured perf reject, not a HOLD. Do not re-attempt
+scan-fusion here: the multi-pass early-exit + `memchr` classifier is already near-optimal for short queries.
+Kin to the SimHash-tableless and count-free-WAND rejects (fusing/eliminating passes loses when the
+individual passes are SIMD-optimized and short-circuiting).
