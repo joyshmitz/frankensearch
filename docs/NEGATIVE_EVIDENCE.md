@@ -15295,3 +15295,30 @@ result deterministically ~1.0×, so an ~18-min two-build confirmation would only
 `max_avx2` proxy arm added last turn stays in the `max_reduction` bench as a standing record of the kernel gap.
 If the native reranker is ever productionized, revisit AVX2-dispatching ITS `wide::f32x8` kernels (landable in
 the rerank crate, no workspace flag) — that is the only place the 3.5× would reach real code.
+
+### 2026-07-16 — BlackThrush — NULL (profiling, no bench): storage crate CPU-lever surface is drained (SQLite-query-bound + already-mined)
+
+Profiled `frankensearch-storage` this pass (the "fresh/less-swarmed crate" route from
+[[perf-frontier-dry-quill-codeless-2026-07-16]]). It is NOT a fresh CPU vein — its production paths are
+SQLite-query-bound and its CPU-adjacent hot paths are already optimized-and-landed by the swarm:
+
+- **`truncate_chars`** (pipeline.rs:1163) is already the fast `char_indices().nth(max_chars)`+slice form (walks
+  ≤ max_chars+1 chars); the slow `chars().take().collect()` survives only as `truncate_chars_slow` for the
+  `truncate_preview_ab` bench. Shipped-optimized.
+- **dedup** (`Storage::check_dedup_batch`, content_hash.rs:159) has a landed `dedup_batch` A/B (production vs
+  legacy vs slot-join); **content_hash** has `content_hash_dual`. Mined.
+- **`ingest_batch`** (pipeline.rs:498) does a per-doc `request.clone()` (clones `text` + `metadata`) because
+  `ingest` consumes the request. But every caller is a `#[test]` (no production caller), and each `ingest` runs a
+  full SQLite transaction (fsync), so the ~µs text clone is hidden under the ~ms DB write → **wash end-to-end**
+  (same shape as the tombstone FMA-hides-load resolution). Eliminating it also requires a breaking
+  `&[IngestRequest]`→`Vec<IngestRequest>` signature change. Not a lever.
+- **hidden-quadratic** family (nested `.iter().find/any/contains` over a 2nd collection, the 2–65× ops win): the
+  grep over pipeline/job_queue/document hits ONLY test error-message `.contains()` — absent from production
+  (queue/dedup use SQL, not in-memory scans).
+
+**No remaining clean CPU lever in storage.** Combined with last pass's finding that durability is external-RaptorQ/
+SQLite-delegated (thin frankensearch-side surface) and fsfs `code_structure_sidecar` is mined, the accessible
+"fresh" crates (durability/fsfs/storage) are all mined-or-delegated. The CPU-rich crates (index/fusion/embed/core/
+lexical/rerank) hold the remaining levers but are heavily swarmed; the swarm keeps landing clone-elision wins there
+(e.g. `fe866683` repair-trailer reuse landed mid-profile). Finding fresh ones needs symbolized self-time (blocked,
+`bd-e41k`) or claiming a specific unmined hot fn. No code change this pass.
