@@ -14708,6 +14708,28 @@ Production and benchmark files were restored exactly; only this blocker record s
 local Cargo fallback, parallel benchmark, or second attempt ran. Retry this exact sibling-consistency lever only
 when RCH can admit the worker that owns the warm Model2Vec release artifact (or expose a hard worker pin).
 
+**2026-07-16 measured retry (BlackThrush): REJECT.** A dependency-free harness compiled the actual shipped
+`frankensearch_core::scale_f32_in_place` source and retained the former scalar finish beside it. Before timing,
+it proved exact `to_bits()` output parity at dimensions `0/1/7/8/9/255/256/257/384` for three token counts and
+for zero, near-zero, EPSILON-boundary, infinity, and NaN inputs. Thus the mean and normalization scale passes
+changed, while the norm-squared reduction order and `is_finite() && > f32::EPSILON` guard stayed identical.
+
+The cold target first received an untimed `--no-run` warm-up. The foreground measurement then ran on the same
+strict-remote `vmi1227854` target with `--profile release`, LTO explicitly disabled, and a 120-second runner cap
+on the benchmark executable only. Each of 41 paired AB/BA rounds finished 2,048 pre-cloned 256-float vectors;
+an interleaved former/former control measured the same worker's null floor.
+
+| Evidence | Former scalar finish | Shipped SIMD-scaler candidate | Ratio (candidate / former) |
+|---|---:|---:|---:|
+| median time per finish | 180.8 ns | 159.1 ns | diagnostic medians: 0.8800 |
+| paired lever, 41 AB/BA rounds | — | — | median **0.8978**, p5 0.7732, p95 **1.0323** |
+| paired A/A null control | — | — | median 0.9897, p5 **0.8747**, p95 1.1991 |
+
+The attractive 0.8978 median does not clear the calibrated noise floor: the lever p95 (1.0323) overlaps and
+exceeds the A/A p5 (0.8747). **Reject the direct two-loop scaler substitution and leave production unchanged.**
+Do not retry this exact finish-only lever without a materially tighter null distribution or a product-level
+profile showing these two passes dominate enough to separate from worker noise.
+
 ### 2026-07-14 — IcyRidge — INVALID/HOLD: hyphen decomposition allocation gate found a cold lexical release pool (`bd-q9u4`)
 
 **Negative-ledger-first route and attribution.** `bv --robot-triage` still preferred the closed
