@@ -242,7 +242,7 @@ Quill is one engine crate (`crates/frankensearch-quill`) with five named subsyst
 
 - **Shard-per-worker, share-nothing.** An ingest session (bulk build or watch batch) fans documents across `W` shard workers (default: physical cores, clamped by config). Each worker holds: a docid-range lease (§7), a local string-interner (`ahash` map term-bytes → local term id, arena-backed), columnar triple buffers, and the live delta-segment writer for its range. **No shared mutable state**; the only cross-worker artifact is the manifest update at seal time.
 - **SIMD front-end.** Tokenization + case folding run as `wide`-vectorized byte classification with scalar tails (§8.1). Emits token spans directly against the borrowed input; no per-token `String` allocation on the hot path (`CompactString` only at dictionary-insert time for new terms).
-- **Columnar accumulation.** Per token: append `(local_term_id: u32, doc_ord: u32, pos: u16)` to SoA arenas (position stream only for position-indexed fields). Per document: one doc-length entry (fieldnorm byte) per field. This is a pure sequential write pattern — the cache-hostile per-token dictionary-chain append of the Lucene school is confined to the (small, L2-resident) delta segment.
+- **Columnar accumulation.** Per token: append `(local_term_id: u32, doc_ord: u32, pos: u32)` to SoA arenas (position stream only for position-indexed fields; positions are u32 — a 2 MiB source file exceeds 65k tokens, so u16 would silently truncate phrase positions; tantivy likewise uses u32). Per document: one doc-length entry (fieldnorm byte) per field. This is a pure sequential write pattern — the cache-hostile per-token dictionary-chain append of the Lucene school is confined to the (small, L2-resident) delta segment.
 - **Flush = radix + build.** When arenas hit the shard budget (default 64 MiB, config `scribe_shard_budget_bytes`): histogram + prefix-sum radix partition by `term_id` (1 pass at ≤2¹⁶ terms, 2-pass MSD beyond), then per-partition sequential posting-block build (delta+FOR bitpack, block-max computation), term dict build (sort local terms by bytes, prefix-block encode), doc-length column, docid-map section — one sealed FSLX mini-segment, one file, fsync'd by Keeper.
 - **Batch API discipline.** `index_documents` is the primary path (fsfs already batches); single-doc `index_document` is a batch of one into the delta. Bulk build (index_builder) uses a high-watermark pipeline: tokenize/accumulate workers feed a sealer via two-phase channels — sealing (compression + fsync) overlaps tokenization of the next arenas.
 
@@ -389,7 +389,8 @@ sections (each 64-byte aligned, order fixed by kind):
   TERMDICT   prefix-compressed term blocks + two-level index (§6.2)
   POSTINGS   FOR/bitpacked doc blocks (+freq blocks) per term (§10.4)
   POSITIONS  optional; per-term position streams (vint blocks), present iff schema indexes positions
-  BLOCKMAX   1-byte quantized per-block max-impact tables + skip entries
+  BLOCKMAX   per-block (max_freq quantized-up u8, min_fieldnorm u8) bound pairs + skip entries
+             (impact computed at query time with live idf/avgdl — see §10.4)
   DOCLEN     fieldnorm bytes per (field, doc) — 1 byte each
   IDMAP      docid → DocId (CompactString bytes): offset array + blob  (§10.3)
   IDHASH     open-addressed hash (xxh3-64 of DocId bytes — stable, versioned; NEVER ahash,
@@ -407,7 +408,7 @@ Docid→`DocId` is a direct section (materialization = offset lookup + slice); `
 
 ### 10.4 Posting encoding
 
-Blocks of 128 docids: `first_doc: u32` absolute + 127 deltas bitpacked at the block's width (4-bit width descriptor); freq blocks likewise (width ∥ all-ones flag for freq=1 runs); final partial block vint-encoded. Dense hybrid: if a block's local density > 1/4 (docid span < 512), a 512-bit bitmap container replaces it (roaring lesson, §4.2). Block-max: quantized (1 byte, monotone table) upper bound of the block's max `tf_part·idf` contribution, recomputed cheaply at merge seams. Decode kernels: `wide` u32x8 unpack; scalar reference implementation kept for the differential fixture (SIMD≡scalar bit-parity gate).
+Blocks of 128 docids: `first_doc: u32` absolute + 127 deltas bitpacked at the block's width (4-bit width descriptor); freq blocks likewise (width ∥ all-ones flag for freq=1 runs); final partial block vint-encoded. Dense hybrid: if a block's local density > 1/4 (docid span < 512), a 512-bit bitmap container replaces it (roaring lesson, §4.2). Block-max: per block, the pair `(max_freq quantized up via monotone u8 table, min_fieldnorm byte)` — **not** a precomputed impact scalar, because `tf_part` depends on snapshot-level `avgdl`, which changes as the index grows (a seal-time impact bound would be unsound when avgdl later increases). Argus computes the block's impact upper bound at query time from the stored pair with live idf/avgdl: `tf_part` is increasing in freq and decreasing in `|d|`, so (max_freq, min_fieldnorm) dominates every doc in the block. Seam blocks recompute the pair cheaply at merge. Decode kernels: `wide` u32x8 unpack; scalar reference implementation kept for the differential fixture (SIMD≡scalar bit-parity gate).
 
 ### 10.5 Tombstones live in the MANIFEST, not the segment
 
@@ -567,13 +568,13 @@ Created via `br` with dependencies (validated acyclic via `bv --robot-insights`)
 | Epic | Contents | Gate |
 |---|---|---|
 | **quill-e0 Contracts & Gauntlet Skeleton** | Language Contract + fixtures; FSLX registry; Q1 obligations doc; Divergence Register; gauntlet kernel (oracle wiring, comparators, EngineIdentity); perf manifests | G0 |
-| **quill-e1 Scribe** | SIMD tokenizer (+3-way parity bench); CASS analyzer family; interner/arenas; columnar accumulator; radix flush; hash-vs-columnar A/B (ledgered); shard router + docid leases | G1 |
-| **quill-e2 Grimoire & Quiver** | prefix-block dict; FOR/bitmap codecs + SIMD unpack (scalar-parity gate); block-max; positions streams; DOCLEN/IDMAP/IDHASH/NUMERIC/STATS sections | G1 |
+| **quill-e1 Scribe** | engine-crate scaffolding (workspace membership, QuillConfig, errors, schema descriptors, tracing conventions); SIMD tokenizer (+3-way parity bench); CASS analyzer family; interner/arenas; columnar accumulator; radix flush; hash-vs-columnar A/B (ledgered); shard router + docid leases (R1 seal-at-lease-boundary) | G1 |
+| **quill-e2 Grimoire & Quiver** | prefix-block dict (field-namespaced keys); FOR/bitmap codecs + SIMD unpack (scalar-parity gate); block-max pairs; positions streams (u32); DOCLEN/IDMAP/IDHASH/NUMERIC/STOREDMETA/STATS sections | G1 |
 | **quill-e3 Keeper** | FSLX writer/reader; manifest + two-slot publish; crash-only open/GC; tombstones; concat-merge (Q1-OB2/3 fixtures); compaction (OB4); tiering; durability `.fec` integration | G1→G2 |
 | **quill-e4 Argus** | parsers (default lenient + CASS grammar); planner; exhaustive kernel; MaxScore/BMW (+rank-safety differentials); phrase/range/glob; collectors; snippets; segment-parallel fan-out | G1→G2 |
 | **quill-e5 Delta** | per-shard delta segment; epoch publish; seal path; mixed-state conformance | G1→G2 |
 | **quill-e6 Gauntlet at scale** | corpus/query generators; metamorphic suites; ported behavioral tests; LabRuntime determinism + crash matrices; statistical gates; fusion e2e quality | G2 |
-| **quill-e7 Integration & Flip** | LexicalSearch/Sync impls; fsfs LiveIngest + backend + debounce retune; index_builder/facade ports; feature graph; rebuild-on-upgrade; the flip commit | G3 |
+| **quill-e7 Integration & Flip** | LexicalSearch/Sync impls + public API assembly; fsfs LiveIngest + backend + debounce retune; index_builder/facade ports; feature graph; rebuild-on-upgrade; consumer-port e2e sweep (all-features matrix); the flip commit | G3 |
 | **quill-e8 Perf doctrine** | bench matrix vs oracle (QG-1..10); .bench-history ratchet; flamegraph lanes; lever beads (one per optimization, ledger-disciplined); scaling-curve studies (Apple Silicon + x86) | G3 |
 | **quill-e9 Docs & retirement** | README/AGENTS updates; format/ops docs; cass-compat carve-out tracking bead; tantivy default-graph removal; retrospective | G3 |
 
