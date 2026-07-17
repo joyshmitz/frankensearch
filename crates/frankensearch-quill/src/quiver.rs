@@ -656,6 +656,8 @@ pub struct PostingBlockMeta {
     pub last_doc: u32,
     /// Posting ordinal of this block's first entry.
     pub base_posting_ordinal: u32,
+    /// Canonical conservative maximum-frequency code derived during validation.
+    pub max_frequency_code: u8,
 }
 
 impl PostingBlockMeta {
@@ -702,25 +704,75 @@ impl EncodedPostingList {
 
         let mut bytes = Vec::new();
         for block in postings.chunks(POSTINGS_PER_BLOCK) {
-            if block.len() == POSTINGS_PER_BLOCK {
-                let first = block.first().map_or(0, |posting| posting.doc_id);
-                let last = block.last().map_or(first, |posting| posting.doc_id);
-                let span = u64::from(last) - u64::from(first) + 1;
-                if span < 512 {
-                    encode_bitmap_block(block, &mut bytes)?;
-                } else {
-                    encode_for_block(block, &mut bytes)?;
-                }
-            } else {
-                encode_vint_block(block, &mut bytes)?;
-            }
+            encode_posting_block(block, &mut bytes)?;
         }
 
         let expected_block_count = postings.len().div_ceil(POSTINGS_PER_BLOCK);
+        Self::finish_encoding(bytes, doc_freq, postings.len(), expected_block_count)
+    }
+
+    /// Encode POSTINGS and its aligned BLOCKMAX stream in one fresh-seal pass.
+    ///
+    /// Bound components are derived directly from the source postings before
+    /// the newly written POSTINGS bytes undergo their normal self-validation;
+    /// fresh seal therefore does not decode the output a second time merely to
+    /// compute BLOCKMAX. Compaction may instead call [`EncodedBlockMax::encode`]
+    /// against an already validated posting view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed posting-codec error, a missing DOCLEN value, checked
+    /// offset overflow, or a fallible BLOCKMAX allocation failure.
+    pub fn encode_with_block_max<F>(
+        postings: &[Posting],
+        mut fieldnorm_for_doc: F,
+    ) -> Result<(Self, EncodedBlockMax), BlockMaxError>
+    where
+        F: FnMut(u32) -> Option<u8>,
+    {
+        let doc_freq =
+            u32::try_from(postings.len()).map_err(|_| PostingCodecError::TooManyPostings {
+                count: postings.len(),
+            })?;
+        validate_encoder_input(postings)?;
+
+        let entry_count = postings.len().div_ceil(POSTINGS_PER_BLOCK);
+        let mut posting_bytes = Vec::new();
+        let mut block_max_bytes = allocate_block_max_bytes(entry_count, "fresh-seal bytes")?;
+        for (block_index, block) in postings.chunks(POSTINGS_PER_BLOCK).enumerate() {
+            let block_offset = u64::try_from(posting_bytes.len()).map_err(|_| {
+                BlockMaxError::ArithmeticOverflow {
+                    field: "fresh-seal posting block offset",
+                }
+            })?;
+            let entry = derive_fresh_block_max_entry(
+                block,
+                block_index,
+                block_offset,
+                &mut fieldnorm_for_doc,
+            )?;
+            encode_posting_block(block, &mut posting_bytes)?;
+            append_block_max_entry(entry, &mut block_max_bytes);
+        }
+
+        let postings = Self::finish_encoding(posting_bytes, doc_freq, postings.len(), entry_count)?;
+        let block_max = EncodedBlockMax {
+            bytes: block_max_bytes,
+            entry_count,
+        };
+        Ok((postings, block_max))
+    }
+
+    fn finish_encoding(
+        bytes: Vec<u8>,
+        doc_freq: u32,
+        posting_count: usize,
+        expected_block_count: usize,
+    ) -> Result<Self, PostingCodecError> {
         let parsed = PostingList::parse_with_limits(
             &bytes,
             doc_freq,
-            Self::validation_limits(postings.len(), expected_block_count),
+            Self::validation_limits(posting_count, expected_block_count),
         )?;
         let block_count = parsed.block_count();
         Ok(Self {
@@ -872,6 +924,7 @@ impl<'a> PostingList<'a> {
                 first_doc: decoded.first_doc,
                 last_doc: decoded.last_doc,
                 base_posting_ordinal: actual_doc_freq,
+                max_frequency_code: canonical_block_max_frequency_code(&decoded),
             });
             previous_last = Some(decoded.last_doc);
             actual_doc_freq = next_doc_freq;
@@ -1166,6 +1219,869 @@ impl<'a> PostingCursor<'a> {
         }
         self.state = CursorState::Positioned { block, within };
         Ok(self.current())
+    }
+}
+
+/// Typed failures from encoding or validating an FSLX BLOCKMAX term stream.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum BlockMaxError {
+    /// The referenced POSTINGS block could not be decoded consistently.
+    #[error("posting validation failed while processing BLOCKMAX: {0}")]
+    Posting(#[from] PostingCodecError),
+    /// Durable bytes ended before one complete BLOCKMAX entry was available.
+    #[error(
+        "truncated BLOCKMAX stream at offset {offset}: need {needed} bytes, only {remaining} remain"
+    )]
+    Truncated {
+        /// Byte offset relative to the term's BLOCKMAX span.
+        offset: usize,
+        /// Required byte count.
+        needed: usize,
+        /// Available byte count.
+        remaining: usize,
+    },
+    /// A u64 LEB128 offset used more bytes than its shortest encoding.
+    #[error("non-canonical BLOCKMAX offset vint at byte {offset}")]
+    NonCanonicalVint {
+        /// Vint start relative to the term's BLOCKMAX span.
+        offset: usize,
+    },
+    /// A u64 LEB128 offset exceeded ten bytes or the u64 domain.
+    #[error("BLOCKMAX offset vint overflow at byte {offset}")]
+    VintOverflow {
+        /// Vint start relative to the term's BLOCKMAX span.
+        offset: usize,
+    },
+    /// A real posting block cannot have maximum frequency zero.
+    #[error("BLOCKMAX entry {block_index} uses zero as its maximum-frequency code")]
+    ZeroMaximumFrequency {
+        /// Zero-based posting-block index.
+        block_index: usize,
+    },
+    /// The redundant first-doc skip key disagreed with POSTINGS.
+    #[error("BLOCKMAX entry {block_index} first doc mismatch: expected {expected}, got {actual}")]
+    FirstDocMismatch {
+        /// Zero-based posting-block index.
+        block_index: usize,
+        /// POSTINGS block's validated first docid.
+        expected: u32,
+        /// Durable BLOCKMAX value.
+        actual: u32,
+    },
+    /// The redundant posting-byte skip offset disagreed with POSTINGS.
+    #[error(
+        "BLOCKMAX entry {block_index} posting offset mismatch: expected {expected}, got {actual}"
+    )]
+    BlockOffsetMismatch {
+        /// Zero-based posting-block index.
+        block_index: usize,
+        /// POSTINGS block's validated term-relative byte offset.
+        expected: u64,
+        /// Durable BLOCKMAX value.
+        actual: u64,
+    },
+    /// A frequency code was not the unique conservative encoding of the block.
+    #[error(
+        "BLOCKMAX entry {block_index} frequency code mismatch: expected {expected}, got {actual}"
+    )]
+    MaximumFrequencyMismatch {
+        /// Zero-based posting-block index.
+        block_index: usize,
+        /// Canonical code derived from POSTINGS.
+        expected: u8,
+        /// Durable BLOCKMAX value.
+        actual: u8,
+    },
+    /// A posting docid had no corresponding DOCLEN value.
+    #[error("BLOCKMAX entry {block_index} has no fieldnorm for docid {doc_id}")]
+    MissingFieldnorm {
+        /// Zero-based posting-block index.
+        block_index: usize,
+        /// Present posting docid missing from DOCLEN.
+        doc_id: u32,
+    },
+    /// The stored componentwise minimum fieldnorm disagreed with DOCLEN.
+    #[error(
+        "BLOCKMAX entry {block_index} minimum fieldnorm mismatch: expected {expected}, got {actual}"
+    )]
+    MinimumFieldnormMismatch {
+        /// Zero-based posting-block index.
+        block_index: usize,
+        /// Minimum stored fieldnorm ID over the block's present docs.
+        expected: u8,
+        /// Durable BLOCKMAX value.
+        actual: u8,
+    },
+    /// Bytes remained after the exact one-entry-per-posting-block grammar.
+    #[error("BLOCKMAX stream has {remaining} trailing bytes at offset {offset}")]
+    TrailingBytes {
+        /// First unconsumed byte.
+        offset: usize,
+        /// Unconsumed byte count.
+        remaining: usize,
+    },
+    /// Q1 concat inputs were not in strictly increasing docid order.
+    #[error(
+        "BLOCKMAX concat part {part_index} starts at docid {first_doc}, not after {previous_last_doc}"
+    )]
+    NonAscendingConcat {
+        /// Source part containing the invalid first block.
+        part_index: usize,
+        /// Last docid in the prior non-empty source part.
+        previous_last_doc: u32,
+        /// First docid in this source part.
+        first_doc: u32,
+    },
+    /// Checked size, offset, or posting-ordinal arithmetic overflowed.
+    #[error("arithmetic overflow while computing BLOCKMAX {field}")]
+    ArithmeticOverflow {
+        /// Value being computed.
+        field: &'static str,
+    },
+    /// A bounded metadata allocation failed instead of panicking.
+    #[error("unable to reserve BLOCKMAX {resource} for {count} entries")]
+    Allocation {
+        /// Collection being reserved.
+        resource: &'static str,
+        /// Requested entry count.
+        count: usize,
+    },
+}
+
+/// One canonical BLOCKMAX record, aligned one-for-one with a POSTINGS block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockMaxEntry {
+    /// First absolute docid in the posting block.
+    first_doc: u32,
+    /// Byte offset from this term's `postings_offset`.
+    block_offset: u64,
+    /// Conservative maximum-frequency code.
+    max_frequency_code: u8,
+    /// Minimum stored fieldnorm ID among docs in the block.
+    min_fieldnorm_id: u8,
+}
+
+impl BlockMaxEntry {
+    /// First absolute docid in the posting block.
+    #[must_use]
+    pub const fn first_doc(self) -> u32 {
+        self.first_doc
+    }
+
+    /// Byte offset from this term's `postings_offset`.
+    #[must_use]
+    pub const fn block_offset(self) -> u64 {
+        self.block_offset
+    }
+
+    /// Conservative maximum-frequency wire code.
+    #[must_use]
+    pub const fn max_frequency_code(self) -> u8 {
+        self.max_frequency_code
+    }
+
+    /// Exact minimum stored fieldnorm ID among docs in the block.
+    #[must_use]
+    pub const fn min_fieldnorm_id(self) -> u8 {
+        self.min_fieldnorm_id
+    }
+
+    /// Decode the conservative maximum frequency represented by this entry.
+    #[must_use]
+    pub const fn max_frequency(self) -> u32 {
+        crate::contract::block_max_frequency_from_code(self.max_frequency_code)
+    }
+
+    /// Decode the minimum quantized document length represented by this entry.
+    #[must_use]
+    pub fn min_fieldnorm(self) -> u32 {
+        crate::contract::id_to_fieldnorm(self.min_fieldnorm_id)
+    }
+
+    /// Compute the conservative live-snapshot BM25 tf-factor.
+    #[must_use]
+    pub fn tf_factor_upper_bound(self, live_avgdl: f32) -> Option<f32> {
+        crate::contract::block_max_tf_factor(
+            self.max_frequency_code,
+            self.min_fieldnorm_id,
+            live_avgdl,
+        )
+    }
+
+    /// Apply the full non-negative `idf * (1 + k1) * boost` live term weight.
+    #[must_use]
+    pub fn score_upper_bound(self, live_avgdl: f32, nonnegative_weight: f32) -> Option<f32> {
+        crate::contract::block_max_score(
+            self.max_frequency_code,
+            self.min_fieldnorm_id,
+            live_avgdl,
+            nonnegative_weight,
+        )
+    }
+}
+
+/// Owned canonical bytes for one term's BLOCKMAX range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedBlockMax {
+    bytes: Vec<u8>,
+    entry_count: usize,
+}
+
+impl EncodedBlockMax {
+    /// Recompute one bound record per validated posting block.
+    ///
+    /// `fieldnorm_for_doc` must return the stored DOCLEN byte for every
+    /// POSTINGS-present docid. Every `u8`, including zero, is valid; `None`
+    /// means the column is missing or the docid is out of range.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for a missing fieldnorm, inconsistent validated
+    /// POSTINGS bytes, checked arithmetic overflow, or allocation failure.
+    pub fn encode<F>(
+        postings: &PostingList<'_>,
+        mut fieldnorm_for_doc: F,
+    ) -> Result<Self, BlockMaxError>
+    where
+        F: FnMut(u32) -> Option<u8>,
+    {
+        let entry_count = postings.block_count();
+        let mut bytes = allocate_block_max_bytes(entry_count, "fresh-seal bytes")?;
+        for block_index in 0..postings.block_count() {
+            let entry = derive_block_max_entry(postings, block_index, &mut fieldnorm_for_doc)?;
+            append_block_max_entry(entry, &mut bytes);
+        }
+        Ok(Self { bytes, entry_count })
+    }
+
+    /// Re-emit Q1 concat inputs without recomputing either bound component.
+    ///
+    /// Only `block_offset` changes: each source offset is increased by the sum
+    /// of prior source term POSTINGS byte lengths. No seam entry is added.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for out-of-order source docids, offset/size
+    /// overflow, or allocation failure.
+    pub fn concatenate(parts: &[&BlockMaxConcatList<'_>]) -> Result<Self, BlockMaxError> {
+        let entry_count = parts.iter().try_fold(0_usize, |count, part| {
+            count
+                .checked_add(part.entry_count())
+                .ok_or(BlockMaxError::ArithmeticOverflow {
+                    field: "concat entry count",
+                })
+        })?;
+        let mut bytes = allocate_block_max_bytes(entry_count, "concat bytes")?;
+
+        let mut posting_base = 0_u64;
+        let mut previous_last_doc = None;
+        for (part_index, part) in parts.iter().enumerate() {
+            if let (Some(previous), Some(first)) = (previous_last_doc, part.entries.first()) {
+                if first.first_doc <= previous {
+                    return Err(BlockMaxError::NonAscendingConcat {
+                        part_index,
+                        previous_last_doc: previous,
+                        first_doc: first.first_doc,
+                    });
+                }
+            }
+            for entry in &part.entries {
+                append_block_max_entry(
+                    BlockMaxEntry {
+                        first_doc: entry.first_doc,
+                        block_offset: posting_base.checked_add(entry.block_offset).ok_or(
+                            BlockMaxError::ArithmeticOverflow {
+                                field: "rebased block offset",
+                            },
+                        )?,
+                        max_frequency_code: entry.max_frequency_code,
+                        min_fieldnorm_id: entry.min_fieldnorm_id,
+                    },
+                    &mut bytes,
+                );
+            }
+            posting_base = posting_base.checked_add(part.posting_bytes_len).ok_or(
+                BlockMaxError::ArithmeticOverflow {
+                    field: "concat posting-byte prefix",
+                },
+            )?;
+            if let Some(last_doc) = part.last_doc {
+                previous_last_doc = Some(last_doc);
+            }
+        }
+
+        Ok(Self { bytes, entry_count })
+    }
+
+    /// Borrow the exact durable bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return the exact durable bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Number of one-per-posting-block records.
+    #[must_use]
+    pub const fn entry_count(&self) -> usize {
+        self.entry_count
+    }
+
+    /// Re-open bytes as a merge-only view that cannot calculate score bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the wire or POSTINGS cross-section invariants
+    /// fail. The opaque fieldnorm byte is intentionally not trusted for score
+    /// pruning until [`Self::block_max_list`] performs DOCLEN validation.
+    pub fn concat_list<'a>(
+        &'a self,
+        postings: &PostingList<'_>,
+    ) -> Result<BlockMaxConcatList<'a>, BlockMaxError> {
+        BlockMaxConcatList::parse(&self.bytes, postings)
+    }
+
+    /// Re-open these owned bytes against the referenced POSTINGS term stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the wire or cross-section invariants fail.
+    pub fn block_max_list<'a>(
+        &'a self,
+        postings: &PostingList<'_>,
+        fieldnorms: DocLenField<'_>,
+    ) -> Result<BlockMaxList<'a>, BlockMaxError> {
+        BlockMaxList::parse(&self.bytes, postings, fieldnorms)
+    }
+}
+
+/// Merge-only BLOCKMAX view with no score-bound API.
+///
+/// This validates canonical wire shape plus redundant POSTINGS keys and keeps
+/// `min_fieldnorm_id` opaque. It is sufficient for Q1 byte-preserving concat;
+/// only [`BlockMaxList`] can expose entries and calculate pruning bounds after
+/// validation against DOCLEN.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockMaxConcatList<'a> {
+    bytes: &'a [u8],
+    entries: Vec<BlockMaxEntry>,
+    posting_bytes_len: u64,
+    last_doc: Option<u32>,
+}
+
+impl<'a> BlockMaxConcatList<'a> {
+    /// Validate the merge-safe wire and POSTINGS invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed/non-canonical bytes, redundant-key
+    /// mismatch, a non-canonical frequency code, or allocation failure.
+    pub fn parse(bytes: &'a [u8], postings: &PostingList<'_>) -> Result<Self, BlockMaxError> {
+        let block_count = postings.block_count();
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(block_count)
+            .map_err(|_| BlockMaxError::Allocation {
+                resource: "entries",
+                count: block_count,
+            })?;
+
+        let mut reader = BlockMaxByteReader::new(bytes);
+        for (block_index, posting_block) in postings.blocks().iter().enumerate() {
+            let first_doc = reader.read_u32()?;
+            let block_offset = reader.read_vint()?;
+            let max_frequency_code = reader.read_u8()?;
+            let min_fieldnorm_id = reader.read_u8()?;
+            if max_frequency_code == 0 {
+                return Err(BlockMaxError::ZeroMaximumFrequency { block_index });
+            }
+            if first_doc != posting_block.first_doc {
+                return Err(BlockMaxError::FirstDocMismatch {
+                    block_index,
+                    expected: posting_block.first_doc,
+                    actual: first_doc,
+                });
+            }
+            let expected_offset = u64::try_from(posting_block.byte_offset).map_err(|_| {
+                BlockMaxError::ArithmeticOverflow {
+                    field: "posting block offset",
+                }
+            })?;
+            if block_offset != expected_offset {
+                return Err(BlockMaxError::BlockOffsetMismatch {
+                    block_index,
+                    expected: expected_offset,
+                    actual: block_offset,
+                });
+            }
+            let required_code = posting_block.max_frequency_code;
+            if max_frequency_code != required_code {
+                return Err(BlockMaxError::MaximumFrequencyMismatch {
+                    block_index,
+                    expected: required_code,
+                    actual: max_frequency_code,
+                });
+            }
+            entries.push(BlockMaxEntry {
+                first_doc,
+                block_offset,
+                max_frequency_code,
+                min_fieldnorm_id,
+            });
+        }
+        reader.finish()?;
+
+        let posting_bytes_len = u64::try_from(postings.as_bytes().len()).map_err(|_| {
+            BlockMaxError::ArithmeticOverflow {
+                field: "posting term byte length",
+            }
+        })?;
+        let last_doc = postings.blocks().last().map(|block| block.last_doc);
+        Ok(Self {
+            bytes,
+            entries,
+            posting_bytes_len,
+            last_doc,
+        })
+    }
+
+    /// Exact borrowed durable bytes copied by Q1 concat.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Number of structurally validated merge records.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Borrowed, validated view of one term's BLOCKMAX range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockMaxList<'a> {
+    bytes: &'a [u8],
+    entries: Vec<BlockMaxEntry>,
+    block_last_docs: Vec<u32>,
+    posting_bytes_len: u64,
+}
+
+impl<'a> BlockMaxList<'a> {
+    /// Validate exact wire grammar and cross-check POSTINGS plus DOCLEN bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed/non-canonical bytes, an under- or
+    /// over-stated frequency/fieldnorm bound, a cross-section mismatch, or
+    /// allocation failure. No score-capable view exists before both bound
+    /// components have been validated.
+    pub fn parse(
+        bytes: &'a [u8],
+        postings: &PostingList<'_>,
+        fieldnorms: DocLenField<'_>,
+    ) -> Result<Self, BlockMaxError> {
+        Self::parse_with_fieldnorms(bytes, postings, |doc_id| {
+            fieldnorms.fieldnorm_id(u64::from(doc_id))
+        })
+    }
+
+    fn parse_with_fieldnorms<F>(
+        bytes: &'a [u8],
+        postings: &PostingList<'_>,
+        mut fieldnorm_for_doc: F,
+    ) -> Result<Self, BlockMaxError>
+    where
+        F: FnMut(u32) -> Option<u8>,
+    {
+        let structural = BlockMaxConcatList::parse(bytes, postings)?;
+        let block_count = structural.entry_count();
+        let mut block_last_docs = Vec::new();
+        block_last_docs
+            .try_reserve_exact(block_count)
+            .map_err(|_| BlockMaxError::Allocation {
+                resource: "last-doc skip keys",
+                count: block_count,
+            })?;
+
+        for (block_index, (entry, posting_block)) in
+            structural.entries.iter().zip(postings.blocks()).enumerate()
+        {
+            let decoded = decode_block_for_block_max(postings, block_index)?;
+            let required_minimum =
+                minimum_block_fieldnorm(&decoded, block_index, &mut fieldnorm_for_doc)?;
+            if entry.min_fieldnorm_id != required_minimum {
+                return Err(BlockMaxError::MinimumFieldnormMismatch {
+                    block_index,
+                    expected: required_minimum,
+                    actual: entry.min_fieldnorm_id,
+                });
+            }
+            block_last_docs.push(posting_block.last_doc);
+        }
+        Ok(Self {
+            bytes,
+            entries: structural.entries,
+            block_last_docs,
+            posting_bytes_len: structural.posting_bytes_len,
+        })
+    }
+
+    /// Exact borrowed durable bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Validated one-per-posting-block entries in durable order.
+    #[must_use]
+    pub fn entries(&self) -> &[BlockMaxEntry] {
+        &self.entries
+    }
+
+    /// Number of validated BLOCKMAX records.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Referenced term POSTINGS byte length used by concat rebasing.
+    #[must_use]
+    pub const fn posting_bytes_len(&self) -> u64 {
+        self.posting_bytes_len
+    }
+
+    /// Create a metadata-only block cursor positioned on the first entry.
+    ///
+    /// Validation is intentionally eager once per immutable term view; callers
+    /// should retain this view and create cheap cursors from it per scorer.
+    #[must_use]
+    pub fn cursor(&self) -> BlockMaxCursor<'_> {
+        BlockMaxCursor {
+            entries: &self.entries,
+            block_last_docs: &self.block_last_docs,
+            block_index: (!self.entries.is_empty()).then_some(0),
+        }
+    }
+}
+
+/// Metadata-only cursor that performs no POSTINGS decoding while it moves.
+pub struct BlockMaxCursor<'a> {
+    entries: &'a [BlockMaxEntry],
+    block_last_docs: &'a [u32],
+    block_index: Option<usize>,
+}
+
+impl BlockMaxCursor<'_> {
+    /// Current validated BLOCKMAX entry.
+    #[must_use]
+    pub fn current(&self) -> Option<BlockMaxEntry> {
+        self.block_index
+            .and_then(|index| self.entries.get(index).copied())
+    }
+
+    /// Current zero-based posting-block index.
+    #[must_use]
+    pub const fn block_index(&self) -> Option<usize> {
+        self.block_index
+    }
+
+    /// Validated inclusive last docid of the current posting block.
+    #[must_use]
+    pub fn last_doc(&self) -> Option<u32> {
+        self.block_index
+            .and_then(|index| self.block_last_docs.get(index).copied())
+    }
+
+    /// Advance by one posting block. Exhaustion is fused.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<BlockMaxEntry> {
+        let current = self.block_index?;
+        let next = current + 1;
+        if next >= self.entries.len() {
+            self.block_index = None;
+            return None;
+        }
+        self.block_index = Some(next);
+        self.current()
+    }
+
+    /// Land on the first posting block whose validated last doc reaches target.
+    ///
+    /// This never rewinds. It skips complete blocks without decoding their
+    /// postings and returns `None` when no later block can contain a matching
+    /// docid.
+    pub fn advance(&mut self, target: u32) -> Option<BlockMaxEntry> {
+        let current = self.block_index?;
+        if self.block_last_docs.get(current).copied()? >= target {
+            return self.current();
+        }
+        let later = self.block_last_docs.get(current + 1..)?;
+        let relative = later.partition_point(|last_doc| *last_doc < target);
+        if relative == later.len() {
+            self.block_index = None;
+            return None;
+        }
+        self.block_index = Some(current + 1 + relative);
+        self.current()
+    }
+}
+
+fn encode_posting_block(block: &[Posting], output: &mut Vec<u8>) -> Result<(), PostingCodecError> {
+    if block.len() == POSTINGS_PER_BLOCK {
+        let first = block.first().map_or(0, |posting| posting.doc_id);
+        let last = block.last().map_or(first, |posting| posting.doc_id);
+        let span = u64::from(last) - u64::from(first) + 1;
+        if span < 512 {
+            encode_bitmap_block(block, output)
+        } else {
+            encode_for_block(block, output)
+        }
+    } else {
+        encode_vint_block(block, output)
+    }
+}
+
+fn derive_fresh_block_max_entry<F>(
+    postings: &[Posting],
+    block_index: usize,
+    block_offset: u64,
+    fieldnorm_for_doc: &mut F,
+) -> Result<BlockMaxEntry, BlockMaxError>
+where
+    F: FnMut(u32) -> Option<u8>,
+{
+    let first_doc = postings
+        .first()
+        .ok_or(BlockMaxError::ArithmeticOverflow {
+            field: "empty fresh-seal posting block",
+        })?
+        .doc_id;
+    let maximum_frequency = postings
+        .iter()
+        .map(|posting| posting.freq)
+        .max()
+        .unwrap_or(0);
+    let mut min_fieldnorm_id = u8::MAX;
+    for posting in postings {
+        let fieldnorm_id =
+            fieldnorm_for_doc(posting.doc_id).ok_or(BlockMaxError::MissingFieldnorm {
+                block_index,
+                doc_id: posting.doc_id,
+            })?;
+        min_fieldnorm_id = min_fieldnorm_id.min(fieldnorm_id);
+    }
+    Ok(BlockMaxEntry {
+        first_doc,
+        block_offset,
+        max_frequency_code: crate::contract::block_max_frequency_to_code(maximum_frequency),
+        min_fieldnorm_id,
+    })
+}
+
+fn derive_block_max_entry<F>(
+    postings: &PostingList<'_>,
+    block_index: usize,
+    fieldnorm_for_doc: &mut F,
+) -> Result<BlockMaxEntry, BlockMaxError>
+where
+    F: FnMut(u32) -> Option<u8>,
+{
+    let block = postings
+        .blocks()
+        .get(block_index)
+        .ok_or(BlockMaxError::ArithmeticOverflow {
+            field: "posting block index",
+        })?;
+    let decoded = decode_block_for_block_max(postings, block_index)?;
+    let min_fieldnorm_id = minimum_block_fieldnorm(&decoded, block_index, fieldnorm_for_doc)?;
+    Ok(BlockMaxEntry {
+        first_doc: block.first_doc,
+        block_offset: u64::try_from(block.byte_offset).map_err(|_| {
+            BlockMaxError::ArithmeticOverflow {
+                field: "posting block offset",
+            }
+        })?,
+        max_frequency_code: canonical_block_max_frequency_code(&decoded),
+        min_fieldnorm_id,
+    })
+}
+
+fn decode_block_for_block_max(
+    postings: &PostingList<'_>,
+    block_index: usize,
+) -> Result<DecodedBlock, BlockMaxError> {
+    let block = postings
+        .blocks()
+        .get(block_index)
+        .ok_or(BlockMaxError::ArithmeticOverflow {
+            field: "posting block index",
+        })?;
+    let base_posting_ordinal = usize::try_from(block.base_posting_ordinal).map_err(|_| {
+        BlockMaxError::ArithmeticOverflow {
+            field: "posting ordinal",
+        }
+    })?;
+    Ok(decode_block_at(
+        postings.as_bytes(),
+        block.byte_offset,
+        base_posting_ordinal,
+    )?)
+}
+
+fn canonical_block_max_frequency_code(decoded: &DecodedBlock) -> u8 {
+    let count = usize::from(decoded.posting_count);
+    let maximum = decoded.freqs[..count].iter().copied().max().unwrap_or(0);
+    crate::contract::block_max_frequency_to_code(maximum)
+}
+
+fn minimum_block_fieldnorm<F>(
+    decoded: &DecodedBlock,
+    block_index: usize,
+    fieldnorm_for_doc: &mut F,
+) -> Result<u8, BlockMaxError>
+where
+    F: FnMut(u32) -> Option<u8>,
+{
+    let mut minimum = u8::MAX;
+    for &doc_id in &decoded.docs[..usize::from(decoded.posting_count)] {
+        let fieldnorm_id = fieldnorm_for_doc(doc_id).ok_or(BlockMaxError::MissingFieldnorm {
+            block_index,
+            doc_id,
+        })?;
+        minimum = minimum.min(fieldnorm_id);
+    }
+    Ok(minimum)
+}
+
+fn allocate_block_max_bytes(
+    entry_count: usize,
+    resource: &'static str,
+) -> Result<Vec<u8>, BlockMaxError> {
+    const MAX_ENTRY_BYTES: usize = 4 + 10 + 1 + 1;
+    let capacity =
+        entry_count
+            .checked_mul(MAX_ENTRY_BYTES)
+            .ok_or(BlockMaxError::ArithmeticOverflow {
+                field: "encoded byte capacity",
+            })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| BlockMaxError::Allocation {
+            resource,
+            count: entry_count,
+        })?;
+    Ok(bytes)
+}
+
+fn append_block_max_entry(entry: BlockMaxEntry, bytes: &mut Vec<u8>) {
+    bytes.extend_from_slice(&entry.first_doc.to_le_bytes());
+    write_vint64(entry.block_offset, bytes);
+    bytes.push(entry.max_frequency_code);
+    bytes.push(entry.min_fieldnorm_id);
+}
+
+fn vint64_length(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn write_vint64(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+struct BlockMaxByteReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> BlockMaxByteReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], BlockMaxError> {
+        let offset = self.position;
+        let remaining = self.bytes.len().saturating_sub(offset);
+        let end = offset
+            .checked_add(length)
+            .ok_or(BlockMaxError::ArithmeticOverflow {
+                field: "reader position",
+            })?;
+        let bytes = self
+            .bytes
+            .get(offset..end)
+            .ok_or(BlockMaxError::Truncated {
+                offset,
+                needed: length,
+                remaining,
+            })?;
+        self.position = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, BlockMaxError> {
+        let offset = self.position;
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or(BlockMaxError::Truncated {
+                offset,
+                needed: 1,
+                remaining: 0,
+            })
+    }
+
+    fn read_u32(&mut self) -> Result<u32, BlockMaxError> {
+        let bytes = self.take(4)?;
+        let mut little_endian = [0_u8; 4];
+        little_endian.copy_from_slice(bytes);
+        Ok(u32::from_le_bytes(little_endian))
+    }
+
+    fn read_vint(&mut self) -> Result<u64, BlockMaxError> {
+        let start = self.position;
+        let mut value = 0_u64;
+        for byte_index in 0..10 {
+            let byte = self.read_u8()?;
+            if byte_index == 9 && byte & 0xfe != 0 {
+                return Err(BlockMaxError::VintOverflow { offset: start });
+            }
+            value |= u64::from(byte & 0x7f) << (byte_index * 7);
+            if byte & 0x80 == 0 {
+                if vint64_length(value) != byte_index + 1 {
+                    return Err(BlockMaxError::NonCanonicalVint { offset: start });
+                }
+                return Ok(value);
+            }
+        }
+        Err(BlockMaxError::VintOverflow { offset: start })
+    }
+
+    fn finish(self) -> Result<(), BlockMaxError> {
+        let remaining = self.bytes.len().saturating_sub(self.position);
+        if remaining == 0 {
+            Ok(())
+        } else {
+            Err(BlockMaxError::TrailingBytes {
+                offset: self.position,
+                remaining,
+            })
+        }
     }
 }
 
@@ -3112,6 +4028,11 @@ mod tests {
         postings
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
+    fn fixture_fieldnorm(doc_id: u32) -> Option<u8> {
+        Some((doc_id % 251) as u8)
+    }
+
     fn raw_block(kind: u8, count: u8, payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
         let payload_len = u16::try_from(payload.len())?;
         let mut bytes = vec![kind, count];
@@ -3793,6 +4714,601 @@ mod tests {
             assert_eq!(list.blocks()[0].kind, PostingBlockKind::Vint);
             assert_eq!(list.blocks()[1].kind, PostingBlockKind::Vint);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_fresh_seal_roundtrips_all_posting_block_shapes() -> TestResult {
+        for count in [0, 1, 127, 128, 129, 255, 256, 400] {
+            let mut postings = sparse_postings(count, 100);
+            for (ordinal, posting) in postings.iter_mut().enumerate() {
+                posting.freq = match ordinal % 7 {
+                    0 => 1,
+                    1 => 254,
+                    2 => 255,
+                    3 => 256,
+                    4 => 65_535,
+                    5 => u32::MAX,
+                    _ => 17,
+                };
+            }
+            let ordinary_postings = EncodedPostingList::encode(&postings)?;
+            let (encoded_postings, encoded) =
+                EncodedPostingList::encode_with_block_max(&postings, fixture_fieldnorm)?;
+            assert_eq!(
+                encoded_postings, ordinary_postings,
+                "posting parity count={count}"
+            );
+            let posting_list = encoded_postings.posting_list()?;
+            let recomputed = EncodedBlockMax::encode(&posting_list, fixture_fieldnorm)?;
+            assert_eq!(encoded, recomputed, "integrated parity count={count}");
+            let (repeated_postings, repeated_bounds) =
+                EncodedPostingList::encode_with_block_max(&postings, fixture_fieldnorm)?;
+            assert_eq!(
+                encoded_postings, repeated_postings,
+                "posting determinism count={count}"
+            );
+            assert_eq!(encoded, repeated_bounds, "bound determinism count={count}");
+            let parsed = BlockMaxList::parse_with_fieldnorms(
+                encoded.as_bytes(),
+                &posting_list,
+                fixture_fieldnorm,
+            )?;
+            assert_eq!(parsed.entry_count(), posting_list.block_count());
+            assert_eq!(encoded.entry_count(), posting_list.block_count());
+            assert_eq!(parsed.as_bytes(), encoded.as_bytes());
+            for (block_index, (entry, block)) in parsed
+                .entries()
+                .iter()
+                .zip(posting_list.blocks())
+                .enumerate()
+            {
+                assert_eq!(entry.first_doc(), block.first_doc, "count={count}");
+                assert_eq!(
+                    entry.block_offset(),
+                    u64::try_from(block.byte_offset)?,
+                    "count={count}"
+                );
+                let decoded = decode_block_for_block_max(&posting_list, block_index)?;
+                assert_eq!(
+                    entry.max_frequency_code(),
+                    canonical_block_max_frequency_code(&decoded),
+                    "count={count}"
+                );
+                assert_eq!(
+                    entry.min_fieldnorm(),
+                    crate::contract::id_to_fieldnorm(entry.min_fieldnorm_id())
+                );
+            }
+            assert_eq!(parsed.cursor().current(), parsed.entries().first().copied());
+        }
+
+        let (_, singleton) =
+            EncodedPostingList::encode_with_block_max(&[Posting::new(128, 256)], |_| Some(0))?;
+        assert_eq!(singleton.as_bytes(), [0x80, 0, 0, 0, 0, 0xff, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_u64_vints_are_canonical_through_the_full_domain() -> TestResult {
+        for value in [
+            0,
+            1,
+            127,
+            128,
+            16_383,
+            16_384,
+            u64::from(u32::MAX),
+            u64::MAX,
+        ] {
+            let mut bytes = Vec::new();
+            write_vint64(value, &mut bytes);
+            assert_eq!(bytes.len(), vint64_length(value));
+            let mut reader = BlockMaxByteReader::new(&bytes);
+            assert_eq!(reader.read_vint()?, value);
+            reader.finish()?;
+        }
+        assert_eq!(
+            {
+                let mut bytes = Vec::new();
+                write_vint64(u64::MAX, &mut bytes);
+                bytes
+            },
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_parser_rejects_wire_and_cross_section_corruption() -> TestResult {
+        let encoded_postings = EncodedPostingList::encode(&[Posting::new(128, 7)])?;
+        let posting_list = encoded_postings.posting_list()?;
+        let encoded = EncodedBlockMax::encode(&posting_list, |_| Some(4))?;
+        assert_eq!(encoded.as_bytes(), [0x80, 0, 0, 0, 0, 7, 4]);
+
+        for cut in 0..encoded.as_bytes().len() {
+            assert!(
+                BlockMaxList::parse_with_fieldnorms(
+                    &encoded.as_bytes()[..cut],
+                    &posting_list,
+                    |_| Some(4),
+                )
+                .is_err(),
+                "cut={cut}"
+            );
+        }
+
+        let mut first_doc = encoded.as_bytes().to_vec();
+        first_doc[0] ^= 1;
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&first_doc, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::FirstDocMismatch { .. })
+        ));
+
+        let mut block_offset = encoded.as_bytes().to_vec();
+        block_offset[4] = 1;
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&block_offset, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::BlockOffsetMismatch { .. })
+        ));
+
+        let mut zero_frequency = encoded.as_bytes().to_vec();
+        zero_frequency[5] = 0;
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&zero_frequency, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::ZeroMaximumFrequency { .. })
+        ));
+
+        let mut wrong_frequency = encoded.as_bytes().to_vec();
+        wrong_frequency[5] = 6;
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&wrong_frequency, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::MaximumFrequencyMismatch { .. })
+        ));
+
+        let mut wrong_fieldnorm = encoded.as_bytes().to_vec();
+        wrong_fieldnorm[6] = u8::MAX;
+        let merge_only = BlockMaxConcatList::parse(&wrong_fieldnorm, &posting_list)?;
+        assert_eq!(merge_only.entry_count(), 1);
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&wrong_fieldnorm, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::MinimumFieldnormMismatch { .. })
+        ));
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(encoded.as_bytes(), &posting_list, |_| None),
+            Err(BlockMaxError::MissingFieldnorm { doc_id: 128, .. })
+        ));
+
+        let mut trailing = encoded.as_bytes().to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&trailing, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::TrailingBytes { remaining: 1, .. })
+        ));
+
+        let mut noncanonical = 128_u32.to_le_bytes().to_vec();
+        noncanonical.extend_from_slice(&[0x80, 0x00, 7, 4]);
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&noncanonical, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::NonCanonicalVint { .. })
+        ));
+
+        let mut overflow = 128_u32.to_le_bytes().to_vec();
+        overflow.extend_from_slice(&[0x80; 9]);
+        overflow.extend_from_slice(&[0x02, 7, 4]);
+        assert!(matches!(
+            BlockMaxList::parse_with_fieldnorms(&overflow, &posting_list, |_| Some(4)),
+            Err(BlockMaxError::VintOverflow { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_public_score_view_requires_validated_doclen() -> TestResult {
+        let postings = [Posting::new(128, 7), Posting::new(130, 3)];
+        let document_lengths = [Some(3), None, Some(41)];
+        let field_inputs = [DocLenFieldInput::new(7, &document_lengths)];
+        let doclen = EncodedDocLenSection::encode(128, 131, &[7], &field_inputs)?;
+        let section = doclen.section(&[7])?;
+        let fieldnorms = section.field(7).ok_or("validated field")?;
+
+        let (encoded_postings, encoded_bounds) =
+            EncodedPostingList::encode_with_block_max(&postings, |doc_id| {
+                fieldnorms.fieldnorm_id(u64::from(doc_id))
+            })?;
+        let posting_list = encoded_postings.posting_list()?;
+        let validated = encoded_bounds.block_max_list(&posting_list, fieldnorms)?;
+        assert_eq!(validated.entry_count(), 1);
+
+        let mut understated = encoded_bounds.as_bytes().to_vec();
+        let minimum = understated.last_mut().ok_or("fieldnorm byte")?;
+        *minimum = u8::MAX;
+        assert!(matches!(
+            BlockMaxList::parse(&understated, &posting_list, fieldnorms),
+            Err(BlockMaxError::MinimumFieldnormMismatch { .. })
+        ));
+
+        let maximum_length = [Some(u32::MAX)];
+        let maximum_input = [DocLenFieldInput::new(7, &maximum_length)];
+        let maximum_doclen = EncodedDocLenSection::encode(200, 201, &[7], &maximum_input)?;
+        let maximum_section = maximum_doclen.section(&[7])?;
+        let maximum_field = maximum_section.field(7).ok_or("maximum fieldnorm")?;
+        let (maximum_postings, maximum_bounds) =
+            EncodedPostingList::encode_with_block_max(&[Posting::new(200, 1)], |doc_id| {
+                maximum_field.fieldnorm_id(u64::from(doc_id))
+            })?;
+        let maximum_list = maximum_postings.posting_list()?;
+        let maximum_validated = maximum_bounds.block_max_list(&maximum_list, maximum_field)?;
+        assert_eq!(maximum_validated.entries()[0].min_fieldnorm_id(), u8::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_cursor_advance_matches_validated_posting_blocks() -> TestResult {
+        let postings = sparse_postings(400, 100);
+        let encoded_postings = EncodedPostingList::encode(&postings)?;
+        let posting_list = encoded_postings.posting_list()?;
+        let encoded = EncodedBlockMax::encode(&posting_list, fixture_fieldnorm)?;
+        let list = BlockMaxList::parse_with_fieldnorms(
+            encoded.as_bytes(),
+            &posting_list,
+            fixture_fieldnorm,
+        )?;
+        let last_doc = postings.last().ok_or("non-empty postings")?.doc_id;
+        let targets = [
+            0,
+            postings[0].doc_id,
+            postings[127].doc_id,
+            postings[127].doc_id + 1,
+            postings[128].doc_id,
+            last_doc,
+            last_doc + 1,
+            u32::MAX,
+        ];
+        for target in targets {
+            let expected_index = posting_list
+                .blocks()
+                .iter()
+                .position(|block| block.last_doc >= target);
+            let mut cursor = list.cursor();
+            let actual = cursor.advance(target);
+            assert_eq!(cursor.block_index(), expected_index, "target={target}");
+            assert_eq!(
+                cursor.last_doc(),
+                expected_index.map(|index| posting_list.blocks()[index].last_doc),
+                "target={target}"
+            );
+            assert_eq!(
+                actual,
+                expected_index.and_then(|index| list.entries().get(index).copied()),
+                "target={target}"
+            );
+        }
+
+        let mut cursor = list.cursor();
+        for block_index in 0..list.entry_count() {
+            assert_eq!(cursor.block_index(), Some(block_index));
+            if block_index + 1 == list.entry_count() {
+                assert_eq!(cursor.next(), None);
+                assert_eq!(cursor.next(), None);
+            } else {
+                assert_eq!(cursor.next(), list.entries().get(block_index + 1).copied());
+            }
+        }
+
+        let mut no_rewind = list.cursor();
+        let late_target = postings[200].doc_id;
+        let late_entry = no_rewind.advance(late_target);
+        let late_index = no_rewind.block_index();
+        assert!(late_index.is_some());
+        assert_eq!(no_rewind.advance(0), late_entry);
+        assert_eq!(no_rewind.block_index(), late_index);
+
+        let max_postings = [Posting::new(u32::MAX - 1, 3), Posting::new(u32::MAX, 7)];
+        let max_encoded = EncodedPostingList::encode(&max_postings)?;
+        let max_posting_list = max_encoded.posting_list()?;
+        let max_bounds = EncodedBlockMax::encode(&max_posting_list, fixture_fieldnorm)?;
+        let max_list = BlockMaxList::parse_with_fieldnorms(
+            max_bounds.as_bytes(),
+            &max_posting_list,
+            fixture_fieldnorm,
+        )?;
+        let mut max_cursor = max_list.cursor();
+        assert_eq!(
+            max_cursor.advance(u32::MAX),
+            max_list.entries().first().copied()
+        );
+        assert_eq!(max_cursor.last_doc(), Some(u32::MAX));
+        assert_eq!(max_cursor.next(), None);
+        assert_eq!(max_cursor.advance(u32::MAX), None);
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_covers_bitmap_posting_blocks() -> TestResult {
+        let postings = postings_with_span(511);
+        let ordinary_postings = EncodedPostingList::encode(&postings)?;
+        let (encoded_postings, encoded) =
+            EncodedPostingList::encode_with_block_max(&postings, fixture_fieldnorm)?;
+        assert_eq!(encoded_postings, ordinary_postings);
+        let posting_list = encoded_postings.posting_list()?;
+        assert_eq!(posting_list.blocks()[0].kind, PostingBlockKind::Bitmap);
+
+        assert_eq!(
+            encoded,
+            EncodedBlockMax::encode(&posting_list, fixture_fieldnorm)?
+        );
+        let parsed = BlockMaxList::parse_with_fieldnorms(
+            encoded.as_bytes(),
+            &posting_list,
+            fixture_fieldnorm,
+        )?;
+        let entry = parsed
+            .entries()
+            .first()
+            .copied()
+            .ok_or("one bitmap bound")?;
+        assert_eq!(parsed.entry_count(), 1);
+        assert_eq!(entry.first_doc(), postings[0].doc_id);
+        assert_eq!(entry.block_offset(), 0);
+        assert_eq!(entry.max_frequency(), 9);
+        assert_eq!(
+            entry.min_fieldnorm_id(),
+            postings
+                .iter()
+                .filter_map(|posting| fixture_fieldnorm(posting.doc_id))
+                .min()
+                .ok_or("bitmap fieldnorm minimum")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn blockmax_bounds_dominate_every_score_across_live_avgdl_regimes() -> TestResult {
+        let mut postings = dense_postings(400, 100);
+        for (ordinal, posting) in postings.iter_mut().enumerate() {
+            posting.freq = match ordinal / POSTINGS_PER_BLOCK {
+                0 => u32::try_from(ordinal % 37 + 1)?,
+                1 => u32::try_from(ordinal % 254 + 1)?,
+                2 => match ordinal % 11 {
+                    0 => u32::MAX,
+                    1 => 256,
+                    2 => 255,
+                    _ => u32::try_from(ordinal % 31 + 1)?,
+                },
+                _ => u32::try_from(ordinal % 17 + 1)?,
+            };
+        }
+        let encoded_postings = EncodedPostingList::encode(&postings)?;
+        let posting_list = encoded_postings.posting_list()?;
+        let encoded = EncodedBlockMax::encode(&posting_list, fixture_fieldnorm)?;
+        let blockmax = BlockMaxList::parse_with_fieldnorms(
+            encoded.as_bytes(),
+            &posting_list,
+            fixture_fieldnorm,
+        )?;
+        let snapshot_pairs = blockmax.entries().to_vec();
+
+        for average_fieldnorm in [0.25_f32, 1.0, 17.5, 1_000.0, 1_000_000.0] {
+            for doc_count in [400_u64, 1_000, 100_000] {
+                let idf = crate::contract::idf(400, doc_count);
+                for boost in [0.25_f32, 1.0, 4.0] {
+                    let weight = idf * (1.0 + crate::contract::BM25_K1) * boost;
+                    for (block_index, entry) in blockmax.entries().iter().copied().enumerate() {
+                        let bound = entry
+                            .score_upper_bound(average_fieldnorm, weight)
+                            .ok_or("valid positive block bound")?;
+                        let decoded = decode_block_for_block_max(&posting_list, block_index)?;
+                        for within in 0..usize::from(decoded.posting_count) {
+                            let frequency = decoded.freqs[within] as f32;
+                            let fieldnorm_id = fixture_fieldnorm(decoded.docs[within])
+                                .ok_or("fixture fieldnorm")?;
+                            let norm = crate::contract::cached_tf_component(
+                                crate::contract::id_to_fieldnorm(fieldnorm_id),
+                                average_fieldnorm,
+                            );
+                            let score = weight * (frequency / (frequency + norm));
+                            assert!(
+                                bound >= score,
+                                "block={block_index} within={within} avgdl={average_fieldnorm} doc_count={doc_count} boost={boost} bound={bound} score={score}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(blockmax.entries(), snapshot_pairs);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn randomized_blockmax_bounds_dominate_seeded_oracle() -> TestResult {
+        let boundary_counts = [1, 127, 128, 129, 255, 256, 400];
+        for case in 0_u64..32 {
+            let seed = 0xd1b5_4a32_d192_ed03 ^ case;
+            let mut state = seed;
+            let count = boundary_counts[usize::try_from(case)? % boundary_counts.len()];
+            let mut doc_id = random_u32(&mut state) % 100;
+            let mut postings = Vec::with_capacity(count);
+            for ordinal in 0..count {
+                if ordinal != 0 {
+                    let random = random_u32(&mut state);
+                    let step = if case.is_multiple_of(2) {
+                        1 + random % 3
+                    } else {
+                        5 + random % 12
+                    };
+                    doc_id = doc_id.checked_add(step).ok_or("seeded docid overflow")?;
+                }
+                let random = random_u32(&mut state);
+                let frequency = if case.is_multiple_of(4) {
+                    1 + random % 254
+                } else {
+                    match ordinal % 43 {
+                        0 => 255,
+                        1 => 256,
+                        2 => u32::MAX,
+                        _ => 1 + random % 254,
+                    }
+                };
+                postings.push(Posting::new(doc_id, frequency));
+            }
+            let fieldnorm_for_doc = |doc_id: u32| {
+                u8::try_from((u64::from(doc_id).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seed) & 0xff)
+                    .ok()
+            };
+            let (encoded_postings, encoded_bounds) =
+                EncodedPostingList::encode_with_block_max(&postings, fieldnorm_for_doc)?;
+            let posting_list = encoded_postings.posting_list()?;
+            let bounds = BlockMaxList::parse_with_fieldnorms(
+                encoded_bounds.as_bytes(),
+                &posting_list,
+                fieldnorm_for_doc,
+            )?;
+
+            for live_avgdl in [0.25_f32, 1.0, 17.5, 1_000.0, 1_000_000.0] {
+                for weight in [0.0_f32, 0.25, 3.25] {
+                    for (block_index, entry) in bounds.entries().iter().copied().enumerate() {
+                        let upper = entry
+                            .score_upper_bound(live_avgdl, weight)
+                            .ok_or("valid seeded bound")?;
+                        let decoded = decode_block_for_block_max(&posting_list, block_index)?;
+                        for within in 0..usize::from(decoded.posting_count) {
+                            let frequency = decoded.freqs[within] as f32;
+                            let fieldnorm_id = fieldnorm_for_doc(decoded.docs[within])
+                                .ok_or("seeded fieldnorm")?;
+                            let norm = crate::contract::cached_tf_component(
+                                crate::contract::id_to_fieldnorm(fieldnorm_id),
+                                live_avgdl,
+                            );
+                            let score = weight * (frequency / (frequency + norm));
+                            assert!(
+                                upper >= score,
+                                "seed={seed:#x} case={case} block={block_index} within={within} avgdl={live_avgdl} weight={weight} upper={upper} score={score}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_q1_concat_preserves_bounds_and_rebases_only_offsets() -> TestResult {
+        let left_postings = sparse_postings(100, 100);
+        let right_postings = sparse_postings(300, 10_000);
+        let left_encoded = EncodedPostingList::encode(&left_postings)?;
+        let right_encoded = EncodedPostingList::encode(&right_postings)?;
+        let left_list = left_encoded.posting_list()?;
+        let right_list = right_encoded.posting_list()?;
+        let left_bounds = EncodedBlockMax::encode(&left_list, fixture_fieldnorm)?;
+        let right_bounds = EncodedBlockMax::encode(&right_list, fixture_fieldnorm)?;
+        let left_blockmax = BlockMaxList::parse_with_fieldnorms(
+            left_bounds.as_bytes(),
+            &left_list,
+            fixture_fieldnorm,
+        )?;
+        let right_blockmax = BlockMaxList::parse_with_fieldnorms(
+            right_bounds.as_bytes(),
+            &right_list,
+            fixture_fieldnorm,
+        )?;
+        let left_concat = left_bounds.concat_list(&left_list)?;
+        let right_concat = right_bounds.concat_list(&right_list)?;
+
+        let merged_bounds = EncodedBlockMax::concatenate(&[&left_concat, &right_concat])?;
+        let mut merged_posting_bytes = left_encoded.as_bytes().to_vec();
+        merged_posting_bytes.extend_from_slice(right_encoded.as_bytes());
+        let merged_postings = PostingList::parse(&merged_posting_bytes, 400)?;
+        let merged = BlockMaxList::parse_with_fieldnorms(
+            merged_bounds.as_bytes(),
+            &merged_postings,
+            fixture_fieldnorm,
+        )?;
+        assert_eq!(merged.entry_count(), 4);
+        assert_eq!(
+            merged_postings
+                .blocks()
+                .iter()
+                .map(|block| block.posting_count)
+                .collect::<Vec<_>>(),
+            [100, 128, 128, 44]
+        );
+
+        let left_prefix = u64::try_from(left_encoded.as_bytes().len())?;
+        let mut expected_entries = left_blockmax.entries().to_vec();
+        expected_entries.extend(right_blockmax.entries().iter().map(|entry| BlockMaxEntry {
+            first_doc: entry.first_doc,
+            block_offset: left_prefix + entry.block_offset,
+            max_frequency_code: entry.max_frequency_code,
+            min_fieldnorm_id: entry.min_fieldnorm_id,
+        }));
+        assert_eq!(merged.entries(), expected_entries);
+
+        for left_count in 1..POSTINGS_PER_BLOCK {
+            let left = sparse_postings(left_count, 10);
+            let right = sparse_postings(3, 100_000);
+            let left_bytes = EncodedPostingList::encode(&left)?;
+            let right_bytes = EncodedPostingList::encode(&right)?;
+            let left_posting_list = left_bytes.posting_list()?;
+            let right_posting_list = right_bytes.posting_list()?;
+            let left_bound_bytes = EncodedBlockMax::encode(&left_posting_list, fixture_fieldnorm)?;
+            let right_bound_bytes =
+                EncodedBlockMax::encode(&right_posting_list, fixture_fieldnorm)?;
+            let left_bound_list = left_bound_bytes.concat_list(&left_posting_list)?;
+            let right_bound_list = right_bound_bytes.concat_list(&right_posting_list)?;
+            let bounds = EncodedBlockMax::concatenate(&[&left_bound_list, &right_bound_list])?;
+            let mut postings_bytes = left_bytes.as_bytes().to_vec();
+            postings_bytes.extend_from_slice(right_bytes.as_bytes());
+            let postings_list =
+                PostingList::parse(&postings_bytes, u32::try_from(left_count + right.len())?)?;
+            let parsed = BlockMaxList::parse_with_fieldnorms(
+                bounds.as_bytes(),
+                &postings_list,
+                fixture_fieldnorm,
+            )?;
+            assert_eq!(parsed.entry_count(), 2, "left_count={left_count}");
+            assert_eq!(parsed.entries()[0].block_offset, 0);
+            assert_eq!(
+                parsed.entries()[1].block_offset,
+                u64::try_from(left_bytes.as_bytes().len())?,
+                "left_count={left_count}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blockmax_concat_rebasing_is_associative_and_checks_q1_order() -> TestResult {
+        let a_postings = EncodedPostingList::encode(&sparse_postings(100, 100))?;
+        let b_postings = EncodedPostingList::encode(&sparse_postings(300, 10_000))?;
+        let c_postings = EncodedPostingList::encode(&sparse_postings(17, 100_000))?;
+        let a_list = a_postings.posting_list()?;
+        let b_list = b_postings.posting_list()?;
+        let c_list = c_postings.posting_list()?;
+        let a_bounds = EncodedBlockMax::encode(&a_list, fixture_fieldnorm)?;
+        let b_bounds = EncodedBlockMax::encode(&b_list, fixture_fieldnorm)?;
+        let c_bounds = EncodedBlockMax::encode(&c_list, fixture_fieldnorm)?;
+        let a_blockmax = a_bounds.concat_list(&a_list)?;
+        let b_blockmax = b_bounds.concat_list(&b_list)?;
+        let c_blockmax = c_bounds.concat_list(&c_list)?;
+
+        let direct = EncodedBlockMax::concatenate(&[&a_blockmax, &b_blockmax, &c_blockmax])?;
+        let ab = EncodedBlockMax::concatenate(&[&a_blockmax, &b_blockmax])?;
+        let mut ab_posting_bytes = a_postings.as_bytes().to_vec();
+        ab_posting_bytes.extend_from_slice(b_postings.as_bytes());
+        let ab_posting_list = PostingList::parse(&ab_posting_bytes, 400)?;
+        let first_pair_blockmax = ab.concat_list(&ab_posting_list)?;
+        let staged = EncodedBlockMax::concatenate(&[&first_pair_blockmax, &c_blockmax])?;
+        assert_eq!(staged, direct);
+
+        assert!(matches!(
+            EncodedBlockMax::concatenate(&[&c_blockmax, &a_blockmax]),
+            Err(BlockMaxError::NonAscendingConcat { .. })
+        ));
         Ok(())
     }
 

@@ -243,15 +243,49 @@ Per term (fields with positions only): per-doc position runs, doc-aligned with P
 ### 5.4 BLOCKMAX
 
 Per term, one entry per POSTINGS block (including every full or partial block,
-regardless of position):
+regardless of position). The TERMDICT `blockmax_len` span contains entries
+back-to-back with **no count prefix**; its exact entry count is derived from the
+validated POSTINGS block stream:
 
 ```
-{ first_doc: u32, block_offset: vint (from term's postings_offset),
-  max_freq_q: u8,        # quantized UP via the monotone freq table (round-up; table in quill contract module)
-  min_fieldnorm: u8 }    # minimum fieldnorm id over docs in the block
+{ first_doc: u32 LE,
+  block_offset: u64 canonical vint (from this term's postings_offset),
+  max_freq_q: u8,
+  min_fieldnorm: u8 }
 ```
 
-**Soundness contract:** impact bounds are computed at **query time** from `(max_freq_q, min_fieldnorm)` with the live snapshot's idf/avgdl — never stored as impact scalars (stored impacts are unsound under changing avgdl; see plan §10.4 and bead e2.3). `max_freq_q` decodes to a value ≥ the true block max freq; `min_fieldnorm` decodes to a length ≤ the true block min. Together they dominate every (freq, |d|) in the block for BM25's tf_part, which is increasing in freq and decreasing in |d|.
+`max_freq_q` uses the pinned Tantivy 0.26.1 conservative encoding: encode as
+`min(max_frequency, 255)`; codes `0..=254` decode exactly, while code `255`
+decodes to `u32::MAX`. Code zero is invalid for a real block because posting
+frequencies are positive. `min_fieldnorm` is the exact minimum stored DOCLEN
+byte among the block's posting docs. Every byte value is valid data; presence
+comes from POSTINGS/IDMAP, never from a fieldnorm sentinel.
+
+Readers parse exactly one record per validated POSTINGS block and reject
+missing/trailing records, malformed/non-canonical vints, a first doc or byte
+offset that disagrees with POSTINGS, or a non-canonical maximum-frequency code.
+A merge-only structural view may preserve the fieldnorm byte opaquely, but it
+exposes no scoring API. The score-capable view additionally binds DOCLEN and
+rejects an incorrect or missing minimum fieldnorm before exposing bounds. That
+validation is performed once per immutable term view and the result is cached;
+skip/scoring cursors then reuse it and advance without decoding skipped blocks.
+
+**Soundness contract:** impact bounds are computed at **query time** from
+`(max_freq_q, min_fieldnorm)` with the live snapshot's idf/avgdl — never stored
+as impact scalars (stored impacts are unsound under changing avgdl; see plan
+§10.4 and bead e2.3). `max_freq_q` decodes to a value ≥ the true block max
+frequency; `min_fieldnorm` decodes to a length ≤ every scored document length
+in the block. Together they dominate every `(freq, |d|)` for BM25's tf factor,
+which is increasing in frequency and decreasing in document length. Pruning is
+disabled for negative/non-finite term weights because they invalidate that
+monotonicity argument.
+
+Ordinary Q1 concat re-emits entries in posting-block order. It preserves
+`first_doc`, `max_freq_q`, and `min_fieldnorm`, and adds the sum of prior source
+term POSTINGS byte lengths to `block_offset`. It never synthesizes a seam entry
+or recomputes a bound. Fresh seal derives POSTINGS and BLOCKMAX from the same
+source-block pass before the written POSTINGS self-validation; deep compaction
+is the re-encoding path.
 
 ### 5.5 DOCLEN
 
@@ -435,5 +469,6 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.10 | 2026-07-17 | DOCLEN/STATS v1 pre-freeze correction: holes use canonical `0x00` but membership never derives from a fieldnorm byte because all u8 values are valid; each indexed-field STATS row uses the segment at-seal doc count and BM25 avgdl is raw `total_tokens / doc_count`, not a fieldnorm-decoded aggregate | — (pre-freeze correction) | DOCLEN hole/membership fixtures and STATS avgdl/row-count differential (e2.5) |
 | 1.0.11 | 2026-07-17 | Segment-container publication hardening: non-empty segment ranges are bounded by the u32 payload domain; public writers reject unregistered extension kinds while readers retain the optional-skippable forward valve; mmap open is restricted to canonical regular published segment paths after sync-and-rename, and no unchecked reader API exposes payload bytes before first-touch verification | — (pre-freeze validation hardening) | pinned inline wire oracle, writer/reader extension differential, u32 boundary, published-mmap parity, and typed torn-file tests (e3.1) |
 | 1.0.12 | 2026-07-17 | NUMERIC signedness correction: schema-driven `value_bits: u64` preserves the complete indexed I64 and U64 domains without a redundant row tag; ordering and bounds use the field's schema type | — (pre-freeze correction) | indexed-I64/indexed-U64 section-presence coverage (e3.1); typed range/roundtrip including `u64 > i64::MAX` (e2.7) |
+| 1.0.13 | 2026-07-17 | BLOCKMAX v1 pre-freeze hardening: no count prefix; u64 canonical term-relative offsets; Tantivy-compatible conservative max-frequency codes; exact minimum stored fieldnorm IDs; POSTINGS/DOCLEN cross-validation; live-snapshot query bounds; and Q1 concat offset-only rebasing are pinned | — (pre-freeze contract hardening) | BLOCKMAX wire/corruption, bound-soundness, skip, and `df=100 + df=300` concat fixtures (e2.3) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*

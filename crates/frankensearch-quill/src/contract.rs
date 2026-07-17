@@ -285,13 +285,85 @@ pub fn id_to_fieldnorm(id: u8) -> u32 {
 /// Encode a document length, rounding down to its fieldnorm bucket.
 // A search hit is at most index 255; a miss inserts after table[0], so the
 // preceding bucket is also at most 255 and cannot underflow.
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_lossless, clippy::cast_possible_truncation)]
 #[inline]
 #[must_use]
 pub fn fieldnorm_to_id(fieldnorm: u32) -> u8 {
     FIELD_NORMS_TABLE
         .binary_search(&fieldnorm)
         .unwrap_or_else(|index| index - 1) as u8
+}
+
+/// Encode a posting block's maximum term frequency into one byte.
+///
+/// Codes `0..=254` are exact. Every frequency at or above 255 uses the
+/// saturating code `255`, whose decoder deliberately returns [`u32::MAX`].
+/// This is the conservative Tantivy 0.26.1 Block-WAND encoding: decoding an
+/// encoded frequency can never under-estimate the original value.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub const fn block_max_frequency_to_code(max_frequency: u32) -> u8 {
+    if max_frequency >= 255 {
+        u8::MAX
+    } else {
+        max_frequency as u8
+    }
+}
+
+/// Decode a posting block's conservative maximum-frequency code.
+///
+/// Code `255` is an unbounded sentinel, not the exact frequency 255.
+#[inline]
+#[must_use]
+#[allow(clippy::cast_lossless)]
+pub const fn block_max_frequency_from_code(code: u8) -> u32 {
+    if code == u8::MAX {
+        u32::MAX
+    } else {
+        code as u32
+    }
+}
+
+/// Compute the conservative BM25 tf-factor for one durable BLOCKMAX pair.
+///
+/// The average field length is supplied from the live snapshot. Returning
+/// `None` disables pruning for invalid snapshot inputs or for code zero, which
+/// cannot describe a real non-empty posting block. The arithmetic order
+/// matches the term scorer: first compute `norm`, then `f / (f + norm)`.
+#[must_use]
+pub(crate) fn block_max_tf_factor(
+    max_frequency_code: u8,
+    min_fieldnorm_id: u8,
+    live_avgdl: f32,
+) -> Option<f32> {
+    if max_frequency_code == 0 || !live_avgdl.is_finite() || live_avgdl <= 0.0 {
+        return None;
+    }
+    let frequency = block_max_frequency_from_code(max_frequency_code) as f32;
+    let norm = cached_tf_component(id_to_fieldnorm(min_fieldnorm_id), live_avgdl);
+    let factor = frequency / (frequency + norm);
+    factor.is_finite().then_some(factor)
+}
+
+/// Apply a non-negative live BM25 weight to a conservative BLOCKMAX tf-factor.
+///
+/// Negative or non-finite weights return `None`: callers must disable pruning
+/// in those regimes because multiplying by a negative weight reverses the
+/// max-frequency/min-length monotonicity argument.
+#[must_use]
+pub(crate) fn block_max_score(
+    max_frequency_code: u8,
+    min_fieldnorm_id: u8,
+    live_avgdl: f32,
+    nonnegative_weight: f32,
+) -> Option<f32> {
+    if !nonnegative_weight.is_finite() || nonnegative_weight < 0.0 {
+        return None;
+    }
+    let score =
+        nonnegative_weight * block_max_tf_factor(max_frequency_code, min_fieldnorm_id, live_avgdl)?;
+    score.is_finite().then_some(score)
 }
 
 /// Tantivy-compatible BM25 inverse document frequency.
@@ -368,6 +440,49 @@ mod tests {
         assert_eq!(fieldnorm_to_id(u32::MAX), u8::MAX);
         assert_eq!(fieldnorm_to_id(2_013_265_943), 254);
         assert_eq!(fieldnorm_to_id(2_013_265_944), u8::MAX);
+    }
+
+    #[test]
+    fn block_max_frequency_encoding_is_exact_then_conservative() {
+        for frequency in 0..u32::from(u8::MAX) {
+            let code = block_max_frequency_to_code(frequency);
+            assert_eq!(u32::from(code), frequency);
+            assert_eq!(block_max_frequency_from_code(code), frequency);
+        }
+        for frequency in [255, 256, 65_535, u32::MAX] {
+            let code = block_max_frequency_to_code(frequency);
+            assert_eq!(code, u8::MAX);
+            assert_eq!(block_max_frequency_from_code(code), u32::MAX);
+            assert!(block_max_frequency_from_code(code) >= frequency);
+        }
+    }
+
+    #[test]
+    fn block_max_score_dominates_componentwise_smaller_inputs() {
+        let max_frequency = 37;
+        let min_fieldnorm_id = 4;
+        let code = block_max_frequency_to_code(max_frequency);
+        for average in [0.25_f32, 1.0, 17.5, 1_000.0, 1_000_000.0] {
+            let weight = 3.25_f32;
+            let bound = block_max_score(code, min_fieldnorm_id, average, weight)
+                .expect("valid positive scoring regime");
+            for frequency in 1..=max_frequency {
+                for fieldnorm_id in [min_fieldnorm_id, 5, 40, 128, u8::MAX] {
+                    let frequency = frequency as f32;
+                    let norm = cached_tf_component(id_to_fieldnorm(fieldnorm_id), average);
+                    let score = weight * (frequency / (frequency + norm));
+                    assert!(
+                        bound >= score,
+                        "avg={average} frequency={frequency} fieldnorm_id={fieldnorm_id} bound={bound} score={score}"
+                    );
+                }
+            }
+        }
+        assert_eq!(block_max_tf_factor(0, 0, 1.0), None);
+        assert_eq!(block_max_tf_factor(1, 0, 0.0), None);
+        assert_eq!(block_max_tf_factor(1, 0, f32::NAN), None);
+        assert_eq!(block_max_score(1, 0, 1.0, -1.0), None);
+        assert_eq!(block_max_score(1, 0, 1.0, f32::INFINITY), None);
     }
 
     #[test]
