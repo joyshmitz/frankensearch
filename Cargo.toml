@@ -124,7 +124,7 @@ ft-autograd = { git = "https://github.com/Dicklesworthstone/frankentorch", rev =
 ft-core = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c305306b251753099620ad5fe02e78c07c167cf6" }
 
 # Full-text search
-tantivy = "0.26.1"
+tantivy = "=0.26.1"
 
 ndarray = "0.17"
 

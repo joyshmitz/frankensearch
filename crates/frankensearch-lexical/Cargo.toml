@@ -9,6 +9,9 @@ repository.workspace = true
 [features]
 # Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
 bench-internals = ["frankensearch-core/bench-internals"]
+# Dev-only observation surface for the Quill conformance oracle. This keeps
+# full Tantivy DocAddress/count evidence out of shipping APIs and default builds.
+tantivy-oracle = []
 
 [dependencies]
 frankensearch-core = { workspace = true }

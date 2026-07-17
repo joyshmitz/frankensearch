@@ -217,6 +217,40 @@ pub struct LexicalIdHit {
     pub rank: usize,
 }
 
+/// Dev-only ranked oracle evidence retaining Tantivy's full native tie key.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleRankedHit {
+    /// External document identifier used for cross-engine alignment.
+    pub doc_id: String,
+    /// Exact BM25 score representation.
+    pub score_bits: u32,
+    /// Native rank in the fetched oracle result list.
+    pub rank: usize,
+    /// Tantivy segment ordinal (the first half of `DocAddress`).
+    pub segment_ord: u32,
+    /// Segment-local document ID (the second half of `DocAddress`).
+    pub segment_doc_id: u32,
+    /// Rendered snippet; `None` remains distinct from an empty snippet.
+    pub snippet: Option<String>,
+}
+
+/// Dev-only complete observation used by the Quill conformance gauntlet.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleQueryObservation {
+    /// Requested top-k rows in native Tantivy order.
+    pub hits: Vec<OracleRankedHit>,
+    /// Expanded exact-score group at the top-k cutoff.
+    pub cutoff_tie_group: Vec<OracleRankedHit>,
+    /// False when the configured expansion budget ended inside the tie group.
+    pub cutoff_tie_complete: bool,
+    /// Exact total number of matches, independent of top-k.
+    pub total_count: usize,
+    /// Exact live-document count.
+    pub doc_count: usize,
+}
+
 /// Execute a pre-built Tantivy query with offset pagination.
 ///
 /// This helper centralizes error mapping and result-shape normalization so
@@ -1095,6 +1129,107 @@ impl TantivyIndex {
         }
 
         Ok(results)
+    }
+
+    /// Observe the shipping parser/search/snippet path for Quill conformance.
+    ///
+    /// This surface is deliberately feature-gated: it retains the full Tantivy
+    /// `DocAddress`, exact count, score bits, and an expanded cutoff tie group.
+    /// Shipping consumers should use the ordinary lexical APIs instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if query execution or stored-field loading fails.
+    #[cfg(feature = "tantivy-oracle")]
+    #[instrument(skip_all, fields(query = %query, limit = limit, tie_expansion_limit = tie_expansion_limit))]
+    pub fn oracle_observe_query(
+        &self,
+        _cx: &Cx,
+        query: &str,
+        limit: usize,
+        tie_expansion_limit: usize,
+        snippet_config: &SnippetConfig,
+    ) -> SearchResult<OracleQueryObservation> {
+        let query = Self::truncate_query(query);
+        if query.trim().is_empty() {
+            return Ok(OracleQueryObservation {
+                hits: Vec::new(),
+                cutoff_tie_group: Vec::new(),
+                cutoff_tie_complete: true,
+                total_count: 0,
+                doc_count: self.doc_count.load(Ordering::Relaxed),
+            });
+        }
+
+        let parsed = self.parse_query_lenient(query);
+        let searcher = self.reader.searcher();
+        let fetch_limit = if limit == 0 {
+            0
+        } else {
+            limit.saturating_add(tie_expansion_limit)
+        };
+        let search_result = execute_query_with_offset(&searcher, &*parsed, fetch_limit, 0)?;
+        let snippet_gen =
+            try_build_snippet_generator(&searcher, &*parsed, self.fields.content, snippet_config);
+        let mut materialized = Vec::with_capacity(search_result.hits.len());
+        for hit in search_result.hits {
+            let doc = load_doc(&searcher, hit.doc_address)?;
+            let doc_id = doc
+                .get_first(self.fields.id)
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let snippet = snippet_gen.as_ref().and_then(|generator| {
+                render_snippet_html(
+                    generator,
+                    &doc,
+                    &snippet_config.highlight_prefix,
+                    &snippet_config.highlight_postfix,
+                )
+            });
+            materialized.push(OracleRankedHit {
+                doc_id,
+                score_bits: hit.bm25_score.to_bits(),
+                rank: hit.rank,
+                segment_ord: hit.doc_address.segment_ord,
+                segment_doc_id: hit.doc_address.doc_id,
+                snippet,
+            });
+        }
+
+        let top_len = limit.min(materialized.len());
+        let cutoff_bits = top_len
+            .checked_sub(1)
+            .and_then(|index| materialized.get(index))
+            .map(|hit| hit.score_bits);
+        let cutoff_tie_group = cutoff_bits.map_or_else(Vec::new, |cutoff| {
+            materialized
+                .iter()
+                .filter(|hit| {
+                    f32::from_bits(hit.score_bits)
+                        .total_cmp(&f32::from_bits(cutoff))
+                        .is_eq()
+                })
+                .cloned()
+                .collect()
+        });
+        let cutoff_tie_complete = cutoff_bits.is_none_or(|cutoff| {
+            search_result.total_count <= fetch_limit
+                || materialized.last().is_none_or(|last| {
+                    !f32::from_bits(last.score_bits)
+                        .total_cmp(&f32::from_bits(cutoff))
+                        .is_eq()
+                })
+        });
+        materialized.truncate(top_len);
+
+        Ok(OracleQueryObservation {
+            hits: materialized,
+            cutoff_tie_group,
+            cutoff_tie_complete,
+            total_count: search_result.total_count,
+            doc_count: self.doc_count.load(Ordering::Relaxed),
+        })
     }
 
     /// Search and return only `(doc_id, score, rank)` rows.
