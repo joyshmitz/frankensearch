@@ -11,6 +11,13 @@ Conventions:
 - A lever is **reverted** if ratio ∈ [0.97, 1.03] (noise) or > 1.03 (regression).
 - Wins (ratio < 0.97, kept) go in `docs/PERF_LEDGER.md`, not here.
 
+### 2026-07-16 — `prf_expand` in-place interpolation buffer (`frankensearch-fusion`, BlackThrush)
+
+- **Hypothesis:** `prf::prf_expand` (PRF query expansion) allocates a second `dims`-length `expanded` vector and zero-initializes it, then overwrites every element on the very next loop — a wasted allocation + zero-init. Folding the interpolation back into the already-owned `centroid` buffer (`centroid[i] = alpha*orig[i] + beta*centroid[i]`, read-then-write per index) should drop both, byte-identically (the durability zero-init-elision class, **not** the `bd-d2a8` scale-wash class).
+- **Attribution / parity:** The new `prf_expand_ab` same-binary bench mirrors both variants over a realistic fixture (dim 384; 3/8/20 feedback embeddings; α=0.8) and asserted exact `to_bits()` equality of the returned `Vec<f32>` for every arm before timing. Parity held.
+- **Real same-binary A/B:** strict-remote release on `vmi1227854`, 30 samples, 150 ms warm-up, 500 ms measurement. in_place/two_buffer (`<1` wins): **n=3 → 0.963** (`[3.429,3.534]` vs `[3.461,3.777]` µs, CIs overlap), **n=8 → 0.974** (`[8.619,8.948]` vs `[8.822,9.156]` µs, CIs overlap), **n=20 → 1.117 REGRESSION** (`[22.25,27.13]` vs `[20.69,23.19]` µs, high-variance).
+- **Decision:** **REJECT / no ship.** The elision never separates from the noise floor and inverts to a regression at n=20: the centroid accumulation (`N × dims` `mul_add`s) dominates, so a single 384-float alloc+zero-init is too small a fraction to clear worker noise — the same small-buffer lesson as `bd-d2a8`. Production `prf.rs` reverted to the two-buffer form; the fusion `prf` lib suite (30/30) passed on the reverted source. Bench retained so the negative stays reproducible. **Do not retry this finish-buffer elision without a product-level profile showing the interpolation dominates.**
+
 ### 2026-07-15 — fused ASCII token boundary + FNV hashing (`frankensearch-embed`, FoggyBasin)
 
 - **Hypothesis:** Fusing ASCII token-boundary discovery with FNV-1a updates would remove the shipping path's second scan of each token while preserving `fnv1a-*` embedding bits.

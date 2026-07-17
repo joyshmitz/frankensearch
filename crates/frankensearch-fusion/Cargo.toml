@@ -63,6 +63,10 @@ name = "rrf_fuse"
 harness = false
 
 [[bench]]
+name = "prf_expand_ab"
+harness = false
+
+[[bench]]
 name = "pool_minmax_fuse"
 harness = false
 
