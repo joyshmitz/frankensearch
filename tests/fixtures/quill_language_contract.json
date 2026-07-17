@@ -1,0 +1,881 @@
+{
+  "schema_version": 1,
+  "contract_version": "1.0.0",
+  "oracle": {
+    "engine": "tantivy",
+    "version": "0.26.1",
+    "lockfile": "Cargo.lock",
+    "default_conformance": "RankExact",
+    "score_epsilon": 0.0001
+  },
+  "fixture_execution": {
+    "lexical_loader_executes": ["schema", "analyzers", "helpers", "bm25_operation_order"],
+    "quill_differential_executes": ["canonical_query_trees", "ranking", "statistics_transitions", "writer_reader_lifecycle", "snippets", "durability", "errors", "concurrency"]
+  },
+  "source_corpora": [
+    {
+      "id": "source-corpus-120",
+      "path": "tests/fixtures/corpus.json",
+      "expected_document_count": 120,
+      "purpose": "120 documents spanning the shared five-cluster relevance corpus"
+    },
+    {
+      "id": "source-queries-25",
+      "path": "tests/fixtures/queries.json",
+      "purpose": "harvested identifier, short-keyword, and natural-language relevance slices"
+    },
+    {
+      "id": "source-quality-harness",
+      "path": "crates/frankensearch-fsfs/tests/search_quality_harness.rs",
+      "purpose": "load and differential quality harness for the shared corpus and query slices"
+    }
+  ],
+  "analyzer_cases": [
+    {
+      "id": "analyzer-default-ascii-split-lower",
+      "analyzer": "frankensearch_default",
+      "input": "Rust POL-358",
+      "expected_tokens": [
+        { "text": "rust", "position": 0, "offset_from": 0, "offset_to": 4, "position_length": 1 },
+        { "text": "pol", "position": 1, "offset_from": 5, "offset_to": 8, "position_length": 1 },
+        { "text": "358", "position": 2, "offset_from": 9, "offset_to": 12, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-default-unicode-lower-offsets",
+      "analyzer": "frankensearch_default",
+      "input": "ÉCLAIR 東京",
+      "expected_tokens": [
+        { "text": "éclair", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
+        { "text": "東京", "position": 1, "offset_from": 8, "offset_to": 14, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-default-unicode-lower-expansion",
+      "analyzer": "frankensearch_default",
+      "input": "İ",
+      "expected_tokens": [
+        { "text": "i̇", "position": 0, "offset_from": 0, "offset_to": 2, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-hyphen-compound-and-parts",
+      "analyzer": "hyphen_normalize",
+      "input": "BD-Q3FY search",
+      "expected_tokens": [
+        { "text": "bd-q3fy", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
+        { "text": "bd", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
+        { "text": "q3fy", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 },
+        { "text": "search", "position": 1, "offset_from": 8, "offset_to": 14, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-hyphen-cjk-bigrams",
+      "analyzer": "hyphen_normalize",
+      "input": "搜索引擎",
+      "expected_tokens": [
+        { "text": "搜索", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
+        { "text": "索引", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
+        { "text": "引擎", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-prefix-no-hyphen-decompose",
+      "analyzer": "prefix_normalize",
+      "input": "bd-q3fy",
+      "expected_tokens": [
+        { "text": "bd-q3fy", "position": 0, "offset_from": 0, "offset_to": 7, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-cass-limit-256-kept",
+      "analyzer": "hyphen_normalize",
+      "generated_input": { "repeat": "A", "count": 256 },
+      "expected_token_count": 1,
+      "expected_token_bytes": 256,
+      "expected_token_repeat": "a"
+    },
+    {
+      "id": "analyzer-cass-limit-257-dropped",
+      "analyzer": "hyphen_normalize",
+      "generated_input": { "repeat": "A", "count": 257 },
+      "expected_tokens": []
+    },
+    {
+      "id": "analyzer-tantivy-index-limit-65530-kept",
+      "analyzer": "frankensearch_default",
+      "generated_input": { "repeat": "x", "count_bytes": 65530 },
+      "token_admission": "kept",
+      "applies_to": ["document_indexing"]
+    },
+    {
+      "id": "analyzer-tantivy-index-limit-65531-dropped",
+      "analyzer": "frankensearch_default",
+      "generated_input": { "repeat": "x", "count_bytes": 65531 },
+      "token_admission": "dropped",
+      "diagnostic": "warning",
+      "applies_to": ["document_indexing"]
+    },
+    {
+      "id": "analyzer-quill-query-limit-65531-dropped",
+      "analyzer": "frankensearch_default",
+      "generated_input": { "repeat": "x", "count_bytes": 65531 },
+      "token_admission": "dropped",
+      "applies_to": ["quill_query_analysis"],
+      "classification": "explicit Quill hardening amendment; Tantivy QueryParser does not enforce MAX_TOKEN_LEN",
+      "ordinary_string_query_reachable": false
+    }
+  ],
+  "helper_cases": [
+    {
+      "id": "helper-edge-prefix-ascii",
+      "helper": "cass_generate_edge_ngrams",
+      "input": "hello world",
+      "expected": "he hel hell hello wo wor worl world"
+    },
+    {
+      "id": "helper-edge-prefix-unicode",
+      "helper": "cass_generate_edge_ngrams",
+      "input": "éclair",
+      "expected": "éc écl écla éclai éclair"
+    },
+    {
+      "id": "helper-edge-prefix-cap-20",
+      "helper": "cass_generate_edge_ngrams",
+      "input": "abcdefghijklmnopqrstuvwxy",
+      "last_expected_prefix": "abcdefghijklmnopqrst",
+      "expected_prefix_count": 19
+    },
+    {
+      "id": "helper-preview-unicode",
+      "helper": "cass_build_preview",
+      "input": "éclair",
+      "max_chars": 3,
+      "expected": "écl…"
+    },
+    {
+      "id": "helper-preview-zero",
+      "helper": "cass_build_preview",
+      "input": "hello",
+      "max_chars": 0,
+      "expected": "…"
+    },
+    {
+      "id": "helper-query-truncate-ascii",
+      "helper": "truncate_query",
+      "generated_input": { "repeat": "a", "count_chars": 10001 },
+      "expected_chars": 10000,
+      "backends": ["tantivy", "fts5"]
+    },
+    {
+      "id": "helper-query-truncate-unicode",
+      "helper": "truncate_query",
+      "generated_input": { "repeat": "é", "count_chars": 10001 },
+      "expected_chars": 10000,
+      "expected_bytes": 20000,
+      "backends": ["tantivy", "fts5"]
+    }
+  ],
+  "parse_tree_cases": [
+    {
+      "id": "query-identifier-path-phrase",
+      "query_class": "identifier",
+      "parser": "default_lenient",
+      "input": "src/main.rs",
+      "source": "contract extension for the path-shaped identifier class",
+      "expected_ast": {
+        "type": "Phrase",
+        "terms": ["src", "main", "rs"],
+        "slop": 0,
+        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+      }
+    },
+    {
+      "id": "query-identifier-raw-colon-dropped",
+      "query_class": "identifier",
+      "parser": "default_lenient",
+      "input": "SearchIndex::new",
+      "source": "tests/fixtures/queries.json",
+      "expected_ast": { "type": "Empty" },
+      "expected_diagnostic": "unknown field SearchIndex"
+    },
+    {
+      "id": "query-short-keyword-default-or",
+      "query_class": "short_keyword",
+      "parser": "default_lenient",
+      "input": "rust ownership borrowing",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-natural-language-default-or",
+      "query_class": "natural_language",
+      "parser": "default_lenient",
+      "input": "how do transformers work for text embeddings",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "how", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "do", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "transformers", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "work", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "for", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "text", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "embeddings", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-phrase-both-fields",
+      "query_class": "phrase",
+      "parser": "default_lenient",
+      "input": "\"error handling\"",
+      "expected_ast": {
+        "type": "Phrase",
+        "terms": ["error", "handling"],
+        "slop": 0,
+        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+      }
+    },
+    {
+      "id": "query-quoted-single-token-is-term",
+      "query_class": "phrase",
+      "parser": "default_lenient",
+      "input": "\"rust\"",
+      "expected_ast": {
+        "type": "Term",
+        "text": "rust",
+        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+      }
+    },
+    {
+      "id": "query-default-and-precedes-or",
+      "query_class": "boolean",
+      "parser": "default_lenient",
+      "input": "rust OR ownership AND borrowing",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+          { "occur": "Should", "query": { "type": "Boolean", "operator": "AND", "children": [
+            { "occur": "Must", "query": { "type": "Term", "text": "ownership", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } },
+            { "occur": "Must", "query": { "type": "Term", "text": "borrowing", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+          ] } }
+        ]
+      }
+    },
+    {
+      "id": "query-default-field-and-boost",
+      "query_class": "short_keyword",
+      "parser": "default_lenient",
+      "input": "title:rust^3",
+      "expected_ast": {
+        "type": "Boost",
+        "factor": 3.0,
+        "query": {
+          "type": "Term",
+          "text": "rust",
+          "fields": [{ "name": "title", "boost": 2.0 }]
+        }
+      }
+    },
+    {
+      "id": "query-default-all-negative-complement",
+      "query_class": "boolean",
+      "parser": "default_lenient",
+      "input": "-deprecated",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }], "score": 0.0 } },
+          { "occur": "Should", "query": { "type": "All" } }
+        ]
+      },
+      "expected_diagnostic": "all-negative query repaired with All"
+    },
+    {
+      "id": "query-default-recursive-dedup",
+      "query_class": "short_keyword",
+      "parser": "default_lenient",
+      "input": "rust rust",
+      "expected_ast": {
+        "type": "Term",
+        "text": "rust",
+        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+      }
+    },
+    {
+      "id": "query-lenient-unterminated-quote-recovers",
+      "query_class": "short_keyword",
+      "parser": "default_lenient",
+      "input": "\"rust",
+      "expected_ast": {
+        "type": "Term",
+        "text": "rust",
+        "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }]
+      },
+      "expected_diagnostic": "syntax recovery"
+    },
+    {
+      "id": "query-lenient-diagnostic-keeps-valid-sibling",
+      "query_class": "short_keyword",
+      "parser": "default_lenient",
+      "input": "unknown_field:value rust",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "rust", "fields": [{ "name": "content", "boost": 1.0 }, { "name": "title", "boost": 2.0 }] } }
+        ]
+      },
+      "expected_diagnostic": "unsupported field fragment dropped"
+    },
+    {
+      "id": "query-boolean-or-tighter-than-and",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth OR token AND cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Boolean", "operator": "OR", "children": [
+            { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+            { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          ] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-boolean-negative-standalone-universe",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "-deprecated",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "All" } },
+          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+        ]
+      },
+      "known_shipping_gap": "cass_compat currently emits a negative-only BooleanQuery for this shape"
+    },
+    {
+      "id": "query-boolean-negative-or-operand-universe",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth OR NOT deprecated",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                { "occur": "Must", "query": { "type": "All" } },
+                { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "query-boolean-and-not-no-all-score",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth AND NOT deprecated",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+        ]
+      }
+    },
+    {
+      "id": "query-boolean-repeated-not-is-idempotent",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth AND NOT NOT deprecated",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "MustNot", "query": { "type": "Term", "text": "deprecated", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }], "score": 0.0 } }
+        ]
+      },
+      "double_negation": false
+    },
+    {
+      "id": "query-glob-exact",
+      "query_class": "glob",
+      "parser": "cass",
+      "input": "exact",
+      "expected_ast": {
+        "type": "Glob",
+        "pattern": "exact",
+        "class": "Exact",
+        "strategy": "TermQuery",
+        "fields": ["title", "content", "title_prefix", "content_prefix"]
+      }
+    },
+    {
+      "id": "query-glob-prefix",
+      "query_class": "glob",
+      "parser": "cass",
+      "input": "prefix*",
+      "expected_ast": {
+        "type": "Glob",
+        "pattern": "prefix*",
+        "normalized_term": "prefix",
+        "class": "Prefix",
+        "strategy": "TermQuery",
+        "fields": ["title", "content", "title_prefix", "content_prefix"]
+      }
+    },
+    {
+      "id": "query-glob-suffix",
+      "query_class": "glob",
+      "parser": "cass",
+      "input": "*suffix",
+      "expected_ast": {
+        "type": "Glob",
+        "pattern": "*suffix",
+        "class": "Suffix",
+        "strategy": "RegexQuery",
+        "regex": ".*suffix$",
+        "fields": ["content", "title"]
+      }
+    },
+    {
+      "id": "query-glob-substring",
+      "query_class": "glob",
+      "parser": "cass",
+      "input": "*middle*",
+      "expected_ast": {
+        "type": "Glob",
+        "pattern": "*middle*",
+        "class": "Substring",
+        "strategy": "RegexQuery",
+        "regex": ".*middle.*",
+        "fields": ["content", "title"]
+      }
+    },
+    {
+      "id": "query-glob-complex",
+      "query_class": "glob",
+      "parser": "cass",
+      "input": "a*b*c",
+      "expected_ast": {
+        "type": "Glob",
+        "pattern": "a*b*c",
+        "class": "Complex",
+        "strategy": "RegexQuery",
+        "regex": "^a.*b.*c$",
+        "fields": ["content", "title"],
+        "question_mark_operator": false
+      }
+    },
+    {
+      "id": "query-range-inclusive-created-at",
+      "query_class": "range",
+      "parser": "cass",
+      "input": "cache",
+      "filters": { "created_from": 1700000000000, "created_to": 1700000000999 },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "value": 1700000000000, "bound": "Included" }, "upper": { "value": 1700000000999, "bound": "Included" }, "matched_score": 1.0 } }
+        ]
+      }
+    },
+    {
+      "id": "query-cjk-all-bigrams",
+      "query_class": "short_keyword",
+      "parser": "cass",
+      "input": "搜索引擎",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "搜索", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "索引", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "引擎", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cjk-mixed-script-keeps-cjk-only",
+      "query_class": "short_keyword",
+      "parser": "cass",
+      "input": "abc搜索def",
+      "expected_ast": {
+        "type": "Term",
+        "text": "搜索",
+        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }]
+      },
+      "discarded_query_characters": "abcdef"
+    },
+    {
+      "id": "query-cjk-single-character-unigram",
+      "query_class": "short_keyword",
+      "parser": "cass",
+      "input": "搜",
+      "expected_ast": {
+        "type": "Term",
+        "text": "搜",
+        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }]
+      },
+      "does_not_match_inside_multi_character_run": true
+    },
+    {
+      "id": "query-empty-cass-all",
+      "query_class": "short_keyword",
+      "parser": "cass",
+      "input": "",
+      "expected_ast": { "type": "All" }
+    },
+    {
+      "id": "query-boolean-should-optional-with-must",
+      "query_class": "boolean",
+      "parser": "direct_boolean",
+      "input": "synthetic",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "required" } },
+          { "occur": "Should", "query": { "type": "Term", "text": "bonus" } },
+          { "occur": "MustNot", "query": { "type": "Term", "text": "excluded", "score": 0.0 } }
+        ],
+        "minimum_should_match": 0
+      }
+    },
+    {
+      "id": "query-boolean-should-only-required",
+      "query_class": "boolean",
+      "parser": "direct_boolean",
+      "input": "synthetic",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "first" } },
+          { "occur": "Should", "query": { "type": "Term", "text": "second" } }
+        ],
+        "minimum_should_match": 1
+      }
+    },
+    {
+      "id": "query-boolean-should-plus-mustnot-required",
+      "query_class": "boolean",
+      "parser": "direct_boolean",
+      "input": "synthetic",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "included" } },
+          { "occur": "MustNot", "query": { "type": "Term", "text": "excluded", "score": 0.0 } }
+        ],
+        "minimum_should_match": 1
+      }
+    },
+    {
+      "id": "query-boolean-mustnot-only-empty",
+      "query_class": "boolean",
+      "parser": "direct_boolean",
+      "input": "synthetic",
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "MustNot", "query": { "type": "Term", "text": "excluded", "score": 0.0 } }
+        ],
+        "matching_semantics": "empty"
+      }
+    }
+  ],
+  "scoring_cases": [
+    {
+      "id": "score-bm25-constants-operation-order",
+      "conformance": "RankExact",
+      "k1": 1.2,
+      "b": 0.75,
+      "idf_expression": "ln(1 + (N - n + 0.5) / (n + 0.5))",
+      "norm_expression": "k1 * (1 - b + b * doc_len / avgdl)",
+      "weight_expression": "idf * (1 + k1)",
+      "tf_factor_expression": "f / (f + norm)",
+      "term_score_expression": "weight * tf_factor",
+      "arithmetic": "f32 in tantivy operation order; no reassociation, ln_1p, or FMA"
+    },
+    {
+      "id": "score-bm25-operation-order-bits",
+      "conformance": "RankExact",
+      "input": { "doc_freq": 1, "doc_count": 1, "term_freq": 1, "fieldnorm_id": 0, "avgdl": 1.0 },
+      "comparison": "compute both expressions on the executing platform",
+      "expect_exact_and_reassociated_bits_to_differ": true,
+      "universal_libm_bit_pattern": false
+    },
+    {
+      "id": "score-fieldnorm-landmarks",
+      "conformance": "RankExact",
+      "decoded": { "0": 0, "40": 40, "41": 42, "64": 152, "128": 32792, "200": 16777240, "255": 2013265944 },
+      "table_checksum_u64": 24696067732
+    },
+    {
+      "id": "score-avgdl-uses-raw-statistics",
+      "conformance": "RankExact",
+      "segment_max_docs": [2, 1],
+      "segment_total_tokens": [13, 8],
+      "deleted_docs": 1,
+      "expected_total_num_docs": 3,
+      "expected_total_num_tokens": 21,
+      "expected_avgdl": 7.0,
+      "forbidden_calculation": "mean of decoded per-document fieldnorm buckets"
+    },
+    {
+      "id": "score-deleted-doc-statistics-until-merge",
+      "conformance": "RankExact",
+      "before_merge": { "matching_docs": "live only", "N": "sum segment max_doc", "doc_freq": "sealed postings including deleted", "total_num_tokens": "sealed statistics including deleted" },
+      "after_merge": { "matching_docs": "live only", "statistics": "recomputed from retained live documents" }
+    },
+    {
+      "id": "score-multifield-title-boost",
+      "conformance": "RankExact",
+      "scope": "default_lenient",
+      "fields": [
+        { "name": "content", "boost": 1.0 },
+        { "name": "title", "boost": 2.0 }
+      ],
+      "accumulation": "f32 in Tantivy scorer-tree order; required aggregate before optional Should aggregate"
+    },
+    {
+      "id": "score-cass-fields-unboosted",
+      "conformance": "RankExact",
+      "scope": "cass",
+      "fields": [
+        { "name": "title", "boost": 1.0 },
+        { "name": "content", "boost": 1.0 },
+        { "name": "title_prefix", "boost": 1.0 },
+        { "name": "content_prefix", "boost": 1.0 }
+      ]
+    },
+    {
+      "id": "score-cass-fast-range-constant",
+      "conformance": "RankExact",
+      "scope": "cass",
+      "query": "created_at inclusive i64 range as Must",
+      "matched_score": 1.0,
+      "implementation": "Tantivy FastFieldRangeWeight ConstScorer at default boost"
+    },
+    {
+      "id": "score-phrase-bm25",
+      "conformance": "RankExact",
+      "term_doc_freqs_in_phrase_order": [2, 3, 2],
+      "doc_count": 8,
+      "phrase_occurrences": 2,
+      "fieldnorm_id": 8,
+      "avgdl": 7.0,
+      "idf_accumulation": "left-to-right f32 in phrase-term order",
+      "term_frequency": "phrase occurrence count, not individual term frequencies"
+    },
+    {
+      "id": "score-required-scorers-cost-order",
+      "conformance": "RankExact",
+      "construction_order": ["common", "rare", "medium", "equal_cost_later"],
+      "runtime_costs": [900, 3, 200, 200],
+      "expected_evaluation_order": ["rare", "medium", "equal_cost_later", "common"],
+      "equal_cost_rule": "stable construction order"
+    },
+    {
+      "id": "score-cass-regex-fields-constant",
+      "conformance": "RankExact",
+      "scope": "cass suffix, substring, and complex glob",
+      "fields": ["content", "title"],
+      "matched_score_per_field": 1.0,
+      "term_dictionary_expansion_bound": null
+    },
+    {
+      "id": "score-deterministic-total-order",
+      "conformance": "RankExact",
+      "oracle_order": [
+        "score descending via f32 total_cmp",
+        "DocAddress ascending by segment_ord then segment-local doc_id"
+      ],
+      "quill_native_tie_key": "global u32 docid ascending",
+      "comparison_rule": "preserve native order; classify only expanded exact-score tie-group differences as TieOrder"
+    },
+    {
+      "id": "score-epsilon-layout-class",
+      "conformance": "ScoreEpsilon",
+      "relative_delta_max": 0.0001,
+      "result_set": "exact",
+      "rank_flip_rule": "only inside maximal connected components of epsilon-adjacent oracle scores",
+      "requires_artifact_reason": true
+    },
+    {
+      "id": "score-epsilon-component-boundary",
+      "conformance": "ScoreEpsilon",
+      "oracle_order": [
+        { "id": "a", "score": 1.0 },
+        { "id": "b", "score": 0.99995 },
+        { "id": "c", "score": 0.9999 },
+        { "id": "d", "score": 0.9997 }
+      ],
+      "expected_components": [["a", "b", "c"], ["d"]],
+      "rule": "connect adjacent oracle-order scores when relative delta <= 0.0001, then take maximal connected components"
+    }
+  ],
+  "behavior_cases": [
+    {
+      "id": "behavior-schema-default-fields",
+      "surface": "schema",
+      "fields": [
+        { "name": "id", "type": "text", "indexed": true, "record_option": "Basic", "stored": true, "fast": false, "tokenizer": "raw" },
+        { "name": "content", "type": "text", "indexed": true, "record_option": "WithFreqsAndPositions", "stored": true, "fast": false, "tokenizer": "frankensearch_default" },
+        { "name": "title", "type": "text", "indexed": true, "record_option": "WithFreqsAndPositions", "stored": true, "fast": false, "tokenizer": "frankensearch_default" },
+        { "name": "metadata_json", "type": "text", "indexed": false, "record_option": null, "stored": true, "fast": false, "tokenizer": null },
+        { "name": "ord", "type": "u64", "indexed": false, "record_option": null, "stored": true, "fast": true, "tokenizer": null }
+      ]
+    },
+    {
+      "id": "behavior-collectors",
+      "surface": "collectors",
+      "contracts": ["top-k plus offset", "exact count", "unscored id set", "count-free top-k rank parity"]
+    },
+    {
+      "id": "behavior-writer-mutations",
+      "surface": "writer",
+      "contracts": ["add", "batch add", "upsert delete then add", "delete", "delete_all", "commit or seal", "cancellation classification"]
+    },
+    {
+      "id": "behavior-reader-snapshot",
+      "surface": "reader",
+      "contracts": ["immediate Quill visibility", "live doc_count", "stable external doc-id materialization"]
+    },
+    {
+      "id": "behavior-snippet-output",
+      "surface": "snippets",
+      "max_chars": 200,
+      "observable_budget_unit": "UTF-8 byte offsets at token boundaries",
+      "prefix": "<b>",
+      "suffix": "</b>",
+      "comparison": "exact unless a reviewed divergence entry names a tie window",
+      "unicode_golden": {
+        "content": "éé alpha",
+        "query": "éé",
+        "max_chars_argument": 6,
+        "expected_html": "<b>éé</b>",
+        "note": "two Unicode scalars consume four UTF-8 bytes; adding the next token would end at byte 10"
+      }
+    },
+    {
+      "id": "behavior-segments-durability",
+      "surface": "segments_durability",
+      "contracts": ["checksummed FSLX", "checksummed manifest", "owned relative paths", "repair or quarantine", "tombstone-aware open"]
+    },
+    {
+      "id": "behavior-errors-no-panic",
+      "surface": "errors",
+      "contracts": ["IndexNotFound", "Cancelled", "InvalidConfig", "I/O or corruption", "SubsystemError quill", "invalid input never panics"]
+    },
+    {
+      "id": "behavior-concurrency",
+      "surface": "concurrency",
+      "contracts": ["Send + Sync", "Cx on operations", "immediately-ready lexical SearchFuture", "no private runtime"]
+    },
+    {
+      "id": "behavior-pagination-and-limit-zero",
+      "surface": "collectors",
+      "contracts": ["limit zero returns no hits without collector panic", "counted limit zero still returns exact total", "offset pages use page-local rank starting at zero", "exact total when requested"]
+    },
+    {
+      "id": "behavior-boolean-occur",
+      "surface": "queries",
+      "contracts": ["Should-only requires one", "Should optional only with a positive Must", "Should plus MustNot still requires one Should", "MustNot-only matches nothing", "MustNot contributes no score"]
+    },
+    {
+      "id": "behavior-scoring",
+      "surface": "scoring",
+      "contracts": ["BM25 constants", "raw avgdl", "decoded per-document fieldnorm", "title boost", "f32 order", "stable tie key"]
+    },
+    {
+      "id": "behavior-analyzers",
+      "surface": "analyzers",
+      "contracts": ["exact token stream", "default", "hyphen", "CJK", "prefix", "oversized term admission"]
+    },
+    {
+      "id": "behavior-oversized-token-position-gap",
+      "surface": "analyzers",
+      "input_shape": ["kept at position 0", "65531-byte dropped token at position 1", "tail at position 2"],
+      "expected_retained_positions": [0, 2],
+      "contract": "dropping an oversized token preserves the following token's position gap"
+    },
+    {
+      "id": "behavior-cass-prefix-and-cjk-boundaries",
+      "surface": "queries",
+      "contracts": [
+        "prefix fields contain lengths 2 through 20 only",
+        "a* does not generally match a longer token",
+        "exact terms of length 2 through 20 may match longer tokens through prefix fields",
+        "mixed-script CJK input drops non-CJK characters before bigramming",
+        "single CJK unigram does not match inside a multi-character bigram-indexed run"
+      ]
+    },
+    {
+      "id": "behavior-quill-oversized-query-lowering",
+      "surface": "queries",
+      "token_bytes": 65531,
+      "status": "G0 target; executable G1 classification tracked by bd-quill-e0-contracts-j53p.8",
+      "shapes": [
+        { "shape": "standalone oversized term", "expected": "Empty" },
+        { "shape": "Must(valid, oversized)", "expected": "Empty" },
+        { "shape": "Phrase(valid, oversized)", "expected": "Empty" },
+        { "shape": "Should(valid, oversized)", "expected": "Should(valid)" },
+        { "shape": "Must(valid) + MustNot(oversized)", "expected": "Must(valid)" }
+      ],
+      "ordinary_string_query_reachable": false,
+      "ast_or_diagnostic_difference_requires_divergence_entry": true
+    }
+  ],
+  "harvested_queries": [
+    { "id": "harvest-identifier", "query_class": "identifier", "query": "SearchIndex::new", "source_kind": "harvested", "source": "tests/fixtures/queries.json" },
+    { "id": "harvest-short-keyword", "query_class": "short_keyword", "query": "rust ownership borrowing", "source_kind": "harvested", "source": "tests/fixtures/queries.json" },
+    { "id": "harvest-natural-language", "query_class": "natural_language", "query": "how do transformers work for text embeddings", "source_kind": "harvested", "source": "tests/fixtures/queries.json" },
+    { "id": "harvest-phrase", "query_class": "phrase", "query": "\"error handling\"", "source_kind": "constructed", "source_fact": "phrase contract extension seeded from tests/fixtures/queries.json" },
+    { "id": "harvest-boolean", "query_class": "boolean", "query": "auth OR token AND cache", "source_kind": "constructed", "source_fact": "CASS OR-over-AND grammar in crates/frankensearch-lexical/src/cass_compat.rs" },
+    { "id": "harvest-glob", "query_class": "glob", "query": "config*", "source_kind": "constructed", "source_fact": "CassWildcardPattern Prefix branch in crates/frankensearch-lexical/src/cass_compat.rs" },
+    {
+      "id": "harvest-range",
+      "query_class": "range",
+      "query": "cache",
+      "filters": { "created_from": 1700000000000, "created_to": 1700000000999 },
+      "source_kind": "constructed",
+      "source_fact": "CassQueryFilters structured created_from/created_to bounds in crates/frankensearch-lexical/src/cass_compat.rs"
+    }
+  ],
+  "surface_coverage": [
+    { "surface": "schema", "fixture_ids": ["behavior-schema-default-fields"] },
+    { "surface": "analyzers", "fixture_ids": ["analyzer-default-ascii-split-lower", "analyzer-default-unicode-lower-offsets", "analyzer-default-unicode-lower-expansion", "analyzer-hyphen-compound-and-parts", "analyzer-hyphen-cjk-bigrams", "analyzer-prefix-no-hyphen-decompose", "analyzer-cass-limit-256-kept", "analyzer-cass-limit-257-dropped", "analyzer-tantivy-index-limit-65530-kept", "analyzer-tantivy-index-limit-65531-dropped", "analyzer-quill-query-limit-65531-dropped", "helper-edge-prefix-ascii", "helper-preview-unicode", "behavior-analyzers", "behavior-oversized-token-position-gap"] },
+    { "surface": "queries", "fixture_ids": ["query-identifier-path-phrase", "query-identifier-raw-colon-dropped", "query-short-keyword-default-or", "query-natural-language-default-or", "query-phrase-both-fields", "query-quoted-single-token-is-term", "query-default-and-precedes-or", "query-default-field-and-boost", "query-default-all-negative-complement", "query-default-recursive-dedup", "query-lenient-unterminated-quote-recovers", "query-boolean-or-tighter-than-and", "query-boolean-negative-standalone-universe", "query-boolean-negative-or-operand-universe", "query-boolean-and-not-no-all-score", "query-boolean-repeated-not-is-idempotent", "query-glob-exact", "query-glob-prefix", "query-glob-suffix", "query-glob-substring", "query-glob-complex", "query-range-inclusive-created-at", "query-cjk-all-bigrams", "query-cjk-mixed-script-keeps-cjk-only", "query-cjk-single-character-unigram", "query-empty-cass-all", "query-boolean-should-optional-with-must", "query-boolean-should-only-required", "query-boolean-should-plus-mustnot-required", "query-boolean-mustnot-only-empty", "helper-query-truncate-unicode", "behavior-boolean-occur", "behavior-cass-prefix-and-cjk-boundaries", "behavior-quill-oversized-query-lowering"] },
+    { "surface": "collectors", "fixture_ids": ["behavior-collectors", "behavior-pagination-and-limit-zero"] },
+    { "surface": "scoring", "fixture_ids": ["score-bm25-constants-operation-order", "score-bm25-operation-order-bits", "score-fieldnorm-landmarks", "score-avgdl-uses-raw-statistics", "score-deleted-doc-statistics-until-merge", "score-multifield-title-boost", "score-cass-fields-unboosted", "score-cass-fast-range-constant", "score-phrase-bm25", "score-required-scorers-cost-order", "score-cass-regex-fields-constant", "score-deterministic-total-order", "score-epsilon-layout-class", "score-epsilon-component-boundary", "behavior-scoring"] },
+    { "surface": "writer", "fixture_ids": ["behavior-writer-mutations"] },
+    { "surface": "reader", "fixture_ids": ["behavior-reader-snapshot"] },
+    { "surface": "snippets", "fixture_ids": ["behavior-snippet-output"] },
+    { "surface": "segments_durability", "fixture_ids": ["behavior-segments-durability"] },
+    { "surface": "errors", "fixture_ids": ["behavior-errors-no-panic"] },
+    { "surface": "concurrency", "fixture_ids": ["behavior-concurrency"] }
+  ]
+}

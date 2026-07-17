@@ -201,21 +201,19 @@ impl Fts5LexicalSearch {
 
     /// Truncate overly long queries to prevent pathological parsing.
     fn truncate_query(query: &str) -> &str {
-        if query.len() > MAX_QUERY_LENGTH {
-            warn!(
-                original_len = query.len(),
-                max = MAX_QUERY_LENGTH,
-                "fts5: query truncated"
-            );
-            // Truncate at a char boundary.
-            let mut end = MAX_QUERY_LENGTH;
-            while end > 0 && !query.is_char_boundary(end) {
-                end -= 1;
-            }
-            &query[..end]
-        } else {
-            query
+        if query.len() <= MAX_QUERY_LENGTH {
+            return query;
         }
+
+        let Some((end, _)) = query.char_indices().nth(MAX_QUERY_LENGTH) else {
+            return query;
+        };
+        warn!(
+            original_len_bytes = query.len(),
+            max_chars = MAX_QUERY_LENGTH,
+            "fts5: query truncated"
+        );
+        &query[..end]
     }
 
     /// Build column values from an `IndexableDocument`.
@@ -901,7 +899,22 @@ mod tests {
     fn long_query_is_truncated() {
         let long_query = "a".repeat(MAX_QUERY_LENGTH + 100);
         let truncated = Fts5LexicalSearch::truncate_query(&long_query);
-        assert!(truncated.len() <= MAX_QUERY_LENGTH);
+        assert_eq!(truncated.chars().count(), MAX_QUERY_LENGTH);
+    }
+
+    #[test]
+    fn multibyte_query_uses_character_limit() {
+        let long_query = "\u{00E9}".repeat(MAX_QUERY_LENGTH + 3);
+        let truncated = Fts5LexicalSearch::truncate_query(&long_query);
+        assert_eq!(truncated.chars().count(), MAX_QUERY_LENGTH);
+        assert_eq!(truncated.len(), MAX_QUERY_LENGTH * '\u{00E9}'.len_utf8());
+    }
+
+    #[test]
+    fn multibyte_query_within_character_limit_is_unchanged() {
+        let query = "\u{00E9}".repeat(MAX_QUERY_LENGTH / 2 + 1);
+        assert!(query.len() > MAX_QUERY_LENGTH);
+        assert_eq!(Fts5LexicalSearch::truncate_query(&query), query);
     }
 
     #[test]

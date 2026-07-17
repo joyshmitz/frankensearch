@@ -75,7 +75,8 @@ const TITLE_BOOST: f32 = 2.0;
 /// with a warning log. Prevents pathological parsing of enormous inputs.
 const MAX_QUERY_LENGTH: usize = 10_000;
 
-/// Default maximum snippet length in characters.
+/// Default Tantivy snippet window value. Tantivy names this a character limit,
+/// but observably compares UTF-8 byte offsets and cuts at token boundaries.
 const DEFAULT_SNIPPET_MAX_CHARS: usize = 200;
 
 // ─── Query Explanation ──────────────────────────────────────────────────────
@@ -133,7 +134,9 @@ fn classify_query(query: &str) -> QueryExplanation {
 /// Configuration for snippet generation in [`TantivyIndex::search_with_snippets`].
 #[derive(Debug, Clone)]
 pub struct SnippetConfig {
-    /// Maximum number of characters for the snippet fragment.
+    /// Tantivy snippet window value. Despite the upstream name, the pinned
+    /// implementation enforces this against UTF-8 byte offsets at token
+    /// boundaries.
     pub max_chars: usize,
     /// HTML tag prefix for highlighted terms (e.g., `"<b>"`).
     pub highlight_prefix: String,
@@ -230,6 +233,20 @@ pub fn execute_query_with_offset(
     limit: usize,
     offset: usize,
 ) -> SearchResult<LexicalSearchResult> {
+    if limit == 0 {
+        let total_count =
+            searcher
+                .search(query, &Count)
+                .map_err(|e| SearchError::SubsystemError {
+                    subsystem: "tantivy",
+                    source: Box::new(e),
+                })?;
+        return Ok(LexicalSearchResult {
+            hits: Vec::new(),
+            total_count,
+        });
+    }
+
     let (top_docs, total_count) = searcher
         .search(
             query,
@@ -274,6 +291,10 @@ pub fn execute_top_k(
     limit: usize,
     offset: usize,
 ) -> SearchResult<Vec<LexicalDocHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let top_docs = searcher
         .search(
             query,
@@ -971,19 +992,23 @@ impl TantivyIndex {
 
     /// Truncate an overlong query and log a warning.
     fn truncate_query(query: &str) -> &str {
+        // UTF-8 uses at least one byte per character, so this is a cheap
+        // common-case proof that the query is within the character limit.
         if query.len() <= MAX_QUERY_LENGTH {
             return query;
         }
+
+        // `char_indices().nth(MAX_QUERY_LENGTH)` points at the first character
+        // outside the allowed prefix. If it is absent, the string exceeds the
+        // byte count but still contains at most MAX_QUERY_LENGTH characters.
+        let Some((end, _)) = query.char_indices().nth(MAX_QUERY_LENGTH) else {
+            return query;
+        };
         warn!(
-            original_len = query.len(),
-            max = MAX_QUERY_LENGTH,
+            original_len_bytes = query.len(),
+            max_chars = MAX_QUERY_LENGTH,
             "query truncated to MAX_QUERY_LENGTH"
         );
-        // Truncate at a char boundary.
-        let mut end = MAX_QUERY_LENGTH;
-        while end > 0 && !query.is_char_boundary(end) {
-            end -= 1;
-        }
         &query[..end]
     }
 
@@ -1344,7 +1369,7 @@ impl LexicalSearch for TantivyIndex {
         Box::pin(async move {
             let query = Self::truncate_query(query);
 
-            if query.trim().is_empty() {
+            if query.trim().is_empty() || limit == 0 {
                 return Ok(Vec::new());
             }
 
@@ -1923,6 +1948,75 @@ mod tests {
         });
     }
 
+    #[test]
+    fn zero_limit_returns_empty_without_collector_panic() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            idx.index_document(&cx, &IndexableDocument::new("doc-1", "searchable text"))
+                .await
+                .expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let parsed = idx.parse_query_lenient("searchable");
+            let searcher = idx.reader.searcher();
+            let counted = execute_query_with_offset(&searcher, &*parsed, 0, 0)
+                .expect("counted zero-limit search");
+            assert!(counted.hits.is_empty());
+            assert_eq!(counted.total_count, 1);
+            assert!(
+                execute_top_k(&searcher, &*parsed, 0, 0)
+                    .expect("count-free zero-limit search")
+                    .is_empty()
+            );
+
+            assert!(
+                idx.search(&cx, "searchable", 0)
+                    .await
+                    .expect("search")
+                    .is_empty()
+            );
+            assert!(
+                idx.search_doc_ids(&cx, "searchable", 0)
+                    .expect("id search")
+                    .is_empty()
+            );
+            assert!(
+                idx.search_with_snippets(&cx, "searchable", 0, &SnippetConfig::default())
+                    .expect("snippet search")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn tantivy_indexing_enforces_max_token_len_boundary() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let max = tantivy::tokenizer::MAX_TOKEN_LEN;
+            let kept = "k".repeat(max);
+            let dropped = "d".repeat(max + 1);
+            idx.index_document(&cx, &IndexableDocument::new("kept", &kept))
+                .await
+                .expect("index boundary token");
+            idx.index_document(&cx, &IndexableDocument::new("dropped", &dropped))
+                .await
+                .expect("index oversized token document");
+            idx.commit(&cx).await.expect("commit");
+
+            let searcher = idx.reader.searcher();
+            let kept_query = TermQuery::new(
+                Term::from_field_text(idx.fields.content, &kept),
+                IndexRecordOption::WithFreqsAndPositions,
+            );
+            let dropped_query = TermQuery::new(
+                Term::from_field_text(idx.fields.content, &dropped),
+                IndexRecordOption::WithFreqsAndPositions,
+            );
+            assert_eq!(searcher.search(&kept_query, &Count).expect("search"), 1);
+            assert_eq!(searcher.search(&dropped_query, &Count).expect("search"), 0);
+        });
+    }
+
     // ─── Delete tests ───────────────────────────────────────────────────
 
     #[test]
@@ -2105,6 +2199,27 @@ mod tests {
         assert_eq!(config.max_chars, DEFAULT_SNIPPET_MAX_CHARS);
         assert_eq!(config.highlight_prefix, "<b>");
         assert_eq!(config.highlight_postfix, "</b>");
+    }
+
+    #[test]
+    fn snippet_unicode_window_uses_tantivy_byte_offsets() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            idx.index_document(&cx, &IndexableDocument::new("unicode", "éé alpha"))
+                .await
+                .expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let config = SnippetConfig {
+                max_chars: 6,
+                ..SnippetConfig::default()
+            };
+            let results = idx
+                .search_with_snippets(&cx, "éé", 1, &config)
+                .expect("snippet search");
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].snippet.as_deref(), Some("<b>éé</b>"));
+        });
     }
 
     // ─── search_with_snippets tests (bd-3un.18) ─────────────────────────
@@ -2355,16 +2470,23 @@ mod tests {
         let q = "a".repeat(MAX_QUERY_LENGTH + 100);
         let truncated = TantivyIndex::truncate_query(&q);
         assert_eq!(truncated.len(), MAX_QUERY_LENGTH);
+        assert_eq!(truncated.chars().count(), MAX_QUERY_LENGTH);
     }
 
     #[test]
-    fn truncate_query_multibyte_boundary() {
-        // Create a string with multibyte chars that would split mid-char at MAX_QUERY_LENGTH.
-        let base = "x".repeat(MAX_QUERY_LENGTH - 1);
-        let over = format!("{base}\u{00E9}\u{00E9}\u{00E9}"); // é is 2 bytes in UTF-8
+    fn truncate_query_counts_multibyte_characters() {
+        let over = "\u{00E9}".repeat(MAX_QUERY_LENGTH + 3);
         let truncated = TantivyIndex::truncate_query(&over);
         assert!(truncated.is_char_boundary(truncated.len()));
-        assert!(truncated.len() <= MAX_QUERY_LENGTH);
+        assert_eq!(truncated.chars().count(), MAX_QUERY_LENGTH);
+        assert_eq!(truncated.len(), MAX_QUERY_LENGTH * '\u{00E9}'.len_utf8());
+    }
+
+    #[test]
+    fn truncate_query_preserves_multibyte_query_within_character_limit() {
+        let query = "\u{00E9}".repeat(MAX_QUERY_LENGTH / 2 + 1);
+        assert!(query.len() > MAX_QUERY_LENGTH);
+        assert_eq!(TantivyIndex::truncate_query(&query), query);
     }
 
     #[test]

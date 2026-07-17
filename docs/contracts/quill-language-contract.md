@@ -1,0 +1,270 @@
+# Quill Language and Scoring Contract
+
+**Contract version:** 1.0.0
+
+**Owning bead:** `bd-quill-e0-contracts-j53p.1`
+
+**Oracle:** Tantivy 0.26.1, pinned by `Cargo.lock`
+**Contract fixture:** `tests/fixtures/quill_language_contract.json`
+
+This document defines what “the same results as Tantivy” means for Quill. It is normative for the used lexical surface in `COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md` §3.1, §5, and §8. Quill code does not merge past gate G0 unless its scalar reference path satisfies this contract. The lexical-crate loader currently executes schema, analyzer, helper, and BM25 operation-order goldens and structurally validates the other records; the G1/G2 differential runner is responsible for executing canonical query trees, lifecycle rows, and cross-engine result comparisons.
+
+The conformance target is the observable behavior of frankensearch, not every Tantivy API. Analyzer behavior is pinned to the shipping scalar implementations. Query and scoring behavior is pinned to the shipping adapters plus the Tantivy 0.26.1 source used as the oracle. Intentional departures belong in `docs/contracts/quill-divergence-register.md`; an unclassified departure is a failure.
+
+## 1. Normative sources and precedence
+
+When sources disagree, apply this order:
+
+1. This versioned contract and its executable fixtures.
+2. Shipping frankensearch behavior in:
+   - `crates/frankensearch-lexical/src/lib.rs`
+   - `crates/frankensearch-lexical/src/cass_compat.rs`
+   - `crates/frankensearch-core/src/traits.rs`
+3. Tantivy 0.26.1 for scoring, Boolean `Occur`, parser-default, and token-admission semantics.
+4. The comprehensive Quill plan.
+
+The fixture distinguishes harvested queries from constructed boundary cases and records source paths or source facts for that query-class corpus. Analyzer and scoring rows are constructed contract vectors whose normative source is this section plus the pinned implementation named above. A later source discovery that contradicts a fixture requires a contract-version amendment, not a silent code change.
+
+Two clarifications supersede older planning prose:
+
+- `avgdl` is raw `total_num_tokens / total_num_docs`. Only a document’s `|d|` is decoded from its one-byte fieldnorm. Averaging decoded fieldnorm buckets is wrong and changes scores.
+- Tantivy scoring statistics include deleted documents until their segment is merged. Tombstones suppress matches, but `N`, term document frequency, and total token counts remain the sealed-segment values until compaction.
+
+## 2. Used-surface coverage
+
+Every §3.1 row has at least one fixture ID in the executable `surface_coverage` table.
+
+| Surface | Normative behavior |
+|---|---|
+| Schema | `id`: stored exact text (`Basic` postings); `content` and `title`: stored text using `frankensearch_default` with frequencies, positions, and fieldnorms; `metadata_json`: stored-only text; `ord`: stored fast `u64`. |
+| Analyzers | `frankensearch_default`, `hyphen_normalize`, `prefix_normalize`, edge-prefix generation, and preview generation. |
+| Queries | Term, Boolean, phrase, inclusive i64 range, glob-derived term matching, all-docs, and the default lenient parser. |
+| Collectors | Top-k plus offset, exact count, id-set collection, and count-free top-k where applicable. |
+| Scoring | BM25 constants/formula, fieldnorm quantization, title boost, fixed f32 accumulation, and deterministic tie order. |
+| Writer | Add, batch add, upsert, delete, clear, commit/seal, and cancellation taxonomy. |
+| Reader | Immediate snapshot visibility for Quill, live document count, and stable doc-ID materialization. |
+| Snippets | Default value 200, enforced by Tantivy against UTF-8 byte offsets at token boundaries despite the upstream `max_num_chars` name; configured tags and exact output comparison. |
+| Durability | Checksummed FSLX segments/manifests, path safety, repair integration, and tombstone-aware open. |
+| Errors | `IndexNotFound`, `Cancelled`, `InvalidConfig`, I/O/corruption, and `SubsystemError { subsystem: "quill" }`. |
+| Concurrency | `Send + Sync`, `Cx` on operations, and an immediately-ready fusion read future. |
+
+Anything in plan §3.2 is out of contract until added here with fixtures.
+
+## 3. Analyzer contract
+
+### 3.1 Token record
+
+Analyzer equality is exact equality of the ordered token stream:
+
+```text
+(text: UTF-8 string, position: usize, offset_from: byte index,
+ offset_to: byte index, position_length: usize)
+```
+
+Offsets are half-open byte ranges into the original input. Position duplicates are legal. Quill must not normalize, coalesce, or reorder duplicate-position alternatives.
+
+### 3.2 Default analyzer
+
+`frankensearch_default` is the shipping `FrankensearchTokenizer`:
+
+- Split on characters for which `char::is_alphanumeric` is false.
+- Lowercase ASCII in place and apply the full `char::to_lowercase` expansion for non-ASCII.
+- Start positions at zero and increment once per emitted token.
+- Preserve source byte offsets even when lowercasing changes the output byte length.
+- Do not apply an analyzer-local length filter.
+
+The Quill SIMD path may classify pure-ASCII spans in wide lanes. Encountering a high byte falls back to the scalar char walk for the affected span. SIMD and scalar streams must be byte-identical.
+
+### 3.3 CASS analyzer family
+
+The shipping `hyphen_normalize` pipeline is:
+
+```text
+CassTokenizer
+  -> HyphenDecompose
+  -> CjkBigramDecompose
+  -> CassNormalizeAndLimit
+```
+
+`CassTokenizer` emits either:
+
+- ASCII alphanumeric runs with interior hyphens only when both sides are ASCII alphanumeric; or
+- contiguous runs in the exact CJK ranges listed in `cass_compat.rs`.
+
+`HyphenDecompose` replaces an interior-hyphen token with the compound followed by each non-empty part. All alternatives retain the compound’s position, full source offsets, and position length.
+
+`CjkBigramDecompose` replaces an all-CJK token of at least two characters with overlapping bigrams in source order. A single CJK character remains a unigram; non-CJK tokens pass through. All generated bigrams retain the source token’s position and full offsets.
+
+`CassNormalizeAndLimit` drops tokens whose UTF-8 length exceeds 256 bytes, then ASCII-lowercases retained tokens. The restriction is safe because `CassTokenizer` emits ASCII/hyphen tokens or CJK runs.
+
+The `prefix_normalize` pipeline omits `HyphenDecompose` because its input is generated whitespace-separated edge prefixes:
+
+```text
+CassTokenizer -> CjkBigramDecompose -> CassNormalizeAndLimit
+```
+
+Edge-prefix generation emits every prefix of length 2 through 20 Unicode scalar values for each alphanumeric word, in word and prefix-length order, separated by one ASCII space. Preview generation returns the first `max_chars` Unicode scalar values and appends `…` iff input remains.
+
+### 3.4 Oversized terms
+
+Tantivy 0.26.1 defines `MAX_TOKEN_LEN = u16::MAX - 5 = 65_530` bytes. Its postings writer admits an indexed token of exactly 65,530 bytes and drops a 65,531-byte token with a warning. Tantivy’s `QueryParser` does not repeat that check. Quill deliberately applies the 65,530-byte admission rule on both document and query analysis so a term cannot be accepted on only one side; this symmetric query-side check is an explicit Quill hardening amendment, not a claim about Tantivy internals. Ordinary frankensearch string queries are already capped at 10,000 characters, so the query-side boundary is reachable only through lower-level query construction. This limit is distinct from CASS’s analyzer-local 256-byte limit.
+
+The hardening must preserve oracle result semantics, not merely erase the token: a standalone oversized term, required oversized clause, or phrase containing one lowers to `Empty`/match-none; an unmatchable optional `Should` or excluding `MustNot` may be removed only while valid sibling semantics remain intact. Dropped document tokens preserve subsequent position gaps. The AST/diagnostic classification and executable G1 shape proof are tracked by `bd-quill-e0-contracts-j53p.8`; until it lands, the rule is a G0 target and not an accepted divergence.
+
+## 4. Query grammar contract
+
+### 4.1 Canonical fixture AST
+
+Fixtures use an engine-neutral JSON AST. Nodes are `Empty`, `All`, `Term`, `Phrase`, `PhrasePrefix`, typed `Range`, `Set`, `Glob`, `Boost`, or `Boolean`; `RangeI64` is the concrete CASS timestamp-range tag. Boolean children carry `Must`, `Should`, or `MustNot`. Default-parser and CASS `Term`/`Phrase` nodes list their ordered field/boost expansion explicitly; direct-Boolean semantic fixtures use synthetic unfielded terms. `Boolean.children` preserves construction order, while §5.4 separately defines runtime scorer order. Implementations may use different internal types but must canonicalize to the fixture tree. Classification matrices are represented as separate `Glob` cases, never as several inputs packed into one pseudo-tree.
+
+### 4.2 Default lenient parser
+
+The default parser searches unfielded literals across `[content, title]` and multiplies title literal/BM25 contributions by `2.0`. Its conjunction default is false, so adjacent plain fragments are a disjunction. It otherwise inherits the pinned Tantivy 0.26.1 query grammar: explicit `AND` binds tighter than `OR`; parentheses group; `+`/`-` set `Must`/`MustNot`; fields use `field:value`; `^` boosts a leaf or group; quoted literals support slop and phrase-prefix forms; typed fields support ranges and sets; and `*` denotes all documents. Regex and fuzzy parsing are not enabled by the shipping adapter.
+
+```text
+query        := expression
+expression   := fragment ((AND | OR | whitespace) fragment)*
+fragment     := ['+' | '-' | 'NOT'] (literal | group | field_fragment) ['^' boost]
+default join := OR; explicit AND has precedence over OR
+```
+
+Every unfielded literal fragment is analyzed independently for each default field; a field-qualified literal is analyzed only for that field. Zero emitted tokens remove that field branch, one token makes a `Term`, and two or more tokens make a slop-zero `Phrase` even when the fragment was not quoted. Quoting therefore controls grammar grouping, not the token-count-to-query-node rule; a quoted one-token fragment is still a `Term`. Typed ranges, sets, and `All` bypass literal analysis and do not inherit the title literal boost. Equal clauses are recursively deduplicated before the logical AST is converted to query objects.
+
+Lenient mode recovers as much input as possible. Semantic failures such as an unknown field are diagnosed and their invalid branch is dropped while valid siblings remain. Syntax recovery may retain a repaired branch—for example, an unterminated quote can still yield a term—with a diagnostic. An all-negative AST is diagnosed and receives an `All` clause so it has complement semantics. The current adapter records diagnostics through tracing. Empty or whitespace-only input returns no results.
+
+Queries are capped at 10,000 Unicode scalar values. Truncation selects the first 10,000 characters and therefore always ends at a UTF-8 boundary. This is a character contract, not a byte contract, and applies consistently to the Tantivy and FTS5 lexical adapters.
+
+### 4.3 CASS Boolean grammar
+
+CASS uses implicit `AND`; explicit `AND`/`&&`; explicit `OR`/`||`; and `NOT` or a leading `-`. Its intentionally non-standard precedence makes OR bind tighter than AND:
+
+```text
+query      := and_expr
+and_expr   := or_expr ((AND | && | implicit_whitespace) or_expr)*
+or_expr    := unary ((OR | ||) unary)*
+unary      := (NOT | '-')* primary
+primary    := term | quoted_phrase
+```
+
+For example, `auth OR token AND cache` means `(auth OR token) AND cache`. One or more adjacent negators lower to one `MustNot`; `NOT NOT a` is not logical double negation. In a conjunction, a negative is a raw top-level `MustNot`, so `auth AND NOT deprecated` is `Must(auth) + MustNot(deprecated)` and does not gain an `All` score. A negation used as a positive-valued OR operand is wrapped as `Must(All) + MustNot(primary)`. A standalone negative has the same complement target shape; the shipping CASS builder currently omits that standalone wrapper and therefore matches nothing (`bd-2b2u`). Sanitization preserves alphanumerics, `*`, `"`, and `-`, replacing other characters with spaces.
+
+### 4.4 Boolean `Occur` semantics
+
+- A Boolean node containing only `Should` children requires at least one match.
+- If a positive `Must` child is present, ordinary `Should` children are optional: they affect score but do not gate matching.
+- `Should` plus `MustNot`, with no positive `Must`, still requires at least one `Should` match. A raw `MustNot`-only Boolean node matches nothing; parser lowering adds `Must(All)` when complement semantics are intended.
+- `MustNot` filters matches and contributes no score.
+- Within an `Occur` group, clause construction order is stable. Across groups, score evaluation follows Tantivy’s scorer tree rather than raw parse order: the required aggregate is evaluated before the optional `Should` aggregate. Quill must match the oracle’s f32 evaluation order for each Boolean shape.
+
+These rules are pinned independently of the parser because query planners also construct Boolean trees directly.
+
+### 4.5 Phrase, range, glob, and CJK rules
+
+- Ordinary default and CASS phrases require exact adjacent positions (slop zero) in `content` or `title`. An explicit default-parser `~n` suffix uses slop `n`, and a trailing phrase `*` creates a phrase-prefix query. A CJK phrase in the CASS path falls back to the compound bigram query used by shipping.
+- `created_at` filters use inclusive i64 lower and upper bounds; either side may be unbounded. Shipping inserts the FAST-field range as a `Must` query, whose matched `ConstScorer` contributes `1.0`; “filter” describes its selection role, not a scoreless implementation.
+- `CassWildcardPattern` classifies terms as `Exact`, `Prefix`, `Suffix`, `Substring`, or `Complex`. Exact and prefix terms issue exact `TermQuery` clauses over `title`, `content`, `title_prefix`, and `content_prefix`; the prefix fields contain only prefixes of 2 through 20 Unicode scalar values. Consequently `a*` does not generally prefix-match longer words, a prefix longer than 20 is not accelerated, and an `Exact` term of length 2 through 20 can match a longer indexed word through a prefix field. Suffix, substring, and complex `*` patterns issue `RegexQuery` clauses over `content` and `title`. Regex expansion is unbounded in the shipping path and each matching field uses Tantivy's constant scorer; introducing a bound requires a `GlobExpansionLimit` divergence. The sanitizer does not preserve `?`, so `?` is not a shipping wildcard operator.
+- A term containing any CJK character drops its non-CJK characters for query bigram generation. The remaining CJK characters expand into overlapping bigrams; every bigram is `Must` and may match any searchable field (`title`, `content`, `title_prefix`, `content_prefix`). A single CJK character remains a unigram, but it cannot match inside a multi-character indexed run because that run is represented only by bigrams.
+- Empty CASS input produces `All`, after which any supplied filters still apply.
+
+## 5. Scoring and statistics contract
+
+### 5.1 Formula and constants
+
+For term frequency `f`, term document frequency `n`, corpus document count `N`, decoded document length `|d|`, and raw average field length `avgdl`:
+
+```text
+k1 = 1.2
+b  = 0.75
+idf = ln(1 + (N - n + 0.5) / (n + 0.5))
+norm = k1 * (1 - b + b * |d| / avgdl)
+weight = idf * (1 + k1)
+tf_factor = f / (f + norm)
+term_score = weight * tf_factor
+```
+
+All contract arithmetic is f32 in the displayed Tantivy operation order. In particular, do not algebraically reassociate the score to `idf * (f * (1 + k1) / (f + norm))`; that produces different low bits. Do not replace `(1.0 + x).ln()` with `ln_1p` or use FMA in contract mode.
+
+For a phrase, Tantivy sums the per-term IDFs left-to-right in phrase-term order, multiplies that sum by `1 + k1`, and uses the number of phrase occurrences in the document as `f` in the same tf factor. Phrase score is not the sum of independently scored term queries.
+
+### 5.2 Field length and `avgdl`
+
+Each document stores one fieldnorm byte. `|d|` is `id_to_fieldnorm(byte)` using the complete table and functions vendored in `crates/frankensearch-lexical/src/quill_contract.rs`.
+
+`avgdl` is **not** the mean of decoded fieldnorms. It is:
+
+```text
+total_num_tokens(field) as f32 / total_num_docs as f32
+```
+
+The 256-entry tf cache is built by combining every decoded per-document fieldnorm with that raw `avgdl`.
+
+### 5.3 Deletes and scoring statistics
+
+Tantivy’s scorer sums sealed segment statistics. Until merge/compaction:
+
+- `N` is the sum of segment `max_doc`, including tombstoned documents.
+- `total_num_tokens` includes tokens from tombstoned documents.
+- term document frequency includes tombstoned documents.
+- tombstones are excluded from matching and result collection.
+
+After compaction, statistics are re-derived from retained live documents. The public live `doc_count` is separate from BM25’s pre-compaction `N` and must not be substituted into the formula.
+
+### 5.4 Multi-field accumulation and ties
+
+For default-parser literal/BM25 contributions, per-field scores use `content = 1.0` and `title = 2.0`; typed ranges, sets, and `All` are not field-boosted by that setting. The shipping CASS builder applies no field boost: `title`, `content`, `title_prefix`, and `content_prefix` are all `1.0` unless a future query node explicitly says otherwise. Scores are summed using the oracle scorer-tree order in f32. For an intersection, Tantivy stable-sorts required scorers by ascending runtime `Scorer::cost()`, then evaluates `left + right + sum(others)` in that order; equal-cost scorers retain construction order. Optional and exclusion aggregates are composed around that required scorer. Contract mode performs scalar score accumulation even if SIMD is used for decode and gather.
+
+The Tantivy oracle's result order is the total order:
+
+1. score descending via `f32::total_cmp`;
+2. `DocAddress` ascending, lexicographically by `(segment_ord, segment-local doc_id)`.
+
+Quill's native tie key is its global u32 docid. The differential comparator preserves each engine's native order for the primary comparison and records the oracle `DocAddress` for every hit; it must never collapse that address to the segment-local docid. A difference confined to an exactly equal-score group is classified as `TieOrder`, including a top-k boundary difference only when an expanded oracle tie group proves that every substituted document has the identical score. Any other order or cutoff difference fails `RankExact`.
+
+## 6. Behavioral, collector, and runtime contract
+
+- Upsert is delete-by-external-ID followed by add, with the new document becoming the sole visible version after publication.
+- Delete removes matches immediately from the published snapshot; scoring statistics follow §5.3 until compaction.
+- `delete_all` leaves a valid empty index.
+- `doc_count` reports live documents.
+- `limit = 0` returns no hits without invoking Tantivy’s nonzero-limit collector; a counted request still reports the exact total. Offset pagination returns page-local ranks starting at zero plus the exact total count when requested.
+- Count-free top-k may skip exact-count work only when the caller did not request a count; rankings must match the counted path.
+- Id-set collection is unscored and order-insensitive.
+- Snippet defaults pass `200` to Tantivy and use `<b>…</b>` tags. Observable window enforcement compares tokenizer byte offsets, then cuts only at token boundaries; it is not a Unicode-scalar budget. Non-ASCII HTML is fixture-compared exactly. Any accepted tie-window difference requires a Divergence Register entry.
+- Missing index maps to `IndexNotFound`; cancellation maps to `Cancelled`; corrupt/invalid input never panics and uses the shared error taxonomy with subsystem `quill`.
+- The read path is synchronous under an immediately-ready `SearchFuture`, because fusion polls lexical work inside a Rayon join. It remains `Send + Sync` and does not create a runtime.
+- Durable open validates checksums and path ownership. Repair/quarantine policy does not silently return partial results.
+
+## 7. Conformance classes
+
+### 7.1 RankExact
+
+For equal-statistics configurations:
+
+- identical result IDs and native top-k order, including Tantivy's full `DocAddress` tie-break;
+- identical count, pagination, and behavioral outputs;
+- bit-identical contract-mode BM25 factor/score outputs when Quill and Tantivy are compared in the same process/platform.
+
+RankExact is the default gate for single-segment and otherwise equal-statistics fixtures. Persisted cross-platform artifacts do not use a universal bit pin for values containing `f32::ln`; they compare engines on the executing platform and then apply `ScoreEpsilon` when platform libm is the only classified cause.
+
+### 7.2 ScoreEpsilon
+
+For layouts where the oracle’s own segment geometry changes floating-point scores:
+
+- result sets are identical;
+- relative score delta is at most `1e-4`, using `abs(a-b) / max(abs(a), abs(b), 1e-12)`;
+- rank flips occur only within the same deterministic epsilon component. Components are the maximal connected runs in oracle total-order: adjacent oracle scores share an edge when their relative delta is at most `1e-4`, and connected components are assigned before examining Quill order;
+- the artifact records why RankExact was not applicable.
+
+Every comparison is classified as exactly one of `RankExact`, `ScoreEpsilon`, or a reviewed Divergence Register entry. “Close enough” without a classification fails the gate.
+
+## 8. Fixture maintenance
+
+`tests/fixtures/quill_language_contract.json` contains:
+
+- exact analyzer token streams and helper outputs;
+- canonical parse trees for identifier, short-keyword, natural-language, phrase, Boolean, glob, and range classes;
+- scoring/statistics cases;
+- behavioral cases for every §3.1 row;
+- a query-class corpus that labels genuinely harvested rows separately from constructed Boolean, glob, range, and boundary probes.
+
+Fixture IDs are stable and additive. Editing expected behavior requires a contract-version bump and a rationale. The lexical crate test loads the JSON, rejects duplicate or dangling IDs, verifies required query/analyzer classes, introspects the shipping schema, executes analyzer/helper/BM25-order goldens, and proves every §3.1 surface row has coverage. Canonical parse trees, lifecycle rows, deleted-stat transitions, and end-to-end ranking cases remain inputs to the downstream Quill differential runner rather than claims of execution by this loader.
