@@ -29,7 +29,6 @@ pub const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
 pub const HNSW_DEFAULT_EF_SEARCH: usize = 100;
 /// Default HNSW max layer depth.
 pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
-const DIST_DOT_SHRINK: f32 = 0.999_999;
 
 /// ANN construction/runtime parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,11 +54,23 @@ impl Default for HnswConfig {
     }
 }
 
-/// Current on-disk metadata format. v2 adds the native graph sidecars
-/// (`*.hnsw.graph` + `*.hnsw.data`) alongside the JSON metadata; v1 (legacy,
-/// represented by a missing `format_version`) stored metadata only and always
-/// rebuilt the graph on load.
-const HNSW_META_FORMAT_V2: u32 = 2;
+/// Current on-disk metadata format. v2 added the native graph sidecars
+/// (`*.hnsw.graph` + `*.hnsw.data`) alongside the JSON metadata; v3 records
+/// graphs built with the dimension-aware `DistDot` roundoff budget. Older native
+/// graphs contain vectors normalized with a different scale and must be rebuilt
+/// so returned cosine scores can be corrected exactly.
+const HNSW_META_FORMAT_CURRENT: u32 = 3;
+
+// Keep the classical gamma_k floating-point error model in its well-conditioned
+// region. With u = f32::EPSILON / 2 and k = 8n + 32, this cap is exactly the
+// largest dimension for which k*u <= 1/4.
+const DIST_DOT_MAX_DIMENSION: usize = 524_284;
+
+#[derive(Debug, Clone, Copy)]
+struct DistDotBudget {
+    radius_squared: f32,
+    score_tolerance: f32,
+}
 
 /// On-disk metadata for the HNSW index.
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,12 +83,12 @@ struct HnswMeta {
     dimension: usize,
     /// Deterministic fingerprint of the vectors the persisted graph was built
     /// from (FNV-1a 64 over sampled f32 vector bytes; see
-    /// [`fingerprint_vectors_from_index`]). Lets v2 load detect "doc IDs match
+    /// [`fingerprint_vectors_from_index`]). Lets native-graph load detect "doc IDs match
     /// but the underlying vectors were silently swapped" and fall back to a
     /// rebuild rather than serve stale ANN hits.
     ///
     /// Absent in legacy v1 metadata (deserializes to 0). A stored value of 0
-    /// also disables fingerprint enforcement, so v2 sidecars produced before
+    /// also disables fingerprint enforcement, so native sidecars produced before
     /// this field existed (none yet shipped) keep loading.
     #[serde(default)]
     vector_fingerprint: u64,
@@ -180,21 +191,26 @@ impl HnswIndex {
             ));
         }
 
-        // v2: deserialize the prebuilt native graph directly, skipping the
+        // Validate before the native fast path. Otherwise a forged v3 sidecar
+        // could bypass the dimension bound enforced by graph construction.
+        dist_dot_budget(meta.dimension)?;
+
+        // Current format: deserialize the prebuilt native graph directly, skipping the
         // O(n log n) rebuild. Any problem (missing/corrupt sidecars, point-count
         // mismatch, or stale vector fingerprint) returns None and we fall
         // through to the rebuild path, so a bad graph sidecar degrades to
         // "slow load" rather than a hard failure.
-        if meta.format_version >= HNSW_META_FORMAT_V2
+        if meta.format_version == HNSW_META_FORMAT_CURRENT
             && let Some(index) = Self::try_load_native_graph(path, &meta, source_index)
         {
             return Ok(index);
-        } else if meta.format_version < HNSW_META_FORMAT_V2 {
+        } else if meta.format_version != HNSW_META_FORMAT_CURRENT {
             tracing::warn!(
                 path = %path.display(),
                 format_version = meta.format_version,
-                "loading legacy v1 HNSW sidecar; re-save to upgrade to v2 \
-                 (skips rebuild on next cold load)"
+                current_format_version = HNSW_META_FORMAT_CURRENT,
+                "rebuilding HNSW sidecar written with a different vector-normalization contract; \
+                 re-save to skip rebuild on the next cold load"
             );
         }
 
@@ -211,7 +227,7 @@ impl HnswIndex {
         Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
     }
 
-    /// Attempt to load the prebuilt native `hnsw_rs` graph for a v2 sidecar.
+    /// Attempt to load the prebuilt native `hnsw_rs` graph for a current-format sidecar.
     ///
     /// Returns `None` (so the caller rebuilds) if any of the following hold —
     /// a degraded sidecar always degrades to "slow load", never a hard error:
@@ -244,7 +260,7 @@ impl HnswIndex {
         if !meta_matches_live_doc_ids(meta, source_index).ok()? {
             tracing::warn!(
                 path = %path.display(),
-                "v2 HNSW sidecar doc_ids disagree with live VectorIndex; rebuilding"
+                "HNSW sidecar doc_ids disagree with live VectorIndex; rebuilding"
             );
             return None;
         }
@@ -254,7 +270,7 @@ impl HnswIndex {
         // contents while keeping the same doc IDs in the same order, the
         // persisted graph would otherwise silently serve hits against vectors
         // that no longer exist. A fingerprint of 0 means the sidecar was
-        // written before fingerprint enforcement existed — accept it (no v2
+        // written before fingerprint enforcement existed — accept it (no native
         // sidecars without a fingerprint have ever shipped to users today, but
         // future-proof the field default just like format_version).
         if meta.vector_fingerprint != 0 {
@@ -266,7 +282,7 @@ impl HnswIndex {
                     path = %path.display(),
                     expected = meta.vector_fingerprint,
                     actual = live_fp,
-                    "v2 HNSW sidecar vector fingerprint disagrees with live VectorIndex \
+                    "HNSW sidecar vector fingerprint disagrees with live VectorIndex \
                      (vectors swapped behind matching doc ids); rebuilding"
                 );
                 return None;
@@ -322,7 +338,7 @@ impl HnswIndex {
         std::fs::create_dir_all(parent)?;
 
         // Persist the native graph + data sidecars first; only stamp the
-        // metadata as v2 once the graph is durably written, so a partial dump
+        // metadata as current once the graph is durably written, so a partial dump
         // can never advertise a graph that isn't there.
         let basename = hnsw_sidecar_basename(path)?;
         self.hnsw.file_dump(parent, &basename).map_err(|error| {
@@ -332,7 +348,7 @@ impl HnswIndex {
         })?;
 
         let meta = HnswMeta {
-            format_version: HNSW_META_FORMAT_V2,
+            format_version: HNSW_META_FORMAT_CURRENT,
             doc_ids: self.doc_ids.clone(),
             config: self.config,
             dimension: self.dimension,
@@ -363,6 +379,14 @@ impl HnswIndex {
             });
         }
 
+        if query.iter().any(|value| !value.is_finite()) {
+            return Err(SearchError::InvalidConfig {
+                field: "query".to_owned(),
+                value: "non-finite".to_owned(),
+                reason: "all query vector values must be finite".to_owned(),
+            });
+        }
+
         if k == 0 || self.doc_ids.is_empty() {
             let stats = AnnSearchStats {
                 index_size: self.len(),
@@ -379,7 +403,8 @@ impl HnswIndex {
 
         let effective_k = k.min(self.doc_ids.len());
         let effective_ef = ef_search.max(effective_k).max(1);
-        let normalized_query = normalize_for_dist_dot(query.to_vec());
+        let budget = dist_dot_budget(self.dimension)?;
+        let normalized_query = normalize_for_dist_dot(query.to_vec(), budget);
 
         let start = Instant::now();
         let neighbors = self
@@ -403,9 +428,31 @@ impl HnswIndex {
                 value: neighbor.d_id.to_string(),
                 reason: "neighbor id exceeds u32 range for VectorHit".to_owned(),
             })?;
+            let restored_score = (1.0 - neighbor.distance) / budget.radius_squared;
+            let score_envelope = -1.0 - budget.score_tolerance..=1.0 + budget.score_tolerance;
+            if !restored_score.is_finite() || !score_envelope.contains(&restored_score) {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "hnsw",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "DistDot returned distance {} (restored score {restored_score}); \
+                             expected a score within [{}, {}]",
+                            neighbor.distance,
+                            score_envelope.start(),
+                            score_envelope.end()
+                        ),
+                    )),
+                });
+            }
             hits.push(VectorHit {
                 index,
-                score: 1.0 - neighbor.distance,
+                // Graph and query vectors use the same deterministic radius.
+                // Undo that uniform scale so callers continue receiving cosine
+                // similarity rather than a dimension-dependent proxy score.
+                // Clamp only after proving the deviation is inside the derived
+                // floating-point envelope; materially invalid distances fail.
+                score: restored_score.clamp(-1.0, 1.0),
                 doc_id: doc_id.as_str().into(),
             });
         }
@@ -566,6 +613,7 @@ impl HnswIndex {
                 reason: "dimension must be greater than zero".to_owned(),
             });
         }
+        let budget = dist_dot_budget(dimension)?;
         if doc_ids.len() != vectors.len() {
             return Err(SearchError::InvalidConfig {
                 field: "vectors".to_owned(),
@@ -576,7 +624,7 @@ impl HnswIndex {
         // Fingerprint the raw (un-normalized) input vectors. This is what
         // VectorIndex::vector_at_f32 returns at load time, so a fresh load from
         // the live VectorIndex will produce the same digest iff the underlying
-        // bytes are unchanged. Used by the v2 native-graph load path to detect
+        // bytes are unchanged. Used by the native-graph load path to detect
         // "doc IDs match but vectors were silently swapped" and trigger a
         // rebuild (see try_load_native_graph).
         let vector_fingerprint = fingerprint_vectors(&doc_ids, &vectors);
@@ -596,7 +644,7 @@ impl HnswIndex {
                     reason: "all vector values must be finite".to_owned(),
                 });
             }
-            normalized_vectors.push(normalize_for_dist_dot(vector));
+            normalized_vectors.push(normalize_for_dist_dot(vector, budget));
         }
 
         let hnsw = Hnsw::new(
@@ -682,7 +730,7 @@ fn fnv1a_update_f32(mut h: u64, vec: &[f32]) -> u64 {
 /// Stride-samples vectors so the cost stays bounded for large indexes (~256
 /// samples regardless of corpus size). Doc IDs are mixed in for every record,
 /// so doc-id permutations are caught even on un-sampled rows. The output is
-/// stored in the v2 metadata sidecar and re-derived at load time by
+/// stored in the native metadata sidecar and re-derived at load time by
 /// [`fingerprint_live_vector_index`] against the live `VectorIndex`; a
 /// mismatch means "doc IDs match but the underlying vector bytes were
 /// silently swapped" → reject the persisted graph.
@@ -831,12 +879,65 @@ fn ann_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
     }
 }
 
-fn normalize_for_dist_dot(mut vector: Vec<f32>) -> Vec<f32> {
-    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        let inv_norm = DIST_DOT_SHRINK / norm;
+/// Derive the normalization and score-restoration budget for `DistDot`.
+///
+/// A length-`n` f32 dot product has a forward-error bound conventionally
+/// expressed as `gamma_k = k*u/(1-k*u)`, where `u = eps/2`. We budget `8n+32`
+/// rounded operations: component rescaling, multiplication, lane-local
+/// accumulation, horizontal reduction, score restoration, and a 2x
+/// architecture margin. Scaling exact unit vectors to
+/// `1/sqrt(1+gamma_k)` makes the worst bounded computed self-dot no greater
+/// than one. Dimensions for which `k*u > 1/4` are rejected rather than hiding
+/// an ill-conditioned error bound behind an arbitrary shrink factor.
+#[allow(clippy::cast_possible_truncation)]
+fn dist_dot_budget(dimension: usize) -> SearchResult<DistDotBudget> {
+    if dimension == 0 || dimension > DIST_DOT_MAX_DIMENSION {
+        return Err(SearchError::InvalidConfig {
+            field: "dimension".to_owned(),
+            value: dimension.to_string(),
+            reason: format!(
+                "DistDot requires a dimension in 1..={DIST_DOT_MAX_DIMENSION} \
+                 so its f32 roundoff bound remains finite and conservative"
+            ),
+        });
+    }
+
+    let dimension = u32::try_from(dimension).map_err(|_| SearchError::InvalidConfig {
+        field: "dimension".to_owned(),
+        value: dimension.to_string(),
+        reason: "dimension exceeds the DistDot f32 error model".to_owned(),
+    })?;
+    let rounded_operations = f64::from(dimension).mul_add(8.0, 32.0);
+    let unit_roundoff = f64::from(f32::EPSILON) / 2.0;
+    let accumulated_roundoff = rounded_operations * unit_roundoff;
+    debug_assert!(accumulated_roundoff <= 0.25);
+    let gamma = accumulated_roundoff / (1.0 - accumulated_roundoff);
+    let radius_squared = 1.0 / (1.0 + gamma);
+    // Include a small fixed allowance for the final f32 subtraction and
+    // division when converting DistDot's distance back to cosine score.
+    let score_tolerance = gamma + 8.0 * f64::from(f32::EPSILON);
+    Ok(DistDotBudget {
+        radius_squared: radius_squared as f32,
+        score_tolerance: score_tolerance as f32,
+    })
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn normalize_for_dist_dot(mut vector: Vec<f32>, budget: DistDotBudget) -> Vec<f32> {
+    // f64 accumulation prevents the normalization pass itself from consuming
+    // the f32 error budget intended for hnsw_rs/anndists' distance reduction.
+    let norm_squared = vector
+        .iter()
+        .map(|&value| {
+            let value = f64::from(value);
+            value * value
+        })
+        .sum::<f64>();
+    if norm_squared > 0.0 && norm_squared.is_finite() {
+        let radius = f64::from(budget.radius_squared).sqrt();
+        let scale = radius / norm_squared.sqrt();
         for value in &mut vector {
-            *value *= inv_norm;
+            *value = (f64::from(*value) * scale) as f32;
         }
     }
     vector
@@ -1443,10 +1544,143 @@ mod tests {
     #[test]
     fn normalize_zero_vector_unchanged() {
         let zero = vec![0.0_f32; 8];
-        let result = normalize_for_dist_dot(zero.clone());
+        let budget = dist_dot_budget(zero.len()).expect("budget");
+        let result = normalize_for_dist_dot(zero.clone(), budget);
         assert_eq!(
             result, zero,
             "zero vector should remain zero after normalize"
+        );
+    }
+
+    #[test]
+    fn dist_dot_roundoff_budget_is_dimension_aware_and_ranking_neutral() {
+        let radius_16 = dist_dot_budget(16).expect("budget").radius_squared;
+        let radius_384 = dist_dot_budget(384).expect("budget").radius_squared;
+        let radius_4096 = dist_dot_budget(4096).expect("budget").radius_squared;
+
+        assert!((0.5..1.0).contains(&radius_16));
+        assert!(radius_384 < radius_16);
+        assert!(radius_4096 < radius_384);
+        assert!(
+            radius_384 > 0.999,
+            "384-dim safety margin must stay small enough to preserve cosine resolution"
+        );
+
+        let error = dist_dot_budget(DIST_DOT_MAX_DIMENSION + 1)
+            .expect_err("ill-conditioned f32 bound must fail closed");
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "dimension")
+        );
+    }
+
+    #[test]
+    fn dist_dot_normalization_stays_below_one_across_reduction_orders() {
+        fn reassociated_dot(left: &[f32], right: &[f32], lanes: usize) -> f32 {
+            let mut partials = vec![0.0_f32; lanes];
+            for (index, (&left, &right)) in left.iter().zip(right).enumerate() {
+                partials[index % lanes] += left * right;
+            }
+            partials.into_iter().fold(0.0_f32, |sum, value| sum + value)
+        }
+
+        for dimension in [16_usize, 384, 4_096] {
+            let budget = dist_dot_budget(dimension).expect("budget");
+            let vectors: Vec<Vec<f32>> = (0..16)
+                .map(|seed| normalize_for_dist_dot(normalized_vector(seed, dimension), budget))
+                .collect();
+            for left in &vectors {
+                for right in &vectors {
+                    for lanes in [1_usize, 2, 4, 8, 16] {
+                        let dot = reassociated_dot(left, right, lanes);
+                        assert!(
+                            dot <= 1.0,
+                            "DistDot precondition violated: dim={dimension} lanes={lanes} dot={dot}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn safe_radius_scaling_preserves_valid_cosine_ranking() {
+        fn dot(left: &[f32], right: &[f32]) -> f32 {
+            left.iter().zip(right).map(|(a, b)| a * b).sum()
+        }
+
+        let query = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let candidates = [
+            vec![1.0_f32, 0.0, 0.0, 0.0],
+            vec![0.8_f32, 0.6, 0.0, 0.0],
+            vec![0.6_f32, 0.8, 0.0, 0.0],
+            vec![-0.2_f32, 0.0, 0.0, 0.98],
+        ];
+        let budget = dist_dot_budget(query.len()).expect("budget");
+        let scaled_query = normalize_for_dist_dot(query.clone(), budget);
+
+        let mut original: Vec<(usize, f32)> = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let candidate_norm = dot(candidate, candidate).sqrt();
+                (index, dot(&query, candidate) / candidate_norm)
+            })
+            .collect();
+        let mut restored: Vec<(usize, f32)> = candidates
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let scaled = normalize_for_dist_dot(candidate, budget);
+                (index, dot(&scaled_query, &scaled) / budget.radius_squared)
+            })
+            .collect();
+        original.sort_by(|left, right| right.1.total_cmp(&left.1));
+        restored.sort_by(|left, right| right.1.total_cmp(&left.1));
+
+        assert_eq!(
+            original.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            restored.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+            "uniform safety scaling must not change valid cosine ranking"
+        );
+        for ((_, expected), (_, actual)) in original.iter().zip(&restored) {
+            assert!((expected - actual).abs() <= budget.score_tolerance);
+        }
+    }
+
+    #[test]
+    fn hnsw_restores_cosine_score_after_safe_radius_scaling() {
+        let path = temp_path("safe-radius-score", "fsvi");
+        let vector = normalized_vector(41, 384);
+        let index = write_index(&path, std::slice::from_ref(&vector)).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+
+        let hits = ann
+            .knn_search(&vector, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            (hits[0].score - 1.0).abs() <= 1.0e-5,
+            "uniform DistDot safety scaling must not leak into public cosine scores: {}",
+            hits[0].score
+        );
+    }
+
+    #[test]
+    fn hnsw_rejects_non_finite_query_before_distance_evaluation() {
+        let path = temp_path("non-finite-query", "fsvi");
+        let vector = normalized_vector(42, 32);
+        let index = write_index(&path, std::slice::from_ref(&vector)).expect("index");
+        let ann = HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("ann");
+        let mut query = vector;
+        query[7] = f32::NAN;
+
+        let error = ann
+            .knn_search(&query, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect_err("non-finite queries must return an error rather than panic in DistDot");
+        assert!(
+            matches!(error, SearchError::InvalidConfig { ref field, ref reason, .. }
+                if field == "query" && reason.contains("finite")),
+            "expected query InvalidConfig, got {error:?}"
         );
     }
 
@@ -1559,7 +1793,7 @@ mod tests {
         let save_path = temp_path("persist_native", "hnsw");
         ann.save(&save_path).expect("save");
 
-        // v2 save writes the native graph + data sidecars next to the metadata.
+        // Current-format save writes the native graph + data sidecars next to the metadata.
         let parent = save_path.parent().expect("parent");
         let basename = save_path.file_stem().unwrap().to_str().unwrap();
         assert!(
@@ -1573,7 +1807,7 @@ mod tests {
 
         let meta: HnswMeta =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse meta");
-        assert_eq!(meta.format_version, HNSW_META_FORMAT_V2);
+        assert_eq!(meta.format_version, HNSW_META_FORMAT_CURRENT);
 
         // Load goes through the native graph path and still answers correctly.
         let loaded = HnswIndex::load(&save_path, &index).expect("native load");
@@ -1617,15 +1851,52 @@ mod tests {
         assert_eq!(hits[0].doc_id, "doc-0010");
     }
 
-    /// Stale-vectors validation: the v2 native-graph load path must reject a
+    #[test]
+    fn load_never_treats_v2_native_graph_as_v3() {
+        // The source index says doc-0000 is e0 and doc-0001 is e1.
+        let source_path = temp_path("persist_v2_source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+
+        // Build a valid native graph with the same document IDs but the two
+        // vectors swapped, then mark its metadata as v2 and disable the vector
+        // fingerprint. If load accepts v2 as current, an e0 query returns
+        // doc-0001. Correct v3-only loading rebuilds from source and returns
+        // doc-0000.
+        let swapped_path = temp_path("persist_v2_swapped", "fsvi");
+        let swapped_index = write_index(&swapped_path, &[vec![0.0_f32, 1.0], vec![1.0_f32, 0.0]])
+            .expect("swapped index");
+        let swapped_ann = HnswIndex::build_from_vector_index(&swapped_index, HnswConfig::default())
+            .expect("swapped ann");
+        let save_path = temp_path("persist_v2_native", "hnsw");
+        swapped_ann.save(&save_path).expect("save native graph");
+
+        let mut meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
+        meta.format_version = 2;
+        meta.vector_fingerprint = 0;
+        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v2"))
+            .expect("write v2 metadata");
+
+        let loaded = HnswIndex::load(&save_path, &source_index).expect("rebuild v2");
+        let hits = loaded
+            .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search rebuilt graph");
+        assert_eq!(
+            hits[0].doc_id, "doc-0000",
+            "v2 native graph must be rebuilt, never deserialized under v3's scaling contract"
+        );
+    }
+
+    /// Stale-vectors validation: the native-graph load path must reject a
     /// sidecar whose persisted vector fingerprint disagrees with the live
     /// `VectorIndex` (i.e. someone swapped the FSVI contents behind matching
     /// doc IDs), and transparently fall back to rebuild rather than silently
     /// serving hits against vectors that no longer exist. This is the exact
     /// scenario the prompt for `frankensearch#25` calls out.
     #[test]
-    fn load_rejects_v2_sidecar_when_vectors_swapped_under_same_doc_ids() {
-        // Build + save a v2 sidecar over an FSVI where doc-i ≈ basis_i.
+    fn load_rejects_native_sidecar_when_vectors_swapped_under_same_doc_ids() {
+        // Build + save a native sidecar over an FSVI where doc-i ≈ basis_i.
         let fsvi_path = temp_path("persist_swap", "fsvi");
         let original_vectors: Vec<Vec<f32>> = (0..16).map(|i| normalized_vector(i, 32)).collect();
         let original_index = write_index(&fsvi_path, &original_vectors).expect("index");
@@ -1633,7 +1904,7 @@ mod tests {
             .expect("build");
 
         let save_path = temp_path("persist_swap", "hnsw");
-        ann.save(&save_path).expect("save v2");
+        ann.save(&save_path).expect("save native graph");
 
         // Sanity: a load against the *original* FSVI takes the fast path and
         // returns doc-0007 for query≈doc-0007.
@@ -1649,19 +1920,19 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse meta");
         assert_ne!(
             meta.vector_fingerprint, 0,
-            "v2 save must stamp a fingerprint"
+            "native save must stamp a fingerprint"
         );
 
         // Now swap vectors behind the same doc IDs (doc-0007 now points at
         // basis_99) while leaving the .hnsw.graph / .hnsw.data sidecars
-        // unchanged. A naive v2 fast path would return doc-0007 against the
+        // unchanged. A naive native fast path would return doc-0007 against the
         // *old* graph; the fingerprint guard forces a rebuild instead.
         let mut swapped_vectors = original_vectors.clone();
         swapped_vectors[7] = normalized_vector(99, 32);
         let swapped_path = temp_path("persist_swap_after", "fsvi");
         let swapped_index = write_index(&swapped_path, &swapped_vectors).expect("swapped");
 
-        // Copy the v2 metadata + graph + data sidecars next to the swapped FSVI
+        // Copy the metadata + graph + data sidecars next to the swapped FSVI
         // so the load path's directory layout is plausible.
         let swap_save_path = temp_path("persist_swap_after", "hnsw");
         std::fs::copy(&save_path, &swap_save_path).expect("copy meta");
