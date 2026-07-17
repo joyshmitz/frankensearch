@@ -93,7 +93,7 @@ Composite key = `field_ord: u16 (BIG-endian)` ++ `term bytes`. Raw-byte ordering
 
 ```
 u32 block_count
-block index: block_count × { first_key_len: vint, first_key: bytes, block_offset: vint (from dict start) }
+block index: block_count × { first_key_len: vint, first_key: bytes, block_offset: vint (from blocks-area start) }
 blocks: prefix-compressed, target ~4 KiB:
   u16 entry_count
   entries (restart interval R = 16):
@@ -106,9 +106,44 @@ blocks: prefix-compressed, target ~4 KiB:
       positions_offset: vint    # present iff POSITIONS section exists AND field indexes positions; else omitted
       positions_len: vint       #   (presence decided per-field from schema descriptor — not per-entry flags)
       blockmax_offset: vint     # from BLOCKMAX start
+      blockmax_len: vint
 ```
 
-Lookup: binary-search block index (on `first_key`), scan one block (≤ R-entry linear between restarts). Ordered iteration and prefix/range scans are first-class (glob support).
+TERMDICT keys are arbitrary byte strings: the term portion is 0..=65,530 bytes
+(so the composite key is 2..=65,532 bytes), and an empty term is legal. `doc_freq`
+must fit `u32`; all other TERMDICT vints have the common-convention `u64`
+domain. There is no per-entry flags word in v1. Positions presence is derived
+from the schema field, so adjacent positional and non-positional fields may use
+different payload widths in the same block.
+
+POSTINGS, the positional subset of POSITIONS, and BLOCKMAX ranges are contiguous
+in composite-term order: the first range starts at zero, each next offset equals
+the prior end, and the final end equals the referenced section length. The
+explicit `blockmax_len` is load-bearing because `doc_freq` does not determine
+the number of posting blocks after Q1 concat-merges preserve interior partial
+blocks.
+
+The blocks area begins immediately after the final block-index entry. The first
+relative `block_offset` is zero and later offsets are strictly increasing. This
+relative base avoids a self-referential encoding in which absolute offset vint
+widths change the size of the index that precedes them.
+
+Canonical writers count the two-byte `entry_count` header toward a 4096-byte
+block target. They start a new block before the next entry would exceed that
+target, reset the restart ordinal in the new block, and encode every non-restart
+entry with the longest shared prefix. A single entry whose legal term bytes make
+the block exceed 4096 bytes is retained as one oversized singleton block.
+Readers reject oversized multi-entry or prematurely split blocks, non-maximal
+shared prefixes, empty blocks, duplicate/out-of-order keys, index/block
+first-key disagreement, gaps, and trailing bytes. On open, a reader builds a
+bounded in-memory restart directory from the validated full-key entries;
+restart offsets are not duplicated on disk.
+
+Lookup binary-searches the block index and the validated restart directory,
+then scans at most `R = 16` entries. Ordered iteration is field-major. Per-field
+range scans are half-open `[start, end)`. An empty prefix selects the whole
+field; other prefix scans stop on the first field or byte-prefix mismatch, so
+an all-`0xff` prefix does not require fabricating a successor key.
 
 ### 5.2 POSTINGS
 
@@ -349,5 +384,6 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.5 | 2026-07-17 | Tombstone roaring-lite `chunk_count` widened from `u16` to `u32`; a full u32 docid-domain set can contain all 65,536 non-empty chunks, which `u16` could not represent — folded into v1 pre-freeze | — (pre-freeze correction) | manifest hostile-input and tombstone canonicality tests (e3.2/e3.4) |
 | 1.0.6 | 2026-07-17 | MANIFEST adjacent-generation invariants pinned: retained segment metadata is immutable, tombstones are monotone, new `seal_seq` values advance the prior non-empty maximum, an explicit empty generation starts a new seal epoch, and tombstone-only generations preserve the at-seal stats rollup | — (pre-freeze contract hardening) | manifest transition publish/reopen tests (e3.2) |
 | 1.0.7 | 2026-07-17 | MANIFEST temp retry semantics pinned: a no-follow regular, byte-identical durable `.tmp-manifest-<gen>` is reusable after claim/rename failure; any symlink, non-regular, or mismatched temp fails closed without overwrite until writer-locked recovery/GC | — (pre-freeze protocol hardening) | manifest claim-failure retry, mismatch, and symlink tests (e3.2/e3.3) |
+| 1.0.8 | 2026-07-17 | TERMDICT v1 pre-freeze correction: block offsets are relative to the blocks-area start; terms are arbitrary 0..=65,530-byte strings; payload domains, contiguous spans, explicit `blockmax_len`, and schema-derived positions are pinned; no undefined flags word is encoded; canonical greedy 4096-byte splitting with oversized singletons, maximal-prefix compression, half-open ranges, and bounded in-memory restart metadata are required | — (pre-freeze correction) | termdict wire goldens, restart-bound lookup, field/prefix/range, corruption, span-bound, and budget tests (e2.1) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*
