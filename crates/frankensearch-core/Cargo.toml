@@ -40,6 +40,10 @@ name = "strip_italic_underscores_ab"
 harness = false
 
 [[bench]]
+name = "shared_prefix_depth_ab"
+harness = false
+
+[[bench]]
 name = "query_class"
 harness = false
 

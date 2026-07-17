@@ -359,14 +359,18 @@ pub fn project_affinity_multiplier(
 }
 
 /// Count shared path prefix components (platform-independent).
+///
+/// Walks both component streams in lockstep instead of collecting each into a
+/// `Vec<&str>` first — the two intermediate vectors were only ever `zip`ped, so
+/// eliding them is byte-identical and drops two per-call allocations on the
+/// per-candidate `path_proximity` ranking-prior path.
 #[must_use]
 pub fn shared_prefix_depth(path_a: &str, path_b: &str) -> usize {
-    let components_a: Vec<&str> = path_a.split('/').filter(|c| !c.is_empty()).collect();
-    let components_b: Vec<&str> = path_b.split('/').filter(|c| !c.is_empty()).collect();
+    let components_a = path_a.split('/').filter(|c| !c.is_empty());
+    let components_b = path_b.split('/').filter(|c| !c.is_empty());
 
     components_a
-        .iter()
-        .zip(components_b.iter())
+        .zip(components_b)
         .take_while(|(a, b)| a == b)
         .count()
 }

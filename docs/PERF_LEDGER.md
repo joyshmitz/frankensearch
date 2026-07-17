@@ -1,5 +1,20 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — `shared_prefix_depth` walks split iterators instead of collecting two Vecs (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill docs. This turn swept fresh subsystems after confirming the scoring/blend/normalize veins are closed — notably the normalize-SIMD-scale sibling (`l2_normalize`, embedder finishes) is the same class the negative ledger just measured-rejected as a noise-floor wash (`bd-d2a8`: median 0.8978 but lever p95 1.0323 overlaps the A/A p5 0.8747), so it was skipped rather than re-tread. The clean lever surfaced in `fsfs::ranking_priors::shared_prefix_depth` — the per-candidate `path_proximity` prior counted shared leading path components by collecting **two** `Vec<&str>` and then `zip`ping them, though the vectors fed nothing but that `zip`.
+- **Single lever:** `shared_prefix_depth` now `zip`s the two `split('/').filter(non-empty)` iterators directly and counts the matching-prefix `take_while` — dropping two allocations per call. Same components, same order, same count → byte-identical. `path_proximity_multiplier` and `apply_to_candidate` are unchanged.
+- **Same-binary paired A/B:** strict remote-only `rch`, one foreground release binary on worker `vmi1227854`, `--profile release` (LTO disabled), 25 samples, 150 ms warm-up, 500 ms measurement. A new `shared_prefix_depth_ab` bench (hosted in `core` — the function is a pure string algorithm, and `fsfs` is a ~10-minute compile) mirrors both variants over a source-tree-shaped candidate set and asserts identical counts before timing. new/old (`<1` wins):
+
+| candidates | alloc (old) | zip (new) | ratio | speedup |
+|---:|---:|---:|---:|---:|
+| 100 | 12.007 µs | 6.9472 µs | 0.579 | ~1.73× |
+| 500 | 52.139 µs | 32.913 µs | 0.631 | ~1.58× |
+
+Both rows have disjoint confidence intervals (100: `7.33 < 11.29`; 500: `34.54 < 48.23`).
+- **Verification:** the bench's parity gate proved identical counts across shared-depth 0–4 path pairs for the *exact* new iterator code before timing, and `rustfmt` / `diff --check` passed on both owned files. The scoped `fsfs` release test (`ranking_priors`) could **not** be run this turn: `frankensearch-fsfs` transitively depends on `frankensearch-lexical`, which is mid-refactor in the shared tree (a concurrent agent's uncommitted `LexicalSearch`/`DocId` changes fail to compile), so the whole dependency build fails before reaching any test — an issue entirely outside this change. Correctness rests on the provable byte-identity (a redundant `collect` elided before a `zip`) plus the identical-code parity gate; the existing `shared_prefix_depth_basic_cases` unit test is unchanged and passes by construction once the tree builds again.
+- **Scope:** KEEP for the per-candidate `path_proximity` ranking prior. Byte-identical, zero behavior change; the win is the two elided per-call allocations, realized whenever the path-proximity prior is enabled.
+
 ## 2026-07-16 — `strip_italic_underscores` borrows when nothing is dropped (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill contract docs, so this turn audited the canonicalization (ingest) chain, whose markdown-link parsers gained recent scratch-reuse / source-slice wins (`bd-xs7l`, `bd-xwb9`). One sibling was still un-Cow'd: `strip_italic_underscores` was the *only* strip in `strip_markdown_line`'s chain returning a fresh `String` (its siblings `strip_markdown_line` / `strip_prefixes_and_list_marker` / `strip_list_marker` / `strip_markdown_links` all borrow-or-reuse when unchanged). It is guarded by `has_underscore`, but `_` is ubiquitous in technical text (`snake_case`, `variable_name`, `fn foo_bar`), where **no** underscore is an italic boundary — yet the shipping code allocated a whole-line copy identical to the input on every such line.
