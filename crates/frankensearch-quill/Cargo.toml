@@ -14,10 +14,10 @@ bench-internals = ["frankensearch-core/bench-internals"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
+frankensearch-index = { workspace = true }
 asupersync = { workspace = true }
 wide = { workspace = true }
 bytemuck = { workspace = true }
-memmap2 = { workspace = true }
 rayon = { workspace = true }
 compact_str = { workspace = true }
 ahash = { workspace = true }

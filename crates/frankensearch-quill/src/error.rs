@@ -49,6 +49,14 @@ pub enum QuillError {
         /// Failed invariant.
         detail: String,
     },
+    /// A configured ceiling or allocation request could not be satisfied.
+    #[error("Quill resource failure for {resource}: {detail}")]
+    Resource {
+        /// Bounded resource or allocation category.
+        resource: &'static str,
+        /// Requested size, configured ceiling, or allocation diagnostic.
+        detail: String,
+    },
     /// Underlying filesystem I/O failed.
     #[error("Quill I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -58,6 +66,7 @@ impl From<QuillError> for SearchError {
     fn from(error: QuillError) -> Self {
         match error {
             QuillError::IndexNotFound { path } => Self::IndexNotFound { path },
+            QuillError::IndexCorrupted { path, detail } => Self::IndexCorrupted { path, detail },
             QuillError::Cancelled { phase, reason } => Self::Cancelled { phase, reason },
             other => Self::SubsystemError {
                 subsystem: "quill",
@@ -147,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn corruption_keeps_quill_specific_guidance() {
+    fn corruption_preserves_the_public_typed_variant() {
         let error: SearchError = QuillError::IndexCorrupted {
             path: PathBuf::from("index/seg-1.fslx"),
             detail: "section checksum mismatch".to_owned(),
@@ -155,10 +164,9 @@ mod tests {
         .into();
         assert!(matches!(
             error,
-            SearchError::SubsystemError {
-                subsystem: "quill",
-                ..
-            }
+            SearchError::IndexCorrupted { path, detail }
+                if path == PathBuf::from("index/seg-1.fslx")
+                    && detail == "section checksum mismatch"
         ));
     }
 }

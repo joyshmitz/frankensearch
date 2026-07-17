@@ -27,10 +27,10 @@ Segment ids are random u64 (hex16 lowercase), collision-checked against the live
 
 - **Endianness:** little-endian everywhere **except** the TERMDICT field-ordinal key prefix (§5.1), which is big-endian so that raw byte comparison equals (field, term) lexicographic order.
 - **Alignment:** every section starts at a 64-byte boundary (zero padding between sections; padding bytes are not covered by section checksums).
-- **Checksums:** each section carries xxh3-64 over its exact `len` bytes (recorded in the section table). The segment header carries `header_crc32` (CRC32 over header bytes). The file trailer carries `file_xxh3` (xxh3-64 over all bytes from offset 0 to the start of the trailer) + `trailer_crc32` (CRC32 over the trailer's preceding 8 bytes). The `.fec` fast-path verify uses `file_xxh3` — one hash pass shared with durability.
+- **Checksums:** each section carries xxh3-64 over its exact `len` bytes (recorded in the section table). The segment header carries `header_crc32` (CRC32 over header bytes). The file trailer carries `file_xxh3` (xxh3-64 over all bytes from offset 0 to the start of the trailer) + `trailer_crc32` (CRC32 over the trailer's preceding 8 bytes). "CRC32" in this specification means the IEEE CRC-32 computed exactly by `crc32fast::hash`. The `.fec` fast-path verify uses `file_xxh3` — one hash pass shared with durability.
 - **Varints ("vint"):** LEB128, max 10 bytes, canonical (no over-long encodings; readers reject).
 - **Strings/blobs:** raw bytes, never NUL-terminated; lengths always explicit.
-- **Docids:** u32 in all postings/section payloads; u64 in header/manifest fields (future-proofing). Docid semantics are governed by Q1 (`docs/contracts/quill-q1-docid-discipline.md`): monotone allocation, session leases, burned tails, **never reused**; R1 = a segment's docid range is a subinterval of one lease block; R2 = merges combine only bound-consecutive runs.
+- **Docids:** u32 in all postings/section payloads; u64 in header/manifest fields (future-proofing). Every segment has `docid_lo < docid_hi <= 2^32` and `doc_count <= docid_hi - docid_lo`. Docid semantics are governed by Q1 (`docs/contracts/quill-q1-docid-discipline.md`): monotone allocation, session leases, burned tails, **never reused**; R1 = a segment's docid range is a subinterval of one lease block; R2 = merges combine only bound-consecutive runs.
 - **Positions:** u32 (a 2 MiB document exceeds u16 token positions).
 - **Fieldnorms:** 1 byte, tantivy 0.26.1's exact 256-entry table (vendored: `crates/frankensearch-lexical/src/quill_contract.rs`, landed c5cd8b51).
 - **schema_id:** xxh3-64 of the schema descriptor's canonical encoding (see `SchemaDescriptor` in the scaffolding bead `bd-quill-e1-0-crate-scaffold-j1i6`). A reader that sees an unknown `schema_id` returns a typed error; it never guesses.
@@ -50,7 +50,12 @@ Segment ids are random u64 (hex16 lowercase), collision-checked against the live
 | 9 | STOREDMETA | iff schema stores any field | §5.9 |
 | 10 | STATS | yes | §5.10 |
 
-Unknown section kinds: readers **skip** kinds > 10 whose table entries carry flag bit 0 (`OPTIONAL_SKIPPABLE`) and **reject** otherwise — forward-compatibility valve, registry row required to use it.
+Known section kinds 1..=10 appear exactly once when required by the schema and
+are absent when their schema condition is false; their `flags` field is zero.
+Kind 0 is invalid. Readers skip an unknown kind > 10 only when its flags are
+exactly bit 0 (`OPTIONAL_SKIPPABLE`) and reject it when bit 0 is clear or any
+other flag bit is set. This is the forward-compatibility valve, and a registry
+row is required before a writer uses it.
 
 ## 4. Segment file layout
 
@@ -83,7 +88,33 @@ EOF-12  8     file_xxh3: u64           (xxh3-64 over bytes [0, EOF-12))
 EOF-4   4     trailer_crc32: u32       (CRC32 over the 8 file_xxh3 bytes)
 ```
 
-Validation on open: magic, version, header CRC **eagerly**; section xxh3 **lazily** on first touch (plus an eager `verify()` mode for doctor flows). Any failure → typed corruption error (`SearchError`-mapped), never a panic. Readers are generic over the byte source (`&[u8]`): mmap-backed on disk, owned buffers for `in_memory()` (bead e3.1 notes).
+For canonical v1 bytes, `H = 56 + 28 * section_count`; readers reject every
+other `header_len`. The section table is strictly increasing by `section_kind`
+and must contain the unique, exact schema-required known-section set described
+in §3, plus only valid optional-skippable unknown entries. The first section
+starts at `align_up(16 + H + 4, 64)`. Every later section starts at
+`align_up(previous.offset + previous.len, 64)`. All offset/length arithmetic is
+checked, payload ranges must not overlap or extend beyond the trailer, and every
+byte skipped for alignment is zero. The 12-byte trailer begins immediately
+after the final section payload: there is no final alignment padding and no
+trailing data after `trailer_crc32`.
+
+Validation on open is structural and eager: readers validate bounds with checked
+arithmetic, magic, version, canonical header length, reserved fields, the exact
+section set/flags/order, minimal alignment, non-overlap, zero padding, exact
+trailer placement, `header_crc32`, and `trailer_crc32`. They do not hash any
+section payload during structural open. Each section entry's xxh3 is validated
+lazily before that payload is first exposed; skipped unknown sections are not
+exposed by normal reads. `verify()` performs the same structural validation,
+hashes every section table entry (including unknown optional-skippable
+sections), and recomputes `file_xxh3` over `[0, EOF-12)`.
+Any failure becomes a typed corruption error (`SearchError`-mapped), never a
+panic. Readers are generic over the byte source (`&[u8]`): mmap-backed on disk,
+owned buffers for `in_memory()` (bead e3.1 notes). The mmap-backed constructor
+accepts only a regular canonical `seg-<hex16>.fslx` path after Keeper has synced
+and atomically renamed the temp artifact; the filename id must equal the header
+`segment_id`. Published segment inodes are never
+mutated or truncated in place while a reader can retain them.
 
 ## 5. Section payloads
 
@@ -224,7 +255,7 @@ regardless of position):
 
 ### 5.5 DOCLEN
 
-Per field with `Text`/`Keyword` indexing: `doc_count_span = docid_hi - docid_lo` fieldnorm bytes, direct-indexed by `docid - docid_lo`. **Holes:** positions for docids absent from the segment (burned/tombstone-folded) hold `0xFF` (never a valid norm for a present doc; readers must not score absent docs — cursors only visit present docids, so this is a debugging/audit aid, not a correctness mechanism). Post-compaction segments keep positional indexing with holes; space overhead is bounded by the compaction-density threshold.
+Per field with `Text`/`Keyword` indexing: `doc_count_span = docid_hi - docid_lo` fieldnorm bytes, direct-indexed by `docid - docid_lo`. **Holes:** positions for docids absent from the segment (burned/tombstone-folded) hold canonical byte `0x00`. Every u8, including `0x00` and `0xFF`, is a valid fieldnorm for a present document, so readers must derive presence from IDMAP/postings membership and never from the DOCLEN byte. Cursors only score present docids. Post-compaction segments keep positional indexing with holes; space overhead is bounded by the compaction-density threshold.
 
 Field order: ascending `field_ord`; each field's array is 64-aligned within the section; a small directory (`field_count × {field_ord: u16, offset: u32}`) heads the section.
 
@@ -253,7 +284,15 @@ Open-addressed, linear-probe table for `DocId → docid` (upsert/delete/resume p
 
 ### 5.8 NUMERIC
 
-Per indexed i64 field: `{ field_ord: u16, count: u32, pairs: count × { value: i64, docid: u32 } }`, sorted by (value, docid). Range filter = binary-search bounds → docid predicate. Field directory as in §5.5.
+Per indexed numeric field:
+`{ field_ord: u16, count: u32, pairs: count × { value_bits: u64, docid: u32 } }`.
+The schema is the type tag: `I64` interprets `value_bits` as the little-endian
+two's-complement bytes of an `i64`, while `U64` interprets the same eight bytes
+as an unsigned `u64`. No redundant per-row tag is encoded. Fields appear in
+ascending schema ordinal and pairs are sorted by the field's typed `(value,
+docid)` order, so the full `u64` domain (including values above `i64::MAX`)
+round-trips losslessly. A range filter binary-searches typed bounds and emits a
+docid predicate.
 
 ### 5.9 STOREDMETA
 
@@ -261,7 +300,14 @@ Per stored field (schema-descriptor-driven; `metadata_json` always; `content` if
 
 ### 5.10 STATS
 
-Per field: `{ field_ord: u16, total_tokens: u64, doc_count: u32 }`. **Semantics:** counts are **at-seal** values and include docs later tombstoned (oracle-mirroring: tantivy does not discount deletes from stats until merge; snapshot-level aggregation sums these across live segments; compaction re-derives them). `avgdl` inputs decode through the fieldnorm table (contract: quill_contract.rs conventions).
+Per indexed field: `{ field_ord: u16, total_tokens: u64, doc_count: u32 }`.
+**Semantics:** counts are **at-seal** values and include docs later tombstoned
+(oracle-mirroring: tantivy does not discount deletes from stats until merge;
+snapshot-level aggregation sums these across live segments; compaction
+re-derives them). Every indexed-field row's `doc_count` equals the segment
+header's at-seal `doc_count`. BM25 `avgdl` is the raw
+`total_tokens / doc_count` ratio; fieldnorm decoding applies only to an
+individual document's length and never to the STATS aggregate.
 
 ## 6. MANIFEST
 
@@ -385,5 +431,9 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.6 | 2026-07-17 | MANIFEST adjacent-generation invariants pinned: retained segment metadata is immutable, tombstones are monotone, new `seal_seq` values advance the prior non-empty maximum, an explicit empty generation starts a new seal epoch, and tombstone-only generations preserve the at-seal stats rollup | — (pre-freeze contract hardening) | manifest transition publish/reopen tests (e3.2) |
 | 1.0.7 | 2026-07-17 | MANIFEST temp retry semantics pinned: a no-follow regular, byte-identical durable `.tmp-manifest-<gen>` is reusable after claim/rename failure; any symlink, non-regular, or mismatched temp fails closed without overwrite until writer-locked recovery/GC | — (pre-freeze protocol hardening) | manifest claim-failure retry, mismatch, and symlink tests (e3.2/e3.3) |
 | 1.0.8 | 2026-07-17 | TERMDICT v1 pre-freeze correction: block offsets are relative to the blocks-area start; terms are arbitrary 0..=65,530-byte strings; payload domains, contiguous spans, explicit `blockmax_len`, and schema-derived positions are pinned; no undefined flags word is encoded; canonical greedy 4096-byte splitting with oversized singletons, maximal-prefix compression, half-open ranges, and bounded in-memory restart metadata are required | — (pre-freeze correction) | termdict wire goldens, restart-bound lookup, field/prefix/range, corruption, span-bound, and budget tests (e2.1) |
+| 1.0.9 | 2026-07-17 | Segment-container v1 pre-freeze hardening: canonical header length and exact section set/flags are pinned; section ranges use strict kind order, checked non-overlap, minimal 64-byte alignment, and zero padding; the trailer is adjacent to the final payload; IEEE CRC-32 and eager structural/header/trailer validation are explicit; section hashes remain first-touch lazy while `verify()` checks every section plus the whole-file xxh3 | — (pre-freeze validation hardening) | segment wire golden, torn-file matrix, and header/section/trailer corruption sweep (e3.1/e2.8) |
+| 1.0.10 | 2026-07-17 | DOCLEN/STATS v1 pre-freeze correction: holes use canonical `0x00` but membership never derives from a fieldnorm byte because all u8 values are valid; each indexed-field STATS row uses the segment at-seal doc count and BM25 avgdl is raw `total_tokens / doc_count`, not a fieldnorm-decoded aggregate | — (pre-freeze correction) | DOCLEN hole/membership fixtures and STATS avgdl/row-count differential (e2.5) |
+| 1.0.11 | 2026-07-17 | Segment-container publication hardening: non-empty segment ranges are bounded by the u32 payload domain; public writers reject unregistered extension kinds while readers retain the optional-skippable forward valve; mmap open is restricted to canonical regular published segment paths after sync-and-rename, and no unchecked reader API exposes payload bytes before first-touch verification | — (pre-freeze validation hardening) | pinned inline wire oracle, writer/reader extension differential, u32 boundary, published-mmap parity, and typed torn-file tests (e3.1) |
+| 1.0.12 | 2026-07-17 | NUMERIC signedness correction: schema-driven `value_bits: u64` preserves the complete indexed I64 and U64 domains without a redundant row tag; ordering and bounds use the field's schema type | — (pre-freeze correction) | indexed-I64/indexed-U64 section-presence coverage (e3.1); typed range/roundtrip including `u64 > i64::MAX` (e2.7) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*

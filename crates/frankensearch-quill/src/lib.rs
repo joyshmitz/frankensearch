@@ -22,6 +22,7 @@ pub mod keeper;
 pub mod quiver;
 pub mod schema;
 pub mod scribe;
+pub mod segment;
 pub mod stats;
 pub mod tracing_conventions;
 
@@ -42,5 +43,10 @@ pub use keeper::{
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,
     SchemaDescriptor,
+};
+pub use segment::{
+    EncodedSegment, FSLX_FORMAT_VERSION, FSLX_SECTION_ALIGNMENT, FSLX_SEGMENT_MAGIC,
+    PendingSegmentFile, SectionEntry, SectionInput, SectionKind, SegmentHeader, SegmentHeaderInput,
+    SegmentLimits, SegmentReader,
 };
 pub use stats::{SegmentStats, SegmentStatsProvider};

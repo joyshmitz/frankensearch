@@ -45,6 +45,7 @@
 #[cfg(feature = "ann")]
 pub mod hnsw;
 pub mod in_memory;
+pub mod mapped_file;
 pub mod mrl;
 pub mod quantization;
 pub mod recall_certificate;
