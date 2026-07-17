@@ -80,6 +80,34 @@
       ]
     },
     {
+      "id": "analyzer-hyphen-cjk-extension-b",
+      "analyzer": "hyphen_normalize",
+      "input": "𠀀𠀁",
+      "expected_tokens": [
+        { "text": "𠀀𠀁", "position": 0, "offset_from": 0, "offset_to": 8, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-hyphen-japanese-bigrams",
+      "analyzer": "hyphen_normalize",
+      "input": "かなカナ",
+      "expected_tokens": [
+        { "text": "かな", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
+        { "text": "なカ", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
+        { "text": "カナ", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 }
+      ]
+    },
+    {
+      "id": "analyzer-hyphen-korean-bigrams",
+      "analyzer": "hyphen_normalize",
+      "input": "한글검색",
+      "expected_tokens": [
+        { "text": "한글", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
+        { "text": "글검", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 },
+        { "text": "검색", "position": 0, "offset_from": 0, "offset_to": 12, "position_length": 1 }
+      ]
+    },
+    {
       "id": "analyzer-prefix-no-hyphen-decompose",
       "analyzer": "prefix_normalize",
       "input": "bd-q3fy",

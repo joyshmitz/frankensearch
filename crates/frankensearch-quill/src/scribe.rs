@@ -18,6 +18,8 @@
 //!   flush trigger (`QuillConfig::scribe_shard_budget_bytes`).
 //! - [`FrankensearchTokenizer`]: the allocation-reusing scalar reference for
 //!   the shipping `SimpleTokenizer + LowerCaser` semantics.
+//! - [`CassAnalyzer`]: the native CASS hyphen/CJK analyzer family plus the
+//!   matching edge-prefix and bounded-preview helpers.
 //! - [`ColumnarAccumulator`]: schema-driven, per-field `SoA` token columns plus
 //!   raw document lengths and their Tantivy-compatible fieldnorm bytes.
 //!
@@ -287,6 +289,286 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         self.token.offset_to = 0;
         self.token.position_length = 0;
     }
+}
+
+/// Maximum token length retained by the native CASS analyzer pipeline.
+///
+/// This is the incumbent CASS `RemoveLongFilter` limit and is intentionally
+/// much smaller than Quill's global [`MAX_TERM_BYTES`] admission ceiling.
+pub const CASS_MAX_TOKEN_BYTES: usize = 256;
+
+/// Maximum Unicode-scalar prefix length generated for CASS prefix fields.
+pub const CASS_MAX_EDGE_NGRAM_CHARS: usize = 20;
+
+/// Native implementation of the two CASS analyzer pipelines.
+///
+/// [`AnalyzerKind::CassHyphenNormalize`] applies the shipping
+/// `CassTokenizer -> HyphenDecompose -> CjkBigramDecompose ->
+/// CassNormalizeAndLimit` stages. [`AnalyzerKind::CassPrefixNormalize`] omits
+/// only hyphen decomposition. One scratch token is reused for the complete
+/// stream; compound alternatives, parts, and CJK bigrams are sent directly to
+/// the callback without a staging allocation.
+#[derive(Debug, Clone, Default)]
+pub struct CassAnalyzer {
+    token: AnalyzedToken,
+}
+
+impl sealed::Sealed for CassAnalyzer {}
+
+/// Exact CJK ranges recognized by the incumbent CASS tokenizer.
+///
+/// Keep this predicate shared inside Quill: broadening it to later Unicode
+/// extensions would change durable term bytes and therefore requires an
+/// explicit language-contract revision.
+#[inline]
+pub(crate) fn is_cass_cjk(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{3100}'..='\u{312F}'
+            | '\u{3300}'..='\u{33FF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{20000}'..='\u{2A6DF}'
+    )
+}
+
+fn cass_ascii_token_end(text: &str, mut cursor: usize) -> usize {
+    let mut end = cursor;
+    let mut last_was_ascii_alphanumeric = false;
+
+    while let Some((ch, next_cursor)) = tokenizer_next_char(text, cursor) {
+        if ch.is_ascii_alphanumeric() {
+            end = next_cursor;
+            cursor = next_cursor;
+            last_was_ascii_alphanumeric = true;
+            continue;
+        }
+        if ch == '-'
+            && last_was_ascii_alphanumeric
+            && let Some((next_ch, _)) = tokenizer_next_char(text, next_cursor)
+            && next_ch.is_ascii_alphanumeric()
+        {
+            end = next_cursor;
+            cursor = next_cursor;
+            last_was_ascii_alphanumeric = false;
+            continue;
+        }
+        break;
+    }
+    end
+}
+
+fn cass_cjk_token_end(text: &str, mut cursor: usize) -> usize {
+    let mut end = cursor;
+    while let Some((ch, next_cursor)) = tokenizer_next_char(text, cursor) {
+        if !is_cass_cjk(ch) {
+            break;
+        }
+        end = next_cursor;
+        cursor = next_cursor;
+    }
+    end
+}
+
+impl CassAnalyzer {
+    fn emit_normalized(
+        &mut self,
+        source: &str,
+        position: u32,
+        offset_from: usize,
+        offset_to: usize,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        if source.len() > CASS_MAX_TOKEN_BYTES {
+            return;
+        }
+        self.token.text.clear();
+        self.token.text.push_str(source);
+        self.token.text.make_ascii_lowercase();
+        self.token.position = position;
+        self.token.offset_from = offset_from;
+        self.token.offset_to = offset_to;
+        self.token.position_length = 1;
+        sink(&self.token);
+    }
+
+    fn emit_cjk(
+        &mut self,
+        source: &str,
+        position: u32,
+        offset_from: usize,
+        offset_to: usize,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        let mut chars = source.chars();
+        let Some(mut left) = chars.next() else {
+            return;
+        };
+        let Some(mut right) = chars.next() else {
+            self.emit_normalized(source, position, offset_from, offset_to, sink);
+            return;
+        };
+
+        loop {
+            self.token.text.clear();
+            self.token.text.push(left);
+            self.token.text.push(right);
+            self.token.position = position;
+            self.token.offset_from = offset_from;
+            self.token.offset_to = offset_to;
+            self.token.position_length = 1;
+            sink(&self.token);
+
+            left = right;
+            let Some(next) = chars.next() else {
+                break;
+            };
+            right = next;
+        }
+    }
+
+    fn emit_ascii(
+        &mut self,
+        analyzer: AnalyzerKind,
+        source: &str,
+        position: u32,
+        offset_from: usize,
+        offset_to: usize,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        self.emit_normalized(source, position, offset_from, offset_to, sink);
+        if analyzer != AnalyzerKind::CassHyphenNormalize || !source.contains('-') {
+            return;
+        }
+        for part in source.split('-').filter(|part| !part.is_empty()) {
+            self.emit_normalized(part, position, offset_from, offset_to, sink);
+        }
+    }
+}
+
+impl TokenAnalyzer for CassAnalyzer {
+    fn supports(&self, analyzer: AnalyzerKind) -> bool {
+        matches!(
+            analyzer,
+            AnalyzerKind::CassHyphenNormalize | AnalyzerKind::CassPrefixNormalize
+        )
+    }
+
+    fn analyze(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        debug_assert!(self.supports(analyzer));
+        let mut cursor = 0;
+        let mut position = 0_u32;
+
+        while let Some((ch, next_cursor)) = tokenizer_next_char(text, cursor) {
+            let (offset_to, is_cjk) = if ch.is_ascii_alphanumeric() {
+                (cass_ascii_token_end(text, cursor), false)
+            } else if is_cass_cjk(ch) {
+                (cass_cjk_token_end(text, next_cursor), true)
+            } else {
+                cursor = next_cursor;
+                continue;
+            };
+            let source = &text[cursor..offset_to];
+            if is_cjk {
+                self.emit_cjk(source, position, cursor, offset_to, sink);
+            } else {
+                self.emit_ascii(analyzer, source, position, cursor, offset_to, sink);
+            }
+            position = next_token_position(position);
+            cursor = offset_to;
+        }
+    }
+
+    fn bytes_reserved(&self) -> usize {
+        self.token.text.capacity()
+    }
+
+    fn reset(&mut self) {
+        self.token.text.clear();
+        self.token.position = 0;
+        self.token.offset_from = 0;
+        self.token.offset_to = 0;
+        self.token.position_length = 0;
+    }
+}
+
+fn push_cass_prefix(out: &mut String, prefix: &str) {
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(prefix);
+}
+
+/// Generate the shipping CASS edge-prefix field value.
+///
+/// Every alphanumeric word contributes prefixes of 2 through 20 Unicode
+/// scalar values, in word and prefix-length order, separated by one ASCII
+/// space. Source case is preserved; the prefix analyzer lowercases later.
+#[must_use]
+pub fn cass_generate_edge_ngrams(text: &str) -> String {
+    const MAX_BOUNDARIES: usize = CASS_MAX_EDGE_NGRAM_CHARS + 1;
+    let mut prefixes = String::with_capacity(text.len().saturating_mul(2));
+    for word in text.split(|ch: char| !ch.is_alphanumeric()) {
+        if word.is_ascii() {
+            let upper = word.len().min(CASS_MAX_EDGE_NGRAM_CHARS);
+            for end in 2..=upper {
+                push_cass_prefix(&mut prefixes, &word[..end]);
+            }
+            continue;
+        }
+
+        let mut boundaries = [0_usize; MAX_BOUNDARIES];
+        let mut boundary_count = 0;
+        for (byte_index, _) in word.char_indices() {
+            if boundary_count == MAX_BOUNDARIES {
+                break;
+            }
+            boundaries[boundary_count] = byte_index;
+            boundary_count += 1;
+        }
+        if boundary_count < MAX_BOUNDARIES {
+            boundaries[boundary_count] = word.len();
+            boundary_count += 1;
+        }
+        if boundary_count < 3 {
+            continue;
+        }
+        for &end in &boundaries[2..boundary_count] {
+            push_cass_prefix(&mut prefixes, &word[..end]);
+        }
+    }
+    prefixes
+}
+
+/// Return a Unicode-scalar-bounded CASS preview.
+///
+/// The first `max_chars` scalar values are copied byte-for-byte and `…` is
+/// appended exactly when additional input remains.
+#[must_use]
+pub fn cass_build_preview(content: &str, max_chars: usize) -> String {
+    let mut cut = content.len();
+    for (count, (byte_index, _)) in content.char_indices().enumerate() {
+        if count == max_chars {
+            cut = byte_index;
+            break;
+        }
+    }
+    let truncated = cut < content.len();
+    let mut preview = String::with_capacity(cut + if truncated { '…'.len_utf8() } else { 0 });
+    preview.push_str(&content[..cut]);
+    if truncated {
+        preview.push('…');
+    }
+    preview
 }
 
 /// A span into a [`ByteArena`]: which chunk, where, how long.
@@ -1264,6 +1546,7 @@ mod tests {
 
     const LANGUAGE_CONTRACT_FIXTURE: &str =
         include_str!("../../../tests/fixtures/quill_language_contract.json");
+    const SHARED_CORPUS_FIXTURE: &str = include_str!("../../../tests/fixtures/corpus.json");
 
     /// Degenerate hasher: every key hashes to 0, forcing every intern through
     /// the `Many` collision-verification path.
@@ -1491,6 +1774,45 @@ mod tests {
         tokens
     }
 
+    fn cass_tokens(analyzer_kind: AnalyzerKind, text: &str) -> Vec<AnalyzedToken> {
+        let mut analyzer = CassAnalyzer::default();
+        let mut tokens = Vec::new();
+        analyzer.analyze(analyzer_kind, text, &mut |token| tokens.push(token.clone()));
+        tokens
+    }
+
+    fn incumbent_cass_tokens(analyzer_kind: AnalyzerKind, text: &str) -> Vec<AnalyzedToken> {
+        let mut index = frankensearch_lexical::tantivy_crate::Index::create_in_ram(
+            frankensearch_lexical::cass_compat::cass_build_schema(),
+        );
+        frankensearch_lexical::cass_compat::cass_ensure_tokenizer(&mut index);
+        let tokenizer_name = match analyzer_kind {
+            AnalyzerKind::CassHyphenNormalize => "hyphen_normalize",
+            AnalyzerKind::CassPrefixNormalize => "prefix_normalize",
+            AnalyzerKind::FrankensearchDefault => {
+                unreachable!("CASS incumbent helper requires a CASS analyzer")
+            }
+        };
+        let mut analyzer = index
+            .tokenizers()
+            .get(tokenizer_name)
+            .expect("shipping CASS tokenizer is registered");
+        let mut stream = analyzer.token_stream(text);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            let token = stream.token();
+            tokens.push(AnalyzedToken {
+                text: token.text.clone(),
+                position: u32::try_from(token.position)
+                    .expect("shipping CASS tokenizer position fits Quill u32 contract"),
+                offset_from: token.offset_from,
+                offset_to: token.offset_to,
+                position_length: token.position_length,
+            });
+        }
+        tokens
+    }
+
     fn fixture_input(case: &Value) -> String {
         if let Some(input) = case.get("input").and_then(Value::as_str) {
             return input.to_owned();
@@ -1589,6 +1911,398 @@ mod tests {
             }
         }
         assert_eq!(executed, 6, "all default-analyzer fixtures must execute");
+    }
+
+    #[test]
+    fn native_cass_executes_fixture_and_matches_shipping_incumbent() {
+        let fixture: Value = serde_json::from_str(LANGUAGE_CONTRACT_FIXTURE)
+            .expect("language contract fixture is valid JSON");
+        let cases = fixture["analyzer_cases"]
+            .as_array()
+            .expect("language contract analyzer_cases is an array");
+        let mut executed = 0_u32;
+        for case in cases {
+            let analyzer_kind = match case["analyzer"].as_str() {
+                Some("hyphen_normalize") => AnalyzerKind::CassHyphenNormalize,
+                Some("prefix_normalize") => AnalyzerKind::CassPrefixNormalize,
+                Some("frankensearch_default") => continue,
+                Some(other) => panic!("unhandled language-contract analyzer {other}"),
+                None => panic!("analyzer fixture has no analyzer name"),
+            };
+            executed += 1;
+            let case_id = case["id"].as_str().expect("analyzer case has an id");
+            let input = fixture_input(case);
+            let actual = cass_tokens(analyzer_kind, &input);
+            assert_eq!(
+                actual,
+                incumbent_cass_tokens(analyzer_kind, &input),
+                "native CASS stream diverged from the shipping incumbent for {case_id}"
+            );
+            if let Some(expected) = expected_fixture_tokens(case) {
+                assert_eq!(actual, expected, "fixture golden diverged for {case_id}");
+            }
+            if let Some(expected_count) = case.get("expected_token_count").and_then(Value::as_u64) {
+                assert_eq!(
+                    actual.len(),
+                    usize::try_from(expected_count).expect("fixture token count fits usize"),
+                    "{case_id}"
+                );
+            }
+            if let Some(expected_bytes) = case.get("expected_token_bytes").and_then(Value::as_u64) {
+                assert_eq!(
+                    actual.first().map(|token| token.text.len()),
+                    Some(usize::try_from(expected_bytes).expect("fixture byte count fits usize")),
+                    "{case_id}"
+                );
+            }
+            if let Some(repeat) = case.get("expected_token_repeat").and_then(Value::as_str) {
+                let expected_byte = repeat.as_bytes().first().copied();
+                assert!(
+                    repeat.len() == 1
+                        && actual.first().is_some_and(|token| {
+                            token
+                                .text
+                                .as_bytes()
+                                .iter()
+                                .all(|byte| Some(*byte) == expected_byte)
+                        }),
+                    "{case_id}"
+                );
+            }
+        }
+        assert_eq!(executed, 8, "all CASS analyzer fixtures must execute");
+    }
+
+    #[test]
+    fn native_cass_matches_incumbent_at_token_boundaries_and_script_edges() {
+        for analyzer_kind in [
+            AnalyzerKind::CassHyphenNormalize,
+            AnalyzerKind::CassPrefixNormalize,
+        ] {
+            for input in [
+                "",
+                "-abc abc- a--b a-b a1-b2",
+                "ASCII_123/next",
+                "搜",
+                "搜索引擎",
+                "かなカナ",
+                "한글검색",
+                "𠀀𠀁",
+                "東京かな한글",
+                "A搜索B",
+                "éclair",
+            ] {
+                assert_eq!(
+                    cass_tokens(analyzer_kind, input),
+                    incumbent_cass_tokens(analyzer_kind, input),
+                    "analyzer={analyzer_kind:?} input={input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn generated_prefix_pipeline_matches_incumbent_composition() {
+        for input in [
+            "",
+            "Hello, happy tax payer!",
+            "bd-q3fy foo_bar baz-qux",
+            "abc-123 -- def",
+            "Hello搜索World",
+            "foo搜索-barあいう123",
+            "café 𠀀 token",
+            "multi---dash and trailing- hyphen",
+        ] {
+            let generated = cass_generate_edge_ngrams(input);
+            let prefix_tokens = cass_tokens(AnalyzerKind::CassPrefixNormalize, &generated);
+            assert_eq!(
+                prefix_tokens,
+                incumbent_cass_tokens(AnalyzerKind::CassPrefixNormalize, &generated),
+                "generated prefix stream diverged for input={input:?}"
+            );
+            assert_eq!(
+                prefix_tokens,
+                cass_tokens(AnalyzerKind::CassHyphenNormalize, &generated),
+                "generated prefixes must not require hyphen decomposition for input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_cass_matches_incumbent_across_shared_fixture_corpus() {
+        let fixture: Value = serde_json::from_str(SHARED_CORPUS_FIXTURE)
+            .expect("shared corpus fixture is valid JSON");
+        let documents = fixture["documents"]
+            .as_array()
+            .expect("shared corpus documents are an array");
+        assert_eq!(
+            documents.len(),
+            120,
+            "the complete pinned corpus must execute"
+        );
+        for document in documents {
+            let doc_id = document["doc_id"].as_str().expect("fixture document id");
+            for field_name in ["title", "content"] {
+                let text = document[field_name].as_str().expect("fixture text field");
+                assert_eq!(
+                    cass_tokens(AnalyzerKind::CassHyphenNormalize, text),
+                    incumbent_cass_tokens(AnalyzerKind::CassHyphenNormalize, text),
+                    "doc={doc_id} field={field_name}"
+                );
+
+                let generated = cass_generate_edge_ngrams(text);
+                assert_eq!(
+                    cass_tokens(AnalyzerKind::CassPrefixNormalize, &generated),
+                    incumbent_cass_tokens(AnalyzerKind::CassPrefixNormalize, &generated),
+                    "generated prefix doc={doc_id} field={field_name}"
+                );
+                assert_eq!(
+                    cass_build_preview(text, 400),
+                    frankensearch_lexical::cass_compat::cass_build_preview_slow(text, 400),
+                    "preview doc={doc_id} field={field_name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_cass_differential_matches_incumbent_and_named_slow_oracles() {
+        const SEED: u64 = 0xE102_CA55_5C12_1BE5;
+        const ATOMS: [&str; 15] = [
+            "A", "z9", "-", "--", " ", "_", "/", "搜", "索", "かな", "한글", "𠀀", "é", "🙂", "123",
+        ];
+        let mut rng = DeterministicRng(SEED);
+        for case in 0..128_u32 {
+            let mut input = String::new();
+            for _ in 0..rng.choose(48) {
+                input.push_str(ATOMS[rng.choose(ATOMS.len())]);
+            }
+
+            let mut offset = 0;
+            let mut native_walk = 0_u64;
+            while let Some((ch, next)) = tokenizer_next_char(&input, offset) {
+                native_walk = native_walk.wrapping_add(u64::from(ch as u32));
+                offset = next;
+            }
+            assert_eq!(
+                native_walk,
+                frankensearch_lexical::cass_compat::cass_char_walk_slow(&input),
+                "seed={SEED:#x} case={case} input={input:?}"
+            );
+
+            let native_cjk = if input.is_empty() || !input.chars().all(is_cass_cjk) {
+                None
+            } else {
+                let chars: Vec<char> = input.chars().collect();
+                (chars.len() >= 2).then_some(chars)
+            };
+            assert_eq!(
+                native_cjk,
+                frankensearch_lexical::cass_compat::cass_cjk_collect_slow(&input),
+                "seed={SEED:#x} case={case} input={input:?}"
+            );
+
+            for analyzer_kind in [
+                AnalyzerKind::CassHyphenNormalize,
+                AnalyzerKind::CassPrefixNormalize,
+            ] {
+                assert_eq!(
+                    cass_tokens(analyzer_kind, &input),
+                    incumbent_cass_tokens(analyzer_kind, &input),
+                    "seed={SEED:#x} case={case} analyzer={analyzer_kind:?} input={input:?}"
+                );
+            }
+            assert_eq!(
+                cass_generate_edge_ngrams(&input),
+                frankensearch_lexical::cass_compat::cass_generate_edge_ngrams_slow(&input),
+                "seed={SEED:#x} case={case} input={input:?}"
+            );
+            let preview_bound = rng.choose(32);
+            assert_eq!(
+                cass_build_preview(&input, preview_bound),
+                frankensearch_lexical::cass_compat::cass_build_preview_slow(&input, preview_bound),
+                "seed={SEED:#x} case={case} max_chars={preview_bound} input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_cjk_range_endpoints_and_neighbors_match_slow_oracle() {
+        const RANGES: [(u32, u32); 9] = [
+            (0x4E00, 0x9FFF),
+            (0x3400, 0x4DBF),
+            (0x3040, 0x309F),
+            (0x30A0, 0x30FF),
+            (0xAC00, 0xD7AF),
+            (0x3100, 0x312F),
+            (0x3300, 0x33FF),
+            (0xF900, 0xFAFF),
+            (0x20000, 0x2A6DF),
+        ];
+        for (start, end) in RANGES {
+            assert!(is_cass_cjk(
+                char::from_u32(start).expect("valid range start")
+            ));
+            assert!(is_cass_cjk(char::from_u32(end).expect("valid range end")));
+            for codepoint in [start - 1, start, end, end + 1] {
+                let Some(ch) = char::from_u32(codepoint) else {
+                    continue;
+                };
+                let input = ch.to_string().repeat(2);
+                assert_eq!(
+                    is_cass_cjk(ch),
+                    frankensearch_lexical::cass_compat::cass_cjk_collect_slow(&input).is_some(),
+                    "codepoint=U+{codepoint:04X}"
+                );
+                assert_eq!(
+                    cass_tokens(AnalyzerKind::CassHyphenNormalize, &input),
+                    incumbent_cass_tokens(AnalyzerKind::CassHyphenNormalize, &input),
+                    "codepoint=U+{codepoint:04X}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cass_filter_order_preserves_parts_bigrams_and_position_gaps() {
+        let oversized_compound = format!("{}-{}", "A".repeat(130), "B".repeat(130));
+        let compound_tokens = cass_tokens(AnalyzerKind::CassHyphenNormalize, &oversized_compound);
+        assert_eq!(
+            compound_tokens,
+            incumbent_cass_tokens(AnalyzerKind::CassHyphenNormalize, &oversized_compound)
+        );
+        assert_eq!(compound_tokens.len(), 2);
+        assert!(compound_tokens.iter().all(|token| token.position == 0));
+        assert_eq!(compound_tokens[0].text, "a".repeat(130));
+        assert_eq!(compound_tokens[1].text, "b".repeat(130));
+
+        let long_cjk = "搜".repeat(100);
+        let cjk_tokens = cass_tokens(AnalyzerKind::CassHyphenNormalize, &long_cjk);
+        assert_eq!(
+            cjk_tokens,
+            incumbent_cass_tokens(AnalyzerKind::CassHyphenNormalize, &long_cjk)
+        );
+        assert_eq!(cjk_tokens.len(), 99);
+        assert!(cjk_tokens.iter().all(|token| token.text == "搜搜"));
+
+        let dropped_then_kept = format!("{} ok", "X".repeat(CASS_MAX_TOKEN_BYTES + 1));
+        let gap_tokens = cass_tokens(AnalyzerKind::CassHyphenNormalize, &dropped_then_kept);
+        assert_eq!(
+            gap_tokens,
+            incumbent_cass_tokens(AnalyzerKind::CassHyphenNormalize, &dropped_then_kept)
+        );
+        assert_eq!(gap_tokens.len(), 1);
+        assert_eq!(gap_tokens[0].text, "ok");
+        assert_eq!(gap_tokens[0].position, 1);
+    }
+
+    #[test]
+    fn cass_helpers_execute_contract_fixture_and_match_slow_oracles() {
+        let fixture: Value = serde_json::from_str(LANGUAGE_CONTRACT_FIXTURE)
+            .expect("language contract fixture is valid JSON");
+        let cases = fixture["helper_cases"]
+            .as_array()
+            .expect("language contract helper_cases is an array");
+        let mut executed = 0_u32;
+        for case in cases {
+            let case_id = case["id"].as_str().expect("helper case has an id");
+            let input = fixture_input(case);
+            match case["helper"].as_str() {
+                Some("cass_generate_edge_ngrams") => {
+                    executed += 1;
+                    let actual = cass_generate_edge_ngrams(&input);
+                    assert_eq!(
+                        actual,
+                        frankensearch_lexical::cass_compat::cass_generate_edge_ngrams_slow(&input),
+                        "{case_id}"
+                    );
+                    if let Some(expected) = case.get("expected").and_then(Value::as_str) {
+                        assert_eq!(actual, expected, "{case_id}");
+                    }
+                    if let Some(expected_last) =
+                        case.get("last_expected_prefix").and_then(Value::as_str)
+                    {
+                        assert_eq!(actual.split_whitespace().next_back(), Some(expected_last));
+                    }
+                    if let Some(expected_count) =
+                        case.get("expected_prefix_count").and_then(Value::as_u64)
+                    {
+                        assert_eq!(
+                            actual.split_whitespace().count(),
+                            usize::try_from(expected_count)
+                                .expect("fixture prefix count fits usize"),
+                            "{case_id}"
+                        );
+                    }
+                }
+                Some("cass_build_preview") => {
+                    executed += 1;
+                    let max_chars = case["max_chars"]
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .expect("preview fixture bound fits usize");
+                    let actual = cass_build_preview(&input, max_chars);
+                    assert_eq!(
+                        actual,
+                        frankensearch_lexical::cass_compat::cass_build_preview_slow(
+                            &input, max_chars
+                        ),
+                        "{case_id}"
+                    );
+                    assert_eq!(
+                        actual,
+                        case["expected"].as_str().expect("preview expected value"),
+                        "{case_id}"
+                    );
+                }
+                Some("truncate_query") => {}
+                Some(other) => panic!("unhandled language-contract helper {other} in {case_id}"),
+                None => panic!("helper fixture {case_id} has no helper name"),
+            }
+        }
+        assert_eq!(executed, 5, "all native CASS helper fixtures must execute");
+    }
+
+    #[test]
+    fn cass_helper_boundaries_match_slow_oracles() {
+        let inputs = [
+            String::new(),
+            "a".to_owned(),
+            "é".to_owned(),
+            "é".repeat(20),
+            "é".repeat(21),
+            "hello,世界/한글".to_owned(),
+        ];
+        for input in &inputs {
+            assert_eq!(
+                cass_generate_edge_ngrams(input),
+                frankensearch_lexical::cass_compat::cass_generate_edge_ngrams_slow(input),
+                "input={input:?}"
+            );
+            for max_chars in [0, 1, 2, 19, 20, 21, 64] {
+                assert_eq!(
+                    cass_build_preview(input, max_chars),
+                    frankensearch_lexical::cass_compat::cass_build_preview_slow(input, max_chars),
+                    "input={input:?} max_chars={max_chars}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cass_analyzer_reset_retains_reusable_scratch() {
+        let mut analyzer = CassAnalyzer::default();
+        analyzer.analyze(
+            AnalyzerKind::CassHyphenNormalize,
+            &"A".repeat(CASS_MAX_TOKEN_BYTES),
+            &mut |_| {},
+        );
+        let retained = analyzer.bytes_reserved();
+        assert!(retained >= CASS_MAX_TOKEN_BYTES);
+        analyzer.reset();
+        assert_eq!(analyzer.bytes_reserved(), retained);
+        analyzer.analyze(AnalyzerKind::CassPrefixNormalize, "short", &mut |_| {});
+        assert_eq!(analyzer.bytes_reserved(), retained);
     }
 
     #[test]
@@ -1713,6 +2427,53 @@ mod tests {
             Err(UnsupportedAnalysis {
                 analyzer: AnalyzerKind::CassHyphenNormalize,
             })
+        );
+    }
+
+    #[test]
+    fn native_cass_family_accumulates_alternatives_and_prefixes() {
+        let mut accumulator =
+            ColumnarAccumulator::with_analyzer(CASS_SEMANTIC_SCHEMA, CassAnalyzer::default())
+                .expect("native CASS family covers the complete semantic schema");
+        let report = accumulator
+            .add_document(
+                0,
+                &[
+                    IndexedFieldValue::new(6, "BD-Q3FY search"),
+                    IndexedFieldValue::new(8, "BD-Q3FY"),
+                ],
+            )
+            .expect("native CASS analysis accumulates");
+        assert_eq!(report.admitted_tokens, 5);
+        assert_eq!(report.oversized_tokens, 0);
+
+        let title = accumulator.field(6).expect("title column");
+        let title_prefix = accumulator.field(8).expect("title prefix column");
+        assert_eq!(title.positions(), Some([0, 0, 0, 1].as_slice()));
+        assert_eq!(title.document_lengths(), &[4]);
+        assert_eq!(title_prefix.positions(), None);
+        assert_eq!(title_prefix.document_lengths(), &[1]);
+
+        let term_id = |field_ord: u16, term: &[u8]| {
+            (0..u32::try_from(accumulator.terms().len()).expect("small term table"))
+                .find(|id| accumulator.terms().field_and_term(*id) == (field_ord, term))
+                .expect("expected CASS term is interned")
+        };
+        let compound = term_id(6, b"bd-q3fy");
+        let left = term_id(6, b"bd");
+        let right = term_id(6, b"q3fy");
+        let search = term_id(6, b"search");
+        // E1 owns the position-column contract. The production phrase-scorer
+        // differential that consumes these alternatives belongs to E4.5.
+        assert!(phrase_matches(title, 0, &[compound, search]));
+        assert!(phrase_matches(title, 0, &[left, search]));
+        assert!(phrase_matches(title, 0, &[right, search]));
+        assert!(!phrase_matches(title, 0, &[left, right]));
+        assert_eq!(
+            accumulator
+                .terms()
+                .field_and_term(title_prefix.term_ids()[0]),
+            (8, b"bd-q3fy".as_slice())
         );
     }
 
