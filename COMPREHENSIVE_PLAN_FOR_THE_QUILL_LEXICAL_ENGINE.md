@@ -422,10 +422,13 @@ Deletes against sealed segments append to a per-segment tombstone set stored in 
 
 ```
 magic "FSLXMAN\0" | format_version | generation: u64 | docid_high_watermark: u64
-schema_id | engine_version | segment entries [{segment_id, file_len, file_xxh3,
-docid_lo, docid_hi, doc_count, tombstones: roaring-bytes}] | stats rollup | crc32
+schema_id | engine_version (major:u8, minor:u8, patch:u16 packed into u32) |
+flags: u32 | segment_count: u32 |
+segment entries[segment_count] [{segment_id, seal_seq, file_len, file_xxh3, docid_lo, docid_hi,
+doc_count, tombstones: roaring-bytes}] | field_count: u32 |
+stats rollup[field_count] | crc32
 ```
-Publish protocol in §11.4. **Format registry:** every FSLX/MANIFEST change lands a row in `docs/contracts/fslx-format-registry.md` (version, change, migration note, gauntlet fixture id) — G0 creates the file with v1 rows.
+Segments are ordered by ascending `docid_lo`; stats are ordered by ascending `field_ord`. Adjacent generations preserve retained segment metadata, grow retained tombstones monotonically, allocate every new `seal_seq` above the prior non-empty maximum, and leave at-seal stats unchanged when the immutable segment set is unchanged. An explicit empty generation starts a new seal-sequence epoch because no older segment remains queryable. Publish protocol in §11.3 and the exact crash windows in the format registry §6.2. A retry after a claim or rename failure reuses a durable temp only when the directory entry is a no-follow regular file whose bytes exactly match the proposal; an unexpected temp fails closed without overwrite. E3.2 implements the in-process mutex and two-slot file steps; the dependent cross-process writer-lock bead supplies the mandatory O_EXCL generation-claim CAS before shipping. **Format registry:** every FSLX/MANIFEST change lands a row in `docs/contracts/fslx-format-registry.md` (version, change, migration note, gauntlet fixture id) — G0 creates the file with v1 rows.
 
 ---
 

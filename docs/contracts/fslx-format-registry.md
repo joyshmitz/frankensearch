@@ -67,7 +67,7 @@ offset  size  field
                 doc_count: u32           # live docs at seal (tombstones excluded at seal time)
                 reserved: u32 = 0
                 created_unix_s: i64
-                engine_version: u32      # crate minor encoded; informational only
+                engine_version: u32      # packed semver; informational only (§6.1)
                 section_count: u16
                 reserved2: u16 = 0
                 section_table: section_count × {
@@ -238,30 +238,33 @@ docid_high_watermark: u64 | schema_id: u64 | engine_version: u32
 flags: u32 (bit 0 = bulk_mode_in_progress)
 segment_count: u32
 segments: segment_count × {
-  segment_id: u64, file_len: u64, file_xxh3: u64,
+  segment_id: u64, seal_seq: u64, file_len: u64, file_xxh3: u64,
   docid_lo: u64, docid_hi: u64, doc_count: u32,
   tombstones: tombstone-set bytes (§6.3)
 }
+field_count: u32
 stats rollup: field_count × { field_ord: u16, total_tokens: u64, doc_count: u32 }   # sums over segments
 crc32: u32 (over all preceding bytes)
 ```
 
-Segments are listed in **ascending docid_lo** order (the R2 merge order and the IDHASH newest-first probe order derive from generation history: an auxiliary `seal_seq: u64` per segment entry provides recency — **amendment v1.0.1**, see registry).
+`engine_version` packs the crate semver as `(major:u8 << 24) | (minor:u8 << 16) | patch:u16`; prerelease/build metadata is not encoded. Segments are listed in **ascending docid_lo** order. R2 merge order follows that range order, while IDHASH newest-first probe order uses descending `seal_seq` (the per-segment recency witness added by amendment v1.0.1). Stats entries are listed in strictly ascending `field_ord` order. Across adjacent generations, retained segment metadata is immutable, retained tombstones only grow, and every newly referenced segment has a `seal_seq` greater than the maximum in the prior non-empty generation. An explicit empty generation starts a new seal-sequence epoch; restarting at 1 is valid because no older segment remains queryable or participates in newest-first probing. If the immutable segment set is unchanged, its at-seal stats rollup is unchanged as well; tombstone-only generations do not rewrite BM25 statistics.
 
 ### 6.2 Publish protocol (normative, crash-window exact)
 
-1. Write `MANIFEST` (gen N+1) content to `.tmp-manifest-<gen>`; fsync file.
-2. Claim the generation: create `gen-<N+1>.claim` with `O_CREAT|O_EXCL` (fails ⇒ another writer won; abort with typed error — the CAS of bead `bd-quill-duel-writer-lock`).
+1. Write `MANIFEST` (gen N+1) content to `.tmp-manifest-<gen>`; fsync file. A retry after a failed claim or rename may reuse that temp only when a no-follow open proves the directory entry is a regular file and its complete bytes exactly match the canonical proposal, then fsyncs it again. Any symlink, non-regular, or mismatched temp fails closed without overwrite and is left for writer-locked recovery/GC.
+2. Claim the generation: create `gen-<N+1>.claim` with `O_CREAT|O_EXCL` (fails ⇒ another writer won; abort with typed error — the CAS of bead `bd-quill-duel-writer-lock`). E3.2 exposes the checked pre-publish seam and implements the in-process mutex plus steps 1 and 3–5; the cross-process claim/release implementation lands with that dependent writer-lock bead.
 3. `rename(MANIFEST, MANIFEST.prev)` (skip if no MANIFEST — genesis).
 4. `rename(.tmp-manifest-<gen>, MANIFEST)`.
 5. fsync directory. 6. Unlink the claim file (best-effort; stale claims for generations ≤ current are GC-eligible under the writer lock).
+
+The E3.2 implementation currently admits publication only on Unix, where replacement rename and directory fsync provide these exact guarantees; unsupported platforms fail closed before creating the temp file until an equivalent safe backend lands.
 
 **Recovery rules (open):** valid `MANIFEST` → use it. Missing/corrupt `MANIFEST` + valid `MANIFEST.prev` → **mid-publish crash**: recover from prev (generation must be exactly current−1 of any claim present, else typed corruption error). Neither present → `IndexNotFound` (distinct error from corruption). Readers never write during recovery; writer-open completes the interrupted publish or rolls forward per Q1 validation.
 
 ### 6.3 Tombstone-set encoding (roaring-lite)
 
 ```
-u16 chunk_count, chunks: chunk_count × {
+u32 chunk_count, chunks: chunk_count × {
   chunk_id: u16            # docid >> 16
   kind: u8                 # 0 = ARRAY, 1 = BITMAP
   count: u16               # cardinality within chunk (0 encodes 65536 for kind=1)
@@ -320,9 +323,9 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | IDMAP (incl. content_hash) + IDHASH | quill-e2.6 (+ bd-quill-duel-resumable-bulk) |
 | NUMERIC | quill-e2.7 |
 | STOREDMETA | bd-quill-e2-9-storedmeta-9jkw |
-| MANIFEST + publish | quill-e3.2 |
+| MANIFEST codec + in-process serialized two-slot publish (steps 1, 3–5) | quill-e3.2 |
 | Tombstone sets | quill-e3.4 |
-| LOCK + claim + GC ownership | bd-quill-duel-writer-lock (+ e3.3) |
+| LOCK + generation claim/release (step 2) + GC ownership | bd-quill-duel-writer-lock (+ e3.3) |
 | CURRENT | bd-quill-duel-blue-green |
 | v1 golden segment fixture | quill-e2.8 |
 
@@ -342,5 +345,9 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.1 | 2026-07-17 | `seal_seq: u64` added to MANIFEST segment entries (recency for IDHASH newest-first probe order and forensics) — folded into v1 pre-freeze | — (pre-freeze fold) | manifest roundtrip test |
 | 1.0.2 | 2026-07-17 | IDMAP gains per-doc `content_hash: u64` (resumable-bulk witness + doctor audit; bd-quill-duel-resumable-bulk) — folded into v1 pre-freeze | — (pre-freeze fold) | resume-equivalence fixture (pending) |
 | 1.0.3 | 2026-07-17 | POSTINGS blocks gain a common `{kind, posting_count, payload_len}` header; VINT partials are legal at preserved interior seams so Q1 merges copy blocks verbatim without cascading re-encode; `doc_width` is explicitly one byte covering 0..=32 | — (pre-freeze correction) | `df=100 + df=300` concat + scalar/SIMD bitpack differential (e2.2) |
+| 1.0.4 | 2026-07-17 | MANIFEST v1 pre-freeze correction: place `seal_seq` in each segment entry, encode `field_count: u32`, define packed-semver `engine_version`, and split E3.2's in-process two-slot publish from the dependent cross-process generation-claim CAS | — (pre-freeze correction) | manifest wire golden + roundtrip/recovery tests (e3.2) |
+| 1.0.5 | 2026-07-17 | Tombstone roaring-lite `chunk_count` widened from `u16` to `u32`; a full u32 docid-domain set can contain all 65,536 non-empty chunks, which `u16` could not represent — folded into v1 pre-freeze | — (pre-freeze correction) | manifest hostile-input and tombstone canonicality tests (e3.2/e3.4) |
+| 1.0.6 | 2026-07-17 | MANIFEST adjacent-generation invariants pinned: retained segment metadata is immutable, tombstones are monotone, new `seal_seq` values advance the prior non-empty maximum, an explicit empty generation starts a new seal epoch, and tombstone-only generations preserve the at-seal stats rollup | — (pre-freeze contract hardening) | manifest transition publish/reopen tests (e3.2) |
+| 1.0.7 | 2026-07-17 | MANIFEST temp retry semantics pinned: a no-follow regular, byte-identical durable `.tmp-manifest-<gen>` is reusable after claim/rename failure; any symlink, non-regular, or mismatched temp fails closed without overwrite until writer-locked recovery/GC | — (pre-freeze protocol hardening) | manifest claim-failure retry, mismatch, and symlink tests (e3.2/e3.3) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*

@@ -27,6 +27,12 @@ pub mod tracing_conventions;
 
 pub use config::QuillConfig;
 pub use error::{QuillError, map_lock_error};
+pub use keeper::{
+    CURRENT_ENGINE_VERSION, EMPTY_TOMBSTONES, KeeperError, LoadedManifest, MANIFEST_FORMAT_VERSION,
+    MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats, ManifestPublisher,
+    ManifestSegment, ManifestSource, load_manifest_pair, pack_engine_version,
+    unpack_engine_version,
+};
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,
     SchemaDescriptor,
