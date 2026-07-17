@@ -17,6 +17,7 @@
 //! Title matches receive a 2× boost via `QueryParser::set_field_boost`.
 
 pub mod cass_compat;
+pub mod quill_contract;
 
 pub use cass_compat::{
     CASS_SCHEMA_HASH, CASS_SCHEMA_VERSION, CassDocument, CassDocumentRef, CassFields,
