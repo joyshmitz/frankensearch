@@ -1,0 +1,34 @@
+#![forbid(unsafe_code)]
+//! Quill is frankensearch's native, deterministic lexical engine.
+//!
+//! This crate owns the schema and scoring contracts shared by the ingest,
+//! storage, query, and lifecycle subsystems. The current milestone establishes
+//! those contracts; later milestones fill in each subsystem behind them.
+//!
+//! ```
+//! use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
+//!
+//! let config = QuillConfig::default();
+//! assert_eq!(config.tier_fanout, 8);
+//! assert_ne!(DEFAULT_SCHEMA.schema_id().unwrap(), 0);
+//! ```
+
+pub mod argus;
+pub mod config;
+pub mod contract;
+pub mod error;
+pub mod grimoire;
+pub mod keeper;
+pub mod quiver;
+pub mod schema;
+pub mod scribe;
+pub mod stats;
+pub mod tracing_conventions;
+
+pub use config::QuillConfig;
+pub use error::{QuillError, map_lock_error};
+pub use schema::{
+    Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,
+    SchemaDescriptor,
+};
+pub use stats::{SegmentStats, SegmentStatsProvider};

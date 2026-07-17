@@ -1,0 +1,33 @@
+[package]
+name = "frankensearch-quill"
+version = "0.2.1"
+description = "Quill native lexical search engine for frankensearch"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Same-binary A/B helpers are available only to explicit benchmark builds.
+bench-internals = ["frankensearch-core/bench-internals"]
+
+[dependencies]
+frankensearch-core = { workspace = true }
+asupersync = { workspace = true }
+wide = { workspace = true }
+bytemuck = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
+compact_str = { workspace = true }
+ahash = { workspace = true }
+crc32fast = { workspace = true }
+xxhash-rust = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Stored metadata stays opaque until result materialization. Durable formats
+# never use serde or serde_json.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
