@@ -29,5 +29,13 @@ tracing = { workspace = true }
 # never use serde or serde_json.
 serde_json = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "postings_decode_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

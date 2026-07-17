@@ -11,6 +11,22 @@ Conventions:
 - A lever is **reverted** if ratio ∈ [0.97, 1.03] (noise) or > 1.03 (regression).
 - Wins (ratio < 0.97, kept) go in `docs/PERF_LEDGER.md`, not here.
 
+### 2026-07-17 — Quiver global `wide::u32x8` postings unpack policy (`bd-quill-e2-grimoire-quiver-accg.2`, BeigeHorse)
+
+- **Hypothesis:** routing every canonical FSLX bitpacked doc-delta and frequency payload through the portable eight-lane `wide::u32x8` unpacker would beat the scalar reservoir for the complete width domain without changing bytes or decoded values.
+- **Parity and workload:** fixture `quiver-postings-bitpack-scalar-wide-v1` proved scalar/wide equality for widths 0..=32, counts 127/128, truncated/noncanonical inputs, FOR and BITMAP payloads, then ran paired A/A and scalar→wide gates for every nonzero width at source offsets 0/1/15/31 (256 nonzero shapes plus four width-zero controls). One strict-remote, same-worker, same-binary run completed on pinned `ovh-a`:
+
+  ```bash
+  env RCH_REQUIRE_REMOTE=1 RCH_WORKER=ovh-a RCH_WORKERS=ovh-a RCH_PREFERRED_WORKER=ovh-a \
+    rch exec -- env CARGO_TARGET_DIR=/tmp/frankensearch-quill-e22-bench \
+    QUILL_POSTINGS_AB_INNER=64 cargo bench -p frankensearch-quill \
+    --features bench-internals --bench postings_decode_ab -- \
+    --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot
+  ```
+
+- **Admissible rejection rows:** the overall summary was intentionally `INVALID` because 85/256 nonzero and all four width-zero A/A bands failed to bracket 1.0; those rows support no conclusion. Independent rows with valid null controls nevertheless block the global policy. At c127/w1/o0, A/A was median 0.9714 (p5 0.9170, p95 1.0169) while wide/scalar was **2.3860×**. At c128/w29/o0, A/A was 0.8142..1.0208 while wide/scalar was **1.1014×**; widths 29–32 produced additional decisive regressions, including c128/w32/o0 at **1.1994×** against an A/A band of 0.8321..1.0465. Criterion diagnostics agreed: c127/w1 was about 81.0 ns scalar vs 165.0 ns wide; c128/w8 showed the opposite shape (267.0 ns vs 104.5 ns), confirming that one route is not uniformly best.
+- **Decision:** **REJECT global wide-for-all; do not ship the measured regression.** Production FOR/frequency decoding uses the canonical scalar reservoir. The wide kernel with bit-identical decoded output, exhaustive differential, and benchmark remain available for a future per-width dispatcher, but no dispatcher may land until each routed width clears valid same-binary null controls across the required offsets. No positive row is entered in `PERF_LEDGER.md` because this bead ships no measured runtime speedup.
+
 ### 2026-07-16 — `prf_expand` in-place interpolation buffer (`frankensearch-fusion`, BlackThrush)
 
 - **Hypothesis:** `prf::prf_expand` (PRF query expansion) allocates a second `dims`-length `expanded` vector and zero-initializes it, then overwrites every element on the very next loop — a wasted allocation + zero-init. Folding the interpolation back into the already-owned `centroid` buffer (`centroid[i] = alpha*orig[i] + beta*centroid[i]`, read-then-write per index) should drop both, byte-identically (the durability zero-init-elision class, **not** the `bd-d2a8` scale-wash class).

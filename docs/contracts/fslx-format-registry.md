@@ -112,30 +112,63 @@ Lookup: binary-search block index (on `first_key`), scan one block (≤ R-entry 
 
 ### 5.2 POSTINGS
 
-Per term: a sequence of **doc blocks** followed by an optional **tail**.
+Per term: a sequence of independently self-delimiting **doc blocks**. A fresh
+seal emits zero or more 128-posting FOR/BITMAP blocks followed by at most one
+partial VINT block. A concat-merged stream may retain VINT partial blocks at
+interior segment seams; readers therefore consume blocks until the TERMDICT
+`postings_len` is exhausted and validate that the sum of `posting_count` equals
+`doc_freq`. This is load-bearing for Q1: ordinary merges preserve every input
+block byte-for-byte instead of shifting all later 128-posting boundaries.
 
 ```
-full block (128 docs):
-  u8  block_kind             # 0 = FOR, 1 = BITMAP
-  FOR:
-    u32 first_doc            # ABSOLUTE global docid (load-bearing for concat-merge: no rebase)
-    u8  doc_width            # 0..32 bits; 127 deltas (doc[i+1]-doc[i], always >=1, stored minus 1)
-    u8  freq_kind            # 0 = all freqs == 1; 1 = bitpacked
-    u8  freq_width           # present iff freq_kind == 1
-    bitpacked delta payload (ceil(127*doc_width/8) bytes, LSB-first within bytes)
-    bitpacked freq payload   # iff freq_kind == 1: 128 values, stored minus 1
-  BITMAP (chosen at build when the 128 docs' span < 512):
-    u32 first_doc
-    u16 span                 # < 512
-    64-byte bitmap (512 bits), bit i => doc first_doc+i present
-    freq payload as in FOR (kind/width + 128 packed values, in bitmap doc order)
-tail (doc_count % 128 docs):
-  u8  block_kind = 2         # VINT tail
-  u16 count
-  count × { doc_delta: vint (first is absolute-from-zero... see note), freq: vint }
+every block:
+  u8  block_kind             # 0 = FOR, 1 = BITMAP, 2 = VINT partial
+  u8  posting_count          # 1..=128; FOR/BITMAP = 128, VINT = 1..=127
+  u16 payload_len            # LE; bytes after this common header
+
+FOR payload (posting_count = 128):
+  u32 first_doc              # ABSOLUTE global docid (load-bearing for concat-merge: no rebase)
+  u8  doc_width              # 0..=32 bits; 127 deltas (doc[i+1]-doc[i], always >=1, stored minus 1)
+  u8  freq_kind              # 0 = all freqs == 1; 1 = bitpacked
+  u8  freq_width             # present iff freq_kind == 1; 1..=32
+  bitpacked delta payload    # ceil(127*doc_width/8) bytes, LSB-first within bytes
+  bitpacked freq payload     # iff freq_kind == 1: 128 values, stored minus 1
+
+BITMAP payload (posting_count = 128; selected by fresh writers when span < 512):
+  u32 first_doc
+  u16 span                   # last_doc - first_doc + 1; 128..511
+  64-byte bitmap (512 bits)  # bit i is bitmap[i/8] & (1 << (i%8)); doc first_doc+i present
+  u8  freq_kind              # 0 = all freqs == 1; 1 = bitpacked
+  u8  freq_width             # present iff freq_kind == 1; 1..=32
+  bitpacked freq payload     # iff freq_kind == 1: 128 freq-1 values in bitmap doc order
+
+VINT partial payload (posting_count = 1..=127):
+  posting_count × { doc_delta: vint (first is absolute-from-zero... see note), freq: vint }
 ```
 
-**Tail delta note (normative):** the tail's first entry stores the absolute docid as a vint (u32 range); subsequent entries store `delta-1` vints. Freqs stored as-is (≥1) in the tail.
+`payload_len` is canonical: it must exactly equal the bytes implied by the
+selected codec/header fields, and readers reject both truncation and trailing
+payload bytes. Widths are minimal: `doc_width` is the bit width of the largest
+stored `delta-1`; `freq_kind=0` iff every frequency is one, otherwise
+`freq_width` is the bit width of the largest stored `freq-1`. FOR/BITMAP counts
+other than 128 and VINT counts outside 1..=127 are corrupt. Fresh writers select
+BITMAP iff a full block's inclusive span is <512 and FOR otherwise. Readers also
+accept a structurally canonical FOR block at any span; this keeps the decoder
+domain complete (including width-0 FOR) without changing deterministic writer
+output. For BITMAP, bit 0 and bit `span-1` are set, exactly 128 bits are set, and
+every bit at index `>= span` is zero.
+
+**Partial-block delta note (normative):** the block's first entry stores the
+absolute docid as a vint (u32 range); subsequent entries store `delta-1` vints.
+Freqs are stored as-is (≥1). Partial blocks are legal anywhere in a merged term
+stream, not only at its end.
+
+**Fragmentation contract:** an ordinary merge never creates a new posting
+fragment. Each freshly sealed leaf segment contributes at most one partial block
+per term. A merge output preserves exactly the leaf partial blocks already
+present in its inputs; it may therefore contain multiple partial blocks, but
+repeated merge schedules create none. Optional reblocking is reserved for an
+explicit deep-compaction lever and is not part of Q1 concat.
 
 ### 5.3 POSITIONS
 
@@ -143,7 +176,8 @@ Per term (fields with positions only): per-doc position runs, doc-aligned with P
 
 ### 5.4 BLOCKMAX
 
-Per term, one entry per POSTINGS block (including the tail):
+Per term, one entry per POSTINGS block (including every full or partial block,
+regardless of position):
 
 ```
 { first_doc: u32, block_offset: vint (from term's postings_offset),
@@ -298,7 +332,7 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 2. **Torn-file matrix**: truncate at every 1 KiB boundary → typed errors (e3.1).
 3. **Publish crash-window matrix**: kill between every §6.2 step; recovery rules hold (e3.3/e3.9 + writer-lock bead multi-process rows).
 4. **Checksum flip sweep**: corrupt each byte class (header/section/trailer/manifest/tombstones) → typed error, never panic (e2.8).
-5. **Encoding edge fixtures**: width-0 and width-32 FOR blocks, bitmap threshold spans 511/512, tails of 1 and 127, zero-delta positions, 256-byte terms, empty DocId rejection, holes in DOCLEN/IDMAP/STOREDMETA after simulated compaction.
+5. **Encoding edge fixtures**: width-0 and width-32 FOR blocks, bitmap threshold spans 511/512, VINT partial blocks of 1 and 127 at final and interior positions, `payload_len` truncation/trailing-byte rejection, the Q1 `df=100 + df=300` raw-block-concat case, zero-delta positions, 256-byte terms, empty DocId rejection, holes in DOCLEN/IDMAP/STOREDMETA after simulated compaction.
 
 ## 12. Format registry (append-only)
 
@@ -307,5 +341,6 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.0 | 2026-07-17 | Initial FSLX v1: segment container + sections 1–10; MANIFEST v1 + two-rename/claim publish; tombstone roaring-lite; LOCK/claim/CURRENT artifacts; GC safety rules | — (genesis) | golden segment (e2.8, pending) |
 | 1.0.1 | 2026-07-17 | `seal_seq: u64` added to MANIFEST segment entries (recency for IDHASH newest-first probe order and forensics) — folded into v1 pre-freeze | — (pre-freeze fold) | manifest roundtrip test |
 | 1.0.2 | 2026-07-17 | IDMAP gains per-doc `content_hash: u64` (resumable-bulk witness + doctor audit; bd-quill-duel-resumable-bulk) — folded into v1 pre-freeze | — (pre-freeze fold) | resume-equivalence fixture (pending) |
+| 1.0.3 | 2026-07-17 | POSTINGS blocks gain a common `{kind, posting_count, payload_len}` header; VINT partials are legal at preserved interior seams so Q1 merges copy blocks verbatim without cascading re-encode; `doc_width` is explicitly one byte covering 0..=32 | — (pre-freeze correction) | `df=100 + df=300` concat + scalar/SIMD bitpack differential (e2.2) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*

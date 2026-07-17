@@ -43,12 +43,24 @@ Shard sessions acquire lease blocks alternately, so one shard's later leases int
 **What merge actually does** (all streaming, no posting decode):
 
 1. K-way merge the n TERMDICTs by composite key bytes (galloping over prefix blocks).
-2. Per term: copy posting-block bytes **verbatim** (FOR blocks store `first_doc` as an absolute u32 — no rebase exists to do). The only re-encoding is at **seams**: Sᵢ's final partial (vint tail) block + Sᵢ₊₁'s first block may combine into ≤1 re-encoded block per boundary per term.
-3. BLOCKMAX: copy entries; recompute only seam-block pairs.
+2. Per term: copy posting-block bytes **verbatim and in input order** (FOR blocks store `first_doc` as an absolute u32 — no rebase exists to do). Every FSLX posting block is self-delimiting; a source stream's partial VINT block therefore remains legal at an interior segment seam. Ordinary merge never shifts later 128-posting boundaries.
+3. BLOCKMAX: re-emit entries in the same block order, adjusting each `block_offset` relative to the merged term's posting stream while preserving `first_doc`, `max_freq_q`, and `min_fieldnorm`. No seam entry is synthesized because no posting block is rewritten.
 4. DOCLEN/IDMAP/STOREDMETA/NUMERIC: concatenate (positional sections stay positional over the merged range; the gap between `hiᵢ` and `loᵢ₊₁` — other shards' burned or foreign docids are *not* in the run by R2… see §4.1).
 5. STATS: sum. Tombstones: union (carried, not folded — folding is compaction §5). IDHASH: rebuild linearly from merged IDMAP (cheap, sequential).
 
 Expected cost: sequential read + sequential write; I/O-bound. The e3.5 bench asserts CPU/byte stays ~flat as segment count grows.
+
+**Why interior partial blocks are intentional.** A tail-only canonical grammar
+cannot satisfy verbatim concat. For example, `df(A)=100` and `df(B)=300` would
+group monolithically as `128/128/128/16`; filling A's tail consumes 28 postings
+from B and shifts every later B boundary. FSLX instead preserves
+`partial(100)/full(128)/full(128)/partial(44)`. Decoded postings, stats, and
+queries are identical to the monolithic build, while every copied input block
+is byte-identical and ordered. Each freshly sealed leaf segment contributes at
+most one partial block per term. A merge output preserves exactly the leaf
+partials already present in its inputs; it may contain multiple partial blocks,
+but repeated merge schedules create none. Optional reblocking is reserved for explicit deep compaction, where
+the CPU/storage trade is measured rather than hidden in ordinary merges.
 
 ### 4.1 Positional sections across run gaps
 
@@ -63,7 +75,8 @@ Compaction rewrites one segment to fold its tombstones: surviving docids are **p
 | ID | Obligation | Where enforced/tested |
 |---|---|---|
 | **Q1-OB1** | Manifest validation rejects overlapping covering intervals; `merge()` asserts bound-consecutive inputs (R2); seal asserts single-lease spans (R1) | e3.2/e3.3 validation + e3.5 assertion + e3.9 crash matrix |
-| **Q1-OB2** | `merge(S₁…Sₙ)` is bit-identical to indexing the concatenated document stream into one segment with the same docid assignments | e3.5 fixture (bridges via e5.4's seal-determinism) |
+| **Q1-OB2a** | Decoded postings, aggregate stats, and query results from `merge(S₁…Sₙ)` equal monolithic indexing of the concatenated document stream with the same docid assignments | e3.5 fixture, including `df=100 + df=300` (bridges via e5.4's seal determinism) |
+| **Q1-OB2b** | Every input posting block appears byte-identically and in source order in the merged term stream; merge creates no new posting fragments | e3.5 raw-block witness + arbitrary merge-schedule property test |
 | **Q1-OB3** | Query results are invariant under ANY merge schedule (BM25 stats are snapshot-level aggregates) | e3.5 random-merge-order property test; e6.3 metamorphic suite |
 | **Q1-OB4** | Compaction preserves surviving docids; compacted segment is query-identical to the tombstone-paired original | e3.6 fixture (measured at realistic densities: 5/20/50% — never 0%) |
 | **Q1-OB5** | Lease disjointness under concurrent sessions; burn-on-end accounting; R1 cut on lease exhaustion (both flush and delta-seal paths) | e1.6 property tests + e5.4 note |
