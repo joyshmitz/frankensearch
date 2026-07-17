@@ -112,7 +112,7 @@ pub(crate) fn widen8_f16_bytes(b: &[u8; 16]) -> f32x8 {
 
 /// Widen 8 consecutive `f16` values (from a fixed array) to `f32x8` (SIMD widen).
 #[inline(always)]
-fn widen8_f16_slice(s: &[f16; 8]) -> f32x8 {
+pub(crate) fn widen8_f16_slice(s: &[f16; 8]) -> f32x8 {
     let lanes: [u32; 8] = [
         u32::from(s[0].to_bits()),
         u32::from(s[1].to_bits()),

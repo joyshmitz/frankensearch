@@ -1,5 +1,21 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — `InMemoryVectorIndex::vector_at_f32` decodes f16 via SIMD widen (the in-memory twin) (BlackThrush)
+
+- **Negative-ledger-first route and profile:** grepping for the remaining scalar `f16::to_f32` decode loops (the "grep ALL consumers of a SIMD'd scalar op" lead from the FSVI `vector_at_f32` win, `38f471a9`) surfaced the direct twin I had missed: `InMemoryVectorIndex::vector_at_f32` (the fully-resident index used to materialize vectors for HNSW graph build / fingerprinting) still decoded its `&[f16]` slice with `stored.iter().map(|v| v.to_f32()).collect()` — scalar — while the f16 dot kernels already widen 8 f16 per block via `simd::widen8_f16_slice`.
+- **Single lever:** made `widen8_f16_slice` `pub(crate)` and the in-memory `vector_at_f32` now widens 8 f16 per `chunks_exact(8)` block through it (`.to_array()` → 8 `f32`), with the original scalar `to_f32` tail for the final `< 8`. Same widen the dot generic path ships → byte-identical output. (The `wal::decode_vector` open-time f16 decode is the one remaining scalar consumer — a colder route-next left for a follow-up.)
+- **Same-binary paired A/B:** strict remote-only `rch`, one foreground release binary on worker `vmi1152480`, `--profile release` (LTO disabled), 30 samples, 150 ms warm-up, 500 ms measurement. A new `inmem_vector_decode_f16_ab` bench decodes an f16 slice both ways (the `widen` arm is a byte-for-byte copy of `widen8_f16_slice`) and asserts a bit-identical `Vec<f32>` before timing. widen/scalar (`<1` wins):
+
+| dim | scalar | widen | ratio | speedup |
+|---:|---:|---:|---:|---:|
+| 256 | 648.63 ns | 195.76 ns | 0.302 | ~3.31× |
+| 384 | 1053.7 ns | 234.00 ns | 0.222 | ~4.50× |
+| 768 | 1775.3 ns | 471.05 ns | 0.265 | ~3.77× |
+
+All three rows have disjoint confidence intervals. (Slightly under the FSVI bytes path's flat ~4.5× because `widen8_f16_slice` marshals via `to_bits` into a `[u32; 8]` rather than the direct 16-byte load.)
+- **Verification:** the focused index lib `in_memory` suite passed remotely (**22 passed, 0 failed**), covering the in-memory `vector_at_f32` recovery round-trips; the bench parity gate proved bit-identical decode at dim 256/384/768; and `widen8_f16_slice` is independently validated bit-identical by the shipped f16-dot generic/AVX2 parity tests. Owned-file `rustfmt` and `git diff --check` passed.
+- **Scope:** KEEP for in-memory f16 vector materialization. This is a cold-path (HNSW build / fingerprint) decode-kernel win that completes the f16-decode-materializer sibling sweep started at `38f471a9` (FSVI path); the decode is a fraction of the surrounding build, so this is a materialization-kernel speedup, not an end-to-end build-latency claim.
+
 ## 2026-07-16 — `vector_at_f32` decodes f16 via SIMD widen, not a scalar `to_f32` loop (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill docs, and the newest landed code (`c5cd8b51` quill fieldnorm/BM25) is a *pinned bit-parity contract* — explicitly no `mul_add`, off-limits. Sibling-path audit of the f16 decode instead: the f16 **dot** kernels widen 8 f16 per 16-byte block through `simd::widen8_f16_bytes` (the `wide` magic-factor widen, proven bit-identical to `f16::to_f32`), but `VectorIndex::vector_at_f32`'s F16 branch — the materializer used by PRF feedback-vector lookup (`searcher.rs` per-query when expansion is enabled) and index refresh/build — still decoded each f16 with a **scalar `half::f16::to_f32` loop**. It was an un-updated consumer of the same scalar op the dot path already replaced.

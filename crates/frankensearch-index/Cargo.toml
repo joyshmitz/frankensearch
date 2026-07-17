@@ -77,6 +77,11 @@ harness = false
 name = "vector_decode_f16_ab"
 harness = false
 
+# InMemoryVectorIndex::vector_at_f32 f16 decode: scalar vs SIMD widen8_f16_slice — paired A/B.
+[[bench]]
+name = "inmem_vector_decode_f16_ab"
+harness = false
+
 # HNSW (ANN) vs flat brute-force vector search — lever validation (latency + recall).
 [[bench]]
 name = "hnsw_vs_flat"

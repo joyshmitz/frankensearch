@@ -904,7 +904,19 @@ impl InMemoryVectorIndex {
             });
         }
         let stored = self.vector_slice(index);
-        Ok(stored.iter().map(|v| v.to_f32()).collect())
+        // SIMD-widen 8 f16 per block (`widen8_f16_slice`, the same magic-factor widen
+        // the f16 dot kernels use — bit-identical to the scalar `f16::to_f32`), then a
+        // scalar tail for the last < 8. Mirrors the FSVI `VectorIndex::vector_at_f32`.
+        let mut out = Vec::with_capacity(stored.len());
+        let mut blocks = stored.chunks_exact(8);
+        for block in &mut blocks {
+            let arr: &[f16; 8] = block.try_into().expect("chunks_exact(8) yields 8 f16");
+            out.extend_from_slice(&crate::simd::widen8_f16_slice(arr).to_array());
+        }
+        for v in blocks.remainder() {
+            out.push(v.to_f32());
+        }
+        Ok(out)
     }
 
     /// Compute dot products between a query and specific hit positions.
