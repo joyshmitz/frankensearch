@@ -865,6 +865,213 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
+    fn fieldnorm_codec_matches_tantivy_decodes_and_encode_boundaries() {
+        use frankensearch_lexical::tantivy_crate::fieldnorm::FieldNormReader;
+        use frankensearch_quill::contract::{FIELD_NORMS_TABLE, fieldnorm_to_id, id_to_fieldnorm};
+
+        for id in 0..=u8::MAX {
+            assert_eq!(
+                id_to_fieldnorm(id),
+                FieldNormReader::id_to_fieldnorm(id),
+                "decode id={id}"
+            );
+        }
+        // The encoder is constant between consecutive table boundaries, so
+        // each boundary and both adjacent values cover every output interval.
+        let mut probes = vec![0, u32::MAX];
+        for &boundary in &FIELD_NORMS_TABLE {
+            probes.push(boundary);
+            probes.push(boundary.saturating_sub(1));
+            probes.push(boundary.saturating_add(1));
+        }
+        probes.sort_unstable();
+        probes.dedup();
+        for length in probes {
+            assert_eq!(
+                fieldnorm_to_id(length),
+                FieldNormReader::fieldnorm_to_id(length),
+                "encode length={length}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn doclen_and_raw_stats_match_tantivy_before_and_after_delete() {
+        use frankensearch_lexical::tantivy_crate::indexer::NoMergePolicy;
+        use frankensearch_lexical::tantivy_crate::query::Bm25StatisticsProvider;
+        use frankensearch_lexical::tantivy_crate::schema::{STORED, STRING, Schema, TEXT};
+        use frankensearch_lexical::tantivy_crate::{Index, Term, doc};
+        use frankensearch_quill::contract::id_to_fieldnorm;
+        use frankensearch_quill::quiver::{
+            DocLenFieldInput, EncodedDocLenSection, EncodedStatsSection, FieldStats,
+            aggregate_field_stats,
+        };
+
+        fn tokens(count: usize) -> String {
+            std::iter::repeat_n("x", count)
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        assert_eq!(
+            oracle_version_contract()
+                .expect("version contract")
+                .tantivy_version,
+            "0.26.1"
+        );
+        let raw_lengths = [41_u32, 42, 65];
+        let mut schema_builder = Schema::builder();
+        let id = schema_builder.add_text_field("id", STRING | STORED);
+        let content = schema_builder.add_text_field("content", TEXT | STORED);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer = index
+            .writer_with_num_threads(1, 50_000_000)
+            .expect("single-segment oracle writer");
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        for (document_index, &length) in raw_lengths.iter().enumerate() {
+            writer
+                .add_document(doc!(
+                    id => format!("stats-{document_index}"),
+                    content => tokens(usize::try_from(length).unwrap_or(usize::MAX)),
+                ))
+                .expect("add oracle document");
+        }
+        writer.commit().expect("commit oracle fixture");
+        let reader = index.reader().expect("oracle reader");
+        reader.reload().expect("reload committed oracle");
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+
+        let oracle_tokens = Bm25StatisticsProvider::total_num_tokens(&searcher, content)
+            .expect("oracle token count");
+        let oracle_docs =
+            Bm25StatisticsProvider::total_num_docs(&searcher).expect("oracle document count");
+        assert_eq!(oracle_tokens, 148);
+        assert_eq!(oracle_docs, 3);
+        let mut oracle_ids = searcher
+            .segment_readers()
+            .iter()
+            .flat_map(|segment| {
+                let norms = segment
+                    .get_fieldnorms_reader(content)
+                    .expect("content fieldnorms");
+                (0..segment.max_doc())
+                    .map(move |doc| norms.fieldnorm_id(doc))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        oracle_ids.sort_unstable();
+
+        let lengths = raw_lengths.map(Some);
+        let inputs = [DocLenFieldInput::new(1, &lengths)];
+        let encoded_doclen =
+            EncodedDocLenSection::encode(0, 3, &[1], &inputs).expect("Quill DOCLEN");
+        let mut quill_ids = encoded_doclen
+            .section(&[1])
+            .expect("parse Quill DOCLEN")
+            .field(1)
+            .expect("Quill content field")
+            .fieldnorm_ids()
+            .to_vec();
+        quill_ids.sort_unstable();
+        assert_eq!(quill_ids, oracle_ids);
+
+        let segment_stats = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                let row = [FieldStats::new(
+                    1,
+                    segment
+                        .inverted_index(content)
+                        .expect("inverted index")
+                        .total_num_tokens(),
+                    segment.max_doc(),
+                )];
+                EncodedStatsSection::encode(&[1], &row, segment.max_doc())
+                    .expect("encode segment STATS")
+                    .section(&[1])
+                    .expect("parse segment STATS")
+            })
+            .collect::<Vec<_>>();
+        let aggregate = aggregate_field_stats(segment_stats.iter())
+            .expect("aggregate multi-segment Quill STATS");
+        let raw_avgdl = aggregate[0]
+            .average_field_length()
+            .expect("non-empty average");
+        assert_eq!(raw_avgdl.to_bits(), (148.0_f32 / 3.0).to_bits());
+        let decoded_avgdl =
+            oracle_ids.iter().copied().map(id_to_fieldnorm).sum::<u32>() as f32 / 3.0;
+        assert_ne!(raw_avgdl.to_bits(), decoded_avgdl.to_bits());
+
+        drop(searcher);
+        writer.delete_term(Term::from_field_text(id, "stats-1"));
+        writer.commit().expect("commit oracle delete");
+        reader.reload().expect("reload oracle deletion");
+        let deleted_searcher = reader.searcher();
+        assert_eq!(deleted_searcher.num_docs(), 2);
+        assert_eq!(
+            Bm25StatisticsProvider::total_num_docs(&deleted_searcher)
+                .expect("post-delete oracle document count"),
+            3
+        );
+        assert_eq!(
+            Bm25StatisticsProvider::total_num_tokens(&deleted_searcher, content)
+                .expect("post-delete oracle token count"),
+            148
+        );
+        let mut post_delete_ids = deleted_searcher
+            .segment_readers()
+            .iter()
+            .flat_map(|segment| {
+                let norms = segment
+                    .get_fieldnorms_reader(content)
+                    .expect("post-delete fieldnorms");
+                (0..segment.max_doc())
+                    .map(move |doc| norms.fieldnorm_id(doc))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        post_delete_ids.sort_unstable();
+        assert_eq!(post_delete_ids, oracle_ids);
+        assert!(
+            deleted_searcher
+                .segment_readers()
+                .iter()
+                .any(|segment| { (0..segment.max_doc()).any(|doc| segment.is_deleted(doc)) })
+        );
+
+        let post_delete_sections = deleted_searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                let row = [FieldStats::new(
+                    1,
+                    segment
+                        .inverted_index(content)
+                        .expect("post-delete inverted index")
+                        .total_num_tokens(),
+                    segment.max_doc(),
+                )];
+                EncodedStatsSection::encode(&[1], &row, segment.max_doc())
+                    .expect("encode post-delete STATS")
+                    .section(&[1])
+                    .expect("parse post-delete STATS")
+            })
+            .collect::<Vec<_>>();
+        let post_delete = aggregate_field_stats(post_delete_sections.iter())
+            .expect("aggregate post-delete STATS");
+        assert_eq!(post_delete[0].total_tokens, 148);
+        assert_eq!(post_delete[0].doc_count, 3);
+        assert_eq!(
+            post_delete[0].average_field_length().map(f32::to_bits),
+            Some(raw_avgdl.to_bits())
+        );
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
     fn oracle_constructor_rejects_dirty_or_mismatched_source() {
         let revision = oracle_version_contract()
             .expect("version contract")
