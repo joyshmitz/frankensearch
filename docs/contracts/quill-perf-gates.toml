@@ -1,0 +1,84 @@
+# Quill performance gate manifests (QG-1..QG-10) — bd-quill-e0-contracts-j53p.6
+# Normative companion: docs/contracts/quill-perf-gates.md (laws, activation rules, layout).
+# A gate is PROVISIONAL until `activated = true`, which requires every pin below to be real
+# (fixtures committed, oracle config verified identical, stat rule wired into the harness).
+# Consumed by the gauntlet crate's bench harness (crates/frankensearch-quill-gauntlet) by path.
+
+[defaults]
+oracle = "tantivy 0.26.1 via frankensearch-lexical (feature tantivy-oracle)"
+oracle_config = "identical analyzer semantics; identical heap budget; commits inside timed windows for BOTH engines; symmetric setup/teardown outside timed windows; same-binary paired A/B (bench-internals convention)"
+build_profile = "release-perf equivalent: opt-level=3, lto=thin, codegen-units=1, force-frame-pointers=yes"
+stat_rule = ">=10 runs; median + MAD; cv_pct < 5 else the cell is NOISE (quarantine, never keep); bootstrap CI on ratios (metrics_eval::bootstrap_compare, 2000 resamples, seeded)"
+ratchet = ".bench-history/<gate>.latest.json committed; pass-over-pass within thresholds; regressions replay via seeded harness"
+machines = ["apple-silicon >= M2 Pro class (P/E asymmetric)", "x86 Zen3+ >=16C (RCH fleet for trend lines; documented noise budget; attribution runs LOCAL only per bd-e41k)"]
+rss_probe = "linux: /proc/self/status VmHWM; macos: mach task_info / time -l (per-OS abstraction mandatory — e8.4 notes)"
+
+[corpus.tiny]
+source = "fsfs benchmark_baseline_matrix golden profile 'tiny'"
+[corpus.small]
+source = "fsfs benchmark_baseline_matrix golden profile 'small'"
+[corpus.medium]
+source = "fsfs benchmark_baseline_matrix golden profile 'medium'"
+[corpus.xlarge]
+source = "synthetic 1M docs; Zipf terms s in {0.8,1.1,1.4}; code-file length distribution capped 2MiB; unicode mix lanes; generator = quill-e6.1 (content-addressed seed manifest embedded in artifacts)"
+status = "PENDING generator (quill-e6.1); gates depending on xlarge stay provisional until it lands"
+
+[gate.QG-1]
+name = "bulk indexing, multi-core"
+fixture = "medium + xlarge; positions ON; threads = 8; commit included in timed window"
+target = "docs_per_sec >= 3.0x oracle AND >= 0.60x measured tokenize-only bandwidth ceiling (honesty denominator lane: same corpus through the tokenizer alone)"
+activated = false
+
+[gate.QG-2]
+name = "bulk indexing, single-thread"
+fixture = "medium; positions ON; threads = 1; commit included"
+target = "docs_per_sec >= 1.5x oracle"
+activated = false
+
+[gate.QG-3]
+name = "watch-mode incremental"
+fixture = "5k-update upsert-heavy batches over a warm medium corpus; measured in BOTH topologies (bd-quill-duel-visibility-contract): (a) in-process reader, (b) fresh-process reader"
+target = "floor: >=20k docs/s initial, >=5k updates/s, p95 <= 25ms (lexical_pipeline.rs contract, both topologies where applicable); headroom: update->searchable >= 4x oracle commit+reload path — claim (a) IN-PROCESS ONLY, publish both numbers with topology labels"
+activated = false
+
+[gate.QG-4]
+name = "commit latency"
+fixture = "100k-doc index, warm; sealed-commit distribution over 100 commits"
+target = "p99 <= 50ms sealed commit; visibility lead (in-process searchable-before-commit) demonstrated once delta (e5.x) lands — until then this clause is N/A (G1a has no delta)"
+activated = false
+
+[gate.QG-5]
+name = "full compaction"
+fixture = "1M docs (xlarge) at tombstone densities {5, 20, 50}% — NEVER 0% (bd-6m8p lesson)"
+target = "wall-clock >= 5x faster than oracle force-merge at 20%; report all densities"
+activated = false
+
+[gate.QG-6]
+name = "query latency"
+fixture = "query-class mix from search_quality_harness slices (identifier/short_keyword/natural_language/phrase/boolean) x k in {10,100} x corpus {100k, 1M}"
+target = "p50 parity (+-10%) per class; p99 <= oracle per class; NO class regresses >10%; fuel-metering checkpoints (bd-quill-duel-fuel-metering) must show no measurable delta here before merging"
+activated = false
+
+[gate.QG-7]
+name = "memory"
+fixture = "peak ingest RSS at equal budget config (medium, 8 threads); index bytes/doc on medium+xlarge"
+target = "peak RSS <= oracle; bytes/doc <= 1.15x oracle (positions ON) and <= 0.8x (positions OFF vs oracle positions-on default); budget DECLARES the 8-bytes/doc IDMAP content_hash (registry 1.0.2) and tombstone/blockmax/idmap overheads itemized"
+activated = false
+
+[gate.QG-8]
+name = "scaling curve (contention honesty)"
+fixture = "bulk indexing threads {1,2,4,8,16,(32 where available)}; both reference machines; oracle curve measured alongside"
+target = "16-thread >= 1.8x own 4-thread on x86 reference; Apple Silicon P-only vs P+E curves published (graceful E-core join, no cliff); any plateau ATTRIBUTED (allocator contention axis mandatory — e8.4 notes; a bandwidth ceiling is honest, a lock plateau is a bug)"
+activated = false
+
+[gate.QG-9]
+name = "cold open"
+fixture = "1M-doc index (xlarge), cold page cache (documented eviction method per OS); default config (durable verify OFF)"
+target = "open() <= 50ms (manifest + lazy sections) vs oracle reader open"
+activated = false
+
+[gate.QG-10]
+name = "dependency surface"
+fixture = "cargo tree -p frankensearch --features lexical, default features, post-flip"
+target = "tantivy + its transitive tree ABSENT from default graph; delta recorded in the flip evidence bundle (quill-e7.6)"
+activated = false
