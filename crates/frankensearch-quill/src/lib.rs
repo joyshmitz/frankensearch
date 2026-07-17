@@ -27,6 +27,12 @@ pub mod tracing_conventions;
 
 pub use config::QuillConfig;
 pub use error::{QuillError, map_lock_error};
+pub use grimoire::{
+    ByteSpan, EncodedTermDictionary, MAX_COMPOSITE_KEY_BYTES, MAX_TERM_BYTES, OwnedTerm,
+    TERM_BLOCK_TARGET_BYTES, TERM_RESTART_INTERVAL, TermCursor, TermDictionary,
+    TermDictionaryError, TermDictionaryLimits, TermInput, TermMatch, TermMetadata, TermRef,
+    TermScratch, TermSectionLengths,
+};
 pub use keeper::{
     CURRENT_ENGINE_VERSION, EMPTY_TOMBSTONES, KeeperError, LoadedManifest, MANIFEST_FORMAT_VERSION,
     MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats, ManifestPublisher,

@@ -43,5 +43,10 @@ name = "postings_decode_ab"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "term_dictionary_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true
