@@ -356,6 +356,9 @@ impl QuillIndex {
                                 cfg: &SnippetConfig) -> SearchResult<Vec<LexicalHit>>;
     pub fn search_doc_ids(&self, cx: &Cx, query: &str, limit: usize)
                                 -> SearchResult<Vec<LexicalIdHit>>;
+    pub fn search_paginated(&self, cx: &Cx, query: &str, limit: usize, offset: usize)
+                                -> SearchResult<PaginatedHits>;   // hits + exact total_count
+                                                                  // (replaces (TopDocs, Count) tuple surface)
     pub fn segment_stats(&self) -> SegmentStats;               // ops/status surface
     pub async fn compact(&self, cx: &Cx, policy: CompactionPolicy) -> SearchResult<CompactionReport>;
 }
