@@ -91,6 +91,9 @@ test_logs/
 # NTM session state
 .ntm/
 
+# Quill conformance-gauntlet run artifacts
+.gauntlet/
+
 # Root-level agent-generated scripts and scratch output
 *.log
 /*.txt

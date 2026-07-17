@@ -13,6 +13,7 @@ members = [
     "crates/frankensearch-tui",
     "crates/frankensearch-ops",
     "crates/frankensearch-quill",
+    "crates/frankensearch-quill-gauntlet",
     "frankensearch",
     "tools/optimize_params",
 ]
