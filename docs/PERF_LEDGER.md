@@ -1,5 +1,21 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — `vector_at_f32` decodes f16 via SIMD widen, not a scalar `to_f32` loop (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill docs, and the newest landed code (`c5cd8b51` quill fieldnorm/BM25) is a *pinned bit-parity contract* — explicitly no `mul_add`, off-limits. Sibling-path audit of the f16 decode instead: the f16 **dot** kernels widen 8 f16 per 16-byte block through `simd::widen8_f16_bytes` (the `wide` magic-factor widen, proven bit-identical to `f16::to_f32`), but `VectorIndex::vector_at_f32`'s F16 branch — the materializer used by PRF feedback-vector lookup (`searcher.rs` per-query when expansion is enabled) and index refresh/build — still decoded each f16 with a **scalar `half::f16::to_f32` loop**. It was an un-updated consumer of the same scalar op the dot path already replaced.
+- **Single lever:** the F16 branch now widens 8 f16 per `chunks_exact(16)` block via `widen8_f16_bytes` (`.to_array()` → 8 `f32`), with the original scalar `to_f32` tail for the final `< 8`. Same widen the dot kernels ship → byte-identical output; the F32 branch, bounds checks, and errors are unchanged. No `unsafe` (reuses the safe `wide` helper).
+- **Same-binary paired A/B:** strict remote-only `rch`, one foreground release binary on worker `vmi1152480`, `--profile release` (LTO disabled), 30 samples, 150 ms warm-up, 500 ms measurement. A new `vector_decode_f16_ab` bench decodes a realistic f16 slab both ways (the `widen` arm is a byte-for-byte copy of `widen8_f16_bytes`) and asserts a bit-identical `Vec<f32>` before timing. widen/scalar (`<1` wins):
+
+| dim | scalar | widen | ratio | speedup |
+|---:|---:|---:|---:|---:|
+| 256 | 582.91 ns | 128.96 ns | 0.221 | ~4.52× |
+| 384 | 1047.1 ns | 231.44 ns | 0.221 | ~4.52× |
+| 768 | 1737.7 ns | 430.13 ns | 0.248 | ~4.04× |
+
+All three rows have hugely disjoint confidence intervals.
+- **Verification:** the focused index lib `vector_at` suite passed remotely (**3 passed, 0 failed**), covering the materializer (its small-dim tests exercise the scalar tail path, `dim % 8 ≠ 0`); the bench's parity gate proved bit-identical decode at dim 256/384/768; and `widen8_f16_bytes` is independently validated bit-identical by the shipped f16-dot generic/AVX2 parity tests. Owned-file `rustfmt` and `git diff --check` passed.
+- **Scope:** KEEP for f16 vector materialization. This is a ~4.5× decode-kernel win realized on every `vector_at_f32` caller — per-query PRF feedback vectors and cold index refresh/build — not an end-to-end search-latency claim. It complements the earlier fused-byte-dot rescore win (`7988941d`): the *scoring* path avoids materialization entirely; the paths that genuinely need an owned `Vec<f32>` now decode ~4.5× faster.
+
 ## 2026-07-16 — `shared_prefix_depth` walks split iterators instead of collecting two Vecs (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill docs. This turn swept fresh subsystems after confirming the scoring/blend/normalize veins are closed — notably the normalize-SIMD-scale sibling (`l2_normalize`, embedder finishes) is the same class the negative ledger just measured-rejected as a noise-floor wash (`bd-d2a8`: median 0.8978 but lever p95 1.0323 overlaps the A/A p5 0.8747), so it was skipped rather than re-tread. The clean lever surfaced in `fsfs::ranking_priors::shared_prefix_depth` — the per-candidate `path_proximity` prior counted shared leading path components by collecting **two** `Vec<&str>` and then `zip`ping them, though the vectors fed nothing but that `zip`.

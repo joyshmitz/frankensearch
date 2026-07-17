@@ -72,6 +72,11 @@ harness = false
 name = "quality_rescore_fused_dot_ab"
 harness = false
 
+# vector_at_f32 F16 decode: scalar half::to_f32 vs SIMD widen8_f16_bytes — paired A/B.
+[[bench]]
+name = "vector_decode_f16_ab"
+harness = false
+
 # HNSW (ANN) vs flat brute-force vector search — lever validation (latency + recall).
 [[bench]]
 name = "hnsw_vs_flat"

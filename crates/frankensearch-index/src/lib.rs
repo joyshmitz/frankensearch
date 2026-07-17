@@ -1281,7 +1281,17 @@ impl VectorIndex {
                     ));
                 }
                 let mut out = Vec::with_capacity(dim);
-                for chunk in self.data[start..end].chunks_exact(2) {
+                // SIMD-widen 8 little-endian f16 per 16-byte block (`widen8_f16_bytes`,
+                // the same magic-factor widen the f16 dot kernels use — bit-identical
+                // to the scalar `f16::to_f32`), then a scalar tail for the last < 8.
+                let mut blocks = self.data[start..end].chunks_exact(16);
+                for block in &mut blocks {
+                    let arr: &[u8; 16] = block
+                        .try_into()
+                        .expect("chunks_exact(16) yields 16-byte blocks");
+                    out.extend_from_slice(&crate::simd::widen8_f16_bytes(arr).to_array());
+                }
+                for chunk in blocks.remainder().chunks_exact(2) {
                     out.push(f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
                 }
                 Ok(out)
