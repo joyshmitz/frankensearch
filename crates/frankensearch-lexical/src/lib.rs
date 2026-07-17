@@ -1262,6 +1262,45 @@ impl TantivyIndex {
         self.collect_id_hits(&searcher, hits)
     }
 
+    /// Enumerate every live document identifier in the committed index.
+    ///
+    /// This is intended for generation reconciliation and repair paths that
+    /// cannot trust an external manifest. Results are sorted and deduplicated
+    /// so callers can stage deterministic deletes even when an older index
+    /// contains duplicate IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if a live stored document cannot be loaded or the
+    /// segment ordinal cannot be represented by Tantivy's address type.
+    pub fn all_doc_ids(&self) -> SearchResult<Vec<DocId>> {
+        let searcher = self.reader.searcher();
+        let mut ids = Vec::with_capacity(self.doc_count.load(Ordering::Relaxed));
+        for (segment_ord, segment) in searcher.segment_readers().iter().enumerate() {
+            let segment_ord =
+                u32::try_from(segment_ord).map_err(|_| SearchError::InvalidConfig {
+                    field: "tantivy.segment_ord".to_owned(),
+                    value: segment_ord.to_string(),
+                    reason: "segment ordinal must fit in u32".to_owned(),
+                })?;
+            for doc_id in 0..segment.max_doc() {
+                if segment.is_deleted(doc_id) {
+                    continue;
+                }
+                let doc = load_doc(&searcher, DocAddress::new(segment_ord, doc_id))?;
+                if let Some(doc_id) = doc
+                    .get_first(self.fields.id)
+                    .and_then(|value| value.as_str())
+                {
+                    ids.push(DocId::from(doc_id));
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Pre-optimization baseline for [`Self::search_doc_ids`] that retains the
     /// discarded total-count collector. This is used only by the `doc_ids_topk`
     /// benchmark so the optimized and counted paths can be compared in one
@@ -2394,6 +2433,27 @@ mod tests {
                 assert!(!hit.doc_id.is_empty());
                 assert!(hit.bm25_score.is_finite());
             }
+        });
+    }
+
+    #[test]
+    fn all_doc_ids_enumerates_only_live_committed_documents() {
+        let idx = TantivyIndex::in_memory().expect("create");
+        run_with_cx(|cx| async move {
+            let docs = [
+                IndexableDocument::new("doc-c", "gamma"),
+                IndexableDocument::new("doc-a", "alpha"),
+                IndexableDocument::new("doc-b", "beta"),
+            ];
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+            idx.delete_document(&cx, "doc-b").await.expect("delete");
+            idx.commit(&cx).await.expect("commit delete");
+
+            assert_eq!(
+                idx.all_doc_ids().expect("enumerate ids"),
+                vec![DocId::from("doc-a"), DocId::from("doc-c")]
+            );
         });
     }
 

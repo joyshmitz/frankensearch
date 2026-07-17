@@ -367,6 +367,73 @@ impl VectorIndex {
         Self::create_with_revision(path, embedder_id, "", dimension, Quantization::F16)
     }
 
+    /// Replace any existing index generation with a durable empty F16 index.
+    ///
+    /// Unlike calling [`Self::create`] directly, this first removes and
+    /// directory-syncs the incremental WAL sidecar. That ordering prevents a
+    /// WAL from the replaced generation from being accepted by the new empty
+    /// generation after a crash or restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the stale WAL cannot be removed durably, or the
+    /// same validation and corruption errors as [`Self::create`] and
+    /// [`Self::open`].
+    pub fn replace_with_empty(
+        path: &Path,
+        embedder_id: &str,
+        dimension: usize,
+    ) -> SearchResult<Self> {
+        let replacement_path = temporary_output_path(path);
+        let writer = Self::create(&replacement_path, embedder_id, dimension)?;
+        writer.finish()?;
+        Self::install_replacement(path, &replacement_path)
+    }
+
+    /// Durably install a fully written FSVI generation over `path`.
+    ///
+    /// The replacement is validated before the destination is touched. The
+    /// destination WAL is then removed and directory-synced before the main
+    /// file is atomically replaced, preventing records from the prior
+    /// generation from being replayed into the replacement after a crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the replacement is invalid, has a live WAL, is
+    /// the destination itself, or cannot be atomically installed and synced.
+    pub fn install_replacement(path: &Path, replacement_path: &Path) -> SearchResult<Self> {
+        if path == replacement_path {
+            return Err(SearchError::InvalidConfig {
+                field: "replacement_path".to_owned(),
+                value: replacement_path.display().to_string(),
+                reason: "replacement path must differ from destination".to_owned(),
+            });
+        }
+
+        let replacement = Self::open(replacement_path)?;
+        if replacement.wal_record_count() != 0 {
+            return Err(SearchError::InvalidConfig {
+                field: "replacement_path".to_owned(),
+                value: replacement_path.display().to_string(),
+                reason: "replacement generation must not have a live WAL".to_owned(),
+            });
+        }
+        drop(replacement);
+
+        let wal_path = wal::wal_path_for(path);
+        wal::remove_wal(&wal_path)?;
+        sync_parent_directory(&wal_path)?;
+
+        let temporary = tempfile::TempPath::try_from_path(replacement_path.to_path_buf())?;
+        if let Err(error) = temporary.persist(path) {
+            let tempfile::PathPersistError { error, mut path } = error;
+            path.disable_cleanup(true);
+            return Err(SearchError::Io(error));
+        }
+        sync_parent_directory(path)?;
+        Self::open(path)
+    }
+
     /// Create a writer with explicit embedder revision and quantization.
     ///
     /// # Errors
@@ -2899,6 +2966,47 @@ mod tests {
         // Cleanup.
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    #[test]
+    fn replace_with_empty_cannot_resurrect_previous_wal_entries() {
+        let path = temp_index_path("wal-replace-empty");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("main-old", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("wal-old", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append old WAL");
+        assert!(wal::wal_path_for(&path).exists());
+        drop(old);
+
+        assert!(
+            VectorIndex::replace_with_empty(&path, "invalid", 0).is_err(),
+            "replacement validation must fail before touching the old generation"
+        );
+        let intact = VectorIndex::open(&path).expect("reopen generation after rejected replace");
+        assert_eq!(intact.record_count(), 1);
+        assert_eq!(intact.wal_record_count(), 1);
+        drop(intact);
+
+        let replacement =
+            VectorIndex::replace_with_empty(&path, "new", 4).expect("replace generation");
+        assert_eq!(replacement.embedder_id(), "new");
+        assert_eq!(replacement.record_count(), 0);
+        assert_eq!(replacement.wal_record_count(), 0);
+        assert!(!wal::wal_path_for(&path).exists());
+        drop(replacement);
+
+        let reopened = VectorIndex::open(&path).expect("reopen replacement");
+        let hits = reopened
+            .search_top_k(&[1.0, 1.0, 0.0, 0.0], 10, None)
+            .expect("search replacement");
+        assert!(hits.is_empty(), "old WAL entries must not be resurrected");
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

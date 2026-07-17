@@ -68,13 +68,13 @@ notify = "8.2.0"
 ignore = "0.4"
 sha2 = { workspace = true }
 pdf-extract = { workspace = true }
+tempfile = "3"
 ureq = { version = "3", features = ["json"] }
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
-tempfile = "3"
 proptest = { workspace = true }
 jsonschema = "0.46"
 criterion = { workspace = true }

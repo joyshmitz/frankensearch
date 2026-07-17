@@ -15,8 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use asupersync::fs::{
-    copy as async_file_copy, read as async_file_read, read_to_string as async_file_read_to_string,
-    remove_file as async_file_remove, rename as async_file_rename,
+    read as async_file_read, read_to_string as async_file_read_to_string,
+    remove_file as async_file_remove,
 };
 use asupersync::runtime::spawn_blocking;
 use dirs::home_dir;
@@ -1035,6 +1035,20 @@ struct IndexCandidate {
     ingestion_class: IngestionClass,
 }
 
+#[derive(Debug, Clone)]
+struct PendingIndexDocument {
+    ingestion_class: IngestionClass,
+    file_key: String,
+    ingestion_class_label: String,
+    canonical_bytes: u64,
+    revision: i64,
+    reason_code: String,
+    content_hash_hex: String,
+    lexical_required: bool,
+    semantic_reused: bool,
+    document: IndexableDocument,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IndexDiscoveryStats {
     discovered_files: usize,
@@ -1055,12 +1069,14 @@ const FSFS_CHECKPOINT_FILE: &str = "index_checkpoint.json";
 const EMBEDDING_PROBE_MAX_RETRIES: usize = 2;
 const EMBEDDING_BATCH_MAX_RETRIES: usize = 3;
 const CHECKPOINT_PERSIST_INTERVAL: usize = 4;
+const INDEXING_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CheckpointFileEntry {
     revision: i64,
     ingestion_class: String,
     canonical_bytes: u64,
+    reason_code: String,
     lexical_indexed: bool,
     semantic_indexed: bool,
     content_hash_hex: String,
@@ -1074,15 +1090,28 @@ struct IndexingCheckpoint {
     started_at_ms: u64,
     updated_at_ms: u64,
     embedder_id: String,
+    embedder_dimension: usize,
     embedder_is_hash_fallback: bool,
+    artifacts_durable: bool,
+    source_hash_hex: String,
+    reason_codes: Vec<String>,
     files: BTreeMap<String, CheckpointFileEntry>,
     discovered_files: usize,
     skipped_files: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointReuse {
+    None,
+    LexicalOnly,
+    Complete,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct IndexSentinel {
     schema_version: u16,
+    #[serde(default = "completed_generation_default")]
+    generation_complete: bool,
     generated_at_ms: u64,
     command: String,
     target_root: String,
@@ -1093,6 +1122,10 @@ struct IndexSentinel {
     reason_codes: Vec<String>,
     total_canonical_bytes: u64,
     source_hash_hex: String,
+}
+
+const fn completed_generation_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7906,7 +7939,14 @@ impl FsfsRuntime {
     }
 
     fn read_index_manifest(index_root: &Path) -> SearchResult<Option<Vec<IndexManifestEntry>>> {
-        let path = index_root.join(FSFS_VECTOR_MANIFEST_FILE);
+        Self::read_index_manifest_file(index_root, FSFS_VECTOR_MANIFEST_FILE)
+    }
+
+    fn read_index_manifest_file(
+        index_root: &Path,
+        file_name: &str,
+    ) -> SearchResult<Option<Vec<IndexManifestEntry>>> {
+        let path = index_root.join(file_name);
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -7919,6 +7959,62 @@ impl FsfsRuntime {
             }
         })?;
         Ok(Some(manifest))
+    }
+
+    fn read_matching_manifest_generation(
+        index_root: &Path,
+    ) -> SearchResult<Option<BTreeMap<String, IndexManifestEntry>>> {
+        let Some(vector_manifest) =
+            Self::read_index_manifest_file(index_root, FSFS_VECTOR_MANIFEST_FILE)?
+        else {
+            return Ok(None);
+        };
+        let Some(lexical_manifest) =
+            Self::read_index_manifest_file(index_root, FSFS_LEXICAL_MANIFEST_FILE)?
+        else {
+            return Ok(None);
+        };
+        if vector_manifest != lexical_manifest {
+            return Ok(None);
+        }
+
+        let mut by_key = BTreeMap::new();
+        for entry in vector_manifest {
+            let key = entry.file_key.clone();
+            if by_key.insert(key, entry).is_some() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(by_key))
+    }
+
+    fn read_checkpoint_manifest_generation(
+        index_root: &Path,
+        checkpoint: &IndexingCheckpoint,
+    ) -> SearchResult<Option<BTreeMap<String, IndexManifestEntry>>> {
+        let Some(by_key) = Self::read_matching_manifest_generation(index_root)? else {
+            return Ok(None);
+        };
+        let Some(sentinel) = Self::read_index_sentinel(index_root)? else {
+            return Ok(None);
+        };
+        let manifests = by_key.values().cloned().collect::<Vec<_>>();
+        let total_canonical_bytes = manifests.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.canonical_bytes)
+        });
+        if index_source_hash_hex(&manifests) != checkpoint.source_hash_hex
+            || by_key.len() != checkpoint.files.len()
+            || sentinel.target_root != checkpoint.target_root
+            || sentinel.index_root != checkpoint.index_root
+            || sentinel.source_hash_hex != checkpoint.source_hash_hex
+            || sentinel.discovered_files != checkpoint.discovered_files
+            || sentinel.indexed_files != by_key.len()
+            || sentinel.skipped_files != checkpoint.skipped_files
+            || sentinel.total_canonical_bytes != total_canonical_bytes
+        {
+            return Ok(None);
+        }
+        Ok(Some(by_key))
     }
 
     fn count_stale_files(
@@ -8214,33 +8310,7 @@ impl FsfsRuntime {
             &[],
         ))?;
 
-        // Load checkpoint for resume
-        let existing_checkpoint = read_indexing_checkpoint(&index_root);
-        let mut checkpoint_indexed_keys: HashSet<String> = HashSet::new();
-        if let Some(ref ckpt) = existing_checkpoint {
-            if ckpt.target_root == target_root.display().to_string() {
-                for (key, entry) in &ckpt.files {
-                    if entry.lexical_indexed {
-                        checkpoint_indexed_keys.insert(key.clone());
-                    }
-                }
-                if !checkpoint_indexed_keys.is_empty() {
-                    info!(
-                        resumed_files = checkpoint_indexed_keys.len(),
-                        "resumed from checkpoint; skipping already-indexed files"
-                    );
-                }
-            }
-        }
-        let pre_checkpoint_count = candidates.len();
-        candidates.retain(|c| !checkpoint_indexed_keys.contains(&c.file_key));
-        let checkpoint_skipped = pre_checkpoint_count.saturating_sub(candidates.len());
-        if checkpoint_skipped > 0 {
-            info!(
-                checkpoint_skipped,
-                "checkpoint resume: skipping {} already-indexed files", checkpoint_skipped
-            );
-        }
+        candidates.sort_by(|left, right| left.file_key.cmp(&right.file_key));
 
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
@@ -8328,22 +8398,221 @@ impl FsfsRuntime {
             &recent_warnings,
         ))?;
 
-        // 2. Prepare indexes
+        // 2. Prepare indexes and validate the last durable checkpoint generation.
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
-        let mut vector_writer = Some(VectorIndex::create(
-            &vector_path,
-            embedder.id(),
-            embedder.dimension(),
-        )?);
+        let existing_checkpoint = match read_indexing_checkpoint(&index_root) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                warn!(error = %error, "ignoring malformed indexing checkpoint");
+                push_warning(
+                    &mut recent_warnings,
+                    IndexingWarningSeverity::Warn,
+                    format!("Ignoring malformed indexing checkpoint: {error}"),
+                );
+                None
+            }
+        };
+        let target_root_label = target_root.display().to_string();
+        let index_root_label = index_root.display().to_string();
+        let checkpoint_metadata_valid = existing_checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.schema_version == INDEXING_CHECKPOINT_SCHEMA_VERSION
+                && checkpoint.artifacts_durable
+                && checkpoint.target_root == target_root_label
+                && checkpoint.index_root == index_root_label
+        });
+        let checkpoint_manifests = if checkpoint_metadata_valid {
+            match Self::read_checkpoint_manifest_generation(
+                &index_root,
+                existing_checkpoint
+                    .as_ref()
+                    .expect("checkpoint checked above"),
+            ) {
+                Ok(manifests) => manifests,
+                Err(error) => {
+                    warn!(error = %error, "ignoring inconsistent checkpoint manifests");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let reconciliation_manifests = match Self::read_matching_manifest_generation(&index_root) {
+            Ok(manifests) => manifests,
+            Err(error) => {
+                warn!(error = %error, "unable to read prior manifests for lexical reconciliation");
+                None
+            }
+        };
+        let checkpoint_started_at = existing_checkpoint
+            .as_ref()
+            .filter(|_| checkpoint_metadata_valid)
+            .map_or_else(pressure_timestamp_ms, |previous| previous.started_at_ms);
+        write_indexing_checkpoint(
+            &index_root,
+            &IndexingCheckpoint {
+                schema_version: INDEXING_CHECKPOINT_SCHEMA_VERSION,
+                target_root: target_root_label.clone(),
+                index_root: index_root_label.clone(),
+                started_at_ms: checkpoint_started_at,
+                updated_at_ms: pressure_timestamp_ms(),
+                embedder_id: embedder.id().to_owned(),
+                embedder_dimension: embedder.dimension(),
+                embedder_is_hash_fallback,
+                artifacts_durable: false,
+                source_hash_hex: existing_checkpoint
+                    .as_ref()
+                    .map_or_else(String::new, |previous| previous.source_hash_hex.clone()),
+                reason_codes: existing_checkpoint
+                    .as_ref()
+                    .map_or_else(Vec::new, |previous| previous.reason_codes.clone()),
+                files: existing_checkpoint
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |previous| previous.files.clone()),
+                discovered_files: stats.discovered_files,
+                skipped_files: stats.skipped_files,
+            },
+        )?;
+
+        let mut vector_generation_compatible = false;
+        let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
+            match VectorIndex::open(&vector_path) {
+                Ok(index)
+                    if index.embedder_id() == embedder.id()
+                        && index.dimension() == embedder.dimension()
+                        && index.wal_record_count() == 0 =>
+                {
+                    vector_generation_compatible = true;
+                    Some(index)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(error = %error, "checkpoint FSVI is unavailable; rebuilding vectors");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if vector_index.is_none() {
+            vector_index = Some(VectorIndex::replace_with_empty(
+                &vector_path,
+                embedder.id(),
+                embedder.dimension(),
+            )?);
+        }
+        let mut vector_index = vector_index.expect("vector index initialized above");
+        let initial_live_vector_ids = if vector_generation_compatible {
+            vector_live_doc_ids(&vector_index)?
+        } else {
+            HashSet::new()
+        };
 
         let lexical_path = index_root.join("lexical");
         let lexical_index = TantivyIndex::create(&lexical_path)?;
 
         let canonicalizer = DefaultCanonicalizer::default();
         let file_classification_contract = FileClassificationContractDefinition::default();
-        let mut manifests = Vec::new();
+        let mut manifests = BTreeMap::<String, IndexManifestEntry>::new();
+        let mut resume_reuse = BTreeMap::<String, CheckpointReuse>::new();
+        let mut validated_content_hashes = HashMap::<String, String>::new();
+
+        if let (Some(previous), Some(previous_manifests)) =
+            (existing_checkpoint.as_ref(), checkpoint_manifests.as_ref())
+        {
+            for candidate in &candidates {
+                let Some(entry) = previous.files.get(&candidate.file_key) else {
+                    continue;
+                };
+                let Some(manifest) = previous_manifests.get(&candidate.file_key) else {
+                    continue;
+                };
+                let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
+                if entry.revision != revision
+                    || entry.ingestion_class != ingestion_class_label(candidate.ingestion_class)
+                {
+                    continue;
+                }
+                let Ok(bytes) = async_file_read(&candidate.file_path).await else {
+                    continue;
+                };
+                let content_hash_hex = content_sha256_hex(&bytes);
+                let reuse = checkpoint_entry_reuse(
+                    previous,
+                    entry,
+                    manifest,
+                    candidate,
+                    &content_hash_hex,
+                    embedder.id(),
+                    embedder.dimension(),
+                    embedder_is_hash_fallback,
+                    &initial_live_vector_ids,
+                );
+                if reuse == CheckpointReuse::None {
+                    continue;
+                }
+                validated_content_hashes.insert(candidate.file_key.clone(), content_hash_hex);
+                resume_reuse.insert(candidate.file_key.clone(), reuse);
+            }
+        }
+
+        if !resume_reuse.is_empty() {
+            info!(
+                resumed_files = resume_reuse.len(),
+                semantic_generation_reused = vector_generation_compatible,
+                "validated durable checkpoint generation"
+            );
+        }
+
+        let reusable_semantic_ids = candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.ingestion_class,
+                    IngestionClass::FullSemanticLexical
+                ) && resume_reuse.get(&candidate.file_key) == Some(&CheckpointReuse::Complete)
+            })
+            .map(|candidate| candidate.file_key.as_str())
+            .collect::<HashSet<_>>();
+        let stale_vector_ids = initial_live_vector_ids
+            .iter()
+            .filter(|file_key| !reusable_semantic_ids.contains(file_key.as_str()))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !stale_vector_ids.is_empty() {
+            vector_index.soft_delete_batch(&stale_vector_ids)?;
+        }
+
+        let mut lexical_reconciliation_ids = lexical_index
+            .all_doc_ids()?
+            .into_iter()
+            .map(|doc_id| doc_id.to_string())
+            .collect::<BTreeSet<_>>();
+        if let Some(previous_manifests) = reconciliation_manifests.as_ref() {
+            lexical_reconciliation_ids.extend(
+                previous_manifests
+                    .values()
+                    .map(|entry| entry.file_key.clone()),
+            );
+        }
+        if let Some(previous) = existing_checkpoint.as_ref() {
+            lexical_reconciliation_ids.extend(
+                previous
+                    .files
+                    .iter()
+                    .filter(|(_, entry)| entry.lexical_indexed)
+                    .map(|(file_key, _)| file_key.clone()),
+            );
+        }
+        for file_key in lexical_reconciliation_ids {
+            lexical_index.delete_document(cx, &file_key).await?;
+        }
         let mut observed_reason_codes: BTreeSet<String> =
             stats.reason_codes.iter().cloned().collect();
+        if checkpoint_manifests.is_some() {
+            if let Some(previous) = existing_checkpoint.as_ref() {
+                observed_reason_codes.extend(previous.reason_codes.iter().cloned());
+            }
+        }
         let mut semantic_doc_count = 0_usize;
         let mut content_skipped_files = 0_usize;
         let mut processed_files = 0_usize;
@@ -8352,20 +8621,22 @@ impl FsfsRuntime {
         let mut last_active_file = None;
 
         // Checkpoint state
-        let mut checkpoint = existing_checkpoint.unwrap_or_else(|| IndexingCheckpoint {
-            schema_version: 1,
-            target_root: target_root.display().to_string(),
-            index_root: index_root.display().to_string(),
-            started_at_ms: pressure_timestamp_ms(),
+        let mut checkpoint = IndexingCheckpoint {
+            schema_version: INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            target_root: target_root_label,
+            index_root: index_root_label,
+            started_at_ms: checkpoint_started_at,
             updated_at_ms: pressure_timestamp_ms(),
             embedder_id: embedder.id().to_string(),
+            embedder_dimension: embedder.dimension(),
             embedder_is_hash_fallback,
+            artifacts_durable: false,
+            source_hash_hex: String::new(),
+            reason_codes: observed_reason_codes.iter().cloned().collect(),
             files: BTreeMap::new(),
             discovered_files: stats.discovered_files,
             skipped_files: stats.skipped_files,
-        });
-        checkpoint.embedder_id = embedder.id().to_string();
-        checkpoint.embedder_is_hash_fallback = embedder_is_hash_fallback;
+        };
 
         let canonicalize_start = Instant::now();
         // We'll track cumulative timings for the batched phases
@@ -8373,13 +8644,38 @@ impl FsfsRuntime {
         let mut vector_elapsed_ms = 0_u128;
         let mut embedding_elapsed_ms = 0_u128;
         let mut batch_counter = 0_usize;
+        let mut remaining_reused_semantic = candidates
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.ingestion_class,
+                    IngestionClass::FullSemanticLexical
+                ) && resume_reuse.get(&candidate.file_key) == Some(&CheckpointReuse::Complete)
+            })
+            .count();
 
         // 3. Process in batches
         for chunk in candidates.chunks(BATCH_SIZE) {
+            checkpoint.artifacts_durable = false;
+            checkpoint.updated_at_ms = pressure_timestamp_ms();
+            write_indexing_checkpoint(&index_root, &checkpoint)?;
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
             // Read & Canonicalize
             for candidate in chunk {
+                let mut reuse = resume_reuse
+                    .get(&candidate.file_key)
+                    .copied()
+                    .unwrap_or(CheckpointReuse::None);
+                if reuse == CheckpointReuse::Complete
+                    && matches!(
+                        candidate.ingestion_class,
+                        IngestionClass::FullSemanticLexical
+                    )
+                {
+                    remaining_reused_semantic = remaining_reused_semantic.saturating_sub(1);
+                }
+
                 let bytes = match async_file_read(&candidate.file_path).await {
                     Ok(bytes) => bytes,
                     Err(error) if is_ignorable_index_walk_error(&error) => {
@@ -8392,6 +8688,13 @@ impl FsfsRuntime {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                let content_hash_hex = content_sha256_hex(&bytes);
+                if validated_content_hashes
+                    .get(&candidate.file_key)
+                    .is_some_and(|validated| validated != &content_hash_hex)
+                {
+                    reuse = CheckpointReuse::None;
+                }
 
                 // PDF files are binary but contain extractable text.
                 // Try PDF extraction before the generic binary check.
@@ -8426,26 +8729,31 @@ impl FsfsRuntime {
                 }
 
                 let canonical_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
-                canonical_bytes_total = canonical_bytes_total.saturating_add(canonical_bytes);
                 canonical_line_count =
                     canonical_line_count.saturating_add(count_non_empty_lines(&canonical));
-                let ingestion_class =
-                    format!("{:?}", candidate.ingestion_class).to_ascii_lowercase();
-                let reason_code = match candidate.ingestion_class {
-                    IngestionClass::FullSemanticLexical => "index.plan.full_semantic_lexical",
-                    IngestionClass::LexicalOnly => "index.plan.lexical_only",
-                    IngestionClass::MetadataOnly => "index.plan.metadata_only",
-                    IngestionClass::Skip => "index.plan.skip",
-                }
-                .to_owned();
-
-                manifests.push(IndexManifestEntry {
+                let ingestion_class = ingestion_class_label(candidate.ingestion_class).to_owned();
+                let reason_code = ingestion_plan_reason(candidate.ingestion_class).to_owned();
+                let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
+                let manifest = IndexManifestEntry {
                     file_key: candidate.file_key.clone(),
-                    revision: i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX),
+                    revision,
                     ingestion_class: ingestion_class.clone(),
                     canonical_bytes,
-                    reason_code,
-                });
+                    reason_code: reason_code.clone(),
+                };
+                if manifests
+                    .insert(candidate.file_key.clone(), manifest)
+                    .is_none()
+                {
+                    canonical_bytes_total = canonical_bytes_total.saturating_add(canonical_bytes);
+                    if matches!(
+                        candidate.ingestion_class,
+                        IngestionClass::FullSemanticLexical
+                    ) {
+                        semantic_doc_count = semantic_doc_count.saturating_add(1);
+                    }
+                    processed_files = processed_files.saturating_add(1);
+                }
 
                 let file_name = candidate
                     .file_path
@@ -8462,31 +8770,36 @@ impl FsfsRuntime {
                     doc = attach_file_classification_metadata(doc, classification);
                 }
 
-                if matches!(
-                    candidate.ingestion_class,
-                    IngestionClass::FullSemanticLexical
-                ) {
-                    semantic_doc_count = semantic_doc_count.saturating_add(1);
-                }
-                processed_files = processed_files.saturating_add(1);
                 last_active_file = Some(candidate.file_path.display().to_string());
-                chunk_docs.push((
-                    candidate.ingestion_class,
-                    candidate.file_key.clone(),
-                    ingestion_class,
+                chunk_docs.push(PendingIndexDocument {
+                    ingestion_class: candidate.ingestion_class,
+                    file_key: candidate.file_key.clone(),
+                    ingestion_class_label: ingestion_class,
                     canonical_bytes,
-                    doc,
-                ));
+                    revision,
+                    reason_code,
+                    content_hash_hex,
+                    lexical_required: matches!(
+                        candidate.ingestion_class,
+                        IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+                    ),
+                    semantic_reused: reuse == CheckpointReuse::Complete,
+                    document: doc,
+                });
             }
 
             // Lexical Indexing
             let lexical_start = Instant::now();
             let lexical_batch = chunk_docs
                 .iter()
-                .filter(|(class, _, _, _, _)| {
-                    !matches!(class, IngestionClass::MetadataOnly | IngestionClass::Skip)
+                .filter(|pending| {
+                    pending.lexical_required
+                        && !matches!(
+                            pending.ingestion_class,
+                            IngestionClass::MetadataOnly | IngestionClass::Skip
+                        )
                 })
-                .map(|(_, _, _, _, doc)| doc.clone())
+                .map(|pending| pending.document.clone())
                 .collect::<Vec<_>>();
             if !lexical_batch.is_empty() {
                 lexical_index.index_documents(cx, &lexical_batch).await?;
@@ -8497,14 +8810,18 @@ impl FsfsRuntime {
             // Semantic Embedding & Vector Writing with retry
             let semantic_docs = chunk_docs
                 .iter()
-                .filter(|(class, _, _, _, _)| matches!(class, IngestionClass::FullSemanticLexical))
-                .map(|(_, key, _, _, doc)| (key.clone(), doc))
+                .filter(|pending| {
+                    matches!(pending.ingestion_class, IngestionClass::FullSemanticLexical)
+                        && !pending.semantic_reused
+                })
                 .collect::<Vec<_>>();
+
+            let mut semantic_succeeded_this_chunk = HashSet::new();
 
             if !semantic_docs.is_empty() {
                 let semantic_texts = semantic_docs
                     .iter()
-                    .map(|(_, doc)| doc.content.as_str())
+                    .map(|pending| pending.document.content.as_str())
                     .collect::<Vec<_>>();
 
                 let mut batch_succeeded = false;
@@ -8528,11 +8845,17 @@ impl FsfsRuntime {
                                 });
                             }
                             let vector_start = Instant::now();
-                            for ((_, doc), embedding) in semantic_docs.iter().zip(embeddings) {
-                                if let Some(writer) = vector_writer.as_mut() {
-                                    writer.write_record(&doc.id, &embedding)?;
-                                }
-                            }
+                            let vector_batch = semantic_docs
+                                .iter()
+                                .zip(embeddings)
+                                .map(|(pending, embedding)| {
+                                    (pending.document.id.clone(), embedding)
+                                })
+                                .collect::<Vec<_>>();
+                            vector_index.append_batch(&vector_batch)?;
+                            semantic_succeeded_this_chunk.extend(
+                                semantic_docs.iter().map(|pending| pending.file_key.clone()),
+                            );
                             vector_elapsed_ms = vector_elapsed_ms
                                 .saturating_add(vector_start.elapsed().as_millis());
                             batch_succeeded = true;
@@ -8605,8 +8928,8 @@ impl FsfsRuntime {
                                     IndexingWarningSeverity::Error,
                                     msg,
                                 );
-                                for (key, _) in &semantic_docs {
-                                    deferred_semantic_file_keys.push(key.clone());
+                                for pending in &semantic_docs {
+                                    deferred_semantic_file_keys.push(pending.file_key.clone());
                                 }
                                 semantic_deferred_files =
                                     semantic_deferred_files.saturating_add(semantic_docs.len());
@@ -8618,25 +8941,76 @@ impl FsfsRuntime {
             }
 
             // Update checkpoint entries for this batch
-            for (_, file_key, ingestion_class, canonical_bytes, _) in &chunk_docs {
-                let semantic_indexed = !deferred_semantic_file_keys.contains(file_key);
+            for pending in &chunk_docs {
+                let lexical_indexed = matches!(
+                    pending.ingestion_class,
+                    IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+                );
+                let semantic_indexed =
+                    matches!(pending.ingestion_class, IngestionClass::FullSemanticLexical)
+                        && (pending.semantic_reused
+                            || semantic_succeeded_this_chunk.contains(&pending.file_key));
                 checkpoint.files.insert(
-                    file_key.clone(),
+                    pending.file_key.clone(),
                     CheckpointFileEntry {
-                        revision: 0,
-                        ingestion_class: ingestion_class.clone(),
-                        canonical_bytes: *canonical_bytes,
-                        lexical_indexed: true,
+                        revision: pending.revision,
+                        ingestion_class: pending.ingestion_class_label.clone(),
+                        canonical_bytes: pending.canonical_bytes,
+                        reason_code: pending.reason_code.clone(),
+                        lexical_indexed,
                         semantic_indexed,
-                        content_hash_hex: String::new(),
+                        content_hash_hex: pending.content_hash_hex.clone(),
                     },
                 );
             }
 
             batch_counter = batch_counter.saturating_add(1);
-            if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 {
+            if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
+                checkpoint.artifacts_durable = false;
                 checkpoint.updated_at_ms = pressure_timestamp_ms();
-                write_indexing_checkpoint(&index_root, &checkpoint);
+                write_indexing_checkpoint(&index_root, &checkpoint)?;
+
+                let lexical_commit_start = Instant::now();
+                lexical_index.commit(cx).await?;
+                lexical_elapsed_ms =
+                    lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
+
+                let vector_compact_start = Instant::now();
+                reconcile_vector_generation(&mut vector_index, &checkpoint)?;
+                vector_elapsed_ms =
+                    vector_elapsed_ms.saturating_add(vector_compact_start.elapsed().as_millis());
+
+                let published_manifests = manifests.values().cloned().collect::<Vec<_>>();
+                checkpoint.source_hash_hex = index_source_hash_hex(&published_manifests);
+                checkpoint.reason_codes = observed_reason_codes.iter().cloned().collect();
+                checkpoint.updated_at_ms = pressure_timestamp_ms();
+                checkpoint.skipped_files = stats
+                    .discovered_files
+                    .saturating_sub(published_manifests.len());
+                self.write_index_artifacts(&index_root, &published_manifests)?;
+                let partial_total_canonical_bytes =
+                    published_manifests.iter().fold(0_u64, |total, entry| {
+                        total.saturating_add(entry.canonical_bytes)
+                    });
+                self.write_index_sentinel(
+                    &index_root,
+                    &IndexSentinel {
+                        schema_version: 1,
+                        generation_complete: false,
+                        generated_at_ms: pressure_timestamp_ms(),
+                        command: format!("{command:?}").to_ascii_lowercase(),
+                        target_root: target_root.display().to_string(),
+                        index_root: index_root.display().to_string(),
+                        discovered_files: stats.discovered_files,
+                        indexed_files: published_manifests.len(),
+                        skipped_files: checkpoint.skipped_files,
+                        reason_codes: checkpoint.reason_codes.clone(),
+                        total_canonical_bytes: partial_total_canonical_bytes,
+                        source_hash_hex: checkpoint.source_hash_hex.clone(),
+                    },
+                )?;
+                checkpoint.artifacts_durable = true;
+                write_indexing_checkpoint(&index_root, &checkpoint)?;
             }
 
             on_progress(&make_snapshot(
@@ -8719,10 +9093,15 @@ impl FsfsRuntime {
                         &recent_warnings,
                     ))?;
 
-                    // Finish the hash-based writer before rebuilding.
-                    if let Some(writer) = vector_writer.take() {
-                        writer.finish()?;
-                    }
+                    // Retire the last advertised generation before the upgrade
+                    // mutates or replaces its vector artifact. A crash during
+                    // the rebuild must never make the prior checkpoint admit a
+                    // partially upgraded FSVI file on the next run.
+                    checkpoint.artifacts_durable = false;
+                    checkpoint.updated_at_ms = pressure_timestamp_ms();
+                    write_indexing_checkpoint(&index_root, &checkpoint)?;
+
+                    vector_index.compact()?;
 
                     let upgrade_suffix = pressure_timestamp_ms();
                     let upgrade_path =
@@ -8738,7 +9117,7 @@ impl FsfsRuntime {
                         Vec::with_capacity(BATCH_SIZE);
 
                     for entry in manifests
-                        .iter()
+                        .values()
                         .filter(|entry| entry.ingestion_class == "full_semantic_lexical")
                     {
                         if upgrade_failed {
@@ -8774,7 +9153,7 @@ impl FsfsRuntime {
                             .map(system_time_to_ms)
                             .unwrap_or_default();
                         let indexed_revision_ms = u64::try_from(entry.revision).unwrap_or_default();
-                        if modified_ms > indexed_revision_ms {
+                        if modified_ms != indexed_revision_ms {
                             upgrade_failed = true;
                             push_warning(
                                 &mut recent_warnings,
@@ -8814,6 +9193,26 @@ impl FsfsRuntime {
                             }
                             Err(error) => return Err(error.into()),
                         };
+                        let content_hash_hex = content_sha256_hex(&bytes);
+                        if checkpoint.files.get(&entry.file_key).is_none_or(|indexed| {
+                            indexed.revision != entry.revision
+                                || indexed.content_hash_hex != content_hash_hex
+                        }) {
+                            upgrade_failed = true;
+                            push_warning(
+                                &mut recent_warnings,
+                                IndexingWarningSeverity::Error,
+                                format!(
+                                    "Semantic upgrade aborted: content changed for {}",
+                                    source_path.display()
+                                ),
+                            );
+                            warn!(
+                                path = %source_path.display(),
+                                "semantic upgrade aborted due to content hash mismatch"
+                            );
+                            break;
+                        }
 
                         let canonical = if is_pdf_file(&source_path) {
                             match try_extract_pdf_text(&bytes, &source_path) {
@@ -8993,35 +9392,24 @@ impl FsfsRuntime {
                         );
                     } else {
                         upgrade_writer.finish()?;
-                        if let Err(error) = async_file_rename(&upgrade_path, &vector_path).await {
-                            warn!(
-                                upgrade = %upgrade_path.display(),
-                                target = %vector_path.display(),
-                                error = %error,
-                                "semantic upgrade rename failed; attempting copy"
-                            );
-                            async_file_copy(&upgrade_path, &vector_path)
-                                .await
-                                .map_err(|e| SearchError::SubsystemError {
-                                    subsystem: "fsfs.semantic_upgrade.swap",
-                                    source: Box::new(e),
-                                })?;
-                            push_warning(
-                                &mut recent_warnings,
-                                IndexingWarningSeverity::Warn,
-                                format!(
-                                    "Semantic upgrade copied new index into place; leftover file at {}",
-                                    upgrade_path.display()
-                                ),
-                            );
-                        }
+                        drop(vector_index);
+                        vector_index =
+                            VectorIndex::install_replacement(&vector_path, &upgrade_path)?;
 
                         deferred_semantic_file_keys.clear();
                         semantic_deferred_files = 0;
                         embedder_is_hash_fallback = false;
                         embedder_degraded = false;
                         checkpoint.embedder_id = real_embedder.id().to_string();
+                        checkpoint.embedder_dimension = real_embedder.dimension();
                         checkpoint.embedder_is_hash_fallback = false;
+                        for (file_key, entry) in &mut checkpoint.files {
+                            if manifests.get(file_key).is_some_and(|manifest| {
+                                manifest.ingestion_class == "full_semantic_lexical"
+                            }) {
+                                entry.semantic_indexed = true;
+                            }
+                        }
                         push_warning(
                             &mut recent_warnings,
                             IndexingWarningSeverity::Info,
@@ -9032,28 +9420,34 @@ impl FsfsRuntime {
             }
         }
 
-        // 4. Commit and Finish
+        // 4. Publish the final durable generation. The checkpoint is always
+        // last, so every row it advertises is already represented on disk.
+        checkpoint.artifacts_durable = false;
+        checkpoint.updated_at_ms = pressure_timestamp_ms();
+        write_indexing_checkpoint(&index_root, &checkpoint)?;
         let lexical_commit_start = Instant::now();
         lexical_index.commit(cx).await?;
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
         let vector_finish_start = Instant::now();
-        if let Some(writer) = vector_writer.take() {
-            writer.finish()?;
-        }
+        reconcile_vector_generation(&mut vector_index, &checkpoint)?;
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
 
-        manifests.sort_by(|left, right| left.file_key.cmp(&right.file_key));
+        let manifests = manifests.into_values().collect::<Vec<_>>();
         let source_hash_hex = index_source_hash_hex(&manifests);
-        let indexed_files = processed_files;
+        let indexed_files = manifests.len();
         let skipped_files = stats.discovered_files.saturating_sub(indexed_files);
-        let total_canonical_bytes = canonical_bytes_total;
+        let total_canonical_bytes = manifests.iter().fold(0_u64, |total, entry| {
+            total.saturating_add(entry.canonical_bytes)
+        });
+        let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
         self.write_index_artifacts(&index_root, &manifests)?;
         let sentinel = IndexSentinel {
             schema_version: 1,
+            generation_complete: true,
             generated_at_ms: pressure_timestamp_ms(),
             command: format!("{command:?}").to_ascii_lowercase(),
             target_root: target_root.display().to_string(),
@@ -9061,9 +9455,9 @@ impl FsfsRuntime {
             discovered_files: stats.discovered_files,
             indexed_files,
             skipped_files,
-            reason_codes: observed_reason_codes.into_iter().collect(),
+            reason_codes: reason_codes.clone(),
             total_canonical_bytes,
-            source_hash_hex,
+            source_hash_hex: source_hash_hex.clone(),
         };
         self.write_index_sentinel(&index_root, &sentinel)?;
 
@@ -9071,9 +9465,14 @@ impl FsfsRuntime {
         let should_persist_checkpoint = embedder_is_hash_fallback || semantic_deferred_files > 0;
         if should_persist_checkpoint {
             checkpoint.updated_at_ms = pressure_timestamp_ms();
-            write_indexing_checkpoint(&index_root, &checkpoint);
+            checkpoint.artifacts_durable = true;
+            checkpoint.source_hash_hex = source_hash_hex;
+            checkpoint.reason_codes = reason_codes;
+            checkpoint.discovered_files = stats.discovered_files;
+            checkpoint.skipped_files = skipped_files;
+            write_indexing_checkpoint(&index_root, &checkpoint)?;
         } else {
-            remove_indexing_checkpoint(&index_root);
+            remove_indexing_checkpoint(&index_root)?;
         }
 
         let storage_usage = self.collect_index_storage_usage(&IndexStoragePaths {
@@ -9263,6 +9662,17 @@ impl FsfsRuntime {
         mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
         let index_root = self.resolve_status_index_root()?;
+        if let Some(checkpoint) = read_indexing_checkpoint(&index_root)?
+            && (checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
+                || !checkpoint.artifacts_durable)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index_dir".to_owned(),
+                value: index_root.display().to_string(),
+                reason: "index generation is incomplete; resume `fsfs index` before searching"
+                    .to_owned(),
+            });
+        }
         let lexical_path = index_root.join("lexical");
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
@@ -15020,6 +15430,115 @@ fn normalize_file_key_for_index(path: &Path, target_root: &Path) -> String {
         .replace('\\', "/")
 }
 
+const fn ingestion_class_label(class: IngestionClass) -> &'static str {
+    match class {
+        IngestionClass::FullSemanticLexical => "full_semantic_lexical",
+        IngestionClass::LexicalOnly => "lexical_only",
+        IngestionClass::MetadataOnly => "metadata_only",
+        IngestionClass::Skip => "skip",
+    }
+}
+
+const fn ingestion_plan_reason(class: IngestionClass) -> &'static str {
+    match class {
+        IngestionClass::FullSemanticLexical => "index.plan.full_semantic_lexical",
+        IngestionClass::LexicalOnly => "index.plan.lexical_only",
+        IngestionClass::MetadataOnly => "index.plan.metadata_only",
+        IngestionClass::Skip => "index.plan.skip",
+    }
+}
+
+fn content_sha256_hex(bytes: &[u8]) -> String {
+    sha256_digest_hex(Sha256::digest(bytes))
+}
+
+fn vector_live_doc_ids(index: &VectorIndex) -> SearchResult<HashSet<String>> {
+    let mut ids = HashSet::with_capacity(index.record_count());
+    for record_index in 0..index.record_count() {
+        if !index.is_deleted(record_index) {
+            ids.insert(index.doc_id_at(record_index)?.to_owned());
+        }
+    }
+    Ok(ids)
+}
+
+fn reconcile_vector_generation(
+    index: &mut VectorIndex,
+    checkpoint: &IndexingCheckpoint,
+) -> SearchResult<()> {
+    index.compact()?;
+    let desired = checkpoint
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.semantic_indexed)
+        .map(|(file_key, _)| file_key.as_str())
+        .collect::<HashSet<_>>();
+    let stale = vector_live_doc_ids(index)?
+        .into_iter()
+        .filter(|file_key| !desired.contains(file_key.as_str()))
+        .collect::<Vec<_>>();
+    if !stale.is_empty() {
+        let stale_refs = stale.iter().map(String::as_str).collect::<Vec<_>>();
+        index.soft_delete_batch(&stale_refs)?;
+    }
+    Ok(())
+}
+
+fn checkpoint_entry_reuse(
+    checkpoint: &IndexingCheckpoint,
+    entry: &CheckpointFileEntry,
+    manifest: &IndexManifestEntry,
+    candidate: &IndexCandidate,
+    content_hash_hex: &str,
+    embedder_id: &str,
+    embedder_dimension: usize,
+    embedder_is_hash_fallback: bool,
+    live_vector_ids: &HashSet<String>,
+) -> CheckpointReuse {
+    let ingestion_class = ingestion_class_label(candidate.ingestion_class);
+    let reason_code = ingestion_plan_reason(candidate.ingestion_class);
+    let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
+    if entry.revision != revision
+        || entry.ingestion_class != ingestion_class
+        || entry.content_hash_hex != content_hash_hex
+        || entry.content_hash_hex.is_empty()
+        || entry.reason_code != reason_code
+        || manifest.file_key != candidate.file_key
+        || manifest.revision != revision
+        || manifest.ingestion_class != ingestion_class
+        || manifest.canonical_bytes != entry.canonical_bytes
+        || manifest.reason_code != reason_code
+    {
+        return CheckpointReuse::None;
+    }
+
+    let requires_lexical = matches!(
+        candidate.ingestion_class,
+        IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+    );
+    if entry.lexical_indexed != requires_lexical {
+        return CheckpointReuse::None;
+    }
+
+    if !matches!(
+        candidate.ingestion_class,
+        IngestionClass::FullSemanticLexical
+    ) {
+        return CheckpointReuse::Complete;
+    }
+
+    if checkpoint.embedder_id == embedder_id
+        && checkpoint.embedder_dimension == embedder_dimension
+        && checkpoint.embedder_is_hash_fallback == embedder_is_hash_fallback
+        && entry.semantic_indexed
+        && live_vector_ids.contains(&candidate.file_key)
+    {
+        CheckpointReuse::Complete
+    } else {
+        CheckpointReuse::LexicalOnly
+    }
+}
+
 fn index_source_hash_hex(manifests: &[IndexManifestEntry]) -> String {
     let mut hasher = DefaultHasher::new();
     for entry in manifests {
@@ -15180,38 +15699,79 @@ const fn degradation_controller_config_for_profile(
     }
 }
 
-/// Write `data` to `path` with fsync so the content is durable even under
-/// sudden power loss.  Used for manifest, sentinel, and other metadata files
-/// whose silent loss would leave the index in an inconsistent state.
+/// Atomically replace `path` with `data` and fsync both the file and its parent.
+/// Used for metadata whose partial publication would make a durable index
+/// generation ambiguous after a crash.
 fn write_durable(path: impl AsRef<Path>, data: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let mut file = fs::File::create(path)?;
-    file.write_all(data.as_ref())?;
-    file.sync_all()?;
+    let path = path.as_ref();
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("metadata path has no file name: {}", path.display()),
+            )
+        })?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("metadata path has no parent: {}", path.display()),
+        )
+    })?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".{file_name}."))
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    temporary.write_all(data.as_ref())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
-fn read_indexing_checkpoint(index_root: &Path) -> Option<IndexingCheckpoint> {
+fn read_indexing_checkpoint(index_root: &Path) -> SearchResult<Option<IndexingCheckpoint>> {
     let path = index_root.join(FSFS_CHECKPOINT_FILE);
-    let data = fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.index.checkpoint.read",
+            source: Box::new(source),
+        })
 }
 
-fn write_indexing_checkpoint(index_root: &Path, checkpoint: &IndexingCheckpoint) {
+fn write_indexing_checkpoint(
+    index_root: &Path,
+    checkpoint: &IndexingCheckpoint,
+) -> SearchResult<()> {
     let path = index_root.join(FSFS_CHECKPOINT_FILE);
-    if let Ok(json) = serde_json::to_string_pretty(checkpoint) {
-        if let Err(e) = write_durable(&path, &json) {
-            tracing::error!(
-                path = %path.display(),
-                error = %e,
-                "failed to persist indexing checkpoint — data may be lost on restart"
-            );
+    let json =
+        serde_json::to_string_pretty(checkpoint).map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.index.checkpoint.serialize",
+            source: Box::new(source),
+        })?;
+    write_durable(&path, json).map_err(SearchError::Io)
+}
+
+fn remove_indexing_checkpoint(index_root: &Path) -> SearchResult<()> {
+    let path = index_root.join(FSFS_CHECKPOINT_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
         }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-}
-
-fn remove_indexing_checkpoint(index_root: &Path) {
-    let path = index_root.join(FSFS_CHECKPOINT_FILE);
-    let _ = fs::remove_file(path);
 }
 
 /// Emit a helpful hint when model detection fails in a lite build
@@ -15373,16 +15933,16 @@ mod tests {
             );
         }
 
-        for required in [
-            "async_file_remove(&socket_path).await",
-            "async_file_rename(&upgrade_path, &vector_path).await",
-            "async_file_copy(&upgrade_path, &vector_path).await",
-        ] {
+        for required in ["async_file_remove(&socket_path).await"] {
             assert!(
                 source.contains(required),
                 "async fsfs mutation path should use asupersync helper: {required}"
             );
         }
+        assert!(
+            source.contains("VectorIndex::install_replacement(&vector_path, &upgrade_path)"),
+            "semantic upgrade should use the WAL-safe durable replacement API"
+        );
     }
 
     #[test]
@@ -17561,6 +18121,428 @@ mod tests {
     }
 
     #[test]
+    fn runtime_index_rejects_undurable_checkpoint_and_rebuilds_exact_generation() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            let index_root = project.join(".frankensearch");
+            fs::create_dir_all(project.join("src")).expect("project dirs");
+            fs::create_dir_all(&index_root).expect("index root");
+            fs::write(
+                project.join("src/live.rs"),
+                "pub fn live() { /* durable_live_token */ }\n",
+            )
+            .expect("write live source");
+
+            let lexical_path = index_root.join("lexical");
+            let lexical = TantivyIndex::create(&lexical_path).expect("create orphan lexical index");
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new(
+                        "src/orphan.rs".to_owned(),
+                        "undurable_orphan_token".to_owned(),
+                    ),
+                )
+                .await
+                .expect("stage orphan lexical row");
+            lexical
+                .commit(&cx)
+                .await
+                .expect("commit orphan lexical row");
+            drop(lexical);
+
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("FSVI parent"))
+                .expect("create vector index directory");
+            VectorIndex::create(&vector_path, "fnv1a-256", 256)
+                .expect("create empty FSVI")
+                .finish()
+                .expect("finish empty FSVI");
+
+            let checkpoint = super::IndexingCheckpoint {
+                schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+                target_root: project.display().to_string(),
+                index_root: index_root.display().to_string(),
+                started_at_ms: 1,
+                updated_at_ms: 2,
+                embedder_id: "fnv1a-256".to_owned(),
+                embedder_dimension: 256,
+                embedder_is_hash_fallback: false,
+                artifacts_durable: false,
+                source_hash_hex: "never-published".to_owned(),
+                reason_codes: Vec::new(),
+                files: super::BTreeMap::from([(
+                    "src/checkpoint-only.rs".to_owned(),
+                    super::CheckpointFileEntry {
+                        revision: 1,
+                        ingestion_class: "full_semantic_lexical".to_owned(),
+                        canonical_bytes: 24,
+                        reason_code: "index.plan.full_semantic_lexical".to_owned(),
+                        lexical_indexed: true,
+                        semantic_indexed: true,
+                        content_hash_hex: "apparently-valid".to_owned(),
+                    },
+                )]),
+                discovered_files: 1,
+                skipped_files: 0,
+            };
+            super::write_indexing_checkpoint(&index_root, &checkpoint)
+                .expect("write undurable intent checkpoint");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let search_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root.clone()),
+                query: Some("undurable_orphan_token".to_owned()),
+                ..CliInput::default()
+            });
+            let search_result = search_runtime
+                .prepare_search_execution_resources(super::SearchExecutionMode::Full)
+                .map(|_| ());
+            assert!(
+                search_result.is_err(),
+                "search must fail closed on an undurable generation"
+            );
+            let search_error = search_result.expect_err("undurable generation must be rejected");
+            assert!(
+                search_error
+                    .to_string()
+                    .contains("generation is incomplete")
+            );
+
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            runtime
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("restart should rebuild the undurable generation");
+
+            let manifest = FsfsRuntime::read_index_manifest(&index_root)
+                .expect("read rebuilt manifest")
+                .expect("rebuilt manifest");
+            let manifest_ids = manifest
+                .iter()
+                .map(|entry| entry.file_key.as_str())
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(manifest_ids, super::BTreeSet::from(["src/live.rs"]));
+
+            let vectors = VectorIndex::open(&vector_path).expect("open rebuilt FSVI");
+            let vector_ids = super::vector_live_doc_ids(&vectors)
+                .expect("read rebuilt vector ids")
+                .into_iter()
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(
+                vector_ids,
+                super::BTreeSet::from(["src/live.rs".to_owned()])
+            );
+
+            let lexical = TantivyIndex::open(&lexical_path).expect("open rebuilt lexical index");
+            assert!(
+                lexical
+                    .search(&cx, "undurable_orphan_token", 10)
+                    .await
+                    .expect("query orphan token")
+                    .is_empty(),
+                "undurable orphan must be reconciled away"
+            );
+            let live_ids = lexical
+                .search_doc_ids(&cx, "durable_live_token", 10)
+                .expect("query live token")
+                .into_iter()
+                .map(|hit| hit.doc_id.to_string())
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
+        });
+    }
+
+    #[test]
+    fn runtime_index_reconciles_legacy_manifest_labels() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("project dirs");
+            fs::write(
+                project.join("src/live.rs"),
+                "pub fn live() { /* migration_live_token */ }\n",
+            )
+            .expect("write live source");
+            fs::write(
+                project.join("src/stale.rs"),
+                "pub fn stale() { /* migration_stale_token */ }\n",
+            )
+            .expect("write stale source");
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            runtime
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("initial index");
+
+            let index_root = project.join(".frankensearch");
+            let mut legacy_manifest = FsfsRuntime::read_index_manifest(&index_root)
+                .expect("read initial manifest")
+                .expect("initial manifest");
+            for entry in &mut legacy_manifest {
+                if entry.ingestion_class == "full_semantic_lexical" {
+                    entry.ingestion_class = "fullsemanticlexical".to_owned();
+                }
+            }
+            runtime
+                .write_index_artifacts(&index_root, &legacy_manifest)
+                .expect("write legacy-format manifests");
+            fs::write(
+                project.join("src/stale.rs"),
+                [0_u8, 17, 2, 144, 0, 31, 7, 0],
+            )
+            .expect("make stale source ineligible");
+
+            runtime
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("reindex legacy generation");
+
+            let lexical = TantivyIndex::open(&index_root.join("lexical"))
+                .expect("open reconciled lexical index");
+            assert!(
+                lexical
+                    .search(&cx, "migration_stale_token", 10)
+                    .await
+                    .expect("query stale legacy token")
+                    .is_empty(),
+                "legacy manifest labels must not preserve stale Tantivy rows"
+            );
+            let live_ids = lexical
+                .search_doc_ids(&cx, "migration_live_token", 10)
+                .expect("query live token")
+                .into_iter()
+                .map(|hit| hit.doc_id.to_string())
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(live_ids, super::BTreeSet::from(["src/live.rs".to_owned()]));
+
+            let manifest = FsfsRuntime::read_index_manifest(&index_root)
+                .expect("read reconciled manifest")
+                .expect("reconciled manifest");
+            let manifest_ids = manifest
+                .into_iter()
+                .map(|entry| entry.file_key)
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(
+                manifest_ids,
+                super::BTreeSet::from(["src/live.rs".to_owned()])
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_index_resume_publishes_one_cumulative_durable_generation() {
+        run_test_with_cx(|cx| async move {
+            const FILE_COUNT: usize = 1_100;
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("project dirs");
+            let expected_ids = (0..FILE_COUNT)
+                .map(|index| format!("src/resume_{index:04}.rs"))
+                .collect::<super::BTreeSet<_>>();
+            for file_key in &expected_ids {
+                fs::write(
+                    project.join(file_key),
+                    format!("pub fn resume_{file_key:?}() {{ /* resume_common */ }}\n"),
+                )
+                .expect("write resume fixture");
+            }
+
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            let interrupted = runtime
+                .run_one_shot_index_scaffold_with_progress(&cx, CliCommand::Index, |snapshot| {
+                    if snapshot.stage == super::IndexingProgressStage::Indexing
+                        && snapshot.processed_files >= 1_024
+                    {
+                        return Err(frankensearch_core::SearchError::InvalidConfig {
+                            field: "test.interrupt_after_checkpoint".to_owned(),
+                            value: snapshot.processed_files.to_string(),
+                            reason: "deterministic checkpoint interruption".to_owned(),
+                        });
+                    }
+                    Ok(())
+                })
+                .await;
+            assert!(
+                interrupted.is_err(),
+                "first run must stop after a checkpoint"
+            );
+
+            let index_root = project.join(".frankensearch");
+            let mut checkpoint = super::read_indexing_checkpoint(&index_root)
+                .expect("read checkpoint")
+                .expect("checkpoint published before callback");
+            assert_eq!(checkpoint.schema_version, 2);
+            assert!(checkpoint.artifacts_durable);
+            assert_eq!(checkpoint.files.len(), 1_024);
+            assert!(
+                checkpoint.files.values().all(|entry| {
+                    entry.revision > 0
+                        && !entry.content_hash_hex.is_empty()
+                        && entry.lexical_indexed
+                        && entry.semantic_indexed
+                }),
+                "checkpoint rows must describe durable lexical and semantic artifacts"
+            );
+
+            let partial_vector_manifest = FsfsRuntime::read_index_manifest_file(
+                &index_root,
+                super::FSFS_VECTOR_MANIFEST_FILE,
+            )
+            .expect("read partial vector manifest")
+            .expect("partial vector manifest");
+            let partial_lexical_manifest = FsfsRuntime::read_index_manifest_file(
+                &index_root,
+                super::FSFS_LEXICAL_MANIFEST_FILE,
+            )
+            .expect("read partial lexical manifest")
+            .expect("partial lexical manifest");
+            assert_eq!(partial_vector_manifest, partial_lexical_manifest);
+            assert_eq!(
+                super::index_source_hash_hex(&partial_vector_manifest),
+                checkpoint.source_hash_hex
+            );
+            let partial_sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read partial sentinel")
+                .expect("partial sentinel published before checkpoint");
+            assert!(!partial_sentinel.generation_complete);
+            assert_eq!(partial_sentinel.indexed_files, checkpoint.files.len());
+            assert_eq!(partial_sentinel.source_hash_hex, checkpoint.source_hash_hex);
+            let partial_manifest_ids = partial_vector_manifest
+                .iter()
+                .map(|entry| entry.file_key.clone())
+                .collect::<super::BTreeSet<_>>();
+            let mut partial_vector =
+                VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
+                    .expect("open partial FSVI");
+            partial_vector.compact().expect("compact partial FSVI");
+            let partial_vector_ids = super::vector_live_doc_ids(&partial_vector)
+                .expect("read partial vector ids")
+                .into_iter()
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(partial_vector_ids, partial_manifest_ids);
+            let partial_lexical =
+                TantivyIndex::open(&index_root.join("lexical")).expect("open partial Tantivy");
+            let partial_lexical_ids = partial_lexical
+                .search_doc_ids(&cx, "resume_common", FILE_COUNT)
+                .expect("query partial Tantivy")
+                .into_iter()
+                .map(|hit| hit.doc_id.to_string())
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(partial_lexical_ids, partial_manifest_ids);
+            drop(partial_lexical);
+
+            let deferred_id = partial_manifest_ids
+                .first()
+                .expect("partial generation has a semantic document")
+                .clone();
+            assert!(
+                partial_vector
+                    .soft_delete(&deferred_id)
+                    .expect("defer one semantic vector")
+            );
+            checkpoint
+                .files
+                .get_mut(&deferred_id)
+                .expect("checkpoint row for deferred vector")
+                .semantic_indexed = false;
+            super::write_indexing_checkpoint(&index_root, &checkpoint)
+                .expect("publish deferred semantic checkpoint");
+            drop(partial_vector);
+
+            let resume_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            });
+            resume_runtime
+                .run_one_shot_index_scaffold(&cx, CliCommand::Index)
+                .await
+                .expect("resume should complete");
+
+            assert!(
+                super::read_indexing_checkpoint(&index_root)
+                    .expect("read completed checkpoint state")
+                    .is_none(),
+                "successful resume removes the transient checkpoint"
+            );
+            let vector_manifest = FsfsRuntime::read_index_manifest_file(
+                &index_root,
+                super::FSFS_VECTOR_MANIFEST_FILE,
+            )
+            .expect("read vector manifest")
+            .expect("vector manifest");
+            let lexical_manifest = FsfsRuntime::read_index_manifest_file(
+                &index_root,
+                super::FSFS_LEXICAL_MANIFEST_FILE,
+            )
+            .expect("read lexical manifest")
+            .expect("lexical manifest");
+            assert_eq!(vector_manifest, lexical_manifest);
+            let manifest_ids = vector_manifest
+                .iter()
+                .map(|entry| entry.file_key.clone())
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(manifest_ids, expected_ids);
+
+            let mut vector_index =
+                VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
+                    .expect("open resumed FSVI");
+            vector_index.compact().expect("compact resumed FSVI");
+            let vector_ids = super::vector_live_doc_ids(&vector_index)
+                .expect("read resumed vector ids")
+                .into_iter()
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(vector_ids, expected_ids);
+
+            let lexical_index =
+                TantivyIndex::open(&index_root.join("lexical")).expect("open resumed Tantivy");
+            let lexical_ids = lexical_index
+                .search_doc_ids(&cx, "resume_common", FILE_COUNT)
+                .expect("query resumed Tantivy")
+                .into_iter()
+                .map(|hit| hit.doc_id.to_string())
+                .collect::<super::BTreeSet<_>>();
+            assert_eq!(lexical_ids, expected_ids);
+
+            let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read resumed sentinel")
+                .expect("resumed sentinel");
+            assert!(sentinel.generation_complete);
+            assert_eq!(sentinel.indexed_files, FILE_COUNT);
+            assert_eq!(
+                sentinel.source_hash_hex,
+                super::index_source_hash_hex(&vector_manifest)
+            );
+            assert_eq!(
+                sentinel.total_canonical_bytes,
+                vector_manifest.iter().fold(0_u64, |total, entry| total
+                    .saturating_add(entry.canonical_bytes))
+            );
+        });
+    }
+
+    #[test]
     fn runtime_index_command_respects_index_dir_override() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -18176,6 +19158,7 @@ mod tests {
 
         let sentinel = super::IndexSentinel {
             schema_version: 1,
+            generation_complete: true,
             generated_at_ms: super::pressure_timestamp_ms(),
             command: "index".to_owned(),
             target_root: project.display().to_string(),
@@ -19517,8 +20500,9 @@ mod tests {
             "src/main.rs".to_owned(),
             super::CheckpointFileEntry {
                 revision: 42,
-                ingestion_class: "fullsemanticlexical".to_owned(),
+                ingestion_class: "full_semantic_lexical".to_owned(),
                 canonical_bytes: 1024,
+                reason_code: "index.plan.full_semantic_lexical".to_owned(),
                 lexical_indexed: true,
                 semantic_indexed: false,
                 content_hash_hex: "abc123".to_owned(),
@@ -19528,22 +20512,27 @@ mod tests {
             "src/lib.rs".to_owned(),
             super::CheckpointFileEntry {
                 revision: 99,
-                ingestion_class: "lexicalonly".to_owned(),
+                ingestion_class: "lexical_only".to_owned(),
                 canonical_bytes: 512,
+                reason_code: "index.plan.lexical_only".to_owned(),
                 lexical_indexed: true,
-                semantic_indexed: true,
+                semantic_indexed: false,
                 content_hash_hex: "def456".to_owned(),
             },
         );
 
         let checkpoint = super::IndexingCheckpoint {
-            schema_version: 1,
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
             target_root: "/home/user/project".to_owned(),
             index_root: "/home/user/.fsfs/index".to_owned(),
             started_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_060_000,
             embedder_id: "all-MiniLM-L6-v2".to_owned(),
+            embedder_dimension: 384,
             embedder_is_hash_fallback: false,
+            artifacts_durable: true,
+            source_hash_hex: "generation-hash".to_owned(),
+            reason_codes: vec!["FSFS_CODE_EXTENSION_INCLUDED".to_owned()],
             files,
             discovered_files: 100,
             skipped_files: 5,
@@ -19556,7 +20545,108 @@ mod tests {
         assert_eq!(decoded.files.len(), 2);
         assert_eq!(decoded.files["src/main.rs"].canonical_bytes, 1024);
         assert!(!decoded.files["src/main.rs"].semantic_indexed);
-        assert!(decoded.files["src/lib.rs"].semantic_indexed);
+        assert!(!decoded.files["src/lib.rs"].semantic_indexed);
+    }
+
+    #[test]
+    fn checkpoint_reuse_requires_exact_source_and_live_vector_identity() {
+        let candidate = super::IndexCandidate {
+            file_path: PathBuf::from("/tmp/project/src/main.rs"),
+            file_key: "src/main.rs".to_owned(),
+            modified_ms: 42,
+            ingestion_class: IngestionClass::FullSemanticLexical,
+        };
+        let manifest = super::IndexManifestEntry {
+            file_key: candidate.file_key.clone(),
+            revision: 42,
+            ingestion_class: "full_semantic_lexical".to_owned(),
+            canonical_bytes: 1_024,
+            reason_code: "index.plan.full_semantic_lexical".to_owned(),
+        };
+        let entry = super::CheckpointFileEntry {
+            revision: 42,
+            ingestion_class: manifest.ingestion_class.clone(),
+            canonical_bytes: manifest.canonical_bytes,
+            reason_code: manifest.reason_code.clone(),
+            lexical_indexed: true,
+            semantic_indexed: true,
+            content_hash_hex: "abc123".to_owned(),
+        };
+        let checkpoint = super::IndexingCheckpoint {
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            target_root: "/tmp/project".to_owned(),
+            index_root: "/tmp/index".to_owned(),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            embedder_id: "hash-fnv1a".to_owned(),
+            embedder_dimension: 256,
+            embedder_is_hash_fallback: false,
+            artifacts_durable: true,
+            source_hash_hex: "generation-hash".to_owned(),
+            reason_codes: vec!["FSFS_CODE_EXTENSION_INCLUDED".to_owned()],
+            files: super::BTreeMap::new(),
+            discovered_files: 1,
+            skipped_files: 0,
+        };
+        let live_vector_ids = super::HashSet::from([candidate.file_key.clone()]);
+
+        let reuse = |checkpoint: &super::IndexingCheckpoint,
+                     entry: &super::CheckpointFileEntry,
+                     content_hash: &str,
+                     live_ids: &super::HashSet<String>| {
+            super::checkpoint_entry_reuse(
+                checkpoint,
+                entry,
+                &manifest,
+                &candidate,
+                content_hash,
+                "hash-fnv1a",
+                256,
+                false,
+                live_ids,
+            )
+        };
+
+        assert_eq!(
+            reuse(&checkpoint, &entry, "abc123", &live_vector_ids),
+            super::CheckpointReuse::Complete
+        );
+        assert_eq!(
+            reuse(&checkpoint, &entry, "changed", &live_vector_ids),
+            super::CheckpointReuse::None
+        );
+        assert_eq!(
+            reuse(&checkpoint, &entry, "abc123", &super::HashSet::new()),
+            super::CheckpointReuse::LexicalOnly
+        );
+
+        let mut mismatched_embedder = checkpoint.clone();
+        mismatched_embedder.embedder_id = "different".to_owned();
+        assert_eq!(
+            reuse(&mismatched_embedder, &entry, "abc123", &live_vector_ids),
+            super::CheckpointReuse::LexicalOnly
+        );
+
+        let mut stale_entry = entry.clone();
+        stale_entry.revision = 41;
+        assert_eq!(
+            reuse(&checkpoint, &stale_entry, "abc123", &live_vector_ids),
+            super::CheckpointReuse::None
+        );
+
+        let mut deferred_entry = entry.clone();
+        deferred_entry.semantic_indexed = false;
+        assert_eq!(
+            reuse(&checkpoint, &deferred_entry, "abc123", &live_vector_ids),
+            super::CheckpointReuse::LexicalOnly
+        );
+
+        let mut fallback_checkpoint = checkpoint;
+        fallback_checkpoint.embedder_is_hash_fallback = true;
+        assert_eq!(
+            reuse(&fallback_checkpoint, &entry, "abc123", &live_vector_ids),
+            super::CheckpointReuse::LexicalOnly
+        );
     }
 
     #[test]
@@ -19565,32 +20655,57 @@ mod tests {
         let index_root = temp.path();
 
         // Initially no checkpoint
-        assert!(super::read_indexing_checkpoint(index_root).is_none());
+        assert!(
+            super::read_indexing_checkpoint(index_root)
+                .expect("read absent checkpoint")
+                .is_none()
+        );
 
         // Write checkpoint
         let checkpoint = super::IndexingCheckpoint {
-            schema_version: 1,
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
             target_root: "/tmp/project".to_owned(),
             index_root: index_root.display().to_string(),
             started_at_ms: 1_000,
             updated_at_ms: 2_000,
             embedder_id: "hash-fnv1a".to_owned(),
+            embedder_dimension: 256,
             embedder_is_hash_fallback: true,
+            artifacts_durable: true,
+            source_hash_hex: "generation-hash".to_owned(),
+            reason_codes: Vec::new(),
             files: super::BTreeMap::new(),
             discovered_files: 50,
             skipped_files: 3,
         };
-        super::write_indexing_checkpoint(index_root, &checkpoint);
+        super::write_indexing_checkpoint(index_root, &checkpoint).expect("write checkpoint");
 
         // Read it back
-        let loaded = super::read_indexing_checkpoint(index_root).expect("checkpoint should exist");
+        let loaded = super::read_indexing_checkpoint(index_root)
+            .expect("read checkpoint")
+            .expect("checkpoint should exist");
         assert_eq!(loaded.target_root, "/tmp/project");
         assert!(loaded.embedder_is_hash_fallback);
         assert_eq!(loaded.discovered_files, 50);
 
+        let mut replacement = checkpoint.clone();
+        replacement.updated_at_ms = 3_000;
+        replacement.discovered_files = 51;
+        super::write_indexing_checkpoint(index_root, &replacement)
+            .expect("atomically replace existing checkpoint");
+        let replaced = super::read_indexing_checkpoint(index_root)
+            .expect("read replaced checkpoint")
+            .expect("replacement checkpoint should exist");
+        assert_eq!(replaced.updated_at_ms, 3_000);
+        assert_eq!(replaced.discovered_files, 51);
+
         // Remove
-        super::remove_indexing_checkpoint(index_root);
-        assert!(super::read_indexing_checkpoint(index_root).is_none());
+        super::remove_indexing_checkpoint(index_root).expect("remove checkpoint");
+        assert!(
+            super::read_indexing_checkpoint(index_root)
+                .expect("read removed checkpoint")
+                .is_none()
+        );
     }
 
     #[test]
