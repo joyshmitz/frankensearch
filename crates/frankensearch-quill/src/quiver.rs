@@ -2717,6 +2717,1692 @@ fn decode_vint_payload(
     })
 }
 
+/// Fresh-seal payload target for one FSLX POSITIONS block.
+///
+/// Complete document runs are never split. A single run wider than the target
+/// remains a legal oversized singleton, and Q1 concatenation preserves source
+/// block seams without repacking them.
+pub const POSITION_BLOCK_TARGET_BYTES: usize = 4_096;
+/// Default maximum bytes accepted for one term's complete POSITIONS span.
+pub const DEFAULT_MAX_POSITION_BYTES_PER_TERM: usize = 128 * 1024 * 1024;
+/// Default maximum skip-directory entries retained for one positional term.
+pub const DEFAULT_MAX_POSITION_BLOCKS: usize = 1 << 18;
+/// Default maximum frequency-derived position values validated for one term.
+pub const DEFAULT_MAX_POSITIONS_PER_TERM: u64 = 1 << 24;
+
+const POSITION_DIRECTORY_HEADER_LEN: usize = 4;
+
+/// Explicit resource ceilings for one TERMDICT-referenced POSITIONS span.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PositionListLimits {
+    /// Maximum complete term-span bytes, including the block directory.
+    pub max_bytes: usize,
+    /// Maximum retained block-directory entries.
+    pub max_blocks: usize,
+    /// Maximum sum of POSTINGS frequencies validated for the term.
+    pub max_positions: u64,
+}
+
+impl Default for PositionListLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_MAX_POSITION_BYTES_PER_TERM,
+            max_blocks: DEFAULT_MAX_POSITION_BLOCKS,
+            max_positions: DEFAULT_MAX_POSITIONS_PER_TERM,
+        }
+    }
+}
+
+/// Typed failures from encoding or validating an FSLX POSITIONS term stream.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum PositionCodecError {
+    /// The corresponding POSTINGS list was invalid or could not be decoded.
+    #[error(transparent)]
+    Posting(#[from] PostingCodecError),
+    /// Flat position values did not match the sum of posting frequencies.
+    #[error("position count mismatch: POSTINGS frequencies require {expected}, got {actual}")]
+    PositionCountMismatch {
+        /// Frequency-derived position count.
+        expected: u64,
+        /// Supplied flat position count.
+        actual: usize,
+    },
+    /// Encoder input positions decreased within one document run.
+    #[error(
+        "positions decrease for posting {posting_ordinal} at run index {position_index}: {previous} then {position}"
+    )]
+    NonAscendingPosition {
+        /// Zero-based posting ordinal.
+        posting_ordinal: u32,
+        /// Zero-based position index within the document run.
+        position_index: usize,
+        /// Previous absolute position.
+        previous: u32,
+        /// Rejected absolute position.
+        position: u32,
+    },
+    /// A complete term span exceeded the caller-selected byte ceiling.
+    #[error("position byte limit {limit} exceeded by {actual} bytes")]
+    ByteLimitExceeded {
+        /// Configured byte ceiling.
+        limit: usize,
+        /// Required or supplied bytes.
+        actual: usize,
+    },
+    /// Frequency-derived work exceeded the caller-selected position ceiling.
+    #[error("position validation limit {limit} exceeded by {actual} values")]
+    PositionLimitExceeded {
+        /// Configured value ceiling.
+        limit: u64,
+        /// Frequency-derived values.
+        actual: u64,
+    },
+    /// A durable or newly produced directory exceeded its block ceiling.
+    #[error("position block limit {limit} exceeded by {actual} blocks")]
+    BlockLimitExceeded {
+        /// Configured block ceiling.
+        limit: usize,
+        /// Declared or produced blocks.
+        actual: usize,
+    },
+    /// The fixed block count cannot describe the referenced posting list.
+    #[error("position block count {block_count} is invalid for doc_freq {doc_freq}")]
+    InvalidBlockCount {
+        /// Declared directory row count.
+        block_count: usize,
+        /// Validated posting count.
+        doc_freq: u32,
+    },
+    /// The first directory row was not the canonical `(0, 0)` pair.
+    #[error(
+        "first position block must start at posting 0 and payload offset 0, got ({first_posting_ordinal}, {block_offset})"
+    )]
+    InvalidDirectoryStart {
+        /// First durable posting ordinal.
+        first_posting_ordinal: u32,
+        /// First blocks-area-relative byte offset.
+        block_offset: u64,
+    },
+    /// Directory posting ordinals were not strictly increasing.
+    #[error(
+        "position block {block_index} posting ordinal is not ascending: {previous} then {current}"
+    )]
+    NonAscendingBlockOrdinal {
+        /// Rejected block index.
+        block_index: usize,
+        /// Previous first posting ordinal.
+        previous: u32,
+        /// Rejected first posting ordinal.
+        current: u32,
+    },
+    /// Directory payload offsets were not strictly increasing.
+    #[error(
+        "position block {block_index} payload offset is not ascending: {previous} then {current}"
+    )]
+    NonAscendingBlockOffset {
+        /// Rejected block index.
+        block_index: usize,
+        /// Previous blocks-area-relative byte offset.
+        previous: u64,
+        /// Rejected blocks-area-relative byte offset.
+        current: u64,
+    },
+    /// A block began outside the corresponding POSTINGS ordinal domain.
+    #[error(
+        "position block {block_index} starts at posting {first_posting_ordinal}, outside doc_freq {doc_freq}"
+    )]
+    BlockOrdinalOutOfRange {
+        /// Rejected block index.
+        block_index: usize,
+        /// Rejected posting ordinal.
+        first_posting_ordinal: u32,
+        /// Validated posting count.
+        doc_freq: u32,
+    },
+    /// A block offset did not point inside the blocks area.
+    #[error(
+        "position block {block_index} offset {block_offset} is outside payload length {payload_len}"
+    )]
+    BlockOffsetOutOfRange {
+        /// Rejected block index.
+        block_index: usize,
+        /// Rejected blocks-area-relative byte offset.
+        block_offset: u64,
+        /// Complete blocks-area byte length.
+        payload_len: usize,
+    },
+    /// A directory row described no postings or no payload bytes.
+    #[error("position block {block_index} is empty")]
+    EmptyBlock {
+        /// Rejected block index.
+        block_index: usize,
+    },
+    /// Only one complete document run may exceed the 4096-byte target.
+    #[error(
+        "position block {block_index} has {posting_count} documents in oversized {byte_len}-byte payload"
+    )]
+    OversizedMultiDocumentBlock {
+        /// Rejected block index.
+        block_index: usize,
+        /// Frequency-derived document runs in the block.
+        posting_count: u32,
+        /// Block payload bytes.
+        byte_len: usize,
+    },
+    /// Durable bytes ended before a fixed field or vint completed.
+    #[error(
+        "truncated position stream at offset {offset}: need {needed} bytes, only {remaining} remain"
+    )]
+    Truncated {
+        /// Absolute byte offset in the term span.
+        offset: usize,
+        /// Minimum additional bytes needed.
+        needed: usize,
+        /// Available bytes in the bounded range.
+        remaining: usize,
+    },
+    /// A vint used more bytes than its shortest representation.
+    #[error("non-canonical {domain} position vint at offset {offset}")]
+    NonCanonicalVint {
+        /// Absolute vint start offset.
+        offset: usize,
+        /// Stable integer-domain name.
+        domain: &'static str,
+    },
+    /// A vint exceeded its declared integer domain.
+    #[error("{domain} position vint overflow at offset {offset}")]
+    VintOverflow {
+        /// Absolute vint start offset.
+        offset: usize,
+        /// Stable integer-domain name.
+        domain: &'static str,
+    },
+    /// Reconstructing a delta-encoded absolute position overflowed u32.
+    #[error(
+        "position overflow for posting {posting_ordinal}: previous {previous} plus delta {delta}"
+    )]
+    PositionOverflow {
+        /// Zero-based posting ordinal.
+        posting_ordinal: u32,
+        /// Previous absolute position.
+        previous: u32,
+        /// Rejected delta.
+        delta: u32,
+    },
+    /// Frequency-derived runs did not exhaust one bounded block exactly.
+    #[error("position block {block_index} has {remaining} trailing bytes")]
+    TrailingBlockBytes {
+        /// Rejected block index.
+        block_index: usize,
+        /// Unconsumed bytes.
+        remaining: usize,
+    },
+    /// Concatenation inputs were not ordered by disjoint absolute docids.
+    #[error("position concat docids are not ascending: {previous} then {current}")]
+    NonAscendingConcat {
+        /// Last docid in the preceding non-empty input.
+        previous: u32,
+        /// First docid in the rejected input.
+        current: u32,
+    },
+    /// A requested posting ordinal was outside the paired list.
+    #[error("position posting ordinal {posting_ordinal} is outside doc_freq {doc_freq}")]
+    PostingOrdinalOutOfRange {
+        /// Rejected zero-based posting ordinal.
+        posting_ordinal: u32,
+        /// Validated posting count.
+        doc_freq: u32,
+    },
+    /// Checked offset, count, or length arithmetic overflowed.
+    #[error("position arithmetic overflow for {field}")]
+    ArithmeticOverflow {
+        /// Stable value name.
+        field: &'static str,
+    },
+    /// A bounded allocation request failed.
+    #[error("unable to reserve {count} entries for {resource}")]
+    Allocation {
+        /// Stable allocation purpose.
+        resource: &'static str,
+        /// Requested entries or bytes.
+        count: usize,
+    },
+    /// Already validated paired metadata disagreed during cursor use.
+    #[error("position cursor invariant failed for {field}")]
+    CursorInvariant {
+        /// Stable invariant name.
+        field: &'static str,
+    },
+}
+
+/// Validated location and posting interval of one POSITIONS payload block.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PositionBlockMeta {
+    base_posting_ordinal: u32,
+    posting_count: u32,
+    first_doc: u32,
+    last_doc: u32,
+    byte_offset: usize,
+    byte_len: usize,
+}
+
+impl PositionBlockMeta {
+    /// First zero-based posting ordinal represented by the block.
+    #[must_use]
+    pub const fn base_posting_ordinal(&self) -> u32 {
+        self.base_posting_ordinal
+    }
+
+    /// Number of complete document runs represented by the block.
+    #[must_use]
+    pub const fn posting_count(&self) -> u32 {
+        self.posting_count
+    }
+
+    /// Absolute first docid, derived from the paired POSTINGS stream.
+    #[must_use]
+    pub const fn first_doc(&self) -> u32 {
+        self.first_doc
+    }
+
+    /// Absolute last docid, derived from the paired POSTINGS stream.
+    #[must_use]
+    pub const fn last_doc(&self) -> u32 {
+        self.last_doc
+    }
+
+    /// Absolute byte offset inside the complete positional term span.
+    #[must_use]
+    pub const fn byte_offset(&self) -> usize {
+        self.byte_offset
+    }
+
+    /// Exact payload byte length.
+    #[must_use]
+    pub const fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    fn byte_range(&self) -> Option<Range<usize>> {
+        self.byte_offset
+            .checked_add(self.byte_len)
+            .map(|end| self.byte_offset..end)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RawPositionBlock {
+    first_posting_ordinal: u32,
+    block_offset: u64,
+}
+
+/// Owned canonical bytes for one term's POSITIONS stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedPositionList {
+    bytes: Vec<u8>,
+    doc_freq: u32,
+    total_positions: u64,
+    block_count: usize,
+}
+
+impl EncodedPositionList {
+    /// Encode flat absolute positions aligned by each posting's `freq`.
+    ///
+    /// Fresh blocks greedily contain complete document runs up to the 4096-byte
+    /// payload target. Positions reset per posting and may repeat.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for invalid postings, count misalignment,
+    /// decreasing positions, arithmetic overflow, or resource exhaustion.
+    pub fn encode(postings: &[Posting], positions: &[u32]) -> Result<Self, PositionCodecError> {
+        Self::encode_with_limits(postings, positions, PositionListLimits::default())
+    }
+
+    /// Encode with explicit byte, block, and position ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::encode`], plus a selected
+    /// resource ceiling when exceeded.
+    pub fn encode_with_limits(
+        postings: &[Posting],
+        positions: &[u32],
+        limits: PositionListLimits,
+    ) -> Result<Self, PositionCodecError> {
+        validate_encoder_input(postings)?;
+        let doc_freq =
+            u32::try_from(postings.len()).map_err(|_| PostingCodecError::TooManyPostings {
+                count: postings.len(),
+            })?;
+        let total_positions = expected_input_position_count(postings, limits.max_positions)?;
+        if total_positions != u64::try_from(positions.len()).unwrap_or(u64::MAX) {
+            return Err(PositionCodecError::PositionCountMismatch {
+                expected: total_positions,
+                actual: positions.len(),
+            });
+        }
+
+        let mut payload = Vec::new();
+        let mut directory = Vec::new();
+        let mut position_index = 0_usize;
+        for (posting_index, posting) in postings.iter().enumerate() {
+            let count = usize::try_from(posting.freq).map_err(|_| {
+                PositionCodecError::ArithmeticOverflow {
+                    field: "posting frequency",
+                }
+            })?;
+            let end = position_index.checked_add(count).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "flat position range",
+                },
+            )?;
+            let run = positions.get(position_index..end).ok_or(
+                PositionCodecError::PositionCountMismatch {
+                    expected: total_positions,
+                    actual: positions.len(),
+                },
+            )?;
+            let posting_ordinal = u32::try_from(posting_index).map_err(|_| {
+                PositionCodecError::ArithmeticOverflow {
+                    field: "posting ordinal",
+                }
+            })?;
+            let run_len = validated_position_run_len(posting_ordinal, run)?;
+            let next_payload_len = payload.len().checked_add(run_len).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "position payload length",
+                },
+            )?;
+            if next_payload_len > limits.max_bytes {
+                return Err(PositionCodecError::ByteLimitExceeded {
+                    limit: limits.max_bytes,
+                    actual: next_payload_len,
+                });
+            }
+
+            let start_new_block = directory.last().is_none_or(|_| {
+                let current_start = usize::try_from(
+                    directory
+                        .last()
+                        .map_or(0, |block: &RawPositionBlock| block.block_offset),
+                )
+                .unwrap_or(usize::MAX);
+                payload
+                    .len()
+                    .checked_sub(current_start)
+                    .and_then(|current| current.checked_add(run_len))
+                    .is_none_or(|combined| combined > POSITION_BLOCK_TARGET_BYTES)
+            });
+            if start_new_block {
+                if directory.len() >= limits.max_blocks {
+                    return Err(PositionCodecError::BlockLimitExceeded {
+                        limit: limits.max_blocks,
+                        actual: directory.len().saturating_add(1),
+                    });
+                }
+                directory
+                    .try_reserve(1)
+                    .map_err(|_| PositionCodecError::Allocation {
+                        resource: "position block directory",
+                        count: directory.len().saturating_add(1),
+                    })?;
+                directory.push(RawPositionBlock {
+                    first_posting_ordinal: posting_ordinal,
+                    block_offset: u64::try_from(payload.len()).map_err(|_| {
+                        PositionCodecError::ArithmeticOverflow {
+                            field: "position payload offset",
+                        }
+                    })?,
+                });
+            }
+            payload
+                .try_reserve(run_len)
+                .map_err(|_| PositionCodecError::Allocation {
+                    resource: "position payload bytes",
+                    count: next_payload_len,
+                })?;
+            write_position_run(run, &mut payload);
+            position_index = end;
+        }
+
+        Self::finish_encoding(&directory, &payload, doc_freq, total_positions, limits)
+    }
+
+    /// Concatenate validated source streams without rewriting payload blocks.
+    ///
+    /// Only directory ordinals and offsets are rebased. Underfilled source
+    /// seams remain visible, so direct and staged Q1 merges create no fragments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for reversed/overlapping source docids, checked
+    /// count overflow, or resource exhaustion.
+    pub fn concatenate(parts: &[&PositionList<'_>]) -> Result<Self, PositionCodecError> {
+        Self::concatenate_with_limits(parts, PositionListLimits::default())
+    }
+
+    /// Concatenate with explicit byte, block, and position ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::concatenate`], plus a selected
+    /// resource ceiling when exceeded.
+    pub fn concatenate_with_limits(
+        parts: &[&PositionList<'_>],
+        limits: PositionListLimits,
+    ) -> Result<Self, PositionCodecError> {
+        let mut directory = Vec::new();
+        let mut payload_len = 0_usize;
+        let mut doc_freq = 0_u32;
+        let mut total_positions = 0_u64;
+        let mut previous_last_doc = None;
+
+        for part in parts {
+            let first_doc = part.posting_blocks.first().map(|block| block.first_doc);
+            let last_doc = part.posting_blocks.last().map(|block| block.last_doc);
+            if let (Some(previous), Some(current)) = (previous_last_doc, first_doc)
+                && current <= previous
+            {
+                return Err(PositionCodecError::NonAscendingConcat { previous, current });
+            }
+            if last_doc.is_some() {
+                previous_last_doc = last_doc;
+            }
+
+            total_positions = total_positions.checked_add(part.total_positions).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "concatenated position count",
+                },
+            )?;
+            if total_positions > limits.max_positions {
+                return Err(PositionCodecError::PositionLimitExceeded {
+                    limit: limits.max_positions,
+                    actual: total_positions,
+                });
+            }
+            for block in &part.blocks {
+                if directory.len() >= limits.max_blocks {
+                    return Err(PositionCodecError::BlockLimitExceeded {
+                        limit: limits.max_blocks,
+                        actual: directory.len().saturating_add(1),
+                    });
+                }
+                directory
+                    .try_reserve(1)
+                    .map_err(|_| PositionCodecError::Allocation {
+                        resource: "concatenated position directory",
+                        count: directory.len().saturating_add(1),
+                    })?;
+                directory.push(RawPositionBlock {
+                    first_posting_ordinal: doc_freq.checked_add(block.base_posting_ordinal).ok_or(
+                        PositionCodecError::ArithmeticOverflow {
+                            field: "concatenated posting ordinal",
+                        },
+                    )?,
+                    block_offset: u64::try_from(payload_len).map_err(|_| {
+                        PositionCodecError::ArithmeticOverflow {
+                            field: "concatenated payload offset",
+                        }
+                    })?,
+                });
+                payload_len = payload_len.checked_add(block.byte_len).ok_or(
+                    PositionCodecError::ArithmeticOverflow {
+                        field: "concatenated payload length",
+                    },
+                )?;
+            }
+            doc_freq = doc_freq.checked_add(part.doc_freq).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "concatenated doc_freq",
+                },
+            )?;
+        }
+
+        let directory_len = position_directory_len(&directory)?;
+        let complete_len = directory_len.checked_add(payload_len).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "concatenated term length",
+            },
+        )?;
+        if complete_len > limits.max_bytes {
+            return Err(PositionCodecError::ByteLimitExceeded {
+                limit: limits.max_bytes,
+                actual: complete_len,
+            });
+        }
+        let block_count =
+            u32::try_from(directory.len()).map_err(|_| PositionCodecError::BlockLimitExceeded {
+                limit: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
+                actual: directory.len(),
+            })?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(complete_len)
+            .map_err(|_| PositionCodecError::Allocation {
+                resource: "concatenated position bytes",
+                count: complete_len,
+            })?;
+        bytes.extend_from_slice(&block_count.to_le_bytes());
+        for block in &directory {
+            write_vint(block.first_posting_ordinal, &mut bytes);
+            write_vint64(block.block_offset, &mut bytes);
+        }
+        for part in parts {
+            for block in &part.blocks {
+                let range = block
+                    .byte_range()
+                    .ok_or(PositionCodecError::ArithmeticOverflow {
+                        field: "source position block range",
+                    })?;
+                let payload = part
+                    .bytes
+                    .get(range)
+                    .ok_or(PositionCodecError::CursorInvariant {
+                        field: "validated source position block",
+                    })?;
+                bytes.extend_from_slice(payload);
+            }
+        }
+        debug_assert_eq!(bytes.len(), complete_len);
+        Ok(Self {
+            bytes,
+            doc_freq,
+            total_positions,
+            block_count: directory.len(),
+        })
+    }
+
+    fn finish_encoding(
+        directory: &[RawPositionBlock],
+        payload: &[u8],
+        doc_freq: u32,
+        total_positions: u64,
+        limits: PositionListLimits,
+    ) -> Result<Self, PositionCodecError> {
+        let directory_len = position_directory_len(directory)?;
+        let complete_len = directory_len.checked_add(payload.len()).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "position term length",
+            },
+        )?;
+        if complete_len > limits.max_bytes {
+            return Err(PositionCodecError::ByteLimitExceeded {
+                limit: limits.max_bytes,
+                actual: complete_len,
+            });
+        }
+        let block_count =
+            u32::try_from(directory.len()).map_err(|_| PositionCodecError::BlockLimitExceeded {
+                limit: usize::try_from(u32::MAX).unwrap_or(usize::MAX),
+                actual: directory.len(),
+            })?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(complete_len)
+            .map_err(|_| PositionCodecError::Allocation {
+                resource: "position term bytes",
+                count: complete_len,
+            })?;
+        bytes.extend_from_slice(&block_count.to_le_bytes());
+        for block in directory {
+            write_vint(block.first_posting_ordinal, &mut bytes);
+            write_vint64(block.block_offset, &mut bytes);
+        }
+        bytes.extend_from_slice(payload);
+        debug_assert_eq!(bytes.len(), complete_len);
+        Ok(Self {
+            bytes,
+            doc_freq,
+            total_positions,
+            block_count: directory.len(),
+        })
+    }
+
+    /// Exact canonical term bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return exact canonical term bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Number of aligned postings.
+    #[must_use]
+    pub const fn doc_freq(&self) -> u32 {
+        self.doc_freq
+    }
+
+    /// Frequency-derived number of encoded positions.
+    #[must_use]
+    pub const fn total_positions(&self) -> u64 {
+        self.total_positions
+    }
+
+    /// Number of preserved payload blocks.
+    #[must_use]
+    pub const fn block_count(&self) -> usize {
+        self.block_count
+    }
+
+    /// Re-open owned bytes against the corresponding validated POSTINGS list.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if an internal encoder invariant regressed.
+    pub fn position_list<'a>(
+        &'a self,
+        postings: &'a PostingList<'_>,
+    ) -> Result<PositionList<'a>, PositionCodecError> {
+        PositionList::parse_with_limits(
+            &self.bytes,
+            postings,
+            PositionListLimits {
+                max_bytes: self.bytes.len(),
+                max_blocks: self.block_count,
+                max_positions: self.total_positions,
+            },
+        )
+    }
+}
+
+/// Borrowed, fully validated POSITIONS span paired with its POSTINGS list.
+#[derive(Clone, Debug)]
+pub struct PositionList<'a> {
+    bytes: &'a [u8],
+    posting_bytes: &'a [u8],
+    posting_blocks: &'a [PostingBlockMeta],
+    doc_freq: u32,
+    total_positions: u64,
+    blocks: Vec<PositionBlockMeta>,
+}
+
+impl<'a> PositionList<'a> {
+    /// Validate a complete positional term span against POSTINGS frequencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed/corrupt durable bytes, frequency
+    /// misalignment, integer overflow, or resource exhaustion.
+    pub fn parse(
+        bytes: &'a [u8],
+        postings: &'a PostingList<'_>,
+    ) -> Result<Self, PositionCodecError> {
+        Self::parse_with_limits(bytes, postings, PositionListLimits::default())
+    }
+
+    /// Validate with explicit byte, block, and position ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::parse`], plus a selected resource
+    /// ceiling when exceeded.
+    pub fn parse_with_limits(
+        bytes: &'a [u8],
+        postings: &'a PostingList<'_>,
+        limits: PositionListLimits,
+    ) -> Result<Self, PositionCodecError> {
+        if bytes.len() > limits.max_bytes {
+            return Err(PositionCodecError::ByteLimitExceeded {
+                limit: limits.max_bytes,
+                actual: bytes.len(),
+            });
+        }
+        let total_positions = expected_position_count(postings, limits.max_positions)?;
+        let count_bytes =
+            bytes
+                .get(..POSITION_DIRECTORY_HEADER_LEN)
+                .ok_or(PositionCodecError::Truncated {
+                    offset: 0,
+                    needed: POSITION_DIRECTORY_HEADER_LEN,
+                    remaining: bytes.len(),
+                })?;
+        let block_count = usize::try_from(u32::from_le_bytes([
+            count_bytes[0],
+            count_bytes[1],
+            count_bytes[2],
+            count_bytes[3],
+        ]))
+        .map_err(|_| PositionCodecError::ArithmeticOverflow {
+            field: "position block count",
+        })?;
+        if block_count > limits.max_blocks {
+            return Err(PositionCodecError::BlockLimitExceeded {
+                limit: limits.max_blocks,
+                actual: block_count,
+            });
+        }
+        if (postings.doc_freq == 0 && block_count != 0)
+            || (postings.doc_freq != 0
+                && (block_count == 0
+                    || u64::try_from(block_count).unwrap_or(u64::MAX)
+                        > u64::from(postings.doc_freq)))
+        {
+            return Err(PositionCodecError::InvalidBlockCount {
+                block_count,
+                doc_freq: postings.doc_freq,
+            });
+        }
+        if block_count == 0 {
+            if bytes.len() != POSITION_DIRECTORY_HEADER_LEN {
+                return Err(PositionCodecError::TrailingBlockBytes {
+                    block_index: 0,
+                    remaining: bytes.len() - POSITION_DIRECTORY_HEADER_LEN,
+                });
+            }
+            return Ok(Self {
+                bytes,
+                posting_bytes: postings.bytes,
+                posting_blocks: &postings.blocks,
+                doc_freq: 0,
+                total_positions: 0,
+                blocks: Vec::new(),
+            });
+        }
+
+        let mut reader =
+            PositionByteReader::new(bytes, POSITION_DIRECTORY_HEADER_LEN, bytes.len())?;
+        let mut raw_blocks: Vec<RawPositionBlock> = Vec::new();
+        raw_blocks
+            .try_reserve_exact(block_count)
+            .map_err(|_| PositionCodecError::Allocation {
+                resource: "position block directory",
+                count: block_count,
+            })?;
+        for block_index in 0..block_count {
+            let first_posting_ordinal = reader.read_u32_vint()?;
+            let block_offset = reader.read_u64_vint()?;
+            if block_index == 0 && (first_posting_ordinal != 0 || block_offset != 0) {
+                return Err(PositionCodecError::InvalidDirectoryStart {
+                    first_posting_ordinal,
+                    block_offset,
+                });
+            }
+            if let Some(previous) = raw_blocks.last() {
+                if first_posting_ordinal <= previous.first_posting_ordinal {
+                    return Err(PositionCodecError::NonAscendingBlockOrdinal {
+                        block_index,
+                        previous: previous.first_posting_ordinal,
+                        current: first_posting_ordinal,
+                    });
+                }
+                if block_offset <= previous.block_offset {
+                    return Err(PositionCodecError::NonAscendingBlockOffset {
+                        block_index,
+                        previous: previous.block_offset,
+                        current: block_offset,
+                    });
+                }
+            }
+            if first_posting_ordinal >= postings.doc_freq {
+                return Err(PositionCodecError::BlockOrdinalOutOfRange {
+                    block_index,
+                    first_posting_ordinal,
+                    doc_freq: postings.doc_freq,
+                });
+            }
+            raw_blocks.push(RawPositionBlock {
+                first_posting_ordinal,
+                block_offset,
+            });
+        }
+        let blocks_area_start = reader.position();
+        let payload_len = bytes.len().checked_sub(blocks_area_start).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "position blocks-area length",
+            },
+        )?;
+
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(block_count)
+            .map_err(|_| PositionCodecError::Allocation {
+                resource: "validated position metadata",
+                count: block_count,
+            })?;
+        let mut postings_cursor = postings.cursor()?;
+        let mut decoded_positions = 0_u64;
+        for (block_index, raw) in raw_blocks.iter().copied().enumerate() {
+            let next_ordinal = raw_blocks
+                .get(block_index + 1)
+                .map_or(postings.doc_freq, |next| next.first_posting_ordinal);
+            let posting_count = next_ordinal.checked_sub(raw.first_posting_ordinal).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "position block posting count",
+                },
+            )?;
+            if posting_count == 0 {
+                return Err(PositionCodecError::EmptyBlock { block_index });
+            }
+            let relative_start = usize::try_from(raw.block_offset).map_err(|_| {
+                PositionCodecError::BlockOffsetOutOfRange {
+                    block_index,
+                    block_offset: raw.block_offset,
+                    payload_len,
+                }
+            })?;
+            let relative_end_u64 = raw_blocks.get(block_index + 1).map_or_else(
+                || u64::try_from(payload_len).unwrap_or(u64::MAX),
+                |next| next.block_offset,
+            );
+            let relative_end = usize::try_from(relative_end_u64).map_err(|_| {
+                PositionCodecError::BlockOffsetOutOfRange {
+                    block_index,
+                    block_offset: relative_end_u64,
+                    payload_len,
+                }
+            })?;
+            if relative_start >= payload_len || relative_end > payload_len {
+                return Err(PositionCodecError::BlockOffsetOutOfRange {
+                    block_index,
+                    block_offset: if relative_start >= payload_len {
+                        raw.block_offset
+                    } else {
+                        relative_end_u64
+                    },
+                    payload_len,
+                });
+            }
+            if relative_start >= relative_end {
+                return Err(PositionCodecError::EmptyBlock { block_index });
+            }
+            let byte_offset = blocks_area_start.checked_add(relative_start).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "position block start",
+                },
+            )?;
+            let byte_end = blocks_area_start.checked_add(relative_end).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "position block end",
+                },
+            )?;
+            let byte_len = byte_end.checked_sub(byte_offset).ok_or(
+                PositionCodecError::ArithmeticOverflow {
+                    field: "position block length",
+                },
+            )?;
+            if byte_len > POSITION_BLOCK_TARGET_BYTES && posting_count != 1 {
+                return Err(PositionCodecError::OversizedMultiDocumentBlock {
+                    block_index,
+                    posting_count,
+                    byte_len,
+                });
+            }
+
+            let actual_ordinal =
+                postings_cursor
+                    .posting_ordinal()
+                    .ok_or(PositionCodecError::CursorInvariant {
+                        field: "position block first posting",
+                    })?;
+            if actual_ordinal != raw.first_posting_ordinal {
+                return Err(PositionCodecError::CursorInvariant {
+                    field: "position directory posting ordinal",
+                });
+            }
+            let first_doc = postings_cursor
+                .doc()
+                .ok_or(PositionCodecError::CursorInvariant {
+                    field: "position block first doc",
+                })?;
+            let mut last_doc = first_doc;
+            let mut block_reader = PositionByteReader::new(bytes, byte_offset, byte_end)?;
+            for expected_ordinal in raw.first_posting_ordinal..next_ordinal {
+                if postings_cursor.posting_ordinal() != Some(expected_ordinal) {
+                    return Err(PositionCodecError::CursorInvariant {
+                        field: "position/posting ordinal alignment",
+                    });
+                }
+                let freq = postings_cursor
+                    .freq()
+                    .ok_or(PositionCodecError::CursorInvariant {
+                        field: "position/posting frequency alignment",
+                    })?;
+                consume_position_run(&mut block_reader, expected_ordinal, freq)?;
+                decoded_positions = decoded_positions.checked_add(u64::from(freq)).ok_or(
+                    PositionCodecError::ArithmeticOverflow {
+                        field: "decoded position count",
+                    },
+                )?;
+                if decoded_positions > limits.max_positions {
+                    return Err(PositionCodecError::PositionLimitExceeded {
+                        limit: limits.max_positions,
+                        actual: decoded_positions,
+                    });
+                }
+                last_doc = postings_cursor
+                    .doc()
+                    .ok_or(PositionCodecError::CursorInvariant {
+                        field: "position block last doc",
+                    })?;
+                postings_cursor.next()?;
+            }
+            if !block_reader.is_empty() {
+                return Err(PositionCodecError::TrailingBlockBytes {
+                    block_index,
+                    remaining: block_reader.remaining(),
+                });
+            }
+            blocks.push(PositionBlockMeta {
+                base_posting_ordinal: raw.first_posting_ordinal,
+                posting_count,
+                first_doc,
+                last_doc,
+                byte_offset,
+                byte_len,
+            });
+        }
+        if postings_cursor.current().is_some() || decoded_positions != total_positions {
+            return Err(PositionCodecError::CursorInvariant {
+                field: "complete position/posting coverage",
+            });
+        }
+
+        Ok(Self {
+            bytes,
+            posting_bytes: postings.bytes,
+            posting_blocks: &postings.blocks,
+            doc_freq: postings.doc_freq,
+            total_positions,
+            blocks,
+        })
+    }
+
+    /// Exact borrowed durable term bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Validated aligned posting count.
+    #[must_use]
+    pub const fn doc_freq(&self) -> u32 {
+        self.doc_freq
+    }
+
+    /// Frequency-derived position count.
+    #[must_use]
+    pub const fn total_positions(&self) -> u64 {
+        self.total_positions
+    }
+
+    /// Number of validated payload blocks.
+    #[must_use]
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Validated payload block directory.
+    #[must_use]
+    pub fn blocks(&self) -> &[PositionBlockMeta] {
+        &self.blocks
+    }
+
+    /// Exact payload bytes for one validated block.
+    #[must_use]
+    pub fn block_bytes(&self, block_index: usize) -> Option<&'a [u8]> {
+        let range = self.blocks.get(block_index)?.byte_range()?;
+        self.bytes.get(range)
+    }
+
+    /// Stream one document's absolute positions by zero-based posting ordinal.
+    ///
+    /// Lookup binary-searches the bounded block directory, then scans at most
+    /// that block's complete frequency-derived runs. It allocates no per-doc
+    /// metadata or output buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed out-of-range error or an internal validated-cursor
+    /// invariant failure.
+    pub fn positions_for_ordinal(
+        &self,
+        posting_ordinal: u32,
+    ) -> Result<PositionIter<'_>, PositionCodecError> {
+        positions_for_ordinal(
+            self.bytes,
+            &self.blocks,
+            self.posting_bytes,
+            self.posting_blocks,
+            self.doc_freq,
+            posting_ordinal,
+        )
+    }
+
+    /// Create an allocation-free posting cursor layered with position access.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the paired, already validated POSTINGS bytes no
+    /// longer satisfy their cursor invariant.
+    pub fn cursor(&self) -> Result<PositionCursor<'_>, PositionCodecError> {
+        let postings = PostingCursor::new(self.posting_bytes, self.posting_blocks)?;
+        let (position_block_index, position_reader) = if postings.current().is_some() {
+            let first_block = self
+                .blocks
+                .first()
+                .ok_or(PositionCodecError::CursorInvariant {
+                    field: "initial position block",
+                })?;
+            (
+                Some(0),
+                PositionByteReader::from_block(self.bytes, first_block)?,
+            )
+        } else {
+            (
+                None,
+                PositionByteReader::new(self.bytes, self.bytes.len(), self.bytes.len())?,
+            )
+        };
+        Ok(PositionCursor {
+            position_bytes: self.bytes,
+            position_blocks: &self.blocks,
+            position_block_index,
+            position_reader,
+            postings,
+        })
+    }
+}
+
+/// Streaming decoder for one frequency-bounded document position run.
+pub struct PositionIter<'a> {
+    reader: PositionByteReader<'a>,
+    posting_ordinal: u32,
+    remaining: u32,
+    previous: Option<u32>,
+}
+
+impl Iterator for PositionIter<'_> {
+    type Item = Result<u32, PositionCodecError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let encoded = match self.reader.read_u32_vint() {
+            Ok(value) => value,
+            Err(error) => {
+                self.remaining = 0;
+                return Some(Err(error));
+            }
+        };
+        let position = if let Some(previous) = self.previous {
+            match previous.checked_add(encoded) {
+                Some(position) => position,
+                None => {
+                    self.remaining = 0;
+                    return Some(Err(PositionCodecError::PositionOverflow {
+                        posting_ordinal: self.posting_ordinal,
+                        previous,
+                        delta: encoded,
+                    }));
+                }
+            }
+        } else {
+            encoded
+        };
+        self.previous = Some(position);
+        self.remaining -= 1;
+        Some(Ok(position))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PositionIter<'_> {}
+
+/// Posting cursor paired with allocation-free access to the current positions.
+pub struct PositionCursor<'a> {
+    position_bytes: &'a [u8],
+    position_blocks: &'a [PositionBlockMeta],
+    position_block_index: Option<usize>,
+    position_reader: PositionByteReader<'a>,
+    postings: PostingCursor<'a>,
+}
+
+impl PositionCursor<'_> {
+    /// Current posting, including a valid `u32::MAX` docid when present.
+    #[must_use]
+    pub fn current(&self) -> Option<Posting> {
+        self.postings.current()
+    }
+
+    /// Current absolute docid.
+    #[must_use]
+    pub fn doc(&self) -> Option<u32> {
+        self.postings.doc()
+    }
+
+    /// Current term frequency.
+    #[must_use]
+    pub fn freq(&self) -> Option<u32> {
+        self.postings.freq()
+    }
+
+    /// Current zero-based posting ordinal.
+    #[must_use]
+    pub fn posting_ordinal(&self) -> Option<u32> {
+        self.postings.posting_ordinal()
+    }
+
+    /// Stream the current posting's absolute positions without allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal invariant failure if the paired validated streams
+    /// disagree.
+    pub fn positions(&self) -> Result<Option<PositionIter<'_>>, PositionCodecError> {
+        let Some(posting_ordinal) = self.postings.posting_ordinal() else {
+            return Ok(None);
+        };
+        let freq = self
+            .postings
+            .freq()
+            .ok_or(PositionCodecError::CursorInvariant {
+                field: "current position frequency",
+            })?;
+        if self.position_block_index.is_none() {
+            return Err(PositionCodecError::CursorInvariant {
+                field: "current position block",
+            });
+        }
+        Ok(Some(PositionIter {
+            reader: self.position_reader.clone(),
+            posting_ordinal,
+            remaining: freq,
+            previous: None,
+        }))
+    }
+
+    /// Move strictly forward by one posting. Exhaustion is fused.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the paired POSTINGS cursor cannot decode its
+    /// next validated block.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Posting>, PositionCodecError> {
+        self.advance_one()
+    }
+
+    /// Land on the first posting whose docid is at least `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the paired POSTINGS cursor cannot decode the
+    /// selected validated block.
+    pub fn advance(&mut self, target: u32) -> Result<Option<Posting>, PositionCodecError> {
+        let Some(current) = self.postings.current() else {
+            return Ok(None);
+        };
+        if current.doc_id >= target {
+            return Ok(Some(current));
+        }
+
+        let destination = self
+            .position_blocks
+            .partition_point(|block| block.last_doc < target);
+        let Some(destination_block) = self.position_blocks.get(destination) else {
+            let landed = self.postings.advance(target)?;
+            if landed.is_some() {
+                return Err(PositionCodecError::CursorInvariant {
+                    field: "position advance exhaustion",
+                });
+            }
+            self.position_block_index = None;
+            self.position_reader = PositionByteReader::new(
+                self.position_bytes,
+                self.position_bytes.len(),
+                self.position_bytes.len(),
+            )?;
+            return Ok(None);
+        };
+
+        let current_block =
+            self.position_block_index
+                .ok_or(PositionCodecError::CursorInvariant {
+                    field: "position advance current block",
+                })?;
+        if destination > current_block {
+            let landed = self.postings.advance(destination_block.first_doc)?;
+            if landed.map(|posting| posting.doc_id) != Some(destination_block.first_doc)
+                || self.postings.posting_ordinal() != Some(destination_block.base_posting_ordinal)
+            {
+                return Err(PositionCodecError::CursorInvariant {
+                    field: "position advance block seek",
+                });
+            }
+            self.position_block_index = Some(destination);
+            self.position_reader =
+                PositionByteReader::from_block(self.position_bytes, destination_block)?;
+        } else if destination < current_block {
+            return Err(PositionCodecError::CursorInvariant {
+                field: "position advance moved backward",
+            });
+        }
+
+        while self.postings.doc().is_some_and(|doc| doc < target) {
+            self.advance_one()?;
+        }
+        Ok(self.postings.current())
+    }
+
+    fn advance_one(&mut self) -> Result<Option<Posting>, PositionCodecError> {
+        let Some(posting_ordinal) = self.postings.posting_ordinal() else {
+            return Ok(None);
+        };
+        let freq = self
+            .postings
+            .freq()
+            .ok_or(PositionCodecError::CursorInvariant {
+                field: "position cursor frequency",
+            })?;
+        consume_position_run(&mut self.position_reader, posting_ordinal, freq)?;
+        let next = self.postings.next()?;
+        let Some(next_posting) = next else {
+            if !self.position_reader.is_empty() {
+                return Err(PositionCodecError::CursorInvariant {
+                    field: "final position block exhaustion",
+                });
+            }
+            self.position_block_index = None;
+            return Ok(None);
+        };
+
+        let block_index = self
+            .position_block_index
+            .ok_or(PositionCodecError::CursorInvariant {
+                field: "position cursor block index",
+            })?;
+        let block =
+            self.position_blocks
+                .get(block_index)
+                .ok_or(PositionCodecError::CursorInvariant {
+                    field: "position cursor block metadata",
+                })?;
+        let block_end_ordinal = block
+            .base_posting_ordinal
+            .checked_add(block.posting_count)
+            .ok_or(PositionCodecError::ArithmeticOverflow {
+                field: "position cursor block end ordinal",
+            })?;
+        let next_ordinal =
+            self.postings
+                .posting_ordinal()
+                .ok_or(PositionCodecError::CursorInvariant {
+                    field: "position cursor next ordinal",
+                })?;
+        if next_ordinal == block_end_ordinal {
+            if !self.position_reader.is_empty() {
+                return Err(PositionCodecError::CursorInvariant {
+                    field: "position block exhaustion",
+                });
+            }
+            let next_block_index =
+                block_index
+                    .checked_add(1)
+                    .ok_or(PositionCodecError::ArithmeticOverflow {
+                        field: "next position block index",
+                    })?;
+            let next_block = self.position_blocks.get(next_block_index).ok_or(
+                PositionCodecError::CursorInvariant {
+                    field: "next position block metadata",
+                },
+            )?;
+            if next_block.base_posting_ordinal != next_ordinal
+                || next_block.first_doc != next_posting.doc_id
+            {
+                return Err(PositionCodecError::CursorInvariant {
+                    field: "next position block alignment",
+                });
+            }
+            self.position_block_index = Some(next_block_index);
+            self.position_reader = PositionByteReader::from_block(self.position_bytes, next_block)?;
+        } else if next_ordinal > block_end_ordinal {
+            return Err(PositionCodecError::CursorInvariant {
+                field: "position cursor skipped block seam",
+            });
+        }
+        Ok(Some(next_posting))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PositionByteReader<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+    end: usize,
+}
+
+impl<'a> PositionByteReader<'a> {
+    fn new(bytes: &'a [u8], start: usize, end: usize) -> Result<Self, PositionCodecError> {
+        if start > end || end > bytes.len() {
+            return Err(PositionCodecError::Truncated {
+                offset: start.min(bytes.len()),
+                needed: end.saturating_sub(start),
+                remaining: bytes.len().saturating_sub(start.min(bytes.len())),
+            });
+        }
+        Ok(Self {
+            bytes,
+            cursor: start,
+            end,
+        })
+    }
+
+    fn from_block(bytes: &'a [u8], block: &PositionBlockMeta) -> Result<Self, PositionCodecError> {
+        let end = block.byte_offset.checked_add(block.byte_len).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "position block reader end",
+            },
+        )?;
+        Self::new(bytes, block.byte_offset, end)
+    }
+
+    const fn position(&self) -> usize {
+        self.cursor
+    }
+
+    const fn remaining(&self) -> usize {
+        self.end - self.cursor
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.cursor == self.end
+    }
+
+    fn read_byte(&mut self) -> Result<u8, PositionCodecError> {
+        let byte =
+            self.bytes
+                .get(self.cursor)
+                .copied()
+                .ok_or_else(|| PositionCodecError::Truncated {
+                    offset: self.cursor,
+                    needed: 1,
+                    remaining: self.remaining(),
+                })?;
+        if self.cursor >= self.end {
+            return Err(PositionCodecError::Truncated {
+                offset: self.cursor,
+                needed: 1,
+                remaining: 0,
+            });
+        }
+        self.cursor += 1;
+        Ok(byte)
+    }
+
+    fn read_u32_vint(&mut self) -> Result<u32, PositionCodecError> {
+        let start = self.cursor;
+        let mut value = 0_u32;
+        for byte_index in 0..5 {
+            let byte = self.read_byte()?;
+            let payload = byte & 0x7f;
+            if byte_index == 4 && payload > 0x0f {
+                return Err(PositionCodecError::VintOverflow {
+                    offset: start,
+                    domain: "u32",
+                });
+            }
+            value |= u32::from(payload) << (byte_index * 7);
+            if byte & 0x80 == 0 {
+                if vint_length(value) != byte_index + 1 {
+                    return Err(PositionCodecError::NonCanonicalVint {
+                        offset: start,
+                        domain: "u32",
+                    });
+                }
+                return Ok(value);
+            }
+        }
+        Err(PositionCodecError::VintOverflow {
+            offset: start,
+            domain: "u32",
+        })
+    }
+
+    fn read_u64_vint(&mut self) -> Result<u64, PositionCodecError> {
+        let start = self.cursor;
+        let mut value = 0_u64;
+        for byte_index in 0..10 {
+            let byte = self.read_byte()?;
+            let payload = byte & 0x7f;
+            if byte_index == 9 && payload > 1 {
+                return Err(PositionCodecError::VintOverflow {
+                    offset: start,
+                    domain: "u64",
+                });
+            }
+            value |= u64::from(payload) << (byte_index * 7);
+            if byte & 0x80 == 0 {
+                if vint64_length(value) != byte_index + 1 {
+                    return Err(PositionCodecError::NonCanonicalVint {
+                        offset: start,
+                        domain: "u64",
+                    });
+                }
+                return Ok(value);
+            }
+        }
+        Err(PositionCodecError::VintOverflow {
+            offset: start,
+            domain: "u64",
+        })
+    }
+}
+
+fn expected_position_count(
+    postings: &PostingList<'_>,
+    limit: u64,
+) -> Result<u64, PositionCodecError> {
+    let mut total = 0_u64;
+    let mut cursor = postings.cursor()?;
+    while let Some(posting) = cursor.current() {
+        total = total.checked_add(u64::from(posting.freq)).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "frequency-derived position count",
+            },
+        )?;
+        if total > limit {
+            return Err(PositionCodecError::PositionLimitExceeded {
+                limit,
+                actual: total,
+            });
+        }
+        cursor.next()?;
+    }
+    Ok(total)
+}
+
+fn expected_input_position_count(
+    postings: &[Posting],
+    limit: u64,
+) -> Result<u64, PositionCodecError> {
+    let mut total = 0_u64;
+    for posting in postings {
+        total = total.checked_add(u64::from(posting.freq)).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "frequency-derived position count",
+            },
+        )?;
+        if total > limit {
+            return Err(PositionCodecError::PositionLimitExceeded {
+                limit,
+                actual: total,
+            });
+        }
+    }
+    Ok(total)
+}
+
+fn validated_position_run_len(
+    posting_ordinal: u32,
+    positions: &[u32],
+) -> Result<usize, PositionCodecError> {
+    let Some((&first, rest)) = positions.split_first() else {
+        return Ok(0);
+    };
+    let mut length = vint_length(first);
+    let mut previous = first;
+    for (index, &position) in rest.iter().enumerate() {
+        if position < previous {
+            return Err(PositionCodecError::NonAscendingPosition {
+                posting_ordinal,
+                position_index: index + 1,
+                previous,
+                position,
+            });
+        }
+        length = length.checked_add(vint_length(position - previous)).ok_or(
+            PositionCodecError::ArithmeticOverflow {
+                field: "encoded position run length",
+            },
+        )?;
+        previous = position;
+    }
+    Ok(length)
+}
+
+fn write_position_run(positions: &[u32], output: &mut Vec<u8>) {
+    let Some((&first, rest)) = positions.split_first() else {
+        return;
+    };
+    write_vint(first, output);
+    let mut previous = first;
+    for &position in rest {
+        write_vint(position - previous, output);
+        previous = position;
+    }
+}
+
+fn position_directory_len(directory: &[RawPositionBlock]) -> Result<usize, PositionCodecError> {
+    let mut length = POSITION_DIRECTORY_HEADER_LEN;
+    for block in directory {
+        length = length
+            .checked_add(vint_length(block.first_posting_ordinal))
+            .and_then(|value| value.checked_add(vint64_length(block.block_offset)))
+            .ok_or(PositionCodecError::ArithmeticOverflow {
+                field: "position directory length",
+            })?;
+    }
+    Ok(length)
+}
+
+fn consume_position_run(
+    reader: &mut PositionByteReader<'_>,
+    posting_ordinal: u32,
+    freq: u32,
+) -> Result<(), PositionCodecError> {
+    let mut previous: Option<u32> = None;
+    for _ in 0..freq {
+        let encoded = reader.read_u32_vint()?;
+        let position = if let Some(previous) = previous {
+            previous
+                .checked_add(encoded)
+                .ok_or(PositionCodecError::PositionOverflow {
+                    posting_ordinal,
+                    previous,
+                    delta: encoded,
+                })?
+        } else {
+            encoded
+        };
+        previous = Some(position);
+    }
+    Ok(())
+}
+
+fn positions_for_ordinal<'a>(
+    position_bytes: &'a [u8],
+    position_blocks: &[PositionBlockMeta],
+    posting_bytes: &[u8],
+    posting_blocks: &[PostingBlockMeta],
+    doc_freq: u32,
+    posting_ordinal: u32,
+) -> Result<PositionIter<'a>, PositionCodecError> {
+    if posting_ordinal >= doc_freq {
+        return Err(PositionCodecError::PostingOrdinalOutOfRange {
+            posting_ordinal,
+            doc_freq,
+        });
+    }
+    let after =
+        position_blocks.partition_point(|block| block.base_posting_ordinal <= posting_ordinal);
+    let block_index = after
+        .checked_sub(1)
+        .ok_or(PositionCodecError::CursorInvariant {
+            field: "position block lookup",
+        })?;
+    let block = position_blocks
+        .get(block_index)
+        .ok_or(PositionCodecError::CursorInvariant {
+            field: "position block index",
+        })?;
+    let block_end_ordinal = block
+        .base_posting_ordinal
+        .checked_add(block.posting_count)
+        .ok_or(PositionCodecError::ArithmeticOverflow {
+            field: "position block end ordinal",
+        })?;
+    if posting_ordinal >= block_end_ordinal {
+        return Err(PositionCodecError::CursorInvariant {
+            field: "position block ordinal range",
+        });
+    }
+    let block_end = block.byte_offset.checked_add(block.byte_len).ok_or(
+        PositionCodecError::ArithmeticOverflow {
+            field: "position block end",
+        },
+    )?;
+    let mut reader = PositionByteReader::new(position_bytes, block.byte_offset, block_end)?;
+    let mut postings = PostingCursor::new(posting_bytes, posting_blocks)?;
+    let first = postings
+        .advance(block.first_doc)?
+        .ok_or(PositionCodecError::CursorInvariant {
+            field: "position block first posting seek",
+        })?;
+    if first.doc_id != block.first_doc
+        || postings.posting_ordinal() != Some(block.base_posting_ordinal)
+    {
+        return Err(PositionCodecError::CursorInvariant {
+            field: "position block first posting metadata",
+        });
+    }
+
+    loop {
+        let current_ordinal =
+            postings
+                .posting_ordinal()
+                .ok_or(PositionCodecError::CursorInvariant {
+                    field: "position ordinal scan",
+                })?;
+        let freq = postings.freq().ok_or(PositionCodecError::CursorInvariant {
+            field: "position frequency scan",
+        })?;
+        if current_ordinal == posting_ordinal {
+            return Ok(PositionIter {
+                reader,
+                posting_ordinal,
+                remaining: freq,
+                previous: None,
+            });
+        }
+        consume_position_run(&mut reader, current_ordinal, freq)?;
+        if current_ordinal > posting_ordinal || postings.next()?.is_none() {
+            return Err(PositionCodecError::CursorInvariant {
+                field: "position ordinal reachability",
+            });
+        }
+    }
+}
+
 /// Byte alignment of every per-field FSLX DOCLEN column.
 pub const DOCLEN_ALIGNMENT: usize = 64;
 /// Canonical byte written for a global-docid hole in a DOCLEN column.
@@ -4047,6 +5733,40 @@ mod tests {
         Ok(bytes)
     }
 
+    fn raw_positions(directory: &[(u32, u64)], payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
+        let block_count = u32::try_from(directory.len())?;
+        let mut bytes = block_count.to_le_bytes().to_vec();
+        for &(first_posting_ordinal, block_offset) in directory {
+            write_vint(first_posting_ordinal, &mut bytes);
+            write_vint64(block_offset, &mut bytes);
+        }
+        bytes.extend_from_slice(payload);
+        Ok(bytes)
+    }
+
+    fn collect_positions(
+        positions: &PositionList<'_>,
+        posting_ordinal: u32,
+    ) -> Result<Vec<u32>, PositionCodecError> {
+        positions.positions_for_ordinal(posting_ordinal)?.collect()
+    }
+
+    fn zero_positions(postings: &[Posting]) -> Result<Vec<u32>, PositionCodecError> {
+        let count = postings.iter().try_fold(0_usize, |total, posting| {
+            let freq = usize::try_from(posting.freq).map_err(|_| {
+                PositionCodecError::ArithmeticOverflow {
+                    field: "test position count",
+                }
+            })?;
+            total
+                .checked_add(freq)
+                .ok_or(PositionCodecError::ArithmeticOverflow {
+                    field: "test position count",
+                })
+        })?;
+        Ok(vec![0; count])
+    }
+
     #[test]
     fn independent_bitpack_known_answers() -> TestResult {
         assert_eq!(pack_lsb(&[1, 2, 5], 3)?, [0x51, 0x01]);
@@ -4713,6 +6433,601 @@ mod tests {
             assert_eq!(list.decode_all()?, expected, "left_count={left_count}");
             assert_eq!(list.blocks()[0].kind, PostingBlockKind::Vint);
             assert_eq!(list.blocks()[1].kind, PostingBlockKind::Vint);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positions_wire_golden_and_full_u32_vint_domain() -> TestResult {
+        let postings = [Posting::new(10, 3), Posting::new(20, 2)];
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let posting_list = posting_bytes.posting_list()?;
+        let encoded = EncodedPositionList::encode(&postings, &[0, 0, 7, 130, 130])?;
+        assert_eq!(
+            encoded.as_bytes(),
+            [1, 0, 0, 0, 0, 0, 0, 0, 7, 0x82, 0x01, 0]
+        );
+        let positions = encoded.position_list(&posting_list)?;
+        assert_eq!(collect_positions(&positions, 0)?, [0, 0, 7]);
+        assert_eq!(collect_positions(&positions, 1)?, [130, 130]);
+
+        let boundary_values = [0, 127, 128, 16_383, 16_384, 65_535, 65_536, u32::MAX];
+        let boundary_postings: Vec<Posting> = boundary_values
+            .iter()
+            .enumerate()
+            .map(|(index, _)| Ok(Posting::new(100 + u32::try_from(index)?, 1)))
+            .collect::<Result<_, std::num::TryFromIntError>>()?;
+        let boundary_posting_bytes = EncodedPostingList::encode(&boundary_postings)?;
+        let boundary_posting_list = boundary_posting_bytes.posting_list()?;
+        let boundary_encoded = EncodedPositionList::encode(&boundary_postings, &boundary_values)?;
+        let boundary_list = boundary_encoded.position_list(&boundary_posting_list)?;
+        assert_eq!(
+            boundary_list.block_bytes(0),
+            Some(
+                &[
+                    0x00, 0x7f, 0x80, 0x01, 0xff, 0x7f, 0x80, 0x80, 0x01, 0xff, 0xff, 0x03, 0x80,
+                    0x80, 0x04, 0xff, 0xff, 0xff, 0xff, 0x0f,
+                ][..]
+            )
+        );
+        for (ordinal, expected) in boundary_values.iter().copied().enumerate() {
+            assert_eq!(
+                collect_positions(&boundary_list, u32::try_from(ordinal)?)?,
+                [expected]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn positions_empty_count_alignment_and_resource_limits() -> TestResult {
+        let empty_postings = EncodedPostingList::encode(&[])?;
+        let empty_posting_list = empty_postings.posting_list()?;
+        let empty = EncodedPositionList::encode(&[], &[])?;
+        assert_eq!(empty.as_bytes(), [0, 0, 0, 0]);
+        let empty_list = empty.position_list(&empty_posting_list)?;
+        assert_eq!(empty_list.doc_freq(), 0);
+        assert_eq!(empty_list.total_positions(), 0);
+        assert_eq!(empty_list.block_count(), 0);
+        assert!(empty_list.cursor()?.positions()?.is_none());
+
+        let postings = [Posting::new(1, 2)];
+        assert!(matches!(
+            EncodedPositionList::encode(&postings, &[7]),
+            Err(PositionCodecError::PositionCountMismatch {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            EncodedPositionList::encode(&postings, &[7, 8, 9]),
+            Err(PositionCodecError::PositionCountMismatch {
+                expected: 2,
+                actual: 3
+            })
+        ));
+        assert!(matches!(
+            EncodedPositionList::encode(&postings, &[8, 7]),
+            Err(PositionCodecError::NonAscendingPosition { .. })
+        ));
+        assert!(matches!(
+            EncodedPositionList::encode_with_limits(
+                &postings,
+                &[7, 8],
+                PositionListLimits {
+                    max_bytes: usize::MAX,
+                    max_blocks: usize::MAX,
+                    max_positions: 1,
+                }
+            ),
+            Err(PositionCodecError::PositionLimitExceeded {
+                limit: 1,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            EncodedPositionList::encode_with_limits(
+                &postings,
+                &[7, 8],
+                PositionListLimits {
+                    max_bytes: 5,
+                    max_blocks: 1,
+                    max_positions: 2,
+                }
+            ),
+            Err(PositionCodecError::ByteLimitExceeded { limit: 5, .. })
+        ));
+        assert!(matches!(
+            EncodedPositionList::encode_with_limits(
+                &postings,
+                &[7, 8],
+                PositionListLimits {
+                    max_bytes: usize::MAX,
+                    max_blocks: 0,
+                    max_positions: 2,
+                }
+            ),
+            Err(PositionCodecError::BlockLimitExceeded {
+                limit: 0,
+                actual: 1
+            })
+        ));
+
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let posting_list = posting_bytes.posting_list()?;
+        let encoded = EncodedPositionList::encode(&postings, &[7, 8])?;
+        assert!(matches!(
+            PositionList::parse_with_limits(
+                encoded.as_bytes(),
+                &posting_list,
+                PositionListLimits {
+                    max_bytes: encoded.as_bytes().len() - 1,
+                    max_blocks: 1,
+                    max_positions: 2,
+                }
+            ),
+            Err(PositionCodecError::ByteLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse_with_limits(
+                encoded.as_bytes(),
+                &posting_list,
+                PositionListLimits {
+                    max_bytes: encoded.as_bytes().len(),
+                    max_blocks: 0,
+                    max_positions: 2,
+                }
+            ),
+            Err(PositionCodecError::BlockLimitExceeded {
+                limit: 0,
+                actual: 1
+            })
+        ));
+        assert!(matches!(
+            PositionList::parse_with_limits(
+                encoded.as_bytes(),
+                &posting_list,
+                PositionListLimits {
+                    max_bytes: encoded.as_bytes().len(),
+                    max_blocks: 1,
+                    max_positions: 1,
+                }
+            ),
+            Err(PositionCodecError::PositionLimitExceeded {
+                limit: 1,
+                actual: 2
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn positions_fresh_blocks_cover_exact_fit_and_oversized_singleton() -> TestResult {
+        let exact_postings = [Posting::new(1, 4_096), Posting::new(2, 1)];
+        let exact_posting_bytes = EncodedPostingList::encode(&exact_postings)?;
+        let exact_posting_list = exact_posting_bytes.posting_list()?;
+        let exact_values = zero_positions(&exact_postings)?;
+        let exact = EncodedPositionList::encode(&exact_postings, &exact_values)?;
+        let exact_list = exact.position_list(&exact_posting_list)?;
+        assert_eq!(exact_list.block_count(), 2);
+        assert_eq!(exact_list.blocks()[0].byte_len(), 4_096);
+        assert_eq!(exact_list.blocks()[0].posting_count(), 1);
+        assert_eq!(exact_list.blocks()[1].byte_len(), 1);
+        assert_eq!(exact_list.blocks()[1].base_posting_ordinal(), 1);
+
+        let oversized_postings = [Posting::new(10, 4_097), Posting::new(20, 1)];
+        let oversized_posting_bytes = EncodedPostingList::encode(&oversized_postings)?;
+        let oversized_posting_list = oversized_posting_bytes.posting_list()?;
+        let oversized_values = zero_positions(&oversized_postings)?;
+        let oversized = EncodedPositionList::encode(&oversized_postings, &oversized_values)?;
+        let oversized_list = oversized.position_list(&oversized_posting_list)?;
+        assert_eq!(oversized_list.block_count(), 2);
+        assert_eq!(oversized_list.blocks()[0].byte_len(), 4_097);
+        assert_eq!(oversized_list.blocks()[0].posting_count(), 1);
+        assert_eq!(collect_positions(&oversized_list, 0)?.len(), 4_097);
+
+        let invalid_postings = [Posting::new(100, 3_000), Posting::new(200, 3_000)];
+        let invalid_posting_bytes = EncodedPostingList::encode(&invalid_postings)?;
+        let invalid_posting_list = invalid_posting_bytes.posting_list()?;
+        let oversized_multi = raw_positions(&[(0, 0)], &vec![0; 6_000])?;
+        assert!(matches!(
+            PositionList::parse(&oversized_multi, &invalid_posting_list),
+            Err(PositionCodecError::OversizedMultiDocumentBlock {
+                block_index: 0,
+                posting_count: 2,
+                byte_len: 6_000
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn randomized_positions_roundtrip_duplicates_and_large_u32_values() -> TestResult {
+        for case in 0_u64..32 {
+            let mut state = 0x243f_6a88_85a3_08d3 ^ case;
+            let count = if case == 0 {
+                0
+            } else {
+                1 + usize::try_from(random_u32(&mut state) % 96)?
+            };
+            let mut postings = Vec::with_capacity(count);
+            let mut expected_runs = Vec::with_capacity(count);
+            let mut flat = Vec::new();
+            let mut doc_id = random_u32(&mut state) % 100;
+            for ordinal in 0..count {
+                if ordinal != 0 {
+                    doc_id = doc_id
+                        .checked_add(1 + random_u32(&mut state) % 9)
+                        .ok_or("random position fixture docid overflow")?;
+                }
+                let freq = 1 + random_u32(&mut state) % 8;
+                postings.push(Posting::new(doc_id, freq));
+                let mut run = Vec::with_capacity(usize::try_from(freq)?);
+                let mut position = if ordinal % 5 == 0 {
+                    65_536 + random_u32(&mut state) % 100_000
+                } else {
+                    random_u32(&mut state) % 10_000
+                };
+                for index in 0..freq {
+                    if index != 0 {
+                        position = position
+                            .checked_add(random_u32(&mut state) % 7)
+                            .ok_or("random position fixture overflow")?;
+                    }
+                    run.push(position);
+                    flat.push(position);
+                }
+                expected_runs.push(run);
+            }
+
+            let posting_bytes = EncodedPostingList::encode(&postings)?;
+            let posting_list = posting_bytes.posting_list()?;
+            let encoded = EncodedPositionList::encode(&postings, &flat)?;
+            assert_eq!(encoded, EncodedPositionList::encode(&postings, &flat)?);
+            let list = encoded.position_list(&posting_list)?;
+            assert_eq!(list.doc_freq(), u32::try_from(count)?);
+            assert_eq!(list.total_positions(), u64::try_from(flat.len())?);
+            for (ordinal, expected) in expected_runs.iter().enumerate() {
+                assert_eq!(
+                    collect_positions(&list, u32::try_from(ordinal)?)?,
+                    *expected,
+                    "case={case} ordinal={ordinal}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn position_cursor_reuses_state_across_posting_and_position_blocks() -> TestResult {
+        let mut postings = Vec::with_capacity(270);
+        let mut expected_runs = Vec::with_capacity(270);
+        let mut flat = Vec::new();
+        for ordinal in 0_u32..270 {
+            postings.push(Posting::new(10 + ordinal * 3, 24));
+            let base = 70_000 + ordinal * 100;
+            let run: Vec<u32> = (0_u32..24).map(|index| base + index / 2).collect();
+            flat.extend_from_slice(&run);
+            expected_runs.push(run);
+        }
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let posting_list = posting_bytes.posting_list()?;
+        assert_eq!(posting_list.blocks()[1].base_posting_ordinal, 128);
+        let encoded = EncodedPositionList::encode(&postings, &flat)?;
+        let positions = encoded.position_list(&posting_list)?;
+        assert!(positions.block_count() >= 2);
+        assert_ne!(positions.blocks()[1].base_posting_ordinal(), 128);
+
+        let mut cursor = positions.cursor()?;
+        assert_eq!(cursor.posting_ordinal(), Some(0));
+        assert_eq!(
+            cursor
+                .positions()?
+                .ok_or("position cursor start")?
+                .collect::<Result<Vec<_>, _>>()?,
+            expected_runs[0]
+        );
+        assert_eq!(cursor.advance(postings[127].doc_id)?, Some(postings[127]));
+        assert_eq!(cursor.posting_ordinal(), Some(127));
+        assert_eq!(
+            cursor
+                .positions()?
+                .ok_or("position cursor 127")?
+                .collect::<Result<Vec<_>, _>>()?,
+            expected_runs[127]
+        );
+        assert_eq!(cursor.next()?, Some(postings[128]));
+        assert_eq!(cursor.posting_ordinal(), Some(128));
+        assert_eq!(
+            cursor
+                .positions()?
+                .ok_or("position cursor 128")?
+                .collect::<Result<Vec<_>, _>>()?,
+            expected_runs[128]
+        );
+
+        let position_seam = usize::try_from(positions.blocks()[1].base_posting_ordinal())?;
+        let before_seam = position_seam
+            .checked_sub(1)
+            .ok_or("position seam at zero")?;
+        assert_eq!(
+            cursor.advance(postings[before_seam].doc_id)?,
+            Some(postings[before_seam])
+        );
+        assert_eq!(cursor.next()?, Some(postings[position_seam]));
+        assert_eq!(
+            cursor
+                .positions()?
+                .ok_or("sequential position seam")?
+                .collect::<Result<Vec<_>, _>>()?,
+            expected_runs[position_seam]
+        );
+        let after_seam = position_seam + 7;
+        assert_eq!(
+            cursor.advance(postings[after_seam].doc_id)?,
+            Some(postings[after_seam])
+        );
+        assert_eq!(
+            cursor
+                .positions()?
+                .ok_or("position seam in-block advance")?
+                .collect::<Result<Vec<_>, _>>()?,
+            expected_runs[after_seam]
+        );
+        assert_eq!(cursor.advance(u32::MAX)?, None);
+        assert_eq!(cursor.next()?, None);
+        assert!(cursor.positions()?.is_none());
+
+        let maximum_postings = [Posting::new(0, 2), Posting::new(u32::MAX, 1)];
+        let maximum_posting_bytes = EncodedPostingList::encode(&maximum_postings)?;
+        let maximum_posting_list = maximum_posting_bytes.posting_list()?;
+        let maximum_encoded = EncodedPositionList::encode(&maximum_postings, &[1, 1, u32::MAX])?;
+        let maximum_positions = maximum_encoded.position_list(&maximum_posting_list)?;
+        let mut maximum_cursor = maximum_positions.cursor()?;
+        assert_eq!(maximum_cursor.advance(u32::MAX)?, Some(maximum_postings[1]));
+        assert_eq!(
+            maximum_cursor
+                .positions()?
+                .ok_or("u32 max position cursor")?
+                .collect::<Result<Vec<_>, _>>()?,
+            [u32::MAX]
+        );
+        assert_eq!(maximum_cursor.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn positions_q1_concat_preserves_payloads_and_is_associative() -> TestResult {
+        let left_postings = sparse_postings(100, 100);
+        let right_postings = sparse_postings(300, 100_000);
+        let left_posting_bytes = EncodedPostingList::encode(&left_postings)?;
+        let right_posting_bytes = EncodedPostingList::encode(&right_postings)?;
+        let left_posting_list = left_posting_bytes.posting_list()?;
+        let right_posting_list = right_posting_bytes.posting_list()?;
+        let left_values = zero_positions(&left_postings)?;
+        let right_values = zero_positions(&right_postings)?;
+        let left_encoded = EncodedPositionList::encode(&left_postings, &left_values)?;
+        let right_encoded = EncodedPositionList::encode(&right_postings, &right_values)?;
+        let left = left_encoded.position_list(&left_posting_list)?;
+        let right = right_encoded.position_list(&right_posting_list)?;
+
+        let merged_encoded = EncodedPositionList::concatenate(&[&left, &right])?;
+        let expected_blocks = left.block_count() + right.block_count();
+        assert!(matches!(
+            EncodedPositionList::concatenate_with_limits(
+                &[&left, &right],
+                PositionListLimits {
+                    max_bytes: usize::MAX,
+                    max_blocks: left.block_count(),
+                    max_positions: u64::MAX,
+                }
+            ),
+            Err(PositionCodecError::BlockLimitExceeded { actual, .. })
+                if actual == left.block_count() + 1
+        ));
+        assert!(matches!(
+            EncodedPositionList::concatenate_with_limits(
+                &[&left, &right],
+                PositionListLimits {
+                    max_bytes: usize::MAX,
+                    max_blocks: expected_blocks,
+                    max_positions: merged_encoded.total_positions() - 1,
+                }
+            ),
+            Err(PositionCodecError::PositionLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            EncodedPositionList::concatenate_with_limits(
+                &[&left, &right],
+                PositionListLimits {
+                    max_bytes: merged_encoded.as_bytes().len() - 1,
+                    max_blocks: expected_blocks,
+                    max_positions: merged_encoded.total_positions(),
+                }
+            ),
+            Err(PositionCodecError::ByteLimitExceeded { .. })
+        ));
+        let mut merged_posting_bytes = left_posting_bytes.as_bytes().to_vec();
+        merged_posting_bytes.extend_from_slice(right_posting_bytes.as_bytes());
+        let merged_postings = PostingList::parse(&merged_posting_bytes, 400)?;
+        let merged = merged_encoded.position_list(&merged_postings)?;
+        assert_eq!(merged.doc_freq(), 400);
+        assert_eq!(
+            merged.block_count(),
+            left.block_count() + right.block_count()
+        );
+        let mut expected_payloads = Vec::new();
+        for source in [&left, &right] {
+            for block_index in 0..source.block_count() {
+                expected_payloads.push(
+                    source
+                        .block_bytes(block_index)
+                        .ok_or("source position block")?
+                        .to_vec(),
+                );
+            }
+        }
+        let mut actual_payloads = Vec::new();
+        for block_index in 0..merged.block_count() {
+            actual_payloads.push(
+                merged
+                    .block_bytes(block_index)
+                    .ok_or("merged position block")?
+                    .to_vec(),
+            );
+        }
+        assert_eq!(actual_payloads, expected_payloads);
+        assert_eq!(
+            merged.blocks()[left.block_count()].base_posting_ordinal(),
+            100
+        );
+        assert_eq!(
+            collect_positions(&merged, 100)?.len(),
+            usize::try_from(right_postings[0].freq)?
+        );
+
+        let middle_postings = sparse_postings(120, 100_000);
+        let tail_postings = sparse_postings(180, 200_000);
+        let middle_posting_bytes = EncodedPostingList::encode(&middle_postings)?;
+        let tail_posting_bytes = EncodedPostingList::encode(&tail_postings)?;
+        let middle_posting_list = middle_posting_bytes.posting_list()?;
+        let tail_posting_list = tail_posting_bytes.posting_list()?;
+        let middle_encoded =
+            EncodedPositionList::encode(&middle_postings, &zero_positions(&middle_postings)?)?;
+        let tail_encoded =
+            EncodedPositionList::encode(&tail_postings, &zero_positions(&tail_postings)?)?;
+        let middle = middle_encoded.position_list(&middle_posting_list)?;
+        let tail = tail_encoded.position_list(&tail_posting_list)?;
+
+        let direct = EncodedPositionList::concatenate(&[&left, &middle, &tail])?;
+        let first_pair = EncodedPositionList::concatenate(&[&left, &middle])?;
+        let mut first_pair_posting_bytes = left_posting_bytes.as_bytes().to_vec();
+        first_pair_posting_bytes.extend_from_slice(middle_posting_bytes.as_bytes());
+        let first_pair_postings = PostingList::parse(&first_pair_posting_bytes, 220)?;
+        let first_pair_list = first_pair.position_list(&first_pair_postings)?;
+        let staged = EncodedPositionList::concatenate(&[&first_pair_list, &tail])?;
+        assert_eq!(direct, staged);
+        assert!(matches!(
+            EncodedPositionList::concatenate(&[&tail, &left]),
+            Err(PositionCodecError::NonAscendingConcat { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn positions_parser_rejects_structured_corruption_and_never_panics() -> TestResult {
+        let one_posting_bytes = EncodedPostingList::encode(&[Posting::new(10, 1)])?;
+        let one_posting = one_posting_bytes.posting_list()?;
+        let valid = EncodedPositionList::encode(&[Posting::new(10, 1)], &[0])?;
+        for cut in 0..valid.as_bytes().len() {
+            assert!(
+                PositionList::parse(&valid.as_bytes()[..cut], &one_posting).is_err(),
+                "cut={cut}"
+            );
+        }
+        assert!(matches!(
+            PositionList::parse(&[0, 0, 0, 0], &one_posting),
+            Err(PositionCodecError::InvalidBlockCount { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(&raw_positions(&[(1, 0)], &[0])?, &one_posting),
+            Err(PositionCodecError::InvalidDirectoryStart { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(&[1, 0, 0, 0, 0x80, 0, 0, 0], &one_posting),
+            Err(PositionCodecError::NonCanonicalVint { domain: "u32", .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(&[1, 0, 0, 0, 0, 0x80, 0, 0], &one_posting),
+            Err(PositionCodecError::NonCanonicalVint { domain: "u64", .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(&[1, 0, 0, 0, 0, 0, 0x80, 0], &one_posting),
+            Err(PositionCodecError::NonCanonicalVint { domain: "u32", .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(
+                &[1, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0x10],
+                &one_posting
+            ),
+            Err(PositionCodecError::VintOverflow { domain: "u32", .. })
+        ));
+
+        let mut offset_overflow = vec![1, 0, 0, 0, 0];
+        offset_overflow.extend_from_slice(&[0xff; 9]);
+        offset_overflow.extend_from_slice(&[0x02, 0]);
+        assert!(matches!(
+            PositionList::parse(&offset_overflow, &one_posting),
+            Err(PositionCodecError::VintOverflow { domain: "u64", .. })
+        ));
+
+        let two_postings = [Posting::new(10, 1), Posting::new(20, 1)];
+        let two_posting_bytes = EncodedPostingList::encode(&two_postings)?;
+        let two_posting_list = two_posting_bytes.posting_list()?;
+        assert!(matches!(
+            PositionList::parse(
+                &raw_positions(&[(0, 0), (0, 1)], &[0, 0])?,
+                &two_posting_list
+            ),
+            Err(PositionCodecError::NonAscendingBlockOrdinal { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(
+                &raw_positions(&[(0, 0), (1, 0)], &[0, 0])?,
+                &two_posting_list
+            ),
+            Err(PositionCodecError::NonAscendingBlockOffset { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(
+                &raw_positions(&[(0, 0), (2, 1)], &[0, 0])?,
+                &two_posting_list
+            ),
+            Err(PositionCodecError::BlockOrdinalOutOfRange {
+                block_index: 1,
+                first_posting_ordinal: 2,
+                doc_freq: 2
+            })
+        ));
+        assert!(matches!(
+            PositionList::parse(
+                &raw_positions(&[(0, 0), (1, 3)], &[0, 0])?,
+                &two_posting_list
+            ),
+            Err(PositionCodecError::BlockOffsetOutOfRange { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(
+                &raw_positions(&[(0, 0), (1, 1)], &[0x80, 0x01, 0])?,
+                &two_posting_list
+            ),
+            Err(PositionCodecError::Truncated { .. })
+        ));
+
+        let overflow_postings = [Posting::new(10, 2)];
+        let overflow_posting_bytes = EncodedPostingList::encode(&overflow_postings)?;
+        let overflow_posting_list = overflow_posting_bytes.posting_list()?;
+        assert!(matches!(
+            PositionList::parse(
+                &raw_positions(&[(0, 0)], &[0xff, 0xff, 0xff, 0xff, 0x0f, 1])?,
+                &overflow_posting_list
+            ),
+            Err(PositionCodecError::PositionOverflow { .. })
+        ));
+        assert!(matches!(
+            PositionList::parse(&raw_positions(&[(0, 0)], &[0, 0])?, &one_posting),
+            Err(PositionCodecError::TrailingBlockBytes {
+                block_index: 0,
+                remaining: 1
+            })
+        ));
+
+        let mut state = 0x1319_8a2e_0370_7344;
+        for len in 0..64 {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| random_u32(&mut state).to_le_bytes()[0])
+                .collect();
+            let _ = PositionList::parse(&bytes, &two_posting_list);
         }
         Ok(())
     }

@@ -238,7 +238,60 @@ explicit deep-compaction lever and is not part of Q1 concat.
 
 ### 5.3 POSITIONS
 
-Per term (fields with positions only): per-doc position runs, doc-aligned with POSTINGS order; run length for a doc = that doc's freq. Positions are u32, delta-encoded within the doc (first absolute, then `delta` — **zero deltas legal**: same-position duplicate tokens, e.g. HyphenDecompose), vint-encoded, grouped in blocks of 4096 bytes with a vint skip header `{doc_index: vint, offset: vint}` every block for phrase-time seeking.
+Per term (fields with positions only), the TERMDICT-referenced span has this
+canonical grammar:
+
+```
+u32 block_count LE
+block directory: block_count × {
+  first_posting_ordinal: canonical u32 vint
+  block_offset: canonical u64 vint  # relative to blocks-area start
+}
+blocks area: concatenated whole-document runs {
+  first_position: canonical u32 vint
+  (freq - 1) × delta: canonical u32 vint
+}
+```
+
+Runs are doc-aligned with POSTINGS order and contain exactly that posting's
+`freq` positions. Positions are u32; the first value in every document is
+absolute and later values are checked deltas from the preceding position.
+Positions must therefore be nondecreasing, and **zero deltas are legal** for
+same-position alternatives such as `HyphenDecompose`. Reconstructing a value
+past `u32::MAX`, a non-canonical or overflowing vint, a truncated run, or bytes
+remaining after the last frequency-derived value is corruption.
+
+For `doc_freq > 0`, the first directory row is `(0, 0)`. Later posting ordinals
+and offsets are strictly increasing and in range. A block's posting interval
+ends at the next directory ordinal (or `doc_freq` for the last block), and its
+byte interval ends at the next offset (or the term span's end). Blocks are
+non-empty and never split a document run. The codec-level empty-list form is
+exactly `block_count = 0` with no directory rows or payload bytes. Directory
+offsets use the blocks-area-relative base so their vint widths cannot change
+the directory base that precedes them.
+
+A fresh seal greedily packs complete document runs into a 4096-byte payload
+target: it starts a new block before the next complete run would exceed the
+target. A single run larger than 4096 bytes is retained as one oversized
+one-document block. Readers validate the directory, frequency alignment,
+integer domains, and the oversized-singleton rule, but accept underfilled
+interior blocks because they may be preserved Q1 seams.
+
+Ordinary concat-merge creates no new position block and never repacks a run. It
+copies every source block payload byte-for-byte in input order, then rewrites
+only the directory: `first_posting_ordinal` is rebased by prior source
+`doc_freq`, and `block_offset` by prior source payload length. Thus repeated
+merge schedules preserve exactly the leaf blocks already present. Optional
+reblocking remains an explicit deep-compaction operation.
+
+The POSITIONS section exists iff at least one schema field enables positions;
+it is a canonical zero-length section when such a schema has no positional
+terms. Only terms from position-enabled fields carry non-empty POSITIONS spans.
+Segment open, ordinary term queries, and position-free field reads determine
+that POSITIONS is unnecessary from schema and TERMDICT metadata; they must not
+call `section(POSITIONS)`, expose its payload, or checksum it. Explicit position
+access and phrase evaluation trigger first exposure and checksum validation;
+full `verify()` remains intentionally eager.
 
 ### 5.4 BLOCKMAX
 
@@ -470,5 +523,6 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.11 | 2026-07-17 | Segment-container publication hardening: non-empty segment ranges are bounded by the u32 payload domain; public writers reject unregistered extension kinds while readers retain the optional-skippable forward valve; mmap open is restricted to canonical regular published segment paths after sync-and-rename, and no unchecked reader API exposes payload bytes before first-touch verification | — (pre-freeze validation hardening) | pinned inline wire oracle, writer/reader extension differential, u32 boundary, published-mmap parity, and typed torn-file tests (e3.1) |
 | 1.0.12 | 2026-07-17 | NUMERIC signedness correction: schema-driven `value_bits: u64` preserves the complete indexed I64 and U64 domains without a redundant row tag; ordering and bounds use the field's schema type | — (pre-freeze correction) | indexed-I64/indexed-U64 section-presence coverage (e3.1); typed range/roundtrip including `u64 > i64::MAX` (e2.7) |
 | 1.0.13 | 2026-07-17 | BLOCKMAX v1 pre-freeze hardening: no count prefix; u64 canonical term-relative offsets; Tantivy-compatible conservative max-frequency codes; exact minimum stored fieldnorm IDs; POSTINGS/DOCLEN cross-validation; live-snapshot query bounds; and Q1 concat offset-only rebasing are pinned | — (pre-freeze contract hardening) | BLOCKMAX wire/corruption, bound-soundness, skip, and `df=100 + df=300` concat fixtures (e2.3) |
+| 1.0.14 | 2026-07-17 | POSITIONS v1 pre-freeze hardening: fixed-LE block count; canonical u32 posting ordinals and u64 blocks-area-relative offsets; whole-document u32 first-plus-delta runs with zero deltas; frequency-derived boundaries; greedy 4096-byte fresh blocks with oversized singletons; bounded validation; and Q1 payload-preserving directory rebasing are pinned | — (pre-freeze contract hardening) | POSITIONS wire/corruption, zero-delta, >65k, block-boundary, cursor, and concat-seam fixtures (e2.4) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*

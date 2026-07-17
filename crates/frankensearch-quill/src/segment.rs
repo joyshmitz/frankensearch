@@ -1899,6 +1899,40 @@ mod tests {
     }
 
     #[test]
+    fn position_free_paths_do_not_touch_a_corrupt_positions_section() -> TestResult {
+        assert!(matches!(DEFAULT_SCHEMA.fields[0].kind, FieldKind::Keyword));
+        assert!(schema_has_positions(DEFAULT_SCHEMA));
+        let owned = fixture_sections(DEFAULT_SCHEMA, false);
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let positions = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::POSITIONS)
+            .copied()
+            .expect("default-schema POSITIONS entry");
+        let mut corrupt_bytes = encoded.into_bytes();
+        let positions_offset = usize::try_from(positions.offset)?;
+        corrupt_bytes[positions_offset] ^= 0x80;
+
+        // Opening and the sections needed by an ordinary keyword term path
+        // remain independent of POSITIONS first-touch validation.
+        let reader = SegmentReader::from_owned(corrupt_bytes, DEFAULT_SCHEMA)?;
+        for kind in [
+            SectionKind::TERMDICT,
+            SectionKind::POSTINGS,
+            SectionKind::BLOCKMAX,
+            SectionKind::DOCLEN,
+        ] {
+            assert!(reader.section(kind)?.is_some(), "kind={}", kind.raw());
+        }
+        assert!(matches!(
+            reader.section(SectionKind::POSITIONS),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn verify_freshly_checks_whole_file_after_section_hashes_pass() -> TestResult {
         let owned = fixture_sections(MINIMAL_SCHEMA, false);
         let encoded = encode_owned(fixture_header(MINIMAL_SCHEMA), &owned)?;
