@@ -559,9 +559,13 @@ impl<T: TokenStream> TokenStream for CjkBigramDecomposeStream<'_, T> {
     }
 }
 
-/// A cass-specific normalization filter that preserves the behavior of
-/// `LowerCaser + RemoveLongFilter::limit(256)` for the restricted token
-/// language emitted by `CassTokenizer`.
+/// A cass-specific normalization filter that preserves the shipping CASS
+/// analyzer's inclusive 256-byte admission contract.
+///
+/// This intentionally differs at exactly 256 bytes from Tantivy's
+/// `RemoveLongFilter::limit(256)`, whose predicate retains only tokens shorter
+/// than the configured limit. CASS has historically retained 256-byte tokens
+/// and dropped tokens starting at 257 bytes, so that behavior is the oracle.
 ///
 /// `CassTokenizer` only emits ASCII alphanumeric runs (optionally hyphenated)
 /// plus CJK runs, so ASCII-only in-place lowercasing is behaviorally identical
@@ -1551,8 +1555,8 @@ pub fn cass_index_dir(base: &Path) -> SearchResult<PathBuf> {
 ///   3. `CjkBigramDecompose` — decomposes CJK-only tokens into overlapping
 ///      character bigrams so that sub-string queries work for Chinese,
 ///      Japanese, and Korean text.
-///   4. `CassNormalizeAndLimit` — applies the same lowercase + 256-byte
-///      length-limit semantics as the old `LowerCaser + RemoveLongFilter`.
+///   4. `CassNormalizeAndLimit` — applies ASCII lowercase plus the shipping
+///      CASS inclusive 256-byte limit (not Tantivy's strict `< 256` predicate).
 ///
 /// `prefix_normalize` is used only for generated edge-ngram fields. Those
 /// values are whitespace-separated prefix terms produced by
@@ -3144,6 +3148,8 @@ mod cass_query_tests {
             "foo搜索-barあいう123",
             "caf\u{00E9} 𠀀 token",
             "multi---dash and trailing- hyphen",
+            &format!("{} keep", "X".repeat(255)),
+            &format!("{} keep", "X".repeat(257)),
             &format!("{} keep", "X".repeat(300)),
         ] {
             let mut legacy = TextAnalyzer::builder(CassTokenizer::default())
@@ -3187,6 +3193,81 @@ mod cass_query_tests {
             assert_eq!(
                 optimized_tokens, legacy_tokens,
                 "normalized analyzer mismatch for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cass_normalize_and_limit_pins_inclusive_shipping_boundary() {
+        let shipping_tokens = |text: &str| {
+            let mut analyzer = TextAnalyzer::builder(CassTokenizer::default())
+                .filter(HyphenDecompose)
+                .filter(CjkBigramDecompose)
+                .filter(CassNormalizeAndLimit)
+                .build();
+            let mut stream = analyzer.token_stream(text);
+            let mut tokens = Vec::new();
+            while stream.advance() {
+                let token = stream.token();
+                tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                    token.position_length,
+                ));
+            }
+            tokens
+        };
+        let tantivy_tokens = |text: &str| {
+            let mut analyzer = TextAnalyzer::builder(CassTokenizer::default())
+                .filter(HyphenDecompose)
+                .filter(CjkBigramDecompose)
+                .filter(tantivy::tokenizer::LowerCaser)
+                .filter(tantivy::tokenizer::RemoveLongFilter::limit(256))
+                .build();
+            let mut stream = analyzer.token_stream(text);
+            let mut tokens = Vec::new();
+            while stream.advance() {
+                let token = stream.token();
+                tokens.push((
+                    token.text.clone(),
+                    token.offset_from,
+                    token.offset_to,
+                    token.position,
+                    token.position_length,
+                ));
+            }
+            tokens
+        };
+
+        for length in [255, 256, 257] {
+            let input = format!("{} keep", "X".repeat(length));
+            let kept = vec![
+                ("x".repeat(length), 0, length, 0, 1),
+                ("keep".to_owned(), length + 1, length + 5, 1, 1),
+            ];
+            let dropped = vec![("keep".to_owned(), length + 1, length + 5, 1, 1)];
+            let shipping_actual = shipping_tokens(&input);
+            let tantivy_actual = tantivy_tokens(&input);
+
+            assert_eq!(
+                shipping_actual.as_slice(),
+                if length <= 256 {
+                    kept.as_slice()
+                } else {
+                    dropped.as_slice()
+                },
+                "shipping CASS boundary at {length} bytes"
+            );
+            assert_eq!(
+                tantivy_actual.as_slice(),
+                if length < 256 {
+                    kept.as_slice()
+                } else {
+                    dropped.as_slice()
+                },
+                "Tantivy RemoveLongFilter boundary at {length} bytes"
             );
         }
     }

@@ -293,8 +293,10 @@ impl TokenAnalyzer for FrankensearchTokenizer {
 
 /// Maximum token length retained by the native CASS analyzer pipeline.
 ///
-/// This is the incumbent CASS `RemoveLongFilter` limit and is intentionally
-/// much smaller than Quill's global [`MAX_TERM_BYTES`] admission ceiling.
+/// The shipping CASS analyzer retains exactly 256 UTF-8 bytes and drops 257.
+/// This inclusive boundary intentionally differs from Tantivy's strict
+/// `RemoveLongFilter::limit(256)` predicate and is much smaller than Quill's
+/// global [`MAX_TERM_BYTES`] admission ceiling.
 pub const CASS_MAX_TOKEN_BYTES: usize = 256;
 
 /// Maximum Unicode-scalar prefix length generated for CASS prefix fields.
@@ -2184,6 +2186,15 @@ mod tests {
         );
         assert_eq!(cjk_tokens.len(), 99);
         assert!(cjk_tokens.iter().all(|token| token.text == "搜搜"));
+
+        let exact_limit = "X".repeat(CASS_MAX_TOKEN_BYTES);
+        let limit_tokens = cass_tokens(AnalyzerKind::CassHyphenNormalize, &exact_limit);
+        assert_eq!(
+            limit_tokens,
+            incumbent_cass_tokens(AnalyzerKind::CassHyphenNormalize, &exact_limit)
+        );
+        assert_eq!(limit_tokens.len(), 1);
+        assert_eq!(limit_tokens[0].text, "x".repeat(CASS_MAX_TOKEN_BYTES));
 
         let dropped_then_kept = format!("{} ok", "X".repeat(CASS_MAX_TOKEN_BYTES + 1));
         let gap_tokens = cass_tokens(AnalyzerKind::CassHyphenNormalize, &dropped_then_kept);

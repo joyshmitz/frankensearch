@@ -95,7 +95,7 @@ CassTokenizer
 
 `CjkBigramDecompose` replaces an all-CJK token of at least two characters with overlapping bigrams in source order. A single CJK character remains a unigram; non-CJK tokens pass through. All generated bigrams retain the source token’s position and full offsets.
 
-`CassNormalizeAndLimit` drops tokens whose UTF-8 length exceeds 256 bytes, then ASCII-lowercases retained tokens. The restriction is safe because `CassTokenizer` emits ASCII/hyphen tokens or CJK runs.
+`CassNormalizeAndLimit` drops tokens whose UTF-8 length exceeds 256 bytes, then ASCII-lowercases retained tokens. The boundary is deliberately inclusive: the shipping CASS analyzer retains exactly 256 bytes and starts dropping at 257. Tantivy 0.26.1's `RemoveLongFilter::limit(256)` instead retains only lengths strictly below 256, so it is not the boundary oracle. The restriction is safe because `CassTokenizer` emits ASCII/hyphen tokens or CJK runs.
 
 The `prefix_normalize` pipeline omits `HyphenDecompose` because its input is generated whitespace-separated edge prefixes:
 
