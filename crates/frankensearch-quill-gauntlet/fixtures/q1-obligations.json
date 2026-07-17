@@ -48,10 +48,10 @@
   "internal_differentials": [
     {
       "id": "quiver-postings-bitpack-scalar-wide-v1",
-      "status": "stub",
+      "status": "executable",
       "source_contract": "docs/contracts/fslx-format-registry.md#52-postings",
-      "future_enforcement": "e2.2 scalar and portable-SIMD Quiver decode differential",
-      "assertion": "scalar and portable-SIMD decoders produce identical posting docids and frequencies for every canonical POSTINGS bitpack width"
+      "enforcement": "gauntlet scalar and portable-SIMD Quiver decode differential",
+      "assertion": "scalar and portable-SIMD decoders produce identical canonical values for every POSTINGS bitpack width across 127-value doc-delta and 128-value frequency shapes"
     }
   ]
 }

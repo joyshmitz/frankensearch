@@ -4,8 +4,9 @@
 //! This crate is a workspace member but intentionally excluded from
 //! `default-members` and cannot be published. Shipping crates must never depend
 //! on it. The current G0 milestone provides engine identity guards, pure
-//! comparators, immutable content-addressed artifacts, and pending Q1 fixtures;
-//! the Quill subject remains an explicit non-executable stub until G1.
+//! comparators, immutable content-addressed artifacts, pending Q1 fixtures, and
+//! an executable same-engine Quiver codec differential. The Quill search
+//! subject remains an explicit non-executable stub until G1.
 
 mod artifact;
 mod comparator;
@@ -33,7 +34,7 @@ pub use engine::{
     QuillSubjectStub,
 };
 pub use version_contract::{
-    InternalDifferentialStub, OracleVersionContract, Q1FixtureCatalog, Q1FixtureStub,
+    InternalDifferentialFixture, OracleVersionContract, Q1FixtureCatalog, Q1FixtureStub,
     oracle_version_contract, q1_fixture_catalog,
 };
 

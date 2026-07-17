@@ -11,9 +11,10 @@ const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
 const TANTIVY_VERSION: &str = "0.26.1";
 const TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
+const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
 const Q1_FIXTURE_CATALOG_SHA256: [u8; 32] = [
-    0xe1, 0xb4, 0x26, 0xc0, 0x69, 0xb3, 0x76, 0x9d, 0x22, 0xb2, 0x04, 0xdf, 0x79, 0x92, 0xe2, 0xae,
-    0x62, 0x45, 0x62, 0xf1, 0x7f, 0x34, 0x26, 0x28, 0x82, 0x40, 0x3b, 0x7e, 0x56, 0xd7, 0x88, 0xae,
+    0x9b, 0x59, 0x99, 0xd8, 0x3f, 0xc5, 0x38, 0xeb, 0x39, 0xae, 0x12, 0xf1, 0xe8, 0x35, 0x32, 0xd4,
+    0x55, 0x0b, 0x4d, 0x89, 0x01, 0xfa, 0xf4, 0x9f, 0x93, 0x13, 0x70, 0xd8, 0xa7, 0xee, 0xa9, 0x3d,
 ];
 
 /// Committed provenance contract for the shipping Tantivy oracle adapter.
@@ -68,24 +69,24 @@ pub struct Q1FixtureStub {
     pub assertion: String,
 }
 
-/// Committed catalog of Q1 obligation fixtures waiting for executable engines.
+/// Committed catalog of pending Q1 obligations and live internal differentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Q1FixtureCatalog {
     pub schema_version: u32,
     pub source_contract: String,
     pub fixtures: Vec<Q1FixtureStub>,
-    pub internal_differentials: Vec<InternalDifferentialStub>,
+    pub internal_differentials: Vec<InternalDifferentialFixture>,
 }
 
-/// One future same-engine kernel differential. `stub` is non-passing.
+/// One registered same-engine kernel differential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct InternalDifferentialStub {
+pub struct InternalDifferentialFixture {
     pub id: String,
     pub status: String,
     pub source_contract: String,
-    pub future_enforcement: String,
+    pub enforcement: String,
     pub assertion: String,
 }
 
@@ -115,12 +116,13 @@ pub fn oracle_version_contract() -> Result<OracleVersionContract, GauntletError>
     Ok(contract)
 }
 
-/// Parse and validate all seven pending Q1 fixture stubs.
+/// Parse and validate all seven pending Q1 stubs and the live Quiver fixture.
 ///
 /// # Errors
 ///
 /// Returns an error when IDs are missing, duplicated, reordered, or accidentally
-/// promoted from `stub` before executable enforcement exists.
+/// promoted from `stub` before executable enforcement exists, or when the
+/// registered Quiver differential is not executable.
 pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
     let catalog: Q1FixtureCatalog = serde_json::from_str(Q1_FIXTURE_CATALOG_JSON)?;
     let catalog_hash = Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes());
@@ -147,14 +149,14 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
                 || fixture.assertion.is_empty()
         })
         || internal.len() != 1
-        || internal[0].id != "quiver-postings-bitpack-scalar-wide-v1"
-        || internal[0].status != "stub"
+        || internal[0].id != QUIVER_DIFFERENTIAL_FIXTURE_ID
+        || internal[0].status != "executable"
         || internal[0].source_contract != "docs/contracts/fslx-format-registry.md#52-postings"
-        || internal[0].future_enforcement.is_empty()
+        || internal[0].enforcement.is_empty()
         || internal[0].assertion.is_empty()
     {
         return Err(GauntletError::InvalidContract {
-            reason: "fixture catalog must contain seven ordered Q1 stubs and the Quiver differential stub"
+            reason: "fixture catalog must contain seven ordered Q1 stubs and the executable Quiver differential"
                 .to_owned(),
         });
     }
@@ -171,6 +173,46 @@ fn is_lower_hex(value: &str, width: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch_quill::quiver::differential::{
+        BitpackError, FIXTURE_ID, SPEC_SECTION, pack_values, unpack_scalar_into, unpack_wide_into,
+    };
+
+    fn bitpack_fixture_values(width: u8, count: usize) -> Vec<u32> {
+        let mask = match width {
+            0 => 0,
+            32 => u32::MAX,
+            _ => (1_u32 << width) - 1,
+        };
+        let mut state = 0x9e37_79b9_u32
+            ^ u32::from(width)
+            ^ u32::try_from(count).expect("fixture count fits in u32");
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            values.push(state & mask);
+        }
+        if let Some(first) = values.first_mut() {
+            *first = 0;
+        }
+        if let Some(last) = values.last_mut() {
+            *last = mask;
+        }
+        values
+    }
+
+    fn matching_decode_error(input: &[u8], width: u8, count: usize) -> BitpackError {
+        let untouched = vec![0xa5a5_a5a5; count];
+        let mut scalar = untouched.clone();
+        let mut wide = untouched.clone();
+        let scalar_result = unpack_scalar_into(input, width, &mut scalar);
+        let wide_result = unpack_wide_into(input, width, &mut wide);
+        assert_eq!(scalar_result, wide_result, "typed error mismatch");
+        assert_eq!(scalar, untouched, "scalar mutated output before rejecting");
+        assert_eq!(wide, untouched, "wide mutated output before rejecting");
+        scalar_result.expect_err("malformed fixture must be rejected")
+    }
 
     #[test]
     fn embedded_oracle_contract_is_exact_and_rejects_dirty_source() {
@@ -196,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn q1_catalog_has_exactly_seven_non_passing_stubs() {
+    fn q1_catalog_has_seven_stubs_and_one_executable_internal_differential() {
         let catalog = q1_fixture_catalog().expect("valid Q1 catalog");
         assert_eq!(
             Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes()).as_slice(),
@@ -210,10 +252,140 @@ mod tests {
                 .all(|fixture| fixture.status == "stub")
         );
         assert_eq!(catalog.internal_differentials.len(), 1);
+        assert_eq!(catalog.internal_differentials[0].id, FIXTURE_ID);
+        assert_eq!(catalog.internal_differentials[0].status, "executable");
+    }
+
+    #[test]
+    fn quiver_bitpack_scalar_and_wide_fixture_is_executable() -> Result<(), BitpackError> {
+        let catalog = q1_fixture_catalog().expect("valid fixture catalog");
+        let fixture = &catalog.internal_differentials[0];
+        assert_eq!(fixture.id, FIXTURE_ID);
+        assert_eq!(fixture.status, "executable");
         assert_eq!(
-            catalog.internal_differentials[0].id,
-            "quiver-postings-bitpack-scalar-wide-v1"
+            fixture.source_contract,
+            "docs/contracts/fslx-format-registry.md#52-postings"
         );
-        assert_eq!(catalog.internal_differentials[0].status, "stub");
+        assert_eq!(FIXTURE_ID, "quiver-postings-bitpack-scalar-wide-v1");
+        assert_eq!(
+            SPEC_SECTION,
+            "FSLX v1 section 5.2 LSB-first bitpacked payloads"
+        );
+
+        let known_answers: [(&[u8], u8, &[u32]); 3] = [
+            (&[0x51, 0x01], 3, &[1, 2, 5]),
+            (&[0x39], 2, &[1, 2, 3]),
+            (
+                &[0x12, 0x34, 0x56, 0x78, 0xef, 0xbe, 0xad, 0xde],
+                32,
+                &[0x7856_3412, 0xdead_beef],
+            ),
+        ];
+        for (packed, width, expected) in known_answers {
+            assert_eq!(pack_values(expected, width)?, packed);
+            let mut scalar = vec![u32::MAX; expected.len()];
+            let mut wide = scalar.clone();
+            unpack_scalar_into(packed, width, &mut scalar)?;
+            unpack_wide_into(packed, width, &mut wide)?;
+            assert_eq!(scalar, expected, "known scalar answer width={width}");
+            assert_eq!(wide, expected, "known wide answer width={width}");
+        }
+
+        for (shape, count) in [("doc-delta", 127), ("frequency", 128)] {
+            for width in 0..=32 {
+                let expected = bitpack_fixture_values(width, count);
+                let packed = pack_values(&expected, width)?;
+                for offset in 0..32 {
+                    let mut storage = vec![0x5a; offset];
+                    let payload_start = storage.len();
+                    storage.extend_from_slice(&packed);
+                    let payload_end = storage.len();
+                    storage.extend_from_slice(&[0xa5; 32]);
+                    let input = &storage[payload_start..payload_end];
+                    let mut scalar = vec![u32::MAX; count];
+                    let mut wide = scalar.clone();
+
+                    let scalar_result = unpack_scalar_into(input, width, &mut scalar);
+                    let wide_result = unpack_wide_into(input, width, &mut wide);
+                    assert_eq!(
+                        scalar_result, wide_result,
+                        "result mismatch for {shape} width={width} offset={offset}"
+                    );
+                    scalar_result?;
+                    assert_eq!(
+                        scalar, expected,
+                        "scalar mismatch for {shape} width={width} offset={offset}"
+                    );
+                    assert_eq!(
+                        wide, expected,
+                        "wide mismatch for {shape} width={width} offset={offset}"
+                    );
+                }
+            }
+        }
+
+        let expected = bitpack_fixture_values(7, 127);
+        let packed = pack_values(&expected, 7)?;
+        let truncated = &packed[..packed.len() - 1];
+        assert_eq!(
+            matching_decode_error(truncated, 7, expected.len()),
+            BitpackError::LengthMismatch {
+                expected: packed.len(),
+                actual: truncated.len(),
+            }
+        );
+
+        let mut overlong = packed.clone();
+        overlong.push(0);
+        assert_eq!(
+            matching_decode_error(&overlong, 7, expected.len()),
+            BitpackError::LengthMismatch {
+                expected: packed.len(),
+                actual: overlong.len(),
+            }
+        );
+
+        let mut noncanonical = pack_values(&bitpack_fixture_values(3, 127), 3)?;
+        let final_byte = noncanonical
+            .last_mut()
+            .expect("127 three-bit values have a final byte");
+        *final_byte |= 0x80;
+        let final_byte = *final_byte;
+        assert_eq!(
+            matching_decode_error(&noncanonical, 3, 127),
+            BitpackError::NonCanonicalPadding {
+                byte: final_byte,
+                used_bits: 5,
+            }
+        );
+        assert_eq!(
+            matching_decode_error(&[], 33, 128),
+            BitpackError::InvalidWidth { width: 33 }
+        );
+        assert_eq!(
+            matching_decode_error(&[0], 0, 128),
+            BitpackError::LengthMismatch {
+                expected: 0,
+                actual: 1,
+            }
+        );
+        assert_eq!(
+            pack_values(&[1], 0),
+            Err(BitpackError::ValueOutOfRange {
+                index: 0,
+                value: 1,
+                width: 0,
+            })
+        );
+        assert_eq!(
+            pack_values(&[0, 8], 3),
+            Err(BitpackError::ValueOutOfRange {
+                index: 1,
+                value: 8,
+                width: 3,
+            })
+        );
+
+        Ok(())
     }
 }
