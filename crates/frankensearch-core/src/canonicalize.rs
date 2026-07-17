@@ -368,8 +368,8 @@ fn strip_markdown_line(line: &str) -> Cow<'_, str> {
     if has_star {
         r = Cow::Owned(r.replace('*', "")); // remaining italic stars
     }
-    if has_underscore {
-        r = Cow::Owned(strip_italic_underscores(&r)); // italic underscores
+    if has_underscore && let Some(stripped) = strip_italic_underscores(&r) {
+        r = Cow::Owned(stripped); // italic underscores
     }
     if has_backtick {
         r = Cow::Owned(r.replace('`', "")); // inline code
@@ -397,28 +397,39 @@ fn strip_prefixes_and_list_marker(s: &str) -> Cow<'_, str> {
 /// identifiers (`snake_case`). An underscore is treated as an italic marker only
 /// when it lies on a word boundary: no adjacent alphanumeric or underscore on
 /// the side facing away from the emphasized span.
-fn strip_italic_underscores(text: &str) -> String {
+/// Strip italic underscore markers (`_word_`), borrowing when nothing is dropped.
+///
+/// Returns `None` when no `_` sits on an italic word boundary — the common case
+/// for `snake_case` / `variable_name` lines, which the former always-`String`
+/// version copied in full (identical to the input) despite dropping nothing. This
+/// is the last strip in [`strip_markdown_line`]'s chain to gain the borrow-when-
+/// unchanged shape its siblings already have. `Some(stripped)` is returned only
+/// when at least one marker is removed; the buffer is lazily seeded from the
+/// borrowed prefix at the first drop, so the built string is byte-identical to the
+/// prior full copy. Same boundary test and order → byte-identical materialization.
+fn strip_italic_underscores(text: &str) -> Option<String> {
     let is_word = |c: char| c.is_alphanumeric() || c == '_';
 
-    // Single pass building the output directly: `prev` tracks the previous source
-    // char (kept or not) and `chars.peek()` supplies the next, so the same
-    // boundary test as before is applied without materializing a `Vec<char>` + a
-    // `Vec<bool>` + a final `collect` (three allocations → one). Byte-identical.
-    let mut result = String::with_capacity(text.len());
+    let mut result: Option<String> = None;
     let mut prev: Option<char> = None;
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        let drop_marker = if c == '_' {
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
+        let drop_marker = c == '_' && {
             let prev_is_word = prev.is_some_and(|p| is_word(p) && p != '_');
-            let next_is_word = chars.peek().is_some_and(|&n| is_word(n) && n != '_');
+            let next_is_word = chars.peek().is_some_and(|&(_, n)| is_word(n) && n != '_');
             // Opening marker: preceded by non-word (or BOL), followed by word.
             // Closing marker: preceded by word, followed by non-word (or EOL).
             (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word)
-        } else {
-            false
         };
-        if !drop_marker {
-            result.push(c);
+        if drop_marker {
+            // First drop: seed the buffer with the untouched borrowed prefix.
+            result.get_or_insert_with(|| {
+                let mut buf = String::with_capacity(text.len());
+                buf.push_str(&text[..idx]);
+                buf
+            });
+        } else if let Some(buf) = result.as_mut() {
+            buf.push(c);
         }
         prev = Some(c);
     }
@@ -1194,7 +1205,16 @@ mod tests {
             "_leading",
         ];
         for c in cases {
-            assert_eq!(strip_italic_underscores(c), reference(c), "input={c:?}");
+            let reference_out = reference(c);
+            // `None` means "unchanged", equivalent to materializing the input.
+            let got = strip_italic_underscores(c).unwrap_or_else(|| c.to_owned());
+            assert_eq!(got, reference_out, "input={c:?}");
+            // The borrow elision must fire exactly when nothing is stripped.
+            assert_eq!(
+                strip_italic_underscores(c).is_none(),
+                reference_out == c,
+                "borrow-elision parity for input={c:?}"
+            );
         }
     }
 

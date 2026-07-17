@@ -1,5 +1,20 @@
 # PERF_LEDGER.md — frankensearch measured wins
 
+## 2026-07-16 — `strip_italic_underscores` borrows when nothing is dropped (BlackThrush)
+
+- **Negative-ledger-first route and profile:** `bv --robot-triage` was still all Quill contract docs, so this turn audited the canonicalization (ingest) chain, whose markdown-link parsers gained recent scratch-reuse / source-slice wins (`bd-xs7l`, `bd-xwb9`). One sibling was still un-Cow'd: `strip_italic_underscores` was the *only* strip in `strip_markdown_line`'s chain returning a fresh `String` (its siblings `strip_markdown_line` / `strip_prefixes_and_list_marker` / `strip_list_marker` / `strip_markdown_links` all borrow-or-reuse when unchanged). It is guarded by `has_underscore`, but `_` is ubiquitous in technical text (`snake_case`, `variable_name`, `fn foo_bar`), where **no** underscore is an italic boundary — yet the shipping code allocated a whole-line copy identical to the input on every such line.
+- **Single lever:** `strip_italic_underscores` now returns `Option<String>` — `None` when nothing is dropped (the caller keeps its borrowed/owned `Cow` unchanged), and `Some(stripped)` lazily seeded from the borrowed prefix at the first dropped marker only. Same boundary test and order → byte-identical materialization. The caller uses an `if …&& let Some(stripped) = …` let-chain so the borrow ends before the reassign.
+- **Same-binary paired A/B:** strict remote-only `rch`, one foreground release binary on worker `vmi1149989`, `--profile release` (LTO disabled), 25 samples, 150 ms warm-up, 500 ms measurement. A new `strip_italic_underscores_ab` bench mirrors both variants and asserts byte-identical materialization (and kept-byte totals) before timing. new/old (`<1` wins):
+
+| batch | alloc (old) | cow (new) | ratio | note |
+|---|---:|---:|---:|---|
+| `snake_only` (no drop) | 678.50 ns | 570.47 ns | 0.841 (~1.19×) | CIs marginally overlap |
+| `italic_only` (all drop) | 799.38 ns | 843.11 ns | 1.05 (wash) | CIs heavily overlap |
+| `mixed_4to1` (realistic) | 3.6264 µs | 2.7021 µs | 0.745 (~1.34×) | **disjoint CIs** |
+
+- **Verification:** the focused release core canonicalize suite passed remotely — **38 passed, 0 failed** — including the reference-parity test (extended to assert `None` fires exactly when nothing is stripped) and the `strip_markdown_line` chain. This is a modest, byte-identical elision: the char-scan is shared by both arms, so the saving is only the per-line allocation + copy-back on `has-underscore-but-no-italic` lines; italic-heavy prose is a measured wash.
+- **Scope:** KEEP for the canonicalization ingest path. This closes the last non-Cow strip in the chain — a consistency fix as much as a small perf one; byte-identical output, neutral worst case.
+
 ## 2026-07-16 — Incremental candidate updates truncate the owned result vector (BlackThrush)
 
 - **Negative-ledger-first route and profile:** `bv --robot-triage` and `br ready` exposed no ready performance bead; the graph was dominated by Quill contract work. A retry of open Model2Vec bead `bd-d2a8` reached only cold dependency builds on two workers, so it remains open with no timing and no reject. The turn then pivoted to the fresh fusion incremental-search subsystem. Before production editing, a faithful profile arm reproduced `IncrementalSearcher::update` taking an owned 256-ID `Vec<String>`, cloning its retained 100-ID prefix with `[..pool].to_vec()`, and dropping the original vector. Input construction was outside the timed region.

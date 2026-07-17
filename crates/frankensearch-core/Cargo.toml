@@ -36,6 +36,10 @@ name = "canonicalize"
 harness = false
 
 [[bench]]
+name = "strip_italic_underscores_ab"
+harness = false
+
+[[bench]]
 name = "query_class"
 harness = false
 
