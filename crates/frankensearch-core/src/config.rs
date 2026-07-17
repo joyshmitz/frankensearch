@@ -59,6 +59,8 @@ pub enum FusionStrategy {
 /// | `FRANKENSEARCH_HUBNESS_BETA`     | `hubness_beta`     | `0.0` (off) |
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+// These booleans are independent, serde-visible public configuration flags.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TwoTierConfig {
     /// Weight for quality-tier scores in the blend (0.0–1.0).
     /// Default: 0.7 (70% quality, 30% fast).

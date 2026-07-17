@@ -136,7 +136,7 @@ impl DefaultCanonicalizer {
                     // End of code block — collapse it
                     push_collapsed_code_block(
                         &mut result,
-                        &code_block_lang,
+                        code_block_lang,
                         &code_lines,
                         self.code_head_lines,
                         self.code_tail_lines,
@@ -166,7 +166,7 @@ impl DefaultCanonicalizer {
         if in_code_block && !code_lines.is_empty() {
             push_collapsed_code_block(
                 &mut result,
-                &code_block_lang,
+                code_block_lang,
                 &code_lines,
                 self.code_head_lines,
                 self.code_tail_lines,

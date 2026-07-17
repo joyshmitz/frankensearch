@@ -249,3 +249,4 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "nqc_adaptive_cost_ab"
 harness = false
+required-features = ["bench-internals"]
