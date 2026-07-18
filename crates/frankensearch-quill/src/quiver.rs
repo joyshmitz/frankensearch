@@ -6468,6 +6468,23 @@ pub struct IdHashSection<'a> {
     id_map: IdMapSection<'a>,
 }
 
+/// Non-borrowing probe metadata derived from a fully validated IDMAP/IDHASH
+/// pair.
+///
+/// Keeper retains the immutable segment bytes separately. This compact plan
+/// lets its delete path perform ordinary hash-table probes without reparsing
+/// every physical identifier on each lookup or constructing a self-referential
+/// cached section view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IdHashLookupPlan {
+    docid_lo: u64,
+    span: usize,
+    id_map_blob_offset: usize,
+    id_map_len: usize,
+    id_hash_len: usize,
+    capacity: usize,
+}
+
 impl<'a> IdHashSection<'a> {
     /// Validate durable slots against the exact IDMAP bytes used for lookups.
     ///
@@ -6510,6 +6527,20 @@ impl<'a> IdHashSection<'a> {
     #[must_use]
     pub const fn occupied(self) -> usize {
         self.occupied
+    }
+
+    /// Capture allocation-free lookup metadata after full cross-section
+    /// validation.
+    #[must_use]
+    pub(crate) fn lookup_plan(self) -> IdHashLookupPlan {
+        IdHashLookupPlan {
+            docid_lo: self.id_map.docid_lo,
+            span: self.id_map.offset_count(),
+            id_map_blob_offset: self.id_map.bytes.len() - self.id_map.blob.len(),
+            id_map_len: self.id_map.bytes.len(),
+            id_hash_len: self.bytes.len(),
+            capacity: self.capacity,
+        }
     }
 
     /// Probe a document identifier, verifying exact IDMAP bytes on hash hits.
@@ -6573,6 +6604,75 @@ impl<'a> IdHashSection<'a> {
             slot = (slot + 1) & mask;
         }
         Ok(None)
+    }
+}
+
+impl IdHashLookupPlan {
+    /// Whether the bound IDMAP contains a physical row for this global docid.
+    #[must_use]
+    pub(crate) fn contains_global_docid(self, id_map_bytes: &[u8], global_docid: u32) -> bool {
+        if id_map_bytes.len() != self.id_map_len {
+            return false;
+        }
+        let Some(ordinal) = u64::from(global_docid).checked_sub(self.docid_lo) else {
+            return false;
+        };
+        let Ok(ordinal) = usize::try_from(ordinal) else {
+            return false;
+        };
+        self.document_id_bytes(id_map_bytes, ordinal).is_some()
+    }
+
+    /// Probe the exact immutable section bytes from which this plan was built.
+    ///
+    /// The caller owns that identity binding: Keeper stores this plan beside
+    /// the same immutable `SegmentReader` used during validation. Length and
+    /// layout checks below make accidental mismatches fail closed; all slice
+    /// access remains checked.
+    #[must_use]
+    pub(crate) fn lookup(
+        self,
+        id_map_bytes: &[u8],
+        id_hash_bytes: &[u8],
+        document_id: &str,
+    ) -> Option<u64> {
+        if id_map_bytes.len() != self.id_map_len || id_hash_bytes.len() != self.id_hash_len {
+            return None;
+        }
+        let entries = id_hash_bytes.get(ID_HASH_HEADER_LEN..)?;
+        let mask = self.capacity.checked_sub(1)?;
+        let mask_u64 = u64::try_from(mask).ok()?;
+        let key_hash = seeded_id_hash(document_id.as_bytes());
+        let mut slot = usize::try_from(key_hash & mask_u64).ok()?;
+        for _ in 0..self.capacity {
+            let (stored_hash, doc_ord_plus1) = id_hash_slot(entries, slot)?;
+            if doc_ord_plus1 == 0 {
+                return None;
+            }
+            if stored_hash == key_hash {
+                let ordinal = usize::try_from(doc_ord_plus1 - 1).ok()?;
+                let stored_document_id = self.document_id_bytes(id_map_bytes, ordinal)?;
+                if stored_document_id == document_id.as_bytes() {
+                    return self.docid_lo.checked_add(u64::try_from(ordinal).ok()?);
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        None
+    }
+
+    fn document_id_bytes(self, id_map_bytes: &[u8], ordinal: usize) -> Option<&[u8]> {
+        if ordinal >= self.span {
+            return None;
+        }
+        let offsets = id_map_bytes.get(ID_MAP_HEADER_LEN..self.id_map_blob_offset)?;
+        let start = usize::try_from(id_map_offset(offsets, ordinal)?).ok()?;
+        let end = usize::try_from(id_map_offset(offsets, ordinal.checked_add(1)?)?).ok()?;
+        if start == end {
+            return None;
+        }
+        let blob = id_map_bytes.get(self.id_map_blob_offset..)?;
+        blob.get(start..end)
     }
 }
 

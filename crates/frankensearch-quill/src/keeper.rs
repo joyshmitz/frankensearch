@@ -25,6 +25,9 @@ use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use thiserror::Error;
 
 use crate::error::QuillError;
+use crate::quiver::{
+    IdHashCodecError, IdHashLookupPlan, IdHashSection, IdMapCodecError, IdMapSection,
+};
 use crate::schema::SchemaDescriptor;
 use crate::segment::{PendingSegmentFile, SectionKind, SegmentHeader, SegmentReader};
 
@@ -70,6 +73,7 @@ const FIELD_STATS_BYTES: usize = 2 + 8 + 4;
 const MAX_DOCID_EXCLUSIVE: u64 = 4_294_967_296;
 const TOMBSTONE_ARRAY_MAX_CARDINALITY: u16 = 4_096;
 const TOMBSTONE_BITMAP_MIN_CARDINALITY: u64 = 3_584;
+const TOMBSTONE_BITMAP_BYTES: usize = 8_192;
 const MAX_TOMBSTONE_CHUNKS: usize = 65_536;
 
 // Construction initializes this once outside the async publication path. The
@@ -300,6 +304,66 @@ pub enum KeeperError {
         /// Failed identity, range, length, or checksum-witness comparison.
         detail: String,
     },
+    /// A queryable segment omitted one required identity section.
+    #[error("Quill segment at {path} is missing required identity section {kind:?}")]
+    MissingIdentitySection {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Missing IDMAP or IDHASH section.
+        kind: SectionKind,
+    },
+    /// A segment's IDMAP payload failed canonical cross-section validation.
+    #[error("corrupt Quill IDMAP at {path}: {source}")]
+    IdMapCorrupted {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Typed IDMAP diagnosis.
+        #[source]
+        source: IdMapCodecError,
+    },
+    /// A segment's IDHASH payload failed canonical IDMAP-bound validation.
+    #[error("corrupt Quill IDHASH at {path}: {source}")]
+    IdHashCorrupted {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Typed IDHASH diagnosis.
+        #[source]
+        source: IdHashCodecError,
+    },
+    /// IDMAP presence disagreed with the segment and MANIFEST at-seal count.
+    #[error("Quill segment document count mismatch at {path}: manifest={manifest}, IDMAP={id_map}")]
+    AtSealDocCountMismatch {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Count authenticated by the MANIFEST and segment header.
+        manifest: u32,
+        /// Present rows validated from IDMAP.
+        id_map: usize,
+    },
+    /// A durable tombstone named a positional IDMAP hole.
+    #[error(
+        "Quill segment {segment_id:#018x} at {path} tombstones missing IDMAP row {global_docid}"
+    )]
+    TombstoneReferencesHole {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Segment identity carrying the invalid tombstone.
+        segment_id: u64,
+        /// Tombstoned global document id with no physical row.
+        global_docid: u32,
+    },
+    /// More than one current segment exposed the same live external identifier.
+    #[error(
+        "Quill upsert invariant violated in {directory}: document identifier resolves to live docids {first_global_docid} and {duplicate_global_docid}"
+    )]
+    MultipleLiveDocumentIds {
+        /// Snapshot directory, or the in-memory sentinel.
+        directory: PathBuf,
+        /// First live global document id in descending seal order.
+        first_global_docid: u32,
+        /// Additional live global document id.
+        duplicate_global_docid: u32,
+    },
     /// A fallback MANIFEST and an extant generation claim disagree.
     #[error(
         "invalid interrupted-publish claim at {path}: recovered generation {recovered}, claimed generation {claimed}"
@@ -450,6 +514,48 @@ impl From<KeeperError> for SearchError {
             KeeperError::SegmentMetadataMismatch { path, detail } => {
                 Self::IndexCorrupted { path, detail }
             }
+            KeeperError::MissingIdentitySection { path, kind } => Self::IndexCorrupted {
+                path,
+                detail: format!("MANIFEST-referenced segment is missing {kind:?}"),
+            },
+            KeeperError::IdMapCorrupted { path, source } => Self::IndexCorrupted {
+                path,
+                detail: source.to_string(),
+            },
+            KeeperError::IdHashCorrupted { path, source } => Self::IndexCorrupted {
+                path,
+                detail: source.to_string(),
+            },
+            KeeperError::AtSealDocCountMismatch {
+                path,
+                manifest,
+                id_map,
+            } => Self::IndexCorrupted {
+                path,
+                detail: format!(
+                    "at-seal document count mismatch: manifest={manifest}, IDMAP={id_map}"
+                ),
+            },
+            KeeperError::TombstoneReferencesHole {
+                path,
+                segment_id,
+                global_docid,
+            } => Self::IndexCorrupted {
+                path,
+                detail: format!(
+                    "segment {segment_id:#018x} tombstones missing IDMAP row {global_docid}"
+                ),
+            },
+            KeeperError::MultipleLiveDocumentIds {
+                directory,
+                first_global_docid,
+                duplicate_global_docid,
+            } => Self::IndexCorrupted {
+                path: directory,
+                detail: format!(
+                    "document identifier has multiple live rows {first_global_docid}/{duplicate_global_docid}"
+                ),
+            },
             KeeperError::InvalidRecoveryClaim {
                 path,
                 recovered,
@@ -489,6 +595,272 @@ impl From<KeeperError> for SearchError {
     }
 }
 
+/// Owned canonical roaring-lite tombstone set.
+///
+/// The exact wire bytes remain authoritative so decoding preserves ARRAY or
+/// BITMAP representation inside the hysteresis overlap. Cached cardinality
+/// makes live-count rollups constant-time, while mutation rewrites only this
+/// small delete-path value and copies untouched containers byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TombstoneSet {
+    encoded: Vec<u8>,
+    cardinality: u64,
+}
+
+impl TombstoneSet {
+    /// Construct the canonical empty set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            encoded: EMPTY_TOMBSTONES.to_vec(),
+            cardinality: 0,
+        }
+    }
+
+    /// Parse canonical roaring-lite bytes without normalizing container kinds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects truncation, unknown kinds, noncanonical ordering/cardinality,
+    /// resource-limit violations, trailing bytes, or allocation failure.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ManifestCodecError> {
+        let cardinality = validate_tombstone_bytes(bytes, None)?;
+        let encoded = copy_bytes(bytes, "tombstone set")?;
+        Ok(Self {
+            encoded,
+            cardinality,
+        })
+    }
+
+    fn from_validated_bytes(encoded: Vec<u8>, cardinality: u64) -> Self {
+        Self {
+            encoded,
+            cardinality,
+        }
+    }
+
+    /// Borrow the exact canonical wire representation.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    /// Number of tombstoned global document ids.
+    #[must_use]
+    pub const fn cardinality(&self) -> u64 {
+        self.cardinality
+    }
+
+    /// Whether the set contains no document ids.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.cardinality == 0
+    }
+
+    /// Test one global document id without allocating.
+    #[must_use]
+    pub fn contains(&self, global_docid: u32) -> bool {
+        let (chunk_id, low) = split_tombstone_docid(global_docid);
+        let Ok(mut containers) = TombstoneContainers::new(&self.encoded) else {
+            return false;
+        };
+        while let Ok(Some(container)) = containers.next_container() {
+            match container.chunk_id.cmp(&chunk_id) {
+                std::cmp::Ordering::Less => {}
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal => {
+                    return match container.kind {
+                        0 => array_binary_search(container.payload, low),
+                        1 => bitmap_contains(container.payload, low),
+                        _ => false,
+                    };
+                }
+            }
+        }
+        false
+    }
+
+    /// Insert one global document id, promoting ARRAY to BITMAP at 4,097.
+    ///
+    /// # Errors
+    ///
+    /// Returns an allocation or invariant error without changing the set.
+    pub fn insert(&mut self, global_docid: u32) -> Result<bool, ManifestCodecError> {
+        if self.contains(global_docid) {
+            return Ok(false);
+        }
+        let (chunk_id, low) = split_tombstone_docid(global_docid);
+        let chunk_count = tombstone_chunk_count(&self.encoded)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(
+                self.encoded
+                    .len()
+                    .checked_add(7)
+                    .ok_or_else(|| invalid("tombstone insertion length overflow"))?,
+            )
+            .map_err(|error| invalid(format!("tombstone insertion allocation failed: {error}")))?;
+
+        let mut containers = TombstoneContainers::new(&self.encoded)?;
+        let mut inserted = false;
+        let adds_chunk = !tombstone_chunk_exists(&self.encoded, chunk_id)?;
+        let next_chunk_count = chunk_count
+            .checked_add(u32::from(adds_chunk))
+            .ok_or_else(|| invalid("tombstone chunk count overflow"))?;
+        put_u32(&mut output, next_chunk_count);
+        while let Some(container) = containers.next_container()? {
+            if !inserted && chunk_id < container.chunk_id {
+                write_singleton_tombstone_chunk(&mut output, chunk_id, low);
+                inserted = true;
+            }
+            if container.chunk_id == chunk_id {
+                write_inserted_tombstone_container(&mut output, container, low)?;
+                inserted = true;
+            } else {
+                output.extend_from_slice(container.encoded);
+            }
+        }
+        if !inserted {
+            write_singleton_tombstone_chunk(&mut output, chunk_id, low);
+        }
+        let next_cardinality = self
+            .cardinality
+            .checked_add(1)
+            .ok_or_else(|| invalid("tombstone cardinality overflow"))?;
+        debug_assert_eq!(
+            validate_tombstone_bytes(&output, None).ok(),
+            Some(next_cardinality)
+        );
+        self.encoded = output;
+        self.cardinality = next_cardinality;
+        Ok(true)
+    }
+
+    /// Remove one id, retaining BITMAP through 3,584 and demoting at 3,583.
+    ///
+    /// Retained MANIFEST segments prohibit shrinking tombstones; this mutation
+    /// is intended for isolated codec work and later replacement-segment
+    /// compaction, not an in-place publication transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an allocation or invariant error without changing the set.
+    pub fn remove(&mut self, global_docid: u32) -> Result<bool, ManifestCodecError> {
+        if !self.contains(global_docid) {
+            return Ok(false);
+        }
+        let (chunk_id, low) = split_tombstone_docid(global_docid);
+        let chunk_count = tombstone_chunk_count(&self.encoded)?;
+        let mut containers = TombstoneContainers::new(&self.encoded)?;
+        let mut target_cardinality = None;
+        while let Some(container) = containers.next_container()? {
+            if container.chunk_id == chunk_id {
+                target_cardinality = Some(container.cardinality);
+                break;
+            }
+        }
+        let target_cardinality =
+            target_cardinality.ok_or_else(|| invalid("tombstone membership/container mismatch"))?;
+        let removes_chunk = target_cardinality == 1;
+        let next_chunk_count = chunk_count
+            .checked_sub(u32::from(removes_chunk))
+            .ok_or_else(|| invalid("tombstone chunk count underflow"))?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(self.encoded.len())
+            .map_err(|error| invalid(format!("tombstone removal allocation failed: {error}")))?;
+        put_u32(&mut output, next_chunk_count);
+        let mut containers = TombstoneContainers::new(&self.encoded)?;
+        while let Some(container) = containers.next_container()? {
+            if container.chunk_id == chunk_id {
+                write_removed_tombstone_container(&mut output, container, low)?;
+            } else {
+                output.extend_from_slice(container.encoded);
+            }
+        }
+        let next_cardinality = self
+            .cardinality
+            .checked_sub(1)
+            .ok_or_else(|| invalid("tombstone cardinality underflow"))?;
+        debug_assert_eq!(
+            validate_tombstone_bytes(&output, None).ok(),
+            Some(next_cardinality)
+        );
+        self.encoded = output;
+        self.cardinality = next_cardinality;
+        Ok(true)
+    }
+
+    fn validate_range(&self, range: (u64, u64)) -> Result<(), ManifestCodecError> {
+        let validated = validate_tombstone_bytes(&self.encoded, Some(range))?;
+        if validated != self.cardinality {
+            return Err(invalid("cached tombstone cardinality mismatch"));
+        }
+        Ok(())
+    }
+
+    fn is_monotone_superset_of(&self, previous: &Self) -> Result<bool, ManifestCodecError> {
+        if previous == self {
+            return Ok(true);
+        }
+        if previous.cardinality > self.cardinality
+            || !tombstones_are_subset(&previous.encoded, &self.encoded)?
+        {
+            return Ok(false);
+        }
+
+        // Every chunk follows the mutation state machine across generations:
+        // ARRAY promotes only above 4,096 entries, while a retained BITMAP
+        // never demotes in this growth-only transition. This also rejects a
+        // newly introduced, prematurely promoted BITMAP in the overlap.
+        let mut old = TombstoneContainers::new(&previous.encoded)?;
+        let mut new = TombstoneContainers::new(&self.encoded)?;
+        let mut prior = old.next_container()?;
+        while let Some(current) = new.next_container()? {
+            if prior.is_some_and(|container| container.chunk_id < current.chunk_id) {
+                return Ok(false);
+            }
+            let previous_kind = prior
+                .filter(|container| container.chunk_id == current.chunk_id)
+                .map(|container| container.kind);
+            let representation_is_valid = match previous_kind {
+                Some(1) => current.kind == 1,
+                Some(0) | None => {
+                    current.kind == 0
+                        || (current.kind == 1
+                            && current.cardinality > u64::from(TOMBSTONE_ARRAY_MAX_CARDINALITY))
+                }
+                _ => false,
+            };
+            if !representation_is_valid {
+                return Ok(false);
+            }
+            if previous_kind.is_some() {
+                prior = old.next_container()?;
+            }
+        }
+        Ok(prior.is_none())
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.encoded.len()
+    }
+}
+
+impl Default for TombstoneSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TryFrom<&[u8]> for TombstoneSet {
+    type Error = ManifestCodecError;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_bytes(bytes)
+    }
+}
+
 /// One immutable segment referenced by a MANIFEST generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestSegment {
@@ -507,7 +879,42 @@ pub struct ManifestSegment {
     /// Live-at-seal document count.
     pub doc_count: u32,
     /// Canonical roaring-lite tombstone bytes.
-    pub tombstones: Vec<u8>,
+    pub tombstones: TombstoneSet,
+}
+
+impl ManifestSegment {
+    /// Live rows after applying this generation's tombstones.
+    #[must_use]
+    pub fn live_doc_count(&self) -> u32 {
+        self.doc_count
+            .saturating_sub(u32::try_from(self.tombstones.cardinality()).unwrap_or(u32::MAX))
+    }
+
+    /// Whether a ranged physical candidate survives this segment's tombstones.
+    #[must_use]
+    pub fn is_live(&self, global_docid: u32) -> bool {
+        (self.docid_lo..self.docid_hi).contains(&u64::from(global_docid))
+            && !self.tombstones.contains(global_docid)
+    }
+
+    fn insert_tombstone(&mut self, global_docid: u32) -> Result<bool, ManifestCodecError> {
+        if !(self.docid_lo..self.docid_hi).contains(&u64::from(global_docid)) {
+            return Err(invalid(format!(
+                "tombstoned docid {global_docid} is outside segment range [{}, {})",
+                self.docid_lo, self.docid_hi
+            )));
+        }
+        if self.tombstones.contains(global_docid) {
+            return Ok(false);
+        }
+        if self.tombstones.cardinality() >= u64::from(self.doc_count) {
+            return Err(invalid(format!(
+                "segment {:#018x} cannot tombstone more than {} physical rows",
+                self.segment_id, self.doc_count
+            )));
+        }
+        self.tombstones.insert(global_docid)
+    }
 }
 
 /// Snapshot-level field statistics rolled up over referenced segments.
@@ -616,7 +1023,7 @@ impl Manifest {
             put_u64(&mut bytes, segment.docid_lo);
             put_u64(&mut bytes, segment.docid_hi);
             put_u32(&mut bytes, segment.doc_count);
-            bytes.extend_from_slice(&segment.tombstones);
+            bytes.extend_from_slice(segment.tombstones.as_bytes());
         }
         put_u32(&mut bytes, field_count);
         for stats in &self.field_stats {
@@ -699,11 +1106,12 @@ impl Manifest {
             let docid_hi = cursor.u64()?;
             let doc_count = cursor.u32()?;
             let tombstone_start = cursor.position();
-            consume_tombstone_set(&mut cursor, None)?;
-            let tombstones = copy_bytes(
+            let tombstone_count = consume_tombstone_set(&mut cursor, None)?;
+            let tombstone_bytes = copy_bytes(
                 &bytes[tombstone_start..cursor.position()],
                 "tombstone bytes",
             )?;
+            let tombstones = TombstoneSet::from_validated_bytes(tombstone_bytes, tombstone_count);
             segments.push(ManifestSegment {
                 segment_id,
                 seal_seq,
@@ -780,18 +1188,209 @@ pub struct LoadedManifest {
     pub source: ManifestSource,
 }
 
+#[derive(Clone)]
+struct TombstoneIndex {
+    chunks: Vec<TombstoneChunkIndex>,
+}
+
+#[derive(Clone, Copy)]
+struct TombstoneChunkIndex {
+    chunk_id: u16,
+    kind: u8,
+    payload_offset: usize,
+    payload_length: usize,
+}
+
+impl TombstoneIndex {
+    fn build(tombstones: &TombstoneSet) -> Result<Self, ManifestCodecError> {
+        let chunk_count =
+            usize::try_from(tombstone_chunk_count(tombstones.as_bytes())?).map_err(|_| {
+                ManifestCodecError::ResourceLimit {
+                    resource: "host tombstone chunk count",
+                    actual: u64::from(u32::MAX),
+                    limit: usize_to_u64(usize::MAX),
+                }
+            })?;
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(chunk_count)
+            .map_err(|error| invalid(format!("tombstone index allocation failed: {error}")))?;
+        let mut containers = TombstoneContainers::new(tombstones.as_bytes())?;
+        while let Some(container) = containers.next_container()? {
+            chunks.push(TombstoneChunkIndex {
+                chunk_id: container.chunk_id,
+                kind: container.kind,
+                payload_offset: container.payload_offset,
+                payload_length: container.payload.len(),
+            });
+        }
+        Ok(Self { chunks })
+    }
+
+    fn contains(&self, encoded: &[u8], global_docid: u32) -> bool {
+        let (chunk_id, low) = split_tombstone_docid(global_docid);
+        let Ok(index) = self
+            .chunks
+            .binary_search_by_key(&chunk_id, |chunk| chunk.chunk_id)
+        else {
+            return false;
+        };
+        let chunk = self.chunks[index];
+        let Some(payload_end) = chunk.payload_offset.checked_add(chunk.payload_length) else {
+            return false;
+        };
+        let Some(payload) = encoded.get(chunk.payload_offset..payload_end) else {
+            return false;
+        };
+        match chunk.kind {
+            0 => array_binary_search(payload, low),
+            1 => bitmap_contains(payload, low),
+            _ => false,
+        }
+    }
+}
+
+fn required_identity_section<'a>(
+    path: &Path,
+    reader: &'a SegmentReader<ReadOnlyMappedFile>,
+    kind: SectionKind,
+) -> Result<&'a [u8], KeeperError> {
+    reader
+        .section(kind)
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .ok_or_else(|| KeeperError::MissingIdentitySection {
+            path: path.to_path_buf(),
+            kind,
+        })
+}
+
+fn first_tombstone_hole(
+    tombstones: &TombstoneSet,
+    id_map: IdMapSection<'_>,
+) -> Result<Option<u32>, ManifestCodecError> {
+    let mut containers = TombstoneContainers::new(tombstones.as_bytes())?;
+    while let Some(container) = containers.next_container()? {
+        match container.kind {
+            0 => {
+                for index in 0..container.payload.len() / 2 {
+                    let global_docid = (u32::from(container.chunk_id) << 16)
+                        | u32::from(array_value(container.payload, index));
+                    if !id_map.contains(u64::from(global_docid)) {
+                        return Ok(Some(global_docid));
+                    }
+                }
+            }
+            1 => {
+                for (byte_index, byte) in container.payload.iter().copied().enumerate() {
+                    let mut bits = byte;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        let low = u16::try_from(byte_index * 8 + bit)
+                            .map_err(|_| invalid("bitmap tombstone low-bit overflow"))?;
+                        let global_docid = (u32::from(container.chunk_id) << 16) | u32::from(low);
+                        if !id_map.contains(u64::from(global_docid)) {
+                            return Ok(Some(global_docid));
+                        }
+                        bits &= bits - 1;
+                    }
+                }
+            }
+            _ => return Err(invalid("unknown validated tombstone container kind")),
+        }
+    }
+    Ok(None)
+}
+
+/// One live external-identifier resolution routed to its immutable segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolvedDocumentId {
+    /// Segment containing the unique live physical row.
+    pub segment_id: u64,
+    /// Current segment publication order witness.
+    pub seal_seq: u64,
+    /// Stable global Quill document id.
+    pub global_docid: u32,
+}
+
 /// One immutable, mmap-backed segment admitted by a recovered snapshot.
 ///
-/// Structural framing and MANIFEST witnesses are checked during open. Section
-/// payload hashes remain lazy and are checked on first access.
+/// Structural framing, MANIFEST witnesses, and the IDMAP-bound IDHASH identity
+/// pair are checked during open. All unrelated payload hashes remain lazy and
+/// are checked on first access.
 #[derive(Clone)]
 pub struct RecoveredSegment {
     path: PathBuf,
     manifest: ManifestSegment,
     reader: Arc<SegmentReader<ReadOnlyMappedFile>>,
+    tombstone_index: TombstoneIndex,
+    id_lookup: IdHashLookupPlan,
+    live_doc_count: u32,
 }
 
 impl RecoveredSegment {
+    fn bind(
+        path: PathBuf,
+        manifest: ManifestSegment,
+        reader: SegmentReader<ReadOnlyMappedFile>,
+    ) -> Result<Self, KeeperError> {
+        let reader = Arc::new(reader);
+        let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
+        let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
+            .map_err(|source| KeeperError::IdMapCorrupted {
+                path: path.clone(),
+                source,
+            })?;
+        if u64::try_from(id_map.present_count()).unwrap_or(u64::MAX)
+            != u64::from(manifest.doc_count)
+        {
+            return Err(KeeperError::AtSealDocCountMismatch {
+                path,
+                manifest: manifest.doc_count,
+                id_map: id_map.present_count(),
+            });
+        }
+        let tombstone_hole =
+            first_tombstone_hole(&manifest.tombstones, id_map).map_err(|source| {
+                KeeperError::ManifestCorrupted {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        if let Some(global_docid) = tombstone_hole {
+            return Err(KeeperError::TombstoneReferencesHole {
+                path,
+                segment_id: manifest.segment_id,
+                global_docid,
+            });
+        }
+        let id_hash_bytes = required_identity_section(&path, &reader, SectionKind::IDHASH)?;
+        let id_hash = IdHashSection::parse(id_hash_bytes, id_map).map_err(|source| {
+            KeeperError::IdHashCorrupted {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let id_lookup = id_hash.lookup_plan();
+        let tombstone_index = TombstoneIndex::build(&manifest.tombstones).map_err(|source| {
+            KeeperError::ManifestCorrupted {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let live_doc_count = manifest.live_doc_count();
+        Ok(Self {
+            path,
+            manifest,
+            reader,
+            tombstone_index,
+            id_lookup,
+            live_doc_count,
+        })
+    }
+
     /// Canonical published segment path.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -802,6 +1401,53 @@ impl RecoveredSegment {
     #[must_use]
     pub const fn manifest(&self) -> &ManifestSegment {
         &self.manifest
+    }
+
+    /// At-seal physical row count used by BM25 statistics.
+    #[must_use]
+    pub const fn at_seal_doc_count(&self) -> u32 {
+        self.manifest.doc_count
+    }
+
+    /// Current MANIFEST tombstone cardinality.
+    #[must_use]
+    pub fn tombstone_count(&self) -> u64 {
+        self.manifest.tombstones.cardinality()
+    }
+
+    /// Current live row count after tombstones.
+    #[must_use]
+    pub const fn doc_count(&self) -> u32 {
+        self.live_doc_count
+    }
+
+    /// Whether this segment's current MANIFEST state hides one document id.
+    #[must_use]
+    pub fn is_tombstoned(&self, global_docid: u32) -> bool {
+        self.tombstone_index
+            .contains(self.manifest.tombstones.as_bytes(), global_docid)
+    }
+
+    fn contains_identity_row(&self, global_docid: u32) -> bool {
+        self.reader
+            .section(SectionKind::IDMAP)
+            .ok()
+            .flatten()
+            .is_some_and(|id_map| self.id_lookup.contains_global_docid(id_map, global_docid))
+    }
+
+    fn lookup_document_id(&self, document_id: &str) -> Result<Option<u32>, KeeperError> {
+        let id_map = required_identity_section(&self.path, &self.reader, SectionKind::IDMAP)?;
+        let id_hash = required_identity_section(&self.path, &self.reader, SectionKind::IDHASH)?;
+        self.id_lookup
+            .lookup(id_map, id_hash, document_id)
+            .map(|global_docid| {
+                u32::try_from(global_docid).map_err(|_| KeeperError::SegmentMetadataMismatch {
+                    path: self.path.clone(),
+                    detail: format!("IDHASH returned non-u32 global docid {global_docid}"),
+                })
+            })
+            .transpose()
     }
 
     /// Structurally validated FSLX header.
@@ -830,6 +1476,14 @@ impl RecoveredSegment {
     }
 }
 
+impl crate::argus::LiveDocs for RecoveredSegment {
+    fn is_live(&self, global_docid: u32) -> bool {
+        (self.manifest.docid_lo..self.manifest.docid_hi).contains(&u64::from(global_docid))
+            && self.contains_identity_row(global_docid)
+            && !self.is_tombstoned(global_docid)
+    }
+}
+
 /// A read-only, internally consistent Keeper snapshot.
 ///
 /// `open` performs recovery by selecting the admitted MANIFEST slot and
@@ -842,9 +1496,55 @@ pub struct KeeperSnapshot {
     schema: SchemaDescriptor,
     loaded: LoadedManifest,
     segments: Vec<RecoveredSegment>,
+    segments_by_seal_desc: Vec<usize>,
+    at_seal_doc_count: u64,
+    tombstone_count: u64,
+    live_doc_count: u64,
 }
 
 impl KeeperSnapshot {
+    fn from_parts(
+        directory: Option<PathBuf>,
+        schema: SchemaDescriptor,
+        loaded: LoadedManifest,
+        segments: Vec<RecoveredSegment>,
+    ) -> Result<Self, KeeperError> {
+        let error_path = directory
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("<in-memory>"));
+        let mut segments_by_seal_desc = Vec::new();
+        segments_by_seal_desc
+            .try_reserve_exact(segments.len())
+            .map_err(|error| KeeperError::Io {
+                operation: "allocate segment probe order",
+                path: error_path,
+                source: io::Error::other(error.to_string()),
+            })?;
+        segments_by_seal_desc.extend(0..segments.len());
+        segments_by_seal_desc
+            .sort_unstable_by_key(|&index| std::cmp::Reverse(segments[index].manifest.seal_seq));
+
+        let at_seal_doc_count = segments
+            .iter()
+            .map(|segment| u64::from(segment.at_seal_doc_count()))
+            .sum();
+        let tombstone_count = segments.iter().map(RecoveredSegment::tombstone_count).sum();
+        let live_doc_count = segments
+            .iter()
+            .map(|segment| u64::from(segment.doc_count()))
+            .sum();
+        Ok(Self {
+            directory,
+            schema,
+            loaded,
+            segments,
+            segments_by_seal_desc,
+            at_seal_doc_count,
+            tombstone_count,
+            live_doc_count,
+        })
+    }
+
     /// Open one durable snapshot without mutating the index directory.
     ///
     /// # Errors
@@ -886,19 +1586,14 @@ impl KeeperSnapshot {
                 }
             })?;
             validate_segment_witnesses(&path, manifest_segment, &reader)?;
-            segments.push(RecoveredSegment {
+            segments.push(RecoveredSegment::bind(
                 path,
-                manifest: manifest_segment.clone(),
-                reader: Arc::new(reader),
-            });
+                manifest_segment.clone(),
+                reader,
+            )?);
         }
 
-        Ok(Self {
-            directory: Some(directory.to_path_buf()),
-            schema,
-            loaded,
-            segments,
-        })
+        Self::from_parts(Some(directory.to_path_buf()), schema, loaded, segments)
     }
 
     /// Create a genesis index or open an existing index with the same schema.
@@ -948,15 +1643,15 @@ impl KeeperSnapshot {
         let schema_id = schema
             .schema_id()
             .map_err(|source| KeeperError::InvalidSchema { source })?;
-        Ok(Self {
-            directory: None,
+        Self::from_parts(
+            None,
             schema,
-            loaded: LoadedManifest {
+            LoadedManifest {
                 manifest: Manifest::empty(1, schema_id, 0),
                 source: ManifestSource::InMemory,
             },
-            segments: Vec::new(),
-        })
+            Vec::new(),
+        )
     }
 
     /// Durable index directory, or `None` for an in-memory snapshot.
@@ -982,6 +1677,268 @@ impl KeeperSnapshot {
     pub fn segments(&self) -> &[RecoveredSegment] {
         &self.segments
     }
+
+    /// Physical at-seal rows retained for BM25 statistics until compaction.
+    #[must_use]
+    pub const fn at_seal_doc_count(&self) -> u64 {
+        self.at_seal_doc_count
+    }
+
+    /// Tombstones paired with this immutable snapshot generation.
+    #[must_use]
+    pub const fn tombstone_count(&self) -> u64 {
+        self.tombstone_count
+    }
+
+    /// Public live document count, cached during snapshot construction.
+    #[must_use]
+    pub const fn doc_count(&self) -> u64 {
+        self.live_doc_count
+    }
+
+    /// Whether one global document id is visible in this snapshot.
+    #[must_use]
+    pub fn is_live(&self, global_docid: u32) -> bool {
+        let global_docid_u64 = u64::from(global_docid);
+        let insertion = self
+            .segments
+            .partition_point(|segment| segment.manifest.docid_lo <= global_docid_u64);
+        let Some(segment) = insertion
+            .checked_sub(1)
+            .and_then(|index| self.segments.get(index))
+        else {
+            return false;
+        };
+        crate::argus::LiveDocs::is_live(segment, global_docid)
+    }
+
+    /// Resolve an external identifier against current sealed segments.
+    ///
+    /// Probes descend by `seal_seq`, continue after tombstoned hits, and keep
+    /// scanning after the first live hit so duplicate-live upsert corruption is
+    /// diagnosed rather than silently masked.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed identity-section or multiple-live-row failure.
+    pub fn resolve_document_id(
+        &self,
+        document_id: &str,
+    ) -> Result<Option<ResolvedDocumentId>, KeeperError> {
+        self.resolve_document_id_in(&self.loaded.manifest, document_id)
+    }
+
+    /// Clone exactly one next-generation MANIFEST for staged writer changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed generation-exhaustion failure.
+    pub fn next_manifest(&self) -> Result<Manifest, KeeperError> {
+        let mut manifest = self.loaded.manifest.clone();
+        manifest.generation =
+            manifest
+                .generation
+                .checked_add(1)
+                .ok_or(KeeperError::GenerationExhausted {
+                    current: manifest.generation,
+                })?;
+        Ok(manifest)
+    }
+
+    /// Stage an idempotent sealed-document deletion into one next MANIFEST.
+    ///
+    /// Missing and already-deleted identifiers return `false` without changing
+    /// `proposed`. Multiple calls compose in the same generation; publication
+    /// remains the caller's explicit [`KeeperWriter::publish`] operation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-successor proposal, corrupt identity state, tombstone-on-
+    /// hole attempts, allocation failure, or the multiple-live upsert invariant.
+    pub fn delete_document(
+        &self,
+        proposed: &mut Manifest,
+        document_id: &str,
+    ) -> Result<bool, KeeperError> {
+        validate_staged_manifest(&self.loaded.manifest, proposed)?;
+        if let Some(segment) = proposed.segments.iter().find(|segment| {
+            self.loaded
+                .manifest
+                .segments
+                .binary_search_by_key(&segment.docid_lo, |current| current.docid_lo)
+                .map_or(true, |index| {
+                    self.loaded.manifest.segments[index].segment_id != segment.segment_id
+                })
+        }) {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "stage deletes before adding replacement segment {:#018x}",
+                    segment.segment_id
+                ),
+            });
+        }
+        let Some(resolved) = self.resolve_document_id_in(proposed, document_id)? else {
+            return Ok(false);
+        };
+        let mut staged = proposed.clone();
+        let segment = staged
+            .segments
+            .iter_mut()
+            .find(|segment| segment.segment_id == resolved.segment_id)
+            .ok_or_else(|| KeeperError::InvalidTransition {
+                detail: format!(
+                    "resolved segment {:#018x} is absent from staged manifest",
+                    resolved.segment_id
+                ),
+            })?;
+        let before = segment.tombstones.cardinality();
+        if !segment
+            .insert_tombstone(resolved.global_docid)
+            .map_err(|source| KeeperError::InvalidManifest { source })?
+        {
+            return Ok(false);
+        }
+        validate_staged_manifest(&self.loaded.manifest, &staged)?;
+        tracing::trace!(
+            target: crate::tracing_conventions::TARGET,
+            phase = "keeper.delete_document",
+            generation = staged.generation,
+            segment_id = resolved.segment_id,
+            seal_seq = resolved.seal_seq,
+            tombstones_before = before,
+            tombstones_after = before + 1,
+            "staged sealed-document tombstone"
+        );
+        *proposed = staged;
+        Ok(true)
+    }
+
+    /// Stage a valid empty generation while preserving identity and watermark.
+    ///
+    /// This does not remove segment files; ordinary two-slot publication,
+    /// snapshot lifetime, and writer-locked grace-window GC retain ownership of
+    /// physical reclamation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a proposal that is not this snapshot's next generation.
+    pub fn delete_all(&self, proposed: &mut Manifest) -> Result<(), KeeperError> {
+        validate_staged_manifest(&self.loaded.manifest, proposed)?;
+        let mut staged = proposed.clone();
+        staged.segments.clear();
+        staged.field_stats.clear();
+        validate_staged_manifest(&self.loaded.manifest, &staged)?;
+        *proposed = staged;
+        Ok(())
+    }
+
+    fn resolve_document_id_in(
+        &self,
+        manifest: &Manifest,
+        document_id: &str,
+    ) -> Result<Option<ResolvedDocumentId>, KeeperError> {
+        let mut live: Option<ResolvedDocumentId> = None;
+        for &index in &self.segments_by_seal_desc {
+            let segment = &self.segments[index];
+            let Ok(manifest_index) = manifest
+                .segments
+                .binary_search_by_key(&segment.manifest.docid_lo, |candidate| candidate.docid_lo)
+            else {
+                continue;
+            };
+            let manifest_segment = &manifest.segments[manifest_index];
+            if manifest_segment.segment_id != segment.manifest.segment_id {
+                return Err(KeeperError::InvalidTransition {
+                    detail: format!(
+                        "staged segment range [{}, {}) changed identity from {:#018x} to {:#018x}",
+                        segment.manifest.docid_lo,
+                        segment.manifest.docid_hi,
+                        segment.manifest.segment_id,
+                        manifest_segment.segment_id
+                    ),
+                });
+            }
+            let Some(global_docid) = segment.lookup_document_id(document_id)? else {
+                tracing::trace!(
+                    target: crate::tracing_conventions::TARGET,
+                    phase = "keeper.idhash_probe",
+                    generation = manifest.generation,
+                    segment_id = segment.manifest.segment_id,
+                    seal_seq = segment.manifest.seal_seq,
+                    query_len = document_id.len(),
+                    outcome = "miss",
+                    "probed sealed-segment identity"
+                );
+                continue;
+            };
+            if manifest_segment.tombstones.contains(global_docid) {
+                tracing::trace!(
+                    target: crate::tracing_conventions::TARGET,
+                    phase = "keeper.idhash_probe",
+                    generation = manifest.generation,
+                    segment_id = segment.manifest.segment_id,
+                    seal_seq = segment.manifest.seal_seq,
+                    query_len = document_id.len(),
+                    outcome = "tombstoned",
+                    "continued after tombstoned identity hit"
+                );
+                continue;
+            }
+            let resolved = ResolvedDocumentId {
+                segment_id: segment.manifest.segment_id,
+                seal_seq: segment.manifest.seal_seq,
+                global_docid,
+            };
+            if let Some(first) = live {
+                return Err(KeeperError::MultipleLiveDocumentIds {
+                    directory: self
+                        .directory
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("<in-memory>")),
+                    first_global_docid: first.global_docid,
+                    duplicate_global_docid: global_docid,
+                });
+            }
+            tracing::trace!(
+                target: crate::tracing_conventions::TARGET,
+                phase = "keeper.idhash_probe",
+                generation = manifest.generation,
+                segment_id = segment.manifest.segment_id,
+                seal_seq = segment.manifest.seal_seq,
+                query_len = document_id.len(),
+                outcome = "live",
+                "resolved live sealed-document identity"
+            );
+            live = Some(resolved);
+        }
+        Ok(live)
+    }
+}
+
+impl crate::argus::LiveDocs for KeeperSnapshot {
+    fn is_live(&self, global_docid: u32) -> bool {
+        self.is_live(global_docid)
+    }
+}
+
+impl crate::argus::LiveDocs for Manifest {
+    fn is_live(&self, global_docid: u32) -> bool {
+        let global_docid_u64 = u64::from(global_docid);
+        let insertion = self
+            .segments
+            .partition_point(|segment| segment.docid_lo <= global_docid_u64);
+        insertion
+            .checked_sub(1)
+            .and_then(|index| self.segments.get(index))
+            .is_some_and(|segment| segment.is_live(global_docid))
+    }
+}
+
+fn validate_staged_manifest(previous: &Manifest, proposed: &Manifest) -> Result<(), KeeperError> {
+    proposed
+        .validate()
+        .map_err(|source| KeeperError::InvalidManifest { source })?;
+    validate_manifest_successor(previous, proposed)
 }
 
 #[derive(Clone)]
@@ -3225,6 +4182,7 @@ fn validate_proposed_manifest_segments(
         }
         #[cfg(not(feature = "durability"))]
         let _ = protection;
+        let _validated_segment = RecoveredSegment::bind(path, manifest_segment.clone(), reader)?;
     }
     Ok(())
 }
@@ -5010,14 +5968,14 @@ fn validate_segment_transitions(
                         ),
                     });
                 }
-                let monotone =
-                    tombstones_are_subset(&old.tombstones, &new.tombstones).map_err(|error| {
-                        KeeperError::InvalidTransition {
-                            detail: format!(
-                                "cannot compare tombstones for segment {:#018x}: {error}",
-                                old.segment_id
-                            ),
-                        }
+                let monotone = new
+                    .tombstones
+                    .is_monotone_superset_of(&old.tombstones)
+                    .map_err(|error| KeeperError::InvalidTransition {
+                        detail: format!(
+                            "cannot compare tombstones for segment {:#018x}: {error}",
+                            old.segment_id
+                        ),
                     })?;
                 if !monotone {
                     return Err(KeeperError::InvalidTransition {
@@ -5071,6 +6029,8 @@ struct TombstoneContainer<'a> {
     kind: u8,
     cardinality: u64,
     payload: &'a [u8],
+    payload_offset: usize,
+    encoded: &'a [u8],
 }
 
 struct TombstoneContainers<'a> {
@@ -5097,6 +6057,7 @@ impl<'a> TombstoneContainers<'a> {
             return Ok(None);
         }
 
+        let container_start = self.cursor.position();
         let chunk_id = self.cursor.u16()?;
         let kind = self.cursor.u8()?;
         let encoded_count = self.cursor.u16()?;
@@ -5108,7 +6069,7 @@ impl<'a> TombstoneContainers<'a> {
                 } else {
                     u64::from(encoded_count)
                 },
-                8_192,
+                TOMBSTONE_BITMAP_BYTES,
             ),
             other => {
                 return Err(non_canonical(format!(
@@ -5116,15 +6077,209 @@ impl<'a> TombstoneContainers<'a> {
                 )));
             }
         };
+        let payload_offset = self.cursor.position();
         let payload = self.cursor.take(payload_length)?;
+        let encoded = &self.cursor.bytes[container_start..self.cursor.position()];
         self.remaining -= 1;
         Ok(Some(TombstoneContainer {
             chunk_id,
             kind,
             cardinality,
             payload,
+            payload_offset,
+            encoded,
         }))
     }
+}
+
+fn tombstone_chunk_count(bytes: &[u8]) -> Result<u32, ManifestCodecError> {
+    let mut cursor = ByteCursor::new(bytes);
+    cursor.u32()
+}
+
+fn tombstone_chunk_exists(bytes: &[u8], chunk_id: u16) -> Result<bool, ManifestCodecError> {
+    let mut containers = TombstoneContainers::new(bytes)?;
+    while let Some(container) = containers.next_container()? {
+        match container.chunk_id.cmp(&chunk_id) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => return Ok(true),
+            std::cmp::Ordering::Greater => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
+fn write_tombstone_container_header(
+    output: &mut Vec<u8>,
+    chunk_id: u16,
+    kind: u8,
+    cardinality: u64,
+) -> Result<(), ManifestCodecError> {
+    put_u16(output, chunk_id);
+    output.push(kind);
+    let encoded_count = if kind == 1 && cardinality == 65_536 {
+        0
+    } else {
+        u16::try_from(cardinality)
+            .map_err(|_| invalid("tombstone container cardinality does not fit wire count"))?
+    };
+    put_u16(output, encoded_count);
+    Ok(())
+}
+
+fn write_singleton_tombstone_chunk(output: &mut Vec<u8>, chunk_id: u16, low: u16) {
+    put_u16(output, chunk_id);
+    output.push(0);
+    put_u16(output, 1);
+    put_u16(output, low);
+}
+
+fn write_inserted_tombstone_container(
+    output: &mut Vec<u8>,
+    container: TombstoneContainer<'_>,
+    low: u16,
+) -> Result<(), ManifestCodecError> {
+    let next_cardinality = container
+        .cardinality
+        .checked_add(1)
+        .ok_or_else(|| invalid("tombstone container cardinality overflow"))?;
+    match container.kind {
+        0 if container.cardinality < u64::from(TOMBSTONE_ARRAY_MAX_CARDINALITY) => {
+            write_tombstone_container_header(output, container.chunk_id, 0, next_cardinality)?;
+            let mut emitted = false;
+            for index in 0..container.payload.len() / 2 {
+                let current = array_value(container.payload, index);
+                if !emitted && low < current {
+                    put_u16(output, low);
+                    emitted = true;
+                }
+                put_u16(output, current);
+            }
+            if !emitted {
+                put_u16(output, low);
+            }
+        }
+        0 => {
+            write_tombstone_container_header(output, container.chunk_id, 1, next_cardinality)?;
+            let payload_start = output.len();
+            output.resize(payload_start + TOMBSTONE_BITMAP_BYTES, 0);
+            for index in 0..container.payload.len() / 2 {
+                set_bitmap_value(
+                    &mut output[payload_start..],
+                    array_value(container.payload, index),
+                );
+            }
+            set_bitmap_value(&mut output[payload_start..], low);
+        }
+        1 => {
+            let encoded_start = output.len();
+            output.extend_from_slice(container.encoded);
+            let count_offset = encoded_start + 3;
+            let encoded_count = if next_cardinality == 65_536 {
+                0
+            } else {
+                u16::try_from(next_cardinality)
+                    .map_err(|_| invalid("bitmap tombstone cardinality does not fit wire count"))?
+            };
+            output[count_offset..count_offset + 2].copy_from_slice(&encoded_count.to_le_bytes());
+            let payload_start = encoded_start + 5;
+            set_bitmap_value(
+                &mut output[payload_start..payload_start + TOMBSTONE_BITMAP_BYTES],
+                low,
+            );
+        }
+        _ => return Err(invalid("unknown validated tombstone container kind")),
+    }
+    Ok(())
+}
+
+fn write_removed_tombstone_container(
+    output: &mut Vec<u8>,
+    container: TombstoneContainer<'_>,
+    low: u16,
+) -> Result<(), ManifestCodecError> {
+    let next_cardinality = container
+        .cardinality
+        .checked_sub(1)
+        .ok_or_else(|| invalid("tombstone container cardinality underflow"))?;
+    match container.kind {
+        0 if next_cardinality == 0 => {}
+        0 => {
+            write_tombstone_container_header(output, container.chunk_id, 0, next_cardinality)?;
+            for index in 0..container.payload.len() / 2 {
+                let current = array_value(container.payload, index);
+                if current != low {
+                    put_u16(output, current);
+                }
+            }
+        }
+        1 if next_cardinality < TOMBSTONE_BITMAP_MIN_CARDINALITY => {
+            write_tombstone_container_header(output, container.chunk_id, 0, next_cardinality)?;
+            for (byte_index, byte) in container.payload.iter().copied().enumerate() {
+                let mut bits = byte;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    let value = u16::try_from(byte_index * 8 + bit)
+                        .map_err(|_| invalid("bitmap tombstone low-bit overflow"))?;
+                    if value != low {
+                        put_u16(output, value);
+                    }
+                    bits &= bits - 1;
+                }
+            }
+        }
+        1 => {
+            let encoded_start = output.len();
+            output.extend_from_slice(container.encoded);
+            let count_offset = encoded_start + 3;
+            let encoded_count = if next_cardinality == 65_536 {
+                0
+            } else {
+                u16::try_from(next_cardinality)
+                    .map_err(|_| invalid("bitmap tombstone cardinality does not fit wire count"))?
+            };
+            output[count_offset..count_offset + 2].copy_from_slice(&encoded_count.to_le_bytes());
+            let payload_start = encoded_start + 5;
+            clear_bitmap_value(
+                &mut output[payload_start..payload_start + TOMBSTONE_BITMAP_BYTES],
+                low,
+            );
+        }
+        _ => return Err(invalid("unknown validated tombstone container kind")),
+    }
+    Ok(())
+}
+
+fn array_binary_search(bytes: &[u8], value: u16) -> bool {
+    let mut lo = 0_usize;
+    let mut hi = bytes.len() / 2;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match array_value(bytes, mid).cmp(&value) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Equal => return true,
+            std::cmp::Ordering::Greater => hi = mid,
+        }
+    }
+    false
+}
+
+fn set_bitmap_value(bitmap: &mut [u8], value: u16) {
+    let value = usize::from(value);
+    bitmap[value / 8] |= 1 << (value % 8);
+}
+
+fn clear_bitmap_value(bitmap: &mut [u8], value: u16) {
+    let value = usize::from(value);
+    bitmap[value / 8] &= !(1 << (value % 8));
+}
+
+fn split_tombstone_docid(global_docid: u32) -> (u16, u16) {
+    let bytes = global_docid.to_le_bytes();
+    (
+        u16::from_le_bytes([bytes[2], bytes[3]]),
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+    )
 }
 
 fn tombstones_are_subset(previous: &[u8], proposed: &[u8]) -> Result<bool, ManifestCodecError> {
@@ -5529,10 +6684,10 @@ fn validate_manifest(
                 segment.doc_count
             )));
         }
-        let tombstone_count = validate_tombstone_bytes(
-            &segment.tombstones,
-            Some((segment.docid_lo, segment.docid_hi)),
-        )?;
+        segment
+            .tombstones
+            .validate_range((segment.docid_lo, segment.docid_hi))?;
+        let tombstone_count = segment.tombstones.cardinality();
         if tombstone_count > u64::from(segment.doc_count) {
             return Err(reject(format!(
                 "segment {index} tombstone count {tombstone_count} exceeds doc_count {}",
@@ -5736,7 +6891,7 @@ fn manifest_encoded_len(manifest: &Manifest) -> Result<usize, ManifestCodecError
         )
         .and_then(|length| {
             manifest.segments.iter().try_fold(length, |total, segment| {
-                total.checked_add(segment.tombstones.len())
+                total.checked_add(segment.tombstones.encoded_len())
             })
         })
         .and_then(|length| {
@@ -5879,6 +7034,7 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileHealth};
     use tempfile::tempdir;
 
+    use crate::quiver::{EncodedIdHashSection, EncodedIdMapSection, IdMapEntryInput};
     use crate::schema::{DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA};
     #[cfg(feature = "durability")]
     use crate::segment::SegmentWriteCheckpoint;
@@ -5888,7 +7044,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn array_tombstones(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
+    fn array_tombstone_bytes(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::new();
         put_u32(&mut bytes, 1);
         put_u16(&mut bytes, chunk_id);
@@ -5903,7 +7059,12 @@ mod tests {
         bytes
     }
 
-    fn bitmap_tombstones(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
+    fn array_tombstones(chunk_id: u16, lows: &[u16]) -> TombstoneSet {
+        TombstoneSet::from_bytes(&array_tombstone_bytes(chunk_id, lows))
+            .expect("test array tombstones are canonical")
+    }
+
+    fn bitmap_tombstone_bytes(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::new();
         put_u32(&mut bytes, 1);
         put_u16(&mut bytes, chunk_id);
@@ -5921,6 +7082,11 @@ mod tests {
             bytes[payload_start + low / 8] |= 1 << (low % 8);
         }
         bytes
+    }
+
+    fn bitmap_tombstones(chunk_id: u16, lows: &[u16]) -> TombstoneSet {
+        TombstoneSet::from_bytes(&bitmap_tombstone_bytes(chunk_id, lows))
+            .expect("test bitmap tombstones are canonical")
     }
 
     fn sample_manifest(generation: u64) -> Manifest {
@@ -5949,7 +7115,7 @@ mod tests {
                     docid_lo: 65_536,
                     docid_hi: 65_600,
                     doc_count: 2,
-                    tombstones: EMPTY_TOMBSTONES.to_vec(),
+                    tombstones: TombstoneSet::new(),
                 },
             ],
             field_stats: vec![
@@ -5984,8 +7150,48 @@ mod tests {
         docid_lo: u64,
         docid_hi: u64,
         doc_count: u32,
-    ) -> Result<EncodedSegment, QuillError> {
-        EncodedSegment::encode(
+    ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
+        let span = usize::try_from(docid_hi.saturating_sub(docid_lo))?;
+        let document_ids = (0..span)
+            .map(|ordinal| format!("doc-{segment_id:016x}-{ordinal}"))
+            .collect::<Vec<_>>();
+        let identifiers = document_ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, document_id)| {
+                (ordinal < usize::try_from(doc_count).unwrap_or(usize::MAX))
+                    .then_some(document_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        encoded_identity_test_segment(segment_id, docid_lo, &identifiers)
+    }
+
+    fn encoded_identity_test_segment(
+        segment_id: u64,
+        docid_lo: u64,
+        document_ids: &[Option<&str>],
+    ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
+        let docid_hi = docid_lo
+            .checked_add(u64::try_from(document_ids.len())?)
+            .ok_or_else(|| QuillError::Invariant {
+                detail: "test IDMAP range overflow".to_owned(),
+            })?;
+        let entries = document_ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, document_id)| {
+                document_id.map(|document_id| {
+                    IdMapEntryInput::new(
+                        document_id,
+                        u64::try_from(ordinal).unwrap_or(u64::MAX).saturating_add(1),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let doc_count = u32::try_from(entries.iter().flatten().count())?;
+        let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &entries)?;
+        let id_hash = EncodedIdHashSection::encode(id_map.section()?)?;
+        Ok(EncodedSegment::encode(
             SegmentHeaderInput {
                 segment_id,
                 schema: DEFAULT_SCHEMA,
@@ -6001,12 +7207,27 @@ mod tests {
                 SectionInput::new(SectionKind::POSITIONS, b"positions"),
                 SectionInput::new(SectionKind::BLOCKMAX, b"blockmax"),
                 SectionInput::new(SectionKind::DOCLEN, b"doclen"),
-                SectionInput::new(SectionKind::IDMAP, b"idmap"),
-                SectionInput::new(SectionKind::IDHASH, b"idhash"),
+                SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()),
+                SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()),
                 SectionInput::new(SectionKind::STOREDMETA, b"storedmeta"),
                 SectionInput::new(SectionKind::STATS, b"stats"),
             ],
-        )
+        )?)
+    }
+
+    fn write_identity_test_segment(
+        directory: &Path,
+        segment_id: u64,
+        seal_seq: u64,
+        docid_lo: u64,
+        document_ids: &[Option<&str>],
+    ) -> Result<ManifestSegment, Box<dyn std::error::Error>> {
+        let encoded = encoded_identity_test_segment(segment_id, docid_lo, document_ids)?;
+        std::fs::write(
+            directory.join(canonical_segment_name(segment_id)),
+            encoded.as_bytes(),
+        )?;
+        Ok(manifest_segment(&encoded, seal_seq))
     }
 
     fn write_test_segment(
@@ -6034,7 +7255,7 @@ mod tests {
             docid_lo: header.docid_lo,
             docid_hi: header.docid_hi,
             doc_count: header.doc_count,
-            tombstones: EMPTY_TOMBSTONES.to_vec(),
+            tombstones: TombstoneSet::new(),
         }
     }
 
@@ -6262,28 +7483,24 @@ mod tests {
         manifest.segments[0].tombstones = array_tombstones(0, &[99]);
         assert!(manifest.validate().is_err());
 
-        let mut manifest = sample_manifest(1);
-        manifest.segments[0].tombstones = array_tombstones(0, &[150, 150]);
-        assert!(manifest.validate().is_err());
+        assert!(TombstoneSet::from_bytes(&array_tombstone_bytes(0, &[150, 150])).is_err());
 
         let mut bitmap = vec![1, 0, 0, 0, 0, 0, 1, 1, 0];
         bitmap.extend_from_slice(&[0; 8_192]);
         bitmap[9] = 1;
-        let mut manifest = sample_manifest(1);
-        manifest.segments[0].tombstones = bitmap;
-        assert!(manifest.validate().is_err());
+        assert!(TombstoneSet::from_bytes(&bitmap).is_err());
     }
 
     #[test]
     fn tombstone_container_thresholds_and_chunk_count_are_bounded() {
         let oversized_lows = (0..=TOMBSTONE_ARRAY_MAX_CARDINALITY).collect::<Vec<_>>();
         assert!(matches!(
-            validate_tombstone_bytes(&array_tombstones(0, &oversized_lows), None),
+            validate_tombstone_bytes(&array_tombstone_bytes(0, &oversized_lows), None),
             Err(ManifestCodecError::NonCanonical { .. })
         ));
 
         assert!(matches!(
-            validate_tombstone_bytes(&bitmap_tombstones(0, &[7]), None),
+            validate_tombstone_bytes(&bitmap_tombstone_bytes(0, &[7]), None),
             Err(ManifestCodecError::NonCanonical { .. })
         ));
 
@@ -6292,10 +7509,11 @@ mod tests {
             .collect::<Vec<_>>();
         let dense = bitmap_tombstones(0, &dense_lows);
         assert_eq!(
-            validate_tombstone_bytes(&dense, Some((0, 65_536))).expect("dense bitmap is canonical"),
+            validate_tombstone_bytes(dense.as_bytes(), Some((0, 65_536)))
+                .expect("dense bitmap is canonical"),
             TOMBSTONE_BITMAP_MIN_CARDINALITY
         );
-        assert!(validate_tombstone_bytes(&dense, Some((100, 65_536))).is_err());
+        assert!(validate_tombstone_bytes(dense.as_bytes(), Some((100, 65_536))).is_err());
 
         let mut too_many_chunks = Vec::new();
         put_u32(
@@ -6311,13 +7529,117 @@ mod tests {
         ));
 
         let sparse = array_tombstones(0, &[1, 100]);
-        let dense_lows = (0..u16::try_from(TOMBSTONE_BITMAP_MIN_CARDINALITY)
-            .expect("bitmap threshold fits u16"))
-            .collect::<Vec<_>>();
+        let dense_lows = (0..=TOMBSTONE_ARRAY_MAX_CARDINALITY).collect::<Vec<_>>();
         let dense = bitmap_tombstones(0, &dense_lows);
-        assert!(tombstones_are_subset(&sparse, &dense).expect("compare array to bitmap"));
-        let missing = array_tombstones(0, &[1, 4_000]);
-        assert!(!tombstones_are_subset(&missing, &dense).expect("detect missing bitmap bit"));
+        assert!(
+            dense
+                .is_monotone_superset_of(&sparse)
+                .expect("compare array to bitmap")
+        );
+        let missing = array_tombstones(0, &[1, 5_000]);
+        assert!(
+            !dense
+                .is_monotone_superset_of(&missing)
+                .expect("detect missing bitmap bit")
+        );
+    }
+
+    #[test]
+    fn tombstone_set_mutation_preserves_hysteresis_and_exact_roundtrip() -> TestResult {
+        let sparse_lows = (0..4_095_u16).collect::<Vec<_>>();
+        let mut set = array_tombstones(0, &sparse_lows);
+        assert_eq!(set.cardinality(), 4_095);
+        assert_eq!(set.as_bytes()[6], 0);
+
+        assert!(set.insert(4_095)?);
+        assert_eq!(set.cardinality(), 4_096);
+        assert_eq!(set.as_bytes()[6], 0, "4,096 remains ARRAY");
+        let array_wire = set.as_bytes().to_vec();
+        assert_eq!(
+            TombstoneSet::from_bytes(&array_wire)?.as_bytes(),
+            array_wire
+        );
+
+        assert!(set.insert(4_096)?);
+        assert_eq!(set.cardinality(), 4_097);
+        assert_eq!(set.as_bytes()[6], 1, "4,097 promotes to BITMAP");
+        assert!((0..=4_096_u32).all(|docid| set.contains(docid)));
+        let bitmap_wire = set.as_bytes().to_vec();
+        assert_eq!(
+            TombstoneSet::from_bytes(&bitmap_wire)?.as_bytes(),
+            bitmap_wire
+        );
+
+        let dense_lows = (0..3_585_u16).collect::<Vec<_>>();
+        let mut dense = bitmap_tombstones(0, &dense_lows);
+        assert!(dense.remove(3_584)?);
+        assert_eq!(dense.cardinality(), 3_584);
+        assert_eq!(dense.as_bytes()[6], 1, "3,584 retains BITMAP");
+        assert!(dense.remove(3_583)?);
+        assert_eq!(dense.cardinality(), 3_583);
+        assert_eq!(dense.as_bytes()[6], 0, "3,583 demotes to ARRAY");
+        Ok(())
+    }
+
+    #[test]
+    fn tombstone_set_handles_chunk_edges_duplicates_and_full_bitmap() -> TestResult {
+        let mut set = TombstoneSet::new();
+        for docid in [u32::MAX, 0, 65_536 + 7, 65_535] {
+            assert!(set.insert(docid)?);
+        }
+        assert!(!set.insert(u32::MAX)?);
+        assert_eq!(set.cardinality(), 4);
+        assert!(
+            [u32::MAX, 0, 65_536 + 7, 65_535]
+                .into_iter()
+                .all(|docid| set.contains(docid))
+        );
+        assert_eq!(tombstone_chunk_count(set.as_bytes())?, 3);
+        assert_eq!(TombstoneSet::from_bytes(set.as_bytes())?, set);
+
+        let all_lows = (0..=u16::MAX).collect::<Vec<_>>();
+        let mut full = bitmap_tombstones(u16::MAX, &all_lows);
+        assert_eq!(full.cardinality(), 65_536);
+        assert_eq!(&full.as_bytes()[7..9], &[0, 0]);
+        assert!(full.remove(u32::MAX)?);
+        assert_eq!(&full.as_bytes()[7..9], &u16::MAX.to_le_bytes());
+        assert!(full.insert(u32::MAX)?);
+        assert_eq!(&full.as_bytes()[7..9], &[0, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn tombstone_successors_preserve_representation_state() -> TestResult {
+        let array_4_096 = array_tombstones(0, &(0..4_096_u16).collect::<Vec<_>>());
+        let bitmap_4_097 = bitmap_tombstones(0, &(0..4_097_u16).collect::<Vec<_>>());
+        assert!(bitmap_4_097.is_monotone_superset_of(&array_4_096)?);
+
+        let bitmap_3_584 = bitmap_tombstones(0, &(0..3_584_u16).collect::<Vec<_>>());
+        let array_3_585 = array_tombstones(0, &(0..3_585_u16).collect::<Vec<_>>());
+        assert!(
+            !array_3_585.is_monotone_superset_of(&bitmap_3_584)?,
+            "retained BITMAP cannot demote in a growth-only generation"
+        );
+
+        let array_overlap = array_tombstones(0, &(0..4_096_u16).collect::<Vec<_>>());
+        let bitmap_overlap = bitmap_tombstones(0, &(0..4_096_u16).collect::<Vec<_>>());
+        assert!(
+            !bitmap_overlap.is_monotone_superset_of(&array_overlap)?,
+            "ARRAY cannot promote before its 4,097th member"
+        );
+        assert!(
+            !bitmap_3_584.is_monotone_superset_of(&TombstoneSet::new())?,
+            "a new chunk cannot begin as BITMAP inside the hysteresis overlap"
+        );
+        assert_eq!(
+            TombstoneSet::from_bytes(array_overlap.as_bytes())?.as_bytes(),
+            array_overlap.as_bytes()
+        );
+        assert_eq!(
+            TombstoneSet::from_bytes(bitmap_overlap.as_bytes())?.as_bytes(),
+            bitmap_overlap.as_bytes()
+        );
+        Ok(())
     }
 
     #[test]
@@ -6616,7 +7938,7 @@ mod tests {
                 docid_lo: 70_000,
                 docid_hi: 70_001,
                 doc_count: 1,
-                tombstones: EMPTY_TOMBSTONES.to_vec(),
+                tombstones: TombstoneSet::new(),
             });
             assert!(matches!(
                 publisher.publish(&cx, &stale_seal).await,
@@ -7898,7 +9220,7 @@ mod tests {
             docid_lo: 10,
             docid_hi: 20,
             doc_count: 1,
-            tombstones: EMPTY_TOMBSTONES.to_vec(),
+            tombstones: TombstoneSet::new(),
         };
         let manifest = durable_test_manifest(1, vec![segment]);
         write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
@@ -7928,6 +9250,266 @@ mod tests {
             Err(KeeperError::SchemaMismatch { .. })
         ));
         Ok(())
+    }
+
+    #[test]
+    fn staged_delete_filters_before_commit_and_persists_after_publish() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempdir().expect("temp directory");
+            let low = write_identity_test_segment(directory.path(), 0x201, 10, 0, &[Some("same")])
+                .expect("write low segment");
+            let mut high =
+                write_identity_test_segment(directory.path(), 0x202, 30, 100, &[Some("same")])
+                    .expect("write high segment");
+            assert!(
+                high.tombstones
+                    .insert(100)
+                    .expect("tombstone newer representative")
+            );
+            let mut manifest = durable_test_manifest(1, vec![low, high]);
+            manifest.field_stats.push(ManifestFieldStats {
+                field_ord: 0,
+                total_tokens: 17,
+                doc_count: 2,
+            });
+            write_manifest(&directory.path().join("MANIFEST"), &manifest)
+                .expect("write genesis manifest");
+
+            let original = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .expect("open original snapshot");
+            assert_eq!(original.at_seal_doc_count(), 2);
+            assert_eq!(original.tombstone_count(), 1);
+            assert_eq!(original.doc_count(), 1);
+            assert!(original.is_live(0));
+            assert!(!original.is_live(100));
+            assert_eq!(
+                original
+                    .resolve_document_id("same")
+                    .expect("resolve through tombstoned newest segment"),
+                Some(ResolvedDocumentId {
+                    segment_id: 0x201,
+                    seal_seq: 10,
+                    global_docid: 0,
+                })
+            );
+
+            let mut proposed = original.next_manifest().expect("next generation");
+            assert!(
+                original
+                    .delete_document(&mut proposed, "same")
+                    .expect("stage delete")
+            );
+            assert!(original.is_live(0), "installed snapshot remains unchanged");
+            assert!(!crate::argus::LiveDocs::is_live(&proposed, 0));
+            assert_eq!(proposed.field_stats, manifest.field_stats);
+            let idempotent = proposed.clone();
+            assert!(
+                !original
+                    .delete_document(&mut proposed, "same")
+                    .expect("already-deleted id is a no-op")
+            );
+            assert_eq!(proposed, idempotent);
+
+            let mut writer = KeeperWriter::open(&cx, directory.path(), DEFAULT_SCHEMA)
+                .await
+                .expect("open writer");
+            let published = writer
+                .publish(&cx, &proposed)
+                .await
+                .expect("publish tombstone generation");
+            assert_eq!(published.at_seal_doc_count(), 2);
+            assert_eq!(published.tombstone_count(), 2);
+            assert_eq!(published.doc_count(), 0);
+            assert_eq!(
+                published.loaded_manifest().manifest.field_stats,
+                manifest.field_stats
+            );
+            assert_eq!(
+                published
+                    .resolve_document_id("same")
+                    .expect("all-dead lookup"),
+                None
+            );
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .expect("reopen published tombstones");
+            assert_eq!(reopened.doc_count(), 0);
+            assert!(!reopened.is_live(0));
+            assert!(original.is_live(0), "older mmap snapshot stays visible");
+
+            let high_watermark = writer
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .docid_high_watermark;
+            let segment_paths = writer
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| segment.path().to_path_buf())
+                .collect::<Vec<_>>();
+            let mut empty = writer.snapshot().next_manifest().expect("empty successor");
+            writer
+                .snapshot()
+                .delete_all(&mut empty)
+                .expect("stage delete_all");
+            assert!(empty.segments.is_empty());
+            assert!(empty.field_stats.is_empty());
+            assert_eq!(empty.docid_high_watermark, high_watermark);
+            assert_eq!(empty.schema_id, manifest.schema_id);
+            assert_eq!(empty.engine_version, manifest.engine_version);
+            let empty_snapshot = writer
+                .publish(&cx, &empty)
+                .await
+                .expect("publish delete_all generation");
+            assert_eq!(empty_snapshot.at_seal_doc_count(), 0);
+            assert_eq!(empty_snapshot.tombstone_count(), 0);
+            assert_eq!(empty_snapshot.doc_count(), 0);
+            assert!(
+                segment_paths.iter().all(|path| path.exists()),
+                "publication never synchronously reclaims segment files"
+            );
+        });
+    }
+
+    #[test]
+    fn identity_resolution_handles_repeated_upserts_and_duplicate_live_rows() -> TestResult {
+        let directory = tempdir()?;
+        let mut segments = Vec::new();
+        for (ordinal, (docid_lo, seal_seq)) in [(0_u64, 40_u64), (10, 10), (20, 30), (30, 20)]
+            .into_iter()
+            .enumerate()
+        {
+            let segment_id = 0x300 + u64::try_from(ordinal)?;
+            let mut segment = write_identity_test_segment(
+                directory.path(),
+                segment_id,
+                seal_seq,
+                docid_lo,
+                &[Some("repeated")],
+            )?;
+            if docid_lo != 20 {
+                assert!(segment.tombstones.insert(u32::try_from(docid_lo)?)?);
+            }
+            segments.push(segment);
+        }
+        let manifest = durable_test_manifest(1, segments);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(snapshot.at_seal_doc_count(), 4);
+        assert_eq!(snapshot.tombstone_count(), 3);
+        assert_eq!(snapshot.doc_count(), 1);
+        assert_eq!(
+            snapshot.resolve_document_id("repeated")?,
+            Some(ResolvedDocumentId {
+                segment_id: 0x302,
+                seal_seq: 30,
+                global_docid: 20,
+            })
+        );
+
+        let mut all_dead = manifest.clone();
+        assert!(all_dead.segments[2].tombstones.insert(20)?);
+        write_manifest(&directory.path().join("MANIFEST"), &all_dead)?;
+        assert_eq!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?
+                .resolve_document_id("repeated")?,
+            None
+        );
+
+        let mut duplicate_live = manifest;
+        assert!(duplicate_live.segments[0].tombstones.remove(0)?);
+        write_manifest(&directory.path().join("MANIFEST"), &duplicate_live)?;
+        let duplicate = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert!(matches!(
+            duplicate.resolve_document_id("repeated"),
+            Err(KeeperError::MultipleLiveDocumentIds {
+                first_global_docid: 0,
+                duplicate_global_docid: 20,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_rejects_tombstone_targeting_idmap_hole() -> TestResult {
+        let directory = tempdir()?;
+        let segment =
+            write_identity_test_segment(directory.path(), 0x401, 1, 50, &[None, Some("present")])?;
+        let clean_manifest = durable_test_manifest(1, vec![segment]);
+        write_manifest(&directory.path().join("MANIFEST"), &clean_manifest)?;
+        let clean = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(clean.doc_count(), 1);
+        assert!(!clean.is_live(50));
+        assert!(clean.is_live(51));
+        assert!(!crate::argus::LiveDocs::is_live(&clean.segments()[0], 50));
+        assert!(crate::argus::LiveDocs::is_live(&clean.segments()[0], 51));
+
+        let mut manifest = clean_manifest;
+        assert!(manifest.segments[0].tombstones.insert(50)?);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::TombstoneReferencesHole {
+                segment_id: 0x401,
+                global_docid: 50,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn publish_preflight_rejects_tombstone_hole_without_replacing_manifest() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempdir().expect("temp directory");
+            let segment = write_identity_test_segment(
+                directory.path(),
+                0x402,
+                1,
+                50,
+                &[None, Some("present")],
+            )
+            .expect("write identity segment");
+            let manifest = durable_test_manifest(1, vec![segment]);
+            let manifest_path = directory.path().join("MANIFEST");
+            write_manifest(&manifest_path, &manifest).expect("write initial manifest");
+
+            let mut writer = KeeperWriter::open(&cx, directory.path(), DEFAULT_SCHEMA)
+                .await
+                .expect("open writer");
+            let before = std::fs::read(&manifest_path).expect("read initial manifest");
+            let mut proposed = writer.snapshot().next_manifest().expect("next generation");
+            assert!(
+                proposed.segments[0]
+                    .tombstones
+                    .insert(50)
+                    .expect("stage hole tombstone")
+            );
+
+            assert!(matches!(
+                writer.publish(&cx, &proposed).await,
+                Err(KeeperError::TombstoneReferencesHole {
+                    segment_id: 0x402,
+                    global_docid: 50,
+                    ..
+                })
+            ));
+            assert_eq!(
+                std::fs::read(&manifest_path).expect("read manifest after rejection"),
+                before,
+                "preflight rejection must leave the current MANIFEST untouched"
+            );
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                    .expect("reopen prior snapshot")
+                    .loaded_manifest()
+                    .manifest
+                    .generation,
+                1
+            );
+        });
     }
 
     #[test]
@@ -8537,7 +10119,7 @@ mod tests {
             docid_lo: 0,
             docid_hi: 2,
             doc_count: 1,
-            tombstones: EMPTY_TOMBSTONES.to_vec(),
+            tombstones: TombstoneSet::new(),
         };
         write_manifest(
             &directory.path().join("MANIFEST"),
