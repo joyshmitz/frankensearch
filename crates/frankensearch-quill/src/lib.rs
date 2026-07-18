@@ -18,6 +18,7 @@ pub mod config;
 pub mod contract;
 pub mod error;
 pub mod grimoire;
+pub mod index;
 pub mod keeper;
 pub mod query;
 pub mod quiver;
@@ -36,23 +37,23 @@ pub use grimoire::{
     TermDictionaryError, TermDictionaryLimits, TermInput, TermMatch, TermMetadata, TermRef,
     TermScratch, TermSectionLengths,
 };
+pub use index::{QuillHit, QuillIndex, QuillIndexError, QuillSearchResult};
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
     CurrentPointer, CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
     GarbageCollectionOptions, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
-    LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC,
-    Manifest, ManifestCodecError,
-    ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment, ResolvedCurrent,
-    ResolvedDocumentId, TombstoneSet, WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC,
-    WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version, publish_current,
-    resolve_current, unpack_engine_version,
+    LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC, Manifest,
+    ManifestCodecError, ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment,
+    ResolvedCurrent, ResolvedDocumentId, TombstoneSet, WRITER_LOCK_FORMAT_VERSION,
+    WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version,
+    publish_current, resolve_current, unpack_engine_version,
 };
 pub use query::{
     BooleanClause, BooleanOperator, CassQueryFilters, CassQueryParser, CassQueryParserConfigError,
     CassSourceFilter, CassWildcardPattern, DefaultQueryParser, MAX_QUERY_DEPTH, MAX_QUERY_LENGTH,
-    Occur, ParsedQuery, PositionedTerm, Query, QueryDiagnostic, QueryDiagnosticKind,
-    QueryExplanation, QueryField, QueryParserConfigError, QueryValue, cass_sanitize_query,
-    classify_query, truncate_query,
+    Occur, ParsedQuery, PositionedTerm, Query, QueryCanonicalizationReport, QueryDiagnostic,
+    QueryDiagnosticKind, QueryExplanation, QueryField, QueryParserConfigError, QueryValue,
+    canonicalize_query, cass_sanitize_query, classify_query, truncate_query,
 };
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,

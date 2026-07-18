@@ -191,6 +191,291 @@ impl Query {
     }
 }
 
+/// Outcome of one [`canonicalize_query`] pass (bd-quill-duel-ast-dedup-7hsu).
+///
+/// Every count is score-neutral by construction: scoring clauses
+/// (`Term`/`Phrase`/scoring `Must`/`Should`) are never removed, so oracle
+/// conformance on duplicate-term queries is preserved exactly.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QueryCanonicalizationReport {
+    /// Exact-duplicate `MustNot` clauses removed (exclusion is idempotent).
+    pub must_not_duplicates_removed: usize,
+    /// Exact-duplicate match-only (`Range`/`Set`/`Glob`/`All`) `Must` clauses
+    /// removed (constant-score filters; a `Term`/`Phrase` `Must` is scoring
+    /// and is always retained).
+    pub filter_duplicates_removed: usize,
+    /// Exact-duplicate field entries removed from `Term`/`Phrase` expansions
+    /// (an exact `(field_id, boost)` repeat would double-score one branch).
+    pub duplicate_fields_removed: usize,
+    /// Boolean nodes whose children were re-ordered into the deterministic
+    /// canonical order.
+    pub boolean_levels_sorted: usize,
+    /// Glob nodes whose field list was sorted/deduplicated.
+    pub glob_fields_canonicalized: usize,
+}
+
+/// Rank used to group canonical Boolean children: required, optional,
+/// excluded. Within one group, children order by their structural key.
+const fn occur_rank(occur: Occur) -> u8 {
+    match occur {
+        Occur::Must => 0,
+        Occur::Should => 1,
+        Occur::MustNot => 2,
+    }
+}
+
+/// Whether a query branch is a constant-score filter: it cannot contribute
+/// BM25 score, so an exact duplicate under `Must` is removable.
+fn is_match_only_filter(query: &Query) -> bool {
+    match query {
+        Query::All | Query::Range { .. } | Query::Set { .. } | Query::Glob { .. } => true,
+        // A Boost wrapper around a filter multiplies a constant score and
+        // remains a filter for dedup purposes only when the factor is one.
+        Query::Boost { query, factor } => {
+            factor.to_bits() == 1.0_f32.to_bits() && is_match_only_filter(query)
+        }
+        Query::Empty | Query::Term { .. } | Query::Phrase { .. } | Query::Boolean { .. } => false,
+    }
+}
+
+fn push_query_field_key(out: &mut Vec<u8>, field: QueryField) {
+    out.extend_from_slice(&field.field_id.to_be_bytes());
+    out.extend_from_slice(&field.boost.to_bits().to_be_bytes());
+}
+
+fn push_query_value_key(out: &mut Vec<u8>, value: &QueryValue) {
+    match value {
+        QueryValue::I64(v) => {
+            out.push(0);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        QueryValue::U64(v) => {
+            out.push(1);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+        QueryValue::Str(text) => {
+            out.push(2);
+            out.extend_from_slice(text.as_bytes());
+        }
+    }
+}
+
+fn push_bound_key(out: &mut Vec<u8>, bound: &Bound<QueryValue>) {
+    match bound {
+        Bound::Included(value) => {
+            out.push(0);
+            push_query_value_key(out, value);
+        }
+        Bound::Excluded(value) => {
+            out.push(1);
+            push_query_value_key(out, value);
+        }
+        Bound::Unbounded => out.push(2),
+    }
+}
+
+/// Total deterministic structural key for one query subtree. Two subtrees
+/// share a key iff they are structurally identical (field ids, boost bits,
+/// terms, positions, bounds, values, patterns, and child order-sensitive
+/// structure), so the key is safe both for deterministic ordering and for
+/// exact-duplicate detection.
+fn canonical_sort_key(query: &Query) -> Vec<u8> {
+    let mut out = Vec::new();
+    match query {
+        Query::Empty => out.push(0),
+        Query::All => out.push(1),
+        Query::Term { fields, text } => {
+            out.push(2);
+            for field in fields {
+                push_query_field_key(&mut out, *field);
+            }
+            out.push(0xFF);
+            out.extend_from_slice(text.as_bytes());
+        }
+        Query::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        } => {
+            out.push(3);
+            for field in fields {
+                push_query_field_key(&mut out, *field);
+            }
+            out.push(0xFF);
+            for term in terms {
+                out.extend_from_slice(&term.position.to_be_bytes());
+                out.extend_from_slice(term.text.as_bytes());
+                out.push(0);
+            }
+            out.extend_from_slice(&slop.to_be_bytes());
+            out.push(u8::from(*prefix));
+        }
+        Query::Boolean { clauses, operator } => {
+            out.push(4);
+            out.push(match operator {
+                None => 0,
+                Some(BooleanOperator::And) => 1,
+                Some(BooleanOperator::Or) => 2,
+            });
+            for clause in clauses {
+                out.push(occur_rank(clause.occur));
+                out.extend_from_slice(&canonical_sort_key(&clause.query));
+                out.push(0xFE);
+            }
+        }
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => {
+            out.push(5);
+            out.extend_from_slice(&field_id.to_be_bytes());
+            push_bound_key(&mut out, lower);
+            push_bound_key(&mut out, upper);
+        }
+        Query::Set { field_id, values } => {
+            out.push(6);
+            out.extend_from_slice(&field_id.to_be_bytes());
+            for value in values {
+                push_query_value_key(&mut out, value);
+                out.push(0xFD);
+            }
+        }
+        Query::Glob { field_ids, pattern } => {
+            out.push(7);
+            for field_id in field_ids {
+                out.extend_from_slice(&field_id.to_be_bytes());
+            }
+            out.push(0xFF);
+            out.extend_from_slice(pattern.as_bytes());
+        }
+        Query::Boost { query, factor } => {
+            out.push(8);
+            out.extend_from_slice(&factor.to_bits().to_be_bytes());
+            out.extend_from_slice(&canonical_sort_key(query));
+        }
+    }
+    out
+}
+
+/// Canonicalize a parsed query tree for deterministic planning and
+/// score-neutral deduplication (bd-quill-duel-ast-dedup-7hsu).
+///
+/// The pass is recursive (bottom-up) and applies four score-neutral rules:
+///
+/// 1. **Deterministic order**: Boolean children are sorted by
+///    `(occur, structural key)` so one input always plans identically. BM25
+///    sum-union scoring is commutative over clauses, and rank-safe pruning
+///    (e4.4) makes evaluation order invisible, so this changes no score.
+/// 2. **`MustNot` dedup**: exact-duplicate exclusion clauses collapse to
+///    one; exclusion is idempotent.
+/// 3. **Match-only `Must` dedup**: exact-duplicate constant-score filters
+///    (`Range`/`Set`/`Glob`/`All`, or factor-1 boosts of them) collapse.
+///    Scoring clauses — `Term`, `Phrase`, and every `Should` — are never
+///    removed: Lucene/Tantivy do not dedup scoring clauses, so duplicate
+///    terms must keep their repeated contribution for oracle conformance.
+/// 4. **Field-list hygiene**: exact duplicate `(field_id, boost)` entries
+///    are removed from `Term`/`Phrase` expansions (preserving contract
+///    order), and `Glob` field ids are sorted and deduplicated.
+///
+/// Clause-level repetition caps are unnecessary here: `MAX_QUERY_LENGTH`
+/// already bounds the source, and this pass only rewrites structure.
+/// Idempotent: a second pass is a no-op and returns a zero report.
+#[must_use]
+pub fn canonicalize_query(query: &mut Query) -> QueryCanonicalizationReport {
+    let mut report = QueryCanonicalizationReport::default();
+    canonicalize_query_inner(query, &mut report);
+    report
+}
+
+fn canonicalize_query_inner(query: &mut Query, report: &mut QueryCanonicalizationReport) {
+    match query {
+        Query::Boolean { clauses, .. } => {
+            for clause in clauses.iter_mut() {
+                canonicalize_query_inner(&mut clause.query, report);
+            }
+            // MustNot dedup: exclusion is idempotent.
+            let mut seen_must_not = Vec::new();
+            clauses.retain(|clause| {
+                if clause.occur != Occur::MustNot {
+                    return true;
+                }
+                let key = canonical_sort_key(&clause.query);
+                if seen_must_not.contains(&key) {
+                    report.must_not_duplicates_removed += 1;
+                    return false;
+                }
+                seen_must_not.push(key);
+                true
+            });
+            // Match-only Must dedup: constant-score filters only; scoring
+            // clauses are never removed (oracle conformance).
+            let mut seen_filters = Vec::new();
+            clauses.retain(|clause| {
+                if clause.occur != Occur::Must || !is_match_only_filter(&clause.query) {
+                    return true;
+                }
+                let key = canonical_sort_key(&clause.query);
+                if seen_filters.contains(&key) {
+                    report.filter_duplicates_removed += 1;
+                    return false;
+                }
+                seen_filters.push(key);
+                true
+            });
+            // Deterministic order: group by occur rank, structural key within.
+            let before: Vec<Vec<u8>> = clauses
+                .iter()
+                .map(|clause| (occur_rank(clause.occur), canonical_sort_key(&clause.query)))
+                .map(|(rank, key)| {
+                    let mut composite = vec![rank];
+                    composite.extend_from_slice(&key);
+                    composite
+                })
+                .collect();
+            clauses.sort_by_cached_key(|clause| {
+                let mut composite = vec![occur_rank(clause.occur)];
+                composite.extend_from_slice(&canonical_sort_key(&clause.query));
+                composite
+            });
+            let after: Vec<Vec<u8>> = clauses
+                .iter()
+                .map(|clause| {
+                    let mut composite = vec![occur_rank(clause.occur)];
+                    composite.extend_from_slice(&canonical_sort_key(&clause.query));
+                    composite
+                })
+                .collect();
+            if before != after {
+                report.boolean_levels_sorted += 1;
+            }
+        }
+        Query::Term { fields, .. } | Query::Phrase { fields, .. } => {
+            let mut seen = Vec::new();
+            fields.retain(|field| {
+                let key = (field.field_id, field.boost.to_bits());
+                if seen.contains(&key) {
+                    report.duplicate_fields_removed += 1;
+                    return false;
+                }
+                seen.push(key);
+                true
+            });
+        }
+        Query::Glob { field_ids, .. } => {
+            let original = field_ids.clone();
+            field_ids.sort_unstable();
+            field_ids.dedup();
+            if *field_ids != original {
+                report.glob_fields_canonicalized += 1;
+            }
+        }
+        Query::Boost { query, .. } => canonicalize_query_inner(query, report),
+        Query::Empty | Query::All | Query::Range { .. } | Query::Set { .. } => {}
+    }
+}
+
 /// Stable user-facing classification preserved from the incumbent adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum QueryExplanation {
@@ -2371,6 +2656,19 @@ fn negative_boolean_dedup_key(child: &str) -> String {
     )
 }
 
+/// Whether a lowered node is a negation wrapper: exactly one MustNot child.
+/// Exclusion is idempotent, so identical wrappers may merge at combine time
+/// (bd-quill-duel-ast-dedup).
+fn is_negation_wrapper(query: &Query) -> bool {
+    matches!(
+        query,
+        Query::Boolean {
+            clauses,
+            operator: None,
+        } if clauses.len() == 1 && clauses[0].occur == Occur::MustNot
+    )
+}
+
 fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
     combine_boolean(
         nodes,
@@ -2407,9 +2705,20 @@ fn combine_boolean(
     let mut keys = Vec::with_capacity(nodes.len());
     for node in nodes {
         let occur = node.occur.unwrap_or(default_occur);
-        if !keys.iter().any(|(candidate_occur, candidate_key)| {
-            *candidate_occur == occur && candidate_key == &node.dedup_key
-        }) {
+        // Only idempotent occurrences merge (bd-quill-duel-ast-dedup): in a
+        // BM25 sum-union, (A OR A) scores A twice, so merging positive
+        // clauses would diverge from the oracle. Lone MustNot clauses and
+        // negation wrappers exclude the same documents once or twice
+        // identically, so they may merge. Score-affecting cursor sharing is
+        // deferred to the query planner (e4.4+), where duplicate scoring
+        // clauses can share one cursor and multiply its contribution —
+        // score-identical and probe-cheap.
+        let mergeable = occur == Occur::MustNot || is_negation_wrapper(&node.query);
+        if !mergeable
+            || !keys.iter().any(|(candidate_occur, candidate_key)| {
+                *candidate_occur == occur && candidate_key == &node.dedup_key
+            })
+        {
             keys.push((occur, node.dedup_key));
             clauses.push(BooleanClause::new(occur, node.query));
         }
@@ -4884,18 +5193,32 @@ mod tests {
 
     #[test]
     fn boosts_groups_and_scopes_canonicalize_before_dedup() {
-        assert!(matches!(
-            parser().parse("(rust) rust").query,
-            Query::Term { .. }
-        ));
-        assert!(matches!(
-            parser().parse("rust rust^1").query,
-            Query::Term { .. }
-        ));
-        assert!(matches!(
-            parser().parse("rust^2 rust^2.0").query,
-            Query::Boost { factor, .. } if factor.to_bits() == 2.0_f32.to_bits()
-        ));
+        // Conformance contract (bd-quill-duel-ast-dedup-7hsu): scoring
+        // duplicates are RETAINED because the oracle's BM25 sum-union scores
+        // (A OR A) twice. Only MustNot clauses and negation wrappers merge —
+        // exclusion is idempotent. Boost/group/scope recovery still
+        // canonicalizes before that merge decision.
+        for raw in ["(rust) rust", "rust rust^1", "rust^2 rust^2.0"] {
+            let Query::Boolean { clauses, .. } = &parser().parse(raw).query else {
+                panic!("{raw:?} must retain both scoring clauses");
+            };
+            assert_eq!(
+                clauses.len(),
+                2,
+                "{raw:?}: scoring duplicates are never merged"
+            );
+            assert_eq!(clauses[0].query, clauses[1].query, "{raw:?}");
+        }
+        // Idempotent exclusions DO merge.
+        let merged = parser().parse("-rust -rust").query;
+        let count_must_not = |query: &Query| match query {
+            Query::Boolean { clauses, .. } => clauses
+                .iter()
+                .filter(|clause| clause.occur == Occur::MustNot)
+                .count(),
+            _ => 0,
+        };
+        assert_eq!(count_must_not(&merged), 1, "duplicate exclusions merge");
 
         for raw in ["rust^2^3", "(rust)^2^3", "\"rust\"^2^3"] {
             let recovered = parser().parse(raw);
@@ -4927,7 +5250,12 @@ mod tests {
         }));
 
         let invalid = parser().parse("rust rust^scientific1e2");
-        assert!(matches!(invalid.query, Query::Term { .. }));
+        // The invalid boost is rejected, the atom survives as a scoring Term,
+        // and scoring duplicates are retained (bd-quill-duel-ast-dedup-7hsu).
+        assert!(matches!(
+            invalid.query,
+            Query::Boolean { .. } | Query::Term { .. }
+        ));
         assert!(
             invalid
                 .diagnostics
@@ -5264,10 +5592,14 @@ mod tests {
 
     #[test]
     fn dedup_is_raw_and_does_not_merge_distinct_normalized_fragments() {
-        assert!(matches!(
-            parser().parse("rust rust").query,
-            Query::Term { .. }
-        ));
+        // Scoring duplicates are retained verbatim — the oracle's sum-union
+        // scores them twice (bd-quill-duel-ast-dedup-7hsu).
+        let Query::Boolean { clauses, .. } = parser().parse("rust rust").query else {
+            panic!("scoring duplicates must be retained");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].query, clauses[1].query);
+
         let distinct = parser().parse("Rust rust").query;
         assert!(matches!(&distinct, Query::Boolean { .. }));
         let Query::Boolean { clauses, .. } = distinct else {
@@ -5276,6 +5608,7 @@ mod tests {
         assert_eq!(clauses.len(), 2);
         assert_eq!(clauses[0].query, clauses[1].query);
 
+        // Idempotent MustNot clauses DO merge, even nested.
         let recursive = parser().parse("a OR -b OR (-b)").query;
         assert!(matches!(
             recursive,
@@ -5653,5 +5986,230 @@ mod tests {
                 .any(|clause| clause.occur == Occur::MustNot && clause.query.is_empty()),
             "negated oversized operand lowers to MustNot(Empty): {clauses:?}"
         );
+    }
+
+    // ==== AST canonicalization (bd-quill-duel-ast-dedup-7hsu) ====
+
+    fn term_clause(occur: Occur, field_id: u16, text: &str) -> BooleanClause {
+        BooleanClause::new(
+            occur,
+            Query::Term {
+                fields: vec![QueryField::new(field_id, 1.0)],
+                text: text.to_owned(),
+            },
+        )
+    }
+
+    fn range_clause(occur: Occur, field_id: u16, low: i64, high: i64) -> BooleanClause {
+        BooleanClause::new(
+            occur,
+            Query::Range {
+                field_id,
+                lower: Bound::Included(QueryValue::I64(low)),
+                upper: Bound::Included(QueryValue::I64(high)),
+            },
+        )
+    }
+
+    #[test]
+    fn canonicalize_dedups_must_not_and_preserves_distinct_exclusions() {
+        let mut query = Query::Boolean {
+            clauses: vec![
+                term_clause(Occur::MustNot, 1, "alpha"),
+                term_clause(Occur::MustNot, 1, "beta"),
+                term_clause(Occur::MustNot, 1, "alpha"),
+                term_clause(Occur::Must, 1, "gamma"),
+            ],
+            operator: None,
+        };
+        let report = canonicalize_query(&mut query);
+        assert_eq!(report.must_not_duplicates_removed, 1);
+        let Query::Boolean { clauses, .. } = &query else {
+            panic!("stays Boolean")
+        };
+        let must_not_terms: Vec<_> = clauses
+            .iter()
+            .filter(|clause| clause.occur == Occur::MustNot)
+            .filter_map(|clause| match &clause.query {
+                Query::Term { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(must_not_terms, ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn canonicalize_never_dedups_scoring_clauses_for_oracle_conformance() {
+        // THE CAVEAT: (A OR A) scores A twice in the oracle's sum-union, so
+        // scoring duplicates MUST survive canonicalization.
+        let mut should_query = Query::Boolean {
+            clauses: vec![
+                term_clause(Occur::Should, 1, "alpha"),
+                term_clause(Occur::Should, 1, "alpha"),
+                term_clause(Occur::Should, 1, "alpha"),
+            ],
+            operator: Some(BooleanOperator::Or),
+        };
+        let report = canonicalize_query(&mut should_query);
+        assert_eq!(report.must_not_duplicates_removed, 0);
+        assert_eq!(report.filter_duplicates_removed, 0);
+        let Query::Boolean { clauses, .. } = &should_query else {
+            panic!("stays Boolean")
+        };
+        assert_eq!(clauses.len(), 3, "every scoring duplicate is retained");
+
+        // Scoring Must (Term) duplicates are retained for the same reason.
+        let mut must_query = Query::Boolean {
+            clauses: vec![
+                term_clause(Occur::Must, 1, "alpha"),
+                term_clause(Occur::Must, 1, "alpha"),
+            ],
+            operator: Some(BooleanOperator::And),
+        };
+        canonicalize_query(&mut must_query);
+        let Query::Boolean { clauses, .. } = &must_query else {
+            panic!("stays Boolean")
+        };
+        assert_eq!(clauses.len(), 2, "scoring Must duplicates are retained");
+    }
+
+    #[test]
+    fn canonicalize_dedups_match_only_must_filters() {
+        let mut query = Query::Boolean {
+            clauses: vec![
+                range_clause(Occur::Must, 7, 10, 99),
+                term_clause(Occur::Must, 1, "alpha"),
+                range_clause(Occur::Must, 7, 10, 99),
+                BooleanClause::new(Occur::Must, Query::All),
+                BooleanClause::new(Occur::Must, Query::All),
+            ],
+            operator: None,
+        };
+        let report = canonicalize_query(&mut query);
+        assert_eq!(report.filter_duplicates_removed, 2);
+        let Query::Boolean { clauses, .. } = &query else {
+            panic!("stays Boolean")
+        };
+        assert_eq!(clauses.len(), 3);
+        assert!(
+            clauses
+                .iter()
+                .any(|clause| matches!(&clause.query, Query::Term { text, .. } if text == "alpha"))
+        );
+    }
+
+    #[test]
+    fn canonicalize_sorts_children_deterministically() {
+        let shuffled = Query::Boolean {
+            clauses: vec![
+                term_clause(Occur::MustNot, 1, "zzz"),
+                term_clause(Occur::Must, 9, "beta"),
+                term_clause(Occur::Should, 3, "alpha"),
+                term_clause(Occur::Must, 1, "alpha"),
+            ],
+            operator: None,
+        };
+        let mut left = shuffled.clone();
+        let mut right = Query::Boolean {
+            clauses: vec![
+                term_clause(Occur::Must, 1, "alpha"),
+                term_clause(Occur::Should, 3, "alpha"),
+                term_clause(Occur::Must, 9, "beta"),
+                term_clause(Occur::MustNot, 1, "zzz"),
+            ],
+            operator: None,
+        };
+        canonicalize_query(&mut left);
+        canonicalize_query(&mut right);
+        assert_eq!(left, right, "any input order yields one canonical plan");
+        let Query::Boolean { clauses, .. } = &left else {
+            panic!("stays Boolean")
+        };
+        let occurs: Vec<_> = clauses.iter().map(|clause| clause.occur).collect();
+        assert_eq!(
+            occurs,
+            [Occur::Must, Occur::Must, Occur::Should, Occur::MustNot]
+        );
+    }
+
+    #[test]
+    fn canonicalize_recurses_and_is_idempotent() {
+        let mut query = Query::Boolean {
+            clauses: vec![
+                BooleanClause::new(
+                    Occur::Must,
+                    Query::Boolean {
+                        clauses: vec![
+                            term_clause(Occur::MustNot, 2, "dup"),
+                            term_clause(Occur::MustNot, 2, "dup"),
+                            term_clause(Occur::Must, 2, "b"),
+                            term_clause(Occur::Must, 2, "a"),
+                        ],
+                        operator: None,
+                    },
+                ),
+                term_clause(Occur::Must, 1, "outer"),
+            ],
+            operator: None,
+        };
+        let first = canonicalize_query(&mut query);
+        assert_eq!(first.must_not_duplicates_removed, 1);
+        assert!(first.boolean_levels_sorted >= 1);
+        let after_first = query.clone();
+        let second = canonicalize_query(&mut query);
+        assert_eq!(query, after_first, "idempotent");
+        assert_eq!(second.must_not_duplicates_removed, 0);
+        assert_eq!(second.filter_duplicates_removed, 0);
+        assert_eq!(second.boolean_levels_sorted, 0);
+    }
+
+    #[test]
+    fn canonicalize_cleans_glob_fields_and_duplicate_field_expansions() {
+        let mut glob = Query::Glob {
+            field_ids: vec![3, 1, 3, 2, 1],
+            pattern: "alp*".to_owned(),
+        };
+        let report = canonicalize_query(&mut glob);
+        assert_eq!(report.glob_fields_canonicalized, 1);
+        let Query::Glob { field_ids, .. } = &glob else {
+            panic!("stays Glob")
+        };
+        assert_eq!(field_ids, &[1, 2, 3]);
+
+        let mut term = Query::Term {
+            fields: vec![
+                QueryField::new(1, 1.0),
+                QueryField::new(2, 2.0),
+                QueryField::new(1, 1.0),
+                QueryField::new(1, 2.0), // same id, different boost: kept
+            ],
+            text: "alpha".to_owned(),
+        };
+        let report = canonicalize_query(&mut term);
+        assert_eq!(report.duplicate_fields_removed, 1);
+        let Query::Term { fields, .. } = &term else {
+            panic!("stays Term")
+        };
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], QueryField::new(1, 1.0));
+        assert_eq!(fields[1], QueryField::new(2, 2.0));
+        assert_eq!(fields[2], QueryField::new(1, 2.0));
+    }
+
+    #[test]
+    fn canonicalize_leaves_parse_fixtures_exact_when_already_canonical() {
+        // A query that is already canonical is byte-stable (no report, no
+        // reorder), so differential-pinned parser fixtures never drift.
+        let mut query = Query::Boolean {
+            clauses: vec![
+                term_clause(Occur::Must, 1, "alpha"),
+                term_clause(Occur::Should, 3, "beta"),
+            ],
+            operator: Some(BooleanOperator::And),
+        };
+        let original = query.clone();
+        let report = canonicalize_query(&mut query);
+        assert_eq!(query, original);
+        assert_eq!(report.boolean_levels_sorted, 0);
     }
 }
