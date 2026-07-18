@@ -4,7 +4,9 @@ RaptorQ durability primitives for frankensearch indices.
 
 ## Overview
 
-This crate provides a durability layer for frankensearch index artifacts using RaptorQ fountain codes (via FrankenSQLite's `SymbolCodec`). It enables self-healing of corrupted vector index files and Tantivy segments by encoding repair symbols into binary trailers appended to protected files. If corruption is detected (via CRC32 or xxHash verification), the repair data can reconstruct the original content without external backups.
+This crate provides a durability layer for frankensearch index artifacts using RaptorQ fountain codes (via FrankenSQLite's `SymbolCodec`). It enables self-healing of corrupted index files by encoding repair symbols into binary trailers appended to protected files. If corruption is detected (via CRC32 or xxHash verification), the repair data can reconstruct the original content without external backups.
+
+The crate is engine-neutral by construction (bd-tkjm): Tantivy appears nowhere in its dependency graph. Engine-specific wrappers compose with the generic `FileProtector` boundary from their own crates; the retired `DurableTantivyIndex`/`TantivySegmentProtector` wrapper (`src/tantivy_wrapper.rs`) is no longer part of the build, and its removal proposal rides with the post-flip retirement sweep (quill-e9.3).
 
 ## Key Types
 
@@ -31,11 +33,9 @@ This crate provides a durability layer for frankensearch index artifacts using R
 - `FsviProtector` - specialized protector for FSVI vector index files
 - `FsviVerifyResult` / `FsviRepairResult` / `FsviProtectionResult` - FSVI-specific outcomes
 
-### Tantivy Segment Protection
+### Tantivy Segment Protection (retired)
 
-- `DurableTantivyIndex` - durability wrapper for Tantivy lexical indices
-- `TantivySegmentProtector` - per-segment protection for Tantivy index files
-- `SegmentHealthReport` / `SegmentProtectionReport` - segment-level health diagnostics
+`DurableTantivyIndex` and `TantivySegmentProtector` were removed from the build in the Quill migration (bd-tkjm) so this crate stays engine-neutral; `src/tantivy_wrapper.rs` remains on disk only until the quill-e9.3 retirement sweep lands its approved removal.
 
 ### Repair Trailer Format
 

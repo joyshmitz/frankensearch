@@ -14,17 +14,16 @@ fsqlite-error = "0.1.2"
 fsqlite-types = "0.1.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
-tantivy = { workspace = true, optional = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 memmap2 = { workspace = true }
 
 [features]
-default = ["tantivy"]
-# Tantivy-specific wrappers are optional so non-Tantivy storage engines can
-# reuse the generic file durability primitives without pulling Tantivy in.
-tantivy = ["dep:tantivy"]
+# Engine-neutral by construction (bd-tkjm): durability primitives compose with
+# any engine through the generic FileProtector boundary; the retired Tantivy
+# wrapper is no longer built (retirement sweep: quill-e9.3).
+default = []
 # Exposes bench-only twins (e.g. FileProtector::verify_and_repair_file_no_reuse) for A/B benches.
 bench-internals = []
 

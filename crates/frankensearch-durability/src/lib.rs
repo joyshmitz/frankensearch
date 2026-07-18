@@ -6,8 +6,12 @@
 //! `FrankenSQLite`'s `RaptorQ` abstractions (`SymbolCodec`) plus:
 //! - binary repair-trailer I/O,
 //! - file protection / verification / repair orchestration,
-//! - Tantivy segment helper wrappers,
 //! - durability telemetry counters.
+//!
+//! Engine neutrality (bd-tkjm): this crate never depends on a concrete search
+//! engine. The retired Tantivy wrapper (`tantivy_wrapper.rs`) is no longer
+//! part of the build; its removal proposal rides with the post-flip
+//! retirement sweep (quill-e9.3).
 #![allow(
     clippy::missing_const_for_fn,
     clippy::missing_errors_doc,
@@ -22,8 +26,6 @@ pub mod file_protector;
 pub mod fsvi_protector;
 pub mod metrics;
 pub mod repair_trailer;
-#[cfg(feature = "tantivy")]
-pub mod tantivy_wrapper;
 
 pub use codec::{
     CodecFacade, DecodeFailureClass, DecodedPayload, DefaultSymbolCodec, EncodedData,
@@ -41,8 +43,4 @@ pub use metrics::{DecodeOutcomeClass, DurabilityMetrics, DurabilityMetricsSnapsh
 pub use repair_trailer::{
     REPAIR_TRAILER_MAGIC, REPAIR_TRAILER_VERSION, RepairSymbol, RepairTrailerHeader,
     deserialize_repair_trailer, serialize_repair_trailer,
-};
-#[cfg(feature = "tantivy")]
-pub use tantivy_wrapper::{
-    DurableTantivyIndex, SegmentHealthReport, SegmentProtectionReport, TantivySegmentProtector,
 };
