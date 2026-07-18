@@ -29,7 +29,9 @@ use crate::quiver::{
     IdHashCodecError, IdHashLookupPlan, IdHashSection, IdMapCodecError, IdMapSection,
 };
 use crate::schema::SchemaDescriptor;
-use crate::segment::{PendingSegmentFile, SectionKind, SegmentHeader, SegmentReader};
+use crate::segment::{
+    EncodedSegment, PendingSegmentFile, SectionKind, SegmentHeader, SegmentReader,
+};
 
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
 
@@ -1280,9 +1282,55 @@ impl TombstoneIndex {
     }
 }
 
+enum RecoveredSegmentBacking {
+    Mapped(SegmentReader<ReadOnlyMappedFile>),
+    Owned(SegmentReader<Vec<u8>>),
+}
+
+impl RecoveredSegmentBacking {
+    fn header(&self) -> SegmentHeader {
+        match self {
+            Self::Mapped(reader) => reader.header(),
+            Self::Owned(reader) => reader.header(),
+        }
+    }
+
+    fn section(&self, kind: SectionKind) -> Result<Option<&[u8]>, QuillError> {
+        match self {
+            Self::Mapped(reader) => reader.section(kind),
+            Self::Owned(reader) => reader.section(kind),
+        }
+    }
+
+    fn verify(&self) -> Result<(), QuillError> {
+        match self {
+            Self::Mapped(reader) => reader.verify(),
+            Self::Owned(reader) => reader.verify(),
+        }
+    }
+
+    fn source_bytes(&self) -> &[u8] {
+        match self {
+            Self::Mapped(reader) => reader.source_bytes(),
+            Self::Owned(reader) => reader.source_bytes(),
+        }
+    }
+
+    fn validate_witnesses(
+        &self,
+        path: &Path,
+        manifest: &ManifestSegment,
+    ) -> Result<(), KeeperError> {
+        match self {
+            Self::Mapped(reader) => validate_segment_witnesses(path, manifest, reader),
+            Self::Owned(reader) => validate_segment_witnesses(path, manifest, reader),
+        }
+    }
+}
+
 fn required_identity_section<'a>(
     path: &Path,
-    reader: &'a SegmentReader<ReadOnlyMappedFile>,
+    reader: &'a RecoveredSegmentBacking,
     kind: SectionKind,
 ) -> Result<&'a [u8], KeeperError> {
     reader
@@ -1345,16 +1393,16 @@ pub struct ResolvedDocumentId {
     pub global_docid: u32,
 }
 
-/// One immutable, mmap-backed segment admitted by a recovered snapshot.
+/// One immutable mapped or owned segment admitted by a recovered snapshot.
 ///
 /// Structural framing, MANIFEST witnesses, and the IDMAP-bound IDHASH identity
-/// pair are checked during open. All unrelated payload hashes remain lazy and
-/// are checked on first access.
+/// pair are checked during open or owned publication. All unrelated payload
+/// hashes remain lazy and are checked on first access.
 #[derive(Clone)]
 pub struct RecoveredSegment {
     path: PathBuf,
     manifest: ManifestSegment,
-    reader: Arc<SegmentReader<ReadOnlyMappedFile>>,
+    reader: Arc<RecoveredSegmentBacking>,
     tombstone_index: TombstoneIndex,
     id_lookup: IdHashLookupPlan,
     live_doc_count: u32,
@@ -1366,7 +1414,38 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: SegmentReader<ReadOnlyMappedFile>,
     ) -> Result<Self, KeeperError> {
-        let reader = Arc::new(reader);
+        Self::bind_backing(path, manifest, RecoveredSegmentBacking::Mapped(reader))
+    }
+
+    fn bind_owned(
+        path: PathBuf,
+        manifest: ManifestSegment,
+        encoded: EncodedSegment,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        let reader = SegmentReader::from_owned(encoded.into_bytes(), schema).map_err(|source| {
+            KeeperError::SegmentOpen {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        validate_segment_witnesses(&path, &manifest, &reader)?;
+        Self::bind_backing(path, manifest, RecoveredSegmentBacking::Owned(reader))
+    }
+
+    fn bind_backing(
+        path: PathBuf,
+        manifest: ManifestSegment,
+        reader: RecoveredSegmentBacking,
+    ) -> Result<Self, KeeperError> {
+        Self::bind_shared(path, manifest, Arc::new(reader))
+    }
+
+    fn bind_shared(
+        path: PathBuf,
+        manifest: ManifestSegment,
+        reader: Arc<RecoveredSegmentBacking>,
+    ) -> Result<Self, KeeperError> {
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
             .map_err(|source| KeeperError::IdMapCorrupted {
@@ -1421,7 +1500,12 @@ impl RecoveredSegment {
         })
     }
 
-    /// Canonical published segment path.
+    fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
+        self.reader.validate_witnesses(&self.path, &manifest)?;
+        Self::bind_shared(self.path.clone(), manifest, Arc::clone(&self.reader))
+    }
+
+    /// Canonical published path, or a stable synthetic label for owned bytes.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -1512,6 +1596,12 @@ impl RecoveredSegment {
         self.reader.section(kind)
     }
 
+    /// Borrow the complete immutable FSLX image for byte-level verification.
+    #[must_use]
+    pub fn source_bytes(&self) -> &[u8] {
+        self.reader.source_bytes()
+    }
+
     /// Eagerly recompute every segment checksum for doctor-style verification.
     ///
     /// # Errors
@@ -1534,8 +1624,8 @@ impl crate::argus::LiveDocs for RecoveredSegment {
 ///
 /// `open` performs recovery by selecting the admitted MANIFEST slot and
 /// validating every referenced segment. It never repairs, renames, or removes
-/// filesystem entries. Keeping this value alive keeps its immutable mmaps
-/// alive as well.
+/// filesystem entries. Keeping this value alive retains every immutable mapped
+/// or owned byte source as well.
 #[derive(Clone)]
 pub struct KeeperSnapshot {
     directory: Option<PathBuf>,
@@ -1679,7 +1769,7 @@ impl KeeperSnapshot {
 
     /// Construct an owned-buffer genesis snapshot without creating files.
     ///
-    /// Later ingest milestones attach mutable deltas and owned FSLX segments;
+    /// [`Self::publish_owned_segments`] attaches committed owned FSLX bytes;
     /// recovery and garbage collection remain no-ops for this backend.
     ///
     /// # Errors
@@ -1697,6 +1787,141 @@ impl KeeperSnapshot {
                 source: ManifestSource::InMemory,
             },
             Vec::new(),
+        )
+    }
+
+    /// Publish owned FSLX segments into one immutable in-memory successor.
+    ///
+    /// `proposed` must be the exact next MANIFEST generation. Retained
+    /// segments reuse their immutable byte backing while adopting only the
+    /// successor's validated tombstone state. Every newly referenced segment
+    /// must have exactly one matching `EncodedSegment`; unreferenced or
+    /// duplicate inputs are rejected. The current snapshot is never changed,
+    /// so encoded bytes remain invisible until this method returns the fully
+    /// validated successor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed backend, MANIFEST-transition, segment-witness, or
+    /// identity-section error. Durable snapshots must publish through
+    /// [`KeeperWriter`] instead.
+    pub fn publish_owned_segments(
+        &self,
+        proposed: &Manifest,
+        encoded_segments: Vec<EncodedSegment>,
+    ) -> Result<Self, KeeperError> {
+        if self.directory.is_some() || self.loaded.source != ManifestSource::InMemory {
+            return Err(KeeperError::InvalidTransition {
+                detail: "owned segment publication requires an in-memory Keeper snapshot"
+                    .to_owned(),
+            });
+        }
+        proposed
+            .validate()
+            .map_err(|source| KeeperError::InvalidManifest { source })?;
+        validate_manifest_successor(&self.loaded.manifest, proposed)?;
+
+        let mut owned_by_id = Vec::new();
+        owned_by_id
+            .try_reserve_exact(encoded_segments.len())
+            .map_err(|error| KeeperError::InvalidTransition {
+                detail: format!("owned segment inventory allocation failed: {error}"),
+            })?;
+        for encoded in encoded_segments {
+            owned_by_id.push((encoded.header().segment_id, Some(encoded)));
+        }
+        owned_by_id.sort_unstable_by_key(|entry| entry.0);
+        if let Some(duplicate) = owned_by_id
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0)
+        {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!("owned segment {duplicate:#018x} was supplied more than once"),
+            });
+        }
+
+        let mut current_by_id = Vec::new();
+        current_by_id
+            .try_reserve_exact(self.segments.len())
+            .map_err(|error| KeeperError::InvalidTransition {
+                detail: format!("current segment inventory allocation failed: {error}"),
+            })?;
+        current_by_id.extend(0..self.segments.len());
+        current_by_id.sort_unstable_by_key(|&index| self.segments[index].manifest.segment_id);
+
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(proposed.segments.len())
+            .map_err(|error| KeeperError::InvalidTransition {
+                detail: format!("successor segment inventory allocation failed: {error}"),
+            })?;
+        for manifest_segment in &proposed.segments {
+            let segment_id = manifest_segment.segment_id;
+            let current = current_by_id
+                .binary_search_by_key(&segment_id, |&index| {
+                    self.segments[index].manifest.segment_id
+                })
+                .ok()
+                .map(|index| current_by_id[index]);
+            let supplied = owned_by_id
+                .binary_search_by_key(&segment_id, |entry| entry.0)
+                .ok();
+
+            if let Some(current) = current {
+                if supplied.is_some() {
+                    return Err(KeeperError::InvalidTransition {
+                        detail: format!(
+                            "retained segment {segment_id:#018x} also supplied replacement bytes"
+                        ),
+                    });
+                }
+                segments.push(self.segments[current].rebind(manifest_segment.clone())?);
+                continue;
+            }
+
+            let supplied = supplied.ok_or_else(|| KeeperError::InvalidTransition {
+                detail: format!(
+                    "new manifest segment {segment_id:#018x} has no supplied owned bytes"
+                ),
+            })?;
+            let encoded =
+                owned_by_id[supplied]
+                    .1
+                    .take()
+                    .ok_or_else(|| KeeperError::InvalidTransition {
+                        detail: format!(
+                            "owned segment {segment_id:#018x} was consumed more than once"
+                        ),
+                    })?;
+            let path = PathBuf::from("<in-memory>").join(canonical_segment_name(segment_id));
+            segments.push(RecoveredSegment::bind_owned(
+                path,
+                manifest_segment.clone(),
+                encoded,
+                self.schema,
+            )?);
+        }
+
+        if let Some(unreferenced) = owned_by_id
+            .iter()
+            .find_map(|(segment_id, encoded)| encoded.is_some().then_some(*segment_id))
+        {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "supplied owned segment {unreferenced:#018x} is absent from the successor manifest"
+                ),
+            });
+        }
+
+        Self::from_parts(
+            None,
+            self.schema,
+            LoadedManifest {
+                manifest: proposed.clone(),
+                source: ManifestSource::InMemory,
+            },
+            segments,
         )
     }
 
@@ -2004,6 +2229,19 @@ fn validate_staged_manifest(previous: &Manifest, proposed: &Manifest) -> Result<
     validate_manifest_successor(previous, proposed)
 }
 
+fn manifest_matches_proposal(installed: &Manifest, proposed: &Manifest) -> bool {
+    if proposed.last_publish_unix_s == 0 {
+        if installed.last_publish_unix_s <= 0 {
+            return false;
+        }
+        let mut normalized = installed.clone();
+        normalized.last_publish_unix_s = 0;
+        &normalized == proposed
+    } else {
+        installed == proposed
+    }
+}
+
 #[derive(Clone)]
 enum WriterProtection {
     Disabled,
@@ -2222,7 +2460,8 @@ impl KeeperWriter {
     /// # Errors
     ///
     /// Returns typed cancellation, claim, transition, durability, or I/O
-    /// failures. The prior snapshot remains installed on error.
+    /// failures. An ambiguous prior attempt is reconciled to the exact
+    /// installed proposal; a differing installed generation remains an error.
     pub async fn publish(
         &mut self,
         cx: &Cx,
@@ -2262,13 +2501,13 @@ impl KeeperWriter {
         }
         let claim_admission = Arc::clone(&self.admission);
         let publisher = ManifestPublisher::new(&directory);
-        match &self.protection {
+        let publish_result = match &self.protection {
             WriterProtection::Disabled => {
                 publisher
                     .publish_with_generation_claim(cx, manifest, move |_, generation| {
                         GenerationClaimGuard::acquire(claim_admission, generation)
                     })
-                    .await?;
+                    .await
             }
             #[cfg(feature = "durability")]
             WriterProtection::Enabled(protector) => {
@@ -2281,12 +2520,44 @@ impl KeeperWriter {
                             GenerationClaimGuard::acquire(claim_admission, generation)
                         },
                     )
-                    .await?;
+                    .await
             }
+        };
+        if let Err(error) = publish_result {
+            if self.reconcile_manifest_proposal(cx, manifest).await? {
+                return Ok(&self.snapshot);
+            }
+            return Err(error);
         }
         self.admission.ensure_directory_identity()?;
         self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
         Ok(&self.snapshot)
+    }
+
+    async fn reconcile_manifest_proposal(
+        &mut self,
+        cx: &Cx,
+        proposed: &Manifest,
+    ) -> Result<bool, KeeperError> {
+        let guard = writer_mutation_guard(cx).await?;
+        let admission = Arc::clone(&self.admission);
+        let protection = self.protection.clone();
+        let schema = self.snapshot.schema();
+        let directory = admission.directory.clone();
+        spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            recover_writer_directory(&admission, schema, &protection)?;
+            sync_directory(&admission.directory)?;
+            admission.ensure_directory_identity()
+        })
+        .await?;
+        let recovered = open_snapshot_blocking(directory, schema).await?;
+        if !manifest_matches_proposal(&recovered.loaded_manifest().manifest, proposed) {
+            return Ok(false);
+        }
+        self.snapshot = recovered;
+        Ok(true)
     }
 
     /// Atomically install one synced immutable segment while holding `LOCK`.
@@ -2328,6 +2599,11 @@ impl KeeperWriter {
                     ),
                 });
             }
+            if let Some(published) = reconcile_published_segment(&admission, &protection, &pending)?
+            {
+                admission.ensure_directory_identity()?;
+                return Ok(published);
+            }
             let published = match &protection {
                 WriterProtection::Disabled => publish_pending_segment(pending),
                 #[cfg(feature = "durability")]
@@ -2362,6 +2638,83 @@ impl KeeperWriter {
         })
         .await
     }
+}
+
+fn reconcile_published_segment(
+    admission: &WriterAdmissionInner,
+    protection: &WriterProtection,
+    pending: &PendingSegmentFile,
+) -> Result<Option<PathBuf>, KeeperError> {
+    let published = admission
+        .directory
+        .join(canonical_segment_name(pending.segment_id()));
+    let published_metadata = match std::fs::symlink_metadata(&published) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "inspect retry segment destination",
+                path: published,
+                source,
+            });
+        }
+    };
+    let pending_metadata =
+        std::fs::symlink_metadata(pending.path()).map_err(|source| KeeperError::Io {
+            operation: "inspect retry segment temp",
+            path: pending.path().to_path_buf(),
+            source,
+        })?;
+    if !published_metadata.file_type().is_file()
+        || !pending_metadata.file_type().is_file()
+        || published_metadata.len() != pending.file_len()
+        || pending_metadata.len() != pending.file_len()
+    {
+        return Err(KeeperError::Io {
+            operation: "reconcile published segment",
+            path: published,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "published segment and retry temp are not matching regular files",
+            ),
+        });
+    }
+    let expected = std::fs::read(pending.path()).map_err(|source| KeeperError::Io {
+        operation: "read retry segment temp",
+        path: pending.path().to_path_buf(),
+        source,
+    })?;
+    let actual = std::fs::read(&published).map_err(|source| KeeperError::Io {
+        operation: "read retry segment destination",
+        path: published.clone(),
+        source,
+    })?;
+    if actual != expected {
+        return Err(KeeperError::Io {
+            operation: "reconcile published segment",
+            path: published,
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "published segment differs from the retry temp",
+            ),
+        });
+    }
+    File::open(&published)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "sync reconciled segment",
+            path: published.clone(),
+            source,
+        })?;
+    sync_directory(&admission.directory)?;
+    #[cfg(feature = "durability")]
+    if let WriterProtection::Enabled(protector) = protection {
+        ensure_matching_durability_sidecar(admission, protector, &published, &actual)?;
+        sync_directory(&admission.directory)?;
+    }
+    #[cfg(not(feature = "durability"))]
+    let _ = protection;
+    Ok(Some(published))
 }
 
 async fn writer_mutation_guard(cx: &Cx) -> Result<OwnedMutexGuard<()>, KeeperError> {
@@ -4162,7 +4515,7 @@ fn create_probed_file(
             .open(&candidate)
         {
             Ok(file) => return Ok((candidate, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(KeeperError::Io {
                     operation: "create collision-safe staging file",
@@ -7318,9 +7671,9 @@ fn validate_manifest(
                 stats.field_ord
             )));
         }
-        if u64::from(stats.doc_count) > total_documents {
+        if u64::from(stats.doc_count) != total_documents {
             return Err(reject(format!(
-                "field {} doc_count {} exceeds aggregate segment count {total_documents}",
+                "field {} doc_count {} differs from canonical at-seal denominator {total_documents} (bd-quill-e3-keeper-ndtk.10)",
                 stats.field_ord, stats.doc_count
             )));
         }
@@ -8407,7 +8760,7 @@ mod tests {
                 ManifestFieldStats {
                     field_ord: 3,
                     total_tokens: 42,
-                    doc_count: 4,
+                    doc_count: 5,
                 },
             ],
         }
@@ -8938,6 +9291,49 @@ mod tests {
     }
 
     #[test]
+    fn stats_denominator_must_equal_the_canonical_at_seal_count() {
+        // Every field row uses the same global at-seal denominator
+        // (bd-quill-e3-keeper-ndtk.10); tombstones do not change it. Reject
+        // deviations in either direction; exact equality round-trips.
+        let mut too_large = sample_manifest(1);
+        too_large.field_stats[0].doc_count = 6;
+        let error = too_large.validate().expect_err("over-count rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("differs from canonical at-seal denominator")
+        );
+
+        let mut too_small = sample_manifest(1);
+        too_small.field_stats[1].doc_count = 4;
+        let error = too_small.validate().expect_err("under-count rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("differs from canonical at-seal denominator")
+        );
+
+        let canonical = sample_manifest(1);
+        canonical.validate().expect("exact denominator passes");
+        let bytes = canonical.to_bytes().expect("encode canonical");
+        assert_eq!(
+            Manifest::from_bytes(&bytes).expect("decode canonical"),
+            canonical,
+            "canonical denominator round-trips"
+        );
+
+        // Tombstones never change the denominator: removing the tombstone
+        // set from a segment does not relax the equality rule.
+        let mut no_tombstones = canonical;
+        no_tombstones.segments[0].tombstones = TombstoneSet::new();
+        no_tombstones
+            .validate()
+            .expect("tombstone-free keeps denominator");
+        no_tombstones.field_stats[0].doc_count = 2;
+        assert!(no_tombstones.validate().is_err());
+    }
+
+    #[test]
     fn arbitrary_bytes_never_panic() {
         let mut state = 0x5e31_9a72_d0c4_b611_u64;
         for case in 0..1_000 {
@@ -9224,6 +9620,11 @@ mod tests {
                 doc_count: 1,
                 tombstones: TombstoneSet::new(),
             });
+            // Keep the canonical STATS denominator consistent with the new
+            // aggregate so the stale seal_seq is the transition being tested.
+            for stats in &mut stale_seal.field_stats {
+                stats.doc_count = 6;
+            }
             assert!(matches!(
                 publisher.publish(&cx, &stale_seal).await,
                 Err(KeeperError::InvalidTransition { .. })
@@ -9288,7 +9689,7 @@ mod tests {
                 ManifestFieldStats {
                     field_ord: 3,
                     total_tokens: 42,
-                    doc_count: 2,
+                    doc_count: 3,
                 },
             ];
             publisher
@@ -10483,6 +10884,58 @@ mod tests {
                 Err(KeeperError::SchemaMismatch { .. })
             ));
         });
+    }
+
+    #[test]
+    fn owned_segment_publication_is_snapshot_isolated_and_uniform() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xb01, 0, &[Some("owned-a")])?;
+        let second = encoded_identity_test_segment(0xb02, 65_536, &[None, Some("owned-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 131_072;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+
+        assert!(original.segments().is_empty());
+        assert_eq!(original.doc_count(), 0);
+        assert_eq!(original.materialize_document_id(0), None);
+
+        let published = original.publish_owned_segments(&proposed, vec![first, second])?;
+        assert!(
+            original.segments().is_empty(),
+            "old snapshot stays unchanged"
+        );
+        assert_eq!(original.doc_count(), 0);
+        assert_eq!(published.segments().len(), 2);
+        assert_eq!(published.at_seal_doc_count(), 2);
+        assert_eq!(published.doc_count(), 2);
+        assert_eq!(
+            published.materialize_document_id(0),
+            Some(DocId::new("owned-a"))
+        );
+        assert_eq!(published.materialize_document_id(65_536), None);
+        assert_eq!(
+            published.materialize_document_id(65_537),
+            Some(DocId::new("owned-b"))
+        );
+        assert_eq!(published.segments()[0].header().segment_id, 0xb01);
+        assert_eq!(
+            published.segments()[1].section(SectionKind::TERMDICT)?,
+            Some(b"termdict".as_slice())
+        );
+        published.segments()[0].verify()?;
+        published.segments()[1].verify()?;
+
+        let mut tombstoned = published.next_manifest()?;
+        assert!(tombstoned.segments[0].insert_tombstone(0)?);
+        let deleted = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert_eq!(deleted.doc_count(), 1);
+        assert_eq!(deleted.materialize_document_id(0), None);
+        assert_eq!(
+            published.materialize_document_id(0),
+            Some(DocId::new("owned-a")),
+            "retained owned backing does not change the older snapshot"
+        );
+        Ok(())
     }
 
     #[test]
@@ -11911,6 +12364,175 @@ mod tests {
                 .and_then(|entry| entry.file_name().into_string().ok())
                 .is_some_and(|name| name.starts_with(".tmp-abandoned-manifest-3-"))
         }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeper_writer_adopts_exact_published_segment_and_preserves_retry_temp() -> TestResult {
+        let directory = tempdir()?.keep();
+        let assertion_directory = directory.clone();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let encoded =
+                encoded_test_segment(0xa11d, 0, 2, 1).map_err(|error| error.to_string())?;
+            let canonical = directory.join(canonical_segment_name(encoded.header().segment_id));
+            std::fs::write(&canonical, encoded.as_bytes()).map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            let temp_path = pending.path().to_path_buf();
+
+            let published = writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            if published != canonical {
+                return Err("reconciled segment returned the wrong canonical path".to_owned());
+            }
+            if std::fs::read(&canonical).map_err(|error| error.to_string())? != encoded.as_bytes() {
+                return Err("reconciled canonical segment bytes changed".to_owned());
+            }
+            if std::fs::read(&temp_path).map_err(|error| error.to_string())? != encoded.as_bytes() {
+                return Err("reconciled retry temp was not preserved exactly".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
+        assert!(assertion_directory.is_dir());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeper_writer_rejects_differing_published_segment_without_overwrite() -> TestResult {
+        let directory = tempdir()?.keep();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let encoded =
+                encoded_test_segment(0xc011, 0, 2, 1).map_err(|error| error.to_string())?;
+            let canonical = directory.join(canonical_segment_name(encoded.header().segment_id));
+            let mut differing = encoded.as_bytes().to_vec();
+            let changed = differing
+                .last_mut()
+                .ok_or_else(|| "encoded segment fixture must not be empty".to_owned())?;
+            *changed ^= 0x40;
+            std::fs::write(&canonical, &differing).map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            let temp_path = pending.path().to_path_buf();
+
+            match writer.publish_segment(&cx, pending).await {
+                Err(KeeperError::Io {
+                    operation: "reconcile published segment",
+                    source,
+                    ..
+                }) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!(
+                        "unexpected segment reconciliation failure: {error}"
+                    ));
+                }
+                Ok(_) => return Err("differing canonical segment was adopted".to_owned()),
+            }
+            if std::fs::read(&canonical).map_err(|error| error.to_string())? != differing {
+                return Err("differing canonical segment was overwritten".to_owned());
+            }
+            if std::fs::read(&temp_path).map_err(|error| error.to_string())? != encoded.as_bytes() {
+                return Err("retry temp changed after canonical conflict".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeper_writer_reconciles_exact_installed_manifest_from_stale_snapshot() -> TestResult {
+        let directory = tempdir()?.keep();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let schema_id = DEFAULT_SCHEMA
+                .schema_id()
+                .map_err(|error| error.to_string())?;
+            let proposed = Manifest::empty(2, schema_id, 0);
+            ManifestPublisher::new(&directory)
+                .publish(&cx, &proposed)
+                .await
+                .map_err(|error| error.to_string())?;
+            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+                return Err("writer snapshot unexpectedly advanced before retry".to_owned());
+            }
+
+            writer
+                .publish(&cx, &proposed)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            let installed = &writer.snapshot().loaded_manifest().manifest;
+            if installed.generation != 2 {
+                return Err("exact installed proposal was not reconciled".to_owned());
+            }
+            if !manifest_matches_proposal(installed, &proposed) {
+                return Err("reconciled MANIFEST differs from the proposal".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeper_writer_rejects_differing_installed_manifest_from_stale_snapshot() -> TestResult {
+        let directory = tempdir()?.keep();
+        let outcome: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let schema_id = DEFAULT_SCHEMA
+                .schema_id()
+                .map_err(|error| error.to_string())?;
+            let mut installed = Manifest::empty(2, schema_id, 0);
+            installed.last_publish_unix_s = 1_700_000_000;
+            let mut differing = installed.clone();
+            differing.last_publish_unix_s = 1_700_000_001;
+            ManifestPublisher::new(&directory)
+                .publish(&cx, &installed)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            match writer.publish(&cx, &differing).await {
+                Err(KeeperError::GenerationConflict {
+                    expected: 3,
+                    proposed: 2,
+                }) => {}
+                Err(error) => {
+                    return Err(format!("unexpected differing-proposal failure: {error}"));
+                }
+                Ok(_) => return Err("differing installed MANIFEST was reconciled".to_owned()),
+            }
+            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+                return Err("writer snapshot advanced after differing proposal".to_owned());
+            }
+            let on_disk = load_manifest_pair(&directory)
+                .map_err(|error| error.to_string())?
+                .manifest;
+            if on_disk != installed {
+                return Err("differing retry changed the installed MANIFEST".to_owned());
+            }
+            Ok(())
+        });
+        outcome.map_err(io::Error::other)?;
         Ok(())
     }
 
