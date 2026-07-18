@@ -1561,7 +1561,7 @@ mod tests {
         }
 
         let mut bytes = Vec::with_capacity(hex.len() / 2);
-        for pair in hex.as_bytes().chunks_exact(2) {
+        for pair in hex.as_bytes().as_chunks::<2>().0 {
             bytes.push(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?);
         }
         Ok(bytes)
@@ -1695,11 +1695,10 @@ mod tests {
                 result.is_ok(),
                 "seed={SEED:#x} offset={offset} region={region}: parser panicked"
             );
-            let codec_error = match result.expect("byte-class parser result") {
-                Err(error) => error,
-                Ok(_) => panic!(
+            let Err(codec_error) = result.expect("byte-class parser result") else {
+                panic!(
                     "seed={SEED:#x} offset={offset} region={region}: byte-class mutation was accepted"
-                ),
+                );
             };
             let public_error: SearchError = codec_error.into();
             assert!(

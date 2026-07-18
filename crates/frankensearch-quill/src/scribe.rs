@@ -3311,6 +3311,465 @@ fn filled_vec<T: Clone>(
     Ok(output)
 }
 
+// ---------------------------------------------------------------------------
+// Q1 docid allocation and shard routing (bd-quill-e1-scribe-bejd.6)
+// ---------------------------------------------------------------------------
+
+/// Width of one docid lease block in global docids (Q1 §2): exactly one
+/// tombstone `chunk_id` of 65,536 contiguous docids.
+pub const DOCID_LEASE_BLOCK: u64 = DOC_ORDS_PER_LEASE as u64;
+
+/// One recorded lease grant in the allocator's append-only session log.
+///
+/// The log is the deterministic witness replay suites compare: two sessions
+/// fed the same routed batch sequence must produce identical grant vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseGrant {
+    /// Zero-based shard that received the lease.
+    pub shard: usize,
+    /// Global docid at ordinal zero of the block (always 65,536-aligned).
+    pub base_docid: u64,
+    /// Monotone grant sequence within the allocator session.
+    pub grant_seq: u64,
+}
+
+/// One contiguous run of docids allocated inside a single lease block.
+///
+/// A span never crosses a lease boundary (Q1 R1); when a batch exhausts a
+/// lease mid-batch the allocator ends the span, cuts, and continues in a
+/// freshly granted lease. Every span after the first in one batch therefore
+/// starts at ordinal zero of a new lease, and the ingest driver MUST seal the
+/// accumulator before starting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocIdSpan {
+    /// Global docid of the lease block's ordinal zero. This is the value the
+    /// flush stage consumes as [`FlushSegmentInput::lease_docid_base`].
+    pub lease_base: u64,
+    /// First allocated lease-relative ordinal.
+    pub ord_start: u32,
+    /// Number of consecutive ordinals allocated.
+    pub len: u32,
+}
+
+impl DocIdSpan {
+    /// Global docid of the first document in the span.
+    #[must_use]
+    pub const fn global_first(&self) -> u64 {
+        self.lease_base + self.ord_start as u64
+    }
+
+    /// Global docid one past the last document in the span.
+    #[must_use]
+    pub const fn global_end(&self) -> u64 {
+        self.lease_base + self.ord_start as u64 + self.len as u64
+    }
+}
+
+/// Docids allocated for one routed batch, as one or more lease-local spans.
+///
+/// Most batches fit the shard's live lease and yield exactly one span. A
+/// batch that crosses a lease boundary yields multiple spans; the driver must
+/// perform the R1 segment cut between consecutive spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchDocIds {
+    spans: Vec<DocIdSpan>,
+}
+
+impl BatchDocIds {
+    /// Allocated spans in allocation order; never empty.
+    #[must_use]
+    pub fn spans(&self) -> &[DocIdSpan] {
+        &self.spans
+    }
+
+    /// Whether the batch crossed a lease boundary (an R1 cut is required
+    /// before each span after the first).
+    #[must_use]
+    pub fn crossed_lease(&self) -> bool {
+        self.spans.len() > 1
+    }
+
+    /// Total docids allocated across all spans.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.spans.iter().map(|span| u64::from(span.len)).sum()
+    }
+
+    /// Whether the batch allocated no docids. Always false for a successful
+    /// allocation; provided for exhaustive match ergonomics.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+}
+
+/// Per-grant burn accounting emitted when an allocator session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseBurnRecord {
+    /// Zero-based shard that held the lease.
+    pub shard: usize,
+    /// Global docid at ordinal zero of the burned-or-exhausted block.
+    pub lease_base: u64,
+    /// Docids consumed by documents before the session ended.
+    pub used: u32,
+    /// Docids burned (never issued, never reusable — Q1-d).
+    pub burned: u32,
+}
+
+/// Whole-session lease accounting returned by [`DocIdAllocator::end_session`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LeaseBurnReport {
+    /// One record per grant in grant order.
+    pub records: Vec<LeaseBurnRecord>,
+    /// Docids skipped at session open to align a non-block-aligned manifest
+    /// watermark up to the next lease boundary.
+    pub open_gap_burned: u64,
+    /// Total docids leased during the session (blocks × 65,536).
+    pub total_leased: u64,
+    /// Total docids consumed by documents.
+    pub total_used: u64,
+    /// Total docids burned: open gap plus unused lease tails (Q1-d).
+    pub total_burned: u64,
+    /// Watermark the next session must open from; never decreases.
+    pub final_watermark: u64,
+}
+
+/// Typed failures from [`DocIdAllocator`].
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DocIdAllocatorError {
+    /// An allocator must serve at least one shard.
+    #[error("shard count must be at least one")]
+    ZeroShards,
+    /// The shard id is outside the session's configured shard count.
+    #[error("shard {shard} is outside the configured shard count {shard_count}")]
+    UnknownShard {
+        /// Rejected shard id.
+        shard: usize,
+        /// Session shard count.
+        shard_count: usize,
+    },
+    /// Empty batches must not reach docid allocation.
+    #[error("cannot allocate docids for an empty batch")]
+    EmptyAllocation,
+    /// The u32 payload domain is exhausted; deep compaction (reserved, not
+    /// implemented at 1.0) is the documented escape hatch (Q1 §2).
+    #[error("docid space exhausted: lease block base {base} would leave the u32 payload domain")]
+    DocIdSpaceExhausted {
+        /// Block base that could not be granted.
+        base: u64,
+    },
+    /// The session was ended; its lease tails are burned and no further
+    /// docids may issue from it (Q1-d).
+    #[error("allocator session is closed; its lease tails are burned")]
+    SessionClosed,
+}
+
+/// Per-shard live lease state.
+#[derive(Debug, Clone, Copy)]
+struct ShardLease {
+    base_docid: u64,
+    next_ord: u32,
+}
+
+/// Keeper-side monotone docid allocator implementing the Q1 lease discipline
+/// (`docs/contracts/quill-q1-docid-discipline.md` §2).
+///
+/// One allocator serves one writer session. It opens from the manifest's
+/// persisted `docid_high_watermark` and never issues a docid below it. Shards
+/// hold session leases of [`DOCID_LEASE_BLOCK`] contiguous docids, reused
+/// across watch-mode batches; when a session ends the unused tail of every
+/// live lease is burned, never reused (Q1-d).
+///
+/// The watermark advances by whole lease blocks *at grant time*, so a crash
+/// mid-session lands recovery on a watermark that already accounts for every
+/// burned tail — no end-of-session manifest write is required for safety.
+/// The value to persist at the next manifest publish is [`Self::watermark`].
+#[derive(Debug)]
+pub struct DocIdAllocator {
+    shard_count: usize,
+    next_block_base: u64,
+    open_gap_burned: u64,
+    grant_seq: u64,
+    leases: Vec<Option<ShardLease>>,
+    grants: Vec<LeaseGrant>,
+    open: bool,
+}
+
+impl DocIdAllocator {
+    /// Open a session allocator at the manifest's persisted watermark.
+    ///
+    /// A watermark that is not lease-block-aligned is aligned *up* to the next
+    /// block boundary, burning the gap (Q1-d makes burning always safe; the
+    /// Keeper manifest validator already guarantees the watermark is at or
+    /// above every live docid, so the gap can contain no live document).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocIdAllocatorError::ZeroShards`] for a zero shard count.
+    pub fn open(manifest_watermark: u64, shard_count: usize) -> Result<Self, DocIdAllocatorError> {
+        if shard_count == 0 {
+            return Err(DocIdAllocatorError::ZeroShards);
+        }
+        let next_block_base = manifest_watermark.div_ceil(DOCID_LEASE_BLOCK) * DOCID_LEASE_BLOCK;
+        Ok(Self {
+            shard_count,
+            next_block_base,
+            open_gap_burned: next_block_base - manifest_watermark,
+            grant_seq: 0,
+            leases: vec![None; shard_count],
+            grants: Vec::new(),
+            open: true,
+        })
+    }
+
+    /// Number of shards this session allocates for.
+    #[must_use]
+    pub const fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+
+    /// Watermark to persist in the manifest at the next publish.
+    ///
+    /// Advances by whole lease blocks at grant time and never decreases, so
+    /// persisting it at any point preserves Q1-d across crashes.
+    #[must_use]
+    pub const fn watermark(&self) -> u64 {
+        self.next_block_base
+    }
+
+    /// Append-only log of every lease grant this session, in grant order.
+    #[must_use]
+    pub fn lease_grants(&self) -> &[LeaseGrant] {
+        &self.grants
+    }
+
+    /// Live lease state of one shard as `(lease_base, next_free_ordinal)`, or
+    /// `None` when the shard holds no lease yet.
+    #[must_use]
+    pub fn live_lease(&self, shard: usize) -> Option<(u64, u32)> {
+        self.leases
+            .get(shard)
+            .and_then(|lease| lease.map(|live| (live.base_docid, live.next_ord)))
+    }
+
+    /// Allocate `count` docids for one batch routed to `shard`.
+    ///
+    /// Docids issue from the shard's live lease when one exists (watch-mode
+    /// batch reuse); an exhausted or missing lease triggers a fresh grant.
+    /// Spans never cross a lease boundary (R1): a batch larger than the
+    /// remaining lease tail yields multiple spans, each after the first
+    /// starting at ordinal zero of a newly granted lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocIdAllocatorError`] for an unknown shard, an empty batch,
+    /// a closed session, or u32 docid-space exhaustion.
+    pub fn alloc_batch(
+        &mut self,
+        shard: usize,
+        count: u32,
+    ) -> Result<BatchDocIds, DocIdAllocatorError> {
+        self.ensure_usable(shard)?;
+        if count == 0 {
+            return Err(DocIdAllocatorError::EmptyAllocation);
+        }
+        let mut remaining = count;
+        let mut spans = Vec::new();
+        while remaining > 0 {
+            let lease = self.ensure_lease(shard)?;
+            let free = DOC_ORDS_PER_LEASE - lease.next_ord;
+            let take = free.min(remaining);
+            let span = DocIdSpan {
+                lease_base: lease.base_docid,
+                ord_start: lease.next_ord,
+                len: take,
+            };
+            lease.next_ord += take;
+            remaining -= take;
+            spans.push(span);
+        }
+        Ok(BatchDocIds { spans })
+    }
+
+    /// Allocate one fresh global docid for `shard` (the upsert path: allocate
+    /// a new docid, then tombstone the old one found via the IDHASH probe).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::alloc_batch`].
+    pub fn alloc_one(&mut self, shard: usize) -> Result<u64, DocIdAllocatorError> {
+        let batch = self.alloc_batch(shard, 1)?;
+        Ok(batch.spans[0].global_first())
+    }
+
+    /// End the session: burn the unused tail of every live lease (Q1-d) and
+    /// return whole-session lease accounting. The allocator is closed;
+    /// further allocation returns [`DocIdAllocatorError::SessionClosed`].
+    #[must_use]
+    pub fn end_session(&mut self) -> LeaseBurnReport {
+        self.open = false;
+        let mut report = LeaseBurnReport {
+            open_gap_burned: self.open_gap_burned,
+            final_watermark: self.next_block_base,
+            ..LeaseBurnReport::default()
+        };
+        for grant in &self.grants {
+            let live = self.leases[grant.shard].filter(|live| live.base_docid == grant.base_docid);
+            // A grant that is not the shard's live lease was necessarily
+            // exhausted in place before its successor was granted.
+            let used = live.map_or(DOC_ORDS_PER_LEASE, |live| live.next_ord);
+            let burned = DOC_ORDS_PER_LEASE - used;
+            report.records.push(LeaseBurnRecord {
+                shard: grant.shard,
+                lease_base: grant.base_docid,
+                used,
+                burned,
+            });
+            report.total_leased += DOCID_LEASE_BLOCK;
+            report.total_used += u64::from(used);
+            report.total_burned += u64::from(burned);
+        }
+        report.total_burned += self.open_gap_burned;
+        report
+    }
+
+    fn ensure_usable(&self, shard: usize) -> Result<(), DocIdAllocatorError> {
+        if !self.open {
+            return Err(DocIdAllocatorError::SessionClosed);
+        }
+        if shard >= self.shard_count {
+            return Err(DocIdAllocatorError::UnknownShard {
+                shard,
+                shard_count: self.shard_count,
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_lease(&mut self, shard: usize) -> Result<&mut ShardLease, DocIdAllocatorError> {
+        let needs_grant =
+            self.leases[shard].is_none_or(|lease| lease.next_ord == DOC_ORDS_PER_LEASE);
+        if needs_grant {
+            self.grant_lease(shard)?;
+        }
+        Ok(self.leases[shard].as_mut().expect("lease just granted"))
+    }
+
+    fn grant_lease(&mut self, shard: usize) -> Result<(), DocIdAllocatorError> {
+        let base = self.next_block_base;
+        if base > u64::from(u32::MAX) - (DOCID_LEASE_BLOCK - 1) {
+            return Err(DocIdAllocatorError::DocIdSpaceExhausted { base });
+        }
+        let grant = LeaseGrant {
+            shard,
+            base_docid: base,
+            grant_seq: self.grant_seq,
+        };
+        self.grant_seq += 1;
+        self.next_block_base += DOCID_LEASE_BLOCK;
+        self.leases[shard] = Some(ShardLease {
+            base_docid: base,
+            next_ord: 0,
+        });
+        self.grants.push(grant);
+        tracing::trace!(
+            target: crate::tracing_conventions::TARGET,
+            phase = "scribe.docid_lease_grant",
+            shard_id = grant.shard,
+            grant_seq = grant.grant_seq,
+            lease_base = grant.base_docid,
+            "docid lease granted"
+        );
+        Ok(())
+    }
+}
+
+/// Typed failures from [`ShardRouter`].
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ShardRouterError {
+    /// A router must have at least one shard.
+    #[error("shard count must be at least one")]
+    ZeroShards,
+    /// The requested shard count exceeds the configured clamp.
+    #[error("shard count {requested} exceeds the configured maximum {max}")]
+    TooManyShards {
+        /// Requested shard count.
+        requested: usize,
+        /// Configured `max_ingest_shards` clamp.
+        max: usize,
+    },
+}
+
+/// Round-robin-by-batch shard router (Q1 §7, plan §5).
+///
+/// Whole batches of `IndexableDocument`s fan across `W` shard workers —
+/// routing is by batch, never by document hash, so each batch keeps source
+/// locality and its docids stay contiguous inside the shard's lease. In
+/// `deterministic_ingest` mode the config resolves the shard count to one, so
+/// docid assignment is a pure function of ingest order (`LabRuntime` suites and
+/// replay rely on this).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardRouter {
+    shard_count: usize,
+    next_shard: usize,
+}
+
+impl ShardRouter {
+    /// Build a router over `shard_count` workers, clamped by the configured
+    /// `max_ingest_shards`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardRouterError::ZeroShards`] for zero shards and
+    /// [`ShardRouterError::TooManyShards`] above the configured clamp.
+    pub fn new(shard_count: usize, max_ingest_shards: usize) -> Result<Self, ShardRouterError> {
+        if shard_count == 0 {
+            return Err(ShardRouterError::ZeroShards);
+        }
+        if shard_count > max_ingest_shards {
+            return Err(ShardRouterError::TooManyShards {
+                requested: shard_count,
+                max: max_ingest_shards,
+            });
+        }
+        Ok(Self {
+            shard_count,
+            next_shard: 0,
+        })
+    }
+
+    /// Build a router from engine config plus an externally detected
+    /// parallelism count. `deterministic_ingest` resolves to a single shard;
+    /// otherwise the count is clamped to `1..=max_ingest_shards`.
+    #[must_use]
+    pub fn from_config(config: &crate::config::QuillConfig, detected_parallelism: usize) -> Self {
+        Self {
+            shard_count: config.resolved_ingest_shards(detected_parallelism),
+            next_shard: 0,
+        }
+    }
+
+    /// Shard that receives the next batch; advances the round-robin cursor.
+    pub fn route_batch(&mut self) -> usize {
+        let shard = self.next_shard;
+        self.next_shard = (self.next_shard + 1) % self.shard_count;
+        shard
+    }
+
+    /// Number of shard workers batches fan across.
+    #[must_use]
+    pub const fn shard_count(&self) -> usize {
+        self.shard_count
+    }
+
+    /// Whether routing is deterministic-by-construction (single shard), as
+    /// resolved from `deterministic_ingest`.
+    #[must_use]
+    pub const fn is_deterministic(&self) -> bool {
+        self.shard_count == 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5908,5 +6367,378 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![crate::quiver::NumericEntry::u64(42, 0)]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Q1 docid allocator + shard router (bd-quill-e1-scribe-bejd.6)
+    // ------------------------------------------------------------------
+
+    /// Tiny deterministic xorshift64* PRNG for property-style tests (no dev
+    /// dependency; the seed pins the schedule).
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    #[test]
+    fn allocator_grants_aligned_disjoint_leases_and_tracks_watermark() {
+        let mut allocator = DocIdAllocator::open(0, 2).expect("two-shard session opens");
+        assert_eq!(allocator.watermark(), 0);
+        let first = allocator
+            .alloc_batch(0, 10)
+            .expect("shard 0 batch allocates");
+        let second = allocator
+            .alloc_batch(1, 20)
+            .expect("shard 1 batch allocates");
+        assert_eq!(first.spans().len(), 1);
+        assert_eq!(second.spans().len(), 1);
+        let (a, b) = (first.spans()[0], second.spans()[0]);
+        assert_eq!(a.lease_base, 0);
+        assert_eq!(b.lease_base, DOCID_LEASE_BLOCK);
+        assert_eq!(a.ord_start, 0);
+        assert_eq!(b.ord_start, 0);
+        // Blocks are pairwise disjoint and watermark advances by whole blocks.
+        assert!(a.global_end() <= b.lease_base);
+        assert_eq!(allocator.watermark(), 2 * DOCID_LEASE_BLOCK);
+        assert_eq!(
+            allocator.lease_grants(),
+            &[
+                LeaseGrant {
+                    shard: 0,
+                    base_docid: 0,
+                    grant_seq: 0,
+                },
+                LeaseGrant {
+                    shard: 1,
+                    base_docid: DOCID_LEASE_BLOCK,
+                    grant_seq: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn allocator_aligns_unaligned_manifest_watermark_and_accounts_gap() {
+        // 70_000 sits inside block 1; opening must align up to block 2 and
+        // burn the gap (Q1-d: burning is always safe, reuse never is).
+        let mut allocator = DocIdAllocator::open(70_000, 1).expect("unaligned watermark opens");
+        assert_eq!(allocator.watermark(), 2 * DOCID_LEASE_BLOCK);
+        let batch = allocator.alloc_batch(0, 3).expect("batch allocates");
+        assert_eq!(batch.spans()[0].lease_base, 2 * DOCID_LEASE_BLOCK);
+        let report = allocator.end_session();
+        assert_eq!(report.open_gap_burned, 2 * DOCID_LEASE_BLOCK - 70_000);
+        assert!(report.total_burned >= report.open_gap_burned);
+    }
+
+    #[test]
+    fn allocator_reuses_live_lease_across_watch_mode_batches() {
+        let mut allocator = DocIdAllocator::open(0, 1).expect("session opens");
+        let first = allocator.alloc_batch(0, 7).expect("first batch");
+        let second = allocator.alloc_batch(0, 9).expect("second batch");
+        assert_eq!(first.spans()[0].lease_base, second.spans()[0].lease_base);
+        assert_eq!(second.spans()[0].ord_start, 7);
+        assert_eq!(allocator.lease_grants().len(), 1);
+    }
+
+    #[test]
+    fn r1_batch_crossing_lease_boundary_cuts_into_fresh_lease() {
+        let mut allocator = DocIdAllocator::open(0, 1).expect("session opens");
+        let fill = DOC_ORDS_PER_LEASE - 6;
+        let head = allocator.alloc_batch(0, fill).expect("head fills lease");
+        assert_eq!(head.spans()[0].len, fill);
+        let crossing = allocator
+            .alloc_batch(0, 10)
+            .expect("crossing batch allocates");
+        assert!(crossing.crossed_lease());
+        assert_eq!(crossing.len(), 10);
+        let spans = crossing.spans();
+        assert_eq!(spans.len(), 2);
+        // Span 1 finishes the current lease; span 2 opens a fresh lease at
+        // ordinal zero, so the driver can seal between them (R1).
+        assert_eq!(spans[0].lease_base, 0);
+        assert_eq!((spans[0].ord_start, spans[0].len), (fill, 6));
+        assert_eq!(spans[0].global_end(), DOCID_LEASE_BLOCK);
+        assert_eq!(spans[1].lease_base, DOCID_LEASE_BLOCK);
+        assert_eq!((spans[1].ord_start, spans[1].len), (0, 4));
+        // No span ever straddles a block boundary.
+        for span in spans {
+            assert_eq!(
+                span.lease_base / DOCID_LEASE_BLOCK,
+                (span.global_end() - 1) / DOCID_LEASE_BLOCK
+            );
+        }
+    }
+
+    #[test]
+    fn lease_disjointness_under_concurrent_sessions_property() {
+        let mut rng = XorShift(0x5EED_5EED_5EED_5EED);
+        let mut watermark = 0;
+        let mut handed_out = std::collections::HashSet::new();
+        let mut total_allocated = 0_u64;
+        for session in 0..8_u64 {
+            let shard_count = 1 + usize::try_from(rng.below(4)).unwrap();
+            let mut allocator =
+                DocIdAllocator::open(watermark, shard_count).expect("session opens");
+            let mut session_allocated = 0_u64;
+            // Simulate concurrent shard sessions holding leases at once:
+            // interleave batches across shards without ending any lease.
+            for _round in 0..40 {
+                let shard = usize::try_from(rng.below(shard_count as u64)).unwrap();
+                let count = 1 + u32::try_from(rng.below(2_000)).unwrap();
+                let batch = allocator
+                    .alloc_batch(shard, count)
+                    .expect("batch allocates");
+                for span in batch.spans() {
+                    for offset in 0..u64::from(span.len) {
+                        let docid = span.global_first() + offset;
+                        assert!(
+                            handed_out.insert(docid),
+                            "session {session} reissued docid {docid}"
+                        );
+                        total_allocated += 1;
+                        session_allocated += 1;
+                    }
+                }
+            }
+            // All grants inside one session are pairwise disjoint blocks.
+            let grants = allocator.lease_grants();
+            for (i, a) in grants.iter().enumerate() {
+                for b in &grants[i + 1..] {
+                    assert!(
+                        a.base_docid + DOCID_LEASE_BLOCK <= b.base_docid
+                            || b.base_docid + DOCID_LEASE_BLOCK <= a.base_docid,
+                        "session {session} grants overlap: {a:?} vs {b:?}"
+                    );
+                }
+            }
+            // Simultaneously live leases never share a block.
+            let live: Vec<u64> = (0..shard_count)
+                .filter_map(|shard| allocator.live_lease(shard).map(|(base, _)| base))
+                .collect();
+            let mut unique = live.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(live.len(), unique.len(), "live leases overlap");
+            let report = allocator.end_session();
+            assert_eq!(report.total_used, session_allocated);
+            assert_eq!(
+                report.total_used + report.total_burned,
+                report.total_leased + report.open_gap_burned
+            );
+            assert!(report.final_watermark >= watermark);
+            watermark = report.final_watermark;
+        }
+        assert_eq!(handed_out.len() as u64, total_allocated);
+    }
+
+    #[test]
+    fn burn_on_end_accounting_and_burned_tail_never_reused() {
+        let mut allocator = DocIdAllocator::open(0, 2).expect("session opens");
+        allocator.alloc_batch(0, 10).expect("shard 0 partial lease");
+        allocator
+            .alloc_batch(1, DOC_ORDS_PER_LEASE)
+            .expect("shard 1 fills a lease");
+        allocator
+            .alloc_batch(1, 5)
+            .expect("shard 1 opens a second lease");
+        let report = allocator.end_session();
+        assert_eq!(report.records.len(), 3);
+        assert_eq!(
+            (report.records[0].used, report.records[0].burned),
+            (10, DOC_ORDS_PER_LEASE - 10)
+        );
+        assert_eq!(
+            (report.records[1].used, report.records[1].burned),
+            (DOC_ORDS_PER_LEASE, 0)
+        );
+        assert_eq!(
+            (report.records[2].used, report.records[2].burned),
+            (5, DOC_ORDS_PER_LEASE - 5)
+        );
+        assert_eq!(report.total_leased, 3 * DOCID_LEASE_BLOCK);
+        assert_eq!(report.total_used, DOCID_LEASE_BLOCK + 15);
+        assert_eq!(
+            report.total_burned,
+            u64::from(DOC_ORDS_PER_LEASE - 10) + u64::from(DOC_ORDS_PER_LEASE - 5)
+        );
+        assert_eq!(report.final_watermark, 3 * DOCID_LEASE_BLOCK);
+
+        // The next session opens at the burned watermark: the tails are gone.
+        let mut next = DocIdAllocator::open(report.final_watermark, 2).expect("next session");
+        let batch = next.alloc_batch(0, 1).expect("next session allocates");
+        assert_eq!(batch.spans()[0].lease_base, 3 * DOCID_LEASE_BLOCK);
+    }
+
+    #[test]
+    fn upsert_path_allocates_fresh_monotone_docids() {
+        let mut allocator = DocIdAllocator::open(0, 1).expect("session opens");
+        let original = allocator.alloc_one(0).expect("original docid");
+        let replacement = allocator.alloc_one(0).expect("upsert docid");
+        assert!(replacement > original);
+        assert_eq!(replacement, original + 1);
+    }
+
+    #[test]
+    fn closed_session_and_invalid_requests_are_typed_errors() {
+        let mut allocator = DocIdAllocator::open(0, 1).expect("session opens");
+        assert_eq!(
+            allocator.alloc_batch(0, 0),
+            Err(DocIdAllocatorError::EmptyAllocation)
+        );
+        assert_eq!(
+            allocator.alloc_batch(7, 1),
+            Err(DocIdAllocatorError::UnknownShard {
+                shard: 7,
+                shard_count: 1,
+            })
+        );
+        let _report = allocator.end_session();
+        assert_eq!(
+            allocator.alloc_batch(0, 1),
+            Err(DocIdAllocatorError::SessionClosed)
+        );
+        assert_eq!(
+            DocIdAllocator::open(0, 0).map(|a| a.watermark()),
+            Err(DocIdAllocatorError::ZeroShards)
+        );
+    }
+
+    #[test]
+    fn docid_space_exhaustion_is_a_typed_error() {
+        // Largest legal aligned base: block starting at u32::MAX - 65_535.
+        let last_base = u64::from(u32::MAX) - (DOCID_LEASE_BLOCK - 1);
+        assert_eq!(last_base % DOCID_LEASE_BLOCK, 0);
+        let mut allocator = DocIdAllocator::open(last_base, 2).expect("final block opens");
+        allocator
+            .alloc_batch(0, 1)
+            .expect("last legal lease grants");
+        assert_eq!(
+            allocator.alloc_batch(1, 1),
+            Err(DocIdAllocatorError::DocIdSpaceExhausted {
+                base: last_base + DOCID_LEASE_BLOCK,
+            })
+        );
+    }
+
+    #[test]
+    fn router_cycles_batches_round_robin() {
+        let mut router = ShardRouter::new(3, 8).expect("three-shard router");
+        let order: Vec<usize> = (0..7).map(|_| router.route_batch()).collect();
+        assert_eq!(order, [0, 1, 2, 0, 1, 2, 0]);
+        assert!(!router.is_deterministic());
+    }
+
+    #[test]
+    fn router_config_resolution_and_clamps() {
+        let config = crate::config::QuillConfig::default();
+        let router = ShardRouter::from_config(&config, 128);
+        assert_eq!(router.shard_count(), config.max_ingest_shards);
+
+        let deterministic = crate::config::QuillConfig {
+            deterministic_ingest: true,
+            ..crate::config::QuillConfig::default()
+        };
+        let mut router = ShardRouter::from_config(&deterministic, 16);
+        assert!(router.is_deterministic());
+        assert_eq!(router.shard_count(), 1);
+        assert_eq!(router.route_batch(), 0);
+        assert_eq!(router.route_batch(), 0);
+
+        assert_eq!(
+            ShardRouter::new(0, 8).map(|router| router.shard_count()),
+            Err(ShardRouterError::ZeroShards)
+        );
+        assert_eq!(
+            ShardRouter::new(9, 8).map(|router| router.shard_count()),
+            Err(ShardRouterError::TooManyShards {
+                requested: 9,
+                max: 8,
+            })
+        );
+    }
+
+    /// Drive a fixed document stream through router + allocator + accumulator
+    /// + flush, returning the sealed bytes and the lease-grant witness log.
+    fn replay_deterministic_segments() -> (Vec<u8>, Vec<LeaseGrant>) {
+        let docs: Vec<(String, String)> = (0..48)
+            .map(|i| {
+                (
+                    format!("doc-{i:03}"),
+                    format!("alpha beta gamma delta document number {i}"),
+                )
+            })
+            .collect();
+        let config = crate::config::QuillConfig {
+            deterministic_ingest: true,
+            ..crate::config::QuillConfig::default()
+        };
+        let mut router = ShardRouter::from_config(&config, 8);
+        let mut allocator = DocIdAllocator::open(0, router.shard_count()).expect("allocator opens");
+        let mut accumulator =
+            ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid schema");
+        let mut identities = Vec::new();
+        // Arbitrary batching must not perturb docid assignment in
+        // deterministic mode: route three uneven batches.
+        for batch in [&docs[..10], &docs[10..37], &docs[37..]] {
+            let shard = router.route_batch();
+            let ids = allocator
+                .alloc_batch(shard, u32::try_from(batch.len()).unwrap())
+                .expect("batch docids allocate");
+            assert_eq!(ids.spans().len(), 1);
+            let span = ids.spans()[0];
+            for (offset, (id, content)) in batch.iter().enumerate() {
+                let doc_ord = span.ord_start + u32::try_from(offset).unwrap();
+                accumulator
+                    .add_document_with_stored(
+                        doc_ord,
+                        &[
+                            IndexedFieldValue::new(0, id.as_str()),
+                            IndexedFieldValue::new(1, content.as_str()),
+                        ],
+                        &[StoredFieldValue::new(3, content.as_bytes())],
+                    )
+                    .expect("document accumulates");
+                identities.push(FlushDocumentInput::from_canonical_content(
+                    doc_ord,
+                    id,
+                    content.as_bytes(),
+                ));
+            }
+        }
+        let input = FlushSegmentInput {
+            segment_id: 42,
+            lease_docid_base: 0,
+            created_unix_s: 1_700_000_000,
+            engine_version: 0,
+            documents: &identities,
+        };
+        let segment = flush_accumulator(&accumulator, input).expect("segment seals");
+        (segment.into_bytes(), allocator.lease_grants().to_vec())
+    }
+
+    #[test]
+    fn deterministic_replay_produces_byte_identical_segments_and_grant_logs() {
+        let (first_bytes, first_grants) = replay_deterministic_segments();
+        let (second_bytes, second_grants) = replay_deterministic_segments();
+        assert_eq!(first_grants, second_grants);
+        assert_eq!(first_bytes, second_bytes);
+        // Single-shard deterministic ingest assigns docids as a pure function
+        // of ingest order: 48 docs from block zero.
+        let reader = SegmentReader::from_bytes(&first_bytes, MIXED_POSITION_SCHEMA)
+            .expect("segment reopens");
+        assert_eq!(reader.header().docid_lo, 0);
+        assert_eq!(reader.header().docid_hi, 48);
     }
 }
