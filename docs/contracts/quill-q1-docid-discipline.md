@@ -45,8 +45,9 @@ Shard sessions acquire lease blocks alternately, so one shard's later leases int
 1. K-way merge the n TERMDICTs by composite key bytes (galloping over prefix blocks).
 2. Per term: copy posting-block bytes **verbatim and in input order** (FOR blocks store `first_doc` as an absolute u32 — no rebase exists to do). Every FSLX posting block is self-delimiting; a source stream's partial VINT block therefore remains legal at an interior segment seam. Ordinary merge never shifts later 128-posting boundaries.
 3. BLOCKMAX: re-emit entries in the same block order, adjusting each `block_offset` relative to the merged term's posting stream while preserving `first_doc`, `max_freq_q`, and `min_fieldnorm`. No seam entry is synthesized because no posting block is rewritten.
-4. DOCLEN/IDMAP/STOREDMETA/NUMERIC: concatenate (positional sections stay positional over the merged range; the gap between `hiᵢ` and `loᵢ₊₁` — other shards' burned or foreign docids are *not* in the run by R2… see §4.1).
-5. STATS: sum. Tombstones: union (carried, not folded — folding is compaction §5). IDHASH: rebuild linearly from merged IDMAP (cheap, sequential).
+4. DOCLEN/IDMAP/STOREDMETA: concatenate into the merged positional span (the gap between `hiᵢ` and `loᵢ₊₁` materializes as holes; see §4.1).
+5. NUMERIC: k-way merge each field's `(value, docid)` pairs by their canonical value-then-docid order, preserving absolute docids. Raw segment-order concatenation is forbidden because disjoint docid ranges do not imply disjoint or ordered value ranges.
+6. STATS: sum. Tombstones: union (carried, not folded — folding is compaction §5). IDHASH: rebuild linearly from merged IDMAP (cheap, sequential).
 
 Expected cost: sequential read + sequential write; I/O-bound. The e3.5 bench asserts CPU/byte stays ~flat as segment count grows.
 
@@ -75,7 +76,7 @@ Compaction rewrites one segment to fold its tombstones: surviving docids are **p
 | ID | Obligation | Where enforced/tested |
 |---|---|---|
 | **Q1-OB1** | Manifest validation rejects overlapping covering intervals; `merge()` asserts bound-consecutive inputs (R2); seal asserts single-lease spans (R1) | e3.2/e3.3 validation + e3.5 assertion + e3.9 crash matrix |
-| **Q1-OB2a** | Decoded postings, aggregate stats, and query results from `merge(S₁…Sₙ)` equal monolithic indexing of the concatenated document stream with the same docid assignments | e3.5 fixture, including `df=100 + df=300` (bridges via e5.4's seal determinism) |
+| **Q1-OB2a** | Decoded postings, aggregate stats, and query results from `merge(S₁…Sₙ)` equal monolithic indexing of the concatenated document stream with the same docid assignments | e3.5 fixture, including `df=100 + df=300` (bridges through G1a's direct accumulator-to-seal reference path) |
 | **Q1-OB2b** | Every input posting block appears byte-identically and in source order in the merged term stream; merge creates no new posting fragments | e3.5 raw-block witness + arbitrary merge-schedule property test |
 | **Q1-OB3** | Query results are invariant under ANY merge schedule (BM25 stats are snapshot-level aggregates) | e3.5 random-merge-order property test; e6.3 metamorphic suite |
 | **Q1-OB4** | Compaction preserves surviving docids; compacted segment is query-identical to the tombstone-paired original | e3.6 fixture (measured at realistic densities: 5/20/50% — never 0%) |
