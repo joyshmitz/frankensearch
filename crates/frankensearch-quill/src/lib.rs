@@ -37,12 +37,15 @@ pub use grimoire::{
     TermScratch, TermSectionLengths,
 };
 pub use keeper::{
-    CURRENT_ENGINE_VERSION, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES, GarbageCollectionOptions,
-    GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LoadedManifest,
-    MANIFEST_FORMAT_VERSION, MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats,
-    ManifestSegment, ManifestSource, RecoveredSegment, ResolvedDocumentId, TombstoneSet,
-    WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES, load_manifest_pair,
-    pack_engine_version, unpack_engine_version,
+    BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
+    CurrentPointer, CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
+    GarbageCollectionOptions, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
+    LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1, MANIFEST_MAGIC,
+    Manifest, ManifestCodecError,
+    ManifestFieldStats, ManifestSegment, ManifestSource, RecoveredSegment, ResolvedCurrent,
+    ResolvedDocumentId, TombstoneSet, WRITER_LOCK_FORMAT_VERSION, WRITER_LOCK_MAGIC,
+    WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version, publish_current,
+    resolve_current, unpack_engine_version,
 };
 pub use query::{
     BooleanClause, BooleanOperator, CassQueryFilters, CassQueryParser, CassQueryParserConfigError,

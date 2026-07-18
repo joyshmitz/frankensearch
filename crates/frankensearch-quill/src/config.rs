@@ -20,6 +20,10 @@ pub const DEFAULT_MERGE_MAX_HOLE_RATIO: f64 = 0.50;
 pub const DEFAULT_GLOB_EXPANSION_LIMIT: usize = 16_384;
 /// Default cap on independent ingest shards.
 pub const DEFAULT_MAX_INGEST_SHARDS: usize = 32;
+/// Default cross-process visibility bound: one second between the first
+/// unpublished change and its durable publication (visibility contract, bead
+/// bd-quill-duel-visibility-contract-9rk3).
+pub const DEFAULT_MAX_VISIBILITY_LAG_MS: u64 = 1_000;
 
 /// All engine-level Quill tuning knobs.
 ///
@@ -42,6 +46,10 @@ pub struct QuillConfig {
     pub max_ingest_shards: usize,
     /// Force one deterministic shard for replay and conformance runs.
     pub deterministic_ingest: bool,
+    /// Cross-process visibility bound: once unpublished changes are this old,
+    /// the writer must run a seal-and-publish barrier instead of waiting for
+    /// the ordinary cadence (visibility contract, `max_visibility_lag_ms`).
+    pub max_visibility_lag_ms: u64,
 }
 
 impl Default for QuillConfig {
@@ -55,6 +63,7 @@ impl Default for QuillConfig {
             glob_expansion_limit: DEFAULT_GLOB_EXPANSION_LIMIT,
             max_ingest_shards: DEFAULT_MAX_INGEST_SHARDS,
             deterministic_ingest: false,
+            max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
         }
     }
 }
@@ -83,6 +92,13 @@ impl QuillConfig {
         require_fraction_closed("merge_max_hole_ratio", self.merge_max_hole_ratio)?;
         require_positive("glob_expansion_limit", self.glob_expansion_limit)?;
         require_positive("max_ingest_shards", self.max_ingest_shards)?;
+        if self.max_visibility_lag_ms == 0 {
+            return Err(invalid_config(
+                "max_visibility_lag_ms",
+                &self.max_visibility_lag_ms,
+                "must be positive so the cross-process freshness bound is a guarantee, not a suggestion",
+            ));
+        }
         Ok(())
     }
 
@@ -159,6 +175,7 @@ mod tests {
                 glob_expansion_limit: 16_384,
                 max_ingest_shards: 32,
                 deterministic_ingest: false,
+                max_visibility_lag_ms: 1_000,
             }
         );
         assert!(QuillConfig::default().validate().is_ok());
@@ -197,5 +214,14 @@ mod tests {
         assert!(config.validate().is_ok());
         config.merge_max_hole_ratio = 1.01;
         assert!(config.validate().is_err());
+
+        config = QuillConfig::default();
+        config.max_visibility_lag_ms = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "max_visibility_lag_ms"
+        ));
+        config.max_visibility_lag_ms = 1;
+        assert!(config.validate().is_ok());
     }
 }

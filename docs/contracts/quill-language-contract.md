@@ -268,3 +268,24 @@ Every comparison is classified as exactly one of `RankExact`, `ScoreEpsilon`, or
 - a query-class corpus that labels genuinely harvested rows separately from constructed Boolean, glob, range, and boundary probes.
 
 Fixture IDs are stable and additive. Editing expected behavior requires a contract-version bump and a rationale. The lexical crate test loads the JSON, rejects duplicate or dangling IDs, verifies required query/analyzer classes, introspects the shipping schema, executes analyzer/helper/BM25-order goldens, and proves every §3.1 surface row has coverage. Canonical parse trees, lifecycle rows, deleted-stat transitions, and end-to-end ranking cases remain inputs to the downstream Quill differential runner rather than claims of execution by this loader.
+
+## 9. Update visibility contract (cross-process freshness)
+
+**Owning bead:** `bd-quill-duel-visibility-contract-9rk3`. Bet Q3's "searchable immediately" (plan §6.3) is true **in-process only**: the delta segment (E5) is process-local memory, so the flagship topology — an `fsfs index --watch` daemon plus separate `fsfs search` CLI invocations — observes only sealed **and published** segments: commit-cadence freshness, exactly like the tantivy incumbent. This section pins that truth so no metric, gate, or claim may silently conflate the two topologies.
+
+### 9.1 Visibility classes (normative)
+
+- **InProcess visibility.** A reader in the writer's process observes delta-segment documents immediately after their batch returns (no seal, no publish). This class exists only where a delta exists and only inside that process.
+- **CrossProcess visibility.** Any other process observes a document exactly when a MANIFEST generation containing it is durably published (§6.2 of the FSLX registry: temp + claim + two renames + directory fsync). Freshness is **publish-cadence** freshness.
+
+### 9.2 `max_visibility_lag_ms` (configured guarantee)
+
+`QuillConfig::max_visibility_lag_ms` (default 1,000) bounds CrossProcess staleness: once the oldest unpublished change has waited this long since the last durable publication, the writer must run a seal-and-publish barrier instead of waiting for the ordinary cadence. The bound piggybacks the existing seal/commit triggers — it adds no new artifact kind. The MANIFEST v2 `last_publish_unix_s` witness (registry §6.1, amendment v1.0.18) is the durable timestamp the lag is measured against; it is second-granular, so sub-second bounds behave as one second. `fsfs flush` is the operator-facing explicit barrier: it forces the same seal-and-publish on demand. Cross-process freshness is thereby a configured guarantee with a typed surface, not an emergent accident of debounce tuning.
+
+### 9.3 Freshness surfacing
+
+`segment_stats()` carries `published_generation`, `last_publish_unix` (from the MANIFEST v2 witness; absent for v1-era or in-memory images), and `live_writer` (from the D1 LOCK record plus POSIX `kill(pid, 0)` liveness — never from mtime staleness). Status surfaces (`fsfs status`, `--format json` search responses) carry this `index_freshness` block verbatim once the fsfs port lands (e7.2); they must never report InProcess freshness while serving CrossProcess readers.
+
+### 9.4 Honest-topology measurement rule
+
+Any update-to-searchable latency claim (QG-3 in `quill-perf-gates.toml`) must be measured in **both** topologies: (a) in-process reader (delta-visible), and (b) fresh-process reader (publish-visible). Publishing only the in-process number as "the" freshness figure is a contract violation: it is the topology almost no deployment runs.

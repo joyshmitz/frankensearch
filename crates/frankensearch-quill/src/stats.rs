@@ -1,5 +1,7 @@
 //! Stable operational statistics surfaced by Keeper snapshots.
 
+use std::time::Duration;
+
 /// Point-in-time Quill segment and footprint statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegmentStats {
@@ -44,6 +46,38 @@ impl SegmentStats {
         } else {
             self.tombstones as f64 / total as f64
         }
+    }
+
+    /// Whether the cross-process visibility bound requires a publish barrier
+    /// (visibility contract, bead bd-quill-duel-visibility-contract-9rk3).
+    ///
+    /// The caller reports `has_unpublished_changes` from its own ingest lane:
+    /// with no pending changes the barrier is never due. With pending changes
+    /// and no durable publish timestamp the barrier is immediately due;
+    /// otherwise it is due once the oldest unpublished change has waited at
+    /// least `max_visibility_lag` past the last durable publication. The
+    /// MANIFEST timestamp is second-granular, so sub-second bounds behave as
+    /// one second; clock skew (`now_unix_s` behind the publish stamp) reads
+    /// as zero lag rather than a negative duration.
+    #[must_use]
+    pub fn visibility_barrier_due(
+        &self,
+        max_visibility_lag: Duration,
+        has_unpublished_changes: bool,
+        now_unix_s: i64,
+    ) -> bool {
+        if !has_unpublished_changes {
+            return false;
+        }
+        let Some(last_publish) = self.last_publish_unix else {
+            return true;
+        };
+        let elapsed_ms = now_unix_s
+            .saturating_sub(last_publish)
+            .max(0)
+            .saturating_mul(1_000);
+        let elapsed_ms = u128::try_from(elapsed_ms).unwrap_or(u128::MAX);
+        elapsed_ms >= max_visibility_lag.as_millis()
     }
 }
 

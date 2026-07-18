@@ -35,8 +35,14 @@ pub use crate::stats::{SegmentStats, SegmentStatsProvider};
 
 /// Eight-byte MANIFEST magic, including its trailing NUL.
 pub const MANIFEST_MAGIC: [u8; 8] = *b"FSLXMAN\0";
-/// Current durable MANIFEST format version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// Current durable MANIFEST format version written by this crate.
+///
+/// v2 adds the generation-level `last_publish_unix_s` freshness witness
+/// (registry §6.2). Readers accept v1 images and decode the field as `0`
+/// (unknown); v1 readers reject v2 images as an unsupported version.
+pub const MANIFEST_FORMAT_VERSION: u32 = 2;
+/// First durable MANIFEST format version, still accepted on read.
+pub const MANIFEST_FORMAT_VERSION_V1: u32 = 1;
 /// Maximum MANIFEST accepted by an eager reader.
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum segment records admitted by one MANIFEST.
@@ -68,6 +74,8 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 2, 1);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
+/// v2 images carry the additional `last_publish_unix_s` word after `flags`.
+const MANIFEST_V2_MIN_BYTES: usize = MANIFEST_MIN_BYTES + 8;
 const SEGMENT_FIXED_BYTES: usize = 8 + 8 + 8 + 8 + 8 + 8 + 4;
 const FIELD_STATS_BYTES: usize = 2 + 8 + 4;
 const MAX_DOCID_EXCLUSIVE: u64 = 4_294_967_296;
@@ -928,7 +936,7 @@ pub struct ManifestFieldStats {
     pub doc_count: u32,
 }
 
-/// Fully owned MANIFEST v1 contents.
+/// Fully owned MANIFEST v2 contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     /// Monotone publication generation. Genesis is generation 1.
@@ -941,6 +949,14 @@ pub struct Manifest {
     pub engine_version: u32,
     /// Versioned manifest flags.
     pub flags: u32,
+    /// Wall-clock seconds when this generation was published; `0` means
+    /// unknown (v1 images and hand-built manifests). The publisher stamps a
+    /// zero field with the current time, so every keeper-written generation
+    /// carries the cross-process freshness witness required by the
+    /// visibility contract (bead bd-quill-duel-visibility-contract-9rk3).
+    /// Informational only: never validated for monotonicity, because NTP
+    /// steps make wall-clock ordering unreliable.
+    pub last_publish_unix_s: i64,
     /// Segments in strictly ascending `docid_lo` order.
     pub segments: Vec<ManifestSegment>,
     /// Field statistics in strictly ascending `field_ord` order.
@@ -957,6 +973,7 @@ impl Manifest {
             schema_id,
             engine_version: CURRENT_ENGINE_VERSION,
             flags: 0,
+            last_publish_unix_s: 0,
             segments: Vec::new(),
             field_stats: Vec::new(),
         }
@@ -1014,6 +1031,7 @@ impl Manifest {
         put_u64(&mut bytes, self.schema_id);
         put_u32(&mut bytes, self.engine_version);
         put_u32(&mut bytes, self.flags);
+        bytes.extend_from_slice(&self.last_publish_unix_s.to_le_bytes());
         put_u32(&mut bytes, segment_count);
         for segment in &self.segments {
             put_u64(&mut bytes, segment.segment_id);
@@ -1073,7 +1091,7 @@ impl Manifest {
             return Err(ManifestCodecError::BadMagic);
         }
         let version = cursor.u32()?;
-        if version != MANIFEST_FORMAT_VERSION {
+        if version != MANIFEST_FORMAT_VERSION && version != MANIFEST_FORMAT_VERSION_V1 {
             return Err(ManifestCodecError::UnsupportedVersion { found: version });
         }
         let generation = cursor.u64()?;
@@ -1081,6 +1099,17 @@ impl Manifest {
         let schema_id = cursor.u64()?;
         let engine_version = cursor.u32()?;
         let flags = cursor.u32()?;
+        let last_publish_unix_s = if version == MANIFEST_FORMAT_VERSION {
+            i64::from_le_bytes(cursor.take(8)?.try_into().map_err(|_| {
+                ManifestCodecError::Truncated {
+                    offset: cursor.position(),
+                    needed: 8,
+                    remaining: cursor.remaining(),
+                }
+            })?)
+        } else {
+            0
+        };
         let segment_count = count_to_usize(cursor.u32()?, "segment count", MAX_MANIFEST_SEGMENTS)?;
         let minimum_segment_bytes = segment_count
             .checked_mul(SEGMENT_FIXED_BYTES + EMPTY_TOMBSTONES.len())
@@ -1158,6 +1187,7 @@ impl Manifest {
             schema_id,
             engine_version,
             flags,
+            last_publish_unix_s,
             segments,
             field_stats,
         };
@@ -5254,6 +5284,22 @@ impl ManifestPublisher {
         }
         // Encode only after admission to the process-global critical section.
         // Otherwise every waiter could retain its own 64 MiB output buffer.
+        //
+        // The publisher owns the freshness witness: a caller that left
+        // `last_publish_unix_s` zero gets stamped with the current wall clock,
+        // so every keeper-written generation carries the cross-process
+        // visibility timestamp. An explicit caller stamp is preserved, which
+        // keeps deterministic fixtures byte-stable.
+        let mut manifest = manifest.clone();
+        if manifest.last_publish_unix_s == 0 {
+            manifest.last_publish_unix_s = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+                .ok_or_else(|| KeeperError::InvalidTransition {
+                    detail: "current wall clock is outside the MANIFEST timestamp range".to_owned(),
+                })?;
+        }
         let bytes = manifest
             .to_bytes()
             .map_err(|source| KeeperError::InvalidManifest { source })?;
@@ -6914,7 +6960,7 @@ fn check_manifest_byte_limit(length: usize) -> Result<(), ManifestCodecError> {
 }
 
 fn manifest_encoded_len(manifest: &Manifest) -> Result<usize, ManifestCodecError> {
-    let length = MANIFEST_MIN_BYTES
+    let length = MANIFEST_V2_MIN_BYTES
         .checked_add(
             manifest
                 .segments
@@ -7589,6 +7635,94 @@ struct ByteCursor<'a> {
     position: usize,
 }
 
+// ============================================================================
+// Segment statistics (visibility contract: published_generation,
+// last_publish_unix from the MANIFEST v2 freshness witness, live_writer from
+// the D1 LOCK record + POSIX liveness).
+// ============================================================================
+
+/// Best-effort total of Quill-managed bytes under `directory`.
+///
+/// Sums FSLX segments, MANIFEST slots and repair sidecars, and lifecycle
+/// metadata (LOCK). Entries that vanish or cannot be stat'ed mid-walk are
+/// skipped: this is a status number, never an accounting authority.
+// Engine-managed filenames are canonical lowercase by construction; a
+// case-insensitive compare would mis-count foreign files the engine never
+// wrote.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn managed_disk_bytes(directory: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let managed = (name.starts_with("seg-") && name.ends_with(".fslx"))
+            || matches!(name, "MANIFEST" | "MANIFEST.prev" | "LOCK")
+            || name.ends_with(".fec");
+        if !managed {
+            continue;
+        }
+        if let Ok(metadata) = entry.metadata() {
+            if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    total
+}
+
+/// Whether a live writer currently holds `directory`'s LOCK.
+///
+/// Reads the D1 LOCK record and applies the POSIX `kill(pid, 0)` liveness
+/// rule: only a valid record whose pid is demonstrably alive counts. Any
+/// read/parse failure conservatively reports no live writer. Non-Unix targets
+/// cannot prove liveness, so a valid record alone decides there.
+fn detect_live_writer(directory: &Path) -> bool {
+    let lock_path = directory.join("LOCK");
+    let Ok(mut file) = File::open(&lock_path) else {
+        return false;
+    };
+    let Ok(Some(record)) = read_writer_lock_record(&lock_path, &mut file) else {
+        return false;
+    };
+    !writer_pid_is_dead(record.pid)
+}
+
+impl SegmentStatsProvider for KeeperSnapshot {
+    fn segment_stats(&self) -> SegmentStats {
+        let manifest = &self.loaded.manifest;
+        let (managed_disk_bytes, live_writer) =
+            self.directory.as_ref().map_or((0, false), |directory| {
+                (managed_disk_bytes(directory), detect_live_writer(directory))
+            });
+        SegmentStats {
+            schema_id: manifest.schema_id,
+            published_generation: manifest.generation,
+            sealed_segments: self.segments.len(),
+            // The searchable delta segment is E5; nothing pre-delta exists yet.
+            delta_segments: 0,
+            live_docs: usize::try_from(self.live_doc_count).unwrap_or(usize::MAX),
+            tombstones: usize::try_from(self.tombstone_count).unwrap_or(usize::MAX),
+            managed_disk_bytes,
+            delta_memory_bytes: 0,
+            last_publish_unix: (manifest.last_publish_unix_s != 0)
+                .then_some(manifest.last_publish_unix_s),
+            live_writer,
+        }
+    }
+}
+
+impl SegmentStatsProvider for KeeperWriter {
+    fn segment_stats(&self) -> SegmentStats {
+        let mut stats = self.snapshot.segment_stats();
+        // The writer holds LOCK by construction; no probe is needed.
+        stats.live_writer = true;
+        stats
+    }
+}
+
 impl<'a> ByteCursor<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
@@ -7717,6 +7851,7 @@ mod tests {
             schema_id: 0x1122_3344_5566_7788,
             engine_version: CURRENT_ENGINE_VERSION,
             flags: 0,
+            last_publish_unix_s: 1_700_000_000,
             segments: vec![
                 ManifestSegment {
                     segment_id: 0x1001,
@@ -7891,6 +8026,7 @@ mod tests {
             schema_id: DEFAULT_SCHEMA.schema_id().expect("valid test schema"),
             engine_version: CURRENT_ENGINE_VERSION,
             flags: 0,
+            last_publish_unix_s: 1_700_000_000,
             segments,
             field_stats: Vec::new(),
         }
@@ -7962,8 +8098,8 @@ mod tests {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
         let expected = hex_bytes(
-            "46534c584d414e0001000000010000000000000000000000000000008877665544332211\
-             010002000000000000000000000000005846c4c1",
+            "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
+             01000200000000000000000000000000000000000000000087ee6320",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
@@ -7985,6 +8121,7 @@ mod tests {
             schema_id: 0x1122_3344_5566_7788,
             engine_version: 0x0102_0304,
             flags: MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+            last_publish_unix_s: 1_700_000_000,
             segments: vec![ManifestSegment {
                 segment_id: 0x1020_3040_5060_7080,
                 seal_seq: 0x1112_1314_1516_1718,
@@ -8002,11 +8139,13 @@ mod tests {
             }],
         };
         let bytes = manifest.to_bytes()?;
+        // v2 golden: version 2, `last_publish_unix_s` (1_700_000_000) after
+        // flags, then the v1 segment/tombstone/stats layout unchanged.
         let expected = hex_bytes(
-            "46534c584d414e0001000000080706050403020114000000000000008877665544332211\
-             040302010100000001000000807060504030201018171615141312112827262524232221\
-             38373635343332310a0000000000000014000000000000000200000001000000000000\
-             02000c0012000100000003004847464544434241020000007bcad46b",
+            "46534c584d414e0002000000080706050403020114000000000000008877665544332211\
+             040302010100000000f15365000000000100000080706050403020101817161514131211\
+             282726252423222138373635343332310a00000000000000140000000000000002000000\
+             0100000000000002000c001200010000000300484746454443424102000000122be130",
         );
         assert_eq!(
             bytes, expected,
@@ -8067,7 +8206,7 @@ mod tests {
         let mut bytes = Manifest::empty(1, 7, 0).to_bytes()?;
         let hostile_segment_count =
             u32::try_from(MAX_MANIFEST_SEGMENTS + 1).expect("segment cap fits u32");
-        bytes[44..48].copy_from_slice(&hostile_segment_count.to_le_bytes());
+        bytes[52..56].copy_from_slice(&hostile_segment_count.to_le_bytes());
         rewrite_crc(&mut bytes);
         assert!(matches!(
             Manifest::from_bytes(&bytes),
@@ -8599,17 +8738,19 @@ mod tests {
                 .await
                 .expect("publish genesis");
 
-            let empty = Manifest::empty(
+            let mut empty = Manifest::empty(
                 2,
                 first.schema_id,
                 first.docid_high_watermark.saturating_add(1),
             );
+            empty.last_publish_unix_s = 1_700_000_000;
             publisher
                 .publish(&cx, &empty)
                 .await
                 .expect("publish explicit empty generation");
 
             let mut restarted = Manifest::empty(3, first.schema_id, empty.docid_high_watermark);
+            restarted.last_publish_unix_s = 1_700_000_000;
             let mut segment = first.segments[0].clone();
             segment.segment_id = 0x2001;
             segment.seal_seq = 1;
@@ -12457,5 +12598,154 @@ mod tests {
             b"crash witness"
         );
         Ok(())
+    }
+
+    // ==== Visibility contract (bd-quill-duel-visibility-contract-9rk3) ====
+
+    /// Build a v1 MANIFEST image by removing the v2 timestamp word from a v2
+    /// image and re-versioning/re-checksumming it.
+    fn downgrade_to_v1_image(v2: &[u8]) -> Vec<u8> {
+        // v2 layout: magic(8) version(4) generation(8) watermark(8) schema(8)
+        // engine(4) flags(4) timestamp(8) rest.. crc(4)
+        assert_eq!(&v2[8..12], &MANIFEST_FORMAT_VERSION.to_le_bytes());
+        let mut v1 = Vec::with_capacity(v2.len() - 8);
+        v1.extend_from_slice(&v2[..8]);
+        v1.extend_from_slice(&MANIFEST_FORMAT_VERSION_V1.to_le_bytes());
+        v1.extend_from_slice(&v2[12..44]); // generation..flags
+        v1.extend_from_slice(&v2[52..]); // segments/stats..crc
+        let body_len = v1.len() - 4;
+        let crc = crc32fast::hash(&v1[..body_len]);
+        v1[body_len..].copy_from_slice(&crc.to_le_bytes());
+        v1
+    }
+
+    #[test]
+    fn manifest_v1_images_read_with_unknown_timestamp_and_rewrite_as_v2() -> TestResult {
+        let v2 = sample_manifest(5).to_bytes()?;
+        let v1 = downgrade_to_v1_image(&v2);
+        let decoded = Manifest::from_bytes(&v1)?;
+        assert_eq!(decoded.last_publish_unix_s, 0, "v1 images carry no witness");
+        let mut expected = sample_manifest(5);
+        expected.last_publish_unix_s = 0;
+        assert_eq!(decoded, expected);
+        // Rewriting upgrades the image to v2 while preserving the zero field.
+        let rewritten = decoded.to_bytes()?;
+        assert_eq!(&rewritten[8..12], &MANIFEST_FORMAT_VERSION.to_le_bytes());
+        assert_eq!(Manifest::from_bytes(&rewritten)?, decoded);
+        // A v1 image with hostile trailing content still fails closed.
+        let mut trailed = v1.clone();
+        trailed.push(0);
+        assert!(Manifest::from_bytes(&trailed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn publisher_stamps_zero_timestamp_and_preserves_explicit_witnesses() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempdir().expect("temp directory");
+            let publisher = ManifestPublisher::new(directory.path());
+            let mut first = sample_manifest(1);
+            first.last_publish_unix_s = 0;
+            let before = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("wall clock")
+                .as_secs();
+            let loaded = publisher
+                .publish(&cx, &first)
+                .await
+                .expect("publish zero-timestamp proposal");
+            let stamped = loaded.manifest.last_publish_unix_s;
+            assert!(
+                u64::try_from(stamped).expect("stamped witness is positive")
+                    >= before.saturating_sub(2),
+                "zero witness is stamped with the publish wall clock"
+            );
+
+            // An explicit witness is preserved verbatim (deterministic fixtures).
+            let mut second = sample_manifest(2);
+            second.last_publish_unix_s = 1_700_000_042;
+            let loaded = publisher
+                .publish(&cx, &second)
+                .await
+                .expect("publish explicit-timestamp proposal");
+            assert_eq!(loaded.manifest.last_publish_unix_s, 1_700_000_042);
+
+            // Successors built from a loaded manifest keep the stamped chain.
+            let mut third = loaded.manifest.clone();
+            third.generation = 3;
+            let loaded = publisher
+                .publish(&cx, &third)
+                .await
+                .expect("publish successor built from loaded manifest");
+            assert_eq!(loaded.manifest.last_publish_unix_s, 1_700_000_042);
+        });
+    }
+
+    #[test]
+    fn segment_stats_surfaces_freshness_fields_and_live_writer() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempdir().expect("temp directory");
+            let writer = KeeperWriter::create(&cx, directory.path(), DEFAULT_SCHEMA)
+                .await
+                .expect("create index");
+            let writer_stats = SegmentStatsProvider::segment_stats(&writer);
+            assert_eq!(writer_stats.published_generation, 1);
+            assert_eq!(writer_stats.sealed_segments, 0);
+            assert_eq!(writer_stats.live_docs, 0);
+            assert!(
+                writer_stats.last_publish_unix.is_some(),
+                "genesis is stamped"
+            );
+            assert!(
+                writer_stats.live_writer,
+                "writer holds LOCK by construction"
+            );
+            assert!(
+                writer_stats.managed_disk_bytes > 0,
+                "MANIFEST and LOCK are managed bytes"
+            );
+            assert_eq!(writer_stats.delta_segments, 0);
+
+            // A concurrent read-only snapshot sees the live writer through the
+            // D1 LOCK record (same pid, demonstrably alive).
+            let snapshot =
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("open snapshot");
+            let snapshot_stats = SegmentStatsProvider::segment_stats(&snapshot);
+            assert_eq!(snapshot_stats.published_generation, 1);
+            assert!(snapshot_stats.last_publish_unix.is_some());
+            assert!(snapshot_stats.live_writer, "LOCK record names a live pid");
+
+            // After the writer releases admission, the truncated LOCK record
+            // reports no live writer.
+            drop(writer);
+            let snapshot =
+                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA).expect("reopen snapshot");
+            let released = SegmentStatsProvider::segment_stats(&snapshot);
+            assert!(
+                !released.live_writer,
+                "released LOCK reports no live writer"
+            );
+        });
+    }
+
+    #[test]
+    fn visibility_barrier_truth_table_matches_the_contract() {
+        let base = SegmentStats {
+            last_publish_unix: Some(1_700_000_000),
+            ..SegmentStats::default()
+        };
+        let one_second = Duration::from_millis(1_000);
+        // No pending changes: never due, even with no witness at all.
+        assert!(!base.visibility_barrier_due(one_second, false, 1_700_100_000));
+        assert!(!SegmentStats::default().visibility_barrier_due(one_second, false, 1_700_100_000));
+        // Pending changes with no durable witness: immediately due.
+        assert!(SegmentStats::default().visibility_barrier_due(one_second, true, 1_700_100_000));
+        // Within the bound: not due; at or beyond: due.
+        assert!(!base.visibility_barrier_due(one_second, true, 1_700_000_000));
+        assert!(base.visibility_barrier_due(one_second, true, 1_700_000_001));
+        assert!(base.visibility_barrier_due(Duration::from_millis(500), true, 1_700_000_001));
+        assert!(base.visibility_barrier_due(one_second, true, 1_700_000_100));
+        // Clock skew reads as zero lag, never as a negative duration.
+        assert!(!base.visibility_barrier_due(one_second, true, 1_699_999_000));
     }
 }

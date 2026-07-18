@@ -490,9 +490,10 @@ individual document's length and never to the STATS aggregate.
 ### 6.1 Layout
 
 ```
-magic "FSLXMAN\0" | format_version: u32 = 1 | generation: u64
+magic "FSLXMAN\0" | format_version: u32 = 2 | generation: u64
 docid_high_watermark: u64 | schema_id: u64 | engine_version: u32
 flags: u32 (bit 0 = bulk_mode_in_progress)
+last_publish_unix_s: i64   # v2; visibility freshness witness, 0 = unknown (amendment v1.0.18)
 segment_count: u32
 segments: segment_count × {
   segment_id: u64, seal_seq: u64, file_len: u64, file_xxh3: u64,
@@ -503,6 +504,8 @@ field_count: u32
 stats rollup: field_count × { field_ord: u16, total_tokens: u64, doc_count: u32 }   # sums over segments
 crc32: u32 (over all preceding bytes)
 ```
+
+Readers accept `format_version` 1 and 2; a v1 image decodes `last_publish_unix_s` as `0` (unknown). Writers emit v2 only, stamping the field with the publish wall clock when the proposer left it zero, so every keeper-written generation carries the cross-process freshness witness (visibility contract, bead `bd-quill-duel-visibility-contract-9rk3`). The field is informational: never validated for monotonicity, because NTP steps make wall-clock ordering unreliable.
 
 `engine_version` packs the crate semver as `(major:u8 << 24) | (minor:u8 << 16) | patch:u16`; prerelease/build metadata is not encoded. Segments are listed in **ascending docid_lo** order. R2 merge order follows that range order, while IDHASH cross-segment probe priority uses descending `seal_seq` (added by amendment v1.0.1); a tombstoned hit continues to later segments because `seal_seq` orders current containers, not the physical updates republished inside them. Stats entries are listed in strictly ascending `field_ord` order. Across adjacent generations, retained segment metadata is immutable, retained tombstones only grow, and every newly referenced segment has a `seal_seq` greater than the maximum in the prior non-empty generation. An explicit empty generation starts a new seal-sequence epoch; restarting at 1 is valid because no older segment remains queryable or participates in cross-segment probing. If the immutable segment set is unchanged, its at-seal stats rollup is unchanged as well; tombstone-only generations do not rewrite BM25 statistics.
 
@@ -616,6 +619,7 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.15 | 2026-07-18 | STOREDMETA v1 pre-freeze correction: every schema-stored field gets a packed presence bitmap before its positional offset table, preserving absent/hole versus present-empty values; exact directory offsets, bitmap canonicality, zero-copy reads, sparse Scribe sealing, and gap-preserving concat are pinned | — (pre-freeze correction) | exact wire golden, absent/empty/non-UTF8 roundtrip, sparse accumulator holes, corruption/resource matrix, lazy first-touch, and direct/left/right concat equivalence (e2.9) |
 | 1.0.16 | 2026-07-18 | IDMAP/IDHASH v1 pre-freeze correction: cap positional span at the layout-derived 357,913,940; pin unseeded content hashes, hole/offset rules, segment-relative one-based IDHASH ordinals, minimum canonical capacity, ascending representative insertion, exact-byte collision checks, bounded probe work, live-first tombstone-aware duplicate resolution with a lowest-docid all-dead fallback, and continue-after-tombstone cross-segment probing | — (pre-freeze correction) | exact seeded/unseeded wire oracles, collision/wrap/zero-hash and corruption matrix, external-representative and merge-of-merges regressions, span-bound arithmetic, concat equivalence, 1M-ID reopen/probe, and materialization A/B (e2.6) |
 | 1.0.17 | 2026-07-18 | Writer admission and generation publication are pinned: persistent no-follow `LOCK` inode, exact LE+CRC record, nonblocking exclusive flock, ESRCH-only residual takeover independent of mtime, exact-record truncate-on-release without unlink, retained O_EXCL `gen-N.claim`, writer-only recovery/repair/GC, and touchless reader open | — (pre-freeze protocol hardening) | wire/corruption matrix, real SIGSTOP owner, two-process dead-owner race, inode-replacement ABA, reader directory-identity, interrupted-claim recovery, and durable staged-repair fixtures (writer-lock bead) |
+| 1.0.18 | 2026-07-18 | MANIFEST v2: generation-level `last_publish_unix_s: i64` after `flags` (visibility freshness witness; 0 = unknown; publisher stamps zero fields; never monotonicity-validated). Readers accept v1 images as timestamp-unknown; writers emit v2 only (bead `bd-quill-duel-visibility-contract-9rk3`) | v1 images read with timestamp 0 (unknown) | v1/v2 wire goldens, v1-image read compatibility, publisher stamping + caller-override, successor stamp propagation (keeper inline) |
 
 The v1 golden decodes to 921 bytes and is the exact output pinned by
 `segment::tests::pinned_wire_oracle_and_roundtrip_preserve_header_table_and_payloads`.
