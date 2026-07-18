@@ -2876,27 +2876,115 @@ fn recover_corrupt_primary_slot(admission: &WriterAdmissionInner) -> Result<(), 
     let previous = admission.directory.join("MANIFEST.prev");
     let current_slot = read_manifest_slot(&current)?;
     let previous_slot = read_manifest_slot(&previous)?;
-    if !matches!(current_slot, ManifestSlot::Invalid(_))
-        || !matches!(previous_slot, ManifestSlot::Valid(_))
+    if matches!(current_slot, ManifestSlot::Invalid(_))
+        && matches!(previous_slot, ManifestSlot::Valid(_))
     {
+        let retired = admission.directory.join(format!(
+            ".tmp-corrupt-manifest-{:016x}",
+            admission.record.pid_start_nonce
+        ));
+        let changed = retire_regular_artifact(admission, &current, &retired)?;
+        let current_sidecar = append_path_suffix(&current, ".fec");
+        let retired_sidecar = append_path_suffix(&retired, ".fec");
+        let changed =
+            retire_regular_artifact(admission, &current_sidecar, &retired_sidecar)? || changed;
+        if changed {
+            admission
+                .directory_file
+                .sync_all()
+                .map_err(|source| KeeperError::Io {
+                    operation: "fsync corrupt MANIFEST retirement",
+                    path: admission.directory.clone(),
+                    source,
+                })?;
+        }
         return Ok(());
     }
 
+    // A crash between the two renames above leaves MANIFEST retired while its
+    // sidecar remains canonical; complete that interrupted retirement once.
+    if matches!(current_slot, ManifestSlot::Missing)
+        && matches!(previous_slot, ManifestSlot::Valid(_))
+    {
+        recover_interrupted_corrupt_retirement(admission)?;
+    }
+    Ok(())
+}
+
+/// Complete an interrupted corrupt-primary retirement (bd-qxce).
+///
+/// Corrupt-primary retirement performs two renames — `MANIFEST` into its
+/// no-replace quarantine, then `MANIFEST.fec` — followed by one directory
+/// fsync. A crash between the renames leaves the sidecar at its canonical
+/// name while the `.tmp-corrupt-manifest-*` quarantine records the deliberate
+/// retirement. Future durable opens would otherwise reconsider that orphan
+/// sidecar on every admission, repeating the repair attempt the retiring
+/// writer already rejected. When the retirement evidence exists, retire the
+/// orphan sidecar once, deterministically, into its own no-replace
+/// quarantine. A canonical sidecar without retirement evidence is a
+/// legitimate crash survivor and is left untouched.
+fn recover_interrupted_corrupt_retirement(
+    admission: &WriterAdmissionInner,
+) -> Result<(), KeeperError> {
+    let sidecar = admission.directory.join("MANIFEST.fec");
+    let sidecar_exists = match std::fs::symlink_metadata(&sidecar) {
+        Ok(metadata) if metadata.file_type().is_file() => true,
+        Ok(_) => {
+            return Err(KeeperError::Io {
+                operation: "inspect interrupted-retirement sidecar",
+                path: sidecar.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "interrupted-retirement sidecar is not a regular file",
+                ),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(KeeperError::Io {
+                operation: "inspect interrupted-retirement sidecar",
+                path: sidecar.clone(),
+                source: error,
+            });
+        }
+    };
+    if !sidecar_exists {
+        return Ok(());
+    }
+    let mut retirement_evidence = false;
+    let entries = std::fs::read_dir(&admission.directory).map_err(|source| KeeperError::Io {
+        operation: "scan for corrupt-retirement evidence",
+        path: admission.directory.clone(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| KeeperError::Io {
+            operation: "read corrupt-retirement evidence entry",
+            path: admission.directory.clone(),
+            source,
+        })?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".tmp-corrupt-manifest-"))
+        {
+            retirement_evidence = true;
+            break;
+        }
+    }
+    if !retirement_evidence {
+        return Ok(());
+    }
     let retired = admission.directory.join(format!(
-        ".tmp-corrupt-manifest-{:016x}",
+        ".tmp-corrupt-manifest-fec-{:016x}",
         admission.record.pid_start_nonce
     ));
-    let changed = retire_regular_artifact(admission, &current, &retired)?;
-    let current_sidecar = append_path_suffix(&current, ".fec");
-    let retired_sidecar = append_path_suffix(&retired, ".fec");
-    let changed =
-        retire_regular_artifact(admission, &current_sidecar, &retired_sidecar)? || changed;
-    if changed {
+    if retire_regular_artifact(admission, &sidecar, &retired)? {
         admission
             .directory_file
             .sync_all()
             .map_err(|source| KeeperError::Io {
-                operation: "fsync corrupt MANIFEST retirement",
+                operation: "fsync interrupted corrupt-sidecar retirement",
                 path: admission.directory.clone(),
                 source,
             })?;
@@ -3344,19 +3432,46 @@ fn install_recovered_bytes(
     destination: &Path,
     bytes: &[u8],
 ) -> Result<(), KeeperError> {
-    install_recovered_bytes_with_hook(admission, label, destination, bytes, |_| Ok(()))
+    install_recovered_bytes_with_observer(admission, label, destination, bytes, &mut |_, _| Ok(()))
+}
+
+/// Deterministic crash-window checkpoints in recovered-byte installation
+/// (bd-qxce). Every durable side effect boundary reports here so the crash
+/// matrix can suspend the choreography at each step and prove recovery.
+#[cfg(all(
+    feature = "durability",
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredByteInstallCheckpoint {
+    /// The recovered-byte temp file was written and fsynced.
+    TempSynced,
+    /// The descriptor-bound ready link was created and the directory fsynced.
+    StagingSynced,
+    /// Immediately before the atomic link/exchange into the canonical name.
+    BeforeAtomicInstall,
+    /// The canonical name now names the recovered inode.
+    AfterAtomicInstall,
+    /// A detected substitution was rolled back by the reverse exchange.
+    AfterRollback,
+    /// The rollback directory fsync completed.
+    AfterRollbackSync,
+    /// The replaced corrupt authority was retired to its no-replace quarantine.
+    AfterCorruptRetirement,
+    /// The final installation directory fsync completed.
+    FinalSynced,
 }
 
 #[cfg(all(
     feature = "durability",
     any(target_os = "linux", target_os = "android", target_vendor = "apple")
 ))]
-fn install_recovered_bytes_with_hook(
+fn install_recovered_bytes_with_observer(
     admission: &WriterAdmissionInner,
     label: &str,
     destination: &Path,
     bytes: &[u8],
-    before_atomic_install: impl FnOnce(&Path) -> io::Result<()>,
+    observe: &mut impl FnMut(RecoveredByteInstallCheckpoint, &Path) -> io::Result<()>,
 ) -> Result<(), KeeperError> {
     use rustix::fs::{
         AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, linkat, openat, renameat_with, statat,
@@ -3445,6 +3560,13 @@ fn install_recovered_bytes_with_hook(
             path: temporary_path.clone(),
             source,
         })?;
+    observe(RecoveredByteInstallCheckpoint::TempSynced, &temporary_path).map_err(|source| {
+        KeeperError::Io {
+            operation: "run recovered-byte install checkpoint",
+            path: temporary_path.clone(),
+            source,
+        }
+    })?;
     if !temporary_metadata.file_type().is_file()
         || temporary_file
             .metadata()
@@ -3547,6 +3669,15 @@ fn install_recovered_bytes_with_hook(
             path: admission.directory.clone(),
             source,
         })?;
+    observe(
+        RecoveredByteInstallCheckpoint::StagingSynced,
+        &admission.directory,
+    )
+    .map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: admission.directory.clone(),
+        source,
+    })?;
 
     let destination_identity = match statat(
         &admission.directory_file,
@@ -3575,7 +3706,11 @@ fn install_recovered_bytes_with_hook(
             });
         }
     };
-    before_atomic_install(&ready_path).map_err(|source| KeeperError::Io {
+    observe(
+        RecoveredByteInstallCheckpoint::BeforeAtomicInstall,
+        &ready_path,
+    )
+    .map_err(|source| KeeperError::Io {
         operation: "run recovered-byte install checkpoint",
         path: ready_path.clone(),
         source,
@@ -3621,6 +3756,15 @@ fn install_recovered_bytes_with_hook(
             source,
         })?;
     }
+    observe(
+        RecoveredByteInstallCheckpoint::AfterAtomicInstall,
+        destination,
+    )
+    .map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: destination.to_path_buf(),
+        source,
+    })?;
     let destination_stat = statat(
         &admission.directory_file,
         destination_name,
@@ -3655,6 +3799,13 @@ fn install_recovered_bytes_with_hook(
             path: destination.to_path_buf(),
             source,
         })?;
+        observe(RecoveredByteInstallCheckpoint::AfterRollback, destination).map_err(|source| {
+            KeeperError::Io {
+                operation: "run recovered-byte install checkpoint",
+                path: destination.to_path_buf(),
+                source,
+            }
+        })?;
         let restored = destination_identity.is_some_and(|(device, inode, size)| {
             statat(
                 &admission.directory_file,
@@ -3681,6 +3832,15 @@ fn install_recovered_bytes_with_hook(
                 path: admission.directory.clone(),
                 source,
             })?;
+        observe(
+            RecoveredByteInstallCheckpoint::AfterRollbackSync,
+            &admission.directory,
+        )
+        .map_err(|source| KeeperError::Io {
+            operation: "run recovered-byte install checkpoint",
+            path: admission.directory.clone(),
+            source,
+        })?;
         return Err(KeeperError::Io {
             operation: "verify installed recovered bytes",
             path: destination.to_path_buf(),
@@ -3696,6 +3856,15 @@ fn install_recovered_bytes_with_hook(
             admission.record.pid_start_nonce
         ));
         retire_regular_artifact(admission, &ready_path, &retired)?;
+        observe(
+            RecoveredByteInstallCheckpoint::AfterCorruptRetirement,
+            &retired,
+        )
+        .map_err(|source| KeeperError::Io {
+            operation: "run recovered-byte install checkpoint",
+            path: retired.clone(),
+            source,
+        })?;
     }
     // Keep the exclusively-created temp name as a second link until ordinary
     // grace-period garbage collection retires it. Conditional unlink is not
@@ -3708,7 +3877,16 @@ fn install_recovered_bytes_with_hook(
             operation: "fsync staged repair installation",
             path: admission.directory.clone(),
             source,
-        })
+        })?;
+    observe(
+        RecoveredByteInstallCheckpoint::FinalSynced,
+        &admission.directory,
+    )
+    .map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: admission.directory.clone(),
+        source,
+    })
 }
 
 #[cfg(all(
@@ -11592,14 +11770,17 @@ mod tests {
         std::fs::write(&destination, &prior)?;
         let displaced_ready = index.path().join("displaced-owned-ready-link");
 
-        let error = install_recovered_bytes_with_hook(
+        let error = install_recovered_bytes_with_observer(
             &admission,
             "MANIFEST",
             &destination,
             b"validated recovery",
-            |ready| {
-                std::fs::rename(ready, &displaced_ready)?;
-                std::fs::write(ready, b"substituted bytes")
+            &mut |checkpoint, ready| {
+                if checkpoint == RecoveredByteInstallCheckpoint::BeforeAtomicInstall {
+                    std::fs::rename(ready, &displaced_ready)?;
+                    std::fs::write(ready, b"substituted bytes")?;
+                }
+                Ok(())
             },
         )
         .expect_err("a substituted ready link must not become authority");
@@ -11629,14 +11810,17 @@ mod tests {
         let destination = index.path().join("MANIFEST");
         let displaced_ready = index.path().join("displaced-owned-ready-link");
 
-        install_recovered_bytes_with_hook(
+        install_recovered_bytes_with_observer(
             &admission,
             "MANIFEST",
             &destination,
             b"validated recovery",
-            |ready| {
-                std::fs::rename(ready, &displaced_ready)?;
-                std::fs::write(ready, b"substituted bytes")
+            &mut |checkpoint, ready| {
+                if checkpoint == RecoveredByteInstallCheckpoint::BeforeAtomicInstall {
+                    std::fs::rename(ready, &displaced_ready)?;
+                    std::fs::write(ready, b"substituted bytes")?;
+                }
+                Ok(())
             },
         )?;
         assert_eq!(std::fs::read(&destination)?, b"validated recovery");
@@ -12747,5 +12931,300 @@ mod tests {
         assert!(base.visibility_barrier_due(one_second, true, 1_700_000_100));
         // Clock skew reads as zero lag, never as a negative duration.
         assert!(!base.visibility_barrier_due(one_second, true, 1_699_999_000));
+    }
+
+    // ==== Recovered-byte install crash matrix (bd-qxce) ====
+
+    #[cfg(all(
+        feature = "durability",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn recovered_byte_install_crash_matrix_recovers_idempotently() -> TestResult {
+        use RecoveredByteInstallCheckpoint as Cp;
+
+        let schema_id = DEFAULT_SCHEMA.schema_id()?;
+        let prior = Manifest::empty(1, schema_id, 0).to_bytes()?;
+        let recovered = Manifest::empty(2, schema_id, 0).to_bytes()?;
+
+        #[derive(Debug)]
+        struct Row {
+            fault: RecoveredByteInstallCheckpoint,
+            destination_present: bool,
+            substitute_at_install: bool,
+        }
+        let mut rows = Vec::new();
+        for destination_present in [true, false] {
+            for fault in [
+                Cp::TempSynced,
+                Cp::StagingSynced,
+                Cp::BeforeAtomicInstall,
+                Cp::AfterAtomicInstall,
+                Cp::FinalSynced,
+            ] {
+                rows.push(Row {
+                    fault,
+                    destination_present,
+                    substitute_at_install: false,
+                });
+            }
+        }
+        rows.push(Row {
+            fault: Cp::AfterCorruptRetirement,
+            destination_present: true,
+            substitute_at_install: false,
+        });
+        rows.push(Row {
+            fault: Cp::AfterRollback,
+            destination_present: true,
+            substitute_at_install: true,
+        });
+        rows.push(Row {
+            fault: Cp::AfterRollbackSync,
+            destination_present: true,
+            substitute_at_install: true,
+        });
+
+        for row in rows {
+            let context = format!("{row:?}");
+            let index = tempdir()?;
+            let admission = acquire_writer_admission(index.path())?;
+            let destination = index.path().join("MANIFEST");
+            if row.destination_present {
+                std::fs::write(&destination, &prior)?;
+            }
+            let displaced_ready = index.path().join("displaced-ready");
+            let error = install_recovered_bytes_with_observer(
+                &admission,
+                "MANIFEST",
+                &destination,
+                &recovered,
+                &mut |checkpoint, ready| {
+                    if row.substitute_at_install && checkpoint == Cp::BeforeAtomicInstall {
+                        std::fs::rename(ready, &displaced_ready)?;
+                        std::fs::write(ready, b"hostile substitution")?;
+                    }
+                    if checkpoint == row.fault {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "injected deterministic crash",
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err(&context);
+            assert!(
+                matches!(error, KeeperError::Io { .. }),
+                "{context}: fault surfaces as typed I/O"
+            );
+
+            // Authority after the crash: pre-install faults keep the prior
+            // authority (or absence); install faults have already exchanged;
+            // rollback faults restored the prior authority.
+            let expect_recovered = matches!(
+                row.fault,
+                Cp::AfterAtomicInstall | Cp::AfterCorruptRetirement | Cp::FinalSynced
+            );
+            let canonical = std::fs::read(&destination).ok();
+            if expect_recovered {
+                assert_eq!(
+                    canonical.as_deref(),
+                    Some(recovered.as_slice()),
+                    "{context}: exchanged authority is the recovered generation"
+                );
+            } else if row.destination_present {
+                assert_eq!(
+                    canonical.as_deref(),
+                    Some(prior.as_slice()),
+                    "{context}: prior authority survives"
+                );
+            } else {
+                assert!(canonical.is_none(), "{context}: no authority was installed");
+            }
+
+            // Reopen #1: a completed retry converges to the recovered
+            // authority regardless of the crash debris left behind.
+            drop(admission);
+            let admission = acquire_writer_admission(index.path())?;
+            install_recovered_bytes(&admission, "MANIFEST", &destination, &recovered)
+                .unwrap_or_else(|error| panic!("{context}: retry after crash succeeds: {error}"));
+            assert_eq!(
+                std::fs::read(&destination)?,
+                recovered,
+                "{context}: retry installs the recovered generation"
+            );
+            // Reopen #2: byte-identical authority, proving idempotence.
+            drop(admission);
+            let admission = acquire_writer_admission(index.path())?;
+            assert_eq!(std::fs::read(&destination)?, recovered, "{context}: stable");
+
+            // Grace-expired GC removes every repair orphan without changing
+            // canonical bytes; a second sweep is empty.
+            let report = collect_writer_garbage_under_lock(
+                index.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions {
+                    grace_period: Duration::ZERO,
+                },
+            )?;
+            assert_eq!(
+                std::fs::read(&destination)?,
+                recovered,
+                "{context}: GC preserved authority"
+            );
+            let second = collect_writer_garbage_under_lock(
+                index.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions {
+                    grace_period: Duration::ZERO,
+                },
+            )?;
+            assert!(
+                second.removed.len() <= report.removed.len(),
+                "{context}: GC is idempotent"
+            );
+            assert!(
+                second.removed.is_empty(),
+                "{context}: second sweep finds nothing: {:?}",
+                second.removed
+            );
+            drop(admission);
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "durability",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn interrupted_corrupt_retirement_orphan_sidecar_is_retired_once() -> TestResult {
+        let index = tempdir()?;
+        let schema_id = DEFAULT_SCHEMA.schema_id()?;
+        // State: MANIFEST.prev valid (gen 1), MANIFEST deliberately retired
+        // (quarantine evidence), orphan MANIFEST.fec left by the interrupted
+        // second rename. The sidecar is REAL: produced by the durability
+        // protector over the gen-2 bytes, never a mock.
+        let previous = Manifest::empty(1, schema_id, 0).to_bytes()?;
+        std::fs::write(index.path().join("MANIFEST.prev"), &previous)?;
+        let orphan_source = index.path().join("MANIFEST");
+        let orphan_bytes = Manifest::empty(2, schema_id, 0).to_bytes()?;
+        std::fs::write(&orphan_source, &orphan_bytes)?;
+        let protector = test_file_protector();
+        protector
+            .protect_file_with_witness(&orphan_source, FileSourceWitness::from_bytes(&orphan_bytes))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let orphan_sidecar = FileProtector::sidecar_path(&orphan_source);
+        assert!(orphan_sidecar.exists(), "real FEC sidecar was produced");
+        std::fs::remove_file(&orphan_source)?; // the interrupted first rename
+        std::fs::write(
+            index.path().join(".tmp-corrupt-manifest-0000000000000001"),
+            b"deliberately retired corrupt authority",
+        )?;
+
+        let admission = acquire_writer_admission(index.path())?;
+        recover_writer_directory(&admission, DEFAULT_SCHEMA, &WriterProtection::Disabled)?;
+        assert!(
+            !orphan_sidecar.exists(),
+            "orphan sidecar is retired once, deterministically"
+        );
+        let quarantines = std::fs::read_dir(index.path())?
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".tmp-corrupt-manifest-fec-"))
+            .count();
+        assert_eq!(quarantines, 1, "orphan moved to no-replace quarantine");
+        assert_eq!(
+            std::fs::read(index.path().join("MANIFEST.prev"))?,
+            previous,
+            "previous authority is untouched"
+        );
+        assert!(
+            !index.path().join("MANIFEST").exists(),
+            "retired authority is not resurrected"
+        );
+
+        // A second recovery performs no further work: reopen and compare the
+        // whole directory byte-for-byte.
+        let before = directory_bytes(index.path())?;
+        recover_writer_directory(&admission, DEFAULT_SCHEMA, &WriterProtection::Disabled)?;
+        assert_eq!(
+            directory_bytes(index.path())?,
+            before,
+            "recovery is idempotent"
+        );
+        drop(admission);
+
+        // Negative row: the same orphan sidecar WITHOUT retirement evidence is
+        // a legitimate crash survivor and stays put.
+        let survivor = tempdir()?;
+        std::fs::write(
+            survivor.path().join("MANIFEST.prev"),
+            &Manifest::empty(1, schema_id, 0).to_bytes()?,
+        )?;
+        let survivor_source = survivor.path().join("MANIFEST");
+        std::fs::write(&survivor_source, &orphan_bytes)?;
+        protector
+            .protect_file_with_witness(
+                &survivor_source,
+                FileSourceWitness::from_bytes(&orphan_bytes),
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        std::fs::remove_file(&survivor_source)?;
+        let admission = acquire_writer_admission(survivor.path())?;
+        recover_writer_directory(&admission, DEFAULT_SCHEMA, &WriterProtection::Disabled)?;
+        assert!(
+            FileProtector::sidecar_path(&survivor_source).exists(),
+            "no evidence: crash-survivor sidecar is preserved"
+        );
+        drop(admission);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grace_expired_gc_removes_every_repair_orphan_without_touching_authority() -> TestResult {
+        let index = tempdir()?;
+        let schema_id = DEFAULT_SCHEMA.schema_id()?;
+        let canonical = Manifest::empty(1, schema_id, 0).to_bytes()?;
+        std::fs::write(index.path().join("MANIFEST"), &canonical)?;
+        let orphans = [
+            ".tmp-repair-MANIFEST-00000000000000aa",
+            ".tmp-repair-MANIFEST-00000000000000aa.1",
+            ".tmp-ready-repair-MANIFEST-00000000000000aa",
+            ".tmp-corrupt-MANIFEST-00000000000000aa",
+            ".tmp-corrupt-manifest-fec-00000000000000aa",
+            ".tmp-corrupt-manifest-00000000000000aa",
+        ];
+        for (offset, name) in orphans.iter().enumerate() {
+            std::fs::write(index.path().join(name), format!("orphan {offset}"))?;
+        }
+        let report = collect_writer_garbage_under_lock(
+            index.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions {
+                grace_period: Duration::ZERO,
+            },
+        )?;
+        assert_eq!(
+            report.removed.len(),
+            orphans.len(),
+            "every orphan class swept"
+        );
+        assert_eq!(
+            std::fs::read(index.path().join("MANIFEST"))?,
+            canonical,
+            "canonical authority bytes are unchanged"
+        );
+        let second = collect_writer_garbage_under_lock(
+            index.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions {
+                grace_period: Duration::ZERO,
+            },
+        )?;
+        assert!(second.removed.is_empty(), "second sweep is empty");
+        Ok(())
     }
 }
