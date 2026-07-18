@@ -11,6 +11,7 @@ use std::collections::BinaryHeap;
 use std::fmt;
 use std::sync::Arc;
 
+use frankensearch_core::DocId;
 use thiserror::Error;
 
 use crate::contract::{BM25_K1, compute_tf_cache, idf};
@@ -184,6 +185,23 @@ pub enum ArgusError {
         /// Global Quill document id.
         global_docid: u32,
     },
+    /// Offset pagination overflowed the host collection domain.
+    #[error("top-k collector window overflows usize: limit {limit}, offset {offset}")]
+    CollectorWindowOverflow {
+        /// Requested page size.
+        limit: usize,
+        /// Requested number of leading hits to skip.
+        offset: usize,
+    },
+    /// An exact match count exceeded the durable collection domain.
+    #[error("exact match count overflowed u64")]
+    MatchCountOverflow,
+    /// A scoreless collector received a scorer that scores while advancing.
+    #[error("doc-set collection requires a recursively unscored Boolean scorer")]
+    ScoredTreeForUnscoredCollector,
+    /// A caller attempted to score a deliberately unscored query tree.
+    #[error("an unscored Boolean query has no BM25 score")]
+    ScoreUnavailable,
 }
 
 /// Forward-only posting access shared by sealed and future delta segments.
@@ -1335,8 +1353,15 @@ enum ScorerNode<'a> {
     Phrase(PhraseScorer<'a>),
     Intersection(IntersectionScorer<'a>),
     Union(BufferedUnionScorer<'a>),
+    UnscoredUnion(UnscoredUnionScorer<'a>),
     RequiredOptional(RequiredOptionalScorer<'a>),
     Exclude(ExcludeScorer<'a>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BooleanMode {
+    Scored,
+    Unscored,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1402,6 +1427,22 @@ impl<'a> ReferenceScorer<'a> {
         matches!(self.node, ScorerNode::Empty)
     }
 
+    fn is_unscored_safe(&self) -> bool {
+        match &self.node {
+            ScorerNode::Empty | ScorerNode::Term(_) | ScorerNode::Phrase(_) => true,
+            ScorerNode::Intersection(scorer) => scorer.scorers.iter().all(Self::is_unscored_safe),
+            ScorerNode::Union(_) => false,
+            ScorerNode::UnscoredUnion(scorer) => scorer.active.iter().all(Self::is_unscored_safe),
+            ScorerNode::RequiredOptional(scorer) => {
+                scorer.required.is_unscored_safe() && scorer.optional.is_unscored_safe()
+            }
+            ScorerNode::Exclude(scorer) => {
+                scorer.include.is_unscored_safe()
+                    && scorer.excluded.iter().all(Self::is_unscored_safe)
+            }
+        }
+    }
+
     /// Lower Boolean clauses into the pinned Tantivy scorer-tree shape.
     ///
     /// `Should` is required only when no positive `Must` exists. A raw
@@ -1412,6 +1453,35 @@ impl<'a> ReferenceScorer<'a> {
     /// Returns a typed error if bounded scorer buffers cannot be allocated or
     /// initial cursor alignment detects malformed state.
     pub fn boolean(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
+        Self::boolean_with_mode(clauses, BooleanMode::Scored)
+    }
+
+    /// Lower Boolean clauses into a genuinely scoreless matching tree.
+    ///
+    /// The caller must use this constructor recursively for nested Boolean
+    /// children. Unlike the parity-pinned buffered scored union, its `Should`
+    /// union advances lazily and never invokes BM25 scoring. Optional `Should`
+    /// clauses are omitted when a positive `Must` already determines matching.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a child tree containing a scored buffered union, or any ordinary
+    /// allocation and cursor-alignment failure.
+    pub fn boolean_unscored(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
+        Self::boolean_with_mode(clauses, BooleanMode::Unscored)
+    }
+
+    fn boolean_with_mode(
+        clauses: Vec<ScorerClause<'a>>,
+        mode: BooleanMode,
+    ) -> Result<Self, ArgusError> {
+        if mode == BooleanMode::Unscored
+            && clauses
+                .iter()
+                .any(|clause| !clause.scorer.is_unscored_safe())
+        {
+            return Err(ArgusError::ScoredTreeForUnscoredCollector);
+        }
         if matches!(
             clauses.as_slice(),
             [clause] if clause.occur == Occur::MustNot
@@ -1442,10 +1512,13 @@ impl<'a> ReferenceScorer<'a> {
         }
 
         let include = if must.is_empty() {
-            scorer_union(should)?
+            match mode {
+                BooleanMode::Scored => scorer_union(should)?,
+                BooleanMode::Unscored => scorer_union_unscored(should)?,
+            }
         } else {
             let required = scorer_intersection(must)?;
-            if should.is_empty() {
+            if should.is_empty() || mode == BooleanMode::Unscored {
                 required
             } else {
                 let optional = scorer_union(should)?;
@@ -1473,6 +1546,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.doc(),
             ScorerNode::Intersection(scorer) => scorer.doc(),
             ScorerNode::Union(scorer) => scorer.doc(),
+            ScorerNode::UnscoredUnion(scorer) => scorer.doc(),
             ScorerNode::RequiredOptional(scorer) => scorer.doc(),
             ScorerNode::Exclude(scorer) => scorer.doc(),
         }
@@ -1487,6 +1561,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.cost,
             ScorerNode::Intersection(scorer) => scorer.cost(),
             ScorerNode::Union(scorer) => scorer.cost(),
+            ScorerNode::UnscoredUnion(scorer) => scorer.cost(),
             ScorerNode::RequiredOptional(scorer) => scorer.cost(),
             ScorerNode::Exclude(scorer) => scorer.cost(),
         }
@@ -1501,6 +1576,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.size_hint,
             ScorerNode::Intersection(scorer) => scorer.size_hint(),
             ScorerNode::Union(scorer) => scorer.size_hint(),
+            ScorerNode::UnscoredUnion(scorer) => scorer.size_hint(),
             ScorerNode::RequiredOptional(scorer) => scorer.size_hint(),
             ScorerNode::Exclude(scorer) => scorer.size_hint(),
         }
@@ -1515,6 +1591,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.segment_num_docs,
             ScorerNode::Intersection(scorer) => scorer.segment_num_docs,
             ScorerNode::Union(scorer) => scorer.segment_num_docs,
+            ScorerNode::UnscoredUnion(scorer) => scorer.segment_num_docs,
             ScorerNode::RequiredOptional(scorer) => scorer.segment_num_docs,
             ScorerNode::Exclude(scorer) => scorer.segment_num_docs,
         }
@@ -1536,6 +1613,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.next(),
             ScorerNode::Intersection(scorer) => scorer.next(),
             ScorerNode::Union(scorer) => scorer.next(),
+            ScorerNode::UnscoredUnion(scorer) => scorer.next(),
             ScorerNode::RequiredOptional(scorer) => scorer.next(),
             ScorerNode::Exclude(scorer) => scorer.next(),
         }
@@ -1553,6 +1631,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.seek(target),
             ScorerNode::Intersection(scorer) => scorer.seek(target),
             ScorerNode::Union(scorer) => scorer.seek(target),
+            ScorerNode::UnscoredUnion(scorer) => scorer.seek(target),
             ScorerNode::RequiredOptional(scorer) => scorer.seek(target),
             ScorerNode::Exclude(scorer) => scorer.seek(target),
         }
@@ -1579,6 +1658,7 @@ impl<'a> ReferenceScorer<'a> {
             }
             ScorerNode::Intersection(scorer) => scorer.seek_danger(target),
             ScorerNode::Union(scorer) => scorer.seek_danger(target),
+            ScorerNode::UnscoredUnion(scorer) => scorer.seek_danger(target),
             ScorerNode::RequiredOptional(scorer) => scorer.seek_danger(target),
             ScorerNode::Exclude(scorer) => {
                 let result = if scorer.doc().is_some_and(|doc| doc < target) {
@@ -1604,6 +1684,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Phrase(scorer) => scorer.score(),
             ScorerNode::Intersection(scorer) => scorer.score(),
             ScorerNode::Union(scorer) => scorer.score(),
+            ScorerNode::UnscoredUnion(_) => Err(ArgusError::ScoreUnavailable),
             ScorerNode::RequiredOptional(scorer) => scorer.score(),
             ScorerNode::Exclude(scorer) => scorer.score(),
         }
@@ -1622,43 +1703,60 @@ impl<'a> ReferenceScorer<'a> {
     where
         L: LiveDocs + ?Sized,
     {
-        if limit == 0 {
-            return Ok(Vec::new());
+        let mut collector = TopDocsCollector::new(limit, 0)?;
+        collector.collect(self, live_docs)?;
+        Ok(collector.finish()?.hits)
+    }
+
+    /// Exhaust this recursively unscored tree into sorted unique global docids.
+    ///
+    /// Use [`Self::boolean_unscored`] for every Boolean level. Term and phrase
+    /// leaves are intrinsically safe because advancing them never evaluates a
+    /// BM25 score.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a scored buffered union anywhere in the tree and propagates
+    /// cursor or bounded-allocation failures.
+    pub fn collect_doc_set<L>(&mut self, live_docs: &L) -> Result<Vec<u32>, ArgusError>
+    where
+        L: LiveDocs + ?Sized,
+    {
+        let mut collector = DocSetCollector::new();
+        collector.collect(self, live_docs)?;
+        Ok(collector.finish())
+    }
+
+    fn collect_with<L>(
+        &mut self,
+        collector: &mut CollectorState<'_>,
+        live_docs: &L,
+    ) -> Result<(), ArgusError>
+    where
+        L: LiveDocs + ?Sized,
+    {
+        if matches!(collector, CollectorState::DocSet(_)) && !self.is_unscored_safe() {
+            return Err(ArgusError::ScoredTreeForUnscoredCollector);
         }
-        let capacity = limit.saturating_add(1);
-        let mut heap = BinaryHeap::new();
-        heap.try_reserve(capacity)
-            .map_err(|_| ArgusError::Allocation {
-                resource: "top-k heap",
-                count: capacity,
-            })?;
         while let Some(doc) = self.doc() {
-            let score = self.score()?;
-            if live_docs.is_live(doc) {
-                let entry = HeapEntry {
-                    global_docid: doc,
-                    score,
-                };
-                if heap.len() < limit {
-                    heap.push(entry);
-                } else if heap.peek().is_some_and(|cutoff| entry < *cutoff) {
-                    let _ = heap.pop();
-                    heap.push(entry);
+            match collector {
+                CollectorState::TopDocs(top_docs) => {
+                    // Scoring physical deleted matches before visibility
+                    // filtering preserves the buffered union's f32 state.
+                    let score = (top_docs.retained != 0).then(|| self.score()).transpose()?;
+                    if live_docs.is_live(doc) {
+                        top_docs.record_live(doc, score)?;
+                    }
+                }
+                CollectorState::DocSet(doc_set) => {
+                    if live_docs.is_live(doc) {
+                        doc_set.push(doc)?;
+                    }
                 }
             }
             self.next()?;
         }
-        let winner_count = heap.len();
-        let mut winners = Vec::new();
-        winners
-            .try_reserve_exact(winner_count)
-            .map_err(|_| ArgusError::Allocation {
-                resource: "top-k winners",
-                count: winner_count,
-            })?;
-        winners.extend(heap.into_iter().map(ScoredDoc::from));
-        winners.sort_unstable_by(|left, right| compare_scored_best_first(*left, *right));
-        Ok(winners)
+        Ok(())
     }
 }
 
@@ -1757,6 +1855,97 @@ fn scorer_union(mut scorers: Vec<ReferenceScorer<'_>>) -> Result<ReferenceScorer
         _ => Ok(ReferenceScorer {
             node: ScorerNode::Union(BufferedUnionScorer::new(scorers)?),
         }),
+    }
+}
+
+fn scorer_union_unscored(
+    mut scorers: Vec<ReferenceScorer<'_>>,
+) -> Result<ReferenceScorer<'_>, ArgusError> {
+    match scorers.len() {
+        0 => Ok(ReferenceScorer::empty()),
+        1 => scorers.pop().ok_or(ArgusError::CursorInvariant(
+            "unscored optional scorer count changed during lowering",
+        )),
+        _ => Ok(ReferenceScorer {
+            node: ScorerNode::UnscoredUnion(UnscoredUnionScorer::new(scorers)?),
+        }),
+    }
+}
+
+/// Lazy scoreless disjunction used only by doc-set collection.
+///
+/// The scored parity path keeps [`BufferedUnionScorer`] unchanged. This cursor
+/// advances all children at the current minimum document together, so it
+/// deduplicates matches without evaluating or retaining any BM25 contribution.
+struct UnscoredUnionScorer<'a> {
+    active: Vec<ReferenceScorer<'a>>,
+    current: Option<u32>,
+    segment_num_docs: u32,
+}
+
+impl<'a> UnscoredUnionScorer<'a> {
+    fn new(mut scorers: Vec<ReferenceScorer<'a>>) -> Result<Self, ArgusError> {
+        let segment_num_docs = shared_segment_num_docs(&scorers)?;
+        scorers.retain(|scorer| scorer.doc().is_some());
+        let current = scorers.iter().filter_map(ReferenceScorer::doc).min();
+        Ok(Self {
+            active: scorers,
+            current,
+            segment_num_docs,
+        })
+    }
+
+    const fn doc(&self) -> Option<u32> {
+        self.current
+    }
+
+    fn cost(&self) -> u64 {
+        self.active
+            .iter()
+            .map(ReferenceScorer::cost)
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    fn size_hint(&self) -> u32 {
+        estimate_union(
+            self.active.iter().map(ReferenceScorer::size_hint),
+            self.segment_num_docs,
+        )
+    }
+
+    fn refresh_current(&mut self) -> Option<u32> {
+        self.active.retain(|scorer| scorer.doc().is_some());
+        self.current = self.active.iter().filter_map(ReferenceScorer::doc).min();
+        self.current
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+        let Some(current) = self.current else {
+            return Ok(None);
+        };
+        for scorer in &mut self.active {
+            if scorer.doc() == Some(current) {
+                scorer.next()?;
+            }
+        }
+        Ok(self.refresh_current())
+    }
+
+    fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+        if self.current.is_some_and(|doc| doc >= target) {
+            return Ok(self.current);
+        }
+        for scorer in &mut self.active {
+            if scorer.doc().is_some_and(|doc| doc < target) {
+                scorer.advance(target)?;
+            }
+        }
+        Ok(self.refresh_current())
+    }
+
+    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+        let result = self.seek(target)?;
+        classify_seek_result(target, result)
     }
 }
 
@@ -2306,13 +2495,219 @@ pub struct ScoredDoc {
     pub score: f32,
 }
 
+/// Final globally merged top-doc page.
+///
+/// `total_count` is present only when the collector was created with
+/// [`TopDocsCollector::with_exact_count`]. Hits are already offset-sliced and
+/// remain in the canonical `(score desc, global_docid asc)` order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollectedTopDocs {
+    /// Page-local ranked hits.
+    pub hits: Vec<ScoredDoc>,
+    /// Exact number of live matches across every collected scorer.
+    pub total_count: Option<u64>,
+}
+
+/// Cross-segment exhaustive top-doc accumulator.
+///
+/// Feed every per-segment scorer into one instance, then call [`Self::finish`]
+/// exactly once. Offset slicing happens only after the global heap is sorted,
+/// preventing per-segment pagination from discarding valid winners.
+#[derive(Debug)]
+pub struct TopDocsCollector {
+    limit: usize,
+    offset: usize,
+    retained: usize,
+    exact_count: bool,
+    total_count: u64,
+    heap: BinaryHeap<HeapEntry>,
+}
+
+impl TopDocsCollector {
+    /// Build a count-free top-k collector with Tantivy-compatible offset.
+    ///
+    /// # Errors
+    ///
+    /// Rejects `limit + offset` overflow and bounded heap allocation failure.
+    pub fn new(limit: usize, offset: usize) -> Result<Self, ArgusError> {
+        Self::build(limit, offset, false)
+    }
+
+    /// Build a top-k collector that also exhaustively counts every live match.
+    ///
+    /// `limit == 0` retains no scores but still counts all matches.
+    ///
+    /// # Errors
+    ///
+    /// Rejects `limit + offset` overflow and bounded heap allocation failure.
+    pub fn with_exact_count(limit: usize, offset: usize) -> Result<Self, ArgusError> {
+        Self::build(limit, offset, true)
+    }
+
+    fn build(limit: usize, offset: usize, exact_count: bool) -> Result<Self, ArgusError> {
+        let retained = if limit == 0 {
+            0
+        } else {
+            limit
+                .checked_add(offset)
+                .ok_or(ArgusError::CollectorWindowOverflow { limit, offset })?
+        };
+        let mut heap = BinaryHeap::new();
+        heap.try_reserve_exact(retained)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "top-k heap",
+                count: retained,
+            })?;
+        Ok(Self {
+            limit,
+            offset,
+            retained,
+            exact_count,
+            total_count: 0,
+            heap,
+        })
+    }
+
+    /// Consume one segment scorer into this global accumulator.
+    ///
+    /// # Errors
+    ///
+    /// Propagates scorer, visibility, count, and allocation failures.
+    pub fn collect<L>(
+        &mut self,
+        scorer: &mut ReferenceScorer<'_>,
+        live_docs: &L,
+    ) -> Result<(), ArgusError>
+    where
+        L: LiveDocs + ?Sized,
+    {
+        if self.retained == 0 && !self.exact_count {
+            return Ok(());
+        }
+        let mut state = CollectorState::TopDocs(self);
+        scorer.collect_with(&mut state, live_docs)
+    }
+
+    fn record_live(&mut self, global_docid: u32, score: Option<f32>) -> Result<(), ArgusError> {
+        if self.exact_count {
+            self.total_count = self
+                .total_count
+                .checked_add(1)
+                .ok_or(ArgusError::MatchCountOverflow)?;
+        }
+        if self.retained == 0 {
+            return Ok(());
+        }
+        let score = score.ok_or(ArgusError::CursorInvariant(
+            "top-k collector did not score a retained match",
+        ))?;
+        let entry = HeapEntry {
+            global_docid,
+            score,
+        };
+        if self.heap.len() < self.retained {
+            self.heap.push(entry);
+        } else if self.heap.peek().is_some_and(|cutoff| entry < *cutoff) {
+            let _ = self.heap.pop();
+            self.heap.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Sort the global heap, apply offset once, and return page winners.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed allocation failure when the final compact hit vector
+    /// cannot be reserved.
+    pub fn finish(self) -> Result<CollectedTopDocs, ArgusError> {
+        let winner_count = self.heap.len();
+        let mut hits = Vec::new();
+        hits.try_reserve_exact(winner_count)
+            .map_err(|_| ArgusError::Allocation {
+                resource: "top-k winners",
+                count: winner_count,
+            })?;
+        hits.extend(self.heap.into_iter().map(ScoredDoc::from));
+        hits.sort_unstable_by(|left, right| compare_scored_best_first(*left, *right));
+        let start = self.offset.min(hits.len());
+        let end = start.saturating_add(self.limit).min(hits.len());
+        if start != 0 {
+            hits.copy_within(start..end, 0);
+        }
+        hits.truncate(end - start);
+        Ok(CollectedTopDocs {
+            hits,
+            total_count: self.exact_count.then_some(self.total_count),
+        })
+    }
+}
+
+/// Cross-segment scoreless global-document set accumulator.
+#[derive(Debug, Default)]
+pub struct DocSetCollector {
+    docs: Vec<u32>,
+}
+
+impl DocSetCollector {
+    /// Build an empty scoreless collector.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { docs: Vec::new() }
+    }
+
+    /// Consume one recursively unscored segment scorer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects scored buffered unions and propagates cursor or allocation
+    /// failures.
+    pub fn collect<L>(
+        &mut self,
+        scorer: &mut ReferenceScorer<'_>,
+        live_docs: &L,
+    ) -> Result<(), ArgusError>
+    where
+        L: LiveDocs + ?Sized,
+    {
+        let mut state = CollectorState::DocSet(self);
+        scorer.collect_with(&mut state, live_docs)
+    }
+
+    fn push(&mut self, global_docid: u32) -> Result<(), ArgusError> {
+        if self.docs.len() == self.docs.capacity() {
+            self.docs
+                .try_reserve(1)
+                .map_err(|_| ArgusError::Allocation {
+                    resource: "doc-set matches",
+                    count: self.docs.len().saturating_add(1),
+                })?;
+        }
+        self.docs.push(global_docid);
+        Ok(())
+    }
+
+    /// Return deterministic sorted unique global docids.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<u32> {
+        self.docs.sort_unstable();
+        self.docs.dedup();
+        self.docs
+    }
+}
+
+enum CollectorState<'a> {
+    TopDocs(&'a mut TopDocsCollector),
+    DocSet(&'a mut DocSetCollector),
+}
+
 /// Winner after phase-two external-id materialization.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterializedHit {
     /// Stable global Quill document id.
     pub global_docid: u32,
     /// External document id resolved only after top-k selection.
-    pub document_id: String,
+    pub document_id: DocId,
     /// Exact contract-mode f32 score.
     pub score: f32,
 }
@@ -2325,7 +2720,7 @@ pub struct MaterializedHit {
 /// allocation failure.
 pub fn materialize_doc_ids(
     winners: &[ScoredDoc],
-    mut resolve: impl FnMut(u32) -> Result<String, ArgusError>,
+    mut resolve: impl FnMut(u32) -> Result<DocId, ArgusError>,
 ) -> Result<Vec<MaterializedHit>, ArgusError> {
     let mut hits = Vec::new();
     hits.try_reserve_exact(winners.len())
@@ -3884,19 +4279,34 @@ mod tests {
                     1.0,
                 )
             };
-            let either = ReferenceScorer::boolean(vec![
-                ScorerClause::should(leaf(0)?),
-                ScorerClause::should(leaf(1)?),
-            ])?;
-            let mut query = ReferenceScorer::boolean(vec![
-                ScorerClause::must(either),
-                ScorerClause::must(leaf(2)?),
-                ScorerClause::must_not(leaf(3)?),
-                ScorerClause::should(leaf(4)?),
-            ])?;
-            let mut actual = query
-                .top_k(DOCS, &AllLiveDocs)?
-                .into_iter()
+            let scored_query = || {
+                let either = ReferenceScorer::boolean(vec![
+                    ScorerClause::should(leaf(0)?),
+                    ScorerClause::should(leaf(1)?),
+                ])?;
+                ReferenceScorer::boolean(vec![
+                    ScorerClause::must(either),
+                    ScorerClause::must(leaf(2)?),
+                    ScorerClause::must_not(leaf(3)?),
+                    ScorerClause::should(leaf(4)?),
+                ])
+            };
+            let unscored_query = || {
+                let either = ReferenceScorer::boolean_unscored(vec![
+                    ScorerClause::should(leaf(0)?),
+                    ScorerClause::should(leaf(1)?),
+                ])?;
+                ReferenceScorer::boolean_unscored(vec![
+                    ScorerClause::must(either),
+                    ScorerClause::must(leaf(2)?),
+                    ScorerClause::must_not(leaf(3)?),
+                    ScorerClause::should(leaf(4)?),
+                ])
+            };
+            let mut query = scored_query()?;
+            let ranked = query.top_k(DOCS, &AllLiveDocs)?;
+            let mut actual = ranked
+                .iter()
                 .map(|hit| hit.global_docid)
                 .collect::<Vec<_>>();
             actual.sort_unstable();
@@ -3909,7 +4319,172 @@ mod tests {
                 .map(|doc| u32::try_from(doc).expect("DOCS fits in u32"))
                 .collect::<Vec<_>>();
             assert_eq!(actual, expected, "seed {seed}");
+
+            let offset = usize::try_from(seed % 11).expect("bounded seed offset");
+            let limit = 7;
+            let mut counted_query = scored_query()?;
+            let mut counted_collector = TopDocsCollector::with_exact_count(limit, offset)?;
+            counted_collector.collect(&mut counted_query, &AllLiveDocs)?;
+            let counted = counted_collector.finish()?;
+            let page_start = offset.min(ranked.len());
+            let page_end = page_start.saturating_add(limit).min(ranked.len());
+            assert_eq!(counted.hits, ranked[page_start..page_end], "seed {seed}");
+            assert_eq!(
+                counted.total_count,
+                Some(expected.len() as u64),
+                "seed {seed}"
+            );
+
+            let mut unscored = unscored_query()?;
+            assert_eq!(
+                unscored.collect_doc_set(&AllLiveDocs)?,
+                expected,
+                "seed {seed}"
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn global_collectors_page_count_and_materialize_only_winners()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let lengths = vec![Some(1); 10];
+        let encoded =
+            EncodedDocLenSection::encode(0, 10, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 10, 10)?;
+        let left_docs = [0, 2, 4, 6, 8];
+        let right_docs = [1, 3, 5, 7, 9];
+
+        let collect = |limit: usize,
+                       offset: usize,
+                       exact_count: bool,
+                       live_docs: &dyn LiveDocs|
+         -> Result<CollectedTopDocs, ArgusError> {
+            let mut collector = if exact_count {
+                TopDocsCollector::with_exact_count(limit, offset)?
+            } else {
+                TopDocsCollector::new(limit, offset)?
+            };
+            for docs in [&left_docs[..], &right_docs[..]] {
+                let mut scorer = term(postings(docs), field, &snapshot, 10, 5, 1.0)?;
+                collector.collect(&mut scorer, live_docs)?;
+            }
+            collector.finish()
+        };
+
+        let full = collect(10, 0, false, &AllLiveDocs)?;
+        assert_eq!(
+            full.hits
+                .iter()
+                .map(|hit| hit.global_docid)
+                .collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(full.total_count, None);
+
+        let page = collect(3, 4, false, &AllLiveDocs)?;
+        assert_eq!(page.hits, full.hits[4..7]);
+        let past_end = collect(3, 20, false, &AllLiveDocs)?;
+        assert!(past_end.hits.is_empty());
+
+        let live = |doc| doc % 3 != 0;
+        let live_full = collect(10, 0, false, &live)?;
+        let counted = collect(2, 1, true, &live)?;
+        assert_eq!(counted.total_count, Some(6));
+        assert_eq!(counted.hits, live_full.hits[1..3]);
+        let count_only = collect(0, usize::MAX, true, &live)?;
+        assert!(count_only.hits.is_empty());
+        assert_eq!(count_only.total_count, Some(6));
+
+        let mut unconsumed = term(postings(&left_docs), field, &snapshot, 10, 5, 1.0)?;
+        let mut empty_page = TopDocsCollector::new(0, usize::MAX)?;
+        empty_page.collect(&mut unconsumed, &AllLiveDocs)?;
+        assert_eq!(unconsumed.doc(), Some(0));
+        assert!(empty_page.finish()?.hits.is_empty());
+        assert!(matches!(
+            TopDocsCollector::new(1, usize::MAX),
+            Err(ArgusError::CollectorWindowOverflow {
+                limit: 1,
+                offset: usize::MAX
+            })
+        ));
+
+        let mut materialized = Vec::new();
+        let hits = materialize_doc_ids(&page.hits, |global_docid| {
+            materialized.push(global_docid);
+            Ok(format!("winner-{global_docid}").into())
+        })?;
+        assert_eq!(materialized, vec![4, 5, 6]);
+        assert_eq!(hits.len(), page.hits.len());
+        Ok(())
+    }
+
+    #[test]
+    fn doc_set_uses_recursive_lazy_unscored_unions() -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Clone)]
+        struct CountingFieldNorm<'a> {
+            field: DocLenField<'a>,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl FieldNormReader for CountingFieldNorm<'_> {
+            fn field_ord(&self) -> u16 {
+                self.field.field_ord()
+            }
+
+            fn fieldnorm_id(&self, global_docid: u32) -> Option<u8> {
+                self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+                self.field.fieldnorm_id(u64::from(global_docid))
+            }
+        }
+
+        let lengths = vec![Some(1); 5];
+        let encoded =
+            EncodedDocLenSection::encode(0, 5, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, 5, 5)?;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let leaf = |docs: &[u32]| {
+            Ok::<_, ArgusError>(ReferenceScorer::term(TermScorer::new(
+                VecCursor::new(postings(docs), docs.len() as u64, 5),
+                CountingFieldNorm {
+                    field,
+                    reads: Arc::clone(&reads),
+                },
+                snapshot.clone(),
+                docs.len() as u64,
+                1.0,
+            )?))
+        };
+        let union = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::should(leaf(&[0, 2, 4])?),
+            ScorerClause::should(leaf(&[1, 2, 3])?),
+        ])?;
+        let excluded = leaf(&[3])?;
+        let mut query = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::must(union),
+            ScorerClause::must_not(excluded),
+        ])?;
+        assert_eq!(query.collect_doc_set(&AllLiveDocs)?, vec![0, 1, 2, 4]);
+        assert_eq!(
+            reads.load(AtomicOrdering::SeqCst),
+            7,
+            "each physical posting is fieldnorm-validated once; none is scored"
+        );
+
+        let mut scored_union = ReferenceScorer::boolean(vec![
+            ScorerClause::should(term(postings(&[0, 2]), field, &snapshot, 2, 2, 1.0)?),
+            ScorerClause::should(term(postings(&[1, 2]), field, &snapshot, 2, 2, 1.0)?),
+        ])?;
+        assert!(matches!(
+            scored_union.collect_doc_set(&AllLiveDocs),
+            Err(ArgusError::ScoredTreeForUnscoredCollector)
+        ));
         Ok(())
     }
 
@@ -3933,7 +4508,7 @@ mod tests {
         let mut calls = Vec::new();
         let hits = materialize_doc_ids(&winners, |doc| {
             calls.push(doc);
-            Ok(format!("external-{doc}"))
+            Ok(format!("external-{doc}").into())
         })?;
         assert_eq!(calls, vec![1]);
         assert_eq!(hits[0].document_id, "external-1");
