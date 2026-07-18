@@ -6625,6 +6625,11 @@ impl FsfsRuntime {
                             Err(error) => return Err(error),
                         }
                     }
+                    Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
+                        // Cancellation is never a fallback signal: propagate so
+                        // the stream command can emit the Cancelled terminal.
+                        return Err(error);
+                    }
                     Err(error) if lexical_available => {
                         info!(
                             error = %error,
@@ -6732,6 +6737,12 @@ impl FsfsRuntime {
                 };
 
                 match quality_outcome {
+                    Err(error) if matches!(error, SearchError::Cancelled { .. }) => {
+                        // Cancellation is never a refinement failure: propagate
+                        // so the stream command emits the Cancelled terminal
+                        // and no Refined/RefinementFailed artifact follows it.
+                        return Err(error);
+                    }
                     Ok(quality_candidates) => {
                         let fused_refined_head = orchestrator.fuse_rankings(
                             &lexical_head_candidates,
@@ -15923,6 +15934,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use asupersync::test_utils::run_test_with_cx;
+    use asupersync::Cx;
+    use asupersync::runtime::RuntimeBuilder;
     use frankensearch_core::{
         Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchFuture,
     };
@@ -19336,6 +19349,221 @@ mod tests {
             for (expected, frame) in final_frames.iter().enumerate() {
                 assert_eq!(frame.seq, expected as u64);
             }
+        });
+    }
+
+    /// Embedder that always returns `SearchError::Cancelled` — used to prove
+    /// cancellation is never swallowed into a fallback or a RefinementFailed
+    /// artifact (bd-jwis).
+    struct CancelledEmbedder;
+
+    impl Embedder for CancelledEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async {
+                Err(frankensearch_core::SearchError::Cancelled {
+                    phase: "embed".to_owned(),
+                    reason: "test cancellation".to_owned(),
+                })
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            384
+        }
+
+        fn id(&self) -> &str {
+            "cancelled-embedder"
+        }
+
+        fn model_name(&self) -> &str {
+            "Cancelled Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    fn cancelled_terminal_frames(
+        writer: &FlushVisibleWriter,
+    ) -> Vec<StreamFrame<SearchHitPayload>> {
+        decode_visible_stream(writer)
+            .into_iter()
+            .filter(|frame| matches!(&frame.event, StreamEvent::Terminal(_)))
+            .collect()
+    }
+
+    #[test]
+    fn runtime_stream_fast_embed_cancellation_emits_cancelled_terminal() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let lexical_path = temp.path().join("lexical");
+            let vector_path = temp.path().join("fast-cancel.fsvi");
+            let lexical_index = TantivyIndex::create(&lexical_path).expect("create lexical index");
+            // Lexical is *available* (the old fallback guard's condition) but
+            // its head is empty for this query, which force-runs the
+            // semantic stage straight into the cancelling embedder.
+            lexical_index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("docs/a.md".to_owned(), "zzz qqq vvv".to_owned()),
+                )
+                .await
+                .expect("seed lexical doc");
+            lexical_index.commit(&cx).await.expect("commit lexical");
+
+            let fast_embedder = HashEmbedder::default_384();
+            let query_vector = fast_embedder.embed_sync("alpha beta");
+            let mut vector_writer = VectorIndex::create(&vector_path, "hash-384", 384)
+                .expect("create vector index");
+            vector_writer
+                .write_record("docs/a.md", &query_vector)
+                .expect("write vector record");
+            vector_writer.finish().expect("finish vector index");
+
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                lexical_index: Some(lexical_index),
+                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                fast_embedder: Some(Arc::new(CancelledEmbedder)),
+                quality_embedder: None,
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let outcome = runtime
+                .run_search_stream_command_with_writer(
+                    &cx,
+                    "alpha beta",
+                    5,
+                    "stream-fast-cancel",
+                    &mut transport,
+                    Some((
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                    )),
+                )
+                .await;
+
+            let error = outcome.expect_err("fast embed cancellation must propagate");
+            assert!(
+                matches!(error, frankensearch_core::SearchError::Cancelled { .. }),
+                "expected Cancelled, got {error:?}"
+            );
+            let terminal_frames = cancelled_terminal_frames(&writer);
+            assert_eq!(
+                terminal_frames.len(),
+                1,
+                "exactly one terminal frame must be emitted"
+            );
+            let StreamEvent::Terminal(terminal) = &terminal_frames[0].event else {
+                panic!("filtered frame must be terminal");
+            };
+            assert_eq!(terminal.status, StreamTerminalStatus::Cancelled);
+            // No payload may follow cancellation: the lexical fallback that
+            // used to swallow the cancel would have emitted an Initial result
+            // plus a Completed terminal.
+            assert!(
+                decode_visible_stream(&writer)
+                    .iter()
+                    .all(|frame| !matches!(&frame.event, StreamEvent::Result(_))),
+                "no result payload may be emitted after fast-embed cancellation"
+            );
+        });
+    }
+
+    #[test]
+    fn runtime_stream_quality_cancellation_suppresses_refinement_failed() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let vector_path = temp.path().join("quality-cancel.fsvi");
+            let fast_embedder = HashEmbedder::default_384();
+            let query = "quality cancellation ordering";
+            let query_vector = fast_embedder.embed_sync(query);
+            let mut vector_writer = VectorIndex::create(&vector_path, "hash-384", 384)
+                .expect("create vector index");
+            vector_writer
+                .write_record("docs/quality.md", &query_vector)
+                .expect("write vector record");
+            vector_writer.finish().expect("finish vector index");
+
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                lexical_index: None,
+                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                fast_embedder: Some(Arc::new(fast_embedder)),
+                quality_embedder: Some(Arc::new(CancelledEmbedder)),
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let outcome = runtime
+                .run_search_stream_command_with_writer(
+                    &cx,
+                    query,
+                    5,
+                    "stream-quality-cancel",
+                    &mut transport,
+                    Some((
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                    )),
+                )
+                .await;
+
+            let error = outcome.expect_err("quality cancellation must propagate");
+            assert!(
+                matches!(error, frankensearch_core::SearchError::Cancelled { .. }),
+                "expected Cancelled, got {error:?}"
+            );
+            let frames = decode_visible_stream(&writer);
+            let terminal_frames = cancelled_terminal_frames(&writer);
+            assert_eq!(terminal_frames.len(), 1);
+            let StreamEvent::Terminal(terminal) = &terminal_frames[0].event else {
+                panic!("filtered frame must be terminal");
+            };
+            assert_eq!(terminal.status, StreamTerminalStatus::Cancelled);
+            // Initial completed legitimately; the cancelled quality stage
+            // must not emit a Refined or RefinementFailed payload after it.
+            assert!(frames.iter().any(|frame| {
+                matches!(&frame.event, StreamEvent::Progress(progress)
+                    if progress.reason_code == "query.stream.initial_ready")
+            }));
+            assert!(!frames.iter().any(|frame| {
+                matches!(&frame.event, StreamEvent::Progress(progress)
+                    if progress.reason_code == "query.stream.refined_ready"
+                        || progress.reason_code == "query.stream.refinement_failed")
+            }));
         });
     }
 
