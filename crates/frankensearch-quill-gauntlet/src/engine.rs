@@ -587,6 +587,8 @@ impl GauntletEngine for TantivyOracle {
                 hits,
                 cutoff_tie_group,
                 cutoff_tie_complete: observation.cutoff_tie_complete,
+                offset_tie_group: Vec::new(),
+                offset_tie_complete: false,
                 snippets,
                 match_count: if case.count_requested {
                     CountState::Value(u64::try_from(observation.total_count).unwrap_or(u64::MAX))
@@ -594,6 +596,7 @@ impl GauntletEngine for TantivyOracle {
                     CountState::NotRequested
                 },
                 doc_count: u64::try_from(observation.doc_count).unwrap_or(u64::MAX),
+                ast_differences: Vec::new(),
             })
         })
     }
@@ -712,9 +715,12 @@ mod tests {
             hits: Vec::new(),
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
             snippets: BTreeMap::new(),
             match_count: CountState::Value(2),
             doc_count: 2,
+            ast_differences: Vec::new(),
         };
         let case = DifferentialCase::new("underfilled", "query", 10);
         assert!(
@@ -731,17 +737,23 @@ mod tests {
             hits: vec![quill_hit.clone()],
             cutoff_tie_group: vec![quill_hit],
             cutoff_tie_complete: true,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
             snippets: BTreeMap::new(),
             match_count: CountState::Value(1),
             doc_count: 1,
+            ast_differences: Vec::new(),
         };
         let oracle_empty = EngineObservation {
             hits: Vec::new(),
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
             snippets: BTreeMap::new(),
             match_count: CountState::Value(0),
             doc_count: 1,
+            ast_differences: Vec::new(),
         };
         let zero_limit = DifferentialCase::new("overfilled", "query", 0);
         assert!(

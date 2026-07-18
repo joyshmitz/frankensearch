@@ -517,9 +517,12 @@ mod tests {
             hits,
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
             snippets,
             match_count: CountState::Value(2),
             doc_count: 2,
+            ast_differences: Vec::new(),
         }
     }
 

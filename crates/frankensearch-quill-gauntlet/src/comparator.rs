@@ -41,12 +41,59 @@ pub struct EngineObservation {
     pub cutoff_tie_group: Vec<RankedHit>,
     /// Whether `cutoff_tie_group` is proven complete rather than fetch-limited.
     pub cutoff_tie_complete: bool,
+    /// Full oracle tie group at the page's leading (offset) boundary, when
+    /// the first returned rank cuts an exact-score group. Same evidence
+    /// contract as `cutoff_tie_group`, for the offset edge: without it, a
+    /// page starting inside a tie cannot prove its membership is order-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offset_tie_group: Vec<RankedHit>,
+    /// Whether `offset_tie_group` is proven complete rather than
+    /// fetch-limited. Defaults to the conservative `false` (no proof) so
+    /// legacy artifacts without leading evidence keep their behavior.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub offset_tie_complete: bool,
     /// Snippets keyed by external document ID.
     pub snippets: BTreeMap<String, String>,
     /// Exact match count, or an explicit marker that the case did not request it.
     pub match_count: CountState,
     /// Exact live-document count.
     pub doc_count: u64,
+    /// AST/diagnostic lowering differences the engine recorded while
+    /// executing this query. Result-level equivalence is still proven by the
+    /// rank/count comparison; these records make intentional lowerings
+    /// (register classes) visible instead of silent. Empty records are
+    /// omitted from canonical bytes so artifact hashes are unchanged for
+    /// queries with no recorded lowering difference.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ast_differences: Vec<AstDifference>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if protocol
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Stable taxonomy for AST/diagnostic lowering differences. New kinds must
+/// land with a divergence-register class in the same commit; the comparator
+/// fails closed on kinds it cannot classify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AstLoweringKind {
+    /// An oversized (>65,530-byte) query token lowered to `MatchNone` under
+    /// Quill's symmetric admission rule (register DIV-004).
+    OversizedQueryToken,
+}
+
+/// One recorded AST/diagnostic lowering difference between subject and oracle
+/// for the same logical query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AstDifference {
+    /// Stable lowering class.
+    pub kind: AstLoweringKind,
+    /// Human-reviewable oracle AST/diagnostic summary.
+    pub oracle: String,
+    /// Human-reviewable subject AST/diagnostic summary.
+    pub subject: String,
 }
 
 /// Query-count observation. Missing evidence is never treated as zero.
@@ -152,6 +199,7 @@ pub enum DivergenceClass {
     SnippetMismatch,
     CountMismatch,
     DocumentCountMismatch,
+    OversizedQueryToken,
 }
 
 impl DivergenceClass {
@@ -220,6 +268,7 @@ pub fn compare_observations(
     if let Some(divergence) = rank_divergence {
         divergences.push(divergence);
     }
+    classify_ast_differences(&subject, &oracle, &mut divergences);
     compare_snippets(&subject, &oracle, &mut divergences);
     if subject.match_count != oracle.match_count {
         divergences.push(Divergence {
@@ -271,15 +320,34 @@ fn validate_observation(label: &str, observation: &EngineObservation) -> Result<
         &observation.cutoff_tie_group,
         false,
     )?;
+    validate_hit_slice(
+        label,
+        "offset_tie_group",
+        &observation.offset_tie_group,
+        false,
+    )?;
     validate_cross_evidence_identity(label, &observation.hits, &observation.cutoff_tie_group)?;
+    validate_cross_evidence_identity(label, &observation.hits, &observation.offset_tie_group)?;
+    validate_cross_evidence_identity(
+        label,
+        &observation.offset_tie_group,
+        &observation.cutoff_tie_group,
+    )?;
     let hit_key = observation.hits.first().map(|hit| &hit.native_tie_key);
     let cutoff_key = observation
         .cutoff_tie_group
         .first()
         .map(|hit| &hit.native_tie_key);
+    let offset_key = observation
+        .offset_tie_group
+        .first()
+        .map(|hit| &hit.native_tie_key);
     if hit_key
         .zip(cutoff_key)
         .is_some_and(|(left, right)| !same_tie_key_family(left, right))
+        || hit_key
+            .zip(offset_key)
+            .is_some_and(|(left, right)| !same_tie_key_family(left, right))
     {
         return Err(GauntletError::InvalidObservation {
             reason: format!("{label} mixes native tie-key families across evidence"),
@@ -495,50 +563,78 @@ fn is_proven_cutoff_tie_substitution(
     subject: &EngineObservation,
     oracle: &EngineObservation,
 ) -> bool {
-    if subject.hits.len() != oracle.hits.len()
-        || subject.hits.is_empty()
-        || !oracle.cutoff_tie_complete
-        || oracle.cutoff_tie_group.is_empty()
-    {
+    is_proven_boundary_tie_substitution(subject, oracle)
+}
+
+/// One validated single-score boundary group: the boundary score plus the
+/// complete document membership. `None` when the evidence is absent,
+/// incomplete, or internally inconsistent (mixed scores or repeated IDs).
+fn complete_boundary_group(
+    group: &[RankedHit],
+    complete: bool,
+) -> Option<(u32, BTreeSet<&str>)> {
+    if !complete || group.is_empty() {
+        return None;
+    }
+    let score_bits = group.first()?.score_bits;
+    let mut docs = BTreeSet::new();
+    for hit in group {
+        if !scores_exact(hit.score_bits, score_bits) || !docs.insert(hit.doc_id.as_str()) {
+            return None;
+        }
+    }
+    Some((score_bits, docs))
+}
+
+/// Whether `hit` is explained by one of the two complete boundary groups.
+fn explained_by_boundary_group(
+    hit: &RankedHit,
+    leading: Option<&(u32, BTreeSet<&str>)>,
+    trailing: Option<&(u32, BTreeSet<&str>)>,
+) -> bool {
+    [leading, trailing].into_iter().flatten().any(|(score_bits, docs)| {
+        scores_exact(hit.score_bits, *score_bits) && docs.contains(hit.doc_id.as_str())
+    })
+}
+
+/// Generalized tie-substitution proof covering both page boundaries.
+///
+/// Every position where the subject and oracle pages differ — by document
+/// identity or score — must be explained by a complete oracle boundary
+/// group: the differing documents on both sides must share one exact score
+/// and belong to the complete leading (offset) or trailing (cutoff) tie
+/// group. Positions outside the differing span are exact by construction.
+/// With only trailing evidence present this reduces to the original cutoff
+/// substitution proof; absent or incomplete evidence fails closed.
+fn is_proven_boundary_tie_substitution(
+    subject: &EngineObservation,
+    oracle: &EngineObservation,
+) -> bool {
+    if subject.hits.len() != oracle.hits.len() || subject.hits.is_empty() {
         return false;
     }
 
-    let cutoff_bits = oracle.hits.last().map(|hit| hit.score_bits);
-    let Some(cutoff_bits) = cutoff_bits else {
+    let mut first_diff = None;
+    let mut last_diff = None;
+    for (index, (subject_hit, oracle_hit)) in subject.hits.iter().zip(&oracle.hits).enumerate() {
+        if subject_hit.doc_id != oracle_hit.doc_id
+            || !scores_exact(subject_hit.score_bits, oracle_hit.score_bits)
+        {
+            first_diff.get_or_insert(index);
+            last_diff = Some(index);
+        }
+    }
+    let (Some(first_diff), Some(last_diff)) = (first_diff, last_diff) else {
         return false;
     };
-    let group_start = oracle
-        .hits
-        .iter()
-        .position(|hit| scores_exact(hit.score_bits, cutoff_bits))
-        .unwrap_or(oracle.hits.len());
 
-    if !sequence_is_exact(&subject.hits[..group_start], &oracle.hits[..group_start]) {
-        return false;
-    }
+    let leading = complete_boundary_group(&oracle.offset_tie_group, oracle.offset_tie_complete);
+    let trailing = complete_boundary_group(&oracle.cutoff_tie_group, oracle.cutoff_tie_complete);
 
-    let expansion = oracle
-        .cutoff_tie_group
-        .iter()
-        .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
-        .collect::<BTreeMap<_, _>>();
-    if expansion.len() != oracle.cutoff_tie_group.len()
-        || expansion
-            .values()
-            .any(|score_bits| !scores_exact(*score_bits, cutoff_bits))
-    {
-        return false;
-    }
-
-    subject.hits[group_start..]
-        .iter()
-        .chain(&oracle.hits[group_start..])
-        .all(|hit| {
-            scores_exact(hit.score_bits, cutoff_bits)
-                && expansion
-                    .get(hit.doc_id.as_str())
-                    .is_some_and(|score_bits| scores_exact(*score_bits, cutoff_bits))
-        })
+    (first_diff..=last_diff).all(|index| {
+        explained_by_boundary_group(&subject.hits[index], leading.as_ref(), trailing.as_ref())
+            && explained_by_boundary_group(&oracle.hits[index], leading.as_ref(), trailing.as_ref())
+    })
 }
 
 fn is_score_epsilon_equivalent(subject: &[RankedHit], oracle: &[RankedHit], epsilon: f32) -> bool {
@@ -677,6 +773,28 @@ fn describe_count(count: CountState) -> String {
     }
 }
 
+/// Fold recorded AST/diagnostic lowering differences into the divergence
+/// list. Every recorded kind maps to a reviewed register class; kinds the
+/// comparator does not know cannot reach here because the enum is closed,
+/// and adding a kind without its register class fails review.
+fn classify_ast_differences(
+    subject: &EngineObservation,
+    _oracle: &EngineObservation,
+    divergences: &mut Vec<Divergence>,
+) {
+    for (index, difference) in subject.ast_differences.iter().enumerate() {
+        let class = match difference.kind {
+            AstLoweringKind::OversizedQueryToken => DivergenceClass::OversizedQueryToken,
+        };
+        divergences.push(Divergence {
+            class,
+            pointer: format!("/comparison/subject/ast_differences/{index}"),
+            oracle: difference.oracle.clone(),
+            subject: difference.subject.clone(),
+        });
+    }
+}
+
 fn compare_snippets(
     subject: &EngineObservation,
     oracle: &EngineObservation,
@@ -756,7 +874,10 @@ mod tests {
             hits,
             cutoff_tie_group: Vec::new(),
             cutoff_tie_complete: true,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
             snippets: BTreeMap::new(),
+            ast_differences: Vec::new(),
         }
     }
 
@@ -932,5 +1053,162 @@ mod tests {
                 .all(|divergence| projection.pointer(&divergence.pointer).is_some())
         );
         assert_eq!(report.status, ComparisonStatus::Failed);
+    }
+
+    #[test]
+    fn oversized_query_token_ast_difference_is_classified_not_failed() {
+        // Result-equivalent lowering: identical hits, one recorded AST
+        // difference for the oversized-token admission (register DIV-004).
+        let mut subject = observation(vec![quill_hit("a", 5.0, 1), quill_hit("b", 4.0, 2)]);
+        subject.ast_differences.push(AstDifference {
+            kind: AstLoweringKind::OversizedQueryToken,
+            oracle: "BooleanQuery(TermQuery(content:oversized))".to_owned(),
+            subject: "Empty (oversized > 65,530-byte token admitted as MatchNone)".to_owned(),
+        });
+        let oracle = observation(vec![tantivy_hit("a", 5.0, 1), tantivy_hit("b", 4.0, 2)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("oversized-token comparison");
+
+        assert_eq!(report.status, ComparisonStatus::Classified);
+        assert_eq!(report.rank_class, RankClass::RankExact);
+        assert_eq!(report.divergences.len(), 1);
+        assert_eq!(
+            report.divergences[0].class,
+            DivergenceClass::OversizedQueryToken
+        );
+        assert_eq!(
+            report.divergences[0].pointer,
+            "/comparison/subject/ast_differences/0"
+        );
+        // The classified pointer resolves in the serialized artifact.
+        let projection = serde_json::json!({ "comparison": &report });
+        assert!(projection.pointer(&report.divergences[0].pointer).is_some());
+    }
+
+    #[test]
+    fn ast_difference_does_not_mask_result_level_failures() {
+        // An oversized-token record may accompany only result-equivalent
+        // runs; a real rank divergence still fails closed.
+        let mut subject = observation(vec![quill_hit("a", 5.0, 1)]);
+        subject.ast_differences.push(AstDifference {
+            kind: AstLoweringKind::OversizedQueryToken,
+            oracle: "TermQuery".to_owned(),
+            subject: "Empty".to_owned(),
+        });
+        let oracle = observation(vec![tantivy_hit("b", 5.0, 1)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("rank divergence with ast record");
+
+        assert_eq!(report.status, ComparisonStatus::Failed);
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.class == DivergenceClass::RankMismatch)
+        );
+    }
+
+    #[test]
+    fn observation_without_ast_differences_still_deserializes() {
+        // Artifacts written before the ast_differences channel existed must
+        // keep parsing (serde default).
+        let legacy = serde_json::json!({
+            "hits": [],
+            "cutoff_tie_group": [],
+            "cutoff_tie_complete": true,
+            "snippets": {},
+            "match_count": "not_requested",
+            "doc_count": 0,
+        });
+        let observation: EngineObservation =
+            serde_json::from_value(legacy).expect("legacy observation parses");
+        assert!(observation.ast_differences.is_empty());
+        assert!(observation.offset_tie_group.is_empty());
+        assert!(!observation.offset_tie_complete);
+    }
+
+    #[test]
+    fn leading_offset_tie_substitution_is_classified_tie_order() {
+        // Page [C9, D8] at offset 2 inside oracle order A10,B9,C9,D8: the
+        // subject's native order walked B9 into the page instead of C9. The
+        // complete leading group {B9, C9} proves the membership difference
+        // is order-only.
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("b", 9.0, 1), tantivy_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = true;
+        let subject = observation(vec![quill_hit("b", 9.0, 1), quill_hit("d", 8.0, 3)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("offset tie comparison");
+
+        assert_eq!(report.rank_class, RankClass::TieOrder);
+        assert_eq!(report.status, ComparisonStatus::Classified);
+        assert_eq!(
+            report.divergences[0].class,
+            DivergenceClass::TieOrder
+        );
+    }
+
+    #[test]
+    fn leading_offset_tie_substitution_fails_closed_without_complete_group() {
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("b", 9.0, 1), tantivy_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = false;
+        let subject = observation(vec![quill_hit("b", 9.0, 1), quill_hit("d", 8.0, 3)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("incomplete offset evidence fails closed");
+
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.status, ComparisonStatus::Failed);
+    }
+
+    #[test]
+    fn leading_and_trailing_substitutions_combine_across_boundaries() {
+        // Offset 2 cuts {B9, C9}; the page tail cuts {D8, E8}. Both
+        // substitutions are explainable when both complete groups exist.
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("b", 9.0, 1), tantivy_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = true;
+        oracle.cutoff_tie_group = vec![tantivy_hit("d", 8.0, 3), tantivy_hit("e", 8.0, 4)];
+        oracle.cutoff_tie_complete = true;
+        let subject = observation(vec![quill_hit("b", 9.0, 1), quill_hit("e", 8.0, 4)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("two-boundary tie comparison");
+
+        assert_eq!(report.rank_class, RankClass::TieOrder);
+        assert_eq!(report.status, ComparisonStatus::Classified);
+    }
+
+    #[test]
+    fn unexplained_score_difference_at_leading_edge_is_rank_mismatch() {
+        // The substitute has a different score than every boundary group:
+        // genuinely divergent, not a tie artifact.
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("b", 9.0, 1), tantivy_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = true;
+        let subject = observation(vec![quill_hit("b", 8.0, 1), quill_hit("d", 8.0, 3)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("score-mismatched substitute fails closed");
+
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.status, ComparisonStatus::Failed);
+    }
+
+    #[test]
+    fn offset_group_inconsistent_with_page_hits_is_rejected() {
+        // The same document appears in the page and in the offset group with
+        // a different score: the evidence is internally inconsistent.
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("c", 7.0, 2)];
+        oracle.offset_tie_complete = true;
+
+        let error = compare_observations(oracle.clone(), oracle, ComparatorConfig::default())
+            .expect_err("inconsistent offset evidence is rejected");
+        assert!(matches!(error, GauntletError::InvalidObservation { .. }));
     }
 }
