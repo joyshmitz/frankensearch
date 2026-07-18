@@ -7,7 +7,11 @@
 
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
-use std::fs;
+use std::fmt::Write as _;
+#[cfg(not(windows))]
+use std::fs::File;
+#[cfg(not(windows))]
+use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
 use frankensearch_core::IndexableDocument;
@@ -32,6 +36,7 @@ pub const FULL_SHARED_DOCUMENT_COUNT: usize = 120;
 const MAX_VOCABULARY_SIZE: u32 = 65_536;
 const DEFAULT_VOCABULARY_SIZE: u32 = 4_096;
 const MAX_FREQUENCY_REPETITIONS: usize = 65_536;
+const MAX_GENERATED_QUERY_LIMIT: u64 = 100_000;
 const CORPUS_HASH_DOMAIN: &[u8] = b"frankensearch/quill/corpus-content/v1\0";
 const MANIFEST_HASH_DOMAIN: &[u8] = b"frankensearch/quill/corpus-manifest/v1\0";
 const QUERY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/query-content/v1\0";
@@ -280,7 +285,7 @@ impl SyntheticCorpus {
 
     /// Stream the complete corpus into a content-addressed manifest.
     ///
-    /// This intentionally performs O(document_count) work while holding only
+    /// This intentionally performs `O(document_count)` work while holding only
     /// one generated document at a time.
     ///
     /// # Errors
@@ -313,37 +318,61 @@ impl SyntheticCorpus {
 
     fn generate_document(&self, index: u64) -> GeneratedDocument {
         let mut rng = DeterministicRng::for_stream(self.spec.seed, 0x434f_5250_5553, index);
-        let unicode_lane = UnicodeLane::ALL[(index as usize) % UnicodeLane::ALL.len()];
-        let (content, pathology) = match index {
-            0 => (String::new(), Some(Pathology::Empty)),
-            1 => ("  \n\t  ".to_owned(), Some(Pathology::Whitespace)),
-            2 => ("singleton".to_owned(), Some(Pathology::SingleToken)),
-            3 => ("t".repeat(256), Some(Pathology::Term256Bytes)),
+        let lane_count = u64::try_from(UnicodeLane::ALL.len()).unwrap_or(1);
+        let lane_index = usize::try_from(index % lane_count).unwrap_or(0);
+        let regular_unicode_lane = UnicodeLane::ALL[lane_index];
+        let (content, pathology, unicode_lane) = match index {
+            0 => (String::new(), Some(Pathology::Empty), UnicodeLane::Ascii),
+            1 => (
+                "  \n\t  ".to_owned(),
+                Some(Pathology::Whitespace),
+                UnicodeLane::Ascii,
+            ),
+            2 => (
+                "singleton".to_owned(),
+                Some(Pathology::SingleToken),
+                UnicodeLane::Ascii,
+            ),
+            3 => (
+                "t".repeat(256),
+                Some(Pathology::Term256Bytes),
+                UnicodeLane::Ascii,
+            ),
             4 => (
                 "bd-q3fy high-performance state-of-the-art tail".to_owned(),
                 Some(Pathology::SamePositionHyphens),
+                UnicodeLane::Ascii,
             ),
             5 => (
-                maximum_frequency_content(self.spec.max_document_bytes as usize),
+                maximum_frequency_content(usize_from_u32(self.spec.max_document_bytes)),
                 Some(Pathology::MaximumFrequency),
+                UnicodeLane::Ascii,
             ),
             6 => (
                 "naïve cafe\u{301} résumé coo\u{308}perate".to_owned(),
                 Some(Pathology::Latin1Normalization),
+                UnicodeLane::Latin1,
             ),
             7 => (
                 "extension b boundary 𠀀 𪛟 搜索".to_owned(),
                 Some(Pathology::CjkExtensionB),
+                UnicodeLane::CjkExtensionB,
             ),
             8 => (
                 "mixed ASCII café 搜索 𠀀 code::symbol".to_owned(),
                 Some(Pathology::MixedScripts),
+                UnicodeLane::Mixed,
             ),
             9 => (
-                near_limit_code(self.spec.max_document_bytes as usize),
+                near_limit_code(usize_from_u32(self.spec.max_document_bytes)),
                 Some(Pathology::NearLimitCode),
+                UnicodeLane::Ascii,
             ),
-            _ => (self.generate_regular_content(&mut rng, unicode_lane), None),
+            _ => (
+                self.generate_regular_content(&mut rng, regular_unicode_lane),
+                None,
+                regular_unicode_lane,
+            ),
         };
         let mut metadata = BTreeMap::new();
         metadata.insert("generator_id".to_owned(), GENERATOR_ID.to_owned());
@@ -361,7 +390,7 @@ impl SyntheticCorpus {
         GeneratedDocument {
             id: format!("synthetic-{index:08}"),
             title: Some(format!("Synthetic document {index}")),
-            content: truncate_utf8(content, self.spec.max_document_bytes as usize),
+            content: truncate_utf8(content, usize_from_u32(self.spec.max_document_bytes)),
             created_at_ms: 1_700_000_000_000_i64
                 .saturating_add(i64::try_from(index).unwrap_or(i64::MAX)),
             cass: Some(CassDocumentFields {
@@ -383,9 +412,9 @@ impl SyntheticCorpus {
         rng: &mut DeterministicRng,
         unicode_lane: UnicodeLane,
     ) -> String {
-        let cap = self.spec.max_document_bytes as usize;
+        let cap = usize_from_u32(self.spec.max_document_bytes);
         let target = sampled_document_length(rng, cap);
-        let mut content = String::with_capacity(target.min(64 * 1024));
+        let mut content = String::with_capacity(target);
         let prefix = match unicode_lane {
             UnicodeLane::Ascii => "fn indexed_record() { let search = ",
             UnicodeLane::Latin1 => "naïve café re\u{301}sume\u{301} ",
@@ -396,8 +425,7 @@ impl SyntheticCorpus {
         push_bounded(&mut content, prefix, target);
         while content.len() < target {
             let rank = self.sample_zipf_rank(rng);
-            let term = format!("term{rank:05}");
-            if !push_token_bounded(&mut content, &term, target) {
+            if !push_ranked_term_bounded(&mut content, rank, target) {
                 break;
             }
         }
@@ -409,6 +437,15 @@ impl SyntheticCorpus {
         let draw = rng.bounded(total);
         let index = self.zipf_cdf.partition_point(|&value| value <= draw);
         u32::try_from(index + 1).unwrap_or(self.spec.vocabulary_size)
+    }
+}
+
+impl<'a> IntoIterator for &'a SyntheticCorpus {
+    type Item = GeneratedDocument;
+    type IntoIter = SyntheticCorpusIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -430,8 +467,7 @@ impl Iterator for SyntheticCorpusIter<'_> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.corpus.len().saturating_sub(self.next_index);
-        let lower = usize::try_from(remaining).unwrap_or(usize::MAX);
-        (lower, Some(lower))
+        usize::try_from(remaining).map_or((usize::MAX, None), |exact| (exact, Some(exact)))
     }
 }
 
@@ -535,10 +571,10 @@ impl RepositorySnapshot {
         validate_repository_id(&repository_id)?;
         let mut paths = tracked_paths
             .into_iter()
-            .map(|path| normalize_relative_path(&path).map(|normalized| (normalized, path)))
+            .map(|path| normalize_relative_path(&path))
             .collect::<Result<Vec<_>, _>>()?;
-        paths.sort_by(|left, right| left.0.cmp(&right.0));
-        if paths.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        paths.sort();
+        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(generator_error(
                 "tracked path list contains a duplicate path",
             ));
@@ -546,34 +582,14 @@ impl RepositorySnapshot {
 
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
-        for (normalized, original) in paths {
-            let absolute = root.join(original);
-            let metadata = match fs::symlink_metadata(&absolute) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    skipped.push(SkippedRepositoryEntry {
-                        path: normalized,
-                        reason: RepositorySkipReason::Missing,
-                    });
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                skipped.push(SkippedRepositoryEntry {
+        for normalized in paths {
+            match read_tracked_path_beneath(root, &normalized)? {
+                TrackedPathRead::Bytes(bytes) => entries.push((normalized, bytes)),
+                TrackedPathRead::Skipped(reason) => skipped.push(SkippedRepositoryEntry {
                     path: normalized,
-                    reason: RepositorySkipReason::NotRegularFile,
-                });
-                continue;
+                    reason,
+                }),
             }
-            if metadata.len() > u64::from(MAX_DOCUMENT_BYTES) {
-                skipped.push(SkippedRepositoryEntry {
-                    path: normalized,
-                    reason: RepositorySkipReason::TooLarge,
-                });
-                continue;
-            }
-            entries.push((normalized, fs::read(absolute)?));
         }
         Self::prepare_repository(repository_id, entries, skipped)
     }
@@ -586,7 +602,7 @@ impl RepositorySnapshot {
         let mut documents = Vec::new();
         let mut files = Vec::new();
         for (path, bytes) in entries {
-            if bytes.len() > MAX_DOCUMENT_BYTES as usize {
+            if bytes.len() > usize_from_u32(MAX_DOCUMENT_BYTES) {
                 skipped.push(SkippedRepositoryEntry {
                     path,
                     reason: RepositorySkipReason::TooLarge,
@@ -602,12 +618,13 @@ impl RepositorySnapshot {
             };
             files.push(RepositoryFileDigest {
                 path: path.clone(),
-                bytes: bytes.len() as u64,
+                bytes: u64_from_usize(bytes.len()),
                 sha256: sha256_hex(&bytes),
             });
             let mut metadata = BTreeMap::new();
             metadata.insert("repository_id".to_owned(), repository_id.clone());
             metadata.insert("source_path".to_owned(), path.clone());
+            let unicode_lane = classify_unicode_lane(&content);
             documents.push(GeneratedDocument {
                 id: format!("repo:{path}"),
                 title: Some(path.clone()),
@@ -619,11 +636,11 @@ impl RepositorySnapshot {
                     source_id: path.clone(),
                     source_path: path,
                     origin_kind: "repository_snapshot".to_owned(),
-                    message_index: documents.len() as u64,
+                    message_index: u64_from_usize(documents.len()),
                 }),
                 metadata,
                 pathology: None,
-                unicode_lane: UnicodeLane::Mixed,
+                unicode_lane,
             });
         }
         skipped.sort_by(|left, right| left.path.cmp(&right.path));
@@ -642,12 +659,81 @@ impl RepositorySnapshot {
     }
 }
 
+enum TrackedPathRead {
+    Bytes(Vec<u8>),
+    Skipped(RepositorySkipReason),
+}
+
+#[cfg(not(windows))]
+fn read_tracked_path_beneath(
+    root: &Path,
+    normalized_path: &str,
+) -> Result<TrackedPathRead, GauntletError> {
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+    use rustix::io::Errno;
+
+    let directory_flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
+    let root_descriptor =
+        openat(CWD, root, directory_flags, Mode::empty()).map_err(std::io::Error::from)?;
+    let mut directory = File::from(root_descriptor);
+    let mut components = normalized_path.split('/').peekable();
+    while let Some(component) = components.next() {
+        let flags = if components.peek().is_some() {
+            directory_flags
+        } else {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK
+        };
+        let descriptor = match openat(&directory, component, flags, Mode::empty()) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::NOENT) => {
+                return Ok(TrackedPathRead::Skipped(RepositorySkipReason::Missing));
+            }
+            Err(Errno::LOOP | Errno::NOTDIR) => {
+                return Ok(TrackedPathRead::Skipped(
+                    RepositorySkipReason::NotRegularFile,
+                ));
+            }
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        };
+        if components.peek().is_some() {
+            directory = File::from(descriptor);
+            continue;
+        }
+        let file = File::from(descriptor);
+        if !file.metadata()?.is_file() {
+            return Ok(TrackedPathRead::Skipped(
+                RepositorySkipReason::NotRegularFile,
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(u64::from(MAX_DOCUMENT_BYTES) + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > usize::try_from(MAX_DOCUMENT_BYTES).unwrap_or(usize::MAX) {
+            return Ok(TrackedPathRead::Skipped(RepositorySkipReason::TooLarge));
+        }
+        return Ok(TrackedPathRead::Bytes(bytes));
+    }
+    Err(generator_error("tracked path contains no components"))
+}
+
+#[cfg(windows)]
+fn read_tracked_path_beneath(
+    _root: &Path,
+    _normalized_path: &str,
+) -> Result<TrackedPathRead, GauntletError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "descriptor-relative no-symlink repository snapshots are unsupported on Windows; use RepositorySnapshot::from_entries",
+    )
+    .into())
+}
+
 /// Identifies one embedded shared source file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFileDigest {
     /// Stable repository-relative fixture path.
     pub path: String,
-    /// Lowercase SHA-256 of exact committed bytes.
+    /// Lowercase SHA-256 after normalizing committed CRLF text to LF.
     pub sha256: String,
 }
 
@@ -749,9 +835,10 @@ impl CorpusManifest {
         D: Borrow<GeneratedDocument>,
     {
         let (count, bytes, digest) = hash_documents(documents)?;
+        let content_sha256_matches = digest.as_bytes().eq(self.content_sha256.as_bytes());
         if count != self.document_count
             || bytes != self.total_content_bytes
-            || digest != self.content_sha256
+            || !content_sha256_matches
         {
             return Err(GauntletError::ManifestMismatch {
                 reason: "replayed document stream does not match corpus content pins".to_owned(),
@@ -1047,7 +1134,7 @@ pub struct QueryGeneratorSpec {
     pub seed: u64,
     /// Default result limit for non-pagination probes.
     pub default_limit: u64,
-    /// Include all 25 committed relevance queries.
+    /// Include all 25 committed relevance queries and seven E0.1 contract anchors.
     pub include_shared_relevance_queries: bool,
 }
 
@@ -1118,8 +1205,10 @@ impl GeneratedQuerySuite {
         corpus_manifest_hash: impl Into<String>,
         shared: &SharedFixtureSuite,
     ) -> Result<Self, GauntletError> {
-        if spec.default_limit == 0 {
-            return Err(generator_error("default query limit must be nonzero"));
+        if spec.default_limit == 0 || spec.default_limit > MAX_GENERATED_QUERY_LIMIT {
+            return Err(generator_error(format!(
+                "default query limit must be in 1..={MAX_GENERATED_QUERY_LIMIT}"
+            )));
         }
         let corpus_manifest_hash = corpus_manifest_hash.into();
         validate_sha256(&corpus_manifest_hash, "corpus manifest hash")?;
@@ -1145,6 +1234,12 @@ impl GeneratedQuerySuite {
                         source: "tests/fixtures/queries.json".to_owned(),
                     }),
             );
+            let contract_cases = shared
+                .harvested_contract_queries
+                .iter()
+                .map(|query| contract_query_case(query, spec.default_limit))
+                .collect::<Result<Vec<_>, _>>()?;
+            cases.extend(contract_cases);
         }
         let (query_count, content_sha256) = hash_queries(&cases)?;
         let manifest = QueryManifest {
@@ -1157,6 +1252,71 @@ impl GeneratedQuerySuite {
         };
         Ok(Self { cases, manifest })
     }
+}
+
+fn contract_query_case(
+    query: &HarvestedContractQuery,
+    limit: u64,
+) -> Result<GeneratedQueryCase, GauntletError> {
+    if query
+        .filters
+        .keys()
+        .any(|key| !matches!(key.as_str(), "created_from" | "created_to"))
+    {
+        return Err(generator_error(format!(
+            "contract query {} contains an unsupported filter key",
+            query.id
+        )));
+    }
+    let (syntax, query_kind) = match query.query_class.as_str() {
+        "phrase" => (QuerySyntax::Default, GeneratedQueryKind::Phrase),
+        "boolean" => (QuerySyntax::Cass, GeneratedQueryKind::Boolean),
+        "glob" => (
+            QuerySyntax::Cass,
+            GeneratedQueryKind::Glob {
+                pattern_class: GlobPatternClass::Prefix,
+            },
+        ),
+        "range" => (
+            QuerySyntax::Cass,
+            GeneratedQueryKind::Range {
+                range_class: RangeClass::Inclusive,
+            },
+        ),
+        "identifier" | "short_keyword" | "natural_language" => (
+            QuerySyntax::Default,
+            GeneratedQueryKind::Harvested {
+                semantic_class: query.query_class.clone(),
+            },
+        ),
+        unsupported => {
+            return Err(generator_error(format!(
+                "contract query {} has unsupported class {unsupported:?}",
+                query.id
+            )));
+        }
+    };
+    let source = format!(
+        "tests/fixtures/quill_language_contract.json#kind={}#source={}#fact={}",
+        query.source_kind,
+        query.source.as_deref().unwrap_or(""),
+        query.source_fact.as_deref().unwrap_or("")
+    );
+    Ok(GeneratedQueryCase {
+        id: format!("contract-{}", query.id),
+        syntax,
+        query_kind,
+        query: query.query.clone(),
+        limit,
+        offset: 0,
+        count_requested: true,
+        filters: GeneratedQueryFilters {
+            created_from_ms: query.filters.get("created_from").copied(),
+            created_to_ms: query.filters.get("created_to").copied(),
+        },
+        expected_divergence: None,
+        source,
+    })
 }
 
 /// Broad query anchor parsed from the committed language contract.
@@ -1211,6 +1371,7 @@ impl SharedDocument {
             .collect::<BTreeMap<_, _>>();
         metadata.insert("created_at".to_owned(), self.created_at);
         metadata.insert("doc_type".to_owned(), self.doc_type);
+        let unicode_lane = classify_unicode_lane(&self.content);
         GeneratedDocument {
             id: self.doc_id,
             title: Some(self.title),
@@ -1219,7 +1380,7 @@ impl SharedDocument {
             cass: None,
             metadata,
             pathology: None,
-            unicode_lane: UnicodeLane::Mixed,
+            unicode_lane,
         }
     }
 }
@@ -1235,9 +1396,10 @@ struct LanguageContractQueries {
 }
 
 fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQueryCase> {
-    let mut rng = DeterministicRng::for_stream(seed, 0x5155_4552_4945_53, 0);
+    let mut rng = DeterministicRng::for_stream(seed, 0x0051_5545_5249_4553, 0);
     let terms = ["ownership", "search", "cache", "token", "config"];
-    let selected = terms[rng.bounded(terms.len() as u64) as usize];
+    let selected_index = usize::try_from(rng.bounded(u64_from_usize(terms.len()))).unwrap_or(0);
+    let selected = terms[selected_index];
     let base = |id: &str, syntax: QuerySyntax, query_kind: GeneratedQueryKind, query: String| {
         GeneratedQueryCase {
             id: id.to_owned(),
@@ -1414,7 +1576,7 @@ fn shared_source_digests() -> Vec<SourceFileDigest> {
     .into_iter()
     .map(|(path, contents)| SourceFileDigest {
         path: path.to_owned(),
-        sha256: sha256_hex(contents.as_bytes()),
+        sha256: sha256_lf_normalized(contents),
     })
     .collect()
 }
@@ -1431,10 +1593,14 @@ where
     for document in documents {
         let document = document.borrow();
         let bytes = serde_json::to_vec(document)?;
-        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(u64_from_usize(bytes.len()).to_be_bytes());
         hasher.update(bytes);
-        count = count.saturating_add(1);
-        content_bytes = content_bytes.saturating_add(document.content.len() as u64);
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| generator_error("document count overflow while hashing corpus"))?;
+        content_bytes = content_bytes
+            .checked_add(u64::try_from(document.content.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| generator_error("content byte count overflow while hashing corpus"))?;
     }
     Ok((count, content_bytes, lower_hex(&hasher.finalize())))
 }
@@ -1444,15 +1610,15 @@ fn hash_queries(cases: &[GeneratedQueryCase]) -> Result<(u64, String), GauntletE
     hasher.update(QUERY_HASH_DOMAIN);
     for case in cases {
         let bytes = serde_json::to_vec(case)?;
-        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(u64_from_usize(bytes.len()).to_be_bytes());
         hasher.update(bytes);
     }
-    Ok((cases.len() as u64, lower_hex(&hasher.finalize())))
+    Ok((u64_from_usize(cases.len()), lower_hex(&hasher.finalize())))
 }
 
 fn build_zipf_cdf(vocabulary_size: u32, exponent: ZipfExponent) -> Result<Vec<u64>, GauntletError> {
     let mut cumulative = 0_u64;
-    let mut cdf = Vec::with_capacity(vocabulary_size as usize);
+    let mut cdf = Vec::with_capacity(usize_from_u32(vocabulary_size));
     for rank in 1..=vocabulary_size {
         let denominator_q8 = zipf_denominator_q8(rank, exponent);
         let weight = (1_u64 << 55) / denominator_q8.max(1);
@@ -1536,24 +1702,25 @@ impl DeterministicRng {
         if upper <= 1 {
             return 0;
         }
-        ((u128::from(self.next_u64()) * u128::from(upper)) >> 64) as u64
+        u64::try_from((u128::from(self.next_u64()) * u128::from(upper)) >> 64).unwrap_or(u64::MAX)
     }
 }
 
 fn sampled_document_length(rng: &mut DeterministicRng, cap: usize) -> usize {
     let bucket = rng.bounded(1_000);
-    let (minimum, span) = if bucket < 700 {
+    let (minimum, span) = if bucket < 750 {
         (64_usize, 448_usize)
-    } else if bucket < 930 {
+    } else if bucket < 950 {
         (512, 7_680)
-    } else if bucket < 990 {
+    } else if bucket < 999 {
         (8_192, 57_344)
     } else {
         (65_536, cap.saturating_sub(65_536).saturating_add(1))
     };
     let available_minimum = minimum.min(cap);
     let available_span = span.min(cap.saturating_sub(available_minimum).saturating_add(1));
-    available_minimum + rng.bounded(available_span.max(1) as u64) as usize
+    let span = u64_from_usize(available_span.max(1));
+    available_minimum + usize::try_from(rng.bounded(span)).unwrap_or(usize::MAX)
 }
 
 fn maximum_frequency_content(cap: usize) -> String {
@@ -1579,16 +1746,16 @@ fn near_limit_code(cap: usize) -> String {
     content
 }
 
-fn push_token_bounded(target: &mut String, token: &str, limit: usize) -> bool {
+fn push_ranked_term_bounded(target: &mut String, rank: u32, limit: usize) -> bool {
+    const MAX_TERM_BYTES: usize = "term65536".len();
     let separator = usize::from(!target.is_empty());
-    if target.len() + separator + token.len() > limit {
+    if target.len() + separator + MAX_TERM_BYTES > limit {
         return false;
     }
     if separator == 1 {
         target.push(' ');
     }
-    target.push_str(token);
-    true
+    write!(target, "term{rank:05}").is_ok()
 }
 
 fn push_bounded(target: &mut String, source: &str, limit: usize) {
@@ -1612,10 +1779,37 @@ fn truncate_utf8(mut value: String, limit: usize) -> String {
     value
 }
 
+fn classify_unicode_lane(content: &str) -> UnicodeLane {
+    if content.is_ascii() {
+        return UnicodeLane::Ascii;
+    }
+    let mut latin = false;
+    let mut cjk = false;
+    let mut extension_b = false;
+    let mut other = false;
+    for character in content.chars().filter(|character| !character.is_ascii()) {
+        match u32::from(character) {
+            0x0080..=0x024f | 0x0300..=0x036f => latin = true,
+            0x3040..=0x30ff | 0x3400..=0x9fff | 0xac00..=0xd7af => cjk = true,
+            0x20000..=0x2a6df => extension_b = true,
+            _ => other = true,
+        }
+    }
+    match (latin, cjk, extension_b, other) {
+        (true, false, false, false) => UnicodeLane::Latin1,
+        (false, true, false, false) => UnicodeLane::Cjk,
+        (false, false, true, false) => UnicodeLane::CjkExtensionB,
+        _ => UnicodeLane::Mixed,
+    }
+}
+
 fn normalize_relative_path(path: &Path) -> Result<String, GauntletError> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
+    let Some(raw_path) = path.to_str() else {
+        return Err(generator_error("repository path must be valid UTF-8"));
+    };
+    if raw_path.is_empty() || raw_path.contains('\\') || path.is_absolute() {
         return Err(generator_error(format!(
-            "repository path must be nonempty and relative: {}",
+            "repository path must be nonempty, relative, UTF-8, and slash-separated: {}",
             path.display()
         )));
     }
@@ -1670,14 +1864,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
     lower_hex(&Sha256::digest(bytes))
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
+fn sha256_lf_normalized(text: &str) -> String {
+    sha256_hex(text.replace("\r\n", "\n").as_bytes())
+}
 
+fn lower_hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+fn usize_from_u32(value: u32) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn generator_error(reason: impl Into<String>) -> GauntletError {
@@ -1686,9 +1890,7 @@ fn generator_error(reason: impl Into<String>) -> GauntletError {
     }
 }
 
-pub(crate) fn validate_generated_case_metadata(
-    case: &DifferentialCase,
-) -> Result<(), GauntletError> {
+pub fn validate_generated_case_metadata(case: &DifferentialCase) -> Result<(), GauntletError> {
     if case.metadata.generator_id.as_deref() != Some(GENERATOR_ID) {
         return Ok(());
     }
@@ -1719,10 +1921,14 @@ mod tests {
         corpus_spec: SyntheticCorpusSpec,
         corpus_manifest: CorpusManifest,
         corpus_manifest_hash: String,
-        documents: Vec<GeneratedDocument>,
+        document_ids: Vec<String>,
+        document_pathologies: Vec<Option<Pathology>>,
+        document_unicode_lanes: Vec<UnicodeLane>,
         query_manifest: QueryManifest,
         query_manifest_hash: String,
-        queries: Vec<GeneratedQueryCase>,
+        query_ids: Vec<String>,
+        query_syntaxes: Vec<QuerySyntax>,
+        query_kinds: Vec<GeneratedQueryKind>,
     }
 
     fn small_spec(seed: u64, document_count: u64) -> SyntheticCorpusSpec {
@@ -1735,8 +1941,15 @@ mod tests {
         }
     }
 
-    fn generate_small_golden() -> GeneratorGolden {
-        let corpus_spec = small_spec(0x5eed, 12);
+    fn generate_small_golden() -> (
+        GeneratorGolden,
+        Vec<GeneratedDocument>,
+        Vec<GeneratedQueryCase>,
+    ) {
+        let corpus_spec = SyntheticCorpusSpec {
+            max_document_bytes: 256,
+            ..small_spec(0x5eed, 12)
+        };
         let corpus = SyntheticCorpus::new(corpus_spec.clone()).expect("golden corpus");
         let documents = corpus.iter().collect::<Vec<_>>();
         let corpus_manifest = corpus.manifest().expect("corpus manifest");
@@ -1753,31 +1966,53 @@ mod tests {
         )
         .expect("golden query suite");
         let query_manifest_hash = query_suite.manifest.manifest_hash().expect("query hash");
-        GeneratorGolden {
+        let golden = GeneratorGolden {
             schema_version: GENERATOR_SCHEMA_VERSION,
             corpus_spec,
             corpus_manifest,
             corpus_manifest_hash,
-            documents,
+            document_ids: documents
+                .iter()
+                .map(|document| document.id.clone())
+                .collect(),
+            document_pathologies: documents
+                .iter()
+                .map(|document| document.pathology)
+                .collect(),
+            document_unicode_lanes: documents
+                .iter()
+                .map(|document| document.unicode_lane)
+                .collect(),
             query_manifest: query_suite.manifest,
             query_manifest_hash,
-            queries: query_suite.cases,
-        }
+            query_ids: query_suite
+                .cases
+                .iter()
+                .map(|case| case.id.clone())
+                .collect(),
+            query_syntaxes: query_suite.cases.iter().map(|case| case.syntax).collect(),
+            query_kinds: query_suite
+                .cases
+                .iter()
+                .map(|case| case.query_kind.clone())
+                .collect(),
+        };
+        (golden, documents, query_suite.cases)
     }
 
     #[test]
     fn committed_small_generator_output_is_an_exact_replay_golden() {
         let expected: GeneratorGolden =
             serde_json::from_str(GENERATOR_GOLDEN_JSON).expect("valid committed golden");
-        let actual = generate_small_golden();
+        let (actual, documents, queries) = generate_small_golden();
         assert_eq!(actual, expected);
         actual
             .corpus_manifest
-            .verify_documents(&actual.documents)
+            .verify_documents(&documents)
             .expect("corpus replay");
         actual
             .query_manifest
-            .verify(&actual.queries)
+            .verify(&queries)
             .expect("query replay");
         assert_eq!(
             actual.corpus_manifest.manifest_hash().unwrap(),
@@ -1790,16 +2025,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "maintainer helper: prints the manually reviewed generator golden"]
-    fn emit_small_generator_golden() {
-        let golden = generate_small_golden();
-        panic!(
-            "{}",
-            serde_json::to_string_pretty(&golden).expect("serialize golden")
-        );
-    }
-
-    #[test]
     fn splitmix_stream_is_pinned_and_domain_separated() {
         let mut rng = DeterministicRng::for_stream(42, 7, 11);
         let actual = [
@@ -1808,7 +2033,15 @@ mod tests {
             rng.next_u64(),
             rng.next_u64(),
         ];
-        assert_eq!(actual, [0, 0, 0, 0]);
+        assert_eq!(
+            actual,
+            [
+                18_253_566_837_895_693_334,
+                12_315_204_370_234_691_178,
+                10_379_684_996_734_907_096,
+                4_158_975_417_640_783_922,
+            ]
+        );
 
         let mut different_domain = DeterministicRng::for_stream(42, 8, 11);
         assert_ne!(actual[0], different_domain.next_u64());
@@ -1833,6 +2066,33 @@ mod tests {
         });
         assert!(head_hits[0] < head_hits[1]);
         assert!(head_hits[1] < head_hits[2]);
+        let pinned_cdf = ZipfExponent::ALL.map(|exponent| {
+            let cdf = build_zipf_cdf(1_024, exponent).expect("valid CDF");
+            [cdf[0], cdf[1], cdf[15], cdf[1_023]]
+        });
+        assert_eq!(
+            pinned_cdf,
+            [
+                [
+                    140_737_488_355_328,
+                    221_701_077_161_988,
+                    608_528_386_439_328,
+                    2_190_841_941_626_733,
+                ],
+                [
+                    140_737_488_355_328,
+                    206_483_468_316_941,
+                    426_789_846_743_358,
+                    786_862_503_390_202,
+                ],
+                [
+                    140_737_488_355_328,
+                    194_192_676_810_764,
+                    322_651_937_770_287,
+                    415_333_824_121_154,
+                ],
+            ]
+        );
         assert!(
             build_zipf_cdf(0, ZipfExponent::S08)
                 .expect("empty lookup is representable")
@@ -1854,7 +2114,7 @@ mod tests {
             .map(|index| corpus.document_at(index).expect("document exists"))
             .collect::<Vec<_>>();
         assert!(documents.iter().all(|document| {
-            document.content.len() <= MAX_DOCUMENT_BYTES as usize
+            document.content.len() <= usize_from_u32(MAX_DOCUMENT_BYTES)
                 && document.content.is_char_boundary(document.content.len())
         }));
         assert!(documents[0].content.is_empty());
@@ -1888,7 +2148,7 @@ mod tests {
             })
             .expect("accepted cap");
             let document = corpus.document_at(9).expect("near-limit anchor");
-            assert!(document.content.len() <= cap as usize);
+            assert!(document.content.len() <= usize_from_u32(cap));
             assert!(document.content.is_char_boundary(document.content.len()));
         }
         assert!(
@@ -1993,10 +2253,26 @@ mod tests {
             suite
                 .cases
                 .iter()
-                .filter(|case| { matches!(&case.query_kind, GeneratedQueryKind::Harvested { .. }) })
+                .filter(|case| case.source == "tests/fixtures/queries.json")
                 .count(),
             25
         );
+        assert_eq!(
+            suite
+                .cases
+                .iter()
+                .filter(|case| {
+                    case.source
+                        .starts_with("tests/fixtures/quill_language_contract.json#")
+                })
+                .count(),
+            7
+        );
+        assert!(suite.cases.iter().any(|case| {
+            case.id == "contract-harvest-range"
+                && case.filters.created_from_ms == Some(1_700_000_000_000)
+                && case.filters.created_to_ms == Some(1_700_000_000_999)
+        }));
         let globs = suite
             .cases
             .iter()
@@ -2085,6 +2361,29 @@ mod tests {
             .unwrap();
         assert!(cass.to_differential_case(4, &corpus_hash).is_err());
         assert!(term.to_differential_case(4, "0123456789abcdef").is_err());
+        assert!(
+            GeneratedQuerySuite::generate(
+                QueryGeneratorSpec {
+                    seed: 4,
+                    default_limit: MAX_GENERATED_QUERY_LIMIT + 1,
+                    include_shared_relevance_queries: false,
+                },
+                &corpus_hash,
+                &shared,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn contract_query_lowering_rejects_unknown_classes_and_filters() {
+        let shared = SharedFixtureSuite::load().expect("fixtures");
+        let mut query = shared.harvested_contract_queries()[0].clone();
+        query.query_class = "future_class".to_owned();
+        assert!(contract_query_case(&query, 10).is_err());
+        query.query_class = "identifier".to_owned();
+        query.filters.insert("future_filter".to_owned(), 1);
+        assert!(contract_query_case(&query, 10).is_err());
     }
 
     #[test]
@@ -2106,7 +2405,7 @@ mod tests {
                 },
                 RepositoryEntry {
                     relative_path: PathBuf::from("large.txt"),
-                    bytes: vec![b'x'; MAX_DOCUMENT_BYTES as usize + 1],
+                    bytes: vec![b'x'; usize_from_u32(MAX_DOCUMENT_BYTES) + 1],
                 },
             ],
         )
@@ -2114,14 +2413,27 @@ mod tests {
         assert_eq!(snapshot.documents.len(), 2);
         assert_eq!(snapshot.documents[0].id, "repo:README.md");
         assert_eq!(snapshot.documents[1].id, "repo:src/z.rs");
+        assert!(
+            snapshot
+                .documents
+                .iter()
+                .all(|document| document.unicode_lane == UnicodeLane::Ascii)
+        );
         assert_eq!(snapshot.manifest.skipped_repository_entries.len(), 2);
         snapshot
             .manifest
             .verify_documents(&snapshot.documents)
             .expect("snapshot replay");
-        let source = match &snapshot.manifest.source {
-            CorpusSourceManifest::Repository { files, .. } => files,
-            _ => panic!("repository source expected"),
+        let CorpusSourceManifest::Repository { files: source, .. } = &snapshot.manifest.source
+        else {
+            assert!(
+                matches!(
+                    snapshot.manifest.source,
+                    CorpusSourceManifest::Repository { .. }
+                ),
+                "repository source expected"
+            );
+            return;
         };
         assert_eq!(source[0].path, "README.md");
         assert_eq!(source[1].path, "src/z.rs");
@@ -2135,6 +2447,107 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            RepositorySnapshot::from_entries(
+                "frankensearch",
+                [RepositoryEntry {
+                    relative_path: PathBuf::from("src\\platform-dependent.rs"),
+                    bytes: Vec::new(),
+                }]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn external_content_script_classification_is_deterministic() {
+        assert_eq!(classify_unicode_lane("plain ASCII"), UnicodeLane::Ascii);
+        assert_eq!(
+            classify_unicode_lane("naïve cafe\u{301}"),
+            UnicodeLane::Latin1
+        );
+        assert_eq!(classify_unicode_lane("搜索 エンジン"), UnicodeLane::Cjk);
+        assert_eq!(classify_unicode_lane("𠀀 𪛟"), UnicodeLane::CjkExtensionB);
+        assert_eq!(classify_unicode_lane("café 搜索 𠀀"), UnicodeLane::Mixed);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tracked_repository_lane_reads_only_explicit_relative_paths() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let snapshot = RepositorySnapshot::from_tracked_paths(
+            root,
+            "frankensearch-quill-gauntlet",
+            [
+                PathBuf::from("src/lib.rs"),
+                PathBuf::from("Cargo.toml"),
+                PathBuf::from("missing-tracked-file"),
+            ],
+        )
+        .expect("tracked snapshot");
+        assert_eq!(snapshot.documents.len(), 2);
+        assert_eq!(snapshot.documents[0].id, "repo:Cargo.toml");
+        assert_eq!(snapshot.documents[1].id, "repo:src/lib.rs");
+        assert_eq!(
+            snapshot.manifest.skipped_repository_entries,
+            [SkippedRepositoryEntry {
+                path: "missing-tracked-file".to_owned(),
+                reason: RepositorySkipReason::Missing,
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_repository_lane_rejects_final_and_intermediate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("snapshot root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, b"outside target must never be read").expect("outside file");
+        symlink(&outside_file, root.path().join("final-link")).expect("final symlink");
+        symlink(outside.path(), root.path().join("intermediate")).expect("directory symlink");
+
+        let snapshot = RepositorySnapshot::from_tracked_paths(
+            root.path(),
+            "symlink-regression",
+            [
+                PathBuf::from("final-link"),
+                PathBuf::from("intermediate/secret.txt"),
+            ],
+        )
+        .expect("symlinks are recorded as skipped entries");
+
+        assert!(snapshot.documents.is_empty());
+        assert_eq!(
+            snapshot.manifest.skipped_repository_entries,
+            [
+                SkippedRepositoryEntry {
+                    path: "final-link".to_owned(),
+                    reason: RepositorySkipReason::NotRegularFile,
+                },
+                SkippedRepositoryEntry {
+                    path: "intermediate/secret.txt".to_owned(),
+                    reason: RepositorySkipReason::NotRegularFile,
+                },
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tracked_repository_lane_reports_unsupported_on_windows() {
+        let error = RepositorySnapshot::from_tracked_paths(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "frankensearch-quill-gauntlet",
+            [PathBuf::from("Cargo.toml")],
+        )
+        .expect_err("descriptor-relative tracked reads are unsupported on Windows");
+        assert!(matches!(
+            error,
+            GauntletError::Io(error) if error.kind() == std::io::ErrorKind::Unsupported
+        ));
     }
 
     #[test]
@@ -2151,20 +2564,49 @@ mod tests {
         assert_eq!(
             corpus.iter().size_hint(),
             (
-                XLARGE_DOCUMENT_COUNT as usize,
-                Some(XLARGE_DOCUMENT_COUNT as usize)
+                usize::try_from(XLARGE_DOCUMENT_COUNT).unwrap_or(usize::MAX),
+                Some(usize::try_from(XLARGE_DOCUMENT_COUNT).unwrap_or(usize::MAX))
             )
         );
     }
 
     #[test]
-    #[ignore = "nightly-only one-million-document streaming integrity lane"]
+    #[ignore = "nightly-only three-million-document xlarge matrix integrity lane"]
     fn nightly_xlarge_stream_hash_integrity() {
-        let corpus = SyntheticCorpus::new(SyntheticCorpusSpec::xlarge(0x5eed, ZipfExponent::S11))
-            .expect("xlarge recipe");
-        let manifest = corpus.manifest().expect("streamed manifest");
-        assert_eq!(manifest.document_count, XLARGE_DOCUMENT_COUNT);
-        assert_eq!(manifest.content_sha256.len(), 64);
-        assert_eq!(manifest.manifest_hash().expect("hash").len(), 64);
+        let corpora = SyntheticCorpusSpec::xlarge_matrix(0x5eed)
+            .map(|spec| SyntheticCorpus::new(spec).expect("xlarge recipe must remain valid"));
+        let manifests = corpora
+            .each_ref()
+            .map(|corpus| corpus.manifest().expect("streamed xlarge manifest"));
+        let actual = (
+            manifests.each_ref().map(|manifest| manifest.document_count),
+            manifests
+                .each_ref()
+                .map(|manifest| manifest.total_content_bytes),
+            manifests
+                .each_ref()
+                .map(|manifest| manifest.content_sha256.clone()),
+            manifests
+                .each_ref()
+                .map(|manifest| manifest.manifest_hash().expect("xlarge manifest hash")),
+        );
+
+        assert_eq!(
+            actual,
+            (
+                [XLARGE_DOCUMENT_COUNT; 3],
+                [3_978_050_198; 3],
+                [
+                    "4003abd3f8d3de470ad8d70401c95e2ee0199388e7388dc8169fac1a7e596ef8".to_owned(),
+                    "c07b02b1541c25a29a68b00ccd6cd64e09636f593fe5700ce10df9e5cb842d5a".to_owned(),
+                    "ffdf5a9b502c5e6847c4ddf33969c87012fc4277e6aa4bbabe601ad257a077e4".to_owned(),
+                ],
+                [
+                    "66a49dd8191d383b1d016f17fb55c8392803d648bc427dcfcc03eb299f722a8b".to_owned(),
+                    "8524cd498b8d480b0a2c45f2fa5f56a56a8e97bc72a9aaf082aec3f984a928d2".to_owned(),
+                    "55cf61b93b78b94b787875def3618354c2fab28baab5bbfece73b412811228d1".to_owned(),
+                ],
+            )
+        );
     }
 }

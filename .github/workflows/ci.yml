@@ -12,8 +12,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
 
 permissions:
   contents: read
@@ -104,6 +104,11 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      - name: Nightly Quill xlarge generator integrity
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 30
+        run: cargo test --profile release -p frankensearch-quill-gauntlet generator::tests::nightly_xlarge_stream_hash_integrity -- --ignored --exact --nocapture
 
       - name: Nightly full validation (all features)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
