@@ -42,9 +42,11 @@ pub use keeper::{
     unpack_engine_version,
 };
 pub use query::{
-    BooleanClause, BooleanOperator, DefaultQueryParser, MAX_QUERY_DEPTH, MAX_QUERY_LENGTH, Occur,
-    ParsedQuery, PositionedTerm, Query, QueryDiagnostic, QueryDiagnosticKind, QueryExplanation,
-    QueryField, QueryParserConfigError, QueryValue, classify_query, truncate_query,
+    BooleanClause, BooleanOperator, CassQueryFilters, CassQueryParser, CassQueryParserConfigError,
+    CassSourceFilter, CassWildcardPattern, DefaultQueryParser, MAX_QUERY_DEPTH, MAX_QUERY_LENGTH,
+    Occur, ParsedQuery, PositionedTerm, Query, QueryDiagnostic, QueryDiagnosticKind,
+    QueryExplanation, QueryField, QueryParserConfigError, QueryValue, cass_sanitize_query,
+    classify_query, truncate_query,
 };
 pub use schema::{
     Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind,

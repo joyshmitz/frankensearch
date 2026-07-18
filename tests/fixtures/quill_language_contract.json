@@ -615,6 +615,63 @@
       }
     },
     {
+      "id": "query-cass-agent-workspace-filters",
+      "query_class": "structured_filter",
+      "parser": "cass",
+      "input": "cache",
+      "filters": { "agents": ["claude", "codex"], "workspaces": ["/alpha", "/beta"] },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "claude", "fields": [{ "name": "agent", "boost": 1.0 }] } }, { "occur": "Should", "query": { "type": "Term", "text": "codex", "fields": [{ "name": "agent", "boost": 1.0 }] } }] } },
+          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "/alpha", "fields": [{ "name": "workspace", "boost": 1.0 }] } }, { "occur": "Should", "query": { "type": "Term", "text": "/beta", "fields": [{ "name": "workspace", "boost": 1.0 }] } }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-source-local-filter",
+      "query_class": "structured_filter",
+      "parser": "cass",
+      "input": "",
+      "filters": { "source_filter": "local" },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "All" } },
+          { "occur": "Must", "query": { "type": "Term", "text": "local", "fields": [{ "name": "origin_kind", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-source-remote-filter",
+      "query_class": "structured_filter",
+      "parser": "cass",
+      "input": "",
+      "filters": { "source_filter": "remote" },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "All" } },
+          { "occur": "Must", "query": { "type": "Term", "text": "ssh", "fields": [{ "name": "origin_kind", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-source-id-filter",
+      "query_class": "structured_filter",
+      "parser": "cass",
+      "input": "",
+      "filters": { "source_filter": "source_id", "source_id": "archive-7" },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "All" } },
+          { "occur": "Must", "query": { "type": "Term", "text": "archive-7", "fields": [{ "name": "source_id", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
       "id": "query-cjk-all-bigrams",
       "query_class": "short_keyword",
       "parser": "cass",
@@ -659,6 +716,237 @@
       "parser": "cass",
       "input": "",
       "expected_ast": { "type": "All" }
+    },
+    {
+      "id": "query-cass-phrase-two-term",
+      "query_class": "phrase",
+      "parser": "cass",
+      "input": "\"error handling\"",
+      "expected_ast": {
+        "type": "Phrase",
+        "terms": ["error", "handling"],
+        "slop": 0,
+        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }]
+      }
+    },
+    {
+      "id": "query-cass-phrase-single-token-collapses",
+      "query_class": "phrase",
+      "parser": "cass",
+      "input": "\"auth\"",
+      "expected_ast": {
+        "type": "Term",
+        "text": "auth",
+        "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }]
+      }
+    },
+    {
+      "id": "query-cass-phrase-implicit-and",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "\"error handling\" cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Phrase", "terms": ["error", "handling"], "slop": 0, "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-cjk-quoted-phrase-bigrams",
+      "query_class": "phrase",
+      "parser": "cass",
+      "input": "\"搜索引擎\"",
+      "expected_ast": { "ref": "query-cjk-all-bigrams" }
+    },
+    {
+      "id": "query-cass-implicit-and",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth token",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-explicit-and-equivalent",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth AND token",
+      "expected_ast": { "ref": "query-cass-implicit-and" }
+    },
+    {
+      "id": "query-cass-symbolic-and-equivalent",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth&&token",
+      "expected_ast": { "ref": "query-cass-implicit-and" }
+    },
+    {
+      "id": "query-cass-or-chain",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth OR token OR cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-symbolic-or",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth||token",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          { "occur": "Should", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-right-or-precedence",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth AND token OR cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Boolean", "operator": "OR", "children": [
+            { "occur": "Should", "query": { "type": "Term", "text": "token", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+            { "occur": "Should", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+          ] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-hyphen-negative-with-positive",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth -deprecated",
+      "expected_ast": { "ref": "query-boolean-and-not-no-all-score" }
+    },
+    {
+      "id": "query-cass-created-from-only",
+      "query_class": "range",
+      "parser": "cass",
+      "input": "cache",
+      "filters": { "created_from": 1700000000000 },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "value": 1700000000000, "bound": "Included" }, "upper": { "bound": "Unbounded" }, "matched_score": 1.0 } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-created-to-only",
+      "query_class": "range",
+      "parser": "cass",
+      "input": "cache",
+      "filters": { "created_to": 1700000000999 },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "bound": "Unbounded" }, "upper": { "value": 1700000000999, "bound": "Included" }, "matched_score": 1.0 } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-single-agent-filter-group",
+      "query_class": "structured_filter",
+      "parser": "cass",
+      "input": "cache",
+      "filters": { "agents": ["codex"] },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "codex", "fields": [{ "name": "agent", "boost": 1.0 }] } }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-all-filter-order",
+      "query_class": "structured_filter",
+      "parser": "cass",
+      "input": "cache",
+      "filters": { "agents": ["codex"], "workspaces": ["/alpha"], "created_from": 1700000000000, "created_to": 1700000000999, "source_filter": "source_id", "source_id": "archive-7" },
+      "expected_ast": {
+        "type": "Boolean",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "codex", "fields": [{ "name": "agent", "boost": 1.0 }] } }] } },
+          { "occur": "Must", "query": { "type": "Boolean", "children": [{ "occur": "Should", "query": { "type": "Term", "text": "/alpha", "fields": [{ "name": "workspace", "boost": 1.0 }] } }] } },
+          { "occur": "Must", "query": { "type": "RangeI64", "field": "created_at", "lower": { "value": 1700000000000, "bound": "Included" }, "upper": { "value": 1700000000999, "bound": "Included" }, "matched_score": 1.0 } },
+          { "occur": "Must", "query": { "type": "Term", "text": "archive-7", "fields": [{ "name": "source_id", "boost": 1.0 }] } }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-recovery-leading-and",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "AND auth",
+      "expected_ast": { "ref": "query-cass-phrase-single-token-collapses" },
+      "expected_diagnostic": "AND without an adjacent operand was recovered"
+    },
+    {
+      "id": "query-cass-recovery-dangling-or",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth OR",
+      "expected_ast": { "ref": "query-cass-phrase-single-token-collapses" },
+      "expected_diagnostic": "dangling binary operator has no operand"
+    },
+    {
+      "id": "query-cass-recovery-unterminated-phrase",
+      "query_class": "phrase",
+      "parser": "cass",
+      "input": "\"error handling",
+      "expected_ast": { "ref": "query-cass-phrase-two-term" },
+      "expected_diagnostic": "unterminated phrase"
+    },
+    {
+      "id": "query-cass-recovery-dangling-not",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth NOT",
+      "expected_ast": { "ref": "query-cass-phrase-single-token-collapses" },
+      "expected_diagnostic": "dangling NOT has no operand"
+    },
+    {
+      "id": "query-cass-carriage-return-is-not-grammar-whitespace",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth\rOR\rcache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          { "occur": "Must", "query": { "type": "Term", "text": "auth", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "or", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } },
+          { "occur": "Must", "query": { "type": "Term", "text": "cache", "fields": [{ "name": "title", "boost": 1.0 }, { "name": "content", "boost": 1.0 }, { "name": "title_prefix", "boost": 1.0 }, { "name": "content_prefix", "boost": 1.0 }] } }
+        ]
+      }
     },
     {
       "id": "query-boolean-should-optional-with-must",
@@ -979,7 +1267,7 @@
   "surface_coverage": [
     { "surface": "schema", "fixture_ids": ["behavior-schema-default-fields"] },
     { "surface": "analyzers", "fixture_ids": ["analyzer-default-ascii-split-lower", "analyzer-default-unicode-lower-offsets", "analyzer-default-unicode-lower-expansion", "analyzer-hyphen-compound-and-parts", "analyzer-hyphen-cjk-bigrams", "analyzer-prefix-no-hyphen-decompose", "analyzer-cass-limit-256-kept", "analyzer-cass-limit-257-dropped", "analyzer-tantivy-index-limit-65530-kept", "analyzer-tantivy-index-limit-65531-dropped", "analyzer-quill-query-limit-65531-dropped", "helper-edge-prefix-ascii", "helper-preview-unicode", "behavior-analyzers", "behavior-oversized-token-position-gap"] },
-    { "surface": "queries", "fixture_ids": ["query-identifier-path-phrase", "query-identifier-raw-colon-dropped", "query-short-keyword-default-or", "query-natural-language-default-or", "query-phrase-both-fields", "query-quoted-single-token-is-term", "query-default-and-precedes-or", "query-default-field-and-boost", "query-default-all-negative-complement", "query-default-recursive-dedup", "query-lenient-unterminated-quote-recovers", "query-lenient-diagnostic-keeps-valid-sibling", "query-default-string-range-mixed-bounds", "query-default-string-set-stable-dedup", "query-default-group-boost", "query-default-field-scoped-group", "query-default-field-scope-explicit-override", "query-default-field-scoped-typed-leaves", "query-boolean-or-tighter-than-and", "query-boolean-negative-standalone-universe", "query-boolean-negative-or-operand-universe", "query-boolean-and-not-no-all-score", "query-boolean-repeated-not-is-idempotent", "query-glob-exact", "query-glob-prefix", "query-glob-suffix", "query-glob-substring", "query-glob-complex", "query-range-inclusive-created-at", "query-cjk-all-bigrams", "query-cjk-mixed-script-keeps-cjk-only", "query-cjk-single-character-unigram", "query-empty-cass-all", "query-boolean-should-optional-with-must", "query-boolean-should-only-required", "query-boolean-should-plus-mustnot-required", "query-boolean-mustnot-only-empty", "helper-query-truncate-unicode", "behavior-boolean-occur", "behavior-cass-prefix-and-cjk-boundaries", "behavior-quill-oversized-query-lowering"] },
+    { "surface": "queries", "fixture_ids": ["query-identifier-path-phrase", "query-identifier-raw-colon-dropped", "query-short-keyword-default-or", "query-natural-language-default-or", "query-phrase-both-fields", "query-quoted-single-token-is-term", "query-default-and-precedes-or", "query-default-field-and-boost", "query-default-all-negative-complement", "query-default-recursive-dedup", "query-lenient-unterminated-quote-recovers", "query-lenient-diagnostic-keeps-valid-sibling", "query-default-string-range-mixed-bounds", "query-default-string-set-stable-dedup", "query-default-group-boost", "query-default-field-scoped-group", "query-default-field-scope-explicit-override", "query-default-field-scoped-typed-leaves", "query-boolean-or-tighter-than-and", "query-boolean-negative-standalone-universe", "query-boolean-negative-or-operand-universe", "query-boolean-and-not-no-all-score", "query-boolean-repeated-not-is-idempotent", "query-glob-exact", "query-glob-prefix", "query-glob-suffix", "query-glob-substring", "query-glob-complex", "query-range-inclusive-created-at", "query-cass-agent-workspace-filters", "query-cass-source-local-filter", "query-cass-source-remote-filter", "query-cass-source-id-filter", "query-cjk-all-bigrams", "query-cjk-mixed-script-keeps-cjk-only", "query-cjk-single-character-unigram", "query-empty-cass-all", "query-cass-phrase-two-term", "query-cass-phrase-single-token-collapses", "query-cass-phrase-implicit-and", "query-cass-cjk-quoted-phrase-bigrams", "query-cass-implicit-and", "query-cass-explicit-and-equivalent", "query-cass-symbolic-and-equivalent", "query-cass-or-chain", "query-cass-symbolic-or", "query-cass-right-or-precedence", "query-cass-hyphen-negative-with-positive", "query-cass-created-from-only", "query-cass-created-to-only", "query-cass-single-agent-filter-group", "query-cass-all-filter-order", "query-cass-recovery-leading-and", "query-cass-recovery-dangling-or", "query-cass-recovery-unterminated-phrase", "query-cass-recovery-dangling-not", "query-cass-carriage-return-is-not-grammar-whitespace", "query-boolean-should-optional-with-must", "query-boolean-should-only-required", "query-boolean-should-plus-mustnot-required", "query-boolean-mustnot-only-empty", "helper-query-truncate-unicode", "behavior-boolean-occur", "behavior-cass-prefix-and-cjk-boundaries", "behavior-quill-oversized-query-lowering"] },
     { "surface": "collectors", "fixture_ids": ["behavior-collectors", "behavior-pagination-and-limit-zero"] },
     { "surface": "scoring", "fixture_ids": ["score-bm25-constants-operation-order", "score-bm25-operation-order-bits", "score-fieldnorm-landmarks", "score-avgdl-uses-raw-statistics", "score-deleted-doc-statistics-until-merge", "score-multifield-title-boost", "score-cass-fields-unboosted", "score-cass-fast-range-constant", "score-phrase-bm25", "score-required-scorers-cost-order", "score-cass-regex-fields-constant", "score-deterministic-total-order", "score-epsilon-layout-class", "score-epsilon-component-boundary", "behavior-scoring"] },
     { "surface": "writer", "fixture_ids": ["behavior-writer-mutations"] },

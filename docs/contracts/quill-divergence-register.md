@@ -62,6 +62,16 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Decision: fix (bead: `bd-2b2u`)
 - Reviewer: not required for a fix decision
 
+### DIV-002: CASS anchored globs collapse to `AllQuery`
+
+- Class: `OracleBug`
+- First seen: 2026-07-17 · `query-glob-suffix` / `cass_parser_result_sets_match_the_shipping_tantivy_builder`
+- Root cause: `CassWildcardPattern::to_regex` emits explicit `^`/`$` assertions, but pinned `tantivy-fst 0.5.0` rejects zero-width assertions and already matches regexes against the whole term. `cass_build_term_query_clauses` ignores both title/content construction failures; an empty top-level clause list then becomes `AllQuery`.
+- Consumer impact: lone suffix globs such as `*bar` return every document. Affected complex wildcard operands can silently disappear from compound or filtered queries. Substring globs and complex globs bounded by `*` at both ends are unaffected by this anchor failure.
+- Fixture: `query-glob-suffix` plus the result-level differential named above
+- Decision: fix (bead: `bd-cass-wildcard-fst-anchors-t3f9`)
+- Reviewer: not required for a fix decision
+
 ---
 
 *Cross-references: comparator classes implemented in the gauntlet kernel (bead e0.5); auto-triage feeding this ledger (bd-quill-duel-shrinker); statistical gates consuming per-class pass rates (bead e6.6); G2 exit requires this register complete over two consecutive nightly runs (bead e6.8).*

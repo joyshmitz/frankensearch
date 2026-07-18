@@ -1,4 +1,4 @@
-//! Engine-neutral query trees and the shipping default lenient parser.
+//! Engine-neutral query trees and native default/CASS lenient parsers.
 //!
 //! Parsing is deliberately separated from scorer construction. The tree uses
 //! stable Quill field identifiers, never Tantivy field handles, and malformed
@@ -11,9 +11,9 @@ use std::ops::Bound;
 use thiserror::Error;
 
 use crate::schema::{Analyzer as AnalyzerKind, FieldDescriptor, FieldKind, SchemaDescriptor};
-use crate::scribe::{FrankensearchTokenizer, analyze_admitted};
+use crate::scribe::{FrankensearchTokenizer, analyze_admitted, is_cass_cjk};
 
-/// Maximum number of Unicode scalar values admitted to the default parser.
+/// Maximum number of Unicode scalar values admitted to either native parser.
 pub const MAX_QUERY_LENGTH: usize = 10_000;
 
 /// Maximum recursive group depth accepted by the lenient parser.
@@ -171,7 +171,7 @@ pub enum Query {
     Glob {
         /// Stable field identifiers.
         field_ids: Vec<u16>,
-        /// Original glob pattern.
+        /// Lowercased glob pattern in source syntax.
         pattern: String,
     },
     /// Explicit score multiplier.
@@ -2565,8 +2565,809 @@ fn merge_field_queries(queries: Vec<Query>) -> Option<Query> {
     }
 }
 
+/// Source restriction used by the native CASS query parser.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CassSourceFilter {
+    /// Do not restrict the durable source identity.
+    #[default]
+    All,
+    /// Match documents indexed from the local machine.
+    Local,
+    /// Match documents indexed through SSH.
+    Remote,
+    /// Match one exact source identifier.
+    SourceId(String),
+}
+
+/// Structured filters appended to one native CASS query.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CassQueryFilters {
+    /// Exact agent names, combined with OR and required by the root query.
+    pub agents: Vec<String>,
+    /// Exact workspace names, combined with OR and required by the root query.
+    pub workspaces: Vec<String>,
+    /// Inclusive lower timestamp bound.
+    pub created_from: Option<i64>,
+    /// Inclusive upper timestamp bound.
+    pub created_to: Option<i64>,
+    /// Durable source restriction.
+    pub source_filter: CassSourceFilter,
+}
+
+/// Shipping wildcard classes for one CASS term.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CassWildcardPattern {
+    /// No wildcard, lowered through exact term queries.
+    Exact(String),
+    /// One trailing wildcard, accelerated through the prefix fields.
+    Prefix(String),
+    /// One leading wildcard, lowered through regex expansion.
+    Suffix(String),
+    /// Leading and trailing wildcards, lowered through regex expansion.
+    Substring(String),
+    /// One or more interior wildcards, lowered through regex expansion.
+    Complex(String),
+}
+
+impl CassWildcardPattern {
+    /// Classify and lowercase one sanitized CASS query term.
+    #[must_use]
+    pub fn parse(term: &str) -> Self {
+        let starts_with_star = term.starts_with('*');
+        let ends_with_star = term.ends_with('*');
+        let core = term.trim_matches('*');
+        if core.is_empty() {
+            return Self::Exact(String::new());
+        }
+        if core.contains('*') {
+            return Self::Complex(term.to_lowercase());
+        }
+        let core = core.to_lowercase();
+        match (starts_with_star, ends_with_star) {
+            (true, true) => Self::Substring(core),
+            (true, false) => Self::Suffix(core),
+            (false, true) => Self::Prefix(core),
+            (false, false) => Self::Exact(core),
+        }
+    }
+
+    /// Return the incumbent-compatible regex for regex-backed classes.
+    #[must_use]
+    pub fn to_regex(&self) -> Option<String> {
+        match self {
+            Self::Suffix(core) => Some(format!(".*{}$", cass_escape_regex(core))),
+            Self::Substring(core) => Some(format!(".*{}.*", cass_escape_regex(core))),
+            Self::Complex(pattern) => Some(cass_complex_regex(pattern)),
+            Self::Exact(_) | Self::Prefix(_) => None,
+        }
+    }
+}
+
+/// Sanitize a CASS query using the shipping hyphen-normalize boundary.
+///
+/// Alphanumeric scalars, wildcards, quotes, and hyphens survive. Every other
+/// scalar becomes a space so later splitting matches the indexed tokenizer.
+#[must_use]
+pub fn cass_sanitize_query(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '*' | '"' | '-') {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn cass_escape_regex(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len().saturating_mul(2));
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn cass_complex_regex(pattern: &str) -> String {
+    let mut regex = String::with_capacity(pattern.len().saturating_mul(2).saturating_add(2));
+    if pattern.starts_with('*') {
+        regex.push_str(".*");
+    } else {
+        regex.push('^');
+    }
+    let core = pattern.trim_start_matches('*').trim_end_matches('*');
+    for ch in core.chars() {
+        if ch == '*' {
+            regex.push_str(".*");
+        } else {
+            if matches!(
+                ch,
+                '\\' | '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+            ) {
+                regex.push('\\');
+            }
+            regex.push(ch);
+        }
+    }
+    if pattern.ends_with('*') {
+        regex.push_str(".*");
+    } else {
+        regex.push('$');
+    }
+    regex
+}
+
+/// Invalid schema configuration for [`CassQueryParser`].
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum CassQueryParserConfigError {
+    /// The schema violates the dense descriptor contract.
+    #[error("CASS query schema {schema} is invalid: {detail}")]
+    InvalidSchema {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Descriptor validation detail.
+        detail: String,
+    },
+    /// A mandatory CASS field is absent.
+    #[error("CASS query field {field} is absent from schema {schema}")]
+    MissingField {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Missing field name.
+        field: &'static str,
+    },
+    /// A mandatory field has the wrong durable shape.
+    #[error("CASS query field {field} has an incompatible shape in schema {schema}")]
+    InvalidField {
+        /// Schema diagnostic name.
+        schema: &'static str,
+        /// Invalid field name.
+        field: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CassParserFields {
+    agent: u16,
+    workspace: u16,
+    created_at: u16,
+    title: u16,
+    content: u16,
+    title_prefix: u16,
+    content_prefix: u16,
+    source_id: u16,
+    origin_kind: u16,
+}
+
+impl CassParserFields {
+    fn searchable(self) -> Vec<QueryField> {
+        [
+            self.title,
+            self.content,
+            self.title_prefix,
+            self.content_prefix,
+        ]
+        .into_iter()
+        .map(|field_id| QueryField::new(field_id, 1.0))
+        .collect()
+    }
+
+    fn regex_fields(self) -> Vec<u16> {
+        vec![self.content, self.title]
+    }
+}
+
+/// Native parser for the intentionally non-standard CASS Boolean grammar.
+///
+/// OR binds tighter than AND. Negation is idempotent rather than parity-based,
+/// and a negative used as an OR operand or as the complete root is wrapped in
+/// `All + MustNot` so it denotes a complement.
+#[derive(Debug, Clone, Copy)]
+pub struct CassQueryParser {
+    fields: CassParserFields,
+}
+
+impl CassQueryParser {
+    /// Bind the parser to a CASS-compatible schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed configuration error for a missing or incompatible
+    /// field, or for an invalid schema descriptor.
+    pub fn new(schema: SchemaDescriptor) -> Result<Self, CassQueryParserConfigError> {
+        schema
+            .validate()
+            .map_err(|error| CassQueryParserConfigError::InvalidSchema {
+                schema: schema.name,
+                detail: error.to_string(),
+            })?;
+        let keyword = |kind| kind == FieldKind::Keyword;
+        let cass_text = |kind| {
+            matches!(
+                kind,
+                FieldKind::Text {
+                    analyzer: AnalyzerKind::CassHyphenNormalize,
+                    positions: true,
+                }
+            )
+        };
+        let cass_prefix = |kind| {
+            matches!(
+                kind,
+                FieldKind::Text {
+                    analyzer: AnalyzerKind::CassPrefixNormalize,
+                    positions: false,
+                }
+            )
+        };
+        let created_at = |kind| {
+            matches!(
+                kind,
+                FieldKind::I64 {
+                    indexed: true,
+                    fast: true,
+                }
+            )
+        };
+        Ok(Self {
+            fields: CassParserFields {
+                agent: required_cass_field(schema, "agent", keyword)?.id,
+                workspace: required_cass_field(schema, "workspace", keyword)?.id,
+                created_at: required_cass_field(schema, "created_at", created_at)?.id,
+                title: required_cass_field(schema, "title", cass_text)?.id,
+                content: required_cass_field(schema, "content", cass_text)?.id,
+                title_prefix: required_cass_field(schema, "title_prefix", cass_prefix)?.id,
+                content_prefix: required_cass_field(schema, "content_prefix", cass_prefix)?.id,
+                source_id: required_cass_field(schema, "source_id", keyword)?.id,
+                origin_kind: required_cass_field(schema, "origin_kind", keyword)?.id,
+            },
+        })
+    }
+
+    /// Parse one CASS query and append its structured filters.
+    #[must_use]
+    pub fn parse(&self, raw_query: &str, filters: &CassQueryFilters) -> ParsedQuery {
+        let (truncated_query, was_truncated) = truncated_prefix(raw_query);
+        let mut diagnostics = Vec::new();
+        if was_truncated {
+            emit_diagnostic(
+                &mut diagnostics,
+                QueryDiagnostic {
+                    kind: QueryDiagnosticKind::Truncated,
+                    message: format!(
+                        "CASS query truncated to {MAX_QUERY_LENGTH} Unicode scalar values"
+                    ),
+                    byte_offset: Some(truncated_query.len()),
+                    fragment: None,
+                },
+            );
+        }
+        let tokens = cass_lex(truncated_query, &mut diagnostics);
+        let mut grammar = CassGrammar {
+            parser: *self,
+            tokens,
+            diagnostics,
+        };
+        let parsed = grammar.parse();
+        let root = parsed.map_or(Query::All, |node| {
+            if node.negative {
+                cass_complement(node.query)
+            } else {
+                node.query
+            }
+        });
+        let query = self.apply_filters(root, filters);
+        ParsedQuery {
+            query,
+            explanation: classify_query(truncated_query),
+            diagnostics: grammar.diagnostics,
+            was_truncated,
+        }
+    }
+
+    fn apply_filters(&self, root: Query, filters: &CassQueryFilters) -> Query {
+        if filters.agents.is_empty()
+            && filters.workspaces.is_empty()
+            && filters.created_from.is_none()
+            && filters.created_to.is_none()
+            && filters.source_filter == CassSourceFilter::All
+        {
+            return root;
+        }
+        let mut clauses = Vec::with_capacity(5);
+        clauses.push(BooleanClause::new(Occur::Must, root));
+        if let Some(filter) = cass_string_filter(self.fields.agent, &filters.agents) {
+            clauses.push(BooleanClause::new(Occur::Must, filter));
+        }
+        if let Some(filter) = cass_string_filter(self.fields.workspace, &filters.workspaces) {
+            clauses.push(BooleanClause::new(Occur::Must, filter));
+        }
+        if filters.created_from.is_some() || filters.created_to.is_some() {
+            clauses.push(BooleanClause::new(
+                Occur::Must,
+                Query::Range {
+                    field_id: self.fields.created_at,
+                    lower: filters.created_from.map_or(Bound::Unbounded, |value| {
+                        Bound::Included(QueryValue::I64(value))
+                    }),
+                    upper: filters.created_to.map_or(Bound::Unbounded, |value| {
+                        Bound::Included(QueryValue::I64(value))
+                    }),
+                },
+            ));
+        }
+        let source = match &filters.source_filter {
+            CassSourceFilter::All => None,
+            CassSourceFilter::Local => Some((self.fields.origin_kind, "local")),
+            CassSourceFilter::Remote => Some((self.fields.origin_kind, "ssh")),
+            CassSourceFilter::SourceId(source_id) => {
+                Some((self.fields.source_id, source_id.as_str()))
+            }
+        };
+        if let Some((field_id, value)) = source {
+            clauses.push(BooleanClause::new(
+                Occur::Must,
+                cass_exact_term(field_id, value.to_owned()),
+            ));
+        }
+        if clauses.len() == 1 {
+            clauses.pop().map_or(Query::All, |clause| clause.query)
+        } else {
+            Query::Boolean {
+                clauses,
+                operator: None,
+            }
+        }
+    }
+
+    fn lower_term(&self, raw: &str) -> Query {
+        let parts = cass_sanitize_query(raw)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.lower_compound(&parts)
+    }
+
+    fn lower_compound(&self, parts: &[String]) -> Query {
+        let queries = parts
+            .iter()
+            .filter_map(|part| self.lower_term_part(part))
+            .collect::<Vec<_>>();
+        cass_required_query(queries)
+    }
+
+    fn lower_term_part(&self, raw: &str) -> Option<Query> {
+        let pattern = CassWildcardPattern::parse(raw);
+        match pattern {
+            CassWildcardPattern::Exact(term) | CassWildcardPattern::Prefix(term) => {
+                if term.is_empty() {
+                    return None;
+                }
+                if term.chars().any(is_cass_cjk) {
+                    let terms = cass_cjk_terms(&term);
+                    return Some(cass_required_query(
+                        terms
+                            .into_iter()
+                            .map(|text| Query::Term {
+                                fields: self.fields.searchable(),
+                                text,
+                            })
+                            .collect(),
+                    ));
+                }
+                Some(Query::Term {
+                    fields: self.fields.searchable(),
+                    text: term,
+                })
+            }
+            CassWildcardPattern::Suffix(_)
+            | CassWildcardPattern::Substring(_)
+            | CassWildcardPattern::Complex(_) => Some(Query::Glob {
+                field_ids: self.fields.regex_fields(),
+                pattern: raw.to_lowercase(),
+            }),
+        }
+    }
+
+    fn lower_phrase(&self, raw: &str) -> Query {
+        let terms = cass_sanitize_query(raw)
+            .split_whitespace()
+            .map(|term| term.trim_matches('*').to_lowercase())
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>();
+        if terms.len() <= 1 || terms.iter().any(|term| term.chars().any(is_cass_cjk)) {
+            return self.lower_compound(&terms);
+        }
+        Query::Phrase {
+            fields: vec![
+                QueryField::new(self.fields.title, 1.0),
+                QueryField::new(self.fields.content, 1.0),
+            ],
+            terms: terms
+                .into_iter()
+                .zip(0_u32..)
+                .map(|(text, position)| PositionedTerm::new(position, text))
+                .collect(),
+            slop: 0,
+            prefix: false,
+        }
+    }
+}
+
+fn required_cass_field<F>(
+    schema: SchemaDescriptor,
+    name: &'static str,
+    accepts: F,
+) -> Result<FieldDescriptor, CassQueryParserConfigError>
+where
+    F: FnOnce(FieldKind) -> bool,
+{
+    let Some(field) = schema.fields.iter().find(|field| field.name == name) else {
+        return Err(CassQueryParserConfigError::MissingField {
+            schema: schema.name,
+            field: name,
+        });
+    };
+    if !accepts(field.kind) {
+        return Err(CassQueryParserConfigError::InvalidField {
+            schema: schema.name,
+            field: name,
+        });
+    }
+    Ok(*field)
+}
+
+fn cass_string_filter(field_id: u16, values: &[String]) -> Option<Query> {
+    let clauses = values
+        .iter()
+        .map(|value| BooleanClause::new(Occur::Should, cass_exact_term(field_id, value.to_owned())))
+        .collect::<Vec<_>>();
+    (!clauses.is_empty()).then_some(Query::Boolean {
+        clauses,
+        operator: None,
+    })
+}
+
+fn cass_exact_term(field_id: u16, text: String) -> Query {
+    Query::Term {
+        fields: vec![QueryField::new(field_id, 1.0)],
+        text,
+    }
+}
+
+fn cass_required_query(mut queries: Vec<Query>) -> Query {
+    queries.retain(|query| !query.is_empty());
+    match queries.len() {
+        0 => Query::Empty,
+        1 => queries.pop().unwrap_or(Query::Empty),
+        _ => Query::Boolean {
+            clauses: queries
+                .into_iter()
+                .map(|query| BooleanClause::new(Occur::Must, query))
+                .collect(),
+            operator: Some(BooleanOperator::And),
+        },
+    }
+}
+
+fn cass_cjk_terms(term: &str) -> Vec<String> {
+    let chars = term
+        .chars()
+        .filter(|ch| is_cass_cjk(*ch))
+        .collect::<Vec<_>>();
+    if chars.len() <= 1 {
+        return chars.into_iter().map(|ch| ch.to_string()).collect();
+    }
+    chars
+        .windows(2)
+        .map(|pair| pair.iter().collect::<String>())
+        .collect()
+}
+
+fn cass_complement(query: Query) -> Query {
+    Query::Boolean {
+        clauses: vec![
+            BooleanClause::new(Occur::Must, Query::All),
+            BooleanClause::new(Occur::MustNot, query),
+        ],
+        operator: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CassLexToken {
+    Term { text: String, offset: usize },
+    Phrase { text: String, offset: usize },
+    And { offset: usize },
+    Or { offset: usize },
+    Not { offset: usize },
+}
+
+fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexToken> {
+    let mut tokens = Vec::new();
+    let mut chars = query.char_indices().peekable();
+    let mut word = String::new();
+    let mut word_offset = 0_usize;
+    while let Some((offset, ch)) = chars.next() {
+        match ch {
+            '"' => {
+                cass_flush_word(&mut tokens, &mut word, word_offset);
+                let mut phrase = String::new();
+                let mut closed = false;
+                for (_, next) in chars.by_ref() {
+                    if next == '"' {
+                        closed = true;
+                        break;
+                    }
+                    phrase.push(next);
+                }
+                if !phrase.is_empty() {
+                    tokens.push(CassLexToken::Phrase {
+                        text: phrase,
+                        offset,
+                    });
+                }
+                if !closed {
+                    emit_diagnostic(
+                        diagnostics,
+                        QueryDiagnostic {
+                            kind: QueryDiagnosticKind::SyntaxRecovery,
+                            message: "CASS syntax recovery: unterminated phrase".to_owned(),
+                            byte_offset: Some(offset),
+                            fragment: None,
+                        },
+                    );
+                }
+            }
+            '&' if chars.peek().is_some_and(|(_, next)| *next == '&') => {
+                chars.next();
+                cass_flush_word(&mut tokens, &mut word, word_offset);
+                tokens.push(CassLexToken::And { offset });
+            }
+            '|' if chars.peek().is_some_and(|(_, next)| *next == '|') => {
+                chars.next();
+                cass_flush_word(&mut tokens, &mut word, word_offset);
+                tokens.push(CassLexToken::Or { offset });
+            }
+            '-' if word.is_empty() => tokens.push(CassLexToken::Not { offset }),
+            ' ' | '\t' | '\n' => {
+                cass_flush_word(&mut tokens, &mut word, word_offset);
+            }
+            _ => {
+                if word.is_empty() {
+                    word_offset = offset;
+                }
+                word.push(ch);
+            }
+        }
+    }
+    cass_flush_word(&mut tokens, &mut word, word_offset);
+    tokens
+}
+
+fn cass_flush_word(tokens: &mut Vec<CassLexToken>, word: &mut String, offset: usize) {
+    if word.is_empty() {
+        return;
+    }
+    let text = std::mem::take(word);
+    let token = if text.eq_ignore_ascii_case("AND") {
+        CassLexToken::And { offset }
+    } else if text.eq_ignore_ascii_case("OR") {
+        CassLexToken::Or { offset }
+    } else if text.eq_ignore_ascii_case("NOT") {
+        CassLexToken::Not { offset }
+    } else {
+        CassLexToken::Term { text, offset }
+    };
+    tokens.push(token);
+}
+
+#[derive(Debug)]
+struct CassNode {
+    query: Query,
+    negative: bool,
+}
+
+struct CassGrammar {
+    parser: CassQueryParser,
+    tokens: Vec<CassLexToken>,
+    diagnostics: Vec<QueryDiagnostic>,
+}
+
+impl CassGrammar {
+    fn parse(&mut self) -> Option<CassNode> {
+        let mut clauses = Vec::new();
+        let mut pending_or_group = Vec::new();
+        let mut next_occur = Occur::Must;
+        let mut in_or_sequence = false;
+        let mut just_saw_or = false;
+        let mut saw_operand = false;
+        let mut last_binary_offset = None;
+        let mut dangling_not_offset = None;
+
+        for token in std::mem::take(&mut self.tokens) {
+            match token {
+                CassLexToken::And { offset } => {
+                    if !saw_operand || last_binary_offset.is_some() {
+                        self.syntax_diagnostic(
+                            "AND without an adjacent operand was recovered",
+                            offset,
+                        );
+                    }
+                    if let Some(not_offset) = dangling_not_offset.take() {
+                        self.syntax_diagnostic("NOT has no operand before AND", not_offset);
+                    }
+                    cass_flush_native_or_group(&mut pending_or_group, &mut clauses);
+                    in_or_sequence = false;
+                    just_saw_or = false;
+                    next_occur = Occur::Must;
+                    last_binary_offset = Some(offset);
+                }
+                CassLexToken::Or { offset } => {
+                    if !saw_operand || last_binary_offset.is_some() {
+                        self.syntax_diagnostic(
+                            "OR without an adjacent operand was recovered",
+                            offset,
+                        );
+                    }
+                    in_or_sequence = true;
+                    just_saw_or = true;
+                    last_binary_offset = Some(offset);
+                }
+                CassLexToken::Not { offset } => {
+                    if !just_saw_or {
+                        cass_flush_native_or_group(&mut pending_or_group, &mut clauses);
+                        in_or_sequence = false;
+                        just_saw_or = false;
+                    }
+                    next_occur = Occur::MustNot;
+                    dangling_not_offset.get_or_insert(offset);
+                    last_binary_offset = None;
+                }
+                CassLexToken::Term { text, offset } => {
+                    let query = self.parser.lower_term(&text);
+                    if query.is_empty() {
+                        self.syntax_diagnostic("empty term operand was skipped", offset);
+                        continue;
+                    }
+                    cass_apply_native_query(
+                        query,
+                        next_occur,
+                        &mut in_or_sequence,
+                        &mut just_saw_or,
+                        &mut pending_or_group,
+                        &mut clauses,
+                    );
+                    next_occur = Occur::Must;
+                    saw_operand = true;
+                    last_binary_offset = None;
+                    dangling_not_offset = None;
+                }
+                CassLexToken::Phrase { text, offset } => {
+                    let query = self.parser.lower_phrase(&text);
+                    if query.is_empty() {
+                        self.syntax_diagnostic("empty phrase operand was skipped", offset);
+                        continue;
+                    }
+                    cass_apply_native_query(
+                        query,
+                        next_occur,
+                        &mut in_or_sequence,
+                        &mut just_saw_or,
+                        &mut pending_or_group,
+                        &mut clauses,
+                    );
+                    next_occur = Occur::Must;
+                    saw_operand = true;
+                    last_binary_offset = None;
+                    dangling_not_offset = None;
+                }
+            }
+        }
+
+        cass_flush_native_or_group(&mut pending_or_group, &mut clauses);
+        if let Some(offset) = dangling_not_offset {
+            self.syntax_diagnostic("dangling NOT has no operand", offset);
+        }
+        if let Some(offset) = last_binary_offset {
+            self.syntax_diagnostic("dangling binary operator has no operand", offset);
+        }
+        cass_finish_native_clauses(clauses)
+    }
+
+    fn syntax_diagnostic(&mut self, message: &str, offset: usize) {
+        emit_diagnostic(
+            &mut self.diagnostics,
+            QueryDiagnostic {
+                kind: QueryDiagnosticKind::SyntaxRecovery,
+                message: format!("CASS syntax recovery: {message}"),
+                byte_offset: Some(offset),
+                fragment: None,
+            },
+        );
+    }
+}
+
+fn cass_flush_native_or_group(pending_or_group: &mut Vec<Query>, clauses: &mut Vec<BooleanClause>) {
+    if pending_or_group.is_empty() {
+        return;
+    }
+    let query = Query::Boolean {
+        clauses: std::mem::take(pending_or_group)
+            .into_iter()
+            .map(|query| BooleanClause::new(Occur::Should, query))
+            .collect(),
+        operator: Some(BooleanOperator::Or),
+    };
+    clauses.push(BooleanClause::new(Occur::Must, query));
+}
+
+fn cass_apply_native_query(
+    query: Query,
+    next_occur: Occur,
+    in_or_sequence: &mut bool,
+    just_saw_or: &mut bool,
+    pending_or_group: &mut Vec<Query>,
+    clauses: &mut Vec<BooleanClause>,
+) {
+    if *in_or_sequence && *just_saw_or {
+        if pending_or_group.is_empty()
+            && clauses
+                .last()
+                .is_some_and(|clause| matches!(clause.occur, Occur::Must | Occur::MustNot))
+            && let Some(clause) = clauses.pop()
+        {
+            pending_or_group.push(if clause.occur == Occur::MustNot {
+                cass_complement(clause.query)
+            } else {
+                clause.query
+            });
+        }
+        pending_or_group.push(if next_occur == Occur::MustNot {
+            cass_complement(query)
+        } else {
+            query
+        });
+    } else {
+        cass_flush_native_or_group(pending_or_group, clauses);
+        *in_or_sequence = false;
+        clauses.push(BooleanClause::new(next_occur, query));
+    }
+    *just_saw_or = false;
+}
+
+fn cass_finish_native_clauses(mut clauses: Vec<BooleanClause>) -> Option<CassNode> {
+    if clauses.len() == 1 {
+        let clause = clauses.pop()?;
+        return Some(CassNode {
+            query: clause.query,
+            negative: clause.occur == Occur::MustNot,
+        });
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    if clauses.iter().all(|clause| clause.occur == Occur::MustNot) {
+        clauses.insert(0, BooleanClause::new(Occur::Must, Query::All));
+    }
+    Some(CassNode {
+        query: Query::Boolean {
+            clauses,
+            operator: Some(BooleanOperator::And),
+        },
+        negative: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
@@ -2577,8 +3378,10 @@ mod tests {
 
     use super::*;
     use crate::schema::{
-        Analyzer, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor, FieldKind, SchemaDescriptor,
+        Analyzer, CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor,
+        FieldKind, SchemaDescriptor,
     };
+    use crate::scribe::{CassAnalyzer, cass_generate_edge_ngrams};
 
     const TYPED_FIELDS: [FieldDescriptor; 7] = [
         FieldDescriptor {
@@ -2656,6 +3459,18 @@ mod tests {
         title: &'static str,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct CassEvalDoc {
+        msg_idx: u64,
+        agent: &'static str,
+        workspace: Option<&'static str>,
+        created_at: Option<i64>,
+        title: &'static str,
+        content: &'static str,
+        source_id: &'static str,
+        origin_kind: &'static str,
+    }
+
     fn analyzed_terms(text: &str) -> Vec<String> {
         let mut analyzer = FrankensearchTokenizer::default();
         let mut terms = Vec::new();
@@ -2667,6 +3482,177 @@ mod tests {
         );
         assert!(result.is_ok(), "default analyzer is registered");
         terms
+    }
+
+    fn cass_analyzed_terms(text: &str, analyzer_kind: AnalyzerKind) -> Vec<PositionedTerm> {
+        let mut analyzer = CassAnalyzer::default();
+        let mut terms = Vec::new();
+        let result = analyze_admitted(&mut analyzer, analyzer_kind, text, &mut |token| {
+            terms.push(PositionedTerm::new(token.position, token.text.clone()));
+        });
+        assert!(result.is_ok(), "CASS analyzer is registered");
+        terms
+    }
+
+    fn cass_field_text(doc: CassEvalDoc, field_id: u16) -> Option<&'static str> {
+        match CASS_SEMANTIC_SCHEMA.fields.get(usize::from(field_id))?.name {
+            "agent" => Some(doc.agent),
+            "workspace" => doc.workspace,
+            "title" => Some(doc.title),
+            "content" => Some(doc.content),
+            "source_id" => Some(doc.source_id),
+            "origin_kind" => Some(doc.origin_kind),
+            _ => None,
+        }
+    }
+
+    fn cass_field_terms(doc: CassEvalDoc, field_id: u16) -> Vec<PositionedTerm> {
+        let Some(field) = CASS_SEMANTIC_SCHEMA.fields.get(usize::from(field_id)) else {
+            return Vec::new();
+        };
+        match field.name {
+            "title" => cass_analyzed_terms(doc.title, AnalyzerKind::CassHyphenNormalize),
+            "content" => cass_analyzed_terms(doc.content, AnalyzerKind::CassHyphenNormalize),
+            "title_prefix" => cass_analyzed_terms(
+                &cass_generate_edge_ngrams(doc.title),
+                AnalyzerKind::CassPrefixNormalize,
+            ),
+            "content_prefix" => cass_analyzed_terms(
+                &cass_generate_edge_ngrams(doc.content),
+                AnalyzerKind::CassPrefixNormalize,
+            ),
+            _ => cass_field_text(doc, field_id)
+                .map_or_else(Vec::new, |text| vec![PositionedTerm::new(0, text)]),
+        }
+    }
+
+    fn cass_term_matches(doc: CassEvalDoc, field: QueryField, needle: &str) -> bool {
+        cass_field_terms(doc, field.field_id)
+            .iter()
+            .any(|term| term.text == needle)
+    }
+
+    fn cass_phrase_matches(doc: CassEvalDoc, field: QueryField, phrase: &[PositionedTerm]) -> bool {
+        let haystack = cass_field_terms(doc, field.field_id);
+        let Some(first) = phrase.first() else {
+            return false;
+        };
+        haystack.iter().any(|candidate| {
+            candidate.text == first.text
+                && phrase.iter().all(|needle| {
+                    let position = candidate
+                        .position
+                        .saturating_add(needle.position.saturating_sub(first.position));
+                    haystack
+                        .iter()
+                        .any(|term| term.position == position && term.text == needle.text)
+                })
+        })
+    }
+
+    fn cass_bound_matches(
+        value: i64,
+        lower: &Bound<QueryValue>,
+        upper: &Bound<QueryValue>,
+    ) -> bool {
+        let lower_matches = match lower {
+            Bound::Included(QueryValue::I64(lower)) => value >= *lower,
+            Bound::Excluded(QueryValue::I64(lower)) => value > *lower,
+            Bound::Unbounded => true,
+            Bound::Included(_) | Bound::Excluded(_) => false,
+        };
+        let upper_matches = match upper {
+            Bound::Included(QueryValue::I64(upper)) => value <= *upper,
+            Bound::Excluded(QueryValue::I64(upper)) => value < *upper,
+            Bound::Unbounded => true,
+            Bound::Included(_) | Bound::Excluded(_) => false,
+        };
+        lower_matches && upper_matches
+    }
+
+    fn star_glob_matches(pattern: &str, text: &str) -> bool {
+        let pattern = pattern.chars().collect::<Vec<_>>();
+        let text = text.chars().collect::<Vec<_>>();
+        let mut pattern_index = 0_usize;
+        let mut text_index = 0_usize;
+        let mut star_index = None;
+        let mut star_match = 0_usize;
+        while text_index < text.len() {
+            if pattern.get(pattern_index) == text.get(text_index) {
+                pattern_index += 1;
+                text_index += 1;
+            } else if pattern.get(pattern_index) == Some(&'*') {
+                star_index = Some(pattern_index);
+                pattern_index += 1;
+                star_match = text_index;
+            } else if let Some(star) = star_index {
+                star_match += 1;
+                text_index = star_match;
+                pattern_index = star + 1;
+            } else {
+                return false;
+            }
+        }
+        pattern[pattern_index..].iter().all(|ch| *ch == '*')
+    }
+
+    fn cass_ast_matches(query: &Query, doc: CassEvalDoc) -> bool {
+        match query {
+            Query::Empty => false,
+            Query::All => true,
+            Query::Term { fields, text } => fields
+                .iter()
+                .copied()
+                .any(|field| cass_term_matches(doc, field, text)),
+            Query::Phrase { fields, terms, .. } => fields
+                .iter()
+                .copied()
+                .any(|field| cass_phrase_matches(doc, field, terms)),
+            Query::Boolean { clauses, .. } => {
+                let mut has_must = false;
+                let mut should_count = 0_usize;
+                let mut should_match = false;
+                for clause in clauses {
+                    let child_matches = cass_ast_matches(&clause.query, doc);
+                    match clause.occur {
+                        Occur::Must => {
+                            has_must = true;
+                            if !child_matches {
+                                return false;
+                            }
+                        }
+                        Occur::Should => {
+                            should_count += 1;
+                            should_match |= child_matches;
+                        }
+                        Occur::MustNot if child_matches => return false,
+                        Occur::MustNot => {}
+                    }
+                }
+                has_must || (should_count != 0 && should_match)
+            }
+            Query::Range {
+                field_id,
+                lower,
+                upper,
+            } if CASS_SEMANTIC_SCHEMA.fields[usize::from(*field_id)].name == "created_at" => doc
+                .created_at
+                .is_some_and(|value| cass_bound_matches(value, lower, upper)),
+            Query::Range { .. } => false,
+            Query::Set { field_id, values } => {
+                cass_field_text(doc, *field_id).is_some_and(|actual| {
+                    values
+                        .iter()
+                        .any(|value| value == &QueryValue::Str(actual.to_owned()))
+                })
+            }
+            Query::Glob { field_ids, pattern } => field_ids.iter().copied().any(|field_id| {
+                cass_field_terms(doc, field_id)
+                    .iter()
+                    .any(|term| star_glob_matches(pattern, &term.text))
+            }),
+            Query::Boost { query, .. } => cass_ast_matches(query, doc),
+        }
     }
 
     fn field_text(doc: EvalDoc, field_id: u16) -> Option<&'static str> {
@@ -2837,6 +3823,14 @@ mod tests {
     }
 
     fn fixture_json(query: &Query, occur: Option<Occur>) -> Value {
+        fixture_json_for_schema(DEFAULT_SCHEMA, query, occur)
+    }
+
+    fn fixture_json_for_schema(
+        schema: SchemaDescriptor,
+        query: &Query,
+        occur: Option<Occur>,
+    ) -> Value {
         match query {
             Query::Empty => json!({ "type": "Empty" }),
             Query::All => json!({ "type": "All" }),
@@ -2845,7 +3839,7 @@ mod tests {
                     .iter()
                     .map(|field| {
                         json!({
-                            "name": field_name(DEFAULT_SCHEMA, field.field_id),
+                            "name": field_name(schema, field.field_id),
                             "boost": field.boost,
                         })
                     })
@@ -2866,7 +3860,7 @@ mod tests {
                     .iter()
                     .map(|field| {
                         json!({
-                            "name": field_name(DEFAULT_SCHEMA, field.field_id),
+                            "name": field_name(schema, field.field_id),
                             "boost": field.boost,
                         })
                     })
@@ -2896,7 +3890,11 @@ mod tests {
                                 Occur::Should => "Should",
                                 Occur::MustNot => "MustNot",
                             },
-                            "query": fixture_json(&clause.query, Some(clause.occur)),
+                            "query": fixture_json_for_schema(
+                                schema,
+                                &clause.query,
+                                Some(clause.occur),
+                            ),
                         })
                     })
                     .collect::<Vec<_>>();
@@ -2918,16 +3916,20 @@ mod tests {
                     Bound::Included(value) | Bound::Excluded(value) => Some(value),
                     Bound::Unbounded => None,
                 });
-                json!({
+                let mut value = json!({
                     "type": typed_tag("Range", values),
-                    "field": field_name(DEFAULT_SCHEMA, *field_id),
+                    "field": field_name(schema, *field_id),
                     "lower": bound_json(lower),
                     "upper": bound_json(upper),
-                })
+                });
+                if schema == CASS_SEMANTIC_SCHEMA {
+                    value["matched_score"] = json!(1.0);
+                }
+                value
             }
             Query::Set { field_id, values } => json!({
                 "type": typed_tag("Set", values),
-                "field": field_name(DEFAULT_SCHEMA, *field_id),
+                "field": field_name(schema, *field_id),
                 "values": values.iter().map(value_json).collect::<Vec<_>>(),
             }),
             Query::Glob { field_ids, pattern } => json!({
@@ -2935,13 +3937,13 @@ mod tests {
                 "pattern": pattern,
                 "fields": field_ids
                     .iter()
-                    .map(|field_id| field_name(DEFAULT_SCHEMA, *field_id))
+                    .map(|field_id| field_name(schema, *field_id))
                     .collect::<Vec<_>>(),
             }),
             Query::Boost { query, factor } => json!({
                 "type": "Boost",
                 "factor": factor,
-                "query": fixture_json(query, occur),
+                "query": fixture_json_for_schema(schema, query, occur),
             }),
         }
     }
@@ -2991,6 +3993,545 @@ mod tests {
             executed += 1;
         }
         assert_eq!(executed, expected, "every pinned default parser case ran");
+    }
+
+    fn cass_parser() -> CassQueryParser {
+        CassQueryParser::new(CASS_SEMANTIC_SCHEMA).expect("CASS schema supports its parser")
+    }
+
+    fn cass_filters_from_fixture(case: &Value) -> CassQueryFilters {
+        let Some(filters) = case.get("filters") else {
+            return CassQueryFilters::default();
+        };
+        let strings = |name: &str| {
+            filters[name]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().expect("string filter").to_owned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let source_filter = match filters["source_filter"].as_str() {
+            Some("local") => CassSourceFilter::Local,
+            Some("remote") => CassSourceFilter::Remote,
+            Some("source_id") => CassSourceFilter::SourceId(
+                filters["source_id"]
+                    .as_str()
+                    .expect("source_id filter value")
+                    .to_owned(),
+            ),
+            Some(unexpected) => panic!("unexpected CASS source fixture {unexpected:?}"),
+            None => CassSourceFilter::All,
+        };
+        CassQueryFilters {
+            agents: strings("agents"),
+            workspaces: strings("workspaces"),
+            created_from: filters["created_from"].as_i64(),
+            created_to: filters["created_to"].as_i64(),
+            source_filter,
+        }
+    }
+
+    fn cass_wildcard_fixture(input: &str) -> Value {
+        let pattern = CassWildcardPattern::parse(input);
+        let searchable = ["title", "content", "title_prefix", "content_prefix"];
+        let regex_fields = ["content", "title"];
+        match pattern {
+            CassWildcardPattern::Exact(_) => json!({
+                "type": "Glob",
+                "pattern": input,
+                "class": "Exact",
+                "strategy": "TermQuery",
+                "fields": searchable,
+            }),
+            CassWildcardPattern::Prefix(term) => json!({
+                "type": "Glob",
+                "pattern": input,
+                "normalized_term": term,
+                "class": "Prefix",
+                "strategy": "TermQuery",
+                "fields": searchable,
+            }),
+            CassWildcardPattern::Suffix(term) => json!({
+                "type": "Glob",
+                "pattern": input,
+                "class": "Suffix",
+                "strategy": "RegexQuery",
+                "regex": CassWildcardPattern::Suffix(term).to_regex(),
+                "fields": regex_fields,
+            }),
+            CassWildcardPattern::Substring(term) => json!({
+                "type": "Glob",
+                "pattern": input,
+                "class": "Substring",
+                "strategy": "RegexQuery",
+                "regex": CassWildcardPattern::Substring(term).to_regex(),
+                "fields": regex_fields,
+            }),
+            CassWildcardPattern::Complex(term) => json!({
+                "type": "Glob",
+                "pattern": input,
+                "class": "Complex",
+                "strategy": "RegexQuery",
+                "regex": CassWildcardPattern::Complex(term).to_regex(),
+                "fields": regex_fields,
+                "question_mark_operator": false,
+            }),
+        }
+    }
+
+    #[test]
+    fn cass_parser_matches_pinned_tantivy_fixture_trees() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/quill_language_contract.json"
+        ))
+        .expect("language fixture parses");
+        let cases = fixture["parse_tree_cases"]
+            .as_array()
+            .expect("parse tree case array");
+        let expected = cases.iter().filter(|case| case["parser"] == "cass").count();
+        let mut executed = 0_usize;
+        for case in cases {
+            if case["parser"] != "cass" {
+                continue;
+            }
+            let id = case["id"].as_str().expect("fixture id");
+            let input = case["input"].as_str().expect("fixture input");
+            let filters = cass_filters_from_fixture(case);
+            let parsed = cass_parser().parse(input, &filters);
+            let expected_ast =
+                case["expected_ast"]["ref"].as_str().map_or_else(
+                    || &case["expected_ast"],
+                    |reference| {
+                        &cases
+                            .iter()
+                            .find(|candidate| candidate["id"] == reference)
+                            .unwrap_or_else(|| {
+                                panic!("fixture {id} references missing {reference}")
+                            })["expected_ast"]
+                    },
+                );
+            if case["query_class"] == "glob" {
+                assert_eq!(&cass_wildcard_fixture(input), expected_ast, "fixture {id}");
+                match (CassWildcardPattern::parse(input), &parsed.query) {
+                    (
+                        CassWildcardPattern::Exact(expected)
+                        | CassWildcardPattern::Prefix(expected),
+                        Query::Term { fields, text },
+                    ) => {
+                        assert_eq!(text, &expected, "native parser glob text for {id}");
+                        assert_eq!(
+                            fields,
+                            &cass_parser().fields.searchable(),
+                            "native parser glob fields for {id}"
+                        );
+                    }
+                    (
+                        CassWildcardPattern::Suffix(_)
+                        | CassWildcardPattern::Substring(_)
+                        | CassWildcardPattern::Complex(_),
+                        Query::Glob { field_ids, pattern },
+                    ) => {
+                        assert_eq!(pattern, &input.to_lowercase(), "native glob for {id}");
+                        assert_eq!(
+                            field_ids,
+                            &cass_parser().fields.regex_fields(),
+                            "native parser regex fields for {id}"
+                        );
+                    }
+                    (wildcard, query) => {
+                        panic!("native parser glob mismatch for {id}: {wildcard:?} -> {query:?}")
+                    }
+                }
+            } else {
+                assert_eq!(
+                    &fixture_json_for_schema(CASS_SEMANTIC_SCHEMA, &parsed.query, None),
+                    expected_ast,
+                    "fixture {id}"
+                );
+            }
+            if let Some(expected_diagnostic) = case["expected_diagnostic"].as_str() {
+                assert!(
+                    parsed
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains(expected_diagnostic)),
+                    "fixture {id} lacked diagnostic {expected_diagnostic:?}: {:?}",
+                    parsed.diagnostics,
+                );
+            } else {
+                assert!(
+                    parsed.diagnostics.is_empty(),
+                    "fixture {id} unexpectedly diagnosed {:?}",
+                    parsed.diagnostics
+                );
+            }
+            executed += 1;
+        }
+        assert_eq!(executed, expected, "every pinned CASS parser case ran");
+        assert!(executed >= 39, "the full harvested CASS contract slice ran");
+    }
+
+    #[test]
+    fn cass_helpers_match_the_shipping_adapter() {
+        use frankensearch_lexical::{
+            CassQueryToken as OracleToken, CassWildcardPattern as OracleWildcard,
+            cass_parse_boolean_query as oracle_parse, cass_sanitize_query as oracle_sanitize,
+        };
+
+        for input in [
+            "",
+            "auth token",
+            "auth AND token",
+            "auth&&token OR cache",
+            "NOT -deprecated",
+            "\"exact phrase\"",
+            "c++ hello_world bd-q3fy",
+            "検索 abc搜索def",
+            "auth\rOR\rcache",
+            "NOT AND cache",
+            "auth OR NOT AND deprecated",
+        ] {
+            assert_eq!(
+                cass_sanitize_query(input),
+                oracle_sanitize(input),
+                "{input:?}"
+            );
+            let native = cass_lex(input, &mut Vec::new());
+            let oracle = oracle_parse(input);
+            let normalized_native = native
+                .iter()
+                .map(|token| match token {
+                    CassLexToken::Term { text, .. } => ("term", text.as_str()),
+                    CassLexToken::Phrase { text, .. } => ("phrase", text.as_str()),
+                    CassLexToken::And { .. } => ("and", ""),
+                    CassLexToken::Or { .. } => ("or", ""),
+                    CassLexToken::Not { .. } => ("not", ""),
+                })
+                .collect::<Vec<_>>();
+            let normalized_oracle = oracle
+                .iter()
+                .map(|token| match token {
+                    OracleToken::Term(text) => ("term", text.as_str()),
+                    OracleToken::Phrase(text) => ("phrase", text.as_str()),
+                    OracleToken::And => ("and", ""),
+                    OracleToken::Or => ("or", ""),
+                    OracleToken::Not => ("not", ""),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(normalized_native, normalized_oracle, "{input:?}");
+        }
+
+        for input in ["exact", "prefix*", "*suffix", "*middle*", "a*b*c", "f.o*"] {
+            let native = CassWildcardPattern::parse(input);
+            let oracle = OracleWildcard::parse(input);
+            assert_eq!(format!("{native:?}"), format!("{oracle:?}"), "{input:?}");
+            assert_eq!(native.to_regex(), oracle.to_regex(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn cass_parser_validates_configuration_and_recovers_hostile_input() {
+        assert!(matches!(
+            CassQueryParser::new(DEFAULT_SCHEMA),
+            Err(CassQueryParserConfigError::MissingField { field: "agent", .. })
+        ));
+
+        let parser = cass_parser();
+        let mut oversized = "auth".to_owned();
+        oversized.push_str(&" ".repeat(MAX_QUERY_LENGTH - oversized.chars().count()));
+        oversized.push_str("cache");
+        let truncated = parser.parse(&oversized, &CassQueryFilters::default());
+        assert!(truncated.was_truncated);
+        assert!(truncated.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == QueryDiagnosticKind::Truncated
+                && diagnostic.message.contains("10000 Unicode scalar values")
+        }));
+        assert!(matches!(
+            truncated.query,
+            Query::Term { ref text, .. } if text == "auth"
+        ));
+
+        for raw in [
+            "AND auth",
+            "auth OR",
+            "NOT",
+            "NOT NOT",
+            "auth NOT",
+            "* auth",
+            "auth AND OR cache",
+            "auth OR NOT AND deprecated",
+            "\"***\" auth",
+            "\0\0\0",
+        ] {
+            let parsed = parser.parse(raw, &CassQueryFilters::default());
+            assert!(
+                !parsed.diagnostics.is_empty(),
+                "hostile input {raw:?} must explain its recovery"
+            );
+        }
+
+        let recovered = parser.parse("NOT AND cache", &CassQueryFilters::default());
+        assert!(matches!(
+            recovered.query,
+            Query::Term { ref text, .. } if text == "cache"
+        ));
+        let recovered = parser.parse("auth OR NOT AND deprecated", &CassQueryFilters::default());
+        assert!(matches!(
+            recovered.query,
+            Query::Boolean {
+                operator: Some(BooleanOperator::And),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cass_parser_result_sets_match_the_shipping_tantivy_builder() {
+        use frankensearch_lexical::tantivy_crate::collector::DocSetCollector;
+        use frankensearch_lexical::{
+            CassDocumentRef, CassQueryFilters as OracleFilters, CassSourceFilter as OracleSource,
+            CassTantivyIndex, TantivyDocument, Value as TantivyValue, cass_build_tantivy_query,
+        };
+
+        const DOCS: [CassEvalDoc; 8] = [
+            CassEvalDoc {
+                msg_idx: 0,
+                agent: "claude",
+                workspace: Some("/alpha"),
+                created_at: Some(100),
+                title: "Authentication Cache",
+                content: "auth token cache active",
+                source_id: "local-a",
+                origin_kind: "local",
+            },
+            CassEvalDoc {
+                msg_idx: 1,
+                agent: "codex",
+                workspace: Some("/alpha"),
+                created_at: Some(200),
+                title: "Legacy Authentication",
+                content: "auth deprecated token",
+                source_id: "remote-a",
+                origin_kind: "ssh",
+            },
+            CassEvalDoc {
+                msg_idx: 2,
+                agent: "claude",
+                workspace: Some("/beta"),
+                created_at: Some(300),
+                title: "Cache Search",
+                content: "cache search engine",
+                source_id: "archive-7",
+                origin_kind: "local",
+            },
+            CassEvalDoc {
+                msg_idx: 3,
+                agent: "gemini",
+                workspace: None,
+                created_at: Some(400),
+                title: "搜索引擎",
+                content: "这是一个搜索引擎测试",
+                source_id: "remote-b",
+                origin_kind: "ssh",
+            },
+            CassEvalDoc {
+                msg_idx: 4,
+                agent: "codex",
+                workspace: Some("/beta"),
+                created_at: Some(500),
+                title: "Error Handling",
+                content: "error handling guide auth cache",
+                source_id: "archive-7",
+                origin_kind: "local",
+            },
+            CassEvalDoc {
+                msg_idx: 5,
+                agent: "claude",
+                workspace: Some("/alpha"),
+                created_at: Some(600),
+                title: "Foobar Service",
+                content: "foobarbaz middleware",
+                source_id: "remote-c",
+                origin_kind: "ssh",
+            },
+            CassEvalDoc {
+                msg_idx: 6,
+                agent: "codex",
+                workspace: Some("/gamma"),
+                created_at: None,
+                title: "Unrelated",
+                content: "nothing applicable",
+                source_id: "local-b",
+                origin_kind: "local",
+            },
+            CassEvalDoc {
+                msg_idx: 7,
+                agent: "claude",
+                workspace: Some("/alpha"),
+                created_at: Some(700),
+                title: "Token Store",
+                content: "token cache deprecated",
+                source_id: "remote-d",
+                origin_kind: "ssh",
+            },
+        ];
+
+        let directory = tempfile::tempdir().expect("temporary CASS index directory");
+        let mut index = CassTantivyIndex::open_or_create(directory.path()).expect("CASS index");
+        let oracle_documents = DOCS
+            .iter()
+            .map(|doc| CassDocumentRef {
+                agent: doc.agent,
+                workspace: doc.workspace,
+                workspace_original: doc.workspace,
+                source_path: "/fixture/session.jsonl",
+                msg_idx: doc.msg_idx,
+                created_at: doc.created_at,
+                title: Some(doc.title),
+                content: doc.content,
+                source_id: doc.source_id,
+                origin_kind: doc.origin_kind,
+                origin_host: None,
+                conversation_id: None,
+            })
+            .collect::<Vec<_>>();
+        index
+            .add_cass_document_refs(&oracle_documents)
+            .expect("index CASS oracle documents");
+        index.commit().expect("commit CASS oracle documents");
+        let reader = index.reader().expect("open CASS oracle reader");
+        reader.reload().expect("reload committed CASS oracle");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+
+        let cases = vec![
+            ("auth", CassQueryFilters::default()),
+            ("auth token", CassQueryFilters::default()),
+            ("auth OR token AND cache", CassQueryFilters::default()),
+            ("auth && cache", CassQueryFilters::default()),
+            ("auth || search", CassQueryFilters::default()),
+            ("\"error handling\"", CassQueryFilters::default()),
+            ("foo*", CassQueryFilters::default()),
+            ("*bar*", CassQueryFilters::default()),
+            ("搜索", CassQueryFilters::default()),
+            ("auth AND NOT deprecated", CassQueryFilters::default()),
+            ("auth OR NOT deprecated", CassQueryFilters::default()),
+            (
+                "cache",
+                CassQueryFilters {
+                    agents: vec!["claude".to_owned(), "codex".to_owned()],
+                    workspaces: vec!["/alpha".to_owned(), "/beta".to_owned()],
+                    ..CassQueryFilters::default()
+                },
+            ),
+            (
+                "",
+                CassQueryFilters {
+                    created_from: Some(200),
+                    created_to: Some(500),
+                    ..CassQueryFilters::default()
+                },
+            ),
+            (
+                "",
+                CassQueryFilters {
+                    source_filter: CassSourceFilter::Local,
+                    ..CassQueryFilters::default()
+                },
+            ),
+            (
+                "",
+                CassQueryFilters {
+                    source_filter: CassSourceFilter::Remote,
+                    ..CassQueryFilters::default()
+                },
+            ),
+            (
+                "",
+                CassQueryFilters {
+                    source_filter: CassSourceFilter::SourceId("archive-7".to_owned()),
+                    ..CassQueryFilters::default()
+                },
+            ),
+        ];
+
+        for (raw, filters) in cases {
+            let oracle_filters = OracleFilters {
+                agents: filters.agents.clone(),
+                workspaces: filters.workspaces.clone(),
+                created_from: filters.created_from,
+                created_to: filters.created_to,
+                source_filter: match &filters.source_filter {
+                    CassSourceFilter::All => OracleSource::All,
+                    CassSourceFilter::Local => OracleSource::Local,
+                    CassSourceFilter::Remote => OracleSource::Remote,
+                    CassSourceFilter::SourceId(source_id) => {
+                        OracleSource::SourceId(source_id.clone())
+                    }
+                },
+            };
+            let oracle_query = cass_build_tantivy_query(raw, &oracle_filters, &fields);
+            let oracle = searcher
+                .search(&*oracle_query, &DocSetCollector)
+                .expect("search shipping CASS builder")
+                .into_iter()
+                .map(|address| {
+                    let document: TantivyDocument =
+                        searcher.doc(address).expect("load CASS oracle document");
+                    document
+                        .get_first(fields.msg_idx)
+                        .and_then(|value| value.as_u64())
+                        .expect("stored CASS msg_idx")
+                })
+                .collect::<BTreeSet<_>>();
+            let parsed = cass_parser().parse(raw, &filters);
+            let native = DOCS
+                .iter()
+                .copied()
+                .filter(|doc| cass_ast_matches(&parsed.query, *doc))
+                .map(|doc| doc.msg_idx)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(native, oracle, "result-set differential for {raw:?}");
+        }
+
+        let raw = "-deprecated";
+        let oracle_query = cass_build_tantivy_query(raw, &OracleFilters::default(), &fields);
+        let oracle = searcher
+            .search(&*oracle_query, &DocSetCollector)
+            .expect("search known shipping standalone-NOT gap");
+        let parsed = cass_parser().parse(raw, &CassQueryFilters::default());
+        let native = DOCS
+            .iter()
+            .copied()
+            .filter(|doc| cass_ast_matches(&parsed.query, *doc))
+            .map(|doc| doc.msg_idx)
+            .collect::<BTreeSet<_>>();
+        assert!(oracle.is_empty(), "DIV-001 shipping side remains pinned");
+        assert_eq!(native, BTreeSet::from([0, 2, 3, 4, 5, 6]));
+
+        for (raw, expected_native) in [("*bar", BTreeSet::from([5])), ("f*o", BTreeSet::new())] {
+            let oracle_query = cass_build_tantivy_query(raw, &OracleFilters::default(), &fields);
+            let oracle = searcher
+                .search(&*oracle_query, &DocSetCollector)
+                .expect("search known shipping regex-glob gap");
+            let parsed = cass_parser().parse(raw, &CassQueryFilters::default());
+            let native = DOCS
+                .iter()
+                .copied()
+                .filter(|doc| cass_ast_matches(&parsed.query, *doc))
+                .map(|doc| doc.msg_idx)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                oracle.len(),
+                DOCS.len(),
+                "shipping silently drops rejected regex glob {raw:?}"
+            );
+            assert_eq!(native, expected_native, "native glob semantics for {raw:?}");
+        }
     }
 
     #[test]
