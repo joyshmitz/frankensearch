@@ -64,7 +64,7 @@ impl Default for HnswConfig {
 /// the sampled source fingerprint with a digest of every live vector; v5 records
 /// the exact native sidecar generation and basename selected during publication.
 /// Older native graphs must be rebuilt under the current persistence contract.
-const HNSW_META_FORMAT_CURRENT: u32 = 5;
+pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 5;
 
 // Keep the classical gamma_k floating-point error model in its well-conditioned
 // region. With u = f32::EPSILON / 2 and k = 8n + 32, this cap is exactly the
@@ -110,6 +110,15 @@ struct HnswMeta {
     /// invalidate current-format native loading and force a rebuild.
     #[serde(default)]
     sidecar_basename: Option<String>,
+}
+
+/// How an HNSW load obtained its in-memory graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HnswLoadDisposition {
+    /// The current native graph/data pair was deserialized from disk.
+    Native,
+    /// Metadata was readable, but the graph had to be rebuilt from the source index.
+    Rebuilt,
 }
 
 /// Diagnostics for one ANN query.
@@ -183,17 +192,26 @@ impl HnswIndex {
         Self::build_from_parts(doc_ids, vectors, dimension, config)
     }
 
-    /// Load an ANN index from disk, rebuilding the graph using vectors from `source_index`.
+    /// Load an ANN index from disk, rebuilding the graph from `source_index` when
+    /// the native graph/data pair is legacy, stale, missing, or corrupt.
     ///
-    /// The persistent `.hnsw` file only contains metadata and `doc_ids`. The actual
-    /// vector data is read from the provided `VectorIndex` to save disk space and
-    /// ensure consistency.
+    /// The source index validates the persisted document sequence and vector
+    /// fingerprint. A fallback rebuild reads its vectors from that same source.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::IndexCorrupted` if metadata is missing/malformed or
     /// if referenced documents are missing from `source_index`.
     pub fn load(path: &Path, source_index: &VectorIndex) -> SearchResult<Self> {
+        Self::load_with_disposition(path, source_index).map(|(index, _)| index)
+    }
+
+    /// Load an ANN index and report whether its graph came from native sidecars
+    /// or was rebuilt from `source_index`.
+    pub(crate) fn load_with_disposition(
+        path: &Path,
+        source_index: &VectorIndex,
+    ) -> SearchResult<(Self, HnswLoadDisposition)> {
         let metadata_bytes = std::fs::read(path).map_err(SearchError::Io)?;
         let meta: HnswMeta = serde_json::from_slice(&metadata_bytes)
             .map_err(|e| ann_corrupted(path, format!("failed to parse HNSW metadata: {e}")))?;
@@ -221,7 +239,7 @@ impl HnswIndex {
         if meta.format_version == HNSW_META_FORMAT_CURRENT
             && let Some(index) = Self::try_load_native_graph(path, &meta, source_index)
         {
-            return Ok(index);
+            return Ok((index, HnswLoadDisposition::Native));
         } else if meta.format_version != HNSW_META_FORMAT_CURRENT {
             tracing::warn!(
                 path = %path.display(),
@@ -243,6 +261,7 @@ impl HnswIndex {
         }
 
         Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
+            .map(|index| (index, HnswLoadDisposition::Rebuilt))
     }
 
     /// Attempt to load the prebuilt native `hnsw_rs` graph for a current-format sidecar.
@@ -1916,7 +1935,9 @@ mod tests {
         let save_path = temp_path("persist", "hnsw");
         ann.save(&save_path).expect("save");
 
-        let loaded = HnswIndex::load(&save_path, &index).expect("load");
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&save_path, &index).expect("load");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
         assert_eq!(loaded.len(), 64);
         assert_eq!(loaded.dimension(), 32);
 
@@ -2172,7 +2193,9 @@ mod tests {
         let v1_path = temp_path("persist_v1_legacy", "hnsw");
         std::fs::write(&v1_path, serde_json::to_vec(&value).expect("v1 json")).expect("write v1");
 
-        let loaded = HnswIndex::load(&v1_path, &index).expect("v1 rebuild load");
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&v1_path, &index).expect("v1 rebuild load");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
         assert_eq!(loaded.len(), 64);
         let query = normalized_vector(10, 32);
         let hits = loaded

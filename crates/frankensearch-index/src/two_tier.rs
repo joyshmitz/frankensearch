@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use frankensearch_core::{SearchError, SearchResult, TwoTierConfig, VectorHit};
 use tracing::{debug, warn};
 
+#[cfg(all(feature = "ann", test))]
+use crate::hnsw::HNSW_META_FORMAT_CURRENT;
+#[cfg(feature = "ann")]
+use crate::hnsw::HnswLoadDisposition;
 #[cfg(feature = "ann")]
 use crate::{HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex};
 use crate::{SearchParams, VectorIndex, dot_product_f32_f32};
@@ -853,6 +857,25 @@ fn maybe_load_or_build_ann(
     config: &TwoTierConfig,
     tier: &str,
 ) -> Option<HnswIndex> {
+    maybe_load_or_build_ann_with_save(
+        vector_index,
+        ann_path,
+        threshold,
+        config,
+        tier,
+        HnswIndex::save,
+    )
+}
+
+#[cfg(feature = "ann")]
+fn maybe_load_or_build_ann_with_save(
+    vector_index: &VectorIndex,
+    ann_path: &Path,
+    threshold: usize,
+    config: &TwoTierConfig,
+    tier: &str,
+    save_ann: fn(&HnswIndex, &Path) -> SearchResult<()>,
+) -> Option<HnswIndex> {
     if vector_index.record_count() < threshold {
         return None;
     }
@@ -865,11 +888,29 @@ fn maybe_load_or_build_ann(
     };
 
     if ann_path.exists() {
-        match HnswIndex::load(ann_path, vector_index) {
-            Ok(ann) => match ann.matches_vector_index(vector_index) {
+        match HnswIndex::load_with_disposition(ann_path, vector_index) {
+            Ok((ann, load_disposition)) => match ann.matches_vector_index(vector_index) {
                 Ok(true) => {
                     let loaded_config = ann.config();
                     if loaded_config == ann_config {
+                        if load_disposition == HnswLoadDisposition::Rebuilt {
+                            if let Err(error) = save_ann(&ann, ann_path) {
+                                warn!(
+                                    tier,
+                                    ann_path = %ann_path.display(),
+                                    ?error,
+                                    "failed to persist rebuilt ANN sidecar; ANN stays in-memory \
+                                     for this process, but the next startup will rebuild it again; \
+                                     check path permissions and free space"
+                                );
+                            } else {
+                                debug!(
+                                    tier,
+                                    ann_path = %ann_path.display(),
+                                    "persisted rebuilt ANN sidecar after fallback load"
+                                );
+                            }
+                        }
                         return Some(ann);
                     }
                     warn!(
@@ -919,7 +960,7 @@ fn maybe_load_or_build_ann(
         }
     };
 
-    if let Err(error) = ann.save(ann_path) {
+    if let Err(error) = save_ann(&ann, ann_path) {
         warn!(
             tier,
             ann_path = %ann_path.display(),
@@ -961,6 +1002,46 @@ mod tests {
             writer.write_record(doc_id, vector)?;
         }
         writer.finish()
+    }
+
+    #[cfg(feature = "ann")]
+    fn load_native_ann_sidecar(path: &Path, source_index: &VectorIndex) -> HnswIndex {
+        let (ann, disposition) = HnswIndex::load_with_disposition(path, source_index)
+            .expect("load persisted ANN sidecar");
+        assert_eq!(
+            disposition,
+            HnswLoadDisposition::Native,
+            "the repaired sidecar must use the native graph path on its next load"
+        );
+
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read ANN metadata"))
+                .expect("parse ANN metadata");
+        assert_eq!(
+            metadata["format_version"].as_u64(),
+            Some(u64::from(HNSW_META_FORMAT_CURRENT)),
+            "repaired ANN metadata must use the current format"
+        );
+        let generation = metadata["sidecar_generation"]
+            .as_str()
+            .expect("current metadata generation");
+        let basename = metadata["sidecar_basename"]
+            .as_str()
+            .expect("current metadata basename");
+        let sidecar_parent = path.parent().expect("ANN metadata parent").join(generation);
+        assert!(
+            sidecar_parent
+                .join(format!("{basename}.hnsw.graph"))
+                .is_file(),
+            "repaired native graph sibling must exist"
+        );
+        assert!(
+            sidecar_parent
+                .join(format!("{basename}.hnsw.data"))
+                .is_file(),
+            "repaired native data sibling must exist"
+        );
+        ann
     }
 
     #[test]
@@ -1460,8 +1541,7 @@ mod tests {
         assert!(first_open.has_fast_ann());
 
         let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
-        let before =
-            HnswIndex::load(&ann_path, &first_open.fast_index).expect("load initial ann sidecar");
+        let before = load_native_ann_sidecar(&ann_path, &first_open.fast_index);
         let before_config = before.config();
         assert_eq!(before_config.m, 8);
         assert_eq!(before_config.ef_construction, 64);
@@ -1477,8 +1557,7 @@ mod tests {
         let second_open = TwoTierIndex::open(&dir, updated).expect("open with updated ann config");
         assert!(second_open.has_fast_ann());
 
-        let after =
-            HnswIndex::load(&ann_path, &second_open.fast_index).expect("load rebuilt ann sidecar");
+        let after = load_native_ann_sidecar(&ann_path, &second_open.fast_index);
         let after_config = after.config();
         assert_eq!(after_config.m, 24);
         assert_eq!(after_config.ef_construction, 96);
@@ -1519,6 +1598,8 @@ mod tests {
 
         let reopened = TwoTierIndex::open(&dir, config).expect("reopen");
         assert!(reopened.has_fast_ann());
+        let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
+        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
         let after = reopened
             .search_fast(&[1.0, 0.0, 0.0], 1)
             .expect("search after");
@@ -1526,6 +1607,167 @@ mod tests {
             after[0].doc_id, "doc-b",
             "ANN sidecar should rebuild when vector content changes"
         );
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn legacy_ann_fallback_is_persisted_for_native_second_load() {
+        let dir = temp_index_dir("ann-self-heal-legacy");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0, 0.0]), ("doc-b", &[0.0, 1.0, 0.0])],
+        )
+        .expect("write fast index");
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            ..TwoTierConfig::default()
+        };
+        let initial = TwoTierIndex::open(&dir, config.clone()).expect("seed ANN sidecar");
+        assert!(initial.has_fast_ann());
+
+        let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ann_path).expect("read ANN metadata"))
+                .expect("parse ANN metadata");
+        let object = metadata.as_object_mut().expect("ANN metadata object");
+        object.remove("format_version");
+        object.remove("sidecar_generation");
+        object.remove("sidecar_basename");
+        fs::write(
+            &ann_path,
+            serde_json::to_vec(&metadata).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy metadata");
+
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+            .expect("legacy fallback rebuild");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+
+        let reopened = TwoTierIndex::open(&dir, config).expect("self-heal legacy ANN sidecar");
+        assert!(reopened.has_fast_ann());
+        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn degraded_ann_fallback_is_persisted_for_native_second_load() {
+        let dir = temp_index_dir("ann-self-heal-degraded");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0, 0.0]), ("doc-b", &[0.0, 1.0, 0.0])],
+        )
+        .expect("write fast index");
+
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            ..TwoTierConfig::default()
+        };
+        let initial = TwoTierIndex::open(&dir, config.clone()).expect("seed ANN sidecar");
+        assert!(initial.has_fast_ann());
+
+        let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
+        let missing_generation = ".missing-hnsw-generation";
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ann_path).expect("read ANN metadata"))
+                .expect("parse ANN metadata");
+        metadata["sidecar_generation"] = missing_generation.into();
+        fs::write(
+            &ann_path,
+            serde_json::to_vec(&metadata).expect("serialize degraded metadata"),
+        )
+        .expect("write degraded metadata");
+
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+            .expect("degraded fallback rebuild");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+
+        let reopened = TwoTierIndex::open(&dir, config).expect("self-heal degraded ANN sidecar");
+        assert!(reopened.has_fast_ann());
+        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ann_path).expect("read repaired metadata"))
+                .expect("parse repaired metadata");
+        assert_ne!(
+            repaired["sidecar_generation"].as_str(),
+            Some(missing_generation),
+            "self-heal must publish metadata naming the new native generation"
+        );
+    }
+
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_persistence_failure_keeps_rebuilt_index_in_memory() {
+        fn reject_persistence(_: &HnswIndex, _: &Path) -> SearchResult<()> {
+            Err(SearchError::Io(std::io::Error::other(
+                "injected ANN persistence failure",
+            )))
+        }
+
+        let dir = temp_index_dir("ann-persist-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0, 0.0]), ("doc-b", &[0.0, 1.0, 0.0])],
+        )
+        .expect("write fast index");
+
+        let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 64,
+            ..TwoTierConfig::default()
+        };
+        let initial = TwoTierIndex::open(&dir, config.clone()).expect("seed ANN sidecar");
+        assert!(initial.has_fast_ann());
+
+        // Force the successful-load fallback path, then inject a persistence
+        // failure at the exact save seam. Startup must retain the rebuilt ANN
+        // rather than turn a repair failure into a brute-force fallback.
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&ann_path).expect("read ANN metadata"))
+                .expect("parse ANN metadata");
+        let object = metadata.as_object_mut().expect("ANN metadata object");
+        object.remove("format_version");
+        object.remove("sidecar_generation");
+        object.remove("sidecar_basename");
+        fs::write(
+            &ann_path,
+            serde_json::to_vec(&metadata).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy metadata");
+
+        let rebuilt = maybe_load_or_build_ann_with_save(
+            &initial.fast_index,
+            &ann_path,
+            1,
+            &config,
+            "fast",
+            reject_persistence,
+        )
+        .expect("retain rebuilt ANN after persistence failure");
+
+        // The injected failure left legacy metadata installed, proving the
+        // error occurred after a successful rebuild rather than after a native
+        // reload. That means the next startup will retry the repair.
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+            .expect("legacy sidecar still rebuilds after failed persistence");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+
+        let hits = rebuilt
+            .knn_search(&[1.0, 0.0, 0.0], 2, config.hnsw_ef_search)
+            .expect("search in-memory rebuilt ANN");
+        let mut hit_ids: Vec<&str> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+        hit_ids.sort_unstable();
+        assert_eq!(hit_ids, ["doc-a", "doc-b"]);
     }
 
     #[cfg(feature = "ann")]
