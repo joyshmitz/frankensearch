@@ -5,16 +5,25 @@
 //! tombstone mutation, merge/compaction, and cross-process writer ownership
 //! land in the adjacent Keeper milestones.
 
+#[cfg(unix)]
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
 use frankensearch_core::SearchError;
+use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use thiserror::Error;
+
+use crate::error::QuillError;
+use crate::schema::SchemaDescriptor;
+use crate::segment::{SectionKind, SegmentHeader, SegmentReader};
 
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
 
@@ -37,6 +46,8 @@ pub const MANIFEST_FLAG_BULK_MODE_IN_PROGRESS: u32 = 1;
 pub const MANIFEST_KNOWN_FLAGS: u32 = MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
 /// Canonical empty roaring-lite tombstone set (`chunk_count = 0`).
 pub const EMPTY_TOMBSTONES: [u8; 4] = [0, 0, 0, 0];
+/// Minimum age of an unreachable Quill artifact before writer GC may remove it.
+pub const DEFAULT_GARBAGE_GRACE: Duration = Duration::from_secs(300);
 
 /// Current Quill crate version in the MANIFEST packed-semver representation.
 ///
@@ -218,6 +229,84 @@ pub enum KeeperError {
         /// Violated monotonicity invariant.
         detail: String,
     },
+    /// The caller's expected schema does not match the durable MANIFEST.
+    #[error("Quill schema mismatch at {path}: expected {expected:#018x}, found {found:#018x}")]
+    SchemaMismatch {
+        /// MANIFEST path carrying the durable schema identity.
+        path: PathBuf,
+        /// Hash of the schema requested by the caller.
+        expected: u64,
+        /// Hash recorded in the selected MANIFEST.
+        found: u64,
+    },
+    /// The supplied schema descriptor itself is invalid.
+    #[error("invalid Quill schema descriptor: {source}")]
+    InvalidSchema {
+        /// Descriptor validation failure.
+        #[source]
+        source: QuillError,
+    },
+    /// A MANIFEST-referenced segment could not be opened structurally.
+    #[error("cannot open Quill segment at {path}: {source}")]
+    SegmentOpen {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Segment reader diagnosis.
+        #[source]
+        source: QuillError,
+    },
+    /// A segment disagrees with its immutable MANIFEST witnesses.
+    #[error("Quill segment metadata mismatch at {path}: {detail}")]
+    SegmentMetadataMismatch {
+        /// Canonical published segment path.
+        path: PathBuf,
+        /// Failed identity, range, length, or checksum-witness comparison.
+        detail: String,
+    },
+    /// A fallback MANIFEST and an extant generation claim disagree.
+    #[error(
+        "invalid interrupted-publish claim at {path}: recovered generation {recovered}, claimed generation {claimed}"
+    )]
+    InvalidRecoveryClaim {
+        /// Claim path carrying the incompatible generation.
+        path: PathBuf,
+        /// Generation selected from `MANIFEST.prev`.
+        recovered: u64,
+        /// Generation named by the claim.
+        claimed: u64,
+    },
+    /// A canonical generation claim is not the required zero-length file.
+    #[error("invalid Quill generation claim at {path}: {detail}")]
+    InvalidClaimArtifact {
+        /// Canonical claim path.
+        path: PathBuf,
+        /// Failed no-follow type or length invariant.
+        detail: String,
+    },
+    /// A claimed future generation must be resolved before garbage collection.
+    #[error(
+        "writer recovery required at {path}: current generation {current}, claimed generation {claimed}"
+    )]
+    ClaimedGenerationPending {
+        /// Future claim blocking a garbage sweep.
+        path: PathBuf,
+        /// Selected durable generation.
+        current: u64,
+        /// Future claimed generation.
+        claimed: u64,
+    },
+    /// A garbage-collection target was not one safe direct child name.
+    #[error("unsafe Quill garbage path rejected: {path}")]
+    UnsafeGarbagePath {
+        /// Rejected relative or absolute target.
+        path: PathBuf,
+    },
+    /// The supplied index-directory path stopped naming the opened directory.
+    #[error("Quill index directory changed during garbage collection: {directory}")]
+    GarbageDirectoryChanged {
+        /// Directory whose identity was not stable for the sweep.
+        directory: PathBuf,
+    },
     /// Publishing over a corrupt primary requires the later writer-recovery lane.
     #[error("manifest recovery required before publish at {path}")]
     RecoveryRequired {
@@ -238,7 +327,7 @@ pub enum KeeperError {
         source: LockError,
     },
     /// A filesystem operation failed with path and operation context.
-    #[error("manifest {operation} failed at {path}: {source}")]
+    #[error("keeper {operation} failed at {path}: {source}")]
     Io {
         /// Operation label.
         operation: &'static str,
@@ -254,6 +343,77 @@ impl From<KeeperError> for SearchError {
     fn from(error: KeeperError) -> Self {
         match error {
             KeeperError::IndexNotFound { directory } => Self::IndexNotFound { path: directory },
+            KeeperError::ManifestCorrupted { path, source } => Self::IndexCorrupted {
+                path,
+                detail: source.to_string(),
+            },
+            KeeperError::NoValidManifest {
+                directory,
+                current,
+                previous,
+            } => Self::IndexCorrupted {
+                path: directory,
+                detail: format!("no valid manifest: current={current}; previous={previous}"),
+            },
+            KeeperError::InvalidGenerationPair {
+                directory,
+                current,
+                previous,
+            } => Self::IndexCorrupted {
+                path: directory,
+                detail: format!(
+                    "invalid manifest generation pair: current={current}, previous={previous}"
+                ),
+            },
+            KeeperError::InvalidManifestPair {
+                directory,
+                current,
+                previous,
+                detail,
+            } => Self::IndexCorrupted {
+                path: directory,
+                detail: format!(
+                    "invalid manifest pair at generations {current}/{previous}: {detail}"
+                ),
+            },
+            KeeperError::SegmentOpen {
+                path,
+                source: QuillError::IndexCorrupted { detail, .. },
+            } => Self::IndexCorrupted { path, detail },
+            KeeperError::SegmentOpen {
+                path,
+                source: QuillError::Io(source),
+            } if source.kind() == io::ErrorKind::NotFound => Self::IndexCorrupted {
+                path,
+                detail: "MANIFEST-referenced segment is missing".to_owned(),
+            },
+            KeeperError::SegmentOpen {
+                path,
+                source: QuillError::UnknownSchema { schema_id },
+            } => Self::IndexCorrupted {
+                path,
+                detail: format!("MANIFEST-referenced segment has unknown schema {schema_id:#018x}"),
+            },
+            KeeperError::SegmentOpen { path, source } => Self::SubsystemError {
+                subsystem: "quill",
+                source: Box::new(KeeperError::SegmentOpen { path, source }),
+            },
+            KeeperError::SegmentMetadataMismatch { path, detail } => {
+                Self::IndexCorrupted { path, detail }
+            }
+            KeeperError::InvalidRecoveryClaim {
+                path,
+                recovered,
+                claimed,
+            } => Self::IndexCorrupted {
+                path,
+                detail: format!(
+                    "recovered manifest generation {recovered} conflicts with claim {claimed}"
+                ),
+            },
+            KeeperError::InvalidClaimArtifact { path, detail } => {
+                Self::IndexCorrupted { path, detail }
+            }
             KeeperError::PublishLock { source } => match source {
                 LockError::Cancelled => Self::Cancelled {
                     phase: "keeper.publish".to_owned(),
@@ -573,6 +733,8 @@ pub enum ManifestSource {
     PreviousAfterMissingCurrent,
     /// `MANIFEST` existed but was corrupt, so only `MANIFEST.prev` was usable.
     PreviousAfterCorruptCurrent,
+    /// No filesystem is attached; this is an owned-buffer genesis snapshot.
+    InMemory,
 }
 
 /// A validated MANIFEST together with its recovery provenance.
@@ -582,6 +744,274 @@ pub struct LoadedManifest {
     pub manifest: Manifest,
     /// Durable slot that supplied the contents.
     pub source: ManifestSource,
+}
+
+/// One immutable, mmap-backed segment admitted by a recovered snapshot.
+///
+/// Structural framing and MANIFEST witnesses are checked during open. Section
+/// payload hashes remain lazy and are checked on first access.
+#[derive(Clone)]
+pub struct RecoveredSegment {
+    path: PathBuf,
+    manifest: ManifestSegment,
+    reader: Arc<SegmentReader<ReadOnlyMappedFile>>,
+}
+
+impl RecoveredSegment {
+    /// Canonical published segment path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Immutable MANIFEST metadata for this segment.
+    #[must_use]
+    pub const fn manifest(&self) -> &ManifestSegment {
+        &self.manifest
+    }
+
+    /// Structurally validated FSLX header.
+    #[must_use]
+    pub fn header(&self) -> SegmentHeader {
+        self.reader.header()
+    }
+
+    /// Verify and borrow one section payload on first access.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed segment-corruption error when the payload checksum does
+    /// not match its section-table witness.
+    pub fn section(&self, kind: SectionKind) -> Result<Option<&[u8]>, QuillError> {
+        self.reader.section(kind)
+    }
+
+    /// Eagerly recompute every segment checksum for doctor-style verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed corruption error for any checksum mismatch.
+    pub fn verify(&self) -> Result<(), QuillError> {
+        self.reader.verify()
+    }
+}
+
+/// A read-only, internally consistent Keeper snapshot.
+///
+/// `open` performs recovery by selecting the admitted MANIFEST slot and
+/// validating every referenced segment. It never repairs, renames, or removes
+/// filesystem entries. Keeping this value alive keeps its immutable mmaps
+/// alive as well.
+#[derive(Clone)]
+pub struct KeeperSnapshot {
+    directory: Option<PathBuf>,
+    schema: SchemaDescriptor,
+    loaded: LoadedManifest,
+    segments: Vec<RecoveredSegment>,
+}
+
+impl KeeperSnapshot {
+    /// Open one durable snapshot without mutating the index directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed not-found, manifest, schema, segment, or metadata errors.
+    pub fn open(
+        directory: impl AsRef<Path>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        let directory = directory.as_ref();
+        match Self::open_once(directory, schema) {
+            Err(error) if recovery_retryable(&error) => Self::open_once(directory, schema),
+            result => result,
+        }
+    }
+
+    fn open_once(directory: &Path, schema: SchemaDescriptor) -> Result<Self, KeeperError> {
+        let expected_schema_id = schema
+            .schema_id()
+            .map_err(|source| KeeperError::InvalidSchema { source })?;
+        let loaded = load_manifest_pair(directory)?;
+        validate_loaded_schema(directory, expected_schema_id, &loaded)?;
+        validate_recovery_claims(directory, &loaded)?;
+
+        let mut segments = Vec::new();
+        segments
+            .try_reserve_exact(loaded.manifest.segments.len())
+            .map_err(|error| KeeperError::Io {
+                operation: "allocate recovered segment table",
+                path: directory.to_path_buf(),
+                source: io::Error::other(error.to_string()),
+            })?;
+        for manifest_segment in &loaded.manifest.segments {
+            let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
+            let reader = SegmentReader::open_published(&path, schema).map_err(|source| {
+                KeeperError::SegmentOpen {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            validate_segment_witnesses(&path, manifest_segment, &reader)?;
+            segments.push(RecoveredSegment {
+                path,
+                manifest: manifest_segment.clone(),
+                reader: Arc::new(reader),
+            });
+        }
+
+        Ok(Self {
+            directory: Some(directory.to_path_buf()),
+            schema,
+            loaded,
+            segments,
+        })
+    }
+
+    /// Create a genesis index or open an existing index with the same schema.
+    ///
+    /// This is the low-level Keeper create-or-open primitive. Cross-process
+    /// admission is added by the dependent writer-lock milestone; the current
+    /// publisher still serializes all writers inside this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, I/O, schema mismatch, publication, or open
+    /// errors. Existing durable state is never rebuilt on mismatch.
+    pub async fn create(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        let directory = directory.into();
+        match open_snapshot_blocking(directory.clone(), schema).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(KeeperError::IndexNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let create_path = directory.clone();
+        spawn_blocking(move || {
+            std::fs::create_dir_all(&create_path).map_err(|source| KeeperError::Io {
+                operation: "create index directory",
+                path: create_path,
+                source,
+            })
+        })
+        .await?;
+
+        // Another in-process creator may have won while this caller created
+        // the directory. Open first so an existing schema mismatch is typed.
+        match open_snapshot_blocking(directory.clone(), schema).await {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(KeeperError::IndexNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let schema_id = schema
+            .schema_id()
+            .map_err(|source| KeeperError::InvalidSchema { source })?;
+        let genesis = Manifest::empty(1, schema_id, 0);
+        match ManifestPublisher::new(&directory)
+            .publish(cx, &genesis)
+            .await
+        {
+            Ok(_) | Err(KeeperError::GenerationConflict { .. }) => {
+                open_snapshot_blocking(directory, schema).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Construct an owned-buffer genesis snapshot without creating files.
+    ///
+    /// Later ingest milestones attach mutable deltas and owned FSLX segments;
+    /// recovery and garbage collection remain no-ops for this backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-schema error when the descriptor is not canonical.
+    pub fn in_memory(schema: SchemaDescriptor) -> Result<Self, KeeperError> {
+        let schema_id = schema
+            .schema_id()
+            .map_err(|source| KeeperError::InvalidSchema { source })?;
+        Ok(Self {
+            directory: None,
+            schema,
+            loaded: LoadedManifest {
+                manifest: Manifest::empty(1, schema_id, 0),
+                source: ManifestSource::InMemory,
+            },
+            segments: Vec::new(),
+        })
+    }
+
+    /// Durable index directory, or `None` for an in-memory snapshot.
+    #[must_use]
+    pub fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+
+    /// Compile-time schema admitted by this snapshot.
+    #[must_use]
+    pub const fn schema(&self) -> SchemaDescriptor {
+        self.schema
+    }
+
+    /// Selected MANIFEST and its recovery provenance.
+    #[must_use]
+    pub const fn loaded_manifest(&self) -> &LoadedManifest {
+        &self.loaded
+    }
+
+    /// Referenced immutable segments in ascending Q1 range order.
+    #[must_use]
+    pub fn segments(&self) -> &[RecoveredSegment] {
+        &self.segments
+    }
+}
+
+fn recovery_retryable(error: &KeeperError) -> bool {
+    matches!(
+        error,
+        KeeperError::SegmentOpen { .. } | KeeperError::SegmentMetadataMismatch { .. }
+    )
+}
+
+async fn open_snapshot_blocking(
+    directory: PathBuf,
+    schema: SchemaDescriptor,
+) -> Result<KeeperSnapshot, KeeperError> {
+    spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await
+}
+
+/// Writer-owned garbage collection configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GarbageCollectionOptions {
+    /// Minimum artifact age required before deletion.
+    pub grace_period: Duration,
+}
+
+impl Default for GarbageCollectionOptions {
+    fn default() -> Self {
+        Self {
+            grace_period: DEFAULT_GARBAGE_GRACE,
+        }
+    }
+}
+
+/// Deterministic report from one writer-locked garbage sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GarbageCollectionReport {
+    /// Removed direct-child names, sorted bytewise by platform string order.
+    pub removed: Vec<PathBuf>,
+}
+
+impl GarbageCollectionReport {
+    /// Whether the sweep made no filesystem changes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty()
+    }
 }
 
 /// Load the current MANIFEST, falling back to `MANIFEST.prev` without writing.
@@ -740,6 +1170,636 @@ fn validate_manifest_pair(
         manifest: current,
         source: ManifestSource::Current,
     })
+}
+
+fn validate_loaded_schema(
+    directory: &Path,
+    expected: u64,
+    loaded: &LoadedManifest,
+) -> Result<(), KeeperError> {
+    if loaded.manifest.schema_id == expected {
+        return Ok(());
+    }
+    let slot = match loaded.source {
+        ManifestSource::Current => "MANIFEST",
+        ManifestSource::PreviousAfterMissingCurrent
+        | ManifestSource::PreviousAfterCorruptCurrent => "MANIFEST.prev",
+        ManifestSource::InMemory => "<in-memory>",
+    };
+    Err(KeeperError::SchemaMismatch {
+        path: directory.join(slot),
+        expected,
+        found: loaded.manifest.schema_id,
+    })
+}
+
+fn validate_recovery_claims(directory: &Path, loaded: &LoadedManifest) -> Result<(), KeeperError> {
+    if loaded.source == ManifestSource::Current || loaded.source == ManifestSource::InMemory {
+        return Ok(());
+    }
+    let admitted_claim = loaded.manifest.generation.checked_add(1);
+    for (path, claimed) in scan_generation_claims(directory)? {
+        if claimed <= loaded.manifest.generation || admitted_claim == Some(claimed) {
+            continue;
+        }
+        return Err(KeeperError::InvalidRecoveryClaim {
+            path,
+            recovered: loaded.manifest.generation,
+            claimed,
+        });
+    }
+    Ok(())
+}
+
+fn scan_generation_claims(directory: &Path) -> Result<Vec<(PathBuf, u64)>, KeeperError> {
+    let mut claims = Vec::new();
+    let entries = std::fs::read_dir(directory).map_err(|source| KeeperError::Io {
+        operation: "scan recovery claims",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| KeeperError::Io {
+            operation: "read recovery claim entry",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let Some(claimed) = parse_claim_name(&entry.file_name()) else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|source| KeeperError::Io {
+            operation: "inspect generation claim",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() != 0 {
+            return Err(KeeperError::InvalidClaimArtifact {
+                path,
+                detail: format!(
+                    "claim must be a zero-length regular file, found type {:?} and length {}",
+                    metadata.file_type(),
+                    metadata.len()
+                ),
+            });
+        }
+        claims.try_reserve(1).map_err(|error| KeeperError::Io {
+            operation: "allocate recovery claim inventory",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
+        claims.push((path, claimed));
+    }
+    claims.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    Ok(claims)
+}
+
+fn validate_segment_witnesses(
+    path: &Path,
+    manifest: &ManifestSegment,
+    reader: &SegmentReader<ReadOnlyMappedFile>,
+) -> Result<(), KeeperError> {
+    let header = reader.header();
+    let mismatch = if header.segment_id != manifest.segment_id {
+        Some(format!(
+            "header segment_id {:#018x} != manifest {:#018x}",
+            header.segment_id, manifest.segment_id
+        ))
+    } else if reader.file_len() != manifest.file_len {
+        Some(format!(
+            "file length {} != manifest {}",
+            reader.file_len(),
+            manifest.file_len
+        ))
+    } else if reader.file_xxh3() != manifest.file_xxh3 {
+        Some(format!(
+            "trailer file_xxh3 {:#018x} != manifest {:#018x}",
+            reader.file_xxh3(),
+            manifest.file_xxh3
+        ))
+    } else if header.docid_lo != manifest.docid_lo || header.docid_hi != manifest.docid_hi {
+        Some(format!(
+            "header range [{}, {}) != manifest [{}, {})",
+            header.docid_lo, header.docid_hi, manifest.docid_lo, manifest.docid_hi
+        ))
+    } else if header.doc_count != manifest.doc_count {
+        Some(format!(
+            "header doc_count {} != manifest {}",
+            header.doc_count, manifest.doc_count
+        ))
+    } else {
+        None
+    };
+    if let Some(detail) = mismatch {
+        return Err(KeeperError::SegmentMetadataMismatch {
+            path: path.to_path_buf(),
+            detail,
+        });
+    }
+    Ok(())
+}
+
+/// Remove unreachable Quill artifacts while the crate-internal caller holds
+/// the writer lock.
+///
+/// This seam stays crate-private until the dependent writer-lock milestone can
+/// pass a real guard that owns the directory handle. The function first opens
+/// and validates the selected snapshot, so a failed recovery never performs
+/// garbage collection. Reader [`KeeperSnapshot::open`] never calls it.
+/// Reachability is the union of every individually valid MANIFEST slot.
+///
+/// # Errors
+///
+/// Returns before deletion when recovery, directory enumeration, metadata, or
+/// path-safety validation fails. An unlink or final directory fsync failure is
+/// reported with the exact affected path.
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+pub(crate) fn collect_writer_garbage_under_lock(
+    directory: impl AsRef<Path>,
+    schema: SchemaDescriptor,
+    options: GarbageCollectionOptions,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    collect_writer_garbage_at(directory.as_ref(), schema, options, SystemTime::now())
+}
+
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn collect_writer_garbage_at(
+    directory: &Path,
+    schema: SchemaDescriptor,
+    options: GarbageCollectionOptions,
+    now: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    collect_writer_garbage_at_platform(directory, schema, options, now)
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn collect_writer_garbage_at_platform(
+    directory: &Path,
+    _: SchemaDescriptor,
+    _: GarbageCollectionOptions,
+    _: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    ensure_atomic_publish_supported(directory)?;
+    unreachable!("unsupported-platform guard always returns an error")
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn collect_writer_garbage_at_platform(
+    directory: &Path,
+    schema: SchemaDescriptor,
+    options: GarbageCollectionOptions,
+    now: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    let directory_file = open_gc_directory(directory)?;
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    let snapshot = KeeperSnapshot::open(directory, schema)?;
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    let live_segments = live_segment_names_at(&directory_file, directory, &snapshot)?;
+    let current_generation = snapshot.loaded_manifest().manifest.generation;
+    sweep_garbage_directory(
+        &directory_file,
+        directory,
+        &live_segments,
+        current_generation,
+        options,
+        now,
+    )
+}
+
+/// Remove abandoned genesis artifacts when both durable slots are absent.
+///
+/// This is a separate writer-locked state because ordinary snapshot recovery
+/// correctly returns [`KeeperError::IndexNotFound`] when neither slot exists.
+/// Any canonical generation claim blocks deletion for the later writer
+/// recovery protocol to resolve.
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+pub(crate) fn collect_abandoned_genesis_garbage_under_lock(
+    directory: impl AsRef<Path>,
+    options: GarbageCollectionOptions,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    collect_abandoned_genesis_garbage_at(directory.as_ref(), options, SystemTime::now())
+}
+
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn collect_abandoned_genesis_garbage_at(
+    directory: &Path,
+    options: GarbageCollectionOptions,
+    now: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    collect_abandoned_genesis_garbage_at_platform(directory, options, now)
+}
+
+#[cfg(not(unix))]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn collect_abandoned_genesis_garbage_at_platform(
+    directory: &Path,
+    _: GarbageCollectionOptions,
+    _: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    ensure_atomic_publish_supported(directory)?;
+    unreachable!("unsupported-platform guard always returns an error")
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn collect_abandoned_genesis_garbage_at_platform(
+    directory: &Path,
+    options: GarbageCollectionOptions,
+    now: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    let directory_file = open_gc_directory(directory)?;
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    for slot_name in ["MANIFEST", "MANIFEST.prev"] {
+        let path = directory.join(slot_name);
+        match read_manifest_slot_at(&directory_file, OsStr::new(slot_name), &path)? {
+            ManifestSlot::Missing => {}
+            ManifestSlot::Valid(_) => return Err(KeeperError::RecoveryRequired { path }),
+            ManifestSlot::Invalid(source) => {
+                return Err(KeeperError::ManifestCorrupted { path, source });
+            }
+        }
+    }
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    sweep_garbage_directory(&directory_file, directory, &HashSet::new(), 0, options, now)
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn sweep_garbage_directory(
+    directory_file: &File,
+    directory: &Path,
+    live_segments: &HashSet<OsString>,
+    current_generation: u64,
+    options: GarbageCollectionOptions,
+    now: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    use rustix::fs::{AtFlags, Dir, FileType, statat, unlinkat};
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut candidates = Vec::<(OsString, GarbageCandidate, rustix::fs::Stat)>::new();
+    let mut entries = Dir::read_from(directory_file)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "scan garbage candidates",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    while let Some(entry) = entries.read() {
+        let entry = entry
+            .map_err(io::Error::from)
+            .map_err(|source| KeeperError::Io {
+                operation: "read garbage candidate",
+                path: directory.to_path_buf(),
+                source,
+            })?;
+        let name = OsString::from_vec(entry.file_name().to_bytes().to_vec());
+        let Some(candidate) = classify_garbage_candidate(&name) else {
+            continue;
+        };
+        let candidate_path = directory.join(&name);
+        let stat = match statat(directory_file, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(source) if source == rustix::io::Errno::NOENT => continue,
+            Err(source) => {
+                return Err(KeeperError::Io {
+                    operation: "inspect garbage candidate",
+                    path: candidate_path,
+                    source: io::Error::from(source),
+                });
+            }
+        };
+        let is_regular = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile;
+        if let GarbageCandidate::Claim { generation } = &candidate {
+            if !is_regular || stat.st_size != 0 {
+                return Err(KeeperError::InvalidClaimArtifact {
+                    path: candidate_path,
+                    detail: format!(
+                        "claim must be a zero-length regular file, found type {:?} and length {}",
+                        FileType::from_raw_mode(stat.st_mode),
+                        stat.st_size
+                    ),
+                });
+            }
+            if *generation > current_generation {
+                return Err(KeeperError::ClaimedGenerationPending {
+                    path: candidate_path,
+                    current: current_generation,
+                    claimed: *generation,
+                });
+            }
+        }
+        if is_regular {
+            candidates.try_reserve(1).map_err(|error| KeeperError::Io {
+                operation: "allocate garbage candidate inventory",
+                path: directory.to_path_buf(),
+                source: io::Error::other(error.to_string()),
+            })?;
+            candidates.push((name, candidate, stat));
+        }
+    }
+
+    let mut removable_segments = HashSet::<OsString>::new();
+    removable_segments
+        .try_reserve(candidates.len())
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate removable segment inventory",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
+    for (name, candidate, stat) in &candidates {
+        if matches!(candidate, GarbageCandidate::Segment)
+            && !live_segments.contains(name)
+            && stat_old_enough(stat, now, options.grace_period)
+        {
+            removable_segments.insert(name.clone());
+        }
+    }
+
+    let mut removals = Vec::<OsString>::new();
+    removals
+        .try_reserve_exact(candidates.len())
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate garbage removal inventory",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
+    for (name, candidate, stat) in candidates {
+        let old_enough = stat_old_enough(&stat, now, options.grace_period);
+        let remove = match candidate {
+            GarbageCandidate::Temporary => old_enough,
+            GarbageCandidate::Segment => removable_segments.contains(&name),
+            GarbageCandidate::Sidecar { base } => {
+                old_enough
+                    && sidecar_is_orphan_at(directory_file, directory, &removable_segments, &base)?
+            }
+            GarbageCandidate::Claim { .. } => old_enough,
+        };
+        if remove {
+            removals.push(name);
+        }
+    }
+    removals.sort_unstable();
+
+    let mut removed = Vec::new();
+    removed
+        .try_reserve_exact(removals.len())
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate garbage report",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
+    for name in removals {
+        let relative = Path::new(&name);
+        let path = safe_direct_child(directory, relative)?;
+        match unlinkat(directory_file, relative, AtFlags::empty()) {
+            Ok(()) => removed.push(relative.to_path_buf()),
+            Err(source) if source == rustix::io::Errno::NOENT => {}
+            Err(source) => {
+                if !removed.is_empty() {
+                    sync_gc_directory(directory_file, directory)?;
+                }
+                return Err(KeeperError::Io {
+                    operation: "remove garbage candidate",
+                    path,
+                    source: io::Error::from(source),
+                });
+            }
+        }
+    }
+    if !removed.is_empty() {
+        sync_gc_directory(directory_file, directory)?;
+    }
+    Ok(GarbageCollectionReport { removed })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn live_segment_names_at(
+    directory_file: &File,
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+) -> Result<HashSet<OsString>, KeeperError> {
+    let mut live = HashSet::new();
+    for slot_name in ["MANIFEST", "MANIFEST.prev"] {
+        let path = directory.join(slot_name);
+        if let ManifestSlot::Valid(manifest) =
+            read_manifest_slot_at(directory_file, OsStr::new(slot_name), &path)?
+        {
+            live.try_reserve(manifest.segments.len())
+                .map_err(|error| KeeperError::Io {
+                    operation: "allocate live segment set",
+                    path: directory.to_path_buf(),
+                    source: io::Error::other(error.to_string()),
+                })?;
+            live.extend(
+                manifest
+                    .segments
+                    .iter()
+                    .map(|segment| OsString::from(canonical_segment_name(segment.segment_id))),
+            );
+        }
+    }
+    let selected_name = match snapshot.loaded_manifest().source {
+        ManifestSource::Current => "MANIFEST",
+        ManifestSource::PreviousAfterMissingCurrent
+        | ManifestSource::PreviousAfterCorruptCurrent => "MANIFEST.prev",
+        ManifestSource::InMemory => {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+    };
+    let selected_path = directory.join(selected_name);
+    match read_manifest_slot_at(directory_file, OsStr::new(selected_name), &selected_path)? {
+        ManifestSlot::Valid(manifest) if manifest == snapshot.loaded_manifest().manifest => {}
+        ManifestSlot::Missing | ManifestSlot::Invalid(_) | ManifestSlot::Valid(_) => {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+    }
+    Ok(live)
+}
+
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+#[derive(Debug)]
+enum GarbageCandidate {
+    Temporary,
+    Segment,
+    Sidecar { base: OsString },
+    Claim { generation: u64 },
+}
+
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn classify_garbage_candidate(name: &OsStr) -> Option<GarbageCandidate> {
+    let name = name.to_str()?;
+    if name.starts_with(".tmp-") {
+        return Some(GarbageCandidate::Temporary);
+    }
+    if parse_segment_name(name).is_some() {
+        return Some(GarbageCandidate::Segment);
+    }
+    if let Some(base) = name.strip_suffix(".fec")
+        && (parse_segment_name(base).is_some() || matches!(base, "MANIFEST" | "MANIFEST.prev"))
+    {
+        return Some(GarbageCandidate::Sidecar {
+            base: OsString::from(base),
+        });
+    }
+    parse_claim_name(OsStr::new(name)).map(|generation| GarbageCandidate::Claim { generation })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn sidecar_is_orphan_at(
+    directory_file: &File,
+    directory: &Path,
+    removable_segments: &HashSet<OsString>,
+    base: &OsStr,
+) -> Result<bool, KeeperError> {
+    use rustix::fs::{AtFlags, statat};
+
+    let base_text = base.to_str();
+    if base_text.is_some_and(|name| parse_segment_name(name).is_some())
+        && removable_segments.contains(base)
+    {
+        return Ok(true);
+    }
+    match statat(directory_file, base, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(false),
+        Err(source) if source == rustix::io::Errno::NOENT => Ok(true),
+        Err(source) => Err(KeeperError::Io {
+            operation: "inspect sidecar base",
+            path: directory.join(base),
+            source: io::Error::from(source),
+        }),
+    }
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn stat_old_enough(stat: &rustix::fs::Stat, now: SystemTime, grace_period: Duration) -> bool {
+    stat_modified_time(stat).is_some_and(|modified| {
+        now.duration_since(modified)
+            .is_ok_and(|age| age >= grace_period)
+    })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn stat_modified_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
+    let seconds = stat.st_mtime;
+    let nanoseconds = u32::try_from(stat.st_mtime_nsec).ok()?;
+    if nanoseconds >= 1_000_000_000 {
+        return None;
+    }
+    if seconds >= 0 {
+        return SystemTime::UNIX_EPOCH
+            .checked_add(Duration::new(u64::try_from(seconds).ok()?, nanoseconds));
+    }
+    let magnitude = seconds.unsigned_abs();
+    let before_epoch = if nanoseconds == 0 {
+        Duration::from_secs(magnitude)
+    } else {
+        Duration::new(magnitude.checked_sub(1)?, 1_000_000_000 - nanoseconds)
+    };
+    SystemTime::UNIX_EPOCH.checked_sub(before_epoch)
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn open_gc_directory(directory: &Path) -> Result<File, KeeperError> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    open(
+        directory,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|source| KeeperError::Io {
+        operation: "open no-follow garbage-collection directory",
+        path: directory.to_path_buf(),
+        source: io::Error::from(source),
+    })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn ensure_gc_directory_identity(directory: &Path, opened: &File) -> Result<(), KeeperError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path_metadata = std::fs::metadata(directory).map_err(|source| KeeperError::Io {
+        operation: "verify garbage-collection directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let opened_metadata = opened.metadata().map_err(|source| KeeperError::Io {
+        operation: "inspect opened garbage-collection directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    if path_metadata.dev() != opened_metadata.dev()
+        || path_metadata.ino() != opened_metadata.ino()
+        || !opened_metadata.is_dir()
+    {
+        return Err(KeeperError::GarbageDirectoryChanged {
+            directory: directory.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn sync_gc_directory(opened: &File, directory: &Path) -> Result<(), KeeperError> {
+    opened.sync_all().map_err(|source| KeeperError::Io {
+        operation: "fsync garbage-collection directory",
+        path: directory.to_path_buf(),
+        source,
+    })
+}
+
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn safe_direct_child(directory: &Path, relative: &Path) -> Result<PathBuf, KeeperError> {
+    let mut components = relative.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(KeeperError::UnsafeGarbagePath {
+            path: relative.to_path_buf(),
+        });
+    }
+    Ok(directory.join(relative))
+}
+
+fn canonical_segment_name(segment_id: u64) -> String {
+    format!("seg-{segment_id:016x}.fslx")
+}
+
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn parse_segment_name(name: &str) -> Option<u64> {
+    let hex = name.strip_prefix("seg-")?.strip_suffix(".fslx")?;
+    if hex.len() != 16
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+fn parse_claim_name(name: &OsStr) -> Option<u64> {
+    let name = name.to_str()?;
+    let digits = name.strip_prefix("gen-")?.strip_suffix(".claim")?;
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// In-process serializer for the two-slot MANIFEST publication protocol.
@@ -920,6 +1980,29 @@ fn publish_manifest_locked<C, F>(
 where
     F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
 {
+    publish_manifest_choreography(directory, bytes, claim, |_, _| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublishCheckpoint {
+    TempWritten,
+    TempSynced,
+    GenerationClaimed,
+    CurrentMovedToPrevious,
+    TempMovedToCurrent,
+    DirectorySynced,
+}
+
+fn publish_manifest_choreography<C, F, O>(
+    directory: PathBuf,
+    bytes: &[u8],
+    claim: F,
+    mut observe: O,
+) -> Result<LoadedManifest, KeeperError>
+where
+    F: FnOnce(&Path, u64) -> Result<C, KeeperError>,
+    O: FnMut(PublishCheckpoint, &Path) -> Result<(), KeeperError>,
+{
     #[cfg(not(unix))]
     ensure_atomic_publish_supported(&directory)?;
     let proposed =
@@ -991,22 +2074,26 @@ where
     let temp_path = directory.join(format!(".tmp-manifest-{}", proposed.generation));
     let current_path = directory.join("MANIFEST");
     let previous_path = directory.join("MANIFEST.prev");
-    prepare_manifest_temp(&temp_path, bytes)?;
+    prepare_manifest_temp(&temp_path, bytes, &mut observe)?;
 
     let _claim_guard = claim(&directory, proposed.generation)?;
+    observe(PublishCheckpoint::GenerationClaimed, &directory)?;
     if rename_current {
         std::fs::rename(&current_path, &previous_path).map_err(|source| KeeperError::Io {
             operation: "rename current to previous",
             path: current_path.clone(),
             source,
         })?;
+        observe(PublishCheckpoint::CurrentMovedToPrevious, &previous_path)?;
     }
     std::fs::rename(&temp_path, &current_path).map_err(|source| KeeperError::Io {
         operation: "rename temp to current",
         path: temp_path,
         source,
     })?;
+    observe(PublishCheckpoint::TempMovedToCurrent, &current_path)?;
     sync_directory(&directory)?;
+    observe(PublishCheckpoint::DirectorySynced, &directory)?;
 
     Ok(LoadedManifest {
         manifest: proposed,
@@ -1014,11 +2101,16 @@ where
     })
 }
 
-fn prepare_manifest_temp(path: &Path, bytes: &[u8]) -> Result<(), KeeperError> {
+fn prepare_manifest_temp<O>(path: &Path, bytes: &[u8], observe: &mut O) -> Result<(), KeeperError>
+where
+    O: FnMut(PublishCheckpoint, &Path) -> Result<(), KeeperError>,
+{
     let mut temp_file = match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => file,
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-            return verify_reusable_manifest_temp(path, bytes);
+            verify_reusable_manifest_temp(path, bytes)?;
+            observe(PublishCheckpoint::TempSynced, path)?;
+            return Ok(());
         }
         Err(source) => {
             return Err(KeeperError::Io {
@@ -1035,11 +2127,13 @@ fn prepare_manifest_temp(path: &Path, bytes: &[u8]) -> Result<(), KeeperError> {
             path: path.to_path_buf(),
             source,
         })?;
+    observe(PublishCheckpoint::TempWritten, path)?;
     temp_file.sync_all().map_err(|source| KeeperError::Io {
         operation: "fsync temp",
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    observe(PublishCheckpoint::TempSynced, path)
 }
 
 fn verify_reusable_manifest_temp(path: &Path, expected: &[u8]) -> Result<(), KeeperError> {
@@ -1395,9 +2489,33 @@ enum ManifestSlot {
 }
 
 fn read_manifest_slot(path: &Path) -> Result<ManifestSlot, KeeperError> {
-    let file = match File::open(path) {
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ManifestSlot::Missing);
+        }
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "inspect slot path",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !path_metadata.file_type().is_file() {
+        return Ok(ManifestSlot::Invalid(non_canonical(
+            "manifest slot is not a regular file",
+        )));
+    }
+    let file = match open_manifest_slot(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ManifestSlot::Missing),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            return Ok(ManifestSlot::Invalid(non_canonical(
+                "manifest slot became a symlink while opening",
+            )));
+        }
         Err(source) => {
             return Err(KeeperError::Io {
                 operation: "open",
@@ -1406,11 +2524,20 @@ fn read_manifest_slot(path: &Path) -> Result<ManifestSlot, KeeperError> {
             });
         }
     };
+    read_manifest_file(path, file)
+}
+
+fn read_manifest_file(path: &Path, file: File) -> Result<ManifestSlot, KeeperError> {
     let file_length = file.metadata().map_err(|source| KeeperError::Io {
         operation: "stat",
         path: path.to_path_buf(),
         source,
     })?;
+    if !file_length.file_type().is_file() {
+        return Ok(ManifestSlot::Invalid(non_canonical(
+            "manifest slot is not a regular file",
+        )));
+    }
     if file_length.len() > usize_to_u64(MAX_MANIFEST_BYTES) {
         return Ok(ManifestSlot::Invalid(ManifestCodecError::ResourceLimit {
             resource: "byte length",
@@ -1446,6 +2573,82 @@ fn read_manifest_slot(path: &Path) -> Result<ManifestSlot, KeeperError> {
         Ok(manifest) => ManifestSlot::Valid(manifest),
         Err(error) => ManifestSlot::Invalid(error),
     })
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn read_manifest_slot_at(
+    directory: &File,
+    name: &OsStr,
+    path: &Path,
+) -> Result<ManifestSlot, KeeperError> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, openat, statat};
+
+    let stat = match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(source) if source == rustix::io::Errno::NOENT => return Ok(ManifestSlot::Missing),
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "inspect slot path",
+                path: path.to_path_buf(),
+                source: io::Error::from(source),
+            });
+        }
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Ok(ManifestSlot::Invalid(non_canonical(
+            "manifest slot is not a regular file",
+        )));
+    }
+    let file = match openat(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(file) => File::from(file),
+        Err(source) if source == rustix::io::Errno::NOENT => return Ok(ManifestSlot::Missing),
+        Err(source) if source == rustix::io::Errno::LOOP => {
+            return Ok(ManifestSlot::Invalid(non_canonical(
+                "manifest slot became a symlink while opening",
+            )));
+        }
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "open",
+                path: path.to_path_buf(),
+                source: io::Error::from(source),
+            });
+        }
+    };
+    read_manifest_file(path, file)
+}
+
+#[cfg(unix)]
+fn open_manifest_slot(path: &Path) -> io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "slot path has no file name"))?;
+    let directory = File::open(parent)?;
+    let slot = openat(
+        &directory,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    Ok(File::from(slot))
+}
+
+#[cfg(not(unix))]
+fn open_manifest_slot(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 #[cfg(not(unix))]
@@ -1891,6 +3094,9 @@ mod tests {
     use asupersync::{LabConfig, LabRuntime};
     use tempfile::tempdir;
 
+    use crate::schema::{DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA};
+    use crate::segment::{EncodedSegment, SectionInput, SegmentHeaderInput};
+
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1986,6 +3192,88 @@ mod tests {
         Ok(())
     }
 
+    fn encoded_test_segment(
+        segment_id: u64,
+        docid_lo: u64,
+        docid_hi: u64,
+        doc_count: u32,
+    ) -> Result<EncodedSegment, QuillError> {
+        EncodedSegment::encode(
+            SegmentHeaderInput {
+                segment_id,
+                schema: DEFAULT_SCHEMA,
+                docid_lo,
+                docid_hi,
+                doc_count,
+                created_unix_s: 1_700_000_000,
+                engine_version: CURRENT_ENGINE_VERSION,
+            },
+            &[
+                SectionInput::new(SectionKind::TERMDICT, b"termdict"),
+                SectionInput::new(SectionKind::POSTINGS, b"postings"),
+                SectionInput::new(SectionKind::POSITIONS, b"positions"),
+                SectionInput::new(SectionKind::BLOCKMAX, b"blockmax"),
+                SectionInput::new(SectionKind::DOCLEN, b"doclen"),
+                SectionInput::new(SectionKind::IDMAP, b"idmap"),
+                SectionInput::new(SectionKind::IDHASH, b"idhash"),
+                SectionInput::new(SectionKind::STOREDMETA, b"storedmeta"),
+                SectionInput::new(SectionKind::STATS, b"stats"),
+            ],
+        )
+    }
+
+    fn write_test_segment(
+        directory: &Path,
+        segment_id: u64,
+        seal_seq: u64,
+        docid_lo: u64,
+        docid_hi: u64,
+    ) -> Result<ManifestSegment, Box<dyn std::error::Error>> {
+        let encoded = encoded_test_segment(segment_id, docid_lo, docid_hi, 1)?;
+        std::fs::write(
+            directory.join(canonical_segment_name(segment_id)),
+            encoded.as_bytes(),
+        )?;
+        Ok(ManifestSegment {
+            segment_id,
+            seal_seq,
+            file_len: encoded.file_len(),
+            file_xxh3: encoded.file_xxh3(),
+            docid_lo,
+            docid_hi,
+            doc_count: 1,
+            tombstones: EMPTY_TOMBSTONES.to_vec(),
+        })
+    }
+
+    fn durable_test_manifest(generation: u64, segments: Vec<ManifestSegment>) -> Manifest {
+        Manifest {
+            generation,
+            docid_high_watermark: segments
+                .iter()
+                .map(|segment| segment.docid_hi)
+                .max()
+                .unwrap_or(0),
+            schema_id: DEFAULT_SCHEMA.schema_id().expect("valid test schema"),
+            engine_version: CURRENT_ENGINE_VERSION,
+            flags: 0,
+            segments,
+            field_stats: Vec::new(),
+        }
+    }
+
+    fn directory_bytes(directory: &Path) -> Result<Vec<(OsString, Vec<u8>)>, io::Error> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                entries.push((entry.file_name(), std::fs::read(entry.path())?));
+            }
+        }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+
     #[test]
     fn packed_engine_version_matches_crate_semver() {
         let major = env!("CARGO_PKG_VERSION_MAJOR")
@@ -2005,6 +3293,21 @@ mod tests {
             unpack_engine_version(CURRENT_ENGINE_VERSION),
             (major, minor, patch)
         );
+    }
+
+    #[test]
+    fn referenced_segment_unknown_schema_maps_to_public_corruption() {
+        let path = PathBuf::from("index/seg-0000000000000001.fslx");
+        let error: SearchError = KeeperError::SegmentOpen {
+            path: path.clone(),
+            source: QuillError::UnknownSchema { schema_id: 0x55 },
+        }
+        .into();
+        assert!(matches!(
+            error,
+            SearchError::IndexCorrupted { path: actual, detail }
+                if actual == path && detail.contains("unknown schema")
+        ));
     }
 
     #[test]
@@ -2260,6 +3563,59 @@ mod tests {
         assert_eq!(loaded.source, ManifestSource::PreviousAfterMissingCurrent);
 
         std::fs::write(directory.path().join("MANIFEST"), b"corrupt")?;
+        let loaded = load_manifest_pair(directory.path())?;
+        assert_eq!(loaded.manifest, previous);
+        assert_eq!(loaded.source, ManifestSource::PreviousAfterCorruptCurrent);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_loader_never_follows_manifest_symlinks_or_special_entries() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir()?;
+        let previous = sample_manifest(4);
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        let symlink_target = directory.path().join("manifest-target");
+        write_manifest(&symlink_target, &sample_manifest(5))?;
+        symlink(&symlink_target, directory.path().join("MANIFEST"))?;
+
+        let loaded = load_manifest_pair(directory.path())?;
+        assert_eq!(loaded.manifest, previous);
+        assert_eq!(loaded.source, ManifestSource::PreviousAfterCorruptCurrent);
+
+        let directory = tempdir()?;
+        let previous = sample_manifest(7);
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        std::fs::create_dir(directory.path().join("MANIFEST"))?;
+        let loaded = load_manifest_pair(directory.path())?;
+        assert_eq!(loaded.manifest, previous);
+        assert_eq!(loaded.source, ManifestSource::PreviousAfterCorruptCurrent);
+
+        let directory = tempdir()?;
+        let current = sample_manifest(9);
+        write_manifest(&directory.path().join("MANIFEST"), &current)?;
+        let previous_target = directory.path().join("previous-target");
+        write_manifest(&previous_target, &sample_manifest(8))?;
+        symlink(&previous_target, directory.path().join("MANIFEST.prev"))?;
+        let loaded = load_manifest_pair(directory.path())?;
+        assert_eq!(loaded.manifest, current);
+        assert_eq!(loaded.source, ManifestSource::Current);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pair_loader_treats_fifo_manifest_as_invalid_without_blocking() -> TestResult {
+        use rustix::fs::{Mode, mkfifoat};
+
+        let directory = tempdir()?;
+        let previous = sample_manifest(4);
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        let directory_file = File::open(directory.path())?;
+        mkfifoat(&directory_file, "MANIFEST", Mode::RUSR | Mode::WUSR)?;
+
         let loaded = load_manifest_pair(directory.path())?;
         assert_eq!(loaded.manifest, previous);
         assert_eq!(loaded.source, ManifestSource::PreviousAfterCorruptCurrent);
@@ -2586,6 +3942,130 @@ mod tests {
     }
 
     #[test]
+    fn real_manifest_choreography_recovers_at_every_checkpoint() -> TestResult {
+        const CHECKPOINTS: [PublishCheckpoint; 6] = [
+            PublishCheckpoint::TempWritten,
+            PublishCheckpoint::TempSynced,
+            PublishCheckpoint::GenerationClaimed,
+            PublishCheckpoint::CurrentMovedToPrevious,
+            PublishCheckpoint::TempMovedToCurrent,
+            PublishCheckpoint::DirectorySynced,
+        ];
+
+        let success_directory = tempdir()?;
+        let schema_id = DEFAULT_SCHEMA.schema_id()?;
+        write_manifest(
+            &success_directory.path().join("MANIFEST"),
+            &Manifest::empty(1, schema_id, 0),
+        )?;
+        let proposed = Manifest::empty(2, schema_id, 0);
+        let proposed_bytes = proposed.to_bytes()?;
+        let mut observed = Vec::new();
+        publish_manifest_choreography(
+            success_directory.path().to_path_buf(),
+            &proposed_bytes,
+            |_, _| Ok(()),
+            |checkpoint, _| {
+                observed.push(checkpoint);
+                Ok(())
+            },
+        )?;
+        assert_eq!(observed, CHECKPOINTS);
+
+        for fault in CHECKPOINTS {
+            let directory = tempdir()?;
+            let initial = Manifest::empty(1, schema_id, 0);
+            write_manifest(&directory.path().join("MANIFEST"), &initial)?;
+            let result = publish_manifest_choreography(
+                directory.path().to_path_buf(),
+                &proposed_bytes,
+                |_, _| Ok(()),
+                |checkpoint, path| {
+                    if checkpoint == fault {
+                        return Err(KeeperError::Io {
+                            operation: "inject manifest publish crash",
+                            path: path.to_path_buf(),
+                            source: io::Error::other(format!("injected crash at {checkpoint:?}")),
+                        });
+                    }
+                    Ok(())
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(KeeperError::Io {
+                        operation: "inject manifest publish crash",
+                        ..
+                    })
+                ),
+                "{fault:?}"
+            );
+
+            let before_open = directory_bytes(directory.path())?;
+            let first = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+            let second = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+            assert_eq!(directory_bytes(directory.path())?, before_open, "{fault:?}");
+            assert_eq!(
+                first.loaded_manifest(),
+                second.loaded_manifest(),
+                "{fault:?}"
+            );
+            let expected_generation = match fault {
+                PublishCheckpoint::TempWritten
+                | PublishCheckpoint::TempSynced
+                | PublishCheckpoint::GenerationClaimed
+                | PublishCheckpoint::CurrentMovedToPrevious => 1,
+                PublishCheckpoint::TempMovedToCurrent | PublishCheckpoint::DirectorySynced => 2,
+            };
+            assert_eq!(
+                first.loaded_manifest().manifest.generation,
+                expected_generation,
+                "{fault:?}"
+            );
+            let expected_source = if fault == PublishCheckpoint::CurrentMovedToPrevious {
+                ManifestSource::PreviousAfterMissingCurrent
+            } else {
+                ManifestSource::Current
+            };
+            assert_eq!(first.loaded_manifest().source, expected_source, "{fault:?}");
+
+            let now = SystemTime::now()
+                .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+                .expect("test clock remains representable");
+            let report = collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?;
+            let temp_survived_fault = matches!(
+                fault,
+                PublishCheckpoint::TempWritten
+                    | PublishCheckpoint::TempSynced
+                    | PublishCheckpoint::GenerationClaimed
+                    | PublishCheckpoint::CurrentMovedToPrevious
+            );
+            assert_eq!(
+                report.removed,
+                if temp_survived_fault {
+                    vec![PathBuf::from(".tmp-manifest-2")]
+                } else {
+                    Vec::new()
+                },
+                "{fault:?}"
+            );
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+            assert_eq!(
+                reopened.loaded_manifest(),
+                first.loaded_manifest(),
+                "{fault:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn retry_reuses_byte_identical_temp_after_claim_failure() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let directory = tempdir().expect("temp directory");
@@ -2782,6 +4262,729 @@ mod tests {
                 .generation,
             1
         );
+    }
+
+    #[test]
+    fn keeper_create_is_create_or_open_and_in_memory_creates_no_files() {
+        let memory = KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("in-memory genesis");
+        assert_eq!(memory.directory(), None);
+        assert_eq!(memory.loaded_manifest().source, ManifestSource::InMemory);
+        assert_eq!(memory.loaded_manifest().manifest.generation, 1);
+        assert!(memory.segments().is_empty());
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempdir().expect("temp directory");
+            let directory = root.path().join("quill-index");
+            let created = KeeperSnapshot::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .expect("create genesis");
+            assert_eq!(created.directory(), Some(directory.as_path()));
+            assert_eq!(created.loaded_manifest().manifest.generation, 1);
+            let manifest_bytes = std::fs::read(directory.join("MANIFEST")).expect("manifest");
+
+            let reopened = KeeperSnapshot::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .expect("create-or-open existing index");
+            assert_eq!(reopened.loaded_manifest().manifest.generation, 1);
+            assert_eq!(
+                std::fs::read(directory.join("MANIFEST")).expect("manifest after reopen"),
+                manifest_bytes
+            );
+            assert!(matches!(
+                KeeperSnapshot::create(&cx, &directory, FSFS_CHUNK_SCHEMA).await,
+                Err(KeeperError::SchemaMismatch { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn recovered_snapshot_validates_witnesses_and_keeps_section_hashes_lazy() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_test_segment(0xabc, 10, 20, 1)?;
+        let postings = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::POSTINGS)
+            .expect("postings entry");
+        let postings_offset = usize::try_from(postings.offset)?;
+        let mut bytes = encoded.as_bytes().to_vec();
+        bytes[postings_offset] ^= 0x80;
+        std::fs::write(directory.path().join(canonical_segment_name(0xabc)), bytes)?;
+        let segment = ManifestSegment {
+            segment_id: 0xabc,
+            seal_seq: 1,
+            file_len: encoded.file_len(),
+            file_xxh3: encoded.file_xxh3(),
+            docid_lo: 10,
+            docid_hi: 20,
+            doc_count: 1,
+            tombstones: EMPTY_TOMBSTONES.to_vec(),
+        };
+        let manifest = durable_test_manifest(1, vec![segment]);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+        let before = directory_bytes(directory.path())?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert_eq!(snapshot.segments().len(), 1);
+        assert_eq!(
+            snapshot.segments()[0].section(SectionKind::TERMDICT)?,
+            Some(b"termdict".as_slice())
+        );
+        assert!(matches!(
+            snapshot.segments()[0].section(SectionKind::POSTINGS),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
+
+        let mut mismatched = manifest;
+        mismatched.segments[0].file_len += 1;
+        write_manifest(&directory.path().join("MANIFEST"), &mismatched)?;
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::SegmentMetadataMismatch { .. })
+        ));
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), FSFS_CHUNK_SCHEMA),
+            Err(KeeperError::SchemaMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_ignores_manifest_temp_and_rejects_incompatible_claim() -> TestResult {
+        let directory = tempdir()?;
+        let segment = write_test_segment(directory.path(), 0x11, 1, 0, 2)?;
+        let previous = durable_test_manifest(1, vec![segment]);
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        let temp = durable_test_manifest(2, Vec::new());
+        write_manifest(&directory.path().join(".tmp-manifest-2"), &temp)?;
+        let before = directory_bytes(directory.path())?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.loaded_manifest().source,
+            ManifestSource::PreviousAfterMissingCurrent
+        );
+        assert_eq!(snapshot.loaded_manifest().manifest.generation, 1);
+        assert_eq!(directory_bytes(directory.path())?, before);
+
+        std::fs::write(directory.path().join("gen-3.claim"), [])?;
+        assert!(matches!(
+            KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
+            Err(KeeperError::InvalidRecoveryClaim {
+                recovered: 1,
+                claimed: 3,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn deterministic_publish_crash_states_recover_read_only_and_gc_exactly() -> TestResult {
+        const CASES: [&str; 10] = [
+            "segment temp written",
+            "segment temp fsynced",
+            "segment renamed",
+            "segment directory fsynced",
+            "uncommitted sidecar emitted",
+            "manifest temp written",
+            "manifest temp fsynced",
+            "between manifest renames",
+            "new manifest current",
+            "committed sidecar emitted",
+        ];
+
+        for (case_index, label) in CASES.into_iter().enumerate() {
+            let directory = tempdir()?;
+            let segment_a = write_test_segment(directory.path(), 0xa, 1, 0, 2)?;
+            let segment_b_name = canonical_segment_name(0xb);
+            let segment_b = if case_index >= 2 {
+                Some(write_test_segment(directory.path(), 0xb, 2, 2, 4)?)
+            } else {
+                let encoded = encoded_test_segment(0xb, 2, 4, 1)?;
+                let temp_path = directory.path().join(".tmp-segment-000000000000000b");
+                std::fs::write(&temp_path, encoded.as_bytes())?;
+                if case_index == 1 {
+                    File::open(&temp_path)?.sync_all()?;
+                }
+                None
+            };
+
+            let previous = durable_test_manifest(1, vec![segment_a.clone()]);
+            if case_index == 7 {
+                write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+            } else if case_index >= 8 {
+                let current = durable_test_manifest(
+                    2,
+                    vec![segment_a.clone(), segment_b.clone().expect("segment B")],
+                );
+                write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+                write_manifest(&directory.path().join("MANIFEST"), &current)?;
+            } else {
+                write_manifest(&directory.path().join("MANIFEST"), &previous)?;
+            }
+
+            if matches!(case_index, 5..=7) {
+                let next = durable_test_manifest(
+                    2,
+                    vec![segment_a.clone(), segment_b.clone().expect("segment B")],
+                );
+                let temp_manifest = directory.path().join(".tmp-manifest-2");
+                write_manifest(&temp_manifest, &next)?;
+                if case_index == 6 {
+                    File::open(&temp_manifest)?.sync_all()?;
+                }
+            }
+            if case_index == 3 {
+                sync_directory(directory.path())?;
+            }
+            if case_index == 4 || case_index == 9 {
+                std::fs::write(
+                    directory.path().join(format!("{segment_b_name}.fec")),
+                    b"sidecar",
+                )?;
+            }
+
+            let before = directory_bytes(directory.path())?;
+            let first = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .unwrap_or_else(|error| panic!("{label}: first recovery failed: {error}"));
+            let second = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .unwrap_or_else(|error| panic!("{label}: second recovery failed: {error}"));
+            assert_eq!(first.loaded_manifest(), second.loaded_manifest(), "{label}");
+            assert_eq!(directory_bytes(directory.path())?, before, "{label}");
+            let expected_committed = if case_index >= 8 { 2 } else { 1 };
+            assert_eq!(first.segments().len(), expected_committed, "{label}");
+            for segment in first.segments() {
+                assert_eq!(
+                    segment.section(SectionKind::TERMDICT)?,
+                    Some(b"termdict".as_slice()),
+                    "{label}"
+                );
+            }
+
+            let now = SystemTime::now()
+                .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+                .expect("test clock remains representable");
+            let report = collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?;
+            let mut expected_removed = match case_index {
+                0 | 1 => vec![PathBuf::from(".tmp-segment-000000000000000b")],
+                2 | 3 => vec![PathBuf::from(&segment_b_name)],
+                4 => vec![
+                    PathBuf::from(&segment_b_name),
+                    PathBuf::from(format!("{segment_b_name}.fec")),
+                ],
+                5..=7 => vec![
+                    PathBuf::from(".tmp-manifest-2"),
+                    PathBuf::from(&segment_b_name),
+                ],
+                8 | 9 => Vec::new(),
+                _ => unreachable!(),
+            };
+            expected_removed.sort_unstable();
+            assert_eq!(report.removed, expected_removed, "{label}");
+
+            let mut expected_inventory = before;
+            expected_inventory.retain(|(name, _)| {
+                !report
+                    .removed
+                    .iter()
+                    .any(|removed| removed.as_os_str() == name)
+            });
+            assert_eq!(
+                directory_bytes(directory.path())?,
+                expected_inventory,
+                "{label}"
+            );
+            let reopened = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)
+                .unwrap_or_else(|error| panic!("{label}: post-GC recovery failed: {error}"));
+            assert_eq!(
+                reopened.loaded_manifest(),
+                first.loaded_manifest(),
+                "{label}"
+            );
+            assert_eq!(
+                collect_writer_garbage_at(
+                    directory.path(),
+                    DEFAULT_SCHEMA,
+                    GarbageCollectionOptions::default(),
+                    now,
+                )?,
+                GarbageCollectionReport {
+                    removed: Vec::new()
+                },
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn writer_gc_unions_both_slots_honors_grace_and_is_idempotent() -> TestResult {
+        let directory = tempdir()?;
+        let segment_a = write_test_segment(directory.path(), 0xa, 1, 0, 2)?;
+        let segment_b = write_test_segment(directory.path(), 0xb, 3, 2, 4)?;
+        let segment_c = write_test_segment(directory.path(), 0xc, 2, 4, 6)?;
+        let segment_e = write_test_segment(directory.path(), 0xe, 4, 6, 8)?;
+        let segment_f = write_test_segment(directory.path(), 0x10, 5, 8, 10)?;
+        let previous = durable_test_manifest(1, vec![segment_a.clone(), segment_c.clone()]);
+        let mut current = durable_test_manifest(2, vec![segment_a, segment_b]);
+        current.docid_high_watermark = previous.docid_high_watermark;
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&directory.path().join("MANIFEST"), &current)?;
+
+        std::fs::write(directory.path().join(".tmp-manifest-3"), b"uncommitted")?;
+        std::fs::write(
+            directory.path().join(format!(
+                "{}.fec",
+                canonical_segment_name(segment_e.segment_id)
+            )),
+            b"orphan sidecar",
+        )?;
+        let fresh_base = directory
+            .path()
+            .join(canonical_segment_name(segment_f.segment_id));
+        let old_sidecar_with_fresh_base = directory.path().join(format!(
+            "{}.fec",
+            canonical_segment_name(segment_f.segment_id)
+        ));
+        std::fs::write(&old_sidecar_with_fresh_base, b"sidecar older than base")?;
+        File::options().write(true).open(&fresh_base)?.set_times(
+            std::fs::FileTimes::new().set_modified(
+                SystemTime::now()
+                    .checked_add(Duration::from_secs(3_600))
+                    .expect("test clock remains representable"),
+            ),
+        )?;
+        std::fs::write(
+            directory.path().join(format!(
+                "{}.fec",
+                canonical_segment_name(segment_c.segment_id)
+            )),
+            b"previous sidecar",
+        )?;
+        std::fs::write(
+            directory.path().join("MANIFEST.fec"),
+            b"live manifest sidecar",
+        )?;
+        std::fs::write(directory.path().join("notes.fec"), b"user data")?;
+        std::fs::write(directory.path().join(".quarantine"), b"operator data")?;
+        let quarantine_name = format!("{}.quarantine", canonical_segment_name(0xf));
+        std::fs::write(
+            directory.path().join(&quarantine_name),
+            b"quarantined operator data",
+        )?;
+        std::fs::write(
+            directory.path().join("SEG-000000000000000f.fslx"),
+            b"user data",
+        )?;
+        std::fs::create_dir(directory.path().join(".tmp-directory"))?;
+
+        #[cfg(unix)]
+        let outside_fixture = {
+            use std::os::unix::ffi::OsStringExt;
+
+            let outside = tempdir()?;
+            let target = outside.path().join("outside-data");
+            std::fs::write(&target, b"outside")?;
+            std::os::unix::fs::symlink(
+                &target,
+                directory.path().join("seg-000000000000000f.fslx"),
+            )?;
+            std::os::unix::fs::symlink(&target, directory.path().join(".tmp-link"))?;
+            std::fs::write(
+                directory
+                    .path()
+                    .join(OsString::from_vec(b".tmp-nonutf8-\xff".to_vec())),
+                b"non-UTF-8 user data",
+            )?;
+
+            let before_open = directory_bytes(directory.path())?;
+            let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+            assert_eq!(directory_bytes(directory.path())?, before_open);
+            assert_eq!(snapshot.segments().len(), 2);
+            assert_eq!(std::fs::read(&target)?, b"outside");
+            (outside, target)
+        };
+
+        let fresh = collect_writer_garbage_under_lock(
+            directory.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions::default(),
+        )?;
+        assert!(
+            fresh.is_empty(),
+            "fresh garbage must survive the grace window"
+        );
+        assert!(
+            directory
+                .path()
+                .join(canonical_segment_name(segment_e.segment_id))
+                .exists()
+        );
+
+        std::fs::write(directory.path().join("gen-2.claim"), [])?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+        let report = collect_writer_garbage_at(
+            directory.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions::default(),
+            now,
+        )?;
+        let orphan_name = canonical_segment_name(segment_e.segment_id);
+        assert_eq!(
+            report.removed,
+            vec![
+                PathBuf::from(".tmp-manifest-3"),
+                PathBuf::from("gen-2.claim"),
+                PathBuf::from(&orphan_name),
+                PathBuf::from(format!("{orphan_name}.fec")),
+            ]
+        );
+        assert!(directory.path().join(canonical_segment_name(0xc)).exists());
+        assert!(fresh_base.exists());
+        assert!(old_sidecar_with_fresh_base.exists());
+        assert!(
+            directory
+                .path()
+                .join(format!("{}.fec", canonical_segment_name(0xc)))
+                .exists()
+        );
+        assert!(directory.path().join("notes.fec").exists());
+        assert!(directory.path().join(".quarantine").exists());
+        assert!(directory.path().join(&quarantine_name).exists());
+        assert!(directory.path().join("SEG-000000000000000f.fslx").exists());
+        assert!(directory.path().join(".tmp-directory").is_dir());
+        #[cfg(unix)]
+        {
+            assert!(directory.path().join(".tmp-link").is_symlink());
+            assert!(
+                directory
+                    .path()
+                    .join("seg-000000000000000f.fslx")
+                    .is_symlink()
+            );
+            use std::os::unix::ffi::OsStringExt;
+            assert!(
+                directory
+                    .path()
+                    .join(OsString::from_vec(b".tmp-nonutf8-\xff".to_vec()))
+                    .exists()
+            );
+            assert_eq!(std::fs::read(&outside_fixture.1)?, b"outside");
+        }
+        assert!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn future_claim_blocks_gc_before_any_deletion() -> TestResult {
+        let directory = tempdir()?;
+        write_manifest(
+            &directory.path().join("MANIFEST"),
+            &durable_test_manifest(2, Vec::new()),
+        )?;
+        std::fs::write(directory.path().join(".tmp-old"), b"must survive")?;
+        std::fs::write(directory.path().join("gen-3.claim"), [])?;
+        let before = directory_bytes(directory.path())?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            ),
+            Err(KeeperError::ClaimedGenerationPending {
+                current: 2,
+                claimed: 3,
+                ..
+            })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_claim_still_honors_the_gc_grace_period() -> TestResult {
+        let directory = tempdir()?;
+        write_manifest(
+            &directory.path().join("MANIFEST"),
+            &durable_test_manifest(2, Vec::new()),
+        )?;
+        std::fs::write(directory.path().join("gen-2.claim"), [])?;
+
+        assert!(
+            collect_writer_garbage_under_lock(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+            )?
+            .is_empty()
+        );
+        assert!(directory.path().join("gen-2.claim").exists());
+
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+        assert_eq!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .removed,
+            vec![PathBuf::from("gen-2.claim")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_claim_blocks_gc_before_any_deletion() -> TestResult {
+        let directory = tempdir()?;
+        write_manifest(
+            &directory.path().join("MANIFEST"),
+            &durable_test_manifest(2, Vec::new()),
+        )?;
+        std::fs::write(directory.path().join(".tmp-old"), b"must survive")?;
+        std::fs::create_dir(directory.path().join("gen-2.claim"))?;
+        let before = directory_bytes(directory.path())?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            ),
+            Err(KeeperError::InvalidClaimArtifact { .. })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert!(directory.path().join("gen-2.claim").is_dir());
+
+        let nonzero = tempdir()?;
+        write_manifest(
+            &nonzero.path().join("MANIFEST"),
+            &durable_test_manifest(2, Vec::new()),
+        )?;
+        std::fs::write(nonzero.path().join(".tmp-old"), b"must survive")?;
+        std::fs::write(nonzero.path().join("gen-2.claim"), b"not empty")?;
+        let before = directory_bytes(nonzero.path())?;
+        assert!(matches!(
+            collect_writer_garbage_at(
+                nonzero.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            ),
+            Err(KeeperError::InvalidClaimArtifact { .. })
+        ));
+        assert_eq!(directory_bytes(nonzero.path())?, before);
+
+        #[cfg(unix)]
+        {
+            let symlinked = tempdir()?;
+            write_manifest(
+                &symlinked.path().join("MANIFEST"),
+                &durable_test_manifest(2, Vec::new()),
+            )?;
+            std::fs::write(symlinked.path().join(".tmp-old"), b"must survive")?;
+            let target = symlinked.path().join("claim-target");
+            std::fs::write(&target, [])?;
+            std::os::unix::fs::symlink(&target, symlinked.path().join("gen-2.claim"))?;
+            let before = directory_bytes(symlinked.path())?;
+            assert!(matches!(
+                collect_writer_garbage_at(
+                    symlinked.path(),
+                    DEFAULT_SCHEMA,
+                    GarbageCollectionOptions::default(),
+                    now,
+                ),
+                Err(KeeperError::InvalidClaimArtifact { .. })
+            ));
+            assert_eq!(directory_bytes(symlinked.path())?, before);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_rejects_symlinked_directory_alias_without_touching_target() -> TestResult {
+        let target = tempdir()?;
+        std::fs::write(target.path().join(".tmp-old"), b"must survive")?;
+        let alias_root = tempdir()?;
+        let alias = alias_root.path().join("index-alias");
+        std::os::unix::fs::symlink(target.path(), &alias)?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+
+        assert!(matches!(
+            collect_abandoned_genesis_garbage_at(&alias, GarbageCollectionOptions::default(), now,),
+            Err(KeeperError::Io {
+                operation: "open no-follow garbage-collection directory",
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(target.path().join(".tmp-old"))?,
+            b"must survive"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn genesis_gc_requires_absent_slots_and_no_pending_claim() -> TestResult {
+        let directory = tempdir()?;
+        let segment = write_test_segment(directory.path(), 0x44, 1, 0, 2)?;
+        write_manifest(
+            &directory.path().join(".tmp-manifest-1"),
+            &durable_test_manifest(1, vec![segment.clone()]),
+        )?;
+        std::fs::write(directory.path().join(".tmp-write-buffer"), b"uncommitted")?;
+        std::fs::write(directory.path().join("MANIFEST.fec"), b"orphan sidecar")?;
+        std::fs::write(directory.path().join("notes"), b"operator data")?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+
+        let report = collect_abandoned_genesis_garbage_at(
+            directory.path(),
+            GarbageCollectionOptions::default(),
+            now,
+        )?;
+        let segment_name = canonical_segment_name(segment.segment_id);
+        assert_eq!(
+            report.removed,
+            vec![
+                PathBuf::from(".tmp-manifest-1"),
+                PathBuf::from(".tmp-write-buffer"),
+                PathBuf::from("MANIFEST.fec"),
+                PathBuf::from(segment_name),
+            ]
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("notes"))?,
+            b"operator data"
+        );
+        assert!(
+            collect_abandoned_genesis_garbage_at(
+                directory.path(),
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .is_empty()
+        );
+
+        let claimed = tempdir()?;
+        std::fs::write(claimed.path().join(".tmp-manifest-1"), b"must survive")?;
+        std::fs::write(claimed.path().join("gen-1.claim"), [])?;
+        let before = directory_bytes(claimed.path())?;
+        assert!(matches!(
+            collect_abandoned_genesis_garbage_at(
+                claimed.path(),
+                GarbageCollectionOptions::default(),
+                now,
+            ),
+            Err(KeeperError::ClaimedGenerationPending {
+                current: 0,
+                claimed: 1,
+                ..
+            })
+        ));
+        assert_eq!(directory_bytes(claimed.path())?, before);
+
+        let corrupt = tempdir()?;
+        std::fs::write(corrupt.path().join("MANIFEST"), b"corrupt")?;
+        std::fs::write(corrupt.path().join(".tmp-old"), b"must survive")?;
+        let before = directory_bytes(corrupt.path())?;
+        assert!(matches!(
+            collect_abandoned_genesis_garbage_at(
+                corrupt.path(),
+                GarbageCollectionOptions::default(),
+                now,
+            ),
+            Err(KeeperError::ManifestCorrupted { .. })
+        ));
+        assert_eq!(directory_bytes(corrupt.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_writer_recovery_never_collects_and_path_guard_rejects_escape() -> TestResult {
+        let directory = tempdir()?;
+        let missing = ManifestSegment {
+            segment_id: 0xdead,
+            seal_seq: 1,
+            file_len: 100,
+            file_xxh3: 7,
+            docid_lo: 0,
+            docid_hi: 2,
+            doc_count: 1,
+            tombstones: EMPTY_TOMBSTONES.to_vec(),
+        };
+        write_manifest(
+            &directory.path().join("MANIFEST"),
+            &durable_test_manifest(1, vec![missing]),
+        )?;
+        std::fs::write(directory.path().join(".tmp-old"), b"must survive")?;
+        let before = directory_bytes(directory.path())?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            ),
+            Err(KeeperError::SegmentOpen { .. })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+
+        for unsafe_path in [
+            Path::new("../outside"),
+            Path::new("nested/file"),
+            Path::new("/absolute"),
+        ] {
+            assert!(matches!(
+                safe_direct_child(directory.path(), unsafe_path),
+                Err(KeeperError::UnsafeGarbagePath { .. })
+            ));
+        }
+        assert_eq!(
+            safe_direct_child(directory.path(), Path::new(".tmp-owned"))?,
+            directory.path().join(".tmp-owned")
+        );
+        assert!(classify_garbage_candidate(OsStr::new("notes.fec")).is_none());
+        assert!(classify_garbage_candidate(OsStr::new("SEG-0000000000000001.fslx")).is_none());
+        assert!(
+            classify_garbage_candidate(OsStr::new("seg-0000000000000001.fslx.fec.tmp")).is_none()
+        );
+        Ok(())
     }
 
     fn hex_bytes(source: &str) -> Vec<u8> {
