@@ -8,8 +8,9 @@
 //! dimension as JSON. Since format v2 the native `hnsw_rs` graph is also
 //! persisted next to it as `vector.fast.hnsw.graph` + `vector.fast.hnsw.data`,
 //! so `load()` deserializes the prebuilt graph directly instead of rebuilding
-//! it from vectors. Legacy v1 sidecars (metadata only) and any load failure
-//! fall back to the rebuild-from-`VectorIndex` path.
+//! it from vectors. Format v4 fingerprints every live source vector so a stale
+//! graph cannot survive an unsampled vector change. Legacy sidecars and any
+//! load failure fall back to the rebuild-from-`VectorIndex` path.
 
 use std::path::Path;
 use std::time::Instant;
@@ -56,10 +57,10 @@ impl Default for HnswConfig {
 
 /// Current on-disk metadata format. v2 added the native graph sidecars
 /// (`*.hnsw.graph` + `*.hnsw.data`) alongside the JSON metadata; v3 records
-/// graphs built with the dimension-aware `DistDot` roundoff budget. Older native
-/// graphs contain vectors normalized with a different scale and must be rebuilt
-/// so returned cosine scores can be corrected exactly.
-const HNSW_META_FORMAT_CURRENT: u32 = 3;
+/// graphs built with the dimension-aware `DistDot` roundoff budget; v4 replaces
+/// the sampled source fingerprint with a digest of every live vector. Older
+/// native graphs must be rebuilt under the current persistence contract.
+const HNSW_META_FORMAT_CURRENT: u32 = 4;
 
 // Keep the classical gamma_k floating-point error model in its well-conditioned
 // region. With u = f32::EPSILON / 2 and k = 8n + 32, this cap is exactly the
@@ -82,14 +83,14 @@ struct HnswMeta {
     config: HnswConfig,
     dimension: usize,
     /// Deterministic fingerprint of the vectors the persisted graph was built
-    /// from (FNV-1a 64 over sampled f32 vector bytes; see
-    /// [`fingerprint_vectors_from_index`]). Lets native-graph load detect "doc IDs match
+    /// from (FNV-1a 64 over every live f32 vector; see [`fingerprint_vectors`]).
+    /// Lets native-graph load detect "doc IDs match
     /// but the underlying vectors were silently swapped" and fall back to a
     /// rebuild rather than serve stale ANN hits.
     ///
-    /// Absent in legacy v1 metadata (deserializes to 0). A stored value of 0
-    /// also disables fingerprint enforcement, so native sidecars produced before
-    /// this field existed (none yet shipped) keep loading.
+    /// Absent in legacy metadata (deserializes to 0). Legacy formats rebuild
+    /// before the native fast path; current-format sidecars compare 0 like any
+    /// other fingerprint and therefore cannot use omission to bypass validation.
     #[serde(default)]
     vector_fingerprint: u64,
 }
@@ -191,7 +192,7 @@ impl HnswIndex {
             ));
         }
 
-        // Validate before the native fast path. Otherwise a forged v3 sidecar
+        // Validate before the native fast path. Otherwise a forged current-format sidecar
         // could bypass the dimension bound enforced by graph construction.
         dist_dot_budget(meta.dimension)?;
 
@@ -209,7 +210,7 @@ impl HnswIndex {
                 path = %path.display(),
                 format_version = meta.format_version,
                 current_format_version = HNSW_META_FORMAT_CURRENT,
-                "rebuilding HNSW sidecar written with a different vector-normalization contract; \
+                "rebuilding HNSW sidecar written with a different persistence contract; \
                  re-save to skip rebuild on the next cold load"
             );
         }
@@ -269,24 +270,20 @@ impl HnswIndex {
         // This is the critical stale-vectors guard: if a caller swaps the FSVI
         // contents while keeping the same doc IDs in the same order, the
         // persisted graph would otherwise silently serve hits against vectors
-        // that no longer exist. A fingerprint of 0 means the sidecar was
-        // written before fingerprint enforcement existed — accept it (no native
-        // sidecars without a fingerprint have ever shipped to users today, but
-        // future-proof the field default just like format_version).
-        if meta.vector_fingerprint != 0 {
-            let live_fp =
-                fingerprint_live_vector_index(source_index, meta.doc_ids.len(), meta.dimension)
-                    .ok()?;
-            if live_fp != meta.vector_fingerprint {
-                tracing::warn!(
-                    path = %path.display(),
-                    expected = meta.vector_fingerprint,
-                    actual = live_fp,
-                    "HNSW sidecar vector fingerprint disagrees with live VectorIndex \
-                     (vectors swapped behind matching doc ids); rebuilding"
-                );
-                return None;
-            }
+        // that no longer exist. `try_load_native_graph` is only called for the
+        // current format, so a missing fingerprint cannot be treated as a
+        // legacy exception: 0 is compared like any other digest value.
+        let live_fp =
+            fingerprint_live_vector_index(source_index, meta.doc_ids.len(), meta.dimension).ok()?;
+        if live_fp != meta.vector_fingerprint {
+            tracing::warn!(
+                path = %path.display(),
+                expected = meta.vector_fingerprint,
+                actual = live_fp,
+                "HNSW sidecar vector fingerprint disagrees with live VectorIndex \
+                 (vectors swapped behind matching doc ids); rebuilding"
+            );
+            return None;
         }
 
         // `HnswIo::load_hnsw` returns an `Hnsw` borrowed from the `HnswIo`
@@ -688,14 +685,6 @@ fn hnsw_sidecar_basename(path: &Path) -> SearchResult<String> {
         .ok_or_else(|| ann_corrupted(path, "ANN sidecar path has no usable file stem"))
 }
 
-/// Number of evenly-spaced vector samples drawn into the persistence
-/// fingerprint. Caps fingerprint cost at O(SAMPLES · dim) bytes hashed even on
-/// 390K-vector indexes, while still catching any localized vector swap because
-/// stride-based sampling will cover the whole index. Doc IDs are mixed in
-/// separately for every record (the cheap part), so a doc-id permutation is
-/// always caught regardless of how many vectors are sampled.
-const FINGERPRINT_VECTOR_SAMPLE_TARGET: usize = 256;
-
 /// FNV-1a 64-bit. Chosen because it is deterministic across processes (unlike
 /// `ahash`) and stdlib (`DefaultHasher` is randomized + deprecated for
 /// persistence), keeps the fingerprint dependency-free, and is plenty for an
@@ -727,37 +716,19 @@ fn fnv1a_update_f32(mut h: u64, vec: &[f32]) -> u64 {
 /// Compute the persistence fingerprint from the (raw, un-normalized) vectors
 /// and doc IDs used to build the graph.
 ///
-/// Stride-samples vectors so the cost stays bounded for large indexes (~256
-/// samples regardless of corpus size). Doc IDs are mixed in for every record,
-/// so doc-id permutations are caught even on un-sampled rows. The output is
-/// stored in the native metadata sidecar and re-derived at load time by
-/// [`fingerprint_live_vector_index`] against the live `VectorIndex`; a
-/// mismatch means "doc IDs match but the underlying vector bytes were
-/// silently swapped" → reject the persisted graph.
+/// Every vector contributes in live-row order. Doc IDs are mixed in alongside
+/// their vectors, so either a vector edit or a doc-id permutation changes the
+/// digest. The output is stored in the native metadata sidecar and re-derived
+/// at load time by [`fingerprint_live_vector_index`] against the live
+/// `VectorIndex`; a mismatch means "doc IDs match but the underlying vector
+/// bytes were silently swapped" → reject the persisted graph.
 fn fingerprint_vectors(doc_ids: &[String], vectors: &[Vec<f32>]) -> u64 {
     // Mix length so a truncated-but-prefix-matching index doesn't collide.
     let mut h = fnv1a_update(FNV_OFFSET_BASIS_64, &(doc_ids.len() as u64).to_le_bytes());
-    if vectors.is_empty() {
-        return h;
-    }
-
-    let stride = vectors
-        .len()
-        .div_ceil(FINGERPRINT_VECTOR_SAMPLE_TARGET)
-        .max(1);
-    for (i, doc_id) in doc_ids.iter().enumerate() {
-        // Every doc id contributes — cheap and catches doc-id permutations
-        // even on the un-sampled records.
+    for (i, (doc_id, vector)) in doc_ids.iter().zip(vectors).enumerate() {
         h = fnv1a_update(h, &(i as u64).to_le_bytes());
         h = fnv1a_update(h, doc_id.as_bytes());
-
-        // Sample raw vector bytes. We always include index 0 and the final
-        // index (stride covers 0 by construction; force-include the last so
-        // truncations are noticed even when len % stride == 1).
-        let sampled = i == 0 || i % stride == 0 || i == vectors.len() - 1;
-        if sampled {
-            h = fnv1a_update_f32(h, &vectors[i]);
-        }
+        h = fnv1a_update_f32(h, vector);
     }
     h
 }
@@ -779,9 +750,6 @@ fn fingerprint_live_vector_index(
     // Walk live records (tombstones excluded), in row order — same iteration
     // order as `build_from_vector_index`.
     let mut live_idx = 0_usize;
-    let stride = expected_len
-        .div_ceil(FINGERPRINT_VECTOR_SAMPLE_TARGET)
-        .max(1);
     for raw in 0..index.record_count() {
         if index.is_deleted(raw) {
             continue;
@@ -794,16 +762,13 @@ fn fingerprint_live_vector_index(
         h = fnv1a_update(h, &(live_idx as u64).to_le_bytes());
         h = fnv1a_update(h, doc_id.as_bytes());
 
-        let sampled = live_idx == 0 || live_idx % stride == 0 || live_idx + 1 == expected_len;
-        if sampled {
-            let vec = index.vector_at_f32(raw)?;
-            if vec.len() != expected_dim {
-                // Dimension drift — perturb the digest so the caller rejects
-                // and rebuilds rather than asserting.
-                return Ok(h.wrapping_add(1));
-            }
-            h = fnv1a_update_f32(h, &vec);
+        let vec = index.vector_at_f32(raw)?;
+        if vec.len() != expected_dim {
+            // Dimension drift — perturb the digest so the caller rejects and
+            // rebuilds rather than asserting.
+            return Ok(h.wrapping_add(1));
         }
+        h = fnv1a_update_f32(h, &vec);
         live_idx += 1;
     }
     Ok(h)
@@ -1852,39 +1817,117 @@ mod tests {
     }
 
     #[test]
-    fn load_never_treats_v2_native_graph_as_v3() {
+    fn load_never_treats_v3_native_graph_as_v4() {
         // The source index says doc-0000 is e0 and doc-0001 is e1.
-        let source_path = temp_path("persist_v2_source", "fsvi");
+        let source_path = temp_path("persist_v3_source", "fsvi");
         let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
             .expect("source index");
 
         // Build a valid native graph with the same document IDs but the two
-        // vectors swapped, then mark its metadata as v2 and disable the vector
-        // fingerprint. If load accepts v2 as current, an e0 query returns
-        // doc-0001. Correct v3-only loading rebuilds from source and returns
-        // doc-0000.
-        let swapped_path = temp_path("persist_v2_swapped", "fsvi");
+        // vectors swapped, then mark its metadata as v3 and disable the vector
+        // fingerprint so the format boundary is the sole guard. If load accepts
+        // v3 as current, an e0 query returns doc-0001. Correct v4-only loading
+        // rebuilds from source and returns doc-0000.
+        let swapped_path = temp_path("persist_v3_swapped", "fsvi");
         let swapped_index = write_index(&swapped_path, &[vec![0.0_f32, 1.0], vec![1.0_f32, 0.0]])
             .expect("swapped index");
         let swapped_ann = HnswIndex::build_from_vector_index(&swapped_index, HnswConfig::default())
             .expect("swapped ann");
-        let save_path = temp_path("persist_v2_native", "hnsw");
+        let save_path = temp_path("persist_v3_native", "hnsw");
         swapped_ann.save(&save_path).expect("save native graph");
 
         let mut meta: HnswMeta =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
-        meta.format_version = 2;
+        meta.format_version = 3;
         meta.vector_fingerprint = 0;
-        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v2"))
-            .expect("write v2 metadata");
+        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v3"))
+            .expect("write v3 metadata");
 
-        let loaded = HnswIndex::load(&save_path, &source_index).expect("rebuild v2");
+        let loaded = HnswIndex::load(&save_path, &source_index).expect("rebuild v3");
         let hits = loaded
             .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
             .expect("search rebuilt graph");
         assert_eq!(
             hits[0].doc_id, "doc-0000",
-            "v2 native graph must be rebuilt, never deserialized under v3's scaling contract"
+            "v3 sampled-fingerprint graph must be rebuilt under v4's full fingerprint contract"
+        );
+    }
+
+    #[test]
+    fn load_rejects_current_sidecar_with_missing_vector_fingerprint() {
+        let source_path = temp_path("persist_missing_fp_source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+
+        // Persist a current-format native graph whose vectors are swapped
+        // behind the same document IDs, then remove only its fingerprint field.
+        // Treating the serde default of 0 as an opt-out would admit this stale
+        // graph and make an e0 query return doc-0001.
+        let swapped_path = temp_path("persist_missing_fp_swapped", "fsvi");
+        let swapped_index = write_index(&swapped_path, &[vec![0.0_f32, 1.0], vec![1.0_f32, 0.0]])
+            .expect("swapped index");
+        let swapped_ann = HnswIndex::build_from_vector_index(&swapped_index, HnswConfig::default())
+            .expect("swapped ann");
+        let save_path = temp_path("persist_missing_fp_native", "hnsw");
+        swapped_ann.save(&save_path).expect("save native graph");
+
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
+        value
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("vector_fingerprint");
+        std::fs::write(
+            &save_path,
+            serde_json::to_vec(&value).expect("serialize metadata without fingerprint"),
+        )
+        .expect("write metadata without fingerprint");
+
+        let loaded = HnswIndex::load(&save_path, &source_index)
+            .expect("missing fingerprint must rebuild from source");
+        let hits = loaded
+            .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search rebuilt graph");
+        assert_eq!(
+            hits[0].doc_id, "doc-0000",
+            "current-format metadata cannot omit its vector fingerprint to admit a stale graph"
+        );
+    }
+
+    #[test]
+    fn load_rejects_native_sidecar_when_previously_unsampled_vector_changes() {
+        // With 300 rows, the v3 fingerprint's ceil(300 / 256) stride was 2.
+        // Row 1 was therefore neither an even-stride sample nor the final row.
+        const VECTOR_COUNT: usize = 300;
+        let source_path = temp_path("persist_unsampled_source", "fsvi");
+        let original_vectors: Vec<Vec<f32>> = (0..VECTOR_COUNT)
+            .map(|i| normalized_vector(i, 32))
+            .collect();
+        let source_index = write_index(&source_path, &original_vectors).expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("build original graph");
+        let save_path = temp_path("persist_unsampled_native", "hnsw");
+        ann.save(&save_path).expect("save native graph");
+
+        // Keep the document IDs, count, and dimension identical while changing
+        // only the old scheme's unsampled row. Negating the original unit
+        // vector makes doc-0001 the worst possible match in the stale graph and
+        // the exact match after a rebuild, keeping the result proof decisive.
+        let changed_vector: Vec<f32> = original_vectors[1].iter().map(|value| -*value).collect();
+        let mut changed_vectors = original_vectors;
+        changed_vectors[1].clone_from(&changed_vector);
+        let changed_path = temp_path("persist_unsampled_changed", "fsvi");
+        let changed_index = write_index(&changed_path, &changed_vectors).expect("changed index");
+
+        let loaded = HnswIndex::load(&save_path, &changed_index)
+            .expect("fingerprint mismatch must rebuild from changed source");
+        let hits = loaded
+            .knn_search(&changed_vector, 1, VECTOR_COUNT)
+            .expect("search rebuilt graph");
+        assert_eq!(
+            hits[0].doc_id, "doc-0001",
+            "every live vector must affect persisted source identity; otherwise the stale v3 \
+             graph survives a change to row 1"
         );
     }
 
