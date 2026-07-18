@@ -6996,6 +6996,594 @@ fn put_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
+// ============================================================================
+// Blue-green engine directories and the CURRENT pointer (registry §7.3, bead
+// bd-quill-duel-blue-green-vwf7).
+//
+// Versioned sibling engine directories (`quill-v1/`, `tantivy/`) sit one level
+// below a lexical root; a tiny `CURRENT` pointer file in that root names the
+// active engine directory. Publication reuses the MANIFEST temp+rename+dir-
+// fsync discipline one level up, so the G3 flip and every rebuild are single
+// atomic pointer swaps with rollback being the same swap in reverse. The
+// retired engine directory is preserved untouched until a human-approved
+// retirement sweep (e9.3), keeping RULE-1 intact by construction.
+// ============================================================================
+
+/// Eight-byte CURRENT magic, including its trailing NUL.
+pub const CURRENT_MAGIC: [u8; 8] = *b"FSLXCUR\0";
+/// Current durable CURRENT-pointer format version.
+pub const CURRENT_FORMAT_VERSION: u32 = 1;
+/// Canonical CURRENT pointer file name in the lexical root.
+pub const CURRENT_FILE_NAME: &str = "CURRENT";
+/// Index format version recorded for pre-FSLX (tantivy) engine directories.
+pub const TANTIVY_INDEX_FORMAT_VERSION: u32 = 0;
+/// Encoded length excluding the variable directory-name bytes.
+const CURRENT_FIXED_BYTES: usize = 8 + 4 + 1 + 2 + 4 + 4;
+/// Maximum accepted CURRENT pointer length (name bounded by its `u16` field).
+const MAX_CURRENT_BYTES: usize = CURRENT_FIXED_BYTES + 65_535;
+/// Bound on temp-name collisions tolerated from one publisher.
+const CURRENT_TEMP_COLLISION_LIMIT: u32 = 128;
+
+/// Engine family recorded in a CURRENT pointer (registry §7.3 kind codes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlueGreenEngine {
+    /// Quill FSLX engine directory (kind code 1).
+    Quill,
+    /// Legacy tantivy engine directory (kind code 2).
+    Tantivy,
+}
+
+impl BlueGreenEngine {
+    /// Stable human label used in errors and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Quill => "quill",
+            Self::Tantivy => "tantivy",
+        }
+    }
+
+    /// Registry §7.3 wire code.
+    #[must_use]
+    pub const fn kind_code(self) -> u8 {
+        match self {
+            Self::Quill => 1,
+            Self::Tantivy => 2,
+        }
+    }
+
+    fn from_kind_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Quill),
+            2 => Some(Self::Tantivy),
+            _ => None,
+        }
+    }
+
+    /// Marker file whose presence identifies an engine directory of this kind
+    /// during migration-adoption scans.
+    const fn adoption_marker(self) -> &'static str {
+        match self {
+            Self::Quill => "MANIFEST",
+            Self::Tantivy => "meta.json",
+        }
+    }
+
+    /// Index format version recorded when adopting a directory of this kind.
+    const fn adopted_format_version(self) -> u32 {
+        match self {
+            Self::Quill => crate::segment::FSLX_FORMAT_VERSION,
+            Self::Tantivy => TANTIVY_INDEX_FORMAT_VERSION,
+        }
+    }
+}
+
+/// Decoded CURRENT pointer payload (registry §7.3).
+///
+/// Instances are always validated: construction and decoding reject empty,
+/// over-long, non-UTF-8, or path-unsafe directory names, so a pointer can
+/// never name anything but a plain direct child of its lexical root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentPointer {
+    engine: BlueGreenEngine,
+    dir_name: String,
+    index_format_version: u32,
+}
+
+impl CurrentPointer {
+    /// Construct a validated pointer to `dir_name` under a lexical root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurrentPointerError`] for an empty, over-long, or path-unsafe
+    /// directory name.
+    pub fn new(
+        engine: BlueGreenEngine,
+        dir_name: impl Into<String>,
+        index_format_version: u32,
+    ) -> Result<Self, CurrentPointerError> {
+        let dir_name = dir_name.into();
+        validate_current_dir_name(&dir_name)?;
+        Ok(Self {
+            engine,
+            dir_name,
+            index_format_version,
+        })
+    }
+
+    /// Engine family of the active directory.
+    #[must_use]
+    pub const fn engine(&self) -> BlueGreenEngine {
+        self.engine
+    }
+
+    /// Plain directory name (never a path) of the active engine directory.
+    #[must_use]
+    pub fn dir_name(&self) -> &str {
+        &self.dir_name
+    }
+
+    /// Format version of the named engine directory's index format.
+    #[must_use]
+    pub const fn index_format_version(&self) -> u32 {
+        self.index_format_version
+    }
+
+    /// Absolute engine directory for a lexical root.
+    #[must_use]
+    pub fn engine_dir(&self, lexical_root: &Path) -> PathBuf {
+        lexical_root.join(&self.dir_name)
+    }
+
+    /// Encode with the registry §7.3 layout: magic, format version, engine
+    /// kind, `u16` name length, name bytes, index format version, CRC32.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let name_bytes = self.dir_name.as_bytes();
+        let mut bytes = Vec::with_capacity(CURRENT_FIXED_BYTES + name_bytes.len());
+        bytes.extend_from_slice(&CURRENT_MAGIC);
+        put_u32(&mut bytes, CURRENT_FORMAT_VERSION);
+        bytes.push(self.engine.kind_code());
+        #[allow(clippy::cast_possible_truncation)]
+        put_u16(&mut bytes, name_bytes.len() as u16);
+        bytes.extend_from_slice(name_bytes);
+        put_u32(&mut bytes, self.index_format_version);
+        let checksum = crc32fast::hash(&bytes);
+        put_u32(&mut bytes, checksum);
+        bytes
+    }
+
+    /// Decode and fully validate one CURRENT pointer image.
+    ///
+    /// The CRC covers every byte before the trailer; content fields are only
+    /// interpreted after the checksum verifies, so corruption fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CurrentPointerError`] for truncation, bad magic, checksum
+    /// mismatch, unknown versions or kind codes, trailing bytes, or an
+    /// invalid directory name.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CurrentPointerError> {
+        if bytes.len() < CURRENT_FIXED_BYTES {
+            return Err(CurrentPointerError::Truncated {
+                actual: bytes.len(),
+                minimum: CURRENT_FIXED_BYTES,
+            });
+        }
+        if bytes.len() > MAX_CURRENT_BYTES {
+            return Err(CurrentPointerError::LengthMismatch {
+                detail: format!(
+                    "CURRENT pointer length {} exceeds {MAX_CURRENT_BYTES}",
+                    bytes.len()
+                ),
+            });
+        }
+        if bytes[..CURRENT_MAGIC.len()] != CURRENT_MAGIC {
+            return Err(CurrentPointerError::BadMagic);
+        }
+        let body_len = bytes.len() - 4;
+        let expected_crc = crc32fast::hash(&bytes[..body_len]);
+        let actual_crc = u32::from_le_bytes(bytes[body_len..].try_into().map_err(|_| {
+            CurrentPointerError::Truncated {
+                actual: bytes.len(),
+                minimum: CURRENT_FIXED_BYTES,
+            }
+        })?);
+        if actual_crc != expected_crc {
+            return Err(CurrentPointerError::CrcMismatch {
+                expected_crc,
+                actual_crc,
+            });
+        }
+        let mut cursor = ByteCursor::new(&bytes[CURRENT_MAGIC.len()..body_len]);
+        let layout_error = |_| CurrentPointerError::LengthMismatch {
+            detail: "CURRENT pointer body shorter than its declared layout".to_owned(),
+        };
+        let format_version = cursor.u32().map_err(layout_error)?;
+        if format_version != CURRENT_FORMAT_VERSION {
+            return Err(CurrentPointerError::UnsupportedFormatVersion(
+                format_version,
+            ));
+        }
+        let kind_code = cursor.u8().map_err(layout_error)?;
+        let engine = BlueGreenEngine::from_kind_code(kind_code)
+            .ok_or(CurrentPointerError::UnknownEngineKind(kind_code))?;
+        let name_len = usize::from(cursor.u16().map_err(layout_error)?);
+        if cursor.remaining() != name_len + 4 {
+            return Err(CurrentPointerError::LengthMismatch {
+                detail: format!(
+                    "declared name length {name_len} leaves {} bytes, expected name plus index format version",
+                    cursor.remaining()
+                ),
+            });
+        }
+        let name_bytes = cursor.take(name_len).map_err(layout_error)?;
+        let dir_name = std::str::from_utf8(name_bytes)
+            .map_err(|_| CurrentPointerError::DirNameNotUtf8)?
+            .to_owned();
+        validate_current_dir_name(&dir_name)?;
+        let index_format_version = cursor.u32().map_err(layout_error)?;
+        Ok(Self {
+            engine,
+            dir_name,
+            index_format_version,
+        })
+    }
+}
+
+/// Validate that `dir_name` names exactly one plain directory entry.
+fn validate_current_dir_name(dir_name: &str) -> Result<(), CurrentPointerError> {
+    if dir_name.is_empty() {
+        return Err(CurrentPointerError::EmptyDirName);
+    }
+    if dir_name.len() > 65_535 {
+        return Err(CurrentPointerError::DirNameTooLong {
+            actual: dir_name.len(),
+        });
+    }
+    if dir_name.contains(['\\', '\0']) {
+        return Err(CurrentPointerError::UnsafeDirName {
+            dir_name: dir_name.to_owned(),
+        });
+    }
+    let mut components = Path::new(dir_name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(CurrentPointerError::UnsafeDirName {
+            dir_name: dir_name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Typed CURRENT pointer failures (codec, publication, and resolution).
+#[derive(Debug, Error)]
+pub enum CurrentPointerError {
+    /// Fewer bytes than the fixed pointer layout requires.
+    #[error("CURRENT pointer is truncated: {actual} bytes, minimum {minimum}")]
+    Truncated {
+        /// Bytes actually present.
+        actual: usize,
+        /// Fixed-layout minimum.
+        minimum: usize,
+    },
+    /// The eight-byte magic did not match `FSLXCUR\0`.
+    #[error("CURRENT pointer magic mismatch")]
+    BadMagic,
+    /// Reader predates the pointer's format version.
+    #[error(
+        "CURRENT pointer format version {0} is unsupported (reader knows {CURRENT_FORMAT_VERSION})"
+    )]
+    UnsupportedFormatVersion(u32),
+    /// Engine kind byte matches no registry entry.
+    #[error("CURRENT pointer engine kind code {0} is unknown")]
+    UnknownEngineKind(u8),
+    /// Declared and actual field lengths disagree.
+    #[error("CURRENT pointer length mismatch: {detail}")]
+    LengthMismatch {
+        /// Stable mismatch description.
+        detail: String,
+    },
+    /// CRC32 over the body did not match the trailer.
+    #[error(
+        "CURRENT pointer CRC mismatch: computed {expected_crc:#010x}, stored {actual_crc:#010x}"
+    )]
+    CrcMismatch {
+        /// CRC32 computed over the received body.
+        expected_crc: u32,
+        /// CRC32 stored in the trailer.
+        actual_crc: u32,
+    },
+    /// Directory name is zero-length.
+    #[error("CURRENT pointer directory name is empty")]
+    EmptyDirName,
+    /// Directory name exceeds its `u16` length field.
+    #[error("CURRENT pointer directory name is {actual} bytes, exceeding u16")]
+    DirNameTooLong {
+        /// Actual name byte length.
+        actual: usize,
+    },
+    /// Directory name bytes are not UTF-8.
+    #[error("CURRENT pointer directory name is not valid UTF-8")]
+    DirNameNotUtf8,
+    /// Directory name is not one plain relative path component.
+    #[error("CURRENT pointer directory name {dir_name:?} is not a plain direct child name")]
+    UnsafeDirName {
+        /// Rejected name.
+        dir_name: String,
+    },
+    /// CURRENT names an engine directory that does not exist.
+    #[error(
+        "CURRENT pointer names {dir_name:?} under {root}, but that {engine} engine directory is missing; run fsfs doctor"
+    )]
+    MissingEngineDir {
+        /// Lexical root containing the pointer.
+        root: PathBuf,
+        /// Named engine directory.
+        dir_name: String,
+        /// Engine family the pointer recorded.
+        engine: &'static str,
+    },
+    /// No CURRENT and several candidate engine directories: refusing to guess.
+    #[error(
+        "lexical root {root} has no CURRENT pointer and multiple engine directories {candidates:?}; run fsfs doctor to choose one"
+    )]
+    AmbiguousEngineDirs {
+        /// Lexical root scanned.
+        root: PathBuf,
+        /// Sorted candidate directory names.
+        candidates: Vec<String>,
+    },
+    /// Underlying filesystem failure.
+    #[error("CURRENT pointer I/O during {operation} at {path}: {source}")]
+    Io {
+        /// Stable operation label.
+        operation: &'static str,
+        /// Path being operated on.
+        path: PathBuf,
+        /// Original error.
+        source: io::Error,
+    },
+}
+
+impl From<CurrentPointerError> for QuillError {
+    fn from(error: CurrentPointerError) -> Self {
+        match error {
+            CurrentPointerError::Io { source, .. } => Self::Io(source),
+            other => Self::Invariant {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+/// Publish `pointer` as the lexical root's CURRENT with the MANIFEST
+/// temp+rename+dir-fsync discipline (registry §7.3, §6.2).
+///
+/// A unique `.tmp-current-<pid>-<n>` sibling is created `O_EXCL`, fully
+/// written and fsynced, atomically renamed over `CURRENT`, and sealed with a
+/// directory fsync. A crash anywhere before the rename leaves only an inert
+/// temp that resolution ignores; the rename itself is the single atomic
+/// transition, so flip and rollback are both one swap. Republishing identical
+/// content is safe. Stale temps are intentionally left in place: they are
+/// tiny, self-describing crash witnesses, and their retirement rides with the
+/// flip orchestration layer's human-approved sweep.
+///
+/// # Errors
+///
+/// Returns [`CurrentPointerError::Io`] for temp creation, write, fsync,
+/// rename, or directory-fsync failures. On non-Unix targets the directory
+/// fsync gate fails closed, matching MANIFEST publication.
+pub fn publish_current(
+    lexical_root: &Path,
+    pointer: &CurrentPointer,
+) -> Result<(), CurrentPointerError> {
+    let encoded = pointer.encode();
+    let current_path = lexical_root.join(CURRENT_FILE_NAME);
+    let pid = std::process::id();
+    let mut attempt = 0_u32;
+    loop {
+        let temp_path = lexical_root.join(format!(".tmp-current-{pid}-{attempt}"));
+        let mut temp_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt >= CURRENT_TEMP_COLLISION_LIMIT {
+                    return Err(CurrentPointerError::Io {
+                        operation: "allocate CURRENT temp",
+                        path: temp_path,
+                        source: io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "CURRENT temp collision limit exceeded",
+                        ),
+                    });
+                }
+                continue;
+            }
+            Err(source) => {
+                return Err(CurrentPointerError::Io {
+                    operation: "create CURRENT temp",
+                    path: temp_path,
+                    source,
+                });
+            }
+        };
+        temp_file
+            .write_all(&encoded)
+            .and_then(|()| temp_file.sync_all())
+            .map_err(|source| CurrentPointerError::Io {
+                operation: "persist CURRENT temp",
+                path: temp_path.clone(),
+                source,
+            })?;
+        drop(temp_file);
+        std::fs::rename(&temp_path, &current_path).map_err(|source| CurrentPointerError::Io {
+            operation: "rename CURRENT into place",
+            path: current_path.clone(),
+            source,
+        })?;
+        sync_directory(lexical_root).map_err(|source| CurrentPointerError::Io {
+            operation: "fsync CURRENT directory",
+            path: lexical_root.to_path_buf(),
+            source: match source {
+                KeeperError::Io { source, .. } => source,
+                other => io::Error::other(other.to_string()),
+            },
+        })?;
+        return Ok(());
+    }
+}
+
+/// Outcome of resolving a lexical root's active engine directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedCurrent {
+    /// A valid CURRENT pointer was present.
+    Pointer(CurrentPointer),
+    /// No CURRENT existed; exactly one engine directory was found and adopted
+    /// by writing a CURRENT pointer for it (migration bootstrap, registry
+    /// §7.3).
+    Adopted(CurrentPointer),
+    /// No CURRENT and no engine directories: a fresh root.
+    Empty,
+}
+
+impl ResolvedCurrent {
+    /// The active pointer when one exists (present or adopted).
+    #[must_use]
+    pub fn pointer(&self) -> Option<&CurrentPointer> {
+        match self {
+            Self::Pointer(pointer) | Self::Adopted(pointer) => Some(pointer),
+            Self::Empty => None,
+        }
+    }
+}
+
+/// Resolve the active engine directory under `lexical_root` (registry §7.3).
+///
+/// Order of decision: a present CURRENT is decoded, checksum-verified, and
+/// its named directory must exist; an absent CURRENT triggers the adoption
+/// scan — directories containing `MANIFEST` (quill) or `meta.json` (tantivy)
+/// are engine candidates, exactly one candidate is adopted by publishing a
+/// pointer for it, zero candidates yield [`ResolvedCurrent::Empty`], and
+/// several candidates fail closed demanding doctor. Anything that is not a
+/// real directory bearing an engine marker — user files, nested data,
+/// `.tmp-*` crash witnesses — is ignored and never modified.
+///
+/// # Errors
+///
+/// Returns [`CurrentPointerError`] for corrupt or unreadable CURRENT bytes,
+/// a pointer naming a missing directory, ambiguous engine directories, or
+/// underlying I/O failure.
+pub fn resolve_current(lexical_root: &Path) -> Result<ResolvedCurrent, CurrentPointerError> {
+    let current_path = lexical_root.join(CURRENT_FILE_NAME);
+    match read_current_file(&current_path)? {
+        Some(bytes) => {
+            let pointer = CurrentPointer::decode(&bytes)?;
+            let engine_dir = pointer.engine_dir(lexical_root);
+            if !engine_dir.is_dir() {
+                return Err(CurrentPointerError::MissingEngineDir {
+                    root: lexical_root.to_path_buf(),
+                    dir_name: pointer.dir_name().to_owned(),
+                    engine: pointer.engine().label(),
+                });
+            }
+            Ok(ResolvedCurrent::Pointer(pointer))
+        }
+        None => adopt_or_report_empty(lexical_root),
+    }
+}
+
+/// Read a CURRENT file with a no-follow open and a bounded buffer.
+fn read_current_file(current_path: &Path) -> Result<Option<Vec<u8>>, CurrentPointerError> {
+    let mut file = match open_manifest_slot(current_path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CurrentPointerError::Io {
+                operation: "open CURRENT",
+                path: current_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(usize_to_u64(MAX_CURRENT_BYTES).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| CurrentPointerError::Io {
+            operation: "read CURRENT",
+            path: current_path.to_path_buf(),
+            source,
+        })?;
+    Ok(Some(bytes))
+}
+
+/// Scan `lexical_root` for engine directories and apply the adoption rule.
+fn adopt_or_report_empty(lexical_root: &Path) -> Result<ResolvedCurrent, CurrentPointerError> {
+    let entries = std::fs::read_dir(lexical_root).map_err(|source| CurrentPointerError::Io {
+        operation: "scan lexical root for engine directories",
+        path: lexical_root.to_path_buf(),
+        source,
+    })?;
+    let mut candidates: Vec<(String, BlueGreenEngine)> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| CurrentPointerError::Io {
+            operation: "read lexical root entry",
+            path: lexical_root.to_path_buf(),
+            source,
+        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|source| CurrentPointerError::Io {
+                operation: "stat lexical root entry",
+                path: entry.path(),
+                source,
+            })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        // MANIFEST wins when both markers exist: quill is the forward format.
+        let engine = if entry
+            .path()
+            .join(BlueGreenEngine::Quill.adoption_marker())
+            .is_file()
+        {
+            Some(BlueGreenEngine::Quill)
+        } else if entry
+            .path()
+            .join(BlueGreenEngine::Tantivy.adoption_marker())
+            .is_file()
+        {
+            Some(BlueGreenEngine::Tantivy)
+        } else {
+            None
+        };
+        if let Some(engine) = engine {
+            candidates.push((name, engine));
+        }
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    match candidates.len() {
+        0 => Ok(ResolvedCurrent::Empty),
+        1 => {
+            let (dir_name, engine) = candidates.remove(0);
+            let pointer = CurrentPointer::new(engine, dir_name, engine.adopted_format_version())?;
+            publish_current(lexical_root, &pointer)?;
+            Ok(ResolvedCurrent::Adopted(pointer))
+        }
+        _ => Err(CurrentPointerError::AmbiguousEngineDirs {
+            root: lexical_root.to_path_buf(),
+            candidates: candidates.into_iter().map(|(name, _)| name).collect(),
+        }),
+    }
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -11567,5 +12155,307 @@ mod tests {
             b'A'..=b'F' => byte - b'A' + 10,
             _ => panic!("invalid hex byte"),
         }
+    }
+
+    // ==== Blue-green CURRENT pointer (bd-quill-duel-blue-green-vwf7) ====
+
+    fn quill_v1_pointer() -> CurrentPointer {
+        CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-v1",
+            crate::segment::FSLX_FORMAT_VERSION,
+        )
+        .expect("valid quill-v1 pointer")
+    }
+
+    #[test]
+    fn current_pointer_codec_roundtrips_both_engines_and_golden_bytes() {
+        for (engine, dir_name, version) in [
+            (
+                BlueGreenEngine::Quill,
+                "quill-v1",
+                crate::segment::FSLX_FORMAT_VERSION,
+            ),
+            (
+                BlueGreenEngine::Tantivy,
+                "tantivy",
+                TANTIVY_INDEX_FORMAT_VERSION,
+            ),
+            (BlueGreenEngine::Quill, "q", 0),
+            (BlueGreenEngine::Quill, &"x".repeat(255), u32::MAX),
+            (BlueGreenEngine::Tantivy, &"y".repeat(65_535), 7),
+        ] {
+            let pointer = CurrentPointer::new(engine, dir_name, version).expect("valid pointer");
+            let encoded = pointer.encode();
+            assert_eq!(encoded.len(), CURRENT_FIXED_BYTES + dir_name.len());
+            let decoded = CurrentPointer::decode(&encoded).expect("roundtrip decode");
+            assert_eq!(decoded, pointer);
+        }
+
+        // Golden image pins the exact registry §7.3 wire layout.
+        let encoded = quill_v1_pointer().encode();
+        let expected_body: &[u8] = b"FSLXCUR\0";
+        assert_eq!(&encoded[..8], expected_body);
+        assert_eq!(&encoded[8..12], &1_u32.to_le_bytes());
+        assert_eq!(encoded[12], 1);
+        assert_eq!(&encoded[13..15], &8_u16.to_le_bytes());
+        assert_eq!(&encoded[15..23], b"quill-v1");
+        assert_eq!(
+            &encoded[23..27],
+            &crate::segment::FSLX_FORMAT_VERSION.to_le_bytes()
+        );
+        let crc = u32::from_le_bytes(encoded[27..31].try_into().expect("crc bytes"));
+        assert_eq!(crc, crc32fast::hash(&encoded[..27]));
+        assert_eq!(encoded.len(), 31);
+    }
+
+    #[test]
+    fn current_pointer_decode_fails_closed_on_every_corruption_class() {
+        let valid = quill_v1_pointer().encode();
+
+        // Truncation at every byte boundary: typed error, never a panic.
+        for cut in 0..valid.len() {
+            assert!(
+                CurrentPointer::decode(&valid[..cut]).is_err(),
+                "truncation at {cut} must fail"
+            );
+        }
+        // Trailing bytes.
+        let mut trailed = valid.clone();
+        trailed.push(0);
+        assert!(matches!(
+            CurrentPointer::decode(&trailed),
+            Err(CurrentPointerError::CrcMismatch { .. }
+                | CurrentPointerError::LengthMismatch { .. })
+        ));
+        // Single-byte flips across every byte class must fail (CRC or a typed
+        // structural rejection), never silently decode or panic.
+        for offset in 0..valid.len() {
+            let mut flipped = valid.clone();
+            flipped[offset] ^= 0x5A;
+            assert!(
+                CurrentPointer::decode(&flipped).is_err(),
+                "flip at {offset} must fail"
+            );
+        }
+        // Bad magic with a repaired CRC reports the magic, not the checksum.
+        let mut bad_magic = valid.clone();
+        bad_magic[..8].copy_from_slice(b"FSLXNOPE");
+        rewrite_crc(&mut bad_magic);
+        assert!(matches!(
+            CurrentPointer::decode(&bad_magic),
+            Err(CurrentPointerError::BadMagic)
+        ));
+        // Unsupported format version with a repaired CRC.
+        let mut future = valid.clone();
+        future[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        rewrite_crc(&mut future);
+        assert!(matches!(
+            CurrentPointer::decode(&future),
+            Err(CurrentPointerError::UnsupportedFormatVersion(2))
+        ));
+        // Unknown engine kind with a repaired CRC.
+        let mut alien = valid.clone();
+        alien[12] = 9;
+        rewrite_crc(&mut alien);
+        assert!(matches!(
+            CurrentPointer::decode(&alien),
+            Err(CurrentPointerError::UnknownEngineKind(9))
+        ));
+        // Non-UTF-8 directory name with a repaired CRC.
+        let mut non_utf8 = valid.clone();
+        non_utf8[15] = 0xFF;
+        rewrite_crc(&mut non_utf8);
+        assert!(matches!(
+            CurrentPointer::decode(&non_utf8),
+            Err(CurrentPointerError::DirNameNotUtf8)
+        ));
+        // Path-unsafe names with repaired CRCs.
+        for hostile in ["..", "a/b", "/abs", "a\\b", "a\0b", ""] {
+            assert!(CurrentPointer::new(BlueGreenEngine::Quill, hostile, 1).is_err());
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&CURRENT_MAGIC);
+            put_u32(&mut bytes, CURRENT_FORMAT_VERSION);
+            bytes.push(1);
+            put_u16(
+                &mut bytes,
+                u16::try_from(hostile.len()).expect("hostile name fits u16"),
+            );
+            bytes.extend_from_slice(hostile.as_bytes());
+            put_u32(&mut bytes, 1);
+            let crc = crc32fast::hash(&bytes);
+            put_u32(&mut bytes, crc);
+            assert!(
+                CurrentPointer::decode(&bytes).is_err(),
+                "hostile name {hostile:?} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_current_swaps_flip_and_rollback_leave_stale_temps_inert() -> TestResult {
+        let root = tempdir()?;
+        let quill_dir = root.path().join("quill-v1");
+        let tantivy_dir = root.path().join("tantivy");
+        std::fs::create_dir(&quill_dir)?;
+        std::fs::create_dir(&tantivy_dir)?;
+
+        // A stale crash witness from an interrupted earlier attempt is ignored
+        // by resolution and never disturbed by publication.
+        let stale_temp = root.path().join(".tmp-current-1-0");
+        std::fs::write(&stale_temp, b"abandoned crash witness")?;
+
+        let quill_pointer = quill_v1_pointer();
+        publish_current(root.path(), &quill_pointer)?;
+        assert_eq!(
+            resolve_current(root.path())?,
+            ResolvedCurrent::Pointer(quill_pointer.clone())
+        );
+        assert_eq!(std::fs::read(&stale_temp)?, b"abandoned crash witness");
+
+        // Flip: quill -> tantivy in one pointer swap; old directory retained.
+        let tantivy_pointer = CurrentPointer::new(
+            BlueGreenEngine::Tantivy,
+            "tantivy",
+            TANTIVY_INDEX_FORMAT_VERSION,
+        )?;
+        publish_current(root.path(), &tantivy_pointer)?;
+        assert_eq!(
+            resolve_current(root.path())?,
+            ResolvedCurrent::Pointer(tantivy_pointer.clone())
+        );
+        assert!(quill_dir.is_dir(), "retired quill directory is retained");
+
+        // Rollback is the identical swap in reverse, zero rebuild.
+        publish_current(root.path(), &quill_pointer)?;
+        let resolved = resolve_current(root.path())?;
+        assert_eq!(resolved, ResolvedCurrent::Pointer(quill_pointer.clone()));
+        assert_eq!(
+            resolved.pointer().expect("pointer").engine_dir(root.path()),
+            quill_dir
+        );
+        assert!(
+            tantivy_dir.is_dir(),
+            "retired tantivy directory is retained"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_current_adopts_single_engine_dir_and_bootstraps_pointer() -> TestResult {
+        // Quill directory adopted via its MANIFEST marker.
+        let quill_root = tempdir()?;
+        let quill_dir = quill_root.path().join("quill-v1");
+        std::fs::create_dir(&quill_dir)?;
+        std::fs::write(quill_dir.join("MANIFEST"), b"genesis placeholder")?;
+        let adopted = resolve_current(quill_root.path())?;
+        let expected = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-v1",
+            crate::segment::FSLX_FORMAT_VERSION,
+        )?;
+        assert_eq!(adopted, ResolvedCurrent::Adopted(expected.clone()));
+        // Adoption wrote a durable CURRENT; the next resolve reads it.
+        assert_eq!(
+            resolve_current(quill_root.path())?,
+            ResolvedCurrent::Pointer(expected)
+        );
+        assert_eq!(
+            CurrentPointer::decode(&std::fs::read(quill_root.path().join(CURRENT_FILE_NAME))?)?,
+            quill_v1_pointer()
+        );
+
+        // Tantivy directory adopted via its meta.json marker.
+        let tantivy_root = tempdir()?;
+        let tantivy_dir = tantivy_root.path().join("tantivy");
+        std::fs::create_dir(&tantivy_dir)?;
+        std::fs::write(tantivy_dir.join("meta.json"), b"{}")?;
+        assert_eq!(
+            resolve_current(tantivy_root.path())?,
+            ResolvedCurrent::Adopted(CurrentPointer::new(
+                BlueGreenEngine::Tantivy,
+                "tantivy",
+                TANTIVY_INDEX_FORMAT_VERSION,
+            )?)
+        );
+
+        // A directory bearing both markers adopts as quill (forward format wins).
+        let mixed_root = tempdir()?;
+        let mixed_dir = mixed_root.path().join("engine");
+        std::fs::create_dir(&mixed_dir)?;
+        std::fs::write(mixed_dir.join("MANIFEST"), b"x")?;
+        std::fs::write(mixed_dir.join("meta.json"), b"{}")?;
+        let resolved = resolve_current(mixed_root.path())?;
+        assert_eq!(
+            resolved.pointer().expect("adopted pointer").engine(),
+            BlueGreenEngine::Quill
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_current_reports_empty_ambiguous_and_missing_closed() -> TestResult {
+        // Fresh root: Empty, and nothing is created.
+        let empty_root = tempdir()?;
+        assert_eq!(resolve_current(empty_root.path())?, ResolvedCurrent::Empty);
+        assert!(std::fs::read_dir(empty_root.path())?.next().is_none());
+
+        // Multiple engine directories and no CURRENT: fail closed for doctor.
+        let ambiguous_root = tempdir()?;
+        for name in ["quill-v1", "tantivy"] {
+            let dir = ambiguous_root.path().join(name);
+            std::fs::create_dir(&dir)?;
+            std::fs::write(dir.join("MANIFEST"), b"x")?;
+        }
+        let error = resolve_current(ambiguous_root.path()).expect_err("must demand doctor");
+        match error {
+            CurrentPointerError::AmbiguousEngineDirs { candidates, .. } => {
+                assert_eq!(
+                    candidates,
+                    vec!["quill-v1".to_owned(), "tantivy".to_owned()]
+                );
+            }
+            other => panic!("expected AmbiguousEngineDirs, got {other:?}"),
+        }
+        assert!(
+            !ambiguous_root.path().join(CURRENT_FILE_NAME).exists(),
+            "ambiguous resolution must not publish a guess"
+        );
+
+        // CURRENT names a directory that does not exist: fail closed.
+        let missing_root = tempdir()?;
+        publish_current(
+            missing_root.path(),
+            &CurrentPointer::new(BlueGreenEngine::Quill, "quill-v9", 1)?,
+        )?;
+        assert!(matches!(
+            resolve_current(missing_root.path()),
+            Err(CurrentPointerError::MissingEngineDir { .. })
+        ));
+
+        // Corrupt CURRENT bytes: typed decode failure, never a guess.
+        let corrupt_root = tempdir()?;
+        std::fs::write(corrupt_root.path().join(CURRENT_FILE_NAME), b"garbage")?;
+        assert!(resolve_current(corrupt_root.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_current_ignores_user_files_and_tmp_witnesses() -> TestResult {
+        let root = tempdir()?;
+        std::fs::write(root.path().join("notes.txt"), b"user data")?;
+        std::fs::write(root.path().join(".tmp-current-9-3"), b"crash witness")?;
+        let random_dir = root.path().join("random");
+        std::fs::create_dir(&random_dir)?;
+        std::fs::write(random_dir.join("data.bin"), b"not an engine")?;
+        assert_eq!(resolve_current(root.path())?, ResolvedCurrent::Empty);
+        // Nothing was adopted, published, or modified.
+        assert!(!root.path().join(CURRENT_FILE_NAME).exists());
+        assert_eq!(std::fs::read(root.path().join("notes.txt"))?, b"user data");
+        assert_eq!(
+            std::fs::read(root.path().join(".tmp-current-9-3"))?,
+            b"crash witness"
+        );
+        Ok(())
     }
 }
