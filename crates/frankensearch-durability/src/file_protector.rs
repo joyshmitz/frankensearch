@@ -88,6 +88,34 @@ pub enum FileRepairOutcome {
     },
 }
 
+/// Path-free result of reconstructing a protected file.
+///
+/// Callers that need format-specific validation before publication can inspect
+/// recovered bytes without exposing them through a temporary pathname. This
+/// keeps no-clobber installation and crash recovery inside the caller's own
+/// writer-admission protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRecoveryOutcome {
+    /// The source already matches its sidecar, so no recovered copy is returned.
+    NotNeeded,
+    /// Reconstruction produced bytes that match every sidecar witness.
+    Recovered {
+        /// Complete reconstructed source payload.
+        bytes: Vec<u8>,
+        /// Number of source and repair symbols consumed by the codec.
+        symbols_used: u32,
+    },
+    /// The available symbols could not reconstruct the protected source.
+    Unrecoverable {
+        /// Codec classification for the failed reconstruction.
+        reason: DecodeFailureReason,
+        /// Number of symbols available to the codec.
+        symbols_received: u32,
+        /// Minimum source-symbol count required by the sidecar.
+        k_required: u32,
+    },
+}
+
 /// Health status for a single file after verify-and-repair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileHealth {
@@ -552,7 +580,7 @@ impl FileProtector {
     /// verification finds corruption, [`Self::verify_and_repair_file`] hands this decode
     /// straight to repair so it does not re-read the sidecar, re-deserialize the trailer,
     /// and recompute the source CRC32 a second time (the residual `verify_file` +
-    /// `repair_file_internal` re-verify left by the fe866683 standalone-repair reuse).
+    /// `recover_file_internal` re-verify left by the fe866683 standalone-repair reuse).
     fn verify_file_impl(
         path: &Path,
         sidecar_path: &Path,
@@ -669,55 +697,108 @@ impl FileProtector {
     #[allow(clippy::too_many_lines)]
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileRepairOutcome> {
-        self.repair_file_internal(path, path, sidecar_path, None, false)
+        self.repair_file_from(path, path, sidecar_path, None)
     }
 
-    /// Reconstruct a protected source into a distinct, previously absent path.
+    /// Reconstruct a protected source into owned bytes without publishing a
+    /// filesystem path.
     ///
     /// This is the fail-closed recovery primitive for callers that must
     /// validate decoded bytes against a format-specific external witness
-    /// before atomically installing them over a corrupt source. The source is
-    /// never modified, and an existing destination is never overwritten. A
-    /// [`FileRepairOutcome::NotNeeded`] result leaves `destination` absent;
-    /// callers that require a staged copy must handle that outcome explicitly.
+    /// before atomically installing them over a corrupt source. The source and
+    /// every other filesystem path remain untouched. Because publication is
+    /// caller-owned, this method does not increment repair attempt, success, or
+    /// failure counters.
     ///
     /// # Errors
     ///
-    /// Returns an I/O error when `destination` already exists, or any ordinary
-    /// decode, sidecar, allocation, or durable-write error from repair.
+    /// Returns any ordinary source, decode, sidecar, or allocation error from
+    /// recovery. Codec insufficiency is reported as
+    /// [`FileRecoveryOutcome::Unrecoverable`], while an already healthy source
+    /// returns [`FileRecoveryOutcome::NotNeeded`] without copying its bytes.
     #[allow(clippy::too_many_lines)]
-    pub fn repair_file_to(
+    pub fn recover_file_bytes(
         &self,
         source: &Path,
         sidecar_path: &Path,
-        destination: &Path,
-    ) -> SearchResult<FileRepairOutcome> {
-        self.repair_file_internal(destination, source, sidecar_path, None, true)
+    ) -> SearchResult<FileRecoveryOutcome> {
+        let outcome = self.recover_file_internal(source, source, sidecar_path, None)?;
+        if let FileRecoveryOutcome::Recovered {
+            bytes,
+            symbols_used,
+        } = &outcome
+        {
+            info!(
+                path = %source.display(),
+                bytes_recovered = bytes.len(),
+                symbols_used,
+                "durability recovery completed without publishing a path"
+            );
+        }
+        Ok(outcome)
     }
 
-    fn repair_file_internal(
+    fn repair_file_from(
         &self,
         dest_path: &Path,
         source_path: &Path,
         sidecar_path: &Path,
         verified_decode: Option<(RepairTrailerHeader, Vec<RepairSymbol>)>,
-        create_new_destination: bool,
     ) -> SearchResult<FileRepairOutcome> {
-        if create_new_destination {
-            match fs::symlink_metadata(dest_path) {
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::AlreadyExists,
-                        "staged repair destination already exists",
-                    )
-                    .into());
+        self.metrics.record_repair_attempt();
+        let recovered =
+            match self.recover_file_internal(dest_path, source_path, sidecar_path, verified_decode)
+            {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    self.metrics.record_repair_failure();
+                    return Err(error);
                 }
-                Err(source) if source.kind() == ErrorKind::NotFound => {}
-                Err(source) => return Err(source.into()),
+            };
+        match recovered {
+            FileRecoveryOutcome::NotNeeded => Ok(FileRepairOutcome::NotNeeded),
+            FileRecoveryOutcome::Recovered {
+                bytes,
+                symbols_used,
+            } => {
+                if let Err(error) = write_durable(dest_path, &bytes) {
+                    self.metrics.record_repair_failure();
+                    return Err(error.into());
+                }
+                self.metrics.record_repair_success();
+                info!(
+                    path = %dest_path.display(),
+                    bytes_written = bytes.len(),
+                    symbols_used,
+                    "durability repair completed"
+                );
+                Ok(FileRepairOutcome::Repaired {
+                    bytes_written: bytes.len(),
+                    symbols_used,
+                })
+            }
+            FileRecoveryOutcome::Unrecoverable {
+                reason,
+                symbols_received,
+                k_required,
+            } => {
+                self.metrics.record_repair_failure();
+                Ok(FileRepairOutcome::Unrecoverable {
+                    reason,
+                    symbols_received,
+                    k_required,
+                })
             }
         }
-        self.metrics.record_repair_attempt();
+    }
 
+    fn recover_file_internal(
+        &self,
+        logical_path: &Path,
+        source_path: &Path,
+        sidecar_path: &Path,
+        verified_decode: Option<(RepairTrailerHeader, Vec<RepairSymbol>)>,
+    ) -> SearchResult<FileRecoveryOutcome> {
         let source_file = match fs::File::open(source_path) {
             Ok(f) => Some(f),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -759,7 +840,7 @@ impl FileProtector {
                 };
 
                 if healthy {
-                    return Ok(FileRepairOutcome::NotNeeded);
+                    return Ok(FileRecoveryOutcome::NotNeeded);
                 }
                 Some(decoded_trailer)
             } else {
@@ -781,7 +862,6 @@ impl FileProtector {
             if header.source_crc32 != empty_crc32
                 || (header.source_xxh3 != 0 && header.source_xxh3 != empty_xxh3)
             {
-                self.metrics.record_repair_failure();
                 return Err(SearchError::IndexCorrupted {
                     path: sidecar_path.to_path_buf(),
                     detail: "sidecar metadata is inconsistent for empty source payload".to_owned(),
@@ -790,14 +870,8 @@ impl FileProtector {
 
             // Ensure no source handle is kept while rewriting the destination file.
             drop(source_file);
-            write_repaired_destination(dest_path, &[], create_new_destination)?;
-            self.metrics.record_repair_success();
-            info!(
-                path = %dest_path.display(),
-                "durability repair completed (empty payload sidecar)"
-            );
-            return Ok(FileRepairOutcome::Repaired {
-                bytes_written: 0,
+            return Ok(FileRecoveryOutcome::Recovered {
+                bytes: Vec::new(),
                 symbols_used: 0,
             });
         }
@@ -818,7 +892,8 @@ impl FileProtector {
                     // garbage. We skip loading source symbols to avoid OOM on large files
                     // and rely entirely on repair symbols.
                     warn!(
-                        path = %dest_path.display(),
+                        path = %logical_path.display(),
+                        recovery_source = %source_path.display(),
                         len,
                         "source length matches header but CRC failed; skipping source symbols"
                     );
@@ -849,14 +924,14 @@ impl FileProtector {
                 let recovered_crc32 = crc32fast::hash(&data);
 
                 if recovered_crc32 != header.source_crc32 {
-                    self.metrics.record_repair_failure();
                     warn!(
-                        path = %dest_path.display(),
+                        path = %logical_path.display(),
+                        recovery_source = %source_path.display(),
                         expected_crc32 = header.source_crc32,
                         recovered_crc32,
                         "decoded payload failed crc verification"
                     );
-                    return Ok(FileRepairOutcome::Unrecoverable {
+                    return Ok(FileRecoveryOutcome::Unrecoverable {
                         reason: DecodeFailureReason::SymbolSizeMismatch,
                         symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
                         k_required: header.k_source,
@@ -866,9 +941,9 @@ impl FileProtector {
                 if header.source_xxh3 != 0 {
                     let recovered_xxh3 = xxh3_64(&data);
                     if recovered_xxh3 != header.source_xxh3 {
-                        self.metrics.record_repair_failure();
                         warn!(
-                            path = %dest_path.display(),
+                            path = %logical_path.display(),
+                            recovery_source = %source_path.display(),
                             expected_xxh3 = header.source_xxh3,
                             recovered_xxh3,
                             "decoded payload failed xxh3 verification"
@@ -883,16 +958,8 @@ impl FileProtector {
                     }
                 }
 
-                write_repaired_destination(dest_path, &data, create_new_destination)?;
-                self.metrics.record_repair_success();
-                info!(
-                    path = %dest_path.display(),
-                    bytes_written = data.len(),
-                    symbols_used,
-                    "durability repair completed"
-                );
-                Ok(FileRepairOutcome::Repaired {
-                    bytes_written: data.len(),
+                Ok(FileRecoveryOutcome::Recovered {
+                    bytes: data,
                     symbols_used,
                 })
             }
@@ -902,15 +969,15 @@ impl FileProtector {
                 k_required,
                 ..
             } => {
-                self.metrics.record_repair_failure();
                 warn!(
-                    path = %dest_path.display(),
+                    path = %logical_path.display(),
+                    recovery_source = %source_path.display(),
                     ?reason,
                     symbols_received,
                     k_required,
-                    "durability repair could not recover file"
+                    "durability recovery could not reconstruct protected file"
                 );
-                Ok(FileRepairOutcome::Unrecoverable {
+                Ok(FileRecoveryOutcome::Unrecoverable {
                     reason,
                     symbols_received,
                     k_required,
@@ -1009,8 +1076,7 @@ impl FileProtector {
 
         let repair_start = Instant::now();
         let source_path_to_read = if had_source { &backup_path } else { path };
-        let outcome =
-            self.repair_file_internal(path, source_path_to_read, &sidecar, verified_decode, false);
+        let outcome = self.repair_file_from(path, source_path_to_read, &sidecar, verified_decode);
         let repair_time = repair_start.elapsed();
 
         self.finalize_repair(
@@ -1520,39 +1586,6 @@ fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     result
 }
 
-/// Write one staging artifact without replacing an existing destination.
-///
-/// The private temporary name is created exclusively, synced, and hard-linked
-/// into place. Same-directory hard-link publication is atomic and fails if any
-/// filesystem entry already owns the destination name.
-fn write_repaired_destination(path: &Path, data: &[u8], create_new: bool) -> std::io::Result<()> {
-    if !create_new {
-        return write_durable(path, data);
-    }
-    let mut temporary_name = OsString::from(path.as_os_str());
-    temporary_name.push(".durable.tmp");
-    let temporary = PathBuf::from(temporary_name);
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let result = (|| {
-        file.write_all(data)?;
-        file.sync_all()?;
-        drop(file);
-        fs::hard_link(&temporary, path)?;
-        fs::remove_file(&temporary)?;
-        #[cfg(unix)]
-        sync_parent_directory(path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        // `create_new` above proves that this invocation owns the temp name.
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1563,8 +1596,8 @@ mod tests {
     use fsqlite_types::cx::Cx;
 
     use super::{
-        DurabilityProvider, FileHealth, FileProtector, FileRepairOutcome, FileSourceWitness,
-        NoopDurability, RepairPipelineConfig,
+        DurabilityProvider, FileHealth, FileProtector, FileRecoveryOutcome, FileRepairOutcome,
+        FileSourceWitness, NoopDurability, RepairPipelineConfig,
     };
     use crate::config::DurabilityConfig;
 
@@ -1677,11 +1710,10 @@ mod tests {
     }
 
     #[test]
-    fn staged_repair_is_no_clobber_and_preserves_the_source() {
+    fn path_free_recovery_returns_validated_bytes_and_preserves_the_source() {
         let protector =
             FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
-        let source = temp_path("staged-repair-source");
-        let destination = temp_path("staged-repair-destination");
+        let source = temp_path("path-free-repair-source");
         let payload = vec![0x5a_u8; 700];
         std::fs::write(&source, &payload).expect("write source");
         let protected = protector.protect_file(&source).expect("protect source");
@@ -1689,77 +1721,79 @@ mod tests {
         corrupted[17] ^= 0xff;
         std::fs::write(&source, &corrupted).expect("corrupt source");
 
-        let repaired = protector
-            .repair_file_to(&source, &protected.sidecar_path, &destination)
-            .expect("stage repair");
-        assert!(matches!(repaired, FileRepairOutcome::Repaired { .. }));
-        assert_eq!(
-            std::fs::read(&destination).expect("read staged destination"),
-            payload
-        );
+        let recovered = protector
+            .recover_file_bytes(&source, &protected.sidecar_path)
+            .expect("recover bytes");
+        assert!(matches!(
+            recovered,
+            FileRecoveryOutcome::Recovered { ref bytes, .. } if bytes == &payload
+        ));
         assert_eq!(
             std::fs::read(&source).expect("read preserved corrupt source"),
             corrupted
         );
 
-        let occupied = temp_path("staged-repair-occupied");
-        let sentinel = b"existing destination authority";
-        std::fs::write(&occupied, sentinel).expect("write occupied destination");
-        let error = protector
-            .repair_file_to(&source, &protected.sidecar_path, &occupied)
-            .expect_err("staged repair must never clobber an existing destination");
-        assert!(matches!(
-            error,
-            frankensearch_core::SearchError::Io(ref source)
-                if source.kind() == std::io::ErrorKind::AlreadyExists
-        ));
-        assert_eq!(
-            std::fs::read(&occupied).expect("read preserved destination"),
-            sentinel
-        );
-        assert_eq!(
-            std::fs::read(&source).expect("read source after conflict"),
-            corrupted
-        );
-
         std::fs::write(&source, &payload).expect("restore healthy source");
-        let healthy_error = protector
-            .repair_file_to(&source, &protected.sidecar_path, &occupied)
-            .expect_err("healthy source must not bypass occupied destination rejection");
         assert!(matches!(
-            healthy_error,
-            frankensearch_core::SearchError::Io(ref source)
-                if source.kind() == std::io::ErrorKind::AlreadyExists
+            protector
+                .recover_file_bytes(&source, &protected.sidecar_path)
+                .expect("verify healthy source"),
+            FileRecoveryOutcome::NotNeeded
         ));
-        assert_eq!(
-            std::fs::read(&occupied).expect("read occupied destination after healthy conflict"),
-            sentinel
-        );
+        let metrics = protector.metrics_snapshot();
+        assert_eq!(metrics.repair_attempts, 0);
+        assert_eq!(metrics.repair_successes, 0);
+        assert_eq!(metrics.repair_failures, 0);
     }
 
     #[test]
-    fn staged_repair_supports_an_empty_protected_payload() {
+    fn path_free_recovery_supports_an_empty_protected_payload() {
         let protector =
             FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
-        let source = temp_path("staged-empty-source");
-        let destination = temp_path("staged-empty-destination");
+        let source = temp_path("path-free-empty-source");
         std::fs::write(&source, []).expect("write empty source");
         let protected = protector
             .protect_file(&source)
             .expect("protect empty source");
         std::fs::write(&source, b"corrupt non-empty replacement").expect("corrupt source");
 
-        let repaired = protector
-            .repair_file_to(&source, &protected.sidecar_path, &destination)
-            .expect("stage empty repair");
-        assert!(matches!(repaired, FileRepairOutcome::Repaired { .. }));
-        assert_eq!(
-            std::fs::metadata(&destination).expect("stat stage").len(),
-            0
-        );
+        let recovered = protector
+            .recover_file_bytes(&source, &protected.sidecar_path)
+            .expect("recover empty bytes");
+        assert!(matches!(
+            recovered,
+            FileRecoveryOutcome::Recovered { ref bytes, .. } if bytes.is_empty()
+        ));
         assert_eq!(
             std::fs::read(&source).expect("read preserved source"),
             b"corrupt non-empty replacement"
+        );
+    }
+
+    #[test]
+    fn failed_repair_publication_records_a_failure() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let source = temp_path("repair-publication-failure");
+        let payload = vec![0x6c_u8; 700];
+        std::fs::write(&source, &payload).expect("write source");
+        let protected = protector.protect_file(&source).expect("protect source");
+        let mut corrupted = payload;
+        corrupted[23] ^= 0xff;
+        std::fs::write(&source, &corrupted).expect("corrupt source");
+        std::fs::create_dir(source.with_extension("durable.tmp"))
+            .expect("occupy durable staging path with a directory");
+
+        protector
+            .repair_file(&source, &protected.sidecar_path)
+            .expect_err("publication through an occupied staging path must fail");
+        let metrics = protector.metrics_snapshot();
+        assert_eq!(metrics.repair_attempts, 1);
+        assert_eq!(metrics.repair_successes, 0);
+        assert_eq!(metrics.repair_failures, 1);
+        assert_eq!(
+            std::fs::read(&source).expect("read preserved corrupt source"),
+            corrupted
         );
     }
 

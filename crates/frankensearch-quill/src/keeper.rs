@@ -20,7 +20,7 @@ use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
 use frankensearch_core::SearchError;
 #[cfg(feature = "durability")]
-use frankensearch_durability::{FileProtector, FileRepairOutcome, FileSourceWitness};
+use frankensearch_durability::{FileProtector, FileRecoveryOutcome, FileSourceWitness};
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use thiserror::Error;
 
@@ -578,6 +578,8 @@ impl Manifest {
     /// Returns an error for invalid in-memory state, count conversion, or an
     /// output exceeding the eager-reader budget.
     pub fn to_bytes(&self) -> Result<Vec<u8>, ManifestCodecError> {
+        validate_manifest_shape(self, ErrorClass::Invalid)?;
+        let estimated = manifest_encoded_len(self)?;
         self.validate()?;
 
         let segment_count =
@@ -593,27 +595,6 @@ impl Manifest {
                 limit: u64::from(u32::MAX),
             }
         })?;
-
-        let estimated = MANIFEST_MIN_BYTES
-            .checked_add(
-                self.segments
-                    .len()
-                    .checked_mul(SEGMENT_FIXED_BYTES)
-                    .ok_or_else(|| invalid("manifest encoded length overflow"))?,
-            )
-            .and_then(|length| {
-                self.segments.iter().try_fold(length, |total, segment| {
-                    total.checked_add(segment.tombstones.len())
-                })
-            })
-            .and_then(|length| {
-                self.field_stats
-                    .len()
-                    .checked_mul(FIELD_STATS_BYTES)
-                    .and_then(|stats| length.checked_add(stats))
-            })
-            .ok_or_else(|| invalid("manifest encoded length overflow"))?;
-        check_manifest_byte_limit(estimated)?;
 
         let mut bytes = Vec::new();
         bytes
@@ -1015,6 +996,10 @@ enum WriterProtection {
 /// This type is intentionally not `Clone`. Its internal admission token may be
 /// retained by an in-flight blocking publication so cancellation cannot release
 /// the OS lock while filesystem mutation is still running.
+///
+/// Every process that mutates the index directory must honor Quill's `LOCK`.
+/// Crash consistency does not cover an out-of-band process replacing admitted
+/// directory entries while a writer operation is in flight.
 pub struct KeeperWriter {
     admission: Arc<WriterAdmissionInner>,
     snapshot: KeeperSnapshot,
@@ -1223,8 +1208,38 @@ impl KeeperWriter {
         cx: &Cx,
         manifest: &Manifest,
     ) -> Result<&KeeperSnapshot, KeeperError> {
+        if cx.is_cancel_requested() {
+            return Err(KeeperError::PublishLock {
+                source: LockError::Cancelled,
+            });
+        }
         self.admission.ensure_directory_identity()?;
+        validate_manifest_shape(manifest, ErrorClass::Invalid)
+            .map_err(|source| KeeperError::InvalidManifest { source })?;
+        manifest_encoded_len(manifest).map_err(|source| KeeperError::InvalidManifest { source })?;
+        manifest
+            .validate()
+            .map_err(|source| KeeperError::InvalidManifest { source })?;
+        validate_manifest_successor(&self.snapshot.loaded_manifest().manifest, manifest)?;
         let directory = self.admission.directory.clone();
+        let preflight_directory = directory.clone();
+        let preflight_manifest = manifest.clone();
+        let preflight_protection = self.protection.clone();
+        let schema = self.snapshot.schema();
+        spawn_blocking(move || {
+            validate_proposed_manifest_segments(
+                &preflight_directory,
+                &preflight_manifest,
+                schema,
+                &preflight_protection,
+            )
+        })
+        .await?;
+        if cx.is_cancel_requested() {
+            return Err(KeeperError::PublishLock {
+                source: LockError::Cancelled,
+            });
+        }
         let claim_admission = Arc::clone(&self.admission);
         let publisher = ManifestPublisher::new(&directory);
         match &self.protection {
@@ -1819,10 +1834,10 @@ fn retire_interrupted_manifest_temp(
         ".tmp-abandoned-manifest-{generation}-{:016x}",
         admission.record.pid_start_nonce
     ));
-    let changed = retire_regular_artifact(&source, &retired)?;
+    let changed = retire_regular_artifact(admission, &source, &retired)?;
     let source_sidecar = append_path_suffix(&source, ".fec");
     let retired_sidecar = append_path_suffix(&retired, ".fec");
-    let changed = retire_regular_artifact(&source_sidecar, &retired_sidecar)? || changed;
+    let changed = retire_regular_artifact(admission, &source_sidecar, &retired_sidecar)? || changed;
     if changed {
         admission
             .directory_file
@@ -1851,10 +1866,11 @@ fn recover_corrupt_primary_slot(admission: &WriterAdmissionInner) -> Result<(), 
         ".tmp-corrupt-manifest-{:016x}",
         admission.record.pid_start_nonce
     ));
-    let changed = retire_regular_artifact(&current, &retired)?;
+    let changed = retire_regular_artifact(admission, &current, &retired)?;
     let current_sidecar = append_path_suffix(&current, ".fec");
     let retired_sidecar = append_path_suffix(&retired, ".fec");
-    let changed = retire_regular_artifact(&current_sidecar, &retired_sidecar)? || changed;
+    let changed =
+        retire_regular_artifact(admission, &current_sidecar, &retired_sidecar)? || changed;
     if changed {
         admission
             .directory_file
@@ -1880,35 +1896,107 @@ fn recover_durable_manifest_slots(
         .schema_id()
         .map_err(|source| KeeperError::InvalidSchema { source })?;
 
-    let (current, current_staged) = durable_manifest_candidate(
-        admission,
-        protector,
-        &current_path,
-        "MANIFEST",
-        expected_schema,
-    )?;
-    let (previous, previous_staged) = durable_manifest_candidate(
-        admission,
-        protector,
-        &previous_path,
-        "MANIFEST.prev",
-        expected_schema,
-    )?;
+    let (mut current, mut current_repair, current_recovery_error) =
+        durable_manifest_candidate(protector, &current_path, expected_schema)?.into_parts();
+    let (mut previous, mut previous_repair, previous_recovery_error) =
+        durable_manifest_candidate(protector, &previous_path, expected_schema)?.into_parts();
+    if current.is_none() && previous.is_none() {
+        if let Some(error) = current_recovery_error {
+            return Err(*error);
+        }
+        if let Some(error) = previous_recovery_error {
+            return Err(*error);
+        }
+    }
     if let (Some(current_manifest), Some(previous_manifest)) = (&current, &previous) {
-        validate_manifest_pair(
+        let pair = validate_manifest_pair(
             &admission.directory,
             current_manifest.clone(),
             previous_manifest,
-        )?;
+        );
+        if let Err(error) = pair {
+            match (current_repair.is_some(), previous_repair.is_some()) {
+                // Two pre-existing valid slots disagree: retain the existing
+                // fail-closed corruption signal.
+                (false, false) => return Err(error),
+                // Reconstructed current is not allowed to displace the usable
+                // pre-existing fallback when its transition is inconsistent.
+                (true, false) => {
+                    current = None;
+                    current_repair = None;
+                }
+                // A reconstructed previous is optional while a pre-existing
+                // current is usable. Leave the invalid on-disk slot untouched.
+                (false, true) => {
+                    previous = None;
+                    previous_repair = None;
+                }
+                // If neither slot existed as valid authority, an inconsistent
+                // pair of authenticated reconstructions has no safe winner.
+                // Stale or swapped sidecars can make either generation look
+                // plausible in isolation, so preserve the fail-closed signal.
+                (true, true) => return Err(error),
+            }
+        }
     }
-
-    // When both slots need reconstruction, install the fallback first so a
-    // crash between installs still leaves one complete recoverable authority.
-    if previous_staged {
-        install_staged_repair(admission, "MANIFEST.prev", &previous_path)?;
-    }
-    if current_staged {
-        install_staged_repair(admission, "MANIFEST", &current_path)?;
+    // A reconstructed MANIFEST is not authority until every referenced
+    // segment is readable or has itself been reconstructed and validated.
+    // Prefer current, but never let an unusable optional fallback block a
+    // usable current or let an unusable current displace a usable previous.
+    match (&current, &previous) {
+        (Some(current_manifest), _) => {
+            match recover_durable_manifest_segments(admission, schema, protector, current_manifest)
+            {
+                Ok(()) => {
+                    // Install a reconstructed fallback only when its own
+                    // dependencies are sound. It is optional while current is
+                    // usable, so a bad previous-only segment leaves the prior
+                    // slot untouched instead of bricking writer admission.
+                    if let (Some(bytes), Some(previous_manifest)) =
+                        (previous_repair.as_deref(), previous.as_ref())
+                        && recover_durable_manifest_segments(
+                            admission,
+                            schema,
+                            protector,
+                            previous_manifest,
+                        )
+                        .is_ok()
+                    {
+                        install_recovered_bytes(admission, "MANIFEST.prev", &previous_path, bytes)?;
+                    }
+                    if let Some(bytes) = &current_repair {
+                        install_recovered_bytes(admission, "MANIFEST", &current_path, bytes)?;
+                    }
+                }
+                Err(current_error) => {
+                    // A pre-existing valid current was already reader-visible;
+                    // do not mask that corruption here. A reconstructed current
+                    // can instead be skipped when previous is usable.
+                    if current_repair.is_none() {
+                        return Err(current_error);
+                    }
+                    let Some(previous_manifest) = &previous else {
+                        return Err(current_error);
+                    };
+                    recover_durable_manifest_segments(
+                        admission,
+                        schema,
+                        protector,
+                        previous_manifest,
+                    )?;
+                    if let Some(bytes) = &previous_repair {
+                        install_recovered_bytes(admission, "MANIFEST.prev", &previous_path, bytes)?;
+                    }
+                }
+            }
+        }
+        (None, Some(previous_manifest)) => {
+            recover_durable_manifest_segments(admission, schema, protector, previous_manifest)?;
+            if let Some(bytes) = &previous_repair {
+                install_recovered_bytes(admission, "MANIFEST.prev", &previous_path, bytes)?;
+            }
+        }
+        (None, None) => {}
     }
 
     for path in [&current_path, &previous_path] {
@@ -1925,13 +2013,31 @@ fn recover_durable_manifest_slots(
 }
 
 #[cfg(feature = "durability")]
+enum DurableManifestCandidate {
+    Unavailable,
+    Existing(Manifest),
+    Recovered { manifest: Manifest, bytes: Vec<u8> },
+    RecoveryFailed(Box<KeeperError>),
+}
+
+#[cfg(feature = "durability")]
+impl DurableManifestCandidate {
+    fn into_parts(self) -> (Option<Manifest>, Option<Vec<u8>>, Option<Box<KeeperError>>) {
+        match self {
+            Self::Unavailable => (None, None, None),
+            Self::Existing(manifest) => (Some(manifest), None, None),
+            Self::Recovered { manifest, bytes } => (Some(manifest), Some(bytes), None),
+            Self::RecoveryFailed(error) => (None, None, Some(error)),
+        }
+    }
+}
+
+#[cfg(feature = "durability")]
 fn durable_manifest_candidate(
-    admission: &WriterAdmissionInner,
     protector: &FileProtector,
     path: &Path,
-    label: &str,
     expected_schema: u64,
-) -> Result<(Option<Manifest>, bool), KeeperError> {
+) -> Result<DurableManifestCandidate, KeeperError> {
     if let ManifestSlot::Valid(manifest) = read_manifest_slot(path)? {
         if manifest.schema_id != expected_schema {
             return Err(KeeperError::SchemaMismatch {
@@ -1940,47 +2046,50 @@ fn durable_manifest_candidate(
                 found: manifest.schema_id,
             });
         }
-        return Ok((Some(manifest), false));
+        return Ok(DurableManifestCandidate::Existing(manifest));
     }
 
-    let Some(recovered) = stage_repaired_manifest(admission, protector, path, label)? else {
-        return Ok((None, false));
+    let recovered = match recover_manifest_bytes(protector, path) {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            return Ok(DurableManifestCandidate::RecoveryFailed(Box::new(error)));
+        }
+    };
+    let Some((recovered, bytes)) = recovered else {
+        return Ok(DurableManifestCandidate::Unavailable);
     };
     if recovered.schema_id != expected_schema {
-        return Err(KeeperError::SchemaMismatch {
-            path: path.to_path_buf(),
-            expected: expected_schema,
-            found: recovered.schema_id,
-        });
+        return Ok(DurableManifestCandidate::RecoveryFailed(Box::new(
+            KeeperError::SchemaMismatch {
+                path: path.to_path_buf(),
+                expected: expected_schema,
+                found: recovered.schema_id,
+            },
+        )));
     }
-    Ok((Some(recovered), true))
+    Ok(DurableManifestCandidate::Recovered {
+        manifest: recovered,
+        bytes,
+    })
 }
 
 #[cfg(feature = "durability")]
-fn stage_repaired_manifest(
-    admission: &WriterAdmissionInner,
+fn recover_manifest_bytes(
     protector: &FileProtector,
     source: &Path,
-    label: &str,
-) -> Result<Option<Manifest>, KeeperError> {
+) -> Result<Option<(Manifest, Vec<u8>)>, KeeperError> {
     let sidecar = FileProtector::sidecar_path(source);
     if !regular_artifact_exists(&sidecar, "inspect MANIFEST repair sidecar")? {
         return Ok(None);
     }
-    let stage = staged_repair_path(admission, label);
     match protector
-        .repair_file_to(source, &sidecar, &stage)
+        .recover_file_bytes(source, &sidecar)
         .map_err(|source_error| KeeperError::Durability {
-            operation: "stage MANIFEST repair",
+            operation: "recover MANIFEST bytes",
             path: source.to_path_buf(),
             source: source_error,
         })? {
-        FileRepairOutcome::Repaired { .. } => {
-            let bytes = std::fs::read(&stage).map_err(|source_error| KeeperError::Io {
-                operation: "read staged MANIFEST repair",
-                path: stage.clone(),
-                source: source_error,
-            })?;
+        FileRecoveryOutcome::Recovered { bytes, .. } => {
             let witness = FileSourceWitness::from_bytes(&bytes);
             if !protector
                 .sidecar_matches_witness(&sidecar, witness)
@@ -1992,21 +2101,22 @@ fn stage_repaired_manifest(
             {
                 return Err(KeeperError::Io {
                     operation: "validate staged MANIFEST repair witness",
-                    path: stage,
+                    path: source.to_path_buf(),
                     source: io::Error::new(
                         io::ErrorKind::InvalidData,
                         "repaired MANIFEST does not match its complete-source sidecar",
                     ),
                 });
             }
-            Manifest::from_bytes(&bytes)
-                .map(Some)
-                .map_err(|source_error| KeeperError::ManifestCorrupted {
-                    path: stage,
+            let manifest = Manifest::from_bytes(&bytes).map_err(|source_error| {
+                KeeperError::ManifestCorrupted {
+                    path: source.to_path_buf(),
                     source: source_error,
-                })
+                }
+            })?;
+            Ok(Some((manifest, bytes)))
         }
-        FileRepairOutcome::NotNeeded | FileRepairOutcome::Unrecoverable { .. } => Ok(None),
+        FileRecoveryOutcome::NotNeeded | FileRecoveryOutcome::Unrecoverable { .. } => Ok(None),
     }
 }
 
@@ -2027,7 +2137,17 @@ fn recover_durable_writer_files(
     validate_loaded_schema(&admission.directory, expected_schema, &loaded)?;
     validate_recovery_claims(&admission.directory, &loaded)?;
 
-    for manifest_segment in &loaded.manifest.segments {
+    recover_durable_manifest_segments(admission, schema, protector, &loaded.manifest)
+}
+
+#[cfg(feature = "durability")]
+fn recover_durable_manifest_segments(
+    admission: &WriterAdmissionInner,
+    schema: SchemaDescriptor,
+    protector: &FileProtector,
+    manifest: &Manifest,
+) -> Result<(), KeeperError> {
+    for manifest_segment in &manifest.segments {
         let path = admission
             .directory
             .join(canonical_segment_name(manifest_segment.segment_id));
@@ -2046,24 +2166,20 @@ fn recover_durable_writer_files(
                     return Err(original_error);
                 }
                 let label = format!("segment-{:016x}", manifest_segment.segment_id);
-                let stage = staged_repair_path(admission, &label);
-                match protector
-                    .repair_file_to(&path, &sidecar, &stage)
-                    .map_err(|source| KeeperError::Durability {
-                        operation: "stage segment repair",
-                        path: path.clone(),
-                        source,
-                    })? {
-                    FileRepairOutcome::Repaired { .. } => {}
-                    FileRepairOutcome::NotNeeded | FileRepairOutcome::Unrecoverable { .. } => {
-                        return Err(original_error);
-                    }
-                }
-                let bytes = std::fs::read(&stage).map_err(|source| KeeperError::Io {
-                    operation: "read staged segment repair",
-                    path: stage.clone(),
-                    source,
-                })?;
+                let bytes =
+                    match protector
+                        .recover_file_bytes(&path, &sidecar)
+                        .map_err(|source| KeeperError::Durability {
+                            operation: "recover segment bytes",
+                            path: path.clone(),
+                            source,
+                        })? {
+                        FileRecoveryOutcome::Recovered { bytes, .. } => bytes,
+                        FileRecoveryOutcome::NotNeeded
+                        | FileRecoveryOutcome::Unrecoverable { .. } => {
+                            return Err(original_error);
+                        }
+                    };
                 let witness = FileSourceWitness::from_bytes(&bytes);
                 if !protector
                     .sidecar_matches_witness(&sidecar, witness)
@@ -2074,23 +2190,23 @@ fn recover_durable_writer_files(
                     })?
                 {
                     return Err(KeeperError::SegmentMetadataMismatch {
-                        path: stage,
+                        path: path.clone(),
                         detail: "repaired segment does not match its complete-source sidecar"
                             .to_owned(),
                     });
                 }
-                let reader = SegmentReader::from_owned(bytes, schema).map_err(|source| {
+                let reader = SegmentReader::from_bytes(&bytes, schema).map_err(|source| {
                     KeeperError::SegmentOpen {
-                        path: stage.clone(),
+                        path: path.clone(),
                         source,
                     }
                 })?;
                 reader.verify().map_err(|source| KeeperError::SegmentOpen {
-                    path: stage.clone(),
+                    path: path.clone(),
                     source,
                 })?;
-                validate_segment_witnesses(&stage, manifest_segment, &reader)?;
-                install_staged_repair(admission, &label, &path)?;
+                validate_segment_witnesses(&path, manifest_segment, &reader)?;
+                install_recovered_bytes(admission, &label, &path, &bytes)?;
                 open_verified_segment(&path, manifest_segment, schema)?;
             }
         }
@@ -2142,7 +2258,7 @@ fn ensure_matching_durability_sidecar(
             ".tmp-stale-fec-{file_name}-{:016x}",
             admission.record.pid_start_nonce
         ));
-        if retire_regular_artifact(&sidecar, &retired)? {
+        if retire_regular_artifact(admission, &sidecar, &retired)? {
             admission
                 .directory_file
                 .sync_all()
@@ -2198,45 +2314,373 @@ fn regular_artifact_exists(path: &Path, operation: &'static str) -> Result<bool,
     }
 }
 
-#[cfg(feature = "durability")]
-fn staged_repair_path(admission: &WriterAdmissionInner, label: &str) -> PathBuf {
-    admission.directory.join(format!(
-        ".tmp-repair-{label}-{:016x}",
-        admission.record.pid_start_nonce
-    ))
-}
-
-#[cfg(feature = "durability")]
-fn install_staged_repair(
+#[cfg(all(
+    feature = "durability",
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+fn install_recovered_bytes(
     admission: &WriterAdmissionInner,
     label: &str,
     destination: &Path,
+    bytes: &[u8],
 ) -> Result<(), KeeperError> {
-    let stage = staged_repair_path(admission, label);
-    if !regular_artifact_exists(&stage, "inspect staged repair")? {
+    install_recovered_bytes_with_hook(admission, label, destination, bytes, |_| Ok(()))
+}
+
+#[cfg(all(
+    feature = "durability",
+    any(target_os = "linux", target_os = "android", target_vendor = "apple")
+))]
+fn install_recovered_bytes_with_hook(
+    admission: &WriterAdmissionInner,
+    label: &str,
+    destination: &Path,
+    bytes: &[u8],
+    before_atomic_install: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), KeeperError> {
+    use rustix::fs::{
+        AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, linkat, openat, renameat_with, statat,
+    };
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    admission.ensure_directory_identity()?;
+    if destination.parent() != Some(admission.directory.as_path()) {
         return Err(KeeperError::Io {
-            operation: "install staged repair",
-            path: stage,
-            source: io::Error::new(io::ErrorKind::NotFound, "staged repair is absent"),
+            operation: "validate recovered-byte destination",
+            path: destination.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "repair destination is outside the admitted index directory",
+            ),
         });
     }
-    if regular_artifact_exists(destination, "inspect repair destination")? {
+    let expected_stat_size = i64::try_from(bytes.len()).map_err(|_| KeeperError::Io {
+        operation: "validate recovered-byte length",
+        path: destination.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recovered bytes exceed the platform file-size range",
+        ),
+    })?;
+    let destination_name =
+        destination
+            .file_name()
+            .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+                path: destination.to_path_buf(),
+            })?;
+
+    let base = format!(
+        ".tmp-repair-{label}-{:016x}",
+        admission.record.pid_start_nonce
+    );
+    let mut collision = 0_u64;
+    let (temporary_name, mut temporary_file, temporary_metadata) = loop {
+        let name = if collision == 0 {
+            OsString::from(&base)
+        } else {
+            OsString::from(format!("{base}.{collision}"))
+        };
+        safe_direct_child(&admission.directory, Path::new(&name))?;
+        match openat(
+            &admission.directory_file,
+            &name,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+        ) {
+            Ok(file) => {
+                let file = File::from(file);
+                let metadata = file.metadata().map_err(|source| KeeperError::Io {
+                    operation: "inspect owned recovered-byte temp",
+                    path: admission.directory.join(&name),
+                    source,
+                })?;
+                break (name, file, metadata);
+            }
+            Err(source) if source == rustix::io::Errno::EXIST => {
+                collision = collision.checked_add(1).ok_or_else(|| KeeperError::Io {
+                    operation: "allocate recovered-byte temp",
+                    path: admission.directory.join(&base),
+                    source: io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "recovered-byte temp suffix space is exhausted",
+                    ),
+                })?;
+            }
+            Err(source) => {
+                return Err(KeeperError::Io {
+                    operation: "create recovered-byte temp",
+                    path: admission.directory.join(&name),
+                    source: io::Error::from(source),
+                });
+            }
+        }
+    };
+    let temporary_path = admission.directory.join(&temporary_name);
+    temporary_file
+        .write_all(bytes)
+        .and_then(|()| temporary_file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "persist recovered-byte temp",
+            path: temporary_path.clone(),
+            source,
+        })?;
+    if !temporary_metadata.file_type().is_file()
+        || temporary_file
+            .metadata()
+            .map_err(|source| KeeperError::Io {
+                operation: "reinspect recovered-byte temp",
+                path: temporary_path.clone(),
+                source,
+            })?
+            .len()
+            != usize_to_u64(bytes.len())
+    {
+        return Err(KeeperError::Io {
+            operation: "validate recovered-byte temp",
+            path: temporary_path,
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recovered-byte temp is not a regular file with the expected length",
+            ),
+        });
+    }
+    let descriptor_root = if cfg!(target_vendor = "apple") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    let descriptor_path =
+        PathBuf::from(format!("{descriptor_root}/{}", temporary_file.as_raw_fd()));
+    let ready_base = format!(
+        ".tmp-ready-repair-{label}-{:016x}",
+        admission.record.pid_start_nonce
+    );
+    let mut ready_collision = 0_u64;
+    let ready_name = loop {
+        let name = if ready_collision == 0 {
+            OsString::from(&ready_base)
+        } else {
+            OsString::from(format!("{ready_base}.{ready_collision}"))
+        };
+        safe_direct_child(&admission.directory, Path::new(&name))?;
+        match linkat(
+            CWD,
+            &descriptor_path,
+            &admission.directory_file,
+            &name,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) => break name,
+            Err(error) if error == rustix::io::Errno::EXIST => {
+                ready_collision =
+                    ready_collision
+                        .checked_add(1)
+                        .ok_or_else(|| KeeperError::Io {
+                            operation: "allocate recovered-byte ready link",
+                            path: admission.directory.join(&ready_base),
+                            source: io::Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "recovered-byte ready-link suffix space is exhausted",
+                            ),
+                        })?;
+            }
+            Err(error) => {
+                return Err(KeeperError::Io {
+                    operation: "create descriptor-bound recovered-byte ready link",
+                    path: admission.directory.join(&name),
+                    source: io::Error::from(error),
+                });
+            }
+        }
+    };
+    let ready_path = admission.directory.join(&ready_name);
+    let ready_stat = statat(
+        &admission.directory_file,
+        &ready_name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .map_err(io::Error::from)
+    .map_err(|source| KeeperError::Io {
+        operation: "verify recovered-byte ready link",
+        path: ready_path.clone(),
+        source,
+    })?;
+    if ready_stat.st_dev != temporary_metadata.dev()
+        || ready_stat.st_ino != temporary_metadata.ino()
+        || ready_stat.st_size != expected_stat_size
+    {
+        return Err(KeeperError::Io {
+            operation: "verify recovered-byte ready link",
+            path: ready_path.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recovered-byte ready link does not name the owned inode",
+            ),
+        });
+    }
+    admission
+        .directory_file
+        .sync_all()
+        .map_err(|source| KeeperError::Io {
+            operation: "fsync recovered-byte staging links",
+            path: admission.directory.clone(),
+            source,
+        })?;
+
+    let destination_identity = match statat(
+        &admission.directory_file,
+        destination_name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {
+            Some((stat.st_dev, stat.st_ino, stat.st_size))
+        }
+        Ok(_) => {
+            return Err(KeeperError::Io {
+                operation: "inspect recovered-byte destination",
+                path: destination.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recovered-byte destination is not a regular file",
+                ),
+            });
+        }
+        Err(error) if error == rustix::io::Errno::NOENT => None,
+        Err(error) => {
+            return Err(KeeperError::Io {
+                operation: "inspect recovered-byte destination",
+                path: destination.to_path_buf(),
+                source: io::Error::from(error),
+            });
+        }
+    };
+    before_atomic_install(&ready_path).map_err(|source| KeeperError::Io {
+        operation: "run recovered-byte install checkpoint",
+        path: ready_path.clone(),
+        source,
+    })?;
+    let destination_exists = destination_identity.is_some();
+    if destination_exists {
+        // Threat model: writer admission excludes cooperating directory
+        // mutators. A same-directory process that ignores LOCK can replace the
+        // ready pathname; the inode check below detects and rolls that back
+        // during an uninterrupted call, but POSIX has no inode-conditioned
+        // exchange primitive that also makes such hostile substitution
+        // crash-safe. Non-cooperating mutation of an admitted index directory
+        // is therefore outside Keeper's crash-consistency contract.
+        renameat_with(
+            &admission.directory_file,
+            &ready_name,
+            &admission.directory_file,
+            destination_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "atomically exchange recovered bytes",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    } else {
+        // With no canonical destination, link the still-open validated inode
+        // directly into place. The ready pathname is deliberately not the
+        // source, so substitution of that staging name cannot affect the bytes
+        // installed at the canonical name.
+        linkat(
+            CWD,
+            &descriptor_path,
+            &admission.directory_file,
+            destination_name,
+            AtFlags::SYMLINK_FOLLOW,
+        )
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "link descriptor-bound recovered bytes into place",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    }
+    let destination_stat = statat(
+        &admission.directory_file,
+        destination_name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    );
+    let installed_owned_inode = destination_stat.as_ref().is_ok_and(|stat| {
+        stat.st_dev == temporary_metadata.dev()
+            && stat.st_ino == temporary_metadata.ino()
+            && stat.st_size == expected_stat_size
+    });
+    if !installed_owned_inode {
+        if !destination_exists {
+            return Err(KeeperError::Io {
+                operation: "verify descriptor-bound recovered-byte installation",
+                path: destination.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "descriptor-bound recovered-byte destination changed after installation",
+                ),
+            });
+        }
+        renameat_with(
+            &admission.directory_file,
+            destination_name,
+            &admission.directory_file,
+            &ready_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "roll back substituted recovered-byte installation",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        let restored = destination_identity.is_some_and(|(device, inode, size)| {
+            statat(
+                &admission.directory_file,
+                destination_name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .is_ok_and(|stat| stat.st_dev == device && stat.st_ino == inode && stat.st_size == size)
+        });
+        if !restored {
+            return Err(KeeperError::Io {
+                operation: "verify recovered-byte rollback",
+                path: destination.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "recovered-byte rollback did not restore the prior authority",
+                ),
+            });
+        }
+        admission
+            .directory_file
+            .sync_all()
+            .map_err(|source| KeeperError::Io {
+                operation: "fsync recovered-byte rollback",
+                path: admission.directory.clone(),
+                source,
+            })?;
+        return Err(KeeperError::Io {
+            operation: "verify installed recovered bytes",
+            path: destination.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "installed recovered-byte pathname was substituted; prior authority restored",
+            ),
+        });
+    }
+    if destination_exists {
         let retired = admission.directory.join(format!(
             ".tmp-corrupt-{label}-{:016x}",
             admission.record.pid_start_nonce
         ));
-        retire_regular_artifact(destination, &retired)?;
+        retire_regular_artifact(admission, &ready_path, &retired)?;
     }
-    std::fs::hard_link(&stage, destination).map_err(|source| KeeperError::Io {
-        operation: "install no-replace staged repair",
-        path: destination.to_path_buf(),
-        source,
-    })?;
-    std::fs::remove_file(&stage).map_err(|source| KeeperError::Io {
-        operation: "retire installed staged-repair name",
-        path: stage,
-        source,
-    })?;
+    // Keep the exclusively-created temp name as a second link until ordinary
+    // grace-period garbage collection retires it. Conditional unlink is not
+    // available on Unix; leaving the temp avoids a stat-then-unlink race that
+    // could remove a substituted pathname while consuming no extra data blocks.
     admission
         .directory_file
         .sync_all()
@@ -2247,84 +2691,143 @@ fn install_staged_repair(
         })
 }
 
+#[cfg(all(
+    feature = "durability",
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
+))]
+fn install_recovered_bytes(
+    admission: &WriterAdmissionInner,
+    _: &str,
+    destination: &Path,
+    _: &[u8],
+) -> Result<(), KeeperError> {
+    Err(KeeperError::Io {
+        operation: "install recovered bytes",
+        path: destination.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "no-replace recovered-byte installation is unsupported for {}",
+                admission.directory.display()
+            ),
+        ),
+    })
+}
+
 fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(suffix);
     PathBuf::from(value)
 }
 
-fn retire_regular_artifact(source: &Path, destination: &Path) -> Result<bool, KeeperError> {
-    let source_metadata = match std::fs::symlink_metadata(source) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source_error) => {
-            return Err(KeeperError::Io {
-                operation: "inspect retirement source",
-                path: source.to_path_buf(),
-                source: source_error,
-            });
-        }
-    };
-    if !source_metadata.file_type().is_file() {
+fn retire_regular_artifact(
+    admission: &WriterAdmissionInner,
+    source: &Path,
+    destination: &Path,
+) -> Result<bool, KeeperError> {
+    admission.ensure_directory_identity()?;
+    if source.parent() != Some(admission.directory.as_path())
+        || destination.parent() != Some(admission.directory.as_path())
+    {
         return Err(KeeperError::Io {
-            operation: "retire writer artifact",
+            operation: "validate retirement paths",
             path: source.to_path_buf(),
             source: io::Error::new(
-                io::ErrorKind::InvalidData,
-                "retirement source is not a regular file",
+                io::ErrorKind::InvalidInput,
+                "retirement paths must be direct children of the admitted directory",
             ),
         });
     }
 
-    match std::fs::hard_link(source, destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                let destination_metadata =
-                    std::fs::symlink_metadata(destination).map_err(|source_error| {
-                        KeeperError::Io {
-                            operation: "inspect retirement destination",
-                            path: destination.to_path_buf(),
-                            source: source_error,
-                        }
-                    })?;
-                if !destination_metadata.file_type().is_file()
-                    || source_metadata.dev() != destination_metadata.dev()
-                    || source_metadata.ino() != destination_metadata.ino()
-                {
-                    return Err(KeeperError::Io {
-                        operation: "retire writer artifact",
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{AtFlags, FileType, RenameFlags, renameat_with, statat};
+
+        let source_name = source
+            .file_name()
+            .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+                path: source.to_path_buf(),
+            })?;
+        let source_stat = match statat(
+            &admission.directory_file,
+            source_name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+            Err(error) => {
+                return Err(KeeperError::Io {
+                    operation: "inspect retirement source",
+                    path: source.to_path_buf(),
+                    source: io::Error::from(error),
+                });
+            }
+        };
+        if FileType::from_raw_mode(source_stat.st_mode) != FileType::RegularFile {
+            return Err(KeeperError::Io {
+                operation: "retire writer artifact",
+                path: source.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "retirement source is not a regular file",
+                ),
+            });
+        }
+
+        let destination_name =
+            destination
+                .file_name()
+                .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+                    path: destination.to_path_buf(),
+                })?;
+        let mut collision = 0_u64;
+        loop {
+            let candidate = if collision == 0 {
+                destination_name.to_os_string()
+            } else {
+                let mut name = destination_name.to_os_string();
+                name.push(format!(".{collision}"));
+                name
+            };
+            match renameat_with(
+                &admission.directory_file,
+                source_name,
+                &admission.directory_file,
+                &candidate,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => return Ok(true),
+                Err(error) if error == rustix::io::Errno::EXIST => {
+                    collision = collision.checked_add(1).ok_or_else(|| KeeperError::Io {
+                        operation: "allocate retirement destination",
                         path: destination.to_path_buf(),
                         source: io::Error::new(
                             io::ErrorKind::AlreadyExists,
-                            "retirement destination belongs to a different artifact",
+                            "retirement destination suffix space is exhausted",
                         ),
+                    })?;
+                }
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+                Err(error) => {
+                    return Err(KeeperError::Io {
+                        operation: "atomically retire writer artifact",
+                        path: admission.directory.join(candidate),
+                        source: io::Error::from(error),
                     });
                 }
             }
-            #[cfg(not(unix))]
-            return Err(KeeperError::Io {
-                operation: "retire writer artifact",
-                path: destination.to_path_buf(),
-                source: error,
-            });
-        }
-        Err(source_error) => {
-            return Err(KeeperError::Io {
-                operation: "create no-replace retirement link",
-                path: destination.to_path_buf(),
-                source: source_error,
-            });
         }
     }
-    std::fs::remove_file(source).map_err(|source_error| KeeperError::Io {
-        operation: "remove retired writer artifact name",
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    Err(KeeperError::Io {
+        operation: "retire writer artifact",
         path: source.to_path_buf(),
-        source: source_error,
-    })?;
-    Ok(true)
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace retirement is unsupported on this platform",
+        ),
+    })
 }
 
 #[cfg(unix)]
@@ -2681,6 +3184,49 @@ fn scan_generation_claims(directory: &Path) -> Result<Vec<(PathBuf, u64)>, Keepe
     }
     claims.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     Ok(claims)
+}
+
+fn validate_proposed_manifest_segments(
+    directory: &Path,
+    manifest: &Manifest,
+    schema: SchemaDescriptor,
+    protection: &WriterProtection,
+) -> Result<(), KeeperError> {
+    for manifest_segment in &manifest.segments {
+        let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
+        let reader = SegmentReader::open_published(&path, schema).map_err(|source| {
+            KeeperError::SegmentOpen {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        reader.verify().map_err(|source| KeeperError::SegmentOpen {
+            path: path.clone(),
+            source,
+        })?;
+        validate_segment_witnesses(&path, manifest_segment, &reader)?;
+        #[cfg(feature = "durability")]
+        if let WriterProtection::Enabled(protector) = protection {
+            let sidecar = FileProtector::sidecar_path(&path);
+            let verification = protector.verify_file(&path, &sidecar).map_err(|source| {
+                KeeperError::Durability {
+                    operation: "preflight durable segment sidecar",
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+            if !verification.healthy {
+                return Err(KeeperError::SegmentMetadataMismatch {
+                    path,
+                    detail: "durable segment sidecar does not match the proposed FSLX authority"
+                        .to_owned(),
+                });
+            }
+        }
+        #[cfg(not(feature = "durability"))]
+        let _ = protection;
+    }
+    Ok(())
 }
 
 fn validate_segment_witnesses(
@@ -4041,22 +4587,10 @@ fn prepare_manifest_sidecar_rotation(
 
     if rename_current && regular_sidecar_exists(&previous)? {
         let retired = directory.join(format!(".tmp-manifest-previous-fec-{proposed_generation}"));
-        ensure_sidecar_destination(&retired)?;
-        std::fs::rename(&previous, &retired).map_err(|source| KeeperError::Io {
-            operation: "retire stale previous MANIFEST sidecar",
-            path: previous,
-            source,
-        })?;
-        changed = true;
+        changed = retire_manifest_sidecar(directory, &previous, &retired)? || changed;
     } else if !rename_current && current_exists {
         let retired = directory.join(format!(".tmp-manifest-current-fec-{proposed_generation}"));
-        ensure_sidecar_destination(&retired)?;
-        std::fs::rename(&current, &retired).map_err(|source| KeeperError::Io {
-            operation: "retire orphan current MANIFEST sidecar",
-            path: current.clone(),
-            source,
-        })?;
-        changed = true;
+        changed = retire_manifest_sidecar(directory, &current, &retired)? || changed;
     }
 
     if changed {
@@ -4077,13 +4611,9 @@ fn prepare_manifest_sidecar_rotation(
         if current_exists && !sidecar_matches {
             let retired =
                 directory.join(format!(".tmp-manifest-current-fec-{proposed_generation}"));
-            ensure_sidecar_destination(&retired)?;
-            std::fs::rename(&current, &retired).map_err(|source| KeeperError::Io {
-                operation: "retire stale current MANIFEST sidecar",
-                path: current.clone(),
-                source,
-            })?;
-            sync_directory(directory)?;
+            if retire_manifest_sidecar(directory, &current, &retired)? {
+                sync_directory(directory)?;
+            }
         }
         if !sidecar_matches {
             protector
@@ -4158,18 +4688,112 @@ fn regular_sidecar_exists(path: &Path) -> Result<bool, KeeperError> {
 }
 
 #[cfg(feature = "durability")]
-fn ensure_sidecar_destination(path: &Path) -> Result<(), KeeperError> {
-    if regular_sidecar_exists(path)? {
+fn retire_manifest_sidecar(
+    directory: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<bool, KeeperError> {
+    if source.parent() != Some(directory) || destination.parent() != Some(directory) {
         return Err(KeeperError::Io {
-            operation: "retire MANIFEST sidecar",
-            path: path.to_path_buf(),
+            operation: "validate MANIFEST sidecar retirement paths",
+            path: source.to_path_buf(),
             source: io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "retirement artifact already exists",
+                io::ErrorKind::InvalidInput,
+                "sidecar retirement paths must be direct children of the publish directory",
             ),
         });
     }
-    Ok(())
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{AtFlags, FileType, RenameFlags, renameat_with, statat};
+
+        let directory_file = File::open(directory).map_err(|source| KeeperError::Io {
+            operation: "open MANIFEST publish directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let source_name = source
+            .file_name()
+            .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+                path: source.to_path_buf(),
+            })?;
+        let source_stat = match statat(&directory_file, source_name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+            Err(error) => {
+                return Err(KeeperError::Io {
+                    operation: "inspect MANIFEST sidecar retirement source",
+                    path: source.to_path_buf(),
+                    source: io::Error::from(error),
+                });
+            }
+        };
+        if FileType::from_raw_mode(source_stat.st_mode) != FileType::RegularFile {
+            return Err(KeeperError::Io {
+                operation: "retire MANIFEST sidecar",
+                path: source.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MANIFEST sidecar retirement source is not a regular file",
+                ),
+            });
+        }
+
+        let destination_name =
+            destination
+                .file_name()
+                .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+                    path: destination.to_path_buf(),
+                })?;
+        let mut collision = 0_u64;
+        loop {
+            let candidate = if collision == 0 {
+                destination_name.to_os_string()
+            } else {
+                let mut name = destination_name.to_os_string();
+                name.push(format!(".{collision}"));
+                name
+            };
+            match renameat_with(
+                &directory_file,
+                source_name,
+                &directory_file,
+                &candidate,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => return Ok(true),
+                Err(error) if error == rustix::io::Errno::EXIST => {
+                    collision = collision.checked_add(1).ok_or_else(|| KeeperError::Io {
+                        operation: "allocate MANIFEST sidecar retirement destination",
+                        path: destination.to_path_buf(),
+                        source: io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "MANIFEST sidecar retirement suffix space is exhausted",
+                        ),
+                    })?;
+                }
+                Err(error) if error == rustix::io::Errno::NOENT => return Ok(false),
+                Err(error) => {
+                    return Err(KeeperError::Io {
+                        operation: "atomically retire MANIFEST sidecar",
+                        path: directory.join(candidate),
+                        source: io::Error::from(error),
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    Err(KeeperError::Io {
+        operation: "retire MANIFEST sidecar",
+        path: source.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace MANIFEST sidecar retirement is unsupported on this platform",
+        ),
+    })
 }
 
 #[cfg(feature = "durability")]
@@ -4291,6 +4915,41 @@ fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
 #[cfg(not(unix))]
 fn open_existing_manifest_temp(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
+}
+
+fn validate_manifest_successor(
+    previous: &Manifest,
+    proposed: &Manifest,
+) -> Result<(), KeeperError> {
+    let expected = previous
+        .generation
+        .checked_add(1)
+        .ok_or(KeeperError::GenerationExhausted {
+            current: previous.generation,
+        })?;
+    if proposed.generation != expected {
+        return Err(KeeperError::GenerationConflict {
+            expected,
+            proposed: proposed.generation,
+        });
+    }
+    if proposed.schema_id != previous.schema_id {
+        return Err(KeeperError::InvalidTransition {
+            detail: format!(
+                "schema_id changed from {:#018x} to {:#018x}",
+                previous.schema_id, proposed.schema_id
+            ),
+        });
+    }
+    if proposed.docid_high_watermark < previous.docid_high_watermark {
+        return Err(KeeperError::InvalidTransition {
+            detail: format!(
+                "docid_high_watermark rolled back from {} to {}",
+                previous.docid_high_watermark, proposed.docid_high_watermark
+            ),
+        });
+    }
+    validate_segment_transitions(previous, proposed)
 }
 
 fn validate_segment_transitions(
@@ -4771,7 +5430,7 @@ enum ErrorClass {
     NonCanonical,
 }
 
-fn validate_manifest(
+fn validate_manifest_shape(
     manifest: &Manifest,
     error_class: ErrorClass,
 ) -> Result<(), ManifestCodecError> {
@@ -4803,6 +5462,18 @@ fn validate_manifest(
             limit: usize_to_u64(MAX_MANIFEST_FIELDS),
         });
     }
+    Ok(())
+}
+
+fn validate_manifest(
+    manifest: &Manifest,
+    error_class: ErrorClass,
+) -> Result<(), ManifestCodecError> {
+    validate_manifest_shape(manifest, error_class)?;
+    let reject = |detail: String| match error_class {
+        ErrorClass::Invalid => ManifestCodecError::Invalid { detail },
+        ErrorClass::NonCanonical => ManifestCodecError::NonCanonical { detail },
+    };
 
     let mut segment_ids = Vec::new();
     segment_ids
@@ -5052,6 +5723,32 @@ fn check_manifest_byte_limit(length: usize) -> Result<(), ManifestCodecError> {
         });
     }
     Ok(())
+}
+
+fn manifest_encoded_len(manifest: &Manifest) -> Result<usize, ManifestCodecError> {
+    let length = MANIFEST_MIN_BYTES
+        .checked_add(
+            manifest
+                .segments
+                .len()
+                .checked_mul(SEGMENT_FIXED_BYTES)
+                .ok_or_else(|| invalid("manifest encoded length overflow"))?,
+        )
+        .and_then(|length| {
+            manifest.segments.iter().try_fold(length, |total, segment| {
+                total.checked_add(segment.tombstones.len())
+            })
+        })
+        .and_then(|length| {
+            manifest
+                .field_stats
+                .len()
+                .checked_mul(FIELD_STATS_BYTES)
+                .and_then(|stats| length.checked_add(stats))
+        })
+        .ok_or_else(|| invalid("manifest encoded length overflow"))?;
+    check_manifest_byte_limit(length)?;
+    Ok(length)
 }
 
 fn count_to_usize(
@@ -6150,21 +6847,93 @@ mod tests {
 
     #[cfg(feature = "durability")]
     #[test]
-    fn sidecar_retirement_preserves_an_existing_artifact() -> TestResult {
+    fn sidecar_retirement_uses_a_collision_safe_suffix() -> TestResult {
         let directory = tempdir()?;
+        let source = directory.path().join("MANIFEST.fec");
         let retired = directory.path().join(".tmp-manifest-current-fec-2");
         let sentinel = b"operator-preserved crash artifact";
+        let sidecar = b"active sidecar";
+        std::fs::write(&source, sidecar)?;
         std::fs::write(&retired, sentinel)?;
 
-        assert!(matches!(
-            ensure_sidecar_destination(&retired),
-            Err(KeeperError::Io {
-                operation: "retire MANIFEST sidecar",
-                ..
-            })
-        ));
-        assert_eq!(std::fs::read(retired)?, sentinel);
+        assert!(retire_manifest_sidecar(
+            directory.path(),
+            &source,
+            &retired
+        )?);
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&retired)?, sentinel);
+        assert_eq!(std::fs::read(append_path_suffix(&retired, ".1"))?, sidecar);
         Ok(())
+    }
+
+    #[cfg(feature = "durability")]
+    #[test]
+    fn durable_manifest_publish_retries_generation_after_retirement_collision() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempdir().expect("temp directory");
+            let protector = test_file_protector();
+            let mut writer = KeeperWriter::create_durable(
+                &cx,
+                directory.path(),
+                DEFAULT_SCHEMA,
+                protector.clone(),
+            )
+            .await
+            .expect("create durable writer");
+            writer
+                .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                .await
+                .expect("publish durable generation two");
+            drop(writer);
+
+            let previous = directory.path().join("MANIFEST.prev");
+            let previous_sidecar = FileProtector::sidecar_path(&previous);
+            let retired = directory.path().join(".tmp-manifest-previous-fec-3");
+            let retired_bytes = std::fs::read(&previous_sidecar).expect("read prior sidecar");
+            std::fs::rename(&previous_sidecar, &retired)
+                .expect("simulate interrupted generation-three retirement");
+
+            let mut writer = KeeperWriter::open_durable(
+                &cx,
+                directory.path(),
+                DEFAULT_SCHEMA,
+                protector.clone(),
+            )
+            .await
+            .expect("recover active previous sidecar");
+            assert_eq!(
+                std::fs::read(&retired).expect("preserve crash artifact"),
+                retired_bytes
+            );
+            assert!(
+                protector
+                    .verify_file(&previous, &previous_sidecar)
+                    .expect("verify regenerated previous sidecar")
+                    .healthy
+            );
+
+            writer
+                .publish(&cx, &durable_test_manifest(3, Vec::new()))
+                .await
+                .expect("retry durable generation three");
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 3);
+            assert_eq!(
+                std::fs::read(&retired).expect("retain first retirement artifact"),
+                retired_bytes
+            );
+            assert!(append_path_suffix(&retired, ".1").is_file());
+            for source in ["MANIFEST", "MANIFEST.prev"] {
+                let path = directory.path().join(source);
+                assert!(
+                    protector
+                        .verify_file(&path, &FileProtector::sidecar_path(&path))
+                        .expect("verify retried sidecar")
+                        .healthy,
+                    "{source}"
+                );
+            }
+        });
     }
 
     #[cfg(feature = "durability")]
@@ -7862,8 +8631,10 @@ mod tests {
 
         fn kill_and_reap(mut self) -> TestResult {
             let mut child = self.child.take().expect("child is still owned");
-            child.kill()?;
-            let status = child.wait()?;
+            let kill_result = child.kill();
+            let wait_result = child.wait();
+            kill_result?;
+            let status = wait_result?;
             if status.success() {
                 return Err("killed writer child unexpectedly exited successfully".into());
             }
@@ -8138,7 +8909,7 @@ mod tests {
         let reopened: Result<(), String> = run_with_test_cx(move |cx| async move {
             KeeperWriter::open(&cx, reopen_path, DEFAULT_SCHEMA)
                 .await
-                .map(|writer| drop(writer))
+                .map(drop)
                 .map_err(|error| error.to_string())
         });
         reopened.map_err(io::Error::other)?;
@@ -8260,6 +9031,260 @@ mod tests {
                 .and_then(|entry| entry.file_name().into_string().ok())
                 .is_some_and(|name| name.starts_with(".tmp-abandoned-manifest-3-"))
         }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_preflights_missing_segment_before_manifest_publication() -> TestResult {
+        let index = tempdir()?;
+        let encoded = encoded_test_segment(0xdead, 0, 1, 1)?;
+        let proposed = durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]);
+        let directory = index.path().to_path_buf();
+        let rejected: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let manifest_path = directory.join("MANIFEST");
+            let before = std::fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            match writer.publish(&cx, &proposed).await {
+                Err(KeeperError::SegmentOpen { .. }) => {}
+                Err(error) => return Err(format!("unexpected publish failure: {error}")),
+                Ok(_) => return Err("missing segment was published as authority".to_owned()),
+            }
+            let after = std::fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            if after != before {
+                return Err("MANIFEST changed before segment preflight failed".to_owned());
+            }
+            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+                return Err("writer snapshot advanced after rejected publication".to_owned());
+            }
+            Ok(())
+        });
+        rejected.map_err(io::Error::other)?;
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            1
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_validates_manifest_before_segment_preflight() -> TestResult {
+        let index = tempdir()?;
+        let encoded = encoded_test_segment(0xbad, 0, 1, 1)?;
+        let mut proposed = durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]);
+        proposed.generation = 0;
+        let directory = index.path().to_path_buf();
+        let rejected: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            match writer.publish(&cx, &proposed).await {
+                Err(KeeperError::InvalidManifest { .. }) => Ok(()),
+                Err(error) => Err(format!("unexpected publish failure: {error}")),
+                Ok(_) => Err("invalid manifest reached segment preflight".to_owned()),
+            }
+        });
+        rejected.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_preflights_corrupt_segment_before_manifest_publication() -> TestResult {
+        let index = tempdir()?;
+        let encoded = encoded_test_segment(0xcafe, 0, 1, 1)?;
+        let section_offset = usize::try_from(encoded.section_entries()[0].offset)?;
+        let proposed = durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]);
+        let directory = index.path().to_path_buf();
+        let rejected: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            let published = writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut bytes = std::fs::read(&published).map_err(|error| error.to_string())?;
+            bytes[section_offset] ^= 0x80;
+            std::fs::write(&published, bytes).map_err(|error| error.to_string())?;
+
+            let manifest_path = directory.join("MANIFEST");
+            let before = std::fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            match writer.publish(&cx, &proposed).await {
+                Err(KeeperError::SegmentOpen { .. }) => {}
+                Err(error) => return Err(format!("unexpected publish failure: {error}")),
+                Ok(_) => return Err("corrupt segment was published as authority".to_owned()),
+            }
+            let after = std::fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            if after != before {
+                return Err("MANIFEST changed before segment preflight failed".to_owned());
+            }
+            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+                return Err("writer snapshot advanced after rejected publication".to_owned());
+            }
+            Ok(())
+        });
+        rejected.map_err(io::Error::other)?;
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            1
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn durable_writer_preflights_segment_sidecar_before_manifest_publication() -> TestResult {
+        let index = tempdir()?;
+        let encoded = encoded_test_segment(0xfec, 0, 1, 1)?;
+        let proposed = durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]);
+        let directory = index.path().to_path_buf();
+        let protector = test_file_protector();
+        let rejected: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            let published = publish_pending_segment(pending).map_err(|error| error.to_string())?;
+            if FileProtector::sidecar_path(&published).exists() {
+                return Err(
+                    "ordinary segment publication unexpectedly created a sidecar".to_owned(),
+                );
+            }
+
+            let manifest_path = directory.join("MANIFEST");
+            let before = std::fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            match writer.publish(&cx, &proposed).await {
+                Err(KeeperError::Durability {
+                    operation: "preflight durable segment sidecar",
+                    ..
+                }) => {}
+                Err(error) => return Err(format!("unexpected publish failure: {error}")),
+                Ok(_) => return Err("unprotected segment became durable authority".to_owned()),
+            }
+            let after = std::fs::read(&manifest_path).map_err(|error| error.to_string())?;
+            if after != before {
+                return Err("durable MANIFEST changed before sidecar preflight failed".to_owned());
+            }
+            Ok(())
+        });
+        rejected.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "durability",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn recovered_byte_install_skips_stale_temps_and_quarantine_collisions() -> TestResult {
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let destination = index.path().join("MANIFEST");
+        std::fs::write(&destination, b"first corrupt authority")?;
+        let base = format!(
+            ".tmp-repair-MANIFEST-{:016x}",
+            admission.record.pid_start_nonce
+        );
+        let stale_temp = index.path().join(&base);
+        std::fs::write(&stale_temp, b"interrupted prior repair")?;
+
+        install_recovered_bytes(&admission, "MANIFEST", &destination, b"first recovery")?;
+        assert_eq!(std::fs::read(&destination)?, b"first recovery");
+        assert_eq!(std::fs::read(&stale_temp)?, b"interrupted prior repair");
+
+        std::fs::write(&destination, b"second corrupt authority")?;
+        install_recovered_bytes(&admission, "MANIFEST", &destination, b"second recovery")?;
+        assert_eq!(std::fs::read(&destination)?, b"second recovery");
+        assert_eq!(std::fs::read(&stale_temp)?, b"interrupted prior repair");
+        assert_eq!(
+            std::fs::read_dir(index.path())?
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(".tmp-corrupt-MANIFEST-"))
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "durability",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn recovered_byte_install_rolls_back_a_substituted_ready_link() -> TestResult {
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let destination = index.path().join("MANIFEST");
+        let prior = Manifest::empty(1, DEFAULT_SCHEMA.schema_id()?, 0).to_bytes()?;
+        std::fs::write(&destination, &prior)?;
+        let displaced_ready = index.path().join("displaced-owned-ready-link");
+
+        let error = install_recovered_bytes_with_hook(
+            &admission,
+            "MANIFEST",
+            &destination,
+            b"validated recovery",
+            |ready| {
+                std::fs::rename(ready, &displaced_ready)?;
+                std::fs::write(ready, b"substituted bytes")
+            },
+        )
+        .expect_err("a substituted ready link must not become authority");
+        assert!(matches!(
+            error,
+            KeeperError::Io {
+                operation: "verify installed recovered bytes",
+                ..
+            }
+        ));
+        let reopened = std::fs::read(&destination)?;
+        assert_eq!(reopened, prior);
+        assert_eq!(Manifest::from_bytes(&reopened)?.generation, 1);
+        assert_eq!(std::fs::read(&displaced_ready)?, b"validated recovery");
+        Ok(())
+    }
+
+    #[cfg(all(
+        feature = "durability",
+        any(target_os = "linux", target_os = "android", target_vendor = "apple")
+    ))]
+    #[test]
+    fn recovered_byte_install_ignores_a_substituted_ready_link_when_destination_is_missing()
+    -> TestResult {
+        let index = tempdir()?;
+        let admission = acquire_writer_admission(index.path())?;
+        let destination = index.path().join("MANIFEST");
+        let displaced_ready = index.path().join("displaced-owned-ready-link");
+
+        install_recovered_bytes_with_hook(
+            &admission,
+            "MANIFEST",
+            &destination,
+            b"validated recovery",
+            |ready| {
+                std::fs::rename(ready, &displaced_ready)?;
+                std::fs::write(ready, b"substituted bytes")
+            },
+        )?;
+        assert_eq!(std::fs::read(&destination)?, b"validated recovery");
+        assert_eq!(std::fs::read(&displaced_ready)?, b"validated recovery");
         Ok(())
     }
 
@@ -8394,6 +9419,390 @@ mod tests {
 
     #[cfg(all(unix, feature = "durability"))]
     #[test]
+    fn unrecoverable_reconstructed_current_preserves_previous_authority() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let encoded = encoded_test_segment(0xfeed, 0, 2, 1)?;
+        let manifest_segment = manifest_segment(&encoded, 1);
+        let setup_manifest_segment = manifest_segment.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, vec![setup_manifest_segment]))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let current_path = index.path().join("MANIFEST");
+        let segment_path = index
+            .path()
+            .join(canonical_segment_name(manifest_segment.segment_id));
+        let mut corrupt_current = std::fs::read(&current_path)?;
+        corrupt_current[16] ^= 0xff;
+        std::fs::write(&current_path, &corrupt_current)?;
+        let mut corrupt_segment = std::fs::read(&segment_path)?;
+        corrupt_segment[64] ^= 0xff;
+        std::fs::write(&segment_path, corrupt_segment)?;
+        let segment_sidecar = FileProtector::sidecar_path(&segment_path);
+        let saved_sidecar = index.path().join("saved-unrecoverable-segment.fec");
+        std::fs::rename(&segment_sidecar, &saved_sidecar)?;
+
+        let directory = index.path().to_path_buf();
+        let repair_protector = protector.clone();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+                return Err("unrecoverable reconstructed current displaced previous".to_owned());
+            }
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+
+        assert!(!current_path.exists());
+        let retired_current = std::fs::read_dir(index.path())?
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry.file_name().into_string().is_ok_and(|name| {
+                    name.starts_with(".tmp-corrupt-manifest-")
+                        && !Path::new(&name)
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("fec"))
+                })
+            })
+            .ok_or_else(|| io::Error::other("corrupt current was not quarantined"))?;
+        assert_eq!(std::fs::read(retired_current.path())?, corrupt_current);
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            1,
+            "the usable previous generation must remain reader-visible"
+        );
+        assert!(saved_sidecar.is_file());
+        assert!(!segment_sidecar.exists());
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn unusable_reconstructed_fallback_does_not_block_healthy_current() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let encoded = encoded_test_segment(0xfa11, 0, 2, 1)?;
+        let manifest_segment = manifest_segment(&encoded, 1);
+        let setup_manifest_segment = manifest_segment.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, vec![setup_manifest_segment]))
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut current = durable_test_manifest(3, Vec::new());
+            current.docid_high_watermark = 2;
+            writer
+                .publish(&cx, &current)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let previous_path = index.path().join("MANIFEST.prev");
+        let mut corrupt_previous = std::fs::read(&previous_path)?;
+        corrupt_previous[16] ^= 0xff;
+        std::fs::write(&previous_path, &corrupt_previous)?;
+        let segment_path = index
+            .path()
+            .join(canonical_segment_name(manifest_segment.segment_id));
+        let mut corrupt_segment = std::fs::read(&segment_path)?;
+        corrupt_segment[64] ^= 0xff;
+        std::fs::write(&segment_path, corrupt_segment)?;
+        let segment_sidecar = FileProtector::sidecar_path(&segment_path);
+        let saved_sidecar = index.path().join("saved-fallback-segment.fec");
+        std::fs::rename(&segment_sidecar, &saved_sidecar)?;
+
+        let directory = index.path().to_path_buf();
+        let repair_protector = protector.clone();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if writer.snapshot().loaded_manifest().manifest.generation != 3 {
+                return Err("unusable optional fallback displaced healthy current".to_owned());
+            }
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+
+        assert_eq!(std::fs::read(&previous_path)?, corrupt_previous);
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            3
+        );
+        assert!(saved_sidecar.is_file());
+        assert!(!segment_sidecar.exists());
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn stale_reconstructed_fallback_does_not_block_healthy_current() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let previous_path = index.path().join("MANIFEST.prev");
+        let stale = Manifest::empty(50, DEFAULT_SCHEMA.schema_id()?, 0).to_bytes()?;
+        std::fs::write(&previous_path, &stale)?;
+        protector.protect_file(&previous_path)?;
+        let mut corrupt_stale = stale;
+        corrupt_stale[16] ^= 0xff;
+        std::fs::write(&previous_path, &corrupt_stale)?;
+
+        let directory = index.path().to_path_buf();
+        let repair_protector = protector.clone();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if writer.snapshot().loaded_manifest().manifest.generation != 2 {
+                return Err("stale optional fallback displaced healthy current".to_owned());
+            }
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+
+        assert_eq!(std::fs::read(&previous_path)?, corrupt_stale);
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            2
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn mismatched_dual_reconstructed_manifests_fail_closed() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let current_path = index.path().join("MANIFEST");
+        let previous_path = index.path().join("MANIFEST.prev");
+        let current_sidecar = FileProtector::sidecar_path(&current_path);
+        let saved_current_sidecar = index.path().join("saved-current-generation-two.fec");
+        std::fs::rename(&current_sidecar, &saved_current_sidecar)?;
+
+        let synthetic_current = index.path().join(".tmp-synthetic-current-five");
+        let synthetic_bytes = durable_test_manifest(5, Vec::new()).to_bytes()?;
+        std::fs::write(&synthetic_current, &synthetic_bytes)?;
+        protector.protect_file_with_witness(
+            &synthetic_current,
+            FileSourceWitness::from_bytes(&synthetic_bytes),
+        )?;
+        std::fs::rename(
+            FileProtector::sidecar_path(&synthetic_current),
+            &current_sidecar,
+        )?;
+
+        let mut corrupt_current = std::fs::read(&current_path)?;
+        corrupt_current[16] ^= 0xff;
+        std::fs::write(&current_path, &corrupt_current)?;
+        let mut corrupt_previous = std::fs::read(&previous_path)?;
+        corrupt_previous[16] ^= 0xff;
+        std::fs::write(&previous_path, &corrupt_previous)?;
+
+        let directory = index.path().to_path_buf();
+        let open_result: Result<KeeperWriter, KeeperError> =
+            run_with_test_cx(move |cx| async move {
+                KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, protector).await
+            });
+        assert!(matches!(
+            open_result,
+            Err(KeeperError::InvalidGenerationPair {
+                current: 5,
+                previous: 1,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read(&current_path)?, corrupt_current);
+        assert_eq!(std::fs::read(&previous_path)?, corrupt_previous);
+        assert!(saved_current_sidecar.is_file());
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn malformed_current_sidecar_falls_back_to_usable_previous() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let current_path = index.path().join("MANIFEST");
+        let mut corrupt_current = std::fs::read(&current_path)?;
+        corrupt_current[16] ^= 0xff;
+        std::fs::write(&current_path, corrupt_current)?;
+        std::fs::write(
+            FileProtector::sidecar_path(&current_path),
+            b"malformed current sidecar",
+        )?;
+
+        let directory = index.path().to_path_buf();
+        let repair_protector = protector.clone();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if writer.snapshot().loaded_manifest().manifest.generation != 1 {
+                return Err("malformed current sidecar blocked previous fallback".to_owned());
+            }
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            1
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn malformed_previous_sidecar_does_not_block_usable_current() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let previous_path = index.path().join("MANIFEST.prev");
+        let mut corrupt_previous = std::fs::read(&previous_path)?;
+        corrupt_previous[16] ^= 0xff;
+        std::fs::write(&previous_path, &corrupt_previous)?;
+        std::fs::write(
+            FileProtector::sidecar_path(&previous_path),
+            b"malformed previous sidecar",
+        )?;
+
+        let directory = index.path().to_path_buf();
+        let repair_protector = protector.clone();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            if writer.snapshot().loaded_manifest().manifest.generation != 2 {
+                return Err("malformed optional fallback blocked healthy current".to_owned());
+            }
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+
+        assert_eq!(std::fs::read(&previous_path)?, corrupt_previous);
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            2
+        );
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
     fn durable_writer_stages_and_validates_manifest_and_segment_repairs() -> TestResult {
         let index = tempdir()?;
         let directory = index.path().to_path_buf();
@@ -8469,7 +9878,7 @@ mod tests {
         let regenerated: Result<(), String> = run_with_test_cx(move |cx| async move {
             KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, stale_protector)
                 .await
-                .map(|writer| drop(writer))
+                .map(drop)
                 .map_err(|error| error.to_string())
         });
         regenerated.map_err(io::Error::other)?;
@@ -8478,6 +9887,30 @@ mod tests {
             protector
                 .verify_file(&manifest_path, &FileProtector::sidecar_path(&manifest_path))?
                 .healthy
+        );
+
+        std::fs::write(
+            FileProtector::sidecar_path(&manifest_path),
+            b"second malformed stale sidecar",
+        )?;
+        let directory = index.path().to_path_buf();
+        let repeated_protector = protector.clone();
+        let repeated: Result<(), String> = run_with_test_cx(move |cx| async move {
+            KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, repeated_protector)
+                .await
+                .map(drop)
+                .map_err(|error| error.to_string())
+        });
+        repeated.map_err(io::Error::other)?;
+        assert_eq!(std::fs::read(&manifest_path)?, authoritative_manifest);
+        assert_eq!(
+            std::fs::read_dir(index.path())?
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with(".tmp-stale-fec-MANIFEST-"))
+                .count(),
+            2,
+            "each stale sidecar must retain a distinct no-replace quarantine"
         );
         Ok(())
     }

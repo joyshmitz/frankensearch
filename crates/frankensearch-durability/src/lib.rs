@@ -33,8 +33,8 @@ pub use codec::{
 pub use config::DurabilityConfig;
 pub use file_protector::{
     DirectoryHealthReport, DirectoryProtectionReport, DurabilityProvider, FileHealth,
-    FileProtectionResult, FileProtector, FileRepairOutcome, FileSourceWitness, FileVerifyResult,
-    HealthCheckResult, NoopDurability, RepairPipelineConfig,
+    FileProtectionResult, FileProtector, FileRecoveryOutcome, FileRepairOutcome, FileSourceWitness,
+    FileVerifyResult, HealthCheckResult, NoopDurability, RepairPipelineConfig,
 };
 pub use fsvi_protector::{FsviProtectionResult, FsviProtector, FsviRepairResult, FsviVerifyResult};
 pub use metrics::{DecodeOutcomeClass, DurabilityMetrics, DurabilityMetricsSnapshot};
