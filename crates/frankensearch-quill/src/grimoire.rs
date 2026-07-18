@@ -495,6 +495,18 @@ pub enum TermDictionaryError {
         /// Caller-selected result cap.
         limit: usize,
     },
+    /// A glob matched one more dictionary term than the caller allowed.
+    #[error(
+        "glob expansion for field {field_ord} observed at least {actual} matches, exceeding limit {limit}"
+    )]
+    GlobExpansionLimitExceeded {
+        /// Field whose dictionary terms were scanned.
+        field_ord: u16,
+        /// Caller-selected expansion cap.
+        limit: usize,
+        /// Number of matches observed before the scan stopped, always `limit + 1`.
+        actual: usize,
+    },
     /// A fallible allocation could not reserve the required space.
     #[error("unable to reserve {count} items for {context}")]
     Allocation {
@@ -1320,12 +1332,210 @@ impl<'a> TermDictionary<'a> {
         TermCursor::new(self, lower, upper, Some(field_ord), None)
     }
 
+    /// Expand a field-scoped byte glob under an explicit result cap.
+    ///
+    /// `*` is the only wildcard and matches any byte sequence, including the
+    /// empty sequence. Repeated stars are equivalent to one star. Exact terms
+    /// use indexed lookup, a sole trailing star uses the prefix cursor, and all
+    /// other shapes scan only the requested field. Results retain dictionary
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TermDictionaryError::GlobExpansionLimitExceeded`] as soon as
+    /// one more matching term than `limit` is observed. It also propagates
+    /// invalid field, allocation, and validated-decode errors.
+    pub fn expand_glob(
+        &self,
+        field_ord: u16,
+        pattern: &[u8],
+        limit: usize,
+    ) -> Result<Vec<OwnedTerm>, TermDictionaryError> {
+        validate_query_term(self.schema, field_ord, &[])?;
+
+        if !pattern.contains(&b'*') {
+            return self.expand_exact_glob(field_ord, pattern, limit);
+        }
+
+        if let Some(prefix) = trailing_star_prefix(pattern) {
+            return collect_glob_matches(
+                self.prefix_cursor(field_ord, prefix)?,
+                field_ord,
+                limit,
+                |_| true,
+            );
+        }
+
+        let longest_literal = longest_glob_literal(pattern);
+        collect_glob_matches(self.field_cursor(field_ord)?, field_ord, limit, |term| {
+            contains_subslice(term, longest_literal) && star_glob_matches(pattern, term)
+        })
+    }
+
+    fn expand_exact_glob(
+        &self,
+        field_ord: u16,
+        term: &[u8],
+        limit: usize,
+    ) -> Result<Vec<OwnedTerm>, TermDictionaryError> {
+        let Some(term_match) = self.lookup(field_ord, term)? else {
+            return Ok(Vec::new());
+        };
+        if limit == 0 {
+            return Err(glob_limit_error(field_ord, limit, 1));
+        }
+
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(1)
+            .map_err(|_| TermDictionaryError::Allocation {
+                context: "glob expansion rows",
+                count: 1,
+            })?;
+        output.push(OwnedTerm {
+            term_ord: term_match.term_ord,
+            field_ord,
+            term: clone_bytes(term, "exact glob term")?,
+            metadata: term_match.metadata,
+        });
+        Ok(output)
+    }
+
     fn block_for_key(&self, key: &[u8]) -> Option<usize> {
         let insertion = self
             .blocks
             .partition_point(|block| self.bytes[block.first_key_range.clone()] <= *key);
         insertion.checked_sub(1)
     }
+}
+
+fn collect_glob_matches<F>(
+    mut cursor: TermCursor<'_, '_>,
+    field_ord: u16,
+    limit: usize,
+    mut matches: F,
+) -> Result<Vec<OwnedTerm>, TermDictionaryError>
+where
+    F: FnMut(&[u8]) -> bool,
+{
+    let mut output = Vec::new();
+    while let Some(current) = cursor.current() {
+        if matches(current.term) {
+            if output.len() >= limit {
+                return Err(glob_limit_error(
+                    field_ord,
+                    limit,
+                    output.len().saturating_add(1),
+                ));
+            }
+            output
+                .try_reserve(1)
+                .map_err(|_| TermDictionaryError::Allocation {
+                    context: "glob expansion rows",
+                    count: output.len().saturating_add(1),
+                })?;
+            output.push(current.to_owned()?);
+        }
+        cursor.next()?;
+    }
+    Ok(output)
+}
+
+const fn glob_limit_error(field_ord: u16, limit: usize, actual: usize) -> TermDictionaryError {
+    TermDictionaryError::GlobExpansionLimitExceeded {
+        field_ord,
+        limit,
+        actual,
+    }
+}
+
+fn trailing_star_prefix(pattern: &[u8]) -> Option<&[u8]> {
+    let first_star = pattern.iter().position(|byte| *byte == b'*')?;
+    pattern[first_star..]
+        .iter()
+        .all(|byte| *byte == b'*')
+        .then_some(&pattern[..first_star])
+}
+
+fn longest_glob_literal(pattern: &[u8]) -> &[u8] {
+    pattern
+        .split(|byte| *byte == b'*')
+        .max_by_key(|literal| literal.len())
+        .unwrap_or_default()
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
+    // Reject eight impossible starts per word before confirming the complete
+    // literal. This is the safe SWAR analogue of memmem's first-byte filter;
+    // the final `starts_with` remains the semantic authority.
+    const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
+    const BYTE_HIGHS: u64 = 0x8080_8080_8080_8080;
+
+    let final_start = haystack.len() - needle.len();
+    let candidates = &haystack[..=final_start];
+    let repeated_first = u64::from(needle[0]).wrapping_mul(BYTE_ONES);
+    let (chunks, remainder) = candidates.as_chunks::<8>();
+    let mut base = 0_usize;
+    for chunk in chunks {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(chunk);
+        let differences = u64::from_ne_bytes(bytes) ^ repeated_first;
+        let has_first = differences.wrapping_sub(BYTE_ONES) & !differences & BYTE_HIGHS != 0;
+        if has_first
+            && chunk.iter().enumerate().any(|(offset, &candidate)| {
+                candidate == needle[0] && haystack[base + offset..].starts_with(needle)
+            })
+        {
+            return true;
+        }
+        base += chunk.len();
+    }
+    remainder.iter().enumerate().any(|(offset, &candidate)| {
+        candidate == needle[0] && haystack[base + offset..].starts_with(needle)
+    })
+}
+
+fn star_glob_matches(pattern: &[u8], term: &[u8]) -> bool {
+    let mut pattern_pos = 0;
+    let mut term_pos = 0;
+    let mut resume_after_star = None;
+    let mut star_match_end = 0;
+
+    while term_pos < term.len() {
+        match pattern.get(pattern_pos) {
+            Some(pattern_byte) if *pattern_byte == term[term_pos] && *pattern_byte != b'*' => {
+                pattern_pos = pattern_pos.saturating_add(1);
+                term_pos = term_pos.saturating_add(1);
+            }
+            Some(&b'*') => {
+                while pattern.get(pattern_pos) == Some(&b'*') {
+                    pattern_pos = pattern_pos.saturating_add(1);
+                }
+                resume_after_star = Some(pattern_pos);
+                star_match_end = term_pos;
+            }
+            _ => {
+                let Some(resume_pos) = resume_after_star else {
+                    return false;
+                };
+                if star_match_end >= term.len() {
+                    return false;
+                }
+                star_match_end = star_match_end.saturating_add(1);
+                term_pos = star_match_end;
+                pattern_pos = resume_pos;
+            }
+        }
+    }
+
+    pattern[pattern_pos..].iter().all(|byte| *byte == b'*')
 }
 
 /// Reusable exact-lookup buffers.
@@ -2700,6 +2910,45 @@ mod tests {
             .collect()
     }
 
+    fn expanded_glob_terms(
+        dictionary: &TermDictionary<'_>,
+        field_ord: u16,
+        pattern: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, TermDictionaryError> {
+        Ok(dictionary
+            .expand_glob(field_ord, pattern, limit)?
+            .into_iter()
+            .map(|row| row.term)
+            .collect())
+    }
+
+    fn brute_force_glob_matches(pattern: &[u8], term: &[u8]) -> bool {
+        let Some((&head, tail)) = pattern.split_first() else {
+            return term.is_empty();
+        };
+        if head == b'*' {
+            let mut remaining_pattern = tail;
+            while remaining_pattern.first() == Some(&b'*') {
+                remaining_pattern = &remaining_pattern[1..];
+            }
+            return (0..=term.len()).any(|matched_bytes| {
+                brute_force_glob_matches(remaining_pattern, &term[matched_bytes..])
+            });
+        }
+        let Some((&term_head, term_tail)) = term.split_first() else {
+            return false;
+        };
+        head == term_head && brute_force_glob_matches(tail, term_tail)
+    }
+
+    fn next_glob_random(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
     #[test]
     fn empty_and_single_entry_have_golden_wire_bytes() -> TestResult {
         let empty_sections = TermSectionLengths {
@@ -2949,6 +3198,210 @@ mod tests {
             dictionary.range_cursor(0, Bound::Included(b"z"), Bound::Included(b"a")),
             Err(TermDictionaryError::InvalidRange)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn glob_expansion_covers_every_pattern_class_and_field_scope() -> TestResult {
+        let mut keys = vec![
+            (0, Vec::new()),
+            (0, b"alpha".to_vec()),
+            (0, b"alphabet".to_vec()),
+            (0, b"beta".to_vec()),
+            (0, b"delta".to_vec()),
+            (0, b"omega".to_vec()),
+            (0, b"pre-middle-suf".to_vec()),
+            (0, b"prefix".to_vec()),
+            (0, b"quest?mark".to_vec()),
+            (0, "résumé".as_bytes().to_vec()),
+            (0, "世界-end".as_bytes().to_vec()),
+            (0, vec![0xff, 0]),
+            (1, b"alpha".to_vec()),
+            (1, b"omega".to_vec()),
+            (1, b"prefix".to_vec()),
+        ];
+        keys.sort();
+        let (encoded, _, sections) = encode_fixture(MIXED_SCHEMA, &keys)?;
+        let dictionary = encoded.dictionary(MIXED_SCHEMA, sections)?;
+        let generous_limit = keys.len();
+
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"", generous_limit)?,
+            vec![Vec::<u8>::new()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"alpha", generous_limit)?,
+            vec![b"alpha".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"alp*", generous_limit)?,
+            vec![b"alpha".to_vec(), b"alphabet".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"alp***", generous_limit)?,
+            vec![b"alpha".to_vec(), b"alphabet".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"*ta", generous_limit)?,
+            vec![b"beta".to_vec(), b"delta".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"*middle*", generous_limit)?,
+            vec![b"pre-middle-suf".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"p*e*suf", generous_limit)?,
+            vec![b"pre-middle-suf".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"p**e***suf", generous_limit)?,
+            vec![b"pre-middle-suf".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"quest?mark", generous_limit)?,
+            vec![b"quest?mark".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"quest?*", generous_limit)?,
+            vec![b"quest?mark".to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, "ré*".as_bytes(), generous_limit)?,
+            vec!["résumé".as_bytes().to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, "*界*".as_bytes(), generous_limit)?,
+            vec!["世界-end".as_bytes().to_vec()]
+        );
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, &[b'*', 0xff, b'*'], generous_limit)?,
+            vec![vec![0xff, 0]]
+        );
+
+        let expected_field_zero = keys
+            .iter()
+            .filter(|(field_ord, _)| *field_ord == 0)
+            .map(|(_, term)| term.clone())
+            .collect::<Vec<_>>();
+        let all_once = expanded_glob_terms(&dictionary, 0, b"*", generous_limit)?;
+        let all_twice = expanded_glob_terms(&dictionary, 0, b"**", generous_limit)?;
+        assert_eq!(all_once, expected_field_zero);
+        assert_eq!(all_twice, expected_field_zero);
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 1, b"*", generous_limit)?,
+            vec![b"alpha".to_vec(), b"omega".to_vec(), b"prefix".to_vec()]
+        );
+        assert!(expanded_glob_terms(&dictionary, 2, b"*", generous_limit)?.is_empty());
+        assert!(contains_subslice(b"1234567needle", b"needle"));
+        assert!(contains_subslice(b"12345678needle", b"needle"));
+        assert!(!contains_subslice(b"12345678needlf", b"needle"));
+        Ok(())
+    }
+
+    #[test]
+    fn glob_expansion_limit_fails_on_exactly_one_additional_match() -> TestResult {
+        let keys = vec![
+            (0, b"a".to_vec()),
+            (0, b"aa".to_vec()),
+            (0, b"ab".to_vec()),
+            (0, b"b".to_vec()),
+        ];
+        let (encoded, _, sections) = encode_fixture(KEYWORD_SCHEMA, &keys)?;
+        let dictionary = encoded.dictionary(KEYWORD_SCHEMA, sections)?;
+
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"a*", 3)?,
+            vec![b"a".to_vec(), b"aa".to_vec(), b"ab".to_vec()]
+        );
+        assert!(matches!(
+            dictionary.expand_glob(0, b"a*", 2),
+            Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                field_ord: 0,
+                limit: 2,
+                actual: 3,
+            })
+        ));
+        assert!(matches!(
+            dictionary.expand_glob(0, b"*a*", 2),
+            Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                field_ord: 0,
+                limit: 2,
+                actual: 3,
+            })
+        ));
+        assert!(matches!(
+            dictionary.expand_glob(0, b"a", 0),
+            Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                field_ord: 0,
+                limit: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(
+            expanded_glob_terms(&dictionary, 0, b"a", 1)?,
+            vec![b"a".to_vec()]
+        );
+        assert!(expanded_glob_terms(&dictionary, 0, b"missing", 0)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn seeded_glob_expansion_matches_independent_brute_force_filter() -> TestResult {
+        const BASE_SEED: u64 = 0x5eed_fade_cafe_babe;
+        const TERM_ALPHABET: [u8; 8] = [b'a', b'b', b'c', b'-', b'?', 0, 0x80, 0xff];
+        const PATTERN_ALPHABET: [u8; 9] = [b'a', b'b', b'c', b'-', b'?', 0, 0x80, 0xff, b'*'];
+
+        init_replay_tracing();
+        for seed in 0..16_u64 {
+            let case_seed = BASE_SEED ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mut state = case_seed;
+            let mut keys = Vec::new();
+            for field_ord in 0..=1_u16 {
+                for _ in 0..96 {
+                    let term_len = usize::try_from(next_glob_random(&mut state) % 13)?;
+                    let mut term = Vec::with_capacity(term_len);
+                    for _ in 0..term_len {
+                        let alphabet_len = u64::try_from(TERM_ALPHABET.len())?;
+                        let index = usize::try_from(next_glob_random(&mut state) % alphabet_len)?;
+                        term.push(TERM_ALPHABET[index]);
+                    }
+                    keys.push((field_ord, term));
+                }
+            }
+            keys.sort();
+            keys.dedup();
+
+            let (encoded, _, sections) = encode_fixture(MIXED_SCHEMA, &keys)?;
+            let dictionary = encoded.dictionary(MIXED_SCHEMA, sections)?;
+            for pattern_case in 0..48 {
+                let pattern_len = usize::try_from(next_glob_random(&mut state) % 9)?;
+                let mut pattern = Vec::with_capacity(pattern_len.saturating_add(2));
+                for _ in 0..pattern_len {
+                    let alphabet_len = u64::try_from(PATTERN_ALPHABET.len())?;
+                    let index = usize::try_from(next_glob_random(&mut state) % alphabet_len)?;
+                    pattern.push(PATTERN_ALPHABET[index]);
+                }
+                if pattern_case % 7 == 0 {
+                    pattern.extend_from_slice(b"**");
+                }
+
+                for field_ord in 0..=1_u16 {
+                    let expected = keys
+                        .iter()
+                        .filter(|(candidate_field, term)| {
+                            *candidate_field == field_ord
+                                && brute_force_glob_matches(&pattern, term)
+                        })
+                        .map(|(_, term)| term.clone())
+                        .collect::<Vec<_>>();
+                    let actual = expanded_glob_terms(&dictionary, field_ord, &pattern, keys.len())?;
+                    assert_eq!(
+                        actual, expected,
+                        "seed={case_seed:#x} pattern_case={pattern_case} field={field_ord} pattern={pattern:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

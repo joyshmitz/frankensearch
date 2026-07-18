@@ -12,15 +12,28 @@
 //!   cargo bench -p frankensearch-quill --features bench-internals \
 //!   --bench term_dictionary_ab
 //! ```
+//!
+//! The million-term glob distribution is deliberately opt-in because fixture
+//! construction is substantially heavier than the default A/B lanes:
+//!
+//! ```bash
+//! FRANKENSEARCH_QUILL_GLOB_SCALE_1M=1 \
+//!   cargo bench -p frankensearch-quill --features bench-internals \
+//!   --bench term_dictionary_ab
+//! ```
+//!
+//! Its emitted percentiles and raw samples are provisional QG-6 evidence only;
+//! the gate is inactive and this benchmark asserts no latency threshold.
 
 use std::cmp::Ordering;
 use std::hint::black_box;
+use std::time::Instant;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankensearch_quill::DEFAULT_SCHEMA;
 use frankensearch_quill::grimoire::{
-    ByteSpan, EncodedTermDictionary, TermCursor, TermDictionary, TermDictionaryError, TermInput,
-    TermMatch, TermMetadata, TermScratch, TermSectionLengths,
+    ByteSpan, EncodedTermDictionary, OwnedTerm, TermCursor, TermDictionary, TermDictionaryError,
+    TermInput, TermMatch, TermMetadata, TermScratch, TermSectionLengths,
 };
 
 const FIELD_ORDS: [u16; 3] = [0, 1, 2];
@@ -30,6 +43,13 @@ const EXACT_QUERY_COUNT: usize = 4_096;
 const PREFIXES_PER_FIELD: usize = 16;
 const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const DIGEST_PRIME: u64 = 0x0000_0100_0000_01b3;
+const GLOB_SCALE_ENV: &str = "FRANKENSEARCH_QUILL_GLOB_SCALE_1M";
+const GLOB_SCALE_TERM_COUNT: usize = 1_000_000;
+const GLOB_SCALE_FIELD_ORD: u16 = 1;
+const GLOB_SCALE_BUCKET_COUNT: usize = 1_024;
+const GLOB_SCALE_MATCH_LIMIT: usize = 64;
+const GLOB_SCALE_WARMUP_COUNT: usize = 5;
+const GLOB_SCALE_SAMPLE_COUNT: usize = 100;
 
 #[derive(Debug)]
 struct BaselineTerm {
@@ -54,6 +74,40 @@ struct Fixture {
     prefix_queries: Vec<Query>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GlobProbe {
+    label: &'static str,
+    pattern: &'static [u8],
+}
+
+const GLOB_SCALE_PROBES: [GlobProbe; 3] = [
+    GlobProbe {
+        label: "suffix",
+        pattern: b"*::suffix-probe",
+    },
+    GlobProbe {
+        label: "substring",
+        pattern: b"*substring-probe*",
+    },
+    GlobProbe {
+        label: "complex",
+        pattern: b"term-*::bucket-*::complex-alpha*complex-omega*done",
+    },
+];
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedGlobProbe {
+    probe: GlobProbe,
+    expected_count: usize,
+}
+
+#[derive(Debug)]
+struct GlobScaleFixture {
+    encoded: EncodedTermDictionary,
+    sections: TermSectionLengths,
+    terms: Vec<String>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct ObservedTerm {
     term_ord: u32,
@@ -64,6 +118,11 @@ struct ObservedTerm {
 
 fn fail(stage: &str, error: &TermDictionaryError) -> ! {
     eprintln!("term-dictionary-ab {stage} failed: {error}");
+    std::process::exit(2);
+}
+
+fn fail_glob_scale(stage: &str, detail: std::fmt::Arguments<'_>) -> ! {
+    eprintln!("term-dictionary-ab glob-scale {stage} failed: {detail}");
     std::process::exit(2);
 }
 
@@ -92,6 +151,10 @@ fn as_u64(stage: &str, value: usize) -> u64 {
             std::process::exit(2);
         }
     }
+}
+
+fn glob_scale_enabled() -> bool {
+    std::env::var(GLOB_SCALE_ENV).is_ok_and(|value| value == "1")
 }
 
 fn checked_advance(stage: &str, offset: &mut u64, len: u64) -> ByteSpan {
@@ -199,6 +262,62 @@ fn build_fixture() -> Fixture {
     }
 }
 
+fn glob_scale_metadata(index: usize) -> TermMetadata {
+    let offset = as_u64("glob scale metadata offset", index);
+    TermMetadata::with_positions(
+        1,
+        ByteSpan::new(offset, 1),
+        ByteSpan::new(offset, 1),
+        ByteSpan::new(offset, 1),
+    )
+}
+
+fn glob_scale_term(index: usize) -> String {
+    let bucket = index % GLOB_SCALE_BUCKET_COUNT;
+    let tail = match index % 100_000 {
+        17 => "suffix-probe",
+        29 => "left::substring-probe::right",
+        41 => "complex-alpha::bridge::complex-omega::done",
+        _ => "ordinary",
+    };
+    format!("term-{index:06}::bucket-{bucket:04}::{tail}")
+}
+
+fn build_glob_scale_fixture() -> GlobScaleFixture {
+    let mut terms = Vec::with_capacity(GLOB_SCALE_TERM_COUNT);
+    for index in 0..GLOB_SCALE_TERM_COUNT {
+        terms.push(glob_scale_term(index));
+    }
+
+    let sections = TermSectionLengths {
+        postings: as_u64("glob scale POSTINGS length", GLOB_SCALE_TERM_COUNT),
+        // CASS suffix/substring/complex globs target positional text fields,
+        // so the scale fixture includes the same per-term POSITIONS metadata.
+        positions: Some(as_u64("glob scale POSITIONS length", GLOB_SCALE_TERM_COUNT)),
+        blockmax: as_u64("glob scale BLOCKMAX length", GLOB_SCALE_TERM_COUNT),
+    };
+    let inputs = terms
+        .iter()
+        .enumerate()
+        .map(|(index, term)| {
+            TermInput::new(
+                GLOB_SCALE_FIELD_ORD,
+                term.as_bytes(),
+                glob_scale_metadata(index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let encoded = require(
+        "glob scale encode",
+        EncodedTermDictionary::encode_sorted(DEFAULT_SCHEMA, sections, &inputs),
+    );
+    GlobScaleFixture {
+        encoded,
+        sections,
+        terms,
+    }
+}
+
 fn compare_row(row: &BaselineTerm, field_ord: u16, term: &[u8]) -> Ordering {
     row.field_ord
         .cmp(&field_ord)
@@ -257,6 +376,94 @@ fn baseline_prefix_rows(baseline: &[BaselineTerm], query: &Query) -> Vec<Observe
             metadata: row.metadata,
         })
         .collect()
+}
+
+fn brute_force_star_matches(pattern: &[u8], term: &[u8]) -> bool {
+    let Some((&head, tail)) = pattern.split_first() else {
+        return term.is_empty();
+    };
+    if head == b'*' {
+        let mut remaining_pattern = tail;
+        while remaining_pattern.first() == Some(&b'*') {
+            remaining_pattern = &remaining_pattern[1..];
+        }
+        return (0..=term.len()).any(|matched_bytes| {
+            brute_force_star_matches(remaining_pattern, &term[matched_bytes..])
+        });
+    }
+    let Some((&term_head, term_tail)) = term.split_first() else {
+        return false;
+    };
+    head == term_head && brute_force_star_matches(tail, term_tail)
+}
+
+fn prepare_glob_scale_probes(
+    dictionary: &TermDictionary<'_>,
+    terms: &[String],
+) -> Vec<PreparedGlobProbe> {
+    let mut prepared = Vec::with_capacity(GLOB_SCALE_PROBES.len());
+    for probe in GLOB_SCALE_PROBES {
+        let expected = terms
+            .iter()
+            .enumerate()
+            .filter(|(_, term)| brute_force_star_matches(probe.pattern, term.as_bytes()))
+            .collect::<Vec<_>>();
+        if expected.is_empty() {
+            fail_glob_scale(
+                "parity",
+                format_args!("probe {} matched no baseline terms", probe.label),
+            );
+        }
+        if expected.len() > GLOB_SCALE_MATCH_LIMIT {
+            fail_glob_scale(
+                "parity",
+                format_args!(
+                    "probe {} matched {} baseline terms, exceeding benchmark limit {}",
+                    probe.label,
+                    expected.len(),
+                    GLOB_SCALE_MATCH_LIMIT
+                ),
+            );
+        }
+
+        let actual = require(
+            "glob scale parity expansion",
+            dictionary.expand_glob(GLOB_SCALE_FIELD_ORD, probe.pattern, GLOB_SCALE_MATCH_LIMIT),
+        );
+        if actual.len() != expected.len() {
+            fail_glob_scale(
+                "parity",
+                format_args!(
+                    "probe {} returned {} terms; brute force returned {}",
+                    probe.label,
+                    actual.len(),
+                    expected.len()
+                ),
+            );
+        }
+        for (actual_row, (expected_index, expected_term)) in actual.iter().zip(&expected) {
+            let expected_term_ord = as_u32("glob scale expected term ordinal", *expected_index);
+            let expected_metadata = glob_scale_metadata(*expected_index);
+            if actual_row.term_ord != expected_term_ord
+                || actual_row.field_ord != GLOB_SCALE_FIELD_ORD
+                || actual_row.term.as_slice() != expected_term.as_bytes()
+                || actual_row.metadata != expected_metadata
+            {
+                fail_glob_scale(
+                    "parity",
+                    format_args!(
+                        "probe {} diverged at expected term ordinal {}",
+                        probe.label, expected_term_ord
+                    ),
+                );
+            }
+        }
+        prepared.push(PreparedGlobProbe {
+            probe,
+            expected_count: expected.len(),
+        });
+    }
+    prepared
 }
 
 fn assert_parity(
@@ -327,6 +534,12 @@ fn digest_match(digest: u64, found: Option<TermMatch>) -> u64 {
     )
 }
 
+fn owned_terms_digest(rows: &[OwnedTerm]) -> u64 {
+    rows.iter().fold(DIGEST_SEED, |digest, row| {
+        digest_term(digest, row.term_ord, row.field_ord, &row.term, row.metadata)
+    })
+}
+
 fn dictionary_scan_digest(mut cursor: TermCursor<'_, '_>) -> (usize, u64) {
     let mut count = 0_usize;
     let mut digest = DIGEST_SEED;
@@ -367,6 +580,125 @@ fn baseline_prefix_digest(baseline: &[BaselineTerm], query: &Query) -> (usize, u
     baseline_scan_digest(baseline[start..].iter().take_while(|row| {
         row.field_ord == query.field_ord && row.term.as_bytes().starts_with(prefix)
     }))
+}
+
+fn latency_percentile(samples: &[u128], percentile: usize) -> Option<u128> {
+    if samples.is_empty() || !(1..=100).contains(&percentile) {
+        return None;
+    }
+    let rank = samples.len().saturating_mul(percentile).saturating_add(99) / 100;
+    samples.get(rank.saturating_sub(1)).copied()
+}
+
+fn record_glob_scale_distribution(dictionary: &TermDictionary<'_>, probes: &[PreparedGlobProbe]) {
+    for prepared in probes {
+        for _ in 0..GLOB_SCALE_WARMUP_COUNT {
+            let rows = require(
+                "glob scale warmup",
+                dictionary.expand_glob(
+                    GLOB_SCALE_FIELD_ORD,
+                    prepared.probe.pattern,
+                    GLOB_SCALE_MATCH_LIMIT,
+                ),
+            );
+            black_box((rows.len(), owned_terms_digest(&rows)));
+        }
+
+        let mut samples_ns = Vec::with_capacity(GLOB_SCALE_SAMPLE_COUNT);
+        for _ in 0..GLOB_SCALE_SAMPLE_COUNT {
+            let started = Instant::now();
+            let rows = require(
+                "timed glob scale expansion",
+                dictionary.expand_glob(
+                    GLOB_SCALE_FIELD_ORD,
+                    prepared.probe.pattern,
+                    GLOB_SCALE_MATCH_LIMIT,
+                ),
+            );
+            let elapsed_ns = started.elapsed().as_nanos();
+            if rows.len() != prepared.expected_count {
+                fail_glob_scale(
+                    "timed result",
+                    format_args!(
+                        "probe {} returned {} terms; expected {}",
+                        prepared.probe.label,
+                        rows.len(),
+                        prepared.expected_count
+                    ),
+                );
+            }
+            black_box(owned_terms_digest(&rows));
+            samples_ns.push(elapsed_ns);
+        }
+        samples_ns.sort_unstable();
+
+        let Some(min_ns) = samples_ns.first().copied() else {
+            fail_glob_scale(
+                "distribution",
+                format_args!("probe {} recorded no samples", prepared.probe.label),
+            );
+        };
+        let Some(max_ns) = samples_ns.last().copied() else {
+            fail_glob_scale(
+                "distribution",
+                format_args!("probe {} recorded no maximum", prepared.probe.label),
+            );
+        };
+        let Some(p50_ns) = latency_percentile(&samples_ns, 50) else {
+            fail_glob_scale(
+                "distribution",
+                format_args!("probe {} has no p50", prepared.probe.label),
+            );
+        };
+        let Some(p95_ns) = latency_percentile(&samples_ns, 95) else {
+            fail_glob_scale(
+                "distribution",
+                format_args!("probe {} has no p95", prepared.probe.label),
+            );
+        };
+        let Some(p99_ns) = latency_percentile(&samples_ns, 99) else {
+            fail_glob_scale(
+                "distribution",
+                format_args!("probe {} has no p99", prepared.probe.label),
+            );
+        };
+        let total_ns = samples_ns
+            .iter()
+            .copied()
+            .fold(0_u128, u128::saturating_add);
+        let mean_ns = total_ns / u128::from(as_u64("glob scale sample count", samples_ns.len()));
+        eprintln!(
+            "grimoire_glob_scale_distribution gate=QG-6 status=inactive evidence=provisional terms={} field={} probe={} pattern={:?} matches={} samples={} min_ns={} mean_ns={} p50_ns={} p95_ns={} p99_ns={} max_ns={} samples_ns={:?}",
+            GLOB_SCALE_TERM_COUNT,
+            GLOB_SCALE_FIELD_ORD,
+            prepared.probe.label,
+            prepared.probe.pattern,
+            prepared.expected_count,
+            samples_ns.len(),
+            min_ns,
+            mean_ns,
+            p50_ns,
+            p95_ns,
+            p99_ns,
+            max_ns,
+            samples_ns
+        );
+    }
+}
+
+fn run_glob_scale_distribution() {
+    let GlobScaleFixture {
+        encoded,
+        sections,
+        terms,
+    } = build_glob_scale_fixture();
+    let dictionary = require(
+        "glob scale open",
+        encoded.dictionary(DEFAULT_SCHEMA, sections),
+    );
+    let probes = prepare_glob_scale_probes(&dictionary, &terms);
+    drop(terms);
+    record_glob_scale_distribution(&dictionary, &probes);
 }
 
 // Criterion groups intentionally own their reporting state across all registrations.
@@ -503,6 +835,10 @@ fn bench(c: &mut Criterion) {
         },
     );
     full.finish();
+
+    if glob_scale_enabled() {
+        run_glob_scale_distribution();
+    }
 }
 
 criterion_group!(benches, bench);
