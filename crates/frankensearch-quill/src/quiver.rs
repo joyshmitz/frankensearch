@@ -336,6 +336,8 @@ use std::ops::Range;
 
 use thiserror::Error;
 
+use crate::scribe::{ColumnarAccumulator, TokenAnalyzer};
+
 pub use bitpack::BitpackError;
 
 /// Number of postings in every full FOR or bitmap block.
@@ -5068,6 +5070,1640 @@ fn align_doclen(value: usize) -> Option<usize> {
         .map(|sum| sum & !(DOCLEN_ALIGNMENT - 1))
 }
 
+/// Packed size of one `{ field_ord: u16, field_offset: u32 }` STOREDMETA
+/// directory entry.
+pub const STORED_META_DIRECTORY_ENTRY_LEN: usize = 6;
+
+/// Explicit resource ceilings for an FSLX STOREDMETA section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredMetaLimits {
+    /// Maximum schema-derived stored field count.
+    pub max_fields: usize,
+    /// Maximum half-open global docid span represented by each field.
+    pub max_docid_span: u64,
+    /// Maximum complete section size.
+    pub max_section_bytes: u64,
+    /// Maximum concatenated byte blob for one stored field.
+    pub max_field_blob_bytes: u64,
+    /// Maximum single stored value size.
+    pub max_value_bytes: u64,
+}
+
+impl Default for StoredMetaLimits {
+    fn default() -> Self {
+        Self {
+            max_fields: 65_536,
+            max_docid_span: u64::from(u32::MAX),
+            max_section_bytes: u64::from(u32::MAX),
+            max_field_blob_bytes: u64::from(u32::MAX),
+            max_value_bytes: u64::from(u32::MAX),
+        }
+    }
+}
+
+/// One schema-ordered opaque stored-field column supplied to the writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredMetaFieldInput<'a> {
+    /// Stable schema field ordinal.
+    pub field_ord: u16,
+    /// Values indexed by `global_docid - docid_lo`; `None` is an absent field
+    /// or a segment-range hole, while `Some(&[])` is a present empty value.
+    pub values: &'a [Option<&'a [u8]>],
+}
+
+impl<'a> StoredMetaFieldInput<'a> {
+    /// Construct one schema-ordered input column.
+    #[must_use]
+    pub const fn new(field_ord: u16, values: &'a [Option<&'a [u8]>]) -> Self {
+        Self { field_ord, values }
+    }
+}
+
+/// Typed failures from STOREDMETA encoding, validation, or concatenation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum StoredMetaCodecError {
+    /// A segment's half-open docid range was reversed.
+    #[error("invalid STOREDMETA docid range [{docid_lo}, {docid_hi})")]
+    InvalidDocIdRange {
+        /// Inclusive lower bound.
+        docid_lo: u64,
+        /// Exclusive upper bound.
+        docid_hi: u64,
+    },
+    /// A caller or durable declaration exceeded an explicit resource ceiling.
+    #[error("STOREDMETA {resource} {actual} exceeds limit {limit}")]
+    ResourceLimit {
+        /// Bounded resource name.
+        resource: &'static str,
+        /// Rejected amount.
+        actual: u64,
+        /// Configured ceiling.
+        limit: u64,
+    },
+    /// Expected schema field ordinals must be strictly ascending.
+    #[error(
+        "STOREDMETA field ordinals are not strictly ascending at index {index}: previous {previous}, current {current}"
+    )]
+    NonAscendingFields {
+        /// Rejected field index.
+        index: usize,
+        /// Previous ordinal.
+        previous: u16,
+        /// Current ordinal.
+        current: u16,
+    },
+    /// Input or durable field identity disagreed with the schema-derived set.
+    #[error("STOREDMETA field {index} mismatch: expected {expected:?}, got {actual:?}")]
+    UnexpectedField {
+        /// Field position in schema order.
+        index: usize,
+        /// Expected ordinal, if any.
+        expected: Option<u16>,
+        /// Supplied or decoded ordinal, if present.
+        actual: Option<u16>,
+    },
+    /// Every stored field column must cover the complete segment span.
+    #[error("STOREDMETA field {field_ord} has {actual} entries, expected {expected}")]
+    ColumnLengthMismatch {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Required span.
+        expected: usize,
+        /// Supplied entries.
+        actual: usize,
+    },
+    /// Sparse accumulator documents must map into the exact segment range.
+    #[error(
+        "STOREDMETA source document {index} maps to docid {docid}, outside [{docid_lo}, {docid_hi})"
+    )]
+    SourceDocumentOutOfRange {
+        /// Completed-document index in the accumulator.
+        index: usize,
+        /// Rebased global document ID.
+        docid: u64,
+        /// Inclusive segment lower bound.
+        docid_lo: u64,
+        /// Exclusive segment upper bound.
+        docid_hi: u64,
+    },
+    /// Rebased accumulator documents must remain strictly ascending.
+    #[error(
+        "STOREDMETA source documents are not strictly ascending at index {index}: previous {previous}, current {current}"
+    )]
+    NonAscendingSourceDocuments {
+        /// Rejected completed-document index.
+        index: usize,
+        /// Previous rebased global document ID.
+        previous: u64,
+        /// Current rebased global document ID.
+        current: u64,
+    },
+    /// A private Scribe column invariant was violated before sealing.
+    #[error("invalid STOREDMETA source column {field_ord} at value {index}: {detail}")]
+    InvalidSourceColumn {
+        /// Stable schema field ordinal.
+        field_ord: u16,
+        /// Rejected completed-document index.
+        index: usize,
+        /// Violated invariant.
+        detail: &'static str,
+    },
+    /// Checked layout arithmetic overflowed.
+    #[error("STOREDMETA arithmetic overflow while computing {field}")]
+    ArithmeticOverflow {
+        /// Layout component being computed.
+        field: &'static str,
+    },
+    /// A section-relative field offset did not fit its durable u32 slot.
+    #[error("STOREDMETA offset {offset} for field {field_ord} does not fit u32")]
+    OffsetUnrepresentable {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Computed offset.
+        offset: usize,
+    },
+    /// A durable field offset did not equal the canonical packed layout.
+    #[error(
+        "STOREDMETA field {field_ord} uses non-canonical offset {encoded}; expected {expected}"
+    )]
+    NonCanonicalFieldOffset {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Durable section-relative offset.
+        encoded: u32,
+        /// Required section-relative offset.
+        expected: u32,
+    },
+    /// Unused high bits in the final presence byte must be zero.
+    #[error("STOREDMETA field {field_ord} has non-zero unused presence bits in byte {byte:#04x}")]
+    NonCanonicalPresencePadding {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Rejected final presence byte.
+        byte: u8,
+    },
+    /// Every offset table begins at zero.
+    #[error("STOREDMETA field {field_ord} first offset is {actual}, expected 0")]
+    NonZeroFirstOffset {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Rejected first offset.
+        actual: u32,
+    },
+    /// Offsets must be monotone.
+    #[error("STOREDMETA field {field_ord} offsets descend at value {index}: {start} to {end}")]
+    DescendingOffsets {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Rejected value ordinal.
+        index: usize,
+        /// Start offset.
+        start: u32,
+        /// End offset.
+        end: u32,
+    },
+    /// An offset pointed beyond the field blob declared by the next directory
+    /// entry or section end.
+    #[error(
+        "STOREDMETA field {field_ord} offset {offset} at value {index} exceeds blob length {blob_len}"
+    )]
+    OffsetOutOfBounds {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Rejected value ordinal.
+        index: usize,
+        /// Rejected offset.
+        offset: u32,
+        /// Exact available blob length.
+        blob_len: usize,
+    },
+    /// An absent value or hole cannot own blob bytes.
+    #[error("STOREDMETA field {field_ord} absent value {index} spans bytes {start}..{end}")]
+    AbsentValueHasBytes {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Rejected value ordinal.
+        index: usize,
+        /// Start offset.
+        start: u32,
+        /// End offset.
+        end: u32,
+    },
+    /// The terminal offset must name the exact end of the field payload.
+    #[error(
+        "STOREDMETA field {field_ord} terminal offset is {terminal}, but blob length is {blob_len}"
+    )]
+    TerminalOffsetMismatch {
+        /// Schema field ordinal.
+        field_ord: u16,
+        /// Encoded terminal offset.
+        terminal: u32,
+        /// Exact bytes available before the next field or section end.
+        blob_len: usize,
+    },
+    /// Durable bytes ended before a canonical component did.
+    #[error("truncated STOREDMETA section: expected at least {expected} bytes, got {actual}")]
+    Truncated {
+        /// Minimum required length.
+        expected: usize,
+        /// Available length.
+        actual: usize,
+    },
+    /// Canonical sections end exactly after their final field blob.
+    #[error("STOREDMETA section has trailing bytes: expected {expected}, got {actual}")]
+    TrailingBytes {
+        /// Canonical complete size.
+        expected: usize,
+        /// Actual size.
+        actual: usize,
+    },
+    /// Concatenation requires at least one validated source section.
+    #[error("cannot concatenate an empty STOREDMETA section list")]
+    EmptyConcat,
+    /// Concat inputs must be ordered and non-overlapping.
+    #[error(
+        "STOREDMETA concat section {index} begins at {current_lo}, before prior end {previous_hi}"
+    )]
+    ConcatRangeOrder {
+        /// Rejected source index.
+        index: usize,
+        /// Prior source's exclusive high bound.
+        previous_hi: u64,
+        /// Current source's inclusive low bound.
+        current_lo: u64,
+    },
+    /// Fallible allocation failed without panicking.
+    #[error("unable to reserve {bytes} bytes for STOREDMETA {resource}")]
+    Allocation {
+        /// Allocation purpose.
+        resource: &'static str,
+        /// Requested amount.
+        bytes: usize,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredMetaFieldMeta {
+    field_ord: u16,
+    presence: Range<usize>,
+    offsets: Range<usize>,
+    blob: Range<usize>,
+}
+
+/// Owned canonical bytes produced by the fresh-seal STOREDMETA writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedStoredMetaSection {
+    bytes: Vec<u8>,
+    docid_lo: u64,
+    docid_hi: u64,
+    field_count: usize,
+    blob_bytes: u64,
+}
+
+impl EncodedStoredMetaSection {
+    /// Encode schema-derived opaque stored columns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid ranges, field-set drift, column-length mismatch,
+    /// individual or aggregate blob overflow, resource abuse, and allocation
+    /// failure.
+    pub fn encode(
+        docid_lo: u64,
+        docid_hi: u64,
+        expected_field_ords: &[u16],
+        fields: &[StoredMetaFieldInput<'_>],
+    ) -> Result<Self, StoredMetaCodecError> {
+        Self::encode_with_limits(
+            docid_lo,
+            docid_hi,
+            expected_field_ords,
+            fields,
+            StoredMetaLimits::default(),
+        )
+    }
+
+    /// Encode with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::encode`], including explicit
+    /// resource-limit failures selected by `limits`.
+    pub fn encode_with_limits(
+        docid_lo: u64,
+        docid_hi: u64,
+        expected_field_ords: &[u16],
+        fields: &[StoredMetaFieldInput<'_>],
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        validate_stored_meta_field_set(expected_field_ords, fields, limits.max_fields)?;
+        let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
+        let mut blob_lengths = Vec::new();
+        blob_lengths.try_reserve_exact(fields.len()).map_err(|_| {
+            StoredMetaCodecError::Allocation {
+                resource: "field blob lengths",
+                bytes: fields.len().saturating_mul(std::mem::size_of::<usize>()),
+            }
+        })?;
+        let mut total_blob_bytes = 0_u64;
+        for field in fields {
+            if field.values.len() != span {
+                return Err(StoredMetaCodecError::ColumnLengthMismatch {
+                    field_ord: field.field_ord,
+                    expected: span,
+                    actual: field.values.len(),
+                });
+            }
+            let mut blob_len = 0_usize;
+            for value in field.values.iter().flatten() {
+                let value_len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+                if value_len > limits.max_value_bytes {
+                    return Err(StoredMetaCodecError::ResourceLimit {
+                        resource: "value bytes",
+                        actual: value_len,
+                        limit: limits.max_value_bytes,
+                    });
+                }
+                blob_len = blob_len.checked_add(value.len()).ok_or(
+                    StoredMetaCodecError::ArithmeticOverflow {
+                        field: "field blob length",
+                    },
+                )?;
+            }
+            let blob_len_u64 = u64::try_from(blob_len).unwrap_or(u64::MAX);
+            if blob_len_u64 > limits.max_field_blob_bytes {
+                return Err(StoredMetaCodecError::ResourceLimit {
+                    resource: "field blob bytes",
+                    actual: blob_len_u64,
+                    limit: limits.max_field_blob_bytes,
+                });
+            }
+            if u32::try_from(blob_len).is_err() {
+                return Err(StoredMetaCodecError::ResourceLimit {
+                    resource: "durable field blob bytes",
+                    actual: blob_len_u64,
+                    limit: u64::from(u32::MAX),
+                });
+            }
+            total_blob_bytes = total_blob_bytes.checked_add(blob_len_u64).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "total blob bytes",
+                },
+            )?;
+            blob_lengths.push(blob_len);
+        }
+
+        let (field_offsets, total_len) =
+            stored_meta_layout(expected_field_ords, span, &blob_lengths, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section bytes",
+                bytes: total_len,
+            })?;
+        for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
+            bytes.extend_from_slice(&field_ord.to_le_bytes());
+            let offset = u32::try_from(offset)
+                .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        let presence_len = stored_meta_presence_len(span)?;
+        for ((field, &field_offset), &blob_len) in
+            fields.iter().zip(&field_offsets).zip(&blob_lengths)
+        {
+            debug_assert_eq!(bytes.len(), field_offset);
+            let presence_start = bytes.len();
+            bytes.resize(
+                presence_start.checked_add(presence_len).ok_or(
+                    StoredMetaCodecError::ArithmeticOverflow {
+                        field: "presence end",
+                    },
+                )?,
+                0,
+            );
+            for (index, value) in field.values.iter().enumerate() {
+                if value.is_some() {
+                    bytes[presence_start + index / 8] |= 1 << (index % 8);
+                }
+            }
+            let mut current_offset = 0_u32;
+            bytes.extend_from_slice(&current_offset.to_le_bytes());
+            for value in field.values {
+                if let Some(value) = value {
+                    current_offset = current_offset
+                        .checked_add(u32::try_from(value.len()).map_err(|_| {
+                            StoredMetaCodecError::ResourceLimit {
+                                resource: "value bytes",
+                                actual: u64::try_from(value.len()).unwrap_or(u64::MAX),
+                                limit: u64::from(u32::MAX),
+                            }
+                        })?)
+                        .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                            field: "value offset",
+                        })?;
+                }
+                bytes.extend_from_slice(&current_offset.to_le_bytes());
+            }
+            debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
+            for value in field.values.iter().flatten() {
+                bytes.extend_from_slice(value);
+            }
+            tracing::debug!(
+                field_ord = field.field_ord,
+                blob_bytes = blob_len,
+                "encoded Quill STOREDMETA field blob"
+            );
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        tracing::debug!(
+            field_count = fields.len(),
+            blob_bytes = total_blob_bytes,
+            section_bytes = total_len,
+            "encoded Quill STOREDMETA section"
+        );
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            field_count: fields.len(),
+            blob_bytes: total_blob_bytes,
+        })
+    }
+
+    /// Seal the stored columns of one Scribe accumulator directly into the
+    /// segment's positional global-docid span.
+    ///
+    /// `lease_docid_base` is the global docid corresponding to Scribe's local
+    /// ordinal zero. Sparse local ordinals become zero-presence holes without
+    /// materializing a span-sized value matrix. Field ordinals come directly
+    /// from the accumulator's validated schema-derived stored columns.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a range/rebase mismatch, malformed source-column invariant,
+    /// durable offset overflow, resource abuse, or allocation failure.
+    pub fn encode_accumulator<A: TokenAnalyzer>(
+        docid_lo: u64,
+        docid_hi: u64,
+        lease_docid_base: u64,
+        accumulator: &ColumnarAccumulator<A>,
+    ) -> Result<Self, StoredMetaCodecError> {
+        Self::encode_accumulator_with_limits(
+            docid_lo,
+            docid_hi,
+            lease_docid_base,
+            accumulator,
+            StoredMetaLimits::default(),
+        )
+    }
+
+    /// Seal Scribe columns with caller-selected validation and allocation
+    /// ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::encode_accumulator`].
+    pub fn encode_accumulator_with_limits<A: TokenAnalyzer>(
+        docid_lo: u64,
+        docid_hi: u64,
+        lease_docid_base: u64,
+        accumulator: &ColumnarAccumulator<A>,
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
+        let document_ords = accumulator.document_ords();
+        let stored_fields = accumulator.stored_fields();
+
+        let mut previous_docid = None;
+        for (index, &document_ord) in document_ords.iter().enumerate() {
+            let docid = lease_docid_base
+                .checked_add(u64::from(document_ord))
+                .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                    field: "source document rebase",
+                })?;
+            if docid < docid_lo || docid >= docid_hi {
+                return Err(StoredMetaCodecError::SourceDocumentOutOfRange {
+                    index,
+                    docid,
+                    docid_lo,
+                    docid_hi,
+                });
+            }
+            if let Some(previous) = previous_docid
+                && docid <= previous
+            {
+                return Err(StoredMetaCodecError::NonAscendingSourceDocuments {
+                    index,
+                    previous,
+                    current: docid,
+                });
+            }
+            previous_docid = Some(docid);
+        }
+
+        let mut expected_field_ords = Vec::new();
+        expected_field_ords
+            .try_reserve_exact(stored_fields.len())
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "accumulator field ordinals",
+                bytes: stored_fields
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            })?;
+        expected_field_ords.extend(stored_fields.iter().map(|field| field.field_ord()));
+        validate_stored_meta_expected_fields(&expected_field_ords, limits.max_fields)?;
+
+        let expected_offset_count =
+            document_ords
+                .len()
+                .checked_add(1)
+                .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                    field: "source offset count",
+                })?;
+        let mut blob_lengths = Vec::new();
+        blob_lengths
+            .try_reserve_exact(stored_fields.len())
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "accumulator field blob lengths",
+                bytes: stored_fields
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            })?;
+        let mut total_blob_bytes = 0_u64;
+        for field in stored_fields {
+            if field.document_count() != document_ords.len() {
+                return Err(StoredMetaCodecError::ColumnLengthMismatch {
+                    field_ord: field.field_ord(),
+                    expected: document_ords.len(),
+                    actual: field.document_count(),
+                });
+            }
+            if field.presence().len() != document_ords.len() {
+                return Err(StoredMetaCodecError::InvalidSourceColumn {
+                    field_ord: field.field_ord(),
+                    index: field.presence().len(),
+                    detail: "presence length does not match completed documents",
+                });
+            }
+            if field.offsets().len() != expected_offset_count {
+                return Err(StoredMetaCodecError::InvalidSourceColumn {
+                    field_ord: field.field_ord(),
+                    index: field.offsets().len(),
+                    detail: "offset count is not completed documents plus one",
+                });
+            }
+            let first = field.offsets().first().copied().ok_or_else(|| {
+                StoredMetaCodecError::InvalidSourceColumn {
+                    field_ord: field.field_ord(),
+                    index: 0,
+                    detail: "offset table is empty",
+                }
+            })?;
+            if first != 0 {
+                return Err(StoredMetaCodecError::NonZeroFirstOffset {
+                    field_ord: field.field_ord(),
+                    actual: first,
+                });
+            }
+            for index in 0..document_ords.len() {
+                let presence = field.presence()[index];
+                if presence > 1 {
+                    return Err(StoredMetaCodecError::InvalidSourceColumn {
+                        field_ord: field.field_ord(),
+                        index,
+                        detail: "presence byte is not canonical zero or one",
+                    });
+                }
+                let start = field.offsets()[index];
+                let end = field.offsets()[index + 1];
+                if end < start {
+                    return Err(StoredMetaCodecError::DescendingOffsets {
+                        field_ord: field.field_ord(),
+                        index,
+                        start,
+                        end,
+                    });
+                }
+                if usize::try_from(end).map_or(true, |offset| offset > field.blob().len()) {
+                    return Err(StoredMetaCodecError::OffsetOutOfBounds {
+                        field_ord: field.field_ord(),
+                        index,
+                        offset: end,
+                        blob_len: field.blob().len(),
+                    });
+                }
+                if presence == 0 && start != end {
+                    return Err(StoredMetaCodecError::AbsentValueHasBytes {
+                        field_ord: field.field_ord(),
+                        index,
+                        start,
+                        end,
+                    });
+                }
+                let value_len = u64::from(end - start);
+                if value_len > limits.max_value_bytes {
+                    return Err(StoredMetaCodecError::ResourceLimit {
+                        resource: "value bytes",
+                        actual: value_len,
+                        limit: limits.max_value_bytes,
+                    });
+                }
+            }
+            let terminal = field.offsets().last().copied().ok_or_else(|| {
+                StoredMetaCodecError::InvalidSourceColumn {
+                    field_ord: field.field_ord(),
+                    index: 0,
+                    detail: "offset table is empty",
+                }
+            })?;
+            if usize::try_from(terminal).ok() != Some(field.blob().len()) {
+                return Err(StoredMetaCodecError::TerminalOffsetMismatch {
+                    field_ord: field.field_ord(),
+                    terminal,
+                    blob_len: field.blob().len(),
+                });
+            }
+            let blob_len = field.blob().len();
+            let blob_len_u64 = u64::try_from(blob_len).unwrap_or(u64::MAX);
+            if blob_len_u64 > limits.max_field_blob_bytes {
+                return Err(StoredMetaCodecError::ResourceLimit {
+                    resource: "field blob bytes",
+                    actual: blob_len_u64,
+                    limit: limits.max_field_blob_bytes,
+                });
+            }
+            total_blob_bytes = total_blob_bytes.checked_add(blob_len_u64).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "total blob bytes",
+                },
+            )?;
+            blob_lengths.push(blob_len);
+        }
+
+        let (field_offsets, total_len) =
+            stored_meta_layout(&expected_field_ords, span, &blob_lengths, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section bytes",
+                bytes: total_len,
+            })?;
+        for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
+            bytes.extend_from_slice(&field_ord.to_le_bytes());
+            let offset = u32::try_from(offset)
+                .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        let presence_len = stored_meta_presence_len(span)?;
+        for ((field, &field_offset), &blob_len) in
+            stored_fields.iter().zip(&field_offsets).zip(&blob_lengths)
+        {
+            debug_assert_eq!(bytes.len(), field_offset);
+            let presence_start = bytes.len();
+            let presence_end = presence_start.checked_add(presence_len).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "presence end",
+                },
+            )?;
+            bytes.resize(presence_end, 0);
+            let mut current_offset = 0_u32;
+            bytes.extend_from_slice(&current_offset.to_le_bytes());
+            let mut source_index = 0_usize;
+            for ordinal in 0..span {
+                let global_docid = docid_lo
+                    .checked_add(u64::try_from(ordinal).map_err(|_| {
+                        StoredMetaCodecError::ArithmeticOverflow {
+                            field: "global document ordinal",
+                        }
+                    })?)
+                    .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                        field: "global document id",
+                    })?;
+                let next_source_docid = document_ords
+                    .get(source_index)
+                    .map(|&document_ord| {
+                        lease_docid_base.checked_add(u64::from(document_ord)).ok_or(
+                            StoredMetaCodecError::ArithmeticOverflow {
+                                field: "source document rebase",
+                            },
+                        )
+                    })
+                    .transpose()?;
+                if next_source_docid == Some(global_docid) {
+                    if field.presence()[source_index] == 1 {
+                        bytes[presence_start + ordinal / 8] |= 1 << (ordinal % 8);
+                    }
+                    current_offset = field.offsets()[source_index + 1];
+                    source_index += 1;
+                }
+                bytes.extend_from_slice(&current_offset.to_le_bytes());
+            }
+            debug_assert_eq!(source_index, document_ords.len());
+            debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
+            bytes.extend_from_slice(field.blob());
+            tracing::debug!(
+                field_ord = field.field_ord(),
+                blob_bytes = blob_len,
+                "encoded Quill STOREDMETA accumulator field blob"
+            );
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        tracing::debug!(
+            field_count = stored_fields.len(),
+            blob_bytes = total_blob_bytes,
+            section_bytes = total_len,
+            "encoded Quill STOREDMETA section from Scribe accumulator"
+        );
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            field_count: stored_fields.len(),
+            blob_bytes: total_blob_bytes,
+        })
+    }
+
+    /// Concatenate ordered non-overlapping STOREDMETA sections.
+    ///
+    /// Inter-segment docid gaps become holes. Source values remain opaque; the
+    /// output only rebases offsets and concatenates their exact bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty input, field drift, range overlap/reversal, resource
+    /// abuse, arithmetic overflow, or allocation failure.
+    pub fn concatenate(
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+    ) -> Result<Self, StoredMetaCodecError> {
+        Self::concatenate_with_limits(sections, expected_field_ords, StoredMetaLimits::default())
+    }
+
+    /// Concatenate with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::concatenate`].
+    pub fn concatenate_with_limits(
+        sections: &[StoredMetaSection<'_>],
+        expected_field_ords: &[u16],
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        let Some(first) = sections.first() else {
+            return Err(StoredMetaCodecError::EmptyConcat);
+        };
+        validate_stored_meta_expected_fields(expected_field_ords, limits.max_fields)?;
+        for (section_index, section) in sections.iter().enumerate() {
+            let compared = expected_field_ords.len().max(section.fields.len());
+            for field_index in 0..compared {
+                let expected = expected_field_ords.get(field_index).copied();
+                let actual = section.fields.get(field_index).map(|field| field.field_ord);
+                if expected != actual {
+                    return Err(StoredMetaCodecError::UnexpectedField {
+                        index: field_index,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            if section_index != 0 {
+                let previous_hi = sections[section_index - 1].docid_hi;
+                if section.docid_lo < previous_hi {
+                    return Err(StoredMetaCodecError::ConcatRangeOrder {
+                        index: section_index,
+                        previous_hi,
+                        current_lo: section.docid_lo,
+                    });
+                }
+            }
+        }
+        let docid_lo = first.docid_lo;
+        let docid_hi = sections
+            .last()
+            .map(|section| section.docid_hi)
+            .ok_or(StoredMetaCodecError::EmptyConcat)?;
+        let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
+
+        // Preflight the exact packed output before allocating it. Concat does
+        // not materialize values: it validates offset deltas under the target
+        // limits, then copies each opaque source blob exactly once.
+        let mut blob_lengths = Vec::new();
+        blob_lengths
+            .try_reserve_exact(expected_field_ords.len())
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "concat field blob lengths",
+                bytes: expected_field_ords
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            })?;
+        let mut total_blob_bytes = 0_u64;
+        for (field_index, &field_ord) in expected_field_ords.iter().enumerate() {
+            let mut blob_len = 0_usize;
+            for section in sections {
+                let field =
+                    section
+                        .field_at(field_index)
+                        .ok_or(StoredMetaCodecError::UnexpectedField {
+                            index: field_index,
+                            expected: Some(field_ord),
+                            actual: None,
+                        })?;
+                let source_span = usize::try_from(section.span()).map_err(|_| {
+                    StoredMetaCodecError::ResourceLimit {
+                        resource: "source docid span",
+                        actual: section.span(),
+                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                    }
+                })?;
+                for ordinal in 0..source_span {
+                    let start = stored_meta_offset(field.offsets, ordinal).ok_or_else(|| {
+                        StoredMetaCodecError::Truncated {
+                            expected: (ordinal + 1).saturating_mul(std::mem::size_of::<u32>()),
+                            actual: field.offsets.len(),
+                        }
+                    })?;
+                    let end = stored_meta_offset(field.offsets, ordinal + 1).ok_or_else(|| {
+                        StoredMetaCodecError::Truncated {
+                            expected: (ordinal + 2).saturating_mul(std::mem::size_of::<u32>()),
+                            actual: field.offsets.len(),
+                        }
+                    })?;
+                    let value_len = u64::from(end - start);
+                    if value_len > limits.max_value_bytes {
+                        return Err(StoredMetaCodecError::ResourceLimit {
+                            resource: "value bytes",
+                            actual: value_len,
+                            limit: limits.max_value_bytes,
+                        });
+                    }
+                }
+                blob_len = blob_len.checked_add(field.blob.len()).ok_or(
+                    StoredMetaCodecError::ArithmeticOverflow {
+                        field: "concatenated field blob length",
+                    },
+                )?;
+            }
+            let blob_len_u64 = u64::try_from(blob_len).unwrap_or(u64::MAX);
+            if blob_len_u64 > limits.max_field_blob_bytes {
+                return Err(StoredMetaCodecError::ResourceLimit {
+                    resource: "field blob bytes",
+                    actual: blob_len_u64,
+                    limit: limits.max_field_blob_bytes,
+                });
+            }
+            if u32::try_from(blob_len).is_err() {
+                return Err(StoredMetaCodecError::ResourceLimit {
+                    resource: "durable field blob bytes",
+                    actual: blob_len_u64,
+                    limit: u64::from(u32::MAX),
+                });
+            }
+            total_blob_bytes = total_blob_bytes.checked_add(blob_len_u64).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "total blob bytes",
+                },
+            )?;
+            blob_lengths.push(blob_len);
+        }
+
+        let (field_offsets, total_len) =
+            stored_meta_layout(expected_field_ords, span, &blob_lengths, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section bytes",
+                bytes: total_len,
+            })?;
+        for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
+            bytes.extend_from_slice(&field_ord.to_le_bytes());
+            let offset = u32::try_from(offset)
+                .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        let presence_len = stored_meta_presence_len(span)?;
+        for (field_index, ((&field_ord, &field_offset), &blob_len)) in expected_field_ords
+            .iter()
+            .zip(&field_offsets)
+            .zip(&blob_lengths)
+            .enumerate()
+        {
+            debug_assert_eq!(bytes.len(), field_offset);
+            let presence_start = bytes.len();
+            let presence_end = presence_start.checked_add(presence_len).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "presence end",
+                },
+            )?;
+            bytes.resize(presence_end, 0);
+            let mut current_offset = 0_u32;
+            bytes.extend_from_slice(&current_offset.to_le_bytes());
+            let mut output_ordinal = 0_usize;
+            let mut cursor = docid_lo;
+            for section in sections {
+                let gap = section.docid_lo.checked_sub(cursor).ok_or(
+                    StoredMetaCodecError::ConcatRangeOrder {
+                        index: 0,
+                        previous_hi: cursor,
+                        current_lo: section.docid_lo,
+                    },
+                )?;
+                let gap =
+                    usize::try_from(gap).map_err(|_| StoredMetaCodecError::ResourceLimit {
+                        resource: "concat gap",
+                        actual: gap,
+                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                    })?;
+                output_ordinal = output_ordinal.checked_add(gap).ok_or(
+                    StoredMetaCodecError::ArithmeticOverflow {
+                        field: "concat gap end",
+                    },
+                )?;
+                for _ in 0..gap {
+                    bytes.extend_from_slice(&current_offset.to_le_bytes());
+                }
+
+                let field =
+                    section
+                        .field_at(field_index)
+                        .ok_or(StoredMetaCodecError::UnexpectedField {
+                            index: field_index,
+                            expected: Some(field_ord),
+                            actual: None,
+                        })?;
+                let source_span = usize::try_from(section.span()).map_err(|_| {
+                    StoredMetaCodecError::ResourceLimit {
+                        resource: "source docid span",
+                        actual: section.span(),
+                        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                    }
+                })?;
+                for ordinal in 0..source_span {
+                    if stored_meta_presence_bit(field.presence, ordinal).unwrap_or(false) {
+                        bytes[presence_start + output_ordinal / 8] |= 1 << (output_ordinal % 8);
+                    }
+                    let start = stored_meta_offset(field.offsets, ordinal).ok_or_else(|| {
+                        StoredMetaCodecError::Truncated {
+                            expected: (ordinal + 1).saturating_mul(std::mem::size_of::<u32>()),
+                            actual: field.offsets.len(),
+                        }
+                    })?;
+                    let end = stored_meta_offset(field.offsets, ordinal + 1).ok_or_else(|| {
+                        StoredMetaCodecError::Truncated {
+                            expected: (ordinal + 2).saturating_mul(std::mem::size_of::<u32>()),
+                            actual: field.offsets.len(),
+                        }
+                    })?;
+                    current_offset = current_offset.checked_add(end - start).ok_or(
+                        StoredMetaCodecError::ArithmeticOverflow {
+                            field: "concatenated value offset",
+                        },
+                    )?;
+                    bytes.extend_from_slice(&current_offset.to_le_bytes());
+                    output_ordinal += 1;
+                }
+                cursor = section.docid_hi;
+            }
+            debug_assert_eq!(output_ordinal, span);
+            debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
+            for section in sections {
+                let field =
+                    section
+                        .field_at(field_index)
+                        .ok_or(StoredMetaCodecError::UnexpectedField {
+                            index: field_index,
+                            expected: Some(field_ord),
+                            actual: None,
+                        })?;
+                bytes.extend_from_slice(field.blob);
+            }
+            tracing::debug!(
+                field_ord,
+                blob_bytes = blob_len,
+                source_segments = sections.len(),
+                "concatenated Quill STOREDMETA field blob"
+            );
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        tracing::debug!(
+            field_count = expected_field_ords.len(),
+            blob_bytes = total_blob_bytes,
+            section_bytes = total_len,
+            source_segments = sections.len(),
+            "concatenated Quill STOREDMETA section"
+        );
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            field_count: expected_field_ords.len(),
+            blob_bytes: total_blob_bytes,
+        })
+    }
+
+    /// Borrow the exact canonical durable bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return its durable bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Number of schema-stored fields.
+    #[must_use]
+    pub const fn field_count(&self) -> usize {
+        self.field_count
+    }
+
+    /// Sum of opaque field blob bytes, excluding directories and offsets.
+    #[must_use]
+    pub const fn blob_bytes(&self) -> u64 {
+        self.blob_bytes
+    }
+
+    /// Re-open the owned bytes through the validating zero-copy reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal invariant was violated.
+    pub fn section(
+        &self,
+        expected_field_ords: &[u16],
+    ) -> Result<StoredMetaSection<'_>, StoredMetaCodecError> {
+        StoredMetaSection::parse(
+            &self.bytes,
+            self.docid_lo,
+            self.docid_hi,
+            expected_field_ords,
+        )
+    }
+}
+
+/// Borrowed zero-copy view of one validated STOREDMETA field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredMetaField<'a> {
+    field_ord: u16,
+    docid_lo: u64,
+    presence: &'a [u8],
+    offsets: &'a [u8],
+    blob: &'a [u8],
+}
+
+impl<'a> StoredMetaField<'a> {
+    /// Stable schema field ordinal.
+    #[must_use]
+    pub const fn field_ord(self) -> u16 {
+        self.field_ord
+    }
+
+    /// Exact concatenated opaque blob for diagnostics and concat proofs.
+    #[must_use]
+    pub const fn blob(self) -> &'a [u8] {
+        self.blob
+    }
+
+    /// Whether one in-range document carries this field.
+    #[must_use]
+    pub fn is_present(self, global_docid: u64) -> bool {
+        let Some(ordinal) = global_docid.checked_sub(self.docid_lo) else {
+            return false;
+        };
+        let Ok(ordinal) = usize::try_from(ordinal) else {
+            return false;
+        };
+        stored_meta_presence_bit(self.presence, ordinal).unwrap_or(false)
+    }
+
+    /// Borrow one opaque value with two little-endian offset reads.
+    ///
+    /// `None` means the docid is out of range or the value is absent.
+    /// `Some(&[])` is a present empty value.
+    #[must_use]
+    pub fn get(self, global_docid: u64) -> Option<&'a [u8]> {
+        let ordinal = global_docid.checked_sub(self.docid_lo)?;
+        let ordinal = usize::try_from(ordinal).ok()?;
+        if !stored_meta_presence_bit(self.presence, ordinal)? {
+            return None;
+        }
+        let start = usize::try_from(stored_meta_offset(self.offsets, ordinal)?).ok()?;
+        let end = usize::try_from(stored_meta_offset(self.offsets, ordinal + 1)?).ok()?;
+        self.blob.get(start..end)
+    }
+}
+
+/// Borrowed, fully validated FSLX STOREDMETA section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredMetaSection<'a> {
+    bytes: &'a [u8],
+    docid_lo: u64,
+    docid_hi: u64,
+    fields: Vec<StoredMetaFieldMeta>,
+}
+
+impl<'a> StoredMetaSection<'a> {
+    /// Validate a STOREDMETA payload against its segment range and stored-field
+    /// schema set.
+    ///
+    /// # Errors
+    ///
+    /// Rejects field drift, noncanonical directory offsets or presence bits,
+    /// malformed value offsets, absent values owning bytes, truncation,
+    /// trailing bytes, resource abuse, and allocation failure.
+    pub fn parse(
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+        expected_field_ords: &[u16],
+    ) -> Result<Self, StoredMetaCodecError> {
+        Self::parse_with_limits(
+            bytes,
+            docid_lo,
+            docid_hi,
+            expected_field_ords,
+            StoredMetaLimits::default(),
+        )
+    }
+
+    /// Validate with caller-selected resource ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::parse`], including explicit
+    /// limit failures selected by `limits`.
+    pub fn parse_with_limits(
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+        expected_field_ords: &[u16],
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        validate_stored_meta_expected_fields(expected_field_ords, limits.max_fields)?;
+        let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
+        let section_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if section_len > limits.max_section_bytes {
+            return Err(StoredMetaCodecError::ResourceLimit {
+                resource: "section bytes",
+                actual: section_len,
+                limit: limits.max_section_bytes,
+            });
+        }
+        let directory_len = expected_field_ords
+            .len()
+            .checked_mul(STORED_META_DIRECTORY_ENTRY_LEN)
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                field: "directory length",
+            })?;
+        if bytes.len() < directory_len {
+            return Err(StoredMetaCodecError::Truncated {
+                expected: directory_len,
+                actual: bytes.len(),
+            });
+        }
+        if expected_field_ords.is_empty() {
+            if bytes.is_empty() {
+                return Ok(Self {
+                    bytes,
+                    docid_lo,
+                    docid_hi,
+                    fields: Vec::new(),
+                });
+            }
+            return Err(StoredMetaCodecError::TrailingBytes {
+                expected: 0,
+                actual: bytes.len(),
+            });
+        }
+
+        let presence_len = stored_meta_presence_len(span)?;
+        let offset_count = span
+            .checked_add(1)
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                field: "offset count",
+            })?;
+        let offsets_len = offset_count.checked_mul(std::mem::size_of::<u32>()).ok_or(
+            StoredMetaCodecError::ArithmeticOverflow {
+                field: "offset table length",
+            },
+        )?;
+        let mut fields = Vec::new();
+        fields
+            .try_reserve_exact(expected_field_ords.len())
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "field metadata",
+                bytes: expected_field_ords
+                    .len()
+                    .saturating_mul(std::mem::size_of::<StoredMetaFieldMeta>()),
+            })?;
+        let mut canonical_field_offset = directory_len;
+        for (index, &expected_field) in expected_field_ords.iter().enumerate() {
+            let entry = index * STORED_META_DIRECTORY_ENTRY_LEN;
+            let actual_field = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+            if actual_field != expected_field {
+                return Err(StoredMetaCodecError::UnexpectedField {
+                    index,
+                    expected: Some(expected_field),
+                    actual: Some(actual_field),
+                });
+            }
+            let encoded_offset = u32::from_le_bytes([
+                bytes[entry + 2],
+                bytes[entry + 3],
+                bytes[entry + 4],
+                bytes[entry + 5],
+            ]);
+            let expected_offset = u32::try_from(canonical_field_offset).map_err(|_| {
+                StoredMetaCodecError::OffsetUnrepresentable {
+                    field_ord: expected_field,
+                    offset: canonical_field_offset,
+                }
+            })?;
+            if encoded_offset != expected_offset {
+                return Err(StoredMetaCodecError::NonCanonicalFieldOffset {
+                    field_ord: expected_field,
+                    encoded: encoded_offset,
+                    expected: expected_offset,
+                });
+            }
+            let next_field_offset = if index + 1 == expected_field_ords.len() {
+                bytes.len()
+            } else {
+                let next_entry = entry + STORED_META_DIRECTORY_ENTRY_LEN;
+                usize::try_from(u32::from_le_bytes([
+                    bytes[next_entry + 2],
+                    bytes[next_entry + 3],
+                    bytes[next_entry + 4],
+                    bytes[next_entry + 5],
+                ]))
+                .map_err(|_| StoredMetaCodecError::ResourceLimit {
+                    resource: "host field offset",
+                    actual: u64::from(u32::MAX),
+                    limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+                })?
+            };
+            if next_field_offset > bytes.len() {
+                return Err(StoredMetaCodecError::Truncated {
+                    expected: next_field_offset,
+                    actual: bytes.len(),
+                });
+            }
+            let presence_end = canonical_field_offset.checked_add(presence_len).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "presence end",
+                },
+            )?;
+            let offsets_end = presence_end.checked_add(offsets_len).ok_or(
+                StoredMetaCodecError::ArithmeticOverflow {
+                    field: "offset table end",
+                },
+            )?;
+            if next_field_offset < offsets_end || bytes.len() < offsets_end {
+                return Err(StoredMetaCodecError::Truncated {
+                    expected: offsets_end,
+                    actual: next_field_offset.min(bytes.len()),
+                });
+            }
+            let presence = canonical_field_offset..presence_end;
+            let offsets = presence_end..offsets_end;
+            let blob = offsets_end..next_field_offset;
+            if span % 8 != 0 {
+                let used = span % 8;
+                let allowed = u8::MAX >> (8 - used);
+                let final_byte = bytes[presence.end - 1];
+                if final_byte & !allowed != 0 {
+                    return Err(StoredMetaCodecError::NonCanonicalPresencePadding {
+                        field_ord: expected_field,
+                        byte: final_byte,
+                    });
+                }
+            }
+            let blob_len = blob.len();
+            let blob_len_u64 = u64::try_from(blob_len).unwrap_or(u64::MAX);
+            if blob_len_u64 > limits.max_field_blob_bytes {
+                return Err(StoredMetaCodecError::ResourceLimit {
+                    resource: "field blob bytes",
+                    actual: blob_len_u64,
+                    limit: limits.max_field_blob_bytes,
+                });
+            }
+            let offset_bytes = &bytes[offsets.clone()];
+            let first_offset =
+                stored_meta_offset(offset_bytes, 0).ok_or(StoredMetaCodecError::Truncated {
+                    expected: offsets.start + std::mem::size_of::<u32>(),
+                    actual: bytes.len(),
+                })?;
+            if first_offset != 0 {
+                return Err(StoredMetaCodecError::NonZeroFirstOffset {
+                    field_ord: expected_field,
+                    actual: first_offset,
+                });
+            }
+            for value_index in 0..span {
+                let start = stored_meta_offset(offset_bytes, value_index).ok_or(
+                    StoredMetaCodecError::Truncated {
+                        expected: offsets.start + (value_index + 1) * 4,
+                        actual: bytes.len(),
+                    },
+                )?;
+                let end = stored_meta_offset(offset_bytes, value_index + 1).ok_or(
+                    StoredMetaCodecError::Truncated {
+                        expected: offsets.start + (value_index + 2) * 4,
+                        actual: bytes.len(),
+                    },
+                )?;
+                if end < start {
+                    return Err(StoredMetaCodecError::DescendingOffsets {
+                        field_ord: expected_field,
+                        index: value_index,
+                        start,
+                        end,
+                    });
+                }
+                if usize::try_from(end).map_or(true, |offset| offset > blob_len) {
+                    return Err(StoredMetaCodecError::OffsetOutOfBounds {
+                        field_ord: expected_field,
+                        index: value_index,
+                        offset: end,
+                        blob_len,
+                    });
+                }
+                let value_len = u64::from(end - start);
+                if value_len > limits.max_value_bytes {
+                    return Err(StoredMetaCodecError::ResourceLimit {
+                        resource: "value bytes",
+                        actual: value_len,
+                        limit: limits.max_value_bytes,
+                    });
+                }
+                let is_present = stored_meta_presence_bit(&bytes[presence.clone()], value_index)
+                    .unwrap_or(false);
+                if !is_present && start != end {
+                    return Err(StoredMetaCodecError::AbsentValueHasBytes {
+                        field_ord: expected_field,
+                        index: value_index,
+                        start,
+                        end,
+                    });
+                }
+            }
+            let terminal =
+                stored_meta_offset(offset_bytes, span).ok_or(StoredMetaCodecError::Truncated {
+                    expected: offsets.end,
+                    actual: bytes.len(),
+                })?;
+            if usize::try_from(terminal).ok() != Some(blob_len) {
+                if index + 1 == expected_field_ords.len()
+                    && usize::try_from(terminal).is_ok_and(|terminal| terminal < blob_len)
+                {
+                    return Err(StoredMetaCodecError::TrailingBytes {
+                        expected: offsets_end + usize::try_from(terminal).unwrap_or(0),
+                        actual: bytes.len(),
+                    });
+                }
+                return Err(StoredMetaCodecError::TerminalOffsetMismatch {
+                    field_ord: expected_field,
+                    terminal,
+                    blob_len,
+                });
+            }
+            fields.push(StoredMetaFieldMeta {
+                field_ord: expected_field,
+                presence,
+                offsets,
+                blob,
+            });
+            canonical_field_offset = next_field_offset;
+        }
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            fields,
+        })
+    }
+
+    /// Exact durable bytes after canonical validation.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Inclusive lower global docid bound.
+    #[must_use]
+    pub const fn docid_lo(&self) -> u64 {
+        self.docid_lo
+    }
+
+    /// Exclusive upper global docid bound.
+    #[must_use]
+    pub const fn docid_hi(&self) -> u64 {
+        self.docid_hi
+    }
+
+    /// Half-open global docid span.
+    #[must_use]
+    pub const fn span(&self) -> u64 {
+        self.docid_hi - self.docid_lo
+    }
+
+    /// Number of validated stored fields.
+    #[must_use]
+    pub fn field_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Bind one stored field for repeated zero-copy lookups.
+    #[must_use]
+    pub fn field(&self, field_ord: u16) -> Option<StoredMetaField<'a>> {
+        let index = self
+            .fields
+            .binary_search_by_key(&field_ord, |field| field.field_ord)
+            .ok()?;
+        self.field_at(index)
+    }
+
+    /// Iterate borrowed field views in schema order.
+    #[must_use]
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = StoredMetaField<'a>> + '_ {
+        self.fields.iter().map(|field| StoredMetaField {
+            field_ord: field.field_ord,
+            docid_lo: self.docid_lo,
+            presence: &self.bytes[field.presence.clone()],
+            offsets: &self.bytes[field.offsets.clone()],
+            blob: &self.bytes[field.blob.clone()],
+        })
+    }
+
+    fn field_at(&self, index: usize) -> Option<StoredMetaField<'a>> {
+        let field = self.fields.get(index)?;
+        Some(StoredMetaField {
+            field_ord: field.field_ord,
+            docid_lo: self.docid_lo,
+            presence: self.bytes.get(field.presence.clone())?,
+            offsets: self.bytes.get(field.offsets.clone())?,
+            blob: self.bytes.get(field.blob.clone())?,
+        })
+    }
+}
+
+fn validate_stored_meta_expected_fields(
+    expected_field_ords: &[u16],
+    max_fields: usize,
+) -> Result<(), StoredMetaCodecError> {
+    if expected_field_ords.len() > max_fields {
+        return Err(StoredMetaCodecError::ResourceLimit {
+            resource: "field count",
+            actual: u64::try_from(expected_field_ords.len()).unwrap_or(u64::MAX),
+            limit: u64::try_from(max_fields).unwrap_or(u64::MAX),
+        });
+    }
+    for (index, pair) in expected_field_ords.windows(2).enumerate() {
+        if pair[0] >= pair[1] {
+            return Err(StoredMetaCodecError::NonAscendingFields {
+                index: index + 1,
+                previous: pair[0],
+                current: pair[1],
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_stored_meta_field_set(
+    expected_field_ords: &[u16],
+    fields: &[StoredMetaFieldInput<'_>],
+    max_fields: usize,
+) -> Result<(), StoredMetaCodecError> {
+    validate_stored_meta_expected_fields(expected_field_ords, max_fields)?;
+    let compared = expected_field_ords.len().max(fields.len());
+    for index in 0..compared {
+        let expected = expected_field_ords.get(index).copied();
+        let actual = fields.get(index).map(|field| field.field_ord);
+        if expected != actual {
+            return Err(StoredMetaCodecError::UnexpectedField {
+                index,
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn checked_stored_meta_span(
+    docid_lo: u64,
+    docid_hi: u64,
+    limits: StoredMetaLimits,
+) -> Result<usize, StoredMetaCodecError> {
+    let span = docid_hi
+        .checked_sub(docid_lo)
+        .ok_or(StoredMetaCodecError::InvalidDocIdRange { docid_lo, docid_hi })?;
+    if span > limits.max_docid_span {
+        return Err(StoredMetaCodecError::ResourceLimit {
+            resource: "docid span",
+            actual: span,
+            limit: limits.max_docid_span,
+        });
+    }
+    usize::try_from(span).map_err(|_| StoredMetaCodecError::ResourceLimit {
+        resource: "host docid span",
+        actual: span,
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })
+}
+
+fn stored_meta_presence_len(span: usize) -> Result<usize, StoredMetaCodecError> {
+    span.checked_add(7)
+        .map(|bits| bits / 8)
+        .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+            field: "presence bitmap length",
+        })
+}
+
+fn stored_meta_layout(
+    field_ords: &[u16],
+    span: usize,
+    blob_lengths: &[usize],
+    limits: StoredMetaLimits,
+) -> Result<(Vec<usize>, usize), StoredMetaCodecError> {
+    let directory_len = field_ords
+        .len()
+        .checked_mul(STORED_META_DIRECTORY_ENTRY_LEN)
+        .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+            field: "directory length",
+        })?;
+    let presence_len = stored_meta_presence_len(span)?;
+    let offsets_len = span
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+            field: "offset table length",
+        })?;
+    let field_prefix_len =
+        presence_len
+            .checked_add(offsets_len)
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                field: "field prefix length",
+            })?;
+    let mut field_offsets = Vec::new();
+    field_offsets
+        .try_reserve_exact(field_ords.len())
+        .map_err(|_| StoredMetaCodecError::Allocation {
+            resource: "directory offsets",
+            bytes: field_ords
+                .len()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        })?;
+    let mut cursor = directory_len;
+    for (index, &field_ord) in field_ords.iter().enumerate() {
+        if u32::try_from(cursor).is_err() {
+            return Err(StoredMetaCodecError::OffsetUnrepresentable {
+                field_ord,
+                offset: cursor,
+            });
+        }
+        field_offsets.push(cursor);
+        let blob_len =
+            *blob_lengths
+                .get(index)
+                .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                    field: "field blob layout",
+                })?;
+        cursor = cursor
+            .checked_add(field_prefix_len)
+            .and_then(|end| end.checked_add(blob_len))
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow { field: "field end" })?;
+    }
+    let section_len = u64::try_from(cursor).unwrap_or(u64::MAX);
+    if section_len > limits.max_section_bytes {
+        return Err(StoredMetaCodecError::ResourceLimit {
+            resource: "section bytes",
+            actual: section_len,
+            limit: limits.max_section_bytes,
+        });
+    }
+    Ok((field_offsets, cursor))
+}
+
+fn stored_meta_presence_bit(presence: &[u8], ordinal: usize) -> Option<bool> {
+    let byte = *presence.get(ordinal / 8)?;
+    Some(byte & (1 << (ordinal % 8)) != 0)
+}
+
+fn stored_meta_offset(offsets: &[u8], index: usize) -> Option<u32> {
+    let start = index.checked_mul(std::mem::size_of::<u32>())?;
+    let end = start.checked_add(std::mem::size_of::<u32>())?;
+    let bytes = offsets.get(start..end)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 /// One at-seal FSLX STATS row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FieldStats {
@@ -7807,6 +9443,559 @@ mod tests {
         assert!(matches!(
             DocLenSection::parse(encoded.as_bytes(), 0, 3, &[2]),
             Err(DocLenCodecError::UnexpectedField { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_meta_roundtrip_distinguishes_absent_empty_and_opaque_bytes() -> TestResult {
+        let expected_fields = [2_u16, 7];
+        let large = vec![b'x'; 70_000];
+        let non_utf8 = [0xff, 0x00, 0x80];
+        let metadata = [
+            None,
+            Some(b"".as_slice()),
+            Some(non_utf8.as_slice()),
+            Some(large.as_slice()),
+            None,
+        ];
+        let content = [
+            Some(b"alpha".as_slice()),
+            None,
+            Some(b"".as_slice()),
+            None,
+            Some(b"omega".as_slice()),
+        ];
+        let inputs = [
+            StoredMetaFieldInput::new(2, &metadata),
+            StoredMetaFieldInput::new(7, &content),
+        ];
+        let encoded = EncodedStoredMetaSection::encode(100, 105, &expected_fields, &inputs)?;
+        assert_eq!(encoded.field_count(), 2);
+        assert_eq!(encoded.blob_bytes(), 70_013);
+        assert_eq!(&encoded.as_bytes()[..2], &2_u16.to_le_bytes());
+        assert_eq!(&encoded.as_bytes()[6..8], &7_u16.to_le_bytes());
+        assert_eq!(
+            u32::from_le_bytes(encoded.as_bytes()[2..6].try_into()?),
+            u32::try_from(2 * STORED_META_DIRECTORY_ENTRY_LEN)?
+        );
+
+        let section = encoded.section(&expected_fields)?;
+        assert_eq!(section.docid_lo(), 100);
+        assert_eq!(section.docid_hi(), 105);
+        assert_eq!(section.span(), 5);
+        assert_eq!(
+            section
+                .fields()
+                .map(StoredMetaField::field_ord)
+                .collect::<Vec<_>>(),
+            expected_fields
+        );
+        let metadata = section.field(2).ok_or("metadata field")?;
+        assert!(!metadata.is_present(99));
+        assert!(!metadata.is_present(100));
+        assert!(metadata.is_present(101));
+        assert_eq!(metadata.get(100), None);
+        assert_eq!(metadata.get(101), Some(b"".as_slice()));
+        assert_eq!(metadata.get(102), Some(non_utf8.as_slice()));
+        assert_eq!(metadata.get(103), Some(large.as_slice()));
+        assert_eq!(metadata.get(104), None);
+        assert_eq!(metadata.get(105), None);
+        let content = section.field(7).ok_or("content field")?;
+        assert_eq!(content.get(100), Some(b"alpha".as_slice()));
+        assert_eq!(content.get(102), Some(b"".as_slice()));
+        assert_eq!(content.get(104), Some(b"omega".as_slice()));
+
+        let empty = EncodedStoredMetaSection::encode(7, 7, &[], &[])?;
+        assert!(empty.as_bytes().is_empty());
+        assert_eq!(empty.section(&[])?.field_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn stored_meta_wire_is_exactly_packed_little_endian() -> TestResult {
+        let expected_fields = [2_u16, 7];
+        let field_two = [None, Some(b"".as_slice()), Some([0xff, 0x00].as_slice())];
+        let field_seven = [Some(b"A".as_slice()), None, Some(b"BC".as_slice())];
+        let encoded = EncodedStoredMetaSection::encode(
+            40,
+            43,
+            &expected_fields,
+            &[
+                StoredMetaFieldInput::new(2, &field_two),
+                StoredMetaFieldInput::new(7, &field_seven),
+            ],
+        )?;
+        let golden = [
+            0x02, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x07, 0x00, 0x1f, 0x00, 0x00, 0x00, 0x06, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0x00, 0xff, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x03, 0x00, 0x00, 0x00, b'A', b'B', b'C',
+        ];
+        assert_eq!(encoded.as_bytes(), golden);
+
+        let section = StoredMetaSection::parse(&golden, 40, 43, &expected_fields)?;
+        let two = section.field(2).ok_or("field two")?;
+        assert_eq!(two.get(40), None);
+        assert_eq!(two.get(41), Some(b"".as_slice()));
+        assert_eq!(two.get(42), Some([0xff, 0x00].as_slice()));
+        let seven = section.field(7).ok_or("field seven")?;
+        assert_eq!(seven.get(40), Some(b"A".as_slice()));
+        assert_eq!(seven.get(41), None);
+        assert_eq!(seven.get(42), Some(b"BC".as_slice()));
+
+        let mut later_directory_offset = golden;
+        later_directory_offset[8..12].copy_from_slice(&32_u32.to_le_bytes());
+        assert!(matches!(
+            StoredMetaSection::parse(&later_directory_offset, 40, 43, &expected_fields),
+            Err(StoredMetaCodecError::TerminalOffsetMismatch { field_ord: 2, .. })
+        ));
+        assert!(matches!(
+            StoredMetaSection::parse(&golden, 40, 43, &[2]),
+            Err(StoredMetaCodecError::NonCanonicalFieldOffset { field_ord: 2, .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_meta_seals_sparse_scribe_columns_without_value_staging() -> TestResult {
+        use crate::schema::DEFAULT_SCHEMA;
+        use crate::scribe::{IndexedFieldValue, StoredFieldValue};
+
+        let mut accumulator = ColumnarAccumulator::new(DEFAULT_SCHEMA)?;
+        accumulator.add_document_with_stored(
+            1,
+            &[
+                IndexedFieldValue::new(0, "doc-a"),
+                IndexedFieldValue::new(1, ""),
+            ],
+            &[StoredFieldValue::new(3, b"")],
+        )?;
+        let opaque = [0xff, 0x00, 0x80];
+        accumulator.add_document_with_stored(
+            3,
+            &[IndexedFieldValue::new(0, "doc-b")],
+            &[StoredFieldValue::new(3, &opaque)],
+        )?;
+
+        let encoded = EncodedStoredMetaSection::encode_accumulator(100, 105, 100, &accumulator)?;
+        let expected_fields = [0_u16, 1, 2, 3, 4];
+        let section = encoded.section(&expected_fields)?;
+        assert_eq!(section.span(), 5);
+        let ids = section.field(0).ok_or("stored id")?;
+        assert_eq!(ids.get(100), None);
+        assert_eq!(ids.get(101), Some(b"doc-a".as_slice()));
+        assert_eq!(ids.get(102), None);
+        assert_eq!(ids.get(103), Some(b"doc-b".as_slice()));
+        assert_eq!(ids.get(104), None);
+        let content = section.field(1).ok_or("stored content")?;
+        assert_eq!(content.get(101), Some(b"".as_slice()));
+        assert_eq!(content.get(103), None);
+        let metadata = section.field(3).ok_or("stored metadata")?;
+        assert_eq!(metadata.get(101), Some(b"".as_slice()));
+        assert_eq!(metadata.get(103), Some(opaque.as_slice()));
+        assert_eq!(metadata.blob(), opaque);
+
+        assert!(matches!(
+            EncodedStoredMetaSection::encode_accumulator(102, 105, 100, &accumulator),
+            Err(StoredMetaCodecError::SourceDocumentOutOfRange {
+                index: 0,
+                docid: 101,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_meta_rejects_noncanonical_bytes_and_resource_abuse() -> TestResult {
+        let expected_fields = [3_u16];
+        let values = [None, Some(b"x".as_slice()), Some(b"".as_slice())];
+        let input = [StoredMetaFieldInput::new(3, &values)];
+        assert!(matches!(
+            EncodedStoredMetaSection::encode(4, 3, &expected_fields, &input),
+            Err(StoredMetaCodecError::InvalidDocIdRange { .. })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::encode(0, 3, &[3, 3], &input),
+            Err(StoredMetaCodecError::NonAscendingFields { .. })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::encode(0, 3, &[4], &input),
+            Err(StoredMetaCodecError::UnexpectedField { .. })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::encode(0, 4, &expected_fields, &input),
+            Err(StoredMetaCodecError::ColumnLengthMismatch { .. })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::encode_with_limits(
+                0,
+                3,
+                &expected_fields,
+                &input,
+                StoredMetaLimits {
+                    max_fields: 1,
+                    max_docid_span: 3,
+                    max_section_bytes: 1_000,
+                    max_field_blob_bytes: 1_000,
+                    max_value_bytes: 0,
+                }
+            ),
+            Err(StoredMetaCodecError::ResourceLimit {
+                resource: "value bytes",
+                actual: 1,
+                limit: 0,
+            })
+        ));
+
+        let encoded = EncodedStoredMetaSection::encode(0, 3, &expected_fields, &input)?;
+        assert!(matches!(
+            EncodedStoredMetaSection::encode_with_limits(
+                0,
+                3,
+                &expected_fields,
+                &input,
+                StoredMetaLimits {
+                    max_docid_span: 2,
+                    ..StoredMetaLimits::default()
+                },
+            ),
+            Err(StoredMetaCodecError::ResourceLimit {
+                resource: "docid span",
+                actual: 3,
+                limit: 2,
+            })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::encode_with_limits(
+                0,
+                3,
+                &expected_fields,
+                &input,
+                StoredMetaLimits {
+                    max_field_blob_bytes: 0,
+                    ..StoredMetaLimits::default()
+                },
+            ),
+            Err(StoredMetaCodecError::ResourceLimit {
+                resource: "field blob bytes",
+                actual: 1,
+                limit: 0,
+            })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::encode_with_limits(
+                0,
+                3,
+                &expected_fields,
+                &input,
+                StoredMetaLimits {
+                    max_section_bytes: 23,
+                    ..StoredMetaLimits::default()
+                },
+            ),
+            Err(StoredMetaCodecError::ResourceLimit {
+                resource: "section bytes",
+                actual: 24,
+                limit: 23,
+            })
+        ));
+
+        for limits in [
+            StoredMetaLimits {
+                max_fields: 0,
+                ..StoredMetaLimits::default()
+            },
+            StoredMetaLimits {
+                max_docid_span: 2,
+                ..StoredMetaLimits::default()
+            },
+            StoredMetaLimits {
+                max_section_bytes: 23,
+                ..StoredMetaLimits::default()
+            },
+            StoredMetaLimits {
+                max_field_blob_bytes: 0,
+                ..StoredMetaLimits::default()
+            },
+            StoredMetaLimits {
+                max_value_bytes: 0,
+                ..StoredMetaLimits::default()
+            },
+        ] {
+            assert!(
+                StoredMetaSection::parse_with_limits(
+                    encoded.as_bytes(),
+                    0,
+                    3,
+                    &expected_fields,
+                    limits,
+                )
+                .is_err(),
+                "parse limit {limits:?} must be enforced"
+            );
+        }
+
+        let present_empty = [Some(b"".as_slice())];
+        let empty_encoded = EncodedStoredMetaSection::encode_with_limits(
+            9,
+            10,
+            &expected_fields,
+            &[StoredMetaFieldInput::new(3, &present_empty)],
+            StoredMetaLimits {
+                max_value_bytes: 0,
+                ..StoredMetaLimits::default()
+            },
+        )?;
+        assert_eq!(
+            empty_encoded
+                .section(&expected_fields)?
+                .field(3)
+                .ok_or("empty field")?
+                .get(9),
+            Some(b"".as_slice())
+        );
+
+        for cut in 0..encoded.as_bytes().len() {
+            assert!(
+                StoredMetaSection::parse(&encoded.as_bytes()[..cut], 0, 3, &expected_fields)
+                    .is_err(),
+                "cut={cut}"
+            );
+        }
+        let mut bad_field_offset = encoded.as_bytes().to_vec();
+        bad_field_offset[2..6].copy_from_slice(&7_u32.to_le_bytes());
+        assert!(matches!(
+            StoredMetaSection::parse(&bad_field_offset, 0, 3, &expected_fields),
+            Err(StoredMetaCodecError::NonCanonicalFieldOffset { .. })
+        ));
+        let presence_start = STORED_META_DIRECTORY_ENTRY_LEN;
+        let offsets_start = presence_start + 1;
+        let mut bad_presence_tail = encoded.as_bytes().to_vec();
+        bad_presence_tail[presence_start] |= 0x80;
+        assert!(matches!(
+            StoredMetaSection::parse(&bad_presence_tail, 0, 3, &expected_fields),
+            Err(StoredMetaCodecError::NonCanonicalPresencePadding { .. })
+        ));
+        let mut bad_first_offset = encoded.as_bytes().to_vec();
+        bad_first_offset[offsets_start..offsets_start + 4].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            StoredMetaSection::parse(&bad_first_offset, 0, 3, &expected_fields),
+            Err(StoredMetaCodecError::NonZeroFirstOffset { .. })
+        ));
+        let mut descending = encoded.as_bytes().to_vec();
+        descending[presence_start] |= 1;
+        descending[offsets_start + 4..offsets_start + 8].copy_from_slice(&1_u32.to_le_bytes());
+        descending[offsets_start + 8..offsets_start + 12].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            StoredMetaSection::parse(&descending, 0, 3, &expected_fields),
+            Err(StoredMetaCodecError::DescendingOffsets { .. })
+        ));
+        let mut absent_with_bytes = encoded.as_bytes().to_vec();
+        absent_with_bytes[presence_start] &= !(1 << 1);
+        assert!(matches!(
+            StoredMetaSection::parse(&absent_with_bytes, 0, 3, &expected_fields),
+            Err(StoredMetaCodecError::AbsentValueHasBytes { index: 1, .. })
+        ));
+        let mut trailing = encoded.as_bytes().to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            StoredMetaSection::parse(&trailing, 0, 3, &expected_fields),
+            Err(StoredMetaCodecError::TrailingBytes { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_meta_concat_preserves_holes_blobs_and_schedule_equivalence() -> TestResult {
+        let expected_fields = [3_u16];
+        let first_values = [Some(b"a".as_slice()), None, Some(b"".as_slice())];
+        let second_values = [Some(b"bc".as_slice()), Some(b"d".as_slice())];
+        let third_values = [None, Some(b"ef".as_slice())];
+        let first = EncodedStoredMetaSection::encode(
+            10,
+            13,
+            &expected_fields,
+            &[StoredMetaFieldInput::new(3, &first_values)],
+        )?;
+        let second = EncodedStoredMetaSection::encode(
+            15,
+            17,
+            &expected_fields,
+            &[StoredMetaFieldInput::new(3, &second_values)],
+        )?;
+        let third = EncodedStoredMetaSection::encode(
+            17,
+            19,
+            &expected_fields,
+            &[StoredMetaFieldInput::new(3, &third_values)],
+        )?;
+        let first_section = first.section(&expected_fields)?;
+        let second_section = second.section(&expected_fields)?;
+        let third_section = third.section(&expected_fields)?;
+        let direct = EncodedStoredMetaSection::concatenate(
+            &[
+                first_section.clone(),
+                second_section.clone(),
+                third_section.clone(),
+            ],
+            &expected_fields,
+        )?;
+
+        let monolithic_values = [
+            Some(b"a".as_slice()),
+            None,
+            Some(b"".as_slice()),
+            None,
+            None,
+            Some(b"bc".as_slice()),
+            Some(b"d".as_slice()),
+            None,
+            Some(b"ef".as_slice()),
+        ];
+        let monolithic = EncodedStoredMetaSection::encode(
+            10,
+            19,
+            &expected_fields,
+            &[StoredMetaFieldInput::new(3, &monolithic_values)],
+        )?;
+        assert_eq!(direct.as_bytes(), monolithic.as_bytes());
+        let direct_section = direct.section(&expected_fields)?;
+        let merged_field = direct_section.field(3).ok_or("merged stored field")?;
+        assert_eq!(merged_field.blob(), b"abcdef");
+        assert_eq!(merged_field.get(12), Some(b"".as_slice()));
+        assert_eq!(merged_field.get(13), None);
+        assert_eq!(merged_field.get(14), None);
+
+        let staged_prefix = EncodedStoredMetaSection::concatenate(
+            &[first_section.clone(), second_section.clone()],
+            &expected_fields,
+        )?;
+        let staged_prefix_section = staged_prefix.section(&expected_fields)?;
+        let staged = EncodedStoredMetaSection::concatenate(
+            &[staged_prefix_section, third_section.clone()],
+            &expected_fields,
+        )?;
+        assert_eq!(staged.as_bytes(), direct.as_bytes());
+
+        let staged_suffix = EncodedStoredMetaSection::concatenate(
+            &[second_section.clone(), third_section.clone()],
+            &expected_fields,
+        )?;
+        let staged_suffix_section = staged_suffix.section(&expected_fields)?;
+        let right_associated = EncodedStoredMetaSection::concatenate(
+            &[first_section.clone(), staged_suffix_section],
+            &expected_fields,
+        )?;
+        assert_eq!(right_associated.as_bytes(), direct.as_bytes());
+
+        assert!(matches!(
+            EncodedStoredMetaSection::concatenate(
+                &[second_section.clone(), first_section.clone()],
+                &expected_fields,
+            ),
+            Err(StoredMetaCodecError::ConcatRangeOrder { .. })
+        ));
+        let overlapping = EncodedStoredMetaSection::encode(
+            12,
+            14,
+            &expected_fields,
+            &[StoredMetaFieldInput::new(
+                3,
+                &[Some(b"x".as_slice()), Some(b"y".as_slice())],
+            )],
+        )?;
+        assert!(matches!(
+            EncodedStoredMetaSection::concatenate(
+                &[first_section, overlapping.section(&expected_fields)?],
+                &expected_fields,
+            ),
+            Err(StoredMetaCodecError::ConcatRangeOrder { .. })
+        ));
+        assert!(matches!(
+            EncodedStoredMetaSection::concatenate(&[], &expected_fields),
+            Err(StoredMetaCodecError::EmptyConcat)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stored_meta_concat_rebases_multiple_fields_without_decoding_blobs() -> TestResult {
+        let expected_fields = [3_u16, 8];
+        let left_three = [Some(b"a".as_slice()), None];
+        let left_eight = [Some(b"".as_slice()), Some(b"x".as_slice())];
+        let right_three = [Some(b"b".as_slice()), Some(b"".as_slice())];
+        let right_eight = [None, Some([0xff, 0x00].as_slice())];
+        let left = EncodedStoredMetaSection::encode(
+            0,
+            2,
+            &expected_fields,
+            &[
+                StoredMetaFieldInput::new(3, &left_three),
+                StoredMetaFieldInput::new(8, &left_eight),
+            ],
+        )?;
+        let right = EncodedStoredMetaSection::encode(
+            3,
+            5,
+            &expected_fields,
+            &[
+                StoredMetaFieldInput::new(3, &right_three),
+                StoredMetaFieldInput::new(8, &right_eight),
+            ],
+        )?;
+        let left_section = left.section(&expected_fields)?;
+        let right_section = right.section(&expected_fields)?;
+        let merged = EncodedStoredMetaSection::concatenate(
+            &[left_section.clone(), right_section.clone()],
+            &expected_fields,
+        )?;
+
+        let monolithic_three = [
+            Some(b"a".as_slice()),
+            None,
+            None,
+            Some(b"b".as_slice()),
+            Some(b"".as_slice()),
+        ];
+        let monolithic_eight = [
+            Some(b"".as_slice()),
+            Some(b"x".as_slice()),
+            None,
+            None,
+            Some([0xff, 0x00].as_slice()),
+        ];
+        let monolithic = EncodedStoredMetaSection::encode(
+            0,
+            5,
+            &expected_fields,
+            &[
+                StoredMetaFieldInput::new(3, &monolithic_three),
+                StoredMetaFieldInput::new(8, &monolithic_eight),
+            ],
+        )?;
+        assert_eq!(merged.as_bytes(), monolithic.as_bytes());
+        let merged_section = merged.section(&expected_fields)?;
+        assert_eq!(merged_section.field(3).ok_or("field three")?.blob(), b"ab");
+        assert_eq!(
+            merged_section.field(8).ok_or("field eight")?.blob(),
+            [b'x', 0xff, 0x00]
+        );
+        assert!(matches!(
+            EncodedStoredMetaSection::concatenate_with_limits(
+                &[left_section, right_section],
+                &expected_fields,
+                StoredMetaLimits {
+                    max_value_bytes: 0,
+                    ..StoredMetaLimits::default()
+                },
+            ),
+            Err(StoredMetaCodecError::ResourceLimit {
+                resource: "value bytes",
+                actual: 1,
+                limit: 0,
+            })
         ));
         Ok(())
     }

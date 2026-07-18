@@ -383,7 +383,38 @@ docid predicate.
 
 ### 5.9 STOREDMETA
 
-Per stored field (schema-descriptor-driven; `metadata_json` always; `content` iff descriptor stores it): field directory, then per-field `(span + 1) × u32` offsets + blob, holes as in IDMAP. Bytes are opaque (serde_json parsing happens only at hit materialization). Lazy section: queries not touching stored fields never fault it in.
+The schema-derived stored fields appear in ascending `field_ord`; there is no
+redundant count prefix:
+
+```
+directory: stored_field_count × {
+  field_ord: u16
+  field_offset: u32          # section-relative; first = directory length
+}
+
+each field payload at field_offset:
+  presence: ceil(span / 8) bytes       # LSB-first; 1 = present
+  offsets:  (span + 1) × u32           # blob-relative, monotone, first = 0
+  blob:     offsets[span] opaque bytes
+```
+
+Fields are packed without padding. Every later `field_offset` equals the exact
+end of the preceding field blob; the final blob ends at the section boundary.
+Unused high bits in the last presence byte are zero. A zero presence bit
+requires equal adjacent offsets and represents an absent field or docid hole.
+A one bit with equal offsets represents a **present empty value**, which must
+remain distinguishable from absence. Per-field offsets and the presence bitmap
+remain positional over `docid - docid_lo`, including holes after compaction.
+
+All fields whose descriptor sets `stored=true` are represented; bytes are
+opaque and serde_json parsing happens only at hit materialization. Ordinary
+query paths do not request this lazy section and therefore never fault it in or
+validate its section checksum. Fresh seal maps Scribe's completed-document
+columns through the lease base into the exact segment docid span, inserting
+holes for sparse local ordinals without constructing dense value objects.
+Concat-merge rebases offset tables, inserts zero presence bits for
+inter-segment gaps, and copies each source field blob once without interpreting
+or re-encoding values.
 
 ### 5.10 STATS
 
@@ -524,5 +555,6 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.12 | 2026-07-17 | NUMERIC signedness correction: schema-driven `value_bits: u64` preserves the complete indexed I64 and U64 domains without a redundant row tag; ordering and bounds use the field's schema type | — (pre-freeze correction) | indexed-I64/indexed-U64 section-presence coverage (e3.1); typed range/roundtrip including `u64 > i64::MAX` (e2.7) |
 | 1.0.13 | 2026-07-17 | BLOCKMAX v1 pre-freeze hardening: no count prefix; u64 canonical term-relative offsets; Tantivy-compatible conservative max-frequency codes; exact minimum stored fieldnorm IDs; POSTINGS/DOCLEN cross-validation; live-snapshot query bounds; and Q1 concat offset-only rebasing are pinned | — (pre-freeze contract hardening) | BLOCKMAX wire/corruption, bound-soundness, skip, and `df=100 + df=300` concat fixtures (e2.3) |
 | 1.0.14 | 2026-07-17 | POSITIONS v1 pre-freeze hardening: fixed-LE block count; canonical u32 posting ordinals and u64 blocks-area-relative offsets; whole-document u32 first-plus-delta runs with zero deltas; frequency-derived boundaries; greedy 4096-byte fresh blocks with oversized singletons; bounded validation; and Q1 payload-preserving directory rebasing are pinned | — (pre-freeze contract hardening) | POSITIONS wire/corruption, zero-delta, >65k, block-boundary, cursor, and concat-seam fixtures (e2.4) |
+| 1.0.15 | 2026-07-18 | STOREDMETA v1 pre-freeze correction: every schema-stored field gets a packed presence bitmap before its positional offset table, preserving absent/hole versus present-empty values; exact directory offsets, bitmap canonicality, zero-copy reads, sparse Scribe sealing, and gap-preserving concat are pinned | — (pre-freeze correction) | exact wire golden, absent/empty/non-UTF8 roundtrip, sparse accumulator holes, corruption/resource matrix, lazy first-touch, and direct/left/right concat equivalence (e2.9) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*

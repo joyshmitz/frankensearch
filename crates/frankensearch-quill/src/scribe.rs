@@ -954,6 +954,29 @@ impl<'a> IndexedFieldValue<'a> {
     }
 }
 
+/// One opaque stored-field value supplied for a document.
+///
+/// Values are retained byte-for-byte for FSLX STOREDMETA. Indexed string
+/// fields marked `stored` normally derive these bytes directly from their
+/// [`IndexedFieldValue`]; this explicit form supplies stored-only and numeric
+/// fields, or a stored indexed field that is intentionally not indexed for one
+/// document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredFieldValue<'a> {
+    /// Stable schema field ordinal.
+    pub field_ord: u16,
+    /// Borrowed opaque bytes.
+    pub bytes: &'a [u8],
+}
+
+impl<'a> StoredFieldValue<'a> {
+    /// Construct a borrowed stored-field value.
+    #[must_use]
+    pub const fn new(field_ord: u16, bytes: &'a [u8]) -> Self {
+        Self { field_ord, bytes }
+    }
+}
+
 /// Typed validation failures from [`ColumnarAccumulator::add_document`].
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AccumulatorError {
@@ -1015,6 +1038,34 @@ pub enum AccumulatorError {
         field_ord: u16,
         /// Source byte length.
         bytes: usize,
+    },
+    /// A value named a field whose descriptor does not store original bytes.
+    #[error("field {field_ord} ({field_name}) is not stored")]
+    NonStoredField {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Stable schema field name.
+        field_name: &'static str,
+    },
+    /// One stored value cannot be represented by the durable u32 offsets.
+    #[error("stored field {field_ord} value is {bytes} bytes and exceeds the u32 offset domain")]
+    StoredValueTooLarge {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Rejected byte length.
+        bytes: usize,
+    },
+    /// Appending a value would make one field blob exceed the durable u32 domain.
+    #[error(
+        "stored field {field_ord} blob cannot append {appended} bytes to its current {current} bytes"
+    )]
+    StoredBlobTooLarge {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Current accumulated blob length.
+        current: usize,
+        /// Candidate value length.
+        appended: usize,
     },
 }
 
@@ -1182,6 +1233,118 @@ impl FieldTokenColumns {
     }
 }
 
+/// One schema-ordered column of opaque stored values.
+///
+/// Offsets align with completed documents rather than lease ordinals. A
+/// separate presence byte preserves the distinction between an absent value
+/// and a present empty byte string; the FSLX writer packs those bytes into the
+/// STOREDMETA presence bitmap.
+#[derive(Debug)]
+pub struct StoredFieldColumns {
+    field_ord: u16,
+    offsets: Vec<u32>,
+    present: Vec<u8>,
+    blob: Vec<u8>,
+}
+
+impl StoredFieldColumns {
+    fn new(field_ord: u16) -> Self {
+        Self {
+            field_ord,
+            offsets: vec![0],
+            present: Vec::new(),
+            blob: Vec::new(),
+        }
+    }
+
+    /// Stable schema field ordinal.
+    #[must_use]
+    pub const fn field_ord(&self) -> u16 {
+        self.field_ord
+    }
+
+    /// Number of completed documents represented by this column.
+    #[must_use]
+    pub fn document_count(&self) -> usize {
+        self.present.len()
+    }
+
+    /// Monotone blob offsets, with exactly `document_count + 1` entries.
+    #[must_use]
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// One canonical `0`/`1` presence byte per completed document.
+    #[must_use]
+    pub fn presence(&self) -> &[u8] {
+        &self.present
+    }
+
+    /// Concatenated opaque value bytes.
+    #[must_use]
+    pub fn blob(&self) -> &[u8] {
+        &self.blob
+    }
+
+    /// Borrow one value by completed-document index.
+    ///
+    /// `None` means the document index is out of range or the field was
+    /// absent. `Some(&[])` is a present empty value.
+    #[must_use]
+    pub fn value(&self, document_index: usize) -> Option<&[u8]> {
+        if self.present.get(document_index).copied()? == 0 {
+            return None;
+        }
+        let start = usize::try_from(*self.offsets.get(document_index)?).ok()?;
+        let end = usize::try_from(*self.offsets.get(document_index + 1)?).ok()?;
+        self.blob.get(start..end)
+    }
+
+    fn can_append(&self, value: Option<&[u8]>) -> bool {
+        value.is_none_or(|bytes| {
+            self.blob
+                .len()
+                .checked_add(bytes.len())
+                .is_some_and(|len| u32::try_from(len).is_ok())
+        })
+    }
+
+    fn append_document(&mut self, value: Option<&[u8]>) {
+        self.present.push(u8::from(value.is_some()));
+        if let Some(bytes) = value {
+            self.blob.extend_from_slice(bytes);
+        }
+        self.offsets.push(
+            u32::try_from(self.blob.len())
+                .expect("stored blob append was validated before accumulator mutation"),
+        );
+    }
+
+    fn bytes_reserved(&self) -> usize {
+        self.offsets
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(self.present.capacity())
+            .saturating_add(self.blob.capacity())
+    }
+
+    fn bytes_used(&self) -> usize {
+        self.offsets
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(self.present.len())
+            .saturating_add(self.blob.len())
+    }
+
+    fn reset(&mut self) {
+        self.offsets.clear();
+        self.offsets.push(0);
+        self.present.clear();
+        self.blob.clear();
+    }
+}
+
 /// Schema-driven shard-local columnar token accumulator.
 ///
 /// A complete document is validated before any column is changed. Indexed
@@ -1193,6 +1356,7 @@ pub struct ColumnarAccumulator<A = FrankensearchTokenizer> {
     schema: SchemaDescriptor,
     terms: TermInterner,
     fields: Vec<FieldTokenColumns>,
+    stored_fields: Vec<StoredFieldColumns>,
     document_ords: Vec<u32>,
     seen_fields: Vec<bool>,
     last_doc_ord: Option<u32>,
@@ -1256,10 +1420,17 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                 FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => None,
             })
             .collect();
+        let stored_fields = schema
+            .fields
+            .iter()
+            .filter(|field| field.stored)
+            .map(|field| StoredFieldColumns::new(field.id))
+            .collect();
         Ok(Self {
             schema,
             terms: TermInterner::new(),
             fields,
+            stored_fields,
             document_ords: Vec::new(),
             seen_fields: vec![false; schema.fields.len()],
             last_doc_ord: None,
@@ -1283,6 +1454,28 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         &mut self,
         doc_ord: u32,
         values: &[IndexedFieldValue<'_>],
+    ) -> Result<DocumentAccumulation, AccumulatorError> {
+        self.add_document_with_stored(doc_ord, values, &[])
+    }
+
+    /// Add one complete document with explicit opaque stored values.
+    ///
+    /// Indexed string values whose descriptors set `stored=true` are retained
+    /// automatically. `stored_values` supplies stored-only/numeric fields, or
+    /// a stored indexed field omitted from `values`. Naming the same field in
+    /// both slices is rejected rather than admitting divergent indexed and
+    /// stored bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation error before mutating any column when the
+    /// document ordinal, either field set, field shape, analyzer, source-size
+    /// proof, or durable stored-blob bound is invalid.
+    pub fn add_document_with_stored(
+        &mut self,
+        doc_ord: u32,
+        values: &[IndexedFieldValue<'_>],
+        stored_values: &[StoredFieldValue<'_>],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
         if doc_ord >= DOC_ORDS_PER_LEASE {
             return Err(AccumulatorError::DocumentOutsideLease { doc_ord });
@@ -1343,6 +1536,58 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             }
         }
 
+        for value in stored_values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut self.seen_fields[field_index], true) {
+                return Err(AccumulatorError::DuplicateField {
+                    doc_ord,
+                    field_ord: value.field_ord,
+                });
+            }
+            if !field.stored {
+                return Err(AccumulatorError::NonStoredField {
+                    field_ord: field.id,
+                    field_name: field.name,
+                });
+            }
+            if u32::try_from(value.bytes.len()).is_err() {
+                return Err(AccumulatorError::StoredValueTooLarge {
+                    field_ord: field.id,
+                    bytes: value.bytes.len(),
+                });
+            }
+        }
+
+        for field in &self.stored_fields {
+            let value = stored_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+                .map(|value| value.bytes)
+                .or_else(|| {
+                    values
+                        .iter()
+                        .find(|value| value.field_ord == field.field_ord)
+                        .map(|value| value.text.as_bytes())
+                });
+            if !field.can_append(value) {
+                return Err(AccumulatorError::StoredBlobTooLarge {
+                    field_ord: field.field_ord,
+                    current: field.blob.len(),
+                    appended: value.map_or(0, <[u8]>::len),
+                });
+            }
+        }
+
         for field in &mut self.fields {
             field.begin_document();
         }
@@ -1397,6 +1642,20 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             oversized_tokens += dropped;
         }
 
+        for field in &mut self.stored_fields {
+            let value = stored_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+                .map(|value| value.bytes)
+                .or_else(|| {
+                    values
+                        .iter()
+                        .find(|value| value.field_ord == field.field_ord)
+                        .map(|value| value.text.as_bytes())
+                });
+            field.append_document(value);
+        }
+
         self.document_ords.push(doc_ord);
         self.last_doc_ord = Some(doc_ord);
         Ok(DocumentAccumulation {
@@ -1432,6 +1691,21 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .binary_search_by_key(&field_ord, FieldTokenColumns::field_ord)
             .ok()
             .map(|index| &self.fields[index])
+    }
+
+    /// Stored-field columns in stable schema order.
+    #[must_use]
+    pub fn stored_fields(&self) -> &[StoredFieldColumns] {
+        &self.stored_fields
+    }
+
+    /// Look up one stored-field column.
+    #[must_use]
+    pub fn stored_field(&self, field_ord: u16) -> Option<&StoredFieldColumns> {
+        self.stored_fields
+            .binary_search_by_key(&field_ord, StoredFieldColumns::field_ord)
+            .ok()
+            .map(|index| &self.stored_fields[index])
     }
 
     /// Completed shard-relative document ordinals. Per-field length/norm
@@ -1482,6 +1756,17 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     .fold(0, usize::saturating_add),
             )
             .saturating_add(
+                self.stored_fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<StoredFieldColumns>()),
+            )
+            .saturating_add(
+                self.stored_fields
+                    .iter()
+                    .map(StoredFieldColumns::bytes_reserved)
+                    .fold(0, usize::saturating_add),
+            )
+            .saturating_add(
                 self.document_ords
                     .capacity()
                     .saturating_mul(std::mem::size_of::<u32>()),
@@ -1510,6 +1795,17 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     .fold(0, usize::saturating_add),
             )
             .saturating_add(
+                self.stored_fields
+                    .len()
+                    .saturating_mul(std::mem::size_of::<StoredFieldColumns>()),
+            )
+            .saturating_add(
+                self.stored_fields
+                    .iter()
+                    .map(StoredFieldColumns::bytes_used)
+                    .fold(0, usize::saturating_add),
+            )
+            .saturating_add(
                 self.document_ords
                     .len()
                     .saturating_mul(std::mem::size_of::<u32>()),
@@ -1531,6 +1827,9 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         for field in &mut self.fields {
             field.reset();
         }
+        for field in &mut self.stored_fields {
+            field.reset();
+        }
         self.document_ords.clear();
         self.seen_fields.fill(false);
         self.last_doc_ord = None;
@@ -1541,7 +1840,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FieldDescriptor};
+    use crate::schema::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, FSFS_CHUNK_SCHEMA, FieldDescriptor};
     use frankensearch_lexical::tantivy_crate::tokenizer::TokenStream;
     use serde_json::Value;
     use std::hash::BuildHasherDefault;
@@ -2592,6 +2891,133 @@ mod tests {
     }
 
     #[test]
+    fn stored_columns_preserve_opaque_absent_and_present_empty_values() {
+        let mut accumulator = ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("valid schema");
+        let ordinal = 41_u64.to_le_bytes();
+        accumulator
+            .add_document_with_stored(
+                5,
+                &[
+                    IndexedFieldValue::new(0, "doc-a"),
+                    IndexedFieldValue::new(1, "body"),
+                    IndexedFieldValue::new(2, ""),
+                ],
+                &[
+                    StoredFieldValue::new(3, b""),
+                    StoredFieldValue::new(4, &ordinal),
+                ],
+            )
+            .expect("first document accumulates");
+        accumulator
+            .add_document_with_stored(
+                8,
+                &[
+                    IndexedFieldValue::new(0, "doc-b"),
+                    IndexedFieldValue::new(1, ""),
+                ],
+                &[],
+            )
+            .expect("second document accumulates");
+
+        assert_eq!(
+            accumulator
+                .stored_fields()
+                .iter()
+                .map(StoredFieldColumns::field_ord)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        let ids = accumulator.stored_field(0).expect("stored id");
+        assert_eq!(ids.value(0), Some(b"doc-a".as_slice()));
+        assert_eq!(ids.value(1), Some(b"doc-b".as_slice()));
+        let titles = accumulator.stored_field(2).expect("stored title");
+        assert_eq!(titles.value(0), Some(b"".as_slice()));
+        assert_eq!(titles.value(1), None);
+        let metadata = accumulator.stored_field(3).expect("stored metadata");
+        assert_eq!(metadata.value(0), Some(b"".as_slice()));
+        assert_eq!(metadata.value(1), None);
+        assert_eq!(metadata.presence(), &[1, 0]);
+        assert_eq!(metadata.offsets(), &[0, 0, 0]);
+        assert_eq!(
+            accumulator
+                .stored_field(4)
+                .expect("stored ordinal")
+                .value(0),
+            Some(ordinal.as_slice())
+        );
+    }
+
+    #[test]
+    fn stored_columns_follow_each_shipped_descriptor_without_name_hardcoding() {
+        fn assert_stored_fields<A: TokenAnalyzer>(
+            accumulator: &ColumnarAccumulator<A>,
+            expected: &[u16],
+        ) {
+            assert_eq!(
+                accumulator
+                    .stored_fields()
+                    .iter()
+                    .map(StoredFieldColumns::field_ord)
+                    .collect::<Vec<_>>(),
+                expected,
+                "schema={} should derive stored ordinals only from descriptors",
+                accumulator.schema().name
+            );
+        }
+
+        let default = ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("valid default schema");
+        assert_stored_fields(&default, &[0, 1, 2, 3, 4]);
+
+        let fsfs = ColumnarAccumulator::new(FSFS_CHUNK_SCHEMA).expect("valid FSFS schema");
+        assert_stored_fields(&fsfs, &[0, 1, 2, 3, 4, 5, 7]);
+
+        let cass =
+            ColumnarAccumulator::with_analyzer(CASS_SEMANTIC_SCHEMA, CassAnalyzer::default())
+                .expect("native analyzer covers the CASS descriptor");
+        assert_stored_fields(&cass, &[0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn stored_input_validation_is_atomic_and_rejects_divergent_duplicates() {
+        let mut unstored = ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid schema");
+        assert_eq!(
+            unstored.add_document_with_stored(1, &[], &[StoredFieldValue::new(0, b"not stored")],),
+            Err(AccumulatorError::NonStoredField {
+                field_ord: 0,
+                field_name: "key",
+            })
+        );
+        assert_eq!(unstored.document_count(), 0);
+        assert!(unstored.terms().is_empty());
+        assert_eq!(
+            unstored
+                .stored_field(3)
+                .expect("stored-only column")
+                .document_count(),
+            0
+        );
+
+        let mut duplicate = ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("valid schema");
+        assert_eq!(
+            duplicate.add_document_with_stored(
+                2,
+                &[IndexedFieldValue::new(0, "indexed")],
+                &[StoredFieldValue::new(0, b"different stored bytes")],
+            ),
+            Err(AccumulatorError::DuplicateField {
+                doc_ord: 2,
+                field_ord: 0,
+            })
+        );
+        assert_eq!(duplicate.document_count(), 0);
+        assert!(duplicate.terms().is_empty());
+        for field in duplicate.stored_fields() {
+            assert_eq!(field.document_count(), 0);
+            assert_eq!(field.offsets(), &[0]);
+        }
+    }
+
+    #[test]
     fn randomized_accumulation_preserves_all_parallel_column_invariants() {
         const SEEDS: [u64; 12] = [
             1,
@@ -3145,6 +3571,12 @@ mod tests {
             assert!(field.document_lengths().is_empty());
             assert!(field.fieldnorm_ids().is_empty());
         }
+        for field in accumulator.stored_fields() {
+            assert_eq!(field.document_count(), 0);
+            assert_eq!(field.offsets(), &[0]);
+            assert!(field.presence().is_empty());
+            assert!(field.blob().is_empty());
+        }
         assert_eq!(accumulator.bytes_reserved(), retained);
         assert!(
             !accumulator.should_flush(live),
@@ -3185,6 +3617,11 @@ mod tests {
             .capacity()
             .saturating_mul(std::mem::size_of::<FieldTokenColumns>());
         assert!(outer_fields > 0);
+        let outer_stored_fields = accumulator
+            .stored_fields
+            .capacity()
+            .saturating_mul(std::mem::size_of::<StoredFieldColumns>());
+        assert!(outer_stored_fields > 0);
         let exact_components = accumulator
             .terms
             .bytes_reserved()
@@ -3194,6 +3631,14 @@ mod tests {
                     .fields
                     .iter()
                     .map(FieldTokenColumns::bytes_reserved)
+                    .sum::<usize>(),
+            )
+            .saturating_add(outer_stored_fields)
+            .saturating_add(
+                accumulator
+                    .stored_fields
+                    .iter()
+                    .map(StoredFieldColumns::bytes_reserved)
                     .sum::<usize>(),
             )
             .saturating_add(

@@ -1933,6 +1933,40 @@ mod tests {
     }
 
     #[test]
+    fn metadata_free_paths_do_not_touch_a_corrupt_stored_meta_section() -> TestResult {
+        assert!(schema_has_stored_fields(DEFAULT_SCHEMA));
+        let owned = fixture_sections(DEFAULT_SCHEMA, false);
+        let encoded = encode_owned(fixture_header(DEFAULT_SCHEMA), &owned)?;
+        let stored_meta = encoded
+            .section_entries()
+            .iter()
+            .find(|entry| entry.kind == SectionKind::STOREDMETA)
+            .copied()
+            .expect("default-schema STOREDMETA entry");
+        let mut corrupt_bytes = encoded.into_bytes();
+        let stored_meta_offset = usize::try_from(stored_meta.offset)?;
+        corrupt_bytes[stored_meta_offset] ^= 0x20;
+
+        // Structural open and score-only sections stay independent of lazy
+        // stored-field checksum validation.
+        let reader = SegmentReader::from_owned(corrupt_bytes, DEFAULT_SCHEMA)?;
+        for kind in [
+            SectionKind::TERMDICT,
+            SectionKind::POSTINGS,
+            SectionKind::BLOCKMAX,
+            SectionKind::DOCLEN,
+            SectionKind::STATS,
+        ] {
+            assert!(reader.section(kind)?.is_some(), "kind={}", kind.raw());
+        }
+        assert!(matches!(
+            reader.section(SectionKind::STOREDMETA),
+            Err(QuillError::IndexCorrupted { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn verify_freshly_checks_whole_file_after_section_hashes_pass() -> TestResult {
         let owned = fixture_sections(MINIMAL_SCHEMA, false);
         let encoded = encode_owned(fixture_header(MINIMAL_SCHEMA), &owned)?;
