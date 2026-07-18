@@ -64,14 +64,16 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 # Same fix shape as frankensqlite (#104).
 # Keep this pin aligned with HFDT and FrankenSQLite so downstream
 # workspaces resolve a single Asupersync runtime universe. The range
-# `>=0.3.4, <0.4` (rather than a hard `=0.3.4`) lets a downstream workspace
+# `>=0.3.9, <0.4` (rather than a hard `=0.3.4`) lets a downstream workspace
 # that patches asupersync to an unpublished 0.3.5 (e.g. mcp_agent_mail_rust's
 # `[patch.crates-io] asupersync = { path = "/dp/asupersync" }`) resolve a
-# single unified runtime, while a standalone frankensearch build still
-# resolves 0.3.4 from crates.io (0.3.5 is unpublished). A hard `=0.3.4`
+# single unified runtime. The floor is 0.3.9: crates.io 0.3.4 shipped a
+# regression where `time::sleep` futures never fired under bare
+# current-thread `block_on` runtimes (bd-z6pu; it froze fsfs's
+# shutdown-wait tests against a stale lockfile). A hard `=0.3.4`
 # was unsatisfiable under that patch and deadlocked am's whole graph
 # (cargo resolution EXIT 101). [bd-3h229]
-asupersync = { version = ">=0.3.4, <0.4", default-features = false, features = ["proc-macros"] }
+asupersync = { version = ">=0.3.9, <0.4", default-features = false, features = ["proc-macros"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
