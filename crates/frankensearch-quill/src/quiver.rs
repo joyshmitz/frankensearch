@@ -334,7 +334,9 @@ mod bitpack {
 
 use std::ops::Range;
 
+use frankensearch_core::DocId;
 use thiserror::Error;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
 use crate::scribe::{ColumnarAccumulator, TokenAnalyzer};
 
@@ -5070,6 +5072,2109 @@ fn align_doclen(value: usize) -> Option<usize> {
         .map(|sum| sum & !(DOCLEN_ALIGNMENT - 1))
 }
 
+/// Packed size of the `{ entry_count: u32, blob_offset: u32 }` IDMAP header.
+pub const ID_MAP_HEADER_LEN: usize = 8;
+/// Packed size of one IDMAP offset.
+pub const ID_MAP_OFFSET_LEN: usize = 4;
+/// Packed size of one IDMAP canonical-content hash.
+pub const ID_MAP_HASH_LEN: usize = 8;
+/// Largest IDMAP span whose fixed header, offsets, and hashes fit `blob_offset: u32`.
+pub const ID_MAP_MAX_SPAN: u64 = 357_913_940;
+/// Packed size of the IDHASH capacity header.
+pub const ID_HASH_HEADER_LEN: usize = 4;
+/// Packed size of one `{ key_hash: u64, doc_ord_plus1: u32 }` IDHASH slot.
+pub const ID_HASH_ENTRY_LEN: usize = 12;
+/// Stable xxh3-64 seed for durable IDHASH keys (`"QUILL1"`).
+pub const ID_HASH_SEED: u64 = 0x5155_494c_4c31;
+
+/// Hash canonicalized document content for the durable IDMAP witness.
+///
+/// This is deliberately unseeded xxh3-64. It is distinct from both the
+/// seeded IDHASH key and `DocumentFingerprint`'s in-memory FNV witness.
+#[must_use]
+pub fn id_map_content_hash(canonical_content: &[u8]) -> u64 {
+    xxh3_64(canonical_content)
+}
+
+/// One present positional IDMAP row supplied to the deterministic writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdMapEntryInput<'a> {
+    /// Non-empty external document identifier.
+    pub document_id: &'a str,
+    /// Unseeded xxh3-64 of the canonical document content.
+    pub content_hash: u64,
+}
+
+impl<'a> IdMapEntryInput<'a> {
+    /// Construct a row from an externally computed canonical-content witness.
+    #[must_use]
+    pub const fn new(document_id: &'a str, content_hash: u64) -> Self {
+        Self {
+            document_id,
+            content_hash,
+        }
+    }
+
+    /// Construct a row while hashing the supplied canonical content.
+    #[must_use]
+    pub fn from_canonical_content(document_id: &'a str, canonical_content: &[u8]) -> Self {
+        Self::new(document_id, id_map_content_hash(canonical_content))
+    }
+}
+
+/// Explicit resource ceilings for an FSLX IDMAP section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdMapLimits {
+    /// Maximum half-open global docid span.
+    pub max_docid_span: u64,
+    /// Maximum complete section size.
+    pub max_section_bytes: u64,
+    /// Maximum concatenated document-identifier blob size.
+    pub max_blob_bytes: u64,
+    /// Maximum one-document identifier size.
+    pub max_document_id_bytes: u64,
+}
+
+impl Default for IdMapLimits {
+    fn default() -> Self {
+        Self {
+            max_docid_span: ID_MAP_MAX_SPAN,
+            max_section_bytes: u64::from(u32::MAX),
+            max_blob_bytes: u64::from(u32::MAX),
+            max_document_id_bytes: u64::from(u32::MAX),
+        }
+    }
+}
+
+/// Typed failures from IDMAP encoding, validation, or concatenation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum IdMapCodecError {
+    /// A segment's half-open docid range was reversed or exceeded u32 payloads.
+    #[error("invalid IDMAP docid range [{docid_lo}, {docid_hi})")]
+    InvalidDocIdRange {
+        /// Inclusive lower bound.
+        docid_lo: u64,
+        /// Exclusive upper bound.
+        docid_hi: u64,
+    },
+    /// A caller or durable declaration exceeded an explicit resource ceiling.
+    #[error("IDMAP {resource} {actual} exceeds limit {limit}")]
+    ResourceLimit {
+        /// Bounded resource name.
+        resource: &'static str,
+        /// Rejected amount.
+        actual: u64,
+        /// Configured ceiling.
+        limit: u64,
+    },
+    /// Positional input must cover the complete segment span.
+    #[error("IDMAP has {actual} input rows, expected {expected}")]
+    EntryCountMismatch {
+        /// Required span.
+        expected: usize,
+        /// Supplied or decoded count.
+        actual: usize,
+    },
+    /// Equal adjacent offsets are reserved for holes, so IDs cannot be empty.
+    #[error("IDMAP document id at ordinal {ordinal} is empty")]
+    EmptyDocumentId {
+        /// Rejected positional ordinal.
+        ordinal: usize,
+    },
+    /// Checked layout arithmetic overflowed.
+    #[error("IDMAP arithmetic overflow while computing {field}")]
+    ArithmeticOverflow {
+        /// Layout component being computed.
+        field: &'static str,
+    },
+    /// A durable offset did not fit its u32 slot.
+    #[error("IDMAP offset {offset} does not fit u32")]
+    OffsetUnrepresentable {
+        /// Computed offset.
+        offset: usize,
+    },
+    /// The durable blob offset was not the one canonical packed layout.
+    #[error("IDMAP blob offset {encoded} is non-canonical; expected {expected}")]
+    NonCanonicalBlobOffset {
+        /// Durable value.
+        encoded: u32,
+        /// Required value.
+        expected: u32,
+    },
+    /// Every offset table begins at zero.
+    #[error("IDMAP first offset is {actual}, expected 0")]
+    NonZeroFirstOffset {
+        /// Rejected first offset.
+        actual: u32,
+    },
+    /// Offsets must be monotone.
+    #[error("IDMAP offsets descend at ordinal {ordinal}: {start} to {end}")]
+    DescendingOffsets {
+        /// Rejected ordinal.
+        ordinal: usize,
+        /// Start offset.
+        start: u32,
+        /// End offset.
+        end: u32,
+    },
+    /// An offset pointed beyond the identifier blob.
+    #[error("IDMAP offset {offset} at ordinal {ordinal} exceeds blob length {blob_len}")]
+    OffsetOutOfBounds {
+        /// Rejected ordinal.
+        ordinal: usize,
+        /// Rejected offset.
+        offset: u32,
+        /// Exact available blob length.
+        blob_len: usize,
+    },
+    /// Hole rows must carry the canonical zero content hash.
+    #[error("IDMAP hole at ordinal {ordinal} has non-zero content hash {content_hash:#018x}")]
+    NonZeroHoleHash {
+        /// Rejected ordinal.
+        ordinal: usize,
+        /// Rejected witness.
+        content_hash: u64,
+    },
+    /// Present identifier bytes must be valid UTF-8.
+    #[error("IDMAP document id at ordinal {ordinal} is not valid UTF-8")]
+    InvalidUtf8 {
+        /// Rejected ordinal.
+        ordinal: usize,
+    },
+    /// The terminal offset must consume the exact identifier blob.
+    #[error("IDMAP terminal offset is {terminal}, but blob length is {blob_len}")]
+    TerminalOffsetMismatch {
+        /// Durable terminal offset.
+        terminal: u32,
+        /// Exact remaining bytes.
+        blob_len: usize,
+    },
+    /// Durable bytes ended before the canonical layout did.
+    #[error("truncated IDMAP section: expected at least {expected} bytes, got {actual}")]
+    Truncated {
+        /// Minimum required length.
+        expected: usize,
+        /// Available length.
+        actual: usize,
+    },
+    /// Canonical sections end exactly after the identifier blob.
+    #[error("IDMAP section has trailing bytes: expected {expected}, got {actual}")]
+    TrailingBytes {
+        /// Canonical complete size.
+        expected: usize,
+        /// Actual size.
+        actual: usize,
+    },
+    /// Concatenation requires at least one validated source section.
+    #[error("cannot concatenate an empty IDMAP section list")]
+    EmptyConcat,
+    /// Concat inputs must be ordered and non-overlapping.
+    #[error("IDMAP concat section {index} begins at {current_lo}, before prior end {previous_hi}")]
+    ConcatRangeOrder {
+        /// Rejected source index.
+        index: usize,
+        /// Prior source's exclusive high bound.
+        previous_hi: u64,
+        /// Current source's inclusive low bound.
+        current_lo: u64,
+    },
+    /// Fallible allocation failed without panicking.
+    #[error("unable to reserve {bytes} bytes for IDMAP {resource}")]
+    Allocation {
+        /// Allocation purpose.
+        resource: &'static str,
+        /// Requested amount.
+        bytes: usize,
+    },
+}
+
+/// Owned canonical bytes produced by the fresh-seal IDMAP writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedIdMapSection {
+    bytes: Vec<u8>,
+    docid_lo: u64,
+    docid_hi: u64,
+    present_count: usize,
+}
+
+impl EncodedIdMapSection {
+    /// Encode span-aligned document identifiers and canonical-content hashes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid ranges, row-count drift, empty or oversized identifiers,
+    /// resource abuse, arithmetic overflow, and allocation failure.
+    pub fn encode(
+        docid_lo: u64,
+        docid_hi: u64,
+        entries: &[Option<IdMapEntryInput<'_>>],
+    ) -> Result<Self, IdMapCodecError> {
+        Self::encode_with_limits(docid_lo, docid_hi, entries, IdMapLimits::default())
+    }
+
+    /// Encode with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::encode`].
+    pub fn encode_with_limits(
+        docid_lo: u64,
+        docid_hi: u64,
+        entries: &[Option<IdMapEntryInput<'_>>],
+        limits: IdMapLimits,
+    ) -> Result<Self, IdMapCodecError> {
+        let span = checked_id_map_span(docid_lo, docid_hi, limits)?;
+        if entries.len() != span {
+            return Err(IdMapCodecError::EntryCountMismatch {
+                expected: span,
+                actual: entries.len(),
+            });
+        }
+        let mut blob_len = 0_usize;
+        let mut present_count = 0_usize;
+        for (ordinal, entry) in entries.iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if entry.document_id.is_empty() {
+                return Err(IdMapCodecError::EmptyDocumentId { ordinal });
+            }
+            let id_len = u64::try_from(entry.document_id.len()).unwrap_or(u64::MAX);
+            if id_len > limits.max_document_id_bytes {
+                return Err(IdMapCodecError::ResourceLimit {
+                    resource: "document id bytes",
+                    actual: id_len,
+                    limit: limits.max_document_id_bytes,
+                });
+            }
+            blob_len = blob_len.checked_add(entry.document_id.len()).ok_or(
+                IdMapCodecError::ArithmeticOverflow {
+                    field: "identifier blob length",
+                },
+            )?;
+            present_count += 1;
+        }
+        validate_id_map_blob_len(blob_len, limits)?;
+        let (blob_offset, total_len) = id_map_layout(span, blob_len, limits)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| IdMapCodecError::Allocation {
+                resource: "section bytes",
+                bytes: total_len,
+            })?;
+        let entry_count = u32::try_from(span).map_err(|_| IdMapCodecError::ResourceLimit {
+            resource: "durable entry count",
+            actual: u64::try_from(span).unwrap_or(u64::MAX),
+            limit: u64::from(u32::MAX),
+        })?;
+        let blob_offset_u32 =
+            u32::try_from(blob_offset).map_err(|_| IdMapCodecError::OffsetUnrepresentable {
+                offset: blob_offset,
+            })?;
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&blob_offset_u32.to_le_bytes());
+        let mut offset = 0_u32;
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        for entry in entries {
+            if let Some(entry) = entry {
+                let id_len = u32::try_from(entry.document_id.len()).map_err(|_| {
+                    IdMapCodecError::OffsetUnrepresentable {
+                        offset: entry.document_id.len(),
+                    }
+                })?;
+                offset = offset
+                    .checked_add(id_len)
+                    .ok_or(IdMapCodecError::ArithmeticOverflow {
+                        field: "identifier offset",
+                    })?;
+            }
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        for entry in entries {
+            bytes.extend_from_slice(&entry.map_or(0, |entry| entry.content_hash).to_le_bytes());
+        }
+        debug_assert_eq!(bytes.len(), blob_offset);
+        for entry in entries.iter().flatten() {
+            bytes.extend_from_slice(entry.document_id.as_bytes());
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            present_count,
+        })
+    }
+
+    /// Borrow the exact canonical durable bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return its durable bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Number of non-hole rows.
+    #[must_use]
+    pub const fn present_count(&self) -> usize {
+        self.present_count
+    }
+
+    /// Re-open the owned bytes through the validating zero-copy reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal invariant was violated.
+    pub fn section(&self) -> Result<IdMapSection<'_>, IdMapCodecError> {
+        IdMapSection::parse(&self.bytes, self.docid_lo, self.docid_hi)
+    }
+}
+
+/// One borrowed, present IDMAP row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdMapEntry<'a> {
+    document_id: &'a str,
+    content_hash: u64,
+}
+
+impl<'a> IdMapEntry<'a> {
+    /// Borrow the exact external document identifier bytes as UTF-8.
+    #[must_use]
+    pub const fn document_id(self) -> &'a str {
+        self.document_id
+    }
+
+    /// Unseeded xxh3-64 canonical-content witness.
+    #[must_use]
+    pub const fn content_hash(self) -> u64 {
+        self.content_hash
+    }
+
+    /// Materialize the public compact document-identifier representation.
+    #[must_use]
+    pub fn materialize(self) -> DocId {
+        DocId::new(self.document_id)
+    }
+}
+
+/// Borrowed, fully validated FSLX IDMAP section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdMapSection<'a> {
+    bytes: &'a [u8],
+    docid_lo: u64,
+    docid_hi: u64,
+    offsets: &'a [u8],
+    hashes: &'a [u8],
+    blob: &'a str,
+    present_count: usize,
+}
+
+impl<'a> IdMapSection<'a> {
+    /// Validate an IDMAP payload against its segment range.
+    ///
+    /// # Errors
+    ///
+    /// Rejects range/count drift, a noncanonical layout, malformed offsets,
+    /// non-zero hole hashes, empty or invalid UTF-8 identifiers, truncation,
+    /// trailing bytes, resource abuse, and allocation-independent overflow.
+    pub fn parse(bytes: &'a [u8], docid_lo: u64, docid_hi: u64) -> Result<Self, IdMapCodecError> {
+        Self::parse_with_limits(bytes, docid_lo, docid_hi, IdMapLimits::default())
+    }
+
+    /// Validate with caller-selected resource ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::parse`].
+    pub fn parse_with_limits(
+        bytes: &'a [u8],
+        docid_lo: u64,
+        docid_hi: u64,
+        limits: IdMapLimits,
+    ) -> Result<Self, IdMapCodecError> {
+        let span = checked_id_map_span(docid_lo, docid_hi, limits)?;
+        let section_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if section_len > limits.max_section_bytes {
+            return Err(IdMapCodecError::ResourceLimit {
+                resource: "section bytes",
+                actual: section_len,
+                limit: limits.max_section_bytes,
+            });
+        }
+        if bytes.len() < ID_MAP_HEADER_LEN {
+            return Err(IdMapCodecError::Truncated {
+                expected: ID_MAP_HEADER_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let encoded_count =
+            usize::try_from(read_u32(bytes, 0).ok_or(IdMapCodecError::Truncated {
+                expected: std::mem::size_of::<u32>(),
+                actual: bytes.len(),
+            })?)
+            .map_err(|_| IdMapCodecError::ResourceLimit {
+                resource: "host entry count",
+                actual: u64::from(u32::MAX),
+                limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            })?;
+        if encoded_count != span {
+            return Err(IdMapCodecError::EntryCountMismatch {
+                expected: span,
+                actual: encoded_count,
+            });
+        }
+        let expected_blob_offset = id_map_prefix_len(span)?;
+        let expected_blob_offset_u32 = u32::try_from(expected_blob_offset).map_err(|_| {
+            IdMapCodecError::OffsetUnrepresentable {
+                offset: expected_blob_offset,
+            }
+        })?;
+        let encoded_blob_offset = read_u32(bytes, 4).ok_or(IdMapCodecError::Truncated {
+            expected: ID_MAP_HEADER_LEN,
+            actual: bytes.len(),
+        })?;
+        if encoded_blob_offset != expected_blob_offset_u32 {
+            return Err(IdMapCodecError::NonCanonicalBlobOffset {
+                encoded: encoded_blob_offset,
+                expected: expected_blob_offset_u32,
+            });
+        }
+        if bytes.len() < expected_blob_offset {
+            return Err(IdMapCodecError::Truncated {
+                expected: expected_blob_offset,
+                actual: bytes.len(),
+            });
+        }
+        let offsets_len = span
+            .checked_add(1)
+            .and_then(|count| count.checked_mul(ID_MAP_OFFSET_LEN))
+            .ok_or(IdMapCodecError::ArithmeticOverflow {
+                field: "offset table length",
+            })?;
+        let offsets_start = ID_MAP_HEADER_LEN;
+        let offsets_end =
+            offsets_start
+                .checked_add(offsets_len)
+                .ok_or(IdMapCodecError::ArithmeticOverflow {
+                    field: "offset table end",
+                })?;
+        let hashes_len =
+            span.checked_mul(ID_MAP_HASH_LEN)
+                .ok_or(IdMapCodecError::ArithmeticOverflow {
+                    field: "hash table length",
+                })?;
+        let hashes_end =
+            offsets_end
+                .checked_add(hashes_len)
+                .ok_or(IdMapCodecError::ArithmeticOverflow {
+                    field: "hash table end",
+                })?;
+        debug_assert_eq!(hashes_end, expected_blob_offset);
+        let offsets = bytes
+            .get(offsets_start..offsets_end)
+            .ok_or(IdMapCodecError::Truncated {
+                expected: offsets_end,
+                actual: bytes.len(),
+            })?;
+        let hashes = bytes
+            .get(offsets_end..hashes_end)
+            .ok_or(IdMapCodecError::Truncated {
+                expected: hashes_end,
+                actual: bytes.len(),
+            })?;
+        let blob_bytes = bytes.get(hashes_end..).ok_or(IdMapCodecError::Truncated {
+            expected: hashes_end,
+            actual: bytes.len(),
+        })?;
+        let first = id_map_offset(offsets, 0).ok_or(IdMapCodecError::Truncated {
+            expected: offsets_start + ID_MAP_OFFSET_LEN,
+            actual: bytes.len(),
+        })?;
+        if first != 0 {
+            return Err(IdMapCodecError::NonZeroFirstOffset { actual: first });
+        }
+        for ordinal in 0..span {
+            let start = id_map_offset(offsets, ordinal).ok_or(IdMapCodecError::Truncated {
+                expected: offsets_start + (ordinal + 1) * ID_MAP_OFFSET_LEN,
+                actual: bytes.len(),
+            })?;
+            let end = id_map_offset(offsets, ordinal + 1).ok_or(IdMapCodecError::Truncated {
+                expected: offsets_start + (ordinal + 2) * ID_MAP_OFFSET_LEN,
+                actual: bytes.len(),
+            })?;
+            if end < start {
+                return Err(IdMapCodecError::DescendingOffsets {
+                    ordinal,
+                    start,
+                    end,
+                });
+            }
+            let end_usize =
+                usize::try_from(end).map_err(|_| IdMapCodecError::OffsetOutOfBounds {
+                    ordinal,
+                    offset: end,
+                    blob_len: blob_bytes.len(),
+                })?;
+            if end_usize > blob_bytes.len() {
+                return Err(IdMapCodecError::OffsetOutOfBounds {
+                    ordinal,
+                    offset: end,
+                    blob_len: blob_bytes.len(),
+                });
+            }
+        }
+        let terminal = id_map_offset(offsets, span).ok_or(IdMapCodecError::Truncated {
+            expected: offsets_end,
+            actual: bytes.len(),
+        })?;
+        let terminal_usize =
+            usize::try_from(terminal).map_err(|_| IdMapCodecError::TerminalOffsetMismatch {
+                terminal,
+                blob_len: blob_bytes.len(),
+            })?;
+        if terminal_usize != blob_bytes.len() {
+            if terminal_usize < blob_bytes.len() {
+                return Err(IdMapCodecError::TrailingBytes {
+                    expected: hashes_end + terminal_usize,
+                    actual: bytes.len(),
+                });
+            }
+            return Err(IdMapCodecError::TerminalOffsetMismatch {
+                terminal,
+                blob_len: blob_bytes.len(),
+            });
+        }
+        validate_id_map_blob_len(blob_bytes.len(), limits)?;
+        let blob = match std::str::from_utf8(blob_bytes) {
+            Ok(blob) => blob,
+            Err(error) => {
+                let invalid_offset = error.valid_up_to();
+                let mut invalid_ordinal = 0_usize;
+                for ordinal in 0..span {
+                    let start = id_map_offset(offsets, ordinal).unwrap_or(0);
+                    let end = id_map_offset(offsets, ordinal + 1).unwrap_or(0);
+                    if usize::try_from(start).is_ok_and(|start| start <= invalid_offset)
+                        && usize::try_from(end).is_ok_and(|end| invalid_offset < end)
+                    {
+                        invalid_ordinal = ordinal;
+                        break;
+                    }
+                }
+                return Err(IdMapCodecError::InvalidUtf8 {
+                    ordinal: invalid_ordinal,
+                });
+            }
+        };
+        let mut present_count = 0_usize;
+        for ordinal in 0..span {
+            let start = id_map_offset(offsets, ordinal).ok_or(IdMapCodecError::Truncated {
+                expected: offsets_start + (ordinal + 1) * ID_MAP_OFFSET_LEN,
+                actual: bytes.len(),
+            })?;
+            let end = id_map_offset(offsets, ordinal + 1).ok_or(IdMapCodecError::Truncated {
+                expected: offsets_start + (ordinal + 2) * ID_MAP_OFFSET_LEN,
+                actual: bytes.len(),
+            })?;
+            let end_usize =
+                usize::try_from(end).map_err(|_| IdMapCodecError::OffsetOutOfBounds {
+                    ordinal,
+                    offset: end,
+                    blob_len: blob.len(),
+                })?;
+            let content_hash = id_map_hash(hashes, ordinal).ok_or(IdMapCodecError::Truncated {
+                expected: offsets_end + (ordinal + 1) * ID_MAP_HASH_LEN,
+                actual: bytes.len(),
+            })?;
+            if start == end {
+                if content_hash != 0 {
+                    return Err(IdMapCodecError::NonZeroHoleHash {
+                        ordinal,
+                        content_hash,
+                    });
+                }
+                continue;
+            }
+            let id_len = u64::from(end - start);
+            if id_len > limits.max_document_id_bytes {
+                return Err(IdMapCodecError::ResourceLimit {
+                    resource: "document id bytes",
+                    actual: id_len,
+                    limit: limits.max_document_id_bytes,
+                });
+            }
+            let start_usize =
+                usize::try_from(start).map_err(|_| IdMapCodecError::OffsetOutOfBounds {
+                    ordinal,
+                    offset: start,
+                    blob_len: blob.len(),
+                })?;
+            if blob.get(start_usize..end_usize).is_none() {
+                return Err(IdMapCodecError::InvalidUtf8 { ordinal });
+            }
+            present_count += 1;
+        }
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            offsets,
+            hashes,
+            blob,
+            present_count,
+        })
+    }
+
+    /// Exact durable bytes after canonical validation.
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Inclusive lower global docid bound.
+    #[must_use]
+    pub const fn docid_lo(self) -> u64 {
+        self.docid_lo
+    }
+
+    /// Exclusive upper global docid bound.
+    #[must_use]
+    pub const fn docid_hi(self) -> u64 {
+        self.docid_hi
+    }
+
+    /// Half-open positional span, including holes.
+    #[must_use]
+    pub const fn span(self) -> u64 {
+        self.docid_hi - self.docid_lo
+    }
+
+    /// Number of present rows.
+    #[must_use]
+    pub const fn present_count(self) -> usize {
+        self.present_count
+    }
+
+    /// Exact concatenated identifier blob, useful for zero-copy/concat proofs.
+    #[must_use]
+    pub const fn blob(self) -> &'a [u8] {
+        self.blob.as_bytes()
+    }
+
+    /// Borrow one positional row by global docid.
+    #[must_use]
+    pub fn get(self, global_docid: u64) -> Option<IdMapEntry<'a>> {
+        let ordinal = global_docid.checked_sub(self.docid_lo)?;
+        let ordinal = usize::try_from(ordinal).ok()?;
+        self.entry_at_ordinal(ordinal)
+    }
+
+    /// Whether a global docid names a present row.
+    #[must_use]
+    pub fn contains(self, global_docid: u64) -> bool {
+        let Some(ordinal) = global_docid
+            .checked_sub(self.docid_lo)
+            .and_then(|ordinal| usize::try_from(ordinal).ok())
+        else {
+            return false;
+        };
+        self.document_id_at_ordinal(ordinal).is_some()
+    }
+
+    /// Materialize one winner identifier without touching any other row.
+    #[must_use]
+    pub fn materialize(self, global_docid: u64) -> Option<DocId> {
+        let ordinal = global_docid.checked_sub(self.docid_lo)?;
+        let ordinal = usize::try_from(ordinal).ok()?;
+        Some(DocId::new(self.document_id_at_ordinal(ordinal)?))
+    }
+
+    /// Iterate present rows in ascending global-docid order.
+    pub fn entries(self) -> impl Iterator<Item = (u64, IdMapEntry<'a>)> + 'a {
+        (0..self.offset_count()).filter_map(move |ordinal| {
+            let entry = self.entry_at_ordinal(ordinal)?;
+            let ordinal = u64::try_from(ordinal).ok()?;
+            Some((self.docid_lo + ordinal, entry))
+        })
+    }
+
+    fn document_ids(self) -> impl Iterator<Item = (u64, &'a str)> + 'a {
+        (0..self.offset_count()).filter_map(move |ordinal| {
+            let document_id = self.document_id_at_ordinal(ordinal)?;
+            let ordinal = u64::try_from(ordinal).ok()?;
+            Some((self.docid_lo + ordinal, document_id))
+        })
+    }
+
+    fn offset_count(self) -> usize {
+        self.offsets
+            .len()
+            .checked_div(ID_MAP_OFFSET_LEN)
+            .unwrap_or(0)
+            .saturating_sub(1)
+    }
+
+    fn entry_at_ordinal(self, ordinal: usize) -> Option<IdMapEntry<'a>> {
+        let document_id = self.document_id_at_ordinal(ordinal)?;
+        let content_hash = id_map_hash(self.hashes, ordinal)?;
+        Some(IdMapEntry {
+            document_id,
+            content_hash,
+        })
+    }
+
+    fn document_id_at_ordinal(self, ordinal: usize) -> Option<&'a str> {
+        if ordinal >= self.offset_count() {
+            return None;
+        }
+        let start = usize::try_from(id_map_offset(self.offsets, ordinal)?).ok()?;
+        let end = usize::try_from(id_map_offset(self.offsets, ordinal + 1)?).ok()?;
+        if start == end {
+            return None;
+        }
+        self.blob.get(start..end)
+    }
+}
+
+impl EncodedIdMapSection {
+    /// Concatenate ordered non-overlapping IDMAP sections, inserting holes in
+    /// inter-segment gaps and copying each source identifier blob once.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty input, range overlap/reversal, target-limit violations,
+    /// arithmetic overflow, or allocation failure.
+    pub fn concatenate(sections: &[IdMapSection<'_>]) -> Result<Self, IdMapCodecError> {
+        Self::concatenate_with_limits(sections, IdMapLimits::default())
+    }
+
+    /// Concatenate with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::concatenate`].
+    pub fn concatenate_with_limits(
+        sections: &[IdMapSection<'_>],
+        limits: IdMapLimits,
+    ) -> Result<Self, IdMapCodecError> {
+        let Some(first) = sections.first().copied() else {
+            return Err(IdMapCodecError::EmptyConcat);
+        };
+        for (index, pair) in sections.windows(2).enumerate() {
+            if pair[1].docid_lo < pair[0].docid_hi {
+                return Err(IdMapCodecError::ConcatRangeOrder {
+                    index: index + 1,
+                    previous_hi: pair[0].docid_hi,
+                    current_lo: pair[1].docid_lo,
+                });
+            }
+        }
+        let docid_lo = first.docid_lo;
+        let docid_hi = sections
+            .last()
+            .map(|section| section.docid_hi)
+            .ok_or(IdMapCodecError::EmptyConcat)?;
+        let span = checked_id_map_span(docid_lo, docid_hi, limits)?;
+        let mut blob_len = 0_usize;
+        let mut present_count = 0_usize;
+        for section in sections {
+            blob_len = blob_len.checked_add(section.blob.len()).ok_or(
+                IdMapCodecError::ArithmeticOverflow {
+                    field: "concatenated blob length",
+                },
+            )?;
+            present_count = present_count.checked_add(section.present_count).ok_or(
+                IdMapCodecError::ArithmeticOverflow {
+                    field: "concatenated present count",
+                },
+            )?;
+            for (_, entry) in section.entries() {
+                let id_len = u64::try_from(entry.document_id.len()).unwrap_or(u64::MAX);
+                if id_len > limits.max_document_id_bytes {
+                    return Err(IdMapCodecError::ResourceLimit {
+                        resource: "document id bytes",
+                        actual: id_len,
+                        limit: limits.max_document_id_bytes,
+                    });
+                }
+            }
+        }
+        validate_id_map_blob_len(blob_len, limits)?;
+        let (blob_offset, total_len) = id_map_layout(span, blob_len, limits)?;
+        let offsets_capacity = span
+            .checked_add(1)
+            .ok_or(IdMapCodecError::ArithmeticOverflow {
+                field: "concat offset count",
+            })?;
+        let mut offsets = Vec::new();
+        offsets
+            .try_reserve_exact(offsets_capacity)
+            .map_err(|_| IdMapCodecError::Allocation {
+                resource: "concat offsets",
+                bytes: offsets_capacity.saturating_mul(std::mem::size_of::<u32>()),
+            })?;
+        let mut hashes = Vec::new();
+        hashes
+            .try_reserve_exact(span)
+            .map_err(|_| IdMapCodecError::Allocation {
+                resource: "concat hashes",
+                bytes: span.saturating_mul(std::mem::size_of::<u64>()),
+            })?;
+        let mut current_offset = 0_u32;
+        offsets.push(current_offset);
+        let mut cursor = docid_lo;
+        for (section_index, section) in sections.iter().copied().enumerate() {
+            let gap =
+                section
+                    .docid_lo
+                    .checked_sub(cursor)
+                    .ok_or(IdMapCodecError::ConcatRangeOrder {
+                        index: section_index,
+                        previous_hi: cursor,
+                        current_lo: section.docid_lo,
+                    })?;
+            let gap = usize::try_from(gap).map_err(|_| IdMapCodecError::ResourceLimit {
+                resource: "concat gap",
+                actual: gap,
+                limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            })?;
+            for _ in 0..gap {
+                offsets.push(current_offset);
+                hashes.push(0);
+            }
+            for ordinal in 0..section.offset_count() {
+                let start =
+                    id_map_offset(section.offsets, ordinal).ok_or(IdMapCodecError::Truncated {
+                        expected: (ordinal + 1) * ID_MAP_OFFSET_LEN,
+                        actual: section.offsets.len(),
+                    })?;
+                let end = id_map_offset(section.offsets, ordinal + 1).ok_or(
+                    IdMapCodecError::Truncated {
+                        expected: (ordinal + 2) * ID_MAP_OFFSET_LEN,
+                        actual: section.offsets.len(),
+                    },
+                )?;
+                current_offset = current_offset.checked_add(end - start).ok_or(
+                    IdMapCodecError::ArithmeticOverflow {
+                        field: "concatenated identifier offset",
+                    },
+                )?;
+                offsets.push(current_offset);
+                hashes.push(id_map_hash(section.hashes, ordinal).ok_or(
+                    IdMapCodecError::Truncated {
+                        expected: (ordinal + 1) * ID_MAP_HASH_LEN,
+                        actual: section.hashes.len(),
+                    },
+                )?);
+            }
+            cursor = section.docid_hi;
+        }
+        debug_assert_eq!(offsets.len(), offsets_capacity);
+        debug_assert_eq!(hashes.len(), span);
+        debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total_len)
+            .map_err(|_| IdMapCodecError::Allocation {
+                resource: "concatenated section bytes",
+                bytes: total_len,
+            })?;
+        let entry_count = u32::try_from(span).map_err(|_| IdMapCodecError::ResourceLimit {
+            resource: "durable entry count",
+            actual: u64::try_from(span).unwrap_or(u64::MAX),
+            limit: u64::from(u32::MAX),
+        })?;
+        let blob_offset_u32 =
+            u32::try_from(blob_offset).map_err(|_| IdMapCodecError::OffsetUnrepresentable {
+                offset: blob_offset,
+            })?;
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&blob_offset_u32.to_le_bytes());
+        for offset in offsets {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        for content_hash in hashes {
+            bytes.extend_from_slice(&content_hash.to_le_bytes());
+        }
+        debug_assert_eq!(bytes.len(), blob_offset);
+        for section in sections {
+            bytes.extend_from_slice(section.blob.as_bytes());
+        }
+        debug_assert_eq!(bytes.len(), total_len);
+        Ok(Self {
+            bytes,
+            docid_lo,
+            docid_hi,
+            present_count,
+        })
+    }
+}
+
+fn checked_id_map_span(
+    docid_lo: u64,
+    docid_hi: u64,
+    limits: IdMapLimits,
+) -> Result<usize, IdMapCodecError> {
+    let max_docid_hi = u64::from(u32::MAX) + 1;
+    let span = docid_hi
+        .checked_sub(docid_lo)
+        .filter(|_| docid_hi <= max_docid_hi)
+        .ok_or(IdMapCodecError::InvalidDocIdRange { docid_lo, docid_hi })?;
+    if span > limits.max_docid_span {
+        return Err(IdMapCodecError::ResourceLimit {
+            resource: "docid span",
+            actual: span,
+            limit: limits.max_docid_span,
+        });
+    }
+    if span > ID_MAP_MAX_SPAN {
+        return Err(IdMapCodecError::ResourceLimit {
+            resource: "durable IDMAP span",
+            actual: span,
+            limit: ID_MAP_MAX_SPAN,
+        });
+    }
+    if span > u64::from(u32::MAX) {
+        return Err(IdMapCodecError::ResourceLimit {
+            resource: "durable entry count",
+            actual: span,
+            limit: u64::from(u32::MAX),
+        });
+    }
+    usize::try_from(span).map_err(|_| IdMapCodecError::ResourceLimit {
+        resource: "host docid span",
+        actual: span,
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })
+}
+
+fn validate_id_map_blob_len(blob_len: usize, limits: IdMapLimits) -> Result<(), IdMapCodecError> {
+    let blob_len_u64 = u64::try_from(blob_len).unwrap_or(u64::MAX);
+    let limit = limits.max_blob_bytes.min(u64::from(u32::MAX));
+    if blob_len_u64 > limit {
+        return Err(IdMapCodecError::ResourceLimit {
+            resource: "identifier blob bytes",
+            actual: blob_len_u64,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+fn id_map_prefix_len(span: usize) -> Result<usize, IdMapCodecError> {
+    let offsets_len = span
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(ID_MAP_OFFSET_LEN))
+        .ok_or(IdMapCodecError::ArithmeticOverflow {
+            field: "offset table length",
+        })?;
+    let hashes_len =
+        span.checked_mul(ID_MAP_HASH_LEN)
+            .ok_or(IdMapCodecError::ArithmeticOverflow {
+                field: "hash table length",
+            })?;
+    ID_MAP_HEADER_LEN
+        .checked_add(offsets_len)
+        .and_then(|len| len.checked_add(hashes_len))
+        .ok_or(IdMapCodecError::ArithmeticOverflow {
+            field: "blob offset",
+        })
+}
+
+fn id_map_layout(
+    span: usize,
+    blob_len: usize,
+    limits: IdMapLimits,
+) -> Result<(usize, usize), IdMapCodecError> {
+    let blob_offset = id_map_prefix_len(span)?;
+    if u32::try_from(blob_offset).is_err() {
+        return Err(IdMapCodecError::OffsetUnrepresentable {
+            offset: blob_offset,
+        });
+    }
+    let total_len =
+        blob_offset
+            .checked_add(blob_len)
+            .ok_or(IdMapCodecError::ArithmeticOverflow {
+                field: "section length",
+            })?;
+    let total_len_u64 = u64::try_from(total_len).unwrap_or(u64::MAX);
+    if total_len_u64 > limits.max_section_bytes {
+        return Err(IdMapCodecError::ResourceLimit {
+            resource: "section bytes",
+            actual: total_len_u64,
+            limit: limits.max_section_bytes,
+        });
+    }
+    Ok((blob_offset, total_len))
+}
+
+fn id_map_offset(offsets: &[u8], index: usize) -> Option<u32> {
+    read_u32(offsets, index.checked_mul(ID_MAP_OFFSET_LEN)?)
+}
+
+fn id_map_hash(hashes: &[u8], index: usize) -> Option<u64> {
+    read_u64(hashes, index.checked_mul(ID_MAP_HASH_LEN)?)
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let bytes = bytes.get(offset..offset.checked_add(std::mem::size_of::<u32>())?)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let bytes = bytes.get(offset..offset.checked_add(std::mem::size_of::<u64>())?)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Explicit resource ceilings for an FSLX IDHASH section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdHashLimits {
+    /// Maximum present IDMAP rows examined while building or validating.
+    pub max_entries: u64,
+    /// Maximum power-of-two slot capacity.
+    pub max_capacity: u64,
+    /// Maximum complete section size.
+    pub max_section_bytes: u64,
+    /// Maximum cumulative linear-probe steps in one build or validation pass.
+    pub max_probe_steps: u64,
+}
+
+impl Default for IdHashLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: u64::from(u32::MAX),
+            max_capacity: 1_u64 << 28,
+            max_section_bytes: u64::from(u32::MAX),
+            max_probe_steps: 16_777_216,
+        }
+    }
+}
+
+/// Typed failures from IDHASH encoding or cross-section validation.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum IdHashCodecError {
+    /// A caller or durable declaration exceeded an explicit resource ceiling.
+    #[error("IDHASH {resource} {actual} exceeds limit {limit}")]
+    ResourceLimit {
+        /// Bounded resource name.
+        resource: &'static str,
+        /// Rejected amount.
+        actual: u64,
+        /// Configured ceiling.
+        limit: u64,
+    },
+    /// Checked layout arithmetic overflowed.
+    #[error("IDHASH arithmetic overflow while computing {field}")]
+    ArithmeticOverflow {
+        /// Layout component being computed.
+        field: &'static str,
+    },
+    /// Durable capacity must be non-zero.
+    #[error("IDHASH capacity is zero")]
+    ZeroCapacity,
+    /// Durable capacity must be a power of two.
+    #[error("IDHASH capacity {capacity} is not a power of two")]
+    NonPowerOfTwoCapacity {
+        /// Rejected slot count.
+        capacity: u32,
+    },
+    /// The writer has exactly one canonical minimum capacity.
+    #[error("IDHASH capacity {encoded} is non-canonical; expected {expected}")]
+    NonCanonicalCapacity {
+        /// Durable slot count.
+        encoded: u32,
+        /// Required slot count.
+        expected: u32,
+    },
+    /// More than 70 percent of the durable slots were occupied.
+    #[error("IDHASH load {entries}/{capacity} exceeds 0.7")]
+    LoadFactorExceeded {
+        /// Occupied slots.
+        entries: usize,
+        /// Total slots.
+        capacity: usize,
+    },
+    /// Durable bytes ended before the canonical layout did.
+    #[error("truncated IDHASH section: expected {expected} bytes, got {actual}")]
+    Truncated {
+        /// Required length.
+        expected: usize,
+        /// Available length.
+        actual: usize,
+    },
+    /// Canonical sections end exactly after their final slot.
+    #[error("IDHASH section has trailing bytes: expected {expected}, got {actual}")]
+    TrailingBytes {
+        /// Canonical length.
+        expected: usize,
+        /// Actual length.
+        actual: usize,
+    },
+    /// Empty slots are canonical all-zero rows.
+    #[error("IDHASH empty slot {slot} has non-zero key hash {key_hash:#018x}")]
+    NonZeroEmptyHash {
+        /// Rejected slot.
+        slot: usize,
+        /// Rejected durable hash.
+        key_hash: u64,
+    },
+    /// A slot's segment-relative ordinal exceeded the IDMAP span.
+    #[error("IDHASH slot {slot} references out-of-range ordinal {ordinal}")]
+    OrdinalOutOfRange {
+        /// Rejected slot.
+        slot: usize,
+        /// Decoded segment-relative ordinal.
+        ordinal: u32,
+    },
+    /// A slot referenced an IDMAP hole.
+    #[error("IDHASH slot {slot} references IDMAP hole ordinal {ordinal}")]
+    OrdinalHole {
+        /// Rejected slot.
+        slot: usize,
+        /// Segment-relative ordinal.
+        ordinal: u32,
+    },
+    /// A durable seeded hash disagreed with the exact referenced ID bytes.
+    #[error(
+        "IDHASH slot {slot} key hash {encoded:#018x} disagrees with IDMAP hash {expected:#018x}"
+    )]
+    KeyHashMismatch {
+        /// Rejected slot.
+        slot: usize,
+        /// Durable hash.
+        encoded: u64,
+        /// Required seeded xxh3 hash.
+        expected: u64,
+    },
+    /// A candidate representative set selected the same exact identifier more than once.
+    #[error(
+        "IDHASH duplicate document id at ordinals {first_ordinal} and {duplicate_ordinal}; representative selection requires external tombstone/upsert context"
+    )]
+    DuplicateDocumentId {
+        /// First physical occurrence.
+        first_ordinal: usize,
+        /// Later physical occurrence that made the mapping ambiguous.
+        duplicate_ordinal: usize,
+    },
+    /// Merge-resolved representative ordinals must be strictly ascending for canonical insertion.
+    #[error(
+        "IDHASH representative ordinals are not strictly ascending at index {index}: previous {previous}, current {current}"
+    )]
+    NonAscendingRepresentativeOrdinals {
+        /// Rejected representative-set index.
+        index: usize,
+        /// Previous segment-relative ordinal.
+        previous: u32,
+        /// Current segment-relative ordinal.
+        current: u32,
+    },
+    /// A caller-selected representative ordinal exceeded the bound IDMAP span.
+    #[error("IDHASH representative {index} references out-of-range ordinal {ordinal}")]
+    RepresentativeOrdinalOutOfRange {
+        /// Rejected representative-set index.
+        index: usize,
+        /// Segment-relative ordinal.
+        ordinal: u32,
+    },
+    /// A caller-selected representative ordinal referenced an IDMAP hole.
+    #[error("IDHASH representative {index} references IDMAP hole ordinal {ordinal}")]
+    RepresentativeOrdinalHole {
+        /// Rejected representative-set index.
+        index: usize,
+        /// Segment-relative ordinal.
+        ordinal: u32,
+    },
+    /// A present IDMAP identifier was absent or unreachable through probing.
+    #[error("IDHASH has no reachable mapping for IDMAP ordinal {ordinal}")]
+    MissingMapping {
+        /// Present IDMAP ordinal.
+        ordinal: usize,
+    },
+    /// A slot was duplicated, unreachable, or referenced from a noncanonical cluster.
+    #[error("IDHASH slot {slot} is not the canonical reachable mapping for ordinal {ordinal}")]
+    NonCanonicalSlot {
+        /// Rejected slot.
+        slot: usize,
+        /// Referenced IDMAP ordinal.
+        ordinal: usize,
+    },
+    /// Every occupied slot must be the selected representative for an exact identifier.
+    #[error(
+        "IDHASH occupied slot count {occupied} disagrees with {selected} selected representatives"
+    )]
+    SelectedCountMismatch {
+        /// Durable occupied slots.
+        occupied: usize,
+        /// Selected exact-identifier representatives reachable from IDMAP rows.
+        selected: usize,
+    },
+    /// Linear probing exhausted every slot while encoding.
+    #[error("IDHASH table with capacity {capacity} is full")]
+    TableFull {
+        /// Exhausted slot count.
+        capacity: usize,
+    },
+    /// Reconstructing an absolute global docid overflowed the segment range.
+    #[error("IDHASH ordinal {ordinal} cannot be rebased from docid_lo {docid_lo}")]
+    DocIdOverflow {
+        /// Segment-relative ordinal.
+        ordinal: usize,
+        /// Segment lower bound.
+        docid_lo: u64,
+    },
+    /// Fallible allocation failed without panicking.
+    #[error("unable to reserve {bytes} bytes for IDHASH {resource}")]
+    Allocation {
+        /// Allocation purpose.
+        resource: &'static str,
+        /// Requested amount.
+        bytes: usize,
+    },
+}
+
+/// Owned canonical bytes produced by the IDHASH rebuild writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedIdHashSection {
+    bytes: Vec<u8>,
+    capacity: u32,
+    occupied: usize,
+}
+
+impl EncodedIdHashSection {
+    /// Rebuild IDHASH deterministically from a validated IDMAP.
+    ///
+    /// A standalone section has no tombstone/upsert context, so duplicate
+    /// physical identifiers fail closed instead of guessing a representative.
+    /// The seal or merge layer must supply its externally resolved
+    /// representative set; tombstones remain external to the immutable section.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate-ID ambiguity, resource abuse, arithmetic overflow, or
+    /// allocation failure.
+    pub fn encode(id_map: IdMapSection<'_>) -> Result<Self, IdHashCodecError> {
+        Self::encode_with_limits(id_map, IdHashLimits::default())
+    }
+
+    /// Rebuild with caller-selected validation and allocation ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::encode`].
+    pub fn encode_with_limits(
+        id_map: IdMapSection<'_>,
+        limits: IdHashLimits,
+    ) -> Result<Self, IdHashCodecError> {
+        encode_id_hash_with_hasher(id_map, limits, seeded_id_hash)
+    }
+
+    /// Rebuild IDHASH from representatives already resolved by the seal or merge layer.
+    ///
+    /// `representative_ordinals` must contain exactly one physical
+    /// representative for every exact identifier in `id_map`, in strictly
+    /// ascending segment-relative ordinal order. With external tombstone state,
+    /// the caller selects the unique live physical row for an identifier and
+    /// fails if the upsert invariant admits multiple live rows. If every row is
+    /// tombstoned, the caller retains the lowest global docid as a deterministic
+    /// completeness representative. A merge container's `seal_seq` is only
+    /// publication/probe priority and must not override that live-first choice.
+    /// Sorting the resolved ordinals only after selection pins deterministic
+    /// linear-probe insertion.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsorted, out-of-range, hole, duplicate, or incomplete representative
+    /// sets, plus the resource and allocation failures from [`Self::encode`].
+    pub fn encode_resolved_representatives(
+        id_map: IdMapSection<'_>,
+        representative_ordinals: &[u32],
+    ) -> Result<Self, IdHashCodecError> {
+        Self::encode_resolved_representatives_with_limits(
+            id_map,
+            representative_ordinals,
+            IdHashLimits::default(),
+        )
+    }
+
+    /// Rebuild from externally resolved representatives with caller-selected ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::encode_resolved_representatives`].
+    pub fn encode_resolved_representatives_with_limits(
+        id_map: IdMapSection<'_>,
+        representative_ordinals: &[u32],
+        limits: IdHashLimits,
+    ) -> Result<Self, IdHashCodecError> {
+        encode_resolved_id_hash_with_hasher(id_map, representative_ordinals, limits, seeded_id_hash)
+    }
+
+    /// Borrow the exact canonical durable bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the wrapper and return its durable bytes.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Canonical power-of-two slot capacity.
+    #[must_use]
+    pub const fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// Number of unique occupied identifier slots.
+    #[must_use]
+    pub const fn occupied(&self) -> usize {
+        self.occupied
+    }
+
+    /// Re-open the owned bytes through the cross-validating reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal invariant was violated or `id_map` is
+    /// not the exact matching mapping domain.
+    pub fn section<'a>(
+        &'a self,
+        id_map: IdMapSection<'a>,
+    ) -> Result<IdHashSection<'a>, IdHashCodecError> {
+        IdHashSection::parse(&self.bytes, id_map)
+    }
+}
+
+/// Borrowed IDHASH view that is query-capable only after exact IDMAP binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdHashSection<'a> {
+    bytes: &'a [u8],
+    entries: &'a [u8],
+    capacity: usize,
+    occupied: usize,
+    id_map: IdMapSection<'a>,
+}
+
+impl<'a> IdHashSection<'a> {
+    /// Validate durable slots against the exact IDMAP bytes used for lookups.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid capacity/layout/load, non-zero empty rows, invalid or
+    /// hole ordinals, hash mismatches, missing/duplicate/unreachable mappings,
+    /// noncanonical placement, resource abuse, and allocation-independent
+    /// overflow.
+    pub fn parse(bytes: &'a [u8], id_map: IdMapSection<'a>) -> Result<Self, IdHashCodecError> {
+        Self::parse_with_limits(bytes, id_map, IdHashLimits::default())
+    }
+
+    /// Validate with caller-selected resource ceilings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as [`Self::parse`].
+    pub fn parse_with_limits(
+        bytes: &'a [u8],
+        id_map: IdMapSection<'a>,
+        limits: IdHashLimits,
+    ) -> Result<Self, IdHashCodecError> {
+        parse_id_hash_with_hasher(bytes, id_map, limits, seeded_id_hash)
+    }
+
+    /// Exact durable bytes after cross-section validation.
+    #[must_use]
+    pub const fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Power-of-two slot capacity.
+    #[must_use]
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+
+    /// Number of unique occupied slots.
+    #[must_use]
+    pub const fn occupied(self) -> usize {
+        self.occupied
+    }
+
+    /// Probe a document identifier, verifying exact IDMAP bytes on hash hits.
+    #[must_use]
+    pub fn lookup(self, document_id: &str) -> Option<u64> {
+        self.lookup_with_hash(document_id, seeded_id_hash(document_id.as_bytes()))
+    }
+
+    /// Probe and materialize the exact stored identifier for a winning hit.
+    #[must_use]
+    pub fn lookup_materialized(self, document_id: &str) -> Option<(u64, DocId)> {
+        let global_docid = self.lookup(document_id)?;
+        Some((global_docid, self.id_map.materialize(global_docid)?))
+    }
+
+    fn lookup_with_hash(self, document_id: &str, key_hash: u64) -> Option<u64> {
+        let mut probe_steps = 0_u64;
+        self.lookup_with_hash_and_budget(document_id, key_hash, &mut probe_steps, u64::MAX)
+            .ok()
+            .flatten()
+    }
+
+    fn lookup_with_hash_and_budget(
+        self,
+        document_id: &str,
+        key_hash: u64,
+        probe_steps: &mut u64,
+        max_probe_steps: u64,
+    ) -> Result<Option<u64>, IdHashCodecError> {
+        let Some(mask) = self.capacity.checked_sub(1) else {
+            return Ok(None);
+        };
+        let Some(mask_u64) = u64::try_from(mask).ok() else {
+            return Ok(None);
+        };
+        let Some(mut slot) = usize::try_from(key_hash & mask_u64).ok() else {
+            return Ok(None);
+        };
+        for _ in 0..self.capacity {
+            consume_id_hash_probe_step(probe_steps, max_probe_steps)?;
+            let Some((stored_hash, doc_ord_plus1)) = id_hash_slot(self.entries, slot) else {
+                return Ok(None);
+            };
+            if doc_ord_plus1 == 0 {
+                return Ok(None);
+            }
+            if stored_hash == key_hash {
+                let Some(ordinal) = usize::try_from(doc_ord_plus1 - 1).ok() else {
+                    return Ok(None);
+                };
+                let Some(stored_document_id) = self.id_map.document_id_at_ordinal(ordinal) else {
+                    return Ok(None);
+                };
+                if stored_document_id.as_bytes() == document_id.as_bytes() {
+                    let Some(ordinal) = u64::try_from(ordinal).ok() else {
+                        return Ok(None);
+                    };
+                    return Ok(self.id_map.docid_lo.checked_add(ordinal));
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        Ok(None)
+    }
+}
+
+fn consume_id_hash_probe_step(
+    probe_steps: &mut u64,
+    max_probe_steps: u64,
+) -> Result<(), IdHashCodecError> {
+    *probe_steps = probe_steps.saturating_add(1);
+    if *probe_steps > max_probe_steps {
+        return Err(IdHashCodecError::ResourceLimit {
+            resource: "probe steps",
+            actual: *probe_steps,
+            limit: max_probe_steps,
+        });
+    }
+    Ok(())
+}
+
+fn seeded_id_hash(document_id: &[u8]) -> u64 {
+    xxh3_64_with_seed(document_id, ID_HASH_SEED)
+}
+
+fn encode_id_hash_with_hasher<F>(
+    id_map: IdMapSection<'_>,
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<EncodedIdHashSection, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+{
+    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    let provisional_capacity = canonical_id_hash_capacity(id_map.present_count, limits)?;
+    let (mut entries, occupied) =
+        build_id_hash_entries(id_map, provisional_capacity, limits, hash)?;
+    let canonical_capacity = canonical_id_hash_capacity(occupied, limits)?;
+    if canonical_capacity != provisional_capacity {
+        entries = build_id_hash_entries(id_map, canonical_capacity, limits, hash)?.0;
+    }
+    let total_len = id_hash_section_len(canonical_capacity, limits)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total_len)
+        .map_err(|_| IdHashCodecError::Allocation {
+            resource: "section bytes",
+            bytes: total_len,
+        })?;
+    let capacity_u32 =
+        u32::try_from(canonical_capacity).map_err(|_| IdHashCodecError::ResourceLimit {
+            resource: "durable capacity",
+            actual: u64::try_from(canonical_capacity).unwrap_or(u64::MAX),
+            limit: u64::from(u32::MAX),
+        })?;
+    bytes.extend_from_slice(&capacity_u32.to_le_bytes());
+    bytes.extend_from_slice(&entries);
+    debug_assert_eq!(bytes.len(), total_len);
+    let encoded = EncodedIdHashSection {
+        bytes,
+        capacity: capacity_u32,
+        occupied,
+    };
+    // A successful writer must always reopen under the same limits, including
+    // the cumulative probe-work ceiling.
+    parse_id_hash_with_hasher(encoded.as_bytes(), id_map, limits, hash)?;
+    Ok(encoded)
+}
+
+fn encode_resolved_id_hash_with_hasher<F>(
+    id_map: IdMapSection<'_>,
+    representative_ordinals: &[u32],
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<EncodedIdHashSection, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+{
+    // Validation examines the complete physical IDMAP even though the durable
+    // table contains only one externally selected row per exact identifier.
+    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    validate_id_hash_entry_limit(representative_ordinals.len(), limits)?;
+    let capacity = canonical_id_hash_capacity(representative_ordinals.len(), limits)?;
+    let entries =
+        build_resolved_id_hash_entries(id_map, representative_ordinals, capacity, limits, hash)?;
+    let total_len = id_hash_section_len(capacity, limits)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total_len)
+        .map_err(|_| IdHashCodecError::Allocation {
+            resource: "section bytes",
+            bytes: total_len,
+        })?;
+    let capacity_u32 = u32::try_from(capacity).map_err(|_| IdHashCodecError::ResourceLimit {
+        resource: "durable capacity",
+        actual: u64::try_from(capacity).unwrap_or(u64::MAX),
+        limit: u64::from(u32::MAX),
+    })?;
+    bytes.extend_from_slice(&capacity_u32.to_le_bytes());
+    bytes.extend_from_slice(&entries);
+    debug_assert_eq!(bytes.len(), total_len);
+    let encoded = EncodedIdHashSection {
+        bytes,
+        capacity: capacity_u32,
+        occupied: representative_ordinals.len(),
+    };
+    // This proves that the externally supplied set covers every exact IDMAP
+    // identifier and that its durable bytes satisfy the same reader contract.
+    parse_id_hash_with_hasher(encoded.as_bytes(), id_map, limits, hash)?;
+    Ok(encoded)
+}
+
+fn build_resolved_id_hash_entries<F>(
+    id_map: IdMapSection<'_>,
+    representative_ordinals: &[u32],
+    capacity: usize,
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<Vec<u8>, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+{
+    let entries_len =
+        capacity
+            .checked_mul(ID_HASH_ENTRY_LEN)
+            .ok_or(IdHashCodecError::ArithmeticOverflow {
+                field: "entry bytes",
+            })?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(entries_len)
+        .map_err(|_| IdHashCodecError::Allocation {
+            resource: "entry bytes",
+            bytes: entries_len,
+        })?;
+    entries.resize(entries_len, 0);
+    let mask = capacity
+        .checked_sub(1)
+        .ok_or(IdHashCodecError::ZeroCapacity)?;
+    let mut previous = None;
+    let mut probe_steps = 0_u64;
+    for (index, &ordinal_u32) in representative_ordinals.iter().enumerate() {
+        if let Some(previous) = previous
+            && ordinal_u32 <= previous
+        {
+            return Err(IdHashCodecError::NonAscendingRepresentativeOrdinals {
+                index,
+                previous,
+                current: ordinal_u32,
+            });
+        }
+        previous = Some(ordinal_u32);
+        let ordinal = usize::try_from(ordinal_u32).map_err(|_| {
+            IdHashCodecError::RepresentativeOrdinalOutOfRange {
+                index,
+                ordinal: ordinal_u32,
+            }
+        })?;
+        if ordinal >= id_map.offset_count() {
+            return Err(IdHashCodecError::RepresentativeOrdinalOutOfRange {
+                index,
+                ordinal: ordinal_u32,
+            });
+        }
+        let document_id = id_map.document_id_at_ordinal(ordinal).ok_or(
+            IdHashCodecError::RepresentativeOrdinalHole {
+                index,
+                ordinal: ordinal_u32,
+            },
+        )?;
+        let doc_ord_plus1 = ordinal_u32.checked_add(1).ok_or(
+            IdHashCodecError::RepresentativeOrdinalOutOfRange {
+                index,
+                ordinal: ordinal_u32,
+            },
+        )?;
+        let key_hash = hash(document_id.as_bytes());
+        let mut slot = usize::try_from(key_hash & u64::try_from(mask).unwrap_or(u64::MAX))
+            .map_err(|_| IdHashCodecError::ArithmeticOverflow {
+                field: "initial resolved-representative probe slot",
+            })?;
+        let mut inserted = false;
+        for _ in 0..capacity {
+            consume_id_hash_probe_step(&mut probe_steps, limits.max_probe_steps)?;
+            let (stored_hash, stored_plus1) =
+                id_hash_slot(&entries, slot).ok_or(IdHashCodecError::ArithmeticOverflow {
+                    field: "resolved-representative probe slot read",
+                })?;
+            if stored_plus1 == 0 {
+                write_id_hash_slot(&mut entries, slot, key_hash, doc_ord_plus1)?;
+                inserted = true;
+                break;
+            }
+            if stored_hash == key_hash {
+                let stored_ordinal = usize::try_from(stored_plus1 - 1).map_err(|_| {
+                    IdHashCodecError::ArithmeticOverflow {
+                        field: "stored resolved-representative ordinal",
+                    }
+                })?;
+                let stored_document_id = id_map.document_id_at_ordinal(stored_ordinal).ok_or(
+                    IdHashCodecError::OrdinalHole {
+                        slot,
+                        ordinal: stored_plus1 - 1,
+                    },
+                )?;
+                if stored_document_id.as_bytes() == document_id.as_bytes() {
+                    return Err(IdHashCodecError::DuplicateDocumentId {
+                        first_ordinal: stored_ordinal,
+                        duplicate_ordinal: ordinal,
+                    });
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        if !inserted {
+            return Err(IdHashCodecError::TableFull { capacity });
+        }
+    }
+    Ok(entries)
+}
+
+fn build_id_hash_entries<F>(
+    id_map: IdMapSection<'_>,
+    capacity: usize,
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<(Vec<u8>, usize), IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+{
+    let entries_len =
+        capacity
+            .checked_mul(ID_HASH_ENTRY_LEN)
+            .ok_or(IdHashCodecError::ArithmeticOverflow {
+                field: "entry bytes",
+            })?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(entries_len)
+        .map_err(|_| IdHashCodecError::Allocation {
+            resource: "entry bytes",
+            bytes: entries_len,
+        })?;
+    entries.resize(entries_len, 0);
+    let mask = capacity
+        .checked_sub(1)
+        .ok_or(IdHashCodecError::ZeroCapacity)?;
+    let mut occupied = 0_usize;
+    let mut probe_steps = 0_u64;
+    for (global_docid, document_id) in id_map.document_ids() {
+        let ordinal_u64 =
+            global_docid
+                .checked_sub(id_map.docid_lo)
+                .ok_or(IdHashCodecError::DocIdOverflow {
+                    ordinal: 0,
+                    docid_lo: id_map.docid_lo,
+                })?;
+        let ordinal =
+            usize::try_from(ordinal_u64).map_err(|_| IdHashCodecError::ResourceLimit {
+                resource: "host ordinal",
+                actual: ordinal_u64,
+                limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            })?;
+        let doc_ord_plus1 = u32::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| ordinal.checked_add(1))
+            .ok_or(IdHashCodecError::DocIdOverflow {
+                ordinal,
+                docid_lo: id_map.docid_lo,
+            })?;
+        let key_hash = hash(document_id.as_bytes());
+        let mut slot = usize::try_from(key_hash & u64::try_from(mask).unwrap_or(u64::MAX))
+            .map_err(|_| IdHashCodecError::ArithmeticOverflow {
+                field: "initial probe slot",
+            })?;
+        let mut inserted = false;
+        for _ in 0..capacity {
+            consume_id_hash_probe_step(&mut probe_steps, limits.max_probe_steps)?;
+            let (stored_hash, stored_plus1) =
+                id_hash_slot(&entries, slot).ok_or(IdHashCodecError::ArithmeticOverflow {
+                    field: "probe slot read",
+                })?;
+            if stored_plus1 == 0 {
+                write_id_hash_slot(&mut entries, slot, key_hash, doc_ord_plus1)?;
+                occupied += 1;
+                inserted = true;
+                break;
+            }
+            if stored_hash == key_hash {
+                let stored_ordinal = usize::try_from(stored_plus1 - 1).map_err(|_| {
+                    IdHashCodecError::ArithmeticOverflow {
+                        field: "stored ordinal",
+                    }
+                })?;
+                let stored_document_id = id_map.document_id_at_ordinal(stored_ordinal).ok_or(
+                    IdHashCodecError::OrdinalHole {
+                        slot,
+                        ordinal: stored_plus1 - 1,
+                    },
+                )?;
+                if stored_document_id.as_bytes() == document_id.as_bytes() {
+                    return Err(IdHashCodecError::DuplicateDocumentId {
+                        first_ordinal: stored_ordinal,
+                        duplicate_ordinal: ordinal,
+                    });
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+        if !inserted {
+            return Err(IdHashCodecError::TableFull { capacity });
+        }
+    }
+    Ok((entries, occupied))
+}
+
+fn parse_id_hash_with_hasher<'a, F>(
+    bytes: &'a [u8],
+    id_map: IdMapSection<'a>,
+    limits: IdHashLimits,
+    hash: F,
+) -> Result<IdHashSection<'a>, IdHashCodecError>
+where
+    F: Fn(&[u8]) -> u64 + Copy,
+{
+    validate_id_hash_entry_limit(id_map.present_count, limits)?;
+    if bytes.len() < ID_HASH_HEADER_LEN {
+        return Err(IdHashCodecError::Truncated {
+            expected: ID_HASH_HEADER_LEN,
+            actual: bytes.len(),
+        });
+    }
+    let capacity_u32 = read_u32(bytes, 0).ok_or(IdHashCodecError::Truncated {
+        expected: ID_HASH_HEADER_LEN,
+        actual: bytes.len(),
+    })?;
+    if capacity_u32 == 0 {
+        return Err(IdHashCodecError::ZeroCapacity);
+    }
+    if !capacity_u32.is_power_of_two() {
+        return Err(IdHashCodecError::NonPowerOfTwoCapacity {
+            capacity: capacity_u32,
+        });
+    }
+    let capacity = usize::try_from(capacity_u32).map_err(|_| IdHashCodecError::ResourceLimit {
+        resource: "host capacity",
+        actual: u64::from(capacity_u32),
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })?;
+    let capacity_u64 = u64::from(capacity_u32);
+    if capacity_u64 > limits.max_capacity {
+        return Err(IdHashCodecError::ResourceLimit {
+            resource: "capacity",
+            actual: capacity_u64,
+            limit: limits.max_capacity,
+        });
+    }
+    let expected_len = id_hash_section_len(capacity, limits)?;
+    if bytes.len() < expected_len {
+        return Err(IdHashCodecError::Truncated {
+            expected: expected_len,
+            actual: bytes.len(),
+        });
+    }
+    if bytes.len() > expected_len {
+        return Err(IdHashCodecError::TrailingBytes {
+            expected: expected_len,
+            actual: bytes.len(),
+        });
+    }
+    let entries = bytes
+        .get(ID_HASH_HEADER_LEN..)
+        .ok_or(IdHashCodecError::Truncated {
+            expected: expected_len,
+            actual: bytes.len(),
+        })?;
+    let mut occupied = 0_usize;
+    for slot in 0..capacity {
+        let (key_hash, doc_ord_plus1) =
+            id_hash_slot(entries, slot).ok_or(IdHashCodecError::Truncated {
+                expected: expected_len,
+                actual: bytes.len(),
+            })?;
+        if doc_ord_plus1 == 0 {
+            if key_hash != 0 {
+                return Err(IdHashCodecError::NonZeroEmptyHash { slot, key_hash });
+            }
+            continue;
+        }
+        occupied += 1;
+        let ordinal_u32 = doc_ord_plus1 - 1;
+        let ordinal =
+            usize::try_from(ordinal_u32).map_err(|_| IdHashCodecError::OrdinalOutOfRange {
+                slot,
+                ordinal: ordinal_u32,
+            })?;
+        if ordinal >= id_map.offset_count() {
+            return Err(IdHashCodecError::OrdinalOutOfRange {
+                slot,
+                ordinal: ordinal_u32,
+            });
+        }
+        let document_id =
+            id_map
+                .document_id_at_ordinal(ordinal)
+                .ok_or(IdHashCodecError::OrdinalHole {
+                    slot,
+                    ordinal: ordinal_u32,
+                })?;
+        let expected_hash = hash(document_id.as_bytes());
+        if key_hash != expected_hash {
+            return Err(IdHashCodecError::KeyHashMismatch {
+                slot,
+                encoded: key_hash,
+                expected: expected_hash,
+            });
+        }
+    }
+    if occupied
+        .checked_mul(10)
+        .is_none_or(|scaled| scaled > capacity.saturating_mul(7))
+    {
+        return Err(IdHashCodecError::LoadFactorExceeded {
+            entries: occupied,
+            capacity,
+        });
+    }
+    let canonical_capacity = canonical_id_hash_capacity(occupied, limits)?;
+    if canonical_capacity != capacity {
+        return Err(IdHashCodecError::NonCanonicalCapacity {
+            encoded: capacity_u32,
+            expected: u32::try_from(canonical_capacity).unwrap_or(u32::MAX),
+        });
+    }
+    let section = IdHashSection {
+        bytes,
+        entries,
+        capacity,
+        occupied,
+        id_map,
+    };
+    // Validate exact ascending-selected-ordinal insertion without allocating a
+    // mirror table. One bounded probe per physical IDMAP row both finds its
+    // exact representative and proves that every preceding cluster ordinal was
+    // inserted earlier. Duplicate physical rows resolve to the same selected
+    // representative; only that representative's own row increments `selected`.
+    let mask = capacity - 1;
+    let mut selected = 0_usize;
+    let mut probe_steps = 0_u64;
+    for (global_docid, document_id) in id_map.document_ids() {
+        let ordinal = global_docid
+            .checked_sub(id_map.docid_lo)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(IdHashCodecError::DocIdOverflow {
+                ordinal: 0,
+                docid_lo: id_map.docid_lo,
+            })?;
+        let key_hash = hash(document_id.as_bytes());
+        let mut slot = usize::try_from(key_hash & u64::try_from(mask).unwrap_or(u64::MAX))
+            .map_err(|_| IdHashCodecError::ArithmeticOverflow {
+                field: "canonical probe slot",
+            })?;
+        let mut found = false;
+        let mut max_preceding_ordinal = None;
+        for _ in 0..capacity {
+            consume_id_hash_probe_step(&mut probe_steps, limits.max_probe_steps)?;
+            let (durable_hash, doc_ord_plus1) =
+                id_hash_slot(entries, slot).ok_or(IdHashCodecError::Truncated {
+                    expected: expected_len,
+                    actual: bytes.len(),
+                })?;
+            if doc_ord_plus1 == 0 {
+                return Err(IdHashCodecError::MissingMapping { ordinal });
+            }
+            let durable_ordinal = usize::try_from(doc_ord_plus1 - 1).map_err(|_| {
+                IdHashCodecError::OrdinalOutOfRange {
+                    slot,
+                    ordinal: doc_ord_plus1 - 1,
+                }
+            })?;
+            if durable_hash == key_hash {
+                let durable_document_id = id_map.document_id_at_ordinal(durable_ordinal).ok_or(
+                    IdHashCodecError::OrdinalHole {
+                        slot,
+                        ordinal: doc_ord_plus1 - 1,
+                    },
+                )?;
+                if durable_document_id.as_bytes() == document_id.as_bytes() {
+                    if max_preceding_ordinal.is_some_and(|preceding| preceding >= durable_ordinal) {
+                        return Err(IdHashCodecError::NonCanonicalSlot {
+                            slot,
+                            ordinal: durable_ordinal,
+                        });
+                    }
+                    if durable_ordinal == ordinal {
+                        selected += 1;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            max_preceding_ordinal = Some(
+                max_preceding_ordinal.map_or(durable_ordinal, |preceding: usize| {
+                    preceding.max(durable_ordinal)
+                }),
+            );
+            slot = (slot + 1) & mask;
+        }
+        if !found {
+            return Err(IdHashCodecError::MissingMapping { ordinal });
+        }
+    }
+    if occupied != selected {
+        return Err(IdHashCodecError::SelectedCountMismatch { occupied, selected });
+    }
+    Ok(section)
+}
+
+fn validate_id_hash_entry_limit(
+    entries: usize,
+    limits: IdHashLimits,
+) -> Result<(), IdHashCodecError> {
+    let entries_u64 = u64::try_from(entries).unwrap_or(u64::MAX);
+    if entries_u64 > limits.max_entries {
+        return Err(IdHashCodecError::ResourceLimit {
+            resource: "entry count",
+            actual: entries_u64,
+            limit: limits.max_entries,
+        });
+    }
+    Ok(())
+}
+
+fn canonical_id_hash_capacity(
+    entries: usize,
+    limits: IdHashLimits,
+) -> Result<usize, IdHashCodecError> {
+    let mut capacity = 1_usize;
+    while entries
+        .checked_mul(10)
+        .is_none_or(|scaled| scaled > capacity.saturating_mul(7))
+    {
+        capacity = capacity
+            .checked_mul(2)
+            .ok_or(IdHashCodecError::ArithmeticOverflow {
+                field: "capacity growth",
+            })?;
+    }
+    let capacity_u64 = u64::try_from(capacity).unwrap_or(u64::MAX);
+    let durable_limit = limits.max_capacity.min(u64::from(u32::MAX));
+    if capacity_u64 > durable_limit {
+        return Err(IdHashCodecError::ResourceLimit {
+            resource: "capacity",
+            actual: capacity_u64,
+            limit: durable_limit,
+        });
+    }
+    Ok(capacity)
+}
+
+fn id_hash_section_len(capacity: usize, limits: IdHashLimits) -> Result<usize, IdHashCodecError> {
+    let total_len = capacity
+        .checked_mul(ID_HASH_ENTRY_LEN)
+        .and_then(|entries| entries.checked_add(ID_HASH_HEADER_LEN))
+        .ok_or(IdHashCodecError::ArithmeticOverflow {
+            field: "section length",
+        })?;
+    let total_len_u64 = u64::try_from(total_len).unwrap_or(u64::MAX);
+    if total_len_u64 > limits.max_section_bytes {
+        return Err(IdHashCodecError::ResourceLimit {
+            resource: "section bytes",
+            actual: total_len_u64,
+            limit: limits.max_section_bytes,
+        });
+    }
+    Ok(total_len)
+}
+
+fn id_hash_slot(entries: &[u8], slot: usize) -> Option<(u64, u32)> {
+    let offset = slot.checked_mul(ID_HASH_ENTRY_LEN)?;
+    let ordinal_offset = offset.checked_add(std::mem::size_of::<u64>())?;
+    Some((
+        read_u64(entries, offset)?,
+        read_u32(entries, ordinal_offset)?,
+    ))
+}
+
+fn write_id_hash_slot(
+    entries: &mut [u8],
+    slot: usize,
+    key_hash: u64,
+    doc_ord_plus1: u32,
+) -> Result<(), IdHashCodecError> {
+    let offset =
+        slot.checked_mul(ID_HASH_ENTRY_LEN)
+            .ok_or(IdHashCodecError::ArithmeticOverflow {
+                field: "slot offset",
+            })?;
+    let end = offset
+        .checked_add(ID_HASH_ENTRY_LEN)
+        .ok_or(IdHashCodecError::ArithmeticOverflow { field: "slot end" })?;
+    let slot_bytes = entries
+        .get_mut(offset..end)
+        .ok_or(IdHashCodecError::ArithmeticOverflow {
+            field: "slot write",
+        })?;
+    slot_bytes[..8].copy_from_slice(&key_hash.to_le_bytes());
+    slot_bytes[8..].copy_from_slice(&doc_ord_plus1.to_le_bytes());
+    Ok(())
+}
+
 /// Packed size of one `{ field_ord: u16, field_offset: u32 }` STOREDMETA
 /// directory entry.
 pub const STORED_META_DIRECTORY_ENTRY_LEN: usize = 6;
@@ -9444,6 +11549,944 @@ mod tests {
             DocLenSection::parse(encoded.as_bytes(), 0, 3, &[2]),
             Err(DocLenCodecError::UnexpectedField { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_map_wire_roundtrip_holes_utf8_and_u32_boundary() -> TestResult {
+        assert_eq!(id_map_content_hash(b"canonical"), 0x03f3_4438_b914_3253);
+        assert_eq!(id_map_content_hash(b""), 0x2d06_8005_38d3_94c2);
+        assert_eq!(
+            IdMapEntryInput::from_canonical_content("id", b"canonical").content_hash,
+            0x03f3_4438_b914_3253
+        );
+        let inputs = [
+            Some(IdMapEntryInput::new("a", 0x0807_0605_0403_0201)),
+            None,
+            Some(IdMapEntryInput::new("β", 0)),
+        ];
+        let encoded = EncodedIdMapSection::encode(40, 43, &inputs)?;
+        let expected = [
+            3, 0, 0, 0, 48, 0, 0, 0, // directory
+            0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, // offsets
+            1, 2, 3, 4, 5, 6, 7, 8, // first content hash
+            0, 0, 0, 0, 0, 0, 0, 0, // hole hash
+            0, 0, 0, 0, 0, 0, 0, 0, // present zero hash
+            b'a', 0xce, 0xb2,
+        ];
+        assert_eq!(encoded.as_bytes(), expected);
+        assert_eq!(encoded.present_count(), 2);
+        let section = encoded.section()?;
+        assert_eq!(section.docid_lo(), 40);
+        assert_eq!(section.docid_hi(), 43);
+        assert_eq!(section.span(), 3);
+        assert_eq!(section.present_count(), 2);
+        assert_eq!(section.get(39), None);
+        assert_eq!(section.get(40).map(IdMapEntry::document_id), Some("a"));
+        assert_eq!(section.get(41), None);
+        assert_eq!(section.get(42).map(IdMapEntry::document_id), Some("β"));
+        assert_eq!(section.get(43), None);
+        assert_eq!(section.materialize(42).as_deref(), Some("β"));
+        let first = section.get(40).ok_or("first IDMAP row")?;
+        assert_eq!(first.document_id().as_ptr(), section.blob().as_ptr());
+        assert_eq!(
+            section
+                .entries()
+                .map(|(docid, entry)| (docid, entry.document_id()))
+                .collect::<Vec<_>>(),
+            vec![(40, "a"), (42, "β")]
+        );
+
+        let max_input = [Some(IdMapEntryInput::new("max", 9))];
+        let max =
+            EncodedIdMapSection::encode(u64::from(u32::MAX), u64::from(u32::MAX) + 1, &max_input)?;
+        assert_eq!(
+            max.section()?
+                .get(u64::from(u32::MAX))
+                .map(IdMapEntry::document_id),
+            Some("max")
+        );
+
+        let edge_holes = [None, Some(IdMapEntryInput::new("middle", 7)), None];
+        let encoded_edge_holes = EncodedIdMapSection::encode(50, 53, &edge_holes)?;
+        let edge_holes = encoded_edge_holes.section()?;
+        assert_eq!(edge_holes.get(50), None);
+        assert_eq!(
+            edge_holes.get(51).map(IdMapEntry::document_id),
+            Some("middle")
+        );
+        assert_eq!(edge_holes.get(52), None);
+
+        let empty_map = EncodedIdMapSection::encode(0, 0, &[])?;
+        assert_eq!(empty_map.as_bytes(), [0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0]);
+        let empty_map = empty_map.section()?;
+        let empty_hash = EncodedIdHashSection::encode(empty_map)?;
+        assert_eq!(empty_hash.capacity(), 1);
+        assert_eq!(empty_hash.occupied(), 0);
+        assert_eq!(
+            empty_hash.as_bytes(),
+            [0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(empty_hash.section(empty_map)?.lookup("anything"), None);
+
+        let inline_24 = "x".repeat(24);
+        let spilled_25 = "y".repeat(25);
+        let boundary_inputs = [
+            Some(IdMapEntryInput::new(&inline_24, 1)),
+            Some(IdMapEntryInput::new(&spilled_25, 2)),
+        ];
+        let encoded_boundary_map = EncodedIdMapSection::encode(60, 62, &boundary_inputs)?;
+        let boundary_map = encoded_boundary_map.section()?;
+        assert_eq!(
+            boundary_map.materialize(60).as_deref(),
+            Some(inline_24.as_str())
+        );
+        assert_eq!(
+            boundary_map.materialize(61).as_deref(),
+            Some(spilled_25.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn id_map_rejects_noncanonical_bytes_and_limits() -> TestResult {
+        let max_span = usize::try_from(ID_MAP_MAX_SPAN)?;
+        let max_prefix = u64::try_from(id_map_prefix_len(max_span)?)?;
+        assert!(u32::try_from(max_prefix).is_ok());
+        let next_span = ID_MAP_MAX_SPAN + 1;
+        let next_prefix = u64::try_from(ID_MAP_HEADER_LEN)?
+            + (next_span + 1) * u64::try_from(ID_MAP_OFFSET_LEN)?
+            + next_span * u64::try_from(ID_MAP_HASH_LEN)?;
+        assert!(u32::try_from(next_prefix).is_err());
+        assert_eq!(
+            checked_id_map_span(0, ID_MAP_MAX_SPAN, IdMapLimits::default())?,
+            max_span
+        );
+        assert!(matches!(
+            checked_id_map_span(
+                0,
+                ID_MAP_MAX_SPAN + 1,
+                IdMapLimits {
+                    max_docid_span: ID_MAP_MAX_SPAN + 1,
+                    ..IdMapLimits::default()
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "durable IDMAP span",
+                actual,
+                limit: ID_MAP_MAX_SPAN,
+            }) if actual == ID_MAP_MAX_SPAN + 1
+        ));
+        let inputs = [
+            Some(IdMapEntryInput::new("a", 1)),
+            None,
+            Some(IdMapEntryInput::new("longer-than-inline-compact-id", 2)),
+        ];
+        assert!(matches!(
+            EncodedIdMapSection::encode(0, 1, &[Some(IdMapEntryInput::new("", 1))]),
+            Err(IdMapCodecError::EmptyDocumentId { ordinal: 0 })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::encode(2, 1, &[]),
+            Err(IdMapCodecError::InvalidDocIdRange { .. })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::encode(u64::from(u32::MAX) + 1, u64::from(u32::MAX) + 2, &[]),
+            Err(IdMapCodecError::InvalidDocIdRange { .. })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::encode(0, 3, &inputs[..2]),
+            Err(IdMapCodecError::EntryCountMismatch { .. })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::encode_with_limits(
+                0,
+                3,
+                &inputs,
+                IdMapLimits {
+                    max_docid_span: 3,
+                    max_section_bytes: 1_000,
+                    max_blob_bytes: 1_000,
+                    max_document_id_bytes: 24,
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "document id bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::encode_with_limits(
+                0,
+                3,
+                &inputs,
+                IdMapLimits {
+                    max_docid_span: 3,
+                    max_section_bytes: 1_000,
+                    max_blob_bytes: 4,
+                    max_document_id_bytes: 1_000,
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "identifier blob bytes",
+                ..
+            })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::encode_with_limits(
+                0,
+                3,
+                &inputs,
+                IdMapLimits {
+                    max_docid_span: 3,
+                    max_section_bytes: 32,
+                    max_blob_bytes: 1_000,
+                    max_document_id_bytes: 1_000,
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "section bytes",
+                ..
+            })
+        ));
+
+        let encoded = EncodedIdMapSection::encode(0, 3, &inputs)?;
+        for cut in 0..encoded.as_bytes().len() {
+            assert!(
+                IdMapSection::parse(&encoded.as_bytes()[..cut], 0, 3).is_err(),
+                "cut={cut}"
+            );
+        }
+        let mut count = encoded.as_bytes().to_vec();
+        count[..4].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&count, 0, 3),
+            Err(IdMapCodecError::EntryCountMismatch { .. })
+        ));
+        let mut blob_offset = encoded.as_bytes().to_vec();
+        blob_offset[4..8].copy_from_slice(&49_u32.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&blob_offset, 0, 3),
+            Err(IdMapCodecError::NonCanonicalBlobOffset { .. })
+        ));
+        let mut first = encoded.as_bytes().to_vec();
+        first[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&first, 0, 3),
+            Err(IdMapCodecError::NonZeroFirstOffset { .. })
+        ));
+        let mut descending = encoded.as_bytes().to_vec();
+        descending[16..20].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&descending, 0, 3),
+            Err(IdMapCodecError::DescendingOffsets { .. })
+        ));
+        let mut out_of_bounds = encoded.as_bytes().to_vec();
+        out_of_bounds[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&out_of_bounds, 0, 3),
+            Err(IdMapCodecError::OffsetOutOfBounds { .. })
+        ));
+        let mut hole_hash = encoded.as_bytes().to_vec();
+        hole_hash[32..40].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&hole_hash, 0, 3),
+            Err(IdMapCodecError::NonZeroHoleHash { ordinal: 1, .. })
+        ));
+        let mut invalid_utf8 = encoded.as_bytes().to_vec();
+        let blob_start = usize::try_from(read_u32(&invalid_utf8, 4).ok_or("blob offset")?)?;
+        invalid_utf8[blob_start] = 0xff;
+        assert!(matches!(
+            IdMapSection::parse(&invalid_utf8, 0, 3),
+            Err(IdMapCodecError::InvalidUtf8 { ordinal: 0 })
+        ));
+        let split_inputs = [
+            Some(IdMapEntryInput::new("aβ", 1)),
+            Some(IdMapEntryInput::new("z", 2)),
+        ];
+        let mut split_scalar = EncodedIdMapSection::encode(0, 2, &split_inputs)?
+            .as_bytes()
+            .to_vec();
+        split_scalar[12..16].copy_from_slice(&2_u32.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&split_scalar, 0, 2),
+            Err(IdMapCodecError::InvalidUtf8 { ordinal: 0 })
+        ));
+        let mut malformed_before_utf8 = invalid_utf8.clone();
+        malformed_before_utf8[16..20].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            IdMapSection::parse(&malformed_before_utf8, 0, 3),
+            Err(IdMapCodecError::DescendingOffsets { .. })
+        ));
+        let mut trailing = encoded.as_bytes().to_vec();
+        trailing.push(0xff);
+        assert!(matches!(
+            IdMapSection::parse(&trailing, 0, 3),
+            Err(IdMapCodecError::TrailingBytes { .. })
+        ));
+        assert!(matches!(
+            IdMapSection::parse_with_limits(
+                encoded.as_bytes(),
+                0,
+                3,
+                IdMapLimits {
+                    max_docid_span: 2,
+                    ..IdMapLimits::default()
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "docid span",
+                ..
+            })
+        ));
+        assert!(matches!(
+            IdMapSection::parse_with_limits(
+                encoded.as_bytes(),
+                0,
+                3,
+                IdMapLimits {
+                    max_blob_bytes: 1,
+                    ..IdMapLimits::default()
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "identifier blob bytes",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_map_concat_inserts_gaps_and_matches_monolithic_bytes() -> TestResult {
+        let left_inputs = [Some(IdMapEntryInput::new("a", 1)), None];
+        let middle_inputs = [Some(IdMapEntryInput::new("β", 2))];
+        let right_inputs = [
+            Some(IdMapEntryInput::new("longer-than-inline-compact-id", 3)),
+            Some(IdMapEntryInput::new("z", 0)),
+        ];
+        let left = EncodedIdMapSection::encode(10, 12, &left_inputs)?;
+        let middle = EncodedIdMapSection::encode(14, 15, &middle_inputs)?;
+        let right = EncodedIdMapSection::encode(16, 18, &right_inputs)?;
+        let sections = [left.section()?, middle.section()?, right.section()?];
+        let merged = EncodedIdMapSection::concatenate(&sections)?;
+        let monolithic_inputs = [
+            Some(IdMapEntryInput::new("a", 1)),
+            None,
+            None,
+            None,
+            Some(IdMapEntryInput::new("β", 2)),
+            None,
+            Some(IdMapEntryInput::new("longer-than-inline-compact-id", 3)),
+            Some(IdMapEntryInput::new("z", 0)),
+        ];
+        let monolithic = EncodedIdMapSection::encode(10, 18, &monolithic_inputs)?;
+        assert_eq!(merged.as_bytes(), monolithic.as_bytes());
+        assert_eq!(
+            merged.section()?.blob(),
+            b"a\xce\xb2longer-than-inline-compact-idz"
+        );
+        assert_eq!(merged.present_count(), 4);
+
+        let left_associated = EncodedIdMapSection::concatenate(&sections[..2])?;
+        let left_parts = [left_associated.section()?, right.section()?];
+        let left_associated = EncodedIdMapSection::concatenate(&left_parts)?;
+        assert_eq!(left_associated.as_bytes(), merged.as_bytes());
+        let right_associated = EncodedIdMapSection::concatenate(&sections[1..])?;
+        let right_parts = [left.section()?, right_associated.section()?];
+        let right_associated = EncodedIdMapSection::concatenate(&right_parts)?;
+        assert_eq!(right_associated.as_bytes(), merged.as_bytes());
+        assert!(matches!(
+            EncodedIdMapSection::concatenate(&[]),
+            Err(IdMapCodecError::EmptyConcat)
+        ));
+        let reversed = [right.section()?, left.section()?];
+        assert!(matches!(
+            EncodedIdMapSection::concatenate(&reversed),
+            Err(IdMapCodecError::ConcatRangeOrder { .. })
+        ));
+        assert!(matches!(
+            EncodedIdMapSection::concatenate_with_limits(
+                &sections,
+                IdMapLimits {
+                    max_section_bytes: 32,
+                    ..IdMapLimits::default()
+                }
+            ),
+            Err(IdMapCodecError::ResourceLimit {
+                resource: "section bytes",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_hash_roundtrip_reopen_collisions_and_duplicate_rejection() -> TestResult {
+        let inputs = [
+            Some(IdMapEntryInput::new("alpha", 1)),
+            None,
+            Some(IdMapEntryInput::new("omega", 2)),
+        ];
+        let encoded_map = EncodedIdMapSection::encode(10, 13, &inputs)?;
+        let id_map = encoded_map.section()?;
+        let encoded_hash = EncodedIdHashSection::encode(id_map)?;
+        assert_eq!(encoded_hash.capacity(), 4);
+        assert_eq!(encoded_hash.occupied(), 2);
+        let reopened_map = IdMapSection::parse(encoded_map.as_bytes(), 10, 13)?;
+        let hash = IdHashSection::parse(encoded_hash.as_bytes(), reopened_map)?;
+        assert_eq!(hash.lookup("alpha"), Some(10));
+        assert_eq!(hash.lookup("omega"), Some(12));
+        assert_eq!(hash.lookup("missing"), None);
+        assert_eq!(
+            hash.lookup_materialized("omega")
+                .map(|(docid, id)| (docid, id.to_string())),
+            Some((12, "omega".to_owned()))
+        );
+
+        let collision_inputs = [
+            Some(IdMapEntryInput::new("a", 1)),
+            Some(IdMapEntryInput::new("b", 2)),
+            Some(IdMapEntryInput::new("c", 3)),
+        ];
+        let collision_map = EncodedIdMapSection::encode(20, 23, &collision_inputs)?;
+        let collision_map = collision_map.section()?;
+        let collision = encode_id_hash_with_hasher(collision_map, IdHashLimits::default(), |_| 3)?;
+        let collision = parse_id_hash_with_hasher(
+            collision.as_bytes(),
+            collision_map,
+            IdHashLimits::default(),
+            |_| 3,
+        )?;
+        assert_eq!(collision.lookup_with_hash("a", 3), Some(20));
+        assert_eq!(collision.lookup_with_hash("b", 3), Some(21));
+        assert_eq!(collision.lookup_with_hash("c", 3), Some(22));
+        assert_eq!(collision.lookup_with_hash("d", 3), None);
+
+        let wrap =
+            encode_id_hash_with_hasher(collision_map, IdHashLimits::default(), |_| u64::MAX)?;
+        let wrap = parse_id_hash_with_hasher(
+            wrap.as_bytes(),
+            collision_map,
+            IdHashLimits::default(),
+            |_| u64::MAX,
+        )?;
+        assert_eq!(wrap.lookup_with_hash("a", u64::MAX), Some(20));
+        assert_eq!(wrap.lookup_with_hash("c", u64::MAX), Some(22));
+
+        let zero = encode_id_hash_with_hasher(collision_map, IdHashLimits::default(), |_| 0)?;
+        let zero = parse_id_hash_with_hasher(
+            zero.as_bytes(),
+            collision_map,
+            IdHashLimits::default(),
+            |_| 0,
+        )?;
+        assert_eq!(zero.lookup_with_hash("b", 0), Some(21));
+
+        let duplicate_inputs = [
+            Some(IdMapEntryInput::new("same", 1)),
+            Some(IdMapEntryInput::new("other", 2)),
+            Some(IdMapEntryInput::new("same", 3)),
+        ];
+        let duplicate_map = EncodedIdMapSection::encode(30, 33, &duplicate_inputs)?;
+        let duplicate_map = duplicate_map.section()?;
+        assert!(matches!(
+            EncodedIdHashSection::encode(duplicate_map),
+            Err(IdHashCodecError::DuplicateDocumentId {
+                first_ordinal: 0,
+                duplicate_ordinal: 2,
+            })
+        ));
+
+        let max_inputs = [Some(IdMapEntryInput::new("max", 1))];
+        let max_map =
+            EncodedIdMapSection::encode(u64::from(u32::MAX), u64::from(u32::MAX) + 1, &max_inputs)?;
+        let max_map = max_map.section()?;
+        let max_hash = EncodedIdHashSection::encode(max_map)?;
+        assert_eq!(
+            max_hash.section(max_map)?.lookup("max"),
+            Some(u64::from(u32::MAX))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn id_hash_resolved_representatives_require_external_choice_then_canonical_order() -> TestResult
+    {
+        let inputs = [
+            Some(IdMapEntryInput::new("same", 1)),
+            Some(IdMapEntryInput::new("other", 2)),
+            None,
+            Some(IdMapEntryInput::new("same", 3)),
+        ];
+        let encoded_map = EncodedIdMapSection::encode(30, 34, &inputs)?;
+        let id_map = encoded_map.section()?;
+
+        // The lower duplicate is the deterministic fallback when every `same`
+        // row is tombstoned. The codec does not infer recency from docids.
+        let lower = EncodedIdHashSection::encode_resolved_representatives(id_map, &[0, 1])?;
+        let lower = lower.section(id_map)?;
+        assert_eq!(lower.lookup("same"), Some(30));
+        assert_eq!(lower.lookup("other"), Some(31));
+
+        // Conversely, external tombstone state can identify the higher row as
+        // the unique live representative even when the old row was republished
+        // inside a container with a higher seal_seq.
+        let higher = EncodedIdHashSection::encode_resolved_representatives(id_map, &[1, 3])?;
+        let higher = higher.section(id_map)?;
+        assert_eq!(higher.lookup("same"), Some(33));
+        assert_eq!(higher.lookup("other"), Some(31));
+
+        let collision =
+            encode_resolved_id_hash_with_hasher(id_map, &[1, 3], IdHashLimits::default(), |_| {
+                u64::MAX
+            })?;
+        let collision = parse_id_hash_with_hasher(
+            collision.as_bytes(),
+            id_map,
+            IdHashLimits::default(),
+            |_| u64::MAX,
+        )?;
+        assert_eq!(collision.lookup_with_hash("same", u64::MAX), Some(33));
+        assert_eq!(collision.lookup_with_hash("other", u64::MAX), Some(31));
+        assert!(matches!(
+            encode_resolved_id_hash_with_hasher(
+                id_map,
+                &[1, 3],
+                IdHashLimits {
+                    max_probe_steps: 4,
+                    ..IdHashLimits::default()
+                },
+                |_| 0,
+            ),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "probe steps",
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            EncodedIdHashSection::encode_resolved_representatives(id_map, &[3, 1]),
+            Err(IdHashCodecError::NonAscendingRepresentativeOrdinals {
+                index: 1,
+                previous: 3,
+                current: 1,
+            })
+        ));
+        assert!(matches!(
+            EncodedIdHashSection::encode_resolved_representatives(id_map, &[1, 2]),
+            Err(IdHashCodecError::RepresentativeOrdinalHole {
+                index: 1,
+                ordinal: 2,
+            })
+        ));
+        assert!(matches!(
+            EncodedIdHashSection::encode_resolved_representatives(id_map, &[1, 4]),
+            Err(IdHashCodecError::RepresentativeOrdinalOutOfRange {
+                index: 1,
+                ordinal: 4,
+            })
+        ));
+        assert!(matches!(
+            EncodedIdHashSection::encode_resolved_representatives(id_map, &[0]),
+            Err(IdHashCodecError::MissingMapping { ordinal: 1 })
+        ));
+        assert!(matches!(
+            EncodedIdHashSection::encode_resolved_representatives(id_map, &[0, 1, 3]),
+            Err(IdHashCodecError::DuplicateDocumentId {
+                first_ordinal: 0,
+                duplicate_ordinal: 3,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_hash_seed_wire_and_corruption_are_pinned() -> TestResult {
+        // These constants are independent wire oracles for seeded xxh3-64.
+        assert_eq!(seeded_id_hash(b"alpha"), 0x26fd_f19a_9d34_ddef);
+        assert_eq!(seeded_id_hash(b"omega"), 0x2019_49b0_c7e7_214f);
+
+        let inputs = [
+            Some(IdMapEntryInput::new("alpha", 1)),
+            None,
+            Some(IdMapEntryInput::new("omega", 2)),
+        ];
+        let encoded_map = EncodedIdMapSection::encode(10, 13, &inputs)?;
+        let id_map = encoded_map.section()?;
+        let encoded = EncodedIdHashSection::encode(id_map)?;
+        let expected = [
+            4, 0, 0, 0, // capacity
+            0x4f, 0x21, 0xe7, 0xc7, 0xb0, 0x49, 0x19, 0x20, 3, 0, 0, 0, // omega, ord 2
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // empty
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // empty
+            0xef, 0xdd, 0x34, 0x9d, 0x9a, 0xf1, 0xfd, 0x26, 1, 0, 0, 0, // alpha, ord 0
+        ];
+        assert_eq!(encoded.as_bytes(), expected);
+        let reparsed = IdHashSection::parse(encoded.as_bytes(), id_map)?;
+        assert_eq!(reparsed.occupied(), 2);
+
+        for cut in 0..encoded.as_bytes().len() {
+            assert!(
+                IdHashSection::parse(&encoded.as_bytes()[..cut], id_map).is_err(),
+                "cut={cut}"
+            );
+        }
+        let mut zero_capacity = encoded.as_bytes().to_vec();
+        zero_capacity[..4].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(matches!(
+            IdHashSection::parse(&zero_capacity, id_map),
+            Err(IdHashCodecError::ZeroCapacity)
+        ));
+        let mut non_power = encoded.as_bytes().to_vec();
+        non_power[..4].copy_from_slice(&3_u32.to_le_bytes());
+        assert!(matches!(
+            IdHashSection::parse(&non_power, id_map),
+            Err(IdHashCodecError::NonPowerOfTwoCapacity { capacity: 3 })
+        ));
+        let mut trailing = encoded.as_bytes().to_vec();
+        trailing.push(0);
+        assert!(matches!(
+            IdHashSection::parse(&trailing, id_map),
+            Err(IdHashCodecError::TrailingBytes { .. })
+        ));
+
+        let empty_slot = (0..usize::try_from(encoded.capacity())?)
+            .find(|&slot| {
+                id_hash_slot(&encoded.as_bytes()[4..], slot).is_some_and(|row| row.1 == 0)
+            })
+            .ok_or("empty IDHASH slot")?;
+        let mut nonzero_empty = encoded.as_bytes().to_vec();
+        write_id_hash_slot(&mut nonzero_empty[4..], empty_slot, 1, 0)?;
+        assert!(matches!(
+            IdHashSection::parse(&nonzero_empty, id_map),
+            Err(IdHashCodecError::NonZeroEmptyHash { .. })
+        ));
+        let occupied_slot = (0..usize::try_from(encoded.capacity())?)
+            .find(|&slot| {
+                id_hash_slot(&encoded.as_bytes()[4..], slot).is_some_and(|row| row.1 != 0)
+            })
+            .ok_or("occupied IDHASH slot")?;
+        let (_, ordinal_plus1) =
+            id_hash_slot(&encoded.as_bytes()[4..], occupied_slot).ok_or("occupied row")?;
+        let mut wrong_hash = encoded.as_bytes().to_vec();
+        write_id_hash_slot(&mut wrong_hash[4..], occupied_slot, 7, ordinal_plus1)?;
+        assert!(matches!(
+            IdHashSection::parse(&wrong_hash, id_map),
+            Err(IdHashCodecError::KeyHashMismatch { .. })
+        ));
+        let mut hole = encoded.as_bytes().to_vec();
+        write_id_hash_slot(&mut hole[4..], occupied_slot, seeded_id_hash(b"alpha"), 2)?;
+        assert!(matches!(
+            IdHashSection::parse(&hole, id_map),
+            Err(IdHashCodecError::OrdinalHole { .. })
+        ));
+
+        let mut out_of_range = encoded.as_bytes().to_vec();
+        write_id_hash_slot(
+            &mut out_of_range[4..],
+            occupied_slot,
+            seeded_id_hash(b"alpha"),
+            99,
+        )?;
+        assert!(matches!(
+            IdHashSection::parse(&out_of_range, id_map),
+            Err(IdHashCodecError::OrdinalOutOfRange { .. })
+        ));
+
+        let mut noncanonical_capacity = 8_u32.to_le_bytes().to_vec();
+        noncanonical_capacity.extend_from_slice(&encoded.as_bytes()[4..]);
+        noncanonical_capacity.resize(ID_HASH_HEADER_LEN + 8 * ID_HASH_ENTRY_LEN, 0);
+        assert!(matches!(
+            IdHashSection::parse(&noncanonical_capacity, id_map),
+            Err(IdHashCodecError::NonCanonicalCapacity { .. })
+        ));
+        assert!(matches!(
+            IdHashSection::parse_with_limits(
+                encoded.as_bytes(),
+                id_map,
+                IdHashLimits {
+                    max_section_bytes: u64::try_from(encoded.as_bytes().len() - 1)?,
+                    ..IdHashLimits::default()
+                }
+            ),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "section bytes",
+                ..
+            })
+        ));
+
+        let mismatched_inputs = [
+            Some(IdMapEntryInput::new("alpha", 1)),
+            None,
+            Some(IdMapEntryInput::new("different", 2)),
+        ];
+        let mismatched_map = EncodedIdMapSection::encode(10, 13, &mismatched_inputs)?;
+        assert!(matches!(
+            IdHashSection::parse(encoded.as_bytes(), mismatched_map.section()?),
+            Err(IdHashCodecError::KeyHashMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn id_hash_load_and_resource_limits_are_enforced() -> TestResult {
+        let ids = ["a", "b", "c", "d", "e", "f"];
+        let five_inputs = ids[..5]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| Some(IdMapEntryInput::new(id, index as u64)))
+            .collect::<Vec<_>>();
+        let five_map = EncodedIdMapSection::encode(0, 5, &five_inputs)?;
+        let five_map = five_map.section()?;
+        let five = encode_id_hash_with_hasher(five_map, IdHashLimits::default(), |bytes| {
+            u64::from(bytes[0])
+        })?;
+        assert_eq!(five.capacity(), 8);
+        parse_id_hash_with_hasher(
+            five.as_bytes(),
+            five_map,
+            IdHashLimits::default(),
+            |bytes| u64::from(bytes[0]),
+        )?;
+
+        let six_inputs = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| Some(IdMapEntryInput::new(id, index as u64)))
+            .collect::<Vec<_>>();
+        let six_map = EncodedIdMapSection::encode(0, 6, &six_inputs)?;
+        let six_map = six_map.section()?;
+        let (overloaded_entries, occupied) =
+            build_id_hash_entries(six_map, 8, IdHashLimits::default(), |bytes| {
+                u64::from(bytes[0])
+            })?;
+        assert_eq!(occupied, 6);
+        let mut overloaded = 8_u32.to_le_bytes().to_vec();
+        overloaded.extend_from_slice(&overloaded_entries);
+        assert!(matches!(
+            parse_id_hash_with_hasher(&overloaded, six_map, IdHashLimits::default(), |bytes| {
+                u64::from(bytes[0])
+            }),
+            Err(IdHashCodecError::LoadFactorExceeded { .. })
+        ));
+        assert!(matches!(
+            EncodedIdHashSection::encode_with_limits(
+                six_map,
+                IdHashLimits {
+                    max_entries: 5,
+                    ..IdHashLimits::default()
+                }
+            ),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "entry count",
+                ..
+            })
+        ));
+        assert!(matches!(
+            EncodedIdHashSection::encode_with_limits(
+                six_map,
+                IdHashLimits {
+                    max_capacity: 8,
+                    ..IdHashLimits::default()
+                }
+            ),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "capacity",
+                ..
+            })
+        ));
+        assert!(matches!(
+            encode_id_hash_with_hasher(
+                five_map,
+                IdHashLimits {
+                    max_probe_steps: 4,
+                    ..IdHashLimits::default()
+                },
+                |_| 0,
+            ),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "probe steps",
+                ..
+            })
+        ));
+        let clustered = encode_id_hash_with_hasher(five_map, IdHashLimits::default(), |_| 0)?;
+        assert!(matches!(
+            parse_id_hash_with_hasher(
+                clustered.as_bytes(),
+                five_map,
+                IdHashLimits {
+                    max_probe_steps: 4,
+                    ..IdHashLimits::default()
+                },
+                |_| 0,
+            ),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "probe steps",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_hash_rejects_swapped_collision_slots_and_missing_rows_without_panic() -> TestResult {
+        let inputs = [
+            Some(IdMapEntryInput::new("a", 1)),
+            Some(IdMapEntryInput::new("b", 2)),
+        ];
+        let encoded_map = EncodedIdMapSection::encode(0, 2, &inputs)?;
+        let id_map = encoded_map.section()?;
+        let collision = encode_id_hash_with_hasher(id_map, IdHashLimits::default(), |_| 0)?;
+        let mut swapped = collision.as_bytes().to_vec();
+        let first = swapped[4..16].to_vec();
+        let second = swapped[16..28].to_vec();
+        swapped[4..16].copy_from_slice(&second);
+        swapped[16..28].copy_from_slice(&first);
+        assert!(matches!(
+            parse_id_hash_with_hasher(&swapped, id_map, IdHashLimits::default(), |_| 0),
+            Err(IdHashCodecError::NonCanonicalSlot { .. })
+        ));
+
+        let mut missing = 2_u32.to_le_bytes().to_vec();
+        missing.resize(ID_HASH_HEADER_LEN + 2 * ID_HASH_ENTRY_LEN, 0);
+        write_id_hash_slot(&mut missing[4..], 1, u64::from(b'a'), 1)?;
+        let parsed = std::panic::catch_unwind(|| {
+            parse_id_hash_with_hasher(&missing, id_map, IdHashLimits::default(), |bytes| {
+                u64::from(bytes[0])
+            })
+        });
+        assert!(parsed.is_ok());
+        assert!(matches!(
+            parsed,
+            Ok(Err(IdHashCodecError::MissingMapping { ordinal: 1 }))
+        ));
+
+        let single_input = [Some(IdMapEntryInput::new("a", 1))];
+        let single_map = EncodedIdMapSection::encode(0, 1, &single_input)?;
+        let single_map = single_map.section()?;
+        let mut duplicate_ordinal = 4_u32.to_le_bytes().to_vec();
+        duplicate_ordinal.resize(ID_HASH_HEADER_LEN + 4 * ID_HASH_ENTRY_LEN, 0);
+        write_id_hash_slot(&mut duplicate_ordinal[4..], 0, 0, 1)?;
+        write_id_hash_slot(&mut duplicate_ordinal[4..], 1, 0, 1)?;
+        assert!(matches!(
+            parse_id_hash_with_hasher(
+                &duplicate_ordinal,
+                single_map,
+                IdHashLimits::default(),
+                |_| 0
+            ),
+            Err(IdHashCodecError::SelectedCountMismatch {
+                occupied: 2,
+                selected: 1,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_id_map_and_hash_bytes_never_panic() -> TestResult {
+        let inputs = [
+            Some(IdMapEntryInput::new("alpha", 1)),
+            None,
+            Some(IdMapEntryInput::new("omega", 2)),
+        ];
+        let encoded_map = EncodedIdMapSection::encode(10, 13, &inputs)?;
+        let id_map = encoded_map.section()?;
+        let mut state = 0x1d5a_91c3_e26f_5a17;
+        for case in 0..1_000 {
+            let length = usize::try_from(random_u32(&mut state) % 257)?;
+            let bytes = (0..length)
+                .map(|_| random_u32(&mut state).to_le_bytes()[0])
+                .collect::<Vec<_>>();
+            let span = u64::from(random_u32(&mut state) % 16);
+            let parsed_map =
+                std::panic::catch_unwind(|| IdMapSection::parse(&bytes, 100, 100 + span));
+            assert!(
+                parsed_map.is_ok(),
+                "IDMAP parser panic case={case} len={length}"
+            );
+            let parsed_hash = std::panic::catch_unwind(|| IdHashSection::parse(&bytes, id_map));
+            assert!(
+                parsed_hash.is_ok(),
+                "IDHASH parser panic case={case} len={length}"
+            );
+            if let Ok(Ok(section)) = parsed_hash {
+                let lookup = std::panic::catch_unwind(|| section.lookup("alpha"));
+                assert!(lookup.is_ok(), "IDHASH lookup panic case={case}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn id_map_and_hash_roundtrip_sixty_five_thousand_mixed_ids() -> TestResult {
+        const COUNT: usize = 65_536;
+        let ids = (0..COUNT)
+            .map(|index| {
+                if index % 17 == 0 {
+                    format!("document-{index:08}-identifier-longer-than-inline")
+                } else {
+                    format!("d{index:08}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let entries = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                Some(IdMapEntryInput::new(
+                    id,
+                    id_map_content_hash(&index.to_le_bytes()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let encoded_map = EncodedIdMapSection::encode(1_000, 1_000 + COUNT as u64, &entries)?;
+        let id_map = encoded_map.section()?;
+        let encoded_hash = EncodedIdHashSection::encode(id_map)?;
+        let id_hash = encoded_hash.section(id_map)?;
+        for &index in &[0, 1, 16, 17, COUNT / 2, COUNT - 1] {
+            assert_eq!(
+                id_hash.lookup(&ids[index]),
+                Some(1_000 + u64::try_from(index)?)
+            );
+            assert_eq!(
+                id_map.materialize(1_000 + u64::try_from(index)?).as_deref(),
+                Some(ids[index].as_str())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "deterministic 1M-ID acceptance scale; run explicitly"]
+    #[allow(clippy::cast_possible_truncation)]
+    fn id_map_and_hash_roundtrip_one_million_ids() -> TestResult {
+        const COUNT: usize = 1_000_000;
+        let ids = (0..COUNT)
+            .map(|index| {
+                if index % 17 == 0 {
+                    format!("document-{index:08}-identifier-longer-than-inline")
+                } else {
+                    format!("d{index:08}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let entries = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| Some(IdMapEntryInput::new(id, index as u64)))
+            .collect::<Vec<_>>();
+        let encoded_map = EncodedIdMapSection::encode(0, COUNT as u64, &entries)?;
+        let id_map = encoded_map.section()?;
+        let encoded_hash = EncodedIdHashSection::encode(id_map)?;
+        assert_eq!(encoded_hash.capacity(), 2_097_152);
+        let id_hash = encoded_hash.section(id_map)?;
+        for &index in &[0, 17, COUNT / 2, COUNT - 1] {
+            assert_eq!(id_hash.lookup(&ids[index]), Some(index as u64));
+        }
         Ok(())
     }
 

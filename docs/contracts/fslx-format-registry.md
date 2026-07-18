@@ -30,7 +30,7 @@ Segment ids are random u64 (hex16 lowercase), collision-checked against the live
 - **Checksums:** each section carries xxh3-64 over its exact `len` bytes (recorded in the section table). The segment header carries `header_crc32` (CRC32 over header bytes). The file trailer carries `file_xxh3` (xxh3-64 over all bytes from offset 0 to the start of the trailer) + `trailer_crc32` (CRC32 over the trailer's preceding 8 bytes). "CRC32" in this specification means the IEEE CRC-32 computed exactly by `crc32fast::hash`. A `.fec` sidecar binds a separate `source_xxh3` over the complete FSLX file, including this trailer. The encoder derives both hash domains in one traversal; they are not interchangeable.
 - **Varints ("vint"):** LEB128, max 10 bytes, canonical (no over-long encodings; readers reject).
 - **Strings/blobs:** raw bytes, never NUL-terminated; lengths always explicit.
-- **Docids:** u32 in all postings/section payloads; u64 in header/manifest fields (future-proofing). Every segment has `docid_lo < docid_hi <= 2^32` and `doc_count <= docid_hi - docid_lo`. Docid semantics are governed by Q1 (`docs/contracts/quill-q1-docid-discipline.md`): monotone allocation, session leases, burned tails, **never reused**; R1 = a segment's docid range is a subinterval of one lease block; R2 = merges combine only bound-consecutive runs.
+- **Docids:** u32 in all postings/section payloads; u64 in header/manifest fields (future-proofing). Every segment has `docid_lo < docid_hi <= 2^32`, `docid_hi - docid_lo <= 357,913,940`, and `doc_count <= docid_hi - docid_lo`. The layout-derived span cap is `floor((u32::MAX - 12) / 12)`: it keeps IDMAP's mandatory `12 + 12 × span` prefix representable by `blob_offset: u32`, and consequently keeps IDHASH's one-based segment-relative ordinal representable while still permitting global docid `u32::MAX`. Docid semantics are governed by Q1 (`docs/contracts/quill-q1-docid-discipline.md`): monotone allocation, session leases, burned tails, **never reused**; R1 = a segment's docid range is a subinterval of one lease block; R2 = merges combine only bound-consecutive runs.
 - **Positions:** u32 (a 2 MiB document exceeds u16 token positions).
 - **Fieldnorms:** 1 byte, tantivy 0.26.1's exact 256-entry table (vendored: `crates/frankensearch-lexical/src/quill_contract.rs`, landed c5cd8b51).
 - **schema_id:** xxh3-64 of the schema descriptor's canonical encoding (see `SchemaDescriptor` in the scaffolding bead `bd-quill-e1-0-crate-scaffold-j1i6`). A reader that sees an unknown `schema_id` returns a typed error; it never guesses.
@@ -349,7 +349,7 @@ Field order: ascending `field_ord`; each field's array is 64-aligned within the 
 ### 5.6 IDMAP
 
 ```
-directory: { entry_count: u32 = docid span, blob_offset: u32 }
+directory: { entry_count: u32 = docid span, blob_offset: u32 } # exactly 8 bytes
 offsets: (span + 1) × u32     # offsets[i]..offsets[i+1] = DocId bytes for docid_lo+i; equal offsets = hole
 hashes:  span × u64           # xxh3-64 of the doc's CANONICAL CONTENT bytes (content_hash — resumable-bulk
                               #   witness, bd-quill-duel-resumable-bulk); 0 at holes. 8 bytes/doc, declared
@@ -357,17 +357,75 @@ hashes:  span × u64           # xxh3-64 of the doc's CANONICAL CONTENT bytes (c
 blob: concatenated DocId (CompactString) bytes
 ```
 
-Materialization = two offset reads + one slice. Holes (equal adjacent offsets) mark absent docids after compaction.
+`entry_count = docid_hi - docid_lo` and is bounded by **357,913,940** so the
+mandatory `12 + 12 × entry_count` prefix fits `blob_offset: u32`.
+The one canonical `blob_offset` is
+`8 + 4 × (entry_count + 1) + 8 × entry_count`; offsets begin at zero, are
+monotone, and the terminal offset consumes the exact blob. A present DocId is
+non-empty valid UTF-8 and therefore strictly advances its adjacent offsets.
+Equal adjacent offsets mean a hole and require `content_hash == 0`; zero remains
+a legal hash for a present row because presence derives only from offsets.
+`content_hash` is **unseeded xxh3-64** over the externally canonicalized content
+bytes and is a separate hash domain from IDHASH and any in-memory fingerprint.
+
+Materialization = two little-endian offset reads + one borrowed slice, with a
+`CompactString` allocation only for a requested winner. Ordinary Q1 merge
+concatenates complete positional rows and blobs in range order, inserting
+canonical holes for run gaps; it does not deduplicate physical DocId rows.
 
 ### 5.7 IDHASH
 
 Open-addressed, linear-probe table for `DocId → docid` (upsert/delete/resume probes):
 
 ```
-{ capacity: u32 (power of two, load factor <= 0.7), entry: capacity × { key_hash: u64, docid_plus1: u32 } }
+capacity: u32
+entry: capacity × { key_hash: u64, doc_ord_plus1: u32 } # packed 12-byte LE slots
 ```
 
-`key_hash` = xxh3-64 of the DocId bytes with **seed = 0x5155_494C_4C31 ("QUILL1")** — a fixed spec constant, never process-random. Empty slot: `docid_plus1 == 0`. Probe: `h & (capacity-1)`, linear. **Every hit must be verified against IDMAP bytes** (64-bit collisions are legal). Cross-segment resolution order: newest segment first (manifest order), skipping tombstoned docids; at most one live docid per DocId (upsert invariant).
+`capacity` is the smallest power of two satisfying
+`occupied × 10 <= capacity × 7`, with minimum capacity 1. `key_hash` is
+xxh3-64 of the exact DocId UTF-8 bytes with **seed =
+0x5155_494C_4C31 ("QUILL1")** — a fixed spec constant, never process-random.
+An empty slot has both fields zero. An occupied slot stores the selected
+segment-relative ordinal as `doc_ord_plus1 = (global_docid - docid_lo) + 1`;
+lookup reconstructs `global_docid = docid_lo + (doc_ord_plus1 - 1)`. A zero
+`key_hash` is legal in an occupied slot because emptiness derives only from
+`doc_ord_plus1`.
+
+Canonical construction inserts selected representative ordinals in strictly ascending
+segment-relative order. Each insertion starts at `key_hash & (capacity - 1)`
+and probes linearly with wraparound. Every hash match is verified against the
+exact referenced IDMAP bytes before returning or declaring a duplicate; 64-bit
+collisions are legal. A fresh seal with unique DocIds selects every present row.
+When physical duplicates exist at seal or after Q1 positional concat, the
+external resolver applies tombstones and selects the **unique live row** for
+each exact DocId; more than one live row violates the upsert invariant and the
+seal/merge fails. If every physical row for an identifier is tombstoned, the
+resolver retains the lowest global docid as a deterministic completeness
+representative. It then translates selected rows into output-relative ordinals,
+sorts those ordinals ascending, and invokes the resolved-representative writer.
+The immutable section therefore keeps one slot per distinct physical ID even
+for all-dead IDs, while tombstone filtering remains manifest state.
+
+Neither global docid order nor a source container's current `seal_seq` is a
+live-row recency signal. In particular, a partial merge republishes old rows in
+a container with a newer `seal_seq`; live-first tombstone resolution must beat
+that container order during a later merge-of-merges. `seal_seq` provides only a
+deterministic current-segment probe priority and a publication/forensics witness.
+
+The bound reader validates capacity, load, hashes, exact IDMAP reachability,
+one selected slot per distinct identifier, and canonical ascending-selected-
+ordinal placement. It cannot validate the merge layer's live-row representative
+selection from one FSLX segment alone; that decision requires external
+tombstone/upsert state.
+Validation also enforces an explicit cumulative linear-probe-work ceiling in
+addition to byte/count/capacity limits, so a canonical adversarial collision
+cluster cannot make reopen quadratic without bound. Cross-segment probes visit
+segments in descending `seal_seq` for deterministic priority, verify exact
+IDMAP bytes, and **continue to later segments after a tombstoned hit**; a newly
+merged high-`seal_seq` container may carry an older dead representative while a
+lower-`seal_seq` segment still carries the unique live row. At most one live
+docid exists per DocId.
 
 ### 5.8 NUMERIC
 
@@ -446,12 +504,12 @@ stats rollup: field_count × { field_ord: u16, total_tokens: u64, doc_count: u32
 crc32: u32 (over all preceding bytes)
 ```
 
-`engine_version` packs the crate semver as `(major:u8 << 24) | (minor:u8 << 16) | patch:u16`; prerelease/build metadata is not encoded. Segments are listed in **ascending docid_lo** order. R2 merge order follows that range order, while IDHASH newest-first probe order uses descending `seal_seq` (the per-segment recency witness added by amendment v1.0.1). Stats entries are listed in strictly ascending `field_ord` order. Across adjacent generations, retained segment metadata is immutable, retained tombstones only grow, and every newly referenced segment has a `seal_seq` greater than the maximum in the prior non-empty generation. An explicit empty generation starts a new seal-sequence epoch; restarting at 1 is valid because no older segment remains queryable or participates in newest-first probing. If the immutable segment set is unchanged, its at-seal stats rollup is unchanged as well; tombstone-only generations do not rewrite BM25 statistics.
+`engine_version` packs the crate semver as `(major:u8 << 24) | (minor:u8 << 16) | patch:u16`; prerelease/build metadata is not encoded. Segments are listed in **ascending docid_lo** order. R2 merge order follows that range order, while IDHASH cross-segment probe priority uses descending `seal_seq` (added by amendment v1.0.1); a tombstoned hit continues to later segments because `seal_seq` orders current containers, not the physical updates republished inside them. Stats entries are listed in strictly ascending `field_ord` order. Across adjacent generations, retained segment metadata is immutable, retained tombstones only grow, and every newly referenced segment has a `seal_seq` greater than the maximum in the prior non-empty generation. An explicit empty generation starts a new seal-sequence epoch; restarting at 1 is valid because no older segment remains queryable or participates in cross-segment probing. If the immutable segment set is unchanged, its at-seal stats rollup is unchanged as well; tombstone-only generations do not rewrite BM25 statistics.
 
 ### 6.2 Publish protocol (normative, crash-window exact)
 
 1. Write `MANIFEST` (gen N+1) content to `.tmp-manifest-<gen>`; fsync file. A retry after a failed claim or rename may reuse that temp only when a no-follow open proves the directory entry is a regular file and its complete bytes exactly match the canonical proposal, then fsyncs it again. Any symlink, non-regular, or mismatched temp fails closed without overwrite and is left for writer-locked recovery/GC.
-2. Claim the generation: create `gen-<N+1>.claim` with `O_CREAT|O_EXCL` (fails ⇒ another writer won; abort with typed error — the CAS of bead `bd-quill-duel-writer-lock`). E3.2 exposes the checked pre-publish seam and implements the in-process mutex plus steps 1 and 3–5; the cross-process claim/release implementation lands with that dependent writer-lock bead.
+2. Claim the generation: while retaining the cross-process writer admission, create `gen-<N+1>.claim` as a no-follow zero-length regular file with `O_CREAT|O_EXCL` (fails ⇒ another writer won; abort with typed error). Retain the opened claim inode through steps 3–5; release removes the pathname only when it still resolves to that same inode, then fsyncs the directory.
 3. `rename(MANIFEST, MANIFEST.prev)` (skip if no MANIFEST — genesis).
 4. `rename(.tmp-manifest-<gen>, MANIFEST)`.
 5. fsync directory. 6. Unlink the claim file (best-effort; stale claims for generations ≤ current are GC-eligible under the writer lock).
@@ -481,11 +539,11 @@ Promotion threshold 4096 entries (array→bitmap), demotion at 3584 (hysteresis 
 magic "FSLXLCK\0" | format_version: u32 = 1 | pid: u32 | pid_start_nonce: u64 | acquired_unix_s: i64 | crc32
 ```
 
-`pid_start_nonce` = xxh3 of (pid, process start time from /proc where available, else acquired timestamp) — guards PID reuse. Takeover permitted **only** when `kill(pid, 0)` reports ESRCH (process dead). mtime/heartbeat staleness alone **never** authorizes takeover (SIGSTOP hazard). Readers ignore LOCK except to report `live_writer` in freshness surfaces.
+`LOCK` is a persistent no-follow regular inode. A writer first takes a nonblocking exclusive `flock`, then validates any residual record before writing its own exact 36-byte record and fsyncing both file and directory. All integers and the trailing IEEE CRC-32 are little-endian; the CRC covers bytes 0..32. `pid_start_nonce` is unseeded xxh3-64 over canonical little-endian `(pid:u32, process_start:u64)` using `/proc/<pid>/stat` field 22 on Linux, or `(pid:u32, acquired_unix_s:i64)` when that witness is unavailable. Takeover is permitted **only** after the flock succeeds and `kill(pid, 0)` reports `ESRCH`; `Ok`, `EPERM`, malformed records, and all ambiguous liveness results fail closed. mtime/heartbeat staleness alone **never** authorizes takeover (SIGSTOP hazard). Clean release validates that the locked inode still contains the guard's exact record, truncates it to zero, fsyncs, and unlocks; it never unlinks `LOCK` or modifies a replacement pathname. Readers do not open, create, repair, timestamp, or otherwise touch `LOCK`.
 
 ### 7.2 gen-*.claim
 
-Zero-length files; existence is the semantics (O_EXCL create = atomic claim). Named by the generation they claim.
+Zero-length no-follow regular files; existence is the semantics (`O_EXCL` create = atomic claim). Named by the generation they claim. Writer-open removes stale claims only while holding `LOCK`, after validating the current/next-generation relationship and preserving an interrupted next-generation temp under an inert `.tmp-abandoned-*` name. Claims beyond the unique next generation are corruption, not GC candidates.
 
 ### 7.3 CURRENT (blue-green pointer; bead `bd-quill-duel-blue-green`)
 
@@ -541,7 +599,7 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | Version | Date | Change | Migration | Fixture |
 |---|---|---|---|---|
 | 1.0.0 | 2026-07-17 | Initial FSLX v1: segment container + sections 1–10; MANIFEST v1 + two-rename/claim publish; tombstone roaring-lite; LOCK/claim/CURRENT artifacts; GC safety rules | — (genesis) | golden segment (e2.8, pending) |
-| 1.0.1 | 2026-07-17 | `seal_seq: u64` added to MANIFEST segment entries (recency for IDHASH newest-first probe order and forensics) — folded into v1 pre-freeze | — (pre-freeze fold) | manifest roundtrip test |
+| 1.0.1 | 2026-07-17 | `seal_seq: u64` added to MANIFEST segment entries (deterministic current-container IDHASH probe priority and forensics, not physical-row recency; clarified by v1.0.16) — folded into v1 pre-freeze | — (pre-freeze fold) | manifest roundtrip test |
 | 1.0.2 | 2026-07-17 | IDMAP gains per-doc `content_hash: u64` (resumable-bulk witness + doctor audit; bd-quill-duel-resumable-bulk) — folded into v1 pre-freeze | — (pre-freeze fold) | resume-equivalence fixture (pending) |
 | 1.0.3 | 2026-07-17 | POSTINGS blocks gain a common `{kind, posting_count, payload_len}` header; VINT partials are legal at preserved interior seams so Q1 merges copy blocks verbatim without cascading re-encode; `doc_width` is explicitly one byte covering 0..=32 | — (pre-freeze correction) | `df=100 + df=300` concat + scalar/SIMD bitpack differential (e2.2) |
 | 1.0.4 | 2026-07-17 | MANIFEST v1 pre-freeze correction: place `seal_seq` in each segment entry, encode `field_count: u32`, define packed-semver `engine_version`, and split E3.2's in-process two-slot publish from the dependent cross-process generation-claim CAS | — (pre-freeze correction) | manifest wire golden + roundtrip/recovery tests (e3.2) |
@@ -556,5 +614,7 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.13 | 2026-07-17 | BLOCKMAX v1 pre-freeze hardening: no count prefix; u64 canonical term-relative offsets; Tantivy-compatible conservative max-frequency codes; exact minimum stored fieldnorm IDs; POSTINGS/DOCLEN cross-validation; live-snapshot query bounds; and Q1 concat offset-only rebasing are pinned | — (pre-freeze contract hardening) | BLOCKMAX wire/corruption, bound-soundness, skip, and `df=100 + df=300` concat fixtures (e2.3) |
 | 1.0.14 | 2026-07-17 | POSITIONS v1 pre-freeze hardening: fixed-LE block count; canonical u32 posting ordinals and u64 blocks-area-relative offsets; whole-document u32 first-plus-delta runs with zero deltas; frequency-derived boundaries; greedy 4096-byte fresh blocks with oversized singletons; bounded validation; and Q1 payload-preserving directory rebasing are pinned | — (pre-freeze contract hardening) | POSITIONS wire/corruption, zero-delta, >65k, block-boundary, cursor, and concat-seam fixtures (e2.4) |
 | 1.0.15 | 2026-07-18 | STOREDMETA v1 pre-freeze correction: every schema-stored field gets a packed presence bitmap before its positional offset table, preserving absent/hole versus present-empty values; exact directory offsets, bitmap canonicality, zero-copy reads, sparse Scribe sealing, and gap-preserving concat are pinned | — (pre-freeze correction) | exact wire golden, absent/empty/non-UTF8 roundtrip, sparse accumulator holes, corruption/resource matrix, lazy first-touch, and direct/left/right concat equivalence (e2.9) |
+| 1.0.16 | 2026-07-18 | IDMAP/IDHASH v1 pre-freeze correction: cap positional span at the layout-derived 357,913,940; pin unseeded content hashes, hole/offset rules, segment-relative one-based IDHASH ordinals, minimum canonical capacity, ascending representative insertion, exact-byte collision checks, bounded probe work, live-first tombstone-aware duplicate resolution with a lowest-docid all-dead fallback, and continue-after-tombstone cross-segment probing | — (pre-freeze correction) | exact seeded/unseeded wire oracles, collision/wrap/zero-hash and corruption matrix, external-representative and merge-of-merges regressions, span-bound arithmetic, concat equivalence, 1M-ID reopen/probe, and materialization A/B (e2.6) |
+| 1.0.17 | 2026-07-18 | Writer admission and generation publication are pinned: persistent no-follow `LOCK` inode, exact LE+CRC record, nonblocking exclusive flock, ESRCH-only residual takeover independent of mtime, exact-record truncate-on-release without unlink, retained O_EXCL `gen-N.claim`, writer-only recovery/repair/GC, and touchless reader open | — (pre-freeze protocol hardening) | wire/corruption matrix, real SIGSTOP owner, two-process dead-owner race, inode-replacement ABA, reader directory-identity, interrupted-claim recovery, and durable staged-repair fixtures (writer-lock bead) |
 
 *Process: pre-freeze changes fold into v1 with a registry row (as above). Post-freeze changes bump `format_version`, add a migration note, and land a reader-compat gauntlet fixture in the same commit.*
