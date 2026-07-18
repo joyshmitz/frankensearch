@@ -175,7 +175,8 @@ where
             value: format.to_string(),
             reason: "stream mode supports only jsonl and toon".into(),
         }),
-    }
+    }?;
+    writer.flush().map_err(write_err)
 }
 
 /// Emit a single stream frame and return the transport payload as a string.
@@ -780,6 +781,24 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    struct FlushCountingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for FlushCountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes = self.flushes.saturating_add(1);
+            Ok(())
+        }
+    }
+
     // ─── JSON emission ──────────────────────────────────────────────────
 
     #[test]
@@ -880,6 +899,18 @@ mod tests {
         let toon_payload = &output[1..output.len() - 1];
         let decoded: StreamFrame<Vec<String>> = decode_stream_frame_toon(toon_payload).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn emit_stream_frame_flushes_each_external_record() {
+        let frame = sample_stream_frame();
+        for format in [OutputFormat::Jsonl, OutputFormat::Toon] {
+            let mut writer = FlushCountingWriter::default();
+            emit_stream_frame(&frame, format, &mut writer).expect("emit stream frame");
+
+            assert!(!writer.bytes.is_empty());
+            assert_eq!(writer.flushes, 1, "{format} frame must flush exactly once");
+        }
     }
 
     #[test]

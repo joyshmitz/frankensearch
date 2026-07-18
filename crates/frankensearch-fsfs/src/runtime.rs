@@ -234,6 +234,8 @@ struct SearchPhaseArtifact {
     payload: SearchPayload,
 }
 
+type SearchPhaseSink<'a> = &'a mut dyn FnMut(&SearchPayload) -> SearchResult<()>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SearchFilterClause {
     PathContains(String),
@@ -4567,26 +4569,59 @@ impl FsfsRuntime {
 
         let stream_id = format!("search-{}-{}", pressure_timestamp_ms(), std::process::id());
         let mut stdout = std::io::stdout();
+        self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut stdout, None)
+            .await
+    }
+
+    async fn run_search_stream_command_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        stream_id: &str,
+        writer: &mut W,
+        mut resources_override: Option<(&mut SearchExecutionResources, SearchExecutionFlags)>,
+    ) -> SearchResult<()> {
         let mut seq = 0_u64;
 
-        self.emit_search_stream_started(query, &stream_id, &mut seq, &mut stdout)?;
-        match self
-            .execute_search_payloads_cached_for_cli(cx, query, limit)
-            .await
-        {
+        self.emit_search_stream_started(query, stream_id, &mut seq, writer)?;
+        let search_result = {
+            let mut phase_sink = |stage_payload: &SearchPayload| {
+                self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
+            };
+            if let Some((resources, flags)) = resources_override.as_mut() {
+                self.execute_search_phase_artifacts_with_mode_using_resources(
+                    cx,
+                    query,
+                    limit,
+                    SearchExecutionMode::Full,
+                    resources,
+                    *flags,
+                    Some(&mut phase_sink),
+                )
+                .await
+                .map(|artifacts| {
+                    artifacts
+                        .into_iter()
+                        .map(|artifact| artifact.payload)
+                        .collect::<Vec<_>>()
+                })
+            } else {
+                self.execute_search_payloads_cached_for_cli_with_phase_sink(
+                    cx,
+                    query,
+                    limit,
+                    &mut phase_sink,
+                )
+                .await
+            }
+        };
+        match search_result {
             Ok(payloads) => {
                 let payload = payloads.last().cloned().unwrap_or_else(|| {
                     SearchPayload::new(String::new(), SearchOutputPhase::Initial, 0, Vec::new())
                 });
-                for stage_payload in &payloads {
-                    self.emit_search_stream_payload(
-                        stage_payload,
-                        &stream_id,
-                        &mut seq,
-                        &mut stdout,
-                    )?;
-                }
-                self.emit_search_stream_terminal_completed(&stream_id, &mut seq, &mut stdout)?;
+                self.emit_search_stream_terminal_completed(stream_id, &mut seq, writer)?;
                 info!(
                     query = query,
                     phase = payload.phase.to_string(),
@@ -4601,7 +4636,7 @@ impl FsfsRuntime {
                 Ok(())
             }
             Err(error) => {
-                self.emit_search_stream_terminal_error(&stream_id, &error, &mut seq, &mut stdout)?;
+                self.emit_search_stream_terminal_error(stream_id, &error, &mut seq, writer)?;
                 Err(error)
             }
         }
@@ -5540,8 +5575,20 @@ impl FsfsRuntime {
         limit: usize,
         mode: SearchExecutionMode,
     ) -> SearchResult<Vec<SearchPayload>> {
+        self.execute_search_payloads_with_mode_and_phase_sink(cx, query, limit, mode, None)
+            .await
+    }
+
+    async fn execute_search_payloads_with_mode_and_phase_sink(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: SearchExecutionMode,
+        phase_sink: Option<SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPayload>> {
         let artifacts = self
-            .execute_search_phase_artifacts_with_mode(cx, query, limit, mode)
+            .execute_search_phase_artifacts_with_mode(cx, query, limit, mode, phase_sink)
             .await?;
         Ok(artifacts
             .into_iter()
@@ -5560,7 +5607,7 @@ impl FsfsRuntime {
     ) -> SearchResult<Vec<SearchPayload>> {
         let artifacts = self
             .execute_search_phase_artifacts_with_mode_using_resources(
-                cx, query, limit, mode, resources, flags,
+                cx, query, limit, mode, resources, flags, None,
             )
             .await?;
         Ok(artifacts
@@ -5575,16 +5622,45 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
+        self.execute_search_payloads_cached_for_cli_inner(cx, query, limit, None)
+            .await
+    }
+
+    async fn execute_search_payloads_cached_for_cli_with_phase_sink(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        phase_sink: SearchPhaseSink<'_>,
+    ) -> SearchResult<Vec<SearchPayload>> {
+        self.execute_search_payloads_cached_for_cli_inner(cx, query, limit, Some(phase_sink))
+            .await
+    }
+
+    async fn execute_search_payloads_cached_for_cli_inner(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mut phase_sink: Option<SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPayload>> {
         let mode = SearchExecutionMode::Full;
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         if !cache_enabled {
             return self
-                .execute_search_payloads_with_mode(cx, query, limit, mode)
+                .execute_search_payloads_with_mode_and_phase_sink(
+                    cx, query, limit, mode, phase_sink,
+                )
                 .await;
         }
         let key = self.search_cache_key(query, limit, mode);
         match self.try_load_search_payload_cache(&key) {
             Ok(Some(payloads)) => {
+                if let Some(sink) = phase_sink.as_deref_mut() {
+                    for payload in &payloads {
+                        sink(payload)?;
+                    }
+                }
                 if let Err(error) =
                     self.persist_explain_session_for_cached_payloads(query, &payloads)
                 {
@@ -5605,7 +5681,7 @@ impl FsfsRuntime {
         }
 
         let payloads = self
-            .execute_search_payloads_with_mode(cx, query, limit, mode)
+            .execute_search_payloads_with_mode_and_phase_sink(cx, query, limit, mode, phase_sink)
             .await?;
         if let Err(error) = self.write_search_payload_cache(&key, &payloads) {
             warn!(
@@ -6259,6 +6335,7 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
         mode: SearchExecutionMode,
+        phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         let mut resources = self.prepare_search_execution_resources(mode)?;
         self.execute_search_phase_artifacts_with_mode_using_resources(
@@ -6271,6 +6348,7 @@ impl FsfsRuntime {
                 include_snippets: true,
                 persist_explain_session: true,
             },
+            phase_sink,
         )
         .await
     }
@@ -6284,11 +6362,12 @@ impl FsfsRuntime {
         mode: SearchExecutionMode,
         resources: &mut SearchExecutionResources,
         flags: SearchExecutionFlags,
+        mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         let normalized_query = Self::normalize_search_query(query);
         let filter_expr = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
         if normalized_query.is_empty() {
-            return Ok(vec![SearchPhaseArtifact {
+            let artifact = SearchPhaseArtifact {
                 phase: SearchOutputPhase::Initial,
                 fused: Vec::new(),
                 payload: SearchPayload::new(
@@ -6297,7 +6376,11 @@ impl FsfsRuntime {
                     0,
                     Vec::new(),
                 ),
-            }]);
+            };
+            if let Some(sink) = phase_sink.as_deref_mut() {
+                sink(&artifact.payload)?;
+            }
+            return Ok(vec![artifact]);
         }
 
         let lexical_doc_count = resources
@@ -6601,11 +6684,15 @@ impl FsfsRuntime {
         .with_degradation_advice(resources.degradation_advice.clone());
         let fusion_elapsed_ms = fusion_start.elapsed().as_millis();
 
-        let mut artifacts = vec![SearchPhaseArtifact {
+        let initial_artifact = SearchPhaseArtifact {
             phase: SearchOutputPhase::Initial,
             fused: fused_initial.clone(),
             payload: payload.clone(),
-        }];
+        };
+        if let Some(sink) = phase_sink.as_deref_mut() {
+            sink(&initial_artifact.payload)?;
+        }
+        let mut artifacts = vec![initial_artifact];
 
         if plan.quality_stage.enabled {
             if matches!(mode, SearchExecutionMode::Full)
@@ -6667,11 +6754,15 @@ impl FsfsRuntime {
                             &snippets_by_doc,
                             output_limit,
                         );
-                        artifacts.push(SearchPhaseArtifact {
+                        let refined_artifact = SearchPhaseArtifact {
                             phase: SearchOutputPhase::Refined,
                             fused: fused_refined,
                             payload: refined_payload,
-                        });
+                        };
+                        if let Some(sink) = phase_sink.as_deref_mut() {
+                            sink(&refined_artifact.payload)?;
+                        }
+                        artifacts.push(refined_artifact);
                     }
                     Err(error) => {
                         if let SearchError::DimensionMismatch { .. } = error {
@@ -6702,11 +6793,15 @@ impl FsfsRuntime {
                             output_limit,
                         )
                         .with_degradation_advice(advice);
-                        artifacts.push(SearchPhaseArtifact {
+                        let failed_artifact = SearchPhaseArtifact {
                             phase: SearchOutputPhase::RefinementFailed,
                             fused: fused_initial.clone(),
                             payload: failed_payload,
-                        });
+                        };
+                        if let Some(sink) = phase_sink.as_deref_mut() {
+                            sink(&failed_artifact.payload)?;
+                        }
+                        artifacts.push(failed_artifact);
                     }
                 }
             } else {
@@ -6727,11 +6822,15 @@ impl FsfsRuntime {
                     output_limit,
                 )
                 .with_degradation_advice(advice);
-                artifacts.push(SearchPhaseArtifact {
+                let failed_artifact = SearchPhaseArtifact {
                     phase: SearchOutputPhase::RefinementFailed,
                     fused: fused_initial.clone(),
                     payload: failed_payload,
-                });
+                };
+                if let Some(sink) = phase_sink.as_deref_mut() {
+                    sink(&failed_artifact.payload)?;
+                }
+                artifacts.push(failed_artifact);
             }
         }
 
@@ -12287,7 +12386,11 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
     // (found by walking `right` chars from the end). Both are char boundaries, so the
     // slices below are valid and byte-for-byte identical to the old prefix/suffix.
     let left_end = text.char_indices().nth(left).map_or(text.len(), |(i, _)| i);
-    let suffix_start = text.char_indices().rev().nth(right - 1).map_or(0, |(i, _)| i);
+    let suffix_start = text
+        .char_indices()
+        .rev()
+        .nth(right - 1)
+        .map_or(0, |(i, _)| i);
     format!("{}...{}", &text[..left_end], &text[suffix_start..])
 }
 
@@ -15811,13 +15914,18 @@ fn emit_lite_build_model_hint(model_root: &Path) {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::future::{Future, poll_fn};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use asupersync::test_utils::run_test_with_cx;
-    use frankensearch_core::{IndexableDocument, LexicalSearch};
+    use frankensearch_core::{
+        Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchFuture,
+    };
     use frankensearch_embed::{HashEmbedder, ModelManifest};
     use frankensearch_index::VectorIndex;
     use frankensearch_lexical::TantivyIndex;
@@ -15834,10 +15942,11 @@ mod tests {
         FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
         FsfsIndexStatus, FsfsModelStatus, FsfsRuntime, FsfsRuntimeStatus, FsfsStatusPayload,
         IndexStoragePaths, InterfaceMode, LiveIngestPipeline, SearchDashboardState,
-        SearchExecutionMode, SemanticGateDecisionInput, SemanticRecallDecisionInput,
-        VectorIndexWriteAction, VectorPipelineInput, VectorSchedulingTier,
-        degradation_controller_config_for_profile, detect_context_preview_format,
-        is_likely_html_fragment, normalize_html_fragment_for_markdown, render_status_table,
+        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
+        SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
+        VectorPipelineInput, VectorSchedulingTier, degradation_controller_config_for_profile,
+        detect_context_preview_format, is_likely_html_fragment,
+        normalize_html_fragment_for_markdown, render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -15856,7 +15965,7 @@ mod tests {
     use crate::query_planning::QueryIntentClass;
     use crate::shutdown::{ShutdownCoordinator, ShutdownReason};
     use crate::stream_protocol::{
-        StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE,
+        StreamEvent, StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE,
         decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
@@ -18993,6 +19102,243 @@ mod tests {
         });
     }
 
+    #[derive(Default)]
+    struct QualityBarrier {
+        entered: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl QualityBarrier {
+        fn entered(&self) -> bool {
+            self.entered.load(Ordering::Acquire)
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+        }
+    }
+
+    struct BarrierQualityEmbedder {
+        inner: HashEmbedder,
+        barrier: Arc<QualityBarrier>,
+    }
+
+    impl BarrierQualityEmbedder {
+        fn new(barrier: Arc<QualityBarrier>) -> Self {
+            Self {
+                inner: HashEmbedder::default_384(),
+                barrier,
+            }
+        }
+    }
+
+    impl Embedder for BarrierQualityEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            let barrier = Arc::clone(&self.barrier);
+            let mut vector = Some(self.inner.embed_sync(text));
+            Box::pin(poll_fn(move |_task_cx| {
+                barrier.entered.store(true, Ordering::Release);
+                if barrier.released.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(vector.take().expect("quality vector available once")))
+                } else {
+                    Poll::Pending
+                }
+            }))
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            "barrier-quality-384"
+        }
+
+        fn model_name(&self) -> &str {
+            "Barrier Quality Embedder"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushVisibleState {
+        pending: Vec<u8>,
+        visible: Vec<u8>,
+        flushes: usize,
+    }
+
+    #[derive(Clone, Default)]
+    struct FlushVisibleWriter {
+        state: Arc<Mutex<FlushVisibleState>>,
+    }
+
+    impl FlushVisibleWriter {
+        fn visible_text(&self) -> String {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8(state.visible.clone()).expect("visible stream output is utf8")
+        }
+
+        fn flush_count(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flushes
+        }
+    }
+
+    impl std::io::Write for FlushVisibleWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = std::mem::take(&mut state.pending);
+            state.visible.extend_from_slice(&pending);
+            state.flushes = state.flushes.saturating_add(1);
+            Ok(())
+        }
+    }
+
+    fn decode_visible_stream(writer: &FlushVisibleWriter) -> Vec<StreamFrame<SearchHitPayload>> {
+        writer
+            .visible_text()
+            .lines()
+            .map(|line| decode_stream_frame_ndjson(line).expect("decode visible stream frame"))
+            .collect()
+    }
+
+    #[test]
+    fn runtime_stream_exposes_initial_before_quality_barrier_release() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let vector_path = temp.path().join("stream-barrier.fsvi");
+            let query = "quality barrier ordering";
+            let fast_embedder = HashEmbedder::default_384();
+            let query_vector = fast_embedder.embed_sync(query);
+            let mut vector_writer = VectorIndex::create(&vector_path, "barrier-quality-384", 384)
+                .expect("create vector index");
+            vector_writer
+                .write_record("docs/quality.md", &query_vector)
+                .expect("write vector record");
+            vector_writer.finish().expect("finish vector index");
+
+            let barrier = Arc::new(QualityBarrier::default());
+            let mut resources = SearchExecutionResources {
+                index_root: temp.path().to_path_buf(),
+                lexical_index: None,
+                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                fast_embedder: Some(Arc::new(fast_embedder)),
+                quality_embedder: Some(Arc::new(BarrierQualityEmbedder::new(Arc::clone(&barrier)))),
+                fast_embedder_attempted: true,
+                quality_embedder_attempted: true,
+                degradation_advice: Vec::new(),
+            };
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                ..CliInput::default()
+            });
+            let stream_id = "stream-quality-barrier";
+            let writer = FlushVisibleWriter::default();
+            let mut transport = writer.clone();
+            let mut search = Box::pin(runtime.run_search_stream_command_with_writer(
+                &cx,
+                query,
+                5,
+                stream_id,
+                &mut transport,
+                Some((
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                )),
+            ));
+
+            let first_poll = poll_fn(|task_cx| Poll::Ready(search.as_mut().poll(task_cx))).await;
+            assert!(
+                first_poll.is_pending(),
+                "search must wait at the quality barrier after emitting Initial"
+            );
+            assert!(barrier.entered(), "quality embedder must reach its barrier");
+
+            let initial_frames = decode_visible_stream(&writer);
+            assert_eq!(
+                initial_frames.first().map(|frame| frame.event.kind()),
+                Some(StreamEventKind::Started)
+            );
+            assert!(initial_frames.iter().any(|frame| {
+                matches!(
+                    &frame.event,
+                    StreamEvent::Progress(progress)
+                        if progress.reason_code == "query.stream.initial_ready"
+                )
+            }));
+            assert!(
+                initial_frames
+                    .iter()
+                    .any(|frame| { matches!(&frame.event, StreamEvent::Result(_)) })
+            );
+            assert!(!initial_frames.iter().any(|frame| {
+                matches!(
+                    &frame.event,
+                    StreamEvent::Progress(progress)
+                        if progress.reason_code == "query.stream.refined_ready"
+                            || progress.reason_code == "query.stream.refinement_failed"
+                ) || matches!(&frame.event, StreamEvent::Terminal(_))
+            }));
+            assert_eq!(writer.flush_count(), initial_frames.len());
+            for (expected, frame) in initial_frames.iter().enumerate() {
+                assert_eq!(frame.seq, expected as u64);
+            }
+
+            barrier.release();
+            search.await.expect("complete stream after barrier release");
+
+            let final_frames = decode_visible_stream(&writer);
+            assert!(final_frames.iter().any(|frame| {
+                matches!(
+                    &frame.event,
+                    StreamEvent::Progress(progress)
+                        if progress.reason_code == "query.stream.refined_ready"
+                )
+            }));
+            assert_eq!(
+                final_frames.last().map(|frame| frame.event.kind()),
+                Some(StreamEventKind::Terminal)
+            );
+            assert_eq!(writer.flush_count(), final_frames.len());
+            for (expected, frame) in final_frames.iter().enumerate() {
+                assert_eq!(frame.seq, expected as u64);
+            }
+        });
+    }
+
     #[test]
     fn runtime_stream_emitter_outputs_protocol_frames_ndjson() {
         let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
@@ -20441,54 +20787,76 @@ mod tests {
 
     #[test]
     fn search_payload_cache_roundtrip_and_invalidates_on_index_change() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let index_root = temp.path().join("index");
-        std::fs::create_dir_all(&index_root).expect("create index root");
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            std::fs::create_dir_all(&index_root).expect("create index root");
 
-        let mut config = FsfsConfig::default();
-        config.storage.index_dir = index_root.display().to_string();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = index_root.display().to_string();
 
-        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-            index_dir: Some(index_root.clone()),
-            filter: Some("ext:rs".to_owned()),
-            ..CliInput::default()
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(index_root.clone()),
+                filter: Some("ext:rs".to_owned()),
+                ..CliInput::default()
+            });
+            let key = runtime.search_cache_key("cache me", 25, super::SearchExecutionMode::Full);
+            let initial = SearchPayload::new(
+                "cache me",
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "src/lib.rs".to_owned(),
+                    score: 0.75,
+                    snippet: Some("cached snippet".to_owned()),
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(0),
+                    in_both_sources: true,
+                }],
+            );
+            let mut refined = initial.clone();
+            refined.phase = SearchOutputPhase::Refined;
+            refined.hits[0].score = 0.9;
+            let payloads = vec![initial, refined];
+
+            runtime
+                .write_search_payload_cache(&key, &payloads)
+                .expect("write cache");
+            let cached = runtime
+                .try_load_search_payload_cache(&key)
+                .expect("read cache")
+                .expect("cache hit");
+            assert_eq!(cached, payloads);
+
+            let mut replayed = Vec::new();
+            let replayed_payloads = {
+                let mut sink = |payload: &SearchPayload| {
+                    replayed.push(payload.clone());
+                    Ok(())
+                };
+                runtime
+                    .execute_search_payloads_cached_for_cli_with_phase_sink(
+                        &cx, "cache me", 25, &mut sink,
+                    )
+                    .await
+                    .expect("replay cached phases")
+            };
+            assert_eq!(replayed, payloads, "cache hit must replay each phase once");
+            assert_eq!(replayed_payloads, payloads);
+
+            let vector_dir = index_root.join("vector");
+            std::fs::create_dir_all(&vector_dir).expect("create vector dir");
+            std::fs::write(vector_dir.join("index.fsvi"), b"mutated").expect("touch vector index");
+
+            let stale = runtime
+                .try_load_search_payload_cache(&key)
+                .expect("cache read after mutation");
+            assert!(
+                stale.is_none(),
+                "cache should invalidate after index changes"
+            );
         });
-        let key = runtime.search_cache_key("cache me", 25, super::SearchExecutionMode::Full);
-        let payloads = vec![SearchPayload::new(
-            "cache me",
-            SearchOutputPhase::Initial,
-            1,
-            vec![SearchHitPayload {
-                rank: 1,
-                path: "src/lib.rs".to_owned(),
-                score: 0.75,
-                snippet: Some("cached snippet".to_owned()),
-                lexical_rank: Some(0),
-                semantic_rank: Some(0),
-                in_both_sources: true,
-            }],
-        )];
-
-        runtime
-            .write_search_payload_cache(&key, &payloads)
-            .expect("write cache");
-        let cached = runtime
-            .try_load_search_payload_cache(&key)
-            .expect("read cache")
-            .expect("cache hit");
-        assert_eq!(cached, payloads);
-
-        let vector_dir = index_root.join("vector");
-        std::fs::create_dir_all(&vector_dir).expect("create vector dir");
-        std::fs::write(vector_dir.join("index.fsvi"), b"mutated").expect("touch vector index");
-
-        let stale = runtime
-            .try_load_search_payload_cache(&key)
-            .expect("cache read after mutation");
-        assert!(
-            stale.is_none(),
-            "cache should invalidate after index changes"
-        );
     }
 
     // ---- Phase 1/2/3: Relentless indexing tests ----

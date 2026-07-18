@@ -17,8 +17,8 @@ use std::process::{Command, Output};
 
 use frankensearch_fsfs::output_schema::SearchHitPayload;
 use frankensearch_fsfs::stream_protocol::{
-    StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson,
-    decode_stream_frame_toon,
+    StreamEvent, StreamEventKind, StreamFrame, TOON_STREAM_RECORD_SEPARATOR_BYTE,
+    decode_stream_frame_ndjson, decode_stream_frame_toon,
 };
 use serde_json::Value;
 
@@ -767,6 +767,52 @@ fn search_stream_ndjson_starts_and_ends_with_terminal_frame() {
             .kind(),
         StreamEventKind::Terminal
     );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.event.kind() == StreamEventKind::Started)
+            .count(),
+        1,
+        "stream must contain exactly one Started frame"
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.event.kind() == StreamEventKind::Terminal)
+            .count(),
+        1,
+        "stream must contain exactly one terminal frame"
+    );
+    for (expected, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame.seq, expected as u64,
+            "stream sequence must be contiguous"
+        );
+    }
+
+    let initial_position = frames
+        .iter()
+        .position(|frame| {
+            matches!(
+                &frame.event,
+                StreamEvent::Progress(progress)
+                    if progress.reason_code == "query.stream.initial_ready"
+            )
+        })
+        .expect("stream must announce Initial readiness");
+    if let Some(final_phase_position) = frames.iter().position(|frame| {
+        matches!(
+            &frame.event,
+            StreamEvent::Progress(progress)
+                if progress.reason_code == "query.stream.refined_ready"
+                    || progress.reason_code == "query.stream.refinement_failed"
+        )
+    }) {
+        assert!(
+            final_phase_position > initial_position,
+            "Refined or RefinementFailed progress must follow Initial"
+        );
+    }
 }
 
 #[test]
