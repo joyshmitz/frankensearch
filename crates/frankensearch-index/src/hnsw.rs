@@ -11,10 +11,13 @@
 //! every live source vector so a stale graph cannot survive an unsampled vector
 //! change. Format v5 records the exact
 //! generation directory and basename selected during atomic publication, so no
-//! save truncates the pair named by installed metadata. Legacy sidecars and any
-//! load failure fall back to the rebuild-from-`VectorIndex` path.
+//! save truncates the pair named by installed metadata. A persistent advisory
+//! save lock and durable in-generation READY receipt serialize writers and let
+//! publication retries reuse complete generations without deleting them.
+//! Legacy sidecars and any load failure fall back to the
+//! rebuild-from-`VectorIndex` path.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -66,6 +69,13 @@ impl Default for HnswConfig {
 /// Older native graphs must be rebuilt under the current persistence contract.
 pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 5;
 
+const HNSW_GENERATION_RECEIPT_VERSION: u32 = 1;
+const HNSW_GENERATION_RECEIPT_FILENAME: &str = ".frankensearch-hnsw-ready.json";
+const HNSW_GENERATION_RECEIPT_MAX_BYTES: usize = 64 * 1024;
+const HNSW_SAVE_LOCK_DIRECTORY: &str = ".frankensearch-hnsw-save-locks";
+
+type HnswMetadataPublisher = fn(&Path, &Path, &[u8]) -> SearchResult<()>;
+
 // Keep the classical gamma_k floating-point error model in its well-conditioned
 // region. With u = f32::EPSILON / 2 and k = 8n + 32, this cap is exactly the
 // largest dimension for which k*u <= 1/4.
@@ -98,8 +108,8 @@ struct HnswMeta {
     #[serde(default)]
     vector_fingerprint: u64,
     /// Directory containing the native graph/data pair, relative to metadata.
-    /// Every save owns a fresh, atomically created generation so `file_dump`
-    /// never truncates the pair referenced by installed metadata.
+    /// Every distinct graph state owns an atomically created generation so
+    /// `file_dump` never truncates the pair referenced by installed metadata.
     #[serde(default)]
     sidecar_generation: Option<String>,
     /// Basename shared by the native `.hnsw.graph` and `.hnsw.data` files.
@@ -110,6 +120,34 @@ struct HnswMeta {
     /// invalidate current-format native loading and force a rebuild.
     #[serde(default)]
     sidecar_basename: Option<String>,
+}
+
+/// Durable proof that an immutable native generation finished writing before
+/// metadata publication was attempted. A later save can validate and reuse the
+/// generation after an interrupted or failed publication without deleting it
+/// or dumping another complete copy.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HnswGenerationReceipt {
+    receipt_version: u32,
+    metadata_file_name: String,
+    format_version: u32,
+    generation: String,
+    sidecar_basename: String,
+    doc_count: usize,
+    doc_ids_fingerprint: u64,
+    vector_fingerprint: u64,
+    dimension: usize,
+    config: HnswConfig,
+    graph: HnswSidecarDigest,
+    data: HnswSidecarDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HnswSidecarDigest {
+    byte_len: u64,
+    fnv1a64: u64,
 }
 
 /// How an HNSW load obtained its in-memory graph.
@@ -348,27 +386,61 @@ impl HnswIndex {
     /// Writes the JSON metadata sidecar (`doc_ids`, config, dimension) at
     /// `path`, plus the native `hnsw_rs` graph and data pair next to it. The
     /// metadata records the exact generation directory and basename returned by
-    /// `hnsw_rs`. Every save dumps into a fresh generation, so neither a newly
-    /// built nor mmap-backed loaded graph can truncate the currently installed
-    /// pair. Vectors are embedded in the native data sidecar; the `VectorIndex`
-    /// is only consulted on a legacy or fallback rebuild.
+    /// `hnsw_rs`. A new graph state dumps into a fresh immutable generation, so
+    /// neither a newly built nor mmap-backed loaded graph can truncate the
+    /// currently installed pair. Equivalent retries validate and reuse a
+    /// durable READY generation left by an uncertain metadata publication.
+    /// Vectors are embedded in the native data sidecar; the `VectorIndex` is
+    /// only consulted on a legacy or fallback rebuild.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::Io` on write/dump failure.
     pub fn save(&self, path: &Path) -> SearchResult<()> {
+        self.save_with_metadata_publisher(path, publish_hnsw_metadata)
+    }
+
+    fn save_with_metadata_publisher(
+        &self,
+        path: &Path,
+        publish_metadata: HnswMetadataPublisher,
+    ) -> SearchResult<()> {
         let parent = path
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
 
+        let requested_basename = hnsw_sidecar_basename(path)?;
+        let metadata_file_name = hnsw_metadata_file_name(path)?;
+        // Serialize writers before any generation is staged. The lock file
+        // lives in a reserved sibling namespace and remains persistent because
+        // removing or replacing it creates an inode race in which two processes
+        // can each hold a different lock.
+        let _save_lock = acquire_hnsw_save_lock(path)?;
+
+        if let Some(meta) = find_reusable_hnsw_generation(
+            self,
+            path,
+            parent,
+            &requested_basename,
+            &metadata_file_name,
+        )? {
+            // A receipt can survive a crash before the generation's parent
+            // directory entry was durable. Re-sync the parent before making
+            // metadata point at it.
+            sync_hnsw_directory(parent)?;
+            let metadata_bytes = serialize_hnsw_metadata(&meta)?;
+            publish_metadata(path, parent, &metadata_bytes)?;
+            return Ok(());
+        }
+
         // Persist into a unique generation first. `hnsw_rs` truncates an
         // occupied basename for freshly built graphs and uses a racy random
         // suffix for loaded graphs; an atomically created directory avoids both
         // behaviors. Metadata remains the sole commit point.
-        let requested_basename = hnsw_sidecar_basename(path)?;
-        let generation_prefix = format!(".{requested_basename}.generation-");
+        let generation_prefix =
+            hnsw_generation_prefix(&requested_basename, self.vector_fingerprint);
         let generation = tempfile::Builder::new()
             .prefix(&generation_prefix)
             .tempdir_in(parent)
@@ -389,23 +461,51 @@ impl HnswIndex {
             .and_then(|name| name.to_str())
             .ok_or_else(|| ann_corrupted(path, "HNSW generation has no UTF-8 directory name"))?;
         let generation_name = validate_hnsw_sidecar_basename(path, generation_name)?;
+        let meta = self.metadata_for_generation(&generation_name, &dumped_basename);
+        let graph_path = generation
+            .path()
+            .join(format!("{dumped_basename}.hnsw.graph"));
+        let data_path = generation
+            .path()
+            .join(format!("{dumped_basename}.hnsw.data"));
+        let receipt = HnswGenerationReceipt {
+            receipt_version: HNSW_GENERATION_RECEIPT_VERSION,
+            metadata_file_name,
+            format_version: HNSW_META_FORMAT_CURRENT,
+            generation: generation_name,
+            sidecar_basename: dumped_basename,
+            doc_count: self.doc_ids.len(),
+            doc_ids_fingerprint: fingerprint_doc_ids(&self.doc_ids),
+            vector_fingerprint: self.vector_fingerprint,
+            dimension: self.dimension,
+            config: self.config,
+            graph: fingerprint_hnsw_sidecar(&graph_path)?,
+            data: fingerprint_hnsw_sidecar(&data_path)?,
+        };
+        write_hnsw_generation_receipt(generation.path(), &receipt)?;
+
+        // From this point onward every retained complete generation has a
+        // durable receipt and is recoverable by a later save. Metadata remains
+        // the atomic authority visible to readers.
         let _generation_path = generation.keep();
         sync_hnsw_directory(parent)?;
 
-        let meta = HnswMeta {
+        let metadata_bytes = serialize_hnsw_metadata(&meta)?;
+        publish_metadata(path, parent, &metadata_bytes)?;
+
+        Ok(())
+    }
+
+    fn metadata_for_generation(&self, generation: &str, basename: &str) -> HnswMeta {
+        HnswMeta {
             format_version: HNSW_META_FORMAT_CURRENT,
             doc_ids: self.doc_ids.clone(),
             config: self.config,
             dimension: self.dimension,
             vector_fingerprint: self.vector_fingerprint,
-            sidecar_generation: Some(generation_name),
-            sidecar_basename: Some(dumped_basename),
-        };
-        let metadata_bytes = serde_json::to_vec(&meta)
-            .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
-        publish_hnsw_metadata(path, parent, &metadata_bytes)?;
-
-        Ok(())
+            sidecar_generation: Some(generation.to_owned()),
+            sidecar_basename: Some(basename.to_owned()),
+        }
     }
 
     /// Run ANN query and return hits plus query diagnostics.
@@ -735,6 +835,326 @@ fn hnsw_sidecar_basename(path: &Path) -> SearchResult<String> {
         .ok_or_else(|| ann_corrupted(path, "ANN sidecar path has no usable file stem"))
 }
 
+fn hnsw_metadata_file_name(path: &Path) -> SearchResult<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ann_corrupted(path, "ANN metadata path has no usable UTF-8 file name"))
+}
+
+fn hnsw_generation_prefix(requested_basename: &str, vector_fingerprint: u64) -> String {
+    format!(".{requested_basename}.generation-{vector_fingerprint:016x}-")
+}
+
+fn hnsw_save_lock_path(path: &Path) -> SearchResult<PathBuf> {
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(HNSW_SAVE_LOCK_DIRECTORY))
+    }) {
+        return Err(ann_corrupted(
+            path,
+            format!(
+                "ANN metadata paths cannot be inside the reserved '{HNSW_SAVE_LOCK_DIRECTORY}' directory"
+            ),
+        ));
+    }
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ann_corrupted(path, "ANN metadata path has no usable file name"))?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(HNSW_SAVE_LOCK_DIRECTORY).join(lock_name))
+}
+
+fn acquire_hnsw_save_lock(path: &Path) -> SearchResult<std::fs::File> {
+    let lock_path = hnsw_save_lock_path(path)?;
+    let lock_directory = lock_path
+        .parent()
+        .ok_or_else(|| ann_corrupted(path, "HNSW save lock has no parent directory"))?;
+    match std::fs::create_dir(lock_directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to create persistent HNSW save-lock directory '{}': {error}",
+                    lock_directory.display()
+                ),
+            )));
+        }
+    }
+    let lock_directory_metadata = std::fs::symlink_metadata(lock_directory).map_err(|error| {
+        SearchError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to inspect persistent HNSW save-lock directory '{}': {error}",
+                lock_directory.display()
+            ),
+        ))
+    })?;
+    if lock_directory_metadata.file_type().is_symlink() || !lock_directory_metadata.is_dir() {
+        return Err(SearchError::Io(std::io::Error::other(format!(
+            "persistent HNSW save-lock directory '{}' is not a local directory",
+            lock_directory.display()
+        ))));
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to open persistent HNSW save lock '{}': {error}",
+                    lock_path.display()
+                ),
+            ))
+        })?;
+    lock.try_lock().map_err(|error| {
+        let error: std::io::Error = error.into();
+        SearchError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to acquire HNSW save lock '{}': {error}; another writer may be saving",
+                lock_path.display()
+            ),
+        ))
+    })?;
+    Ok(lock)
+}
+
+fn serialize_hnsw_metadata(meta: &HnswMeta) -> SearchResult<Vec<u8>> {
+    serde_json::to_vec(meta)
+        .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))
+}
+
+fn find_reusable_hnsw_generation(
+    index: &HnswIndex,
+    metadata_path: &Path,
+    parent: &Path,
+    requested_basename: &str,
+    metadata_file_name: &str,
+) -> SearchResult<Option<HnswMeta>> {
+    let prefix = hnsw_generation_prefix(requested_basename, index.vector_fingerprint);
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(parent).map_err(SearchError::Io)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::debug!(
+                    path = %metadata_path.display(),
+                    ?error,
+                    "ignoring unreadable HNSW generation directory entry"
+                );
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        if file_name
+            .to_str()
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            candidates.push(entry.path());
+        }
+    }
+    candidates.sort_unstable();
+
+    for generation in candidates {
+        match reusable_hnsw_generation(index, metadata_path, &generation, metadata_file_name) {
+            Ok(Some(meta)) => return Ok(Some(meta)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    path = %metadata_path.display(),
+                    generation = %generation.display(),
+                    ?error,
+                    "ignoring invalid HNSW READY generation"
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn reusable_hnsw_generation(
+    index: &HnswIndex,
+    metadata_path: &Path,
+    generation_path: &Path,
+    metadata_file_name: &str,
+) -> SearchResult<Option<HnswMeta>> {
+    let Some(generation_name) = generation_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let generation_name = validate_hnsw_sidecar_basename(metadata_path, generation_name)?;
+    let receipt_path = generation_path.join(HNSW_GENERATION_RECEIPT_FILENAME);
+    let Ok(generation_metadata) = std::fs::symlink_metadata(generation_path) else {
+        return Ok(None);
+    };
+    let Ok(receipt_metadata) = std::fs::symlink_metadata(&receipt_path) else {
+        return Ok(None);
+    };
+    if generation_metadata.file_type().is_symlink()
+        || !generation_metadata.is_dir()
+        || receipt_metadata.file_type().is_symlink()
+        || !receipt_metadata.is_file()
+    {
+        return Ok(None);
+    }
+    let Ok(receipt_len) = usize::try_from(receipt_metadata.len()) else {
+        return Ok(None);
+    };
+    if receipt_len > HNSW_GENERATION_RECEIPT_MAX_BYTES {
+        return Ok(None);
+    }
+
+    let receipt_file = std::fs::File::open(&receipt_path).map_err(SearchError::Io)?;
+    let opened_receipt_metadata = receipt_file.metadata().map_err(SearchError::Io)?;
+    if !opened_receipt_metadata.is_file() || opened_receipt_metadata.len() != receipt_metadata.len()
+    {
+        return Ok(None);
+    }
+    let receipt_read_limit = u64::try_from(HNSW_GENERATION_RECEIPT_MAX_BYTES)
+        .map_err(|_| SearchError::Io(std::io::Error::other("HNSW receipt limit exceeds u64")))?
+        .saturating_add(1);
+    let mut receipt_bytes = Vec::with_capacity(receipt_len);
+    receipt_file
+        .take(receipt_read_limit)
+        .read_to_end(&mut receipt_bytes)
+        .map_err(SearchError::Io)?;
+    if receipt_bytes.len() > HNSW_GENERATION_RECEIPT_MAX_BYTES {
+        return Ok(None);
+    }
+    let receipt: HnswGenerationReceipt =
+        serde_json::from_slice(&receipt_bytes).map_err(|error| {
+            ann_corrupted(
+                metadata_path,
+                format!("failed to parse HNSW generation receipt: {error}"),
+            )
+        })?;
+
+    if receipt.receipt_version != HNSW_GENERATION_RECEIPT_VERSION
+        || receipt.metadata_file_name != metadata_file_name
+        || receipt.format_version != HNSW_META_FORMAT_CURRENT
+        || receipt.generation.as_str().ne(generation_name.as_str())
+        || receipt.doc_count != index.doc_ids.len()
+        || receipt.doc_ids_fingerprint != fingerprint_doc_ids(&index.doc_ids)
+        || receipt.vector_fingerprint != index.vector_fingerprint
+        || receipt.dimension != index.dimension
+        || receipt.config != index.config
+    {
+        return Ok(None);
+    }
+
+    let basename = validate_hnsw_sidecar_basename(metadata_path, &receipt.sidecar_basename)?;
+    let graph = generation_path.join(format!("{basename}.hnsw.graph"));
+    let data = generation_path.join(format!("{basename}.hnsw.data"));
+    if !native_sidecar_pair_is_local(metadata_path, generation_path, &graph, &data) {
+        return Ok(None);
+    }
+    if fingerprint_hnsw_sidecar(&graph)? != receipt.graph
+        || fingerprint_hnsw_sidecar(&data)? != receipt.data
+    {
+        return Ok(None);
+    }
+
+    // Byte identity alone is not enough: a complete pair can still be
+    // semantically unreadable after a native-format change or a faulty dump.
+    // Republishing such a receipt would make every fallback rebuild select the
+    // same broken generation again. Prove that the current reader can load the
+    // pair before treating it as reusable.
+    if !hnsw_generation_is_loadable(
+        generation_path,
+        &basename,
+        &graph,
+        index.doc_ids.len(),
+        index.dimension,
+    ) {
+        tracing::debug!(
+            path = %metadata_path.display(),
+            generation = %generation_path.display(),
+            "ignoring digest-valid but unloadable HNSW READY generation"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(
+        index.metadata_for_generation(&generation_name, &basename),
+    ))
+}
+
+fn hnsw_generation_is_loadable(
+    generation_path: &Path,
+    basename: &str,
+    graph_path: &Path,
+    expected_points: usize,
+    expected_dimension: usize,
+) -> bool {
+    let Ok(graph_file) = std::fs::File::open(graph_path) else {
+        return false;
+    };
+    let mut graph_reader = std::io::BufReader::new(graph_file);
+    let description = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        hnsw_rs::prelude::load_description(&mut graph_reader)
+    }));
+    let Ok(Ok(description)) = description else {
+        return false;
+    };
+    if description.nb_point != expected_points
+        || (expected_points != 0 && description.dimension != expected_dimension)
+    {
+        return false;
+    }
+
+    // `hnsw_rs` currently unwraps a few native-parser results internally. Keep
+    // corrupt retained generations on the normal reject-and-redump path rather
+    // than letting a validation-only reuse probe unwind through `save()`.
+    let mut native_io = HnswIo::new(generation_path, basename);
+    matches!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            native_io
+                .load_hnsw::<f32, DistDot>()
+                .map(|candidate| candidate.get_nb_point())
+        })),
+        Ok(Ok(points)) if points == expected_points
+    )
+}
+
+fn write_hnsw_generation_receipt(
+    generation_path: &Path,
+    receipt: &HnswGenerationReceipt,
+) -> SearchResult<()> {
+    let bytes = serde_json::to_vec(receipt)
+        .map_err(|error| SearchError::Io(std::io::Error::other(error.to_string())))?;
+    if bytes.len() > HNSW_GENERATION_RECEIPT_MAX_BYTES {
+        return Err(SearchError::Io(std::io::Error::other(format!(
+            "HNSW generation receipt exceeds {} bytes",
+            HNSW_GENERATION_RECEIPT_MAX_BYTES
+        ))));
+    }
+
+    let receipt_path = generation_path.join(HNSW_GENERATION_RECEIPT_FILENAME);
+    let mut receipt_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&receipt_path)
+        .map_err(SearchError::Io)?;
+    receipt_file.write_all(&bytes).map_err(SearchError::Io)?;
+    receipt_file.sync_all().map_err(SearchError::Io)?;
+    sync_hnsw_directory(generation_path)
+}
+
 fn persisted_hnsw_sidecar_location(
     path: &Path,
     meta: &HnswMeta,
@@ -863,6 +1283,11 @@ fn sync_hnsw_directory(directory: &Path) -> SearchResult<()> {
 }
 
 fn publish_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResult<()> {
+    install_hnsw_metadata(path, parent, bytes)?;
+    sync_hnsw_directory(parent)
+}
+
+fn install_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResult<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
     temporary.write_all(bytes).map_err(SearchError::Io)?;
     temporary.as_file().sync_all().map_err(SearchError::Io)?;
@@ -876,7 +1301,7 @@ fn publish_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResu
             ),
         ))
     })?;
-    sync_hnsw_directory(parent)
+    Ok(())
 }
 
 /// FNV-1a 64-bit. Chosen because it is deterministic across processes (unlike
@@ -894,6 +1319,58 @@ fn fnv1a_update(mut h: u64, bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(FNV_PRIME_64);
     }
     h
+}
+
+fn fingerprint_doc_ids(doc_ids: &[String]) -> u64 {
+    let mut h = fnv1a_update(FNV_OFFSET_BASIS_64, &doc_ids.len().to_le_bytes());
+    for (index, doc_id) in doc_ids.iter().enumerate() {
+        h = fnv1a_update(h, &index.to_le_bytes());
+        h = fnv1a_update(h, &doc_id.len().to_le_bytes());
+        h = fnv1a_update(h, doc_id.as_bytes());
+    }
+    h
+}
+
+fn fingerprint_hnsw_sidecar(path: &Path) -> SearchResult<HnswSidecarDigest> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        SearchError::Io(std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to open HNSW sidecar '{}' for READY receipt: {error}",
+                path.display()
+            ),
+        ))
+    })?;
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut byte_len = 0_u64;
+    let mut fingerprint = FNV_OFFSET_BASIS_64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to read HNSW sidecar '{}' for READY receipt: {error}",
+                    path.display()
+                ),
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        let read_u64 = u64::try_from(read).map_err(|_| {
+            SearchError::Io(std::io::Error::other(
+                "HNSW sidecar read length exceeds u64",
+            ))
+        })?;
+        byte_len = byte_len.checked_add(read_u64).ok_or_else(|| {
+            SearchError::Io(std::io::Error::other("HNSW sidecar length exceeds u64"))
+        })?;
+        fingerprint = fnv1a_update(fingerprint, &buffer[..read]);
+    }
+    Ok(HnswSidecarDigest {
+        byte_len,
+        fnv1a64: fingerprint,
+    })
 }
 
 /// Feed an `&[f32]` into the FNV-1a state in little-endian byte order without
@@ -1207,6 +1684,46 @@ mod tests {
         }
         writer.finish()?;
         VectorIndex::open(path)
+    }
+
+    fn reject_hnsw_metadata_publish(_: &Path, _: &Path, _: &[u8]) -> SearchResult<()> {
+        Err(SearchError::Io(std::io::Error::other(
+            "injected metadata publication failure",
+        )))
+    }
+
+    fn install_then_report_parent_sync_failure(
+        path: &Path,
+        parent: &Path,
+        bytes: &[u8],
+    ) -> SearchResult<()> {
+        install_hnsw_metadata(path, parent, bytes)?;
+        Err(SearchError::Io(std::io::Error::other(
+            "injected post-rename parent sync failure",
+        )))
+    }
+
+    fn ready_generation_paths(metadata_path: &Path, vector_fingerprint: u64) -> Vec<PathBuf> {
+        let parent = metadata_path.parent().unwrap_or_else(|| Path::new("."));
+        let basename = hnsw_sidecar_basename(metadata_path).expect("metadata basename");
+        let prefix = hnsw_generation_prefix(&basename, vector_fingerprint);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(parent)
+            .expect("read metadata parent")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix))
+                    && entry
+                        .path()
+                        .join(HNSW_GENERATION_RECEIPT_FILENAME)
+                        .is_file()
+            })
+            .map(|entry| entry.path())
+            .collect();
+        paths.sort_unstable();
+        paths
     }
 
     fn recall_at_k(approx: &[VectorHit], exact: &[VectorHit]) -> f64 {
@@ -1942,6 +2459,303 @@ mod tests {
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0010");
         assert!((hits[0].score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn save_retry_reuses_ready_generation_after_pre_publish_error() {
+        let source_path = temp_path("ready-pre-publish-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("ready-pre-publish", "hnsw");
+
+        let error = ann
+            .save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("injected publication failure");
+        assert!(matches!(&error, SearchError::Io(_)));
+        assert!(
+            !metadata_path.exists(),
+            "pre-publication failure must leave metadata absent"
+        );
+        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(before.len(), 1, "one complete READY generation retained");
+        let retained_generation = before[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("retained generation name")
+            .to_owned();
+
+        ann.save(&metadata_path).expect("retry READY publication");
+        let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(
+            after, before,
+            "retry must reuse the complete generation instead of dumping another"
+        );
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        assert_eq!(
+            metadata.sidecar_generation.as_deref(),
+            Some(retained_generation.as_str())
+        );
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("native load after retry");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    #[test]
+    fn save_retry_after_metadata_rename_sync_uncertainty_reuses_generation() {
+        let source_path = temp_path("ready-post-rename-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("ready-post-rename", "hnsw");
+
+        let error = ann
+            .save_with_metadata_publisher(&metadata_path, install_then_report_parent_sync_failure)
+            .expect_err("injected post-rename sync failure");
+        assert!(matches!(error, SearchError::Io(_)));
+        assert!(
+            metadata_path.is_file(),
+            "metadata rename may already be visible when parent sync fails"
+        );
+        let installed: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        let installed_generation = installed
+            .sidecar_generation
+            .as_deref()
+            .expect("installed generation")
+            .to_owned();
+        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(before.len(), 1);
+
+        ann.save(&metadata_path)
+            .expect("retry durability-uncertain publication");
+        let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(
+            after, before,
+            "retry must not strand the installed generation"
+        );
+        let repaired: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read repaired metadata"))
+                .expect("parse repaired metadata");
+        assert_eq!(
+            repaired.sidecar_generation.as_deref(),
+            Some(installed_generation.as_str())
+        );
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("native load after durability retry");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    #[test]
+    fn save_lock_contention_fails_before_dump() {
+        let source_path = temp_path("save-lock-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("save-lock", "hnsw");
+        let lock = acquire_hnsw_save_lock(&metadata_path).expect("hold save lock");
+
+        let error = ann
+            .save(&metadata_path)
+            .expect_err("contending save must fail before staging");
+        assert!(matches!(&error, SearchError::Io(_)));
+        assert!(
+            error.to_string().contains("another writer may be saving"),
+            "lock failure should be actionable: {error}"
+        );
+        assert!(!metadata_path.exists());
+        assert!(
+            ready_generation_paths(&metadata_path, ann.vector_fingerprint).is_empty(),
+            "contending writer must not dump a generation"
+        );
+
+        drop(lock);
+        ann.save(&metadata_path)
+            .expect("persistent lock file remains reusable after holder exits");
+        assert_eq!(
+            ready_generation_paths(&metadata_path, ann.vector_fingerprint).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn save_ignores_mismatched_ready_receipt() {
+        let source_path = temp_path("ready-mismatch-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("ready-mismatch", "hnsw");
+        ann.save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("retain unpublished READY generation");
+        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(before.len(), 1);
+        let rejected_generation = before[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name")
+            .to_owned();
+        let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
+        let mut receipt: HnswGenerationReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
+                .expect("parse receipt");
+        receipt.config.m = receipt.config.m.saturating_add(1);
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize mismatched receipt"),
+        )
+        .expect("write mismatched receipt");
+
+        ann.save(&metadata_path)
+            .expect("save past mismatched retained receipt");
+        let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(
+            after.len(),
+            2,
+            "invalid retained receipt must remain untouched while a fresh generation is published"
+        );
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        assert_ne!(
+            metadata.sidecar_generation.as_deref(),
+            Some(rejected_generation.as_str())
+        );
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("native load after rejecting receipt");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    #[test]
+    fn save_ignores_digest_valid_but_unloadable_ready_generation() {
+        let source_path = temp_path("ready-unloadable-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("ready-unloadable", "hnsw");
+        ann.save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("retain unpublished READY generation");
+        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(before.len(), 1);
+        let rejected_generation = before[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name")
+            .to_owned();
+        let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
+        let mut receipt: HnswGenerationReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
+                .expect("parse receipt");
+        let corrupt_basename = &receipt.sidecar_basename;
+        let data_path = before[0].join(format!("{corrupt_basename}.hnsw.data"));
+        std::fs::write(&data_path, b"not loadable HNSW vector data").expect("corrupt data fixture");
+        receipt.data = fingerprint_hnsw_sidecar(&data_path).expect("fingerprint corrupt data");
+        std::fs::write(
+            &receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize updated receipt"),
+        )
+        .expect("make corrupt pair digest-valid");
+
+        ann.save(&metadata_path)
+            .expect("save past unloadable retained generation");
+        let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(
+            after.len(),
+            2,
+            "an unloadable generation must not trap rebuild-save in a reuse loop"
+        );
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        assert_ne!(
+            metadata.sidecar_generation.as_deref(),
+            Some(rejected_generation.as_str())
+        );
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("native load after rejecting unloadable generation");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    #[test]
+    fn save_ignores_oversized_ready_receipt() {
+        let source_path = temp_path("ready-oversized-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("ready-oversized", "hnsw");
+        ann.save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("retain unpublished READY generation");
+        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(before.len(), 1);
+        let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
+        std::fs::write(
+            receipt_path,
+            vec![b' '; HNSW_GENERATION_RECEIPT_MAX_BYTES + 1],
+        )
+        .expect("write oversized receipt fixture");
+
+        ann.save(&metadata_path)
+            .expect("save past oversized retained receipt");
+        assert_eq!(
+            ready_generation_paths(&metadata_path, ann.vector_fingerprint).len(),
+            2,
+            "oversized retained receipt must be ignored without removing it"
+        );
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("native load after rejecting oversized receipt");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    #[test]
+    fn save_lock_namespace_prevents_metadata_name_collision() {
+        let source_path = temp_path("save-lock-namespace-source", "fsvi");
+        let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("save-lock-namespace", "hnsw");
+        let held_lock = acquire_hnsw_save_lock(&metadata_path).expect("hold save lock");
+        let lock_path = hnsw_save_lock_path(&metadata_path).expect("lock path");
+
+        let mut old_lock_name = metadata_path
+            .file_name()
+            .expect("metadata file name")
+            .to_os_string();
+        old_lock_name.push(".lock");
+        let formerly_colliding_metadata_path = metadata_path.with_file_name(old_lock_name);
+        ann.save(&formerly_colliding_metadata_path)
+            .expect("adjacent .lock metadata name is isolated from the lock namespace");
+        assert!(lock_path.is_file(), "held lock inode must remain installed");
+
+        let contention = ann
+            .save(&metadata_path)
+            .expect_err("original metadata path must remain locked");
+        assert!(
+            contention
+                .to_string()
+                .contains("another writer may be saving")
+        );
+
+        let reserved_path_error = ann
+            .save(&lock_path)
+            .expect_err("metadata cannot overwrite the reserved lock namespace");
+        assert!(
+            reserved_path_error
+                .to_string()
+                .contains(HNSW_SAVE_LOCK_DIRECTORY)
+        );
+
+        drop(held_lock);
+        ann.save(&metadata_path)
+            .expect("original path saves after lock release");
     }
 
     #[test]
