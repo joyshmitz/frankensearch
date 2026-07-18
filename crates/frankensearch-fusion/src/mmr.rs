@@ -409,7 +409,6 @@ mod tests {
             enabled: true,
             lambda: 0.55,
             candidate_pool: 1000,
-            ..Default::default()
         };
         for &dim in &[8_usize, 64, 384] {
             for &n in &[3_usize, 16, 60] {

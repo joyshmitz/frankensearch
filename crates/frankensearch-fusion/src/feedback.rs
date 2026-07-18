@@ -732,7 +732,7 @@ mod tests {
 
         for i in 0..5 {
             fc.record_signal(&FeedbackSignal::Click {
-                doc_id: format!("doc{i}").into(),
+                doc_id: format!("doc{i}"),
                 rank: 1,
             });
         }

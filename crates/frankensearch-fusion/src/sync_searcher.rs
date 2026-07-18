@@ -249,7 +249,12 @@ impl SyncTwoTierSearcher {
     /// `0.5`): a scaled semantic weight that reaches `<= 0` is treated as neutral `1.0` by the
     /// tier-weight sanitizer, which would *undo* the down-weight rather than maximize it.
     #[must_use]
-    pub fn with_nqc_dense_downweight(mut self, beta: f32, w_min: f32, weight: NqcDenseWeight) -> Self {
+    pub fn with_nqc_dense_downweight(
+        mut self,
+        beta: f32,
+        w_min: f32,
+        weight: NqcDenseWeight,
+    ) -> Self {
         self.nqc_downweight_beta = beta;
         self.nqc_downweight_w_min = w_min;
         self.nqc_dense_weight = weight;
@@ -326,9 +331,11 @@ impl SyncTwoTierSearcher {
         } else {
             nqc_cv_iter(lexical.iter().map(|hit| hit.score))
         };
-        let factor =
-            self.nqc_dense_weight
-                .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
+        let factor = self.nqc_dense_weight.dense_weight(
+            cv,
+            self.nqc_downweight_beta,
+            self.nqc_downweight_w_min,
+        );
         self.rrf_semantic_weight * f64::from(factor)
     }
 
@@ -629,6 +636,9 @@ impl std::fmt::Debug for SyncTwoTierSearcher {
             .field("rrf_semantic_weight", &self.rrf_semantic_weight)
             .field("rrf_tiebreak", &self.rrf_tiebreak)
             .field("nqc_downweight_beta", &self.nqc_downweight_beta)
+            .field("nqc_downweight_w_min", &self.nqc_downweight_w_min)
+            .field("nqc_dense_weight", &self.nqc_dense_weight)
+            .field("nqc_adaptive", &self.nqc_adaptive)
             .finish()
     }
 }
@@ -1075,7 +1085,10 @@ mod tests {
         let (neutral_res, _) = neutral.search_collect(&q, 3).unwrap();
         let (down_res, _) = downweighted.search_collect(&q, 3).unwrap();
         assert!(!neutral_res.is_empty() && !down_res.is_empty());
-        assert_eq!(down_res[0].doc_id, "c", "zeroing the dense tier lets lexical dominate");
+        assert_eq!(
+            down_res[0].doc_id, "c",
+            "zeroing the dense tier lets lexical dominate"
+        );
         assert_ne!(
             neutral_res[0].doc_id, down_res[0].doc_id,
             "the NQC dense down-weight must change the fused top (it reaches fusion)"

@@ -57,7 +57,9 @@ impl HubnessConfig {
     }
 }
 
-/// Query-time: demote hub docs in a candidate pool. `hubness[hit.index as usize]` is the doc's
+/// Query-time: demote hub docs in a candidate pool.
+///
+/// `hubness[hit.index as usize]` is the doc's
 /// precomputed `r_d` (from [`compute_query_hubness`]); a candidate whose index is out of range
 /// gets no penalty. Returns a new pool with the same docs/indices and corrected scores, ready
 /// to be re-sorted. Pure O(pool) transform; clones unchanged on an identity config.
@@ -83,7 +85,9 @@ pub fn apply_hubness_penalty(
         .collect()
 }
 
-/// Offline/amortized: per-doc query-hubness `r_d` = mean cosine of doc `d` to its `kq` nearest
+/// Offline/amortized: per-doc query-hubness `r_d`.
+///
+/// Computed as the mean cosine of doc `d` to its `kq` nearest
 /// queries in a background sample. Both `doc_vecs` and `query_sample` must be **L2-normalized**
 /// (dot = cosine). Returns one `r_d` per doc in `doc_vecs` order (aligned with the vector-store
 /// index, so it indexes directly in [`apply_hubness_penalty`]). Empty sample / `kq == 0` → all

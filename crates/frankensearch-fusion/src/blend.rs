@@ -582,7 +582,7 @@ mod tests {
     /// `Some`-filtered `VectorHit` projection of `fast` — the materialized path
     /// the sync searcher used before. Covers the cases that drive the proof:
     /// docs with/without quality scores, distinct fast vs quality rankings, and
-    /// a duplicate doc_id (where the two-loop→single-pass merge could diverge).
+    /// a duplicate `doc_id` (where the two-loop→single-pass merge could diverge).
     #[test]
     fn aligned_blend_is_bit_identical_to_materialized() {
         let fast = vec![

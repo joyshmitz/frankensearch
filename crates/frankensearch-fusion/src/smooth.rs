@@ -518,11 +518,11 @@ mod tests {
                 mutual: true,
             },
         );
-        let d_m = mutual.iter().find(|h| h.doc_id == "d").unwrap();
+        let doc_d = mutual.iter().find(|h| h.doc_id == "d").unwrap();
         assert!(
-            (d_m.score - 0.20).abs() < 1e-6,
+            (doc_d.score - 0.20).abs() < 1e-6,
             "mutual one-way ignored: {}",
-            d_m.score
+            doc_d.score
         );
     }
 

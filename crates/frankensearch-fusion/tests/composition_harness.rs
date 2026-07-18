@@ -227,7 +227,7 @@ fn three_way_composition_deterministic_under_mixed_signals() {
             user_signal: Some(true),
         });
         fc.record_signal(&FeedbackSignal::Click {
-            doc_id: format!("doc{i}").into(),
+            doc_id: format!("doc{i}"),
             rank: 1,
         });
     }

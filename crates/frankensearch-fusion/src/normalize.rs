@@ -91,6 +91,7 @@ pub fn nqc_cv(scores: &[f32]) -> f32 {
 
 /// Iterator form of [`nqc_cv`] for callers whose scores already live inside another record type.
 /// Keeps the exact same accumulation order without materializing a temporary score vector.
+#[allow(clippy::cast_possible_truncation)] // a coefficient of variation is far inside f32 range
 pub(crate) fn nqc_cv_iter(scores: impl IntoIterator<Item = f32>) -> f32 {
     let mut sum = 0.0_f64;
     let mut sum_sq = 0.0_f64;
@@ -111,7 +112,7 @@ pub(crate) fn nqc_cv_iter(scores: impl IntoIterator<Item = f32>) -> f32 {
     if mean <= f64::from(NUMERIC_EPSILON) {
         return 0.0;
     }
-    let variance = (sum_sq / n - mean * mean).max(0.0);
+    let variance = (sum_sq / n - mean.powi(2)).max(0.0);
     (variance.sqrt() / mean) as f32
 }
 
@@ -249,7 +250,9 @@ impl NqcDenseWeight {
     }
 }
 
-/// A bounded rolling sample of observed query NQC values that rebuilds a [`NqcDenseWeight`]
+/// A bounded rolling sample of observed query NQC values.
+///
+/// Rebuilds a [`NqcDenseWeight`]
 /// on demand — the deployment source [`NqcDenseWeight`]'s docs call for ("a rolling sample of
 /// observed NQC values (the query stream); rebuild periodically"). Retains the most-recent
 /// `capacity` observations so the installed sketch tracks the live query distribution rather
@@ -389,7 +392,9 @@ impl NqcCvSampler {
     }
 }
 
-/// A self-driving rolling NQC dense down-weight: owns an [`NqcCvSampler`] plus a cached
+/// A self-driving rolling NQC dense down-weight.
+///
+/// Owns an [`NqcCvSampler`] plus a cached
 /// [`NqcDenseWeight`], observes each query's NQC, and periodically rebuilds the percentile
 /// sketch so the down-weight tracks the live query distribution with no external sample
 /// management. This is the deployment brain that turns the (dormant) static
@@ -822,13 +827,13 @@ mod tests {
 
     #[test]
     fn nqc_cv_zero_variance_is_zero() {
-        assert_eq!(nqc_cv(&[5.0, 5.0, 5.0]), 0.0);
+        assert_eq!(nqc_cv(&[5.0, 5.0, 5.0]).to_bits(), 0);
     }
 
     #[test]
     fn nqc_cv_empty_and_no_finite_is_zero() {
-        assert_eq!(nqc_cv(&[]), 0.0);
-        assert_eq!(nqc_cv(&[f32::NAN, f32::INFINITY]), 0.0);
+        assert_eq!(nqc_cv(&[]).to_bits(), 0);
+        assert_eq!(nqc_cv(&[f32::NAN, f32::INFINITY]).to_bits(), 0);
     }
 
     #[test]
@@ -929,9 +934,17 @@ mod tests {
     #[test]
     fn nqc_weight_empty_and_beta_zero_are_neutral() {
         let empty = NqcDenseWeight::default();
-        assert_eq!(empty.dense_weight(1.23, 0.5, 0.0), 1.0, "empty -> neutral");
+        assert_eq!(
+            empty.dense_weight(1.23, 0.5, 0.0).to_bits(),
+            1.0f32.to_bits(),
+            "empty -> neutral"
+        );
         let w = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3]);
-        assert_eq!(w.dense_weight(0.3, 0.0, 0.0), 1.0, "beta=0 -> neutral");
+        assert_eq!(
+            w.dense_weight(0.3, 0.0, 0.0).to_bits(),
+            1.0f32.to_bits(),
+            "beta=0 -> neutral"
+        );
     }
 
     #[test]

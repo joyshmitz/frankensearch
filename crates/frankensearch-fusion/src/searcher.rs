@@ -62,9 +62,9 @@ use crate::graph_rank::GraphRanker;
 use crate::mmr::MmrConfig;
 #[cfg(feature = "rerank")]
 use crate::mmr::mmr_rerank;
+use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::phase_gate::{PhaseGate, PhaseGateConfig, PhaseObservation};
 use crate::prf::{PrfConfig, prf_expand};
-use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
 static TELEMETRY_EVENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -168,6 +168,42 @@ pub struct TwoTierSearcher {
     /// When set, `with_quality_embedder` auto-wraps with `CachedEmbedder`.
     embedding_cache_capacity: Option<usize>,
     resource_cpu_state: Mutex<Option<CpuJiffiesSnapshot>>,
+}
+
+/// Candidate pools retained from Phase 1 for Phase-2 refinement.
+///
+/// The Initial display stays bounded to `k`, but refinement must see the
+/// full `k * candidate_multiplier` pool: quality scores can promote
+/// candidates that never reached the displayed page, and the lexical pool is
+/// re-fused against blended vector scores without a second lexical query
+/// (sync-searcher parity, bd-tm83).
+struct RefinementPools {
+    /// Semantic pool after calibration, exclusion filtering, and pool
+    /// corrections — exactly what Phase-1 fusion consumed.
+    fast_hits: Vec<VectorHit>,
+    /// Lexical pool after exclusion filtering. `None` when no lexical
+    /// subsystem is configured; `Some` (possibly empty) when one answered.
+    lexical: Option<Vec<ScoredResult>>,
+}
+
+/// Phase-1 fused results plus the refinement pools when refinement is
+/// meaningful. Short-circuit and fallback exits carry no pools because the
+/// Phase-2 gate cannot open on those paths.
+struct Phase1Outcome {
+    /// Fused candidates bounded to `k * candidate_multiplier`.
+    results: Vec<ScoredResult>,
+    /// Retained pools for Phase-2 refinement, when applicable.
+    pools: Option<RefinementPools>,
+}
+
+impl Phase1Outcome {
+    /// Wrap an exit that carries no refinement pools.
+    fn without_pools(results: Vec<ScoredResult>) -> Self {
+        Self {
+            results,
+            pools: None,
+        }
+    }
 }
 
 impl TwoTierSearcher {
@@ -284,7 +320,12 @@ impl TwoTierSearcher {
     /// applies at PHASE-1 only; phase-2 refines the vector tiers from that seeded ranking (see
     /// the async-wiring trace in `docs/NEGATIVE_EVIDENCE.md`) — validate the refined effect via A/B.
     #[must_use]
-    pub fn with_nqc_dense_downweight(mut self, beta: f32, w_min: f32, weight: NqcDenseWeight) -> Self {
+    pub fn with_nqc_dense_downweight(
+        mut self,
+        beta: f32,
+        w_min: f32,
+        weight: NqcDenseWeight,
+    ) -> Self {
         self.nqc_downweight_beta = beta;
         self.nqc_downweight_w_min = w_min;
         self.nqc_dense_weight = weight;
@@ -361,9 +402,11 @@ impl TwoTierSearcher {
         } else {
             nqc_cv_iter(lexical.iter().map(|hit| hit.score))
         };
-        let factor =
-            self.nqc_dense_weight
-                .dense_weight(cv, self.nqc_downweight_beta, self.nqc_downweight_w_min);
+        let factor = self.nqc_dense_weight.dense_weight(
+            cv,
+            self.nqc_downweight_beta,
+            self.nqc_downweight_w_min,
+        );
         self.rrf_semantic_weight * f64::from(factor)
     }
 
@@ -746,8 +789,8 @@ impl TwoTierSearcher {
             .await;
         metrics.phase1_total_ms = phase1_start.elapsed().as_secs_f64() * 1000.0;
 
-        let initial_hits = match initial {
-            Ok(results) => results,
+        let (initial_hits, refinement_pools) = match initial {
+            Ok(outcome) => (outcome.results, outcome.pools),
             Err(err) => {
                 self.export_error(&err);
                 if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
@@ -833,7 +876,8 @@ impl TwoTierSearcher {
                 semantic_query,
                 query_class,
                 k,
-                &display_hits,
+                &initial_hits,
+                refinement_pools.as_ref(),
                 &text_fn,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
@@ -1166,7 +1210,7 @@ impl TwoTierSearcher {
         text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
-    ) -> SearchResult<Vec<ScoredResult>> {
+    ) -> SearchResult<Phase1Outcome> {
         let candidate_target = self.conformal_candidate_target(k);
         let base_candidates =
             candidate_count(candidate_target, 0, self.config.candidate_multiplier.max(1));
@@ -1212,7 +1256,9 @@ impl TwoTierSearcher {
                     metrics.semantic_candidates = 0;
                     metrics.vector_search_ms = 0.0;
                     metrics.rrf_fusion_ms = 0.0;
-                    return Ok(results.into_iter().take(k).collect());
+                    return Ok(Phase1Outcome::without_pools(
+                        results.into_iter().take(k).collect(),
+                    ));
                 }
                 Err(e) => {
                     metrics.lexical_search_ms = start_lex.elapsed().as_secs_f64() * 1000.0;
@@ -1339,7 +1385,9 @@ impl TwoTierSearcher {
             metrics.semantic_candidates = 0;
             metrics.vector_search_ms = 0.0;
             metrics.rrf_fusion_ms = 0.0;
-            return Ok(lexical.into_iter().take(k).collect());
+            return Ok(Phase1Outcome::without_pools(
+                lexical.into_iter().take(k).collect(),
+            ));
         }
 
         match fast_embed_result {
@@ -1384,7 +1432,9 @@ impl TwoTierSearcher {
                     metrics.semantic_candidates = 0;
                     metrics.phase1_vectors_searched = 0;
                     metrics.vector_search_ms = 0.0;
-                    return Ok(lexical.into_iter().take(base_candidates).collect());
+                    return Ok(Phase1Outcome::without_pools(
+                        lexical.into_iter().take(base_candidates).collect(),
+                    ));
                 }
 
                 // Vector search.
@@ -1527,7 +1577,13 @@ impl TwoTierSearcher {
                 }
                 metrics.rrf_fusion_ms = fuse_start.elapsed().as_secs_f64() * 1000.0;
 
-                Ok(results)
+                Ok(Phase1Outcome {
+                    results,
+                    pools: Some(RefinementPools {
+                        fast_hits,
+                        lexical: lexical_results,
+                    }),
+                })
             }
             Err(embed_err) => {
                 if let Some(root_request_id) = root_request_id {
@@ -1567,7 +1623,9 @@ impl TwoTierSearcher {
                         )
                         .await?;
                     metrics.skip_reason = Some("fast_embed_failed".to_owned());
-                    Ok(lexical.into_iter().take(k).collect())
+                    Ok(Phase1Outcome::without_pools(
+                        lexical.into_iter().take(k).collect(),
+                    ))
                 } else {
                     Err(embed_err)
                 }
@@ -1611,6 +1669,7 @@ impl TwoTierSearcher {
         query_class: QueryClass,
         k: usize,
         initial_results: &[ScoredResult],
+        pools: Option<&RefinementPools>,
         _text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
@@ -1706,18 +1765,26 @@ impl TwoTierSearcher {
             }
         }
 
-        // Get quality scores for top candidates from initial phase.
+        // Get quality scores for the full retained semantic pool (not just
+        // the displayed page): quality can promote candidates that never
+        // reached the Initial top-k (bd-tm83). When the caller supplied no
+        // pools, fall back to reconstructing the pool from `initial_results`.
         let search_start = Instant::now();
-        let fast_hits: Vec<VectorHit> = initial_results
-            .iter()
-            .map(|r| VectorHit {
-                index: r.index.unwrap_or(u32::MAX),
-                // Keep missing semantic-fast source at 0.0 so blending semantics
-                // remain consistent with blend_two_tier contract.
-                score: r.fast_score.unwrap_or(0.0_f32),
-                doc_id: r.doc_id.clone(),
-            })
-            .collect();
+        let fast_hits: Vec<VectorHit> = pools.map_or_else(
+            || {
+                initial_results
+                    .iter()
+                    .map(|r| VectorHit {
+                        index: r.index.unwrap_or(u32::MAX),
+                        // Keep missing semantic-fast source at 0.0 so blending semantics
+                        // remain consistent with blend_two_tier contract.
+                        score: r.fast_score.unwrap_or(0.0_f32),
+                        doc_id: r.doc_id.clone(),
+                    })
+                    .collect()
+            },
+            |pools| pools.fast_hits.clone(),
+        );
         // NOTE: Do NOT calibrate fast_hits here — these scores were already calibrated
         // in Phase 1 (line ~894) and stored in ScoredResult.fast_score. Applying
         // calibration again would double-transform the scores, destroying discriminative
@@ -1810,6 +1877,175 @@ impl TwoTierSearcher {
             }
         }
 
+        // Shared refined-phase explanation builder. `rank_map` supplies the
+        // phase-1 ordering the movement delta is measured against: the fast
+        // pool order for the blend-only path, the fused order for the
+        // lexical re-fusion path.
+        let build_refined_explanation = |final_score: f32,
+                                         rank: usize,
+                                         doc_id: &str,
+                                         fast_score: Option<f32>,
+                                         quality_score: Option<f32>,
+                                         rank_map: &std::collections::HashMap<&str, usize>|
+         -> Option<Box<HitExplanation>> {
+            if !self.config.explain {
+                return None;
+            }
+            let mut components = Vec::new();
+
+            let fast_norm = |s: f32| -> f64 {
+                if !s.is_finite() {
+                    return 0.0;
+                }
+                let range = fast_max - fast_min;
+                if range > 0.01 {
+                    f64::from(((s - fast_min) / range).clamp(0.0, 1.0))
+                } else {
+                    f64::from(s.clamp(0.0, 1.0))
+                }
+            };
+
+            let qual_norm = |s: f32| -> f64 {
+                if !s.is_finite() {
+                    return 0.0;
+                }
+                let range = qual_max - qual_min;
+                if range > 0.01 {
+                    f64::from(((s - qual_min) / range).clamp(0.0, 1.0))
+                } else {
+                    f64::from(s.clamp(0.0, 1.0))
+                }
+            };
+
+            // Fast component
+            if let Some(s) = fast_score {
+                components.push(ScoreComponent {
+                    source: ExplainedSource::SemanticFast {
+                        embedder: self.fast_embedder.id().to_owned(),
+                        cosine_sim: f64::from(s),
+                    },
+                    raw_score: f64::from(s),
+                    normalized_score: fast_norm(s),
+                    rrf_contribution: 0.0,
+                    weight: 1.0 - f64::from(blend_factor),
+                });
+            }
+
+            // Quality component
+            if let Some(s) = quality_score {
+                components.push(ScoreComponent {
+                    source: ExplainedSource::SemanticQuality {
+                        embedder: self
+                            .quality_embedder
+                            .as_ref()
+                            .map_or_else(|| "quality-embedder".to_owned(), |e| e.id().to_owned()),
+                        cosine_sim: f64::from(s),
+                    },
+                    raw_score: f64::from(s),
+                    normalized_score: qual_norm(s),
+                    rrf_contribution: 0.0,
+                    weight: f64::from(blend_factor),
+                });
+            }
+
+            // Rank movement
+            let rank_movement = rank_map.get(doc_id).map(|&i_rank| {
+                let refined_rank = i64::try_from(rank).unwrap_or(i64::MAX);
+                let initial_rank = i64::try_from(i_rank).unwrap_or(i64::MAX);
+                let delta_i64 = refined_rank - initial_rank;
+                let delta = i32::try_from(delta_i64).unwrap_or_else(|_| {
+                    if delta_i64.is_negative() {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
+                });
+                let reason = match delta.cmp(&0) {
+                    std::cmp::Ordering::Less => "promoted",
+                    std::cmp::Ordering::Greater => "demoted",
+                    std::cmp::Ordering::Equal => "stable",
+                };
+                RankMovement {
+                    initial_rank: i_rank,
+                    refined_rank: rank,
+                    delta,
+                    reason: reason.to_owned(),
+                }
+            });
+
+            Some(Box::new(HitExplanation {
+                final_score: f64::from(final_score),
+                components,
+                phase: ExplanationPhase::Refined,
+                rank_movement,
+            }))
+        };
+
+        // Lexical re-fusion (bd-tm83): when Phase 1 retained a lexical pool,
+        // rerun the configured fusion strategy against the blended semantic
+        // pool so the refined ordering reflects both sources — the same
+        // shape as the sync searcher — without a second lexical query.
+        if let Some(lexical_pool) = pools.and_then(|pools| pools.lexical.as_ref()) {
+            let rrf_config = RrfConfig {
+                k: self.effective_rrf_k(query_class),
+                lexical_weight: self.rrf_lexical_weight,
+                semantic_weight: self.effective_semantic_weight(lexical_pool),
+                tiebreak: self.rrf_tiebreak,
+            };
+            let fused = fuse_by_strategy(
+                self.config.fusion_strategy,
+                lexical_pool,
+                &blended,
+                &[],
+                0.0,
+                k,
+                0,
+                &rrf_config,
+            );
+            let mut results = fused_hits_to_scored_results(
+                &fused,
+                lexical_pool,
+                self.config.explain,
+                self.fast_embedder.id(),
+                rrf_config.k,
+            );
+            let initial_fused_rank: std::collections::HashMap<&str, usize> = initial_results
+                .iter()
+                .enumerate()
+                .map(|(rank, result)| (result.doc_id.as_str(), rank))
+                .collect();
+            for (rank, result) in results.iter_mut().enumerate() {
+                let initial = initial_by_doc.get(result.doc_id.as_str()).copied();
+                let fast_score = fast_scores_by_doc.get(result.doc_id.as_str()).copied();
+                let quality_score = quality_scores_by_doc.get(result.doc_id.as_str()).copied();
+                // Restore the raw fast-tier score (the fused conversion
+                // surfaces the blended tier score) and attach quality
+                // evidence; provenance and lexical metadata carry over from
+                // the conversion, with hydrated phase-1 metadata as a
+                // fallback for winners the raw pool did not cover.
+                result.fast_score = fast_score;
+                result.quality_score = quality_score;
+                if quality_score.is_some()
+                    && result.source != ScoreSource::Lexical
+                    && result.source != ScoreSource::Hybrid
+                {
+                    result.source = ScoreSource::SemanticQuality;
+                }
+                if result.metadata.is_none() {
+                    result.metadata = initial.and_then(|initial| initial.metadata.clone());
+                }
+                result.explanation = build_refined_explanation(
+                    result.score,
+                    rank,
+                    result.doc_id.as_str(),
+                    fast_score,
+                    quality_score,
+                    &initial_fused_rank,
+                );
+            }
+            return Ok(results);
+        }
+
         #[allow(unused_mut)] // mut needed when `rerank` feature is enabled
         let mut results: Vec<ScoredResult> = blended
             .iter()
@@ -1830,98 +2066,14 @@ impl TwoTierSearcher {
                     original_source
                 };
 
-                let explanation = if self.config.explain {
-                    let mut components = Vec::new();
-
-                    let fast_norm = |s: f32| -> f64 {
-                        if !s.is_finite() {
-                            return 0.0;
-                        }
-                        let range = fast_max - fast_min;
-                        if range > 0.01 {
-                            f64::from(((s - fast_min) / range).clamp(0.0, 1.0))
-                        } else {
-                            f64::from(s.clamp(0.0, 1.0))
-                        }
-                    };
-
-                    let qual_norm = |s: f32| -> f64 {
-                        if !s.is_finite() {
-                            return 0.0;
-                        }
-                        let range = qual_max - qual_min;
-                        if range > 0.01 {
-                            f64::from(((s - qual_min) / range).clamp(0.0, 1.0))
-                        } else {
-                            f64::from(s.clamp(0.0, 1.0))
-                        }
-                    };
-
-                    // Fast component
-                    if let Some(s) = fast_score {
-                        components.push(ScoreComponent {
-                            source: ExplainedSource::SemanticFast {
-                                embedder: self.fast_embedder.id().to_owned(),
-                                cosine_sim: f64::from(s),
-                            },
-                            raw_score: f64::from(s),
-                            normalized_score: fast_norm(s),
-                            rrf_contribution: 0.0,
-                            weight: 1.0 - f64::from(blend_factor),
-                        });
-                    }
-
-                    // Quality component
-                    if let Some(s) = quality_score {
-                        components.push(ScoreComponent {
-                            source: ExplainedSource::SemanticQuality {
-                                embedder: self.quality_embedder.as_ref().map_or_else(
-                                    || "quality-embedder".to_owned(),
-                                    |e| e.id().to_owned(),
-                                ),
-                                cosine_sim: f64::from(s),
-                            },
-                            raw_score: f64::from(s),
-                            normalized_score: qual_norm(s),
-                            rrf_contribution: 0.0,
-                            weight: f64::from(blend_factor),
-                        });
-                    }
-
-                    // Rank movement
-                    let rank_movement = initial_rank.get(hit.doc_id.as_str()).map(|&i_rank| {
-                        let refined_rank = i64::try_from(rank).unwrap_or(i64::MAX);
-                        let initial_rank = i64::try_from(i_rank).unwrap_or(i64::MAX);
-                        let delta_i64 = refined_rank - initial_rank;
-                        let delta = i32::try_from(delta_i64).unwrap_or_else(|_| {
-                            if delta_i64.is_negative() {
-                                i32::MIN
-                            } else {
-                                i32::MAX
-                            }
-                        });
-                        let reason = match delta.cmp(&0) {
-                            std::cmp::Ordering::Less => "promoted",
-                            std::cmp::Ordering::Greater => "demoted",
-                            std::cmp::Ordering::Equal => "stable",
-                        };
-                        RankMovement {
-                            initial_rank: i_rank,
-                            refined_rank: rank,
-                            delta,
-                            reason: reason.to_owned(),
-                        }
-                    });
-
-                    Some(Box::new(HitExplanation {
-                        final_score: f64::from(hit.score),
-                        components,
-                        phase: ExplanationPhase::Refined,
-                        rank_movement,
-                    }))
-                } else {
-                    None
-                };
+                let explanation = build_refined_explanation(
+                    hit.score,
+                    rank,
+                    hit.doc_id.as_str(),
+                    fast_score,
+                    quality_score,
+                    &initial_rank,
+                );
 
                 ScoredResult {
                     doc_id: hit.doc_id.clone(),
@@ -3513,6 +3665,158 @@ mod tests {
         fn doc_count(&self) -> usize {
             0
         }
+    }
+
+    /// Index crafted so the quality tier disagrees with the fast tier:
+    /// `doc-c` is weak on cosine-fast (0.6) but exact on quality (1.0), so a
+    /// full-pool refinement must promote it past the Initial page boundary.
+    fn build_promotion_index() -> Arc<TwoTierIndex> {
+        let dir = std::env::temp_dir().join(format!(
+            "frankensearch-searcher-promo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let mut builder =
+            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+        builder.set_fast_embedder_id("stub-fast");
+        builder.set_quality_embedder_id("stub-quality");
+        let docs: [(&str, [f32; 4], [f32; 4]); 4] = [
+            ("doc-a", [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]),
+            ("doc-b", [0.95, 0.05, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]),
+            ("doc-c", [0.6, 0.8, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]),
+            ("doc-d", [0.5, 0.866, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]),
+        ];
+        for (id, fast, quality) in &docs {
+            builder
+                .add_fast_record(id.to_string(), fast)
+                .expect("add fast record");
+            builder
+                .add_quality_record(id.to_string(), quality)
+                .expect("add quality record");
+        }
+        Arc::new(builder.finish().expect("finish index"))
+    }
+
+    #[test]
+    fn refined_promotes_quality_candidates_beyond_displayed_top_k() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_promotion_index();
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let config = TwoTierConfig {
+                candidate_multiplier: 2,
+                ..TwoTierConfig::default()
+            };
+            let searcher = TwoTierSearcher::new(index, fast, config).with_quality_embedder(quality);
+
+            let mut initial_display = Vec::new();
+            let mut refined_results = Vec::new();
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "query",
+                    2,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => initial_display = results,
+                        SearchPhase::Refined { results, .. } => refined_results = results,
+                        _ => {}
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            assert_eq!(initial_display.len(), 2);
+            assert!(
+                initial_display
+                    .iter()
+                    .all(|result| result.doc_id != "doc-c"),
+                "doc-c starts outside the displayed top-k: {initial_display:?}"
+            );
+            assert_eq!(
+                refined_results.first().map(|result| result.doc_id.as_str()),
+                Some("doc-c"),
+                "quality tier must promote doc-c past the Initial page boundary"
+            );
+            assert_eq!(
+                refined_results
+                    .iter()
+                    .find(|result| result.doc_id == "doc-c")
+                    .and_then(|result| result.quality_score),
+                Some(1.0),
+                "promoted candidate carries its quality evidence"
+            );
+            // Quality scoring covered the full retained pool (k * multiplier),
+            // not just the displayed page.
+            assert_eq!(metrics.phase2_vectors_searched, 4);
+        });
+    }
+
+    #[test]
+    fn refined_ordering_requires_lexical_re_fusion() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_promotion_index();
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let quality = Arc::new(StubEmbedder::new("quality", 4));
+            let config = TwoTierConfig {
+                candidate_multiplier: 2,
+                ..TwoTierConfig::default()
+            };
+            let searcher = TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .with_lexical(Arc::new(StubLexical));
+
+            let mut initial_display = Vec::new();
+            let mut refined_results = Vec::new();
+            searcher
+                .search(
+                    &cx,
+                    "natural language retrieval query",
+                    2,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => initial_display = results,
+                        SearchPhase::Refined { results, .. } => refined_results = results,
+                        _ => {}
+                    },
+                )
+                .await
+                .expect("search should succeed");
+
+            // doc-c is absent from the Initial page but must surface in the
+            // refined page via quality promotion...
+            assert!(
+                initial_display
+                    .iter()
+                    .all(|result| result.doc_id != "doc-c"),
+                "doc-c starts outside the displayed top-k: {initial_display:?}"
+            );
+            assert!(
+                refined_results
+                    .iter()
+                    .any(|result| result.doc_id == "doc-c"),
+                "refined page must promote doc-c: {refined_results:?}"
+            );
+            // ...and the lexical-only candidate must survive refinement with
+            // its provenance and score intact — impossible under the old
+            // blend-only handoff, where a lexical-only doc's reconstructed
+            // fast score collapsed to 0.0 and it fell out of the page.
+            let lexical_only = refined_results
+                .iter()
+                .find(|result| result.doc_id.starts_with("lex-doc-"))
+                .expect("lexical-only candidate must survive lexical re-fusion");
+            assert_eq!(lexical_only.source, ScoreSource::Lexical);
+            assert!(
+                lexical_only
+                    .lexical_score
+                    .is_some_and(|score| score > 0.0_f32),
+                "lexical score is preserved through re-fusion"
+            );
+            assert!(lexical_only.fast_score.is_none());
+        });
     }
 
     #[derive(Debug)]
@@ -5221,10 +5525,10 @@ mod tests {
                 .find(|result| result.doc_id.starts_with("lex-doc-"))
                 .expect("at least one lexical-only candidate should survive top-k");
             assert!(
-                lexical_only
-                    .fast_score
-                    .is_some_and(|score| score == 0.0_f32),
-                "lexical-only refined result should keep missing fast-source score at 0.0"
+                lexical_only.fast_score.is_none(),
+                "lexical-only refined result carries no fast-tier score, matching the \
+                 Initial phase and the sync searcher (the fused conversion only ever \
+                 assigns fast_score from the semantic pool)"
             );
             assert_eq!(
                 lexical_only.source,
@@ -6574,9 +6878,12 @@ mod tests {
         let hits = [lex_hit("a", 10.0), lex_hit("b", 1.0)]; // peaked → high NQC (cv ≈ 0.818)
 
         // Default OFF: fields neutral, effective weight == base.
-        let off =
-            TwoTierSearcher::new(build_test_index(4), Arc::new(StubEmbedder::new("f", 4)), TwoTierConfig::default());
-        assert_eq!(off.nqc_downweight_beta, 0.0);
+        let off = TwoTierSearcher::new(
+            build_test_index(4),
+            Arc::new(StubEmbedder::new("f", 4)),
+            TwoTierConfig::default(),
+        );
+        assert_eq!(off.nqc_downweight_beta.to_bits(), 0);
         assert!((off.effective_semantic_weight(&hits) - off.rrf_semantic_weight).abs() < 1e-12);
 
         // Enabled but not warmed up: an empty sketch is neutral with no score scan.
@@ -6595,13 +6902,19 @@ mod tests {
         // Enabled: the query NQC is above every sampled value (percentile 1.0), so
         // dense_weight(beta=0.5) = clip(1 − 0.5·1) = 0.5 → the dense weight is halved.
         let weight = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3]);
-        let on =
-            TwoTierSearcher::new(build_test_index(4), Arc::new(StubEmbedder::new("f", 4)), TwoTierConfig::default())
-                .with_nqc_dense_downweight(0.5, 0.0, weight);
+        let on = TwoTierSearcher::new(
+            build_test_index(4),
+            Arc::new(StubEmbedder::new("f", 4)),
+            TwoTierConfig::default(),
+        )
+        .with_nqc_dense_downweight(0.5, 0.0, weight);
         assert!((on.nqc_downweight_beta - 0.5).abs() < 1e-6);
         assert_eq!(on.nqc_dense_weight.len(), 3);
         let eff = on.effective_semantic_weight(&hits);
-        assert!((eff - 0.5 * on.rrf_semantic_weight).abs() < 1e-6, "eff={eff}");
+        assert!(
+            (eff - 0.5 * on.rrf_semantic_weight).abs() < 1e-6,
+            "eff={eff}"
+        );
         assert!(eff < on.rrf_semantic_weight);
     }
 
