@@ -6,8 +6,8 @@
 //! on it. The current G0 milestone provides engine identity guards, pure
 //! comparators, immutable content-addressed artifacts, pending Q1 fixtures, and
 //! an executable same-engine Quiver codec differential, and deterministic,
-//! content-addressed E6 corpus/query generators. The Quill search subject
-//! remains an explicit non-executable stub until its adapter lands.
+//! content-addressed E6 corpus/query generators, and the live scalar Quill
+//! subject used by the G1a default-syntax campaign.
 
 mod artifact;
 mod comparator;
@@ -34,7 +34,7 @@ pub use engine::TantivyOracle;
 pub use engine::{
     ComparisonMode, DifferentialCase, DifferentialCaseMetadata, DifferentialHarness,
     EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine, GauntletFuture, HarnessRun,
-    MAX_SNIPPET_CHARS, QuillSubjectStub,
+    MAX_SNIPPET_CHARS, QuillSubject,
 };
 pub use generator::{
     CORE_RELEVANCE_DOCUMENT_COUNT, CassDocumentFields, CorpusManifest, CorpusSourceManifest,
@@ -53,13 +53,17 @@ pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CampaignCaseResult, CampaignConfig, CampaignDisposition,
     CampaignFuture, CampaignReport, CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH,
     DEFAULT_ANALYZER_CONTRACT_PREIMAGE, DEFAULT_SCHEMA_CONTRACT_HASH,
-    DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DifferentialCampaignEngine, DifferentialCampaignRunner,
-    DivergenceRegisterDecision, DivergenceRegisterEntry, DivergenceRegistry, EngineIndexReceipt,
-    GeneratedCorpusReplay, MismatchGroup, QueryClassSummary, SemanticContract,
+    DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DEFAULT_SHRINK_FUEL, DifferentialCampaignEngine,
+    DifferentialCampaignRunner, DivergenceRegisterDecision, DivergenceRegisterEntry,
+    DivergenceRegistry, EngineIndexReceipt, GeneratedCorpusReplay, MismatchGroup,
+    QueryClassSummary, SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract,
+    ShadowDivergenceRecord, ShrinkDriver, ShrinkEngineFactory, ShrinkError, ShrinkRequest,
+    ShrunkReproduction, SuspectedLayer, TriageConfidence, TriageVerdict,
+    persist_shrunk_reproduction,
 };
 pub use version_contract::{
-    InternalDifferentialFixture, OracleVersionContract, Q1FixtureCatalog, Q1FixtureStub,
-    oracle_version_contract, q1_fixture_catalog,
+    InternalDifferentialFixture, OracleVersionContract, Q1Fixture, Q1FixtureCatalog,
+    oracle_version_contract, q1_fixture_catalog, run_q1_live_fixtures,
 };
 
 /// Typed failure surface for harness setup, execution, comparison, and storage.
@@ -99,6 +103,8 @@ pub enum GauntletError {
     RunManifestConflict { path: PathBuf },
     #[error(transparent)]
     Search(#[from] frankensearch_core::SearchError),
+    #[error(transparent)]
+    Quill(#[from] frankensearch_quill::QuillIndexError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]

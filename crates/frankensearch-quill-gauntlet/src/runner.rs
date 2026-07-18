@@ -41,6 +41,8 @@ pub const DEFAULT_ANALYZER_CONTRACT_HASH: &str =
     "7425c0f2d0a909ca4103bd20f439b6282d3ce00ab3c9f6784ec7333398197041";
 /// Canonical preimage for the default shipping schema, parser, and rank protocol.
 pub const DEFAULT_SCHEMA_CONTRACT_PREIMAGE: &str = "v2;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default_fields(content,title);title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=tantivy-html-configured";
+/// Scalar G1a subset: identical lexical semantics with snippet evidence disabled.
+pub const SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE: &str = "v1;profile=scalar-g1a;id=text:string+stored;content=text:frankensearch_default+freqs_positions+stored;title=text:frankensearch_default+freqs_positions+stored;metadata_json=text:stored;ord=u64:fast+stored;query_parser=default-fields-term-multiterm-exact-phrase-boolean;title_boost_bits=1073741824;default_operator=or;max_query_chars=10000;bm25=tantivy-0.26.1-default;pagination=offset_then_limit;counts=exact;snippets=disabled";
 /// Default schema/query/ranking protocol implemented by the shipping Tantivy adapter.
 pub const DEFAULT_SCHEMA_CONTRACT_HASH: &str =
     "9fed22a53e5060243e9528fbbf40605a0df8ea120b3d74ac41ecbb097c2df571";
@@ -70,6 +72,15 @@ impl SemanticContract {
         Self {
             analyzer_contract_hash: sha256_text(DEFAULT_ANALYZER_CONTRACT_PREIMAGE),
             schema_contract_hash: sha256_text(DEFAULT_SCHEMA_CONTRACT_PREIMAGE),
+        }
+    }
+
+    /// Bounded semantic profile implemented by the scalar G1a subject.
+    #[must_use]
+    pub fn scalar_g1a() -> Self {
+        Self {
+            analyzer_contract_hash: sha256_text(DEFAULT_ANALYZER_CONTRACT_PREIMAGE),
+            schema_contract_hash: sha256_text(SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE),
         }
     }
 
@@ -242,7 +253,7 @@ pub enum CampaignSelection {
     /// Execute every query in manifest order.
     #[default]
     All,
-    /// Execute only the default parser surface. Used by the scalar G1a gate.
+    /// Execute the bounded default-parser classes owned by the scalar G1a gate.
     DefaultSyntax,
     /// Execute the named cases, retaining their original manifest order.
     CaseIds { ids: Vec<String> },
@@ -257,7 +268,20 @@ impl CampaignSelection {
             Self::All => cases.iter().collect(),
             Self::DefaultSyntax => cases
                 .iter()
-                .filter(|case| case.syntax == QuerySyntax::Default)
+                .filter(|case| {
+                    case.syntax == QuerySyntax::Default
+                        && matches!(
+                            &case.query_kind,
+                            GeneratedQueryKind::Term
+                                | GeneratedQueryKind::MultiTerm
+                                | GeneratedQueryKind::Phrase
+                                | GeneratedQueryKind::Boolean
+                                | GeneratedQueryKind::Paginated
+                                | GeneratedQueryKind::Counted
+                        )
+                        && case.filters.created_from_ms.is_none()
+                        && case.filters.created_to_ms.is_none()
+                })
                 .collect(),
             Self::CaseIds { ids } => {
                 if ids.len() > MAX_QUERY_CASES || ids.iter().any(|id| !is_canonical_query_id(id)) {
@@ -2195,29 +2219,31 @@ fn ln_gamma(value: f64) -> f64 {
     0.918_938_533_204_672_7 + (shifted + 0.5) * scale.ln() - scale + series.ln()
 }
 
-#[cfg(feature = "tantivy-oracle")]
-impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
+impl DifferentialCampaignEngine for crate::engine::QuillSubject {
     fn descriptor(&self) -> EngineDescriptor {
-        GauntletEngine::descriptor(self)
+        crate::engine::GauntletEngine::descriptor(self)
     }
 
     fn semantic_contract(&self) -> SemanticContract {
-        SemanticContract::shipping_default()
+        SemanticContract::scalar_g1a()
     }
 
     fn begin_corpus<'a>(
         &'a mut self,
         _cx: &'a Cx,
         _manifest: &'a CorpusManifest,
-        _semantic_contract: &'a SemanticContract,
+        semantic_contract: &'a SemanticContract,
     ) -> CampaignFuture<'a, ()> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
-
-            self.claim_fresh_campaign()?;
-            if self.index().doc_count() != 0 {
+            if semantic_contract != &SemanticContract::scalar_g1a() {
                 return Err(campaign_error(
-                    "Tantivy campaign adapter must own a fresh empty index",
+                    "Quill scalar subject requires the scalar G1a semantic contract",
+                ));
+            }
+            self.claim_fresh_campaign()?;
+            if self.index()?.doc_count() != 0 || self.index()?.has_uncommitted_changes() {
+                return Err(campaign_error(
+                    "Quill campaign adapter must own a fresh empty index",
                 ));
             }
             Ok(())
@@ -2230,8 +2256,108 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         documents: &'a [GeneratedDocument],
     ) -> CampaignFuture<'a, ()> {
         Box::pin(async move {
+            self.require_ingesting()?;
+            let indexable = documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            self.index_mut()?.index_documents(cx, &indexable).await?;
+            Ok(())
+        })
+    }
+
+    fn commit_corpus<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        manifest: &'a CorpusManifest,
+        semantic_contract: &'a SemanticContract,
+    ) -> CampaignFuture<'a, EngineIndexReceipt> {
+        Box::pin(async move {
+            self.require_ingesting()?;
+            self.index_mut()?.commit(cx).await?;
+            let actual_count = self.index()?.doc_count();
+            if actual_count != manifest.document_count {
+                return Err(campaign_error(
+                    "Quill committed document count differs from the corpus manifest",
+                ));
+            }
+            let receipt = EngineIndexReceipt {
+                corpus_manifest_hash: manifest.manifest_hash()?,
+                document_count: actual_count,
+                total_content_bytes: manifest.total_content_bytes,
+                semantic_contract: semantic_contract.clone(),
+            };
+            self.mark_committed()?;
+            Ok(receipt)
+        })
+    }
+
+    fn observe_generated<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        query: &'a GeneratedQueryCase,
+        evidence_case: &'a DifferentialCase,
+    ) -> CampaignFuture<'a, EngineObservation> {
+        Box::pin(async move {
+            self.require_committed()?;
+            if query.syntax != QuerySyntax::Default
+                || query.filters.created_from_ms.is_some()
+                || query.filters.created_to_ms.is_some()
+            {
+                return Err(GauntletError::InvalidCase {
+                    reason:
+                        "the scalar Quill adapter cannot lower CASS syntax or structured filters"
+                            .to_owned(),
+                });
+            }
+            crate::engine::GauntletEngine::observe(self, cx, evidence_case).await
+        })
+    }
+
+    fn abort_corpus(&mut self) {
+        self.abort();
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
+    fn descriptor(&self) -> EngineDescriptor {
+        GauntletEngine::descriptor(self)
+    }
+
+    fn semantic_contract(&self) -> SemanticContract {
+        self.campaign_semantic_contract().clone()
+    }
+
+    fn begin_corpus<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _manifest: &'a CorpusManifest,
+        _semantic_contract: &'a SemanticContract,
+    ) -> CampaignFuture<'a, ()> {
+        Box::pin(async move {
             use frankensearch_core::LexicalSearch;
 
+            if self.index().doc_count() != 0 {
+                return Err(campaign_error(
+                    "Tantivy campaign adapter must own a fresh empty index",
+                ));
+            }
+            self.claim_fresh_campaign()?;
+            Ok(())
+        })
+    }
+
+    fn index_batch<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        documents: &'a [GeneratedDocument],
+    ) -> CampaignFuture<'a, ()> {
+        Box::pin(async move {
+            use frankensearch_core::LexicalSearch;
+
+            self.require_ingesting()?;
             let indexable = documents
                 .iter()
                 .cloned()
@@ -2251,6 +2377,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         Box::pin(async move {
             use frankensearch_core::LexicalSearch;
 
+            self.require_ingesting()?;
             self.index().commit(cx).await?;
             let actual_count = u64::try_from(self.index().doc_count()).unwrap_or(u64::MAX);
             if actual_count != manifest.document_count {
@@ -2258,12 +2385,14 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
                     "Tantivy committed document count differs from the corpus manifest",
                 ));
             }
-            Ok(EngineIndexReceipt {
+            let receipt = EngineIndexReceipt {
                 corpus_manifest_hash: manifest.manifest_hash()?,
                 document_count: actual_count,
                 total_content_bytes: manifest.total_content_bytes,
                 semantic_contract: semantic_contract.clone(),
-            })
+            };
+            self.mark_committed()?;
+            Ok(receipt)
         })
     }
 
@@ -2274,6 +2403,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         evidence_case: &'a DifferentialCase,
     ) -> CampaignFuture<'a, EngineObservation> {
         Box::pin(async move {
+            self.require_committed()?;
             if query.syntax != QuerySyntax::Default
                 || query.filters.created_from_ms.is_some()
                 || query.filters.created_to_ms.is_some()
@@ -2288,10 +2418,682 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
     }
 
     fn abort_corpus(&mut self) {
-        // Tantivy does not expose a rollback through the shipping lexical
-        // facade. The one-shot campaign contract requires callers to discard
-        // this adapter after an aborted run.
+        // Tantivy does not expose rollback through the shipping lexical
+        // facade. Poison the one-shot adapter so no post-abort differential
+        // operation can mistake retained backend bytes for an admissible
+        // campaign snapshot.
+        self.abort_campaign();
     }
+}
+
+// ============================================================================
+// Divergence shrinker + explanation-driven auto-triage
+// (bd-quill-duel-shrinker-2j21)
+//
+// Given a divergent (corpus, query) pair, ddmin the corpus to a minimal
+// reproducer and greedily minimize the query, exploiting engine determinism:
+// a candidate pair either still exhibits the divergence or it does not. The
+// shrunk case persists as a permanent regression fixture alongside the
+// ORIGINAL query text and corpus manifest hash (over-minimization loses
+// parser-edge context, so the original is always retained).
+// ============================================================================
+
+/// Default candidate-evaluation budget for one shrink run.
+pub const DEFAULT_SHRINK_FUEL: usize = 256;
+/// Corpus size at which ddmin refinement stops.
+const SHRINK_TARGET_DOCS: usize = 3;
+
+/// Suspected engine layer for one triaged score divergence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuspectedLayer {
+    /// BM25 arithmetic (fieldnorm quantization, avgdl, idf) diverges.
+    FieldNormArithmetic,
+    /// Query parsing or AST lowering produced a different plan.
+    ParserLowering,
+    /// Native tie-break ordering diverges on equal scores.
+    TieOrder,
+    /// Rank-safe pruning dropped a different candidate set.
+    Pruning,
+    /// Documents indexed differently (content or identity loss).
+    Indexing,
+    /// Evidence does not isolate a layer.
+    Unknown,
+}
+
+/// Confidence of one auto-triage verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriageConfidence {
+    /// Direct structural evidence (AST diff, tie-group proof).
+    High,
+    /// Strong statistical shape (score deltas with identical sets).
+    Medium,
+    /// Weak shape; needs human review.
+    Low,
+}
+
+/// Auto-triage verdict for one shrunk score divergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriageVerdict {
+    /// Comparator class that persisted through the shrink.
+    pub class: DivergenceClass,
+    /// Suspected engine layer.
+    pub suspected_layer: SuspectedLayer,
+    /// Verdict confidence.
+    pub confidence: TriageConfidence,
+    /// Human-readable evidence rows.
+    pub evidence: Vec<String>,
+}
+
+/// One permanent shrunk regression fixture: minimal reproduction plus the
+/// original context (Gemini's anti-over-minimization amendment).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShrunkReproduction {
+    /// Fixture schema version.
+    pub schema_version: u32,
+    /// Divergence class that persisted to the minimal reproducer.
+    pub divergence_class: DivergenceClass,
+    /// Content hash of the FULL original corpus manifest.
+    pub original_corpus_manifest_hash: String,
+    /// Original corpus size before shrinking.
+    pub original_document_count: usize,
+    /// Original query text, untouched.
+    pub original_query_text: String,
+    /// Original structured query identity.
+    pub original_query_id: String,
+    /// Minimal corpus that still diverges.
+    pub minimized_documents: Vec<GeneratedDocument>,
+    /// Minimal query text that still diverges.
+    pub minimized_query_text: String,
+    /// Auto-triage verdict over the minimal reproducer.
+    pub triage: TriageVerdict,
+    /// Accepted reduction steps (document or query removals).
+    pub reduction_steps: usize,
+    /// Total candidates evaluated (fuel consumed).
+    pub candidates_evaluated: usize,
+}
+
+/// Shadow-mode divergence record (`.quill-shadow/divergences.jsonl`).
+///
+/// The stamped generation is the snapshot witness for exact-snapshot replay:
+/// a shadow reader can rebuild the same committed generation and re-run the
+/// shrunk reproduction against it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowDivergenceRecord {
+    /// Record schema version (currently 1).
+    pub schema_version: u32,
+    /// MANIFEST generation stamped when the divergence fired.
+    pub stamped_generation: u64,
+    /// Full-corpus manifest hash for replay identity.
+    pub corpus_manifest_hash: String,
+    /// Full corpus as indexed by the shadow pair.
+    pub documents: Vec<GeneratedDocument>,
+    /// Structured divergent query.
+    pub query: GeneratedQueryCase,
+    /// Engine-neutral evidence envelope.
+    pub evidence_case: DifferentialCase,
+    /// Class the shadow comparator reported.
+    pub divergence_class: DivergenceClass,
+}
+
+/// Errors from shrink orchestration.
+#[derive(Debug, thiserror::Error)]
+pub enum ShrinkError {
+    /// The candidate budget ran out before reaching a fixpoint.
+    #[error("shrink fuel exhausted after {evaluated} candidate evaluations")]
+    FuelExhausted {
+        /// Candidates evaluated before exhaustion.
+        evaluated: usize,
+    },
+    /// A campaign adapter or comparator failed mid-evaluation.
+    #[error("shrink campaign failed: {0}")]
+    Campaign(#[from] GauntletError),
+    /// A shadow divergence record line is malformed.
+    #[error("shadow divergence record invalid: {reason}")]
+    InvalidShadowRecord {
+        /// Parse/validation detail.
+        reason: String,
+    },
+    /// The permanent fixture could not be written durably.
+    #[error("shrunk reproduction persist failed at {path}: {reason}")]
+    Persist {
+        /// Target fixture path.
+        path: std::path::PathBuf,
+        /// I/O detail.
+        reason: String,
+    },
+}
+
+/// Input to one shrink run.
+pub struct ShrinkRequest {
+    /// Full divergent corpus.
+    pub documents: Vec<GeneratedDocument>,
+    /// Content hash of the full corpus manifest.
+    pub corpus_manifest_hash: String,
+    /// Structured divergent query.
+    pub query: GeneratedQueryCase,
+    /// Engine-neutral evidence envelope shared by both engines.
+    pub evidence_case: DifferentialCase,
+    /// Comparator failure class to preserve through the shrink.
+    pub divergence_class: DivergenceClass,
+}
+
+/// Factory for one fresh, empty campaign engine.
+pub type ShrinkEngineFactory =
+    Box<dyn FnMut() -> Result<Box<dyn DifferentialCampaignEngine>, GauntletError>>;
+
+/// ddmin + greedy-query shrinker over the campaign engine boundary.
+pub struct ShrinkDriver {
+    comparator_config: ComparatorConfig,
+    semantic_contract: SemanticContract,
+    fuel: usize,
+}
+
+impl ShrinkDriver {
+    /// Construct a driver with explicit comparator configuration and fuel.
+    #[must_use]
+    pub const fn new(
+        comparator_config: ComparatorConfig,
+        semantic_contract: SemanticContract,
+        fuel: usize,
+    ) -> Self {
+        Self {
+            comparator_config,
+            semantic_contract,
+            fuel,
+        }
+    }
+
+    /// Shrink one divergent (corpus, query) pair to a minimal reproduction.
+    ///
+    /// Document ddmin follows Zeller's delta-debugging: split the corpus into
+    /// `n` chunks and drop chunks while the divergence persists, increasing
+    /// `n` when no single chunk drops. Query minimization greedily removes
+    /// whitespace-delimited tokens while the divergence persists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShrinkError::FuelExhausted`] when the candidate budget runs
+    /// out, or [`ShrinkError::Campaign`] when an adapter fails.
+    #[allow(clippy::future_not_send)]
+    pub async fn shrink(
+        &self,
+        cx: &Cx,
+        request: &ShrinkRequest,
+        make_subject: &mut ShrinkEngineFactory,
+        make_oracle: &mut ShrinkEngineFactory,
+    ) -> Result<ShrunkReproduction, ShrinkError> {
+        let mut budget = ShrinkBudget {
+            remaining: self.fuel,
+            evaluated: 0,
+        };
+        let mut documents = request.documents.clone();
+        let mut steps = 0_usize;
+
+        // ddmin on documents.
+        let mut n = 2_usize;
+        while documents.len() > SHRINK_TARGET_DOCS && n <= documents.len() {
+            let chunk = documents.len().div_ceil(n);
+            let mut reduced = false;
+            for start in (0..documents.len()).step_by(chunk) {
+                let end = (start + chunk).min(documents.len());
+                let mut candidate = documents[..start].to_vec();
+                candidate.extend_from_slice(&documents[end..]);
+                if candidate.is_empty() {
+                    continue;
+                }
+                if self
+                    .persists(
+                        cx,
+                        &candidate,
+                        &request.query,
+                        &request.evidence_case,
+                        request.divergence_class,
+                        make_subject,
+                        make_oracle,
+                        &mut budget,
+                    )
+                    .await?
+                {
+                    documents = candidate;
+                    n = (n - 1).max(2);
+                    steps += 1;
+                    reduced = true;
+                    break;
+                }
+            }
+            if !reduced {
+                if n >= documents.len() {
+                    break;
+                }
+                n = (n * 2).min(documents.len());
+            }
+        }
+
+        // Greedy token-level query minimization.
+        let mut tokens: Vec<String> = request
+            .query
+            .query
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        if tokens.len() > 1 {
+            let mut index = 0;
+            while index < tokens.len() {
+                let candidate_tokens: Vec<String> = tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != index)
+                    .map(|(_, token)| token.clone())
+                    .collect();
+                let candidate_text = candidate_tokens.join(" ");
+                if candidate_text.trim().is_empty() {
+                    index += 1;
+                    continue;
+                }
+                let mut candidate_query = request.query.clone();
+                candidate_query.query = candidate_text.clone();
+                let mut candidate_case = request.evidence_case.clone();
+                candidate_case.query = candidate_text.clone();
+                if self
+                    .persists(
+                        cx,
+                        &documents,
+                        &candidate_query,
+                        &candidate_case,
+                        request.divergence_class,
+                        make_subject,
+                        make_oracle,
+                        &mut budget,
+                    )
+                    .await?
+                {
+                    tokens = candidate_tokens;
+                    steps += 1;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        let query_text = tokens.join(" ");
+
+        // Final evidence + auto-triage on the minimal reproducer.
+        let mut minimized_query = request.query.clone();
+        minimized_query.query = query_text.clone();
+        let mut minimized_case = request.evidence_case.clone();
+        minimized_case.query = query_text.clone();
+        let final_report = self
+            .evaluate(
+                cx,
+                &documents,
+                &minimized_query,
+                &minimized_case,
+                make_subject,
+                make_oracle,
+                &mut budget,
+            )
+            .await?;
+        let triage = auto_triage(request.divergence_class, &final_report);
+
+        Ok(ShrunkReproduction {
+            schema_version: 1,
+            divergence_class: request.divergence_class,
+            original_corpus_manifest_hash: request.corpus_manifest_hash.clone(),
+            original_document_count: request.documents.len(),
+            original_query_text: request.query.query.clone(),
+            original_query_id: request.query.id.clone(),
+            minimized_documents: documents,
+            minimized_query_text: query_text,
+            triage,
+            reduction_steps: steps,
+            candidates_evaluated: budget.evaluated,
+        })
+    }
+
+    /// Parse one `.quill-shadow/divergences.jsonl` line and shrink it.
+    ///
+    /// The stamped generation is preserved in the reproduction's manifest
+    /// hash fields for exact-snapshot replay by the shadow reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShrinkError::InvalidShadowRecord`] for malformed lines, or
+    /// the shrinker's own errors otherwise.
+    #[allow(clippy::future_not_send)]
+    pub async fn shrink_shadow_line(
+        &self,
+        cx: &Cx,
+        line: &str,
+        make_subject: &mut ShrinkEngineFactory,
+        make_oracle: &mut ShrinkEngineFactory,
+    ) -> Result<ShrunkReproduction, ShrinkError> {
+        let record: ShadowDivergenceRecord =
+            serde_json::from_str(line).map_err(|error| ShrinkError::InvalidShadowRecord {
+                reason: error.to_string(),
+            })?;
+        if record.schema_version != 1 {
+            return Err(ShrinkError::InvalidShadowRecord {
+                reason: format!("unsupported shadow record schema {}", record.schema_version),
+            });
+        }
+        if record.documents.is_empty() {
+            return Err(ShrinkError::InvalidShadowRecord {
+                reason: "shadow record carries no documents".to_owned(),
+            });
+        }
+        let request = ShrinkRequest {
+            documents: record.documents,
+            corpus_manifest_hash: format!(
+                "{}#gen-{}",
+                record.corpus_manifest_hash, record.stamped_generation
+            ),
+            query: record.query,
+            evidence_case: record.evidence_case,
+            divergence_class: record.divergence_class,
+        };
+        self.shrink(cx, &request, make_subject, make_oracle).await
+    }
+
+    /// Whether the candidate pair still exhibits the target divergence class.
+    #[allow(clippy::future_not_send)]
+    async fn persists(
+        &self,
+        cx: &Cx,
+        documents: &[GeneratedDocument],
+        query: &GeneratedQueryCase,
+        evidence_case: &DifferentialCase,
+        target_class: DivergenceClass,
+        make_subject: &mut ShrinkEngineFactory,
+        make_oracle: &mut ShrinkEngineFactory,
+        budget: &mut ShrinkBudget,
+    ) -> Result<bool, ShrinkError> {
+        let report = self
+            .evaluate(
+                cx,
+                documents,
+                query,
+                evidence_case,
+                make_subject,
+                make_oracle,
+                budget,
+            )
+            .await?;
+        Ok(report
+            .divergences
+            .iter()
+            .any(|divergence| divergence.class == target_class))
+    }
+
+    /// Index a candidate into fresh engines and compare observations.
+    #[allow(clippy::future_not_send)]
+    async fn evaluate(
+        &self,
+        cx: &Cx,
+        documents: &[GeneratedDocument],
+        query: &GeneratedQueryCase,
+        evidence_case: &DifferentialCase,
+        make_subject: &mut ShrinkEngineFactory,
+        make_oracle: &mut ShrinkEngineFactory,
+        budget: &mut ShrinkBudget,
+    ) -> Result<ComparisonReport, ShrinkError> {
+        budget.spend()?;
+        let manifest = subset_manifest(documents)?;
+        let mut subject = make_subject()?;
+        let mut oracle = make_oracle()?;
+        subject
+            .begin_corpus(cx, &manifest, &self.semantic_contract)
+            .await?;
+        oracle
+            .begin_corpus(cx, &manifest, &self.semantic_contract)
+            .await?;
+        subject.index_batch(cx, documents).await?;
+        oracle.index_batch(cx, documents).await?;
+        subject
+            .commit_corpus(cx, &manifest, &self.semantic_contract)
+            .await?;
+        oracle
+            .commit_corpus(cx, &manifest, &self.semantic_contract)
+            .await?;
+        let subject_observation = subject.observe_generated(cx, query, evidence_case).await?;
+        let oracle_observation = oracle.observe_generated(cx, query, evidence_case).await?;
+        Ok(compare_observations(
+            subject_observation,
+            oracle_observation,
+            self.comparator_config,
+        )?)
+    }
+}
+
+struct ShrinkBudget {
+    remaining: usize,
+    evaluated: usize,
+}
+
+impl ShrinkBudget {
+    fn spend(&mut self) -> Result<(), ShrinkError> {
+        if self.remaining == 0 {
+            return Err(ShrinkError::FuelExhausted {
+                evaluated: self.evaluated,
+            });
+        }
+        self.remaining -= 1;
+        self.evaluated += 1;
+        Ok(())
+    }
+}
+
+/// Build a valid corpus manifest for a shrunk document subset.
+fn subset_manifest(documents: &[GeneratedDocument]) -> Result<CorpusManifest, GauntletError> {
+    let mut hasher = Sha256::new();
+    let mut total_content_bytes = 0_u64;
+    for document in documents {
+        let bytes =
+            serde_json::to_vec(document).map_err(|error| GauntletError::InvalidGenerator {
+                reason: format!("subset manifest canonicalization failed: {error}"),
+            })?;
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+        total_content_bytes = total_content_bytes
+            .checked_add(u64::try_from(document.content.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| GauntletError::InvalidGenerator {
+                reason: "subset content byte overflow".to_owned(),
+            })?;
+    }
+    let digest = hasher.finalize();
+    let mut content_sha256 = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(content_sha256, "{byte:02x}");
+    }
+    Ok(CorpusManifest {
+        schema_version: 1,
+        generator_id: GENERATOR_ID.to_owned(),
+        source: crate::generator::CorpusSourceManifest::Synthetic {
+            spec: crate::generator::SyntheticCorpusSpec {
+                seed: 0,
+                document_count: u64::try_from(documents.len()).map_err(|_| {
+                    GauntletError::InvalidGenerator {
+                        reason: "subset document count does not fit u64".to_owned(),
+                    }
+                })?,
+                vocabulary_size: 1,
+                zipf_exponent: crate::generator::ZipfExponent::S08,
+                max_document_bytes: crate::generator::MAX_DOCUMENT_BYTES,
+            },
+        },
+        document_count: u64::try_from(documents.len()).map_err(|_| {
+            GauntletError::InvalidGenerator {
+                reason: "subset document count does not fit u64".to_owned(),
+            }
+        })?,
+        total_content_bytes,
+        content_sha256,
+        skipped_repository_entries: Vec::new(),
+    })
+}
+
+/// Explanation-driven auto-triage over the minimal reproducer.
+///
+/// The v1 verdict maps comparator evidence to a suspected layer with explicit
+/// confidence: AST differences name parser lowering directly; tie classes
+/// name ordering; score-only deltas with identical document sets point at
+/// BM25 arithmetic; missing/extra documents point at indexing. Factor-level
+/// (idf/tf/norm) decomposition lands when observations carry factor
+/// breakdowns.
+fn auto_triage(target: DivergenceClass, report: &ComparisonReport) -> TriageVerdict {
+    let mut evidence = Vec::new();
+    let has_ast_difference = report
+        .subject
+        .ast_differences
+        .iter()
+        .chain(report.oracle.ast_differences.iter())
+        .any(|difference| {
+            matches!(
+                difference.kind,
+                crate::comparator::AstLoweringKind::OversizedQueryToken
+            )
+        });
+    let subject_ids: BTreeSet<&str> = report
+        .subject
+        .hits
+        .iter()
+        .map(|hit| hit.doc_id.as_str())
+        .collect();
+    let oracle_ids: BTreeSet<&str> = report
+        .oracle
+        .hits
+        .iter()
+        .map(|hit| hit.doc_id.as_str())
+        .collect();
+    let same_set = subject_ids == oracle_ids;
+    evidence.push(format!(
+        "document sets {} (subject {} hits, oracle {} hits)",
+        if same_set { "identical" } else { "differ" },
+        subject_ids.len(),
+        oracle_ids.len()
+    ));
+    let max_score_delta = report
+        .subject
+        .hits
+        .iter()
+        .filter_map(|hit| {
+            report
+                .oracle
+                .hits
+                .iter()
+                .find(|oracle_hit| oracle_hit.doc_id == hit.doc_id)
+                .map(|oracle_hit| {
+                    let delta = i64::from(hit.score_bits) - i64::from(oracle_hit.score_bits);
+                    delta.unsigned_abs()
+                })
+        })
+        .fold(0_u64, u64::max);
+    evidence.push(format!(
+        "max score-bit delta over shared hits: {max_score_delta:.0}"
+    ));
+
+    let (suspected_layer, confidence) = if has_ast_difference
+        || target == DivergenceClass::OversizedQueryToken
+    {
+        evidence.push("oversized-token AST lowering difference present".to_owned());
+        (SuspectedLayer::ParserLowering, TriageConfidence::High)
+    } else {
+        match target {
+            DivergenceClass::TieOrder => {
+                evidence.push("rank flips confined to equal-score tie groups".to_owned());
+                (SuspectedLayer::TieOrder, TriageConfidence::High)
+            }
+            DivergenceClass::ScoreEpsilon => {
+                evidence.push("identical result sets with sub-epsilon score deltas".to_owned());
+                (
+                    SuspectedLayer::FieldNormArithmetic,
+                    TriageConfidence::Medium,
+                )
+            }
+            DivergenceClass::RankMismatch if same_set => {
+                evidence.push("rank flips beyond tie groups with identical sets".to_owned());
+                (
+                    SuspectedLayer::FieldNormArithmetic,
+                    TriageConfidence::Medium,
+                )
+            }
+            DivergenceClass::RankMismatch => {
+                evidence
+                    .push("result sets differ; indexing or parse-time document loss".to_owned());
+                (SuspectedLayer::Indexing, TriageConfidence::Low)
+            }
+            DivergenceClass::SnippetMismatch => {
+                evidence.push("snippet windows disagree on identical hits".to_owned());
+                (SuspectedLayer::ParserLowering, TriageConfidence::Low)
+            }
+            DivergenceClass::CountMismatch | DivergenceClass::DocumentCountMismatch => {
+                evidence.push("count evidence disagrees with the oracle".to_owned());
+                (SuspectedLayer::Indexing, TriageConfidence::Medium)
+            }
+            DivergenceClass::OversizedQueryToken => unreachable!("covered above"),
+        }
+    };
+    TriageVerdict {
+        class: target,
+        suspected_layer,
+        confidence,
+        evidence,
+    }
+}
+
+/// Persist a shrunk reproduction as a permanent regression fixture.
+///
+/// The fixture is content-addressed (`<root>/shrunk/<sha256>.json`) and
+/// written with the house temp+rename+dir-fsync discipline, so concurrent
+/// shrink runs never observe a torn fixture.
+///
+/// # Errors
+///
+/// Returns [`ShrinkError::Persist`] for canonicalization or I/O failures.
+pub fn persist_shrunk_reproduction(
+    root: &std::path::Path,
+    reproduction: &ShrunkReproduction,
+) -> Result<std::path::PathBuf, ShrinkError> {
+    let bytes = serde_json::to_vec_pretty(reproduction).map_err(|error| ShrinkError::Persist {
+        path: root.to_path_buf(),
+        reason: format!("fixture canonicalization failed: {error}"),
+    })?;
+    let digest = Sha256::digest(&bytes);
+    let mut hash = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hash, "{byte:02x}");
+    }
+    let directory = root.join("shrunk");
+    std::fs::create_dir_all(&directory).map_err(|error| ShrinkError::Persist {
+        path: directory.clone(),
+        reason: error.to_string(),
+    })?;
+    let target = directory.join(format!("{hash}.json"));
+    let temporary = directory.join(format!(".tmp-shrunk-{}-{hash}", std::process::id()));
+    std::fs::write(&temporary, &bytes).map_err(|error| ShrinkError::Persist {
+        path: temporary.clone(),
+        reason: error.to_string(),
+    })?;
+    {
+        let file = std::fs::File::open(&temporary).map_err(|error| ShrinkError::Persist {
+            path: temporary.clone(),
+            reason: error.to_string(),
+        })?;
+        file.sync_all().map_err(|error| ShrinkError::Persist {
+            path: temporary.clone(),
+            reason: error.to_string(),
+        })?;
+    }
+    std::fs::rename(&temporary, &target).map_err(|error| ShrinkError::Persist {
+        path: target.clone(),
+        reason: error.to_string(),
+    })?;
+    if let Ok(directory_file) = std::fs::File::open(&directory) {
+        let _ = directory_file.sync_all();
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -2687,6 +3489,34 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tantivy-oracle")]
+    fn make_scalar_g1a_regression_fixture() -> Fixture {
+        let shared = SharedFixtureSuite::load().expect("shared fixtures");
+        let documents = shared
+            .documents(crate::generator::SharedCorpusView::Core100)
+            .to_vec();
+        let corpus_manifest = shared
+            .manifest(crate::generator::SharedCorpusView::Core100)
+            .expect("shared corpus manifest");
+        let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
+        let query_suite = GeneratedQuerySuite::generate(
+            QueryGeneratorSpec {
+                seed: 0x6201,
+                default_limit: 20,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            &shared,
+        )
+        .expect("query suite");
+        Fixture {
+            documents,
+            corpus_manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
     fn semantic_contract() -> SemanticContract {
         SemanticContract::shipping_default()
     }
@@ -2707,6 +3537,161 @@ mod tests {
             registry,
         )
         .expect("campaign runner")
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    async fn run_scalar_g1a_deterministic_regression(
+        cx: &Cx,
+        root: &std::path::Path,
+        fixture: &Fixture,
+    ) -> Result<CampaignReport, GauntletError> {
+        // The fixed subject label and contract-sourced oracle revision make
+        // repeated report bytes comparable. This self-contained test is
+        // deterministic regression coverage, not independently observed live
+        // Git provenance.
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_git_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let mut subject = crate::engine::QuillSubject::in_memory(
+            config,
+            "g1a-deterministic-regression-not-live-provenance",
+            false,
+        )
+        .expect("fresh scalar Quill subject");
+        let mut oracle =
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+                .expect("fresh scalar G1a Tantivy oracle");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(root),
+            SemanticContract::scalar_g1a(),
+            CampaignConfig {
+                selection: CampaignSelection::DefaultSyntax,
+                index_batch_size: 5,
+                snippet_max_chars: None,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("deterministic scalar G1a regression campaign");
+
+        campaign
+            .run(
+                cx,
+                "scalar-g1a-deterministic-regression",
+                &mut subject,
+                &mut oracle,
+                &fixture.documents,
+                &fixture.corpus_manifest,
+                &fixture.query_suite,
+            )
+            .await
+    }
+
+    #[test]
+    fn quill_subject_rejects_calls_outside_its_one_shot_lifecycle() {
+        let fixture = make_fixture();
+        let contract = SemanticContract::scalar_g1a();
+        let selected = CampaignSelection::DefaultSyntax
+            .select(&fixture.query_suite.cases)
+            .expect("scalar G1a query selection");
+        let query = (*selected[0]).clone();
+        let mut evidence_case =
+            DifferentialCase::new("lifecycle-observe-before-commit", &query.query, query.limit);
+        evidence_case.offset = query.offset;
+        evidence_case.count_requested = query.count_requested;
+        evidence_case.snippet_max_chars = None;
+        let deterministic_config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut before_begin = crate::engine::QuillSubject::in_memory(
+                deterministic_config.clone(),
+                "lifecycle-before-begin",
+                false,
+            )
+            .expect("subject before begin");
+            let index_before_begin = DifferentialCampaignEngine::index_batch(
+                &mut before_begin,
+                &cx,
+                &fixture.documents[..1],
+            )
+            .await
+            .expect_err("indexing before begin must fail");
+            assert!(matches!(
+                index_before_begin,
+                GauntletError::InvalidCampaign { .. }
+            ));
+
+            let mut before_commit = crate::engine::QuillSubject::in_memory(
+                deterministic_config.clone(),
+                "lifecycle-before-commit",
+                false,
+            )
+            .expect("subject before commit");
+            DifferentialCampaignEngine::begin_corpus(
+                &mut before_commit,
+                &cx,
+                &fixture.corpus_manifest,
+                &contract,
+            )
+            .await
+            .expect("begin ingest session");
+            let observe_before_commit = DifferentialCampaignEngine::observe_generated(
+                &mut before_commit,
+                &cx,
+                &query,
+                &evidence_case,
+            )
+            .await
+            .expect_err("observation before commit must fail");
+            assert!(matches!(
+                observe_before_commit,
+                GauntletError::InvalidCampaign { .. }
+            ));
+
+            let mut after_commit = crate::engine::QuillSubject::in_memory(
+                deterministic_config,
+                "lifecycle-after-commit",
+                false,
+            )
+            .expect("subject after commit");
+            DifferentialCampaignEngine::begin_corpus(
+                &mut after_commit,
+                &cx,
+                &fixture.corpus_manifest,
+                &contract,
+            )
+            .await
+            .expect("begin ingest session");
+            DifferentialCampaignEngine::index_batch(&mut after_commit, &cx, &fixture.documents)
+                .await
+                .expect("index fixture corpus");
+            DifferentialCampaignEngine::commit_corpus(
+                &mut after_commit,
+                &cx,
+                &fixture.corpus_manifest,
+                &contract,
+            )
+            .await
+            .expect("commit fixture corpus");
+            let index_after_commit = DifferentialCampaignEngine::index_batch(
+                &mut after_commit,
+                &cx,
+                &fixture.documents[..1],
+            )
+            .await
+            .expect_err("indexing after commit must fail");
+            assert!(matches!(
+                index_after_commit,
+                GauntletError::InvalidCampaign { .. }
+            ));
+        });
     }
 
     #[test]
@@ -3257,6 +4242,115 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn scalar_g1a_default_syntax_regression_is_exact_and_deterministic() {
+        let fixture = make_scalar_g1a_regression_fixture();
+        let first_root = tempfile::tempdir()
+            .expect("first deterministic regression tempdir")
+            .keep();
+        let second_root = tempfile::tempdir()
+            .expect("second deterministic regression tempdir")
+            .keep();
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let first = run_scalar_g1a_deterministic_regression(&cx, &first_root, &fixture)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "corpus_hash={} run=first campaign_error={error}",
+                        fixture.corpus_hash
+                    )
+                });
+            let second = run_scalar_g1a_deterministic_regression(&cx, &second_root, &fixture)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "corpus_hash={} run=second campaign_error={error}",
+                        fixture.corpus_hash
+                    )
+                });
+
+            let selected_ids = first
+                .cases
+                .iter()
+                .map(|case| case.case_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                selected_ids,
+                [
+                    "term",
+                    "multi-term",
+                    "phrase",
+                    "same-position-phrase",
+                    "boolean-default",
+                    "paginated",
+                    "uncounted",
+                    "counted",
+                ],
+                "the scalar G1a regression must retain every owned default-parser class",
+            );
+            assert_eq!(first.selected_query_count, 8);
+            let mut observed_regression_hit = false;
+            for case in &first.cases {
+                assert_eq!(
+                    case.disposition,
+                    CampaignDisposition::Exact,
+                    "corpus_hash={} query_id={} first_divergence={:?} reason={:?}",
+                    first.corpus_manifest_hash,
+                    case.case_id,
+                    case.first_divergence,
+                    case.reason,
+                );
+                assert_eq!(
+                    case.comparison_status,
+                    Some(ComparisonStatus::Exact),
+                    "corpus_hash={} query_id={} first_divergence={:?}",
+                    first.corpus_manifest_hash,
+                    case.case_id,
+                    case.first_divergence,
+                );
+                assert_eq!(
+                    case.rank_class,
+                    Some(RankClass::RankExact),
+                    "corpus_hash={} query_id={} first_divergence={:?}",
+                    first.corpus_manifest_hash,
+                    case.case_id,
+                    case.first_divergence,
+                );
+                let object_hash = case
+                    .artifact_hash
+                    .as_deref()
+                    .expect("exact case artifact hash");
+                let object_path = first_root
+                    .join("objects")
+                    .join(format!("{object_hash}.json"));
+                let object: ArtifactObject = serde_json::from_slice(
+                    &std::fs::read(&object_path).expect("regression case artifact bytes"),
+                )
+                .expect("regression case artifact object");
+                assert!(
+                    object.comparison.subject.snippets.is_empty()
+                        && object.comparison.oracle.snippets.is_empty(),
+                    "corpus_hash={} query_id={} unexpectedly emitted snippets",
+                    first.corpus_manifest_hash,
+                    case.case_id,
+                );
+                observed_regression_hit |= !object.comparison.subject.hits.is_empty();
+            }
+            assert!(
+                observed_regression_hit,
+                "corpus_hash={} deterministic regression was vacuous",
+                first.corpus_manifest_hash
+            );
+            assert_eq!(
+                first.report_hash().expect("first report hash"),
+                second.report_hash().expect("second report hash")
+            );
+            assert_eq!(first, second, "repeated deterministic regression drifted");
+        });
+    }
+
     #[test]
     fn campaign_run_id_is_single_use_before_engine_ingest() {
         let fixture = make_fixture();
@@ -3758,13 +4852,77 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn tantivy_campaign_adapter_requires_a_fresh_one_shot_index() {
+    fn tantivy_campaign_adapter_enforces_the_one_shot_lifecycle() {
         let fixture = make_fixture();
         let version = oracle_version_contract().expect("oracle version");
-        let mut oracle = crate::TantivyOracle::in_memory(&version.lexical_git_revision, false)
-            .expect("in-memory oracle");
+        let revision = version.lexical_git_revision;
         let contract = SemanticContract::shipping_default();
+        let query = fixture
+            .query_suite
+            .cases
+            .iter()
+            .find(|case| case.id == "term")
+            .expect("term query case")
+            .clone();
+        let mut evidence_case =
+            DifferentialCase::new("tantivy-lifecycle-term", &query.query, query.limit);
+        evidence_case.offset = query.offset;
+        evidence_case.count_requested = query.count_requested;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut before_begin =
+                crate::TantivyOracle::in_memory(&revision, false).expect("oracle before begin");
+            assert!(matches!(
+                before_begin.index_batch(&cx, &fixture.documents[..1]).await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+            assert!(matches!(
+                before_begin
+                    .commit_corpus(&cx, &fixture.corpus_manifest, &contract)
+                    .await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+            assert!(matches!(
+                before_begin
+                    .observe_generated(&cx, &query, &evidence_case)
+                    .await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+
+            let mut before_commit =
+                crate::TantivyOracle::in_memory(&revision, false).expect("oracle before commit");
+            before_commit
+                .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
+                .await
+                .expect("begin before-commit oracle");
+            assert!(matches!(
+                before_commit
+                    .observe_generated(&cx, &query, &evidence_case)
+                    .await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+            before_commit.abort_corpus();
+            assert!(
+                before_commit
+                    .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
+                    .await
+                    .is_err(),
+                "an aborted oracle must remain poisoned",
+            );
+            assert!(matches!(
+                before_commit
+                    .index_batch(&cx, &fixture.documents[..1])
+                    .await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+            assert!(matches!(
+                before_commit
+                    .observe_generated(&cx, &query, &evidence_case)
+                    .await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+
+            let mut oracle = crate::TantivyOracle::in_memory(&revision, false)
+                .expect("committed in-memory oracle");
             oracle
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
                 .await
@@ -3780,6 +4938,16 @@ mod tests {
                 receipt.document_count,
                 fixture.corpus_manifest.document_count
             );
+            assert!(matches!(
+                oracle.index_batch(&cx, &fixture.documents[..1]).await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
+            assert!(matches!(
+                oracle
+                    .commit_corpus(&cx, &fixture.corpus_manifest, &contract)
+                    .await,
+                Err(GauntletError::InvalidCampaign { .. })
+            ));
             assert!(
                 oracle
                     .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
@@ -3915,5 +5083,429 @@ mod tests {
             mismatch_signature(RankClass::RankMismatch, &substitution),
             mismatch_signature(RankClass::RankMismatch, &missing)
         );
+    }
+
+    // ==== Divergence shrinker (bd-quill-duel-shrinker-2j21) ====
+
+    struct ScriptedShrinkEngine {
+        descriptor: EngineDescriptor,
+        skew_on: Option<String>,
+        documents: Vec<GeneratedDocument>,
+    }
+
+    impl ScriptedShrinkEngine {
+        fn honest(family: EngineFamily, label: &str) -> Self {
+            Self {
+                descriptor: EngineDescriptor {
+                    family,
+                    implementation: label.to_owned(),
+                    crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    source_revision: "test".to_owned(),
+                    source_dirty: false,
+                    config_hash: "test-config".to_owned(),
+                },
+                skew_on: None,
+                documents: Vec::new(),
+            }
+        }
+
+        fn skewed(family: EngineFamily, label: &str, trigger_doc: &str) -> Self {
+            let mut engine = Self::honest(family, label);
+            engine.skew_on = Some(trigger_doc.to_owned());
+            engine
+        }
+    }
+
+    impl DifferentialCampaignEngine for ScriptedShrinkEngine {
+        fn descriptor(&self) -> EngineDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn semantic_contract(&self) -> SemanticContract {
+            SemanticContract::scalar_g1a()
+        }
+
+        fn begin_corpus<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            _manifest: &'a CorpusManifest,
+            _semantic_contract: &'a SemanticContract,
+        ) -> CampaignFuture<'a, ()> {
+            Box::pin(async move {
+                self.documents.clear();
+                Ok(())
+            })
+        }
+
+        fn index_batch<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            documents: &'a [GeneratedDocument],
+        ) -> CampaignFuture<'a, ()> {
+            Box::pin(async move {
+                self.documents.extend_from_slice(documents);
+                Ok(())
+            })
+        }
+
+        fn commit_corpus<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            manifest: &'a CorpusManifest,
+            semantic_contract: &'a SemanticContract,
+        ) -> CampaignFuture<'a, EngineIndexReceipt> {
+            Box::pin(async move {
+                Ok(EngineIndexReceipt {
+                    corpus_manifest_hash: manifest.manifest_hash()?,
+                    document_count: u64::try_from(self.documents.len()).unwrap_or(u64::MAX),
+                    total_content_bytes: manifest.total_content_bytes,
+                    semantic_contract: semantic_contract.clone(),
+                })
+            })
+        }
+
+        fn observe_generated<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            query: &'a GeneratedQueryCase,
+            evidence_case: &'a DifferentialCase,
+        ) -> CampaignFuture<'a, EngineObservation> {
+            Box::pin(async move {
+                let mut hits: Vec<RankedHit> = self
+                    .documents
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, document)| {
+                        // Deterministic content-driven score, well separated.
+                        let mut hasher = Sha256::new();
+                        hasher.update(document.id.as_bytes());
+                        hasher.update(document.content.as_bytes());
+                        let digest = hasher.finalize();
+                        let score = 0.5_f32 + (f32::from(digest[0]) / 255.0) * 10.0;
+                        RankedHit {
+                            doc_id: document.id.clone(),
+                            score_bits: score.to_bits(),
+                            native_tie_key: NativeTieKey::QuillDocId {
+                                doc_id: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                            },
+                        }
+                    })
+                    .collect();
+                hits.sort_by(|left, right| {
+                    right
+                        .score_bits
+                        .cmp(&left.score_bits)
+                        .then_with(|| left.doc_id.cmp(&right.doc_id))
+                });
+                // The skew: when the trigger doc is in the corpus AND the
+                // query names the trigger token, zero its score — a rank
+                // flip beyond tie groups (RankMismatch) with order intact.
+                if let Some(trigger) = &self.skew_on {
+                    let query_names_trigger = query.query.contains("zzz");
+                    if query_names_trigger {
+                        for hit in &mut hits {
+                            if &hit.doc_id == trigger {
+                                hit.score_bits = 0.0_f32.to_bits();
+                            }
+                        }
+                        hits.sort_by(|left, right| {
+                            right
+                                .score_bits
+                                .cmp(&left.score_bits)
+                                .then_with(|| left.doc_id.cmp(&right.doc_id))
+                        });
+                    }
+                }
+                hits.truncate(usize::try_from(evidence_case.limit).unwrap_or(usize::MAX));
+                let count = u64::try_from(hits.len()).unwrap_or(u64::MAX);
+                let doc_count = u64::try_from(self.documents.len()).unwrap_or(u64::MAX);
+                Ok(EngineObservation {
+                    hits,
+                    cutoff_tie_group: Vec::new(),
+                    cutoff_tie_complete: false,
+                    offset_tie_group: Vec::new(),
+                    offset_tie_complete: false,
+                    snippets: BTreeMap::new(),
+                    match_count: CountState::Value(count),
+                    doc_count,
+                    ast_differences: Vec::new(),
+                })
+            })
+        }
+
+        fn abort_corpus(&mut self) {
+            self.documents.clear();
+        }
+    }
+
+    fn shrink_fixture_documents(count: usize) -> Vec<GeneratedDocument> {
+        (0..count)
+            .map(|index| GeneratedDocument {
+                id: format!("doc-{index:03}"),
+                title: None,
+                content: format!("alpha beta document number {index} searchable content"),
+                created_at_ms: 1_700_000_000 + i64::try_from(index).unwrap_or(0),
+                cass: None,
+                metadata: BTreeMap::new(),
+                pathology: None,
+                unicode_lane: crate::generator::UnicodeLane::Ascii,
+            })
+            .collect()
+    }
+
+    fn shrink_query() -> GeneratedQueryCase {
+        GeneratedQueryCase {
+            id: "shrink-case".to_owned(),
+            syntax: QuerySyntax::Default,
+            query_kind: GeneratedQueryKind::Harvested {
+                semantic_class: "test".to_owned(),
+            },
+            query: "zzz alpha beta gamma".to_owned(),
+            limit: 64,
+            offset: 0,
+            count_requested: true,
+            filters: crate::generator::GeneratedQueryFilters::default(),
+            expected_divergence: None,
+            source: "shrink-test".to_owned(),
+        }
+    }
+
+    fn shrink_evidence_case(query_text: &str) -> DifferentialCase {
+        DifferentialCase::new("shrink-case", query_text, 64)
+    }
+
+    fn make_honest() -> ShrinkEngineFactory {
+        Box::new(|| {
+            let engine: Box<dyn DifferentialCampaignEngine> =
+                Box::new(ScriptedShrinkEngine::honest(EngineFamily::Quill, "honest"));
+            Ok(engine)
+        })
+    }
+
+    fn make_skewed(trigger: &str) -> ShrinkEngineFactory {
+        let trigger = trigger.to_owned();
+        Box::new(move || {
+            let engine: Box<dyn DifferentialCampaignEngine> = Box::new(
+                ScriptedShrinkEngine::skewed(EngineFamily::Tantivy, "skewed", &trigger),
+            );
+            Ok(engine)
+        })
+    }
+
+    #[test]
+    fn shrink_minimizes_corpus_and_query_and_preserves_original_context() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let documents = shrink_fixture_documents(12);
+            let trigger_id = "doc-007".to_owned();
+            let query = shrink_query();
+            let request = ShrinkRequest {
+                corpus_manifest_hash: "full-corpus-hash".to_owned(),
+                documents,
+                query,
+                evidence_case: shrink_evidence_case("zzz alpha beta gamma"),
+                divergence_class: DivergenceClass::RankMismatch,
+            };
+            let driver = ShrinkDriver::new(
+                ComparatorConfig::default(),
+                SemanticContract::scalar_g1a(),
+                DEFAULT_SHRINK_FUEL,
+            );
+            let reproduction = driver
+                .shrink(
+                    &cx,
+                    &request,
+                    &mut make_honest(),
+                    &mut make_skewed(&trigger_id),
+                )
+                .await
+                .expect("shrink completes");
+
+            // Corpus reduced to a minimal set that still contains the trigger.
+            assert!(
+                reproduction
+                    .minimized_documents
+                    .iter()
+                    .any(|document| document.id == trigger_id),
+                "trigger survives: {:?}",
+                reproduction
+                    .minimized_documents
+                    .iter()
+                    .map(|document| &document.id)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                reproduction.minimized_documents.len() <= 4,
+                "ddmin converges near the trigger: {}",
+                reproduction.minimized_documents.len()
+            );
+            // Query minimized to the trigger token alone.
+            assert_eq!(reproduction.minimized_query_text, "zzz");
+            // Original context preserved (anti-over-minimization amendment).
+            assert_eq!(reproduction.original_document_count, 12);
+            assert_eq!(reproduction.original_query_text, "zzz alpha beta gamma");
+            assert_eq!(
+                reproduction.original_corpus_manifest_hash,
+                "full-corpus-hash"
+            );
+            assert_eq!(reproduction.divergence_class, DivergenceClass::RankMismatch);
+            assert!(reproduction.candidates_evaluated > 0);
+            assert!(reproduction.reduction_steps > 0);
+            // Auto-triage: identical sets with a rank flip => BM25 arithmetic.
+            assert_eq!(reproduction.triage.class, DivergenceClass::RankMismatch);
+        });
+    }
+
+    #[test]
+    fn shrink_fuel_exhaustion_is_a_typed_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let request = ShrinkRequest {
+                corpus_manifest_hash: "h".to_owned(),
+                documents: shrink_fixture_documents(12),
+                query: shrink_query(),
+                evidence_case: shrink_evidence_case("zzz alpha beta gamma"),
+                divergence_class: DivergenceClass::RankMismatch,
+            };
+            let driver = ShrinkDriver::new(
+                ComparatorConfig::default(),
+                SemanticContract::scalar_g1a(),
+                1,
+            );
+            let error = driver
+                .shrink(
+                    &cx,
+                    &request,
+                    &mut make_honest(),
+                    &mut make_skewed("doc-007"),
+                )
+                .await
+                .expect_err("one evaluation cannot finish a shrink");
+            assert!(matches!(error, ShrinkError::FuelExhausted { .. }));
+        });
+    }
+
+    #[test]
+    fn shrink_shadow_line_parses_and_preserves_stamped_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let record = ShadowDivergenceRecord {
+                schema_version: 1,
+                stamped_generation: 42,
+                corpus_manifest_hash: "shadow-corpus".to_owned(),
+                documents: shrink_fixture_documents(8),
+                query: shrink_query(),
+                evidence_case: shrink_evidence_case("zzz alpha beta gamma"),
+                divergence_class: DivergenceClass::RankMismatch,
+            };
+            let line = serde_json::to_string(&record).expect("serialize record");
+            let driver = ShrinkDriver::new(
+                ComparatorConfig::default(),
+                SemanticContract::scalar_g1a(),
+                DEFAULT_SHRINK_FUEL,
+            );
+            let reproduction = driver
+                .shrink_shadow_line(&cx, &line, &mut make_honest(), &mut make_skewed("doc-004"))
+                .await
+                .expect("shadow shrink completes");
+            assert!(
+                reproduction
+                    .original_corpus_manifest_hash
+                    .ends_with("#gen-42"),
+                "stamped generation rides into the reproduction: {}",
+                reproduction.original_corpus_manifest_hash
+            );
+            assert!(
+                reproduction
+                    .minimized_documents
+                    .iter()
+                    .any(|document| document.id == "doc-004")
+            );
+
+            let bad_line = "{\"schema_version\":99}";
+            let error = driver
+                .shrink_shadow_line(
+                    &cx,
+                    bad_line,
+                    &mut make_honest(),
+                    &mut make_skewed("doc-004"),
+                )
+                .await
+                .expect_err("unsupported schema fails closed");
+            assert!(matches!(error, ShrinkError::InvalidShadowRecord { .. }));
+        });
+    }
+
+    #[test]
+    fn auto_triage_maps_comparator_evidence_to_layers() {
+        let base_observation = |ids: &[&str]| EngineObservation {
+            hits: ids
+                .iter()
+                .enumerate()
+                .map(|(ordinal, id)| RankedHit {
+                    doc_id: (*id).to_owned(),
+                    score_bits: (10.0_f32 - ordinal as f32).to_bits(),
+                    native_tie_key: NativeTieKey::QuillDocId {
+                        doc_id: u32::try_from(ordinal).unwrap_or(u32::MAX),
+                    },
+                })
+                .collect(),
+            cutoff_tie_group: Vec::new(),
+            cutoff_tie_complete: false,
+            offset_tie_group: Vec::new(),
+            offset_tie_complete: false,
+            snippets: BTreeMap::new(),
+            match_count: CountState::Value(ids.len() as u64),
+            doc_count: ids.len() as u64,
+            ast_differences: Vec::new(),
+        };
+        let report = ComparisonReport {
+            status: ComparisonStatus::Failed,
+            rank_class: RankClass::RankMismatch,
+            score_epsilon_reason: None,
+            divergences: Vec::new(),
+            first_divergence: None,
+            subject: base_observation(&["a", "b", "c"]),
+            oracle: base_observation(&["a", "c", "b"]),
+        };
+        let verdict = auto_triage(DivergenceClass::RankMismatch, &report);
+        assert_eq!(verdict.suspected_layer, SuspectedLayer::FieldNormArithmetic);
+        assert_eq!(verdict.confidence, TriageConfidence::Medium);
+
+        let mut differing = report.clone();
+        differing.subject = base_observation(&["a", "b"]);
+        let verdict = auto_triage(DivergenceClass::RankMismatch, &differing);
+        assert_eq!(verdict.suspected_layer, SuspectedLayer::Indexing);
+
+        let verdict = auto_triage(DivergenceClass::TieOrder, &report);
+        assert_eq!(verdict.suspected_layer, SuspectedLayer::TieOrder);
+        assert_eq!(verdict.confidence, TriageConfidence::High);
+    }
+
+    #[test]
+    fn persist_shrunk_reproduction_writes_a_content_addressed_fixture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let reproduction = ShrunkReproduction {
+            schema_version: 1,
+            divergence_class: DivergenceClass::RankMismatch,
+            original_corpus_manifest_hash: "original".to_owned(),
+            original_document_count: 12,
+            original_query_text: "zzz alpha".to_owned(),
+            original_query_id: "case".to_owned(),
+            minimized_documents: shrink_fixture_documents(2),
+            minimized_query_text: "zzz".to_owned(),
+            triage: TriageVerdict {
+                class: DivergenceClass::RankMismatch,
+                suspected_layer: SuspectedLayer::FieldNormArithmetic,
+                confidence: TriageConfidence::Medium,
+                evidence: vec!["rows".to_owned()],
+            },
+            reduction_steps: 9,
+            candidates_evaluated: 41,
+        };
+        let path = persist_shrunk_reproduction(directory.path(), &reproduction)?;
+        assert!(path.exists());
+        assert!(path.starts_with(directory.path().join("shrunk")));
+        let roundtrip: ShrunkReproduction = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(roundtrip, reproduction);
+        Ok(())
     }
 }
