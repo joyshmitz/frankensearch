@@ -37,9 +37,10 @@ pub use grimoire::{
 };
 pub use keeper::{
     CURRENT_ENGINE_VERSION, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES, GarbageCollectionOptions,
-    GarbageCollectionReport, KeeperError, KeeperSnapshot, LoadedManifest, MANIFEST_FORMAT_VERSION,
-    MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats, ManifestPublisher,
-    ManifestSegment, ManifestSource, RecoveredSegment, load_manifest_pair, pack_engine_version,
+    GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter, LoadedManifest,
+    MANIFEST_FORMAT_VERSION, MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats,
+    ManifestSegment, ManifestSource, RecoveredSegment, WRITER_LOCK_FORMAT_VERSION,
+    WRITER_LOCK_MAGIC, WRITER_LOCK_RECORD_BYTES, load_manifest_pair, pack_engine_version,
     unpack_engine_version,
 };
 pub use query::{

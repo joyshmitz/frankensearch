@@ -669,7 +669,30 @@ impl FileProtector {
     #[allow(clippy::too_many_lines)]
     #[allow(unsafe_code)] // Mmap::map requires unsafe for memory-mapped I/O.
     pub fn repair_file(&self, path: &Path, sidecar_path: &Path) -> SearchResult<FileRepairOutcome> {
-        self.repair_file_internal(path, path, sidecar_path, None)
+        self.repair_file_internal(path, path, sidecar_path, None, false)
+    }
+
+    /// Reconstruct a protected source into a distinct, previously absent path.
+    ///
+    /// This is the fail-closed recovery primitive for callers that must
+    /// validate decoded bytes against a format-specific external witness
+    /// before atomically installing them over a corrupt source. The source is
+    /// never modified, and an existing destination is never overwritten. A
+    /// [`FileRepairOutcome::NotNeeded`] result leaves `destination` absent;
+    /// callers that require a staged copy must handle that outcome explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when `destination` already exists, or any ordinary
+    /// decode, sidecar, allocation, or durable-write error from repair.
+    #[allow(clippy::too_many_lines)]
+    pub fn repair_file_to(
+        &self,
+        source: &Path,
+        sidecar_path: &Path,
+        destination: &Path,
+    ) -> SearchResult<FileRepairOutcome> {
+        self.repair_file_internal(destination, source, sidecar_path, None, true)
     }
 
     fn repair_file_internal(
@@ -678,7 +701,21 @@ impl FileProtector {
         source_path: &Path,
         sidecar_path: &Path,
         verified_decode: Option<(RepairTrailerHeader, Vec<RepairSymbol>)>,
+        create_new_destination: bool,
     ) -> SearchResult<FileRepairOutcome> {
+        if create_new_destination {
+            match fs::symlink_metadata(dest_path) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        "staged repair destination already exists",
+                    )
+                    .into());
+                }
+                Err(source) if source.kind() == ErrorKind::NotFound => {}
+                Err(source) => return Err(source.into()),
+            }
+        }
         self.metrics.record_repair_attempt();
 
         let source_file = match fs::File::open(source_path) {
@@ -753,7 +790,7 @@ impl FileProtector {
 
             // Ensure no source handle is kept while rewriting the destination file.
             drop(source_file);
-            write_durable(dest_path, &[])?;
+            write_repaired_destination(dest_path, &[], create_new_destination)?;
             self.metrics.record_repair_success();
             info!(
                 path = %dest_path.display(),
@@ -846,7 +883,7 @@ impl FileProtector {
                     }
                 }
 
-                write_durable(dest_path, &data)?;
+                write_repaired_destination(dest_path, &data, create_new_destination)?;
                 self.metrics.record_repair_success();
                 info!(
                     path = %dest_path.display(),
@@ -973,7 +1010,7 @@ impl FileProtector {
         let repair_start = Instant::now();
         let source_path_to_read = if had_source { &backup_path } else { path };
         let outcome =
-            self.repair_file_internal(path, source_path_to_read, &sidecar, verified_decode);
+            self.repair_file_internal(path, source_path_to_read, &sidecar, verified_decode, false);
         let repair_time = repair_start.elapsed();
 
         self.finalize_repair(
@@ -1483,6 +1520,39 @@ fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Write one staging artifact without replacing an existing destination.
+///
+/// The private temporary name is created exclusively, synced, and hard-linked
+/// into place. Same-directory hard-link publication is atomic and fails if any
+/// filesystem entry already owns the destination name.
+fn write_repaired_destination(path: &Path, data: &[u8], create_new: bool) -> std::io::Result<()> {
+    if !create_new {
+        return write_durable(path, data);
+    }
+    let mut temporary_name = OsString::from(path.as_os_str());
+    temporary_name.push(".durable.tmp");
+    let temporary = PathBuf::from(temporary_name);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&temporary, path)?;
+        fs::remove_file(&temporary)?;
+        #[cfg(unix)]
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // `create_new` above proves that this invocation owns the temp name.
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1604,6 +1674,93 @@ mod tests {
         let snapshot = protector.metrics_snapshot();
         assert_eq!(snapshot.repair_attempts, 1);
         assert_eq!(snapshot.repair_successes, 1);
+    }
+
+    #[test]
+    fn staged_repair_is_no_clobber_and_preserves_the_source() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let source = temp_path("staged-repair-source");
+        let destination = temp_path("staged-repair-destination");
+        let payload = vec![0x5a_u8; 700];
+        std::fs::write(&source, &payload).expect("write source");
+        let protected = protector.protect_file(&source).expect("protect source");
+        let mut corrupted = payload.clone();
+        corrupted[17] ^= 0xff;
+        std::fs::write(&source, &corrupted).expect("corrupt source");
+
+        let repaired = protector
+            .repair_file_to(&source, &protected.sidecar_path, &destination)
+            .expect("stage repair");
+        assert!(matches!(repaired, FileRepairOutcome::Repaired { .. }));
+        assert_eq!(
+            std::fs::read(&destination).expect("read staged destination"),
+            payload
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read preserved corrupt source"),
+            corrupted
+        );
+
+        let occupied = temp_path("staged-repair-occupied");
+        let sentinel = b"existing destination authority";
+        std::fs::write(&occupied, sentinel).expect("write occupied destination");
+        let error = protector
+            .repair_file_to(&source, &protected.sidecar_path, &occupied)
+            .expect_err("staged repair must never clobber an existing destination");
+        assert!(matches!(
+            error,
+            frankensearch_core::SearchError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(&occupied).expect("read preserved destination"),
+            sentinel
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read source after conflict"),
+            corrupted
+        );
+
+        std::fs::write(&source, &payload).expect("restore healthy source");
+        let healthy_error = protector
+            .repair_file_to(&source, &protected.sidecar_path, &occupied)
+            .expect_err("healthy source must not bypass occupied destination rejection");
+        assert!(matches!(
+            healthy_error,
+            frankensearch_core::SearchError::Io(ref source)
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(
+            std::fs::read(&occupied).expect("read occupied destination after healthy conflict"),
+            sentinel
+        );
+    }
+
+    #[test]
+    fn staged_repair_supports_an_empty_protected_payload() {
+        let protector =
+            FileProtector::new(Arc::new(MockRepairCodec), test_config()).expect("protector");
+        let source = temp_path("staged-empty-source");
+        let destination = temp_path("staged-empty-destination");
+        std::fs::write(&source, []).expect("write empty source");
+        let protected = protector
+            .protect_file(&source)
+            .expect("protect empty source");
+        std::fs::write(&source, b"corrupt non-empty replacement").expect("corrupt source");
+
+        let repaired = protector
+            .repair_file_to(&source, &protected.sidecar_path, &destination)
+            .expect("stage empty repair");
+        assert!(matches!(repaired, FileRepairOutcome::Repaired { .. }));
+        assert_eq!(
+            std::fs::metadata(&destination).expect("stat stage").len(),
+            0
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("read preserved source"),
+            b"corrupt non-empty replacement"
+        );
     }
 
     #[test]

@@ -1,15 +1,16 @@
 //! Keeper lifecycle and durability.
 //!
 //! This module owns the hand-rolled MANIFEST v1 wire format, Q1 range
-//! validation, two-slot recovery, and serialized publication. Segment I/O,
-//! tombstone mutation, merge/compaction, and cross-process writer ownership
-//! land in the adjacent Keeper milestones.
+//! validation, two-slot recovery, cross-process writer ownership, staged
+//! durability repair, serialized publication, and writer-admitted garbage
+//! collection. Segment I/O and the remaining merge/compaction policy live in
+//! adjacent Keeper modules and milestones.
 
 #[cfg(unix)]
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -19,7 +20,7 @@ use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
 use frankensearch_core::SearchError;
 #[cfg(feature = "durability")]
-use frankensearch_durability::{FileProtector, FileSourceWitness};
+use frankensearch_durability::{FileProtector, FileRepairOutcome, FileSourceWitness};
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use thiserror::Error;
 
@@ -50,6 +51,12 @@ pub const MANIFEST_KNOWN_FLAGS: u32 = MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
 pub const EMPTY_TOMBSTONES: [u8; 4] = [0, 0, 0, 0];
 /// Minimum age of an unreachable Quill artifact before writer GC may remove it.
 pub const DEFAULT_GARBAGE_GRACE: Duration = Duration::from_secs(300);
+/// Eight-byte writer-admission magic, including its trailing NUL.
+pub const WRITER_LOCK_MAGIC: [u8; 8] = *b"FSLXLCK\0";
+/// Current durable writer-lock record version.
+pub const WRITER_LOCK_FORMAT_VERSION: u32 = 1;
+/// Exact byte length of a v1 writer-lock record, including its CRC32.
+pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 
 /// Current Quill crate version in the MANIFEST packed-semver representation.
 ///
@@ -66,9 +73,10 @@ const TOMBSTONE_BITMAP_MIN_CARDINALITY: u64 = 3_584;
 const MAX_TOMBSTONE_CHUNKS: usize = 65_536;
 
 // Construction initializes this once outside the async publication path. The
-// asupersync mutex is the only lock acquired by a writer. E3.2 deliberately
-// serializes all in-process MANIFEST writers; a later ownership lane can add
-// finer-grained cross-process admission without weakening this guarantee.
+// asupersync mutex serializes every filesystem mutation within the process;
+// every public mutation path additionally requires a retained cross-process
+// `KeeperWriter` admission. Its owned guard is moved into blocking work so a
+// cancelled async caller cannot release serialization before that work exits.
 static PUBLISH_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
 /// Pack semantic-version components into the durable `engine_version` word.
@@ -218,6 +226,33 @@ pub enum KeeperError {
         expected: u64,
         /// Proposed generation.
         proposed: u64,
+    },
+    /// Another process still owns the cross-process writer admission.
+    #[error("Quill writer is busy at {path}; owner pid={owner_pid:?}")]
+    WriterBusy {
+        /// Canonical writer-lock path.
+        path: PathBuf,
+        /// Best-effort owner diagnosis from a complete lock record.
+        owner_pid: Option<u32>,
+    },
+    /// The persistent writer-lock record is malformed and cannot be reclaimed.
+    #[error("corrupt Quill writer lock at {path}: {detail}")]
+    WriterLockCorrupted {
+        /// Canonical writer-lock path.
+        path: PathBuf,
+        /// Failed wire, type, or liveness invariant.
+        detail: String,
+    },
+    /// Cancellation was observed while acquiring or initializing a writer.
+    #[error("Quill writer admission cancelled")]
+    WriterAdmissionCancelled,
+    /// An extant `O_EXCL` artifact already owns the proposed generation.
+    #[error("Quill generation {generation} is already claimed at {path}")]
+    GenerationClaimConflict {
+        /// Existing canonical claim path.
+        path: PathBuf,
+        /// Claimed MANIFEST generation.
+        generation: u64,
     },
     /// The current generation cannot be incremented.
     #[error("manifest generation space exhausted at {current}")]
@@ -428,6 +463,10 @@ impl From<KeeperError> for SearchError {
             KeeperError::InvalidClaimArtifact { path, detail } => {
                 Self::IndexCorrupted { path, detail }
             }
+            KeeperError::WriterAdmissionCancelled => Self::Cancelled {
+                phase: "keeper.writer_admission".to_owned(),
+                reason: "writer admission cancelled".to_owned(),
+            },
             KeeperError::PublishLock { source } => match source {
                 LockError::Cancelled => Self::Cancelled {
                     phase: "keeper.publish".to_owned(),
@@ -883,9 +922,9 @@ impl KeeperSnapshot {
 
     /// Create a genesis index or open an existing index with the same schema.
     ///
-    /// This is the low-level Keeper create-or-open primitive. Cross-process
-    /// admission is added by the dependent writer-lock milestone; the current
-    /// publisher still serializes all writers inside this process.
+    /// Creation is a writer operation: it acquires the cross-process admission,
+    /// publishes genesis through an `O_EXCL` generation claim, and releases the
+    /// writer capability before returning this read-only snapshot.
     ///
     /// # Errors
     ///
@@ -896,44 +935,24 @@ impl KeeperSnapshot {
         directory: impl Into<PathBuf>,
         schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
-        let directory = directory.into();
-        match open_snapshot_blocking(directory.clone(), schema).await {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(KeeperError::IndexNotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
+        let writer = KeeperWriter::create(cx, directory, schema).await?;
+        Ok(writer.snapshot.clone())
+    }
 
-        let create_path = directory.clone();
-        spawn_blocking(move || {
-            std::fs::create_dir_all(&create_path).map_err(|source| KeeperError::Io {
-                operation: "create index directory",
-                path: create_path,
-                source,
-            })
-        })
-        .await?;
-
-        // Another in-process creator may have won while this caller created
-        // the directory. Open first so an existing schema mismatch is typed.
-        match open_snapshot_blocking(directory.clone(), schema).await {
-            Ok(snapshot) => return Ok(snapshot),
-            Err(KeeperError::IndexNotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-
-        let schema_id = schema
-            .schema_id()
-            .map_err(|source| KeeperError::InvalidSchema { source })?;
-        let genesis = Manifest::empty(1, schema_id, 0);
-        match ManifestPublisher::new(&directory)
-            .publish(cx, &genesis)
-            .await
-        {
-            Ok(_) | Err(KeeperError::GenerationConflict { .. }) => {
-                open_snapshot_blocking(directory, schema).await
-            }
-            Err(error) => Err(error),
-        }
+    /// Acquire the sole cross-process writer capability for this index.
+    ///
+    /// Reader [`Self::open`] remains lock-free and filesystem-touchless.
+    /// Writer open acquires `LOCK` before interrupted-publish recovery and GC.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed busy, corrupt-lock, recovery, schema, or I/O failure.
+    pub async fn open_writer(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+    ) -> Result<KeeperWriter, KeeperError> {
+        KeeperWriter::open(cx, directory, schema).await
     }
 
     /// Construct an owned-buffer genesis snapshot without creating files.
@@ -984,6 +1003,345 @@ impl KeeperSnapshot {
     }
 }
 
+#[derive(Clone)]
+enum WriterProtection {
+    Disabled,
+    #[cfg(feature = "durability")]
+    Enabled(FileProtector),
+}
+
+/// Sole cross-process mutation capability for one Quill index directory.
+///
+/// This type is intentionally not `Clone`. Its internal admission token may be
+/// retained by an in-flight blocking publication so cancellation cannot release
+/// the OS lock while filesystem mutation is still running.
+pub struct KeeperWriter {
+    admission: Arc<WriterAdmissionInner>,
+    snapshot: KeeperSnapshot,
+    garbage_options: GarbageCollectionOptions,
+    protection: WriterProtection,
+}
+
+impl KeeperWriter {
+    /// Open an existing index for mutation with the default GC grace period.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed admission, recovery, schema, segment, or I/O failure.
+    pub async fn open(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        Self::open_inner(
+            cx,
+            directory.into(),
+            schema,
+            false,
+            GarbageCollectionOptions::default(),
+            WriterProtection::Disabled,
+        )
+        .await
+    }
+
+    /// Create a genesis index or open an existing one for mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::open`] plus directory creation or
+    /// genesis-publication failures.
+    pub async fn create(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, KeeperError> {
+        Self::open_inner(
+            cx,
+            directory.into(),
+            schema,
+            true,
+            GarbageCollectionOptions::default(),
+            WriterProtection::Disabled,
+        )
+        .await
+    }
+
+    /// Open an existing index and activate writer-only FEC recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::open`] plus typed durability
+    /// decode, validation, or staged-install failures.
+    #[cfg(feature = "durability")]
+    pub async fn open_durable(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+        protector: FileProtector,
+    ) -> Result<Self, KeeperError> {
+        Self::open_inner(
+            cx,
+            directory.into(),
+            schema,
+            false,
+            GarbageCollectionOptions::default(),
+            WriterProtection::Enabled(protector),
+        )
+        .await
+    }
+
+    /// Create or open an index with writer-only FEC recovery enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::open_durable`] plus genesis
+    /// directory or publication failures.
+    #[cfg(feature = "durability")]
+    pub async fn create_durable(
+        cx: &Cx,
+        directory: impl Into<PathBuf>,
+        schema: SchemaDescriptor,
+        protector: FileProtector,
+    ) -> Result<Self, KeeperError> {
+        Self::open_inner(
+            cx,
+            directory.into(),
+            schema,
+            true,
+            GarbageCollectionOptions::default(),
+            WriterProtection::Enabled(protector),
+        )
+        .await
+    }
+
+    async fn open_inner(
+        cx: &Cx,
+        directory: PathBuf,
+        schema: SchemaDescriptor,
+        create: bool,
+        garbage_options: GarbageCollectionOptions,
+        protection: WriterProtection,
+    ) -> Result<Self, KeeperError> {
+        if cx.is_cancel_requested() {
+            return Err(KeeperError::WriterAdmissionCancelled);
+        }
+        let mut directory = normalize_publish_directory(directory);
+        if create {
+            let create_path = directory.clone();
+            spawn_blocking(move || {
+                std::fs::create_dir_all(&create_path).map_err(|source| KeeperError::Io {
+                    operation: "create index directory",
+                    path: create_path,
+                    source,
+                })
+            })
+            .await?;
+            directory = normalize_publish_directory(directory);
+        }
+        let admission_directory = directory.clone();
+        let admission =
+            spawn_blocking(move || acquire_writer_admission(&admission_directory)).await?;
+        if cx.is_cancel_requested() {
+            return Err(KeeperError::WriterAdmissionCancelled);
+        }
+
+        let recovery_admission = Arc::clone(&admission);
+        let recovery_protection = protection.clone();
+        spawn_blocking(move || {
+            recover_writer_directory(&recovery_admission, schema, &recovery_protection)
+        })
+        .await?;
+
+        match open_snapshot_blocking(directory.clone(), schema).await {
+            Ok(_) => {}
+            Err(KeeperError::IndexNotFound { .. }) if create => {
+                let schema_id = schema
+                    .schema_id()
+                    .map_err(|source| KeeperError::InvalidSchema { source })?;
+                let genesis = Manifest::empty(1, schema_id, 0);
+                let claim_admission = Arc::clone(&admission);
+                let publisher = ManifestPublisher::new(&directory);
+                match &protection {
+                    WriterProtection::Disabled => {
+                        publisher
+                            .publish_with_generation_claim(cx, &genesis, move |_, generation| {
+                                GenerationClaimGuard::acquire(claim_admission, generation)
+                            })
+                            .await?;
+                    }
+                    #[cfg(feature = "durability")]
+                    WriterProtection::Enabled(protector) => {
+                        publisher
+                            .publish_durable_with_generation_claim(
+                                cx,
+                                &genesis,
+                                protector,
+                                move |_, generation| {
+                                    GenerationClaimGuard::acquire(claim_admission, generation)
+                                },
+                            )
+                            .await?;
+                    }
+                }
+                open_snapshot_blocking(directory.clone(), schema).await?;
+            }
+            Err(error) => return Err(error),
+        }
+
+        let gc_admission = Arc::clone(&admission);
+        let gc_directory = directory.clone();
+        spawn_blocking(move || {
+            gc_admission.ensure_directory_identity()?;
+            collect_writer_garbage_under_lock(&gc_directory, schema, garbage_options)
+        })
+        .await?;
+        // GC cannot remove reachable bytes, but reopen once so the writer's
+        // snapshot is proven from the post-recovery directory state.
+        let snapshot = open_snapshot_blocking(directory, schema).await?;
+        Ok(Self {
+            admission,
+            snapshot,
+            garbage_options,
+            protection,
+        })
+    }
+
+    /// Current immutable reader view held by this writer.
+    #[must_use]
+    pub const fn snapshot(&self) -> &KeeperSnapshot {
+        &self.snapshot
+    }
+
+    /// Publish exactly the next MANIFEST generation through an `O_EXCL` claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, claim, transition, durability, or I/O
+    /// failures. The prior snapshot remains installed on error.
+    pub async fn publish(
+        &mut self,
+        cx: &Cx,
+        manifest: &Manifest,
+    ) -> Result<&KeeperSnapshot, KeeperError> {
+        self.admission.ensure_directory_identity()?;
+        let directory = self.admission.directory.clone();
+        let claim_admission = Arc::clone(&self.admission);
+        let publisher = ManifestPublisher::new(&directory);
+        match &self.protection {
+            WriterProtection::Disabled => {
+                publisher
+                    .publish_with_generation_claim(cx, manifest, move |_, generation| {
+                        GenerationClaimGuard::acquire(claim_admission, generation)
+                    })
+                    .await?;
+            }
+            #[cfg(feature = "durability")]
+            WriterProtection::Enabled(protector) => {
+                publisher
+                    .publish_durable_with_generation_claim(
+                        cx,
+                        manifest,
+                        protector,
+                        move |_, generation| {
+                            GenerationClaimGuard::acquire(claim_admission, generation)
+                        },
+                    )
+                    .await?;
+            }
+        }
+        self.admission.ensure_directory_identity()?;
+        self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
+        Ok(&self.snapshot)
+    }
+
+    /// Atomically install one synced immutable segment while holding `LOCK`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed path, collision, sidecar, or fsync failure.
+    pub async fn publish_segment(
+        &mut self,
+        cx: &Cx,
+        pending: PendingSegmentFile,
+    ) -> Result<PathBuf, KeeperError> {
+        let guard = writer_mutation_guard(cx).await?;
+        let admission = Arc::clone(&self.admission);
+        let protection = self.protection.clone();
+        spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            let parent = pending.path().parent().ok_or_else(|| KeeperError::Io {
+                operation: "resolve pending segment directory",
+                path: pending.path().to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pending segment path has no parent directory",
+                ),
+            })?;
+            let parent = std::fs::canonicalize(parent).map_err(|source| KeeperError::Io {
+                operation: "canonicalize pending segment directory",
+                path: parent.to_path_buf(),
+                source,
+            })?;
+            if parent != admission.directory {
+                return Err(KeeperError::Io {
+                    operation: "verify pending segment directory",
+                    path: pending.path().to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "pending segment belongs to a different index directory",
+                    ),
+                });
+            }
+            let published = match &protection {
+                WriterProtection::Disabled => publish_pending_segment(pending),
+                #[cfg(feature = "durability")]
+                WriterProtection::Enabled(protector) => {
+                    publish_pending_segment_durable(pending, protector)
+                }
+            }?;
+            admission.ensure_directory_identity()?;
+            Ok(published)
+        })
+        .await
+    }
+
+    /// Run one grace-window garbage sweep under the held writer admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns before removal on any recovery, identity, metadata, or path
+    /// validation failure.
+    pub async fn collect_garbage(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<GarbageCollectionReport, KeeperError> {
+        let guard = writer_mutation_guard(cx).await?;
+        let admission = Arc::clone(&self.admission);
+        let schema = self.snapshot.schema();
+        let options = self.garbage_options;
+        spawn_blocking(move || {
+            let _guard = guard;
+            admission.ensure_directory_identity()?;
+            collect_writer_garbage_under_lock(&admission.directory, schema, options)
+        })
+        .await
+    }
+}
+
+async fn writer_mutation_guard(cx: &Cx) -> Result<OwnedMutexGuard<()>, KeeperError> {
+    if cx.is_cancel_requested() {
+        return Err(KeeperError::WriterAdmissionCancelled);
+    }
+    let guard = OwnedMutexGuard::lock(global_publish_lock(), cx)
+        .await
+        .map_err(|source| KeeperError::PublishLock { source })?;
+    if cx.is_cancel_requested() {
+        return Err(KeeperError::WriterAdmissionCancelled);
+    }
+    Ok(guard)
+}
+
 fn recovery_retryable(error: &KeeperError) -> bool {
     matches!(
         error,
@@ -996,6 +1354,1063 @@ async fn open_snapshot_blocking(
     schema: SchemaDescriptor,
 ) -> Result<KeeperSnapshot, KeeperError> {
     spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriterLockRecord {
+    pid: u32,
+    pid_start_nonce: u64,
+    acquired_unix_s: i64,
+}
+
+impl WriterLockRecord {
+    fn current(path: &Path) -> Result<Self, KeeperError> {
+        let pid = std::process::id();
+        if i32::try_from(pid).is_err() || pid == 0 {
+            return Err(KeeperError::WriterLockCorrupted {
+                path: path.to_path_buf(),
+                detail: format!("current process id {pid} is outside the POSIX pid range"),
+            });
+        }
+        let acquired_unix_s = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+            .ok_or_else(|| KeeperError::WriterLockCorrupted {
+                path: path.to_path_buf(),
+                detail: "current wall clock is outside the v1 lock-record range".to_owned(),
+            })?;
+        Ok(Self {
+            pid,
+            pid_start_nonce: writer_pid_start_nonce(pid, acquired_unix_s),
+            acquired_unix_s,
+        })
+    }
+
+    fn to_bytes(self) -> [u8; WRITER_LOCK_RECORD_BYTES] {
+        let mut bytes = [0_u8; WRITER_LOCK_RECORD_BYTES];
+        bytes[..8].copy_from_slice(&WRITER_LOCK_MAGIC);
+        bytes[8..12].copy_from_slice(&WRITER_LOCK_FORMAT_VERSION.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.pid.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.pid_start_nonce.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.acquired_unix_s.to_le_bytes());
+        let checksum = crc32fast::hash(&bytes[..32]);
+        bytes[32..36].copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != WRITER_LOCK_RECORD_BYTES {
+            return Err(format!(
+                "v1 record must be exactly {WRITER_LOCK_RECORD_BYTES} bytes, found {}",
+                bytes.len()
+            ));
+        }
+        if bytes[..8] != WRITER_LOCK_MAGIC {
+            return Err("invalid writer-lock magic".to_owned());
+        }
+        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if version != WRITER_LOCK_FORMAT_VERSION {
+            return Err(format!("unsupported writer-lock version {version}"));
+        }
+        let stored_checksum = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+        let computed_checksum = crc32fast::hash(&bytes[..32]);
+        if stored_checksum != computed_checksum {
+            return Err(format!(
+                "writer-lock CRC mismatch: stored {stored_checksum:#010x}, computed {computed_checksum:#010x}"
+            ));
+        }
+        let pid = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        if pid == 0 || i32::try_from(pid).is_err() {
+            return Err(format!(
+                "writer-lock pid {pid} is outside the POSIX pid range"
+            ));
+        }
+        let pid_start_nonce = u64::from_le_bytes([
+            bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+        ]);
+        let acquired_unix_s = i64::from_le_bytes([
+            bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
+        ]);
+        if acquired_unix_s < 0 {
+            return Err(format!(
+                "writer-lock acquisition timestamp {acquired_unix_s} predates the Unix epoch"
+            ));
+        }
+        Ok(Self {
+            pid,
+            pid_start_nonce,
+            acquired_unix_s,
+        })
+    }
+}
+
+fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Some(start_time) = linux_process_start_time(pid) {
+        let mut identity = [0_u8; 12];
+        identity[..4].copy_from_slice(&pid.to_le_bytes());
+        identity[4..].copy_from_slice(&start_time.to_le_bytes());
+        return xxhash_rust::xxh3::xxh3_64(&identity);
+    }
+
+    let mut identity = [0_u8; 12];
+    identity[..4].copy_from_slice(&pid.to_le_bytes());
+    identity[4..].copy_from_slice(&acquired_unix_s.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&identity)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_command = stat.get(stat.rfind(')')?.checked_add(1)?..)?;
+    // The first token after the command is field 3 (`state`); starttime is
+    // field 22, hence zero-based token 19 in this suffix.
+    after_command.split_whitespace().nth(19)?.parse().ok()
+}
+
+struct WriterAdmissionInner {
+    directory: PathBuf,
+    directory_file: File,
+    lock_path: PathBuf,
+    lock_file: File,
+    #[cfg(unix)]
+    lock_device: u64,
+    #[cfg(unix)]
+    lock_inode: u64,
+    record: WriterLockRecord,
+}
+
+impl WriterAdmissionInner {
+    #[cfg(unix)]
+    fn ensure_directory_identity(&self) -> Result<(), KeeperError> {
+        ensure_gc_directory_identity(&self.directory, &self.directory_file)?;
+        ensure_writer_lock_identity(self)
+    }
+
+    #[cfg(not(unix))]
+    fn ensure_directory_identity(&self) -> Result<(), KeeperError> {
+        Err(KeeperError::Io {
+            operation: "verify writer-lock directory identity",
+            path: self.directory.clone(),
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "cross-process Quill writer admission requires Unix directory identity",
+            ),
+        })
+    }
+}
+
+impl Drop for WriterAdmissionInner {
+    fn drop(&mut self) {
+        release_writer_admission(self);
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner>, KeeperError> {
+    use rustix::fs::{FlockOperation, Mode, OFlags, flock, openat};
+
+    let directory_file = open_gc_directory(directory)?;
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    let lock_path = directory.join("LOCK");
+    let lock = openat(
+        &directory_file,
+        "LOCK",
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(io::Error::from)
+    .map_err(|source| KeeperError::Io {
+        operation: "open no-follow writer lock",
+        path: lock_path.clone(),
+        source,
+    })?;
+    let mut lock_file = File::from(lock);
+    let metadata = lock_file.metadata().map_err(|source| KeeperError::Io {
+        operation: "inspect writer lock",
+        path: lock_path.clone(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: lock_path,
+            detail: "LOCK must be a no-follow regular file".to_owned(),
+        });
+    }
+    use std::os::unix::fs::MetadataExt;
+    let lock_device = metadata.dev();
+    let lock_inode = metadata.ino();
+    if let Err(source) = flock(&lock_file, FlockOperation::NonBlockingLockExclusive) {
+        if source == rustix::io::Errno::AGAIN {
+            let owner_pid = read_writer_lock_record(&lock_path, &mut lock_file)
+                .ok()
+                .flatten()
+                .map(|record| record.pid);
+            return Err(KeeperError::WriterBusy {
+                path: lock_path,
+                owner_pid,
+            });
+        }
+        return Err(KeeperError::Io {
+            operation: "acquire writer flock",
+            path: lock_path,
+            source: io::Error::from(source),
+        });
+    }
+
+    if let Some(previous) = read_writer_lock_record(&lock_path, &mut lock_file)?
+        && !writer_pid_is_dead(previous.pid)
+    {
+        return Err(KeeperError::WriterBusy {
+            path: lock_path,
+            owner_pid: Some(previous.pid),
+        });
+    }
+
+    let record = WriterLockRecord::current(&lock_path)?;
+    if let Err(error) = write_writer_lock_record(&lock_path, &mut lock_file, record) {
+        // The flock proves this descriptor is the only cooperating writer for
+        // this inode. Best-effort truncation prevents a short failed write from
+        // becoming a permanent corrupt residual record.
+        let _ = lock_file.set_len(0);
+        let _ = lock_file.sync_all();
+        return Err(error);
+    }
+    let admission = Arc::new(WriterAdmissionInner {
+        directory: directory.to_path_buf(),
+        directory_file,
+        lock_path,
+        lock_file,
+        lock_device,
+        lock_inode,
+        record,
+    });
+    admission
+        .directory_file
+        .sync_all()
+        .map_err(|source| KeeperError::Io {
+            operation: "fsync writer-lock directory",
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    admission.ensure_directory_identity()?;
+    Ok(admission)
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+)))]
+fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner>, KeeperError> {
+    Err(KeeperError::Io {
+        operation: "verify writer-lock support",
+        path: directory.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cross-process Quill writer admission requires flock semantics",
+        ),
+    })
+}
+
+fn read_writer_lock_record(
+    path: &Path,
+    file: &mut File,
+) -> Result<Option<WriterLockRecord>, KeeperError> {
+    let length = file
+        .metadata()
+        .map_err(|source| KeeperError::Io {
+            operation: "inspect writer-lock record",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if length == 0 {
+        return Ok(None);
+    }
+    if length != usize_to_u64(WRITER_LOCK_RECORD_BYTES) {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: path.to_path_buf(),
+            detail: format!(
+                "v1 record must be exactly {WRITER_LOCK_RECORD_BYTES} bytes, found {length}"
+            ),
+        });
+    }
+    let mut bytes = [0_u8; WRITER_LOCK_RECORD_BYTES];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut bytes))
+        .map_err(|source| KeeperError::Io {
+            operation: "read writer-lock record",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    WriterLockRecord::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|detail| KeeperError::WriterLockCorrupted {
+            path: path.to_path_buf(),
+            detail,
+        })
+}
+
+fn write_writer_lock_record(
+    path: &Path,
+    file: &mut File,
+    record: WriterLockRecord,
+) -> Result<(), KeeperError> {
+    let bytes = record.to_bytes();
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| file.write_all(&bytes))
+        .and_then(|()| file.sync_all())
+        .map_err(|source| KeeperError::Io {
+            operation: "persist writer-lock record",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(unix)]
+fn writer_pid_is_dead(pid: u32) -> bool {
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return false;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+        return false;
+    };
+    matches!(
+        rustix::process::test_kill_process(pid),
+        Err(source) if source == rustix::io::Errno::SRCH
+    )
+}
+
+#[cfg(not(unix))]
+fn writer_pid_is_dead(_: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn ensure_writer_lock_identity(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata =
+        std::fs::symlink_metadata(&admission.lock_path).map_err(|source| KeeperError::Io {
+            operation: "verify writer-lock pathname",
+            path: admission.lock_path.clone(),
+            source,
+        })?;
+    if !metadata.file_type().is_file()
+        || metadata.dev() != admission.lock_device
+        || metadata.ino() != admission.lock_inode
+    {
+        return Err(KeeperError::WriterLockCorrupted {
+            path: admission.lock_path.clone(),
+            detail: "LOCK pathname no longer resolves to the flocked inode".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn release_writer_admission(admission: &mut WriterAdmissionInner) {
+    use rustix::fs::{FlockOperation, flock};
+
+    if read_writer_lock_record(&admission.lock_path, &mut admission.lock_file)
+        .is_ok_and(|record| record == Some(admission.record))
+    {
+        let _ = admission.lock_file.set_len(0);
+        let _ = admission.lock_file.sync_all();
+    }
+    let _ = flock(&admission.lock_file, FlockOperation::Unlock);
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+)))]
+fn release_writer_admission(_: &mut WriterAdmissionInner) {}
+
+fn recover_writer_directory(
+    admission: &Arc<WriterAdmissionInner>,
+    schema: SchemaDescriptor,
+    protection: &WriterProtection,
+) -> Result<(), KeeperError> {
+    admission.ensure_directory_identity()?;
+    #[cfg(feature = "durability")]
+    if let WriterProtection::Enabled(protector) = protection {
+        recover_durable_manifest_slots(admission, schema, protector)?;
+    }
+    recover_interrupted_generation_claims(admission)?;
+    recover_corrupt_primary_slot(admission)?;
+    #[cfg(feature = "durability")]
+    if let WriterProtection::Enabled(protector) = protection {
+        recover_durable_writer_files(admission, schema, protector)?;
+    }
+    #[cfg(not(feature = "durability"))]
+    {
+        let _ = schema;
+        let _ = protection;
+    }
+    admission.ensure_directory_identity()
+}
+
+fn recover_interrupted_generation_claims(
+    admission: &Arc<WriterAdmissionInner>,
+) -> Result<(), KeeperError> {
+    let recovered_generation = match load_manifest_pair(&admission.directory) {
+        Ok(loaded) => loaded.manifest.generation,
+        Err(KeeperError::IndexNotFound { .. }) => 0,
+        Err(error) => return Err(error),
+    };
+    let next_generation = recovered_generation.checked_add(1);
+    for (path, generation) in scan_generation_claims(&admission.directory)? {
+        if generation > recovered_generation && Some(generation) != next_generation {
+            return Err(KeeperError::InvalidRecoveryClaim {
+                path,
+                recovered: recovered_generation,
+                claimed: generation,
+            });
+        }
+        if Some(generation) == next_generation {
+            retire_interrupted_manifest_temp(admission, generation)?;
+        }
+        remove_stale_generation_claim(admission, &path)?;
+    }
+    Ok(())
+}
+
+fn retire_interrupted_manifest_temp(
+    admission: &WriterAdmissionInner,
+    generation: u64,
+) -> Result<(), KeeperError> {
+    let source = admission
+        .directory
+        .join(format!(".tmp-manifest-{generation}"));
+    let retired = admission.directory.join(format!(
+        ".tmp-abandoned-manifest-{generation}-{:016x}",
+        admission.record.pid_start_nonce
+    ));
+    let changed = retire_regular_artifact(&source, &retired)?;
+    let source_sidecar = append_path_suffix(&source, ".fec");
+    let retired_sidecar = append_path_suffix(&retired, ".fec");
+    let changed = retire_regular_artifact(&source_sidecar, &retired_sidecar)? || changed;
+    if changed {
+        admission
+            .directory_file
+            .sync_all()
+            .map_err(|source| KeeperError::Io {
+                operation: "fsync abandoned MANIFEST temp retirement",
+                path: admission.directory.clone(),
+                source,
+            })?;
+    }
+    Ok(())
+}
+
+fn recover_corrupt_primary_slot(admission: &WriterAdmissionInner) -> Result<(), KeeperError> {
+    let current = admission.directory.join("MANIFEST");
+    let previous = admission.directory.join("MANIFEST.prev");
+    let current_slot = read_manifest_slot(&current)?;
+    let previous_slot = read_manifest_slot(&previous)?;
+    if !matches!(current_slot, ManifestSlot::Invalid(_))
+        || !matches!(previous_slot, ManifestSlot::Valid(_))
+    {
+        return Ok(());
+    }
+
+    let retired = admission.directory.join(format!(
+        ".tmp-corrupt-manifest-{:016x}",
+        admission.record.pid_start_nonce
+    ));
+    let changed = retire_regular_artifact(&current, &retired)?;
+    let current_sidecar = append_path_suffix(&current, ".fec");
+    let retired_sidecar = append_path_suffix(&retired, ".fec");
+    let changed = retire_regular_artifact(&current_sidecar, &retired_sidecar)? || changed;
+    if changed {
+        admission
+            .directory_file
+            .sync_all()
+            .map_err(|source| KeeperError::Io {
+                operation: "fsync corrupt MANIFEST retirement",
+                path: admission.directory.clone(),
+                source,
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durability")]
+fn recover_durable_manifest_slots(
+    admission: &WriterAdmissionInner,
+    schema: SchemaDescriptor,
+    protector: &FileProtector,
+) -> Result<(), KeeperError> {
+    let current_path = admission.directory.join("MANIFEST");
+    let previous_path = admission.directory.join("MANIFEST.prev");
+    let expected_schema = schema
+        .schema_id()
+        .map_err(|source| KeeperError::InvalidSchema { source })?;
+
+    let (current, current_staged) = durable_manifest_candidate(
+        admission,
+        protector,
+        &current_path,
+        "MANIFEST",
+        expected_schema,
+    )?;
+    let (previous, previous_staged) = durable_manifest_candidate(
+        admission,
+        protector,
+        &previous_path,
+        "MANIFEST.prev",
+        expected_schema,
+    )?;
+    if let (Some(current_manifest), Some(previous_manifest)) = (&current, &previous) {
+        validate_manifest_pair(
+            &admission.directory,
+            current_manifest.clone(),
+            previous_manifest,
+        )?;
+    }
+
+    // When both slots need reconstruction, install the fallback first so a
+    // crash between installs still leaves one complete recoverable authority.
+    if previous_staged {
+        install_staged_repair(admission, "MANIFEST.prev", &previous_path)?;
+    }
+    if current_staged {
+        install_staged_repair(admission, "MANIFEST", &current_path)?;
+    }
+
+    for path in [&current_path, &previous_path] {
+        if let ManifestSlot::Valid(_) = read_manifest_slot(path)? {
+            let bytes = std::fs::read(path).map_err(|source| KeeperError::Io {
+                operation: "read valid MANIFEST for sidecar witness",
+                path: path.clone(),
+                source,
+            })?;
+            ensure_matching_durability_sidecar(admission, protector, path, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durability")]
+fn durable_manifest_candidate(
+    admission: &WriterAdmissionInner,
+    protector: &FileProtector,
+    path: &Path,
+    label: &str,
+    expected_schema: u64,
+) -> Result<(Option<Manifest>, bool), KeeperError> {
+    if let ManifestSlot::Valid(manifest) = read_manifest_slot(path)? {
+        if manifest.schema_id != expected_schema {
+            return Err(KeeperError::SchemaMismatch {
+                path: path.to_path_buf(),
+                expected: expected_schema,
+                found: manifest.schema_id,
+            });
+        }
+        return Ok((Some(manifest), false));
+    }
+
+    let Some(recovered) = stage_repaired_manifest(admission, protector, path, label)? else {
+        return Ok((None, false));
+    };
+    if recovered.schema_id != expected_schema {
+        return Err(KeeperError::SchemaMismatch {
+            path: path.to_path_buf(),
+            expected: expected_schema,
+            found: recovered.schema_id,
+        });
+    }
+    Ok((Some(recovered), true))
+}
+
+#[cfg(feature = "durability")]
+fn stage_repaired_manifest(
+    admission: &WriterAdmissionInner,
+    protector: &FileProtector,
+    source: &Path,
+    label: &str,
+) -> Result<Option<Manifest>, KeeperError> {
+    let sidecar = FileProtector::sidecar_path(source);
+    if !regular_artifact_exists(&sidecar, "inspect MANIFEST repair sidecar")? {
+        return Ok(None);
+    }
+    let stage = staged_repair_path(admission, label);
+    match protector
+        .repair_file_to(source, &sidecar, &stage)
+        .map_err(|source_error| KeeperError::Durability {
+            operation: "stage MANIFEST repair",
+            path: source.to_path_buf(),
+            source: source_error,
+        })? {
+        FileRepairOutcome::Repaired { .. } => {
+            let bytes = std::fs::read(&stage).map_err(|source_error| KeeperError::Io {
+                operation: "read staged MANIFEST repair",
+                path: stage.clone(),
+                source: source_error,
+            })?;
+            let witness = FileSourceWitness::from_bytes(&bytes);
+            if !protector
+                .sidecar_matches_witness(&sidecar, witness)
+                .map_err(|source_error| KeeperError::Durability {
+                    operation: "validate staged MANIFEST repair witness",
+                    path: sidecar.clone(),
+                    source: source_error,
+                })?
+            {
+                return Err(KeeperError::Io {
+                    operation: "validate staged MANIFEST repair witness",
+                    path: stage,
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "repaired MANIFEST does not match its complete-source sidecar",
+                    ),
+                });
+            }
+            Manifest::from_bytes(&bytes)
+                .map(Some)
+                .map_err(|source_error| KeeperError::ManifestCorrupted {
+                    path: stage,
+                    source: source_error,
+                })
+        }
+        FileRepairOutcome::NotNeeded | FileRepairOutcome::Unrecoverable { .. } => Ok(None),
+    }
+}
+
+#[cfg(feature = "durability")]
+fn recover_durable_writer_files(
+    admission: &WriterAdmissionInner,
+    schema: SchemaDescriptor,
+    protector: &FileProtector,
+) -> Result<(), KeeperError> {
+    let expected_schema = schema
+        .schema_id()
+        .map_err(|source| KeeperError::InvalidSchema { source })?;
+    let loaded = match load_manifest_pair(&admission.directory) {
+        Ok(loaded) => loaded,
+        Err(KeeperError::IndexNotFound { .. }) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_loaded_schema(&admission.directory, expected_schema, &loaded)?;
+    validate_recovery_claims(&admission.directory, &loaded)?;
+
+    for manifest_segment in &loaded.manifest.segments {
+        let path = admission
+            .directory
+            .join(canonical_segment_name(manifest_segment.segment_id));
+        match open_verified_segment(&path, manifest_segment, schema) {
+            Ok(()) => {
+                let bytes = std::fs::read(&path).map_err(|source| KeeperError::Io {
+                    operation: "read valid segment for sidecar witness",
+                    path: path.clone(),
+                    source,
+                })?;
+                ensure_matching_durability_sidecar(admission, protector, &path, &bytes)?;
+            }
+            Err(original_error) => {
+                let sidecar = FileProtector::sidecar_path(&path);
+                if !regular_artifact_exists(&sidecar, "inspect segment repair sidecar")? {
+                    return Err(original_error);
+                }
+                let label = format!("segment-{:016x}", manifest_segment.segment_id);
+                let stage = staged_repair_path(admission, &label);
+                match protector
+                    .repair_file_to(&path, &sidecar, &stage)
+                    .map_err(|source| KeeperError::Durability {
+                        operation: "stage segment repair",
+                        path: path.clone(),
+                        source,
+                    })? {
+                    FileRepairOutcome::Repaired { .. } => {}
+                    FileRepairOutcome::NotNeeded | FileRepairOutcome::Unrecoverable { .. } => {
+                        return Err(original_error);
+                    }
+                }
+                let bytes = std::fs::read(&stage).map_err(|source| KeeperError::Io {
+                    operation: "read staged segment repair",
+                    path: stage.clone(),
+                    source,
+                })?;
+                let witness = FileSourceWitness::from_bytes(&bytes);
+                if !protector
+                    .sidecar_matches_witness(&sidecar, witness)
+                    .map_err(|source| KeeperError::Durability {
+                        operation: "validate staged segment repair witness",
+                        path: sidecar.clone(),
+                        source,
+                    })?
+                {
+                    return Err(KeeperError::SegmentMetadataMismatch {
+                        path: stage,
+                        detail: "repaired segment does not match its complete-source sidecar"
+                            .to_owned(),
+                    });
+                }
+                let reader = SegmentReader::from_owned(bytes, schema).map_err(|source| {
+                    KeeperError::SegmentOpen {
+                        path: stage.clone(),
+                        source,
+                    }
+                })?;
+                reader.verify().map_err(|source| KeeperError::SegmentOpen {
+                    path: stage.clone(),
+                    source,
+                })?;
+                validate_segment_witnesses(&stage, manifest_segment, &reader)?;
+                install_staged_repair(admission, &label, &path)?;
+                open_verified_segment(&path, manifest_segment, schema)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durability")]
+fn open_verified_segment(
+    path: &Path,
+    manifest: &ManifestSegment,
+    schema: SchemaDescriptor,
+) -> Result<(), KeeperError> {
+    let reader =
+        SegmentReader::open_published(path, schema).map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    reader.verify().map_err(|source| KeeperError::SegmentOpen {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    validate_segment_witnesses(path, manifest, &reader)
+}
+
+#[cfg(feature = "durability")]
+fn ensure_matching_durability_sidecar(
+    admission: &WriterAdmissionInner,
+    protector: &FileProtector,
+    source: &Path,
+    bytes: &[u8],
+) -> Result<(), KeeperError> {
+    let witness = FileSourceWitness::from_bytes(bytes);
+    let sidecar = FileProtector::sidecar_path(source);
+    let sidecar_exists = regular_artifact_exists(&sidecar, "inspect durability sidecar")?;
+    let sidecar_matches = sidecar_exists
+        && protector
+            .sidecar_matches_witness(&sidecar, witness)
+            .unwrap_or(false);
+    if sidecar_matches {
+        return Ok(());
+    }
+    if sidecar_exists {
+        let file_name = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("artifact");
+        let retired = admission.directory.join(format!(
+            ".tmp-stale-fec-{file_name}-{:016x}",
+            admission.record.pid_start_nonce
+        ));
+        if retire_regular_artifact(&sidecar, &retired)? {
+            admission
+                .directory_file
+                .sync_all()
+                .map_err(|source_error| KeeperError::Io {
+                    operation: "fsync stale sidecar retirement",
+                    path: admission.directory.clone(),
+                    source: source_error,
+                })?;
+        }
+    }
+    protector
+        .protect_file_with_witness(source, witness)
+        .map_err(|source_error| KeeperError::Durability {
+            operation: "regenerate durability sidecar",
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    if !protector
+        .sidecar_matches_witness(&sidecar, witness)
+        .map_err(|source_error| KeeperError::Durability {
+            operation: "verify regenerated durability sidecar",
+            path: sidecar.clone(),
+            source: source_error,
+        })?
+    {
+        return Err(KeeperError::Io {
+            operation: "verify regenerated durability sidecar",
+            path: sidecar,
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "regenerated sidecar does not match authoritative source bytes",
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "durability")]
+fn regular_artifact_exists(path: &Path, operation: &'static str) -> Result<bool, KeeperError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(KeeperError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidData, "artifact is not a regular file"),
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(KeeperError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(feature = "durability")]
+fn staged_repair_path(admission: &WriterAdmissionInner, label: &str) -> PathBuf {
+    admission.directory.join(format!(
+        ".tmp-repair-{label}-{:016x}",
+        admission.record.pid_start_nonce
+    ))
+}
+
+#[cfg(feature = "durability")]
+fn install_staged_repair(
+    admission: &WriterAdmissionInner,
+    label: &str,
+    destination: &Path,
+) -> Result<(), KeeperError> {
+    let stage = staged_repair_path(admission, label);
+    if !regular_artifact_exists(&stage, "inspect staged repair")? {
+        return Err(KeeperError::Io {
+            operation: "install staged repair",
+            path: stage,
+            source: io::Error::new(io::ErrorKind::NotFound, "staged repair is absent"),
+        });
+    }
+    if regular_artifact_exists(destination, "inspect repair destination")? {
+        let retired = admission.directory.join(format!(
+            ".tmp-corrupt-{label}-{:016x}",
+            admission.record.pid_start_nonce
+        ));
+        retire_regular_artifact(destination, &retired)?;
+    }
+    std::fs::hard_link(&stage, destination).map_err(|source| KeeperError::Io {
+        operation: "install no-replace staged repair",
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    std::fs::remove_file(&stage).map_err(|source| KeeperError::Io {
+        operation: "retire installed staged-repair name",
+        path: stage,
+        source,
+    })?;
+    admission
+        .directory_file
+        .sync_all()
+        .map_err(|source| KeeperError::Io {
+            operation: "fsync staged repair installation",
+            path: admission.directory.clone(),
+            source,
+        })
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn retire_regular_artifact(source: &Path, destination: &Path) -> Result<bool, KeeperError> {
+    let source_metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source_error) => {
+            return Err(KeeperError::Io {
+                operation: "inspect retirement source",
+                path: source.to_path_buf(),
+                source: source_error,
+            });
+        }
+    };
+    if !source_metadata.file_type().is_file() {
+        return Err(KeeperError::Io {
+            operation: "retire writer artifact",
+            path: source.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retirement source is not a regular file",
+            ),
+        });
+    }
+
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let destination_metadata =
+                    std::fs::symlink_metadata(destination).map_err(|source_error| {
+                        KeeperError::Io {
+                            operation: "inspect retirement destination",
+                            path: destination.to_path_buf(),
+                            source: source_error,
+                        }
+                    })?;
+                if !destination_metadata.file_type().is_file()
+                    || source_metadata.dev() != destination_metadata.dev()
+                    || source_metadata.ino() != destination_metadata.ino()
+                {
+                    return Err(KeeperError::Io {
+                        operation: "retire writer artifact",
+                        path: destination.to_path_buf(),
+                        source: io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            "retirement destination belongs to a different artifact",
+                        ),
+                    });
+                }
+            }
+            #[cfg(not(unix))]
+            return Err(KeeperError::Io {
+                operation: "retire writer artifact",
+                path: destination.to_path_buf(),
+                source: error,
+            });
+        }
+        Err(source_error) => {
+            return Err(KeeperError::Io {
+                operation: "create no-replace retirement link",
+                path: destination.to_path_buf(),
+                source: source_error,
+            });
+        }
+    }
+    std::fs::remove_file(source).map_err(|source_error| KeeperError::Io {
+        operation: "remove retired writer artifact name",
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn remove_stale_generation_claim(
+    admission: &WriterAdmissionInner,
+    path: &Path,
+) -> Result<(), KeeperError> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
+    use std::os::unix::fs::MetadataExt;
+
+    admission.ensure_directory_identity()?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| KeeperError::UnsafeGarbagePath {
+            path: path.to_path_buf(),
+        })?;
+    let claim = openat(
+        &admission.directory_file,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)
+    .map_err(|source| KeeperError::Io {
+        operation: "open stale generation claim",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let claim_file = File::from(claim);
+    let metadata = claim_file.metadata().map_err(|source| KeeperError::Io {
+        operation: "inspect stale generation claim",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() != 0 {
+        return Err(KeeperError::InvalidClaimArtifact {
+            path: path.to_path_buf(),
+            detail: "claim must be a zero-length regular file".to_owned(),
+        });
+    }
+    let stat = statat(&admission.directory_file, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "revalidate stale generation claim",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if stat.st_dev != metadata.dev() || stat.st_ino != metadata.ino() || stat.st_size != 0 {
+        return Err(KeeperError::InvalidClaimArtifact {
+            path: path.to_path_buf(),
+            detail: "claim pathname changed during stale recovery".to_owned(),
+        });
+    }
+    unlinkat(&admission.directory_file, Path::new(name), AtFlags::empty())
+        .map_err(io::Error::from)
+        .map_err(|source| KeeperError::Io {
+            operation: "remove stale generation claim",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    admission
+        .directory_file
+        .sync_all()
+        .map_err(|source| KeeperError::Io {
+            operation: "fsync stale-claim removal",
+            path: admission.directory.clone(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn remove_stale_generation_claim(
+    admission: &WriterAdmissionInner,
+    path: &Path,
+) -> Result<(), KeeperError> {
+    Err(KeeperError::Io {
+        operation: "remove stale generation claim",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "stale claim recovery is unsupported for {}",
+                admission.directory.display()
+            ),
+        ),
+    })
 }
 
 /// Writer-owned garbage collection configuration.
@@ -1271,7 +2686,7 @@ fn scan_generation_claims(directory: &Path) -> Result<Vec<(PathBuf, u64)>, Keepe
 fn validate_segment_witnesses(
     path: &Path,
     manifest: &ManifestSegment,
-    reader: &SegmentReader<ReadOnlyMappedFile>,
+    reader: &SegmentReader<impl AsRef<[u8]>>,
 ) -> Result<(), KeeperError> {
     let header = reader.header();
     let mismatch = if header.segment_id != manifest.segment_id {
@@ -1316,10 +2731,10 @@ fn validate_segment_witnesses(
 /// Remove unreachable Quill artifacts while the crate-internal caller holds
 /// the writer lock.
 ///
-/// This seam stays crate-private until the dependent writer-lock milestone can
-/// pass a real guard that owns the directory handle. The function first opens
-/// and validates the selected snapshot, so a failed recovery never performs
-/// garbage collection. Reader [`KeeperSnapshot::open`] never calls it.
+/// This seam stays crate-private because callers must already hold the
+/// `KeeperWriter` admission that owns the directory handle. The function first
+/// opens and validates the selected snapshot, so a failed recovery never
+/// performs garbage collection. Reader [`KeeperSnapshot::open`] never calls it.
 /// Reachability is the union of every individually valid MANIFEST slot.
 ///
 /// # Errors
@@ -1327,7 +2742,6 @@ fn validate_segment_witnesses(
 /// Returns before deletion when recovery, directory enumeration, metadata, or
 /// path-safety validation fails. An unlink or final directory fsync failure is
 /// reported with the exact affected path.
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 pub(crate) fn collect_writer_garbage_under_lock(
     directory: impl AsRef<Path>,
     schema: SchemaDescriptor,
@@ -1336,7 +2750,6 @@ pub(crate) fn collect_writer_garbage_under_lock(
     collect_writer_garbage_at(directory.as_ref(), schema, options, SystemTime::now())
 }
 
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn collect_writer_garbage_at(
     directory: &Path,
     schema: SchemaDescriptor,
@@ -1386,9 +2799,9 @@ fn collect_writer_garbage_at_platform(
 ///
 /// This is a separate writer-locked state because ordinary snapshot recovery
 /// correctly returns [`KeeperError::IndexNotFound`] when neither slot exists.
-/// Any canonical generation claim blocks deletion for the later writer
-/// recovery protocol to resolve.
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+/// Any canonical generation claim blocks deletion for writer-open recovery to
+/// resolve. This helper remains reserved for a future writer-only doctor path.
+#[allow(dead_code, reason = "reserved for a writer-only doctor path")]
 pub(crate) fn collect_abandoned_genesis_garbage_under_lock(
     directory: impl AsRef<Path>,
     options: GarbageCollectionOptions,
@@ -1396,7 +2809,7 @@ pub(crate) fn collect_abandoned_genesis_garbage_under_lock(
     collect_abandoned_genesis_garbage_at(directory.as_ref(), options, SystemTime::now())
 }
 
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+#[allow(dead_code, reason = "reserved for a writer-only doctor path")]
 fn collect_abandoned_genesis_garbage_at(
     directory: &Path,
     options: GarbageCollectionOptions,
@@ -1728,7 +3141,6 @@ fn stat_modified_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
 }
 
 #[cfg(unix)]
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn open_gc_directory(directory: &Path) -> Result<File, KeeperError> {
     use rustix::fs::{Mode, OFlags, open};
 
@@ -1746,7 +3158,6 @@ fn open_gc_directory(directory: &Path) -> Result<File, KeeperError> {
 }
 
 #[cfg(unix)]
-#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn ensure_gc_directory_identity(directory: &Path, opened: &File) -> Result<(), KeeperError> {
     use std::os::unix::fs::MetadataExt;
 
@@ -1984,6 +3395,163 @@ fn parse_claim_name(name: &OsStr) -> Option<u64> {
     digits.parse().ok()
 }
 
+struct GenerationClaimGuard {
+    admission: Arc<WriterAdmissionInner>,
+    name: OsString,
+    claim_file: File,
+    device: u64,
+    inode: u64,
+}
+
+impl GenerationClaimGuard {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    fn acquire(admission: Arc<WriterAdmissionInner>, generation: u64) -> Result<Self, KeeperError> {
+        use rustix::fs::{AtFlags, Mode, OFlags, openat, statat};
+        use std::os::unix::fs::MetadataExt;
+
+        admission.ensure_directory_identity()?;
+        let name = OsString::from(format!("gen-{generation}.claim"));
+        let path = admission.directory.join(&name);
+        let claim = match openat(
+            &admission.directory_file,
+            &name,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(claim) => claim,
+            Err(source) if source == rustix::io::Errno::EXIST => {
+                let stat = statat(&admission.directory_file, &name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(io::Error::from)
+                    .map_err(|source| KeeperError::Io {
+                        operation: "inspect conflicting generation claim",
+                        path: path.clone(),
+                        source,
+                    })?;
+                let regular = rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::RegularFile;
+                if !regular || stat.st_size != 0 {
+                    return Err(KeeperError::InvalidClaimArtifact {
+                        path,
+                        detail: format!(
+                            "claim must be a zero-length regular file, found type {:?} and length {}",
+                            rustix::fs::FileType::from_raw_mode(stat.st_mode),
+                            stat.st_size
+                        ),
+                    });
+                }
+                return Err(KeeperError::GenerationClaimConflict { path, generation });
+            }
+            Err(source) => {
+                return Err(KeeperError::Io {
+                    operation: "create O_EXCL generation claim",
+                    path,
+                    source: io::Error::from(source),
+                });
+            }
+        };
+        let claim_file = File::from(claim);
+        let metadata = claim_file.metadata().map_err(|source| KeeperError::Io {
+            operation: "inspect owned generation claim",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() != 0 {
+            return Err(KeeperError::InvalidClaimArtifact {
+                path,
+                detail: "new claim is not a zero-length regular file".to_owned(),
+            });
+        }
+        claim_file.sync_all().map_err(|source| KeeperError::Io {
+            operation: "fsync generation claim",
+            path: path.clone(),
+            source,
+        })?;
+        admission
+            .directory_file
+            .sync_all()
+            .map_err(|source| KeeperError::Io {
+                operation: "fsync generation-claim directory",
+                path: admission.directory.clone(),
+                source,
+            })?;
+        admission.ensure_directory_identity()?;
+        Ok(Self {
+            admission,
+            name,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            claim_file,
+        })
+    }
+
+    #[cfg(not(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    )))]
+    fn acquire(admission: Arc<WriterAdmissionInner>, _: u64) -> Result<Self, KeeperError> {
+        Err(KeeperError::Io {
+            operation: "create generation claim",
+            path: admission.directory.clone(),
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "O_EXCL generation claims require Unix filesystem semantics",
+            ),
+        })
+    }
+}
+
+impl Drop for GenerationClaimGuard {
+    fn drop(&mut self) {
+        release_generation_claim(self);
+    }
+}
+
+#[cfg(unix)]
+fn release_generation_claim(claim: &GenerationClaimGuard) {
+    use rustix::fs::{AtFlags, statat, unlinkat};
+
+    // Keep the owned descriptor alive through the identity check. If an
+    // external actor replaced the pathname, leave that replacement untouched.
+    let _ = claim.claim_file.metadata();
+    let Ok(stat) = statat(
+        &claim.admission.directory_file,
+        &claim.name,
+        AtFlags::SYMLINK_NOFOLLOW,
+    ) else {
+        return;
+    };
+    if stat.st_dev != claim.device || stat.st_ino != claim.inode || stat.st_size != 0 {
+        return;
+    }
+    if unlinkat(
+        &claim.admission.directory_file,
+        Path::new(&claim.name),
+        AtFlags::empty(),
+    )
+    .is_ok()
+    {
+        let _ = claim.admission.directory_file.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn release_generation_claim(_: &GenerationClaimGuard) {}
+
 /// In-process serializer for the two-slot MANIFEST publication protocol.
 ///
 /// The owned asupersync guard moves into the blocking I/O closure. If the
@@ -1991,7 +3559,7 @@ fn parse_claim_name(name: &OsStr) -> Option<u64> {
 /// the atomic publication finishes, so a second writer cannot interleave the
 /// two rename steps.
 #[derive(Debug, Clone)]
-pub struct ManifestPublisher {
+struct ManifestPublisher {
     directory: PathBuf,
     publish_lock: Arc<Mutex<()>>,
 }
@@ -2006,28 +3574,21 @@ enum ManifestProtection {
 impl ManifestPublisher {
     /// Bind a publisher to one Quill index directory.
     #[must_use]
-    pub fn new(directory: impl Into<PathBuf>) -> Self {
+    fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
             publish_lock: global_publish_lock(),
         }
     }
 
-    /// Index directory containing the two manifest slots.
-    #[must_use]
-    pub fn directory(&self) -> &Path {
-        &self.directory
-    }
-
-    /// Publish one manifest using only the E3.2 in-process serializer.
+    /// Publish one manifest using only the in-process serializer.
     ///
-    /// The dependent cross-process writer-lock lane must call
-    /// [`Self::publish_with_generation_claim`] instead, installing its `O_EXCL`
-    /// generation claim between the temp-file fsync and the two renames.
-    /// This ordinary path performs no sidecar I/O. If it follows a durable
-    /// publication, an existing `MANIFEST.fec` may therefore be stale and must
-    /// never be used as repair authority without matching the current source
-    /// witness first.
+    /// This is a private substrate-test seam. Public mutation always goes
+    /// through [`Self::publish_with_generation_claim`] while `KeeperWriter`
+    /// retains `LOCK`. This ordinary path performs no sidecar I/O. If it follows
+    /// a durable publication, an existing `MANIFEST.fec` may therefore be stale
+    /// and must never be used as repair authority without matching the current
+    /// source witness first.
     ///
     /// # Errors
     ///
@@ -2035,11 +3596,8 @@ impl ManifestPublisher {
     /// errors. A cancelled caller may observe an ambiguous result after the
     /// blocking phase starts; retrying is safe because generation validation
     /// reports whether the prior publication won.
-    pub async fn publish(
-        &self,
-        cx: &Cx,
-        manifest: &Manifest,
-    ) -> Result<LoadedManifest, KeeperError> {
+    #[allow(dead_code, reason = "exercised by inline publication substrate tests")]
+    async fn publish(&self, cx: &Cx, manifest: &Manifest) -> Result<LoadedManifest, KeeperError> {
         self.publish_with_generation_claim(cx, manifest, |_, _| Ok(()))
             .await
     }
@@ -2048,13 +3606,13 @@ impl ManifestPublisher {
     ///
     /// `claim` runs after the temp file is durable and before either slot is
     /// renamed. Its returned guard stays alive through the directory fsync;
-    /// the writer-lock lane can therefore release its claim from `Drop`.
+    /// `KeeperWriter` can therefore release its claim from `Drop`.
     ///
     /// # Errors
     ///
     /// In addition to [`Self::publish`] failures, returns any typed error from
     /// the claim callback.
-    pub async fn publish_with_generation_claim<C, F>(
+    async fn publish_with_generation_claim<C, F>(
         &self,
         cx: &Cx,
         manifest: &Manifest,
@@ -2083,17 +3641,17 @@ impl ManifestPublisher {
     /// fsync. This prevents a completed checkpoint from pairing a newer
     /// MANIFEST with an older current-slot sidecar. A failure after the
     /// MANIFEST rename but before sidecar installation can leave the new slot
-    /// unprotected; the dependent writer-recovery lane must finish that state
-    /// under its cross-process lock. The ordinary [`Self::publish`] path
-    /// remains sidecar-free.
+    /// unprotected; the next `open_durable` recovery finishes that state while
+    /// retaining its cross-process lock. The ordinary [`Self::publish`] path
+    /// remains sidecar-free and private to substrate tests.
     ///
     /// # Errors
     ///
-    /// Returns typed publication or durability errors. The caller must still
-    /// own the cross-process writer admission required by the writer-lock
-    /// milestone before activating this method in a public commit path.
+    /// Returns typed publication or durability errors. This method is private
+    /// to substrate tests; public callers use the claimed variant below.
     #[cfg(feature = "durability")]
-    pub async fn publish_durable(
+    #[allow(dead_code, reason = "exercised by inline durability substrate tests")]
+    async fn publish_durable(
         &self,
         cx: &Cx,
         manifest: &Manifest,
@@ -2111,7 +3669,7 @@ impl ManifestPublisher {
     /// In addition to [`Self::publish_durable`] failures, returns any typed
     /// error from the claim callback.
     #[cfg(feature = "durability")]
-    pub async fn publish_durable_with_generation_claim<C, F>(
+    async fn publish_durable_with_generation_claim<C, F>(
         &self,
         cx: &Cx,
         manifest: &Manifest,
@@ -5423,6 +6981,100 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn labruntime_writer_admission_blocks_a_second_writer_but_not_a_reader() -> TestResult {
+        let index = tempdir()?;
+        create_test_index(index.path()).map_err(io::Error::other)?;
+        let directory = index.path().to_path_buf();
+        let holder_ready = Arc::new(AtomicBool::new(false));
+        let contender_was_busy = Arc::new(AtomicBool::new(false));
+        let reader_was_touchless = Arc::new(AtomicBool::new(false));
+        let observers_done = Arc::new(AtomicUsize::new(0));
+
+        let mut lab = LabRuntime::new(LabConfig::new(0x10c6).max_steps(100_000));
+        let region = lab.state.create_root_region(Budget::INFINITE);
+
+        let holder_directory = directory.clone();
+        let holder_ready_task = Arc::clone(&holder_ready);
+        let holder_done = Arc::clone(&observers_done);
+        let (holder, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::for_testing();
+                let writer = KeeperWriter::open(&cx, holder_directory, DEFAULT_SCHEMA)
+                    .await
+                    .expect("first writer admission");
+                holder_ready_task.store(true, Ordering::SeqCst);
+                while holder_done.load(Ordering::SeqCst) < 2 {
+                    yield_now().await;
+                }
+                drop(writer);
+            })
+            .expect("create holder task");
+
+        let contender_directory = directory.clone();
+        let contender_ready = Arc::clone(&holder_ready);
+        let contender_result = Arc::clone(&contender_was_busy);
+        let contender_done = Arc::clone(&observers_done);
+        let (contender, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !contender_ready.load(Ordering::SeqCst) {
+                    yield_now().await;
+                }
+                let cx = Cx::for_testing();
+                match KeeperWriter::open(&cx, contender_directory, DEFAULT_SCHEMA).await {
+                    Err(KeeperError::WriterBusy { .. }) => {
+                        contender_result.store(true, Ordering::SeqCst);
+                    }
+                    Ok(writer) => {
+                        drop(writer);
+                        panic!("second writer was admitted while the first held LOCK");
+                    }
+                    Err(error) => panic!("unexpected second-writer result: {error}"),
+                }
+                contender_done.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("create contender task");
+
+        let reader_directory = directory.clone();
+        let reader_ready = Arc::clone(&holder_ready);
+        let reader_result = Arc::clone(&reader_was_touchless);
+        let reader_done = Arc::clone(&observers_done);
+        let (reader, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !reader_ready.load(Ordering::SeqCst) {
+                    yield_now().await;
+                }
+                let before = directory_bytes(&reader_directory).expect("reader inventory before");
+                let snapshot = KeeperSnapshot::open(&reader_directory, DEFAULT_SCHEMA)
+                    .expect("reader opens while writer is live");
+                assert_eq!(snapshot.loaded_manifest().manifest.generation, 1);
+                let after = directory_bytes(&reader_directory).expect("reader inventory after");
+                assert_eq!(after, before, "reader open must not touch the directory");
+                reader_result.store(true, Ordering::SeqCst);
+                reader_done.fetch_add(1, Ordering::SeqCst);
+            })
+            .expect("create reader task");
+
+        lab.scheduler.lock().schedule(holder, 0);
+        lab.step_for_test();
+        assert!(holder_ready.load(Ordering::SeqCst));
+        lab.scheduler.lock().schedule(contender, 0);
+        lab.scheduler.lock().schedule(reader, 0);
+        let report = lab.run_until_quiescent_with_report();
+
+        assert!(contender_was_busy.load(Ordering::SeqCst));
+        assert!(reader_was_touchless.load(Ordering::SeqCst));
+        assert!(report.quiescent, "LabRuntime must reach quiescence");
+        assert!(report.oracle_report.all_passed(), "oracles must pass");
+        assert!(report.invariant_violations.is_empty());
+        assert_eq!(std::fs::metadata(directory.join("LOCK"))?.len(), 0);
+        Ok(())
+    }
+
     #[test]
     fn keeper_create_is_create_or_open_and_in_memory_creates_no_files() {
         let memory = KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("in-memory genesis");
@@ -6163,6 +7815,670 @@ mod tests {
             classify_garbage_candidate(OsStr::new("MANIFEST.fec.tmp")),
             Some(GarbageCandidate::Temporary)
         ));
+        Ok(())
+    }
+
+    fn run_with_test_cx<T, F, Fut>(operation: F) -> T
+    where
+        T: Send + 'static,
+        F: FnOnce(Cx) -> Fut + 'static,
+        Fut: std::future::Future<Output = T> + 'static,
+    {
+        let output = Arc::new(std::sync::Mutex::new(None));
+        let task_output = Arc::clone(&output);
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let value = operation(cx).await;
+            let mut slot = task_output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(value);
+        });
+        let output = Arc::try_unwrap(output)
+            .unwrap_or_else(|_| panic!("test runtime retained its result slot"));
+        output
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("test runtime produced a result")
+    }
+
+    #[cfg(unix)]
+    struct WriterChild {
+        child: Option<std::process::Child>,
+    }
+
+    #[cfg(unix)]
+    impl WriterChild {
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.child.as_mut().expect("child is still owned")
+        }
+
+        fn wait_success(mut self) -> TestResult {
+            let status = self.child.take().expect("child is still owned").wait()?;
+            if !status.success() {
+                return Err(format!("writer child exited with {status}").into());
+            }
+            Ok(())
+        }
+
+        fn kill_and_reap(mut self) -> TestResult {
+            let mut child = self.child.take().expect("child is still owned");
+            child.kill()?;
+            let status = child.wait()?;
+            if status.success() {
+                return Err("killed writer child unexpectedly exited successfully".into());
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WriterChild {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_writer_child(
+        role: &str,
+        directory: &Path,
+        control: &Path,
+        identifier: &str,
+    ) -> Result<WriterChild, Box<dyn std::error::Error>> {
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("keeper::tests::writer_lock_child_dispatch")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("QUILL_WRITER_LOCK_ROLE", role)
+            .env("QUILL_WRITER_LOCK_DIRECTORY", directory)
+            .env("QUILL_WRITER_LOCK_CONTROL", control)
+            .env("QUILL_WRITER_LOCK_ID", identifier)
+            .spawn()?;
+        Ok(WriterChild { child: Some(child) })
+    }
+
+    #[cfg(unix)]
+    fn wait_for_child_marker(child: &mut WriterChild, marker: &Path, label: &str) -> TestResult {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if marker.exists() {
+                return Ok(());
+            }
+            if let Some(status) = child.child_mut().try_wait()? {
+                return Err(format!("{label} exited before its marker: {status}").into());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("timed out waiting for {label}").into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_test_index(directory: &Path) -> Result<(), String> {
+        let directory = directory.to_path_buf();
+        run_with_test_cx(move |cx| async move {
+            KeeperSnapshot::create(&cx, directory, DEFAULT_SCHEMA)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_lock_child_dispatch() {
+        let Ok(role) = std::env::var("QUILL_WRITER_LOCK_ROLE") else {
+            return;
+        };
+        let directory = PathBuf::from(
+            std::env::var_os("QUILL_WRITER_LOCK_DIRECTORY")
+                .expect("child index directory is configured"),
+        );
+        let control = PathBuf::from(
+            std::env::var_os("QUILL_WRITER_LOCK_CONTROL")
+                .expect("child control directory is configured"),
+        );
+        let identifier = std::env::var("QUILL_WRITER_LOCK_ID").expect("child id is configured");
+        let result: Result<(), String> = run_with_test_cx(move |cx| async move {
+            if role == "contend" {
+                let start = control.join("START");
+                while !start.exists() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            match KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA).await {
+                Ok(writer) => {
+                    if role == "hold_unpublished" {
+                        std::fs::write(
+                            directory.join("seg-feedfacefeedface.fslx"),
+                            b"sealed but not yet published",
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    let marker = if role == "contend" {
+                        control.join(format!("winner-{identifier}"))
+                    } else {
+                        control.join(format!("ready-{identifier}"))
+                    };
+                    std::fs::write(&marker, []).map_err(|error| error.to_string())?;
+                    let release = control.join("RELEASE");
+                    while !release.exists() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    drop(writer);
+                    Ok(())
+                }
+                Err(KeeperError::WriterBusy { .. }) if role == "contend" => {
+                    std::fs::write(control.join(format!("busy-{identifier}")), [])
+                        .map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        });
+        result.unwrap_or_else(|error| panic!("writer child failed: {error}"));
+    }
+
+    #[test]
+    fn writer_lock_wire_golden_and_corruption_matrix() {
+        let record = WriterLockRecord {
+            pid: 42,
+            pid_start_nonce: 0x1122_3344_5566_7788,
+            acquired_unix_s: 1_700_000_000,
+        };
+        let golden = hex_bytes(
+            "46534c584c434b00010000002a0000008877665544332211\
+             00f153650000000044f89139",
+        );
+        assert_eq!(record.to_bytes().as_slice(), golden);
+        assert_eq!(WriterLockRecord::from_bytes(&golden), Ok(record));
+        for length in 0..WRITER_LOCK_RECORD_BYTES {
+            assert!(WriterLockRecord::from_bytes(&golden[..length]).is_err());
+        }
+        let mut bad_magic = golden.clone();
+        bad_magic[0] ^= 0xff;
+        assert!(WriterLockRecord::from_bytes(&bad_magic).is_err());
+        let mut bad_version = golden.clone();
+        bad_version[8] = 2;
+        let checksum = crc32fast::hash(&bad_version[..32]);
+        bad_version[32..].copy_from_slice(&checksum.to_le_bytes());
+        assert!(WriterLockRecord::from_bytes(&bad_version).is_err());
+        let mut zero_pid = golden.clone();
+        zero_pid[12..16].copy_from_slice(&0_u32.to_le_bytes());
+        let checksum = crc32fast::hash(&zero_pid[..32]);
+        zero_pid[32..].copy_from_slice(&checksum.to_le_bytes());
+        assert!(WriterLockRecord::from_bytes(&zero_pid).is_err());
+        let mut bad_crc = golden;
+        bad_crc[20] ^= 1;
+        assert!(WriterLockRecord::from_bytes(&bad_crc).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_admission_is_exclusive_reusable_and_corruption_fails_closed() -> TestResult {
+        let directory = tempdir()?;
+        let first = acquire_writer_admission(directory.path())?;
+        let lock_path = directory.path().join("LOCK");
+        let active_bytes = std::fs::read(&lock_path)?;
+        assert_eq!(active_bytes.len(), WRITER_LOCK_RECORD_BYTES);
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterBusy {
+                owner_pid: Some(pid),
+                ..
+            }) if pid == std::process::id()
+        ));
+        assert_eq!(std::fs::read(&lock_path)?, active_bytes);
+        drop(first);
+        assert_eq!(std::fs::metadata(&lock_path)?.len(), 0);
+
+        let second = acquire_writer_admission(directory.path())?;
+        drop(second);
+        std::fs::write(&lock_path, b"truncated")?;
+        let before = std::fs::read(&lock_path)?;
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterLockCorrupted { .. })
+        ));
+        assert_eq!(std::fs::read(lock_path)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_guards_preserve_replacement_lock_and_claim_names() -> TestResult {
+        let directory = tempdir()?;
+        let admission = acquire_writer_admission(directory.path())?;
+        let original_lock = directory.path().join("LOCK");
+        let moved_lock = directory.path().join("LOCK.old");
+        std::fs::rename(&original_lock, &moved_lock)?;
+        let replacement = WriterLockRecord {
+            pid: std::process::id(),
+            pid_start_nonce: 0xfeed_face,
+            acquired_unix_s: 1_700_000_001,
+        }
+        .to_bytes();
+        std::fs::write(&original_lock, replacement)?;
+        assert!(matches!(
+            admission.ensure_directory_identity(),
+            Err(KeeperError::WriterLockCorrupted { .. })
+        ));
+        drop(admission);
+        assert_eq!(std::fs::read(&original_lock)?, replacement);
+        assert_eq!(std::fs::metadata(&moved_lock)?.len(), 0);
+
+        let claims = tempdir()?;
+        let admission = acquire_writer_admission(claims.path())?;
+        let claim = GenerationClaimGuard::acquire(Arc::clone(&admission), 1)?;
+        assert!(matches!(
+            GenerationClaimGuard::acquire(Arc::clone(&admission), 1),
+            Err(KeeperError::GenerationClaimConflict { generation: 1, .. })
+        ));
+        let claim_path = claims.path().join("gen-1.claim");
+        let moved_claim = claims.path().join("gen-1.claim.old");
+        std::fs::rename(&claim_path, moved_claim)?;
+        std::fs::write(&claim_path, [])?;
+        drop(claim);
+        assert!(
+            claim_path.exists(),
+            "old guard must preserve replacement claim"
+        );
+        drop(admission);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigstop_writer_is_never_reaped_and_readers_remain_touchless() -> TestResult {
+        let index = tempdir()?;
+        create_test_index(index.path()).map_err(io::Error::other)?;
+        let control = tempdir()?;
+        let ready = control.path().join("ready-holder");
+        let mut child =
+            spawn_writer_child("hold_unpublished", index.path(), control.path(), "holder")?;
+        wait_for_child_marker(&mut child, &ready, "writer holder")?;
+        assert!(index.path().join("seg-feedfacefeedface.fslx").exists());
+
+        let lock_path = index.path().join("LOCK");
+        let lock_file = OpenOptions::new().write(true).open(&lock_path)?;
+        lock_file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+        let before = directory_bytes(index.path())?;
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(child.child_mut()),
+            rustix::process::Signal::STOP,
+        )?;
+
+        let contender_path = index.path().to_path_buf();
+        let blocked: Result<(), String> = run_with_test_cx(move |cx| async move {
+            match KeeperWriter::open(&cx, contender_path, DEFAULT_SCHEMA).await {
+                Err(KeeperError::WriterBusy { .. }) => Ok(()),
+                Ok(writer) => {
+                    drop(writer);
+                    Err("SIGSTOP holder was incorrectly taken over".to_owned())
+                }
+                Err(error) => Err(format!("unexpected contender failure: {error}")),
+            }
+        });
+        blocked.map_err(io::Error::other)?;
+        KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?;
+        KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(directory_bytes(index.path())?, before);
+
+        rustix::process::kill_process(
+            rustix::process::Pid::from_child(child.child_mut()),
+            rustix::process::Signal::CONT,
+        )?;
+        std::fs::write(control.path().join("RELEASE"), [])?;
+        child.wait_success()?;
+        let reopen_path = index.path().to_path_buf();
+        let reopened: Result<(), String> = run_with_test_cx(move |cx| async move {
+            KeeperWriter::open(&cx, reopen_path, DEFAULT_SCHEMA)
+                .await
+                .map(|writer| drop(writer))
+                .map_err(|error| error.to_string())
+        });
+        reopened.map_err(io::Error::other)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_processes_racing_dead_owner_takeover_admit_exactly_one() -> TestResult {
+        let index = tempdir()?;
+        create_test_index(index.path()).map_err(io::Error::other)?;
+        let dead_control = tempdir()?;
+        let mut dead = spawn_writer_child("hold", index.path(), dead_control.path(), "dead")?;
+        wait_for_child_marker(
+            &mut dead,
+            &dead_control.path().join("ready-dead"),
+            "dead-owner fixture",
+        )?;
+        dead.kill_and_reap()?;
+        assert_eq!(
+            std::fs::metadata(index.path().join("LOCK"))?.len(),
+            usize_to_u64(WRITER_LOCK_RECORD_BYTES)
+        );
+
+        let control = tempdir()?;
+        let mut first = spawn_writer_child("contend", index.path(), control.path(), "a")?;
+        let mut second = spawn_writer_child("contend", index.path(), control.path(), "b")?;
+        std::fs::write(control.path().join("START"), [])?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let first_done =
+                control.path().join("winner-a").exists() || control.path().join("busy-a").exists();
+            let second_done =
+                control.path().join("winner-b").exists() || control.path().join("busy-b").exists();
+            if first_done && second_done {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("timed out waiting for takeover contenders".into());
+            }
+            if let Some(status) = first.child_mut().try_wait()?
+                && !first_done
+            {
+                return Err(format!("first contender exited early: {status}").into());
+            }
+            if let Some(status) = second.child_mut().try_wait()?
+                && !second_done
+            {
+                return Err(format!("second contender exited early: {status}").into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let winners = usize::from(control.path().join("winner-a").exists())
+            + usize::from(control.path().join("winner-b").exists());
+        let busy = usize::from(control.path().join("busy-a").exists())
+            + usize::from(control.path().join("busy-b").exists());
+        assert_eq!(winners, 1);
+        assert_eq!(busy, 1);
+        std::fs::write(control.path().join("RELEASE"), [])?;
+        first.wait_success()?;
+        second.wait_success()?;
+        assert_eq!(std::fs::metadata(index.path().join("LOCK"))?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeper_writer_claims_generations_and_abandons_interrupted_temp() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let first: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                std::fs::metadata(directory.join("LOCK"))
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                usize_to_u64(WRITER_LOCK_RECORD_BYTES)
+            );
+            let schema_id = DEFAULT_SCHEMA
+                .schema_id()
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &Manifest::empty(2, schema_id, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(!directory.join("gen-2.claim").exists());
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            drop(writer);
+            Ok(())
+        });
+        first.map_err(io::Error::other)?;
+        assert_eq!(std::fs::metadata(index.path().join("LOCK"))?.len(), 0);
+
+        let schema_id = DEFAULT_SCHEMA.schema_id()?;
+        let interrupted = Manifest::empty(3, schema_id, 0).to_bytes()?;
+        std::fs::write(index.path().join(".tmp-manifest-3"), interrupted)?;
+        std::fs::write(index.path().join("gen-3.claim"), [])?;
+        let directory = index.path().to_path_buf();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            assert!(!directory.join(".tmp-manifest-3").exists());
+            assert!(!directory.join("gen-3.claim").exists());
+            writer
+                .publish(&cx, &Manifest::empty(3, schema_id, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 3);
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+        assert!(std::fs::read_dir(index.path())?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(".tmp-abandoned-manifest-3-"))
+        }));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_retires_corrupt_primary_and_recovers_from_previous() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let schema_id = DEFAULT_SCHEMA
+                .schema_id()
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &Manifest::empty(2, schema_id, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+        std::fs::write(index.path().join("MANIFEST"), b"corrupt primary")?;
+        let before_reader = directory_bytes(index.path())?;
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            1
+        );
+        assert_eq!(directory_bytes(index.path())?, before_reader);
+
+        let directory = index.path().to_path_buf();
+        let recovered: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 1);
+            let schema_id = DEFAULT_SCHEMA
+                .schema_id()
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &Manifest::empty(2, schema_id, 0))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        recovered.map_err(io::Error::other)?;
+        assert_eq!(
+            KeeperSnapshot::open(index.path(), DEFAULT_SCHEMA)?
+                .loaded_manifest()
+                .manifest
+                .generation,
+            2
+        );
+        assert!(std::fs::read_dir(index.path())?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with(".tmp-corrupt-manifest-"))
+        }));
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn durable_writer_recovers_both_missing_or_corrupt_manifest_slots() -> TestResult {
+        let index = tempdir()?;
+        let protector = test_file_protector();
+        let directory = index.path().to_path_buf();
+        let setup_protector = protector.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, Vec::new()))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let current_path = index.path().join("MANIFEST");
+        let previous_path = index.path().join("MANIFEST.prev");
+        let expected_current = std::fs::read(&current_path)?;
+        let expected_previous = std::fs::read(&previous_path)?;
+        let mut corrupt_current = expected_current.clone();
+        corrupt_current[16] ^= 0xff;
+        let mut corrupt_previous = expected_previous.clone();
+        corrupt_previous[16] ^= 0xff;
+        std::fs::write(&current_path, corrupt_current)?;
+        std::fs::write(&previous_path, corrupt_previous)?;
+
+        let directory = index.path().to_path_buf();
+        let corrupt_protector = protector.clone();
+        let recovered_corrupt: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, corrupt_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            Ok(())
+        });
+        recovered_corrupt.map_err(io::Error::other)?;
+        assert_eq!(std::fs::read(&current_path)?, expected_current);
+        assert_eq!(std::fs::read(&previous_path)?, expected_previous);
+
+        let saved_current = index.path().join("saved-MANIFEST");
+        let saved_previous = index.path().join("saved-MANIFEST.prev");
+        std::fs::rename(&current_path, &saved_current)?;
+        std::fs::rename(&previous_path, &saved_previous)?;
+        let directory = index.path().to_path_buf();
+        let missing_protector = protector.clone();
+        let recovered_missing: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::create_durable(&cx, directory, DEFAULT_SCHEMA, missing_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            Ok(())
+        });
+        recovered_missing.map_err(io::Error::other)?;
+        assert_eq!(std::fs::read(&current_path)?, expected_current);
+        assert_eq!(std::fs::read(&previous_path)?, expected_previous);
+        assert_eq!(std::fs::read(saved_current)?, expected_current);
+        assert_eq!(std::fs::read(saved_previous)?, expected_previous);
+        Ok(())
+    }
+
+    #[cfg(all(unix, feature = "durability"))]
+    #[test]
+    fn durable_writer_stages_and_validates_manifest_and_segment_repairs() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let protector = test_file_protector();
+        let setup_protector = protector.clone();
+        let expected = encoded_test_segment(0xabc, 0, 2, 1)?;
+        let expected_segment = expected.as_bytes().to_vec();
+        let segment_manifest = manifest_segment(&expected, 1);
+        let setup_manifest = segment_manifest.clone();
+        let setup: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let mut writer =
+                KeeperWriter::create_durable(&cx, &directory, DEFAULT_SCHEMA, setup_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            let pending = expected
+                .write_temp(&directory)
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &durable_test_manifest(2, vec![setup_manifest]))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+        setup.map_err(io::Error::other)?;
+
+        let manifest_path = index.path().join("MANIFEST");
+        let expected_manifest = std::fs::read(&manifest_path)?;
+        let segment_path = index
+            .path()
+            .join(canonical_segment_name(segment_manifest.segment_id));
+        let mut corrupt_manifest = expected_manifest.clone();
+        corrupt_manifest[16] ^= 0xff;
+        std::fs::write(&manifest_path, corrupt_manifest)?;
+        let mut corrupt_segment = expected_segment.clone();
+        corrupt_segment[64] ^= 0xff;
+        std::fs::write(&segment_path, corrupt_segment)?;
+
+        let directory = index.path().to_path_buf();
+        let repair_protector = protector.clone();
+        let repaired: Result<(), String> = run_with_test_cx(move |cx| async move {
+            let writer =
+                KeeperWriter::open_durable(&cx, &directory, DEFAULT_SCHEMA, repair_protector)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(writer.snapshot().loaded_manifest().manifest.generation, 2);
+            Ok(())
+        });
+        repaired.map_err(io::Error::other)?;
+        assert_eq!(std::fs::read(&manifest_path)?, expected_manifest);
+        assert_eq!(std::fs::read(&segment_path)?, expected_segment);
+        assert!(
+            protector
+                .verify_file(&manifest_path, &FileProtector::sidecar_path(&manifest_path))?
+                .healthy
+        );
+        assert!(
+            protector
+                .verify_file(&segment_path, &FileProtector::sidecar_path(&segment_path))?
+                .healthy
+        );
+
+        let authoritative_manifest = std::fs::read(&manifest_path)?;
+        std::fs::write(
+            FileProtector::sidecar_path(&manifest_path),
+            b"malformed stale sidecar",
+        )?;
+        let directory = index.path().to_path_buf();
+        let stale_protector = protector.clone();
+        let regenerated: Result<(), String> = run_with_test_cx(move |cx| async move {
+            KeeperWriter::open_durable(&cx, directory, DEFAULT_SCHEMA, stale_protector)
+                .await
+                .map(|writer| drop(writer))
+                .map_err(|error| error.to_string())
+        });
+        regenerated.map_err(io::Error::other)?;
+        assert_eq!(std::fs::read(&manifest_path)?, authoritative_manifest);
+        assert!(
+            protector
+                .verify_file(&manifest_path, &FileProtector::sidecar_path(&manifest_path))?
+                .healthy
+        );
         Ok(())
     }
 
