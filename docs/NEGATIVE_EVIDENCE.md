@@ -15089,6 +15089,20 @@ row and the closed bead ship. The generic-analyzer fusion is unmeasured, not rej
 fallback, worker reroute, cache-warming chase, or `release-perf` build ran. Retry requires a retained remote
 lexical release artifact that can reach the existing benchmark inside the bounded foreground gate.
 
+> **RESOLVED 2026-07-18 (`bd-r3rd`, CopperOrchid): KEEP.** Commit `375e4237` subsequently retained the fused
+> production analyzer and its exact-token comparator. A strict remote retry completed on pinned worker `ovh-a`
+> in one release binary (SHA-256
+> `6778f06d1ba4499d271b96bf9edb2de5099bf6437b23f3445a74faca94bbf58a`). The 48 KiB ASCII-heavy corpus first
+> passed exact `Token` parity across empty, punctuation/identifier, Cyrillic, Greek, Turkish, accented Latin,
+> CJK, Japanese, and Korean fixtures. The alternating-round A/A control was `0.9960 [0.9790, 1.0173]`; the
+> fused/original median was **`0.9634 [0.9514, 0.9808]`**, below the null p5 and therefore a decidable ~1.038x
+> whole-analyzer win. Criterion independently measured `123.05 us` original versus `120.95 us` fused, with
+> CV `0.19%` and `1.47%`. Self-time is N/A for this whole-routine claim: both retained arms consume their token
+> digests through `black_box`, and the parity gate proves the fused stream executed. The earlier untimed HOLD is
+> superseded. A separate remote correctness gate passed all 113 lexical library tests on `vmi1152480`; that
+> rerouted test worker is not used as performance evidence. No local Cargo fallback or production change was
+> needed in this closeout.
+
 ### 2026-07-14 — BlackThrush — INVALID/HOLD: borrowed host-hint token scan never reached timing
 
 **Fresh-subsystem route and profile attribution.** The later 2026-07-12 ledger resolution superseded

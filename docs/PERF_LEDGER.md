@@ -5975,3 +5975,32 @@ regions and only dilutes the ratio):
 15.8% lower end-to-end verify+repair latency; the repair-path-only delta is larger. Cold repair path (corruption
 is rare), but a real byte-identical win completing the fe866683 reuse across the whole verify→repair sequence.
 Landed `file_protector.rs` + retained the `verify_repair_reuse` A/B bench.
+
+## 2026-07-18 — Fused generic default analyzer clears its same-binary null floor (`bd-r3rd`, CopperOrchid)
+
+Commit `375e4237` replaces the generic `SimpleTokenizer` + `LowerCaser` pipeline with one byte-aware token
+stream: ASCII classification and lowercase happen in the same pass, while non-ASCII input retains the exact
+`char::is_alphanumeric` and `char::to_lowercase` behavior. The retained comparator in
+`tokenizer_char_walk_ab` asserted exact `Token` parity before timing across the 48 KiB measured corpus plus
+empty, punctuation/identifier, Cyrillic, Greek, Turkish, accented Latin, CJK, Japanese, and Korean fixtures.
+
+The authoritative retry was one strict-remote `--profile release` binary on pinned RCH worker `ovh-a`, with
+release LTO disabled and 16 codegen units. Binary SHA-256:
+`6778f06d1ba4499d271b96bf9edb2de5099bf6437b23f3445a74faca94bbf58a`. The shared alternating-round sampler
+used 41 rounds x 4 inner calls; fused/original `< 1.0` means the fused analyzer is faster:
+
+| 48 KiB analyzer | median [p5, p95] | verdict |
+|---|---|---|
+| A/A original control | `0.9960 [0.9790, 1.0173]` | observed floor |
+| fused / original | **`0.9634 [0.9514, 0.9808]`** | **DECIDABLE WIN**; median below null p5, ~1.038x |
+
+Criterion's independent 10-sample pass measured `123.05 us [122.87, 123.18]` original versus
+`120.95 us [119.69, 122.56]` fused. The remote estimates give CV `0.19%` and `1.47%`, respectively. Self-time
+is N/A because the claim covers the whole measured analyzer routine rather than a subframe: both retained arms
+consume the complete token digest through `black_box`, and exact token parity proves the fused stream executed.
+A separate remote correctness gate passed all 113 lexical library tests on `vmi1152480`; RCH selected that
+worker despite the `ovh-a` hint, so its result is used only for correctness and not for timing comparability.
+
+**Decision: KEEP.** The earlier July 14 run stopped during a cold dependency update and produced no timing; this
+completed retry supersedes that INVALID/HOLD. The production implementation and reproducible comparator were
+already retained by `375e4237`, so this closeout changes only the evidence ledgers.
