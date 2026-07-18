@@ -204,13 +204,13 @@ pub enum DivergenceClass {
 
 impl DivergenceClass {
     const fn is_failure(self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::TieOrder | Self::ScoreEpsilon | Self::OversizedQueryToken => false,
             Self::RankMismatch
-                | Self::SnippetMismatch
-                | Self::CountMismatch
-                | Self::DocumentCountMismatch
-        )
+            | Self::SnippetMismatch
+            | Self::CountMismatch
+            | Self::DocumentCountMismatch => true,
+        }
     }
 }
 
@@ -572,11 +572,15 @@ fn is_proven_cutoff_tie_substitution(
 fn complete_boundary_group(
     group: &[RankedHit],
     complete: bool,
+    boundary_score_bits: u32,
 ) -> Option<(u32, BTreeSet<&str>)> {
     if !complete || group.is_empty() {
         return None;
     }
     let score_bits = group.first()?.score_bits;
+    if !scores_exact(score_bits, boundary_score_bits) {
+        return None;
+    }
     let mut docs = BTreeSet::new();
     for hit in group {
         if !scores_exact(hit.score_bits, score_bits) || !docs.insert(hit.doc_id.as_str()) {
@@ -586,14 +590,18 @@ fn complete_boundary_group(
     Some((score_bits, docs))
 }
 
-/// Whether `hit` is explained by one of the two complete boundary groups.
-fn explained_by_boundary_group(
-    hit: &RankedHit,
-    leading: Option<&(u32, BTreeSet<&str>)>,
-    trailing: Option<&(u32, BTreeSet<&str>)>,
+/// Whether both sides of one differing rank are members of the same complete
+/// boundary group at their shared exact score.
+fn pair_explained_by_boundary_group(
+    subject: &RankedHit,
+    oracle: &RankedHit,
+    group: Option<&(u32, BTreeSet<&str>)>,
 ) -> bool {
-    [leading, trailing].into_iter().flatten().any(|(score_bits, docs)| {
-        scores_exact(hit.score_bits, *score_bits) && docs.contains(hit.doc_id.as_str())
+    group.is_some_and(|(score_bits, docs)| {
+        scores_exact(subject.score_bits, *score_bits)
+            && scores_exact(oracle.score_bits, *score_bits)
+            && docs.contains(subject.doc_id.as_str())
+            && docs.contains(oracle.doc_id.as_str())
     })
 }
 
@@ -614,27 +622,37 @@ fn is_proven_boundary_tie_substitution(
         return false;
     }
 
-    let mut first_diff = None;
-    let mut last_diff = None;
-    for (index, (subject_hit, oracle_hit)) in subject.hits.iter().zip(&oracle.hits).enumerate() {
-        if subject_hit.doc_id != oracle_hit.doc_id
-            || !scores_exact(subject_hit.score_bits, oracle_hit.score_bits)
+    let leading = oracle.hits.first().and_then(|boundary| {
+        complete_boundary_group(
+            &oracle.offset_tie_group,
+            oracle.offset_tie_complete,
+            boundary.score_bits,
+        )
+    });
+    let trailing = oracle.hits.last().and_then(|boundary| {
+        complete_boundary_group(
+            &oracle.cutoff_tie_group,
+            oracle.cutoff_tie_complete,
+            boundary.score_bits,
+        )
+    });
+
+    let mut saw_difference = false;
+    for (subject_hit, oracle_hit) in subject.hits.iter().zip(&oracle.hits) {
+        if subject_hit.doc_id == oracle_hit.doc_id
+            && scores_exact(subject_hit.score_bits, oracle_hit.score_bits)
         {
-            first_diff.get_or_insert(index);
-            last_diff = Some(index);
+            continue;
+        }
+        saw_difference = true;
+        if !scores_exact(subject_hit.score_bits, oracle_hit.score_bits)
+            || !(pair_explained_by_boundary_group(subject_hit, oracle_hit, leading.as_ref())
+                || pair_explained_by_boundary_group(subject_hit, oracle_hit, trailing.as_ref()))
+        {
+            return false;
         }
     }
-    let (Some(first_diff), Some(last_diff)) = (first_diff, last_diff) else {
-        return false;
-    };
-
-    let leading = complete_boundary_group(&oracle.offset_tie_group, oracle.offset_tie_complete);
-    let trailing = complete_boundary_group(&oracle.cutoff_tie_group, oracle.cutoff_tie_complete);
-
-    (first_diff..=last_diff).all(|index| {
-        explained_by_boundary_group(&subject.hits[index], leading.as_ref(), trailing.as_ref())
-            && explained_by_boundary_group(&oracle.hits[index], leading.as_ref(), trailing.as_ref())
-    })
+    saw_difference
 }
 
 fn is_score_epsilon_equivalent(subject: &[RankedHit], oracle: &[RankedHit], epsilon: f32) -> bool {
@@ -779,7 +797,7 @@ fn describe_count(count: CountState) -> String {
 /// and adding a kind without its register class fails review.
 fn classify_ast_differences(
     subject: &EngineObservation,
-    _oracle: &EngineObservation,
+    oracle: &EngineObservation,
     divergences: &mut Vec<Divergence>,
 ) {
     for (index, difference) in subject.ast_differences.iter().enumerate() {
@@ -789,6 +807,14 @@ fn classify_ast_differences(
         divergences.push(Divergence {
             class,
             pointer: format!("/comparison/subject/ast_differences/{index}"),
+            oracle: difference.oracle.clone(),
+            subject: difference.subject.clone(),
+        });
+    }
+    for (index, difference) in oracle.ast_differences.iter().enumerate() {
+        divergences.push(Divergence {
+            class: DivergenceClass::RankMismatch,
+            pointer: format!("/comparison/oracle/ast_differences/{index}"),
             oracle: difference.oracle.clone(),
             subject: difference.subject.clone(),
         });
@@ -1111,6 +1137,28 @@ mod tests {
     }
 
     #[test]
+    fn oracle_side_ast_difference_fails_closed() {
+        let subject = observation(vec![quill_hit("a", 5.0, 1)]);
+        let mut oracle = observation(vec![tantivy_hit("a", 5.0, 1)]);
+        oracle.ast_differences.push(AstDifference {
+            kind: AstLoweringKind::OversizedQueryToken,
+            oracle: "unexpected oracle diagnostic".to_owned(),
+            subject: "unexpected oracle lowering".to_owned(),
+        });
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("oracle-side AST evidence is represented as a failure");
+
+        assert_eq!(report.status, ComparisonStatus::Failed);
+        assert_eq!(report.divergences.len(), 1);
+        assert_eq!(report.divergences[0].class, DivergenceClass::RankMismatch);
+        assert_eq!(
+            report.divergences[0].pointer,
+            "/comparison/oracle/ast_differences/0"
+        );
+    }
+
+    #[test]
     fn observation_without_ast_differences_still_deserializes() {
         // Artifacts written before the ast_differences channel existed must
         // keep parsing (serde default).
@@ -1145,10 +1193,7 @@ mod tests {
 
         assert_eq!(report.rank_class, RankClass::TieOrder);
         assert_eq!(report.status, ComparisonStatus::Classified);
-        assert_eq!(
-            report.divergences[0].class,
-            DivergenceClass::TieOrder
-        );
+        assert_eq!(report.divergences[0].class, DivergenceClass::TieOrder);
     }
 
     #[test]
@@ -1181,6 +1226,60 @@ mod tests {
 
         assert_eq!(report.rank_class, RankClass::TieOrder);
         assert_eq!(report.status, ComparisonStatus::Classified);
+    }
+
+    #[test]
+    fn two_boundary_substitutions_allow_an_exact_middle_hit() {
+        let mut oracle = observation(vec![
+            tantivy_hit("c", 9.0, 2),
+            tantivy_hit("middle", 8.0, 3),
+            tantivy_hit("d", 7.0, 4),
+        ]);
+        oracle.offset_tie_group = vec![tantivy_hit("b", 9.0, 1), tantivy_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = true;
+        oracle.cutoff_tie_group = vec![tantivy_hit("d", 7.0, 4), tantivy_hit("e", 7.0, 5)];
+        oracle.cutoff_tie_complete = true;
+        let subject = observation(vec![
+            quill_hit("b", 9.0, 1),
+            quill_hit("middle", 8.0, 3),
+            quill_hit("e", 7.0, 5),
+        ]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("two boundary substitutions with exact middle");
+
+        assert_eq!(report.rank_class, RankClass::TieOrder);
+        assert_eq!(report.status, ComparisonStatus::Classified);
+    }
+
+    #[test]
+    fn cross_boundary_score_substitution_fails_closed() {
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("b", 9.0, 1), tantivy_hit("c", 9.0, 2)];
+        oracle.offset_tie_complete = true;
+        oracle.cutoff_tie_group = vec![tantivy_hit("d", 8.0, 3), tantivy_hit("e", 8.0, 4)];
+        oracle.cutoff_tie_complete = true;
+        let subject = observation(vec![quill_hit("b", 9.0, 1), quill_hit("c", 9.0, 2)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("cross-boundary substitution is a real mismatch");
+
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.status, ComparisonStatus::Failed);
+    }
+
+    #[test]
+    fn unrelated_boundary_membership_fails_closed() {
+        let mut oracle = observation(vec![tantivy_hit("c", 9.0, 2), tantivy_hit("d", 8.0, 3)]);
+        oracle.offset_tie_group = vec![tantivy_hit("x", 9.0, 8), tantivy_hit("y", 9.0, 9)];
+        oracle.offset_tie_complete = true;
+        let subject = observation(vec![quill_hit("x", 9.0, 8), quill_hit("d", 8.0, 3)]);
+
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("unrelated boundary group is not proof");
+
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.status, ComparisonStatus::Failed);
     }
 
     #[test]

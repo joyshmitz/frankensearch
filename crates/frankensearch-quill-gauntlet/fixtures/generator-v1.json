@@ -69,18 +69,20 @@
     "latin1"
   ],
   "query_manifest": {
-    "schema_version": 1,
+    "schema_version": 2,
     "generator_id": "frankensearch-quill-gauntlet/generator-v1",
     "spec": {
       "seed": 24302,
       "default_limit": 20,
       "include_shared_relevance_queries": false
     },
+    "source": "generated",
+    "source_identity_sha256": "ebd2cdb4e444096610f9681f96df4e142ae6eb4cb93dae70ee2c4a34d687baf9",
     "corpus_manifest_hash": "a040e2c16e04203b2268b44cb2ff4394def52eed49badb11cc085fcd2fabd6a6",
     "query_count": 17,
-    "content_sha256": "a172ec4fca8ed3dea62ec2f8220ad8ecfd575f38f02bdb1cc61e8681dd0ac251"
+    "content_sha256": "d51e0c0bdc520bc14aed64cbb9357ed33f4474863125a755aa8c8cac79f75d22"
   },
-  "query_manifest_hash": "cdf5e59a6e33826da26380c097b6c3380e79132f8ebdebf564eecc198fd1a139",
+  "query_manifest_hash": "d5c3b9b13f28b780f11d5210526383d31aee12886303afe65d60a8e4c58ee8a7",
   "query_ids": [
     "term",
     "multi-term",

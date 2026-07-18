@@ -13,6 +13,7 @@ mod artifact;
 mod comparator;
 mod engine;
 mod generator;
+mod runner;
 mod version_contract;
 
 use std::path::PathBuf;
@@ -20,30 +21,41 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use artifact::{
-    ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION, OBJECT_SCHEMA_VERSION,
-    PreparedArtifact, RunManifest,
+    ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION, CampaignArtifactContext,
+    OBJECT_SCHEMA_VERSION, PreparedArtifact, RunManifest,
 };
 pub use comparator::{
-    ComparatorConfig, ComparisonReport, ComparisonStatus, CountState, Divergence, DivergenceClass,
-    EngineObservation, NativeTieKey, RankClass, RankedHit, SCORE_EPSILON, ScoreEpsilonReason,
-    compare_observations,
+    AstDifference, AstLoweringKind, ComparatorConfig, ComparisonReport, ComparisonStatus,
+    CountState, Divergence, DivergenceClass, EngineObservation, NativeTieKey, RankClass, RankedHit,
+    SCORE_EPSILON, ScoreEpsilonReason, compare_observations,
 };
 #[cfg(feature = "tantivy-oracle")]
 pub use engine::TantivyOracle;
 pub use engine::{
     ComparisonMode, DifferentialCase, DifferentialCaseMetadata, DifferentialHarness,
     EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine, GauntletFuture, HarnessRun,
-    QuillSubjectStub,
+    MAX_SNIPPET_CHARS, QuillSubjectStub,
 };
 pub use generator::{
     CORE_RELEVANCE_DOCUMENT_COUNT, CassDocumentFields, CorpusManifest, CorpusSourceManifest,
     FULL_SHARED_DOCUMENT_COUNT, GENERATOR_ID, GENERATOR_SCHEMA_VERSION, GeneratedDocument,
     GeneratedQueryCase, GeneratedQueryFilters, GeneratedQueryKind, GeneratedQuerySuite,
-    GlobPatternClass, HarvestedContractQuery, MAX_DOCUMENT_BYTES, Pathology, QueryGeneratorSpec,
-    QueryManifest, QuerySyntax, RangeClass, RepositoryEntry, RepositoryFileDigest,
-    RepositorySkipReason, RepositorySnapshot, SharedCorpusView, SharedEdgeCase, SharedFixtureSuite,
-    SharedRelevanceQuery, SkippedRepositoryEntry, SourceFileDigest, SyntheticCorpus,
-    SyntheticCorpusIter, SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
+    GlobPatternClass, HarvestedContractQuery, MAX_CORPUS_DOCUMENT_COUNT, MAX_DOCUMENT_BYTES,
+    MAX_DOCUMENT_ID_BYTES, MAX_QUERY_CASES, MAX_QUERY_ID_BYTES, MAX_QUERY_SUITE_TEXT_BYTES,
+    MAX_QUERY_TEXT_BYTES, Pathology, QUERY_MANIFEST_SCHEMA_VERSION, QueryGeneratorSpec,
+    QueryManifest, QuerySuiteSource, QuerySyntax, RangeClass, RepositoryEntry,
+    RepositoryFileDigest, RepositorySkipReason, RepositorySnapshot, SharedCorpusView,
+    SharedEdgeCase, SharedFixtureSuite, SharedRelevanceQuery, SkippedRepositoryEntry,
+    SourceFileDigest, SyntheticCorpus, SyntheticCorpusIter, SyntheticCorpusSpec, UnicodeLane,
+    XLARGE_DOCUMENT_COUNT, ZipfExponent,
+};
+pub use runner::{
+    CAMPAIGN_REPORT_SCHEMA_VERSION, CampaignCaseResult, CampaignConfig, CampaignDisposition,
+    CampaignFuture, CampaignReport, CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH,
+    DEFAULT_ANALYZER_CONTRACT_PREIMAGE, DEFAULT_SCHEMA_CONTRACT_HASH,
+    DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DifferentialCampaignEngine, DifferentialCampaignRunner,
+    DivergenceRegisterDecision, DivergenceRegisterEntry, DivergenceRegistry, EngineIndexReceipt,
+    GeneratedCorpusReplay, MismatchGroup, QueryClassSummary, SemanticContract,
 };
 pub use version_contract::{
     InternalDifferentialFixture, OracleVersionContract, Q1FixtureCatalog, Q1FixtureStub,
@@ -67,6 +79,8 @@ pub enum GauntletError {
     InvalidCase { reason: String },
     #[error("invalid deterministic generator input: {reason}")]
     InvalidGenerator { reason: String },
+    #[error("invalid differential campaign: {reason}")]
+    InvalidCampaign { reason: String },
     #[error("content-addressed replay mismatch: {reason}")]
     ManifestMismatch { reason: String },
     #[error("subject is unavailable: {reason}")]

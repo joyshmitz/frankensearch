@@ -6,7 +6,7 @@
 //! their recipes.
 
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 #[cfg(not(windows))]
 use std::fs::File;
@@ -18,16 +18,32 @@ use frankensearch_core::IndexableDocument;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{DifferentialCase, DifferentialCaseMetadata, GauntletError};
+#[cfg(test)]
+use crate::DifferentialCaseMetadata;
+use crate::{DifferentialCase, GauntletError};
 
 /// Schema version for generator specifications and manifests.
 pub const GENERATOR_SCHEMA_VERSION: u32 = 1;
+/// Schema version for query manifests with explicit suite provenance.
+pub const QUERY_MANIFEST_SCHEMA_VERSION: u32 = 2;
 /// Stable identity of this generator implementation.
 pub const GENERATOR_ID: &str = "frankensearch-quill-gauntlet/generator-v1";
 /// Maximum accepted document size, in UTF-8 bytes.
 pub const MAX_DOCUMENT_BYTES: u32 = 2 * 1024 * 1024;
+/// Maximum UTF-8 bytes in an external document ID carried into observations.
+pub const MAX_DOCUMENT_ID_BYTES: usize = 64 * 1024;
 /// Number of documents in the performance-gate xlarge corpus.
 pub const XLARGE_DOCUMENT_COUNT: u64 = 1_000_000;
+/// Maximum corpus size accepted by manifests and campaign generators.
+pub const MAX_CORPUS_DOCUMENT_COUNT: u64 = XLARGE_DOCUMENT_COUNT;
+/// Maximum cases accepted in one query manifest.
+pub const MAX_QUERY_CASES: usize = 100_000;
+/// Maximum UTF-8 bytes in one raw query.
+pub const MAX_QUERY_TEXT_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 bytes across all variable text in one query suite.
+pub const MAX_QUERY_SUITE_TEXT_BYTES: usize = 256 * 1024 * 1024;
+/// Maximum UTF-8 bytes in one stable query or divergence ID.
+pub const MAX_QUERY_ID_BYTES: usize = 1_024;
 /// Number of documents in the original five-cluster relevance fixture.
 pub const CORE_RELEVANCE_DOCUMENT_COUNT: usize = 100;
 /// Number of documents in the complete shared fixture corpus.
@@ -37,10 +53,17 @@ const MAX_VOCABULARY_SIZE: u32 = 65_536;
 const DEFAULT_VOCABULARY_SIZE: u32 = 4_096;
 const MAX_FREQUENCY_REPETITIONS: usize = 65_536;
 const MAX_GENERATED_QUERY_LIMIT: u64 = 100_000;
+const MAX_QUERY_SOURCE_BYTES: usize = 64 * 1024;
+const MAX_DOCUMENT_AUXILIARY_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CANONICAL_DOCUMENT_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_REPOSITORY_ID_BYTES: usize = 1_024;
+const MAX_REPOSITORY_PATH_BYTES: usize = MAX_DOCUMENT_ID_BYTES - "repo:".len();
+const MAX_REPOSITORY_MANIFEST_TEXT_BYTES: usize = 256 * 1024 * 1024;
 const CORPUS_HASH_DOMAIN: &[u8] = b"frankensearch/quill/corpus-content/v1\0";
 const MANIFEST_HASH_DOMAIN: &[u8] = b"frankensearch/quill/corpus-manifest/v1\0";
 const QUERY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/query-content/v1\0";
 const QUERY_MANIFEST_HASH_DOMAIN: &[u8] = b"frankensearch/quill/query-manifest/v1\0";
+const QUERY_SOURCE_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/query-source/v1\0";
 
 const SHARED_CORPUS_JSON: &str = include_str!("../../../tests/fixtures/corpus.json");
 const SHARED_QUERIES_JSON: &str = include_str!("../../../tests/fixtures/queries.json");
@@ -100,6 +123,11 @@ impl SyntheticCorpusSpec {
     }
 
     fn validate(&self) -> Result<(), GauntletError> {
+        if self.document_count > MAX_CORPUS_DOCUMENT_COUNT {
+            return Err(generator_error(format!(
+                "document_count must be at most {MAX_CORPUS_DOCUMENT_COUNT}"
+            )));
+        }
         if self.vocabulary_size == 0 || self.vocabulary_size > MAX_VOCABULARY_SIZE {
             return Err(generator_error(format!(
                 "vocabulary_size must be in 1..={MAX_VOCABULARY_SIZE}"
@@ -542,6 +570,11 @@ impl RepositorySnapshot {
         for entry in entries {
             let path = normalize_relative_path(&entry.relative_path)?;
             normalized.push((path, entry.bytes));
+            if normalized.len() > usize::try_from(MAX_CORPUS_DOCUMENT_COUNT).unwrap_or(usize::MAX) {
+                return Err(generator_error(format!(
+                    "repository snapshots may contain at most {MAX_CORPUS_DOCUMENT_COUNT} entries"
+                )));
+            }
         }
         normalized.sort_by(|left, right| left.0.cmp(&right.0));
         if normalized.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -569,10 +602,15 @@ impl RepositorySnapshot {
     ) -> Result<Self, GauntletError> {
         let repository_id = repository_id.into();
         validate_repository_id(&repository_id)?;
-        let mut paths = tracked_paths
-            .into_iter()
-            .map(|path| normalize_relative_path(&path))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut paths = Vec::new();
+        for path in tracked_paths {
+            paths.push(normalize_relative_path(&path)?);
+            if paths.len() > usize::try_from(MAX_CORPUS_DOCUMENT_COUNT).unwrap_or(usize::MAX) {
+                return Err(generator_error(format!(
+                    "repository snapshots may contain at most {MAX_CORPUS_DOCUMENT_COUNT} tracked paths"
+                )));
+            }
+        }
         paths.sort();
         if paths.windows(2).any(|pair| pair[0] == pair[1]) {
             return Err(generator_error(
@@ -599,6 +637,14 @@ impl RepositorySnapshot {
         entries: Vec<(String, Vec<u8>)>,
         mut skipped: Vec<SkippedRepositoryEntry>,
     ) -> Result<Self, GauntletError> {
+        let tracked_path_count = entries.len().checked_add(skipped.len());
+        if tracked_path_count.is_none_or(|count| {
+            count > usize::try_from(MAX_CORPUS_DOCUMENT_COUNT).unwrap_or(usize::MAX)
+        }) {
+            return Err(generator_error(format!(
+                "repository snapshots may contain at most {MAX_CORPUS_DOCUMENT_COUNT} tracked paths"
+            )));
+        }
         let mut documents = Vec::new();
         let mut files = Vec::new();
         for (path, bytes) in entries {
@@ -781,7 +827,164 @@ pub struct CorpusManifest {
     pub skipped_repository_entries: Vec<SkippedRepositoryEntry>,
 }
 
+/// Incremental verifier used by the campaign's actual indexing replay.
+pub struct CorpusReplayVerifier<'a> {
+    hasher: Sha256,
+    document_count: u64,
+    total_content_bytes: u64,
+    expected_document_count: u64,
+    expected_content_bytes: u64,
+    source: &'a CorpusSourceManifest,
+}
+
+impl CorpusReplayVerifier<'_> {
+    pub(super) fn observe(&mut self, document: &GeneratedDocument) -> Result<u64, GauntletError> {
+        validate_generated_document_bounds(document)?;
+        if let CorpusSourceManifest::Repository {
+            repository_id,
+            files,
+        } = self.source
+        {
+            let ordinal = usize::try_from(self.document_count)
+                .map_err(|_| manifest_error("repository document ordinal does not fit usize"))?;
+            let file = files.get(ordinal).ok_or_else(|| {
+                manifest_error("repository replay contains more documents than file digests")
+            })?;
+            validate_repository_document(repository_id, file, self.document_count, document)?;
+        }
+        let bytes = serde_json::to_vec(document)?;
+        let canonical_bytes = u64_from_usize(bytes.len());
+        if canonical_bytes > MAX_CANONICAL_DOCUMENT_BYTES {
+            return Err(manifest_error(
+                "canonical generated document exceeds the bounded replay size",
+            ));
+        }
+        self.hasher.update(canonical_bytes.to_be_bytes());
+        self.hasher.update(bytes);
+        self.document_count = self
+            .document_count
+            .checked_add(1)
+            .ok_or_else(|| generator_error("document count overflow while verifying replay"))?;
+        self.total_content_bytes = self
+            .total_content_bytes
+            .checked_add(u64::try_from(document.content.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| generator_error("content byte count overflow while verifying replay"))?;
+        if self.document_count > self.expected_document_count
+            || self.total_content_bytes > self.expected_content_bytes
+        {
+            return Err(manifest_error(
+                "indexed document replay exceeded corpus manifest bounds",
+            ));
+        }
+        Ok(canonical_bytes)
+    }
+
+    pub(super) fn finish(self, manifest: &CorpusManifest) -> Result<(), GauntletError> {
+        let digest = lower_hex(&self.hasher.finalize());
+        if self.document_count != manifest.document_count
+            || self.total_content_bytes != manifest.total_content_bytes
+            || digest != manifest.content_sha256
+        {
+            return Err(manifest_error(
+                "indexed document replay does not match corpus content pins",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_generated_document_bounds(document: &GeneratedDocument) -> Result<(), GauntletError> {
+    if document.id.is_empty()
+        || document.id.len() > MAX_DOCUMENT_ID_BYTES
+        || document.content.len() > usize_from_u32(MAX_DOCUMENT_BYTES)
+    {
+        return Err(manifest_error(
+            "generated document ID or content exceeds its bounded contract",
+        ));
+    }
+    let mut auxiliary_bytes = u64_from_usize(document.id.len());
+    if let Some(title) = &document.title {
+        auxiliary_bytes = auxiliary_bytes
+            .checked_add(u64_from_usize(title.len()))
+            .ok_or_else(|| manifest_error("generated document metadata byte count overflow"))?;
+    }
+    for (key, value) in &document.metadata {
+        auxiliary_bytes = auxiliary_bytes
+            .checked_add(u64_from_usize(key.len()))
+            .and_then(|bytes| bytes.checked_add(u64_from_usize(value.len())))
+            .ok_or_else(|| manifest_error("generated document metadata byte count overflow"))?;
+    }
+    if let Some(cass) = &document.cass {
+        for value in [
+            cass.agent.as_str(),
+            cass.workspace.as_str(),
+            cass.source_id.as_str(),
+            cass.source_path.as_str(),
+            cass.origin_kind.as_str(),
+        ] {
+            auxiliary_bytes = auxiliary_bytes
+                .checked_add(u64_from_usize(value.len()))
+                .ok_or_else(|| manifest_error("generated document metadata byte count overflow"))?;
+        }
+    }
+    if auxiliary_bytes > MAX_DOCUMENT_AUXILIARY_BYTES {
+        return Err(manifest_error(
+            "generated document auxiliary metadata exceeds its bounded contract",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_repository_document(
+    repository_id: &str,
+    file: &RepositoryFileDigest,
+    ordinal: u64,
+    document: &GeneratedDocument,
+) -> Result<(), GauntletError> {
+    let expected_metadata = BTreeMap::from([
+        ("repository_id".to_owned(), repository_id.to_owned()),
+        ("source_path".to_owned(), file.path.clone()),
+    ]);
+    let expected_cass = CassDocumentFields {
+        agent: "repository".to_owned(),
+        workspace: repository_id.to_owned(),
+        source_id: file.path.clone(),
+        source_path: file.path.clone(),
+        origin_kind: "repository_snapshot".to_owned(),
+        message_index: ordinal,
+    };
+    let content_bytes = document.content.as_bytes();
+    if document.id != format!("repo:{}", file.path)
+        || document.title.as_deref() != Some(file.path.as_str())
+        || u64_from_usize(content_bytes.len()) != file.bytes
+        || sha256_hex(content_bytes) != file.sha256
+        || document.created_at_ms != 0
+        || document.cass.as_ref() != Some(&expected_cass)
+        || document.metadata != expected_metadata
+        || document.pathology.is_some()
+        || document.unicode_lane != classify_unicode_lane(&document.content)
+    {
+        return Err(manifest_error(
+            "repository replay document does not match its ordered source digest",
+        ));
+    }
+    Ok(())
+}
+
 impl CorpusManifest {
+    pub(super) fn replay_verifier(&self) -> CorpusReplayVerifier<'_> {
+        let mut hasher = Sha256::new();
+        hasher.update(CORPUS_HASH_DOMAIN);
+        CorpusReplayVerifier {
+            hasher,
+            document_count: 0,
+            total_content_bytes: 0,
+            expected_document_count: self.document_count,
+            expected_content_bytes: self.total_content_bytes,
+            source: &self.source,
+        }
+    }
+
     fn from_documents<I, D>(
         source: CorpusSourceManifest,
         documents: I,
@@ -824,6 +1027,106 @@ impl CorpusManifest {
         Ok(lower_hex(&hasher.finalize()))
     }
 
+    pub(crate) fn validate_contract(&self) -> Result<(), GauntletError> {
+        if self.schema_version != GENERATOR_SCHEMA_VERSION
+            || self.generator_id != GENERATOR_ID
+            || self.document_count > MAX_CORPUS_DOCUMENT_COUNT
+            || validate_sha256(&self.content_sha256, "corpus content hash").is_err()
+        {
+            return Err(manifest_error(
+                "corpus manifest schema, generator, or content hash is invalid",
+            ));
+        }
+        match &self.source {
+            CorpusSourceManifest::Synthetic { spec } => {
+                let expected = SyntheticCorpus::new(spec.clone())?.manifest()?;
+                if self != &expected {
+                    return Err(manifest_error(
+                        "synthetic manifest does not match its replay recipe",
+                    ));
+                }
+            }
+            CorpusSourceManifest::SharedFixtures { view, .. } => {
+                let expected = SharedFixtureSuite::load()?.manifest(*view)?;
+                if self != &expected {
+                    return Err(manifest_error(
+                        "shared-fixture manifest does not match its embedded sources",
+                    ));
+                }
+            }
+            CorpusSourceManifest::Repository {
+                repository_id,
+                files,
+            } => {
+                let tracked_path_count = files
+                    .len()
+                    .checked_add(self.skipped_repository_entries.len());
+                if validate_repository_id(repository_id).is_err()
+                    || files.len() != usize::try_from(self.document_count).unwrap_or(usize::MAX)
+                    || tracked_path_count.is_none_or(|count| {
+                        count > usize::try_from(MAX_CORPUS_DOCUMENT_COUNT).unwrap_or(usize::MAX)
+                    })
+                {
+                    return Err(manifest_error(
+                        "repository manifest identity or document count is invalid",
+                    ));
+                }
+                let mut previous = None::<&str>;
+                let mut included = BTreeSet::new();
+                let mut byte_count = 0_u64;
+                let mut manifest_text_bytes = repository_id.len();
+                for file in files {
+                    let normalized = normalize_relative_path(Path::new(&file.path))?;
+                    manifest_text_bytes = manifest_text_bytes
+                        .checked_add(file.path.len())
+                        .ok_or_else(|| {
+                            manifest_error("repository manifest text byte count overflow")
+                        })?;
+                    if normalized != file.path
+                        || previous.is_some_and(|path| path >= file.path.as_str())
+                        || file.bytes > u64::from(MAX_DOCUMENT_BYTES)
+                        || validate_sha256(&file.sha256, "repository file hash").is_err()
+                    {
+                        return Err(manifest_error(
+                            "repository file digests must be safe, sorted, unique, and hashed",
+                        ));
+                    }
+                    byte_count = byte_count
+                        .checked_add(file.bytes)
+                        .ok_or_else(|| manifest_error("repository content byte count overflow"))?;
+                    previous = Some(&file.path);
+                    included.insert(file.path.as_str());
+                }
+                let mut previous_skip = None::<&str>;
+                for skipped in &self.skipped_repository_entries {
+                    let normalized = normalize_relative_path(Path::new(&skipped.path))?;
+                    manifest_text_bytes = manifest_text_bytes
+                        .checked_add(skipped.path.len())
+                        .ok_or_else(|| {
+                            manifest_error("repository manifest text byte count overflow")
+                        })?;
+                    if normalized != skipped.path
+                        || previous_skip.is_some_and(|path| path >= skipped.path.as_str())
+                        || included.contains(skipped.path.as_str())
+                    {
+                        return Err(manifest_error(
+                            "repository exclusions must be safe, sorted, unique, and disjoint",
+                        ));
+                    }
+                    previous_skip = Some(&skipped.path);
+                }
+                if byte_count != self.total_content_bytes
+                    || manifest_text_bytes > MAX_REPOSITORY_MANIFEST_TEXT_BYTES
+                {
+                    return Err(manifest_error(
+                        "repository file bytes or manifest text exceed their bounded contract",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verify arbitrary replay documents against this manifest's content pins.
     ///
     /// # Errors
@@ -834,17 +1137,12 @@ impl CorpusManifest {
         I: IntoIterator<Item = D>,
         D: Borrow<GeneratedDocument>,
     {
-        let (count, bytes, digest) = hash_documents(documents)?;
-        let content_sha256_matches = digest.as_bytes().eq(self.content_sha256.as_bytes());
-        if count != self.document_count
-            || bytes != self.total_content_bytes
-            || !content_sha256_matches
-        {
-            return Err(GauntletError::ManifestMismatch {
-                reason: "replayed document stream does not match corpus content pins".to_owned(),
-            });
+        self.validate_contract()?;
+        let mut verifier = self.replay_verifier();
+        for document in documents {
+            let _ = verifier.observe(document.borrow())?;
         }
-        Ok(())
+        verifier.finish(self)
     }
 }
 
@@ -1067,12 +1365,6 @@ pub struct GeneratedQueryFilters {
     pub created_to_ms: Option<i64>,
 }
 
-impl GeneratedQueryFilters {
-    fn is_empty(&self) -> bool {
-        self.created_from_ms.is_none() && self.created_to_ms.is_none()
-    }
-}
-
 /// Rich engine-neutral query case; E6.2 adapters lower this without data loss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedQueryCase {
@@ -1099,24 +1391,24 @@ pub struct GeneratedQueryCase {
 }
 
 impl GeneratedQueryCase {
-    /// Lower only semantics representable by today's generic differential case.
+    /// Lower the common comparator envelope for every generated query.
+    ///
+    /// Syntax and structured filters remain in this rich case and are passed
+    /// separately to campaign adapters. The differential envelope carries only
+    /// fields shared by both adapters and the comparator.
     ///
     /// # Errors
     ///
-    /// Returns an error for CASS syntax, pagination, structured filters, or a
-    /// malformed corpus manifest hash. E6.2 must lower those adapter-specifically.
-    pub fn to_differential_case(
+    /// Returns an error for a malformed corpus manifest hash.
+    #[cfg(test)]
+    fn to_differential_case(
         &self,
         generator_seed: u64,
         corpus_manifest_hash: &str,
     ) -> Result<DifferentialCase, GauntletError> {
         validate_sha256(corpus_manifest_hash, "corpus manifest hash")?;
-        if self.syntax != QuerySyntax::Default || self.offset != 0 || !self.filters.is_empty() {
-            return Err(generator_error(
-                "query requires adapter-specific CASS, range, or pagination lowering",
-            ));
-        }
         let mut case = DifferentialCase::new(&self.id, &self.query, self.limit);
+        case.offset = self.offset;
         case.count_requested = self.count_requested;
         case.metadata = DifferentialCaseMetadata {
             generator_id: Some(GENERATOR_ID.to_owned()),
@@ -1138,6 +1430,16 @@ pub struct QueryGeneratorSpec {
     pub include_shared_relevance_queries: bool,
 }
 
+/// Provenance mode for a query suite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuerySuiteSource {
+    /// Cases must exactly replay from the embedded generator spec and fixtures.
+    Generated,
+    /// Cases were explicitly supplied and are content-addressed, not claimed as generator output.
+    ExplicitCases,
+}
+
 /// Canonical query-suite identity bound to one corpus manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryManifest {
@@ -1147,6 +1449,10 @@ pub struct QueryManifest {
     pub generator_id: String,
     /// Query recipe.
     pub spec: QueryGeneratorSpec,
+    /// Whether the cases replay from `spec` or were explicitly supplied.
+    pub source: QuerySuiteSource,
+    /// Hash binding source mode, spec, corpus, count, and ordered content digest.
+    pub source_identity_sha256: String,
     /// Manifest hash of the corpus queried.
     pub corpus_manifest_hash: String,
     /// Number of cases.
@@ -1156,6 +1462,36 @@ pub struct QueryManifest {
 }
 
 impl QueryManifest {
+    fn validate_contract(&self, cases: &[GeneratedQueryCase]) -> Result<(), GauntletError> {
+        let expected_source_identity = query_source_identity(
+            self.source,
+            &self.spec,
+            &self.corpus_manifest_hash,
+            self.query_count,
+            &self.content_sha256,
+        )?;
+        if self.schema_version != QUERY_MANIFEST_SCHEMA_VERSION
+            || self.generator_id != GENERATOR_ID
+            || validate_sha256(&self.content_sha256, "query content hash").is_err()
+            || self.source_identity_sha256 != expected_source_identity
+            || validate_query_inputs(&self.spec, &self.corpus_manifest_hash, cases).is_err()
+        {
+            return Err(manifest_error(
+                "query manifest schema, generator, recipe, or cases are invalid",
+            ));
+        }
+        if self.source == QuerySuiteSource::Generated {
+            let shared = SharedFixtureSuite::load()?;
+            let expected = generated_query_cases(&self.spec, &shared)?;
+            if expected != cases {
+                return Err(manifest_error(
+                    "generated query suite does not match its replay recipe",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Domain-separated manifest hash.
     ///
     /// # Errors
@@ -1174,6 +1510,7 @@ impl QueryManifest {
     ///
     /// Returns an error when replayed queries differ.
     pub fn verify(&self, cases: &[GeneratedQueryCase]) -> Result<(), GauntletError> {
+        self.validate_contract(cases)?;
         let (query_count, content_sha256) = hash_queries(cases)?;
         if query_count != self.query_count || content_sha256 != self.content_sha256 {
             return Err(GauntletError::ManifestMismatch {
@@ -1185,7 +1522,7 @@ impl QueryManifest {
 }
 
 /// Generated query suite plus replay manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedQuerySuite {
     /// Ordered generated and harvested cases.
     pub cases: Vec<GeneratedQueryCase>,
@@ -1194,6 +1531,45 @@ pub struct GeneratedQuerySuite {
 }
 
 impl GeneratedQuerySuite {
+    /// Build a replay-verifiable suite from explicit rich query cases.
+    ///
+    /// This is the E6.2 seam for attaching reviewed divergence IDs or selecting
+    /// an independently harvested query corpus without discarding syntax,
+    /// filters, pagination, or provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid corpus hash, an empty/duplicate case ID,
+    /// an out-of-budget limit/offset, or canonical serialization failure.
+    pub fn from_cases(
+        spec: QueryGeneratorSpec,
+        corpus_manifest_hash: impl Into<String>,
+        cases: Vec<GeneratedQueryCase>,
+    ) -> Result<Self, GauntletError> {
+        let corpus_manifest_hash = corpus_manifest_hash.into();
+        validate_query_inputs(&spec, &corpus_manifest_hash, &cases)?;
+        let (query_count, content_sha256) = hash_queries(&cases)?;
+        let source = QuerySuiteSource::ExplicitCases;
+        let source_identity_sha256 = query_source_identity(
+            source,
+            &spec,
+            &corpus_manifest_hash,
+            query_count,
+            &content_sha256,
+        )?;
+        let manifest = QueryManifest {
+            schema_version: QUERY_MANIFEST_SCHEMA_VERSION,
+            generator_id: GENERATOR_ID.to_owned(),
+            spec,
+            source,
+            source_identity_sha256,
+            corpus_manifest_hash,
+            query_count,
+            content_sha256,
+        };
+        Ok(Self { cases, manifest })
+    }
+
     /// Generate the complete E6.1 query matrix.
     ///
     /// # Errors
@@ -1212,46 +1588,64 @@ impl GeneratedQuerySuite {
         }
         let corpus_manifest_hash = corpus_manifest_hash.into();
         validate_sha256(&corpus_manifest_hash, "corpus manifest hash")?;
-        let mut cases = constructed_query_matrix(spec.seed, spec.default_limit);
-        if spec.include_shared_relevance_queries {
-            cases.extend(
-                shared
-                    .relevance_queries
-                    .iter()
-                    .enumerate()
-                    .map(|(index, query)| GeneratedQueryCase {
-                        id: format!("harvested-{index:02}"),
-                        syntax: QuerySyntax::Default,
-                        query_kind: GeneratedQueryKind::Harvested {
-                            semantic_class: query.query_class.clone(),
-                        },
-                        query: query.query.clone(),
-                        limit: spec.default_limit,
-                        offset: 0,
-                        count_requested: true,
-                        filters: GeneratedQueryFilters::default(),
-                        expected_divergence: None,
-                        source: "tests/fixtures/queries.json".to_owned(),
-                    }),
-            );
-            let contract_cases = shared
-                .harvested_contract_queries
-                .iter()
-                .map(|query| contract_query_case(query, spec.default_limit))
-                .collect::<Result<Vec<_>, _>>()?;
-            cases.extend(contract_cases);
-        }
+        let cases = generated_query_cases(&spec, shared)?;
         let (query_count, content_sha256) = hash_queries(&cases)?;
+        let source = QuerySuiteSource::Generated;
+        let source_identity_sha256 = query_source_identity(
+            source,
+            &spec,
+            &corpus_manifest_hash,
+            query_count,
+            &content_sha256,
+        )?;
         let manifest = QueryManifest {
-            schema_version: GENERATOR_SCHEMA_VERSION,
+            schema_version: QUERY_MANIFEST_SCHEMA_VERSION,
             generator_id: GENERATOR_ID.to_owned(),
             spec,
+            source,
+            source_identity_sha256,
             corpus_manifest_hash,
             query_count,
             content_sha256,
         };
         Ok(Self { cases, manifest })
     }
+}
+
+fn generated_query_cases(
+    spec: &QueryGeneratorSpec,
+    shared: &SharedFixtureSuite,
+) -> Result<Vec<GeneratedQueryCase>, GauntletError> {
+    let mut cases = constructed_query_matrix(spec.seed, spec.default_limit);
+    if spec.include_shared_relevance_queries {
+        cases.extend(
+            shared
+                .relevance_queries
+                .iter()
+                .enumerate()
+                .map(|(index, query)| GeneratedQueryCase {
+                    id: format!("harvested-{index:02}"),
+                    syntax: QuerySyntax::Default,
+                    query_kind: GeneratedQueryKind::Harvested {
+                        semantic_class: query.query_class.clone(),
+                    },
+                    query: query.query.clone(),
+                    limit: spec.default_limit,
+                    offset: 0,
+                    count_requested: true,
+                    filters: GeneratedQueryFilters::default(),
+                    expected_divergence: None,
+                    source: "tests/fixtures/queries.json".to_owned(),
+                }),
+        );
+        let contract_cases = shared
+            .harvested_contract_queries
+            .iter()
+            .map(|query| contract_query_case(query, spec.default_limit))
+            .collect::<Result<Vec<_>, _>>()?;
+        cases.extend(contract_cases);
+    }
+    Ok(cases)
 }
 
 fn contract_query_case(
@@ -1492,7 +1886,6 @@ fn constructed_query_matrix(seed: u64, default_limit: u64) -> Vec<GeneratedQuery
             "con*fi?g*".to_owned(),
         ),
     ];
-    cases[3].expected_divergence = Some("DIV-003".to_owned());
     cases.push(GeneratedQueryCase {
         filters: GeneratedQueryFilters {
             created_from_ms: Some(1_700_000_000_000),
@@ -1614,6 +2007,111 @@ fn hash_queries(cases: &[GeneratedQueryCase]) -> Result<(u64, String), GauntletE
         hasher.update(bytes);
     }
     Ok((u64_from_usize(cases.len()), lower_hex(&hasher.finalize())))
+}
+
+fn query_source_identity(
+    source: QuerySuiteSource,
+    spec: &QueryGeneratorSpec,
+    corpus_manifest_hash: &str,
+    query_count: u64,
+    content_sha256: &str,
+) -> Result<String, GauntletError> {
+    let mut hasher = Sha256::new();
+    hasher.update(QUERY_SOURCE_IDENTITY_DOMAIN);
+    hasher.update(serde_json::to_vec(&(
+        source,
+        spec,
+        corpus_manifest_hash,
+        query_count,
+        content_sha256,
+    ))?);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
+fn validate_query_inputs(
+    spec: &QueryGeneratorSpec,
+    corpus_manifest_hash: &str,
+    cases: &[GeneratedQueryCase],
+) -> Result<(), GauntletError> {
+    if spec.default_limit == 0 || spec.default_limit > MAX_GENERATED_QUERY_LIMIT {
+        return Err(generator_error(format!(
+            "default query limit must be in 1..={MAX_GENERATED_QUERY_LIMIT}"
+        )));
+    }
+    validate_sha256(corpus_manifest_hash, "corpus manifest hash")?;
+    if cases.is_empty() {
+        return Err(generator_error(
+            "query suite must contain at least one case",
+        ));
+    }
+    if cases.len() > MAX_QUERY_CASES {
+        return Err(generator_error(format!(
+            "query suite may contain at most {MAX_QUERY_CASES} cases"
+        )));
+    }
+    let mut ids = BTreeSet::new();
+    let mut aggregate_text_bytes = 0_usize;
+    for case in cases {
+        let end = case.offset.checked_add(case.limit);
+        let case_text_bytes = case
+            .id
+            .len()
+            .checked_add(case.query.len())
+            .and_then(|bytes| bytes.checked_add(case.source.len()))
+            .and_then(|bytes| {
+                bytes.checked_add(case.expected_divergence.as_ref().map_or(0, String::len))
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(match &case.query_kind {
+                    GeneratedQueryKind::Harvested { semantic_class } => semantic_class.len(),
+                    _ => 0,
+                })
+            })
+            .ok_or_else(|| generator_error("query case text byte count overflow"))?;
+        aggregate_text_bytes = aggregate_text_bytes
+            .checked_add(case_text_bytes)
+            .ok_or_else(|| generator_error("query suite text byte count overflow"))?;
+        if !is_canonical_query_id(&case.id)
+            || case.query.len() > MAX_QUERY_TEXT_BYTES
+            || !is_canonical_text(&case.source, MAX_QUERY_SOURCE_BYTES)
+            || case
+                .expected_divergence
+                .as_ref()
+                .is_some_and(|id| !is_divergence_id(id))
+            || matches!(
+                &case.query_kind,
+                GeneratedQueryKind::Harvested { semantic_class }
+                    if !is_canonical_query_id(semantic_class)
+            )
+            || !ids.insert(case.id.as_str())
+            || case.limit > MAX_GENERATED_QUERY_LIMIT
+            || case.offset > MAX_GENERATED_QUERY_LIMIT
+            || end.is_none_or(|value| value > MAX_GENERATED_QUERY_LIMIT)
+            || aggregate_text_bytes > MAX_QUERY_SUITE_TEXT_BYTES
+        {
+            return Err(generator_error(
+                "query cases require unique non-empty IDs/sources and bounded limit/offset",
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn is_canonical_query_id(value: &str) -> bool {
+    is_canonical_text(value, MAX_QUERY_ID_BYTES)
+}
+
+fn is_canonical_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn is_divergence_id(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with("DIV-")
+        && value.as_bytes()[4..].iter().all(u8::is_ascii_digit)
 }
 
 fn build_zipf_cdf(vocabulary_size: u32, exponent: ZipfExponent) -> Result<Vec<u64>, GauntletError> {
@@ -1807,7 +2305,11 @@ fn normalize_relative_path(path: &Path) -> Result<String, GauntletError> {
     let Some(raw_path) = path.to_str() else {
         return Err(generator_error("repository path must be valid UTF-8"));
     };
-    if raw_path.is_empty() || raw_path.contains('\\') || path.is_absolute() {
+    if raw_path.is_empty()
+        || raw_path.len() > MAX_REPOSITORY_PATH_BYTES
+        || raw_path.contains('\\')
+        || path.is_absolute()
+    {
         return Err(generator_error(format!(
             "repository path must be nonempty, relative, UTF-8, and slash-separated: {}",
             path.display()
@@ -1839,9 +2341,11 @@ fn normalize_relative_path(path: &Path) -> Result<String, GauntletError> {
 }
 
 fn validate_repository_id(repository_id: &str) -> Result<(), GauntletError> {
-    if repository_id.is_empty() || repository_id.contains(['/', '\\']) {
+    if !is_canonical_text(repository_id, MAX_REPOSITORY_ID_BYTES)
+        || repository_id.contains(['/', '\\'])
+    {
         return Err(generator_error(
-            "repository_id must be a nonempty logical name without path separators",
+            "repository_id must be a bounded canonical logical name without path separators",
         ));
     }
     Ok(())
@@ -1886,6 +2390,12 @@ fn u64_from_usize(value: usize) -> u64 {
 
 fn generator_error(reason: impl Into<String>) -> GauntletError {
     GauntletError::InvalidGenerator {
+        reason: reason.into(),
+    }
+}
+
+fn manifest_error(reason: impl Into<String>) -> GauntletError {
+    GauntletError::ManifestMismatch {
         reason: reason.into(),
     }
 }
@@ -2202,6 +2712,29 @@ mod tests {
         let mut tampered = corpus.iter().collect::<Vec<_>>();
         tampered[10].content.push_str(" tamper");
         assert!(manifest.verify_documents(&tampered).is_err());
+
+        let documents = corpus.iter().collect::<Vec<_>>();
+        let mut forged_schema = manifest.clone();
+        forged_schema.schema_version = 999;
+        assert!(forged_schema.verify_documents(&documents).is_err());
+        let mut forged_recipe = manifest.clone();
+        let CorpusSourceManifest::Synthetic { spec } = &mut forged_recipe.source else {
+            panic!("synthetic manifest source");
+        };
+        spec.seed = spec.seed.wrapping_add(1);
+        assert!(forged_recipe.verify_documents(&documents).is_err());
+
+        let mut oversized_recipe = manifest.clone();
+        let CorpusSourceManifest::Synthetic { spec } = &mut oversized_recipe.source else {
+            panic!("synthetic manifest source");
+        };
+        spec.document_count = MAX_CORPUS_DOCUMENT_COUNT + 1;
+        oversized_recipe.document_count = MAX_CORPUS_DOCUMENT_COUNT + 1;
+        assert!(
+            oversized_recipe
+                .verify_documents(std::iter::empty::<&GeneratedDocument>())
+                .is_err()
+        );
     }
 
     #[test]
@@ -2316,13 +2849,13 @@ mod tests {
             suite
                 .cases
                 .iter()
-                .any(|case| { case.expected_divergence.as_deref() == Some("DIV-003") })
+                .all(|case| case.expected_divergence.is_none())
         );
         suite.manifest.verify(&suite.cases).expect("query replay");
     }
 
     #[test]
-    fn differential_lowering_binds_manifest_and_rejects_lossy_cases() {
+    fn differential_lowering_binds_manifest_and_preserves_common_fields() {
         let shared = SharedFixtureSuite::load().expect("fixtures");
         let corpus_hash = shared
             .manifest(SharedCorpusView::Core100)
@@ -2353,14 +2886,62 @@ mod tests {
             .iter()
             .find(|case| case.id == "paginated")
             .unwrap();
-        assert!(paginated.to_differential_case(4, &corpus_hash).is_err());
+        let paginated_case = paginated
+            .to_differential_case(4, &corpus_hash)
+            .expect("pagination has a common envelope");
+        assert_eq!(paginated_case.offset, paginated.offset);
         let cass = suite
             .cases
             .iter()
             .find(|case| case.id == "boolean-cass")
             .unwrap();
-        assert!(cass.to_differential_case(4, &corpus_hash).is_err());
+        assert_eq!(
+            cass.to_differential_case(4, &corpus_hash)
+                .expect("CASS has a common envelope")
+                .query,
+            cass.query
+        );
         assert!(term.to_differential_case(4, "0123456789abcdef").is_err());
+        let mut duplicate_cases = suite.cases.clone();
+        duplicate_cases.push(suite.cases[0].clone());
+        assert!(suite.manifest.verify(&duplicate_cases).is_err());
+        let mut oversized_query = suite.cases[0].clone();
+        oversized_query.query = "x".repeat(MAX_QUERY_TEXT_BYTES + 1);
+        assert!(
+            GeneratedQuerySuite::from_cases(
+                suite.manifest.spec.clone(),
+                &corpus_hash,
+                vec![oversized_query],
+            )
+            .is_err()
+        );
+        let mut noncanonical_id = suite.cases[0].clone();
+        noncanonical_id.id = " leading-space".to_owned();
+        assert!(
+            GeneratedQuerySuite::from_cases(
+                suite.manifest.spec.clone(),
+                &corpus_hash,
+                vec![noncanonical_id],
+            )
+            .is_err()
+        );
+        let mut invalid_divergence_id = suite.cases[0].clone();
+        invalid_divergence_id.expected_divergence = Some("unreviewed".to_owned());
+        assert!(
+            GeneratedQuerySuite::from_cases(
+                suite.manifest.spec.clone(),
+                &corpus_hash,
+                vec![invalid_divergence_id],
+            )
+            .is_err()
+        );
+        let mut forged_manifest = suite.manifest.clone();
+        forged_manifest.generator_id = "future-generator".to_owned();
+        assert!(forged_manifest.verify(&suite.cases).is_err());
+        let mut forged_spec = suite.manifest.clone();
+        forged_spec.spec.seed = forged_spec.spec.seed.wrapping_add(1);
+        assert!(forged_spec.verify(&suite.cases).is_err());
+        assert_eq!(suite.manifest.source, QuerySuiteSource::Generated);
         assert!(
             GeneratedQuerySuite::generate(
                 QueryGeneratorSpec {
@@ -2437,6 +3018,45 @@ mod tests {
         };
         assert_eq!(source[0].path, "README.md");
         assert_eq!(source[1].path, "src/z.rs");
+
+        let mut forged_digest = snapshot.manifest.clone();
+        let CorpusSourceManifest::Repository { files, .. } = &mut forged_digest.source else {
+            panic!("repository source expected");
+        };
+        files[0].sha256 = "0".repeat(64);
+        assert!(forged_digest.verify_documents(&snapshot.documents).is_err());
+
+        let mut swapped_sizes = snapshot.manifest.clone();
+        let CorpusSourceManifest::Repository { files, .. } = &mut swapped_sizes.source else {
+            panic!("repository source expected");
+        };
+        let first_bytes = files[0].bytes;
+        files[0].bytes = files[1].bytes;
+        files[1].bytes = first_bytes;
+        assert!(swapped_sizes.verify_documents(&snapshot.documents).is_err());
+
+        let mut oversized_document = snapshot.documents[0].clone();
+        oversized_document.content = "x".repeat(usize_from_u32(MAX_DOCUMENT_BYTES) + 1);
+        let oversized_bytes = oversized_document.content.as_bytes();
+        let oversized_manifest = CorpusManifest::from_documents(
+            CorpusSourceManifest::Repository {
+                repository_id: "frankensearch".to_owned(),
+                files: vec![RepositoryFileDigest {
+                    path: "README.md".to_owned(),
+                    bytes: u64_from_usize(oversized_bytes.len()),
+                    sha256: sha256_hex(oversized_bytes),
+                }],
+            },
+            [&oversized_document],
+            Vec::new(),
+        )
+        .expect("forge oversized manifest DTO");
+        assert!(
+            oversized_manifest
+                .verify_documents([&oversized_document])
+                .is_err()
+        );
+
         assert!(
             RepositorySnapshot::from_entries(
                 "frankensearch",
@@ -2449,10 +3069,35 @@ mod tests {
         );
         assert!(
             RepositorySnapshot::from_entries(
+                "r".repeat(MAX_REPOSITORY_ID_BYTES + 1),
+                std::iter::empty::<RepositoryEntry>(),
+            )
+            .is_err()
+        );
+        let mut forged_skip = snapshot.manifest.clone();
+        forged_skip
+            .skipped_repository_entries
+            .push(SkippedRepositoryEntry {
+                path: "x".repeat(MAX_REPOSITORY_PATH_BYTES + 1),
+                reason: RepositorySkipReason::Missing,
+            });
+        assert!(forged_skip.verify_documents(&snapshot.documents).is_err());
+        assert!(
+            RepositorySnapshot::from_entries(
                 "frankensearch",
                 [RepositoryEntry {
                     relative_path: PathBuf::from("src\\platform-dependent.rs"),
                     bytes: Vec::new(),
+                }]
+            )
+            .is_err()
+        );
+        assert!(
+            RepositorySnapshot::from_entries(
+                "frankensearch",
+                [RepositoryEntry {
+                    relative_path: PathBuf::from("x".repeat(MAX_DOCUMENT_ID_BYTES)),
+                    bytes: b"bounded path".to_vec(),
                 }]
             )
             .is_err()

@@ -16,12 +16,20 @@ use crate::comparator::{
     ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey,
     compare_observations,
 };
-#[cfg(feature = "tantivy-oracle")]
+use crate::generator::MAX_DOCUMENT_ID_BYTES;
 use crate::version_contract::oracle_version_contract;
 
 const MAX_ORACLE_LIMIT: u64 = 100_000;
 const MAX_TIE_EXPANSION: u64 = 100_000;
 const MAX_ORACLE_FETCH: u64 = 200_000;
+const MAX_CASE_ID_BYTES: usize = 1_024;
+const MAX_CASE_QUERY_BYTES: usize = 1024 * 1024;
+const MAX_CASE_METADATA_BYTES: usize = 1_024;
+const MAX_AST_DIFFERENCES: usize = 1_024;
+const MAX_OBSERVATION_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_OBSERVATION_AGGREGATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum snippet budget accepted at every harness and campaign boundary.
+pub const MAX_SNIPPET_CHARS: u64 = 1_000_000;
 pub const TANTIVY_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
 
 /// Closed engine family used by the cross-engine false-green guard.
@@ -52,6 +60,28 @@ pub struct EngineDescriptor {
 }
 
 impl EngineDescriptor {
+    fn validate(&self) -> Result<(), GauntletError> {
+        for (label, value) in [
+            ("implementation", self.implementation.as_str()),
+            ("crate_version", self.crate_version.as_str()),
+            ("source_revision", self.source_revision.as_str()),
+            ("config_hash", self.config_hash.as_str()),
+        ] {
+            if value.is_empty()
+                || value.len() > 256
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+            {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!(
+                        "engine descriptor {label} must be nonempty, canonical text of at most 256 bytes"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn implementation_fingerprint(&self) -> (&str, &str, &str, bool, &str) {
         (
             &self.implementation,
@@ -69,6 +99,9 @@ pub struct EnginePairIdentity {
     pub comparison_mode: ComparisonMode,
     pub subject: EngineDescriptor,
     pub oracle: EngineDescriptor,
+    /// Shared campaign semantic contract declared by both adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_contract: Option<crate::runner::SemanticContract>,
 }
 
 impl EnginePairIdentity {
@@ -84,6 +117,8 @@ impl EnginePairIdentity {
         subject: EngineDescriptor,
         oracle: EngineDescriptor,
     ) -> Result<Self, GauntletError> {
+        subject.validate()?;
+        oracle.validate()?;
         let invalid = match comparison_mode {
             ComparisonMode::CrossEngine => {
                 subject.family != EngineFamily::Quill || oracle.family != EngineFamily::Tantivy
@@ -104,7 +139,48 @@ impl EnginePairIdentity {
             comparison_mode,
             subject,
             oracle,
+            semantic_contract: None,
         })
+    }
+
+    pub(crate) fn bind_semantic_contract(
+        &mut self,
+        semantic_contract: crate::runner::SemanticContract,
+    ) -> Result<(), GauntletError> {
+        semantic_contract.validate()?;
+        self.semantic_contract = Some(semantic_contract);
+        Ok(())
+    }
+
+    pub(crate) fn validate_gauntlet_contract(&self) -> Result<(), GauntletError> {
+        let mut rebuilt = Self::new(
+            self.comparison_mode,
+            self.subject.clone(),
+            self.oracle.clone(),
+        )?;
+        if let Some(semantic_contract) = &self.semantic_contract {
+            rebuilt.bind_semantic_contract(semantic_contract.clone())?;
+        }
+        if &rebuilt != self {
+            return Err(GauntletError::InvalidContract {
+                reason: "engine identity is not self-consistent".to_owned(),
+            });
+        }
+        if self.comparison_mode == ComparisonMode::CrossEngine {
+            let oracle_version = oracle_version_contract()?;
+            if self.oracle.implementation != "frankensearch-lexical/tantivy-index"
+                || self.oracle.crate_version != oracle_version.lexical_package_version
+                || self.oracle.source_revision != oracle_version.lexical_git_revision
+                || self.oracle.config_hash != TANTIVY_ORACLE_CONFIG_HASH
+                || self.oracle.source_dirty
+            {
+                return Err(GauntletError::InvalidContract {
+                    reason: "oracle descriptor does not match the lexical version contract"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -114,6 +190,9 @@ pub struct DifferentialCase {
     pub fixture_id: String,
     pub query: String,
     pub limit: u64,
+    /// Number of ranked matches skipped before the returned page.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: u64,
     pub tie_expansion_limit: u64,
     pub count_requested: bool,
     pub snippet_max_chars: Option<u64>,
@@ -135,6 +214,7 @@ impl DifferentialCase {
             fixture_id: fixture_id.into(),
             query: query.into(),
             limit,
+            offset: 0,
             tie_expansion_limit: 256,
             count_requested: true,
             snippet_max_chars: Some(200),
@@ -173,6 +253,47 @@ impl DifferentialCase {
         label: &str,
         observation: &EngineObservation,
     ) -> Result<(), GauntletError> {
+        let observation_text_is_bounded = observation
+            .hits
+            .iter()
+            .chain(&observation.cutoff_tie_group)
+            .chain(&observation.offset_tie_group)
+            .all(|hit| hit.doc_id.len() <= MAX_DOCUMENT_ID_BYTES)
+            && observation.ast_differences.len() <= MAX_AST_DIFFERENCES
+            && observation.ast_differences.iter().all(|difference| {
+                difference.oracle.len() <= MAX_OBSERVATION_TEXT_BYTES
+                    && difference.subject.len() <= MAX_OBSERVATION_TEXT_BYTES
+            });
+        let aggregate_text_bytes = observation
+            .hits
+            .iter()
+            .chain(&observation.cutoff_tie_group)
+            .chain(&observation.offset_tie_group)
+            .map(|hit| hit.doc_id.len())
+            .chain(
+                observation
+                    .snippets
+                    .iter()
+                    .map(|(doc_id, snippet)| doc_id.len().saturating_add(snippet.len())),
+            )
+            .chain(observation.ast_differences.iter().map(|difference| {
+                difference
+                    .oracle
+                    .len()
+                    .saturating_add(difference.subject.len())
+            }))
+            .try_fold(0_usize, usize::checked_add);
+        let snippets_are_bounded = observation.snippets.iter().all(|(doc_id, snippet)| {
+            doc_id.len() <= MAX_DOCUMENT_ID_BYTES && snippet.len() <= MAX_OBSERVATION_TEXT_BYTES
+        });
+        if !observation_text_is_bounded
+            || !snippets_are_bounded
+            || aggregate_text_bytes.is_none_or(|bytes| bytes > MAX_OBSERVATION_AGGREGATE_TEXT_BYTES)
+        {
+            return Err(GauntletError::InvalidObservation {
+                reason: format!("{label} contains oversized result evidence"),
+            });
+        }
         let hit_count = u64::try_from(observation.hits.len()).map_err(|_| {
             GauntletError::InvalidObservation {
                 reason: format!("{label} top-k length does not fit u64"),
@@ -183,9 +304,24 @@ impl DifferentialCase {
                 reason: format!("{label} cutoff tie-group length does not fit u64"),
             }
         })?;
+        let offset_count = u64::try_from(observation.offset_tie_group.len()).map_err(|_| {
+            GauntletError::InvalidObservation {
+                reason: format!("{label} offset tie-group length does not fit u64"),
+            }
+        })?;
+        let evidence_budget = self
+            .offset
+            .checked_add(self.limit)
+            .and_then(|value| value.checked_add(self.tie_expansion_limit))
+            .ok_or_else(|| GauntletError::InvalidObservation {
+                reason: format!("{label} evidence budget overflowed"),
+            })?;
         if hit_count > self.limit
             || hit_count > observation.doc_count
             || cutoff_count > observation.doc_count
+            || offset_count > observation.doc_count
+            || cutoff_count > evidence_budget
+            || offset_count > evidence_budget
         {
             return Err(GauntletError::InvalidObservation {
                 reason: format!("{label} result lengths exceed the case or document count"),
@@ -193,8 +329,9 @@ impl DifferentialCase {
         }
         if let CountState::Value(match_count) = observation.match_count
             && (match_count > observation.doc_count
-                || hit_count != self.limit.min(match_count)
-                || cutoff_count > match_count)
+                || hit_count != self.limit.min(match_count.saturating_sub(self.offset))
+                || cutoff_count > match_count
+                || offset_count > match_count)
         {
             return Err(GauntletError::InvalidObservation {
                 reason: format!("{label} top-k evidence is inconsistent with its exact count"),
@@ -204,6 +341,7 @@ impl DifferentialCase {
             .hits
             .iter()
             .chain(&observation.cutoff_tie_group)
+            .chain(&observation.offset_tie_group)
             .map(|hit| hit.doc_id.as_str())
             .collect::<BTreeSet<_>>();
         let observed_id_count =
@@ -221,57 +359,121 @@ impl DifferentialCase {
         }
 
         let Some(cutoff) = observation.hits.last() else {
-            if observation.cutoff_tie_group.is_empty() {
+            if observation.cutoff_tie_group.is_empty() && observation.offset_tie_group.is_empty() {
                 return Ok(());
             }
             return Err(GauntletError::InvalidObservation {
                 reason: format!("{label} has cutoff evidence without any top-k hit"),
             });
         };
-        if observation.cutoff_tie_group.is_empty() {
-            return Ok(());
-        }
-        let cutoff_score = f32::from_bits(cutoff.score_bits);
-        let cutoff_keys = observation
-            .cutoff_tie_group
-            .iter()
-            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
-            .collect::<BTreeSet<_>>();
-        let group_is_exact = observation.cutoff_tie_group.iter().all(|hit| {
-            f32::from_bits(hit.score_bits)
-                .total_cmp(&cutoff_score)
-                .is_eq()
-        }) && observation.hits.iter().all(|hit| {
-            !f32::from_bits(hit.score_bits)
-                .total_cmp(&cutoff_score)
-                .is_eq()
-                || cutoff_keys.contains(&(hit.doc_id.as_str(), hit.score_bits))
-        });
-        if !group_is_exact {
-            return Err(GauntletError::InvalidObservation {
-                reason: format!("{label} cutoff tie-group does not describe the top-k cutoff"),
+        if !observation.cutoff_tie_group.is_empty() {
+            let cutoff_score = f32::from_bits(cutoff.score_bits);
+            let cutoff_keys = observation
+                .cutoff_tie_group
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<BTreeSet<_>>();
+            let group_is_exact = observation.cutoff_tie_group.iter().all(|hit| {
+                f32::from_bits(hit.score_bits)
+                    .total_cmp(&cutoff_score)
+                    .is_eq()
+            }) && observation.hits.iter().all(|hit| {
+                !f32::from_bits(hit.score_bits)
+                    .total_cmp(&cutoff_score)
+                    .is_eq()
+                    || cutoff_keys.contains(&(hit.doc_id.as_str(), hit.score_bits))
             });
+            if !group_is_exact {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!("{label} cutoff tie-group does not describe the top-k cutoff"),
+                });
+            }
+        }
+        if !observation.offset_tie_group.is_empty() {
+            if self.offset == 0 {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!("{label} has offset tie-group evidence for a zero-offset case"),
+                });
+            }
+            let leading = &observation.hits[0];
+            let leading_score = f32::from_bits(leading.score_bits);
+            let leading_keys = observation
+                .offset_tie_group
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<BTreeSet<_>>();
+            let leading_group_is_exact = observation.offset_tie_group.iter().all(|hit| {
+                f32::from_bits(hit.score_bits)
+                    .total_cmp(&leading_score)
+                    .is_eq()
+            }) && observation.hits.iter().all(|hit| {
+                !f32::from_bits(hit.score_bits)
+                    .total_cmp(&leading_score)
+                    .is_eq()
+                    || leading_keys.contains(&(hit.doc_id.as_str(), hit.score_bits))
+            });
+            let page_ids = observation
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let proves_skipped_member = observation
+                .offset_tie_group
+                .iter()
+                .any(|hit| !page_ids.contains(hit.doc_id.as_str()));
+            if !leading_group_is_exact || !proves_skipped_member {
+                return Err(GauntletError::InvalidObservation {
+                    reason: format!(
+                        "{label} offset tie-group does not describe the page's leading boundary"
+                    ),
+                });
+            }
         }
         Ok(())
     }
 
-    fn validate_shape(&self) -> Result<(), GauntletError> {
-        if self.fixture_id.is_empty() {
+    pub(crate) fn validate_shape(&self) -> Result<(), GauntletError> {
+        let metadata_is_bounded = [
+            self.metadata.generator_id.as_deref(),
+            self.metadata.corpus_hash.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|value| value.len() <= MAX_CASE_METADATA_BYTES);
+        if self.fixture_id.is_empty()
+            || self.fixture_id.len() > MAX_CASE_ID_BYTES
+            || self.query.len() > MAX_CASE_QUERY_BYTES
+            || !metadata_is_bounded
+        {
             return Err(GauntletError::InvalidCase {
-                reason: "fixture ID must not be empty".to_owned(),
+                reason: "fixture ID, query, or metadata exceed the bounded case contract"
+                    .to_owned(),
             });
         }
-        let fetch = self.limit.checked_add(self.tie_expansion_limit);
+        let fetch = self
+            .offset
+            .checked_add(self.limit)
+            .and_then(|value| value.checked_add(self.tie_expansion_limit));
         if self.limit > MAX_ORACLE_LIMIT
+            || self.offset > MAX_ORACLE_LIMIT
             || self.tie_expansion_limit > MAX_TIE_EXPANSION
+            || self
+                .snippet_max_chars
+                .is_some_and(|value| value > MAX_SNIPPET_CHARS)
             || fetch.is_none_or(|value| value > MAX_ORACLE_FETCH)
         {
             return Err(GauntletError::InvalidCase {
-                reason: "top-k and tie expansion exceed the bounded oracle budget".to_owned(),
+                reason: "top-k, tie expansion, or snippets exceed the bounded oracle budget"
+                    .to_owned(),
             });
         }
         Ok(())
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if protocol
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn validate_observation_family(
@@ -283,6 +485,7 @@ fn validate_observation_family(
         .hits
         .iter()
         .chain(&observation.cutoff_tie_group)
+        .chain(&observation.offset_tie_group)
         .all(|hit| {
             matches!(
                 (family, &hit.native_tie_key),
@@ -453,6 +656,8 @@ fn quill_config_hash(config: &QuillConfig) -> String {
 pub struct TantivyOracle {
     index: frankensearch_lexical::TantivyIndex,
     descriptor: EngineDescriptor,
+    campaign_freshness_verified: bool,
+    campaign_started: bool,
 }
 
 #[cfg(feature = "tantivy-oracle")]
@@ -467,10 +672,11 @@ impl TantivyOracle {
         observed_lexical_revision: &str,
         source_dirty: bool,
     ) -> Result<Self, GauntletError> {
-        Self::from_index(
+        Self::from_index_with_campaign_freshness(
             frankensearch_lexical::TantivyIndex::in_memory()?,
             observed_lexical_revision,
             source_dirty,
+            true,
         )
     }
 
@@ -484,6 +690,20 @@ impl TantivyOracle {
         observed_lexical_revision: &str,
         source_dirty: bool,
     ) -> Result<Self, GauntletError> {
+        Self::from_index_with_campaign_freshness(
+            index,
+            observed_lexical_revision,
+            source_dirty,
+            false,
+        )
+    }
+
+    fn from_index_with_campaign_freshness(
+        index: frankensearch_lexical::TantivyIndex,
+        observed_lexical_revision: &str,
+        source_dirty: bool,
+        campaign_freshness_verified: bool,
+    ) -> Result<Self, GauntletError> {
         let contract = oracle_version_contract()?;
         contract.validate_source_state(observed_lexical_revision, source_dirty)?;
         Ok(Self {
@@ -496,7 +716,19 @@ impl TantivyOracle {
                 source_dirty,
                 config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
             },
+            campaign_freshness_verified,
+            campaign_started: false,
         })
+    }
+
+    pub(crate) fn claim_fresh_campaign(&mut self) -> Result<(), GauntletError> {
+        if !self.campaign_freshness_verified || self.campaign_started {
+            return Err(GauntletError::InvalidContract {
+                reason: "Tantivy campaigns require a newly constructed one-shot oracle".to_owned(),
+            });
+        }
+        self.campaign_started = true;
+        Ok(())
     }
 
     /// Index and commit a corpus through the shipping lexical trait.
@@ -505,19 +737,20 @@ impl TantivyOracle {
     ///
     /// Propagates lexical indexing or commit failures.
     pub async fn index_documents(
-        &self,
+        &mut self,
         cx: &Cx,
         documents: &[frankensearch_core::IndexableDocument],
     ) -> Result<(), GauntletError> {
         use frankensearch_core::LexicalSearch;
 
+        self.campaign_freshness_verified = false;
         self.index.index_documents(cx, documents).await?;
         self.index.commit(cx).await?;
         Ok(())
     }
 
     #[must_use]
-    pub const fn index(&self) -> &frankensearch_lexical::TantivyIndex {
+    pub(crate) const fn index(&self) -> &frankensearch_lexical::TantivyIndex {
         &self.index
     }
 }
@@ -534,6 +767,15 @@ impl GauntletEngine for TantivyOracle {
             let limit = usize::try_from(case.limit).map_err(|_| GauntletError::InvalidCase {
                 reason: "limit does not fit usize".to_owned(),
             })?;
+            let offset = usize::try_from(case.offset).map_err(|_| GauntletError::InvalidCase {
+                reason: "offset does not fit usize".to_owned(),
+            })?;
+            let fetch_limit =
+                offset
+                    .checked_add(limit)
+                    .ok_or_else(|| GauntletError::InvalidCase {
+                        reason: "offset plus limit does not fit usize".to_owned(),
+                    })?;
             let tie_expansion_limit = usize::try_from(case.tie_expansion_limit).map_err(|_| {
                 GauntletError::InvalidCase {
                     reason: "tie expansion limit does not fit usize".to_owned(),
@@ -549,14 +791,60 @@ impl GauntletEngine for TantivyOracle {
             let observation = self.index.oracle_observe_query(
                 cx,
                 &case.query,
-                limit,
+                fetch_limit,
                 tie_expansion_limit,
                 &snippet_config,
             )?;
+            let (offset_tie_group, offset_tie_complete) = if offset > 0
+                && offset < observation.hits.len()
+                && observation
+                    .hits
+                    .get(offset - 1)
+                    .zip(observation.hits.get(offset))
+                    .is_some_and(|(previous, first)| {
+                        f32::from_bits(previous.score_bits)
+                            .total_cmp(&f32::from_bits(first.score_bits))
+                            .is_eq()
+                    }) {
+                let leading_bits = observation.hits[offset].score_bits;
+                let same_leading_score = |score_bits| {
+                    f32::from_bits(score_bits)
+                        .total_cmp(&f32::from_bits(leading_bits))
+                        .is_eq()
+                };
+                let cutoff_is_leading = observation
+                    .cutoff_tie_group
+                    .first()
+                    .is_some_and(|hit| same_leading_score(hit.score_bits));
+                if cutoff_is_leading {
+                    (
+                        observation.cutoff_tie_group.clone(),
+                        observation.cutoff_tie_complete,
+                    )
+                } else {
+                    let group = observation
+                        .hits
+                        .iter()
+                        .filter(|hit| same_leading_score(hit.score_bits))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let complete = observation
+                        .hits
+                        .iter()
+                        .skip(offset + 1)
+                        .any(|hit| !same_leading_score(hit.score_bits))
+                        || observation.total_count <= observation.hits.len();
+                    (group, complete)
+                }
+            } else {
+                (Vec::new(), false)
+            };
             let mut snippets = BTreeMap::new();
-            let hits = observation
+            let hits: Vec<RankedHit> = observation
                 .hits
                 .into_iter()
+                .skip(offset)
+                .take(limit)
                 .map(|hit| {
                     if let Some(snippet) = hit.snippet {
                         snippets.insert(hit.doc_id.clone(), snippet);
@@ -571,8 +859,23 @@ impl GauntletEngine for TantivyOracle {
                     }
                 })
                 .collect();
-            let cutoff_tie_group = observation
-                .cutoff_tie_group
+            let cutoff_tie_group = if hits.is_empty() {
+                Vec::new()
+            } else {
+                observation
+                    .cutoff_tie_group
+                    .into_iter()
+                    .map(|hit| RankedHit {
+                        doc_id: hit.doc_id,
+                        score_bits: hit.score_bits,
+                        native_tie_key: NativeTieKey::TantivyDocAddress {
+                            segment_ord: hit.segment_ord,
+                            doc_id: hit.segment_doc_id,
+                        },
+                    })
+                    .collect()
+            };
+            let offset_tie_group = offset_tie_group
                 .into_iter()
                 .map(|hit| RankedHit {
                     doc_id: hit.doc_id,
@@ -587,8 +890,8 @@ impl GauntletEngine for TantivyOracle {
                 hits,
                 cutoff_tie_group,
                 cutoff_tie_complete: observation.cutoff_tie_complete,
-                offset_tie_group: Vec::new(),
-                offset_tie_complete: false,
+                offset_tie_group,
+                offset_tie_complete,
                 snippets,
                 match_count: if case.count_requested {
                     CountState::Value(u64::try_from(observation.total_count).unwrap_or(u64::MAX))
@@ -637,6 +940,16 @@ mod tests {
     }
 
     #[test]
+    fn case_shape_rejects_snippet_budget_at_every_entry_point() {
+        let mut case = DifferentialCase::new("snippet-budget", "anything", 1);
+        case.snippet_max_chars = Some(MAX_SNIPPET_CHARS + 1);
+        assert!(matches!(
+            case.validate_shape(),
+            Err(GauntletError::InvalidCase { .. })
+        ));
+    }
+
+    #[test]
     fn cross_engine_guard_rejects_family_even_when_configs_differ() {
         let first = EngineDescriptor {
             family: EngineFamily::Tantivy,
@@ -651,6 +964,30 @@ mod tests {
         assert!(matches!(
             EnginePairIdentity::new(ComparisonMode::CrossEngine, first, second),
             Err(GauntletError::EngineIdentityCollision { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_guard_rejects_empty_subject_provenance() {
+        let subject = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: String::new(),
+            crate_version: "0.2.1".to_owned(),
+            source_revision: "subject-revision".to_owned(),
+            source_dirty: false,
+            config_hash: "subject-config".to_owned(),
+        };
+        let oracle = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "tantivy".to_owned(),
+            crate_version: "0.26.1".to_owned(),
+            source_revision: "oracle-revision".to_owned(),
+            source_dirty: false,
+            config_hash: "oracle-config".to_owned(),
+        };
+        assert!(matches!(
+            EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle),
+            Err(GauntletError::InvalidContract { .. })
         ));
     }
 
@@ -761,6 +1098,33 @@ mod tests {
                 .validate_observations(&engines, &subject_overfilled, &oracle_empty)
                 .is_err()
         );
+
+        let malformed_offset = EngineObservation {
+            hits: vec![RankedHit {
+                doc_id: "page".to_owned(),
+                score_bits: 1.0_f32.to_bits(),
+                native_tie_key: NativeTieKey::QuillDocId { doc_id: 2 },
+            }],
+            cutoff_tie_group: Vec::new(),
+            cutoff_tie_complete: true,
+            offset_tie_group: vec![RankedHit {
+                doc_id: "prefix".to_owned(),
+                score_bits: 2.0_f32.to_bits(),
+                native_tie_key: NativeTieKey::QuillDocId { doc_id: 1 },
+            }],
+            offset_tie_complete: true,
+            snippets: BTreeMap::new(),
+            match_count: CountState::Value(2),
+            doc_count: 2,
+            ast_differences: Vec::new(),
+        };
+        let mut paginated = DifferentialCase::new("malformed-offset", "query", 1);
+        paginated.offset = 1;
+        assert!(
+            paginated
+                .validate_observations(&engines, &malformed_offset, &malformed_offset)
+                .is_err()
+        );
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -792,7 +1156,7 @@ mod tests {
         let revision = oracle_version_contract()
             .expect("version contract")
             .lexical_git_revision;
-        let oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
+        let mut oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
         let documents = vec![
             frankensearch_core::IndexableDocument::new("a", "shared token"),
             frankensearch_core::IndexableDocument::new("b", "shared token"),
@@ -806,6 +1170,10 @@ mod tests {
         let mut zero_limit_case = case.clone();
         zero_limit_case.fixture_id = "oracle-zero-limit-count".to_owned();
         zero_limit_case.limit = 0;
+        let mut paginated_case = case.clone();
+        paginated_case.fixture_id = "oracle-offset-tie".to_owned();
+        paginated_case.offset = 1;
+        paginated_case.limit = 1;
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             oracle
@@ -842,6 +1210,15 @@ mod tests {
             assert!(zero_limit.cutoff_tie_group.is_empty());
             assert!(zero_limit.cutoff_tie_complete);
             assert_eq!(zero_limit.match_count, CountState::Value(3));
+
+            let paginated = oracle
+                .observe(&cx, &paginated_case)
+                .await
+                .expect("observe offset inside tie");
+            assert_eq!(paginated.hits.len(), 1);
+            assert_eq!(paginated.offset_tie_group.len(), 3);
+            assert!(paginated.offset_tie_complete);
+            assert_eq!(paginated.match_count, CountState::Value(3));
         });
     }
 
@@ -851,7 +1228,7 @@ mod tests {
         let revision = oracle_version_contract()
             .expect("version contract")
             .lexical_git_revision;
-        let oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
+        let mut oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
         let documents = vec![
             frankensearch_core::IndexableDocument::new("a", "alpha beta"),
             frankensearch_core::IndexableDocument::new("b", "alpha beta"),
