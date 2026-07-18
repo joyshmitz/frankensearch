@@ -60,7 +60,8 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Root cause: `cass_build_boolean_query_clauses` emits a lone `MustNot` clause for `-term`; Tantivy's raw negative-only `BooleanQuery` matches nothing, while complement semantics require an `All` clause alongside the exclusion. OR-operand lifting already creates that wrapper, so the shapes disagree inside the shipping adapter.
 - Consumer impact: a standalone negative CASS query returns zero hits instead of every live document not matching the excluded term. Positive `AND NOT` shapes are unaffected and must not receive an `All` scorer.
 - Fixture: `query-boolean-negative-standalone-universe`
-- Decision: fix (bead: `bd-2b2u`)
+- Decision: fix completed 2026-07-18 (bead: `bd-2b2u`)
+- Resolution: shipping now anchors every non-empty all-negative CASS root with `Must(All)` before filters are appended. Result-level tests pin `NOT`/`-` complements with and without filters, exact score neutrality for `MustNot`, and unchanged mixed `AND NOT` scoring; the Quill-oracle differential now treats the standalone shapes as ordinary parity cases.
 - Reviewer: not required for a fix decision
 
 ### DIV-002: CASS anchored globs collapse to `AllQuery`

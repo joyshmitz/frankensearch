@@ -2341,6 +2341,15 @@ fn cass_build_boolean_query_clauses(
 
     cass_flush_pending_or_group(&mut pending_or_group, &mut clauses);
 
+    // Tantivy deliberately treats a BooleanQuery containing only MustNot
+    // clauses as match-none. At the complete CASS root, however, one or more
+    // negative operands denote the complement of their union. Mixed positive
+    // conjunctions must stay unanchored so `auth AND NOT deprecated` does not
+    // gain an AllQuery score.
+    if !clauses.is_empty() && clauses.iter().all(|(occur, _)| *occur == Occur::MustNot) {
+        clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
+    }
+
     clauses
 }
 
@@ -2487,10 +2496,38 @@ fn cass_build_tantivy_query_from_tokens(
 #[cfg(test)]
 mod cass_query_tests {
     use super::*;
+    use tantivy::schema::Value as _;
 
     fn fields() -> CassFields {
         let schema = cass_build_schema();
         cass_fields_from_schema(&schema).expect("cass fields")
+    }
+
+    fn scored_cass_results(
+        searcher: &tantivy::Searcher,
+        fields: &CassFields,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+    ) -> std::collections::BTreeMap<u64, f32> {
+        let query = cass_build_tantivy_query(raw_query, filters, fields);
+        searcher
+            .search(
+                &*query,
+                &tantivy::collector::TopDocs::with_limit(64).order_by_score(),
+            )
+            .expect("search CASS Boolean fixture")
+            .into_iter()
+            .map(|(score, address)| {
+                let document: tantivy::TantivyDocument = searcher
+                    .doc(address)
+                    .expect("load CASS Boolean fixture document");
+                let msg_idx = document
+                    .get_first(fields.msg_idx)
+                    .and_then(|value| value.as_u64())
+                    .expect("stored CASS fixture msg_idx");
+                (msg_idx, score)
+            })
+            .collect()
     }
 
     #[test]
@@ -2959,6 +2996,145 @@ mod cass_query_tests {
             dbg.contains("BooleanQuery"),
             "expected boolean query: {dbg}"
         );
+    }
+
+    #[test]
+    fn cass_standalone_negation_matches_complement_and_is_score_neutral() {
+        let directory = tempfile::tempdir().expect("temporary CASS Boolean index directory");
+        let mut index =
+            CassTantivyIndex::open_or_create_with_writer_parallelism(directory.path(), 1)
+                .expect("create CASS Boolean index");
+        let documents = [
+            CassDocumentRef {
+                agent: "claude",
+                workspace: Some("/alpha"),
+                workspace_original: Some("/alpha"),
+                source_path: "/fixture/0.jsonl",
+                msg_idx: 0,
+                created_at: Some(100),
+                title: Some("Current Alpha"),
+                content: "alpha active",
+                source_id: "local-a",
+                origin_kind: "local",
+                origin_host: None,
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "claude",
+                workspace: Some("/alpha"),
+                workspace_original: Some("/alpha"),
+                source_path: "/fixture/1.jsonl",
+                msg_idx: 1,
+                created_at: Some(200),
+                title: Some("Legacy Alpha"),
+                content: "alpha deprecated",
+                source_id: "local-b",
+                origin_kind: "local",
+                origin_host: None,
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "codex",
+                workspace: Some("/beta"),
+                workspace_original: Some("/beta"),
+                source_path: "/fixture/2.jsonl",
+                msg_idx: 2,
+                created_at: Some(300),
+                title: Some("Current Beta"),
+                content: "beta active",
+                source_id: "remote-a",
+                origin_kind: "ssh",
+                origin_host: Some("worker-a"),
+                conversation_id: None,
+            },
+            CassDocumentRef {
+                agent: "claude",
+                workspace: Some("/gamma"),
+                workspace_original: Some("/gamma"),
+                source_path: "/fixture/3.jsonl",
+                msg_idx: 3,
+                created_at: Some(400),
+                title: Some("Current Gamma"),
+                content: "gamma active",
+                source_id: "remote-b",
+                origin_kind: "ssh",
+                origin_host: Some("worker-b"),
+                conversation_id: None,
+            },
+        ];
+        index
+            .add_cass_document_refs(&documents)
+            .expect("index CASS Boolean documents");
+        index.commit().expect("commit CASS Boolean documents");
+        let reader = index.reader().expect("open CASS Boolean reader");
+        reader.reload().expect("reload CASS Boolean reader");
+        let searcher = reader.searcher();
+        let fields = index.fields();
+
+        let all_scores = scored_cass_results(&searcher, &fields, "", &CassQueryFilters::default());
+        for raw_query in ["NOT deprecated", "-deprecated", "NOT NOT deprecated"] {
+            let actual =
+                scored_cass_results(&searcher, &fields, raw_query, &CassQueryFilters::default());
+            assert_eq!(
+                actual.keys().copied().collect::<Vec<_>>(),
+                vec![0, 2, 3],
+                "standalone complement result set for {raw_query:?}"
+            );
+            for (msg_idx, score) in actual {
+                assert_eq!(
+                    score.to_bits(),
+                    all_scores[&msg_idx].to_bits(),
+                    "MustNot changed the AllQuery score for {raw_query:?} document {msg_idx}"
+                );
+            }
+        }
+
+        let claude_filter = CassQueryFilters {
+            agents: vec!["claude".to_owned()],
+            ..CassQueryFilters::default()
+        };
+        let filtered_all_scores = scored_cass_results(&searcher, &fields, "", &claude_filter);
+        for raw_query in ["NOT deprecated", "-deprecated"] {
+            let actual = scored_cass_results(&searcher, &fields, raw_query, &claude_filter);
+            assert_eq!(
+                actual.keys().copied().collect::<Vec<_>>(),
+                vec![0, 3],
+                "filtered standalone complement result set for {raw_query:?}"
+            );
+            for (msg_idx, score) in actual {
+                assert_eq!(
+                    score.to_bits(),
+                    filtered_all_scores[&msg_idx].to_bits(),
+                    "MustNot changed the filtered score for {raw_query:?} document {msg_idx}"
+                );
+            }
+        }
+
+        let positive_scores =
+            scored_cass_results(&searcher, &fields, "alpha", &CassQueryFilters::default());
+        let mixed = scored_cass_results(
+            &searcher,
+            &fields,
+            "alpha AND NOT deprecated",
+            &CassQueryFilters::default(),
+        );
+        assert_eq!(mixed.keys().copied().collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            mixed[&0].to_bits(),
+            positive_scores[&0].to_bits(),
+            "positive AND NOT gained a score-producing AllQuery anchor"
+        );
+
+        let all_negative = scored_cass_results(
+            &searcher,
+            &fields,
+            "-deprecated -beta",
+            &CassQueryFilters::default(),
+        );
+        assert_eq!(all_negative.keys().copied().collect::<Vec<_>>(), vec![0, 3]);
+        for (msg_idx, score) in all_negative {
+            assert_eq!(score.to_bits(), all_scores[&msg_idx].to_bits());
+        }
     }
 
     #[test]

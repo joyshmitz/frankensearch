@@ -146,7 +146,7 @@ unary      := (NOT | '-')* primary
 primary    := term | quoted_phrase
 ```
 
-For example, `auth OR token AND cache` means `(auth OR token) AND cache`. One or more adjacent negators lower to one `MustNot`; `NOT NOT a` is not logical double negation. In a conjunction, a negative is a raw top-level `MustNot`, so `auth AND NOT deprecated` is `Must(auth) + MustNot(deprecated)` and does not gain an `All` score. A negation used as a positive-valued OR operand is wrapped as `Must(All) + MustNot(primary)`. A standalone negative has the same complement target shape; the shipping CASS builder currently omits that standalone wrapper and therefore matches nothing (`bd-2b2u`). Sanitization preserves alphanumerics, `*`, `"`, and `-`, replacing other characters with spaces.
+For example, `auth OR token AND cache` means `(auth OR token) AND cache`. One or more adjacent negators lower to one `MustNot`; `NOT NOT a` is not logical double negation. In a conjunction, a negative is a raw top-level `MustNot`, so `auth AND NOT deprecated` is `Must(auth) + MustNot(deprecated)` and does not gain an `All` score. A negation used as a positive-valued OR operand is wrapped as `Must(All) + MustNot(primary)`. A standalone negative has the same complement target shape; the shipping CASS builder anchors every non-empty all-negative root with `Must(All)` while leaving mixed positive conjunctions unanchored. Sanitization preserves alphanumerics, `*`, `"`, and `-`, replacing other characters with spaces.
 
 ### 4.4 Boolean `Occur` semantics
 

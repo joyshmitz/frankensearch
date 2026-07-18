@@ -4420,6 +4420,8 @@ mod tests {
             ("搜索", CassQueryFilters::default()),
             ("auth AND NOT deprecated", CassQueryFilters::default()),
             ("auth OR NOT deprecated", CassQueryFilters::default()),
+            ("NOT deprecated", CassQueryFilters::default()),
+            ("-deprecated", CassQueryFilters::default()),
             (
                 "cache",
                 CassQueryFilters {
@@ -4497,21 +4499,6 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(native, oracle, "result-set differential for {raw:?}");
         }
-
-        let raw = "-deprecated";
-        let oracle_query = cass_build_tantivy_query(raw, &OracleFilters::default(), &fields);
-        let oracle = searcher
-            .search(&*oracle_query, &DocSetCollector)
-            .expect("search known shipping standalone-NOT gap");
-        let parsed = cass_parser().parse(raw, &CassQueryFilters::default());
-        let native = DOCS
-            .iter()
-            .copied()
-            .filter(|doc| cass_ast_matches(&parsed.query, *doc))
-            .map(|doc| doc.msg_idx)
-            .collect::<BTreeSet<_>>();
-        assert!(oracle.is_empty(), "DIV-001 shipping side remains pinned");
-        assert_eq!(native, BTreeSet::from([0, 2, 3, 4, 5, 6]));
 
         for (raw, expected_native) in [("*bar", BTreeSet::from([5])), ("f*o", BTreeSet::new())] {
             let oracle_query = cass_build_tantivy_query(raw, &OracleFilters::default(), &fields);
