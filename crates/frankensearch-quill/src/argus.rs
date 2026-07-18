@@ -9,13 +9,17 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use frankensearch_core::DocId;
 use thiserror::Error;
 
 use crate::contract::{BM25_K1, compute_tf_cache, idf};
-use crate::quiver::{DocLenField, PositionCodecError, PostingCodecError, SnapshotFieldStats};
+use crate::quiver::{
+    DocLenField, NumericCodecError, NumericDocIdSet, NumericField, NumericValue,
+    PositionCodecError, PostingCodecError, SnapshotFieldStats,
+};
 
 pub use crate::query::Occur;
 
@@ -100,6 +104,9 @@ pub enum ArgusError {
     /// A sealed position cursor violated its validated paired-stream contract.
     #[error(transparent)]
     Position(#[from] PositionCodecError),
+    /// A numeric range could not be compiled from its validated field column.
+    #[error(transparent)]
+    Numeric(#[from] NumericCodecError),
     /// Snapshot counters cannot describe a valid scored field.
     #[error("invalid BM25 snapshot for field {field_ord}: {reason}")]
     InvalidSnapshot {
@@ -202,6 +209,18 @@ pub enum ArgusError {
     /// A caller attempted to score a deliberately unscored query tree.
     #[error("an unscored Boolean query has no BM25 score")]
     ScoreUnavailable,
+    /// A NUMERIC column cannot contain more values than physical documents.
+    #[error(
+        "NUMERIC field {field_ord} has {value_count} values for {segment_num_docs} physical documents"
+    )]
+    InvalidNumericCardinality {
+        /// Stable schema field ordinal.
+        field_ord: u16,
+        /// Validated values present in the field column.
+        value_count: usize,
+        /// Physical at-seal documents supplied by the segment plan.
+        segment_num_docs: u32,
+    },
 }
 
 /// Forward-only posting access shared by sealed and future delta segments.
@@ -1351,6 +1370,7 @@ enum ScorerNode<'a> {
     Empty,
     Term(TermScorer<'a>),
     Phrase(PhraseScorer<'a>),
+    NumericRange(NumericRangeScorer),
     Intersection(IntersectionScorer<'a>),
     Union(BufferedUnionScorer<'a>),
     UnscoredUnion(UnscoredUnionScorer<'a>),
@@ -1423,13 +1443,55 @@ impl<'a> ReferenceScorer<'a> {
         }
     }
 
+    /// Compile one NUMERIC field range into an owned constant-score doc set.
+    ///
+    /// `segment_num_docs` is the physical at-seal document count, including
+    /// tombstoned rows. Live-document filtering remains a collector concern so
+    /// range leaves compose with the same snapshot statistics as term leaves.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed numeric-codec error for a bound whose signedness does
+    /// not match the field or if the bounded docid set cannot be allocated.
+    /// It also rejects a field value count larger than the caller-supplied
+    /// physical segment document count.
+    pub fn numeric_range(
+        field: NumericField<'_>,
+        lower: Bound<NumericValue>,
+        upper: Bound<NumericValue>,
+        segment_num_docs: u32,
+    ) -> Result<Self, ArgusError> {
+        let value_count = field.len();
+        if value_count > usize::try_from(segment_num_docs).unwrap_or(usize::MAX) {
+            return Err(ArgusError::InvalidNumericCardinality {
+                field_ord: field.field_ord(),
+                value_count,
+                segment_num_docs,
+            });
+        }
+        let docids = field.range_docids(lower, upper)?;
+        if docids.is_empty() {
+            return Ok(Self::empty());
+        }
+        Ok(Self {
+            node: ScorerNode::NumericRange(NumericRangeScorer::new(
+                docids,
+                value_count,
+                segment_num_docs,
+            )),
+        })
+    }
+
     fn is_explicit_empty(&self) -> bool {
         matches!(self.node, ScorerNode::Empty)
     }
 
     fn is_unscored_safe(&self) -> bool {
         match &self.node {
-            ScorerNode::Empty | ScorerNode::Term(_) | ScorerNode::Phrase(_) => true,
+            ScorerNode::Empty
+            | ScorerNode::Term(_)
+            | ScorerNode::Phrase(_)
+            | ScorerNode::NumericRange(_) => true,
             ScorerNode::Intersection(scorer) => scorer.scorers.iter().all(Self::is_unscored_safe),
             ScorerNode::Union(_) => false,
             ScorerNode::UnscoredUnion(scorer) => scorer.active.iter().all(Self::is_unscored_safe),
@@ -1544,6 +1606,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => None,
             ScorerNode::Term(scorer) => scorer.doc(),
             ScorerNode::Phrase(scorer) => scorer.doc(),
+            ScorerNode::NumericRange(scorer) => scorer.doc(),
             ScorerNode::Intersection(scorer) => scorer.doc(),
             ScorerNode::Union(scorer) => scorer.doc(),
             ScorerNode::UnscoredUnion(scorer) => scorer.doc(),
@@ -1559,6 +1622,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => 0,
             ScorerNode::Term(scorer) => scorer.cost,
             ScorerNode::Phrase(scorer) => scorer.cost,
+            ScorerNode::NumericRange(scorer) => scorer.cost(),
             ScorerNode::Intersection(scorer) => scorer.cost(),
             ScorerNode::Union(scorer) => scorer.cost(),
             ScorerNode::UnscoredUnion(scorer) => scorer.cost(),
@@ -1574,6 +1638,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => 0,
             ScorerNode::Term(scorer) => scorer.size_hint,
             ScorerNode::Phrase(scorer) => scorer.size_hint,
+            ScorerNode::NumericRange(scorer) => scorer.size_hint(),
             ScorerNode::Intersection(scorer) => scorer.size_hint(),
             ScorerNode::Union(scorer) => scorer.size_hint(),
             ScorerNode::UnscoredUnion(scorer) => scorer.size_hint(),
@@ -1589,6 +1654,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => 0,
             ScorerNode::Term(scorer) => scorer.segment_num_docs,
             ScorerNode::Phrase(scorer) => scorer.segment_num_docs,
+            ScorerNode::NumericRange(scorer) => scorer.segment_num_docs,
             ScorerNode::Intersection(scorer) => scorer.segment_num_docs,
             ScorerNode::Union(scorer) => scorer.segment_num_docs,
             ScorerNode::UnscoredUnion(scorer) => scorer.segment_num_docs,
@@ -1611,6 +1677,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => Ok(None),
             ScorerNode::Term(scorer) => scorer.next(),
             ScorerNode::Phrase(scorer) => scorer.next(),
+            ScorerNode::NumericRange(scorer) => Ok(scorer.next()),
             ScorerNode::Intersection(scorer) => scorer.next(),
             ScorerNode::Union(scorer) => scorer.next(),
             ScorerNode::UnscoredUnion(scorer) => scorer.next(),
@@ -1629,6 +1696,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => Ok(None),
             ScorerNode::Term(scorer) => scorer.seek(target),
             ScorerNode::Phrase(scorer) => scorer.seek(target),
+            ScorerNode::NumericRange(scorer) => Ok(scorer.seek(target)),
             ScorerNode::Intersection(scorer) => scorer.seek(target),
             ScorerNode::Union(scorer) => scorer.seek(target),
             ScorerNode::UnscoredUnion(scorer) => scorer.seek(target),
@@ -1656,6 +1724,7 @@ impl<'a> ReferenceScorer<'a> {
                 };
                 classify_seek_result(target, result)
             }
+            ScorerNode::NumericRange(scorer) => classify_seek_result(target, scorer.seek(target)),
             ScorerNode::Intersection(scorer) => scorer.seek_danger(target),
             ScorerNode::Union(scorer) => scorer.seek_danger(target),
             ScorerNode::UnscoredUnion(scorer) => scorer.seek_danger(target),
@@ -1682,6 +1751,7 @@ impl<'a> ReferenceScorer<'a> {
             ScorerNode::Empty => Err(ArgusError::CursorInvariant("cannot score an empty scorer")),
             ScorerNode::Term(scorer) => scorer.score(),
             ScorerNode::Phrase(scorer) => scorer.score(),
+            ScorerNode::NumericRange(scorer) => scorer.score(),
             ScorerNode::Intersection(scorer) => scorer.score(),
             ScorerNode::Union(scorer) => scorer.score(),
             ScorerNode::UnscoredUnion(_) => Err(ArgusError::ScoreUnavailable),
@@ -1870,6 +1940,81 @@ fn scorer_union_unscored(
             node: ScorerNode::UnscoredUnion(UnscoredUnionScorer::new(scorers)?),
         }),
     }
+}
+
+/// Owned lower-bound cursor over one materialized NUMERIC predicate.
+///
+/// Movement uses the exact sorted matches, while planning metadata mirrors
+/// Tantivy's runtime fast-field range scorer. Keeping those concerns separate
+/// preserves both filter-first seeking and the oracle's stable f32 score order.
+struct NumericRangeScorer {
+    docids: NumericDocIdSet,
+    index: usize,
+    cost: u64,
+    size_hint: u32,
+    segment_num_docs: u32,
+}
+
+impl NumericRangeScorer {
+    fn new(docids: NumericDocIdSet, value_count: usize, segment_num_docs: u32) -> Self {
+        let match_count = u32::try_from(docids.len()).unwrap_or(u32::MAX);
+        let full_cardinality =
+            value_count == usize::try_from(segment_num_docs).unwrap_or(usize::MAX);
+        let covers_every_document = full_cardinality && match_count == segment_num_docs;
+        let (cost, size_hint) = if covers_every_document {
+            (u64::from(segment_num_docs), segment_num_docs)
+        } else {
+            (tantivy_range_cost(segment_num_docs), segment_num_docs / 10)
+        };
+        Self {
+            docids,
+            index: 0,
+            cost,
+            size_hint,
+            segment_num_docs,
+        }
+    }
+
+    fn doc(&self) -> Option<u32> {
+        self.docids.as_slice().get(self.index).copied()
+    }
+
+    const fn cost(&self) -> u64 {
+        self.cost
+    }
+
+    const fn size_hint(&self) -> u32 {
+        self.size_hint
+    }
+
+    fn next(&mut self) -> Option<u32> {
+        if self.index < self.docids.len() {
+            self.index += 1;
+        }
+        self.doc()
+    }
+
+    fn seek(&mut self, target: u32) -> Option<u32> {
+        let tail = self.docids.as_slice().get(self.index..).unwrap_or_default();
+        self.index += tail.partition_point(|&docid| docid < target);
+        self.doc()
+    }
+
+    fn score(&self) -> Result<f32, ArgusError> {
+        let doc = self.doc().ok_or(ArgusError::CursorInvariant(
+            "cannot score an exhausted numeric range",
+        ))?;
+        finite_score(1.0, doc)
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "contract parity copies Tantivy RangeDocSet::cost's nonnegative f64-to-u64 truncation"
+)]
+fn tantivy_range_cost(segment_num_docs: u32) -> u64 {
+    (f64::from(segment_num_docs) * 0.8) as u64
 }
 
 /// Lazy scoreless disjunction used only by doc-set collection.
@@ -2789,7 +2934,23 @@ mod tests {
     use super::*;
     use crate::contract::{BM25_B, fieldnorm_to_id, id_to_fieldnorm};
     use crate::quiver::{
-        DocLenFieldInput, EncodedDocLenSection, EncodedPositionList, EncodedPostingList, Posting,
+        DocLenFieldInput, EncodedDocLenSection, EncodedNumericSection, EncodedPositionList,
+        EncodedPostingList, NumericEntry, NumericFieldInput, Posting,
+    };
+    use crate::schema::{FieldDescriptor, FieldKind, SchemaDescriptor};
+
+    const RANGE_TEST_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        id: 0,
+        name: "created_at",
+        kind: FieldKind::I64 {
+            indexed: true,
+            fast: true,
+        },
+        stored: false,
+    }];
+    const RANGE_TEST_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "argus-range-tests",
+        fields: &RANGE_TEST_FIELDS,
     };
 
     #[derive(Clone, Debug)]
@@ -3972,6 +4133,140 @@ mod tests {
         Ok(())
     }
 
+    /// Executable Boolean-shape proof for the oversized-query-token class
+    /// (`bd-quill-e0-contracts-j53p.8`, register entry DIV-004).
+    ///
+    /// Quill's symmetric admission rule means an oversized (>65,530-byte)
+    /// query token can never name a dictionary entry, so its lowered leaf is
+    /// [`ReferenceScorer::empty`]. `boolean_with_mode` then shorts
+    /// `Must(empty)` to `MatchNone` and drops empty `Should`/`MustNot`
+    /// clauses. The oracle keeps the same unmatchable leaf as an empty
+    /// posting list. This proof enumerates every clause list of length 1..=3
+    /// over {matchable, oversized} x {`Must`, `Should`, `MustNot`} and asserts the
+    /// two shapes return identical hits with bit-identical scores.
+    #[test]
+    fn oversized_token_boolean_shapes_are_result_equivalent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOCS: u32 = 5;
+        let lengths = [Some(1); DOCS as usize];
+        let encoded = EncodedDocLenSection::encode(
+            0,
+            u64::from(DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(DOCS), u64::from(DOCS))?;
+        // The matchable leaf hits docs {1, 2, 3}; the oversized leaf is
+        // unmatchable under every semantics.
+        let matchable_docs: [u32; 3] = [1, 2, 3];
+        let occurs = [Occur::Must, Occur::Should, Occur::MustNot];
+        // (use_quill_empty, occur) -> scorer for one clause
+        let build = |use_quill_empty: bool,
+                     oversized: bool,
+                     occur: Occur|
+         -> Result<ScorerClause<'_>, ArgusError> {
+            let scorer = if oversized {
+                if use_quill_empty {
+                    ReferenceScorer::empty()
+                } else {
+                    term(postings(&[]), field, &snapshot, 0, 0, 1.0)?
+                }
+            } else {
+                term(postings(&matchable_docs), field, &snapshot, 3, 3, 1.0)?
+            };
+            Ok(ScorerClause::new(occur, scorer))
+        };
+        let mut case_count = 0_u32;
+        for len in 1..=3_usize {
+            let slots = usize::pow(6, u32::try_from(len)?);
+            for combo in 0..slots {
+                let mut remaining = combo;
+                let mut quill_clauses = Vec::with_capacity(len);
+                let mut oracle_clauses = Vec::with_capacity(len);
+                for _slot in 0..len {
+                    let oversized = remaining % 2 == 1;
+                    let occur = occurs[(remaining / 2) % 3];
+                    remaining /= 6;
+                    quill_clauses.push(build(true, oversized, occur)?);
+                    oracle_clauses.push(build(false, oversized, occur)?);
+                }
+                let mut quill = ReferenceScorer::boolean(quill_clauses)?;
+                let mut oracle = ReferenceScorer::boolean(oracle_clauses)?;
+                let quill_hits = quill.top_k(usize::try_from(DOCS)?, &AllLiveDocs)?;
+                let oracle_hits = oracle.top_k(usize::try_from(DOCS)?, &AllLiveDocs)?;
+                assert_eq!(
+                    quill_hits
+                        .iter()
+                        .map(|hit| hit.global_docid)
+                        .collect::<Vec<_>>(),
+                    oracle_hits
+                        .iter()
+                        .map(|hit| hit.global_docid)
+                        .collect::<Vec<_>>(),
+                    "hit sets differ at combo {combo} (len {len})"
+                );
+                for (quill_hit, oracle_hit) in quill_hits.iter().zip(&oracle_hits) {
+                    assert_eq!(
+                        quill_hit.score.to_bits(),
+                        oracle_hit.score.to_bits(),
+                        "scores differ for doc {} at combo {combo} (len {len})",
+                        quill_hit.global_docid
+                    );
+                }
+                case_count += 1;
+            }
+        }
+        assert_eq!(case_count, 6 + 36 + 216);
+        Ok(())
+    }
+
+    /// The doc-set collector path (unscored lowering) must preserve the same
+    /// oversized semantics: empty `Should`/`MustNot` drop, `Must(empty)`
+    /// shorts to `MatchNone`, and the remaining shapes match identical sets.
+    #[test]
+    fn oversized_token_unscored_shapes_are_result_equivalent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const DOCS: u32 = 5;
+        let lengths = [Some(1); DOCS as usize];
+        let encoded = EncodedDocLenSection::encode(
+            0,
+            u64::from(DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let section = encoded.section(&[1])?;
+        let field = section.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(DOCS), u64::from(DOCS))?;
+        let matchable_docs: [u32; 3] = [1, 2, 3];
+        let occurs = [Occur::Must, Occur::Should, Occur::MustNot];
+        for occur in occurs {
+            for oversized in [true, false] {
+                let make = |use_quill_empty: bool| -> Result<ReferenceScorer<'_>, ArgusError> {
+                    let scorer = if oversized {
+                        if use_quill_empty {
+                            ReferenceScorer::empty()
+                        } else {
+                            term(postings(&[]), field, &snapshot, 0, 0, 1.0)?
+                        }
+                    } else {
+                        term(postings(&matchable_docs), field, &snapshot, 3, 3, 1.0)?
+                    };
+                    ReferenceScorer::boolean_unscored(vec![ScorerClause::new(occur, scorer)])
+                };
+                let mut quill = make(true)?;
+                let mut oracle = make(false)?;
+                assert_eq!(
+                    quill.collect_doc_set(&AllLiveDocs)?,
+                    oracle.collect_doc_set(&AllLiveDocs)?,
+                    "doc sets differ for occur {occur:?} oversized={oversized}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn required_cost_sort_and_optional_composition_pin_f32_order()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4484,6 +4779,257 @@ mod tests {
         assert!(matches!(
             scored_union.collect_doc_set(&AllLiveDocs),
             Err(ArgusError::ScoredTreeForUnscoredCollector)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_range_leaf_has_constant_score_and_fused_cursor_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entries = [
+            NumericEntry::i64(-5, 100),
+            NumericEntry::i64(0, 101),
+            NumericEntry::i64(5, 102),
+            NumericEntry::i64(5, 103),
+            NumericEntry::i64(10, 104),
+            NumericEntry::i64(20, 106),
+        ];
+        let fields = [NumericFieldInput::new(0, &entries)];
+        let encoded = EncodedNumericSection::encode(RANGE_TEST_SCHEMA, 100, 108, &fields)?;
+        let field = encoded
+            .section()?
+            .field(0)
+            .expect("created_at NUMERIC field");
+
+        let mut range = ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(NumericValue::I64(5)),
+            Bound::Excluded(NumericValue::I64(10)),
+            8,
+        )?;
+        assert_eq!(range.doc(), Some(102));
+        assert_eq!(range.cost(), 6, "Tantivy RangeDocSet uses floor(0.8N)");
+        assert_eq!(range.size_hint(), 0, "Tantivy range hint is floor(N/10)");
+        assert_eq!(range.score()?.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(range.advance(103)?, Some(103));
+        assert_eq!(range.score()?.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(range.next()?, None);
+        assert_eq!(range.next()?, None, "exhaustion is fused");
+        assert!(matches!(
+            range.score(),
+            Err(ArgusError::CursorInvariant(
+                "cannot score an exhausted numeric range"
+            ))
+        ));
+
+        let mut unscored = ReferenceScorer::numeric_range(
+            field,
+            Bound::Unbounded,
+            Bound::Included(NumericValue::I64(5)),
+            8,
+        )?;
+        assert_eq!(
+            unscored.collect_doc_set(&AllLiveDocs)?,
+            vec![100, 101, 102, 103]
+        );
+
+        let empty = ReferenceScorer::numeric_range(
+            field,
+            Bound::Included(NumericValue::I64(30)),
+            Bound::Included(NumericValue::I64(40)),
+            8,
+        )?;
+        assert_eq!(empty.doc(), None);
+        assert!(matches!(
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::U64(0)),
+                Bound::Unbounded,
+                8
+            ),
+            Err(ArgusError::Numeric(NumericCodecError::BoundTypeMismatch {
+                field_ord: 0,
+                ..
+            }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_range_preserves_oracle_cost_order_and_u32_max()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let sparse_entries = [NumericEntry::i64(7, 0)];
+        let sparse_fields = [NumericFieldInput::new(0, &sparse_entries)];
+        let numeric = EncodedNumericSection::encode(RANGE_TEST_SCHEMA, 0, 10, &sparse_fields)?;
+        let numeric_field = numeric
+            .section()?
+            .field(0)
+            .expect("created_at NUMERIC field");
+        let range = ReferenceScorer::numeric_range(
+            numeric_field,
+            Bound::Included(NumericValue::I64(7)),
+            Bound::Included(NumericValue::I64(7)),
+            10,
+        )?;
+        assert_eq!(
+            range.cost(),
+            8,
+            "one exact match still has oracle range cost"
+        );
+
+        let lengths = [Some(1); 10];
+        let encoded_lengths =
+            EncodedDocLenSection::encode(0, 10, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let length_section = encoded_lengths.section(&[1])?;
+        let fieldnorms = length_section.field(1).expect("fieldnorm column");
+        let stats = snapshot(1, 10, 10)?;
+        let positive = term(postings(&[0]), fieldnorms, &stats, 1, 1, 1.0e8)?;
+        let negative = term(postings(&[0]), fieldnorms, &stats, 1, 2, -1.0e8)?;
+        let mut intersection = ReferenceScorer::boolean(vec![
+            ScorerClause::must(range),
+            ScorerClause::must(positive),
+            ScorerClause::must(negative),
+        ])?;
+        assert_eq!(intersection.doc(), Some(0));
+        assert_eq!(intersection.cost(), 1);
+        assert_eq!(
+            intersection.score()?.to_bits(),
+            1.0_f32.to_bits(),
+            "terms cancel before the range's constant score is accumulated"
+        );
+
+        let high_entries = [
+            NumericEntry::i64(0, u32::MAX - 1),
+            NumericEntry::i64(1, u32::MAX),
+        ];
+        let high_fields = [NumericFieldInput::new(0, &high_entries)];
+        let high_numeric = EncodedNumericSection::encode(
+            RANGE_TEST_SCHEMA,
+            u64::from(u32::MAX) - 1,
+            u64::from(u32::MAX) + 1,
+            &high_fields,
+        )?;
+        let high_field = high_numeric
+            .section()?
+            .field(0)
+            .expect("high created_at NUMERIC field");
+        let mut high =
+            ReferenceScorer::numeric_range(high_field, Bound::Unbounded, Bound::Unbounded, 2)?;
+        assert_eq!(
+            high.cost(),
+            2,
+            "full coverage lowers like Tantivy AllScorer"
+        );
+        assert_eq!(high.size_hint(), 2);
+        assert_eq!(high.advance(u32::MAX)?, Some(u32::MAX));
+        assert_eq!(high.score()?.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(high.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_ranges_preserve_boolean_multiplicity_exclusion_and_live_filtering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entries = [
+            NumericEntry::i64(0, 0),
+            NumericEntry::i64(1, 1),
+            NumericEntry::i64(2, 2),
+        ];
+        let fields = [NumericFieldInput::new(0, &entries)];
+        let encoded = EncodedNumericSection::encode(RANGE_TEST_SCHEMA, 0, 3, &fields)?;
+        let field = encoded
+            .section()?
+            .field(0)
+            .expect("created_at NUMERIC field");
+        let left = || {
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(0)),
+                Bound::Included(NumericValue::I64(1)),
+                3,
+            )
+        };
+        let right = || {
+            ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(1)),
+                Bound::Included(NumericValue::I64(2)),
+                3,
+            )
+        };
+        let all = || ReferenceScorer::numeric_range(field, Bound::Unbounded, Bound::Unbounded, 3);
+
+        let mut should = ReferenceScorer::boolean(vec![
+            ScorerClause::should(left()?),
+            ScorerClause::should(right()?),
+        ])?;
+        let mut hits = should.top_k(3, &AllLiveDocs)?;
+        hits.sort_unstable_by_key(|hit| hit.global_docid);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, 1.0_f32.to_bits()),
+                (1, 2.0_f32.to_bits()),
+                (2, 1.0_f32.to_bits()),
+            ],
+            "overlapping constant-score ranges retain one contribution per child"
+        );
+
+        let mut excluded = ReferenceScorer::boolean(vec![
+            ScorerClause::must(all()?),
+            ScorerClause::must_not(ReferenceScorer::numeric_range(
+                field,
+                Bound::Included(NumericValue::I64(1)),
+                Bound::Included(NumericValue::I64(1)),
+                3,
+            )?),
+        ])?;
+        let excluded_hits = excluded.top_k(3, &AllLiveDocs)?;
+        assert_eq!(
+            excluded_hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            vec![(0, 1.0_f32.to_bits()), (2, 1.0_f32.to_bits())],
+            "MustNot gates matches without adding a score"
+        );
+
+        let mut unscored = ReferenceScorer::boolean_unscored(vec![
+            ScorerClause::should(left()?),
+            ScorerClause::should(right()?),
+        ])?;
+        assert_eq!(unscored.collect_doc_set(&AllLiveDocs)?, vec![0, 1, 2]);
+        let mut live_filtered = all()?;
+        assert_eq!(
+            live_filtered
+                .top_k(3, &|docid| docid != 1)?
+                .iter()
+                .map(|hit| hit.global_docid)
+                .collect::<Vec<_>>(),
+            vec![0, 2],
+            "tombstone filtering happens after the physical range cursor"
+        );
+
+        let repeated_doc = [NumericEntry::i64(0, 0), NumericEntry::i64(1, 0)];
+        let repeated_fields = [NumericFieldInput::new(0, &repeated_doc)];
+        let repeated = EncodedNumericSection::encode(RANGE_TEST_SCHEMA, 0, 2, &repeated_fields)?;
+        let repeated_field = repeated
+            .section()?
+            .field(0)
+            .expect("multi-valued NUMERIC fixture");
+        let ordinary =
+            ReferenceScorer::numeric_range(repeated_field, Bound::Unbounded, Bound::Unbounded, 2)?;
+        assert_eq!(ordinary.cost(), 1);
+        assert_eq!(ordinary.size_hint(), 0);
+        assert!(matches!(
+            ReferenceScorer::numeric_range(repeated_field, Bound::Unbounded, Bound::Unbounded, 1),
+            Err(ArgusError::InvalidNumericCardinality {
+                field_ord: 0,
+                value_count: 2,
+                segment_num_docs: 1,
+            })
         ));
         Ok(())
     }

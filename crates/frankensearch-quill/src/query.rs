@@ -5520,4 +5520,158 @@ mod tests {
         assert!(!logs.contains("unterminated"));
         assert!(!logs.contains("value"));
     }
+
+    /// Parse through the real Grammar while bypassing the public 10,000-byte
+    /// truncation, so the oversized-token admission branch is exercisable.
+    fn parse_untruncated(parser: &DefaultQueryParser, query: &str) -> ParsedQuery {
+        let mut diagnostics = Vec::new();
+        let tokens = lex(query, &mut diagnostics);
+        let mut grammar = Grammar {
+            parser: *parser,
+            tokens,
+            cursor: 0,
+            diagnostics,
+            dropped_fragments: 0,
+            lowered_atoms: Vec::new(),
+            field_scopes: Vec::new(),
+        };
+        grammar.recover_leading_binary_operators();
+        let mut parsed = grammar.parse_expression(0);
+        grammar.recover_trailing_tokens();
+        repair_root_all_negative(&mut parsed, &mut grammar);
+        ParsedQuery {
+            query: parsed.map_or(Query::Empty, |node| node.query),
+            explanation: classify_query(query),
+            diagnostics: grammar.diagnostics,
+            was_truncated: false,
+        }
+    }
+
+    /// One ASCII token of exactly `bytes` length plus its quoted variant.
+    fn oversized_atom() -> String {
+        "x".repeat(crate::grimoire::MAX_TERM_BYTES + 1)
+    }
+
+    #[test]
+    fn public_query_strings_cannot_carry_oversized_tokens() {
+        let parser = parser();
+        // A 70,000-byte single token exceeds the 65,530-byte admission bound,
+        // but the public string cap (10,000 bytes) truncates long before the
+        // admission rule can ever see it.
+        let query = "x".repeat(70_000);
+        let parsed = parser.parse(&query);
+        assert!(parsed.was_truncated);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == QueryDiagnosticKind::Truncated)
+        );
+        fn max_term_bytes(query: &Query) -> usize {
+            match query {
+                Query::Term { text, .. } => text.len(),
+                Query::Phrase { terms, .. } => {
+                    terms.iter().map(|term| term.text.len()).max().unwrap_or(0)
+                }
+                Query::Boolean { clauses, .. } => clauses
+                    .iter()
+                    .map(|clause| max_term_bytes(&clause.query))
+                    .max()
+                    .unwrap_or(0),
+                Query::Boost { query, .. } => max_term_bytes(query),
+                _ => 0,
+            }
+        }
+        assert!(
+            max_term_bytes(&parsed.query) <= MAX_QUERY_LENGTH,
+            "public parser must never surface a token beyond the 10,000-byte cap"
+        );
+    }
+
+    #[test]
+    fn oversized_standalone_and_phrase_atoms_lower_to_match_none() {
+        let parser = parser();
+        // Standalone oversized token: MatchNone.
+        let standalone = parse_untruncated(&parser, &oversized_atom());
+        assert!(
+            standalone.query.is_empty(),
+            "oversized standalone atom must lower to Query::Empty, got {:?}",
+            standalone.query
+        );
+        // Oversized member of a quoted phrase: the whole phrase is MatchNone
+        // (positions of surviving terms are retained; the atom still cannot
+        // match because one required position is unsatisfiable).
+        let phrase = parse_untruncated(&parser, &format!("\"cache {}\"", oversized_atom()));
+        assert!(
+            phrase.query.is_empty(),
+            "phrase containing an oversized term must lower to Query::Empty, got {:?}",
+            phrase.query
+        );
+    }
+
+    #[test]
+    fn oversized_clauses_keep_boolean_sibling_semantics() {
+        let parser = parser();
+        // Required conjunction: the parser retains the Empty clause so the
+        // scorer shorts the whole conjunction to MatchNone (argus proof).
+        let conjunction = parse_untruncated(&parser, &format!("cache AND {}", oversized_atom()));
+        let Query::Boolean { clauses, .. } = &conjunction.query else {
+            panic!(
+                "conjunction must remain a Boolean, got {:?}",
+                conjunction.query
+            );
+        };
+        assert!(
+            clauses
+                .iter()
+                .any(|clause| clause.occur == Occur::Must && clause.query.is_empty()),
+            "conjunction must retain Must(Empty) for the oversized operand: {clauses:?}"
+        );
+        assert!(
+            clauses
+                .iter()
+                .any(|clause| clause.occur == Occur::Must && !clause.query.is_empty()),
+            "conjunction must retain the matchable sibling: {clauses:?}"
+        );
+
+        // Optional disjunction: the oversized operand lowers to an Empty
+        // Should clause, which the scorer drops while the matchable sibling
+        // determines results (argus proof).
+        let disjunction = parse_untruncated(&parser, &format!("cache OR {}", oversized_atom()));
+        let Query::Boolean { clauses, .. } = &disjunction.query else {
+            panic!(
+                "disjunction must remain a Boolean, got {:?}",
+                disjunction.query
+            );
+        };
+        assert!(
+            clauses
+                .iter()
+                .any(|clause| clause.occur == Occur::Should && clause.query.is_empty()),
+            "disjunction must retain Should(Empty) for the oversized operand: {clauses:?}"
+        );
+
+        // Negated oversized operand: the exclusion is vacuous (an oversized
+        // token matches nothing), and the parser's all-negative repair
+        // inserts the All sibling that preserves complement semantics.
+        let negation = parse_untruncated(&parser, &format!("-{}", oversized_atom()));
+        let Query::Boolean { clauses, .. } = &negation.query else {
+            panic!(
+                "repaired negation must be a Boolean, got {:?}",
+                negation.query
+            );
+        };
+        assert!(
+            clauses
+                .iter()
+                .any(|clause| matches!(clause.query, Query::All)),
+            "negated oversized query must gain the All sibling: {clauses:?}"
+        );
+        assert!(
+            clauses
+                .iter()
+                .any(|clause| clause.occur == Occur::MustNot && clause.query.is_empty()),
+            "negated oversized operand lowers to MustNot(Empty): {clauses:?}"
+        );
+    }
 }

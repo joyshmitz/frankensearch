@@ -37,6 +37,7 @@ The gauntlet's comparator auto-classifies against §2's classes; anything it can
 | `OracleBug` | The oracle's behavior is wrong per its own documentation and Quill deliberately does not reproduce it | accept per-entry (needs upstream citation) |
 | `StatsSemantics` | Deletes-vs-stats or delta-vs-sealed stats timing differences not covered by fixtures pinning oracle behavior (e0.1 row 3, e4.3/e5.2 notes) | pending → must converge to fix or a pinned accept |
 | `UnicodeEdge` | Analyzer divergence on degenerate inputs (unpaired surrogates cannot occur in &str; this class covers e.g. exotic casing/width edge cases) proven byte-parity-impossible or oracle-inconsistent | accept per-entry |
+| `OversizedQueryToken` | A >65,530-byte query token lowers to MatchNone under Quill's symmetric admission rule (ingest and query share `MAX_TERM_BYTES`), while the oracle keeps the unmatchable leaf as an empty posting list. Standalone/required/phrase oversized atoms are MatchNone; optional Should/MustNot oversized clauses are dropped only where sibling semantics are preserved. Public parser strings can never carry such a token (10,000-byte cap), so the class surfaces only on programmatic ASTs | accept-by-class (DIV-004 proof) |
 
 Adding a class = a PR that adds the row here **and** teaches the comparator to classify it, in the same commit.
 
@@ -48,7 +49,7 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - `TieOrder` on synthetic corpora with duplicated documents.
 - `SnippetWindow` on documents where two windows have equal term coverage.
 - `GlobExpansionLimit` on >limit-term dictionaries with `Complex` patterns.
-- A dedicated class for score-neutral oversized query-token normalization is blocked on the G1 comparator and executable Boolean-shape proof (`bd-quill-e0-contracts-j53p.8`); it is not accepted under `QueryCanonicalization` by analogy.
+- ~~A dedicated class for score-neutral oversized query-token normalization~~ — landed as `OversizedQueryToken` with the G1 comparator class and executable Boolean-shape proof (`bd-quill-e0-contracts-j53p.8`, DIV-004).
 
 ## 4. Entries
 
@@ -81,6 +82,16 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Fixture: `phrase_same_position_alternatives_are_reviewed_or_divergence`
 - Decision: accept
 - Reviewer: `/root/e45_algo_review` · 2026-07-18
+
+### DIV-004: oversized query tokens lower to MatchNone (symmetric admission)
+
+- Class: `OversizedQueryToken` (class added in the same commit as this entry)
+- First seen: 2026-07-18 · `oversized_token_boolean_shapes_are_result_equivalent` (executable proof, argus)
+- Root cause: Quill applies one admission rule on both sides of the engine — analyzed tokens longer than 65,530 bytes are dropped at ingest (`analyze_admitted`) and therefore can never name a dictionary entry. On the query side the same rule lowers an oversized atom to `Query::Empty` (MatchNone): standalone, required-conjunct, and phrase-member oversized atoms are all unsatisfiable. The scorer then shorts `Must(Empty)` to MatchNone and drops empty `Should`/`MustNot` clauses only where sibling semantics determine results (`boolean_with_mode`). The oracle keeps the same unmatchable leaf as an empty posting list; tantivy never matches it either.
+- Consumer impact: none observable for public query strings — the 10,000-byte parser cap (`MAX_QUERY_LENGTH`) truncates long before a 65,530-byte token can occur, so the class is reachable only through programmatic AST construction. Result sets and per-hit scores are bit-identical to the oracle shape under the exhaustive Boolean-shape proof (all 258 scored clause combinations of length ≤ 3 over {matchable, oversized} × {Must, Should, MustNot}, plus the unscored doc-set shapes).
+- Fixture: `oversized_token_boolean_shapes_are_result_equivalent` + `oversized_token_unscored_shapes_are_result_equivalent` (argus scorer-level proof); `public_query_strings_cannot_carry_oversized_tokens` + `oversized_standalone_and_phrase_atoms_lower_to_match_none` + `oversized_clauses_keep_boolean_sibling_semantics` (parser pins); comparator classification via `EngineObservation.ast_differences` with `AstLoweringKind::OversizedQueryToken`
+- Decision: accept
+- Reviewer: PeachStone (author) · second-agent sign-off requested via agent mail 2026-07-18
 
 ---
 
