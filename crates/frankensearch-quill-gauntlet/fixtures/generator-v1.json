@@ -1,0 +1,44 @@
+{
+  "schema_version": 0,
+  "corpus_spec": {
+    "seed": 0,
+    "document_count": 0,
+    "vocabulary_size": 1,
+    "zipf_exponent": "s08",
+    "max_document_bytes": 256
+  },
+  "corpus_manifest": {
+    "schema_version": 0,
+    "generator_id": "placeholder",
+    "source": {
+      "kind": "synthetic",
+      "spec": {
+        "seed": 0,
+        "document_count": 0,
+        "vocabulary_size": 1,
+        "zipf_exponent": "s08",
+        "max_document_bytes": 256
+      }
+    },
+    "document_count": 0,
+    "total_content_bytes": 0,
+    "content_sha256": "placeholder",
+    "skipped_repository_entries": []
+  },
+  "corpus_manifest_hash": "placeholder",
+  "documents": [],
+  "query_manifest": {
+    "schema_version": 0,
+    "generator_id": "placeholder",
+    "spec": {
+      "seed": 0,
+      "default_limit": 1,
+      "include_shared_relevance_queries": false
+    },
+    "corpus_manifest_hash": "placeholder",
+    "query_count": 0,
+    "content_sha256": "placeholder"
+  },
+  "query_manifest_hash": "placeholder",
+  "queries": []
+}

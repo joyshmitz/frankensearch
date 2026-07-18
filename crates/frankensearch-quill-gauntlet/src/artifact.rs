@@ -10,6 +10,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::GauntletError;
 use crate::comparator::{ComparatorConfig, compare_observations};
 use crate::engine::{EnginePairIdentity, HarnessRun, TANTIVY_ORACLE_CONFIG_HASH};
+use crate::generator::validate_generated_case_metadata;
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
 pub const OBJECT_SCHEMA_VERSION: u32 = 1;
@@ -100,6 +101,7 @@ impl ArtifactObject {
             });
         }
         self.comparator_config.validate_contract()?;
+        validate_generated_case_metadata(&self.case)?;
         self.case.validate_observations(
             &self.engines,
             &self.comparison.subject,

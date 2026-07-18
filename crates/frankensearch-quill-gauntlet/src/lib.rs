@@ -5,12 +5,14 @@
 //! `default-members` and cannot be published. Shipping crates must never depend
 //! on it. The current G0 milestone provides engine identity guards, pure
 //! comparators, immutable content-addressed artifacts, pending Q1 fixtures, and
-//! an executable same-engine Quiver codec differential. The Quill search
-//! subject remains an explicit non-executable stub until G1.
+//! an executable same-engine Quiver codec differential, and deterministic,
+//! content-addressed E6 corpus/query generators. The Quill search subject
+//! remains an explicit non-executable stub until its adapter lands.
 
 mod artifact;
 mod comparator;
 mod engine;
+mod generator;
 mod version_contract;
 
 use std::path::PathBuf;
@@ -33,6 +35,16 @@ pub use engine::{
     EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine, GauntletFuture, HarnessRun,
     QuillSubjectStub,
 };
+pub use generator::{
+    CORE_RELEVANCE_DOCUMENT_COUNT, CassDocumentFields, CorpusManifest, CorpusSourceManifest,
+    FULL_SHARED_DOCUMENT_COUNT, GENERATOR_ID, GENERATOR_SCHEMA_VERSION, GeneratedDocument,
+    GeneratedQueryCase, GeneratedQueryFilters, GeneratedQueryKind, GeneratedQuerySuite,
+    GlobPatternClass, HarvestedContractQuery, MAX_DOCUMENT_BYTES, Pathology, QueryGeneratorSpec,
+    QueryManifest, QuerySyntax, RangeClass, RepositoryEntry, RepositoryFileDigest,
+    RepositorySkipReason, RepositorySnapshot, SharedCorpusView, SharedEdgeCase, SharedFixtureSuite,
+    SharedRelevanceQuery, SkippedRepositoryEntry, SourceFileDigest, SyntheticCorpus,
+    SyntheticCorpusIter, SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
+};
 pub use version_contract::{
     InternalDifferentialFixture, OracleVersionContract, Q1FixtureCatalog, Q1FixtureStub,
     oracle_version_contract, q1_fixture_catalog,
@@ -53,6 +65,10 @@ pub enum GauntletError {
     InvalidObservation { reason: String },
     #[error("invalid differential case: {reason}")]
     InvalidCase { reason: String },
+    #[error("invalid deterministic generator input: {reason}")]
+    InvalidGenerator { reason: String },
+    #[error("content-addressed replay mismatch: {reason}")]
+    ManifestMismatch { reason: String },
     #[error("subject is unavailable: {reason}")]
     SubjectUnavailable { reason: String },
     #[error("invalid committed contract: {reason}")]
