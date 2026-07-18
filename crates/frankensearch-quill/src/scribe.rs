@@ -53,9 +53,10 @@ use crate::grimoire::{
 };
 use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenFieldInput, EncodedDocLenSection, EncodedIdHashSection,
-    EncodedIdMapSection, EncodedPositionList, EncodedPostingList, EncodedStatsSection,
-    EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput,
-    PositionCodecError, Posting, StatsCodecError, StoredMetaCodecError,
+    EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
+    EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError,
+    IdMapEntryInput, NumericCodecError, NumericValue, PositionCodecError, Posting, StatsCodecError,
+    StoredMetaCodecError,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
 use crate::segment::{EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput};
@@ -989,6 +990,39 @@ impl<'a> StoredFieldValue<'a> {
     }
 }
 
+/// One schema-typed indexed numeric value supplied for a document.
+///
+/// Numeric values are retained in a dedicated typed column for NUMERIC. When
+/// the descriptor also sets `stored=true`, Scribe writes the same canonical
+/// eight little-endian bytes into STOREDMETA automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedNumericValue {
+    /// Stable schema field ordinal.
+    pub field_ord: u16,
+    /// Signed or unsigned value matching the field descriptor.
+    pub value: NumericValue,
+}
+
+impl IndexedNumericValue {
+    /// Construct one signed indexed value.
+    #[must_use]
+    pub const fn i64(field_ord: u16, value: i64) -> Self {
+        Self {
+            field_ord,
+            value: NumericValue::I64(value),
+        }
+    }
+
+    /// Construct one unsigned indexed value.
+    #[must_use]
+    pub const fn u64(field_ord: u16, value: u64) -> Self {
+        Self {
+            field_ord,
+            value: NumericValue::U64(value),
+        }
+    }
+}
+
 /// Typed validation failures from [`ColumnarAccumulator::add_document`].
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AccumulatorError {
@@ -1032,6 +1066,48 @@ pub enum AccumulatorError {
         field_ord: u16,
         /// Stable schema field name.
         field_name: &'static str,
+    },
+    /// A typed numeric value named a string or stored-only field.
+    #[error("field {field_ord} ({field_name}) is not numeric")]
+    NonNumericField {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Stable schema field name.
+        field_name: &'static str,
+    },
+    /// A typed numeric value named a non-indexed numeric field.
+    #[error("numeric field {field_ord} ({field_name}) is not indexed")]
+    NonIndexedNumericField {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Stable schema field name.
+        field_name: &'static str,
+    },
+    /// An in-memory numeric tag disagreed with the schema descriptor.
+    #[error("numeric field {field_ord} ({field_name}) expects {expected}, got {actual}")]
+    NumericTypeMismatch {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Stable schema field name.
+        field_name: &'static str,
+        /// Schema type name.
+        expected: &'static str,
+        /// Supplied type name.
+        actual: &'static str,
+    },
+    /// Opaque bytes used as a numeric value must be exactly one scalar wide.
+    #[error(
+        "numeric field {field_ord} ({field_name}) has {actual} stored bytes, expected {expected}"
+    )]
+    InvalidNumericBytes {
+        /// Rejected field ordinal.
+        field_ord: u16,
+        /// Stable schema field name.
+        field_name: &'static str,
+        /// Required byte width.
+        expected: usize,
+        /// Supplied byte width.
+        actual: usize,
     },
     /// The schema requested an analyzer that has not landed in Scribe yet.
     #[error("field {field_ord} ({field_name}) requires unsupported analyzer {analyzer:?}")]
@@ -1313,11 +1389,11 @@ impl StoredFieldColumns {
         self.blob.get(start..end)
     }
 
-    fn can_append(&self, value: Option<&[u8]>) -> bool {
-        value.is_none_or(|bytes| {
+    fn can_append_len(&self, value_len: Option<usize>) -> bool {
+        value_len.is_none_or(|bytes| {
             self.blob
                 .len()
-                .checked_add(bytes.len())
+                .checked_add(bytes)
                 .is_some_and(|len| u32::try_from(len).is_ok())
         })
     }
@@ -1357,6 +1433,58 @@ impl StoredFieldColumns {
     }
 }
 
+/// One schema-ordered indexed numeric column.
+///
+/// Values align with completed documents, not sparse lease ordinals. `None`
+/// represents an absent optional value or a segment-range hole introduced when
+/// Scribe seals sparse local ordinals.
+#[derive(Debug)]
+pub struct NumericFieldColumns {
+    field_ord: u16,
+    values: Vec<Option<NumericValue>>,
+}
+
+impl NumericFieldColumns {
+    fn new(field_ord: u16) -> Self {
+        Self {
+            field_ord,
+            values: Vec::new(),
+        }
+    }
+
+    /// Stable schema field ordinal.
+    #[must_use]
+    pub const fn field_ord(&self) -> u16 {
+        self.field_ord
+    }
+
+    /// One optional typed value per completed document.
+    #[must_use]
+    pub fn values(&self) -> &[Option<NumericValue>] {
+        &self.values
+    }
+
+    fn append_document(&mut self, value: Option<NumericValue>) {
+        self.values.push(value);
+    }
+
+    fn bytes_reserved(&self) -> usize {
+        self.values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Option<NumericValue>>())
+    }
+
+    fn bytes_used(&self) -> usize {
+        self.values
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<NumericValue>>())
+    }
+
+    fn reset(&mut self) {
+        self.values.clear();
+    }
+}
+
 /// Schema-driven shard-local columnar token accumulator.
 ///
 /// A complete document is validated before any column is changed. Indexed
@@ -1368,6 +1496,7 @@ pub struct ColumnarAccumulator<A = FrankensearchTokenizer> {
     schema: SchemaDescriptor,
     terms: TermInterner,
     fields: Vec<FieldTokenColumns>,
+    numeric_fields: Vec<NumericFieldColumns>,
     stored_fields: Vec<StoredFieldColumns>,
     document_ords: Vec<u32>,
     seen_fields: Vec<bool>,
@@ -1432,6 +1561,16 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                 FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => None,
             })
             .collect();
+        let numeric_fields = schema
+            .fields
+            .iter()
+            .filter_map(|field| match field.kind {
+                FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. } => {
+                    Some(NumericFieldColumns::new(field.id))
+                }
+                _ => None,
+            })
+            .collect();
         let stored_fields = schema
             .fields
             .iter()
@@ -1442,6 +1581,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             schema,
             terms: TermInterner::new(),
             fields,
+            numeric_fields,
             stored_fields,
             document_ords: Vec::new(),
             seen_fields: vec![false; schema.fields.len()],
@@ -1467,7 +1607,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         doc_ord: u32,
         values: &[IndexedFieldValue<'_>],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
-        self.add_document_with_stored(doc_ord, values, &[])
+        self.add_document_with_values(doc_ord, values, &[], &[])
     }
 
     /// Add one complete document with explicit opaque stored values.
@@ -1487,6 +1627,47 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         &mut self,
         doc_ord: u32,
         values: &[IndexedFieldValue<'_>],
+        stored_values: &[StoredFieldValue<'_>],
+    ) -> Result<DocumentAccumulation, AccumulatorError> {
+        self.add_document_with_values(doc_ord, values, &[], stored_values)
+    }
+
+    /// Add one complete document with typed indexed numeric values.
+    ///
+    /// Numeric fields marked `stored` automatically retain the exact canonical
+    /// little-endian scalar bytes. Missing numeric fields remain absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation error before mutating any column when the
+    /// document ordinal, field set, numeric type, analyzer, or durable bounds
+    /// are invalid.
+    pub fn add_document_with_numeric(
+        &mut self,
+        doc_ord: u32,
+        values: &[IndexedFieldValue<'_>],
+        numeric_values: &[IndexedNumericValue],
+    ) -> Result<DocumentAccumulation, AccumulatorError> {
+        self.add_document_with_values(doc_ord, values, numeric_values, &[])
+    }
+
+    /// Add one complete document with typed numeric and opaque stored values.
+    ///
+    /// A field may appear in only one input slice. For a stored indexed numeric
+    /// field, prefer `numeric_values`: Scribe derives its canonical stored
+    /// bytes automatically. `stored_values` remains accepted for such a field
+    /// when the bytes are exactly one schema-typed little-endian scalar.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation error before mutating any column when the
+    /// document ordinal, any field set, numeric type/width, analyzer, source
+    /// size, or durable stored-blob bound is invalid.
+    pub fn add_document_with_values(
+        &mut self,
+        doc_ord: u32,
+        values: &[IndexedFieldValue<'_>],
+        numeric_values: &[IndexedNumericValue],
         stored_values: &[StoredFieldValue<'_>],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
         if doc_ord >= DOC_ORDS_PER_LEASE {
@@ -1548,6 +1729,61 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             }
         }
 
+        for value in numeric_values {
+            let field_index = usize::from(value.field_ord);
+            let Some(field) = self.schema.fields.get(field_index) else {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            };
+            if field.id != value.field_ord {
+                return Err(AccumulatorError::UnknownField {
+                    field_ord: value.field_ord,
+                });
+            }
+            if std::mem::replace(&mut self.seen_fields[field_index], true) {
+                return Err(AccumulatorError::DuplicateField {
+                    doc_ord,
+                    field_ord: value.field_ord,
+                });
+            }
+            match (field.kind, value.value) {
+                (FieldKind::I64 { indexed: true, .. }, NumericValue::I64(_))
+                | (FieldKind::U64 { indexed: true, .. }, NumericValue::U64(_)) => {}
+                (
+                    FieldKind::I64 { indexed: false, .. } | FieldKind::U64 { indexed: false, .. },
+                    _,
+                ) => {
+                    return Err(AccumulatorError::NonIndexedNumericField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+                (FieldKind::I64 { .. }, actual) => {
+                    return Err(AccumulatorError::NumericTypeMismatch {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        expected: "i64",
+                        actual: numeric_value_type_name(actual),
+                    });
+                }
+                (FieldKind::U64 { .. }, actual) => {
+                    return Err(AccumulatorError::NumericTypeMismatch {
+                        field_ord: field.id,
+                        field_name: field.name,
+                        expected: "u64",
+                        actual: numeric_value_type_name(actual),
+                    });
+                }
+                _ => {
+                    return Err(AccumulatorError::NonNumericField {
+                        field_ord: field.id,
+                        field_name: field.name,
+                    });
+                }
+            }
+        }
+
         for value in stored_values {
             let field_index = usize::from(value.field_ord);
             let Some(field) = self.schema.fields.get(field_index) else {
@@ -1572,6 +1808,16 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     field_name: field.name,
                 });
             }
+            if matches!(field.kind, FieldKind::I64 { .. } | FieldKind::U64 { .. })
+                && value.bytes.len() != std::mem::size_of::<u64>()
+            {
+                return Err(AccumulatorError::InvalidNumericBytes {
+                    field_ord: field.id,
+                    field_name: field.name,
+                    expected: std::mem::size_of::<u64>(),
+                    actual: value.bytes.len(),
+                });
+            }
             if u32::try_from(value.bytes.len()).is_err() {
                 return Err(AccumulatorError::StoredValueTooLarge {
                     field_ord: field.id,
@@ -1581,24 +1827,52 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         }
 
         for field in &self.stored_fields {
-            let value = stored_values
+            let value_len = stored_values
                 .iter()
                 .find(|value| value.field_ord == field.field_ord)
-                .map(|value| value.bytes)
+                .map(|value| value.bytes.len())
                 .or_else(|| {
                     values
                         .iter()
                         .find(|value| value.field_ord == field.field_ord)
-                        .map(|value| value.text.as_bytes())
+                        .map(|value| value.text.len())
+                })
+                .or_else(|| {
+                    numeric_values
+                        .iter()
+                        .find(|value| value.field_ord == field.field_ord)
+                        .map(|_| std::mem::size_of::<u64>())
                 });
-            if !field.can_append(value) {
+            if !field.can_append_len(value_len) {
                 return Err(AccumulatorError::StoredBlobTooLarge {
                     field_ord: field.field_ord,
                     current: field.blob.len(),
-                    appended: value.map_or(0, <[u8]>::len),
+                    appended: value_len.unwrap_or(0),
                 });
             }
         }
+
+        let resolved_numeric_values = self
+            .numeric_fields
+            .iter()
+            .map(|field| {
+                numeric_values
+                    .iter()
+                    .find(|value| value.field_ord == field.field_ord)
+                    .map(|value| value.value)
+                    .or_else(|| {
+                        stored_values
+                            .iter()
+                            .find(|value| value.field_ord == field.field_ord)
+                            .and_then(|value| {
+                                numeric_value_from_le_bytes(
+                                    self.schema.fields[usize::from(field.field_ord)].kind,
+                                    value.bytes,
+                                )
+                            })
+                    })
+            })
+            .collect::<Vec<_>>();
 
         for field in &mut self.fields {
             field.begin_document();
@@ -1654,7 +1928,19 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             oversized_tokens += dropped;
         }
 
+        for (field, value) in self.numeric_fields.iter_mut().zip(resolved_numeric_values) {
+            field.append_document(value);
+        }
+
         for field in &mut self.stored_fields {
+            if let Some(value) = numeric_values
+                .iter()
+                .find(|value| value.field_ord == field.field_ord)
+            {
+                let bytes = value.value.to_le_bytes();
+                field.append_document(Some(&bytes));
+                continue;
+            }
             let value = stored_values
                 .iter()
                 .find(|value| value.field_ord == field.field_ord)
@@ -1703,6 +1989,21 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .binary_search_by_key(&field_ord, FieldTokenColumns::field_ord)
             .ok()
             .map(|index| &self.fields[index])
+    }
+
+    /// Indexed numeric field columns in stable schema order.
+    #[must_use]
+    pub fn numeric_fields(&self) -> &[NumericFieldColumns] {
+        &self.numeric_fields
+    }
+
+    /// Look up one indexed numeric field's typed column.
+    #[must_use]
+    pub fn numeric_field(&self, field_ord: u16) -> Option<&NumericFieldColumns> {
+        self.numeric_fields
+            .binary_search_by_key(&field_ord, NumericFieldColumns::field_ord)
+            .ok()
+            .map(|index| &self.numeric_fields[index])
     }
 
     /// Stored-field columns in stable schema order.
@@ -1768,6 +2069,17 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     .fold(0, usize::saturating_add),
             )
             .saturating_add(
+                self.numeric_fields
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<NumericFieldColumns>()),
+            )
+            .saturating_add(
+                self.numeric_fields
+                    .iter()
+                    .map(NumericFieldColumns::bytes_reserved)
+                    .fold(0, usize::saturating_add),
+            )
+            .saturating_add(
                 self.stored_fields
                     .capacity()
                     .saturating_mul(std::mem::size_of::<StoredFieldColumns>()),
@@ -1807,6 +2119,17 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     .fold(0, usize::saturating_add),
             )
             .saturating_add(
+                self.numeric_fields
+                    .len()
+                    .saturating_mul(std::mem::size_of::<NumericFieldColumns>()),
+            )
+            .saturating_add(
+                self.numeric_fields
+                    .iter()
+                    .map(NumericFieldColumns::bytes_used)
+                    .fold(0, usize::saturating_add),
+            )
+            .saturating_add(
                 self.stored_fields
                     .len()
                     .saturating_mul(std::mem::size_of::<StoredFieldColumns>()),
@@ -1839,6 +2162,9 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         for field in &mut self.fields {
             field.reset();
         }
+        for field in &mut self.numeric_fields {
+            field.reset();
+        }
         for field in &mut self.stored_fields {
             field.reset();
         }
@@ -1846,6 +2172,22 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         self.seen_fields.fill(false);
         self.last_doc_ord = None;
         self.analyzer.reset();
+    }
+}
+
+fn numeric_value_type_name(value: NumericValue) -> &'static str {
+    match value {
+        NumericValue::I64(_) => "i64",
+        NumericValue::U64(_) => "u64",
+    }
+}
+
+fn numeric_value_from_le_bytes(kind: FieldKind, bytes: &[u8]) -> Option<NumericValue> {
+    let bytes: [u8; 8] = bytes.try_into().ok()?;
+    match kind {
+        FieldKind::I64 { .. } => Some(NumericValue::I64(i64::from_le_bytes(bytes))),
+        FieldKind::U64 { .. } => Some(NumericValue::U64(u64::from_le_bytes(bytes))),
+        FieldKind::Keyword | FieldKind::Text { .. } | FieldKind::StoredOnly => None,
     }
 }
 
@@ -1908,14 +2250,6 @@ pub enum FlushError {
     /// Empty immutable segments are not produced by the shard flush path.
     #[error("cannot flush an empty Scribe accumulator")]
     EmptyAccumulator,
-    /// E2.7 owns the NUMERIC writer required by an indexed numeric field.
-    #[error("indexed numeric field {field_ord} ({field_name}) requires the E2.7 NUMERIC codec")]
-    IndexedNumericUnsupported {
-        /// Stable schema field ordinal.
-        field_ord: u16,
-        /// Stable schema field name.
-        field_name: &'static str,
-    },
     /// Q1 R1 requires every shard lease to begin on its 65,536-doc boundary.
     #[error(
         "lease document base {lease_docid_base} is not aligned to {DOC_ORDS_PER_LEASE} documents"
@@ -2042,6 +2376,9 @@ pub enum FlushError {
     /// IDHASH encoding failed.
     #[error("Scribe IDHASH encoding failed: {0}")]
     IdHash(#[from] IdHashCodecError),
+    /// NUMERIC encoding failed.
+    #[error("Scribe NUMERIC encoding failed: {0}")]
+    Numeric(#[from] NumericCodecError),
     /// STOREDMETA encoding failed.
     #[error("Scribe STOREDMETA encoding failed: {0}")]
     StoredMeta(#[from] StoredMetaCodecError),
@@ -2084,9 +2421,8 @@ struct RadixPartition {
 ///
 /// # Errors
 ///
-/// Returns [`FlushError`] for sidecar drift, unsupported indexed numeric
-/// fields, rebase overflow, accumulator invariant failure, codec failure, or
-/// final segment-framing failure.
+/// Returns [`FlushError`] for sidecar drift, rebase overflow, accumulator
+/// invariant failure, codec failure, or final segment-framing failure.
 pub fn flush_accumulator<A: TokenAnalyzer>(
     accumulator: &ColumnarAccumulator<A>,
     input: FlushSegmentInput<'_>,
@@ -2098,17 +2434,6 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
         .last_doc_ord()
         .ok_or(FlushError::EmptyAccumulator)?;
     let schema = accumulator.schema();
-    if let Some(field) = schema.fields.iter().find(|field| {
-        matches!(
-            field.kind,
-            FieldKind::I64 { indexed: true, .. } | FieldKind::U64 { indexed: true, .. }
-        )
-    }) {
-        return Err(FlushError::IndexedNumericUnsupported {
-            field_ord: field.id,
-            field_name: field.name,
-        });
-    }
     if !input
         .lease_docid_base
         .is_multiple_of(u64::from(DOC_ORDS_PER_LEASE))
@@ -2175,6 +2500,18 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
     let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &id_map_inputs)?;
     let id_hash = EncodedIdHashSection::encode(id_map.section()?)?;
 
+    let numeric = if accumulator.numeric_fields().is_empty() {
+        None
+    } else {
+        Some(EncodedNumericSection::encode_accumulator(
+            schema,
+            docid_lo,
+            docid_hi,
+            input.lease_docid_base,
+            accumulator,
+        )?)
+    };
+
     let stored_meta = if accumulator.stored_fields().is_empty() {
         None
     } else {
@@ -2211,6 +2548,9 @@ pub fn flush_accumulator<A: TokenAnalyzer>(
     sections.push(SectionInput::new(SectionKind::DOCLEN, doclen.as_bytes()));
     sections.push(SectionInput::new(SectionKind::IDMAP, id_map.as_bytes()));
     sections.push(SectionInput::new(SectionKind::IDHASH, id_hash.as_bytes()));
+    if let Some(numeric) = &numeric {
+        sections.push(SectionInput::new(SectionKind::NUMERIC, numeric.as_bytes()));
+    }
     if let Some(stored_meta) = &stored_meta {
         sections.push(SectionInput::new(
             SectionKind::STOREDMETA,
@@ -3061,6 +3401,31 @@ mod tests {
     const INDEXED_NUMERIC_SCHEMA: SchemaDescriptor = SchemaDescriptor {
         name: "scribe-indexed-numeric-v1",
         fields: &INDEXED_NUMERIC_FIELDS,
+    };
+
+    const SIGNED_UNSIGNED_NUMERIC_FIELDS: [FieldDescriptor; 2] = [
+        FieldDescriptor {
+            id: 0,
+            name: "created_at",
+            kind: FieldKind::I64 {
+                indexed: true,
+                fast: false,
+            },
+            stored: false,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "sequence",
+            kind: FieldKind::U64 {
+                indexed: true,
+                fast: false,
+            },
+            stored: false,
+        },
+    ];
+    const SIGNED_UNSIGNED_NUMERIC_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "scribe-signed-unsigned-numeric-v1",
+        fields: &SIGNED_UNSIGNED_NUMERIC_FIELDS,
     };
 
     #[derive(Debug, Default)]
@@ -4169,6 +4534,181 @@ mod tests {
     }
 
     #[test]
+    fn numeric_input_is_typed_stored_and_validation_is_atomic() {
+        let mut accumulator =
+            ColumnarAccumulator::new(INDEXED_NUMERIC_SCHEMA).expect("valid numeric schema");
+        let high_unsigned = (1_u64 << 63) + 17;
+        accumulator
+            .add_document_with_numeric(3, &[], &[IndexedNumericValue::u64(0, high_unsigned)])
+            .expect("typed unsigned value accumulates");
+
+        assert_eq!(accumulator.document_ords(), &[3]);
+        assert_eq!(
+            accumulator
+                .numeric_field(0)
+                .expect("indexed numeric column")
+                .values(),
+            &[Some(NumericValue::U64(high_unsigned))]
+        );
+        assert_eq!(
+            accumulator
+                .stored_field(0)
+                .expect("stored numeric column")
+                .value(0),
+            Some(high_unsigned.to_le_bytes().as_slice())
+        );
+
+        assert_eq!(
+            accumulator.add_document_with_numeric(4, &[], &[IndexedNumericValue::i64(0, -1)]),
+            Err(AccumulatorError::NumericTypeMismatch {
+                field_ord: 0,
+                field_name: "sequence",
+                expected: "u64",
+                actual: "i64",
+            })
+        );
+        assert_eq!(
+            accumulator.add_document_with_stored(4, &[], &[StoredFieldValue::new(0, &[1, 2, 3])],),
+            Err(AccumulatorError::InvalidNumericBytes {
+                field_ord: 0,
+                field_name: "sequence",
+                expected: 8,
+                actual: 3,
+            })
+        );
+        assert_eq!(
+            accumulator.add_document_with_values(
+                4,
+                &[],
+                &[IndexedNumericValue::u64(0, 9)],
+                &[StoredFieldValue::new(0, &9_u64.to_le_bytes())],
+            ),
+            Err(AccumulatorError::DuplicateField {
+                doc_ord: 4,
+                field_ord: 0,
+            })
+        );
+
+        assert_eq!(accumulator.document_ords(), &[3]);
+        assert_eq!(
+            accumulator
+                .numeric_field(0)
+                .expect("indexed numeric column")
+                .values(),
+            &[Some(NumericValue::U64(high_unsigned))]
+        );
+        let stored = accumulator.stored_field(0).expect("stored numeric column");
+        assert_eq!(stored.document_count(), 1);
+        assert_eq!(
+            stored.value(0),
+            Some(high_unsigned.to_le_bytes().as_slice())
+        );
+
+        let next = 42_u64;
+        accumulator
+            .add_document_with_stored(4, &[], &[StoredFieldValue::new(0, &next.to_le_bytes())])
+            .expect("rejected document did not advance accumulator state");
+        assert_eq!(accumulator.document_ords(), &[3, 4]);
+        assert_eq!(
+            accumulator
+                .numeric_field(0)
+                .expect("indexed numeric column")
+                .values(),
+            &[
+                Some(NumericValue::U64(high_unsigned)),
+                Some(NumericValue::U64(next)),
+            ]
+        );
+    }
+
+    #[test]
+    fn sparse_numeric_seal_rebases_both_types_through_u32_max() {
+        let mut accumulator = ColumnarAccumulator::new(SIGNED_UNSIGNED_NUMERIC_SCHEMA)
+            .expect("valid signed/unsigned numeric schema");
+        accumulator
+            .add_document_with_numeric(
+                0,
+                &[],
+                &[
+                    IndexedNumericValue::i64(0, -7),
+                    IndexedNumericValue::u64(1, 0),
+                ],
+            )
+            .expect("first sparse numeric document accumulates");
+        accumulator
+            .add_document_with_numeric(17, &[], &[IndexedNumericValue::i64(0, i64::MAX)])
+            .expect("middle sparse numeric document accumulates");
+        accumulator
+            .add_document_with_numeric(
+                DOC_ORDS_PER_LEASE - 1,
+                &[],
+                &[
+                    IndexedNumericValue::i64(0, i64::MIN),
+                    IndexedNumericValue::u64(1, u64::MAX),
+                ],
+            )
+            .expect("lease-boundary numeric document accumulates");
+
+        let documents = [
+            FlushDocumentInput::new(0, "first", 1),
+            FlushDocumentInput::new(17, "middle", 2),
+            FlushDocumentInput::new(DOC_ORDS_PER_LEASE - 1, "last", 3),
+        ];
+        let lease_docid_base = (1_u64 << 32) - u64::from(DOC_ORDS_PER_LEASE);
+        let encoded = flush_accumulator(
+            &accumulator,
+            FlushSegmentInput {
+                segment_id: 91,
+                lease_docid_base,
+                created_unix_s: 0,
+                engine_version: 0,
+                documents: &documents,
+            },
+        )
+        .expect("sparse signed/unsigned segment seals");
+        let reader =
+            SegmentReader::from_owned(encoded.into_bytes(), SIGNED_UNSIGNED_NUMERIC_SCHEMA)
+                .expect("sparse signed/unsigned segment reopens");
+        assert_eq!(reader.header().docid_lo, lease_docid_base);
+        assert_eq!(reader.header().docid_hi, 1_u64 << 32);
+        let numeric_bytes = reader
+            .section(SectionKind::NUMERIC)
+            .expect("NUMERIC checksum verifies")
+            .expect("numeric schema requires NUMERIC");
+        let section = crate::quiver::NumericSection::parse(
+            numeric_bytes,
+            SIGNED_UNSIGNED_NUMERIC_SCHEMA,
+            lease_docid_base,
+            1_u64 << 32,
+        )
+        .expect("sparse NUMERIC payload validates");
+        let base_docid = u32::try_from(lease_docid_base).expect("lease base fits u32");
+        assert_eq!(
+            section
+                .field(0)
+                .expect("signed field")
+                .entries()
+                .collect::<Vec<_>>(),
+            vec![
+                crate::quiver::NumericEntry::i64(i64::MIN, u32::MAX),
+                crate::quiver::NumericEntry::i64(-7, base_docid),
+                crate::quiver::NumericEntry::i64(i64::MAX, base_docid + 17),
+            ]
+        );
+        assert_eq!(
+            section
+                .field(1)
+                .expect("unsigned field")
+                .entries()
+                .collect::<Vec<_>>(),
+            vec![
+                crate::quiver::NumericEntry::u64(0, base_docid),
+                crate::quiver::NumericEntry::u64(u64::MAX, u32::MAX),
+            ]
+        );
+    }
+
+    #[test]
     fn randomized_accumulation_preserves_all_parallel_column_invariants() {
         const SEEDS: [u64; 12] = [
             1,
@@ -5190,7 +5730,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_rejects_sidecar_drift_duplicates_numeric_and_docid_overflow() {
+    fn flush_rejects_sidecar_drift_duplicates_and_docid_overflow() {
         let empty = ColumnarAccumulator::new(MIXED_POSITION_SCHEMA).expect("valid schema");
         assert!(matches!(
             flush_accumulator(
@@ -5337,21 +5877,36 @@ mod tests {
             .add_document_with_stored(0, &[], &[StoredFieldValue::new(0, &42_u64.to_le_bytes())])
             .expect("numeric stored bytes accumulate");
         let numeric_identity = [FlushDocumentInput::new(0, "numeric", 3)];
-        assert!(matches!(
-            flush_accumulator(
-                &numeric,
-                FlushSegmentInput {
-                    segment_id: 8,
-                    lease_docid_base: 0,
-                    created_unix_s: 0,
-                    engine_version: 0,
-                    documents: &numeric_identity,
-                }
-            ),
-            Err(FlushError::IndexedNumericUnsupported {
-                field_ord: 0,
-                field_name: "sequence"
-            })
-        ));
+        let numeric_segment = flush_accumulator(
+            &numeric,
+            FlushSegmentInput {
+                segment_id: 8,
+                lease_docid_base: 0,
+                created_unix_s: 0,
+                engine_version: 0,
+                documents: &numeric_identity,
+            },
+        )
+        .expect("indexed numeric field seals");
+        let numeric_reader = crate::segment::SegmentReader::from_owned(
+            numeric_segment.into_bytes(),
+            INDEXED_NUMERIC_SCHEMA,
+        )
+        .expect("numeric segment reopens");
+        let numeric_bytes = numeric_reader
+            .section(SectionKind::NUMERIC)
+            .expect("NUMERIC checksum verifies")
+            .expect("indexed numeric schema requires NUMERIC");
+        let numeric_section =
+            crate::quiver::NumericSection::parse(numeric_bytes, INDEXED_NUMERIC_SCHEMA, 0, 1)
+                .expect("NUMERIC payload validates");
+        assert_eq!(
+            numeric_section
+                .field(0)
+                .expect("sequence field")
+                .entries()
+                .collect::<Vec<_>>(),
+            vec![crate::quiver::NumericEntry::u64(42, 0)]
+        );
     }
 }
