@@ -900,7 +900,8 @@ fn maybe_load_or_build_ann_with_save(
                                     ann_path = %ann_path.display(),
                                     ?error,
                                     "failed to persist rebuilt ANN sidecar; ANN stays in-memory \
-                                     for this process, but the next startup will rebuild it again; \
+                                     for this process, but persistence durability was not confirmed \
+                                     and the next startup may rebuild it again; \
                                      check path permissions and free space"
                                 );
                             } else {

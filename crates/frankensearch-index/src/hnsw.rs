@@ -196,12 +196,14 @@ impl HnswIndex {
     /// the native graph/data pair is legacy, stale, missing, or corrupt.
     ///
     /// The source index validates the persisted document sequence and vector
-    /// fingerprint. A fallback rebuild reads its vectors from that same source.
+    /// fingerprint. A fallback rebuild reads every live row from that same
+    /// source, preserving row-to-vector alignment even when document IDs are
+    /// not unique.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::IndexCorrupted` if metadata is missing/malformed or
-    /// if referenced documents are missing from `source_index`.
+    /// if live rows cannot be decoded from `source_index`.
     pub fn load(path: &Path, source_index: &VectorIndex) -> SearchResult<Self> {
         Self::load_with_disposition(path, source_index).map(|(index, _)| index)
     }
@@ -250,17 +252,10 @@ impl HnswIndex {
             );
         }
 
-        // v1/legacy or fallback: rehydrate vectors from the source index and
-        // rebuild the graph.
-        let mut vectors = Vec::with_capacity(meta.doc_ids.len());
-        for doc_id in &meta.doc_ids {
-            let idx = source_index.find_index_by_doc_id(doc_id)?.ok_or_else(|| {
-                ann_corrupted(path, format!("doc_id '{doc_id}' missing from source index"))
-            })?;
-            vectors.push(source_index.vector_at_f32(idx)?);
-        }
-
-        Self::build_from_parts(meta.doc_ids, vectors, meta.dimension, meta.config)
+        // v1/legacy or fallback: rebuild directly from live source rows. Looking
+        // vectors up by doc ID would collapse duplicate IDs onto their first
+        // occurrence and silently attach the wrong vector to later rows.
+        Self::build_from_vector_index(source_index, meta.config)
             .map(|index| (index, HnswLoadDisposition::Rebuilt))
     }
 
@@ -2202,6 +2197,59 @@ mod tests {
             .knn_search(&query, 5, HNSW_DEFAULT_EF_SEARCH)
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0010");
+    }
+
+    #[test]
+    fn fallback_rebuild_preserves_duplicate_doc_id_vector_alignment() {
+        let source_path = temp_path("duplicate-id-source", "fsvi");
+        let mut writer =
+            VectorIndex::create_with_revision(&source_path, "hash", "test", 2, Quantization::F32)
+                .expect("create source index");
+        writer
+            .write_record("duplicate", &[1.0_f32, 0.0])
+            .expect("write first duplicate");
+        writer
+            .write_record("duplicate", &[0.0_f32, 1.0])
+            .expect("write second duplicate");
+        writer.finish().expect("finish source index");
+        let source_index = VectorIndex::open(&source_path).expect("open source index");
+
+        let legacy_path = temp_path("duplicate-id-legacy", "hnsw");
+        let legacy_meta = HnswMeta {
+            format_version: 0,
+            doc_ids: vec!["duplicate".to_owned(), "duplicate".to_owned()],
+            config: HnswConfig::default(),
+            dimension: 2,
+            vector_fingerprint: 0,
+            sidecar_generation: None,
+            sidecar_basename: None,
+        };
+        std::fs::write(
+            &legacy_path,
+            serde_json::to_vec(&legacy_meta).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy metadata");
+
+        let (rebuilt, disposition) = HnswIndex::load_with_disposition(&legacy_path, &source_index)
+            .expect("fallback rebuild");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+
+        let expected_doc_ids = vec!["duplicate".to_owned(), "duplicate".to_owned()];
+        let expected_vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        assert_eq!(
+            rebuilt.vector_fingerprint,
+            fingerprint_vectors(&expected_doc_ids, &expected_vectors),
+            "fallback must fingerprint the vector at each source row, not the first row sharing its ID"
+        );
+
+        let first = rebuilt
+            .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search first duplicate vector");
+        let second = rebuilt
+            .knn_search(&[0.0, 1.0], 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search second duplicate vector");
+        assert_eq!(first[0].index, 0);
+        assert_eq!(second[0].index, 1);
     }
 
     #[test]
